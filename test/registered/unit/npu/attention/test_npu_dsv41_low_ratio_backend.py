@@ -18,6 +18,14 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=8, suite="base-a-test-npu")
 
+# apply_all_hf_patches() imports transformers submodules that pull in
+# accelerate, whose state module probes find_spec("torch_npu") at import
+# time; that probe raises on the torch_npu mock installed below (a
+# MagicMock has no __spec__). Run the patches while the module space is
+# still clean -- a bare `import transformers` stays lazy and never
+# reaches accelerate, so it would not cover this.
+import sglang.srt.hf_transformers  # noqa: F401
+
 # The backend imports ragged_verify at module level, so load the REAL module
 # before the stub block below shadows its package parent.
 from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
@@ -26,6 +34,14 @@ for mod in (
     "torch_npu",
     "torch_npu.contrib",
     "sgl_kernel_npu",
+    "sgl_kernel_npu.operators",
+    "sgl_kernel_npu.operators.attention",
+    "sgl_kernel_npu.operators.indexer",
+    "sgl_kernel_npu.operators.mem_cache",
+    # pool_host/{mha,mamba}.py import this under ``if _is_npu``, so only a
+    # real-NPU environment reaches the import; a mock parent without
+    # ``__path__`` would fail the from-import before the names resolve.
+    "sgl_kernel_npu.kvcacheio",
     "sgl_kernel_npu.attention",
     "sgl_kernel_npu.attention.sinks_attention",
     "sgl_kernel_npu.norm",
@@ -50,46 +66,49 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     LowRatioCompressAscendBackendMixin,
 )
 from sglang.srt.hardware_backend.npu.dsv4 import dsv4_memory_pool
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import NPUDSV4KVLayout
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
     DSV4NPUTokenToKVPool,
     DSV41NPUSingleKVPool,
 )
-from sglang.srt.hardware_backend.npu.dsv4.npu_kv_layout import NPUDSV4KVLayout
-from sglang.srt.layers.quantization import fp8_utils
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DSV41_INDEX_PAGE_SIZE,
     get_dsv4_indexer_bytes_per_token,
 )
 from sglang.srt.mem_cache.registry import create_unified_radix_cache
+from sglang.srt.mem_cache.unified_cache.components import ComponentType
 
 
 class _Ds41Stub(ModuleType):
     """Stand-in for the entry points ``_ds41_ops`` returns.
 
-    Only the two metadata entry points are exercised by these tests; both return
+    Only the metadata entry points are exercised by these tests; each returns
     a real int32 tensor so the graph-buffer ``torch.zeros_like`` probe works.
     """
 
     def __init__(self):
         super().__init__("ds41_stub")
-        self.mixed_quant_sparse_flash_mla = MagicMock(return_value=(None, None))
-        self.quant_lightning_indexer = MagicMock(return_value=(None, None, None, None))
-        self.quant_sparse_lightning_indexer = MagicMock(return_value=(None, None))
+        self.mixed_quant_sparse_flash_mla_dsl = MagicMock(return_value=(None, None))
+        self.quant_lightning_indexer_dsl = MagicMock(
+            return_value=(None, None, None, None)
+        )
+        self.quant_sparse_lightning_indexer_dsl = MagicMock(return_value=(None, None))
         self.compressor = MagicMock()
-        self.indexer_prologue_k = MagicMock()
+        self.indexer_prologue_k_dsl = MagicMock()
 
     @staticmethod
-    def mixed_quant_sparse_flash_mla_metadata(*args, **kwargs):
+    def mixed_quant_sparse_flash_mla_metadata_dsl(*args, **kwargs):
         # The operator returns (2 * cube_core_num,) int32.
         return torch.zeros(48, dtype=torch.int32)
 
     @staticmethod
-    def quant_lightning_indexer_metadata(*args, **kwargs):
+    def quant_lightning_indexer_metadata_dsl(*args, **kwargs):
         # QLI metadata is a fixed 1024 int32.
         return torch.zeros(1024, dtype=torch.int32)
 
     @staticmethod
-    def quant_sparse_lightning_indexer_metadata(*args, **kwargs):
+    def quant_sparse_lightning_indexer_metadata_dsl(*args, **kwargs):
         # QSLI metadata is a fixed 1024 int32.
         return torch.zeros(1024, dtype=torch.int32)
 
@@ -98,23 +117,6 @@ DS41 = _Ds41Stub()
 # Keep the real resolver for routing tests; other tests use CPU metadata stubs.
 _real_ds41_ops = dsv4_backend._ds41_ops
 dsv4_backend._ds41_ops = lambda: DS41
-
-
-def setUpModule():
-    # This suite describes the original A5 packed path. A3 has separate BF16
-    # contract tests; do not let the host running this suite select its ABI.
-    global _arch_patches
-    _arch_patches = [
-        patch.object(module, "is_npu_arch35", return_value=True)
-        for module in (dsv4_backend, dsv4_memory_pool)
-    ]
-    for arch_patch in _arch_patches:
-        arch_patch.start()
-
-
-def tearDownModule():
-    for arch_patch in reversed(_arch_patches):
-        arch_patch.stop()
 
 
 def _low_ratio_backend(*, ratios=(1, 2), window=128):
@@ -292,29 +294,24 @@ class TestPoolFactory(unittest.TestCase):
         # One row per slot: the window page is the global page.
         self.assertEqual(calls["DSV41NPUSingleKVPool"]["kernel_page_size"], 128)
 
-    def test_ratio1_compressed_pool_is_fp4_despite_the_global_page(self):
-        out, calls = self._make(
-            page_size=128,
-            global_page_size=128,
-            kv_layout=NPUDSV4KVLayout.V41_CMP_FP4,
-        )
-        self.assertEqual(out, "DSV41NPUSingleKVPool")
-        self.assertIs(
-            calls["DSV41NPUSingleKVPool"]["layout"], NPUDSV4KVLayout.V41_CMP_FP4
-        )
-
-    def test_ratio2_compressed_pool_is_fp4(self):
-        out, calls = self._make(
-            page_size=64,
-            global_page_size=128,
-            kv_layout=NPUDSV4KVLayout.V41_CMP_FP4,
-        )
-        self.assertEqual(out, "DSV41NPUSingleKVPool")
-        self.assertIs(
-            calls["DSV41NPUSingleKVPool"]["layout"], NPUDSV4KVLayout.V41_CMP_FP4
-        )
-        # A ratio-2 compressed page holds global // 2 rows.
-        self.assertEqual(calls["DSV41NPUSingleKVPool"]["kernel_page_size"], 64)
+    def test_compressed_pools_are_fp4(self):
+        # A ratio-1 compressed page keeps the global page; a ratio-2 page holds
+        # global // 2 rows. Both take the compressed row format.
+        for page_size in (128, 64):
+            with self.subTest(page_size=page_size):
+                out, calls = self._make(
+                    page_size=page_size,
+                    global_page_size=128,
+                    kv_layout=NPUDSV4KVLayout.V41_CMP_FP4,
+                )
+                self.assertEqual(out, "DSV41NPUSingleKVPool")
+                self.assertIs(
+                    calls["DSV41NPUSingleKVPool"]["layout"],
+                    NPUDSV4KVLayout.V41_CMP_FP4,
+                )
+                self.assertEqual(
+                    calls["DSV41NPUSingleKVPool"]["kernel_page_size"], page_size
+                )
 
     def test_v4_window_pool_arrives_pre_tagged(self):
         out, calls = self._make(
@@ -344,16 +341,22 @@ class TestPoolFactory(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self._make(page_size=128, global_page_size=128, kv_layout=KVLayout.V4)
 
+    def _pool(self, compression_ratios, **extra):
+        """A bare pool instance: ``_is_v41_model`` is a method, so the fake
+        self must be of the real class (a plain namespace cannot carry it)."""
+        pool = DSV4NPUTokenToKVPool.__new__(DSV4NPUTokenToKVPool)
+        pool.compression_ratios = tuple(compression_ratios)
+        for key, value in extra.items():
+            setattr(pool, key, value)
+        return pool
+
     def test_window_layout_resolves_the_row_format(self):
-        fake = SimpleNamespace(compression_ratios=(0, 1, 2), _is_v41_model=lambda: True)
-        with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
-            self.assertIs(
-                DSV4NPUTokenToKVPool._window_kv_layout(fake),
-                NPUDSV4KVLayout.V41_SWA_FP8,
-            )
-        fake_v4 = SimpleNamespace(
-            compression_ratios=(0, 4, 128), _is_v41_model=lambda: False
+        fake = self._pool((0, 1, 2))
+        self.assertIs(
+            DSV4NPUTokenToKVPool._window_kv_layout(fake),
+            NPUDSV4KVLayout.V41_SWA_FP8,
         )
+        fake_v4 = self._pool((0, 4, 128))
         with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
             self.assertIs(
                 DSV4NPUTokenToKVPool._window_kv_layout(fake_v4),
@@ -365,24 +368,32 @@ class TestPoolFactory(unittest.TestCase):
                 NPUDSV4KVLayout.V4_BF16,
             )
 
-    def test_compressed_kv_layout_tags_every_ratio(self):
-        fake = SimpleNamespace(
-            compression_ratios=(0, 1, 2),
-            _is_v41_model=lambda: True,
-            kv_layout=KVLayout.V4,
-            compressed_kv_layout_option=None,
-        )
+    def test_pinned_generation_overrides_the_ratio_list(self):
+        # A draft worker pins the V4 generation while its ratio list is empty:
+        # its forward still runs the V4 sparse-attention op.
+        draft = self._pool((0,), _npu_window_generation="v4")
         with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
             self.assertIs(
-                DSV4NPUTokenToKVPool.compressed_kv_layout(fake, 1),
-                NPUDSV4KVLayout.V41_CMP_FP4,
+                DSV4NPUTokenToKVPool._window_kv_layout(draft),
+                NPUDSV4KVLayout.V4_FP8,
             )
-        fake_v4 = SimpleNamespace(
-            compression_ratios=(0, 4, 128),
-            _is_v41_model=lambda: False,
-            kv_layout=KVLayout.V4,
-            compressed_kv_layout_option=None,
+            self.assertIs(
+                DSV4NPUTokenToKVPool.compressed_kv_layout(draft, 1),
+                NPUDSV4KVLayout.V4_FP8,
+            )
+        pinned_v41 = self._pool((0,), _npu_window_generation="v41")
+        self.assertIs(
+            DSV4NPUTokenToKVPool._window_kv_layout(pinned_v41),
+            NPUDSV4KVLayout.V41_SWA_FP8,
         )
+
+    def test_compressed_kv_layout_tags_every_ratio(self):
+        fake = self._pool((0, 1, 2))
+        self.assertIs(
+            DSV4NPUTokenToKVPool.compressed_kv_layout(fake, 1),
+            NPUDSV4KVLayout.V41_CMP_FP4,
+        )
+        fake_v4 = self._pool((0, 4, 128))
         with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
             self.assertIs(
                 DSV4NPUTokenToKVPool.compressed_kv_layout(fake_v4, 4),
@@ -576,24 +587,30 @@ class TestPdBufferEnumeration(unittest.TestCase):
 
 
 class TestCompact1d(unittest.TestCase):
+    """``_stable_compact_1d``: compact into a fixed buffer without NonZero.
+
+    The helper lives on the concrete backend since the verify/seq-metadata
+    unification; the mixin owns the row-value formulas, not the compaction.
+    """
+
     def test_dense_front_with_custom_fill(self):
         dst = torch.full((5,), 99, dtype=torch.int32)
         values = torch.tensor([10, 20, 30], dtype=torch.int64)
         keep = torch.tensor([True, False, True], dtype=torch.bool)
-        LowRatioCompressAscendBackendMixin._dsv41_compact_1d(dst, values, keep, fill=-1)
+        DeepseekV4AscendAttnBackend._stable_compact_1d(dst, values, keep, fill=-1)
         self.assertEqual(dst.tolist(), [10, 30, -1, -1, -1])
 
     def test_overflow_rows_are_dropped_instead_of_raised(self):
         dst = torch.full((2,), 7, dtype=torch.int32)
         values = torch.tensor([1, 2, 3], dtype=torch.int64)
         keep = torch.tensor([True, True, True])
-        LowRatioCompressAscendBackendMixin._dsv41_compact_1d(dst, values, keep, fill=0)
+        DeepseekV4AscendAttnBackend._stable_compact_1d(dst, values, keep, fill=0)
         self.assertEqual(dst.tolist(), [1, 2])
 
     def test_size_mismatch_is_rejected(self):
         dst = torch.zeros(3, dtype=torch.int32)
         with self.assertRaises(ValueError):
-            LowRatioCompressAscendBackendMixin._dsv41_compact_1d(
+            DeepseekV4AscendAttnBackend._stable_compact_1d(
                 dst, torch.tensor([1, 2]), torch.tensor([True]), fill=0
             )
 
@@ -797,6 +814,9 @@ class TestGraphBuffers(unittest.TestCase):
             live_seq_lens=torch.tensor([2], dtype=torch.int32),
             forward_batch=batch,
         )
+        # The unified replay refresh expands the index page tables before the
+        # mode-specific rows (the 1d refresh no longer does it itself).
+        backend._refresh_graph_dsv41_index_page_tables(metadata)
         backend._refresh_graph_dsv41_1d(ctx)
         # Address is stable (the captured graph holds it) and the content is the
         # [k*p, k*p + k) expansion of the refreshed block table.
@@ -841,6 +861,7 @@ class TestGraphBuffers(unittest.TestCase):
             live_seq_lens=torch.tensor([2], dtype=torch.int32),
             forward_batch=batch,
         )
+        backend._refresh_graph_dsv41_index_page_tables(metadata)
         backend._refresh_graph_dsv41_1d(ctx)
         # ratio 2 pages 1:1, ratio 1 expands each full page into two index pages.
         self.assertEqual(metadata.c2_index_page_table.tolist(), [[9, 8]])
@@ -900,7 +921,9 @@ class TestGraphBuffers(unittest.TestCase):
             self.assertEqual(candidate_block_length.numel(), int(cu_seqlens_q[-1]))
             return torch.zeros(1024, dtype=torch.int32)
 
-        with patch.object(DS41, "quant_sparse_lightning_indexer_metadata", schedule):
+        with patch.object(
+            DS41, "quant_sparse_lightning_indexer_metadata_dsl", schedule
+        ):
             for bs, width in ((1, 1), (1, 2), (2, 6)):
                 with self.subTest(bs=bs, width=width):
                     metadata = SimpleNamespace(
@@ -1075,9 +1098,10 @@ class TestIndexerRopeSource(unittest.TestCase):
                 ),
             ),
             patch.object(rope_mod, "Dsv4NpuRoPE", _RopeStub),
-            patch.object(DS41, "quant_lightning_indexer", _QLI()),
+            patch.object(DS41, "quant_lightning_indexer_dsl", _QLI()),
         ):
-            out = backend._dsv41_index_full_topk(
+            # The non-candidate path returns ``(scored, None)``.
+            out, _ = backend._dsv41_index_full_topk(
                 layer,
                 torch.zeros(1, 8),
                 torch.zeros(1, 8),
@@ -1137,6 +1161,12 @@ class TestLowRatioAttentionBody(unittest.TestCase):
             actual_seq_lengths_q_pa=torch.arange(0, 2, dtype=torch.int32),
             actual_seq_lengths_kv=torch.tensor(seq_lens, dtype=torch.int32),
             swa_page_table=torch.zeros((1, 2), dtype=torch.int32),
+            # The metadata pass owns the window geometry: the body reads these
+            # graph-resident buffers instead of recomputing them.
+            dsv41_win_sparse_indices=torch.zeros((1, 1, window), dtype=torch.int32),
+            dsv41_win_topk_length=torch.full(
+                (1, 1), min(window, seq_lens[0]), dtype=torch.int32
+            ),
             **{
                 f"c{ratio}_page_table": torch.zeros((1, 2), dtype=torch.int32),
                 "kernel_metadata": {
@@ -1149,6 +1179,12 @@ class TestLowRatioAttentionBody(unittest.TestCase):
                 fm,
                 f"c{ratio}_topk_indices",
                 torch.zeros((1, backend._dsv4_index_topk), dtype=torch.int32),
+            )
+        if ratio > 0:
+            setattr(
+                fm,
+                f"dsv41_cmp_topk_length_c{ratio}",
+                torch.full((1, 1), seq_lens[0] // ratio, dtype=torch.int32),
             )
         backend.forward_metadata = fm
         backend.token_to_kv_pool = SimpleNamespace(
@@ -1166,7 +1202,7 @@ class TestLowRatioAttentionBody(unittest.TestCase):
             seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
             batch_size=1,
         )
-        with patch.object(DS41, "mixed_quant_sparse_flash_mla", _MQSMLA()):
+        with patch.object(DS41, "mixed_quant_sparse_flash_mla_dsl", _MQSMLA()):
             out = backend._forward_low_ratio_attention(
                 torch.zeros(1, 64, 512), layer, batch, None, ratio
             )
@@ -1188,8 +1224,9 @@ class TestLowRatioAttentionBody(unittest.TestCase):
         self.assertIs(kw["cmp_block_table"], fm.c2_page_table)
         self.assertEqual(kw["cmp_sparse_indices"].shape, (1, 1, 512))
         self.assertIs(kw["metadata"], fm.kernel_metadata["c2a_metadata"])
-        # Per-query lengths are derived from the live positions: p = 6 -> the
-        # 7th token closes the 3rd pair, capped by index_topk.
+        # Per-query lengths come from the metadata pass, which derives them
+        # from the live positions: p = 6 -> the 7th token closes the 3rd pair,
+        # capped by index_topk.
         self.assertEqual(kw["cmp_topk_length"].tolist(), [[3]])
         # Reserved by the operator, but derived from seq_lens.
         self.assertEqual(kw["seqused_cmp_kv"].tolist(), [3])
@@ -1325,48 +1362,6 @@ class TestIndexStepGuards(unittest.TestCase):
             backend._dsv41_index_k_store(layer, None)
 
 
-class TestNPUBlock32Dispatch(unittest.TestCase):
-    def test_native_dispatch_matches_the_load_time_mxfp8_gate(self):
-        native_linear = object()
-        backend = SimpleNamespace(is_auto=lambda: True, is_deep_gemm=lambda: False)
-        for arch35 in (False, True):
-            for ue8m0 in (False, True):
-                for requant in (False, True):
-                    with (
-                        self.subTest(arch35=arch35, ue8m0=ue8m0, requant=requant),
-                        patch.object(
-                            fp8_utils,
-                            "get_fp8_gemm_runner_backend",
-                            return_value=backend,
-                        ),
-                        patch.object(
-                            fp8_utils.deep_gemm_wrapper, "ENABLE_JIT_DEEPGEMM", False
-                        ),
-                        patch.object(fp8_utils, "is_npu_arch35", return_value=arch35),
-                        patch.object(
-                            fp8_utils.envs.SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8,
-                            "get",
-                            return_value=requant,
-                        ),
-                        patch.object(
-                            fp8_utils,
-                            "npu_w8a8_mxfp8_linear",
-                            native_linear,
-                            create=True,
-                        ),
-                    ):
-                        linear = fp8_utils.dispatch_w8a8_block_fp8_linear(
-                            weight_block_size=[32, 32], act_scale_ue8m0=ue8m0
-                        )
-                    if arch35 and (ue8m0 or requant):
-                        self.assertIs(linear, native_linear)
-                    else:
-                        self.assertIs(
-                            linear.func, fp8_utils.triton_w8a8_block_fp8_linear
-                        )
-                        self.assertEqual(linear.keywords, {"act_scale_ue8m0": ue8m0})
-
-
 class TestC128ComponentGating(unittest.TestCase):
     """The C128 sidecar component must only attach where a C128 pool exists.
 
@@ -1380,22 +1375,22 @@ class TestC128ComponentGating(unittest.TestCase):
 
         class _StubCache:
             def __init__(self, params):
-                captured["components"] = tuple(
-                    slot.component for slot in params.tree_slots
-                )
+                captured["tree_components"] = tuple(params.tree_components)
 
         req_to_token_pool = (
             SimpleNamespace(req_to_c128_sidecar=torch.zeros(1, 1, dtype=torch.int32))
             if sidecar
             else SimpleNamespace()
         )
-        params = SimpleNamespace(
+        # The registry writes the slots onto ``params.tree_slots`` and the cache
+        # reads ``params.tree_components``, which is a derived property of that
+        # field -- so params must be the real dataclass, not a plain namespace.
+        params = CacheInitParams(
+            disable=False,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=SimpleNamespace(storage=None, size=1024),
+            page_size=1,
             sliding_window_size=128,
-            draft_swa_window=0,
-            component_registry_override=None,
-            tree_slots=(),
         )
         ctx = SimpleNamespace(
             server_args=None,
@@ -1422,20 +1417,20 @@ class TestC128ComponentGating(unittest.TestCase):
             ),
         ):
             create_unified_radix_cache(ctx, cache_class=_StubCache)
-        return captured["components"]
+        return captured["tree_components"]
 
     def test_dsv4_keeps_the_c128_component(self):
         components = self._components_for((0, 0) + (4,) * 2 + (128,) * 2)
-        self.assertIn("C128", components)
+        self.assertIn(ComponentType.C128, components)
 
     def test_dsv41_drops_the_c128_component(self):
         components = self._components_for((0, 0) + (2,) * 2 + (1,) * 2)
-        self.assertNotIn("C128", components)
-        self.assertIn("SWA", components)
+        self.assertNotIn(ComponentType.C128, components)
+        self.assertIn(ComponentType.SWA, components)
 
     def test_missing_sidecar_pool_never_registers_the_component(self):
         components = self._components_for((128,), sidecar=False)
-        self.assertNotIn("C128", components)
+        self.assertNotIn(ComponentType.C128, components)
 
 
 class TestLowRatioCompressGuards(unittest.TestCase):
@@ -1555,52 +1550,27 @@ class TestEagerGraphMetadataParity(unittest.TestCase):
 
 
 class TestVerifyGraphGuards(unittest.TestCase):
-    """The `_apply_dsv4_graph_metadata` verify arm and the startup guards.
+    """The verify replay seam and the startup spec gate.
 
-    V4.1 owns its verify replay, a stage without
-    low ratios (V4 model or draft worker) keeps its silent bypass, and COMPACT
-    ragged verify is rejected at startup.
+    ``_refresh_graph_verify_rows`` owns the verify replay: a live window
+    refreshes the low-ratio 1-D rows, an idle replay neutralizes them, and a
+    stage without low ratios (V4 model or draft worker) keeps its silent
+    bypass. DeepSeek-V4.1 speculative decoding runs DSpark on the STATIC layout
+    only: every other algorithm and every ragged mode is rejected at startup by
+    ``_validate_spec_support``.
     """
 
-    class _GraphMode:
-        def __init__(self, target_verify):
-            self._target_verify = target_verify
+    def _run_verify_rows(self, *, has_low_ratio=True, is_idle=False):
+        """Run ``_refresh_graph_verify_rows`` with the refresh pair stubbed.
 
-        def is_decode(self):
-            return not self._target_verify
-
-        def is_target_verify(self):
-            return self._target_verify
-
-        def is_decode_or_idle(self):
-            return self.is_decode()
-
-    _REFRESHES = (
-        "_refresh_cycle_state_block_table",
-        "_refresh_graph_seq_metadata",
-        "_refresh_v4_compress_page_tables",
-        "_refresh_graph_decode_rows",
-        "_refresh_graph_dsv41_index_page_tables",
-        "_refresh_graph_explicit_state_block_tables",
-        "_refresh_graph_swa_metadata_direct",
-        "_refresh_graph_dspark_sparse_metadata",
-        "_refresh_graph_kernel_metadata",
-    )
-
-    def _run_replay(
-        self, *, has_low_ratio=True, dspark=True, is_idle=False, verify=True
-    ):
-        """Run ``_apply_dsv4_graph_metadata`` with the refreshes stubbed.
-
-        Returns ``(calls, verify_calls)``: the stubbed refresh names invoked in
-        order, and which of the verify refresh/clear pair fired.
+        Returns which of the verify refresh/clear pair fired.
         """
         backend = _low_ratio_backend()
         backend._dsv4_has_low_ratio = has_low_ratio
-        backend._is_dspark_algorithm = dspark
-        calls = []
-        for name in self._REFRESHES:
-            setattr(backend, name, (lambda ctx, _n=name: calls.append(_n)))
+        backend.forward_metadata = SimpleNamespace(
+            start_pos=torch.zeros(1, dtype=torch.int32),
+            seqused=torch.zeros(1, dtype=torch.int32),
+        )
         verify_calls = []
         backend._refresh_graph_dsv41_verify_1d = lambda ctx: verify_calls.append(
             "refresh"
@@ -1608,107 +1578,84 @@ class TestVerifyGraphGuards(unittest.TestCase):
         backend._clear_graph_dsv41_verify_metadata = lambda ctx: verify_calls.append(
             "clear"
         )
-        backend.is_hybrid_swa = False
-        backend.speculative_num_draft_tokens = 2
-        backend.req_to_token = torch.arange(256).reshape(2, 128)
-        graph_mode = self._GraphMode(verify)
-        forward_batch = SimpleNamespace(
-            batch_size=1,
-            req_pool_indices=torch.tensor([1], dtype=torch.int64),
-            seq_lens=torch.tensor([7], dtype=torch.int32),
-            seq_lens_cpu=torch.tensor([7], dtype=torch.int32),
-            forward_mode=graph_mode,
-            spec_info=None,
-        )
-        metadata = SimpleNamespace(
-            block_tables=torch.full((1, 2), -1, dtype=torch.int32),
-            dsv4_cycle_state_block_table=torch.zeros(1, dtype=torch.int32),
-            start_pos=torch.zeros(1, dtype=torch.int32),
-            seqused=torch.zeros(1, dtype=torch.int32),
-        )
-        backend.graph_metadata[1] = metadata
         ctx = SimpleNamespace(
-            fm=metadata,
+            fm=backend.forward_metadata,
             bs=1,
-            raw_bs=1,
-            forward_batch=forward_batch,
-            graph_mode=graph_mode,
-            is_idle_replay=is_idle,
-            live_seq_lens=torch.tensor([8], dtype=torch.int32),
-            tokens_per_bs=6,
-            device="cpu",
-            ragged_layout=None,
-            # c4/c128 are absent for V4.1, so both verify sub-arms are skipped.
             has_compress=False,
-            active_target_verify=False,
+            is_idle_replay=is_idle,
+            ragged_layout=None,
+            verify_lens=None,
+            tokens_per_bs=3,
+            device=torch.device("cpu"),
+            live_seq_lens=torch.tensor([6], dtype=torch.int32),
+            forward_batch=SimpleNamespace(),
         )
-        backend._build_dsv4_graph_replay_ctx = lambda fb: ctx
-        with patch.object(dsv4_backend, "is_npu_arch35", lambda: False):
-            backend._apply_dsv4_graph_metadata(
-                metadata_key=1, forward_batch=forward_batch, in_capture=False
-            )
-        return calls, verify_calls
+        backend._refresh_graph_verify_rows(ctx)
+        return verify_calls
 
-    def test_dspark_verify_replay_refreshes(self):
-        _, verify_calls = self._run_replay()
-        self.assertEqual(verify_calls, ["refresh"])
+    def test_live_verify_replay_refreshes(self):
+        self.assertEqual(self._run_verify_rows(), ["refresh"])
 
-    def test_dspark_idle_replay_clears(self):
+    def test_idle_replay_clears(self):
         # Idle ranks skip the model body, so nothing is scattered: just clear.
-        _, verify_calls = self._run_replay(is_idle=True)
-        self.assertEqual(verify_calls, ["clear"])
+        self.assertEqual(self._run_verify_rows(is_idle=True), ["clear"])
 
     def test_stage_without_low_ratios_keeps_the_silent_bypass(self):
         # A V4 model, or a draft worker whose ratio list was emptied, has no
         # low-ratio metadata to refresh.
-        _, verify_calls = self._run_replay(has_low_ratio=False)
-        self.assertEqual(verify_calls, [])
+        self.assertEqual(self._run_verify_rows(has_low_ratio=False), [])
 
-    def test_decode_replay_is_untouched(self):
-        _, verify_calls = self._run_replay(verify=False)
-        self.assertEqual(verify_calls, [])
+    def _validate_spec(
+        self, *, is_v41=True, is_none=False, is_dspark=False, is_dflash=False
+    ):
+        backend = _low_ratio_backend()
+        backend._dsv4_is_v41_model = is_v41
+        spec = SimpleNamespace(
+            is_none=lambda: is_none,
+            is_dspark=lambda: is_dspark,
+            is_dflash=lambda: is_dflash,
+        )
+        return backend, spec
 
-    def test_verify_row_refresh_is_not_algorithm_specific(self):
-        _, verify_calls = self._run_replay(dspark=False)
-        self.assertEqual(verify_calls, ["refresh"])
+    def _gate(self, *, mode=RaggedVerifyMode.STATIC, **spec_kwargs):
+        """Run ``_validate_spec_support`` on a V4.1 backend under ``mode``."""
+        backend, spec = self._validate_spec(**spec_kwargs)
+        with patch.object(dsv4_backend, "read_ragged_verify_mode", lambda: mode):
+            backend._validate_spec_support(spec)
 
-    def _ensure_static_mode(self, mode, arch35=True):
-        with (
-            patch.object(dsv4_backend, "read_ragged_verify_mode", lambda: mode),
-            patch.object(dsv4_backend, "is_npu_arch35", lambda: arch35),
-        ):
-            dsv4_backend._ensure_dsv41_static_verify_mode()
+    def test_v41_accepts_dspark_under_static(self):
+        self._gate(is_dspark=True)
 
-    def test_compact_on_arch35_raises_with_unset_guidance(self):
-        with self.assertRaisesRegex(RuntimeError, "SGLANG_RAGGED_VERIFY_MODE"):
-            self._ensure_static_mode(RaggedVerifyMode.COMPACT)
+    def test_v41_rejects_a_non_dspark_algorithm(self):
+        # The low-ratio rows assume the STATIC request-major rectangle; another
+        # algorithm would scatter this step's compressed rows to stale slots.
+        with self.assertRaisesRegex(ValueError, "DSpark"):
+            self._gate()
 
-    def test_static_and_cap_accept_pass(self):
-        # CAP_ACCEPT only changes the accept-length accounting, so it rides
-        # the STATIC execution path.
-        self._ensure_static_mode(RaggedVerifyMode.STATIC)
-        self._ensure_static_mode(RaggedVerifyMode.CAP_ACCEPT)
+    def test_v41_rejects_dflash(self):
+        # DFlash shares DFlashVerifyInfo with DSpark but is a distinct algorithm.
+        with self.assertRaisesRegex(ValueError, "DSpark"):
+            self._gate(is_dflash=True)
 
-    def test_compact_on_a3_uses_the_same_fixed_width_guard(self):
-        with self.assertRaisesRegex(RuntimeError, "SGLANG_RAGGED_VERIFY_MODE"):
-            self._ensure_static_mode(RaggedVerifyMode.COMPACT, arch35=False)
+    def test_v41_rejects_every_ragged_mode_even_for_dspark(self):
+        # CAP_ACCEPT and COMPACT both leave the STATIC request-major rectangle.
+        # Match the env-var name, not "DSpark": both raises mention DSpark, so
+        # only this pins the mode check as the one that fired.
+        for mode in (RaggedVerifyMode.CAP_ACCEPT, RaggedVerifyMode.COMPACT):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(ValueError, "SGLANG_RAGGED_VERIFY_MODE"):
+                    self._gate(mode=mode, is_dspark=True)
 
+    def test_no_spec_decoding_is_not_gated(self):
+        # The constraints are about speculative decoding; a decode-only V4.1 run
+        # is unaffected even if a ragged env value is left set.
+        self._gate(is_none=True, mode=RaggedVerifyMode.COMPACT)
 
-class _FakeTorchOps:
-    """``torch`` proxy that redirects ``torch.ops.custom`` to a recorder.
-
-    Only ``ops`` is replaced; every other attribute falls through to the real
-    torch, so the production writer's ``torch.bfloat16`` / ``torch.uint8`` keep
-    working on a CPU-only box.
-    """
-
-    def __init__(self, custom):
-        self._custom = custom
-
-    def __getattr__(self, name):
-        if name == "ops":
-            return SimpleNamespace(custom=self._custom)
-        return getattr(torch, name)
+    def test_a_v4_model_is_not_gated(self):
+        # V4 (ratios 4/128) runs EAGLE / NGRAM / DSpark / DFLASH on any mode. The
+        # gate reads the generation, not the ratio list, so a draft worker (whose
+        # ratios are emptied but whose generation still resolves) is gated too.
+        self._gate(is_v41=False, mode=RaggedVerifyMode.COMPACT)
 
 
 def _dsv41_llm_pool(row_dim, dtype, layout):
@@ -1730,9 +1677,11 @@ class TestV41PoolWritePath(unittest.TestCase):
     _SELF = SimpleNamespace(qk_nope_head_dim=448, qk_rope_head_dim=64)
 
     def _write(self, *, buf, loc, cache, layout):
+        # The writer calls the ``sgl_kernel_npu`` wrapper directly (imported at
+        # module level), not ``torch.ops.custom``, so the recorder has to
+        # replace that name.
         recorder = MagicMock(name="kv_compress_epilog_v2")
-        custom = SimpleNamespace(kv_compress_epilog_v2=recorder)
-        with patch.object(dsv4_memory_pool, "torch", _FakeTorchOps(custom)):
+        with patch.object(dsv4_memory_pool, "kv_compress_epilog_v2", recorder):
             DSV4NPUTokenToKVPool._write_dsv41_packed_kv(
                 self._SELF, buf=buf, loc=loc, cache=cache, layout=layout
             )
@@ -1918,7 +1867,7 @@ class TestKernelMetadataBuilders(unittest.TestCase):
     def test_mqsmla_metadata_is_one_table_per_ratio_from_the_config(self):
         backend, fm = self._backend()
         recorder, calls = _metadata_recorder((48,))
-        with patch.object(DS41, "mixed_quant_sparse_flash_mla_metadata", recorder):
+        with patch.object(DS41, "mixed_quant_sparse_flash_mla_metadata_dsl", recorder):
             out = backend._dsv41_attention_kernel_metadata(self._batch())
 
         self.assertEqual(set(out), {"win_metadata", "c1a_metadata", "c2a_metadata"})
@@ -1929,18 +1878,23 @@ class TestKernelMetadataBuilders(unittest.TestCase):
 
         # Call order is (ratio 0, *low_ratios): the window table first, with
         # has_cmp_kv=False and an all-zero compressed length (no compressed pool).
-        win_args, win_kwargs = calls[0]
-        self.assertIs(win_args[0], fm.dsv41_win_topk_length)
+        win_kwargs = calls[0][1]
+        self.assertIs(win_kwargs["ori_topk_length"], fm.dsv41_win_topk_length)
         self.assertIs(win_kwargs["has_cmp_kv"], False)
-        self.assertTrue(torch.all(win_args[1] == 0))
-        self.assertEqual(win_args[1].shape, win_args[0].shape)
+        self.assertTrue(torch.all(win_kwargs["cmp_topk_length"] == 0))
+        self.assertEqual(
+            win_kwargs["cmp_topk_length"].shape, win_kwargs["ori_topk_length"].shape
+        )
 
-        for (args, kwargs), ratio in zip(calls[1:], (1, 2)):
-            self.assertEqual(tuple(args[0].shape), (2, 1))
+        for (_, kwargs), ratio in zip(calls[1:], (1, 2)):
+            self.assertEqual(tuple(kwargs["ori_topk_length"].shape), (2, 1))
             self.assertIs(kwargs["has_cmp_kv"], True)
             # The per-query compressed length is the graph-resident buffer, so
             # the mixed builder refreshes rather than allocates.
-            self.assertIs(args[1], getattr(fm, f"dsv41_cmp_topk_length_c{ratio}"))
+            self.assertIs(
+                kwargs["cmp_topk_length"],
+                getattr(fm, f"dsv41_cmp_topk_length_c{ratio}"),
+            )
 
         for args, kwargs in calls:
             self.assertEqual(kwargs["num_heads_q"], 64)
@@ -1960,7 +1914,7 @@ class TestKernelMetadataBuilders(unittest.TestCase):
         backend._dsv4_head_dim = 384  # a value only the backend config carries
         backend.token_to_kv_pool = SimpleNamespace()  # exactly the real pool's API
         recorder, calls = _metadata_recorder((48,))
-        with patch.object(DS41, "mixed_quant_sparse_flash_mla_metadata", recorder):
+        with patch.object(DS41, "mixed_quant_sparse_flash_mla_metadata_dsl", recorder):
             backend._dsv41_attention_kernel_metadata(self._batch())
         for _, kwargs in calls:
             self.assertEqual(kwargs["head_dim"], 384)
@@ -1968,7 +1922,7 @@ class TestKernelMetadataBuilders(unittest.TestCase):
     def test_qli_metadata_derives_the_lengths_and_the_residual_per_ratio(self):
         backend, fm = self._backend()
         recorder, calls = _metadata_recorder((1024,))
-        with patch.object(DS41, "quant_lightning_indexer_metadata", recorder):
+        with patch.object(DS41, "quant_lightning_indexer_metadata_dsl", recorder):
             out = backend._dsv41_index_kernel_metadata(self._batch())
 
         self.assertEqual(set(out), {"c1a_qli_metadata", "c2a_qli_metadata"})
@@ -2005,7 +1959,7 @@ class TestKernelMetadataBuilders(unittest.TestCase):
         backend, fm = self._backend()
         fm.actual_seq_lengths_q_pa = None
         recorder, calls = _metadata_recorder((1024,))
-        with patch.object(DS41, "quant_lightning_indexer_metadata", recorder):
+        with patch.object(DS41, "quant_lightning_indexer_metadata_dsl", recorder):
             self.assertEqual(backend._dsv41_index_kernel_metadata(self._batch()), {})
         self.assertEqual(calls, [])
 
@@ -2149,7 +2103,7 @@ class TestQliKvLens(unittest.TestCase):
     def test_verify_dispatch_tables_use_the_final_length(self):
         backend = _low_ratio_backend()
         seen = []
-        real = DS41.quant_lightning_indexer_metadata
+        real = DS41.quant_lightning_indexer_metadata_dsl
 
         def spy(**kwargs):
             seen.append(kwargs)
@@ -2167,7 +2121,8 @@ class TestQliKvLens(unittest.TestCase):
             batch_size=2,
             draft_token_num=3,
         )
-        backend._dsv41_index_kernel_metadata(batch)
+        with patch.object(DS41, "quant_lightning_indexer_metadata_dsl", spy):
+            backend._dsv41_index_kernel_metadata(batch)
         # ratio 1 first, then ratio 2; the bound is the final length:
         # 9//2 == 4 covers the group pos 7 closes.
         self.assertIsNone(seen[0]["cmp_residual_k"])
@@ -2178,7 +2133,7 @@ class TestQliKvLens(unittest.TestCase):
     def test_decode_dispatch_tables_keep_reading_seq_lens(self):
         backend = _low_ratio_backend()
         seen = []
-        real = DS41.quant_lightning_indexer_metadata
+        real = DS41.quant_lightning_indexer_metadata_dsl
 
         def spy(**kwargs):
             seen.append(kwargs)
@@ -2193,7 +2148,8 @@ class TestQliKvLens(unittest.TestCase):
             positions=[6, 5], out_cache_loc=[0, 0], seq_lens=[6, 5], batch_size=2
         )
         batch.forward_mode = _Mode("decode")
-        backend._dsv41_index_kernel_metadata(batch)
+        with patch.object(DS41, "quant_lightning_indexer_metadata_dsl", spy):
+            backend._dsv41_index_kernel_metadata(batch)
         # Decode ignores the final mirror.
         self.assertEqual(seen[1]["seqused_k"].tolist(), [3, 2])
 
@@ -2217,7 +2173,7 @@ class TestVerifyPaddingRows(unittest.TestCase):
             draft_token_num=2,
         )
         indices, lengths = backend._dsv41_window_indices(batch)
-        self.assertEqual(lengths[:, 0].tolist(), [2, 2, 0, 0])
+        self.assertEqual(lengths[:, 0].tolist(), [4, 4, 0, 0])
         # Live rows unchanged; padding rows emit no indices at all.
         self.assertEqual(indices[0, 0].tolist(), [1, 2, 3, 4])
         self.assertEqual(indices[1, 0].tolist(), [2, 3, 4, 5])
@@ -2226,7 +2182,7 @@ class TestVerifyPaddingRows(unittest.TestCase):
             backend._dsv41_cmp_topk_length(batch, 2)[:, 0].tolist(), [2, 3, 0, 0]
         )
         self.assertEqual(
-            backend._dsv41_cmp_topk_length(batch, 1)[:, 0].tolist(), [2, 3, 0, 0]
+            backend._dsv41_cmp_topk_length(batch, 1)[:, 0].tolist(), [3, 3, 0, 0]
         )
 
     def test_decode_rows_keep_the_per_row_rule(self):
@@ -2276,8 +2232,9 @@ class TestVerifyPaddingRows(unittest.TestCase):
 
 
 class TestVerifyGraphRefresh(unittest.TestCase):
-    """``_refresh_graph_dsv41_verify_1d`` writes the captured buffers with the
-    same values the eager builder derives -- element for element."""
+    """``_refresh_graph_verify_rows`` writes the captured buffers with the same
+    values the eager builder derives -- element for element -- and the decode
+    refresh touches only the rows it owns."""
 
     def _graph_metadata(self, backend, bs, tokens_per_req):
         metadata = SimpleNamespace(
@@ -2302,6 +2259,10 @@ class TestVerifyGraphRefresh(unittest.TestCase):
             raw_bs=sum(1 for v in live if v > 0),
             tokens_per_bs=w,
             device=torch.device("cpu"),
+            has_compress=False,
+            is_idle_replay=False,
+            ragged_layout=None,
+            verify_lens=None,
             live_seq_lens=torch.tensor(live, dtype=torch.int32),
             forward_batch=SimpleNamespace(
                 positions=torch.tensor(positions, dtype=torch.int64),
@@ -2342,7 +2303,7 @@ class TestVerifyGraphRefresh(unittest.TestCase):
             positions=positions,
             out_cache_loc=out_cache_loc,
         )
-        backend._refresh_graph_dsv41_verify_1d(ctx)
+        backend._refresh_graph_verify_rows(ctx)
         self.assertEqual(metadata.c1_loc.tolist(), eager.c1_loc.tolist())
         self.assertEqual(metadata.c2_loc.tolist(), eager.c2_loc.tolist())
         self.assertEqual(
@@ -2379,7 +2340,7 @@ class TestVerifyGraphRefresh(unittest.TestCase):
             positions=[6, 7, 8, 99, 99, 99],
             out_cache_loc=[300, 301, 302],
         )
-        backend._refresh_graph_dsv41_verify_1d(ctx)
+        backend._refresh_graph_verify_rows(ctx)
         self.assertEqual(metadata.c2_loc.tolist(), [150, -1, -1, -1, -1])
         self.assertEqual(metadata.c1_loc.tolist(), [300, 301, 302, -1, -1, -1])
         self.assertEqual(metadata.positions_cmp_padding_c2.tolist(), [6, 0, 0, 0, 0])
@@ -2391,15 +2352,7 @@ class TestVerifyGraphRefresh(unittest.TestCase):
         backend.page_size = 128
         metadata = self._graph_metadata(backend, bs=2, tokens_per_req=3)
         metadata.block_tables[0, 0] = 11
-        positions, out_cache_loc = self._WINDOW
-        ctx = self._ctx(
-            metadata,
-            bs=2,
-            live=[6, 5],
-            positions=positions,
-            out_cache_loc=out_cache_loc,
-        )
-        backend._refresh_graph_dsv41_verify_1d(ctx)
+        backend._refresh_graph_dsv41_index_page_tables(metadata)
         # ratio 2 pages 1:1 with the full table; ratio 1 doubles every full page.
         self.assertEqual(metadata.c2_index_page_table.tolist(), [[11, 8], [9, 10]])
         self.assertEqual(metadata.c1_index_page_table[0].tolist(), [22, 23, 16, 17])
@@ -2421,12 +2374,38 @@ class TestVerifyGraphRefresh(unittest.TestCase):
         self.assertEqual(metadata.positions_cmp_padding_c2.tolist(), [0] * 5)
         self.assertEqual(metadata.dsv41_cmp_topk_length_c2.tolist(), [[0]] * 6)
         # Zero length with a legal first index: the window side skips instead
-        # of feeding MQSMLA an in-prefix -1.
-        self.assertTrue((metadata.dsv41_win_sparse_indices == -1).all())
-        self.assertEqual(metadata.dsv41_win_sparse_indices[0, 0, 0].item(), 0)
+        # of feeding MQSMLA an in-prefix -1. Column 0 stays 0; the rest read
+        # nothing.
+        self.assertTrue((metadata.dsv41_win_sparse_indices[:, :, 1:] == -1).all())
+        self.assertTrue((metadata.dsv41_win_sparse_indices[:, :, 0] == 0).all())
         self.assertEqual(metadata.dsv41_win_topk_length.tolist(), [[0]] * 6)
         self.assertEqual(metadata.start_pos.tolist(), [0, 0])
         self.assertEqual(metadata.seqused.tolist(), [0, 0])
+
+    def test_decode_replay_leaves_the_verify_rows_alone(self):
+        # Decode owns the shared scalars and the c{1,2} rows; the verify-only
+        # topk lengths must survive untouched, or a decode step would inherit a
+        # verify step's sparse map.
+        backend = _low_ratio_backend()
+        metadata = self._graph_metadata(backend, bs=2, tokens_per_req=1)
+        metadata.dsv41_win_topk_length.fill_(4)
+        metadata.dsv41_cmp_topk_length_c2.fill_(3)
+        ctx = self._ctx(
+            metadata,
+            bs=2,
+            live=[6, 5],
+            positions=[5, 4],
+            out_cache_loc=[300, 400],
+            w=1,  # decode feeds one row per request.
+        )
+        backend._refresh_graph_decode_rows(ctx)
+        # start_pos = last live position, seqused = live flag.
+        self.assertEqual(metadata.start_pos.tolist(), [5, 4])
+        self.assertEqual(metadata.seqused.tolist(), [1, 1])
+        self.assertEqual(metadata.c1_loc.tolist(), [300, 400])
+        self.assertEqual(metadata.positions_cmp_padding_c1.tolist(), [5, 4])
+        self.assertTrue((metadata.dsv41_win_topk_length == 4).all())
+        self.assertTrue((metadata.dsv41_cmp_topk_length_c2 == 3).all())
 
 
 class TestDs41OperatorResolver(unittest.TestCase):
@@ -2436,15 +2415,15 @@ class TestDs41OperatorResolver(unittest.TestCase):
         operator_groups = {
             "sgl_kernel_npu.operators.attention": (
                 "compressor_v2",
-                "mixed_quant_sparse_flash_mla",
-                "mixed_quant_sparse_flash_mla_metadata",
+                "mixed_quant_sparse_flash_mla_dsl",
+                "mixed_quant_sparse_flash_mla_metadata_dsl",
             ),
             "sgl_kernel_npu.operators.indexer": (
-                "indexer_prologue_k",
-                "quant_lightning_indexer",
-                "quant_lightning_indexer_metadata",
-                "quant_sparse_lightning_indexer",
-                "quant_sparse_lightning_indexer_metadata",
+                "indexer_prologue_k_dsl",
+                "quant_lightning_indexer_dsl",
+                "quant_lightning_indexer_metadata_dsl",
+                "quant_sparse_lightning_indexer_dsl",
+                "quant_sparse_lightning_indexer_metadata_dsl",
             ),
         }
         stub_modules = {}

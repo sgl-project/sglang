@@ -103,6 +103,7 @@ class TestMegakernelRuntime(CustomTestCase):
             _pre_initialize_fi_a2a_workspace=lambda: events.append("a2a"),
             _pre_initialize_dcp_push_combine=lambda: events.append("dcp"),
             _pre_initialize_pcie_ipc_workspace=lambda: events.append("pcie"),
+            _finalize_symm_workspaces=lambda: events.append("symm"),
             _autotune_buffers=lambda: (object(), 1),
             _flashinfer_autotune=lambda **kw: events.append("autotune"),
         )
@@ -210,6 +211,7 @@ class TestMegakernelRuntime(CustomTestCase):
             "pcie",
             ("model", mr),
             ("plugin", built, prepared_view),
+            "symm",
             "autotune",
             "extend",
         ]

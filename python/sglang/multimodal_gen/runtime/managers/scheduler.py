@@ -1448,7 +1448,7 @@ class Scheduler(
     def recv_reqs(self) -> List[tuple[bytes, Any]]:
         """
         For non-main schedulers, reqs are broadcasted from main using
-        broadcast_pyobj. ``--comfyui-mode`` multi-rank instead keeps CUDA
+        broadcast_pyobj. ``comfyui_mode`` multi-rank instead keeps CUDA
         tensors on NCCL so per-step latents do not pickle onto the gloo group.
         """
         if self.receiver is not None:

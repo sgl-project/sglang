@@ -18,6 +18,7 @@ from sglang.srt.layers.quantization.utils import (
     get_linear_quant_method,
     get_scalar_types,
 )
+from sglang.srt.utils import is_hip
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 from .schemes import (
@@ -28,6 +29,7 @@ from .schemes import (
     GPTQMarlinLinearScheme,
     GPTQMarlinMoEScheme,
     GPTQMoEAscendScheme,
+    GPTQTritonLinearScheme,
     GPTQXPULinearScheme,
 )
 
@@ -182,6 +184,8 @@ class GPTQConfig(QuantizationConfig):
         )
 
     def get_linear_scheme(self, layer: torch.nn.Module):
+        if is_hip():
+            return GPTQTritonLinearScheme(self)
         return GPTQLinearScheme(self)
 
     def get_moe_scheme(self, layer: torch.nn.Module):

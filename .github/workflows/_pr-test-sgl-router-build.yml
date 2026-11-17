@@ -1,0 +1,131 @@
+name: PR Test - Build sgl-router
+
+# Builds sgl-router once per run for the stages that launch it; the source-hash
+# cache carries it across runs. No interpreter or torch ABI, so one compile job
+# per arch.
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: 'Runner label for the compile job. Its glibc has to be at most 2.35.'
+        type: string
+        required: true
+      artifact_name:
+        description: 'Artifact name. Suffix it per caller: artifacts are immutable per name per run, so two callers sharing a run would collide.'
+        type: string
+        default: sgl-router-x86_64
+      git_ref:
+        type: string
+        default: ''
+    outputs:
+      artifact_name:
+        description: 'Artifact holding the binary. Empty when neither job published one; consumers then fall back to the cache, then to a local build.'
+        value: ${{ jobs.restore.outputs.artifact_name || jobs.compile.outputs.artifact_name }}
+
+# check-maintenance reads this; reusable workflows do not inherit the caller's env.
+env:
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    name: Restore sgl-router
+    outputs:
+      hit: ${{ steps.cache.outputs.cache-hit }}
+      key: ${{ steps.cache.outputs.cache-primary-key }}
+      artifact_name: ${{ steps.publish.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref || github.sha }}
+          # What the cache key hashes, plus the actions and scripts this job runs.
+          sparse-checkout: |
+            sgl-router
+            rust
+            .github
+            scripts/ci/utils
+          sparse-checkout-cone-mode: false
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Restore built binary
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: sgl-router-bin/sgl-router
+          # The arch is the compile runner's, as download-sgl-router reads it.
+          key: sgl-router-${{ contains(inputs.runs_on, '-arm') && 'aarch64' || 'x86_64' }}-${{ hashFiles('sgl-router/**', 'rust/**', '.github/workflows/_pr-test-sgl-router-build.yml', 'scripts/ci/utils/build_sgl_router.sh') }}
+
+      - name: Upload binary
+        if: steps.cache.outputs.cache-hit == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: sgl-router-bin/sgl-router
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Publish artifact name
+        id: publish
+        if: steps.cache.outputs.cache-hit == 'true'
+        run: echo "name=${{ inputs.artifact_name }}" >> "$GITHUB_OUTPUT"
+
+  compile:
+    needs: restore
+    if: needs.restore.outputs.hit != 'true'
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 60
+    name: Build sgl-router
+    outputs:
+      artifact_name: ${{ steps.publish.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Install Rust toolchain
+        run: bash scripts/ci/utils/install_rustup.sh
+
+      - name: Build sgl-router
+        run: bash scripts/ci/utils/build_sgl_router.sh sgl-router-bin
+
+      # The oldest test image (jammy) has glibc 2.35; a newer requirement fails at exec.
+      - name: Check the binary's glibc requirement
+        env:
+          MAX_GLIBC: '2.35'
+        run: |
+          set -euo pipefail
+          symbols=$(objdump -T sgl-router-bin/sgl-router)
+          needed=$(printf '%s\n' "${symbols}" | grep -oE 'GLIBC_2\.[0-9]+' | sed 's/GLIBC_//' | sort -V | tail -1 || true)
+          echo "sgl-router requires glibc ${needed:-none}"
+          if [ -n "${needed}" ] \
+             && [ "$(printf '%s\n%s\n' "${MAX_GLIBC}" "${needed}" | sort -V | tail -1)" != "${MAX_GLIBC}" ]; then
+              echo "::error::sgl-router requires glibc ${needed} > ${MAX_GLIBC}; build on an older image"
+              exit 1
+          fi
+
+      - name: Ensure zstd so the restore job can read what this job saves
+        run: bash scripts/ci/utils/ensure_zstd.sh
+
+      # After the glibc check, so a rejected build cannot poison this key.
+      - name: Save built binary
+        uses: actions/cache/save@v4
+        with:
+          path: sgl-router-bin/sgl-router
+          key: ${{ needs.restore.outputs.key }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: sgl-router-bin/sgl-router
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Publish artifact name
+        id: publish
+        run: echo "name=${{ inputs.artifact_name }}" >> "$GITHUB_OUTPUT"

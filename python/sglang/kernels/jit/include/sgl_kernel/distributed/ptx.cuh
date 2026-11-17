@@ -189,6 +189,16 @@ SGL_DEVICE void red_add_relaxed_sys(uint32_t* ptr, uint32_t val) {
   asm volatile("red.relaxed.sys.global.add.u32 [%0], %1;" : : "l"(ptr), "r"(val) : "memory");
 }
 
+/// Rank-local counter increment; nothing on another GPU reads it.
+SGL_DEVICE void red_add_relaxed_gpu(uint32_t* ptr, uint32_t val) {
+  asm volatile("red.relaxed.gpu.global.add.u32 [%0], %1;" : : "l"(ptr), "r"(val) : "memory");
+}
+
+/// 64-bit form of `red_add_relaxed_gpu`.
+SGL_DEVICE void red_add_relaxed_gpu(uint64_t* ptr, uint64_t val) {
+  asm volatile("red.relaxed.gpu.global.add.u64 [%0], %1;" : : "l"(ptr), "l"(val) : "memory");
+}
+
 /// Flag increment that also publishes every prior write to system scope.
 SGL_DEVICE void red_add_release_sys(uint32_t* ptr, uint32_t val) {
   asm volatile("red.release.sys.global.add.u32 [%0], %1;" : : "l"(ptr), "r"(val) : "memory");
@@ -198,6 +208,20 @@ SGL_DEVICE void red_add_release_sys(uint32_t* ptr, uint32_t val) {
 /// so a peer's acquire load of that flag also observes the payload.
 SGL_DEVICE void fence_release_sys() {
   asm volatile("fence.release.sys;" ::: "memory");
+}
+
+/// Owner-side take of a peer-written flag, returning the old value.
+SGL_DEVICE uint32_t atomic_add_relaxed_sys(uint32_t* ptr, uint32_t val) {
+  uint32_t old;
+  asm volatile("atom.relaxed.sys.global.add.u32 %0, [%1], %2;" : "=r"(old) : "l"(ptr), "r"(val) : "memory");
+  return old;
+}
+
+/// Same, and acquires the writes peers released before their increments.
+SGL_DEVICE uint32_t atomic_add_acquire_sys(uint32_t* ptr, uint32_t val) {
+  uint32_t old;
+  asm volatile("atom.acquire.sys.global.add.u32 %0, [%1], %2;" : "=r"(old) : "l"(ptr), "r"(val) : "memory");
+  return old;
 }
 
 /// Device-scope arrival counter. acq_rel so the winner of the count also
@@ -348,6 +372,22 @@ SGL_DEVICE uint32_t load_acquire_sys(const uint32_t* ptr) {
 
 SGL_DEVICE void red_add_relaxed_sys(uint32_t* ptr, uint32_t val) {
   __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+SGL_DEVICE void red_add_relaxed_gpu(uint32_t* ptr, uint32_t val) {
+  __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+SGL_DEVICE void red_add_relaxed_gpu(uint64_t* ptr, uint64_t val) {
+  __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+SGL_DEVICE uint32_t atomic_add_relaxed_sys(uint32_t* ptr, uint32_t val) {
+  return __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+SGL_DEVICE uint32_t atomic_add_acquire_sys(uint32_t* ptr, uint32_t val) {
+  return __hip_atomic_fetch_add(ptr, val, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
 SGL_DEVICE void red_add_release_sys(uint32_t* ptr, uint32_t val) {

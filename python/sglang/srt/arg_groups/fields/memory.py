@@ -143,6 +143,7 @@ class Memory(msgspec.Struct):
                 "page_first",
                 "page_first_direct",
                 "page_first_kv_split",
+                "layer_first_kv_split",
                 "page_head",
                 "page_unified",
             ],

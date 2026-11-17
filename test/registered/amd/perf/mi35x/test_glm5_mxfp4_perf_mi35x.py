@@ -21,6 +21,7 @@ register_amd_ci(
     est_time=18000,
     suite="nightly-perf-8-gpu-mi35x-glm5-mxfp4",
     nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 

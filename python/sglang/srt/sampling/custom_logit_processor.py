@@ -494,6 +494,8 @@ class _RowEdits:
         )
         if logits.is_cuda:
             index = index.pin_memory().to(logits.device, non_blocking=True)
+        else:
+            index = index.to(logits.device)
         rows, cols = index[0], index[1]
         if n_forced:
             logits.index_fill_(0, rows[:n_forced], -float("inf"))

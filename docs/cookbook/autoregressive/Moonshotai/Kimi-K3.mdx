@@ -319,17 +319,17 @@ Outside the two verified B300 1×8 `Unified` cells, no cell has a serving round 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_K3_KDA_FUSED_BACKEND=aiter</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>unset</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Opt in to the fused ROCm KDA decode boundary: the <code>f_b</code> projection is deferred into the gfx950 FlyDSL kernel so decode fuses <code>f_b</code> + convolution + recurrent state update + gated RMSNorm. Any other value (or unset) keeps the unfused KDA path.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Opt in to the fused ROCm KDA decode boundary: the <code>f_b</code> projection is deferred into the gfx950 FlyDSL kernel so decode fuses <code>f_b</code> + convolution + recurrent state update + gated RMSNorm. The kernel takes a BF16 <code>f_b</code>: a block-FP8 one uses the dequantized copy the model already keeps, and a Quark per-channel FP8 one is dequantized once at load. On the pinned image, any other value (or unset) keeps the unfused KDA path; newer builds default to the SGLang <code>gfx950</code> kernel, which takes an FP32 state only.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_K3_FLYDSL_SOURCE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Which FlyDSL implementation backs the fused decode: <code>auto</code> prefers SGLang's vendored kernels and falls back to the AITER module, <code>sglang</code> / <code>aiter</code> pin one. Leave it alone unless you are bisecting the two.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Which FlyDSL implementation backs the fused decode: <code>sglang</code> / <code>aiter</code> pin one, and <code>auto</code> prefers SGLang's vendored kernel but binds AITER's when the vendored one is missing or does not take the recurrent state dtype. The vendored kernel takes an FP32 state only; AITER's (<code>aiter.ops.flydsl.linear_attention_kernels</code>, from <a href="https://github.com/ROCm/aiter/pull/6026">ROCm/aiter#6026</a>) also takes the BF16 state of <code>--mamba-ssm-dtype bfloat16</code>, so <code>auto</code> serves that state on AITER's kernel.</td>
     </tr>
   </tbody>
 </table>
 
-The fused KDA backend is fail-closed at two levels: it arms during model init only when the flag is exactly `aiter` **and** the gfx950 FlyDSL kernels are importable, and each decode step re-validates shapes, dtypes, strides, state indices, and output buffers before dispatch — anything unexpected falls back to the stock KDA implementation rather than erroring. Batch size 2 automatically picks a separately validated kernel schedule; every other batch keeps the original build options. Measured on a 69-layer graph the fused boundary is 9.20 → 8.38 µs/layer (−8.9%), with GSM8K 1319 at 0.950.
+The fused KDA backend is fail-closed at two levels. At model init it arms only when the flag is exactly `aiter`, the gfx950 FlyDSL kernels are importable, the selected kernel takes the `--mamba-ssm-dtype` state, and `f_b` has a BF16 form; a missing kernel, an unsupported state dtype, or an `f_b` with no BF16 form logs a one-time warning. At each decode step it re-validates shapes, dtypes, strides, state indices, and output buffers before dispatch; anything unexpected falls back to the stock KDA implementation rather than erroring. Batch size 2 automatically picks a separately validated kernel schedule; every other batch keeps the original build options. Measured on a 69-layer graph the fused boundary is 9.20 → 8.38 µs/layer (−8.9%), with GSM8K 1319 at 0.950.
 
 ## 3. Advanced Usage
 
@@ -488,8 +488,27 @@ Clients then send requests to the router (`:8000`) instead of an individual role
 
 ### 3.5 VLM Serving Profiles
 
-The open-source K3 serving contract currently supports **image input only** — its
-processor rejects video and audio input.
+The open-source K3 serving contract supports **image and video input**; its
+processor rejects audio input.
+
+#### Video input
+
+Send video as a `video_url` content part, as an `http(s)` URL or a
+`data:video/...;base64,` URL; the audio track is ignored. Sampling and prompt layout
+follow Moonshot's hosted K3 API and the checkpoint's `preprocessor_config.json`:
+
+- Frames are sampled at `sample_fps` (8 fps, or the source rate if lower) and each
+  keeps up to `in_patch_limit_each_frame` ViT patches.
+- Every `temporal_merge_kernel_size` (4) frames form one chunk that the vision tower
+  pools into a single frame's tokens, preceded by the chunk's `hh:mm:ss.fff` start
+  time.
+- A video over `in_patch_limit_video` patches keeps its frame size and samples fewer
+  frames over its full length, so one video costs at most about 41K image tokens.
+  `max_num_frames_each_video` caps frames further when set.
+
+Sampling options on the `video_url` object are ignored. Video requests skip the
+preprocessing cache, reject `mm_content_hashes`, and are not yet validated with EPD
+encoder roles; their tokens are reported as `image_tokens` in usage.
 
 #### VLM feature transport
 

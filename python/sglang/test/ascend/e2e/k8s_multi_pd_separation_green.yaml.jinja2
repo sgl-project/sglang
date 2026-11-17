@@ -54,6 +54,8 @@ spec:
           value: "https://hf-mirror.com"
         - name: METRICS_DATA_FILE
           value: "{{ metrics_data_file }}"
+        - name: NPU_ACCURACY_DATASET
+          value: "{{ accuracy_dataset }}"
         - name: RUN_LABEL
           value: "{{ run_label }}"
         - name: SGLANG_IS_IN_CI
@@ -80,7 +82,13 @@ spec:
         - name: share
           mountPath: /root/sglang
           subPath: {{ sglang_source_relative_path }}
+        - name: shm-volume
+          mountPath: /dev/shm
       volumes:
+      - name: shm-volume
+        emptyDir:
+          medium: Memory
+          sizeLimit: "16Gi"
       - name: share
         hostPath:
           path: /home
@@ -158,6 +166,8 @@ spec:
           value: "https://hf-mirror.com"
         - name: METRICS_DATA_FILE
           value: "{{ metrics_data_file }}"
+        - name: NPU_ACCURACY_DATASET
+          value: "{{ accuracy_dataset }}"
         - name: RUN_LABEL
           value: "{{ run_label }}"
         - name: SGLANG_IS_IN_CI
@@ -184,7 +194,13 @@ spec:
         - name: share
           mountPath: /root/sglang
           subPath: {{ sglang_source_relative_path }}
+        - name: shm-volume
+          mountPath: /dev/shm
       volumes:
+      - name: shm-volume
+        emptyDir:
+          medium: Memory
+          sizeLimit: "16Gi"
       - name: share
         hostPath:
           path: /home
@@ -261,6 +277,8 @@ spec:
           value: "https://hf-mirror.com"
         - name: METRICS_DATA_FILE
           value: "{{ metrics_data_file }}"
+        - name: NPU_ACCURACY_DATASET
+          value: "{{ accuracy_dataset }}"
         - name: RUN_LABEL
           value: "{{ run_label }}"
         - name: SGLANG_IS_IN_CI
@@ -286,7 +304,13 @@ spec:
         - name: share
           mountPath: /root/sglang
           subPath: {{ sglang_source_relative_path }}
+        - name: shm-volume
+          mountPath: /dev/shm
       volumes:
+      - name: shm-volume
+        emptyDir:
+          medium: Memory
+          sizeLimit: "16Gi"
       - name: share
         hostPath:
           path: /home

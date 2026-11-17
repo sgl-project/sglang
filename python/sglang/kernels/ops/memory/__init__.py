@@ -36,13 +36,6 @@ __all__ = []
 # Migrated from srt/layers (RFC #29630, Phase 2.5).
 register_kernel(
     KernelSpec(
-        op="memory.gpu_tensor_hash",
-        backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.memory.gpu_tensor_hash:gpu_tensor_hash",
-    )
-)
-register_kernel(
-    KernelSpec(
         op="memory.gpu_tensor_blake3",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.memory.gpu_tensor_hash_blake3:gpu_tensor_blake3",

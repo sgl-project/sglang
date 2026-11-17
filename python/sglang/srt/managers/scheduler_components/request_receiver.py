@@ -51,6 +51,9 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
+    )
     from sglang.srt.rust_server.server import RustServer
     from sglang.srt.server_args import ServerArgs
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
@@ -71,7 +74,7 @@ class SchedulerRequestReceiver:
     server_args: ServerArgs
     model_config: ModelConfig
     max_recv_per_poll: int
-    stream_output: Callable[..., None]
+    request_retirer: RequestRetirer
     get_last_batch: Callable[[], Any]
     # SGLANG_RUST_SERVER: requests are drained from the embedded Rust
     # listener's ring rather than received over zmq.
@@ -271,7 +274,7 @@ class SchedulerRequestReceiver:
                 else:
                     status_code = HTTPStatus(int(error_code))
                 prepare_abort(req, error_msg, status_code=status_code)
-                self.stream_output([req], req.return_logprob)
+                self.request_retirer.retire_unadmitted(req)
         return recv_reqs
 
     def _finalize_shm_features(self, recv_reqs: Optional[List]) -> None:

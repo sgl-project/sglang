@@ -131,20 +131,22 @@ import { agentx } from "/src/snippets/agentx/zai-org/glm-5.2.jsx";
 
 ### MI355X deployment measured with SemiAnalysis InferenceX
 
-MXFP4 checkpoint with EAGLE MTP on MI355X, benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) ([InferenceX #4064](https://github.com/SemiAnalysisAI/InferenceX/pull/4064)): TP8·EP1 at concurrency 1–4, TP4·EP4 with HiCache at concurrency 4–16, and TP4·EP4 with DCP4 at concurrency 16–48.
+MXFP4 checkpoint with EAGLE MTP on MI355X, benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) ([InferenceX #4748](https://github.com/SemiAnalysisAI/InferenceX/pull/4748), [validation run](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/43487923974)): TP8·EP1 with the Gluon target MoE backend at concurrency 1–2, TP4·EP4 with HiCache at concurrency 4–16, and TP4·EP4 with DCP4 at concurrency 16–48.
 
-Image: `lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261028` (`sha256:2456fff6cfaffb822026d089a0629a4859c84d2448864ffd6d5fa4f945ef2c86`). Set `--max-running-requests` to twice the concurrency and `--cuda-graph-max-bs-decode` to twice the concurrency, capped at 64; the commands below use concurrency 4, 10 and 40.
+Image: `lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261113` (`sha256:d4bb5c35e50960e209341f5f9b5e01564f31c9dbfc86a499bfba0c6e8664fd26`). Set `--max-running-requests` to twice the concurrency and `--cuda-graph-max-bs-decode` to twice the concurrency, capped at 64; the commands below use concurrency 2, 10 and 40.
 
 These commands match the InferenceX runs; the Deploy panel cells above are general-purpose starting points.
 
-```bash TP8·EP1 (concurrency 1–4)
+```bash TP8·EP1 with Gluon target MoE (concurrency 1–2)
 SGLANG_OPT_USE_TOPK_V2=true \
 SGLANG_TIMEOUT_KEEP_ALIVE=900 \
-python -m sglang.launch_server \
+sglang serve \
+  --trust-remote-code \
   --model-path amd/GLM-5.2-MXFP4 \
   --tp-size 8 \
   --ep-size 1 \
-  --trust-remote-code \
+  --moe-runner-backend gluon \
+  --speculative-moe-runner-backend auto \
   --kv-cache-dtype fp8_e4m3 \
   --dsa-prefill-backend triton \
   --dsa-decode-backend triton \
@@ -152,8 +154,8 @@ python -m sglang.launch_server \
   --reasoning-parser glm45 \
   --chunked-prefill-size 32768 \
   --mem-fraction-static 0.85 \
-  --max-running-requests 8 \
-  --cuda-graph-max-bs-decode 8 \
+  --max-running-requests 4 \
+  --cuda-graph-max-bs-decode 4 \
   --speculative-algorithm EAGLE \
   --speculative-num-steps 5 \
   --speculative-eagle-topk 1 \
@@ -166,11 +168,11 @@ python -m sglang.launch_server \
 ```bash TP4·EP4 HiCache (concurrency 4–16)
 SGLANG_OPT_USE_TOPK_V2=true \
 SGLANG_TIMEOUT_KEEP_ALIVE=900 \
-python -m sglang.launch_server \
+sglang serve \
+  --trust-remote-code \
   --model-path amd/GLM-5.2-MXFP4 \
   --tp-size 4 \
   --ep-size 4 \
-  --trust-remote-code \
   --kv-cache-dtype fp8_e4m3 \
   --dsa-prefill-backend triton \
   --dsa-decode-backend triton \
@@ -195,12 +197,12 @@ python -m sglang.launch_server \
 ```bash TP4·EP4 DCP4 (concurrency 16–48)
 SGLANG_OPT_USE_TOPK_V2=true \
 SGLANG_TIMEOUT_KEEP_ALIVE=900 \
-python -m sglang.launch_server \
+sglang serve \
+  --trust-remote-code \
   --model-path amd/GLM-5.2-MXFP4 \
   --tp-size 4 \
   --ep-size 4 \
   --dcp-size 4 \
-  --trust-remote-code \
   --kv-cache-dtype fp8_e4m3 \
   --dsa-prefill-backend triton \
   --dsa-decode-backend triton \
@@ -221,7 +223,7 @@ python -m sglang.launch_server \
 
 ## 1. Model Introduction
 
-**GLM-5.2** is Z.ai's flagship Mixture-of-Experts model built on **DeepSeek Sparse Attention (DSA)**: a lightning indexer selects a sparse set of key tokens per query (top-2048), so attention cost stays near-constant as context grows. It ships in two precisions — **FP8** (`zai-org/GLM-5.2-FP8`) and full **BF16** (`zai-org/GLM-5.2`) — both with **78 transformer layers**, **256 routed experts** (8 active per token), a **1M-token context window**, and a single **MTP (Multi-Token Prediction)** layer for built-in EAGLE-style speculative decoding. FP8 is the recommended deployment; BF16 (~1.5 TB) needs an 8×B300 node or a multi-node setup. For Blackwell, NVIDIA also publishes an **NVFP4** build (`nvidia/GLM-5.2-NVFP4`) that quantizes only the MoE experts' linear weights and activations to 4-bit (the shared expert stays unquantized), holding accuracy within ~1 point of the FP8 baseline on GPQA Diamond, SciCode, and IFBench. For AMD MI355X (gfx950), AMD publishes an **MXFP4** build (`amd/GLM-5.2-MXFP4`, Quark-quantized) — see the AMD GPUs configuration tip below; this recipe is inferred from the validated `amd/GLM-5.1-MXFP4` MI355X recipe and not yet benchmarked on GLM-5.2 (`verified: false`).
+**GLM-5.2** is Z.ai's flagship Mixture-of-Experts model built on **DeepSeek Sparse Attention (DSA)**: a lightning indexer selects a sparse set of key tokens per query (top-2048), so attention cost stays near-constant as context grows. It ships in two precisions — **FP8** (`zai-org/GLM-5.2-FP8`) and full **BF16** (`zai-org/GLM-5.2`) — both with **78 transformer layers**, **256 routed experts** (8 active per token), a **1M-token context window**, and a single **MTP (Multi-Token Prediction)** layer for built-in EAGLE-style speculative decoding. FP8 is the recommended deployment; BF16 (~1.5 TB) needs an 8×B300 node or a multi-node setup. For Blackwell, NVIDIA also publishes an **NVFP4** build (`nvidia/GLM-5.2-NVFP4`) that quantizes only the MoE experts' linear weights and activations to 4-bit (the shared expert stays unquantized), holding accuracy within ~1 point of the FP8 baseline on GPQA Diamond, SciCode, and IFBench. For AMD MI355X (gfx950), AMD publishes an **MXFP4** build (`amd/GLM-5.2-MXFP4`, Quark-quantized) — see the AMD GPUs configuration tip below. The exact AgentX recipes in this page are benchmarked on GLM-5.2; the general-purpose Deploy panel cells remain marked unverified when their batch shapes differ from those measured recipes.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <thead>
@@ -270,13 +272,13 @@ python -m sglang.launch_server \
 - **Chunked-prefill size is regime-dependent.** At long input (8K+) the default `--chunked-prefill-size 2048` is too small and leaves the balanced point prefill-bound (queueing dominates TTFT). Raising it to `--chunked-prefill-size 32768` on the balanced recipe gave roughly **+34–78% output throughput and −39–59% TTFT** on 8×H200 and 8×B200 (8K-in / 1K-out) in our testing. It is **neutral for high-throughput** (decode-bound there) — keep the default. `--max-running-requests` tracks KV capacity, not a tuning free-for-all: ~60–90 concurrent 8K+1K FP8 requests fit on a single 8-GPU node, so pin balanced near `--max-running-requests 80` and let high-throughput run wider.
 
 - **AMD GPUs (MI300X / MI325X / MI355X).** FP8 (`zai-org/GLM-5.2-FP8`) runs single-node at `tp=8` on all three. BF16 (`zai-org/GLM-5.2`, ~1.51 TB) only fits single-node on **MI325X** (2 TB HBM) and **MI355X** (2.3 TB); **MI300X** (1.5 TB) cannot hold the BF16 weights plus KV cache on one node, so use FP8 there (or a multi-node BF16 layout once validated). Use the DSA tilelang backend (`--dsa-prefill-backend tilelang --dsa-decode-backend tilelang`) and add `--chunked-prefill-size 131072` plus `--watchdog-timeout 1200` (20 min for weight loading). FP8 uses about half the memory of BF16 (~89 GB/GPU vs ~175 GB/GPU). GLM-5.2 and DeepSeek-V3.2 share the same model structure; for other DSA / HiSparse tips see the [DeepSeek-V3.2 cookbook](../DeepSeek/DeepSeek-V3_2).
-- **MI355X MXFP4 (gfx950-only).** AMD publishes a Quark-quantized **`amd/GLM-5.2-MXFP4`** build for MI355X. It needs `--trust-remote-code` (Quark's custom quant config) and runs at `tp=4` (the 4-bit MoE weights fit a 4-GPU slice) with `--kv-cache-dtype fp8_e4m3`, the DSA triton backends (`--dsa-prefill-backend triton --dsa-decode-backend triton`, also SGLang's ROCm default), and the same `--chunked-prefill-size` and `--watchdog-timeout` as the FP8/BF16 recipes above. At `tp=4` this shape — 16 query heads per rank on an FP8 KV cache — is the one the gfx950 sparse-MLA kernels are tuned for; the `tp=8` recipes above stay on tilelang, which is what their published numbers were measured with. This recipe is carried over from the validated `amd/GLM-5.1-MXFP4` MI355X deployment (same DSA architecture family) and has not yet been benchmarked on GLM-5.2, so the Deploy panel marks it unverified.
+- **MI355X MXFP4 (gfx950-only).** AMD publishes a Quark-quantized **`amd/GLM-5.2-MXFP4`** build for MI355X. It needs `--trust-remote-code` (Quark's custom quant config) with `--kv-cache-dtype fp8_e4m3` and the DSA triton backends (`--dsa-prefill-backend triton --dsa-decode-backend triton`, also SGLang's ROCm default). The measured AgentX deployment uses TP8/EP1 with the Gluon target MoE backend at concurrency 1–2, TP4/EP4 with HiCache at concurrency 4–16, and TP4/EP4 with DCP4 at concurrency 16–48. The general-purpose Deploy panel cells use different batch shapes and remain marked unverified.
 
 <Note>
 **gfx950 block-FP8 accuracy: fixed as of the pinned MI355X image (`v0.5.13.post1-rocm720-mi35x-20260618`).** Earlier SGLang ROCm images miscompiled AMD aiter's `gemm_a8w8_blockscale_bpreshuffle` GEMM on gfx950 (ROCm 7.2): the error was small per layer but compounded across all 78 layers and silently corrupted output — in-context reasoning broke (GSM8K ≈ 0) while short factual prompts still looked fine. The root cause was a gfx950/ROCm-7.2 miscompile of the CK kernel (a packed illegal-type FMA that relied on an LLVM coercion pass removed in ROCm 7.2; non-deterministic wrong rows near tile boundaries). This is resolved in the pinned image and newer: GLM-5.2-FP8 on MI350X/MI355X (gfx950) was re-validated at TP4 and TP8 — **GSM8K ≈ 0.96 (0% invalid)** and **15/15 needle-in-haystack retrieval to ~118K tokens**. **MI300X / MI325X (gfx942) were never affected.** If you must run an older image, treat gfx950 FP8 output as unverified. Background: [sgl-project/sglang#28685](https://github.com/sgl-project/sglang/issues/28685) (analysis) and the upstream CK fix [ROCm/rocm-libraries#8639](https://github.com/ROCm/rocm-libraries/pull/8639) (scalar FMA + accumulator anchor; restores correctness and determinism at -O3).
 </Note>
 
-- **MTP / EAGLE speculative decoding on AMD.** Five-step MTP is validated for `amd/GLM-5.2-MXFP4` on MI355X with `lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261028`. Choose **Low-Latency** for TP8/EP1, or **High-Throughput** for TP4/EP4 with DCP4 (`--dcp-size 4`). That cell runs without HiCache, which SGLang rejects with DCP and EAGLE. MTP remains unvalidated for GLM-5.2 on MI300X/MI325X and for the other MI355X checkpoint precisions.
+- **MTP / EAGLE speculative decoding on AMD.** Five-step MTP is validated for `amd/GLM-5.2-MXFP4` on MI355X with `lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261113`. Choose the TP8/EP1 Gluon recipe for concurrency 1–2, TP4/EP4 with HiCache for concurrency 4–16, or TP4/EP4 with DCP4 (`--dcp-size 4`) for concurrency 16–48. The DCP4 arm runs without HiCache, which SGLang rejects with DCP and EAGLE. MTP remains unvalidated for GLM-5.2 on MI300X/MI325X and for the other MI355X checkpoint precisions.
 
 - **Ascend NPU (A3 Series) topology.** One A3 node is 8 cards x 2 dies = **16 devices**, so every A3 recipe runs `--tp-size 16` per node. **Single Node** is PD mixed on one node; the **Prefill role** / **Decode role** on the PD Disagg card are one node each, so a 1P1D pair spans two nodes and is fronted by the router command the panel emits below the recipe. Send client traffic to the router, not to either role.
 - **Ascend weights and the MTP head.** The msModelSlim W8A8 build is ~774 GB and fits one node's 16 x 64 GB; the BF16 checkpoint (~1.5 TB) needs two. Quantization covers the main model only: in the shard that holds layer 78 the tensors are BF16 and F32 with no INT8, while ordinary layers in the same shard are INT8 plus F32 scales. That is why every A3 recipe passes `--speculative-draft-model-quantization unquant` -- the nextn head is served unquantized.

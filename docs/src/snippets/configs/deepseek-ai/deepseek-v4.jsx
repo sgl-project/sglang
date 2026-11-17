@@ -3689,14 +3689,16 @@ sgl-eval run mmmu_pro \\
     //   Verified on the v2 image with the cookbook Reproduce commands:
     //   sgl-eval gsm8k 97.5% (200 q), sgl-eval mmmu_pro 85% / 0% errors
     //   (20-q subset, --reasoning-effort max, temp 1.0, top-p 0.95).
-    // Env: FP8 wo_a opt-in + MHC post/pre fusion are the GB10 tuning knobs;
-    // SGLANG_B12X_MAX_TOKENS must track --chunked-prefill-size;
+    // Env: b12x attention + FP8 wo_a opt-in + MHC post/pre fusion are the GB10
+    // tuning knobs; SGLANG_B12X_MAX_TOKENS must track --chunked-prefill-size;
     // expandable_segments avoids unified-memory fragmentation OOMs.
     {
       match: { hw: "dgx-spark", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
       verified: true,
       warn: "The Docker image lmsysorg/sglang:dev-v4f-2dgx-v2 is a DGX Spark-only preview build (2x GB10, TP=2 over ConnectX-7) — do not use it on other hardware. Use Docker mode: the bare Python command needs the b12x kernel package this image ships. See [DGX Spark notes](#spark-note).",
       env: [
+        "SGLANG_SM120_FLASHMLA_BACKEND=b12x",
+        "B12X_MLA_SM120_DSV4_H16_NATIVE=1",
         "SGLANG_OPT_FUSE_MHC_POST_PRE=1",
         "SGLANG_OPT_FP8_WO_A_GEMM=1",
         "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1",
@@ -3725,6 +3727,8 @@ sgl-eval run mmmu_pro \\
       verified: true,
       warn: "The Docker image lmsysorg/sglang:dev-v4f-2dgx-v2 is a DGX Spark-only preview build — do not use it on other hardware, and use Docker mode. NVFP4 on DGX Spark needs the three extra MoE flags shown (cutlass runner for the NVFP4 experts, b12x for the DSpark draft's MXFP4 MTP experts, shared-experts fusion off). See [DGX Spark notes](#spark-note).",
       env: [
+        "SGLANG_SM120_FLASHMLA_BACKEND=b12x",
+        "B12X_MLA_SM120_DSV4_H16_NATIVE=1",
         "SGLANG_OPT_FUSE_MHC_POST_PRE=1",
         "SGLANG_OPT_FP8_WO_A_GEMM=1",
         "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1",
@@ -3754,6 +3758,8 @@ sgl-eval run mmmu_pro \\
       verified: true,
       warn: "The Docker image lmsysorg/sglang:dev-v4f-2dgx-v2 is a DGX Spark-only preview build — do not use it on other hardware, and use Docker mode. Images go in as OpenAI image_url content on /v1/chat/completions (see Vision below); text-only requests work unchanged. See [DGX Spark notes](#spark-note).",
       env: [
+        "SGLANG_SM120_FLASHMLA_BACKEND=b12x",
+        "B12X_MLA_SM120_DSV4_H16_NATIVE=1",
         "SGLANG_OPT_FUSE_MHC_POST_PRE=1",
         "SGLANG_OPT_FP8_WO_A_GEMM=1",
         "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1",

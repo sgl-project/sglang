@@ -53,8 +53,6 @@ def torch_default_sdpa_backends():
 
 
 class SDPABackend(AttentionBackend):
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [32, 64, 96, 128, 160, 192, 224, 256]

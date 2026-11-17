@@ -22,7 +22,7 @@ namespace sglang {
 
 namespace muse_all_gather {
 
-using device::distributed::Counter;
+using device::distributed::EpochCounter;
 
 constexpr uint32_t kBlock = 128;
 constexpr uint32_t kVec = 16 / sizeof(bf16_t);  // 8 bf16 (16B) per thread
@@ -31,8 +31,7 @@ template <uint32_t kWorld>
 struct Params {
   uint8_t* ws_local;      // LOCAL VA of the push workspace base (poll + reset)
   uint8_t* ws_mc;         // multicast VA of the push workspace base (push)
-  Counter* counter;       // per-block phase counters
-  uint32_t num_counters;  // PushPlane::num_blocks
+  EpochCounter* counter;  // the push plane's phase word
   uint32_t half_bytes;    // world_size * slot_bytes
   uint32_t rank;
   const bf16_t* local;  // [M, N / world]
@@ -53,22 +52,10 @@ __global__ __launch_bounds__(kBlock) void all_gather_kernel(const __grid_constan
   const auto tx = threadIdx.x;
   const uint32_t tid = bx * kBlock + tx;
   PDLWaitPrimary<kUsePDL>();
-  const uint32_t phase = params.counter[bx].get() & 1;
+  const uint32_t phase = params.counter->load();
   const uint32_t half_off = phase * params.half_bytes;
 
-  // the last block flips its own counter and every one past the grid
-  if (const auto num_blocks = gridDim.x; bx == num_blocks - 1) {
-    [[unlikely]];
-    PDLTriggerSecondary<kUsePDL>();
-    __syncthreads();
-    for (uint32_t i = num_blocks - 1 + tx; i < params.num_counters; i += kBlock) {
-      params.counter[i].set(phase ^ 1);
-    }
-    return void();
-  }
-
-  // Bound the grid to the existing AR counters; larger batches use a stride.
-  const uint32_t stride = (gridDim.x - 1) * kBlock * kVec;
+  const uint32_t stride = gridDim.x * kBlock * kVec;
   for (uint32_t local_elem = tid * kVec; local_elem < params.num_rows * kNLocal; local_elem += stride) {
     uint4 raw = *reinterpret_cast<const uint4*>(params.local + local_elem);
     // +0.0 is the "not arrived" marker; -0.0 is numerically identical
@@ -112,7 +99,7 @@ __global__ __launch_bounds__(kBlock) void all_gather_kernel(const __grid_constan
     zero.store(src);
   }
   __syncthreads();
-  if (tx == 0) params.counter[bx].set(phase ^ 1);
+  if (tx == 0) params.counter->commit();
 }
 
 }  // namespace muse_all_gather
@@ -150,7 +137,6 @@ struct MuseSparkAllGather {
         .ws_local = push.workspaces[push.rank],
         .ws_mc = push.mc_workspace,
         .counter = push.counter,
-        .num_counters = push.num_blocks,
         .half_bytes = static_cast<uint32_t>(push.slot_bytes * push.world_size),
         .rank = push.rank,
         .local = static_cast<const bf16_t*>(local.data_ptr()),
@@ -160,11 +146,10 @@ struct MuseSparkAllGather {
         .num_rows = num_tokens,
     };
     const auto num_vecs = num_tokens * N / muse_all_gather::kVec;
-    CHECK_HOST(push.num_blocks >= 2) << "gather needs a work block and a counter-update block";
-    const auto num_work_blocks = std::min(host::div_ceil(num_vecs, muse_all_gather::kBlock), push.num_blocks - 1);
+    const auto num_blocks = std::min(host::div_ceil(num_vecs, muse_all_gather::kBlock), push.default_blocks);
     const auto fn =
         b.has_value() ? (c.has_value() ? kernel<1, 1> : kernel<1, 0>) : (c.has_value() ? kernel<0, 1> : kernel<0, 0>);
-    host::LaunchKernel(num_work_blocks + 1, muse_all_gather::kBlock, device.unwrap()).enable_pdl(kUsePDL)(fn, params);
+    host::LaunchKernel(num_blocks, muse_all_gather::kBlock, device.unwrap()).enable_pdl(kUsePDL)(fn, params);
   }
 };
 

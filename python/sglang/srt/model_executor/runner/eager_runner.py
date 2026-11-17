@@ -35,9 +35,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.dp_attention import get_eager_max_batch_size, require_mlp_sync
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
-from sglang.srt.model_executor.cuda_graph_buffer_registry import (
-    build_eager_registry,
-)
+from sglang.srt.model_executor.cuda_graph_buffer_registry import build_eager_registry
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     forward_context,
@@ -119,7 +117,6 @@ class EagerRunner(BaseRunner):
             max_num_token = ceil_align(max_num_token, self.attn_tp_size)
             max_num_token = ceil_align(max_num_token, get_cp_padding_align_size())
         self._eager_max_bs = max_bs
-        self._eager_num_tokens_per_req = num_tokens_per_req
         is_encoder_decoder = mr.model_config.is_encoder_decoder
         self._eager_registry = build_eager_registry(
             device=mr.device,
@@ -382,6 +379,12 @@ class EagerRunner(BaseRunner):
         if not model.pp_group.is_last_rank:
             # A middle stage may return a PP proxy rather than a tuple.
             return hidden_states
+
+        # A model with compact output rows must gather with its output layout and
+        # pass matching token indices and lengths to logits/aux-state consumers.
+        if postprocess_cp_output := getattr(model, "postprocess_cp_output", None):
+            return postprocess_cp_output(hidden_states, forward_batch)
+
         aux_hidden_states = None
         if getattr(model, "capture_aux_hidden_states", False):
             hidden_states, aux_hidden_states = hidden_states

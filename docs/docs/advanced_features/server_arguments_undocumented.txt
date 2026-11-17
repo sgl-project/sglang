@@ -52,7 +52,6 @@
 --http2-initial-connection-window-size
 --linear-attn-verify-backend
 --linear-replayssm-cache-len
---mamba-max-states-per-path
 --max-ep-size
 --min-free-slots-delay
 --mm-feature-transport

@@ -48,6 +48,8 @@ from sglang.test.ci.ci_register import (
     register_xpu_ci,
 )
 from sglang.test.test_utils import (
+    ADMIN_API_KEY_FOR_TEST,
+    ADMIN_HEADERS_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     find_available_port,
@@ -1689,7 +1691,12 @@ class TestDumperHttp:
                 "Qwen/Qwen3-0.6B",
                 base_url,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=["--max-total-tokens", "128"],
+                other_args=[
+                    "--max-total-tokens",
+                    "128",
+                    "--admin-api-key",
+                    ADMIN_API_KEY_FOR_TEST,
+                ],
                 env=env,
             )
             try:
@@ -1699,7 +1706,11 @@ class TestDumperHttp:
 
     @staticmethod
     def _post(base_url: str, method: str, **kwargs) -> list[dict]:
-        resp = requests.post(f"{base_url}/dumper/{method}", json=kwargs or None)
+        resp = requests.post(
+            f"{base_url}/dumper/{method}",
+            json=kwargs or None,
+            headers=ADMIN_HEADERS_FOR_TEST,
+        )
         resp.raise_for_status()
         states = resp.json()
         assert isinstance(states, list) and len(states) >= 1
@@ -1776,6 +1787,7 @@ class TestDumperHttp:
         resp = requests.post(
             f"{dumper_http_url}/dumper/configure",
             json={"nonexistent_field": 123},
+            headers=ADMIN_HEADERS_FOR_TEST,
         )
         assert resp.status_code == 400
 
@@ -1783,6 +1795,7 @@ class TestDumperHttp:
         resp = requests.post(
             f"{dumper_http_url}/dumper/nonexistent",
             json={},
+            headers=ADMIN_HEADERS_FOR_TEST,
         )
         assert resp.status_code == 400
 
@@ -1790,6 +1803,7 @@ class TestDumperHttp:
         resp = requests.post(
             f"{dumper_http_url}/dumper/configure",
             json={"enable": "not_a_bool"},
+            headers=ADMIN_HEADERS_FOR_TEST,
         )
         assert resp.status_code == 400
 
@@ -2351,11 +2365,22 @@ class TestDumperE2E:
             "Qwen/Qwen3-0.6B",
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--tp", "2", "--max-total-tokens", "128"],
+            other_args=[
+                "--tp",
+                "2",
+                "--max-total-tokens",
+                "128",
+                "--admin-api-key",
+                ADMIN_API_KEY_FOR_TEST,
+            ],
             env=env,
         )
         try:
-            states = requests.post(f"{base_url}/dumper/get_state", json={}).json()
+            states = requests.post(
+                f"{base_url}/dumper/get_state",
+                json={},
+                headers=ADMIN_HEADERS_FOR_TEST,
+            ).json()
             assert len(states) == 2, f"Expected 2 ranks (tp=2), got {len(states)}"
             for state in states:
                 assert state["config"]["enable"] is False
@@ -2364,9 +2389,14 @@ class TestDumperE2E:
             requests.post(
                 f"{base_url}/dumper/configure",
                 json={"enable": True, "dir": dump_dir},
+                headers=ADMIN_HEADERS_FOR_TEST,
             ).raise_for_status()
 
-            states = requests.post(f"{base_url}/dumper/get_state", json={}).json()
+            states = requests.post(
+                f"{base_url}/dumper/get_state",
+                json={},
+                headers=ADMIN_HEADERS_FOR_TEST,
+            ).json()
             assert len(states) == 2
             for rank, state in enumerate(states):
                 assert state["config"]["enable"] is True, (
@@ -2380,7 +2410,11 @@ class TestDumperE2E:
             )
             assert resp.status_code == 200, f"Generate failed: {resp.text}"
 
-            states = requests.post(f"{base_url}/dumper/get_state", json={}).json()
+            states = requests.post(
+                f"{base_url}/dumper/get_state",
+                json={},
+                headers=ADMIN_HEADERS_FOR_TEST,
+            ).json()
             assert len(states) == 2
             steps = [s["step"] for s in states]
             for rank, step in enumerate(steps):

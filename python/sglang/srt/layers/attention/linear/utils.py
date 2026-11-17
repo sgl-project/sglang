@@ -93,10 +93,14 @@ def resolve_linear_attn_backends(
         mamba.linear_attn_prefill_backend or prefill_default or base
     )
 
-    # Unset verify follows decode (flashinfer -> its recurrent kernel, else triton).
+    # Unset verify follows decode for backends with their own verify kernel.
     verify = mamba.linear_attn_verify_backend
     if verify is None:
-        verify = decode.value if decode.is_flashinfer() else "triton"
+        verify = (
+            decode.value
+            if decode.is_flashinfer() or decode.is_intel_xpu()
+            else "triton"
+        )
 
     backends = LinearAttnBackends(
         decode=decode, prefill=prefill, verify=LinearAttnKernelBackend(verify)

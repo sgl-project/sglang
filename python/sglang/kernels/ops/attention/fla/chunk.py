@@ -47,6 +47,8 @@ def chunk_gated_delta_rule_fwd(
     inplace_update: bool = True,
     chunk_offsets: torch.LongTensor | None = None,
     o_chunk_indices: torch.LongTensor | None = None,
+    out: Optional[torch.Tensor] = None,
+    output_indices: Optional[torch.Tensor] = None,
 ):
     g = chunk_local_cumsum(
         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
@@ -83,6 +85,8 @@ def chunk_gated_delta_rule_fwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=o_chunk_indices,
+        out=out,
+        output_indices=output_indices,
     )
     if SUPPRESS_LEVEL < 3:
         return g, o, A, None, h, None
@@ -109,6 +113,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         inplace_update: bool = True,
         chunk_indices: Optional[torch.LongTensor] = None,
         chunk_offsets: Optional[torch.LongTensor] = None,
+        out: Optional[torch.Tensor] = None,
+        output_indices: Optional[torch.Tensor] = None,
     ):
         q_orig = q
         k_orig = k
@@ -136,6 +142,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             inplace_update=inplace_update,
             chunk_offsets=chunk_offsets,
             o_chunk_indices=o_chunk_indices,
+            out=out,
+            output_indices=output_indices,
         )
         return o.to(q.dtype), h
 
@@ -156,6 +164,8 @@ def chunk_gated_delta_rule(
     inplace_update: bool = True,
     chunk_indices: Optional[torch.LongTensor] = None,
     chunk_offsets: Optional[torch.LongTensor] = None,
+    out: Optional[torch.Tensor] = None,
+    output_indices: Optional[torch.Tensor] = None,
 ):
     r"""
     Args:
@@ -186,6 +196,10 @@ def chunk_gated_delta_rule(
             Default: `False`.
         inplace_update (Optional[bool]):
             Whether to write final states back to `initial_state`. Default: `True`.
+        out, output_indices (Optional[torch.Tensor]):
+            Inference-only contiguous output buffer and one destination per input token.
+            The caller supplies unique, in-range destinations and initializes unmapped
+            positions. Mapped output is only supported for flattened variable lengths.
 
     Returns:
         o (torch.Tensor):
@@ -223,6 +237,29 @@ def chunk_gated_delta_rule(
         )
     """
     assert q.dtype == k.dtype == v.dtype
+    if (out is None) != (output_indices is None):
+        raise ValueError("out and output_indices must be supplied together")
+    if out is not None:
+        assert output_indices is not None
+        if (
+            cu_seqlens is None
+            or q.shape[0] != 1
+            or out.ndim != 4
+            or out.shape[0] != 1
+            or out.shape[2:] != v.shape[2:]
+            or out.dtype != v.dtype
+            or out.device != v.device
+            or not out.is_contiguous()
+            or output_indices.shape != (q.shape[1],)
+            or output_indices.dtype not in (torch.int32, torch.int64)
+            or output_indices.device != out.device
+            or not output_indices.is_contiguous()
+            or any(tensor.requires_grad for tensor in (q, k, v, g, beta, out))
+            or (initial_state is not None and initial_state.requires_grad)
+        ):
+            raise ValueError(
+                "mapped output requires contiguous inference-only varlen output and device indices"
+            )
     assert q.dtype != torch.float32, (
         "ChunkGatedDeltaRuleFunction does not support float32. Please use bfloat16."
     )
@@ -275,6 +312,8 @@ def chunk_gated_delta_rule(
         inplace_update,
         chunk_indices,
         chunk_offsets,
+        out,
+        output_indices,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")

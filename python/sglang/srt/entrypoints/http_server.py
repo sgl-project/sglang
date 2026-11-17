@@ -20,8 +20,10 @@ This file implements HTTP APIs for the inference engine via fastapi.
 import asyncio
 import dataclasses
 import errno
+import inspect
 import logging
 import os
+import signal
 import socket
 import ssl
 import tempfile
@@ -69,6 +71,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
+from pydantic import ValidationError
 from uvicorn.supervisors.multiprocess import Multiprocess
 
 from sglang.srt.configs.model_config import load_joint_head_config, load_pointer_head
@@ -206,7 +209,7 @@ from sglang.srt.utils import (
     is_mps,
     kill_process_tree,
 )
-from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
+from sglang.srt.utils.auth import AuthLevel, add_api_key_middleware, auth_level
 from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
     dumps_json,
@@ -260,11 +263,6 @@ async def init_multi_tokenizer() -> ServerArgs:
     port_args: PortArgs
 
     publish(server_args, role="tokenizer")
-
-    # API key authentication is not supported in multi-tokenizer mode
-    assert get_serving().api_key is None, (
-        "API key is not supported in multi-tokenizer mode"
-    )
 
     # Create a new ipc name for the current process
     port_args.tokenizer_ipc_name = (
@@ -546,6 +544,11 @@ from sglang.srt.runtime_context import (
 elastic_ep_router.route_class = ORJSONRoute
 app.include_router(elastic_ep_router)
 
+# Outermost, and registered at import so that tokenizer workers get it too.
+add_api_key_middleware(
+    app, get_keys=lambda: (get_serving().api_key, get_serving().admin_api_key)
+)
+
 
 def _anthropic_validation_message(raw_errors) -> str:
     """Render Pydantic-style errors for an Anthropic /v1/messages route.
@@ -581,6 +584,27 @@ def _anthropic_error_response(*, status_code: int, error_type: str, message: str
             "error": {"type": error_type, "message": message},
         },
     )
+
+
+def _chat_route_error_response(
+    request: Request, message: str, err_type: str, status_code: int
+) -> Optional[ORJSONResponse]:
+    """A chat error raised before the handler runs, in its wire's envelope;
+    None when the wire keeps the stock body."""
+    route_path = request.url.path.removeprefix(request.scope.get("root_path", ""))
+    if route_path != "/v1/chat/completions":
+        return None
+    error = ErrorResponse(
+        object="error",
+        message=message,
+        type=err_type,
+        param=None,
+        code=status_code,
+    )
+    body = request.app.state.openai_serving_chat.chat_wire.error_body(error)
+    if body is None:
+        return None
+    return ORJSONResponse(content=body, status_code=status_code)
 
 
 @app.exception_handler(HTTPException)
@@ -629,6 +653,12 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
         return ORJSONResponse(
             content={"error": nested_error}, status_code=exc.status_code
         )
+
+    chat_error = _chat_route_error_response(
+        request, str(exc.detail), str(exc.status_code), exc.status_code
+    )
+    if chat_error is not None:
+        return chat_error
 
     error = ErrorResponse(
         object="error",
@@ -687,6 +717,12 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "code": HTTPStatus.BAD_REQUEST.value,
         }
         return ORJSONResponse(status_code=400, content={"error": nested_error})
+
+    chat_error = _chat_route_error_response(
+        request, message, "BadRequest", HTTPStatus.BAD_REQUEST.value
+    )
+    if chat_error is not None:
+        return chat_error
 
     err = ErrorResponse(
         message=message,
@@ -892,9 +928,9 @@ async def server_info():
 
 
 # example usage:
-# curl -s -X POST http://localhost:30000/set_internal_state -H "Content-Type: application/json" -d '{"server_args": {"pp_max_micro_batch_size": 8}}'
+# curl -s -X POST http://localhost:30000/set_internal_state -H "Content-Type: application/json" -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" -d '{"server_args": {"pp_max_micro_batch_size": 8}}'
 @app.api_route("/set_internal_state", methods=["POST", "PUT"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def set_internal_state(
     obj: Annotated[SetInternalStateReq, Body()], request: Request
 ):
@@ -906,7 +942,7 @@ async def set_internal_state(
 if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
 
     @app.api_route("/dumper/{method}", methods=["POST"])
-    @auth_level(AuthLevel.ADMIN_OPTIONAL)
+    @auth_level(AuthLevel.ADMIN_FORCE)
     async def _dumper_control_handler(method: str, request: Request):
         body_bytes = await request.body()
         body = await request.json() if body_bytes else {}
@@ -1040,7 +1076,7 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
 
 
 @app.post("/add_external_corpus")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def add_external_corpus(request: Request):
     """Add an external corpus for ngram speculative decoding."""
     from sglang.srt.managers.io_struct import AddExternalCorpusReqInput
@@ -1065,7 +1101,7 @@ async def add_external_corpus(request: Request):
 
 
 @app.post("/remove_external_corpus")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def remove_external_corpus(request: Request):
     """Remove an external corpus by ID."""
     body = await request.json()
@@ -1113,6 +1149,7 @@ async def clear_hicache_storage_backend():
 # example usage:
 # curl -s -X PUT http://127.0.0.1:30000/hicache/storage-backend \
 #  -H 'Content-Type: application/json' \
+#  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" \
 #   -d '{
 #     "hicache_storage_backend": "file",
 #     "hicache_storage_backend_extra_config_json": "{}",
@@ -1120,7 +1157,7 @@ async def clear_hicache_storage_backend():
 #     "hicache_write_policy": "write_through"
 #   }'
 @app.api_route("/hicache/storage-backend", methods=["PUT"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def attach_hicache_storage_backend(
     obj: Annotated[AttachHiCacheStorageReqInput, Body()],
 ):
@@ -1128,9 +1165,6 @@ async def attach_hicache_storage_backend(
 
     Only allowed when there are NO running / queued requests.
     """
-    if not get_serving().admin_api_key:
-        return _admin_api_key_missing_response()
-
     ret = await _global_state.tokenizer_manager.attach_hicache_storage(
         hicache_storage_backend=obj.hicache_storage_backend,
         hicache_storage_backend_extra_config_json=obj.hicache_storage_backend_extra_config_json,
@@ -1154,15 +1188,12 @@ async def attach_hicache_storage_backend(
 # example usage:
 # curl -s -X DELETE http://127.0.0.1:30000/hicache/storage-backend
 @app.api_route("/hicache/storage-backend", methods=["DELETE"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def detach_hicache_storage_backend():
     """Detach (disable) HiCache storage backend at runtime.
 
     Only allowed when there are NO running / queued requests.
     """
-    if not get_serving().admin_api_key:
-        return _admin_api_key_missing_response()
-
     ret = await _global_state.tokenizer_manager.detach_hicache_storage()
     msg = ret.message
     return Response(
@@ -1181,12 +1212,9 @@ async def detach_hicache_storage_backend():
 # example usage:
 # curl -s http://127.0.0.1:30000/hicache/storage-backend
 @app.get("/hicache/storage-backend")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def hicache_storage_backend_status():
     """Get current HiCache storage backend status (tokenizer-side view)."""
-    if not get_serving().admin_api_key:
-        return _admin_api_key_missing_response()
-
     return {
         name: _global_state.tokenizer_manager.config_value(name)
         for name in (
@@ -1218,7 +1246,7 @@ async def get_hicache_l3_cache_layout():
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def start_profile_async(obj: Annotated[Optional[ProfileReq], Body()] = None):
     """Start profiling."""
     await _global_state.tokenizer_manager.start_profile(obj or ProfileReq())
@@ -1229,7 +1257,7 @@ async def start_profile_async(obj: Annotated[Optional[ProfileReq], Body()] = Non
 
 
 @app.api_route("/stop_profile", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def stop_profile_async():
     """Stop profiling."""
     await _global_state.tokenizer_manager.stop_profile()
@@ -1264,7 +1292,7 @@ async def freeze_gc_async():
 
 
 @app.api_route("/start_expert_distribution_record", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def start_expert_distribution_record_async():
     """Start recording the expert distribution. Clear the previous record if any."""
     await _global_state.tokenizer_manager.start_expert_distribution_record()
@@ -1275,7 +1303,7 @@ async def start_expert_distribution_record_async():
 
 
 @app.api_route("/stop_expert_distribution_record", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def stop_expert_distribution_record_async():
     """Stop recording the expert distribution."""
     await _global_state.tokenizer_manager.stop_expert_distribution_record()
@@ -1286,7 +1314,7 @@ async def stop_expert_distribution_record_async():
 
 
 @app.api_route("/dump_expert_distribution_record", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def dump_expert_distribution_record_async():
     """Dump expert distribution record."""
     await _global_state.tokenizer_manager.dump_expert_distribution_record()
@@ -1297,7 +1325,7 @@ async def dump_expert_distribution_record_async():
 
 
 @app.post("/update_weights_from_disk")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def update_weights_from_disk(
     obj: Annotated[UpdateWeightFromDiskReqInput, Body()], request: Request
 ):
@@ -1326,7 +1354,7 @@ async def update_weights_from_disk(
 
 
 @app.post("/init_weights_send_group_for_remote_instance")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def init_weights_send_group_for_remote_instance(
     obj: Annotated[InitWeightsSendGroupForRemoteInstanceReqInput, Body()],
     request: Request,
@@ -1345,7 +1373,7 @@ async def init_weights_send_group_for_remote_instance(
 
 
 @app.post("/send_weights_to_remote_instance")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def send_weights_to_remote_instance(
     obj: Annotated[SendWeightsToRemoteInstanceReqInput, Body()], request: Request
 ):
@@ -1401,7 +1429,7 @@ async def remote_instance_transfer_engine_info(rank: int = None):
 
 
 @app.post("/init_weights_update_group")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def init_weights_update_group(
     obj: Annotated[InitWeightsUpdateGroupReqInput, Body()], request: Request
 ):
@@ -1417,7 +1445,7 @@ async def init_weights_update_group(
 
 
 @app.post("/destroy_weights_update_group")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def destroy_weights_update_group(
     obj: Annotated[DestroyWeightsUpdateGroupReqInput, Body()], request: Request
 ):
@@ -1433,7 +1461,7 @@ async def destroy_weights_update_group(
 
 
 @app.post("/update_weights_from_tensor")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def update_weights_from_tensor(
     obj: Annotated[UpdateWeightsFromTensorReqInput, Body()], request: Request
 ):
@@ -1455,7 +1483,7 @@ async def update_weights_from_tensor(
 
 
 @app.post("/begin_weight_update")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def begin_weight_update(
     obj: Annotated[BeginWeightUpdateReqInput, Body()], request: Request
 ):
@@ -1470,7 +1498,7 @@ async def begin_weight_update(
 
 
 @app.post("/end_weight_update")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def end_weight_update(
     obj: Annotated[EndWeightUpdateReqInput, Body()], request: Request
 ):
@@ -1485,7 +1513,7 @@ async def end_weight_update(
 
 
 @app.post("/plugin_weight_update")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def plugin_weight_update(
     obj: Annotated[PluginWeightUpdateReqInput, Body()], request: Request
 ):
@@ -1503,7 +1531,7 @@ async def plugin_weight_update(
 
 
 @app.post("/update_weights_from_distributed")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def update_weights_from_distributed(
     obj: Annotated[UpdateWeightsFromDistributedReqInput, Body()], request: Request
 ):
@@ -1523,7 +1551,7 @@ async def update_weights_from_distributed(
 
 
 @app.post("/update_weights_from_ipc")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def update_weights_from_ipc(
     obj: Annotated[UpdateWeightsFromIPCReqInput, Body()], request: Request
 ):
@@ -1542,7 +1570,7 @@ async def update_weights_from_ipc(
 
 
 @app.post("/update_weight_version")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def update_weight_version(
     obj: Annotated[UpdateWeightVersionReqInput, Body()], request: Request
 ):
@@ -1574,7 +1602,7 @@ async def update_weight_version(
 
 
 @app.api_route("/get_weights_by_name", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def get_weights_by_name(
     obj: Annotated[GetWeightsByNameReqInput, Body()], request: Request
 ):
@@ -1590,7 +1618,7 @@ async def get_weights_by_name(
 
 
 @app.api_route("/release_memory_occupation", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def release_memory_occupation(
     obj: Annotated[ReleaseMemoryOccupationReqInput, Body()], request: Request
 ):
@@ -1602,7 +1630,7 @@ async def release_memory_occupation(
 
 
 @app.api_route("/resume_memory_occupation", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def resume_memory_occupation(
     obj: Annotated[ResumeMemoryOccupationReqInput, Body()], request: Request
 ):
@@ -1614,7 +1642,7 @@ async def resume_memory_occupation(
 
 
 @app.api_route("/weights_checker", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def check_weights(
     obj: Annotated[Optional[CheckWeightsReqInput], Body()] = None,
     request: Request = None,
@@ -1636,7 +1664,7 @@ async def check_weights(
 
 
 @app.api_route("/slow_down", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def slow_down(obj: Annotated[SlowDownReqInput, Body()], request: Request):
     """Slow down the system deliberately. Only for testing. Example scenario:
     when we want to test performance of D in large-scale PD disaggregation and have no enough nodes for P,
@@ -1650,7 +1678,7 @@ async def slow_down(obj: Annotated[SlowDownReqInput, Body()], request: Request):
 
 
 @app.api_route("/pd_role_switch", methods=["POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def pd_role_switch(
     obj: Annotated[PdRoleSwitchReqInput, Body()], request: Request
 ):
@@ -1667,7 +1695,7 @@ async def pd_role_switch(
 
 
 @app.api_route("/load_lora_adapter", methods=["POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def load_lora_adapter(
     obj: Annotated[LoadLoRAAdapterReqInput, Body()], request: Request
 ):
@@ -1678,7 +1706,7 @@ async def load_lora_adapter(
 
 
 @app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def load_lora_adapter_from_tensors(
     obj: Annotated[LoadLoRAAdapterFromTensorsReqInput, Body()], request: Request
 ):
@@ -1691,7 +1719,7 @@ async def load_lora_adapter_from_tensors(
 
 
 @app.api_route("/unload_lora_adapter", methods=["POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def unload_lora_adapter(
     obj: Annotated[UnloadLoRAAdapterReqInput, Body()], request: Request
 ):
@@ -1726,7 +1754,7 @@ async def close_session(obj: Annotated[CloseSessionReqInput, Body()], request: R
 
 
 @app.api_route("/configure_logging", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def configure_logging(
     obj: Annotated[ConfigureLoggingReq, Body()], request: Request
 ):
@@ -1846,7 +1874,7 @@ async def separate_reasoning_request(
 
 
 @app.post("/pause_generation")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def pause_generation(
     obj: Annotated[PauseGenerationReqInput, Body()], request: Request
 ):
@@ -1859,7 +1887,7 @@ async def pause_generation(
 
 
 @app.post("/continue_generation")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def continue_generation(
     obj: Annotated[ContinueGenerationReqInput, Body()], request: Request
 ):
@@ -2218,16 +2246,52 @@ async def sagemaker_health() -> Response:
     return Response(status_code=status_code)
 
 
+# Checked in order, so a body with `messages` always reaches chat. Dispatch is by key
+# rather than by trying each model, because `input` is shared by
+# embeddings/classify/responses and ScoringRequest accepts any body.
+_SAGEMAKER_INVOCATION_ROUTES = (
+    ("messages", ChatCompletionRequest, openai_v1_chat_completions),
+    ("prompt", CompletionRequest, openai_v1_completions),
+    ("input", EmbeddingRequest, openai_v1_embeddings),
+)
+_SAGEMAKER_NO_MATCH_MSG = (
+    "Cannot determine the request type: expected one of 'messages' "
+    "(chat completions), 'prompt' (completions) or 'input' (embeddings)"
+)
+
+
 @app.post("/invocations")
-async def sagemaker_chat_completions(
-    request: ChatCompletionRequest, raw_request: Request
+async def sagemaker_invocations(
+    body: Annotated[Dict[str, Any], Body()], raw_request: Request
 ):
-    """OpenAI-compatible chat completion endpoint."""
-    return model_json_response(
-        await raw_request.app.state.openai_serving_chat.handle_request(
-            request, raw_request
+    """SageMaker's only inference route: dispatch by body key to the matching OpenAI route."""
+    for key, request_cls, route in _SAGEMAKER_INVOCATION_ROUTES:
+        if key in body:
+            break
+    else:
+        # The body is not echoed back: SageMaker request bodies can be up to 6 MB.
+        raise RequestValidationError(
+            errors=[
+                {
+                    "type": "value_error",
+                    "loc": ("body",),
+                    "msg": _SAGEMAKER_NO_MATCH_MSG,
+                }
+            ]
         )
-    )
+    try:
+        request = request_cls.model_validate(body)
+    except ValidationError as e:
+        raise RequestValidationError(
+            errors=[
+                {**err, "loc": ("body", *err["loc"])}
+                for err in e.errors(include_url=False)
+            ]
+        ) from e
+    # Route functions are called directly, so their route-level Depends (e.g.
+    # validate_json_request) and response_class do not apply; the wrapper replaces
+    # the ORJSONResponse that /v1/embeddings would otherwise get.
+    return model_json_response(await route(request, raw_request))
 
 
 ## Vertex AI API
@@ -2266,27 +2330,6 @@ def _create_error_response(e):
     return ORJSONResponse(
         {"error": {"message": str(e)}},
         status_code=getattr(e, "status_code", HTTPStatus.BAD_REQUEST),
-    )
-
-
-# FIXME: In theory we should configure ADMIN_FORCE for some entrypoints, but doing so
-# would currently cause all endpoints to go through add_api_key_middleware
-# (even when neither api-key nor admin-api-key is configured).
-#
-# For now, we simulate ADMIN_FORCE by explicitly checking the admin API key parameter.
-# Once the auth wiring is refactored so ADMIN_FORCE only affects the intended
-# admin endpoints, we should switch this logic to use ADMIN_FORCE directly.
-def _admin_api_key_missing_response(
-    status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
-) -> ORJSONResponse:
-    return ORJSONResponse(
-        content={
-            "error": (
-                "This endpoint requires admin API key, but this server was started "
-                "without one (admin-api-key). Restart with --admin-api-key to enable."
-            )
-        },
-        status_code=status_code,
     )
 
 
@@ -2650,7 +2693,43 @@ def _wait_weights_ready():
     )
 
 
-class _ReusePortMultiprocess(Multiprocess):
+class _SigquitForwardingMultiprocess(Multiprocess):
+    """uvicorn supervisor that keeps SIGQUIT meaning "a child failed".
+
+    ``Multiprocess.__init__`` replaces the SIGQUIT handler with a queue that has
+    no ``handle_quit``, so a scheduler's SIGQUIT to this process is dropped and
+    the server outlives its schedulers. The handler installed before uvicorn
+    took over is called from the supervisor loop instead.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._sigquit_handler = signal.getsignal(signal.SIGQUIT)
+        super().__init__(*args, **kwargs)
+
+    def handle_quit(self) -> None:
+        if callable(self._sigquit_handler):
+            self._sigquit_handler(signal.SIGQUIT, None)
+        else:
+            logger.error("Received SIGQUIT from a child process; exiting.")
+            kill_process_tree(os.getpid())
+
+
+def _run_uvicorn_workers(app_path: str, **uvicorn_options) -> None:
+    """What ``uvicorn.run()`` does for workers > 1, minus its SIGQUIT trap."""
+    config = uvicorn.Config(app_path, **uvicorn_options)
+    sockets = [config.bind_socket()]
+    if "target" in inspect.signature(Multiprocess.__init__).parameters:
+        # uvicorn < 0.51 (not pinned on every platform): the supervisor is
+        # given the server's run().
+        supervisor = _SigquitForwardingMultiprocess(
+            config, target=uvicorn.Server(config=config).run, sockets=sockets
+        )
+    else:
+        supervisor = _SigquitForwardingMultiprocess(config, sockets=sockets)
+    supervisor.run()
+
+
+class _ReusePortMultiprocess(_SigquitForwardingMultiprocess):
     """Give each uvicorn worker a private SO_REUSEPORT listener.
 
     uvicorn's supervisor reads ``self.sockets`` once per worker it spawns, so a
@@ -2798,8 +2877,6 @@ def _run_granian_server(
     The event loop is uvloop. The default backlog and backpressure values are set
     exactly like uvicorn's defaults.
     """
-    import signal
-
     from granian import Granian
     from granian.constants import HTTPModes, Interfaces, Loops
     from granian.http import HTTP2Settings
@@ -2896,26 +2973,6 @@ def _setup_and_run_http_server(
             launch_callback=launch_callback,
             execute_warmup_func=execute_warmup_func,
         )
-
-        # Add api key authorization
-        # This is only supported in single tokenizer mode.
-        #
-        # Backward compatibility:
-        # - api_key only: behavior matches legacy (all endpoints require api_key)
-        # - no keys: legacy had no restriction; ADMIN_FORCE endpoints must still be rejected when
-        #   admin_api_key is not configured.
-        if (
-            get_serving().api_key
-            or get_serving().admin_api_key
-            or app_has_admin_force_endpoints(app)
-        ):
-            from sglang.srt.utils.auth import add_api_key_middleware
-
-            add_api_key_middleware(
-                app,
-                api_key=get_serving().api_key,
-                admin_api_key=get_serving().admin_api_key,
-            )
     else:
         # If it is multi-tokenizer mode, we need to write the arguments to shared memory
         # for other worker processes to read.
@@ -3094,7 +3151,7 @@ def _setup_and_run_http_server(
                     )
                     supervisor.run()
                 else:
-                    uvicorn.run(app_path, **uvicorn_options)
+                    _run_uvicorn_workers(app_path, **uvicorn_options)
     finally:
         if get_serving().tokenizer_worker_num > 1:
             if multi_tokenizer_args_shm is not None:
@@ -3188,7 +3245,8 @@ def launch_server(
         # The Rust server serves api-server, tokenizer, and detokenizer, so the
         # main process has no Python HTTP server / tokenizer manager to run.
         # Each Rust listener runs its own startup warmup and keeps /health at
-        # 503 until it succeeds, so the main process does not warm up here.
+        # 503 until it succeeds, so the main process does not warm up here. A
+        # failed warmup signals this process as a crashed scheduler does.
         from sglang.srt.rust_server.server import drain_notify_name
         from sglang.srt.rust_server.shutdown import RustServerSigtermDrain
 
