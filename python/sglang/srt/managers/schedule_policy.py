@@ -542,13 +542,8 @@ class SchedulePolicy:
         temporary_deprioritized: Set[int] = set()
         self.waiting_queue_radix_tree.reset()
 
-        # NOTE(sang): This logic is for in-batch prefix caching;
-        # If there are more than 1 request that have small matching prefix from
-        # existing cache, but all those requests share the same prefix, we prefer
-        # to schedule only one of them so that we can increase the cache hit rate.
-        # We prefer to set IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD > 0 because too small
-        # threshold means we cannot use in-batch prefix caching for short prefixes.
-        # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
+        # In-batch prefix caching: of the requests with almost nothing cached that
+        # share a prefix, only one runs, so the shared prefix is computed once.
         candidates = []
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
@@ -559,9 +554,8 @@ class SchedulePolicy:
                 candidates.append((r, key_ids))
 
         if policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
-            # The first request of a shared-prefix group runs; the rest wait for it.
-            # Pick the shortest: in queue order, a short request that shares a few
-            # tokens with a queued long one waits as long as SPF defers the long one.
+            # The first of a shared-prefix group runs: make it the shortest, or a
+            # short request waits behind a long one that SPF defers.
             candidates.sort(key=lambda c: self._shortest_prefill_work(c[0]))
 
         for r, key_ids in candidates:
