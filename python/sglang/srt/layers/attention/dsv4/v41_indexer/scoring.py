@@ -557,6 +557,7 @@ def decode_scores(
     req_to_token: torch.Tensor,
     candidate_mask: Optional[torch.Tensor] = None,
     compute_topk_plan: bool = True,
+    score_rows: Optional[slice] = None,
 ) -> Optional[DecodeScores | PagedDecodeScores]:
     """None when there is no row, or nothing visible yet."""
     pool = token_to_kv_pool
@@ -583,6 +584,11 @@ def decode_scores(
     weights = indexer.head_weights(inputs.x)
     table = pool.get_index_k_with_scale_buffer(inputs.layer_id)
     if paged:
+        # Slice after projection to preserve its GEMM shape.
+        if score_rows is not None:
+            q, weights, req = q[score_rows], weights[score_rows], req[score_rows]
+            lens = lens[score_rows]
+            bs = lens.shape[0]
         lens = lens.to(torch.int32)
         # Prepare the device-side plan before scoring, away from its top-k consumer.
         plan = plan_topk_v2(lens) if compute_topk_plan else None
@@ -621,25 +627,35 @@ def decode_scores(
 
 
 def select_decode(
-    inputs: DecodeInputs, d: DecodeScores | PagedDecodeScores, topk: int
+    inputs: DecodeInputs,
+    d: DecodeScores | PagedDecodeScores,
+    topk: int,
+    *,
+    raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
     k = min(topk, d.lmax)
     if isinstance(d, PagedDecodeScores):
         assert d.plan is not None, "paged select_decode needs the top-k v2 plan"
         idx = torch.empty((d.bs, k), dtype=torch.int32, device=d.scores.device)
         topk_transform_paged_v2(d.scores, d.lens, None, idx, 1, d.plan)
+        page_indices = (
+            inputs.out_page_indices
+            if raw_indices is None
+            else torch.empty_like(raw_indices)
+        )
         finish_paged_indexer_topk(
             idx,
             d.scores,
             d.lens,
             d.req,
             d.req_to_token,
-            inputs.out_page_indices,
-            None,
+            page_indices,
+            raw_indices,
             d.ratio,
             d.has_candidate_mask,
         )
     else:
+        assert raw_indices is None, "raw indices require paged decode scores"
         write_decode(inputs, d, d.scores.topk(k, dim=-1, sorted=False).indices)
 
 
