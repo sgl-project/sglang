@@ -80,6 +80,9 @@ def _create_linear_attention_backend(runner, fallback):
 @register_attention_backend("flashinfer")
 def create_flashinfer_backend(runner):
     if not runner.use_mla_backend:
+        from sglang.srt.beam_search.shared_context_backend import (
+            flashinfer_backend_cls,
+        )
         from sglang.srt.layers.attention.flashinfer_backend import (
             FlashInferAttnBackend,
         )
@@ -91,7 +94,7 @@ def create_flashinfer_backend(runner):
                 or not runner.plan_stream_for_flashinfer
             ):
                 runner.plan_stream_for_flashinfer = torch.cuda.Stream()
-        return FlashInferAttnBackend(
+        return flashinfer_backend_cls(FlashInferAttnBackend)(
             runner, init_new_workspace=runner.init_new_workspace
         )
     else:
