@@ -39,6 +39,7 @@ def _restore_gc_state():
     enabled = gc.isenabled()
     _Cycle.finalized = 0
     yield
+    gc.unfreeze()
     gc.set_threshold(*threshold)
     if enabled:
         gc.enable()
@@ -54,6 +55,14 @@ def test_cyclic_garbage_is_not_collected_until_capture_ends() -> None:
         assert _Cycle.finalized == 0
     assert _Cycle.finalized == 100
     assert gc.isenabled()
+
+
+def test_a_heap_frozen_before_the_capture_stays_frozen() -> None:
+    survivor = _Cycle()
+    gc.freeze()
+    with freeze_gc(enable_cudagraph_gc=False):
+        pass
+    assert all(obj is not survivor for obj in gc.get_objects())
 
 
 def test_gc_disabled_by_the_caller_stays_disabled() -> None:
