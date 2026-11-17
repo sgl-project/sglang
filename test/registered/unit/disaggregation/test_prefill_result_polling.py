@@ -1470,6 +1470,7 @@ class _ForwardEvent:
 class _PPEarlySendScheduler(SchedulerDisaggregationPrefillMixin):
     def __init__(self, is_last_rank):
         self.pp_group = SimpleNamespace(is_last_rank=is_last_rank)
+        self.model_config = SimpleNamespace(num_hidden_layers=8)
         self.forward_stream_ctx = nullcontext()
         self.device_module = SimpleNamespace(
             Event=_ForwardEvent, current_stream=lambda: None
@@ -1495,7 +1496,7 @@ def _early_req(
 ):
     kv_mgr = SimpleNamespace(
         request_status={room: status},
-        decode_pulls_every_pp_stage=lambda bootstrap_room: pulls_every_stage,
+        decode_pulls_last_pp_stage=lambda bootstrap_room, layers: pulls_every_stage,
     )
     fields = dict(
         rid=rid,
@@ -1537,6 +1538,7 @@ def _sampled(*token_ids, customized_info=None):
 
 class TestPPPrefillEarlySend(CustomTestCase):
     def test_stage_sends_last_chunk_at_its_forward_and_leaves_aux_to_last_stage(self):
+        self.enterContext(published_topology(pp_size=2))
         done = _early_req("done", 1)
         chunked = _early_req("chunked", 2, extend_end=4)
         logprob = _early_req("logprob", 3, return_logprob=True)
@@ -1585,9 +1587,10 @@ class TestPPPrefillEarlySend(CustomTestCase):
         self.assertEqual([s[0] for s in last.sent], ["done"])
         self.assertEqual(last.sent[0][2], dict(first_output_id=3, send_aux=True))
 
-    def test_stage_keeps_the_aux_for_a_pp_matched_decode(self):
-        # A decode rank holding only this stage's layers reads its aux from this
+    def test_stage_keeps_the_aux_for_a_decode_that_runs_pp(self):
+        # A decode rank that never pulls the last stage reads its aux from this
         # stage, so the request keeps the result path, which sends the aux.
+        self.enterContext(published_topology(pp_size=2))
         matched = _early_req("matched", 1, pulls_every_stage=False)
         stage = _PPEarlySendScheduler(is_last_rank=False)
         stage._pp_pd_early_send_last_chunks(
@@ -1596,13 +1599,12 @@ class TestPPPrefillEarlySend(CustomTestCase):
         self.assertEqual(stage.sent, [])
         self.assertEqual(stage.disagg_prefill_early_sent_rids, set())
 
-        def manager(local_layers, *peer_layers):
+        def manager(*peer_layers):
             infos = {
                 f"s{i}": SimpleNamespace(is_dummy=False, mooncake_session_id=f"s{i}")
                 for i in range(len(peer_layers))
             }
             return SimpleNamespace(
-                kv_args=SimpleNamespace(kv_layer_ids=local_layers),
                 transfer_infos={7: infos},
                 decode_kv_args_table={
                     f"s{i}": SimpleNamespace(dst_kv_layer_ids=layers)
@@ -1610,14 +1612,21 @@ class TestPPPrefillEarlySend(CustomTestCase):
                 },
             )
 
-        pulls = MooncakeKVManager.decode_pulls_every_pp_stage
+        # Prefill PP4 over 8 layers: this is stage 0 (0, 1); the last stage has 6, 7.
+        def pulls(*peer_layers, room=7):
+            return MooncakeKVManager.decode_pulls_last_pp_stage(
+                manager(*peer_layers), room, range(6, 8)
+            )
+
         # Decode without PP holds every layer: it pulls every prefill stage.
-        self.assertTrue(pulls(manager([0, 1], list(range(8))), 7))
+        self.assertTrue(pulls(list(range(8))))
         # A PP-matched decode rank holds only this stage's layers.
-        self.assertFalse(pulls(manager([0, 1], list(range(8)), [0, 1]), 7))
-        # Unknown peers or rooms keep the aux on this stage.
-        self.assertFalse(pulls(manager([0, 1], []), 7))
-        self.assertFalse(pulls(manager([0, 1], list(range(8))), 8))
+        self.assertFalse(pulls(list(range(8)), [0, 1]))
+        # Decode PP2: its first rank spans stages 0 and 1 but not the last one.
+        self.assertFalse(pulls(list(range(4))))
+        # Positional pairing (no layer ids) or an unknown room keeps the aux here.
+        self.assertFalse(pulls([]))
+        self.assertFalse(pulls(list(range(8)), room=8))
 
     def test_result_skips_the_early_sent_chunk_after_its_transfer_ends(self):
         stage = _PPEarlySendScheduler(is_last_rank=False)
