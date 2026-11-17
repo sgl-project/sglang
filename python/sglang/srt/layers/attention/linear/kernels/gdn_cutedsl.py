@@ -12,25 +12,16 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.cutedsl_gdn import (
     cutedsl_fused_sigmoid_gating_delta_rule_update,
 )
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
+from sglang.srt.layers.attention.linear.kernels.state_pool_io import state_pool_indices
 
 logger = logging.getLogger(__name__)
-
-
-def _is_sm10x() -> bool:
-    """True iff running on SM10x, the only arch with the tcgen05/TMEM the kernel uses.
-
-    SM120 (desktop Blackwell) lacks tcgen05 despite its larger capability number.
-    """
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major == 10
 
 
 class CuteDSLGDNKernel(LinearAttnKernelBase):
@@ -46,7 +37,7 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
     def __init__(self):
         # The extend kernel uses tcgen05/TMA-bulk-swizzle features that exist
         # only on SM10x. The decode kernel does work on SM90+.
-        self.supports_prefill = _is_sm10x()
+        self.supports_prefill = current_arch().is_sm(10)
 
         # Heavy CuteDSL imports are deferred to extend() so SM90 boxes can
         # still construct the kernel just for decode.
@@ -145,12 +136,7 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
         # Pool state I/O is fused into the h kernel's TMA load/store: pass the
         # pool + per-seq slots and the kernel reads h0/writes ht in place at
         # those rows (no gather/scatter kernels, no [N, Hv, V, K] intermediates).
-        # Remap padding (-1) to the last (sentinel) slot.
-        ssm_cache_indices = torch.where(
-            cache_indices >= 0,
-            cache_indices,
-            ssm_states.shape[0] - 1,
-        ).to(torch.int32)
+        ssm_cache_indices = state_pool_indices(cache_indices, dtype=torch.int32)
 
         chunk_indices, chunk_offsets = self._prepare_meta_fn(
             cu_seqlens, total_seq_len, chunk_size=64

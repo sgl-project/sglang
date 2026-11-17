@@ -9,8 +9,8 @@ import pytest
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     breakable_cuda_graph as bcg,
 )
@@ -182,7 +182,9 @@ def test_direct_backend_dispatch(sparse):
     batch = make_batch()
     q = torch.zeros(4, 2, 3)
     result = object()
-    backend = SimpleNamespace(forward=lambda *args, **kwargs: result)
+    backend = SimpleNamespace(
+        forward=lambda *args, **kwargs: result, plans_padded_extend_rows=False
+    )
     with (
         attention_scope(batch, backend),
         patch(

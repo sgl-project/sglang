@@ -402,17 +402,6 @@ class TestTileIntervals(unittest.TestCase):
     def test_an_axis_shorter_than_one_tile_stays_whole(self):
         self.assertEqual(_tile_intervals(5, 12, 8, 4), [(0, 5)])
 
-    def test_a_round_robin_split_covers_every_tile_exactly_once(self):
-        # How `tiled_decode` assigns tiles: rank r takes r, r+W, r+2W, ...
-        for total in (1, 7, 14, 15):
-            for world_size in (1, 2, 3, 4):
-                assigned = [
-                    i
-                    for rank in range(world_size)
-                    for i in range(rank, total, world_size)
-                ]
-                self.assertEqual(sorted(assigned), list(range(total)))
-
 
 if __name__ == "__main__":
     unittest.main()

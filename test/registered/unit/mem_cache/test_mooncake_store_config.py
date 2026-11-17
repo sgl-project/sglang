@@ -52,5 +52,17 @@ class TestMooncakeStoreConfigProtocol(CustomTestCase):
         self.assertEqual(cfg.protocol, "rdma")
 
 
+class TestMooncakeStoreConfigLocalBufferSize(CustomTestCase):
+    _BASE_CONFIG = {"master_server_address": "127.0.0.1:50051"}
+
+    def test_local_buffer_size_comes_from_extra_config(self):
+        load = MooncakeStoreConfig.load_from_extra_config
+        self.assertEqual(load(self._BASE_CONFIG).local_buffer_size, 16 * 1024**2)
+        cfg = load({**self._BASE_CONFIG, "local_buffer_size": "4294967296"})
+        self.assertEqual(cfg.local_buffer_size, 4 * 1024**3)
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            load({**self._BASE_CONFIG, "local_buffer_size": -1})
+
+
 if __name__ == "__main__":
     unittest.main()
