@@ -52,6 +52,48 @@ class Buffer:
 
 
 class TestRegisteredNPUHostAllocation(unittest.TestCase):
+    def test_npu_host_backend_defaults_to_acl_without_setting_environment(self):
+        path = ROOT / "python/sglang/srt/mem_cache/pool_host/npu_host_memory.py"
+        functions = [
+            node
+            for node in ast.parse(path.read_text()).body
+            if isinstance(node, ast.FunctionDef)
+            and node.name
+            in (
+                "host_memory_backend",
+                "memfabric_host_memory_enabled",
+                "acl_host_memory_enabled",
+                "get_host_memory_backend",
+            )
+        ]
+        acl_backend = type("AclHostMemoryBackend", (), {})
+        mf_backend = type("MemfabricHostMemoryBackend", (), {})
+        namespace = dict(
+            os=os,
+            NpuHostMemoryBackend=object,
+            AclHostMemoryBackend=acl_backend,
+            MemfabricHostMemoryBackend=mf_backend,
+            _backend=None,
+        )
+        exec(
+            compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"),
+            namespace,
+        )
+        env_name = "SGLANG_HICACHE_HOST_MEM_BACKEND"
+        for setting, expected in (
+            (None, acl_backend),
+            ("", acl_backend),
+            ("memfabric", mf_backend),
+        ):
+            with self.subTest(setting=setting):
+                environment = {} if setting is None else {env_name: setting}
+                with patch.dict(os.environ, environment, clear=True):
+                    namespace["_backend"] = None
+                    self.assertIsInstance(
+                        namespace["get_host_memory_backend"](), expected
+                    )
+                    self.assertEqual(os.environ.get(env_name), setting)
+
     def test_mha_draft_layout_preserves_npu_layer_order(self):
         path = ROOT / "python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py"
         function = next(
@@ -688,10 +730,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
                         ),
                     ):
                         exec(code, namespace)
-                        self.assertEqual(
-                            os.environ.get("SGLANG_HICACHE_HOST_MEM_BACKEND"),
-                            "acl",
-                        )
+                        self.assertNotIn("SGLANG_HICACHE_HOST_MEM_BACKEND", os.environ)
                     if dsv4:
                         expected = (
                             "layer_first" if layout == "layer_first" else "page_first"
@@ -705,7 +744,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
                     else:
                         expected = (
                             "layer_first"
-                            if layout in ("layer_first", "layer_first_kv_split")
+                            if layout == "layer_first"
                             else "page_first"
                         )
                     self.assertEqual(resolved["hicache_mem_layout"], expected)
@@ -754,13 +793,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
                             ),
                         ):
                             exec(code, namespace)
-                            expected = backend
-                            if (
-                                backend is None
-                                and trigger != "disabled"
-                            ):
-                                expected = "acl"
-                            self.assertEqual(os.environ.get(env_name), expected)
+                            self.assertEqual(os.environ.get(env_name), backend)
                             if trigger == "disabled":
                                 namespace["declare_resolution"].assert_not_called()
 
@@ -835,15 +868,11 @@ class TestNPUSparseDispatch(unittest.TestCase):
         cpu_di = object()
         for backend in ("acl", "memfabric", None):
             layouts = (
-                (
-                    "page_first_kv_split",
-                    "layer_first_kv_split",
-                    "page_first",
-                    "layer_first",
-                    "page_first_direct",
-                )
-                if backend
-                else ("page_first_direct",)
+                "page_first_kv_split",
+                "layer_first_kv_split",
+                "page_first",
+                "layer_first",
+                "page_first_direct",
             )
             for layout in layouts:
                 with self.subTest(backend=backend, layout=layout):
@@ -872,16 +901,11 @@ class TestNPUSparseDispatch(unittest.TestCase):
                             mem_pool_host=SimpleNamespace(layout=layout),
                         )
                         move = namespace["move_indices"]
-                        if backend:
-                            self.assertEqual(move(ctl, hi, di), (hi, di))
-                            upload.assert_not_called()
-                            self.assertEqual(move(ctl, cpu_hi, di), (hi, di))
-                            upload.assert_called_once_with(cpu_hi, "npu")
-                            di.cpu.assert_not_called()
-                        else:
-                            self.assertEqual(move(ctl, cpu_hi, di), (cpu_hi, cpu_di))
-                            di.cpu.assert_called_once_with()
-                            upload.assert_not_called()
+                        self.assertEqual(move(ctl, hi, di), (hi, di))
+                        upload.assert_not_called()
+                        self.assertEqual(move(ctl, cpu_hi, di), (hi, di))
+                        upload.assert_called_once_with(cpu_hi, "npu")
+                        di.cpu.assert_not_called()
 
 
 if __name__ == "__main__":

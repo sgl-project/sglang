@@ -356,7 +356,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             len(chunk_indices), v.shape[-2], v.shape[-1], k.shape[-1]
         )  # [NT, NH, DV, Dk]
 
-        core_attn_out, last_recurrent_state = torch.ops.npu.sgl_chunk_gated_delta_rule(
+        core_attn_out, last_recurrent_state = torch.ops.npu.chunk_gated_delta_rule(
             q,
             k,
             v,

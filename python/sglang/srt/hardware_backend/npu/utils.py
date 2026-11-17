@@ -1,6 +1,5 @@
 import functools
 import logging
-import os
 import sys
 from enum import IntEnum
 from typing import TYPE_CHECKING, Callable, Optional
@@ -197,7 +196,6 @@ def set_default_server_args(args: "ServerArgs"):
 
         # DSV4, MLA, and MHA use page-aware transfer operators.
         if is_deepseek_v4(model_config_of(args).hf_config):
-            os.environ.setdefault("SGLANG_HICACHE_HOST_MEM_BACKEND", "acl")
             declare_resolution(
                 args,
                 "set_default_server_args",
@@ -208,7 +206,6 @@ def set_default_server_args(args: "ServerArgs"):
                 ),
             )
         elif use_mla_backend(args):
-            os.environ.setdefault("SGLANG_HICACHE_HOST_MEM_BACKEND", "acl")
             declare_resolution(
                 args,
                 "set_default_server_args",
@@ -219,7 +216,6 @@ def set_default_server_args(args: "ServerArgs"):
                 ),
             )
         elif model_config_of(args).attention_arch == AttentionArch.MHA:
-            os.environ.setdefault("SGLANG_HICACHE_HOST_MEM_BACKEND", "acl")
             declare_resolution(
                 args,
                 "set_default_server_args",

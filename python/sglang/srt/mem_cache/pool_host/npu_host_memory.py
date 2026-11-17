@@ -2,8 +2,9 @@
 
 torch pin_memory buffers are only reachable by the SDMA engine; AIV kernels
 (e.g. kv_exchange) can only de-reference host VAs that were mapped into the
-device VA space first.  SGLANG_HICACHE_HOST_MEM_BACKEND selects the backend
-(a NpuHostMemoryBackend subclass resolved by get_host_memory_backend()):
+device VA space first. SGLANG_HICACHE_HOST_MEM_BACKEND selects the backend
+(a NpuHostMemoryBackend subclass resolved by get_host_memory_backend()); ACL
+is used when the variable is unset:
 
 - ``memfabric`` (MemfabricHostMemoryBackend): a MemFabric ``Offload``
   instance owns the host pool; ``pool.initialize`` reserves and
@@ -30,6 +31,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.mem_cache.device_pool_info import MHABufferInfo
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import is_npu
@@ -42,9 +44,9 @@ logger = logging.getLogger(__name__)
 _MEMFABRIC_GB = 1024**3
 
 
-def host_memory_backend() -> str | None:
-    """Return 'memfabric' | 'acl' | None from SGLANG_HICACHE_HOST_MEM_BACKEND."""
-    return os.environ.get("SGLANG_HICACHE_HOST_MEM_BACKEND", "").lower() or None
+def host_memory_backend() -> str:
+    """Use ACL by default; honor an explicitly selected host-memory backend."""
+    return (os.environ.get("SGLANG_HICACHE_HOST_MEM_BACKEND") or "acl").lower()
 
 
 def memfabric_host_memory_enabled() -> bool:
@@ -152,7 +154,7 @@ class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
 
         total_bytes is the combined byte size of all buffers the calling
         host pool is about to allocate (ultimately derived from
-        --hicache-size / --hicache-ratio).  The entity is sized by the first
+        --hicache-size / --hicache-ratio). The entity is sized by the first
         declaration; later host pools in the same process must fit into
         what is left.
         """
@@ -282,10 +284,8 @@ _backend: NpuHostMemoryBackend | None = None
 def get_host_memory_backend() -> NpuHostMemoryBackend | None:
     """Return the backend selected by SGLANG_HICACHE_HOST_MEM_BACKEND.
 
-    Returns None when no registered-host-memory backend is configured;
-    callers then fall back to plain pinned memory.  The instance is cached,
-    so the selection and the MemFabric entity state are process-wide
-    singletons.
+    ACL is the default. The instance is cached, so the selection and the
+    MemFabric entity state are process-wide singletons.
     """
     global _backend
     if _backend is None:
@@ -294,6 +294,13 @@ def get_host_memory_backend() -> NpuHostMemoryBackend | None:
         elif acl_host_memory_enabled():
             _backend = AclHostMemoryBackend()
     return _backend
+
+
+def reserve_hybrid_host_memory(*, kv_bytes: int, mamba_bytes: int) -> None:
+    """Reserve all hybrid KV and Mamba blocks before the first MF allocation."""
+    backend = get_host_memory_backend()
+    if backend is not None:
+        backend.ensure_capacity(kv_bytes + mamba_bytes, torch.npu.current_device())
 
 
 def reserve_mla_split_host_memory(
@@ -344,6 +351,124 @@ def reserve_mha_host_memory(
         2 * num_pages * page_size * num_layers * head_num * head_dim * dtype.itemsize
     )
     backend.ensure_capacity(total_bytes, torch.npu.current_device())
+
+
+def reserve_mamba_host_memory(*, total_bytes: int) -> None:
+    """Declare Mamba's combined state bytes before allocating any buffers."""
+    backend = get_host_memory_backend()
+    if backend is not None and total_bytes:
+        backend.ensure_capacity(total_bytes, torch.npu.current_device())
+
+
+def mamba_host_allocation_bytes(
+    buffer_info,
+    draft_infos,
+    *,
+    device_capacity: int,
+    host_to_device_ratio: float,
+    host_size: float,
+) -> int:
+    """Price Mamba's temporal, conv and side-state blocks before construction."""
+    from sglang.srt.mem_cache.pool_host.base import sync_fixed_hicache_size
+
+    num_layers = buffer_info.temporal.shape[0] + len(draft_infos)
+    temporal_bytes = (
+        math.prod(buffer_info.temporal.shape[2:])
+        * buffer_info.temporal.dtype.itemsize
+    )
+    conv_bytes = sum(
+        math.prod(conv.shape[2:]) * conv.dtype.itemsize for conv in buffer_info.conv
+    )
+    side_bytes = sum(
+        math.prod(state.shape[1:]) * state.dtype.itemsize
+        for info in (buffer_info, *draft_infos)
+        for state in info.extra_checkpoint_buffers
+    )
+    bytes_per_slot = num_layers * (temporal_bytes + conv_bytes) + side_bytes
+    if host_size > 0:
+        slots = sync_fixed_hicache_size(
+            int(host_size * 1e9 // bytes_per_slot), host_size
+        )
+    else:
+        slots = int(device_capacity * host_to_device_ratio)
+    # Mamba uses page_size=1 and retains one padding slot.
+    return (slots + 1) * bytes_per_slot
+
+
+def mha_host_allocation_bytes(
+    buffer_info,
+    *,
+    draft_count: int,
+    device_capacity: int,
+    host_to_device_ratio: float,
+    host_size: float,
+    page_size: int,
+) -> int:
+    """Return the MHA host allocation including its padding page."""
+    from sglang.srt.mem_cache.pool_host.base import sync_fixed_hicache_size
+
+    if not isinstance(buffer_info, MHABufferInfo):
+        raise NotImplementedError(
+            "MemFabric hybrid reservation currently supports MHA + Mamba pools"
+        )
+    if buffer_info.scales is not None:
+        raise NotImplementedError(
+            "MemFabric hybrid reservation does not support MHA KV scales"
+        )
+    layers = len(buffer_info.buffers.k) + draft_count
+    bytes_per_token = (
+        (buffer_info.head_dim + buffer_info.v_head_dim)
+        * layers
+        * buffer_info.head_num
+        * buffer_info.dtype.itemsize
+    )
+    if host_size > 0:
+        slots = sync_fixed_hicache_size(
+            int(host_size * 1e9 // bytes_per_token), host_size
+        )
+    else:
+        slots = int(device_capacity * host_to_device_ratio)
+    pages = slots // page_size + 1
+    return pages * page_size * bytes_per_token
+
+
+def hybrid_host_allocation_bytes(
+    *,
+    kv_pool,
+    kv_host_size: float | None,
+    kv_draft_pools,
+    page_size: int,
+    mamba_pool,
+    mamba_info,
+    mamba_host_size: float,
+    mamba_draft_pools,
+) -> tuple[int, int]:
+    """Estimate the MHA KV and Mamba blocks of one hybrid stack."""
+    memory = get_memory()
+    kv_capacity = kv_pool.host_capacity_tokens
+    if kv_capacity is None:
+        kv_capacity = kv_pool.size
+    mamba_capacity = mamba_pool.host_capacity_tokens
+    if mamba_capacity is None:
+        mamba_capacity = mamba_pool.size
+    kv_bytes = mha_host_allocation_bytes(
+        kv_pool.get_device_pool_infos()[0].buffer_info,
+        draft_count=len(kv_draft_pools),
+        device_capacity=kv_capacity,
+        host_to_device_ratio=memory.hicache_ratio,
+        host_size=memory.hicache_size if kv_host_size is None else kv_host_size,
+        page_size=page_size,
+    )
+    mamba_bytes = mamba_host_allocation_bytes(
+        mamba_info.buffer_info,
+        tuple(
+            pool.get_device_pool_infos()[0].buffer_info for pool in mamba_draft_pools
+        ),
+        device_capacity=mamba_capacity,
+        host_to_device_ratio=memory.hicache_ratio,
+        host_size=mamba_host_size,
+    )
+    return kv_bytes, mamba_bytes
 
 
 def reserve_dsv4_paged_host_memory(

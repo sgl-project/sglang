@@ -43,7 +43,10 @@ from sglang.srt.mem_cache.pool_host.mha import (
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.npu_host_memory import (
+    hybrid_host_allocation_bytes,
+    memfabric_host_memory_enabled,
     reserve_dsv4_paged_host_memory,
+    reserve_hybrid_host_memory,
 )
 from sglang.srt.mem_cache.pool_host.page_interleave import (
     PageInterleaveHostPool,
@@ -1227,6 +1230,21 @@ def build_hybrid_mamba_stack(
     if index_bytes and kv_host_size is not None:
         kv_bytes = sum(kv_pool.get_kv_size_bytes())
         kv_host_size *= kv_bytes / (kv_bytes + index_bytes)
+    if is_npu() and memfabric_host_memory_enabled():
+        kv_bytes, mamba_bytes = hybrid_host_allocation_bytes(
+            kv_pool=config.root,
+            kv_host_size=kv_host_size,
+            kv_draft_pools=config.packed_draft_device_pools,
+            page_size=params.page_size,
+            mamba_pool=mamba_pool,
+            mamba_info=mamba_info,
+            mamba_host_size=mamba_host_size,
+            mamba_draft_pools=params.mtp_draft_mamba_pools,
+        )
+        reserve_hybrid_host_memory(
+            kv_bytes=kv_bytes,
+            mamba_bytes=mamba_bytes,
+        )
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,

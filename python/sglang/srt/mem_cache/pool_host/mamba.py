@@ -19,6 +19,10 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
+from sglang.srt.mem_cache.pool_host.npu_host_memory import (
+    ascendc_io_enabled,
+    reserve_mamba_host_memory,
+)
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -212,6 +216,8 @@ class MambaPoolHost(HostKVCache):
             for layers in self.conv_device_layers
         ]
 
+        if self._buffer_device.type == "npu":
+            reserve_mamba_host_memory(total_bytes=self.size * self.size_per_token)
         self.kv_buffer = self.init_kv_buffer()
         self._init_npu_state_transfer()
         self._init_write_back_staging_buffers()
@@ -238,6 +244,11 @@ class MambaPoolHost(HostKVCache):
         self._npu_state_transfer_views = ()
         if not _is_npu:
             return
+        if not ascendc_io_enabled():
+            raise RuntimeError(
+                "NPU kernel_ascend Mamba transfers require acl or memfabric "
+                "registered host memory"
+            )
 
         # Device [L, P, 1, 1, W] / host [P, L, 1, 1, W] with page_size = 1:
         # one slot per page, trailing state shape collapsed to width W.

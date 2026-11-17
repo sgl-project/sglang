@@ -1,12 +1,21 @@
+import sys
 import unittest
-from unittest.mock import MagicMock, patch
+from types import ModuleType, SimpleNamespace
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
 
 import sglang.srt.mem_cache.pool_host.mamba as mamba_pool_host
+import sglang.srt.mem_cache.pool_host.npu_host_memory as npu_host_memory
 from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.pool_host.mamba import (
     MambaPoolHost,
+)
+from sglang.srt.mem_cache.pool_host.npu_host_memory import (
+    MemfabricHostMemoryBackend,
+    mha_host_allocation_bytes,
+    mamba_host_allocation_bytes,
+    reserve_hybrid_host_memory,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -29,6 +38,16 @@ def _make_pool(num_layers=2, num_slots=4, draft_infos=(), side_states=()):
         conv=(dev_buf(num_layers),),
         extra_checkpoint_buffers=tuple(side_states),
     )
+    infos = (pool.buffer_info, *draft_infos)
+    pool.temporal_device_layers = [
+        layer for info in infos for layer in info.temporal.unbind(0)
+    ]
+    pool.conv_device_layers = [
+        [layer for info in infos for layer in info.conv[0].unbind(0)]
+    ]
+    pool.temporal_dtype = pool.buffer_info.temporal.dtype
+    pool.conv_dtype = pool.buffer_info.conv[0].dtype
+    pool.conv_state_elem_sizes = [8]
     pool.slot_state_device_tensors = list(side_states)
     pool.temporal_buffer = torch.empty(num_slots, pool.num_mamba_layers, 1, 2, 4)
     pool.conv_buffer = [torch.empty(num_slots, pool.num_mamba_layers, 1, 2, 4)]
@@ -67,7 +86,7 @@ def _npu_state_transfer_gates(backend=True):
             create=True,
         ),
         patch(
-            "sglang.srt.mem_cache.pool_host.npu_host_memory.ascendc_io_enabled",
+            "sglang.srt.mem_cache.pool_host.mamba.ascendc_io_enabled",
             return_value=backend,
         ),
     )
@@ -447,6 +466,93 @@ class TestNPUMambaStateTransferViews(unittest.TestCase):
                 self.assertTrue(
                     torch.equal(host[hi[t], l].reshape(-1), dev[l, di[t]].reshape(-1))
                 )
+
+
+class TestNPUMambaHostReservation(unittest.TestCase):
+    def test_mha_estimate_includes_draft_layer_and_padding_page(self):
+        info = SimpleNamespace(
+            buffers=SimpleNamespace(k=(object(), object())),
+            head_num=2,
+            head_dim=4,
+            v_head_dim=4,
+            dtype=torch.float16,
+            scales=None,
+        )
+        with patch.object(npu_host_memory, "MHABufferInfo", SimpleNamespace):
+            total = mha_host_allocation_bytes(
+                info,
+                draft_count=1,
+                device_capacity=10,
+                host_to_device_ratio=2,
+                host_size=0,
+                page_size=4,
+            )
+        self.assertEqual(total, 6 * 4 * 2 * 3 * 2 * 4 * 2)
+
+    def test_estimate_includes_draft_side_state_and_padding_slot(self):
+        info = MambaStateBufferInfo(
+            temporal=torch.empty(2, 5, 2, 4),
+            conv=(torch.empty(2, 5, 2, 4),),
+            extra_checkpoint_buffers=(torch.empty(5, 6),),
+        )
+        draft = _make_draft_info(4)
+        total = mamba_host_allocation_bytes(
+            info,
+            (draft,),
+            device_capacity=4,
+            host_to_device_ratio=2,
+            host_size=0,
+        )
+        pool = _make_pool(
+            num_layers=2, draft_infos=(draft,), side_states=info.extra_checkpoint_buffers
+        )
+        pool.size = 9
+        pool.conv_state_elem_sizes = [8]
+        self.assertEqual(total, sum(pool.get_mapping_lengths()))
+        self.assertEqual(total, 9 * (3 * (32 + 32) + 24))
+
+    def test_first_kv_reservation_includes_later_mamba_blocks(self):
+        backend = MemfabricHostMemoryBackend()
+        backend._pool = Mock()
+        backend._pool.initialize.return_value = 0
+        backend._pool.empty.side_effect = lambda dims, dtype: torch.empty(
+            dims, dtype=dtype
+        )
+        backend._offload_module = SimpleNamespace(
+            OffloadConfig=SimpleNamespace, Scene=SimpleNamespace(LOCAL=0)
+        )
+        names = (
+            "sgl_kernel_npu",
+            "sgl_kernel_npu.operators",
+            "sgl_kernel_npu.operators.mem_cache",
+            "sgl_kernel_npu.operators.mem_cache.memfabric",
+        )
+        modules = {name: ModuleType(name) for name in names}
+        for module in modules.values():
+            module.__path__ = []
+        host_memory_name = f"{names[-1]}.host_memory"
+        modules[host_memory_name] = ModuleType(host_memory_name)
+        modules[host_memory_name].set_memfabric_pool = Mock()
+        with (
+            patch.dict(sys.modules, modules),
+            patch.object(
+                npu_host_memory, "get_host_memory_backend", return_value=backend
+            ),
+            patch.object(
+                npu_host_memory.torch,
+                "npu",
+                SimpleNamespace(current_device=lambda: 0),
+                create=True,
+            ),
+        ):
+            reserve_hybrid_host_memory(kv_bytes=20, mamba_bytes=30)
+        config = backend._pool.initialize.call_args.args[0]
+        self.assertEqual((config.reserve_size, config.alloc_size), (50, 50))
+        with patch.object(backend, "_register_block"):
+            backend.alloc((20,), torch.uint8, "cpu", True, None)
+            backend.ensure_capacity(30, 0)  # Mamba declares its own blocks.
+            backend.alloc((30,), torch.uint8, "cpu", True, None)
+        self.assertEqual(backend._allocated_bytes, 50)
 
 
 if __name__ == "__main__":
