@@ -12,7 +12,8 @@ from sglang.srt.layers.moe.utils import get_moe_weight_sizes
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
-from sglang.srt.utils import set_weight_attrs, use_intel_amx_backend
+from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.utils import use_intel_amx_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
