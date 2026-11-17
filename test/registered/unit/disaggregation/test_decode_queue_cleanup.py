@@ -211,8 +211,8 @@ class TestHeldDestinationPublication(CustomTestCase):
         )
         scheduler = SimpleNamespace(
             scheduler_stage_metrics=None,
-            tree_cache=SimpleNamespace(linker=None),
             enable_decode_hicache=False,
+            tree_cache=SimpleNamespace(linker=None),
             enable_hisparse=False,
             disagg_decode_prealloc_queue=prealloc,
             disagg_decode_transfer_queue=queue,

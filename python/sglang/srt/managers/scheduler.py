@@ -412,7 +412,7 @@ from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_captur
 from sglang.srt.state_capturer.routed_experts import destroy_global_experts_capturer
 from sglang.srt.utils import (
     DynamicGradMode,
-    configure_gc_logger,
+    configure_gc_logging,
     configure_logger,
     freeze_gc,
     get_available_gpu_memory,
@@ -1620,9 +1620,7 @@ class Scheduler(
             else None
         )
 
-        # Configure GC logger
-        if envs.SGLANG_LOG_GC.get():
-            configure_gc_logger()
+        configure_gc_logging("Scheduler")
 
     def init_disaggregation(self):
         self.mm_receiver = None
@@ -2100,9 +2098,7 @@ class Scheduler(
             result_dict["rust_server_pid"] = os.getpid()
         result_dict["hicache_object_layout"] = self._hicache_l3_layout()
 
-        if get_serving().grpc_port is not None and not (
-            get_serving().smg_grpc_mode or get_serving().grpc_mode
-        ):
+        if get_serving().grpc_port is not None:
             result_dict["kv_event_sources"] = (
                 self.kv_events_publisher.local_kv_event_sources(
                     self.page_size * get_parallel().dcp_size
@@ -3286,16 +3282,20 @@ class Scheduler(
 
     def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
         for req in batch.reqs:
-            if not req.finished() or not (mm_inputs := req.multimodal_inputs):
-                continue
-            # For session requests, keep mm_inputs for the next request
-            if req.session:
-                if isinstance(req.finished_reason, FINISH_ABORT):
-                    req.release_mm_inputs_on_abort()
-                continue
-            # For non-session requests, clear features and mm_inputs
-            mm_inputs.release_features()
-            req.multimodal_inputs = None
+            if req.finished():
+                self._release_mm_inputs(req)
+
+    def _release_mm_inputs(self, req: Req) -> None:
+        if not (mm_inputs := req.multimodal_inputs):
+            return
+        # For session requests, keep mm_inputs for the next request
+        if req.session:
+            if isinstance(req.finished_reason, FINISH_ABORT):
+                req.release_mm_inputs_on_abort()
+            return
+        # For non-session requests, clear features and mm_inputs
+        mm_inputs.release_features()
+        req.multimodal_inputs = None
 
     def _create_generation_req(
         self, recv_req: TokenizedGenerateReqInput, *args, **kwargs
