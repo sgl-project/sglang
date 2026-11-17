@@ -1489,6 +1489,19 @@ class FusedMoE(torch.nn.Module):
         expert_data = param.data
         is_bias = expert_data.dim() == 2
 
+        # EP > 1: the fused checkpoint tensor carries every routed expert on
+        # dim 0, but this rank only stores its own contiguous slice (same
+        # placement as _map_global_expert_id_to_local_expert_id).
+        if (
+            self._num_local_routed != self._num_global_routed
+            and loaded_weight.shape[0] == self._num_global_routed
+        ):
+            loaded_weight = loaded_weight.narrow(
+                0,
+                self._expert_storage_rank * self._num_local_routed,
+                self._num_local_routed,
+            )
+
         # is_transposed: if the dim to shard the weight
         # should be flipped. Required by GPTQ, compressed-tensors
         # should be whatever dimension intermediate_size is
