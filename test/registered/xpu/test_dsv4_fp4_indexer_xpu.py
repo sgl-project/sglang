@@ -30,12 +30,8 @@ def test_compute_q_fp4_allocations_accepted_by_kernel():
     indexer.head_dim = HEAD_DIM
     indexer.weight_scale = 0.25
     # The kernel reads the rope cache as real float32 [MAX_POS, 64].
-    indexer.freqs_cis = torch.randn(
-        MAX_POS, 32, dtype=torch.complex64, device=DEVICE
-    )
-    q = torch.randn(
-        ROWS, HEADS * HEAD_DIM, dtype=torch.bfloat16, device=DEVICE
-    )
+    indexer.freqs_cis = torch.randn(MAX_POS, 32, dtype=torch.complex64, device=DEVICE)
+    q = torch.randn(ROWS, HEADS * HEAD_DIM, dtype=torch.bfloat16, device=DEVICE)
     indexer.wq_b = lambda q_lora: (q, None)
     weight = torch.randn(ROWS, HEADS, dtype=torch.bfloat16, device=DEVICE)
     positions = torch.randint(0, MAX_POS, (ROWS,), device=DEVICE)
