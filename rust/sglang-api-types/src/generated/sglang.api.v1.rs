@@ -3171,6 +3171,38 @@ pub struct OpenAiDetokenizeResponse {
     #[prost(message, optional, tag = "1")]
     pub text: ::core::option::Option<StringOrList>,
 }
+/// `GET /v1/models` and `GET /v1/models/{model}`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiModelCard {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub object: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub created: i64,
+    #[prost(string, tag = "4")]
+    pub owned_by: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "5")]
+    pub root: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "6")]
+    pub parent: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "7")]
+    pub max_model_len: ::core::option::Option<i64>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiModelList {
+    #[prost(string, tag = "1")]
+    pub object: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub data: ::prost::alloc::vec::Vec<OpenAiModelCard>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiListModelsRequest {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiRetrieveModelRequest {
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
+}
 /// `/parse_function_call`.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ParseFunctionCallRequest {

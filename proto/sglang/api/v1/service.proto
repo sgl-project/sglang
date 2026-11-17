@@ -169,6 +169,8 @@ service SglangService {
   rpc OpenAiRerank(OpenAiRerankRequest) returns (OpenAiRerankResponse);
   rpc OpenAiTokenize(OpenAiTokenizeRequest) returns (OpenAiTokenizeResponse);
   rpc OpenAiDetokenize(OpenAiDetokenizeRequest) returns (OpenAiDetokenizeResponse);
+  rpc OpenAiListModels(OpenAiListModelsRequest) returns (OpenAiModelList);
+  rpc OpenAiRetrieveModel(OpenAiRetrieveModelRequest) returns (OpenAiModelCard);
 }
 
 message ListModelsRequest {}
