@@ -245,7 +245,6 @@ class TestLayerNormSPValidation(CustomTestCase):
             ({"attn_cp_size": 2}, "attn_cp_size == 1"),
             ({"moe_a2a_backend": "deepep"}, "moe-a2a-backend none"),
             ({"enable_attn_tp_input_scattered": True}, "input-scattered"),
-            ({"enable_two_batch_overlap": True}, "two-batch-overlap"),
         ):
             with self.subTest(**override), self.assertRaisesRegex(ValueError, message):
                 validate_layernorm_sp(**{**glm, **override})

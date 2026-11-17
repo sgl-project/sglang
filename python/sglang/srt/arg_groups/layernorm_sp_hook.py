@@ -45,7 +45,6 @@ def handle_layernorm_sp(server_args: ServerArgs) -> None:
         speculative_algorithm=cfg.speculative_algorithm,
         enable_megamoe_for_layernorm_sp=use_megamoe,
         enable_attn_tp_input_scattered=cfg.enable_attn_tp_input_scattered,
-        enable_two_batch_overlap=cfg.enable_two_batch_overlap,
     )
     if architectures and architectures[0] in ("MuseSparkForConditionalGeneration",):
         from sglang.srt.environ import envs
@@ -164,7 +163,6 @@ def validate_layernorm_sp(
     moe_runner_backend: str = "auto",
     enable_megamoe_for_layernorm_sp: bool = False,
     enable_attn_tp_input_scattered: bool = False,
-    enable_two_batch_overlap: bool = False,
 ) -> None:
     """Fail loud for unsupported / incompatible configs. Callers gate on the flag."""
     from sglang.srt.layers.layernorm_sp import (
@@ -200,7 +198,6 @@ def validate_layernorm_sp(
             attn_cp_size=attn_cp_size,
             moe_a2a_backend=moe_a2a_backend,
             enable_attn_tp_input_scattered=enable_attn_tp_input_scattered,
-            enable_two_batch_overlap=enable_two_batch_overlap,
         )
     if is_muse_spark_architecture(architecture):
         if (tp_size, ep_size) not in ((4, 4), (8, 8)):
@@ -261,7 +258,6 @@ def _validate_glm5_next_layernorm_sp(
     attn_cp_size: int,
     moe_a2a_backend: str,
     enable_attn_tp_input_scattered: bool,
-    enable_two_batch_overlap: bool,
 ) -> None:
     # GLM's SP layer runs attention and the FFN on gathered rows over the TP
     # group; these modes move or split those rows themselves.
@@ -279,11 +275,6 @@ def _validate_glm5_next_layernorm_sp(
         raise ValueError(
             "--enable-layernorm-sp and --enable-attn-tp-input-scattered both "
             "shard GLM-5.3-Flash's token rows; enable one of them."
-        )
-    if enable_two_batch_overlap:
-        raise ValueError(
-            "--enable-layernorm-sp is not compatible with "
-            "--enable-two-batch-overlap for GLM-5.3-Flash."
         )
 
 

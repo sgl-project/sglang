@@ -203,7 +203,14 @@ class TestStageLayoutSelection(CustomTestCase):
 
 
 def build_mhc(
-    facts, parallel, *, a2a=False, dsa_cp=False, two_batch_overlap=False, **kwargs
+    facts,
+    parallel,
+    *,
+    sp=False,
+    a2a=False,
+    dsa_cp=False,
+    two_batch_overlap=False,
+    **kwargs,
 ):
     overlap = SimpleNamespace(
         comm=SimpleNamespace(
@@ -212,7 +219,7 @@ def build_mhc(
         overlap=SimpleNamespace(enable_two_batch_overlap=two_batch_overlap),
     )
     with (
-        planning(parallel, a2a=a2a, dsa_cp=dsa_cp),
+        planning(parallel, sp=sp, a2a=a2a, dsa_cp=dsa_cp),
         patch_communicator("get_exec", lambda: overlap),
     ):
         mhc = mhc_module.MHCState(
@@ -778,6 +785,30 @@ class TestTheSequenceParallelRegion(CustomTestCase):
     take the layer's ordinary declared steps."""
 
     SIZES = {TokenAxis.ATTN_DP: 1, TokenAxis.ATTN_CP: 1, TokenAxis.ATTN_TP: 2}
+
+    def test_an_mhc_stack_leaves_the_row_moves_to_the_layer(self):
+        # GLM-5.3-Flash gathers rows for attention and the FFN itself and points
+        # MLA's cached input at them, so its mHC boundaries must stay on this
+        # rank's rows: no sum or row move, and the default attention input hook.
+        parallel = parallel_of(attn_dp=1, attn_tp=2)
+        for layer_id in range(3):
+            communicator = build_mhc(layer_case(layer_id, 3), parallel, sp=True)
+            for name in ("attn", "ffn"):
+                steps = getattr(communicator, name).plan.paths.get(
+                    BatchVariant.SEQUENCE_PARALLEL
+                )
+                with self.subTest(layer_id=layer_id, stage=name):
+                    step = steps.entry.prepare.keywords["step"]
+                    self.assertIs(step.func, comm_ops._update_read)
+                    self.assertIsNone(step.keywords["pre_move"])
+                    self.assertIsNone(steps.entry.input_move)
+                    if name == "attn":
+                        self.assertIs(
+                            steps.entry.attn_input_adapter,
+                            comm_ops._attn_input_default,
+                        )
+                    else:
+                        self.assertIs(steps.output_move, keep_output)
 
     def test_what_the_ffn_exit_reads_comes_from_the_batch_s_steps(self):
         # Inside the region the FFN output is complete: no sum to move.

@@ -105,32 +105,6 @@ class TestGlm5NextLayerNormSPAttention(CustomTestCase):
         self.assertIsNone(topk)
 
 
-class TestGlm5NextLayerNormSPFfnOutput(CustomTestCase):
-    def _partial(self, mlp):
-        return glm5_next.Glm5NextDecoderLayer._sp_mlp_output_is_tp_partial(
-            SimpleNamespace(mlp=mlp)
-        )
-
-    def test_moe_output_owes_the_tp_sum_unless_the_combine_did_it(self):
-        moe = glm5_next.Glm5NextMoE.__new__(glm5_next.Glm5NextMoE)
-        for complete in (False, True):
-            with (
-                self.subTest(complete=complete),
-                patch.object(
-                    glm5_next, "post_experts_output_is_complete", return_value=complete
-                ),
-            ):
-                self.assertEqual(self._partial(moe), not complete)
-
-    def test_dense_mlp_output_is_partial_unless_replicated(self):
-        for fully_dp in (False, True):
-            with (
-                self.subTest(fully_dp=fully_dp),
-                patch.object(glm5_next, "is_dense_ffn_fully_dp", return_value=fully_dp),
-            ):
-                self.assertEqual(self._partial(SimpleNamespace()), not fully_dp)
-
-
 if __name__ == "__main__":
     import unittest
 
