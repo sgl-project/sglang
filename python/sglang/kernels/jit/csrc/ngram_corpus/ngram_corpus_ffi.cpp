@@ -41,16 +41,25 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     ngram_ = std::make_unique<ngram::Ngram>(static_cast<size_t>(capacity), param);
   }
 
-  void async_insert(const tvm::ffi::TensorView tokens_flat, const tvm::ffi::TensorView offsets) {
+  void async_insert(
+      const tvm::ffi::TensorView tokens_flat,
+      const tvm::ffi::TensorView offsets,
+      const tvm::ffi::TensorView ns_keys_tv) {
     auto* data = static_cast<const int32_t*>(tokens_flat.data_ptr());
     auto* offs = static_cast<const int64_t*>(offsets.data_ptr());
     int64_t batch_size = offsets.size(0) - 1;
 
     std::vector<std::vector<int32_t>> tokens(batch_size);
+    std::vector<uint64_t> ns_keys(batch_size, 0);
+    auto* ns = static_cast<const int64_t*>(ns_keys_tv.data_ptr());
+    if (ns_keys_tv.size(0) != batch_size) {
+      throw std::runtime_error("async_insert expects ns_keys to match the batch size");
+    }
     for (int64_t i = 0; i < batch_size; ++i) {
       tokens[i].assign(data + offs[i], data + offs[i + 1]);
+      ns_keys[i] = static_cast<uint64_t>(ns[i]);
     }
-    ngram_->asyncInsert(std::move(tokens));
+    ngram_->asyncInsert(std::move(tokens), std::move(ns_keys));
   }
 
   void batch_match_stateful(
@@ -58,23 +67,30 @@ struct NgramCorpusObj : public tvm::ffi::Object {
       const tvm::ffi::TensorView tokens_flat,
       const tvm::ffi::TensorView offsets,
       const tvm::ffi::TensorView total_lens_tv,
+      const tvm::ffi::TensorView ns_keys_tv,
       const tvm::ffi::TensorView out_tokens,
       const tvm::ffi::TensorView out_mask) {
     auto* sid = static_cast<const int64_t*>(state_ids_tv.data_ptr());
     auto* data = static_cast<const int32_t*>(tokens_flat.data_ptr());
     auto* offs = static_cast<const int64_t*>(offsets.data_ptr());
     auto* tlens = static_cast<const int64_t*>(total_lens_tv.data_ptr());
+    auto* ns = static_cast<const int64_t*>(ns_keys_tv.data_ptr());
     int64_t batch_size = offsets.size(0) - 1;
+    if (ns_keys_tv.size(0) != batch_size) {
+      throw std::runtime_error("batch_match_stateful expects ns_keys to match the batch size");
+    }
 
     std::vector<int64_t> state_ids(sid, sid + batch_size);
     std::vector<std::vector<int32_t>> tokens(batch_size);
     std::vector<size_t> total_lens(batch_size);
+    std::vector<uint64_t> ns_keys(batch_size);
     for (int64_t i = 0; i < batch_size; ++i) {
       tokens[i].assign(data + offs[i], data + offs[i + 1]);
       total_lens[i] = static_cast<size_t>(tlens[i]);
+      ns_keys[i] = static_cast<uint64_t>(ns[i]);
     }
 
-    auto result = ngram_->batchMatch(state_ids, tokens, total_lens);
+    auto result = ngram_->batchMatch(state_ids, tokens, total_lens, ns_keys);
     write_result_(result, out_tokens, out_mask);
   }
 

@@ -55,13 +55,19 @@ void Ngram::synchronize() const {
   sync_cv_.wait(lock, [this] { return pending_count_ == 0; });
 }
 
-void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
+void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens, std::vector<uint64_t>&& ns_keys) {
+  if (ns_keys.empty()) {
+    ns_keys.assign(tokens.size(), 0);
+  }
+  if (ns_keys.size() != tokens.size()) {
+    throw std::runtime_error("asyncInsert expects ns_keys to be empty or match tokens in size");
+  }
   {
     std::lock_guard<std::mutex> lock(mutex_);
     pending_count_ += tokens.size();
   }
-  for (auto&& token : tokens) {
-    insert_queue_.enqueue(std::move(token));
+  for (size_t i = 0; i < tokens.size(); ++i) {
+    insert_queue_.enqueue(InsertTask{ns_keys[i], std::move(tokens[i])});
   }
 }
 
@@ -129,12 +135,12 @@ std::vector<std::pair<std::string, int64_t>> Ngram::listExternalCorpora() const 
 
 void Ngram::insertWorker() {
   for (;;) {
-    std::vector<int32_t> data;
-    if (!insert_queue_.dequeue(data)) {
+    InsertTask task;
+    if (!insert_queue_.dequeue(task)) {
       break;
     }
     std::unique_lock<std::mutex> lock(mutex_);
-    trie_->insert(data.data(), data.size());
+    trie_->insert(task.tokens.data(), task.tokens.size(), task.ns_key);
     --pending_count_;
     lock.unlock();
     sync_cv_.notify_all();
@@ -144,15 +150,19 @@ void Ngram::insertWorker() {
 Result Ngram::batchMatch(
     const std::vector<int64_t>& state_ids,
     const std::vector<std::vector<int32_t>>& tokens,
-    const std::vector<size_t>& total_lens) {
+    const std::vector<size_t>& total_lens,
+    const std::vector<uint64_t>& ns_keys) {
   if (state_ids.size() != tokens.size() || state_ids.size() != total_lens.size()) {
     throw std::runtime_error("batchMatch expects state_ids, tokens, and total_lens to match in size");
+  }
+  if (!ns_keys.empty() && ns_keys.size() != tokens.size()) {
+    throw std::runtime_error("batchMatch expects ns_keys to be empty or match tokens in size");
   }
 
   std::unique_lock<std::mutex> lock(mutex_);
 
   using TrieResultBuildFn =
-      Result (Trie::*)(const int32_t*, size_t, int32_t, size_t, const Param&, MatchState&, size_t) const;
+      Result (Trie::*)(const int32_t*, size_t, int32_t, size_t, const Param&, MatchState&, size_t, uint64_t) const;
   using SamResultBuildFn = Result (SuffixAutomaton::*)(const int32_t*, size_t, int32_t, size_t, const Param&) const;
   TrieResultBuildFn trie_result_build_fn;
   SamResultBuildFn sam_result_build_fn;
@@ -181,18 +191,19 @@ Result Ngram::batchMatch(
       throw std::runtime_error("batchMatch received an empty token tail");
     }
 
+    const uint64_t ns_key = ns_keys.empty() ? 0 : ns_keys[i];
     auto& state = match_state_[state_ids[i]];
 
     if (total_sam_budget == 0 || per_sam_budget == 0) {
       auto res = (trie_.get()->*trie_result_build_fn)(
-          suffix.data(), suffix.size(), suffix.back(), total_draft_token_num, param_, state, total_lens[i]);
+          suffix.data(), suffix.size(), suffix.back(), total_draft_token_num, param_, state, total_lens[i], ns_key);
       merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
       merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
       continue;
     }
 
     auto combined = (trie_.get()->*trie_result_build_fn)(
-        suffix.data(), suffix.size(), suffix.back(), trie_budget, param_, state, total_lens[i]);
+        suffix.data(), suffix.size(), suffix.back(), trie_budget, param_, state, total_lens[i], ns_key);
 
     for (const auto& [_, sam] : sams_) {
       auto sam_res =

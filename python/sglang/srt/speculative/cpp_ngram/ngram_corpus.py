@@ -1,8 +1,5 @@
-# -*- coding: utf-8 -*-
-
 import logging
 from collections.abc import Iterable, Sequence
-from typing import Dict, List, Tuple
 
 import numpy as np
 
@@ -36,9 +33,9 @@ class NgramCorpus:
         )
         self.draft_token_num = draft_token_num
         self.external_corpus_max_tokens = external_corpus_max_tokens
-        self._req_id_to_state_id: Dict[str, int] = {}
+        self._req_id_to_state_id: dict[str, int] = {}
         self._next_state_id: int = 0
-        self._corpus_token_counts: Dict[str, int] = {}
+        self._corpus_token_counts: dict[str, int] = {}
         self._total_loaded_tokens: int = 0
 
     def _get_state_id(self, req_id: str) -> int:
@@ -49,8 +46,12 @@ class NgramCorpus:
             self._req_id_to_state_id[req_id] = sid
         return sid
 
-    def batch_put(self, batch_tokens: List[List[int]]):
-        self._obj.insert(batch_tokens)
+    def batch_put(
+        self,
+        batch_tokens: list[list[int]],
+        namespaces: list[str | None] | None = None,
+    ):
+        self._obj.insert(batch_tokens, namespaces)
 
     def synchronize(self):
         self._obj.synchronize()  # type: ignore
@@ -89,7 +90,7 @@ class NgramCorpus:
         old_count = self._corpus_token_counts.pop(corpus_id, 0)
         self._total_loaded_tokens -= old_count
 
-    def list_external_corpora(self) -> Dict[str, int]:
+    def list_external_corpora(self) -> dict[str, int]:
         return self._obj.list_corpora()
 
     def reset(self):
@@ -99,14 +100,15 @@ class NgramCorpus:
 
     def batch_get(
         self,
-        req_ids: List[str],
-        batch_tokens: List[List[int]],
-        total_lens: List[int],
-    ) -> Tuple[np.ndarray, np.ndarray]:
+        req_ids: list[str],
+        batch_tokens: list[list[int]],
+        total_lens: list[int],
+        namespaces: list[str | None] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         state_ids = [self._get_state_id(rid) for rid in req_ids]
-        return self._obj.match_stateful(state_ids, batch_tokens, total_lens)
+        return self._obj.match_stateful(state_ids, batch_tokens, total_lens, namespaces)
 
-    def erase_match_state(self, req_ids: List[str]):
+    def erase_match_state(self, req_ids: list[str]):
         state_ids = []
         for rid in req_ids:
             sid = self._req_id_to_state_id.pop(rid, None)
@@ -116,8 +118,8 @@ class NgramCorpus:
             self._obj.erase_states(state_ids)
 
     def leaf_paths_from_mask(
-        self, tokens: List[int], tree_mask: List[List[int]]
-    ) -> List[List[int]]:
+        self, tokens: list[int], tree_mask: list[list[int]]
+    ) -> list[list[int]]:
         """
         Find all leaf paths according to the binary tree_mask (i.e., paths that are not prefixes of any other path).
 
@@ -174,7 +176,7 @@ class NgramCorpus:
 
 # main function
 if __name__ == "__main__":
-    format = f"%(levelname)s %(asctime)s %(filename)s:%(lineno)d] %(message)s"
+    format = "%(levelname)s %(asctime)s %(filename)s:%(lineno)d] %(message)s"
     logging.basicConfig(
         level=logging.DEBUG,
         format=format,

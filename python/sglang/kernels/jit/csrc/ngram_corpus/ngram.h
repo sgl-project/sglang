@@ -36,7 +36,11 @@ class Ngram {
   // NOTE: tracks inserts from enqueue through trie_->insert() completion,
   // not just queue occupancy. A dequeued item may still be mid-insert.
   size_t pending_count_ = 0;
-  utils::Queue<std::vector<int32_t>> insert_queue_;
+  struct InsertTask {
+    uint64_t ns_key = 0;
+    std::vector<int32_t> tokens;
+  };
+  utils::Queue<InsertTask> insert_queue_;
   std::thread insert_worker_;
   std::unordered_map<int64_t, MatchState> match_state_;
 
@@ -46,7 +50,7 @@ class Ngram {
 
   void synchronize() const;
 
-  void asyncInsert(std::vector<std::vector<int32_t>>&& tokens);
+  void asyncInsert(std::vector<std::vector<int32_t>>&& tokens, std::vector<uint64_t>&& ns_keys);
 
   void startExternalCorpusLoad();
 
@@ -66,7 +70,8 @@ class Ngram {
   Result batchMatch(
       const std::vector<int64_t>& state_ids,
       const std::vector<std::vector<int32_t>>& tokens,
-      const std::vector<size_t>& total_lens);
+      const std::vector<size_t>& total_lens,
+      const std::vector<uint64_t>& ns_keys);
 
   void eraseMatchState(const std::vector<int64_t>& state_ids);
 

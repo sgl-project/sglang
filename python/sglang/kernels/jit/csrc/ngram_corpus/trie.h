@@ -51,6 +51,9 @@ struct NodeRef {
 // the full request length covered by those cached anchors.
 struct MatchState {
   uint64_t trie_epoch = 0;
+  // 0 is the default (unnamespaced) root. A non-zero key selects a pinned
+  // per-namespace root so suffixes never share paths across cache namespaces.
+  uint64_t ns_key = 0;
   size_t processed_total_len = 0;
   std::vector<NodeRef> anchors;
 };
@@ -59,7 +62,7 @@ class Trie {
  public:
   Trie(size_t capacity, const Param& param);
 
-  void insert(const int32_t* tokens, size_t len);
+  void insert(const int32_t* tokens, size_t len, uint64_t ns_key = 0);
 
   Result buildRecency(
       const int32_t* context,
@@ -68,7 +71,8 @@ class Trie {
       size_t draft_token_num,
       const Param& param,
       MatchState& state,
-      size_t total_len) const;
+      size_t total_len,
+      uint64_t ns_key = 0) const;
 
   Result buildFrequency(
       const int32_t* context,
@@ -77,7 +81,8 @@ class Trie {
       size_t draft_token_num,
       const Param& param,
       MatchState& state,
-      size_t total_len) const;
+      size_t total_len,
+      uint64_t ns_key = 0) const;
 
   void squeeze(size_t count);
 
@@ -89,14 +94,20 @@ class Trie {
   // and advance anchors incrementally; otherwise rebuild the cached anchors from
   // `context`. Returns only the suffix matches that are currently expandable.
   std::vector<std::pair<const TrieNode*, int32_t>>
-  match(const int32_t* context, size_t len, MatchState& state, size_t total_len) const;
+  match(const int32_t* context, size_t len, MatchState& state, size_t total_len, uint64_t ns_key) const;
   // Recompute all cached anchors from the current tail. After this, for every
   // d in [1, min(len, max_trie_depth)], anchors[d - 1] represents the suffix of
   // length d ending at context[len - 1].
-  void rebuildMatchState_(const int32_t* context, size_t len, MatchState& state, size_t total_len) const;
+  void
+  rebuildMatchState_(const int32_t* context, size_t len, MatchState& state, size_t total_len, uint64_t ns_key) const;
   // Advance the cached anchors by consuming the newly appended suffix one
   // token at a time, without re-walking all suffixes from root.
-  bool advanceMatchState_(MatchState& state, const int32_t* tokens, size_t len, size_t total_len) const;
+  bool
+  advanceMatchState_(MatchState& state, const int32_t* tokens, size_t len, size_t total_len, uint64_t ns_key) const;
+  // Namespace 0 is root_. Any other key is a pinned root that is not on the
+  // global LRU, so isolation is preserved when leaves are evicted.
+  TrieNode* mutableEffectiveRoot(uint64_t ns_key);
+  const TrieNode* effectiveRoot(uint64_t ns_key) const;
   // Check that every non-empty cached NodeRef in MatchState still resolves to
   // the same logical trie node under the current trie_epoch_.
   bool validateMatchState_(const MatchState& state) const;
@@ -110,11 +121,11 @@ class Trie {
   NodeRef rootRef() const {
     return NodeRef{root_, root_->version};
   }
-  NodeRef capture(TrieNode* node) const {
+  NodeRef capture(const TrieNode* node) const {
     if (node == nullptr) {
       return {};
     }
-    return NodeRef{node, node->version};
+    return NodeRef{const_cast<TrieNode*>(node), node->version};
   }
   void retireNode(TrieNode* node) {
     if (node != nullptr) {
@@ -136,6 +147,7 @@ class Trie {
   size_t free_node_count_;
   std::list<TrieNode*> global_lru_;
   TrieNode* root_;
+  std::unordered_map<uint64_t, TrieNode*> ns_roots_;
   std::vector<TrieNode*> path_;
   Param param_;
   uint64_t trie_epoch_ = 1;
