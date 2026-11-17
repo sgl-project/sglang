@@ -651,7 +651,8 @@ class SchedulerMetricsReporter:
         intermediate_size = getattr(hf_text_config, "intermediate_size", None)
         if intermediate_size is None:
             intermediate_size = getattr(hf_text_config, "ffn_hidden_size", 0)
-        intermediate_size = float(intermediate_size) / max(1, get_parallel().tp_size)
+        raw_intermediate_size = float(intermediate_size)
+        intermediate_size = raw_intermediate_size / max(1, get_parallel().tp_size)
 
         dtype_num_bytes = getattr(model_config.dtype, "itemsize", None)
         if dtype_num_bytes is None:
@@ -752,6 +753,7 @@ class SchedulerMetricsReporter:
 
         # MoE FFN: num_experts_per_tok routed experts (+ shared experts) at
         # moe_intermediate_size, not the dense intermediate_size.
+        moe_tp_size = max(1, get_parallel().moe_tp_size)
         moe_intermediate_size = getattr(hf_text_config, "moe_intermediate_size", None)
         num_experts_per_tok = getattr(hf_text_config, "num_experts_per_tok", None)
         if moe_intermediate_size is None and num_experts_per_tok:
@@ -761,9 +763,9 @@ class SchedulerMetricsReporter:
                 or getattr(hf_text_config, "n_routed_experts", None)
             )
             if total_experts:
-                moe_intermediate_size = intermediate_size
+                moe_intermediate_size = raw_intermediate_size
         if moe_intermediate_size and num_experts_per_tok:
-            moe_intermediate_size = float(moe_intermediate_size)
+            moe_intermediate_size = float(moe_intermediate_size) / moe_tp_size
             shared_expert_count = float(
                 getattr(hf_text_config, "n_shared_experts", None)
                 or getattr(hf_text_config, "num_shared_experts", None)

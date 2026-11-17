@@ -2049,6 +2049,98 @@ class TestEstimatedPerfConstants(CustomTestCase):
             tp1._weight_read_bytes_per_token / 4.0, tp4._weight_read_bytes_per_token
         )
 
+    def test_moe_mlp_flops_shrink_with_moe_tp_size_not_tp_size(self):
+        def _moe_constants_at(tp_size, moe_ep_size, moe_tp_size):
+            scheduler = types.SimpleNamespace()
+            scheduler.waiting_queue = []
+            scheduler.disaggregation_mode = DisaggregationMode.NULL
+            scheduler.model_config = _fake_model_config(
+                hidden_size=256,
+                num_attention_layers=2,
+                head_dim=0,
+                hf_text_config_overrides={
+                    "intermediate_size": 18432,
+                    "moe_intermediate_size": 1024,
+                    "num_experts_per_tok": 8,
+                },
+            )
+            reporter = _make_reporter(self, scheduler)
+            with get_parallel().override(
+                tp_size=tp_size,
+                tp_rank=0,
+                attn_tp_size=tp_size,
+                attn_tp_rank=0,
+                attn_cp_rank=0,
+                moe_ep_rank=0,
+                attn_dp_rank=0,
+                dp_rank=0,
+                moe_ep_size=moe_ep_size,
+                moe_dp_size=1,
+                moe_tp_size=moe_tp_size,
+            ):
+                reporter._init_estimated_perf_constants()
+            return reporter
+
+        plain_tp1 = _moe_constants_at(tp_size=1, moe_ep_size=1, moe_tp_size=1)
+        plain_tp4 = _moe_constants_at(tp_size=4, moe_ep_size=1, moe_tp_size=4)
+        self.assertGreater(plain_tp1._linear_flops_per_token, 0.0)
+        self.assertAlmostEqual(
+            plain_tp1._linear_flops_per_token / 4.0,
+            plain_tp4._linear_flops_per_token,
+        )
+        self.assertAlmostEqual(
+            plain_tp1._weight_read_bytes_per_token / 4.0,
+            plain_tp4._weight_read_bytes_per_token,
+        )
+
+        ep_only = _moe_constants_at(tp_size=4, moe_ep_size=4, moe_tp_size=1)
+        self.assertAlmostEqual(
+            plain_tp1._linear_flops_per_token, ep_only._linear_flops_per_token
+        )
+        self.assertAlmostEqual(
+            plain_tp1._weight_read_bytes_per_token,
+            ep_only._weight_read_bytes_per_token,
+        )
+
+    def test_moe_fallback_per_expert_size_also_shards_by_moe_tp_size(self):
+        def _moe_fallback_constants_at(tp_size, moe_ep_size, moe_tp_size):
+            scheduler = types.SimpleNamespace()
+            scheduler.waiting_queue = []
+            scheduler.disaggregation_mode = DisaggregationMode.NULL
+            scheduler.model_config = _fake_model_config(
+                hidden_size=256,
+                num_attention_layers=2,
+                head_dim=0,
+                hf_text_config_overrides={
+                    "intermediate_size": 1024,
+                    "num_experts_per_tok": 8,
+                    "num_experts": 64,
+                },
+            )
+            reporter = _make_reporter(self, scheduler)
+            with get_parallel().override(
+                tp_size=tp_size,
+                tp_rank=0,
+                attn_tp_size=tp_size,
+                attn_tp_rank=0,
+                attn_cp_rank=0,
+                moe_ep_rank=0,
+                attn_dp_rank=0,
+                dp_rank=0,
+                moe_ep_size=moe_ep_size,
+                moe_dp_size=1,
+                moe_tp_size=moe_tp_size,
+            ):
+                reporter._init_estimated_perf_constants()
+            return reporter
+
+        tp1 = _moe_fallback_constants_at(tp_size=1, moe_ep_size=1, moe_tp_size=1)
+        ep_only = _moe_fallback_constants_at(tp_size=4, moe_ep_size=4, moe_tp_size=1)
+        self.assertGreater(tp1._linear_flops_per_token, 0.0)
+        self.assertAlmostEqual(
+            tp1._linear_flops_per_token, ep_only._linear_flops_per_token
+        )
+
     def test_global_compression_ratio_shrinks_weight_bytes_not_activation_bytes(self):
         # Weight-only quantization (W4A16/W8A16-style) stores weights narrower
         # than the activation dtype, so weight-read bytes must shrink by the
