@@ -49,6 +49,10 @@ COMMON_ARGS = [
 # hold together.
 PREFILL_POOL_TOKENS = 16384
 PREFILL_ARGS = COMMON_ARGS + [
+    # test_c re-asks a cached document with a new final question, so its hit
+    # needs the chunk-boundary GDN states that level 2 never publishes.
+    "--hybrid-cache-checkpoints-level",
+    "3",
     "--attn-cp-size",
     str(CP_SIZE),
     "--enable-prefill-cp",
