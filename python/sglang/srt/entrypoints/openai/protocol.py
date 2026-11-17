@@ -604,20 +604,6 @@ class ChatCompletionMessageContentTextPart(BaseModel):
     text: str
 
 
-class ChatCompletionMessageContentThinkingPart(BaseModel):
-    type: Literal["thinking", "reasoning"]
-    thinking: Optional[str] = None
-    text: Optional[str] = None
-
-    @model_validator(mode="after")
-    def validate_payload(self):
-        if (self.thinking is None) == (self.text is None):
-            raise ValueError(
-                "thinking parts require exactly one of 'thinking' or 'text'"
-            )
-        return self
-
-
 class ChatCompletionMessageContentImageURL(BaseModel):
     url: str
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
@@ -734,7 +720,6 @@ class ChatCompletionMessageContentToolReferenceBlock(BaseModel):
 
 ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentTextPart,
-    ChatCompletionMessageContentThinkingPart,
     ChatCompletionMessageContentImagePart,
     ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageContentAudioPart,
@@ -846,30 +831,10 @@ class ChatCompletionMessageGenericParam(BaseModel):
             return v_lower
         raise ValueError("'role' must be a string")
 
-    @model_validator(mode="after")
-    def validate_thinking_parts_role(self):
-        if self.role != "assistant" and isinstance(self.content, list):
-            for part in self.content:
-                if isinstance(part, ChatCompletionMessageContentThinkingPart):
-                    raise ValueError(
-                        "thinking content parts are only valid in assistant messages"
-                    )
-        return self
-
 
 class ChatCompletionMessageUserParam(BaseModel):
     role: Literal["user"]
     content: Union[str, List[ChatCompletionMessageContentPart]]
-
-    @model_validator(mode="after")
-    def validate_thinking_parts_role(self):
-        if isinstance(self.content, list):
-            for part in self.content:
-                if isinstance(part, ChatCompletionMessageContentThinkingPart):
-                    raise ValueError(
-                        "thinking content parts are only valid in assistant messages"
-                    )
-        return self
 
 
 ChatCompletionMessageParam = Union[
