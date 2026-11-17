@@ -124,6 +124,20 @@ ci_test_util_path=${sglang_pkg_path}/sglang/test/ci
 if [ -d "${ci_test_util_path}" ]; then mv "${ci_test_util_path}" "${ci_test_util_path}_bak"; fi
 cp -r "${sglang_source_path}/scripts/ci/npu/compat/ci" "${ci_test_util_path}"
 
+# The image's environ.py predates the sgl-router test env that the overlaid PD
+# fixture reads; register the missing env field in the module.
+environ_path=${sglang_pkg_path}/sglang/srt/environ.py
+if ! grep -q "SGLANG_TEST_PD_ROUTER_BINARY" "${environ_path}"; then
+cat >> "${environ_path}" <<'EOF'
+
+# Compatibility field for images built before SGLANG_TEST_PD_ROUTER_BINARY.
+if not hasattr(Envs, "SGLANG_TEST_PD_ROUTER_BINARY"):
+    _router_binary_env = EnvStr("sgl-router")
+    _router_binary_env.name = "SGLANG_TEST_PD_ROUTER_BINARY"
+    Envs.SGLANG_TEST_PD_ROUTER_BINARY = _router_binary_env
+EOF
+fi
+
 # set environment of cann
 . /usr/local/Ascend/cann/set_env.sh
 . /usr/local/Ascend/nnal/atb/set_env.sh
