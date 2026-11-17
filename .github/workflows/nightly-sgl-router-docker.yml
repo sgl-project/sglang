@@ -1,10 +1,5 @@
 name: Nightly sgl-router Docker Image
 
-# Builds lmsysorg/sglang-staging:sgl-router from main every night. Versioned
-# releases (`router-v*` tags) publish lmsysorg/sgl-router through
-# release-sgl-router.yml; both share the multi-arch build in
-# _sgl-router-docker.yml.
-
 on:
   schedule:
     - cron: '0 2 * * *'

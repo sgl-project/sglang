@@ -385,7 +385,6 @@ WORKDIR /build
 COPY sgl-router /build/sgl-router
 COPY rust /build/rust
 
-# Install Rust at sgl-router's pinned toolchain and build the binary
 RUN bash /build/sgl-router/scripts/build.sh /build/sgl-router-bin
 
 ########################################################

@@ -1,13 +1,7 @@
 name: Release sgl-router
 
-# `router-v<version>` tags in sgl-project/sglang: publish
-# lmsysorg/sgl-router:v<version> (and :latest) from docker/sgl-router.Dockerfile,
-# and the `sgl-router` wheels (linux x86_64 and aarch64) to PyPI.
-# Pull requests that touch the image, the packaging, or these workflows: check
-# the version and build both arches of both artifacts without publishing.
-# The router is versioned on its own track, separate from SGLang's `v*` tags,
-# which start the SGLang PyPI and Docker releases. Release steps:
-# sgl-router/README.md ("Releases and versions").
+# The router is versioned on its own `router-v*` tags: SGLang's PyPI and Docker
+# releases start on every `v*` tag. Release steps: sgl-router/README.md.
 
 on:
   push:
@@ -69,8 +63,7 @@ jobs:
       - name: Checkout the release ref
         uses: actions/checkout@v4
         with:
-          # Tag pushes and pull requests build the event's own ref; dispatch
-          # builds the requested one.
+          # Empty: the event's own ref (tag push, pull request).
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || '' }}
           persist-credentials: false
 
@@ -136,9 +129,7 @@ jobs:
       push: ${{ github.event_name != 'pull_request' }}
     secrets: inherit
 
-  # A binary-only wheel (maturin `bindings = "bin"`, see sgl-router/pyproject.toml)
-  # per arch, built natively in the manylinux_2_28 container. No sdist: the
-  # crate's path dependencies live outside sgl-router/.
+  # Wheels only, no sdist: the crate's path dependencies live outside sgl-router/.
   pypi-build:
     needs: verify
     strategy:
@@ -186,10 +177,8 @@ jobs:
           path: sgl-router/dist/*.whl
           retention-days: 7
 
-  # Trusted publishing: PyPI accepts this workflow's OIDC token for the
-  # sgl-router project, so no PyPI token is stored in the repo.
-  # After the image: a PyPI version can be uploaded only once, so the
-  # irreversible step waits for every other artifact of the release.
+  # Last: a PyPI version can be uploaded only once. Trusted publishing (PyPI
+  # registers this workflow file and the `pypi` environment), so no token.
   pypi-publish:
     needs: [docker, pypi-build]
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi)

@@ -1,18 +1,10 @@
 #!/bin/bash
 # Build the release sgl-router binary from this checkout and install it at <dest>.
-#
-# The build recipe for CI and for the images built from the checkout they run in
-# (docker/Dockerfile, Dockerfile.cu134). The npu, rocm, and xpu images git-clone
-# their source at a branch or tag that may predate this script, so they build
-# inline. docker/sgl-router.Dockerfile keeps its own cargo-chef build for layer
-# caching, and the PyPI wheel is built by maturin; both use the same toolchain
-# pin, lockfile, and PCRE2_SYS_STATIC setting as this script.
+# Images that git-clone their source (npu, rocm, xpu) build inline:
+# the clone may predate this script.
 #
 # Usage: build.sh <dest> [--cleanup]
-#   <dest>     path of the installed binary, e.g. /usr/local/bin/sgl-router
-#   --cleanup  remove what the build added: rustup itself if this script
-#              installed it, else the pinned toolchain if it was not there
-#              before; and the crate cache. For a RUN step in an image layer.
+#   --cleanup  remove the rustup, toolchain, and crate cache this build added
 set -euo pipefail
 
 dest=""
@@ -61,9 +53,8 @@ else
     rustup toolchain install
 fi
 
-# dynamo-tokenizers pulls in pcre2-sys, which links the system libpcre2-8 when
-# pkg-config finds one; build the vendored copy so the binary runs on hosts and
-# images without it.
+# pcre2-sys links the system libpcre2-8 when pkg-config finds one; the vendored
+# copy lets the binary run where it is absent.
 export PCRE2_SYS_STATIC=1
 
 # A per-build target dir: a self-hosted CI runner is persistent and shared.

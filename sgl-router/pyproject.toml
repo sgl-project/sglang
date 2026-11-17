@@ -1,7 +1,4 @@
-# PyPI packaging for the sgl-router binary: `pip install sgl-router` puts the
-# `sgl-router` executable on PATH. The wheel holds only the binary (no Python
-# module); its version is the crate version in Cargo.toml. Built and published
-# by .github/workflows/release-sgl-router.yml on `router-v*` tags.
+# PyPI packaging of the sgl-router binary, published by release-sgl-router.yml.
 
 [build-system]
 requires = ["maturin>=1.7,<2.0"]
