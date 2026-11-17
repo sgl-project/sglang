@@ -976,7 +976,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
     def test_qwen4_fp8_indexer_dtype_platform_gate(self):
-        """fp8_e4m3 needs CUDA SM90/SM100 and a compressed QSA indexer. The bf16
+        """fp8_e4m3 needs CUDA SM90/SM100 or XPU and a compressed QSA indexer. The bf16
         spellings never consult the platform."""
         qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
         compressed = {
@@ -995,7 +995,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             with self.assertRaisesRegex(ValueError, "compressed QSA indexer"):
                 self._construct(*qwen4, qsa_indexer_dtype="fp8_e4m3")
         with override_platform(
-            is_cuda=False, is_hip=True, is_sm90=False, is_sm100=False
+            is_cuda=False, is_hip=True, is_xpu=False, is_sm90=False, is_sm100=False
         ):
             with self.assertRaisesRegex(ValueError, "SM90/SM100"):
                 self._construct(
@@ -1006,6 +1006,21 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     *qwen4, config_extra=compressed, qsa_indexer_dtype=name
                 )
                 self.assertEqual(self._resolved(sa, "qsa_indexer_dtype"), name)
+        with override_platform(
+            is_cuda=False, is_xpu=True, is_sm90=False, is_sm100=False
+        ):
+            # Compressed addressing forces page_size=64; XPU does not support
+            # the mamba-cache extra_buffer strategy, so no_buffer's
+            # page_size=1 requirement must be sidestepped explicitly here.
+            sa = self._construct(
+                *qwen4,
+                config_extra=compressed,
+                qsa_indexer_dtype="fp8_e4m3",
+                disable_radix_cache=True,
+            )
+            self.assertEqual(self._resolved(sa, "qsa_indexer_dtype"), "fp8_e4m3")
+            with self.assertRaisesRegex(ValueError, "compressed QSA indexer"):
+                self._construct(*qwen4, qsa_indexer_dtype="fp8_e4m3")
 
     def test_nemotron3_embedding_rejects_rocm(self):
         """The ROCm default attention backend ignores ENCODER_ONLY layers, so

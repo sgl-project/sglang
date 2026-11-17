@@ -73,6 +73,8 @@ class QSAIndexer(MultiPlatformOp):
         if rotary_emb is None:
             raise ValueError("QSAIndexer must reuse its Qwen4-Exp attention RoPE")
         self.rotary_emb = rotary_emb
+        # The fused prepare kernels read an fp32 cos/sin cache.
+        self.rotary_emb.keep_cos_sin_cache_fp32 = True
         if not 0 < self.rotary_emb.rotary_dim <= self.index_head_dim:
             raise ValueError(
                 "Qwen4-Exp attention RoPE rotary_dim must fit the QSA index head: "
@@ -130,17 +132,32 @@ class QSAIndexer(MultiPlatformOp):
 
     def _use_fused_prep(self, tensor: torch.Tensor) -> bool:
         """Whether the fused indexer-prep kernels support this configuration."""
-        return (
-            tensor.is_cuda
-            and tensor.dtype in (torch.bfloat16, torch.float16)
-            and self.index_head_dim in (64, 128, 256)
-            and self.rotary_emb.rotary_dim % 2 == 0
-            and not getattr(self.rotary_emb, "mrope_interleaved_glm", False)
-            and len(getattr(self.rotary_emb, "mrope_section", None) or ()) in (0, 3)
-            and getattr(self.rotary_emb, "cos_sin_cache", None) is not None
-            and self.rotary_emb.cos_sin_cache.is_cuda
-            and self.rotary_emb.cos_sin_cache.dtype == torch.float32
-        )
+        rotary = self.rotary_emb
+        if (
+            rotary.rotary_dim % 2
+            or getattr(rotary, "mrope_interleaved_glm", False)
+            or len(getattr(rotary, "mrope_section", None) or ()) not in (0, 3)
+        ):
+            return False
+        cache = getattr(rotary, "cos_sin_cache", None)
+        if cache is None or cache.dtype != torch.float32:
+            return False
+        if tensor.is_cuda:
+            return (
+                tensor.dtype in (torch.bfloat16, torch.float16)
+                and self.index_head_dim in (64, 128, 256)
+                and cache.is_cuda
+            )
+        if tensor.is_xpu:
+            import sgl_kernel  # noqa: F401
+
+            return (
+                tensor.dtype == torch.bfloat16
+                and self.index_head_dim in (64, 128, 256)
+                and 2 <= self.compress_ratio <= 16
+                and cache.is_xpu
+            )
+        return False
 
     def _rope_axis_map(self, device) -> torch.Tensor:
         """axis_map[i] is the MRoPE position axis whose cos/sin rotary pair i reads."""
@@ -179,6 +196,10 @@ class QSAIndexer(MultiPlatformOp):
             and cache_loc is not None
             and qk.shape[0] > 0
             and self._use_fused_prep(qk)
+            and (
+                not qk.is_xpu
+                or pool.qsa_compressed_dtype in (torch.bfloat16, torch.float8_e4m3fn)
+            )
         ):
             from sglang.kernels.ops.attention.qsa_indexer import (
                 qsa_index_q_norm_rope_store,
@@ -220,10 +241,21 @@ class QSAIndexer(MultiPlatformOp):
         return self.apply_rope(block_positions, normalized)
 
     def _use_fused_compress(self, pool) -> bool:
-        return getattr(
-            pool, "qsa_rope_position_buffer", None
-        ) is not None and self._use_fused_prep(
-            pool.get_qsa_key_state_buffer(self.layer_id)
+        if getattr(pool, "qsa_rope_position_buffer", None) is None:
+            return False
+        state = pool.get_qsa_key_state_buffer(self.layer_id)
+        compressed_dtype = pool.get_qsa_compressed_k_buffer(self.layer_id).dtype
+        return (
+            self._use_fused_prep(state)
+            and compressed_dtype == pool.qsa_compressed_dtype
+            and (
+                not state.is_xpu
+                or (
+                    compressed_dtype in (torch.bfloat16, torch.float8_e4m3fn)
+                    # The XPU kernel needs a BF16 norm weight like the BF16 ring.
+                    and self.k_layernorm.weight.dtype == torch.bfloat16
+                )
+            )
         )
 
     def _fused_compress_store(
@@ -739,7 +771,8 @@ class QSAIndexer(MultiPlatformOp):
             q_heads_padded=(
                 # The tilelang decode MQA kernel needs query heads in multiples of 8.
                 ((self.index_n_heads + 7) // 8) * 8
-                if (forward_mode.is_decode() or is_target_verify or is_draft_extend)
+                if hidden_states.is_cuda
+                and (forward_mode.is_decode() or is_target_verify or is_draft_extend)
                 else None
             ),
         )

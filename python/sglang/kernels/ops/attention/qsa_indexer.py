@@ -8,7 +8,7 @@ RoPE-position store into one kernel launch.
 chain gather -> fp32 mean -> GemmaRMSNorm -> MRoPE(group-start position) ->
 compressed-cache store into one kernel launch.
 
-Both kernels reproduce the eager numerics step by step (fp32 norm reduction,
+The CUDA kernels reproduce the eager numerics step by step (fp32 norm reduction,
 per-op rounding to the compute dtype during RoPE, fp32 group mean rounded to
 the compute dtype before the norm). Outputs are bit-comparable to the eager
 indexer path: the eager RMSNorm (flashinfer's CuTe DSL kernel) reduces sums of
@@ -87,16 +87,16 @@ def qsa_index_q_norm_rope_store(
 
     Parameters
     ----------
-    qk              : CUDA bf16/fp16 [tokens, (num_q_heads + 1) * head_dim],
+    qk              : bf16/fp16 [tokens, (num_q_heads + 1) * head_dim],
                       contiguous fused index Q/K projection output
-    positions       : CUDA int64 [tokens] or [3, tokens] RoPE positions
+    positions       : int64 [tokens] or [3, tokens] RoPE positions
                       (a strided trailing slice is accepted)
-    cos_sin_cache   : CUDA fp32 [capacity, rotary_dim] RoPE cache
-    axis_map        : CUDA int32 [rotary_dim // 2] position-axis per pair index
+    cos_sin_cache   : fp32 [capacity, rotary_dim] RoPE cache
+    axis_map        : int32 [rotary_dim // 2] position-axis per pair index
     weight          : [head_dim] gemma norm weight (kernel applies 1 + w)
-    cache_loc       : CUDA int64 [tokens] state slots of each token
-    key_state_buffer : CUDA [slots, head_dim] raw-K state buffer (written)
-    rope_position_buffer : CUDA int64 [slots, 3] position buffer (written)
+    cache_loc       : int64 [tokens] state slots of each token
+    key_state_buffer : [slots, head_dim] raw-K state buffer (written)
+    rope_position_buffer : int64 [slots, 3] position buffer (written)
     num_q_heads     : number of index query heads
     rotary_dim      : rotated prefix of each head row
     eps             : RMSNorm epsilon
@@ -108,7 +108,7 @@ def qsa_index_q_norm_rope_store(
 
     Returns
     -------
-    CUDA tensor [tokens, q_heads_padded, head_dim]: normed + rotated index Q.
+    tensor [tokens, q_heads_padded, head_dim]: normed + rotated index Q.
     """
     num_tokens = qk.shape[0]
     head_dim = weight.shape[0]
@@ -118,6 +118,25 @@ def qsa_index_q_norm_rope_store(
         positions = positions.unsqueeze(0)
     if out_dtype is None:
         out_dtype = qk.dtype
+    if qk.is_xpu:
+        from sgl_kernel import qsa_index_q_norm_rope_store as xpu_q_prep
+
+        return xpu_q_prep(
+            qk,
+            positions,
+            cos_sin_cache,
+            axis_map,
+            weight,
+            cache_loc,
+            key_state_buffer,
+            rope_position_buffer,
+            num_q_heads,
+            rotary_dim,
+            eps,
+            is_neox_style,
+            q_heads_padded,
+            out_dtype,
+        )
     q_out = torch.empty(
         (num_tokens, q_heads_padded, head_dim), dtype=out_dtype, device=qk.device
     )
@@ -159,16 +178,16 @@ def qsa_index_k_compress_store(
 
     Parameters
     ----------
-    key_state_buffer : CUDA bf16/fp16 [slots, head_dim] raw-K state buffer
-    group_locs       : CUDA int32 [groups, compress_ratio] state slots of each
+    key_state_buffer : bf16/fp16 [slots, head_dim] raw-K state buffer
+    group_locs       : int32 [groups, compress_ratio] state slots of each
                        completed group, group-start slot in column 0 (its RoPE
                        position rotates the group; other columns any order)
-    rope_position_buffer : CUDA int64 [slots, 3] per-slot RoPE coordinates
-    cos_sin_cache    : CUDA fp32 [capacity, rotary_dim] RoPE cache
-    axis_map         : CUDA int32 [rotary_dim // 2] position-axis per pair index
+    rope_position_buffer : int64 [slots, 3] per-slot RoPE coordinates
+    cos_sin_cache    : fp32 [capacity, rotary_dim] RoPE cache
+    axis_map         : int32 [rotary_dim // 2] position-axis per pair index
     weight           : [head_dim] gemma norm weight (kernel applies 1 + w)
-    write_locs       : CUDA int32 [groups] compressed-cache slots to write
-    compressed_k_buffer : CUDA [compressed_slots, head_dim] (written), ring dtype
+    write_locs      : int32 [groups] compressed-cache slots to write
+    compressed_k_buffer : [compressed_slots, head_dim] (written), ring dtype
                        or fp8 e4m3
     compress_ratio   : raw keys per compressed key
     rotary_dim       : rotated prefix of each head row
@@ -176,6 +195,24 @@ def qsa_index_k_compress_store(
     is_neox_style    : NeoX (True) or GPT-J (False) RoPE pairing
     """
     head_dim = weight.shape[0]
+    if key_state_buffer.is_xpu:
+        from sgl_kernel import qsa_index_k_compress_store as xpu_k_compress
+
+        xpu_k_compress(
+            key_state_buffer,
+            group_locs,
+            rope_position_buffer,
+            cos_sin_cache,
+            axis_map,
+            weight,
+            write_locs,
+            compressed_k_buffer,
+            compress_ratio,
+            rotary_dim,
+            eps,
+            is_neox_style,
+        )
+        return
     module = _jit_qsa_indexer_module(
         key_state_buffer.dtype, compressed_k_buffer.dtype, head_dim, is_neox_style
     )
