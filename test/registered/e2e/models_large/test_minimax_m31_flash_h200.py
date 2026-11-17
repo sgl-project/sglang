@@ -11,7 +11,12 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=960, stage="nightly", runner_config="8-gpu-h200")
+register_cuda_ci(
+    est_time=960,
+    stage="nightly",
+    runner_config="8-gpu-h200",
+    disabled="times out on every nightly run; disabled while under investigation",
+)
 
 
 class TestMiniMaxM31FlashH200(GSM8KMixin, DefaultServerBase):

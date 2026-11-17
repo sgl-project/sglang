@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -26,9 +27,7 @@ _MAX_N = 65536  # very large N (lm_head) is already at the bandwidth ceiling
 
 
 def _is_sm12x() -> bool:
-    from sglang.kernels.jit.utils import get_jit_cuda_arch
-
-    return get_jit_cuda_arch().major >= 12
+    return current_arch().is_sm_at_least(12)
 
 
 def _config(n: int) -> tuple[int, int, int]:

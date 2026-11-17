@@ -23,12 +23,10 @@ import torch
 from transformers.video_utils import VideoMetadata
 
 from sglang.srt.models.embedding_gemma2 import EmbeddingGemma2Model
-from sglang.srt.multimodal.processors.base_processor import (
-    Modality,
-    MultimodalSpecialTokens,
-)
+from sglang.srt.multimodal.media_io import load_audio
+from sglang.srt.multimodal.modality import Modality
+from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.srt.multimodal.processors.gemma4 import Gemma4SGLangProcessor
-from sglang.srt.utils.common import load_audio
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 logger = logging.getLogger(__name__)

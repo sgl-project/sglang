@@ -1,6 +1,6 @@
 """Engine API with --tokenizer-worker-num > 1 (issue #15157).
 
-The parent Engine keeps generate() working through an in-process TokenizerWorker,
+The parent Engine keeps generate() working through an in-process tokenizer worker,
 and other processes join the same engine with Engine.attach_tokenizer_worker().
 """
 
@@ -12,7 +12,7 @@ import sglang as sgl
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
-register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
 
 PROMPTS = ["The capital of France is", "1 + 1 ="]
 SAMPLING = {"temperature": 0, "max_new_tokens": 8}

@@ -3,12 +3,15 @@ import unittest
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4IndexerPool,
     DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
     DeepSeekV4UnifiedKVPool,
 )
+from sglang.srt.mem_cache.dsv41_request_window import RequestWindowSpec
+from sglang.srt.mem_cache.kv.memory.request_window import RequestWindowMemory
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -106,6 +109,7 @@ class TestDeepSeekV4MemoryUsage(CustomTestCase):
         pool.kv_pools = {4: pool.c4_kv_pool, 128: pool.c128_kv_pool}
         pool.index_pools = {4: pool.c4_indexer_kv_pool}
         pool.request_window = None
+        pool.request_window_memory = None
         pool.compress_state_pools = [_state_pool((10, 11)), None]
         pool.indexer_compress_state_pools = [None, _state_pool((12, 13))]
 
@@ -172,6 +176,7 @@ class TestDeepSeekV4MemoryUsage(CustomTestCase):
         pool = object.__new__(DeepSeekV4TokenToKVPool)
         pool._unified_kv = False
         pool.request_window = None
+        pool.request_window_memory = None
         pool.swa_kv_pool = _single_pool((2, 3))
         pool.kv_pools = {
             4: _single_pool((4, 5)),
@@ -195,6 +200,7 @@ class TestDeepSeekV4MemoryUsage(CustomTestCase):
         )
 
     def test_top_level_counts_request_window_storage(self):
+        """Count backing allocations once, not the non-owning packed-page views."""
         pool = object.__new__(DeepSeekV4TokenToKVPool)
         pool._unified_kv = False
         pool.swa_kv_pool = None
@@ -202,15 +208,62 @@ class TestDeepSeekV4MemoryUsage(CustomTestCase):
         pool.index_pools = {}
         pool.compress_state_pools = []
         pool.indexer_compress_state_pools = []
-        pool.request_window = types.SimpleNamespace(
-            state=_single_pool((2, 3)),
-            workspace=None,
-            tags=torch.empty((4, 5), dtype=torch.int64),
+        spec = RequestWindowSpec.create(
+            num_slots=3,
+            layers=2,
+            page_size=256,
+            capacity=128,
+            workspace_rows=256,
+            kv_layout=KVLayout.V4,
         )
+        pool.request_window_memory = RequestWindowMemory(
+            spec, dtype=torch.float8_e4m3fn, device="cpu"
+        )
+        pool.request_window = pool.request_window_memory.view
+        backing = pool.request_window_memory
+        expected = sum(
+            tensor.nbytes
+            for memory in (backing.state, backing.workspace, backing.tags)
+            for tensor in memory.tensors.values()
+        )
+        self.assertEqual(pool.get_kv_size_bytes(), expected)
 
-        self.assertEqual(pool.get_kv_size_bytes(), 2 * 3 + 4 * 5 * 8)
-        pool.request_window.workspace = _single_pool((6, 7))
-        self.assertEqual(pool.get_kv_size_bytes(), 2 * 3 + 4 * 5 * 8 + 6 * 7)
+    def test_request_window_constructor_exposes_allocated_gib(self):
+        """Encoder-replay construction must not call KVCache methods on views."""
+        override = get_context().override_server_args(
+            page_size=256, enable_encoder_swa_bounded_replay=True
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        pool = DeepSeekV4TokenToKVPool(
+            max_num_reqs=1,
+            swa_size=256,
+            c4_size=0,
+            c128_size=0,
+            c4_state_pool_size=0,
+            c128_state_pool_size=0,
+            page_size=256,
+            swa_page_size=256,
+            dtype=torch.float8_e4m3fn,
+            c4_state_dtype=torch.float32,
+            c128_state_dtype=torch.float32,
+            qk_nope_head_dim=448,
+            qk_rope_head_dim=64,
+            indexer_head_dim=128,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+            compression_ratios=[0, 0],
+        )
+        backing = pool.request_window_memory
+        expected = sum(
+            tensor.nbytes
+            for memory in (backing.state, backing.workspace, backing.tags)
+            for tensor in memory.tensors.values()
+        )
+        self.assertGreater(expected, 0)
+        self.assertEqual(pool.get_kv_size_bytes(), expected)
+        self.assertEqual(pool.mem_usage, expected / (1024**3))
 
 
 if __name__ == "__main__":

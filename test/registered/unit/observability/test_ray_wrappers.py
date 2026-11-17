@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
 from sglang.srt.runtime_context import get_context

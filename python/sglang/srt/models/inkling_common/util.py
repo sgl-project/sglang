@@ -96,7 +96,6 @@ class FusedMoELoadingMixin(abc.ABC):
         helper.quant_config = quant_config
         helper.quant_method = quant_method
         helper.moe_runner_config = moe_runner_config
-        helper.use_triton_kernels = False
         helper.moe_tp_rank = moe_tp_rank
         helper.moe_tp_size = moe_tp_size
         helper.use_presharded_weights = False
