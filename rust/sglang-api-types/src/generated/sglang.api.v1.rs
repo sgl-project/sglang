@@ -232,8 +232,8 @@ pub struct DecodedVideo {
     /// Already sampled: preserve this order; do not perform frame sampling again.
     #[prost(message, repeated, tag = "1")]
     pub frames: ::prost::alloc::vec::Vec<DecodedVideoFrame>,
-    /// Source frame rate and source frame indices preserve temporal provenance.
-    /// Initial processor bridge requires timestamps consistent with this clock.
+    /// Nominal source frame rate; explicit timestamps/indices are preserved.
+    /// Transport does not infer timestamps or impose constant-rate sampling.
     #[prost(double, tag = "2")]
     pub source_fps: f64,
     #[prost(uint64, tag = "3")]

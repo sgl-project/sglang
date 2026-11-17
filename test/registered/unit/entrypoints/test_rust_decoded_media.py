@@ -1,6 +1,7 @@
 """CPU regressions for decoded ingress and preservation of processor results."""
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -59,11 +60,10 @@ def test_decoded_rgb_padding_and_video_order_are_preserved():
     np.testing.assert_array_equal(np.asarray(images[0]).reshape(-1), np.arange(1, 13))
     video = videos[0]
     assert load_video(video) is video
-    frames, metadata = video.as_processor_input()
-    assert tuple(frames.shape) == (2, 3, 1, 2)
-    assert frames[0].sum() == 0 and frames[1].min() == 255
-    assert metadata["frames_indices"] == [0, 15]
-    assert metadata["fps"] == 30.0
+    assert [frame.shape for frame in video.frames] == [(1, 2, 3), (1, 2, 3)]
+    assert video.frames[0].sum() == 0 and video.frames[1].min() == 255
+    assert video.source_frame_indices == [0, 15]
+    assert video.source_fps == 30.0
     assert video.timestamps_us == [0, 500000]
     assert not audios
 
@@ -88,6 +88,55 @@ def test_decoded_pcm_uses_common_audio_loader_and_rejects_nonfinite_samples():
         bad[0, 0] = value
         with pytest.raises(ValueError, match="finite"):
             materialize_media(descriptor, [bad.view(np.uint8)])
+
+
+def test_video_requires_processor_opt_in_before_materialization():
+    bridge = object.__new__(NativeDecodedMediaProcessor)
+    bridge.processor = SimpleNamespace()
+    # Deliberately incomplete descriptor/no pixels: rejection must happen
+    # before the bridge touches bytes or invokes model preprocessing.
+    with pytest.raises(ValueError, match="has not enabled already-sampled video"):
+        bridge([], '{"videos": [{}]}', [])
+
+
+def test_opted_in_processor_receives_video_provenance_without_transport_policy():
+    bridge = object.__new__(NativeDecodedMediaProcessor)
+    bridge.processor = SimpleNamespace(supports_decoded_video=True)
+    captured = {}
+
+    async def process(ids, request):
+        captured["request"] = request
+        return ids, "processor-owned-result"
+
+    bridge._process = process
+    descriptor = {
+        "videos": [
+            {
+                "source_fps": 30.0,
+                "source_frame_count": 90,
+                "frames": [
+                    {"image": image(), "timestamp_us": 0, "source_frame_index": 0},
+                    {
+                        "image": image(width=1, stride=3),
+                        "timestamp_us": 700000,
+                        "source_frame_index": 17,
+                    },
+                ],
+            }
+        ]
+    }
+    with asyncio.Runner() as runner:
+        bridge.runner = runner
+        result = bridge(
+            [7],
+            json.dumps(descriptor),
+            [np.zeros(6, dtype="u1"), np.ones(3, dtype="u1")],
+        )
+    assert result == ([7], "processor-owned-result")
+    video = captured["request"].video_data[0]
+    assert video.source_frame_indices == [0, 17]
+    assert video.timestamps_us == [0, 700000]
+    assert [frame.shape for frame in video.frames] == [(1, 2, 3), (1, 1, 3)]
 
 
 def output():
@@ -125,7 +174,7 @@ def test_bridge_preserves_the_full_existing_processor_output():
     assert ids == [1, 2, 3] and actual is result
     bridge.processor.finalize_cache_identities.assert_called_once_with(result)
     # The drain must pass the object itself, not narrow/rebuild it into the
-    # Qwen-only native metadata shape; model-specific tensors remain intact.
+    # native image metadata shape; processor-owned auxiliary data remain intact.
     server = object.__new__(RustServer)
     server._multimodal_enabled = True
     obj = SimpleNamespace(mm_inputs=None, token_type_ids=None)

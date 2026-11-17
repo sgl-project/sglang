@@ -338,26 +338,24 @@ async def preprocess_video(
     image_factor: int = IMAGE_FACTOR,
     video_config: dict = {},
 ) -> torch.Tensor:
-    # Reuse the existing resize/budget path; only decoding and frame sampling
-    # are skipped for frontend-sampled frames.
-    from sglang.srt.multimodal.media_io import DecodedVideoFrames
-
-    is_decoded = isinstance(vr, DecodedVideoFrames)
-    if is_decoded:
-        video, _ = vr.as_processor_input()
-        total_frames, video_fps = vr.source_frame_count, vr.source_fps
-        idx = np.asarray(vr.source_frame_indices, dtype=np.int64)
-    else:
-        if not isinstance(vr, VideoDecoderWrapper):
-            return vr, None
-        total_frames, video_fps = len(vr), vr.avg_fps
-        nframes = smart_nframes(
-            video_config, total_frames=total_frames, video_fps=video_fps
-        )
-        idx = np.unique(np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64))
-        video = vr.get_frames_as_tensor(idx.tolist()).permute(0, 3, 1, 2)
-
+    # preprocessed video
+    is_video_obj = isinstance(vr, VideoDecoderWrapper)
+    if not is_video_obj:
+        return vr, None
     entry_time = time.perf_counter()
+
+    total_frames, video_fps = len(vr), vr.avg_fps
+
+    nframes = smart_nframes(
+        video_config, total_frames=total_frames, video_fps=video_fps
+    )
+    idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
+    idx = np.unique(idx)
+
+    video = vr.get_frames_as_tensor(idx.tolist())
+
+    video = video.permute(0, 3, 1, 2)  # NHWC -> TCHW
+
     nframes, _, height, width = video.shape
     min_pixels = video_config.get("min_pixels", VIDEO_MIN_PIXELS)
     total_pixels = video_config.get("total_pixels", VIDEO_TOTAL_PIXELS)
@@ -405,7 +403,7 @@ async def preprocess_video(
         "duration": total_frames / video_fps,
         "total_num_frames": total_frames,
         "frames_indices": idx,
-        "video_backend": "decoded_frames" if is_decoded else "torchvision",
+        "video_backend": "torchvision",
     }
     torchvision_resize_time = time.perf_counter()
     logger.debug(
@@ -420,9 +418,6 @@ async def preprocess_video(
 
 # Compatible with Qwen-VL & Qwen-Omni Series
 class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
-    # Common decoded-frame container; resize/model semantics stay here.
-    supports_decoded_video = True
-
     supports_transformers_backend = True
     generates_input_ids_from_raw_prompt = True
     artifact_modality = Modality.IMAGE
@@ -1243,28 +1238,6 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         )
         if processor_video_config is not None:
             processor_kwargs["processor_video_config"] = processor_video_config
-
-        if (
-            self.model_type == "qwen2_5_vl"
-            and video_metadata
-            and all(
-                m is not None and m.get("video_backend") == "decoded_frames"
-                for m in video_metadata
-            )
-        ):
-            # Qwen2.5 encodes a uniform temporal step, rather than arbitrary
-            # per-frame timestamps. Reject a layout it cannot faithfully carry.
-            sampled_fps = []
-            for metadata in video_metadata:
-                steps = np.diff(metadata["frames_indices"])
-                if len(steps) and not np.all(steps == steps[0]):
-                    raise ValueError(
-                        "Qwen2.5-VL decoded video requires uniformly sampled frames"
-                    )
-                sampled_fps.append(
-                    metadata["fps"] / (int(steps[0]) if len(steps) else 1)
-                )
-            processor_kwargs["fps"] = sampled_fps
 
         # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
         if self.hf_config.model_type in (

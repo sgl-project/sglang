@@ -100,29 +100,19 @@ fn validate(
             || !video.source_fps.is_finite()
             || video.source_fps <= 0.0
             || video.source_frame_count == 0
-            || video.source_frame_count > i64::MAX as u64
-            || !(video.source_frame_count as f64 / video.source_fps * 1e6).is_finite()
-            || video.source_frame_count as f64 / video.source_fps * 1e6 > u64::MAX as f64
         {
             return Err("invalid decoded video frame count or source clock".into());
         }
         let mut previous = None;
-        let mut dimensions = None;
         for f in &video.frames {
             if f.source_frame_index >= video.source_frame_count
                 || previous.is_some_and(|(t, i)| f.timestamp_us < t || f.source_frame_index <= i)
-                || ((f.source_frame_index as f64 / video.source_fps) * 1e6 - f.timestamp_us as f64)
-                    .abs()
-                    > 1000.0
             {
-                return Err("decoded video timestamps/indices disagree with source clock".into());
+                return Err("decoded video timestamps/indices are out of order or range".into());
             }
             let i = f.image.as_ref().ok_or("decoded video frame has no image")?;
-            let shape = (i.height, i.width);
-            if dimensions.is_some_and(|d| d != shape) {
-                return Err("decoded video frame dimensions must agree".into());
-            }
-            dimensions = Some(shape);
+            // Transport preserves explicit per-frame layouts/timestamps. It
+            // must not impose a processor's stacking or constant-FPS policy.
             previous = Some((f.timestamp_us, f.source_frame_index));
             regions.push(image(i)?);
             if regions.len() > MAX_ITEMS {
@@ -539,7 +529,16 @@ mod tests {
             payload,
         });
         assert_eq!(validate(&input).unwrap().len(), 3);
-        input.videos[0].frames[0].timestamp_us = 0;
+        // Irregular timing and frame shapes are transport-valid. Model
+        // sampling/stacking restrictions belong to the existing processor.
+        input.videos[0].frames[0].timestamp_us = 600000;
+        let mut next = input.videos[0].frames[0].clone();
+        next.source_frame_index = 20;
+        next.timestamp_us = 950000;
+        next.image.as_mut().unwrap().width = 1;
+        input.videos[0].frames.push(next);
+        assert_eq!(validate(&input).unwrap().len(), 4);
+        input.videos[0].frames[1].timestamp_us = 0;
         assert!(validate(&input).is_err());
         input.videos.clear();
         input.audios[0].sample_frames = u64::MAX;

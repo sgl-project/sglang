@@ -372,15 +372,6 @@ class DecodedVideoFrames:
     source_frame_count: int
     source_frame_indices: list[int]
 
-    def as_processor_input(self):
-        return torch.from_numpy(np.stack(self.frames)).permute(0, 3, 1, 2), {
-            "fps": self.source_fps,
-            "duration": self.source_frame_count / self.source_fps,
-            "total_num_frames": self.source_frame_count,
-            "frames_indices": self.source_frame_indices,
-            "video_backend": "decoded_frames",
-        }
-
 
 def load_audio(
     audio_file: Union[str, bytes], sr: Optional[int] = None, mono: bool = True

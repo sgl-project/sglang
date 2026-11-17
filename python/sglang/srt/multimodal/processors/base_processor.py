@@ -224,6 +224,10 @@ def _init_cpu_worker(media_url_policy: tuple) -> None:
 
 class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
     models = []
+    # Opt-in only: accepting encoded video does not establish support for
+    # externally sampled frames and their temporal metadata. Transport must
+    # not guess support from a model name. No model is opted in by SHM ingress.
+    supports_decoded_video = False
     # Redo preprocessing on CPU when the GPU runs out of memory (the tokenizer
     # process shares its GPU with the scheduler).
     retry_on_cpu_after_gpu_oom = False

@@ -118,7 +118,8 @@ class NativeDecodedMediaProcessor:
             self.processor, "supports_decoded_video", False
         ):
             raise ValueError(
-                "registered processor has not enabled already-sampled video frames"
+                "registered processor has not enabled already-sampled video frames; "
+                "SHM transport does not add model video adaptation"
             )
         tokens = getattr(self.processor, "mm_tokens", None)
         if descriptor.get("audios") and not (tokens and tokens.audio_token):
