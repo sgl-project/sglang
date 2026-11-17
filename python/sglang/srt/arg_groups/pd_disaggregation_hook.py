@@ -215,8 +215,7 @@ def _validate_prefill_complete(server_args: ServerArgs) -> None:
         unsupported.append("transfer backends other than Mooncake")
     if cfg.pp_size != 1 or cfg.attn_cp_size != 1 or cfg.dcp_size != 1:
         unsupported.append("pipeline or attention context parallelism")
-    attn_dp_size = cfg.dp_size if cfg.enable_dp_attention else 1
-    if cfg.tp_size != attn_dp_size:
+    if cfg.tp_size != cfg.attn_dp_size:
         unsupported.append("attention tensor parallelism greater than one")
     if cfg.decoupled_spec_role != "null":
         unsupported.append("decoupled speculation")

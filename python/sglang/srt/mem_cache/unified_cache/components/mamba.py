@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -80,9 +79,6 @@ class MambaComponent(TreeComponent):
     family = TREE_STATE
     # Subclasses that skip this __init__ (MLX auxiliary state) keep the LRU walk.
     state_cost: Optional[StateCostStrategy] = None
-    # Class-level defaults (nothing parked) for instances built without __init__.
-    _parked: Sequence = ()
-    _step = 0
 
     def __init__(
         self, cache: UnifiedRadixCache, params: CacheInitParams, slot: TreeSlot
@@ -120,10 +116,6 @@ class MambaComponent(TreeComponent):
         )
 
         self.host_only_checkpoint = host_only_mamba_checkpoint()
-        # (scheduler step, tracking slot, copy done event) of finished requests'
-        # checkpoints still being copied to host; see reap_parked_slots.
-        self._parked: list = []
-        self._step = 0
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
 
@@ -293,59 +285,17 @@ class MambaComponent(TreeComponent):
                 "Not enough host memory for a mamba host-only checkpoint"
             )
         device_indices = slot.reshape(-1).to(dtype=torch.int64)
-        # A finished request's tracking slot is parked, not freed, until its copy lands.
-        no_wait = envs.SGLANG_OPT_MAMBA_HOST_CHECKPOINT_NO_WAIT.get()
-        park = no_wait and (
-            insert_params.mamba_host_src_freed
-            and insert_params.mamba_host_src_keep_idx is not None
-        )
         try:
-            done = self._backup_mamba_slot(
-                host_indices,
-                device_indices,
-                source_freed=insert_params.mamba_host_src_freed and not park,
-                parked=park,
-                no_wait=no_wait,
-            )
+            self._backup_mamba_slot(host_indices, device_indices)
         except Exception:
             self.free_host_values([host_indices])
             raise
-        if park:
-            self._parked.append((self._step, slot.reshape(-1).clone(), done))
-            insert_params.mamba_keep_idx = insert_params.mamba_host_src_keep_idx
-            insert_params.mamba_host_parked = True
         insert_params.mamba_host_value = host_indices
         insert_params.mamba_host_src = None
 
-    def parked_slot_count(self) -> int:
-        return sum(int(slot.numel()) for _, slot, _ in self._parked)
-
-    def reap_parked_slots(self, *, force: bool = False) -> None:
-        """Free parked slots two scheduler steps after their copy was queued; counting
-        steps, not polling events, frees the same slots on every rank."""
-        if not force:
-            self._step += 1
-        if not self._parked:
-            return
-        keep = []
-        storage, sub_pool = self._state()
-        for step, slot, done in self._parked:
-            if force or step <= self._step - 2:
-                done.synchronize()
-                storage.free_state_slots(sub_pool, slot)
-            else:
-                keep.append((step, slot, done))
-        self._parked = keep
-
     def _backup_mamba_slot(
-        self,
-        host_indices: torch.Tensor,
-        device_indices: torch.Tensor,
-        *,
-        source_freed: bool,
-        parked: bool = False,
-        no_wait: bool = False,
-    ):
+        self, host_indices: torch.Tensor, device_indices: torch.Tensor
+    ) -> None:
         from sglang.srt.managers.cache_controller import CacheOperation
 
         controller = self.cache.cache_controller
@@ -354,8 +304,6 @@ class MambaComponent(TreeComponent):
                 "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT requires the hicache "
                 "transfer engine"
             )
-        engine = controller.l2_transfer_engine
-        forward_stream = controller.write_fence_stream
         transfer = PoolTransfer(
             name=PoolName.MAMBA,
             host_indices=host_indices,
@@ -366,32 +314,17 @@ class MambaComponent(TreeComponent):
         write_host, write_device, write_pools = controller._move_write_operation(
             operation
         )
-        completion = engine.submit_device_to_host(
+        completion = controller.l2_transfer_engine.submit_device_to_host(
             controller._l2_transfers(write_host, write_device, write_pools)
         )
-        done = completion.finish_event
-        if source_freed or forward_stream is None or not no_wait:
-            # The slot is freed next, or nothing orders its next writer.
-            done.synchronize()
-            return done
-        # Loads of the host slot, and the next forward of a request that keeps the
-        # slot, wait on the copy on the GPU; a parked slot is not handed out before.
-        if not parked:
-            forward_stream.wait_event(done)
-        engine.host_to_device_stream.wait_event(done)
-        return done
+        # The transfer engine owns the layout lease. Finish before the host
+        # index is stored or the source slot is freed.
+        completion.finish_event.synchronize()
 
     def _stash_host_checkpoint_source(
-        self,
-        insert_params: InsertParams,
-        slot: torch.Tensor,
-        *,
-        is_finished: bool,
-        keep_idx: Optional[int] = None,
+        self, insert_params: InsertParams, slot: torch.Tensor
     ) -> None:
         insert_params.mamba_host_src = slot.reshape(-1).to(dtype=torch.int64)
-        insert_params.mamba_host_src_freed = is_finished
-        insert_params.mamba_host_src_keep_idx = keep_idx
 
     def materialize_host_only_checkpoint(
         self, insert_params: InsertParams, key
@@ -932,10 +865,6 @@ class MambaComponent(TreeComponent):
                         ),
                     )
                     lock.receipt.skipped_lock_components += (ct,)
-            if self._parked:
-                self.reap_parked_slots(force=True)
-                slot = storage.take_state_slots(sub_pool, 1)
-        if slot is None:
             self.cache.evict_for_alloc(KVDemand(state_slots=1))
             slot = storage.take_state_slots(sub_pool, 1)
         return slot
@@ -1083,12 +1012,9 @@ class MambaComponent(TreeComponent):
                     req.kv.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
                 )
             else:
-                keep_idx = None
                 active_value = req.kv.mamba_pool_idx.unsqueeze(-1).clone()
             if self._mamba_host_only_checkpoint():
-                self._stash_host_checkpoint_source(
-                    insert_params, active_value, is_finished=True, keep_idx=keep_idx
-                )
+                self._stash_host_checkpoint_source(insert_params, active_value)
                 return cache_len
             if self.quantizes_checkpoints:
                 insert_params.mamba_value = self._commit_int8_checkpoint(active_value)
@@ -1107,19 +1033,11 @@ class MambaComponent(TreeComponent):
                         self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
                     )
                     src_slot = req.kv.mamba_ping_pong_track_buffer[keep_idx]
-                    empty = (
-                        req.kv.mamba_ping_pong_empty[keep_idx]
-                        if envs.SGLANG_OPT_MAMBA_CHECKPOINT_HOST_EMPTY_FLAG.get()
-                        else int(src_slot.reshape(-1)[0].item()) < 0
-                    )
                 else:
                     src_slot = req.kv.mamba_pool_idx
-                    empty = int(src_slot.reshape(-1)[0].item()) < 0
-                if empty:
+                if int(src_slot.reshape(-1)[0].item()) < 0:
                     return 0
-                self._stash_host_checkpoint_source(
-                    insert_params, src_slot, is_finished=False
-                )
+                self._stash_host_checkpoint_source(insert_params, src_slot)
                 return cache_len
             # Donate the mamba index to the radix cache instead of copying.
             if self.quantizes_checkpoints:
@@ -1186,9 +1104,6 @@ class MambaComponent(TreeComponent):
                     insert_params.mamba_keep_idx if insert_params is not None else None
                 )
                 keep_idx = prepared_keep_idx if mamba_value_inserted else None
-                if insert_params is not None and insert_params.mamba_host_parked:
-                    # Host-only: parked until its D2H copy lands (reap_parked_slots).
-                    keep_idx = prepared_keep_idx
                 storage, sub_pool = self._state()
                 storage.release_state(sub_pool, req, keep=keep_idx)
                 return

@@ -5,7 +5,6 @@ from typing import Callable, List, Optional
 
 import torch
 
-from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_argmax_only,
     draft_topk1_postprocess,
@@ -99,6 +98,7 @@ from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
     bind_eagle_runtime_hooks,
     build_eagle_verify_input,
+    check_draft_branch_tail_copy,
     prepare_for_draft,
     prepare_for_draft_extend,
     run_eagle_verify,
@@ -258,6 +258,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             memory_pool_config=memory_pool_config,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        )
+        check_draft_branch_tail_copy(
+            self.draft_runner.token_to_kv_pool, self.topk, get_schedule().page_size
         )
         self.init_token_map()
         self.init_lm_head()
@@ -1360,14 +1363,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             elif self.topk == 1:
                 # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
                 # MTP draft selection on FP8 logits.
-                if envs.SGLANG_OPT_SPEC_DRAFT_TOP1_ARGMAX.get():
-                    ret_topk_index = sampling_argmax(
-                        draft_logits_output.next_token_logits
-                    ).unsqueeze(-1)
-                else:
-                    ret_topk_index = torch.argmax(
-                        draft_logits_output.next_token_logits, dim=-1, keepdim=True
-                    )
+                ret_topk_index = torch.argmax(
+                    draft_logits_output.next_token_logits, dim=-1, keepdim=True
+                )
                 ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             else:
                 probs = renorm_draft_probs(
@@ -1534,8 +1532,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             simulated_acc_len_rng=self._simulated_acc_len_rng,
             speculative_runtime_hooks=self._speculative_runtime_hooks,
         )
-        if envs.SGLANG_OPT_POST_VERIFY_POOL_PRESIZE.get():
-            self._post_verify_graphs.enable_pool_presize()
 
     def init_cuda_graphs(self):
         super().init_cuda_graphs()

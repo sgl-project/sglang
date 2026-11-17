@@ -1,6 +1,7 @@
 import fnmatch
 import hashlib
 import importlib.util
+import itertools
 import json
 import os
 import shutil
@@ -165,7 +166,9 @@ class TestPPUCIWorkflow(CustomTestCase):
             ["pr-gate", "check-changes", "ppu-build", "ppu-sanity"],
         )
         self.assertEqual(
-            self.jobs["ppu-sanity"]["if"], "needs.check-changes.outputs.ppu == 'true'"
+            self.jobs["ppu-sanity"]["if"],
+            "needs.check-changes.outputs.ppu == 'true' "
+            "&& needs.pr-gate.outputs.opted-in != 'false'",
         )
         self.assertEqual(
             self.jobs["pr-test-ppu-finish"]["if"],
@@ -214,40 +217,47 @@ class TestPPUCIWorkflow(CustomTestCase):
     def test_finish_requires_successful_build_and_sanity_when_in_scope(self):
         finish = self.jobs["pr-test-ppu-finish"]["steps"][0]
         statuses = ("success", "failure", "cancelled", "skipped")
-        for build in statuses:
-            for sanity in statuses:
-                for in_scope in (True, False):
-                    with self.subTest(build=build, sanity=sanity, in_scope=in_scope):
-                        needs = {
-                            name: {"result": "success"}
-                            for name in self.jobs["pr-test-ppu-finish"]["needs"]
-                        }
-                        needs["ppu-build"] = {"result": build}
-                        needs["ppu-sanity"] = {"result": sanity}
-                        result = subprocess.run(
-                            ["bash", "-e", "-o", "pipefail", "-c", finish["run"]],
-                            env=dict(
-                                os.environ,
-                                NEEDS_JSON=json.dumps(needs),
-                                PPU_IN_SCOPE=str(in_scope).lower(),
-                                BUILD_RESULT=build,
-                                SANITY_RESULT=sanity,
-                            ),
-                            capture_output=True,
-                            text=True,
-                            timeout=10,
-                        )
-                        allowed = {"success"} if in_scope else {"success", "skipped"}
-                        self.assertEqual(
-                            result.returncode == 0,
-                            build in allowed and sanity in allowed,
-                            result.stdout + result.stderr,
-                        )
+        for build, sanity, in_scope, opted_in in itertools.product(
+            statuses, statuses, (True, False), ("true", "false")
+        ):
+            with self.subTest(
+                build=build, sanity=sanity, in_scope=in_scope, opted_in=opted_in
+            ):
+                needs = {
+                    name: {"result": "success"}
+                    for name in self.jobs["pr-test-ppu-finish"]["needs"]
+                }
+                needs["ppu-build"] = {"result": build}
+                needs["ppu-sanity"] = {"result": sanity}
+                result = subprocess.run(
+                    ["bash", "-e", "-o", "pipefail", "-c", finish["run"]],
+                    env=dict(
+                        os.environ,
+                        NEEDS_JSON=json.dumps(needs),
+                        PPU_IN_SCOPE=str(in_scope).lower(),
+                        OPTED_IN=opted_in,
+                        BUILD_RESULT=build,
+                        SANITY_RESULT=sanity,
+                    ),
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                requested = in_scope and opted_in == "true"
+                allowed = {"success"} if requested else {"success", "skipped"}
+                self.assertEqual(
+                    result.returncode == 0,
+                    build in allowed and sanity in allowed,
+                    result.stdout + result.stderr,
+                )
         for variable, job in (
             ("BUILD_RESULT", "ppu-build"),
             ("SANITY_RESULT", "ppu-sanity"),
         ):
             self.assertEqual(finish["env"][variable], "${{ needs." + job + ".result }}")
+        self.assertEqual(
+            finish["env"]["OPTED_IN"], "${{ needs.pr-gate.outputs.opted-in }}"
+        )
 
 
 class TestPPUManualSelftests(CustomTestCase):

@@ -736,7 +736,7 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         self._active_lora_signature = None
         self._use_premerged_stage2_transformer = False
         # set when original mode merges stage-1 distilled LoRA into the DiT base
-        # once at init (see _merge_stage1_distilled_into_base).
+        # once at init (see _maybe_merge_stage1_distilled_into_base).
         self._stage1_distilled_in_base = False
         self._stage1_distilled_base_strength: float | None = None
 

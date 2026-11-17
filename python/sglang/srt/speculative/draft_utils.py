@@ -1,6 +1,7 @@
 import logging
 from typing import Optional
 
+from sglang.srt.configs.model_config import get_dsa_index_kpool, is_deepseek_dsa
 from sglang.srt.layers.attention.qsa.config import QSAProfile
 from sglang.srt.runtime_context import attention_backends, get_spec
 from sglang.srt.utils.device import (
@@ -401,15 +402,19 @@ class DraftBackendFactory:
         )
 
     def _create_ascend_decode_backend(self):
-        from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
-            AscendAttnMultiStepDraftBackend,
-        )
+        config = self.draft_model_runner.model_config.hf_config
+        if is_deepseek_dsa(config) and get_dsa_index_kpool(config) > 1:
+            from sglang.srt.hardware_backend.npu.attention.ascend_dsa_backend import (
+                AscendDSAAttnMultiStepDraftBackend as backend_cls,
+            )
+        else:
+            from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+                AscendAttnMultiStepDraftBackend as backend_cls,
+            )
 
         return (
             "ascend",
-            AscendAttnMultiStepDraftBackend(
-                self.draft_model_runner, self.topk, self.speculative_num_steps
-            ),
+            backend_cls(self.draft_model_runner, self.topk, self.speculative_num_steps),
         )
 
     def _create_dsv4_decode_backend(self):
@@ -551,11 +556,12 @@ class DraftBackendFactory:
         )
 
     def _create_ascend_prefill_backend(self):
-        from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
-            AscendAttnBackend,
+        from sglang.srt.layers.attention.attention_registry import (
+            ATTENTION_BACKENDS,
         )
 
-        return ("ascend", AscendAttnBackend(self.draft_model_runner))
+        # Reuse the registered factory to select KPool metadata for draft extend.
+        return ("ascend", ATTENTION_BACKENDS["ascend"](self.draft_model_runner))
 
     def _create_flashmla_prefill_backend(self):
         if is_sail():

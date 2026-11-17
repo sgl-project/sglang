@@ -345,7 +345,7 @@ def monitor_pod_logs(
     monitor_pod_name = {
         KUBE_JOB_SINGLE: f"{kube_job_prefix_name}-pod-0",
         KUBE_JOB_MULTI_PD_MIX: f"{kube_job_prefix_name}-sglang-node-0",
-        KUBE_JOB_MULTI_PD_SEPARATION: f"{kube_job_prefix_name}-sglang-router-0",
+        KUBE_JOB_MULTI_PD_SEPARATION: f"{kube_job_prefix_name}-sgl-router-0",
     }
     pod_name = monitor_pod_name.get(kube_job_type)
 

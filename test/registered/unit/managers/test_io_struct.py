@@ -464,23 +464,6 @@ class TestGenerateReqInputNormalization(CustomTestCase):
                         )
                         self.assertEqual(params, original)
 
-    def test_parent_session_id_reaches_every_batch_item(self):
-        req = GenerateReqInput(
-            text=["Hello", "World"],
-            sampling_params=[{}, {}],
-            session_id="child",
-            parent_session_id="parent",
-        )
-        req.normalize_batch_and_arguments()
-        for i in range(2):
-            self.assertEqual(req[i].session_id, "child")
-            self.assertEqual(req[i].parent_session_id, "parent")
-        self.assertIsNone(GenerateReqInput(text="Hi").parent_session_id)
-        fields = TokenizedGenerateReqInput.__struct_fields__
-        defaults = TokenizedGenerateReqInput.__struct_defaults__
-        self.assertEqual(fields[-1], "parent_session_id")
-        self.assertIsNone(defaults[-1])
-
     def test_single_request_preserves_caller_sampling_params(self):
         """Reusing defaults after a per-request adjustment must keep the original budget."""
         params = {"max_new_tokens": 20}
@@ -1384,25 +1367,12 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             )
             req.normalize_batch_and_arguments()
 
-    def test_data_parallel_rank_alias_maps_to_routed_dp_rank(self):
-        req = GenerateReqInput(text="Hello", sampling_params={}, data_parallel_rank=2)
-        req.normalize_batch_and_arguments()
-        self.assertEqual(req.routed_dp_rank, 2)
-        self.assertIsNone(req.data_parallel_rank)
-
-    def test_data_parallel_rank_alias_does_not_override_routed_dp_rank(self):
-        req = GenerateReqInput(
-            text="Hello", sampling_params={}, data_parallel_rank=2, routed_dp_rank=1
-        )
-        req.normalize_batch_and_arguments()
-        self.assertEqual(req.routed_dp_rank, 1)
-
-    def test_data_parallel_rank_alias_propagates_to_batch_items(self):
+    def test_routed_dp_rank_propagates_to_batch_items(self):
         req = GenerateReqInput(
             text=["Hello", "World"],
             sampling_params=[{}, {}],
             rid=["id1", "id2"],
-            data_parallel_rank=3,
+            routed_dp_rank=3,
         )
         req.normalize_batch_and_arguments()
         self.assertEqual(req[0].routed_dp_rank, 3)
