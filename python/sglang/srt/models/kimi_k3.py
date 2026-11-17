@@ -1240,7 +1240,13 @@ class KimiK3MoE(nn.Module):
         return max_rows
 
     def _shared_tp_sp_state(self, rows: int):
-        if not self._shared_experts_tp_sp_comm or rows == 0:
+        # The K3 symmetric buffers hold one chunk; a DP-gathered prefill can exceed it.
+        if (
+            not self._shared_experts_tp_sp_comm
+            or rows == 0
+            or rows * self._shared_experts_tp_group.world_size
+            > k3_ar_fusion._max_buffer_rows()
+        ):
             return None
         return k3_sp_collective.tp_group_state()
 
