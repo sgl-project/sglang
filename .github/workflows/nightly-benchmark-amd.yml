@@ -568,12 +568,14 @@ jobs:
           overwrite: true
 
   # ============================================================================
-  # Kimi-K3.1-Pro MXFP4 with DFlash: the row's TP8 arm on GPU KV with the AMD
-  # monokernel, 2 points. Its DCP8 arm with HiCache host-DRAM offload is not
-  # scheduled: main accepts Kimi-K3.1 DCP + DFLASH only with the cutedsl_mla
-  # draft backend, which ROCm does not have, so those points stop at server
-  # start. Dispatch can still name them. The model must already be in each
-  # perf-bench node's HF cache (see the test).
+  # Kimi-K3.1-Pro MXFP4 with DFlash: tp8-c1, the row's TP8 arm on GPU KV with
+  # the AMD monokernel at one request. The rest of the row stops at server start
+  # on main, so it is not scheduled; dispatch can still name any point:
+  # - tp8-c4: with more than one request the monokernel's wide launch imports
+  #   Kimi-K3.1 HIP modules main does not have yet.
+  # - the DCP8 arm (HiCache host-DRAM offload): main accepts Kimi-K3.1 DCP +
+  #   DFLASH only with the cutedsl_mla draft backend, which ROCm does not have.
+  # The model must already be in each perf-bench node's HF cache (see the test).
   # SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D only changes how MoE weights are
   # loaded, as every MI35x nightly model load sets it.
   # ============================================================================
@@ -583,7 +585,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        point: ${{ fromJson(inputs.kimi_k31_pro_point && inputs.kimi_k31_pro_point != 'all' && format('["{0}"]', inputs.kimi_k31_pro_point) || '["tp8-c1", "tp8-c4"]') }}
+        point: ${{ fromJson(inputs.kimi_k31_pro_point && inputs.kimi_k31_pro_point != 'all' && format('["{0}"]', inputs.kimi_k31_pro_point) || '["tp8-c1"]') }}
     runs-on: linux-sglang-mi35x-perf-bench
     timeout-minutes: 610
     steps:

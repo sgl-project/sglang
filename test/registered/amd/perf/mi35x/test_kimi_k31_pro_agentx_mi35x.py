@@ -8,9 +8,10 @@ with the AMD monokernel at c1 and c4, and DCP8 with HiCache host-DRAM offload
 from c8 to c56. InferenceX runs this row on a Kimi-K3.1 dev image and the
 nightly on the rocm10 CI image, so its published points are a reference, not a
 like-for-like comparison: several env switches the recipe sets come from the
-dev branch and are not read by main. The DCP8 points need the dev branch too:
-main accepts Kimi-K3.1 DCP + DFLASH only with the cutedsl_mla draft backend,
-which ROCm does not have, so the nightly schedules only the GPU KV arm.
+dev branch and are not read by main. The nightly schedules only tp8-c1: on
+main, tp8-c4's monokernel wide launch (more than one request) imports
+Kimi-K3.1 HIP modules main does not have yet, and the DCP8 points need the
+cutedsl_mla draft backend for DCP + DFLASH, which ROCm does not have.
 
 The row is pinned to its own InferenceX commit: the harness's commit has an
 older version of it (no c24, other draft-token counts).
