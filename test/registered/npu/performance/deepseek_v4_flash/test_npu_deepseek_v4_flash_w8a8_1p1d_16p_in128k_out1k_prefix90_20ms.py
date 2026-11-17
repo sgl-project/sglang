@@ -80,6 +80,23 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ENVS = {
     "SGLANG_NPU_SPLIT_SHARED_EXPERT_OVERLAP": "1",
 }
 
+# DSPARK speculative decoding arguments shared by the prefill and decode nodes:
+# the PD prefill worker prunes the draft to context-KV injection.
+DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_SPECULATIVE_ARGS = [
+    "--speculative-algorithm",
+    "DSPARK",
+    "--speculative-draft-model-path",
+    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
+    "--speculative-draft-model-quantization",
+    "modelslim",
+    "--speculative-draft-attention-backend",
+    "ascend",
+    "--speculative-num-draft-tokens",
+    6,
+    "--speculative-dspark-block-size",
+    5,
+]
+
 # Prefill node launch arguments for DSV4-Flash PD-Sep 128k1k
 DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     "--page-size",
@@ -145,6 +162,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     "stat",
     "--expert-distribution-recorder-buffer-size",
     512,
+    *DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_SPECULATIVE_ARGS,
 ]
 
 # Decode node launch arguments for DSV4-Flash PD-Sep 128k1k
@@ -182,17 +200,6 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ARGS = [
     "bfloat16",
     "--load-balance-method",
     "round_robin",
-    # DSPARK configuration.
-    "--speculative-algorithm",
-    "DSPARK",
-    "--speculative-draft-model-path",
-    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
-    "--speculative-draft-model-quantization",
-    "modelslim",
-    "--speculative-draft-attention-backend",
-    "ascend",
-    "--speculative-num-draft-tokens",
-    6,
     "--enable-metrics",
     "--enable-cache-report",
     "--swa-full-tokens-ratio",
@@ -210,8 +217,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ARGS = [
     '{"use_index_cache":true,"index_topk_freq":2}',
     "--tokenizer-worker-num",
     16,
-    "--speculative-dspark-block-size",
-    5,
+    *DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_SPECULATIVE_ARGS,
 ]
 
 # Model config for DSV4-Flash W8A8 1P+1D PD-Sep 128k1k deployment
@@ -221,7 +227,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG = {
     "decode_args": DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ARGS,
     "prefill_envs": DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ENVS,
     "decode_envs": DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ENVS,
-    "router_args": ["--policy", "round_robin"],
+    "router_args": [],
     "router_envs": {},
 }
 
