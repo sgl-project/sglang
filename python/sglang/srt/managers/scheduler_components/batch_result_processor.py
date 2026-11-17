@@ -1634,6 +1634,7 @@ class SchedulerBatchResultProcessor:
             result.num_correct_drafts_per_req_cpu is None
             or req.kv.mamba_ping_pong_track_buffer is not None
             or not self.tree_cache.supports_mamba()
+            or self.tree_cache.request_mamba_only
         ):
             return True
 

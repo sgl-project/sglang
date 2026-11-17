@@ -523,8 +523,8 @@ class KVCacheConfigurator:
         # SWA allocators never widen under DCP.
         if self.is_hybrid_swa:
             return max_total_num_tokens
-        # Target rows widen into attn_dcp_size ids; draft sizes already carry
-        # loc_space_scale.
+        # Target rows widen into attn_dcp_size ids; a draft that spans the
+        # widened space carries that widening in its own size (loc_space_scale).
         return (
             max_total_num_tokens * get_parallel().attn_dcp_size // self.loc_space_scale
         )
@@ -655,10 +655,28 @@ class KVCacheConfigurator:
             memory_pool_config=config,
         )
 
+    @property
+    def draft_mla_rows_are_physical(self) -> bool:
+        """True when the plain MLA draft pool stores owner rows at ``loc // dcp_size``
+        under DCP (MLATokenToKVPool._scatter_mla_rows), unlike an MHA draft."""
+        return (
+            self.is_draft_worker
+            and get_parallel().attn_dcp_size > 1
+            and self.use_mla_backend
+            and self.mambaish_config is None
+            and not self.is_hybrid_swa
+            and not is_deepseek_dsa(self.model_config.hf_config)
+            and not is_deepseek_v4(self.model_config.hf_config)
+            and not is_float4_e2m1fn_x2(self.kv_cache_dtype)
+            and not current_platform.is_out_of_tree()
+            and get_exec().kernel.attention_backend != "ascend"
+        )
+
     # Note(kpham-sgl):
     # 1. A replicated draft indexes the allocator's virtual locs raw, so its pools
-    #    span and page that space; the sharded target translates and stays per-rank.
-    #    A draft that executes DCP shards like the target.
+    #    span and page that space; a DCP-collapsed draft and the sharded target
+    #    translate and stay per-rank. A draft that executes DCP shards like the
+    #    target.
     # 2. A pool must page as its allocator does, or its last page falls short.
     @property
     def loc_space_scale(self) -> int:
@@ -821,8 +839,20 @@ class KVCacheConfigurator:
                 draft_virtual_id_space = (
                     (draft_virtual_id_space + page - 1) // page * page
                 )
+                if self.draft_mla_rows_are_physical:
+                    # A rank stores one row per dcp_size widened ids.
+                    dcp_size = get_parallel().attn_dcp_size
+                    widened_page = page * dcp_size
+                    widened = (
+                        (draft_virtual_id_space + widened_page - 1)
+                        // widened_page
+                        * widened_page
+                    )
+                    draft_pool_size = widened // dcp_size
+                else:
+                    draft_pool_size = draft_virtual_id_space
                 size_overrides = {
-                    "max_total_num_tokens": draft_virtual_id_space,
+                    "max_total_num_tokens": draft_pool_size,
                 }
                 if token_to_kv_pool_allocator.has_window_pool and self.is_hybrid_swa:
                     size_overrides["full_max_total_num_tokens"] = draft_virtual_id_space
@@ -918,10 +948,16 @@ class KVCacheConfigurator:
                 )
 
         if draft_virtual_id_space is not None:
-            assert token_to_kv_pool.size >= draft_virtual_id_space, (
+            # The allocator's ids are widened, so compare in that same space.
+            pool_logical_size = (
+                token_to_kv_pool.size
+                * get_parallel().attn_dcp_size
+                // self.loc_space_scale
+            )
+            assert pool_logical_size >= draft_virtual_id_space, (
                 "draft token_to_kv_pool smaller than the shared unified "
                 f"allocator's virtual-id space: pool size="
-                f"{token_to_kv_pool.size} < "
+                f"{pool_logical_size} < "
                 f"virtual_id_space={draft_virtual_id_space}; "
                 "verify-window writes at high virtual ids would go out of "
                 "bounds."
@@ -2506,6 +2542,7 @@ class KVCacheConfigurator:
             tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
             max_running_requests=max_running_requests,
             kv_scale_ue8m0=is_kimi_k31(self.model_config.hf_config),
+            fp8_cast_on_write=is_kimi_k31(self.model_config.hf_config),
             use_fp4_indexer=get_exec().kernel.enable_fp4_indexer,
             **pool_kwargs,
         )
@@ -2785,6 +2822,7 @@ class KVCacheConfigurator:
                         self.model_config.hf_config
                     ),
                     kv_scale_ue8m0=is_kimi_k31(self.model_config.hf_config),
+                    fp8_cast_on_write=is_kimi_k31(self.model_config.hf_config),
                     skip_topk_layers=(
                         None
                         if self.is_draft_worker
@@ -3257,7 +3295,7 @@ class KVCacheConfigurator:
         return int(rest_memory * (1 << 30))  # return in bytes
 
     def _calculate_mamba_ratio(self) -> int:
-        if get_memory().disable_radix_cache:
+        if get_memory().disable_radix_cache or get_exec().mamba.decode_state_free_radix:
             return 1
 
         # Host-only checkpoints keep the live slot plus the ping-pong slots
@@ -3689,10 +3727,8 @@ class KVCacheConfigurator:
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
-            get_memory().disable_radix_cache
-            and get_schedule().max_running_requests is not None
-        ):
-            # Use explicitly set max_running_requests when radix cache is disabled
+            get_memory().disable_radix_cache or get_exec().mamba.decode_state_free_radix
+        ) and get_schedule().max_running_requests is not None:
             get_context().override(
                 "mamba_pool.from_max_running_requests",
                 max_mamba_cache_size=max(
