@@ -26,12 +26,26 @@ const MAX_ITEMS: usize = 4096;
 const MAX_REQUEST_BYTES: u64 = 256 << 20;
 const MAX_INFLIGHT_BYTES: usize = 512 << 20;
 
-#[derive(Debug)]
 pub struct DecodedInput {
     pub descriptor: api::DecodedMediaInput,
     pub consumed: Arc<AtomicBool>,
     bytes: Vec<Vec<u8>>,
     lease: Option<OwnedSemaphorePermit>,
+}
+// Request Debug output must not expand large samples or disclose object names.
+impl std::fmt::Debug for DecodedInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecodedInput")
+            .field("images", &self.descriptor.images.len())
+            .field("videos", &self.descriptor.videos.len())
+            .field("audios", &self.descriptor.audios.len())
+            .field(
+                "snapshot_bytes",
+                &self.bytes.iter().map(Vec::len).sum::<usize>(),
+            )
+            .field("consumed", &self.consumed.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
 }
 impl DecodedInput {
     pub fn new(descriptor: api::DecodedMediaInput) -> Result<Self, Error> {
