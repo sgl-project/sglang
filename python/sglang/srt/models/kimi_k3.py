@@ -3411,7 +3411,6 @@ class KimiK3LinearModel(nn.Module):
             k3_kda_weight_shard.init_for_model(
                 config=config,
                 group_size=shard_size,
-                mover=envs.SGLANG_K3_KDA_WS_MOVER.get(),
                 dtype=torch.get_default_dtype(),
                 shared_expert_layers=(
                     [

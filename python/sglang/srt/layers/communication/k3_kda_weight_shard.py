@@ -17,14 +17,11 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from sglang.srt.environ import envs
-
 logger = logging.getLogger(__name__)
 
 
 # 256 B for bf16, so parameter views keep the alignment cuBLAS and TMA expect.
 ALIGN = 128
-MOVERS = ("ce", "ce_ms")
 
 
 @dataclass(frozen=True)
@@ -121,20 +118,14 @@ class LayerWeightShard:
         device: torch.device,
         alloc_shard: Callable[[int], torch.Tensor],
         peer_shards: Callable[[torch.Tensor], List[torch.Tensor]],
-        mover: str = "ce",
-        prefetch_depth: int = 1,
         group_barrier: Optional[Callable[[], None]] = None,
     ):
-        if prefetch_depth < 1:
-            raise ValueError(f"prefetch depth must be >= 1, got {prefetch_depth}")
         if group_size < 2:
             raise ValueError(f"weight shard group size must be >= 2, got {group_size}")
         if not 0 <= group_rank < group_size:
             raise ValueError(
                 f"group rank {group_rank} out of range for size {group_size}"
             )
-        if mover not in MOVERS:
-            raise ValueError(f"unknown weight gather mover {mover!r} (one of {MOVERS})")
         self.unit_layers = [layer for layer, _ in units]
         if not self.unit_layers or self.unit_layers != sorted(set(self.unit_layers)):
             raise ValueError(
@@ -170,7 +161,6 @@ class LayerWeightShard:
             self.shard_offset.append(off)
             off += size
         self.dtype, self.device = dtype, device
-        self.mover = mover
         self.shard = alloc_shard(off)
         if self.shard.numel() != off or self.shard.dtype != dtype:
             raise ValueError("alloc_shard returned a buffer of the wrong size or dtype")
@@ -179,8 +169,8 @@ class LayerWeightShard:
             raise ValueError(
                 f"peer_shards returned {len(self.peers)} buffers, want {group_size}"
             )
-        self.prefetch_depth = prefetch_depth
-        self.num_slots = prefetch_depth + 1
+        # The running layer's slot and the next sharded layer's, gathered while it runs.
+        self.num_slots = 2
         self.slots = torch.empty(
             (self.num_slots, max(self.e_size)), dtype=dtype, device=device
         )
@@ -193,11 +183,6 @@ class LayerWeightShard:
 
         cuda = device.type == "cuda"
         self._copy_stream = torch.cuda.Stream(device=device) if cuda else None
-        self._peer_streams = (
-            [torch.cuda.Stream(device=device) for _ in range(group_size - 1)]
-            if cuda and mover == "ce_ms"
-            else []
-        )
         # unit -> ready event (None on CPU) for gathers issued and not yet waited on.
         self._pending: Dict[int, Optional[torch.cuda.Event]] = {}
         # slot -> unit holding it until that unit's layer finishes; None when free.
@@ -355,24 +340,6 @@ class LayerWeightShard:
         else:
             _memcpy2d(spec2d, stream)
 
-    def _move(self, u: int) -> None:
-        ops = self._copy_ops(u)
-        if self._copy_stream is None:
-            for op in ops:
-                self._run_op(op, None)
-            return
-        cur = torch.cuda.current_stream(self.device)
-        streams = [cur] + self._peer_streams
-        per_peer = len(self.pieces[u])
-        for i, op in enumerate(ops):
-            st = streams[(i // per_peer) % len(streams)]
-            if st is not cur:
-                st.wait_stream(cur)
-            with torch.cuda.stream(st):
-                self._run_op(op, st)
-        for st in self._peer_streams:
-            cur.wait_stream(st)
-
     def issue(self, k: int) -> None:
         if k in self._pending:
             return
@@ -390,22 +357,13 @@ class LayerWeightShard:
             )
         self._slot_owner[self.slot_of(k)] = k
         if self._copy_stream is None:
-            self._move(k)
+            for op in self._copy_ops(k):
+                self._run_op(op, None)
             self._pending[k] = None
             return
-        if self.mover == "ce":
-            self._pending[k] = self._issue_lean(k)
-            return
-        cur = torch.cuda.current_stream(self.device)
-        # Everything enqueued so far, including the last reader of this slot, precedes the copies.
-        self._copy_stream.wait_stream(cur)
-        with torch.cuda.stream(self._copy_stream):
-            self._move(k)
-            ev = torch.cuda.Event()
-            ev.record(self._copy_stream)
-        self._pending[k] = ev
+        self._pending[k] = self._issue_on_copy_stream(k)
 
-    def _issue_lean(self, k: int) -> torch.cuda.Event:
+    def _issue_on_copy_stream(self, k: int) -> torch.cuda.Event:
         if self._pull_ops is None:
             self._pull_ops = [self._copy_ops(u) for u in range(self.num_units)]
             # Safe to reuse: a unit is reissued only after its last gather was waited on.
@@ -446,17 +404,12 @@ class LayerWeightShard:
         else:
             self._issue_ahead(self.next_unit[layer_idx])
 
-    def _issue_ahead(self, first: int) -> None:
-        for j in range(first, first + self.prefetch_depth):
-            if j >= self.num_units and (j - self.num_units) >= first:
-                break  # wrapped past this forward's own window
-            u = j % self.num_units
-            if u in self._pending:
-                continue
-            if self._slot_owner[self.slot_of(u)] is not None:
-                break
-            self.issue(u)
-            self._issued_this_layer.append(u)
+    def _issue_ahead(self, u: int) -> None:
+        u %= self.num_units
+        if u in self._pending or self._slot_owner[self.slot_of(u)] is not None:
+            return
+        self.issue(u)
+        self._issued_this_layer.append(u)
 
     def needs_layer_hook(self, layer_idx: int) -> bool:
         return layer_idx in self.unit_index or layer_idx > self.unit_layers[-1]
@@ -984,7 +937,6 @@ def init_for_model(
     *,
     config,
     group_size: int,
-    mover: str,
     dtype: torch.dtype,
     shared_expert_layers: Sequence[int] = (),
     shared_intermediate_size: int = 0,
@@ -1008,11 +960,6 @@ def init_for_model(
     group_members, my_group, group_rank = shard_group_layout(
         ranks, attn_tp, group_size, tp_rank
     )
-    if mover not in MOVERS:
-        raise ValueError(
-            f"SGLANG_K3_KDA_WS_MOVER={mover!r} is not supported (one of {MOVERS}): the "
-            "head-aligned shards are gathered by copy-engine peer pulls"
-        )
     cpu_groups = []
     # Every rank creates every subgroup, in the same order (torch.distributed contract).
     for members in group_members:
@@ -1044,8 +991,6 @@ def init_for_model(
             device=device,
             alloc_shard=s_alloc,
             peer_shards=s_peers,
-            mover=mover,
-            prefetch_depth=envs.SGLANG_K3_KDA_WS_PREFETCH_DEPTH.get(),
             group_barrier=group_barrier,
         )
         _ACTIVE_SHARED.dummy_load = dummy_load
@@ -1069,22 +1014,18 @@ def init_for_model(
         device=device,
         alloc_shard=alloc,
         peer_shards=peers,
-        mover=mover,
-        prefetch_depth=envs.SGLANG_K3_KDA_WS_PREFETCH_DEPTH.get(),
         group_barrier=group_barrier,
     )
     _ACTIVE.dummy_load = dummy_load
     shard_b, slot_b = _ACTIVE.bytes_per_rank()
     replicated = len(kda_ids) * (4 * P * H + H * P) * 2
     logger.info(
-        "K3 KDA weight sharding: shard group %d (%d ranks, this is rank %d), mover=%s, "
-        "prefetch depth %d, %d KDA layers: head-aligned shard %.2f GB + %d slots "
-        "%.2f GB per rank instead of %.2f GB replicated",
+        "K3 KDA weight sharding: shard group %d (%d ranks, this is rank %d), %d KDA "
+        "layers: head-aligned shard %.2f GB + %d slots %.2f GB per rank instead of "
+        "%.2f GB replicated",
         my_group,
         group_size,
         group_rank,
-        mover,
-        _ACTIVE.prefetch_depth,
         len(kda_ids),
         shard_b / 1e9,
         _ACTIVE.num_slots,
