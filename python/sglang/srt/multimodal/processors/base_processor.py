@@ -224,10 +224,6 @@ def _init_cpu_worker(media_url_policy: tuple) -> None:
 
 class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
     models = []
-    # Opt-in only: accepting encoded video does not establish support for
-    # externally sampled frames and their temporal metadata. Transport must
-    # not guess support from a model name. No model is opted in by SHM ingress.
-    supports_decoded_video = False
     # Redo preprocessing on CPU when the GPU runs out of memory (the tokenizer
     # process shares its GPU with the scheduler).
     retry_on_cpu_after_gpu_oom = False
@@ -282,10 +278,6 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             self, hf_config, _processor, processor_config=processor_config
         )
         self._cpu_executor_lock = threading.Lock()
-        # Embedded native servers already host Rust threads/CUDA. They must
-        # not fork a process pool from a preprocessing worker.
-        self._cpu_executor_start_method = kwargs.get("cpu_executor_start_method")
-        self._cpu_executor_workers = kwargs.get("cpu_executor_workers")
         self.cpu_executor = self._create_cpu_executor()
 
         # Each tokenizer worker is a separate process with its own CPU cache.
@@ -414,15 +406,14 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         super().shutdown()
 
     def _create_cpu_executor(self) -> concurrent.futures.ProcessPoolExecutor:
-        start_method = getattr(self, "_cpu_executor_start_method", None) or (
+        start_method = (
             "spawn"
             if self._feature_transport.mm_feature_transport == "cuda_vmm"
             else "fork"
         )
         return concurrent.futures.ProcessPoolExecutor(
             mp_context=mp.get_context(start_method),
-            max_workers=getattr(self, "_cpu_executor_workers", None)
-            or int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
+            max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
             initializer=_init_cpu_worker,
             initargs=(media_url_security_config(),),
         )

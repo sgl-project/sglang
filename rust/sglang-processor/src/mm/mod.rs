@@ -1,5 +1,9 @@
 //! Multimodal preprocessing over `dynamo-multimodal`.
 
+mod decoded_media;
+
+pub use decoded_media::{DecodedRgbImage, RgbImageLayout};
+
 use dynamo_multimodal::image::decode::{DecodeLimits, decode_rgb};
 use dynamo_multimodal::processor::{
     DecodedMedia, MmFamilyProcessor, NamedTensors, PositionOutput, ProcessedItem, Tensor,
@@ -33,7 +37,8 @@ pub struct MmOutputItem {
     pub feature: Tensor,
     /// Model kwargs such as Qwen's `image_grid_thw` (Python's `model_specific_data`).
     pub aux: NamedTensors,
-    /// blake3 of the encoded bytes; never comparable with Python's `hash_feature`.
+    /// Encoded inputs use blake3 of encoded bytes; decoded inputs use Dynamo's
+    /// canonical RGB/shape identity. Neither is Python's `hash_feature`.
     pub hash: u64,
 }
 
@@ -67,6 +72,45 @@ impl MmProcessor {
             .map(|bytes| self.process_image(bytes))
             .collect::<Result<Vec<_>, _>>()?;
 
+        self.finish(input_ids, items, hashes)
+    }
+
+    /// Preprocess already decoded images through the same family, prompt layout
+    /// and positions as [`Self::process`], without encoding or decoding pixels.
+    /// The host owns storage authorization and aggregate request byte budgets.
+    pub fn process_decoded_images(
+        &self,
+        input_ids: &[i32],
+        images: Vec<DecodedRgbImage>,
+    ) -> Result<MmOutput, ProcessorError> {
+        if images.is_empty() {
+            return Err("multimodal request without images".into());
+        }
+        for image in &images {
+            image.validate()?;
+        }
+        let hashes = images.iter().map(DecodedRgbImage::content_hash).collect();
+        let items = images
+            .into_iter()
+            .map(|image| {
+                self.family
+                    .process_item(&DecodedMedia::Image {
+                        rgb: image.rgb,
+                        height: image.height as usize,
+                        width: image.width as usize,
+                    })
+                    .map_err(mm_error)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.finish(input_ids, items, hashes)
+    }
+
+    fn finish(
+        &self,
+        input_ids: &[i32],
+        items: Vec<ProcessedItem>,
+        hashes: Vec<u64>,
+    ) -> Result<MmOutput, ProcessorError> {
         let layout = self.family.layout(input_ids, &items).map_err(mm_error)?;
         let token_counts: Vec<usize> = items.iter().map(|item| item.feature_token_count).collect();
         let expanded = token_layout::apply_layout(input_ids, &layout, &token_counts, usize::MAX)

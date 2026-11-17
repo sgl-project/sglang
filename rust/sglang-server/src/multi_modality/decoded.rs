@@ -1,5 +1,5 @@
-//! Same-host decoded media: bounded immutable snapshots, then the existing
-//! Python processor. No model-specific tensor adapter or public pickle.
+//! Same-host decoded media: bounded immutable snapshots for the existing native
+//! processor. Source import only; no Python callback or model-specific adapter.
 use std::fs::File;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::sync::{
@@ -7,19 +7,12 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use pyo3::prelude::*;
-use pyo3::types::PyList;
 use rustix::fs::{Mode, OFlags, openat};
 use sglang_api_types::api::v1 as api;
-use sglang_mm::common::decoded_media::RgbImageLayout;
+use sglang_processor::{DecodedRgbImage, RgbImageLayout};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use super::worker::{MediaError, MmProcessOutput, MmProcessor};
-use crate::message::{
-    buffers::{Buffer, BufferStore},
-    request::MmData,
-    types::TokenIds,
-};
+use super::worker::MediaError;
 use crate::utils::error::Error;
 
 const MAX_ITEMS: usize = 4096;
@@ -57,6 +50,38 @@ impl DecodedInput {
             lease: None,
         })
     }
+
+    pub(crate) fn take_images(&mut self) -> Result<Vec<DecodedRgbImage>, MediaError> {
+        native_images_only(&self.descriptor).map_err(MediaError::Client)?;
+        if !self.consumed.load(Ordering::Acquire)
+            || self.bytes.len() != self.descriptor.images.len()
+        {
+            return Err(MediaError::Server(
+                "decoded images were not snapshotted".into(),
+            ));
+        }
+        self.descriptor
+            .images
+            .iter()
+            .zip(std::mem::take(&mut self.bytes))
+            .map(|(image, bytes)| {
+                RgbImageLayout {
+                    width: image.width,
+                    height: image.height,
+                    row_stride_bytes: image.row_stride_bytes,
+                }
+                .pack_owned(bytes)
+                .map_err(|e| MediaError::Client(e.to_string()))
+            })
+            .collect()
+    }
+}
+
+fn native_images_only(input: &api::DecodedMediaInput) -> Result<(), String> {
+    if !input.videos.is_empty() || !input.audios.is_empty() {
+        return Err("decoded video/audio has no native processor input yet".into());
+    }
+    Ok(())
 }
 fn region(
     payload: Option<&api::MediaPayloadReference>,
@@ -160,13 +185,13 @@ fn validate(
     Ok(regions)
 }
 
-struct DecodedStore {
+pub(crate) struct DecodedStore {
     root: File,
     instance_id: String,
     permits: Arc<Semaphore>,
 }
 impl DecodedStore {
-    fn new(root: &str, instance_id: String) -> Result<Self, String> {
+    pub(crate) fn new(root: &str, instance_id: String) -> Result<Self, String> {
         let fd = rustix::fs::open(
             root,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -183,17 +208,21 @@ impl DecodedStore {
             permits: Arc::new(Semaphore::new(MAX_INFLIGHT_BYTES)),
         })
     }
-    fn snapshot(&self, input: &mut DecodedInput) -> Result<(), MediaError> {
-        let regions = validate(&input.descriptor).map_err(MediaError::Client)?;
-        // Fence every region BEFORE opening any object or reserving bytes.
+    /// Reject unsupported media and stale references before any object I/O.
+    pub(crate) fn check(&self, input: &DecodedInput) -> Result<(), String> {
+        native_images_only(&input.descriptor)?;
+        let regions = validate(&input.descriptor)?;
         if regions
             .iter()
             .any(|r| r.engine_instance_id != self.instance_id)
         {
-            return Err(MediaError::Client(
-                "decoded media engine_instance_id mismatch".into(),
-            ));
+            return Err("decoded media engine_instance_id mismatch".into());
         }
+        Ok(())
+    }
+    pub(crate) fn snapshot(&self, input: &mut DecodedInput) -> Result<(), MediaError> {
+        self.check(input).map_err(MediaError::Client)?;
+        let regions = validate(&input.descriptor).map_err(MediaError::Client)?;
         let total: u64 = regions.iter().map(|r| r.length_bytes).sum();
         let lease = self
             .permits
@@ -270,104 +299,6 @@ impl DecodedStore {
         Ok(bytes)
     }
 }
-pub struct DecodedProcessor {
-    store: DecodedStore,
-    callback: Py<PyAny>,
-    fallback: Option<Arc<dyn MmProcessor>>,
-}
-impl DecodedProcessor {
-    pub fn new(
-        root: &str,
-        instance_id: String,
-        callback: Py<PyAny>,
-        fallback: Option<Arc<dyn MmProcessor>>,
-    ) -> Result<Self, String> {
-        Ok(Self {
-            store: DecodedStore::new(root, instance_id)?,
-            callback,
-            fallback,
-        })
-    }
-}
-impl MmProcessor for DecodedProcessor {
-    fn process(&self, ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, MediaError> {
-        self.fallback
-            .as_ref()
-            .ok_or_else(|| {
-                MediaError::Client(
-                    "encoded media has no native processor for this model; use decoded_media"
-                        .into(),
-                )
-            })?
-            .process(ids, mm)
-    }
-    fn check_media(&self, mm: &MmData) -> Result<(), String> {
-        if let Some(input) = &mm.decoded {
-            let regions = validate(&input.descriptor)?;
-            if regions
-                .iter()
-                .any(|r| r.engine_instance_id != self.store.instance_id)
-            {
-                return Err("decoded media engine_instance_id mismatch".into());
-            }
-            Ok(())
-        } else {
-            self.fallback
-                .as_ref()
-                .ok_or("no native encoded-media processor for this model")?
-                .check_media(mm)
-        }
-    }
-    fn prepare_decoded(&self, input: &mut DecodedInput) -> Result<(), MediaError> {
-        self.store.snapshot(input)
-    }
-    fn process_direct(
-        &self,
-        ids: &TokenIds,
-        mm: &mut MmData,
-    ) -> Option<Result<(TokenIds, Vec<Buffer>), MediaError>> {
-        let input = mm.decoded.as_mut()?;
-        Some((|| {
-            if !input.consumed.load(Ordering::Acquire) {
-                return Err(MediaError::Server(
-                    "decoded media was not snapshotted".into(),
-                ));
-            }
-            let json = serde_json::to_string(&input.descriptor)
-                .map_err(|e| MediaError::Server(e.to_string()))?;
-            Python::attach(|py| -> PyResult<_> {
-                let payloads = PyList::empty(py);
-                // Move allocations into numpy; Python owns all input arrays after
-                // this call. The byte lease remains held until processing ends.
-                for data in std::mem::take(&mut input.bytes) {
-                    let (_, object) = crate::buffer_to_py(py, Buffer::inline("pixels", data))?;
-                    payloads.append(object)?;
-                }
-                let result = self.callback.call1(py, (ids.clone(), json, payloads))?;
-                let (ids, output): (TokenIds, Py<PyAny>) = result.extract(py)?;
-                Ok((
-                    ids,
-                    vec![Buffer {
-                        name: "mm.python_output".into(),
-                        shape: vec![],
-                        store: BufferStore::PythonOutput(output),
-                    }],
-                ))
-            })
-            .map_err(|e| {
-                Python::attach(|py| {
-                    if e.is_instance_of::<pyo3::exceptions::PyValueError>(py) {
-                        MediaError::Client(e.value(py).to_string())
-                    } else {
-                        tracing::error!(error=%e, "decoded media processor failed");
-                        MediaError::Server("decoded media processor failed".into())
-                    }
-                })
-            })
-        })())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,6 +431,81 @@ mod tests {
             .snapshot(&mut DecodedInput::new(descriptor()).unwrap())
             .unwrap();
         assert_eq!(store.permits.available_permits(), 6);
+    }
+    #[test]
+    fn decoded_native_rgb_keeps_its_budget_through_materialization() {
+        let root = Root::new();
+        let mut descriptor = descriptor();
+        let image = &mut descriptor.images[0];
+        image.width = 1;
+        image.height = 2;
+        image.row_stride_bytes = 4;
+        image
+            .payload
+            .as_mut()
+            .unwrap()
+            .mounted_shm
+            .as_mut()
+            .unwrap()
+            .length_bytes = 7;
+        std::fs::write(root.0.join(OBJECT), [77u8, 1, 2, 3, 99, 4, 5, 6]).unwrap();
+        let mut store = root.store();
+        store.permits = Arc::new(Semaphore::new(7));
+        let mut input = DecodedInput::new(descriptor).unwrap();
+        assert!(input.take_images().is_err(), "no pixels before snapshot");
+        store.snapshot(&mut input).unwrap();
+        std::fs::remove_file(root.0.join(OBJECT)).unwrap();
+        let images = input.take_images().unwrap();
+        assert_eq!(images[0].rgb, [1, 2, 3, 4, 5, 6]);
+        assert_eq!((images[0].width, images[0].height), (1, 2));
+        assert_eq!(store.permits.available_permits(), 0);
+        drop(images);
+        drop(input);
+        assert_eq!(store.permits.available_permits(), 7);
+    }
+    #[test]
+    fn decoded_video_audio_are_rejected_before_object_io() {
+        let root = Root::new();
+        let store = root.store();
+        let video = api::DecodedMediaInput {
+            videos: vec![api::DecodedVideo {
+                frames: vec![api::DecodedVideoFrame {
+                    image: Some(rgb()),
+                    timestamp_us: 0,
+                    source_frame_index: 0,
+                }],
+                source_fps: 30.0,
+                source_frame_count: 1,
+            }],
+            ..Default::default()
+        };
+        let mut payload = rgb().payload;
+        payload
+            .as_mut()
+            .unwrap()
+            .mounted_shm
+            .as_mut()
+            .unwrap()
+            .length_bytes = 4;
+        let audio = api::DecodedMediaInput {
+            audios: vec![api::DecodedAudio {
+                sample_format: "f32le".into(),
+                sample_rate_hz: 16000,
+                channels: 1,
+                sample_frames: 1,
+                payload,
+            }],
+            ..Default::default()
+        };
+        for descriptor in [video, audio] {
+            let mut input = DecodedInput::new(descriptor).unwrap();
+            assert!(
+                matches!(store.snapshot(&mut input), Err(MediaError::Client(message))
+                if message.contains("no native processor input"))
+            );
+            assert!(!input.consumed.load(Ordering::Acquire));
+            assert_eq!(store.permits.available_permits(), MAX_INFLIGHT_BYTES);
+        }
     }
     #[test]
     fn decoded_metadata_validates_all_modalities_and_clock_before_io() {

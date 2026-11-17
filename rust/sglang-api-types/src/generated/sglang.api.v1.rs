@@ -184,6 +184,9 @@ pub struct ErrorBody {
 /// Optional same-host decoded media ingress, enabled by an operator-configured
 /// private shared root. These are media samples, NOT model-ready features.
 /// Model resize/normalization/patches/positions remain with existing processors.
+/// The initial native source importer enables RGB images only. Decoded video
+/// and audio descriptors are rejected before storage I/O until native support
+/// is added; their presence here does not advertise processor availability.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DecodedMediaInput {
     #[prost(message, repeated, tag = "1")]

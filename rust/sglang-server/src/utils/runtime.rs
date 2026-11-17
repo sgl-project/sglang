@@ -145,6 +145,24 @@ impl Runtime {
         Ok(())
     }
 
+    /// The same native family pipeline and output/ring path, with an explicit
+    /// same-host decoded RGB source enabled before the pool starts.
+    pub fn start_decoded_mm_workers(
+        &self,
+        spec: crate::message::config::MmSpec,
+        root: &str,
+        workers: usize,
+    ) -> Result<(), String> {
+        let store =
+            crate::multi_modality::decoded::DecodedStore::new(root, self.instance_id().to_owned())?;
+        let ctx = Arc::new(
+            crate::multi_modality::worker::MmContext::new_with_decoded(spec, Some(store))?
+                .with_limits(self.mm_wiring.limits.clone()),
+        );
+        self.spawn_mm_pool(workers, ctx);
+        Ok(())
+    }
+
     /// Start the shared worker pool with a processor supplied by an external
     /// model package. `feature_shm` is that package's `_use_feature_shm`
     /// answer: place feature tensors in POSIX shm for the TP broadcast.

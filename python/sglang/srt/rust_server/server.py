@@ -291,18 +291,31 @@ class RustServer:
     @classmethod
     def _resolve_multimodal(cls, scheduler: Scheduler) -> Optional[RustMmSpec]:
         """Resolve the built-in Rust MM pipeline for a multimodal model, and
-        refuse a model it cannot serve unless the decoded-media Python bridge
-        was explicitly enabled. ``launch`` calls this before the
+        refuse a model it cannot serve. ``launch`` calls this before the
         listener binds, so a refused model never accepts a connection. A
         model package whose ``_start_multimodal`` starts its own pipeline
         overrides this to return ``None``; its server admits no generation
         request until that pipeline starts."""
+        if envs.SGLANG_DECODED_MEDIA_SHM_ROOT.get():
+            parallel = get_parallel()
+            if (
+                any(
+                    getattr(parallel, name) != 1
+                    for name in ("nnodes", "tp_size", "dp_size", "pp_size")
+                )
+                or parallel.attn_dp_enabled
+                or get_disagg().disaggregation_mode != "null"
+            ):
+                raise ValueError(
+                    "decoded RGB SHM currently requires unified single-node "
+                    "single-rank serving"
+                )
         mm_spec = RustMmProcessor(
             server_args=scheduler.server_args,
             model_config=scheduler.model_config,
             processor=scheduler.processor,
         ).resolve_spec()
-        if mm_spec is None and not os.environ.get("SGLANG_DECODED_MEDIA_SHM_ROOT"):
+        if mm_spec is None:
             supported = sorted(
                 set(chain.from_iterable(f.model_types for f in RUST_MM_FAMILIES))
             )
@@ -316,17 +329,14 @@ class RustServer:
 
     def _start_multimodal(self, scheduler: Scheduler) -> None:
         """Start the Rust workers for the pipeline ``launch`` resolved."""
-        if root := os.environ.get("SGLANG_DECODED_MEDIA_SHM_ROOT"):
-            from sglang.srt.rust_server.decoded_media import NativeDecodedMediaProcessor
-
+        assert self.mm_spec is not None
+        if root := envs.SGLANG_DECODED_MEDIA_SHM_ROOT.get():
             self.server.start_decoded_mm_workers(
-                NativeDecodedMediaProcessor(scheduler),
+                self._build_mm_spec(self.mm_spec),
                 root,
-                1,
-                self._build_mm_spec(self.mm_spec) if self.mm_spec is not None else None,
+                get_mm().mm_processor_worker_num or RustMmProcessor.AUTO_MM_WORKERS,
             )
             return
-        assert self.mm_spec is not None
         self.server.start_mm_workers(
             self._build_mm_spec(self.mm_spec),
             get_mm().mm_processor_worker_num or RustMmProcessor.AUTO_MM_WORKERS,
@@ -494,8 +504,8 @@ class RustServer:
             cpu_share=frontend_cpu_share,
         )
 
-        # Multimodal models require a native pipeline unless the operator
-        # explicitly enables the decoded-media Python processor bridge. The listener answers as soon as the server is constructed
+        # Multimodal models must have a Rust pipeline — there is no Python
+        # fallback. The listener answers as soon as the server is constructed
         # (a multimodal one admits generation requests once `_start_multimodal`
         # starts its pool), so refuse a model without one first.
         mm_spec = (
@@ -935,21 +945,6 @@ class RustServer:
         token_ids_logprob = buffers.get("token_ids_logprob")
         if token_ids_logprob is not None:
             obj.token_ids_logprob = token_ids_logprob.tolist()
-        if "mm.python_output" in buffers:
-            from sglang.srt.managers.req_types import MultimodalProcessorOutput
-
-            output = buffers["mm.python_output"]
-            if not self._multimodal_enabled or not isinstance(
-                output, MultimodalProcessorOutput
-            ):
-                raise ValueError("invalid owned Python multimodal output")
-            obj.mm_inputs = output
-            if output.token_type_ids is not None:
-                obj.token_type_ids = (
-                    output.token_type_ids.tolist()
-                    if hasattr(output.token_type_ids, "tolist")
-                    else list(output.token_type_ids)
-                )
         if self._multimodal_enabled and "mm.meta" in buffers:
             # Wrapping the worker's buffers into tensors is the only Python
             # step of the Rust path; a text-only request on a multimodal

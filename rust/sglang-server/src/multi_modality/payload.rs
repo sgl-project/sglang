@@ -43,7 +43,7 @@ fn resolve_media_work_with_budget(
 ) -> Result<ResolvedMediaWork, MediaError> {
     if mm.decoded.is_some() {
         return Err(MediaError::Client(
-            "decoded media requires the decoded processor bridge".into(),
+            "decoded media requires the native decoded-image input".into(),
         ));
     }
     let MmData {

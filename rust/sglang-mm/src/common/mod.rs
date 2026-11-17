@@ -1,4 +1,3 @@
-pub mod decoded_media;
 pub mod fetch;
 pub mod par;
 pub mod resize;
