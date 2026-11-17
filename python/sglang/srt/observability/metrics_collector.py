@@ -2765,10 +2765,10 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         )
         self.linker_load_tokens = Counter(
             name="sglang:linker_load_tokens_total",
-            documentation="External-store KV tokens by load mode: layer_wise counts "
-            "tokens accepted for queued loading, including later cancellation "
-            "or failure; prefetch counts tokens successfully published into "
-            "the cache.",
+            documentation="External-store KV tokens successfully restored by load "
+            "mode: layer_wise counts tokens after all ranks confirm loading "
+            "succeeded; prefetch counts tokens successfully published into "
+            "the cache. Cancelled and failed loads are excluded.",
             labelnames=list(labels.keys()) + ["mode"],
         )
         for mode in ("layer_wise", "prefetch"):
