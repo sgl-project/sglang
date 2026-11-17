@@ -98,6 +98,7 @@ from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
     bind_eagle_runtime_hooks,
     build_eagle_verify_input,
+    check_draft_branch_tail_copy,
     prepare_for_draft,
     prepare_for_draft_extend,
     run_eagle_verify,
@@ -257,6 +258,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             memory_pool_config=memory_pool_config,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        )
+        check_draft_branch_tail_copy(
+            self.draft_runner.token_to_kv_pool, self.topk, get_schedule().page_size
         )
         self.init_token_map()
         self.init_lm_head()
@@ -846,6 +850,27 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             draft_tokens_topk1[:, :1].copy_(topk_index)
 
+        # A megakernel's top-1 fold, on a greedy chain without logprobs.
+        captured_fold = fold = forward_batch.draft_step_fold
+        if (
+            draft_tokens_topk1 is None
+            or forward_batch.mm_input_embeds is not None
+            or forward_batch.return_logprob
+        ):
+            fold = None
+        forward_batch.draft_step_fold = fold
+        mrope = None
+        if fold is not None and self.draft_runner.model_config.model_is_mrope:
+            mrope = forward_batch.mrope_positions
+            positions = forward_batch.positions
+            if (
+                mrope.shape != (3, positions.numel())
+                or mrope.dtype != positions.dtype
+                or mrope.untyped_storage().data_ptr()
+                == positions.untyped_storage().data_ptr()
+            ):
+                mrope = None  # aliased operands keep the sequential updates
+
         # Forward multiple steps
         scores = None
         with IndexTopKShareState.mtp_iteration(
@@ -906,7 +931,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
                 elif self.topk == 1:
-                    if _is_cuda or _is_hip:
+                    if fold is not None:
+                        topk_p, topk_index = fold.finalize(
+                            logits_output.next_token_logits,
+                            forward_batch.positions,
+                            draft_tokens_topk1,
+                            i + 1,
+                            mrope,
+                        )
+                    elif _is_cuda or _is_hip:
                         topk_p, topk_index = draft_topk1_postprocess(
                             logits_output.next_token_logits,
                             forward_batch.positions,
@@ -927,7 +960,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
                     forward_batch.positions.add_(1)
-                if self.draft_runner.model_config.model_is_mrope:
+                if self.draft_runner.model_config.model_is_mrope and mrope is None:
                     forward_batch.mrope_positions.add_(1)
                 maybe_detect_oob(
                     topk_index,
@@ -938,6 +971,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
                 hidden_states = logits_output.hidden_states
+        forward_batch.draft_step_fold = captured_fold
 
         # Organize the results
         if topk1_chain_fits:
