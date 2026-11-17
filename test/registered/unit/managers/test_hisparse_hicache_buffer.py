@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.dsa_backend import (
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseHiCacheBuffer
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -21,6 +22,9 @@ register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestHiSparseHiCacheBuffer(CustomTestCase):
+    def setUp(self):
+        self.enterContext(get_context().override_server_args())
+
     def _build(self, dtype=torch.bfloat16, *, attach=True):
         size, page, layers = 1024, 64, 2
         self.pool = DSATokenToKVPool(
