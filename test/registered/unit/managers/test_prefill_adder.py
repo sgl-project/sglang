@@ -170,6 +170,7 @@ class TestPrefillAdder(CustomTestCase):
         # A spec=Req mock gets a per-instance class; derive extend_len like Req.
         type(req).extend_len = Req.extend_len
         req.extend_end = None
+        req.origin_input_ids = []
         req.full_untruncated_fill_ids = []
         req.output_ids = [0] * output_len
         req.sampling_params = SimpleNamespace(
@@ -2667,7 +2668,7 @@ class TestPrefillAdder(CustomTestCase):
                 )
                 self.mock_tree_cache.init_load_back.side_effect = None
 
-    def test_swa_new_tokens_clamps_remaining_not_total(self):
+    def test_remaining_new_tokens_clamps_remaining_not_total(self):
         # Remaining decode headroom must be min(max_new - generated, CLIP)
         # (subtract-then-clip). The reversed order (clip-then-subtract) zeroes
         # out a request that has already generated >= CLIP tokens but still has a
@@ -2690,7 +2691,116 @@ class TestPrefillAdder(CustomTestCase):
                 req = self.create_mock_req(
                     label, priority=0, max_new_tokens=max_new, output_len=generated
                 )
-                self.assertEqual(adder._swa_new_tokens(req), expected)
+                self.assertEqual(adder._remaining_new_tokens(req), expected)
+
+    def test_retracted_request_does_not_crowd_out_the_next_admission(self):
+        """A re-admitted retracted request must reserve only the decode it has
+        left, or the next request in the same pass is refused with NO_TOKEN."""
+        adder = self._create_delayer_adder(available_tokens=8000, delayer=None)
+        retracted = self._create_delayer_req(1000 + 3000)
+        retracted.sampling_params.max_new_tokens = 4000
+        retracted.output_ids = [0] * 3000
+        retracted.retracted_stain = True
+        fresh = self._create_delayer_req(1500)
+        fresh.sampling_params.max_new_tokens = 500
+
+        self.assertEqual(
+            adder.add_one_req(retracted, False, None), AddReqResult.CONTINUE
+        )
+        self.assertEqual(adder.add_one_req(fresh, False, None), AddReqResult.CONTINUE)
+        self.assertEqual(adder.can_run_list, [retracted, fresh])
+
+    def test_every_admission_path_reserves_the_remaining_decode(self):
+        """Every path that finishes a prefill must reserve the decode headroom
+        the gate checked: max_new_tokens minus the output already generated.
+        "shared" is a unified pool, whose budget prices each request's demand."""
+        dllm = SimpleNamespace(
+            block_size=4,
+            max_running_requests=2,
+            requires_separate_context_encoding=False,
+        )
+        paths = ("whole", "last_chunk", "ignore_eos", "load_back", "dllm", "shared")
+        for path in paths:
+            for generated in (0, 6):
+                with self.subTest(path=path, generated=generated):
+                    tree_cache = self.create_tree_cache()
+                    kwargs = dict(
+                        available_tokens=1000, delayer=None, tree_cache=tree_cache
+                    )
+                    if path == "load_back":
+                        # Promised 20, delivered 24: the chunked shape becomes whole.
+                        req = self._create_host_hit_req(host_hit=24, tail=8)
+                        req.host_hit_length -= 4
+                        tree_cache.init_load_back.side_effect = lambda params: (
+                            24,
+                            params.req.last_node,
+                        )
+                        kwargs.update(page_size=2, rem_chunk_tokens=8)
+                    elif path == "shared":
+                        req = self.create_shared_req("shared", max_new_tokens=80)
+                    else:
+                        req = self._create_delayer_req(4)
+                    req.output_ids = [0] * generated
+                    req.retracted_stain = generated > 0
+                    if path == "last_chunk":
+                        kwargs["rem_chunk_tokens"] = 16
+                    if path == "ignore_eos":
+                        tree_cache.disable = True
+                        req.sampling_params.ignore_eos = True
+                        req.origin_input_ids = list(range(4))
+                    if path == "dllm":
+                        kwargs["dllm_config"] = dllm
+                        req.dllm_incomplete_ids = None
+                    if path == "shared":
+                        adder = self.create_shared_adder()
+                    else:
+                        adder = self._create_delayer_adder(**kwargs)
+
+                    if path in ("last_chunk", "shared"):
+                        self.assertIsNone(adder.add_chunked_req(req))
+                    elif path == "dllm":
+                        adder.add_dllm_staging_req(req)
+                    else:
+                        adder.add_one_req(req, False, None)
+
+                    budget = adder.memory_budget
+                    self.assertEqual(adder.can_run_list, [req])
+                    self.assertEqual(
+                        budget.total_offset - budget.current_offset,
+                        req.sampling_params.max_new_tokens - generated,
+                    )
+
+    def test_preemption_sizes_a_retracted_request_by_its_remaining_decode(self):
+        """Priority preemption must size a retracted newcomer as admission will:
+        prompt and output re-prefilled plus the decode it has left (10 + 50 + 10),
+        also while its fill ids still stop at the last prefill, as
+        reset_for_retract leaves them. Each victim frees 40."""
+        self.scheduling_order(schedule_low_priority_values_first=False)
+        for stale_fill in (False, True):
+            for num_victims, preempts in ((1, False), (2, True)):
+                with self.subTest(stale_fill=stale_fill, num_victims=num_victims):
+                    victims = [
+                        self.create_mock_req(
+                            f"victim{i}", priority=0, max_new_tokens=40
+                        )
+                        for i in range(num_victims)
+                    ]
+                    adder = self.create_adder(self.create_running_batch(victims))
+                    self.mock_token_allocator.available_size.return_value = (
+                        40 * num_victims
+                    )
+                    retracted = self.create_mock_req(
+                        "retracted", priority=1, max_new_tokens=60, output_len=50
+                    )
+                    retracted.origin_input_ids = [0] * 10
+                    retracted.full_untruncated_fill_ids = (
+                        [0] * 10 if stale_fill else [0] * 60
+                    )
+
+                    self.assertEqual(adder.preempt_to_schedule(retracted), preempts)
+                    self.assertCountEqual(
+                        adder.preempt_list, victims if preempts else []
+                    )
 
     def test_delayer_not_consulted_when_kv_budget_rejects(self):
         """A rank whose first candidate fails the KV-budget gate must NOT
