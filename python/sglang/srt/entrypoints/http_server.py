@@ -205,12 +205,12 @@ from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     delete_directory,
-    freeze_gc,
     get_bool_env_var,
     is_mps,
     kill_process_tree,
 )
 from sglang.srt.utils.auth import add_api_key_middleware
+from sglang.srt.utils.gc_utils import freeze_gc
 from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
     dumps_json,

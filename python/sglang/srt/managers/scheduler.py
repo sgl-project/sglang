@@ -273,7 +273,7 @@ from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
 )
 from sglang.srt.managers.scheduler_components.exit_ledger import record_send
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
-from sglang.srt.managers.scheduler_components.idle_gc_freezer import IdleGCFreezer
+from sglang.srt.managers.scheduler_components.gc_manager import SchedulerGCManager
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
     RustServerIdleSleeper,
@@ -413,9 +413,7 @@ from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_captur
 from sglang.srt.state_capturer.routed_experts import destroy_global_experts_capturer
 from sglang.srt.utils import (
     DynamicGradMode,
-    configure_gc_logging,
     configure_logger,
-    freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
     get_int_env_var,
@@ -431,6 +429,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import TypeBasedDispatcher
 from sglang.srt.utils.device import is_confidential_compute, is_npu
+from sglang.srt.utils.gc_utils import configure_gc_logging, freeze_gc
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_versions import record_weight_version_events
@@ -616,7 +615,6 @@ class Scheduler(
         # Init inter-process communication
         self.init_ipc_channels(port_args)
         self.init_idle_sleeper()
-        self.maybe_init_idle_gc_freezer()
 
         # Init tokenizer
         self.init_tokenizer()
@@ -787,6 +785,7 @@ class Scheduler(
         self.init_pool_stats_observer()
 
         self.init_invariant_checker()
+        self.init_gc_manager()
 
         self.init_load_publisher()
 
@@ -939,11 +938,6 @@ class Scheduler(
             )
         else:
             self.idle_sleeper = None
-
-    def maybe_init_idle_gc_freezer(self) -> None:
-        """Freeze the GC heap after an idle period, when --gc-freeze-on-idle-secs is set."""
-        idle_secs = get_device().gc_freeze_on_idle_secs
-        self.idle_gc_freezer = IdleGCFreezer(idle_secs) if idle_secs > 0 else None
 
     def publish_load_snapshot(self, force: bool = False):
         """Returns the LoadSnapshot it published, or None when disabled,
@@ -2834,6 +2828,16 @@ class Scheduler(
             ),
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
+
+    def init_gc_manager(self) -> None:
+        """Control the cyclic GC from the invariant checker's idle and flush checks."""
+        self.gc_manager = SchedulerGCManager(
+            freeze_on_idle_secs=get_device().gc_freeze_on_idle_secs,
+            check_frozen_garbage=envs.SGLANG_ENABLE_GC_FROZEN_GARBAGE_CHECK.get(),
+            get_forward_ct=lambda: self.forward_ct,
+        )
+        for check in self.gc_manager.checks():
+            self.invariant_checker.register(check)
 
     def init_rank_consensus_checker(self) -> None:
         groups = []
@@ -6051,9 +6055,6 @@ class Scheduler(
             self.load_inquirer.get_loads, force=True, snapshot=snapshot
         )
 
-        if self.idle_gc_freezer is not None:
-            self.idle_gc_freezer.on_idle(forward_ct=self.forward_ct)
-
         if self.deferred_responses.has_pending():
             # Held responses are released by polling, not by a socket event:
             # keep polling, and yield the GIL to the completion's worker.
@@ -6285,8 +6286,6 @@ class Scheduler(
 
             if self.draft_worker:
                 self.draft_worker.clear_cache_pool()
-            if self.idle_gc_freezer is not None:
-                self.idle_gc_freezer.on_cache_reset()
 
             if empty_cache:
                 current_platform.empty_cache()

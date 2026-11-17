@@ -141,6 +141,8 @@ def handle_pd_role_switch(
         # is no in-place rollback.
         try:
             teardown_disaggregation(scheduler)
+            # After teardown returns, so its locals no longer hold the old role.
+            scheduler.gc_manager.on_cache_reset()
             get_context().override("role_switch.flip", disaggregation_mode=new_role)
             scheduler.init_disaggregation()
             scheduler._sync_disaggregation_mode_to_subcomponents()
@@ -274,8 +276,6 @@ def teardown_disaggregation(scheduler: Scheduler) -> None:
     scheduler.disagg_metadata_buffers = None
     scheduler.req_to_metadata_buffer_idx_allocator = None
     _release_prefix_cache_for_role_switch(scheduler)
-    if scheduler.idle_gc_freezer is not None:
-        scheduler.idle_gc_freezer.on_cache_reset()
 
 
 def _release_prefix_cache_for_role_switch(scheduler: Scheduler) -> None:

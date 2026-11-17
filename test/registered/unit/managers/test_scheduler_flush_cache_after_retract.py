@@ -85,7 +85,6 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.req_to_token_pool = MagicMock()
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.draft_worker = None
-        scheduler.idle_gc_freezer = None
         scheduler.metrics_reporter = MagicMock()
         scheduler.invariant_checker = MagicMock()
         return scheduler

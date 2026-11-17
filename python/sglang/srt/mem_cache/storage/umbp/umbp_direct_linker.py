@@ -30,7 +30,8 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
 )
-from sglang.srt.utils import freeze_gc, get_device_module
+from sglang.srt.utils import get_device_module
+from sglang.srt.utils.gc_utils import freeze_gc
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
