@@ -1605,6 +1605,16 @@ class Envs:
     # Drop the GB/s and TFLOPS columns from the benchmark marker's table.
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH = EnvBool(False)
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_FLOPS = EnvBool(False)
+    # Directory the benchmark marker appends one JSONL record per case to.
+    # Unset: no records.
+    SGLANG_JIT_BENCHMARK_OUTPUT = EnvStr(None)
+    # Run the full `vals` of every parametrize axis even when SGLANG_IS_IN_CI picks `ci_vals`.
+    SGLANG_JIT_BENCHMARK_FORCE_FULL = EnvBool(False)
+    # Comma-separated case_ids (from the records); when set, only those cases run.
+    SGLANG_JIT_BENCHMARK_CASE_FILTER = EnvTuple(tuple())
+    # Run kind stamped on the records (nightly / main / pr); default derives from
+    # GITHUB_EVENT_NAME, else "local".
+    SGLANG_JIT_BENCHMARK_RUN_KIND = EnvStr(None)
     # The hgcc --gpu-architecture target used by JIT builds on SAIL (hgcc
     # cannot read CUDA sources, so they are converted by sailify first).
     # One of: native, all, all-ppu,
