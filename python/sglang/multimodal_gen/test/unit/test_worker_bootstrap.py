@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import importlib
+import io
 import json
 import multiprocessing as mp
 import os
@@ -103,6 +104,45 @@ def _check_http_server_import_order(pipe_writer) -> None:
 
     pipe_writer.send(observed)
     pipe_writer.close()
+
+
+def _check_tqdm_lock(apply_fix: bool, pipe_writer) -> None:
+    from tqdm import tqdm
+    from tqdm.std import TqdmDefaultWriteLock
+
+    from sglang.multimodal_gen.runtime.utils.process import use_thread_lock_for_tqdm
+
+    if apply_fix:
+        use_thread_lock_for_tqdm()
+    with tqdm(total=1, file=io.StringIO(), disable=False) as bar:
+        bar.update(1)
+
+    pipe_writer.send({"mp_lock_created": "mp_lock" in vars(TqdmDefaultWriteLock)})
+    pipe_writer.close()
+
+
+class TestTqdmThreadLock(unittest.TestCase):
+    """tqdm's default multiprocessing lock is a semaphore that a killed worker leaks."""
+
+    def _mp_lock_created(self, apply_fix: bool) -> bool:
+        reader, writer = mp.Pipe(duplex=False)
+        process = mp.get_context("spawn").Process(
+            target=_check_tqdm_lock, args=(apply_fix, writer)
+        )
+        process.start()
+        writer.close()
+        self.addCleanup(process.join, 10)
+        self.addCleanup(process.kill)
+
+        self.assertTrue(reader.poll(30), "child did not report the tqdm lock")
+        return reader.recv()["mp_lock_created"]
+
+    def test_workers_do_not_create_the_default_multiprocessing_lock(self):
+        self.assertTrue(
+            self._mp_lock_created(apply_fix=False),
+            "tqdm no longer creates its multiprocessing lock; drop the workaround",
+        )
+        self.assertFalse(self._mp_lock_created(apply_fix=True))
 
 
 class TestBootstrapImportBoundary(unittest.TestCase):

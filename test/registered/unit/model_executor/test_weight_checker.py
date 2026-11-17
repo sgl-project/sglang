@@ -117,7 +117,7 @@ class TestShuffledFp8Comparable(CustomTestCase):
                 side_effect=lambda weight, *_args, **_kwargs: weight,
             ),
         ):
-            next(iter(comparable.iter_chunks()))
+            next(iter(comparable.iter_chunks(comparable.device)))
 
         unshuffle.assert_called_once()
 

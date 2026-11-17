@@ -16,7 +16,7 @@
 import json
 import logging
 from functools import cache
-from typing import Iterable, List, NamedTuple, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Union
 
 import torch
 from llguidance import LLExecutor, LLMatcher, LLTokenizer, StructTag, grammar_from
@@ -26,7 +26,6 @@ from llguidance.torch import (
     apply_token_bitmask_inplace,
     fill_next_token_bitmask,
     fill_next_token_bitmask_par,
-    fill_next_token_bitmask_par_with_draft_tokens,
 )
 from transformers import PreTrainedTokenizerFast
 
@@ -37,6 +36,9 @@ from sglang.srt.constrained.base_grammar_backend import (
     InvalidGrammarObject,
     register_vocab_mask_buffer,
 )
+from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
+    set_token_filter_torch,
+)
 from sglang.srt.constrained.utils import is_legacy_structural_tag
 from sglang.srt.utils import get_int_env_var
 
@@ -44,37 +46,9 @@ logger = logging.getLogger(__name__)
 _LLGUIDANCE_LOG_LEVEL = get_int_env_var("LLGUIDANCE_LOG_LEVEL", 1)
 
 
-class GrammarDraftRow(NamedTuple):
-    """Grammar, destination block, and tokens for a draft-chain mask fill."""
-
-    base_row: int
-    grammar: "GuidanceGrammar"
-    draft_tokens: List[int]
-
-
 @cache
 def _get_or_init_mask_executor() -> LLExecutor:
     return LLExecutor()
-
-
-def fill_token_bitmask_with_draft_tokens(
-    entries: List[GrammarDraftRow],
-    vocab_mask: torch.Tensor,
-) -> None:
-    """Fill speculative draft-chain masks with llguidance's native kernel.
-
-    Each matcher is advanced over its legal draft prefix and rolled back by the
-    number of consumed parser tokens before returning. Rows after the first
-    illegal token retain the caller's all-allow value. Correctness requires
-    matcher rollback to restore parser-token state exactly. Matcher errors retain
-    the native executor's behavior; this wrapper adds no per-matcher Python probe.
-    """
-    if not entries:
-        return
-    matchers = [(e.grammar.ll_matcher, e.base_row, e.draft_tokens) for e in entries]
-    fill_next_token_bitmask_par_with_draft_tokens(
-        _get_or_init_mask_executor(), matchers, vocab_mask
-    )
 
 
 def fill_token_bitmask_batched(
@@ -144,8 +118,21 @@ class GuidanceGrammar(BaseGrammarObject):
         if self.ll_matcher.is_stopped() and token in self.eos_tokens:
             self.finished = True
             return
+        # consume_token leaves the matcher in a sticky error state on reject;
+        # validate first so a rejected token raises with the state untouched.
+        if self.ll_matcher.validate_tokens([token]) == 0:
+            raise ValueError(f"Tokens not accepted: {token}")
         self.ll_matcher.consume_token(token)
         self._check_err()
+
+    def try_accept_tokens(self, tokens: List[int]) -> bool:
+        # consume_token on a rejected token leaves the matcher in its error state,
+        # so validate the whole sequence before consuming any of it.
+        if self.finished or self.ll_matcher.validate_tokens(tokens) != len(tokens):
+            return False
+        for token in tokens:
+            self.accept_token(token)
+        return True
 
     def rollback(self, num_tokens: int) -> None:
         if num_tokens <= 0:
@@ -209,21 +196,6 @@ class GuidanceGrammar(BaseGrammarObject):
             ll_matcher=self.ll_matcher.deep_copy(),
         )
 
-    def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
-        ff_tokens = self.ll_matcher.compute_ff_tokens()
-        if ff_tokens:
-            return ff_tokens, ""
-        else:
-            return None
-
-    def jump_forward_str_state(self, helper: Tuple[List[int], str]) -> Tuple[str, int]:
-        return "", -1
-
-    def jump_and_retokenize(
-        self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
-    ):
-        pass
-
     def _check_err(self) -> None:
         if self.ll_matcher.is_error():
             raise ValueError(self.ll_matcher.get_error())
@@ -263,6 +235,14 @@ class GuidanceBackend(BaseGrammarBackend):
             max_rows, self.llguidance_tokenizer.vocab_size
         )
         return register_vocab_mask_buffer(name, vocab_mask, max_rows)
+
+    @staticmethod
+    def set_token_filter(
+        vocab_mask, token_ids, batch_idx, is_allowed=True, reset_vocab_mask=True
+    ):
+        set_token_filter_torch(
+            vocab_mask, token_ids, batch_idx, is_allowed, reset_vocab_mask
+        )
 
     def _from_serialized(self, serialized_grammar) -> BaseGrammarObject:
         try:
