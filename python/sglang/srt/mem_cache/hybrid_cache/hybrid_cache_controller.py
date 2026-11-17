@@ -1789,7 +1789,7 @@ class HybridCacheController(BaseHiCacheController):
     def _clamp_confirmed_trailing_hits(
         self, operation: PrefetchOperation, pages: int
     ) -> None:
-        # Advisory FETCHABLE is not evidence of a source checkpoint. Buffer
+        # An advisory hit is not evidence of a source checkpoint. Buffer
         # mode must not retain an optimistic trailing-pool existence belief
         # after physical confirmation rejected a longer boundary.
         for transfer in operation.pool_transfers or ():
