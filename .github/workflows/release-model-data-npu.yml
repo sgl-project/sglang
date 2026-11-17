@@ -1,0 +1,248 @@
+# Key-model performance/accuracy data collection for NPU releases.
+#
+# Runs a curated matrix of multi-node PD cases through the same reusable
+# workflow as the nightly, so metrics land in the versioned shared-disk layout
+# (/root/.cache/tests/output/...) consumed by the data dashboard, and are also
+# uploaded as workflow artifacts for direct download.
+#
+name: Release Model Data (NPU)
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/release-model-data-npu.yml"
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'NPU image used by the prefill/decode pods.'
+        required: false
+        type: string
+        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B031'
+      use_image_sglang:
+        description: "If 'true' (default), pods import sglang from the image's site-packages. Set 'false' to use the PR checkout's sglang."
+        required: false
+        type: string
+        default: 'true'
+
+concurrency:
+  group: npu-release-model-data-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    name: build-run-metadata
+    runs-on: ubuntu-latest
+    outputs:
+      run_start_metadata: ${{ steps.meta.outputs.run_start_metadata }}
+    steps:
+      - name: Build run metadata
+        id: meta
+        run: |
+          BRANCH_LABEL="${{ github.ref_name }}"
+          BRANCH_LABEL="$(echo "${BRANCH_LABEL}" | tr -cd 'a-zA-Z0-9._/:' | tr '/:' '--')"
+          # Same {branch_label, workflow_name, create_time} layout as the nightly
+          # pipeline, so release data shares the dashboard's directory scheme.
+          RUN_START_METADATA="$(python3 -c "import json,sys; print(json.dumps({'branch_label':sys.argv[1],'workflow_name':sys.argv[2],'create_time':sys.argv[3]}))" "$BRANCH_LABEL" "${{ github.workflow }}" "$(date -u -d '+8 hours' +%Y%m%d-%H%M)")"
+          echo "run_start_metadata=${RUN_START_METADATA}" | tee -a $GITHUB_OUTPUT
+
+  prepare-sgl-router:
+    name: prepare-sgl-router
+    # The test image ships no sgl-router and the pods mount the checkout, so
+    # fetch the aarch64 build once here and hand it to the collect job as the
+    # sgl_router_artifact input, which restores it into sgl-router-bin/ where
+    # run_npu_testcase.sh looks for it.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the prebuilt aarch64 sgl-router
+        run: |
+          set -euo pipefail
+          SGL_ROUTER_OBS_URL="https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/sgl-router/bin/sgl-router-aarch64-npu.zip"
+          archive=/tmp/sgl-router-aarch64-npu.zip
+          mkdir -p sgl-router-bin
+          # OBS lives in the same region as the cluster; bypass any image proxy.
+          if command -v curl >/dev/null 2>&1; then
+            ( unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; curl -fsSL -o "${archive}" "${SGL_ROUTER_OBS_URL}" )
+          elif command -v wget >/dev/null 2>&1; then
+            ( unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; wget -q -O "${archive}" "${SGL_ROUTER_OBS_URL}" )
+          else
+            echo "Neither curl nor wget is available to download sgl-router"
+            exit 1
+          fi
+          python3 -m zipfile -e "${archive}" sgl-router-bin
+          bin="$(find sgl-router-bin -type f -name 'sgl-router' -print -quit)"
+          if [ -z "${bin}" ]; then
+            echo "sgl-router binary not found in ${archive}"
+            exit 1
+          fi
+          # actions/download-artifact restores this at sgl-router-bin/sgl-router.
+          if [ "${bin}" != "sgl-router-bin/sgl-router" ]; then
+            mv "${bin}" sgl-router-bin/sgl-router
+          fi
+          chmod +x sgl-router-bin/sgl-router
+
+      - name: Upload sgl-router artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sgl-router-aarch64-npu-obs
+          path: sgl-router-bin/sgl-router
+          if-no-files-found: error
+          retention-days: 1
+
+  collect:
+    name: ${{ matrix.name }}
+    needs: [metadata, prepare-sgl-router]
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          # - name: test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_basic_accuracy
+          #   test_type: accuracy
+          #   prefill_decode_deployment: separation
+          #   prefill_size: 1
+          #   decode_size: 1
+          #   router_size: 1
+          #   test_case: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_basic_accuracy.py
+          #   test_method: TestNPUDeepSeekV4FlashPDSepBasicAccuracy.test_npu_deepseek_v4_flash_accuracy
+          - name: test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms_off_cp
+            test_type: perf
+            prefill_decode_deployment: separation
+            prefill_size: 1
+            decode_size: 1
+            router_size: 1
+            test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms_off_cp.py
+            test_method: TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20msAisBench.test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms
+    uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
+    with:
+      runner: linux-amd64-cpu-4
+      test_type: ${{ matrix.test_type }}
+      test_config_name: ${{ matrix.name }}
+      prefill_size: ${{ matrix.prefill_size }}
+      decode_size: ${{ matrix.decode_size }}
+      router_size: ${{ matrix.router_size }}
+      test_case: ${{ matrix.test_case }}
+      image: ${{ inputs.image || 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B031' }}
+      prefill_decode_deployment: ${{ matrix.prefill_decode_deployment }}
+      container_patches: ${{ matrix.container_patches || '' }}
+      run_start_metadata: ${{ needs.metadata.outputs.run_start_metadata }}
+      use_image_sglang: ${{ inputs.use_image_sglang || 'true' }}
+      test_method: ${{ matrix.test_method || '' }}
+      sgl_router_artifact: sgl-router-aarch64-npu-obs
+    secrets: inherit
+
+  publish:
+    name: publish-release-data
+    needs: [collect]
+    # Publish whatever was collected even if some case failed; skip on cancel.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download metrics artifacts
+        # No artifacts exist if every collect job failed before running the
+        # test; the consolidation step reports the empty result in that case.
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: npu-metrics-*
+          path: release-data
+
+      - name: Consolidate release data
+        env:
+          INPUT_DIR: release-data
+          OUTPUT_JSON: release-data.json
+          OUTPUT_MARKDOWN: release-data.md
+          RUN_ID: ${{ github.run_id }}
+          COMMIT_SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import glob
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          input_dir = os.environ["INPUT_DIR"]
+
+          # Merge the downloaded per-case metrics.json files, one entry per
+          # (test_case, test_type) so a re-run overwrites instead of duplicating.
+          cases = {}
+          for filepath in sorted(
+              glob.glob(os.path.join(input_dir, "**", "metrics.json"), recursive=True)
+          ):
+              try:
+                  with open(filepath, encoding="utf-8") as f:
+                      data = json.load(f)
+              except (json.JSONDecodeError, OSError) as e:
+                  print(f"Warning: failed to read {filepath}: {e}")
+                  continue
+              test_case = data.get("test_case")
+              if not test_case:
+                  print(f"Warning: {filepath} has no test_case, skipped")
+                  continue
+              test_type = data.get("test_type", "unknown")
+              if (test_case, test_type) in cases:
+                  print(f"Warning: duplicate metrics for {(test_case, test_type)}")
+              raw_labels = data.get("labels")
+              cases[(test_case, test_type)] = {
+                  "test_case": test_case,
+                  "test_type": test_type,
+                  "metrics": data.get("metrics") or {},
+                  "baselines": data.get("baselines") or {},
+                  "labels": raw_labels if isinstance(raw_labels, dict) else {},
+              }
+
+          ordered = [cases[key] for key in sorted(cases)]
+          payload = {
+              "source": "npu-key-model-release",
+              "run_id": os.environ["RUN_ID"],
+              "commit_sha": os.environ["COMMIT_SHA"],
+              "branch": os.environ["BRANCH"],
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+              "cases": ordered,
+          }
+          with open(os.environ["OUTPUT_JSON"], "w", encoding="utf-8") as f:
+              json.dump(payload, f, indent=2)
+
+          lines = ["# NPU Key Model Release Data", ""]
+          if not ordered:
+              lines.append("No metrics were collected.")
+          else:
+              lines.append("| Test case | Type | Metric | Dataset | Value | Baseline |")
+              lines.append("| --- | --- | --- | --- | --- | --- |")
+              for case in ordered:
+                  if not case["metrics"]:
+                      lines.append(
+                          f"| {case['test_case']} | {case['test_type']} | - | - | - | - |"
+                      )
+                      continue
+                  for name in sorted(case["metrics"]):
+                      baseline = case["baselines"].get(name, "-")
+                      # Accuracy metrics carry the evaluated dataset in their
+                      # dump_metric labels (gpqa_diamond / gsm8k / ...).
+                      labels = case["labels"].get(name) or {}
+                      dataset = (
+                          labels.get("dataset", "-")
+                          if isinstance(labels, dict)
+                          else "-"
+                      )
+                      lines.append(
+                          f"| {case['test_case']} | {case['test_type']} | "
+                          f"{name} | {dataset} | {case['metrics'][name]} | {baseline} |"
+                      )
+          markdown = "\n".join(lines) + "\n"
+          with open(os.environ["OUTPUT_MARKDOWN"], "w", encoding="utf-8") as f:
+              f.write(markdown)
+
+          print(f"Collected {len(ordered)} case(s) from {input_dir}")
+          print(markdown)
+          PY
+          cat release-data.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload release data
+        uses: actions/upload-artifact@v4
+        with:
+          name: npu-release-data-${{ github.run_id }}
+          path: |
+            release-data.json
+            release-data.md
+          retention-days: 7
