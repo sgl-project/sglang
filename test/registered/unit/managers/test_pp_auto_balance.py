@@ -30,6 +30,7 @@ class TestPPAutoBalance(unittest.TestCase):
 
     def test_handoff_preserves_rows_and_sampling_history(self):
         import torch
+
         from sglang.test.test_utils import maybe_stub_sgl_kernel
 
         maybe_stub_sgl_kernel()

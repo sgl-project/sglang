@@ -4357,7 +4357,9 @@ class Scheduler(
             running_batch.batch_is_full = False
 
         if self._pp_incoming:
-            running_batch = self._pp_balance_decode(self._pp_balance_slot, running_batch)
+            running_batch = self._pp_balance_decode(
+                self._pp_balance_slot, running_batch
+            )
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch, staged)
