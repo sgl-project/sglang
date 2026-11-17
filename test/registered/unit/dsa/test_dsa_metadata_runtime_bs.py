@@ -17,21 +17,39 @@ _KERNELS = (
 )
 
 
+def _kernel_defs():
+    tree = ast.parse(inspect.getsource(metadata))
+    return {
+        n.name: n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name in _KERNELS
+    }
+
+
 class TestDSAMetadataRuntimeBatchSize(CustomTestCase):
     def test_bs_is_not_constexpr(self):
         """A constexpr `bs` makes Triton compile a new kernel for every batch size."""
-        tree = ast.parse(inspect.getsource(metadata))
-        fns = {
-            n.name: n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.FunctionDef) and n.name in _KERNELS
-        }
+        fns = _kernel_defs()
         self.assertEqual(set(fns), set(_KERNELS))
         for name, fn in fns.items():
             with self.subTest(kernel=name):
                 bs = next(a for a in fn.args.args if a.arg == "bs")
                 annotation = "" if bs.annotation is None else ast.unparse(bs.annotation)
                 self.assertNotIn("constexpr", annotation)
+
+    def test_bs_is_not_specialized(self):
+        """Triton's divisibility specialization of `bs` adds a compile per class."""
+        for name, fn in _kernel_defs().items():
+            with self.subTest(kernel=name):
+                listed = {
+                    elt.value
+                    for dec in fn.decorator_list
+                    if isinstance(dec, ast.Call)
+                    for kw in dec.keywords
+                    if kw.arg == "do_not_specialize"
+                    for elt in kw.value.elts
+                }
+                self.assertIn("bs", listed)
 
 
 if __name__ == "__main__":
