@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.arg_groups.mamba_hook import validate_mamba_extra_buffer
+from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
 from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -61,6 +62,20 @@ class TestMambaExtraBufferPlatform(CustomTestCase):
 
             platform.support_mamba_cache_extra_buffer.return_value = True
             _validate()
+
+    def test_xpu_keeps_model_extra_buffer_support(self):
+        """intel_xpu runs MLA at page_size 128 only, and no_buffer needs page_size 1,
+        so a hybrid MLA + linear-attention model on XPU starts only with extra_buffer.
+        A model-support check that answered no on XPU left Ling-2.6/3.0 with no valid
+        radix-cache strategy (MambaComponent page_size assertion at startup)."""
+        view = SimpleNamespace(linear_attn_backend="triton")
+        for arch in ("BailingMoeV2_5ForCausalLM", "BailingMoeV3ForCausalLM"):
+            with self.subTest(arch=arch), override_platform(is_xpu=True):
+                self.assertTrue(
+                    supports_mamba_cache_extra_buffer(
+                        view, SimpleNamespace(architectures=[arch])
+                    )
+                )
 
 
 if __name__ == "__main__":
