@@ -909,11 +909,17 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         device_indices = maybe_dcp_kernel_indices(
             device_indices, self.dcp_size, self.dcp_rank
         )
-        # Layouts without an all-layer H2D kernel share the sharded fallback,
-        # restoring owned target layers and draft slots with localized indices.
+        # AOT all-layer H2D regressed measured H100 preload latency. Keep
+        # per-layer AOT transfers and share the ownership-aware fallback with
+        # sharded pools and layouts without a batched H2D kernel.
         if (
             self._layer_shard_enabled
             or io_backend == "kernel_ascend"
+            or (
+                io_backend == "kernel"
+                and self.layout == "layer_first"
+                and not self.can_use_jit
+            )
             or (io_backend, self.layout)
             in (
                 ("kernel", "page_first"),
@@ -941,27 +947,16 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
 
         if io_backend == "kernel":
             if self.layout == "layer_first":
-                if self.can_use_jit:
-                    jit_transfer_hicache_all_layer_mla(
-                        page_size=self.page_size,
-                        ptr_dst=device_data_ptrs,
-                        indices_dst=device_indices,
-                        ptr_src=self.data_ptrs,
-                        indices_src=host_indices,
-                        cache_dst_stride_bytes=self.device_row_stride_bytes,
-                        cache_src_stride_bytes=self.token_stride_size,
-                        element_size=self.kv_cache_dim * self.dtype.itemsize,
-                    )
-                else:
-                    self._require_packed_device_rows("transfer_kv_all_layer_mla")
-                    transfer_kv_all_layer_mla(
-                        src_layers=self.data_ptrs,
-                        dst_layers=device_data_ptrs,
-                        src_indices=host_indices,
-                        dst_indices=device_indices,
-                        item_size=self.token_stride_size,
-                        num_layers=self.layer_num,
-                    )
+                jit_transfer_hicache_all_layer_mla(
+                    page_size=self.page_size,
+                    ptr_dst=device_data_ptrs,
+                    indices_dst=device_indices,
+                    ptr_src=self.data_ptrs,
+                    indices_src=host_indices,
+                    cache_dst_stride_bytes=self.device_row_stride_bytes,
+                    cache_src_stride_bytes=self.token_stride_size,
+                    element_size=self.kv_cache_dim * self.dtype.itemsize,
+                )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":

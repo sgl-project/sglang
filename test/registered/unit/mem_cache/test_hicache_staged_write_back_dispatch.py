@@ -865,9 +865,10 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 torch.equal(host.kv_buffer[host_indices, layer_id], expected[layer_id])
             )
 
-    def test_mla_all_layer_load_restores_page_first_draft_rows(self):
-        """Page-first restore must include draft KV and localize DCP slots once."""
+    def test_mla_all_layer_load_fallback_restores_target_and_draft_rows(self):
+        """AOT H2D batching regresses latency; fallback must preserve target/draft KV."""
         for layout, backend, use_jit in (
+            ("layer_first", "kernel", False),
             ("page_first", "kernel", False),
             ("page_first", "kernel", True),
             ("page_first_direct", "direct", False),
@@ -897,11 +898,16 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                         host.can_use_jit = use_jit
                         data = torch.arange(16 * 3 * 4, dtype=torch.float32)
                         host.kv_buffer = data.reshape(16, 3, 1, 4)
-                        host.data_refs = list(host.kv_buffer.transpose(0, 1))
+                        if layout == "layer_first":
+                            host.kv_buffer = host.kv_buffer.transpose(0, 1).contiguous()
+                            host.data_refs = list(host.kv_buffer)
+                        else:
+                            host.data_refs = list(host.kv_buffer.transpose(0, 1))
                         host.device_kv_buffers = tuple(
                             torch.full((16, 1, 4), -1.0) for _ in range(3)
                         )
                         host.device_data_ptrs = None
+                        host.data_ptrs = None
                         if layout == "page_first_direct":
                             host.kv_buffer = host.kv_buffer.unsqueeze(2)
 
@@ -918,7 +924,22 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                                 src_indices, layer_id, 0
                             ]
 
+                        def copy_lf_lf(*, src, dst, src_indices, dst_indices, **_):
+                            dst[dst_indices] = src[src_indices]
+
                         with (
+                            mock.patch(
+                                f"{MLA_POOL_HOST_MODULE}.transfer_kv_per_layer_mla",
+                                side_effect=copy_lf_lf,
+                                create=True,
+                            ),
+                            mock.patch(
+                                f"{MLA_POOL_HOST_MODULE}.transfer_kv_all_layer_mla",
+                                side_effect=AssertionError(
+                                    "AOT H2D must use the per-layer fallback"
+                                ),
+                                create=True,
+                            ),
                             mock.patch(
                                 f"{MLA_POOL_HOST_MODULE}.jit_transfer_hicache_one_layer_mla",
                                 side_effect=_cpu_jit_one_layer_mla_copy,
