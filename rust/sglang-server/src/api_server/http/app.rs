@@ -9,8 +9,8 @@ use axum::Router;
 
 use super::generate_hook::GenerateHook;
 use super::{
-    auth, connections, dp_relay, hicache, info, loads, metrics, native_api, openai, parsers,
-    pre_generate, request_decompression, weights,
+    auth, connections, corpus, dp_relay, hicache, info, loads, metrics, native_api, openai,
+    parsers, pre_generate, request_decompression, weights,
 };
 use crate::HttpLayer;
 use crate::api_server::core::{DrainEnd, FLUSH_INTERVAL};
@@ -158,6 +158,7 @@ pub async fn serve(
         .merge(info::routes())
         .merge(weights::routes())
         .merge(parsers::routes())
+        .merge(corpus::routes())
         .merge(loads::routes())
         .merge(native_api::routes())
         .merge(openai::routes());

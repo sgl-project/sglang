@@ -197,6 +197,23 @@ control_messages! {
         group_name: String,
     }
 
+    /// `/add_external_corpus`: Python's `AddExternalCorpusReqInput`, after
+    /// the frontend tokenized `file_path` / `documents` into `token_chunks`.
+    AddExternalCorpusReqInput {
+        corpus_id: Option<String>,
+        file_path: Option<String>,
+        documents: Option<Vec<String>>,
+        token_chunks: Option<Vec<Vec<i64>>>,
+    }
+
+    /// `/remove_external_corpus`.
+    RemoveExternalCorpusReqInput {
+        corpus_id: String,
+    }
+
+    /// `/list_external_corpora`.
+    ListExternalCorporaReqInput {}
+
     /// `/update_weights_from_disk`: Python's `UpdateWeightFromDiskReqInput`.
     /// `is_async`, `keep_pause`, `token_step` and `manifest` are carried as
     /// Python carries them; its scheduler reads none of them.
@@ -472,6 +489,30 @@ impl SendWeightsToRemoteInstanceReqInput {
             ports,
             group_name,
         }
+    }
+}
+
+impl AddExternalCorpusReqInput {
+    pub fn new(rid: String, corpus_id: String, token_chunks: Vec<Vec<i64>>) -> Self {
+        Self {
+            rid,
+            corpus_id: Some(corpus_id),
+            file_path: None,
+            documents: None,
+            token_chunks: Some(token_chunks),
+        }
+    }
+}
+
+impl RemoveExternalCorpusReqInput {
+    pub fn new(rid: String, corpus_id: String) -> Self {
+        Self { rid, corpus_id }
+    }
+}
+
+impl ListExternalCorporaReqInput {
+    pub fn new(rid: String) -> Self {
+        Self { rid }
     }
 }
 

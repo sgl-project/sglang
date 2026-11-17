@@ -492,6 +492,9 @@ const RELAYED_BY: &[(&str, &[&str])] = &[
         "SendWeightsToRemoteInstanceReqInput",
         &["/send_weights_to_remote_instance"],
     ),
+    ("AddExternalCorpusReqInput", &["/add_external_corpus"]),
+    ("RemoveExternalCorpusReqInput", &["/remove_external_corpus"]),
+    ("ListExternalCorporaReqInput", &["/list_external_corpora"]),
     (
         "UpdateWeightFromDiskReqInput",
         &["/update_weights_from_disk"],

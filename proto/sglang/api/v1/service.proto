@@ -9,6 +9,7 @@ syntax = "proto3";
 package sglang.api.v1;
 
 import "sglang/api/v1/control.proto";
+import "sglang/api/v1/corpus.proto";
 import "sglang/api/v1/generate.proto";
 import "sglang/api/v1/hicache.proto";
 import "sglang/api/v1/parsers.proto";
@@ -106,6 +107,11 @@ service SglangService {
   // `/parse_function_call`, `/separate_reasoning`: frontend-only parsing.
   rpc ParseFunctionCall(ParseFunctionCallRequest) returns (ParseFunctionCallResponse);
   rpc SeparateReasoning(SeparateReasoningRequest) returns (SeparateReasoningResponse);
+
+  // `/add_external_corpus`, `/remove_external_corpus`, `/list_external_corpora`.
+  rpc AddExternalCorpus(AddExternalCorpusRequest) returns (AddExternalCorpusResponse);
+  rpc RemoveExternalCorpus(RemoveExternalCorpusRequest) returns (RemoveExternalCorpusResponse);
+  rpc ListExternalCorpora(ListExternalCorporaRequest) returns (ListExternalCorporaResponse);
 
   // `/freeze_gc`, `/pause_generation`, `/continue_generation`,
   // `/pd_role_switch`, `/update_weight_version`.
