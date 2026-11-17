@@ -133,10 +133,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     "--ep-num-redundant-experts",
     16,
     "--dp-size",
-    4,
-    "--enable-prefill-cp",
-    "--cp-strategy",
-    "zigzag",
+    16,
     "--optimistic-prefill-attempts",
     1,
     "--json-model-override-args",
@@ -145,6 +142,20 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     "stat",
     "--expert-distribution-recorder-buffer-size",
     512,
+    # DSPARK configuration, kept in sync with the decode node: the PD prefill
+    # worker prunes the draft to context-KV injection.
+    "--speculative-algorithm",
+    "DSPARK",
+    "--speculative-draft-model-path",
+    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
+    "--speculative-draft-model-quantization",
+    "modelslim",
+    "--speculative-draft-attention-backend",
+    "ascend",
+    "--speculative-num-draft-tokens",
+    6,
+    "--speculative-dspark-block-size",
+    5,
 ]
 
 # Decode node launch arguments for DSV4-Flash PD-Sep 128k1k
@@ -221,7 +232,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG = {
     "decode_args": DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ARGS,
     "prefill_envs": DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ENVS,
     "decode_envs": DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ENVS,
-    "router_args": ["--policy", "round_robin"],
+    "router_args": [],
     "router_envs": {},
 }
 
