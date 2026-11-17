@@ -425,9 +425,9 @@ def _madvise_random(storage: torch.Tensor, nbytes: int) -> None:
 
 
 def _alloc_cuda_host_table(shape: tuple, dtype: torch.dtype) -> torch.Tensor:
-    # Exact size: torch pin_memory would round the 47.7 GiB FP8 table of
-    # Qwen3.8-Flash-Next up to 64 GiB. Same call and flags as torch's pinned
-    # allocator (cudaHostAllocDefault).
+    # torch's pinned allocator rounds each block up to a power of two, pinning up
+    # to ~2x the requested size; cudaHostAlloc pins exactly nbytes and is freed
+    # with the table. Same call and flags as torch's (cudaHostAllocDefault).
     from sglang.srt.distributed.device_communicators.cuda_wrapper import (
         CudaRTLibrary,
     )
