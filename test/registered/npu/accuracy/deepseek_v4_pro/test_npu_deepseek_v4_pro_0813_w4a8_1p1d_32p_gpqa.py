@@ -41,6 +41,9 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_COMMON_ENVS = {
     "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
     "HCCL_SOCKET_IFNAME": NIC_NAME,
     "GLOO_SOCKET_IFNAME": NIC_NAME,
+    # mtp
+    "SGLANG_ENABLE_SPEC_V2": "1",
+    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     # dspark
     "SGLANG_DSPARK_FAST_SAMPLING": "0",
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "1800",
@@ -58,9 +61,6 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ENVS = {
 DEEPSEEK_V4_PRO_W4A8_PD_SEP_DECODE_ENVS = {
     **DEEPSEEK_V4_PRO_W4A8_PD_SEP_COMMON_ENVS,
     "DEEPEP_HCCL_BUFFSIZE": "1600",
-    # mtp
-    "SGLANG_ENABLE_SPEC_V2": "1",
-    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
 }
 
 # Prefill node launch arguments
@@ -103,9 +103,6 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ARGS = [
     "--deepep-mode",
     "auto",
     "--disable-cuda-graph",
-    "--enable-prefill-cp",
-    "--cp-strategy",
-    "interleave",
     "--enable-metrics",
     "--enable-cache-report",
     "--enable-hierarchical-cache",
@@ -117,6 +114,18 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ARGS = [
     "write_through",
     "--max-total-tokens",
     140000,
+    # DSPARK configuration, kept in sync with the decode node: the PD prefill
+    # worker prunes the draft to context-KV injection.
+    "--speculative-algorithm",
+    "DSPARK",
+    "--speculative-draft-model-path",
+    DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH,
+    "--speculative-draft-model-quantization",
+    "modelslim",
+    "--speculative-draft-attention-backend",
+    "ascend",
+    "--speculative-num-draft-tokens",
+    6,
 ]
 
 # Decode node launch arguments
@@ -176,7 +185,7 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_MODEL_CONFIG = {
     "decode_args": DEEPSEEK_V4_PRO_W4A8_PD_SEP_DECODE_ARGS,
     "prefill_envs": DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ENVS,
     "decode_envs": DEEPSEEK_V4_PRO_W4A8_PD_SEP_DECODE_ENVS,
-    "router_args": ["--policy", "round_robin"],
+    "router_args": [],
     "router_envs": {},
 }
 
