@@ -65,6 +65,10 @@ on:
           a pool that gets one later than its stages do.
         type: boolean
         default: false
+      sgl_router_artifact:
+        description: 'sgl-router-build''s artifact for the PD tests; empty falls back as download-sgl-router describes.'
+        type: string
+        default: ''
 
       scheduled:
         description: 'The caller is a nightly or weekly workflow, not a per-commit one. Switches on per-file timeouts derived from est_time, the full jit_kernel grids, metrics upload, and serial shards unless dispatched with full_parallel.'
@@ -132,7 +136,10 @@ jobs:
 
       - name: Resolve runner_config
         id: rc
-        run: python3 scripts/ci/runner_configs.py '${{ inputs.runner_config }}' >> "$GITHUB_OUTPUT"
+        run: |
+          python3 -c 'import yaml' 2>/dev/null ||
+            python3 -m pip install --disable-pip-version-check pyyaml
+          python3 scripts/ci/runner_configs.py '${{ inputs.runner_config }}' >> "$GITHUB_OUTPUT"
 
       - name: Export rdma_devices to job env
         run: echo "SGLANG_CI_RDMA_ALL_DEVICES=${{ steps.rc.outputs.rdma_devices || '' }}" >> "$GITHUB_ENV"
@@ -161,6 +168,12 @@ jobs:
         if: ${{ !inputs.skip_prebuilt_rust_ext }}
         with:
           artifact_name: ${{ inputs.rust_ext_artifact }}
+
+      # The PD fixture needs two GPUs, so 1-gpu pools never launch the router.
+      - uses: ./.github/actions/download-sgl-router
+        if: ${{ !startsWith(inputs.runner_config, '1-gpu') }}
+        with:
+          artifact_name: ${{ inputs.sgl_router_artifact }}
 
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(steps.rc.outputs.install_timeout) }}

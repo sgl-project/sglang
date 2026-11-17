@@ -567,8 +567,6 @@ def _run_per_token_group_quant_8bit_kernel(
     x_s: torch.Tensor,
     group_size: int,
     eps: float,
-    fp8_min: float,
-    fp8_max: float,
     *,
     scale_ue8m0: bool,
     fuse_silu_and_mul: bool,
@@ -576,35 +574,10 @@ def _run_per_token_group_quant_8bit_kernel(
 ) -> None:
     """Quantize into caller-owned ``x_q`` / ``x_s``.
 
-    CUDA routes to the JIT per_token_group_quant kernel; MUSA stays on the AOT
-    v2 op (the JIT kernel is CUDA-only), and the fp32-pow-2 storage flavor of
-    row-major UE8M0 (float32 ``x_s``, deep_gemm ``ceil_to_ue8m0`` convention)
-    stays on the JIT v2 baseline — per_token_group_quant only packs UE8M0 as
-    int32. The kernel bakes the quant constants in at compile time, so
-    drifted constants are rejected loudly here instead of silently quantizing
-    with different ones; unsupported shapes/layouts error inside its host
-    checks. Whole-row (per-token) quantization is a different op:
-    ``sglang_per_token_quant_fp8``.
+    CUDA uses JIT kernels with a fixed absmax floor and dtype-derived range.
+    The trait kernel handles FP32 power-of-two scales for flat BF16 group32
+    on Hopper; other FP32 power-of-two cases use v2. MUSA keeps the AOT op.
     """
-    if scale_ue8m0 and x_s.dtype == torch.float32 and not _is_musa:
-        from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
-            per_token_group_quant_8bit_v2,
-        )
-
-        per_token_group_quant_8bit_v2(
-            input=x,
-            output_q=x_q,
-            output_s=x_s,
-            group_size=group_size,
-            eps=eps,
-            min_8bit=fp8_min,
-            max_8bit=fp8_max,
-            scale_ue8m0=scale_ue8m0,
-            fuse_silu_and_mul=fuse_silu_and_mul,
-            masked_m=masked_m,
-        )
-        return
-
     if _is_musa:
         sgl_per_token_group_quant_8bit(
             x,
@@ -621,13 +594,37 @@ def _run_per_token_group_quant_8bit_kernel(
         )
         return
 
+    if (
+        scale_ue8m0
+        and x_s.dtype == torch.float32
+        and not (
+            x.dtype == torch.bfloat16
+            and x.ndim == 2
+            and x_s.is_contiguous()
+            and x_q.dtype == fp8_dtype
+            and group_size == 32
+            and eps == 1e-10
+            and not fuse_silu_and_mul
+            and masked_m is None
+        )
+    ):
+        from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
+            per_token_group_quant_8bit_v2,
+        )
+
+        per_token_group_quant_8bit_v2(
+            input=x,
+            output_q=x_q,
+            output_s=x_s,
+            group_size=group_size,
+            scale_ue8m0=scale_ue8m0,
+            fuse_silu_and_mul=fuse_silu_and_mul,
+            masked_m=masked_m,
+        )
+        return
+
     assert eps == 1e-10, (
         f"per_token_group_quant bakes the absmax floor in at 1e-10, got {eps}"
-    )
-    expected_range = (-448.0, 448.0) if x_q.dtype == fp8_dtype else (-128.0, 127.0)
-    assert (fp8_min, fp8_max) == expected_range, (
-        f"per_token_group_quant bakes the {x_q.dtype} quant range in at {expected_range}, "
-        f"got ({fp8_min}, {fp8_max})"
     )
     per_token_group_quant(
         x,
@@ -704,8 +701,6 @@ def sglang_per_token_group_quant_fp8(
             x_s,
             group_size,
             eps,
-            fp8_min,
-            fp8_max,
             scale_ue8m0=scale_ue8m0,
             fuse_silu_and_mul=fuse_silu_and_mul,
             masked_m=masked_m,
@@ -762,8 +757,6 @@ def sglang_per_token_group_quant_fp8_row_padded(
             x_s[:m],
             group_size,
             eps,
-            fp8_min,
-            fp8_max,
             scale_ue8m0=False,
             fuse_silu_and_mul=False,
             masked_m=None,
