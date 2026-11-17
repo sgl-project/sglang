@@ -10,6 +10,7 @@ import orjson
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
+from sglang.srt.constants import ROUTING_KEY_HEADER
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
@@ -260,7 +261,7 @@ class OpenAIServingBase(ABC):
     def extract_routing_key(self, raw_request):
         if raw_request is None:
             return None
-        return raw_request.headers.get("x-smg-routing-key")
+        return raw_request.headers.get(ROUTING_KEY_HEADER)
 
     def extract_routed_dp_rank_from_header(
         self, raw_request: Request, body_routed_dp_rank: Optional[int] = None

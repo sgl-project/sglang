@@ -1,5 +1,6 @@
-// Keep explicit model IDs aligned with multimodal_gen/registry.py. The unit
-// test for this component reports registry entries missing from the catalog.
+// List real Hugging Face repo IDs that resolve through the multimodal_gen
+// registry (hf_model_paths or a model detector in configs/pipeline_configs/*,
+// see registry.py). They may differ from the literal hf_model_paths entries.
 export const DiffusionModelCatalog = ({ category }) => {
   const MODEL_CATALOG = {
   image: [
@@ -84,7 +85,7 @@ export const DiffusionModelCatalog = ({ category }) => {
     },
     {
       name: "Krea-2",
-      modelIds: ["krea/Krea-2"],
+      modelIds: ["krea/Krea-2-Turbo", "krea/Krea-2-Raw"],
       cookbook: "/cookbook/diffusion/Krea/Krea-2",
     },
     {
@@ -102,9 +103,7 @@ export const DiffusionModelCatalog = ({ category }) => {
         "stabilityai/stable-diffusion-3-medium",
         "stabilityai/stable-diffusion-3-medium-diffusers",
         "stabilityai/stable-diffusion-3.5-medium",
-        "stabilityai/stable-diffusion-3.5-medium-diffusers",
         "stabilityai/stable-diffusion-3.5-large",
-        "stabilityai/stable-diffusion-3.5-large-diffusers",
       ],
     },
     {
