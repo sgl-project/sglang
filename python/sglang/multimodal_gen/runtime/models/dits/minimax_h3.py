@@ -1003,7 +1003,8 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
     # under graph capture the forward keeps the in-place norm, and the pipeline
     # runs from the attention core's eager break point instead
     if (
-        envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS in (0, 1)
+        not q.is_cuda  # pipelining is CUDA-only; torch.cuda calls fail on XPU
+        or envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS in (0, 1)
         or torch.cuda.is_current_stream_capturing()
     ):
         return None
