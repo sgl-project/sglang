@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import ctypes
-import itertools
 import logging
 import os
 import resource
@@ -197,23 +196,21 @@ def set_gpu_proc_affinity(gpu_id: int):
     nnodes_per_tp_group = max(parallel.nnodes // parallel.pp_size, 1)
     tp_size_per_node = parallel.tp_size // nnodes_per_tp_group
 
-    # total physical cores
     total_pcores = psutil.cpu_count(logical=False)
+    # Split the cores this process may use: a cpuset narrower than the host (e.g. a
+    # container's CPU slice) does not hold every host core id. Linux numbers core c's
+    # second thread c + total_pcores; it is bound together with its core.
+    allowed = set(p.cpu_affinity())
+    cores = sorted(c for c in allowed if c < total_pcores) or sorted(allowed)
     # physical cores per TP (N.B. more Cores than GPUs on node)
-    num_cores_bind = total_pcores // tp_size_per_node
+    num_cores_bind = max(len(cores) // tp_size_per_node, 1)
 
     # able to handle multiple DP per node
-    start_cpu_id = (gpu_id * num_cores_bind) % total_pcores
-    end_cpu_id = start_cpu_id + num_cores_bind
-
-    if psutil.cpu_count() != psutil.cpu_count(logical=False):
-        # HT on
-        lower_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
-        upper_cpu_ids = [id + total_pcores for id in range(start_cpu_id, end_cpu_id)]
-        bind_cpu_ids = list(itertools.chain(lower_cpu_ids, upper_cpu_ids))
-    else:
-        # HT off
-        bind_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
+    start = (gpu_id * num_cores_bind) % len(cores)
+    bound_cores = cores[start : start + num_cores_bind]
+    bind_cpu_ids = bound_cores + [
+        c + total_pcores for c in bound_cores if c + total_pcores in allowed
+    ]
 
     # set cpu_affinity to current process
     p.cpu_affinity(bind_cpu_ids)
