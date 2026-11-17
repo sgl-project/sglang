@@ -341,3 +341,18 @@ sglang serve \
 ```
 
 Front the server with `sgl-router --policy cache_aware --dp-aware`, so a multi-turn session lands on the DP rank already holding its prefix. The router learns prefixes only from the server's KV events, so add `--kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557"}' --load-publish-endpoint auto` to the server; each DP rank publishes on its own port from 5557.
+
+**DP attention, concurrency 128–256:** the DP2 command above, run on two GPUs or, with EP4, on four. A longer `--prefill-decode-interval` with `--schedule-policy shortest-prefill-first` limits how often a prefill on one rank stalls decode on every rank. The engram tables keep one host copy per node, and with EP, `SGLANG_DP_SHARED_EXPERT_LOCAL=1` runs the shared expert on each rank's local rows before the DP gather. Start from the DP2 command and change:
+
+| Deployment | DP2, c128 | DP2 + EP2, c128 | DP4 + EP4, c128 | DP4 + EP4, c256 |
+|---|---|---|---|---|
+| `--tp`, `--attn-dp-size` | 2 | 2 | 4 | 4 |
+| `--ep-size` | 1 | 2 | 4 | 4 |
+| `SGLANG_DP_SHARED_EXPERT_LOCAL` | unset | 1 | 1 | 1 |
+| `--prefill-decode-interval` | 24 | 32 | 32 | 40 |
+| `--chunked-prefill-size` | 32768 | 32768 | 32768 | 65536 |
+| `--max-running-requests` | 128 | 128 | 128 | 256 |
+| `--cuda-graph-max-bs-decode` | 64 | 64 | 64 | 128 |
+| `--prefill-delayer-token-usage-low-watermark` | 0.7 | 0.7 | 0.7 | 0.85 |
+
+In every column, also set `--mem-fraction-static 0.85`, `--swa-prefix-tails 4096`, `--schedule-policy shortest-prefill-first` and `--engram-config '{"placement": "cpu", "replication": "per_node"}'`, and front the server with the same router.
