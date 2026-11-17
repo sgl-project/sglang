@@ -72,6 +72,12 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
+from sglang.srt.layers.last_layer_ffn import (
+    FFN_GRAPH_ROWS,
+    FFN_GRAPH_VARIANT,
+    graph_rows_for_batch,
+    stage_graph_indices,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.mem_cache.kv.decl import STATE_PART
@@ -341,6 +347,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     _use_draft_input_embeds = False
     _fa4_prefill = False
+    _ffn_graph_enabled = False
     _backend_can_run_prefill_cuda_graph = None
     # The backend's batch-dependent check, judged from a ScheduleBatch for the DP vote.
     _backend_vote_prefill_cuda_graph = None
@@ -758,6 +765,26 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 max_req_slots=self._capture_req_slots,
             )
 
+        # Retain the ordinary graph and capture bounded-row
+        # variants as separate keys. Unsupported batches keep the ordinary key.
+        model = self.model_runner.model
+        self._ffn_graph_enabled = (
+            isinstance(self.backend, BreakableCudaGraphBackend)
+            and getattr(model, "_ffn_pruning_supported", False)
+            and getattr(model, "enable_last_layer_ffn_pruning", False)
+            and not getattr(model, "capture_aux_hidden_states", False)
+            and not getattr(self.layer_model, "layers_to_capture", ())
+            and self.model_runner.is_generation
+            and not self.enable_lora
+        )
+        self._ffn_graph_indices = (
+            torch.zeros(
+                max(FFN_GRAPH_ROWS), dtype=torch.int64, device=self.model_runner.device
+            )
+            if self._ffn_graph_enabled
+            else None
+        )
+
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
         get_parallel().tp_group.barrier()
@@ -1173,6 +1200,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _shape_key(self, num_tokens: int, forward_batch: ForwardBatch) -> ShapeKey:
         variant = None
+        if (
+            self._ffn_graph_enabled
+            and self.model_runner.model.enable_last_layer_ffn_pruning
+            and (rows := graph_rows_for_batch(forward_batch))
+        ):
+            return ShapeKey(size=num_tokens, variant_label=f"{FFN_GRAPH_VARIANT}{rows}")
         if self._capture_chunked_prefix:
             prefix_lens = forward_batch.extend_prefix_lens_cpu
             local_max_prefix_len = (
@@ -1865,6 +1898,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     f"Capturing prefill shape ({num_tokens=} {avail_mem=:.2f} GB)"
                 )
             self.capture_one_shape(num_tokens)
+            if self._ffn_graph_enabled:
+                for rows in FFN_GRAPH_ROWS:
+                    if rows <= num_tokens:
+                        self.capture_one_shape(num_tokens, ffn_rows=rows)
             if self._capture_chunked_prefix:
                 for captured_n in self._prefix_capture_variants:
                     self.capture_one_shape(
@@ -1872,12 +1909,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         prefix_num_chunks=captured_n,
                     )
 
-    def capture_one_shape(self, size: int, *, prefix_num_chunks: int = 0) -> None:
+    def capture_one_shape(
+        self, size: int, *, prefix_num_chunks: int = 0, ffn_rows: int = 0
+    ) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
         """
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
+        if ffn_rows:
+            assert not prefix_num_chunks
+            self._ffn_graph_indices.zero_()
+            forward_batch.last_layer_ffn_indices = self._ffn_graph_indices[:ffn_rows]
+            forward_batch.last_layer_ffn_graph_rows = ffn_rows
         # Recapture can follow decode replay, which may change model-owned storage.
         prepare = getattr(self.model_runner.model, "prepare_for_forward", None)
         if prepare is not None:
@@ -1903,9 +1947,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         shape_key = ShapeKey(
             size=num_tokens,
             variant_label=(
-                _chunked_prefix_variant(prefix_num_chunks)
-                if prefix_num_chunks
-                else None
+                f"{FFN_GRAPH_VARIANT}{ffn_rows}"
+                if ffn_rows
+                else (
+                    _chunked_prefix_variant(prefix_num_chunks)
+                    if prefix_num_chunks
+                    else None
+                )
             ),
         )
         if prefix_num_chunks:
@@ -2517,8 +2565,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
             shape_key = self._shape_key(static_num_tokens, forward_batch)
-            # The only variants this runner records are chunked-prefix ones.
-            if shape_key.variant_label is not None:
+            if (shape_key.variant_label or "").startswith(FFN_GRAPH_VARIANT):
+                rows = int(shape_key.variant_label.removeprefix(FFN_GRAPH_VARIANT))
+                stage_graph_indices(
+                    self._ffn_graph_indices, forward_batch.extend_seq_lens, rows
+                )
+                static_forward_batch.last_layer_ffn_graph_rows = rows
+                static_forward_batch.last_layer_ffn_indices = self._ffn_graph_indices[
+                    :rows
+                ]
+            elif shape_key.variant_label is not None:
                 self._prepare_chunked_prefix_replay(shape_key, forward_batch)
             # Publish after replay prep, including the chunked-prefix gather
             # above, which also reads the shared tables.

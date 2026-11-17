@@ -289,6 +289,7 @@ class Envs:
     # Model configuration, discovery, and weight loading
     # ===================================================================
     SGLANG_USE_MODELSCOPE = EnvBool(False)
+    SGLANG_ENABLE_LAST_LAYER_FFN_PRUNING = EnvBool(False)
     # Controls weight-file ordering for load-time I/O optimization.
     #   -1 : no sorting, no staggering; preserves original file order.
     #    0 : sort files only; maximizes ordering but may reduce cross-rank I/O concurrency.

@@ -2443,3 +2443,24 @@ MPS and does not read them.
     </tr>
   </tbody>
 </table>
+
+## Last-layer FFN pruning
+
+Set `SGLANG_ENABLE_LAST_LAYER_FFN_PRUNING=1` to compute the final decoder
+layer's FFN and final normalization only for the rows needed by next-token
+generation. The default is `false`.
+
+This preserves every attention operation and KV-cache write. It removes unused
+terminal computations without changing model weights or approximating the model.
+Reduced-precision GEMM rounding can differ when the number of rows changes.
+
+Supported models are dense, unquantized Qwen2 (including Qwen2.5) and Qwen3 on a
+single NVIDIA GPU, with tensor, pipeline, and context parallel sizes of one.
+The optimization applies to complete prefills with no cached prefix. Requests
+for prompt logprobs, hidden states, embeddings, speculative decoding, multimodal
+inputs, or LoRA use the original path, as do intermediate prefill chunks.
+
+With the breakable prefill CUDA graph backend, additional graph variants hold
+1, 4, or 16 selected rows. Batches larger than 16 use the ordinary graph.
+The additional variants increase graph capture work and graph storage.
+Eager prefill is also supported; other prefill graph backends use the original path.

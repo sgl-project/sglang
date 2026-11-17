@@ -630,6 +630,7 @@ class LogitsProcessor(nn.Module):
         logits_metadata: Union[LogitsMetadata, ForwardBatch],
         aux_hidden_states: Optional[AuxHiddenStates] = None,
         hidden_states_before_norm: Optional[torch.Tensor] = None,
+        last_layer_ffn_pruned: bool = False,
     ) -> LogitsProcessorOutput:
         # Extract MIS / setwise indices before ForwardBatch → LogitsMetadata conversion
         multi_item_delimiter_indices = None
@@ -700,6 +701,7 @@ class LogitsProcessor(nn.Module):
             hidden_states_before_norm,
             aux_hidden_states,
             logits_metadata,
+            already_pruned=last_layer_ffn_pruned,
         )
 
         hidden_states_to_store = self._get_hidden_states_to_store(
@@ -832,7 +834,15 @@ class LogitsProcessor(nn.Module):
         hidden_states_before_norm: Optional[torch.Tensor],
         aux_hidden_states: Optional[AuxHiddenStates],
         logits_metadata: LogitsMetadata,
+        already_pruned: bool = False,
     ):
+        if already_pruned:
+            assert logits_metadata.forward_mode.is_extend()
+            assert not logits_metadata.extend_return_logprob
+            assert logits_metadata.capture_hidden_mode == CaptureHiddenMode.NULL
+            assert hidden_states_before_norm is None and aux_hidden_states is None
+            assert hidden_states.shape[0] == len(logits_metadata.extend_seq_lens_cpu)
+            return hidden_states, None, None, None, None, []
         pruned_states_before_norm: Optional[torch.Tensor] = None
         aux_pruned_states = None
         token_to_seq_idx = []
