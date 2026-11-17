@@ -412,7 +412,7 @@ from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_captur
 from sglang.srt.state_capturer.routed_experts import destroy_global_experts_capturer
 from sglang.srt.utils import (
     DynamicGradMode,
-    configure_gc_logger,
+    configure_gc_logging,
     configure_logger,
     freeze_gc,
     get_available_gpu_memory,
@@ -1620,9 +1620,7 @@ class Scheduler(
             else None
         )
 
-        # Configure GC logger
-        if envs.SGLANG_LOG_GC.get():
-            configure_gc_logger()
+        configure_gc_logging("Scheduler")
 
     def init_disaggregation(self):
         self.mm_receiver = None
@@ -2100,9 +2098,7 @@ class Scheduler(
             result_dict["rust_server_pid"] = os.getpid()
         result_dict["hicache_object_layout"] = self._hicache_l3_layout()
 
-        if get_serving().grpc_port is not None and not (
-            get_serving().smg_grpc_mode or get_serving().grpc_mode
-        ):
+        if get_serving().grpc_port is not None:
             result_dict["kv_event_sources"] = (
                 self.kv_events_publisher.local_kv_event_sources(
                     self.page_size * get_parallel().dcp_size
