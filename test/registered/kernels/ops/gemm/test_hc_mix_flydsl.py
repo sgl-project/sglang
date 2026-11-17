@@ -203,14 +203,14 @@ def _spy_split_k_down(monkeypatch):
 
 @requires_gfx950
 @pytest.mark.parametrize(
-    "rows", [_MAX_ROWS + 1, 160, 176, 208, 255, 300, 511, 512, 513, 1025, 16384]
+    "rows", [_MAX_ROWS + 1, 160, 176, 208, 255, 300, 511, 512, 513, 1024, 1025, 16384]
 )
 def test_prefill_mix_and_combine_match_reference(monkeypatch, rows):
     # Up to 512 rows (a one-row tail after the 64-row tiles at 129, ragged at 255 and
     # 511, full at 512, verify batches of 4 rows a request among them): the split-K down
-    # kernel. 513 is the first row of the bmm path; 1025 and 16384 are the ends of its
-    # two up-kernel launch configs (a one-row tail after full blocks) and the served
-    # prefill chunk.
+    # kernel. 513 is the first row of the bmm path; 1024 and 1025 are the last and the
+    # first row of its two up-kernel launch configs (1025 a one-row tail after full
+    # blocks); 16384 is the served prefill chunk.
     launched = _spy_split_k_down(monkeypatch)
     site, unfused = _make_site(enabled=True), _make_site(enabled=False)
     h, y = _make_inputs(rows)
@@ -293,6 +293,41 @@ def test_up_kernel_is_bitwise_the_same_on_either_grid(rows):
             xcd_order=xcd_order,
         )
     assert torch.equal(xcd_ordered, row_major)
+
+
+@requires_gfx950
+def test_rejects_operands_the_kernels_cannot_read():
+    from sglang.kernels.ops.gemm.hc_prefill_triton import (
+        hc_prefill_combine,
+        hc_prefill_weights_supported,
+    )
+
+    site = _make_site(enabled=True)
+    down, up, norm_weight = (
+        site.input_mix_weight_down.weight,
+        site.input_mix_weight_up.weight,
+        site.hc_norm.weight,
+    )
+    assert hc_prefill_weights_supported(down, up, norm_weight, HC)
+    # The up kernel reads the up weight and the norm weight row-major.
+    column_major_up = up.T.contiguous().T
+    assert not hc_prefill_weights_supported(down, column_major_up, norm_weight, HC)
+    strided_norm_weight = torch.empty(2 * K, device="cuda", dtype=torch.bfloat16)[::2]
+    assert not hc_prefill_weights_supported(down, up, strided_norm_weight, HC)
+
+    def combine(hs):
+        return hc_prefill_combine(
+            torch.zeros((4, HC * hs), device="cuda", dtype=torch.bfloat16),
+            torch.zeros((4, hs), device="cuda", dtype=torch.bfloat16),
+            torch.zeros((4, HC), device="cuda", dtype=torch.float32),
+            HC,
+        )
+
+    # The combine's 512-column blocks are not masked: a hidden size they do not tile
+    # would leave its tail columns unwritten.
+    assert combine(HS).shape == (4, K)
+    with pytest.raises(ValueError):
+        combine(HS + 64)
 
 
 @requires_gfx950

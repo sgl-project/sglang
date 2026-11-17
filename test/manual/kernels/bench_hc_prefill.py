@@ -20,6 +20,10 @@ repetition and each time the median:
   bmm, control and split_k arms only. Qwen3.8-Flash-Next's 96 target-model sites are
   96 / --chain-sites replays.
 
+Every arm's mixed input, inject logits and combined residual are compared with an FP32
+reference built from the site's weights. An error is max |actual - ref| / max |ref|
+(the max error) or RMS(actual - ref) / RMS(ref) (the RMS error), over all elements.
+
 TorchInductor reads TORCHINDUCTOR_MAX_AUTOTUNE at import, so --also-without-autotune
 repeats the run in a second process with it and TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE set
 to 0. The kernel names of one call of every arm are recorded, and the run fails if an
@@ -106,8 +110,9 @@ def expected_kernels(arm_name, rows):
     ]
 
 
-def reference(site, h, y):
-    """The site in FP32: mixed [M, HS] and combined [M, K]."""
+def reference_mix(site, h):
+    """The mix of a site in FP32 from its parameters: mixed [M, HS] and inject logits
+    [M, HC]. ``h`` may already be FP32."""
     rows = h.shape[0]
     hf = h.float().view(rows, HC, HS)
     rstd = torch.rsqrt(hf.pow(2).mean(-1, keepdim=True) + EPS)
@@ -117,13 +122,24 @@ def reference(site, h, y):
     )
     gate = torch.sigmoid(t @ site.input_mix_weight_up.weight.float().T)
     mixed = (gate * normed).view(rows, HC, HS).mean(1)
-    inject = 2 * torch.sigmoid(normed @ site.block_inject_weight.weight.float().T / HC)
-    combined = (hf + inject[..., None] * y.float()[:, None, :]).reshape(rows, K)
-    return mixed, combined
+    return mixed, normed @ site.block_inject_weight.weight.float().T
 
 
-def relative_error(actual, ref):
-    return ((actual.float() - ref).abs().max() / ref.abs().max()).item()
+def reference_combine(h, logits, y):
+    """h + 2 sigmoid(logits / HC) * y per branch in FP32: [M, K]."""
+    rows = h.shape[0]
+    inject = 2 * torch.sigmoid(logits / HC)
+    combined = h.float().view(rows, HC, HS) + inject[..., None] * y.float()[:, None, :]
+    return combined.reshape(rows, K)
+
+
+def errors(actual, ref):
+    """(max error, RMS error) of ``actual`` against the FP32 ``ref``."""
+    diff = actual.float() - ref
+    return (
+        (diff.abs().max() / ref.abs().max()).item(),
+        (diff.pow(2).mean().sqrt() / ref.pow(2).mean().sqrt()).item(),
+    )
 
 
 def timed_replay(graph, flush_buffer):
@@ -181,9 +197,8 @@ class SiteArm:
     def __init__(self, name, site, h, y):
         self.name, self.site, self.h, self.y = name, site, h, y
         with arm_context(name):
-            for _ in range(
-                3
-            ):  # compile, and build the folded weights, outside the capture
+            # Compile, and build the folded weights, outside the capture.
+            for _ in range(3):
                 self.site.combine(self.y, self.site.mix(self.h)[1])
             torch.cuda.synchronize()
             self.mix_graph, self.combine_graph = (
@@ -191,9 +206,9 @@ class SiteArm:
                 torch.cuda.CUDAGraph(),
             )
             with torch.cuda.graph(self.mix_graph):
-                self.mixed, residuals = self.site.mix(self.h)
+                self.mixed, self.residuals = self.site.mix(self.h)
             with torch.cuda.graph(self.combine_graph):
-                self.combined = self.site.combine(self.y, residuals)
+                self.combined = self.site.combine(self.y, self.residuals)
             self.kernels = kernel_names(
                 lambda: self.site.combine(self.y, self.site.mix(self.h)[1])
             )
@@ -203,6 +218,15 @@ class SiteArm:
         self.samples["mix_us"].append(timed_replay(self.mix_graph, flush_buffer))
         self.samples["combine_us"].append(
             timed_replay(self.combine_graph, flush_buffer)
+        )
+
+    def inject_logits(self):
+        """The prefill path returns them; the unfused path's are what its combine forms
+        from the normed residual in BF16."""
+        if self.residuals[1] is None:
+            return self.residuals[2]
+        return torch.nn.functional.linear(
+            self.residuals[1].float(), self.site.block_inject_weight.weight.float()
         )
 
 
@@ -238,7 +262,8 @@ def run_rows(rows, args, flush_buffer):
         SiteArm(name, make_site(name in ("bmm", "control", "split_k")), h, y)
         for name in ARMS
     ]
-    want_mixed, want_combined = reference(site_arms[0].site, h, y)
+    want_mixed, want_logits = reference_mix(site_arms[0].site, h)
+    want_combined = reference_combine(h, want_logits, y)
     for arm in site_arms:
         check_kernels(arm.name, rows, arm.kernels)
     chain_arms = []
@@ -263,8 +288,15 @@ def run_rows(rows, args, flush_buffer):
             "site_us": statistics.median(site),
             "site_us_p10": quantile(site, 10),
             "site_us_p90": quantile(site, 90),
-            "mixed_error": relative_error(arm.mixed, want_mixed),
-            "combined_error": relative_error(arm.combined, want_combined),
+            **{
+                f"{quantity}_{kind}_err": value
+                for quantity, actual, ref in (
+                    ("mixed", arm.mixed, want_mixed),
+                    ("logits", arm.inject_logits(), want_logits),
+                    ("combined", arm.combined, want_combined),
+                )
+                for kind, value in zip(("max", "rms"), errors(actual, ref))
+            },
             "kernels": arm.kernels,
         }
     for name in ("bmm", "control", "split_k"):
@@ -330,8 +362,9 @@ def print_table(results):
         "site us",
         "vs unfused",
         "vs bmm",
-        "mixed err",
-        "comb err",
+        "mixed max",
+        "logits max",
+        "comb max",
         "verify ms",
         "saved site",
         "saved chain",
@@ -352,7 +385,8 @@ def print_table(results):
                 f"{row['site_us']:>12.1f}"
                 f"{pct(row.get('site_vs_unfused_pct')):>12}"
                 f"{pct(row.get('site_vs_bmm_pct')):>12}"
-                f"{row['mixed_error']:>12.5f}{row['combined_error']:>12.5f}"
+                f"{row['mixed_max_err']:>12.5f}{row['logits_max_err']:>12.5f}"
+                f"{row['combined_max_err']:>12.5f}"
                 f"{ms(chain.get('verify_ms')):>12}"
                 f"{ms(row.get('verify_ms_saved_vs_bmm')):>12}"
                 f"{ms(chain.get('verify_ms_saved_vs_bmm')):>12}"

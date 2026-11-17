@@ -41,10 +41,13 @@ def _sigmoid(v):
 
 
 @triton.jit
-def _xcd_order(program_id, num_tiles, NUM_XCDS: tl.constexpr):
-    """(group, tile) of ``program_id`` in a 1-D grid of num_groups * num_tiles programs,
-    num_groups % NUM_XCDS == 0. The programs of a group share program_id % NUM_XCDS:
-    workgroups go to the XCDs round-robin, so a group stays on one XCD and its L2."""
+def _xcd_order(program_id, num_tiles, NUM_GROUPS: tl.constexpr, NUM_XCDS: tl.constexpr):
+    """(group, tile) of ``program_id`` in a 1-D grid of NUM_GROUPS * num_tiles programs.
+    The programs of a group share program_id % NUM_XCDS: workgroups go to the XCDs
+    round-robin, so a group stays on one XCD and its L2."""
+    tl.static_assert(
+        NUM_GROUPS % NUM_XCDS == 0, "a group count that is not a multiple of NUM_XCDS"
+    )
     quotient = program_id // NUM_XCDS
     group = program_id % NUM_XCDS + NUM_XCDS * (quotient // num_tiles)
     return group, quotient % num_tiles
@@ -99,12 +102,14 @@ def _hc_prefill_down_kernel(
 ):
     """partial[s, m, n] = sum over K slice s of hidden[m, k] * weight[n, k], in BF16.
 
-    1-D grid of SPLITS * cdiv(M, BLOCK_M) * cdiv(PARTIAL_COLS, BLOCK_N) programs,
-    SPLITS % NUM_XCDS == 0; K % (SPLITS * BLOCK_K) == 0."""
+    1-D grid of SPLITS * cdiv(M, BLOCK_M) * cdiv(PARTIAL_COLS, BLOCK_N) programs."""
+    tl.static_assert(K % (SPLITS * BLOCK_K) == 0, "the K slices do not tile K")
     SLICE_K: tl.constexpr = K // SPLITS
     NUM_COL_TILES: tl.constexpr = (PARTIAL_COLS + BLOCK_N - 1) // BLOCK_N
     num_row_tiles = tl.cdiv(M, BLOCK_M)
-    split, tile = _xcd_order(tl.program_id(0), num_row_tiles * NUM_COL_TILES, NUM_XCDS)
+    split, tile = _xcd_order(
+        tl.program_id(0), num_row_tiles * NUM_COL_TILES, SPLITS, NUM_XCDS
+    )
     rows = tile % num_row_tiles * BLOCK_M + tl.arange(0, BLOCK_M)
     row_mask = rows < M
     rows64 = rows.to(tl.int64)
@@ -221,8 +226,8 @@ def _hc_prefill_up_kernel(
     n = b * HS + j.
 
     Grid (cdiv(M, BLOCK_M), HS // BLOCK_J), or with NUM_XCDS > 0 one dimension of
-    cdiv(M, BLOCK_M) * (HS // BLOCK_J) programs, (HS // BLOCK_J) % NUM_XCDS == 0, where
-    the row tiles of a column block share program_id % NUM_XCDS. One
+    cdiv(M, BLOCK_M) * (HS // BLOCK_J) programs, where the row tiles of a column block
+    share program_id % NUM_XCDS. One
     [BLOCK_M, HC * BLOCK_J] GEMM tile per CTA whose columns are the HC branches' copies
     of hidden units j; the low-rank dimension is the K loop in BLOCK_R chunks, and the
     branch mean reduces the tile's HC column groups.
@@ -232,7 +237,9 @@ def _hc_prefill_up_kernel(
     if NUM_XCDS == 0:
         pid_m, pid_j = tl.program_id(0), tl.program_id(1)
     else:
-        pid_j, pid_m = _xcd_order(tl.program_id(0), tl.cdiv(M, BLOCK_M), NUM_XCDS)
+        pid_j, pid_m = _xcd_order(
+            tl.program_id(0), tl.cdiv(M, BLOCK_M), HS // BLOCK_J, NUM_XCDS
+        )
     rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     row_mask = rows < M
     rows64 = rows.to(tl.int64)
@@ -302,7 +309,8 @@ _UP_BLOCK_J, _UP_BLOCK_R = 32, 64
 _COMBINE_BLOCK_J = 512
 # Split-K path: K splits into _SPLITS_PER_BRANCH slices per branch. The support check
 # (HC 4, hidden a multiple of 512) makes the 16 slices a multiple of _NUM_XCDS, a slice
-# a multiple of _DOWN_BLOCK_K and the up grid's column blocks a multiple of _NUM_XCDS.
+# a multiple of _DOWN_BLOCK_K and the up grid's column blocks a multiple of _NUM_XCDS;
+# the kernels static-assert each, so a changed constant fails to compile.
 # _SPLIT_K_MAX_ROWS: the largest row count the path was measured against torch.bmm at.
 _SPLIT_K_MAX_ROWS = 512
 _SPLITS_PER_BRANCH = 4
@@ -334,11 +342,14 @@ def fold_hc_prefill_weights(
     return F.pad(folded, (0, 0, 0, -folded.shape[0] % 16)).to(torch.bfloat16)
 
 
-def hc_prefill_weights_supported(down: torch.Tensor, up: torch.Tensor, hc: int) -> bool:
+def hc_prefill_weights_supported(
+    down: torch.Tensor, up: torch.Tensor, norm_weight: torch.Tensor, hc: int
+) -> bool:
     """Architecture and weight-shape half of the check.
 
     None of it changes after the weights are loaded, so callers evaluate it once per
-    layer. ``down`` is [LOWRANK, HC * HIDDEN] and ``up`` [HC * HIDDEN, LOWRANK].
+    layer. ``down`` is [LOWRANK, HC * HIDDEN], ``up`` [HC * HIDDEN, LOWRANK] and
+    ``norm_weight`` [HC * HIDDEN]; the kernels read the last two row-major.
     """
     hip = current_arch().hip
     lowrank, k = down.shape
@@ -350,6 +361,8 @@ def hc_prefill_weights_supported(down: torch.Tensor, up: torch.Tensor, hc: int) 
         and (k // hc) % _COMBINE_BLOCK_J == 0
         and lowrank % _UP_BLOCK_R == 0
         and up.dtype == torch.bfloat16
+        and up.is_contiguous()
+        and norm_weight.is_contiguous()
     )
 
 
@@ -519,12 +532,13 @@ def hc_prefill_combine(
     2 * sigmoid(``inject_logits`` [M, HC] FP32 / HC), per branch, in BF16.
 
     ``inject_logits`` is what ``hc_prefill_mix`` returned for ``hidden``. All three
-    must be contiguous.
+    must be contiguous, and HS a multiple of 512.
     """
     rows, k = hidden.shape
     hs = k // hc
     if (
-        hidden.dtype != torch.bfloat16
+        hs % _COMBINE_BLOCK_J != 0
+        or hidden.dtype != torch.bfloat16
         or not hidden.is_contiguous()
         or block_output.shape != (rows, hs)
         or not block_output.is_contiguous()

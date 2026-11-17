@@ -234,6 +234,7 @@ class GatedResidual(HyperConnectionBase):
             self._hc_prefill_ok = hc_prefill_weights_supported(
                 self.input_mix_weight_down.weight,
                 self.input_mix_weight_up.weight,
+                self.hc_norm.weight,
                 self.hc_count,
             )
         self._hc_prefill_folded_weight = None
