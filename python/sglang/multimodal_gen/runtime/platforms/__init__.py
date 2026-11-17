@@ -57,8 +57,6 @@ def cuda_platform_plugin() -> str | None:
             raise e
 
         # CUDA is supported on Jetson, but NVML may not be.
-        import os
-
         def cuda_is_jetson() -> bool:
             return os.path.isfile("/etc/nv_tegra_release") or os.path.exists(
                 "/sys/class/tegra-firmware"

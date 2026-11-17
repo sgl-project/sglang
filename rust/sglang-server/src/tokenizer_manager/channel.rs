@@ -48,9 +48,10 @@ impl ToSchedulerTx {
         self.tx.try_send(msg).is_ok()
     }
 
-    /// Reserved, unbounded lane for scheduler cancellation. Active-request
-    /// cardinality bounds this queue, and request-ring saturation must not make
-    /// cancellation lossy.
+    /// Reserved, unbounded lane for scheduler cancellation and the one-way
+    /// control messages nothing retries. Active-request cardinality bounds
+    /// the aborts (the one-way messages are one-off), and request-ring
+    /// saturation must not make either lossy.
     #[inline]
     pub fn push_priority(&self, msg: SchedulerRequest) -> bool {
         self.priority_tx.send(msg).is_ok()

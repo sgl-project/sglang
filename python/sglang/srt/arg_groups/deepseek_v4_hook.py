@@ -111,7 +111,13 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
             logger.warning(
                 "%s deprecated; use --engram-config '%s' instead.",
                 ", ".join(legacy),
-                json.dumps(dataclasses.asdict(config)),
+                json.dumps(
+                    {
+                        k: v
+                        for k, v in dataclasses.asdict(config).items()
+                        if k in ("placement", "replication", "lookup")
+                    }
+                ),
             )
     else:
         if legacy:
@@ -138,6 +144,17 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
         raise ValueError(
             "--engram-config: replication 'per_node' needs the TP group on one node."
         )
+    if config.replication == EngramReplication.GROUP_SHARDS:
+        if config.group_size < cfg.tp_size:
+            raise ValueError(
+                "--engram-config: replication 'group_shards' needs 'group_size' of "
+                "at least --tp-size."
+            )
+        if cfg.pp_size > 1:
+            raise ValueError(
+                "--engram-config: replication 'group_shards' does not support "
+                "pipeline parallelism."
+            )
     declare_resolution(server_args, "_resolve_engram_config", engram_config=config)
     logger.info("DeepSeek-V4.1 Engram tables: %s", config)
 
@@ -151,7 +168,7 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     # (MI355X), which breaks the disaggregation nightly. Keep the previous
     # (dense prefill) behavior on ROCm until the sparse kernel is validated
     # there;
-    if get_platform().is_hip:
+    if get_platform().is_hip and not envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.is_set():
         logger.warning(
             "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL by default on ROCm/HIP "
             f"for {model_arch}; set it explicitly to override."
@@ -465,6 +482,11 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             )
 
     incompatible = (
+        (
+            "prefill CP with the prefill CUDA graph",
+            (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
+            and cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+        ),
         (
             "the prefill CUDA graph",
             cfg.cuda_graph_config.prefill.backend

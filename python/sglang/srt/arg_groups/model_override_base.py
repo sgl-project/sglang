@@ -58,6 +58,22 @@ def register_model_override_predicate(predicate: Callable[[str], bool]):
     return decorator
 
 
+# --moe-a2a-backend values DSpark with DP attention is validated on, per
+# architecture that differs from the default.
+DSPARK_DP_A2A_BACKENDS_DEFAULT: Tuple[str, ...] = ("none", "megamoe", "mori")
+_DSPARK_DP_A2A_BACKENDS: Dict[str, Tuple[str, ...]] = {}
+
+
+def register_dspark_dp_a2a_backends(
+    architecture: str, backends: Tuple[str, ...]
+) -> None:
+    _DSPARK_DP_A2A_BACKENDS[architecture] = backends
+
+
+def dspark_dp_a2a_backends(architecture: str) -> Tuple[str, ...]:
+    return _DSPARK_DP_A2A_BACKENDS.get(architecture, DSPARK_DP_A2A_BACKENDS_DEFAULT)
+
+
 def _invoke_provider(
     fn: Callable[..., dict], server_args: Any, hf_config: Any
 ) -> Dict[str, Any]:
@@ -261,8 +277,25 @@ def startup_weight_load_overlap_of(cfg: Any) -> bool:
     return cfg.startup_weight_load_mode == "overlap"
 
 
+def decode_state_free_radix_of(cfg: Any) -> bool:
+    """Whether a PD decode radix tree keeps FULL KV only; hybrid-SSM models only."""
+    from sglang.srt.environ import envs
+
+    # Partial configs (e.g. golden tests) carry no PD fields.
+    if not (
+        getattr(cfg, "disaggregation_mode", None) == "decode"
+        and bool(cfg.disaggregation_decode_enable_radix_cache)
+        and cfg.disable_radix_cache is False
+    ):
+        return False
+    forced = envs.SGLANG_DECODE_STATE_FREE_RADIX.get()
+    return cfg.decode_state_free_radix_default if forced is None else forced
+
+
 def mamba_extra_buffer_of(cfg: Any) -> bool:
     """Return whether the resolved Mamba cache strategy requires an extra buffer."""
+    if decode_state_free_radix_of(cfg):
+        return False
     return cfg.disable_radix_cache is False and cfg.mamba_radix_cache_strategy in (
         "extra_buffer",
         "extra_buffer_lazy",

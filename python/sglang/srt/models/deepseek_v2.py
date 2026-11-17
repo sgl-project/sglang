@@ -70,8 +70,9 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
-from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+from sglang.srt.layers.attention.dsa.dsa_fp4_indexer import dsa_indexer_cls
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
+from sglang.srt.layers.attention.dsa.dsa_token_shard import dsa_token_shard_enabled
 from sglang.srt.layers.attention.dsa.utils import (
     maybe_prefetch_next_full_attention_kv,
 )
@@ -286,7 +287,6 @@ _moe_quant_once_logged = False
 _enable_pcg_dsv2_dual_stream = (
     _is_cuda and envs.SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM.get()
 )
-_hip_shared_act_mxfp8 = _is_hip and envs.SGLANG_HIP_SHARED_ACT_MXFP8.get()
 
 
 class DeepseekV2MLP(nn.Module):
@@ -442,12 +442,11 @@ class DeepseekV2MLP(nn.Module):
         if self.use_fused_clamp_act_mul and not self._fused_clamp_fp8_checked:
             _hip_act.resolve_fused_clamp_route(self, gate_up.shape[-1] // 2)
 
-        # SGLANG_HIP_SHARED_ACT_MXFP8: an MXFP8 down_proj takes fp8 + ue8m0 straight from the Triton
-        # epilogue instead of aiter's bf16 output plus a separate quant launch.
+        # an MXFP8 down_proj takes fp8 + ue8m0 straight from the Triton epilogue instead of
+        # aiter's bf16 output plus a separate quant launch.
         if (
             self.use_fused_clamp_act_mul
             and self.swiglu_limit is not None
-            and _hip_shared_act_mxfp8
             and self._hip_act_fp8_grid
         ):
             x = _hip_act.silu_and_mul_clamp(self, gate_up)
@@ -1799,7 +1798,7 @@ class DeepseekV2MoE(nn.Module):
     ):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
             if pre_quant_input is None and _is_hip:
-                # SGLANG_HIP_FFN_NORM_MXFP8: the FFN norm launch's fp8 + ue8m0 of these rows
+                # the gfx950 FFN norm launch's fp8 + ue8m0 of these rows
                 pre_quant_input = getattr(hidden_states, "_hip_mxfp8_operand", None)
             if pre_quant_input is not None:
                 # SGLANG_OPT_MOE_QUANT_ONCE: (q, s) rows may be padded to a
@@ -2180,7 +2179,9 @@ class DeepseekV2AttentionMLA(
             if not self.skip_topk or is_nextn:
                 is_neox_style = not getattr(config, "indexer_rope_interleave", False)
                 indexer_cls = (
-                    IndexerKPool if get_dsa_index_kpool(config) > 1 else Indexer
+                    IndexerKPool
+                    if get_dsa_index_kpool(config) > 1
+                    else dsa_indexer_cls()
                 )
                 indexer_kwargs = dict(
                     hidden_size=hidden_size,
@@ -2271,6 +2272,22 @@ class DeepseekV2AttentionMLA(
                 sliding_window_size=sliding_window_size,
                 quant_config=quant_config,
                 attn_type=attn_type,
+                prefix=add_prefix("attn_mqa", prefix),
+            )
+
+        # DSA token-shard: every head for this rank's slice of the tokens; the
+        # weights stay head-sharded. ``use_dsa``, not ``indexer is not None``: a
+        # skip-topk layer owns no Indexer but still attends, so it needs this.
+        self.attn_mqa_for_dsa_token_shard = None
+        if self.use_dsa and dsa_token_shard_enabled():
+            self.attn_mqa_for_dsa_token_shard = RadixAttention(
+                self.num_heads,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                self.scaling,
+                num_kv_heads=1,
+                layer_id=layer_id,
+                v_head_dim=self.kv_lora_rank,
+                quant_config=quant_config,
                 prefix=add_prefix("attn_mqa", prefix),
             )
 
@@ -3157,6 +3174,7 @@ class DeepseekV2Model(nn.Module):
         self.layers_to_capture = []
         self.enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_ascend_ops()
             or get_moe_a2a_backend().is_mooncake()
             or get_moe_a2a_backend().is_deepep_v2()
         )
