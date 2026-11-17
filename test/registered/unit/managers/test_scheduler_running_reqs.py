@@ -36,7 +36,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.test.scheduler_test_utils import empty_request_lists
+from sglang.test.scheduler_test_utils import empty_request_lists, leaving_retirer
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -157,8 +157,9 @@ class TestRequestListsCheck(CustomTestCase):
 
     def test_fails_a_request_owned_by_another_list(self):
         req = _req("a")
-        move([req], self.s.running_reqs)
-        req.owner_list = self.s.waiting_queue
+        move([req], IndexedReqList(ListKind.WAITING))
+        # Corrupt the lists: running also holds the request another list owns.
+        self.s.running_reqs._reqs[req] = None
 
         with self.assertRaisesRegex(
             RuntimeError, "a is in DECODING but owned by WAITING"
@@ -341,6 +342,7 @@ class TestRunningReqsHooks(CustomTestCase):
 
         def process_batch_result(batch, result):
             _finish(done)
+            leaving_retirer().release(done, checkpoint=True)
             s._on_step_processed(batch, result)
 
         s.run_batch = run_batch
@@ -395,7 +397,11 @@ class TestRunningReqsHooks(CustomTestCase):
         move([waiting], s.waiting_queue)
         s.min_free_slots_delayer = None
         s.get_num_allocatable_reqs = lambda *args, **kwargs: 0
-        s.policy = Mock(calc_priority=lambda waiting, *args, **kwargs: list(waiting))
+        s.policy = Mock(
+            _bounded_active=False,
+            calc_priority=lambda waiting, *args, **kwargs: list(waiting),
+            admission_candidates=lambda waiting: iter(waiting),
+        )
         s.disagg_prefill_bootstrap_queue = None
         s.chunked_prefill_size = 8192
         s.dynamic_chunk_sizer = None
@@ -468,6 +474,7 @@ class TestPriorityPreemptionUnderUnifiedMemory(CustomTestCase):
         s.enable_priority_scheduling = True
         s.schedule_low_priority_values_first = False
         s.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        s.dllm_config = None
         Scheduler.init_schedule_policy(s)
         return s.enable_priority_preemption
 

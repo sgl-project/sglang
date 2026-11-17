@@ -94,9 +94,19 @@ def chunk_gated_delta_rule_fwd(
         return g, o, A, w, h, v_new
 
 
+def _has_packed_slots(state: torch.Tensor) -> bool:
+    # Each slot's [H, V, K] state is contiguous and no two slots overlap; only
+    # the slot stride may exceed a packed pool's.
+    return state.is_contiguous() or (
+        state[0].is_contiguous() and state.stride(0) >= state[0].numel()
+    )
+
+
 class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
     @staticmethod
-    @input_guard
+    # The kernels step initial_state's slots by its stride(0), so a strided
+    # pool is read and updated in place; chunk_gated_delta_rule packs each slot.
+    @input_guard(keep_strides=("initial_state",))
     @autocast_custom_fwd
     def forward(
         ctx,
@@ -298,6 +308,8 @@ def chunk_gated_delta_rule(
             )
     if scale is None:
         scale = k.shape[-1] ** -0.5
+    if initial_state is not None and not _has_packed_slots(initial_state):
+        initial_state = initial_state.contiguous()
     o, h = ChunkGatedDeltaRuleFunction.apply(
         q,
         k,
