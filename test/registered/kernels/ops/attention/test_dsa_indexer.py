@@ -1596,6 +1596,7 @@ class TestDSAIndexer(CustomTestCase):
                 backend.dsa_decode_impl = "fa3"
                 backend._flashmla_kv_pad_q_in_place = False
                 backend._trtllm_fused_q = False
+                backend.num_q_heads = 64
                 backend._memory_saver_adapter = TorchMemorySaverAdapter.create(
                     enable=False
                 )
