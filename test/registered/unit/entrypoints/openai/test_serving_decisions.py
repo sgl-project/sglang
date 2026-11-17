@@ -1295,6 +1295,9 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
         from fastapi.exceptions import RequestValidationError
 
         from sglang.srt.entrypoints.http_server import validation_exception_handler
+        from sglang.srt.entrypoints.openai.chat_encoding_adapters import (
+            OPENAI_CHAT_WIRE,
+        )
 
         # The input echo is left out, since JSON encoding can fail on it.
         nested = []
@@ -1316,6 +1319,11 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
             return SimpleNamespace(
                 url=SimpleNamespace(path=root_path + path),
                 scope={"root_path": root_path},
+                app=SimpleNamespace(
+                    state=SimpleNamespace(
+                        openai_serving_chat=SimpleNamespace(chat_wire=OPENAI_CHAT_WIRE)
+                    )
+                ),
             )
 
         for root_path in ["", "/prefix"]:

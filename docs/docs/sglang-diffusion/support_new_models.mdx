@@ -289,22 +289,16 @@ class MyModelPipelineConfig(ImagePipelineConfig):
     dit_config: DiTConfig = field(default_factory=MyModelDiTConfig)
     vae_config: VAEConfig = field(default_factory=MyModelVAEConfig)
 
-    def prepare_pos_cond_kwargs(self, batch, latent_model_input, t, **kwargs):
-        return {
-            "hidden_states": latent_model_input,
-            "encoder_hidden_states": batch.prompt_embeds[0],
-            "timestep": t,
-        }
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        # Extra DiT forward() kwargs only. DenoisingStage already passes
+        # hidden_states, timestep and encoder_hidden_states (from get_pos_prompt_embeds).
+        return {}
 
-    def prepare_neg_cond_kwargs(self, batch, latent_model_input, t, **kwargs):
-        return {
-            "hidden_states": latent_model_input,
-            "encoder_hidden_states": batch.negative_prompt_embeds[0],
-            "timestep": t,
-        }
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        return {}
 ```
 
-Make these kwargs match the denoising module's `forward()` signature exactly.
+Return only the extra kwargs your DiT `forward()` needs beyond `hidden_states`, `timestep` and `encoder_hidden_states`; override `get_pos_prompt_embeds`/`get_neg_prompt_embeds` to change the text embeddings passed.
 
 ### 3. Pipeline Wiring
 

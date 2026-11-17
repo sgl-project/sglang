@@ -24,6 +24,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -109,7 +110,8 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     tree_cache.check_hicache_events = MagicMock()
     s.tree_cache = tree_cache
     s.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
-    s.chunked_req = chunked_req
+    if chunked_req is not None:
+        move([chunked_req], s.chunked_reqs)
     s._pending_chunked_abort_req = None
     s.running_reqs = KeyedReqList(ListKind.DECODING)
     s.invariant_checker = MagicMock()
@@ -186,7 +188,7 @@ class TestPendingPrefillAbortGate(CustomTestCase):
         self.reqs[2].output_ids.append(7)
         for req in self.reqs:
             req.sampling_params.normalize(None)
-        self.scheduler.running_reqs.join([self.reqs[2]])
+        move([self.reqs[2]], self.scheduler.running_reqs)
         self.scheduler.running_batch = ScheduleBatch(reqs=[self.reqs[2]])
         self.batch = ScheduleBatch(
             reqs=self.reqs,
@@ -194,7 +196,7 @@ class TestPendingPrefillAbortGate(CustomTestCase):
             decoding_reqs=[self.reqs[2]],
         )
         self.batch.add_inflight_step()
-        self.scheduler._join_prefill_launched(self.batch)
+        move(self.reqs[:2], self.scheduler.prefill_launched_reqs)
         self.scheduler.last_batch = self.batch
 
     def test_abort_discards_only_the_inflight_prefill_before_decode(self):
