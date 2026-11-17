@@ -141,6 +141,7 @@ def handle_pd_role_switch(
         # is no in-place rollback.
         try:
             teardown_disaggregation(scheduler)
+            scheduler.gc_freezer.on_cache_reset()
             get_context().override("role_switch.flip", disaggregation_mode=new_role)
             scheduler.init_disaggregation()
             scheduler._sync_disaggregation_mode_to_subcomponents()

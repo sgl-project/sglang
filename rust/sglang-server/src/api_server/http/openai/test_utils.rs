@@ -555,7 +555,7 @@ async fn openai_request_lines_carry_whitelisted_headers() {
             fields: vec![("rid".into(), "None".into())],
             batch_item_fields: Vec::new(),
             batch_shared_fields: Vec::new(),
-            headers: vec!["x-smg-routing-key".into()],
+            headers: vec!["x-sgl-routing-key".into()],
             exceeded_ms: -1,
             openai_requests: true,
             chat_completion_fields: vec![("model".into(), None)],
@@ -578,7 +578,7 @@ async fn openai_request_lines_carry_whitelisted_headers() {
             .method("POST")
             .uri(path)
             .header("content-type", "application/json")
-            .header("x-smg-routing-key", "conv-1")
+            .header("x-sgl-routing-key", "conv-1")
             .body(Body::from(body.to_string()))
             .unwrap();
         let response = oneshot(app.clone(), req).await;
@@ -599,7 +599,7 @@ async fn openai_request_lines_carry_whitelisted_headers() {
         );
         for line in &lines {
             assert!(
-                line.contains(", headers={'x-smg-routing-key': 'conv-1'}"),
+                line.contains(", headers={'x-sgl-routing-key': 'conv-1'}"),
                 "{path}: {line}"
             );
         }
