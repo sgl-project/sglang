@@ -184,7 +184,7 @@ class _MockTokenizerManager:
     """Minimal mock that satisfies OpenAIServingChat."""
 
     def __init__(self):
-        self.model_config = Mock(is_multimodal=False)
+        self.model_config = Mock(is_multimodal=False, vocab_size=32000)
         self.server_args = Mock(
             model_path="deepseek-ai/DeepSeek-V4-Flash",
             revision=None,
@@ -1853,6 +1853,26 @@ class ServingChatTestCase(CustomTestCase):
             "return_sampling_mask requires return_meta_info=true.",
         )
 
+    def test_validate_request_bounds_top_logprobs_to_vocab(self):
+        """top_logprobs outside [0, vocab_size] must be a 400, not a topk that
+        kills the scheduler."""
+        for top_logprobs, ok in ((32001, False), (0, True), (32000, True)):
+            with self.subTest(top_logprobs=top_logprobs):
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    logprobs=True,
+                    top_logprobs=top_logprobs,
+                )
+                error = self.chat._validate_request(req)
+                if ok:
+                    self.assertIsNone(error)
+                else:
+                    self.assertEqual(
+                        error,
+                        f"top_logprobs must be in [0, 32000], got {top_logprobs}.",
+                    )
+
     def test_validate_request_rejects_flat_output_top_logprobs_without_meta_info(
         self,
     ):
@@ -1904,6 +1924,53 @@ class ServingChatTestCase(CustomTestCase):
                 self.assertEqual(adapted.top_logprobs_num, 2)
                 self.assertEqual(adapted.return_flat_raw_output_top_logprobs, flat)
                 self.assertEqual(adapted.return_flat_raw_top_logprobs_b64, b64)
+
+    def test_validate_request_rejects_flat_sampling_mask_without_meta_info(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            return_flat_raw_sampling_mask=True,
+        )
+
+        self.assertEqual(
+            self.chat._validate_request(req),
+            "return_flat_raw_sampling_mask requires return_meta_info=true.",
+        )
+
+    def test_convert_to_internal_request_flat_sampling_mask_default_to_b64(self):
+        self.tm.tokenizer = None
+        # (request flags, expected flat mask, expected b64)
+        cases = (
+            ({"return_flat_raw_sampling_mask": True}, True, True),
+            (
+                {
+                    "return_flat_raw_sampling_mask": True,
+                    "return_flat_raw_sampling_mask_b64": False,
+                },
+                True,
+                False,
+            ),
+            ({}, False, False),
+        )
+        for flags, flat, b64 in cases:
+            req = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Hi?"}],
+                input_ids=[101, 102, 103],
+                return_sampling_mask=True,
+                return_meta_info=True,
+                **flags,
+            )
+            with self.subTest(flags=flags):
+                adapted, _ = self.chat._convert_to_internal_request(
+                    req, self.fastapi_request
+                )
+                # The b64 default must not trip GenerateReqInput validation.
+                adapted.normalize_batch_and_arguments()
+
+                self.assertTrue(adapted.return_sampling_mask)
+                self.assertEqual(adapted.return_flat_raw_sampling_mask, flat)
+                self.assertEqual(adapted.return_flat_raw_sampling_mask_b64, b64)
 
     def test_convert_to_internal_request_rejects_stream_return_meta_info(self):
         req = ChatCompletionRequest(
@@ -2860,6 +2927,38 @@ class ServingChatTestCase(CustomTestCase):
         self.assertNotIn("schema_", call.kwargs["response_format"]["json_schema"])
         self.assertEqual(result.prompt_ids, [7, 8, 9])
         self.assertEqual(result.image_data[0].url, "image-1")
+
+    def test_kimi_k3_video_takes_its_ordered_media_slot(self):
+        self.template_manager.chat_template_name = None
+        _use_chat_encoding(self.chat, "kimi_k3")
+        self.tm.model_config.is_multimodal = True
+        self.tm.tokenizer.apply_chat_template.return_value = [7, 8, 9]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "image-1"}},
+                        {"type": "video_url", "video_url": {"url": "video-1"}},
+                        {"type": "text", "text": "Compare them."},
+                    ],
+                }
+            ],
+        )
+
+        result = self.chat._process_messages(request, is_multimodal=True)
+
+        call = self.tm.tokenizer.apply_chat_template.call_args
+        self.assertEqual(
+            call.kwargs["image_prompts"], ["<|media_pad|>", "<|media_content|>"]
+        )
+        self.assertEqual(
+            [part["type"] for part in call.args[0][0]["content"]],
+            ["image_url", "image_url", "text"],
+        )
+        self.assertEqual(result.image_data[0].url, "image-1")
+        self.assertEqual(result.video_data, ["video-1"])
 
     def test_kimi_k3_neutralizes_text_only_assistant_history(self):
         self.template_manager.chat_template_name = None
@@ -6206,7 +6305,7 @@ class TestUsageReasoningTokens(CustomTestCase):
         no_reasoning = UsageProcessor.calculate_token_usage(
             prompt_tokens=5, completion_tokens=7
         )
-        self.assertIsNone(no_reasoning.completion_tokens_details)
+        self.assertEqual(no_reasoning.completion_tokens_details.reasoning_tokens, 0)
 
 
 class TestShouldIncludeUsage(CustomTestCase):

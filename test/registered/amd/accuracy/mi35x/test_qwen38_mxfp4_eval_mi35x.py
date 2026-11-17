@@ -47,7 +47,7 @@ which would leave ``content`` empty and score 0.
 MXFP4 needs gfx95x, so this is MI35x-only and ROCm 7.2-only; it does not
 register on gfx942 (MI300/MI325).
 
-Registry: nightly-amd-8-gpu-mi35x-qwen38-mxfp4 suite
+Registry: nightly-test-8-gpu-amd-mi35x-qwen38-mxfp4 suite
 """
 
 import io
@@ -74,7 +74,7 @@ from sglang.test.test_utils import (
 # Register for AMD CI - Qwen3.8 MXFP4 accuracy + perf on MI35x (~4h: the 1.2 TB
 # checkpoint is loaded twice, once per phase, and dominates both)
 register_amd_ci(
-    est_time=14400, suite="nightly-amd-8-gpu-mi35x-qwen38-mxfp4", nightly=True
+    est_time=14400, suite="nightly-test-8-gpu-amd-mi35x-qwen38-mxfp4", nightly=True
 )
 
 QWEN38_MXFP4_MODEL_PATH = os.environ.get(

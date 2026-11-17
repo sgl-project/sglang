@@ -5,7 +5,10 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
-from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
+from sglang.srt.arg_groups.choices import (
+    DFLASH_MLA_ONLY_DRAFT_BACKENDS,
+    DRAFT_ATTENTION_BACKEND_CHOICES,
+)
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
     dspark_dp_a2a_backends,
@@ -47,11 +50,11 @@ def _should_auto_enable_hip_rejection_sampling(
 ) -> bool:
     """Whether HIP may default ``speculative_use_rejection_sampling`` on.
 
-    Rejection sampling still cannot consume a reduced / hot draft vocab
-    (``eagle_worker_v2`` FIXME: scatter via the d2t map). Auto-enabling there
-    would crash configs that previously ran greedy on HIP, including EAGLE3
-    stage-a ``test_basic_sanity_eagle3`` (draft 32000 vs target 128256). Skip
-    EAGLE3 and any EAGLE run that already has a token map.
+    Rejection sampling can now consume a reduced / hot draft vocab --
+    ``eagle_worker_v2`` scatters ``q`` onto the target vocab through the d2t map
+    -- but that path is not validated on ROCm, so auto-enabling is still withheld
+    for EAGLE3 and for any EAGLE run that already has a token map. Passing the
+    flag explicitly works.
 
     Also skip when ``SGLANG_SIMULATE_ACC_LEN`` is on: AgentX throughput still
     runs the real EAGLE verify then overwrites accept length, so the Triton
@@ -171,7 +174,8 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     if (
         cfg.disaggregation_mode == "decode"
         and cfg.disaggregation_decode_enable_radix_cache
-        and cfg.speculative_algorithm not in (None, "DSPARK", "EAGLE", "EAGLE3")
+        and cfg.speculative_algorithm
+        not in (None, "DFLASH", "DSPARK", "EAGLE", "EAGLE3")
     ):
         raise ValueError(
             "--disaggregation-decode-enable-radix-cache is incompatible "
@@ -323,9 +327,10 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 "SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION=0."
             )
 
-    if cfg.pp_size != 1:
+    if cfg.pp_size != 1 and cfg.disaggregation_mode != "prefill":
         raise ValueError(
-            "Currently DFLASH speculative decoding only supports pp_size == 1."
+            "DFLASH pipeline parallelism requires PD prefill; decode and "
+            "non-disaggregated serving require pp_size == 1."
         )
 
     if cfg.speculative_draft_model_path is None:
@@ -398,17 +403,9 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             parse_dflash_draft_config,
         )
 
-        model_override_args = json.loads(cfg.json_model_override_args)
         inferred_block_size = None
         try:
-            from sglang.srt.hf_transformers import get_config
-
-            draft_hf_config = get_config(
-                cfg.speculative_draft_model_path,
-                trust_remote_code=cfg.trust_remote_code,
-                revision=cfg.speculative_draft_model_revision,
-                model_override_args=model_override_args,
-            )
+            draft_hf_config = _load_draft_hf_config(cfg)
             inferred_block_size = parse_dflash_draft_config(
                 draft_hf_config=draft_hf_config
             ).resolve_block_size(default=None)
@@ -441,6 +438,8 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             )
 
     _resolve_dflash_draft_attention_backend(server_args)
+    _resolve_dflash_mla_draft_window(server_args)
+    _resolve_dflash_draft_kv_ring(server_args)
 
     if cfg.max_running_requests is None:
         declare_resolution(
@@ -724,8 +723,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"(attn_cp_size={cfg.attn_cp_size})."
             )
         if (
-            not _is_npu
-            and cfg.speculative_moe_a2a_backend is not None
+            cfg.speculative_moe_a2a_backend is not None
             and cfg.speculative_moe_a2a_backend != cfg.moe_a2a_backend
         ):
             raise ValueError(
@@ -909,6 +907,17 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         )
 
 
+def _load_draft_hf_config(cfg):
+    from sglang.srt.hf_transformers import get_config
+
+    return get_config(
+        cfg.speculative_draft_model_path,
+        trust_remote_code=cfg.trust_remote_code,
+        revision=cfg.speculative_draft_model_revision,
+        model_override_args=json.loads(cfg.json_model_override_args),
+    )
+
+
 def _keep_mla_draft_off_trtllm_mha(
     draft_backend: Optional[str], *, is_mla: bool
 ) -> Optional[str]:
@@ -944,6 +953,8 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     Consumed by ModelRunner's `is_draft_worker` override (one backend for all
     draft modes).
     """
+    from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+
     cfg = resolving_view(server_args)
 
     supported_draft_backends = DRAFT_ATTENTION_BACKEND_CHOICES
@@ -953,16 +964,14 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             return current_platform.supports_speculative_draft_attention_backend(
                 "DFLASH", backend
             )
-        if backend == "cutedsl_mla":
-            from sglang.srt.hf_transformers import get_config
-            from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
-
-            draft_hf_config = get_config(
-                cfg.speculative_draft_model_path,
-                trust_remote_code=cfg.trust_remote_code,
-                revision=cfg.speculative_draft_model_revision,
-                model_override_args=json.loads(cfg.json_model_override_args),
-            )
+        if backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
+            # trtllm_mla has no bidirectional mask: taken only when named.
+            if (
+                backend == "trtllm_mla"
+                and cfg.speculative_draft_attention_backend is None
+            ):
+                return False
+            draft_hf_config = _load_draft_hf_config(cfg)
             return parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla
         return backend in supported_draft_backends
 
@@ -1009,18 +1018,9 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         )
         draft_backend = fallback_backend
     elif draft_backend == "trtllm_mha":
-        from sglang.srt.hf_transformers import get_config
-        from sglang.srt.speculative.dflash_utils import (
-            get_dflash_layer_types,
-            parse_dflash_draft_config,
-        )
+        from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
 
-        draft_hf_config = get_config(
-            cfg.speculative_draft_model_path,
-            trust_remote_code=cfg.trust_remote_code,
-            revision=cfg.speculative_draft_model_revision,
-            model_override_args=json.loads(cfg.json_model_override_args),
-        )
+        draft_hf_config = _load_draft_hf_config(cfg)
         draft_text_config = (
             getattr(draft_hf_config, "text_config", None) or draft_hf_config
         )
@@ -1057,6 +1057,80 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         server_args,
         "_resolve_dflash_draft_attention_backend",
         speculative_draft_attention_backend=draft_backend,
+    )
+
+
+def _resolve_dflash_mla_draft_window(server_args: ServerArgs) -> None:
+    """Runs after the draft backend is final, which it reads."""
+    from sglang.srt.speculative.dflash_utils import (
+        parse_dflash_draft_config,
+        resolve_mla_draft_compact_window,
+    )
+
+    cfg = resolving_view(server_args)
+    window_size = cfg.speculative_draft_window_size
+    if window_size is None:
+        return
+    if cfg.speculative_draft_attention_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
+        return
+    draft_hf_config = _load_draft_hf_config(cfg)
+    if not parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla:
+        return
+    kept = resolve_mla_draft_compact_window(
+        draft_hf_config,
+        window_size=window_size,
+        dcp_size=cfg.dcp_size,
+        page_size=cfg.page_size,
+        megakernel=bool(cfg.enable_nvidia_megakernel),
+    )
+    if kept is None:
+        logger.warning(
+            "DFLASH: --speculative-draft-window-size %d is dropped on %s: every "
+            "draft layer is sliding_attention and the backend applies that window "
+            "itself over the full request table.",
+            window_size,
+            cfg.speculative_draft_attention_backend,
+        )
+        declare_resolution(
+            server_args,
+            "_resolve_dflash_mla_draft_window",
+            speculative_draft_window_size=None,
+        )
+
+
+def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
+    """Runs after the draft backend is final, which it reads."""
+    from sglang.srt.speculative.dflash_draft_ring import (
+        draft_kv_ring_unsupported_reason,
+    )
+
+    switch = envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING
+    if not switch.get():
+        logger.info("DFLASH draft KV ring: off, SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=0.")
+        return
+    cfg = resolving_view(server_args)
+    reason = draft_kv_ring_unsupported_reason(
+        lambda: _load_draft_hf_config(cfg),
+        draft_backend=cfg.speculative_draft_attention_backend,
+        disaggregation_mode=cfg.disaggregation_mode,
+        disaggregation_transfer_backend=cfg.disaggregation_transfer_backend,
+        disaggregation_decode_host_receive_threshold=(
+            cfg.disaggregation_decode_host_receive_threshold
+        ),
+        enable_unified_memory=cfg.enable_unified_memory,
+        dcp_size=cfg.dcp_size,
+        draft_window_size=cfg.speculative_draft_window_size,
+    )
+    if reason is not None:
+        if switch.is_set():
+            raise ValueError(f"SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1, but {reason}.")
+        logger.info("DFLASH draft KV ring: off, %s.", reason)
+        return
+    logger.info("DFLASH draft KV ring: on.")
+    declare_resolution(
+        server_args,
+        "_resolve_dflash_draft_kv_ring",
+        speculative_dflash_draft_kv_ring=True,
     )
 
 
