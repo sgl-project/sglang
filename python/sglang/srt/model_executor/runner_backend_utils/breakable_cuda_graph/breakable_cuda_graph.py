@@ -93,7 +93,7 @@ def _capture_status(stream_ptr: int) -> "rt.cudaStreamCaptureStatus":
 
 
 def _is_stream_capturing(stream: torch.Stream) -> bool:
-    # On ROCm/HIP, MUSA, NPU, and XPU, cuda-python is unavailable or unnecessary, so
+    # On ROCm/HIP, MUSA, and XPU, cuda-python is unavailable or unnecessary, so
     # use the portable device API. On NVIDIA, keep querying the CUDA runtime
     # directly via cuda-python because torch.cuda.is_current_stream_capturing()
     # has proven unreliable there.

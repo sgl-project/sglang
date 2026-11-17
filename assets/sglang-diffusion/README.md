@@ -42,6 +42,8 @@ Logo ownership remains with the respective organizations and projects.
 
 `logo.svg` and `logo-dark.svg` head the diffusion README on light and dark
 themes. They differ only in the colors of the dots and how strong their glow is.
+The docs and cookbook landing pages, and other sites, load the same two files
+from `main` by URL, so keep their names and location.
 
 - The SGL mark is `assets/logo.svg`, unchanged.
 - The word DIFFUSION is set in Open Sans ExtraBold Italic

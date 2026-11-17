@@ -2708,8 +2708,7 @@ class MQALayer(MqaAttentionBase):
             )
 
         enable_multi_stream = (
-            not _is_npu
-            and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+            envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
             and get_is_capture_mode()
             and (
@@ -2723,18 +2722,8 @@ class MQALayer(MqaAttentionBase):
             _is_npu
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             and self.alt_streams is not None
-            and (
-                (
-                    forward_batch.forward_mode.is_extend()
-                    and is_in_breakable_cuda_graph()
-                    and not is_cp_active(forward_batch)
-                    and self.compress_ratio not in (1, 2)
-                )
-                or (
-                    x.shape[0] <= self._multi_stream_bs_limit
-                    and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-                )
-            )
+            and x.shape[0] <= self._multi_stream_bs_limit
+            and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
 
         low_ratio_multi_stream = (
@@ -2975,17 +2964,13 @@ class MQALayer(MqaAttentionBase):
                     # TRT-LLM returns BF16 even with FP8 queries.
                     dtype=x.dtype,
                 )
-                # Only metadata that also captures the attention request axis
-                # can keep attention in the segment. Batched source graphs
-                # refresh a separate live layout for eager attention.
+                # NPU backends refresh capacity-sized metadata before each
+                # replay, so the attention can stay inside the captured
+                # segment.  Every other platform keeps ending the segment.
                 attention_with_output = (
                     deepseek_v4_attention_with_output
                     if _is_npu
                     and attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
-                    and getattr(
-                        attn_backend.forward_metadata, "dsv4_prefill_graph_state", None
-                    )
-                    is not None
                     else bcg_deepseek_v4_attention_with_output
                 )
                 attention_with_output(

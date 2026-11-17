@@ -85,6 +85,18 @@ def _live_batch(batch_size, num_tokens, *, idle=False):
 
 
 class TestDsv4PrefillGraphMetadata(CustomTestCase):
+    def test_context_bound_sizes_all_page_tables(self):
+        backend = _backend()
+        backend.req_to_token_pool.c128_page_size = 4
+        seed = _seed(128)
+        state = Dsv4PrefillGraphMetadata.allocate(
+            backend=backend, seed=seed, num_tokens=128, max_context_len=1024
+        )
+        self.assertEqual(tuple(state.swa_page_table.shape), (1, 8))
+        self.assertEqual(tuple(state.c4_page_table.shape), (1, 8))
+        self.assertEqual(tuple(state.c128_page_table.shape), (1, 2))
+        self.assertEqual(backend.max_context_len, 4096)
+
     def test_capture_allocates_fixed_isolated_buffers(self):
         seed = _seed(128)
         state = Dsv4PrefillGraphMetadata.allocate(

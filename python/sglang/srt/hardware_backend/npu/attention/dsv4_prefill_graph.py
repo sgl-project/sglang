@@ -111,6 +111,7 @@ class Dsv4PrefillGraphMetadata:
         backend,
         seed: ForwardMetadata,
         num_tokens: int,
+        max_context_len: Optional[int] = None,
     ) -> Dsv4PrefillGraphMetadata:
         state = cls()
         state.metadata = seed
@@ -140,7 +141,9 @@ class Dsv4PrefillGraphMetadata:
             state.locs[ratio] = torch.zeros(capacity, dtype=torch.int64, device=device)
 
         page_size = backend.page_size
-        context_len = backend.max_context_len
+        context_len = (
+            backend.max_context_len if max_context_len is None else max_context_len
+        )
         swa_cols = max(1, (context_len + page_size - 1) // page_size)
         state.swa_page_table = torch.zeros((max_reqs, swa_cols), **int32)
         state.c4_page_table = None

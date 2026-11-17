@@ -9,9 +9,8 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnB
 from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     DeepseekV4AscendAttnBackend,
 )
-from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
@@ -22,6 +21,82 @@ register_npu_ci(est_time=2, suite="stage-a-unit-test-npu")
 
 
 class TestDsv4PrefillMaxContext(unittest.TestCase):
+    def test_capture_and_replay_keep_bounded_storage_and_live_lengths(self):
+        backend = self.backend
+        backend._dsv4_has_c4 = backend._dsv4_has_c128 = True
+        backend._dsv4_state_pools_by_ratio = {
+            ratio: SimpleNamespace(dummy_state_loc=-1) for ratio in (4, 128)
+        }
+
+        def build_metadata(batch):
+            fm = self.init_metadata(batch)
+            cu = torch.cat(
+                [torch.zeros(1, dtype=torch.int32), batch.extend_seq_lens.cumsum(0)]
+            ).int()
+            fm.actual_seq_lengths_q_pa = cu
+            fm.actual_seq_lengths_q = cu[1:]
+            fm.actual_seq_lengths_kv = batch.seq_lens.int()
+            fm.seqused = batch.extend_seq_lens.int()
+            fm.start_pos = batch.extend_prefix_lens.int()
+            fm.swa_page_table = fm.block_tables_swa
+            fm.kernel_metadata = {"li_quant_metadata": torch.zeros(16).int()}
+            for ratio in (4, 128):
+                capacity = min(
+                    batch.input_ids.numel(), batch.input_ids.numel() // ratio + 1
+                )
+                setattr(
+                    fm, f"positions_cmp_padding_c{ratio}", torch.zeros(capacity).long()
+                )
+
+        def state_table(**kwargs):
+            history = 8 if kwargs["ratio"] == 4 else 128
+            return torch.full((1, history + kwargs["max_input_capacity"]), -1).int()
+
+        capture_batch = self.batch(128, 512)
+        capture_batch.positions = torch.arange(128)
+        capture_batch.extend_prefix_lens = torch.zeros(1).int()
+        capture_batch.can_run_tbo = False
+        with (
+            patch.object(backend, "init_forward_metadata", side_effect=build_metadata),
+            patch.object(
+                backend,
+                "_build_dsv4_prefill_graph_state_table",
+                side_effect=state_table,
+            ),
+        ):
+            captured = backend.init_forward_metadata_for_breakable_cuda_graph_capture(
+                capture_batch
+            )
+            state = captured.dsv4_prefill_graph_state
+            tensors = [state.swa_page_table, state.c4_page_table, state.c128_page_table]
+            pointers = [tensor.data_ptr() for tensor in tensors]
+            self.assertEqual(captured.block_tables.shape, (1, 4))
+            self.assertEqual(captured.block_tables_swa.shape, (1, 4))
+            self.assertEqual(state.swa_page_table.shape, (1, 4))
+            self.assertEqual(state.c4_page_table.shape, (1, 4))
+            self.assertEqual(state.c128_page_table.shape, (1, 1))
+
+            live = self.batch(384)
+            live.input_ids = torch.zeros(65).long()
+            live.extend_seq_lens = torch.tensor([65]).int()
+            live.extend_prefix_lens = torch.tensor([319]).int()
+            live.extend_prefix_lens_cpu = [319]
+            live.forward_mode = ForwardMode.EXTEND
+            live.can_run_tbo = False
+            live.global_num_token_non_padded_cpu = 65
+            backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
+                captured,
+                live,
+                static_forward_batch=SimpleNamespace(max_seq_len_override=512),
+            )
+
+        self.assertIs(backend.forward_metadata, captured)
+        self.assertIsNone(live.max_seq_len_override)
+        self.assertEqual(captured.actual_seq_lengths_kv.tolist(), [384])
+        self.assertEqual(captured.seqused.tolist(), [65])
+        self.assertEqual(captured.start_pos.tolist(), [319])
+        self.assertEqual([tensor.data_ptr() for tensor in tensors], pointers)
+
     def setUp(self):
         contexts = ExitStack()
         self.addCleanup(contexts.close)
@@ -87,113 +162,6 @@ class TestDsv4PrefillMaxContext(unittest.TestCase):
             self.backend._build_npu_compress_metadata(batch)
         return self.backend.forward_metadata
 
-    def prefilled_batch(self, prefix_lens, extend_lens, max_context=4096):
-        lengths = [prefix + extend for prefix, extend in zip(prefix_lens, extend_lens)]
-        batch = self.batch(lengths, max_context)
-        num_tokens = sum(extend_lens)
-        batch.input_ids = torch.zeros(num_tokens, dtype=torch.int64)
-        batch.positions = torch.cat(
-            [
-                torch.arange(prefix, length)
-                for prefix, length in zip(prefix_lens, lengths)
-            ]
-        )
-        batch.extend_seq_lens = torch.tensor(extend_lens, dtype=torch.int32)
-        batch.extend_seq_lens_cpu = list(extend_lens)
-        batch.extend_prefix_lens = torch.tensor(prefix_lens, dtype=torch.int64)
-        batch.extend_prefix_lens_cpu = list(prefix_lens)
-        batch.out_cache_loc = torch.arange(num_tokens)
-
-        def completed_groups(ratio):
-            return sum(
-                (prefix + extend) // ratio - prefix // ratio
-                for prefix, extend in zip(prefix_lens, extend_lens)
-            )
-
-        batch.out_cache_loc_dsv4 = SimpleNamespace(
-            out_c4_loc=torch.arange(completed_groups(4)) + 128,
-            out_c128_loc=torch.arange(completed_groups(128)) + 256,
-        )
-        return batch
-
-    def test_cached_chunked_and_mixed_prefill_are_eligible(self):
-        self.backend._dsv4_prefill_capture_num_tokens = (128, 256, 384, 512)
-        for prefix_lens, extend_lens in (
-            ([0], [256]),
-            ([512], [384]),
-            ([2048], [256]),
-            ([2048], [192]),
-            ([2048, 0], [128, 256]),
-            ([2048, 2048], [128, 128]),
-        ):
-            with self.subTest(prefix_lens=prefix_lens, extend_lens=extend_lens):
-                batch = self.prefilled_batch(prefix_lens, extend_lens)
-                self.assertTrue(self.backend.can_run_prefill_cuda_graph(batch))
-
-    def test_prefill_rejects_invalid_prefix_and_unsupported_modes(self):
-        self.backend._dsv4_prefill_capture_num_tokens = (128, 256, 384, 512)
-        for change in (
-            {"extend_prefix_lens_cpu": None},
-            {"extend_prefix_lens_cpu": [2048]},
-            {"extend_prefix_lens_cpu": [-1, 0]},
-            {"attn_cp_metadata": object()},
-            {"out_cache_loc_dsv4": None},
-            {"forward_mode": ForwardMode.TARGET_VERIFY},
-            {"forward_mode": ForwardMode.DECODE},
-        ):
-            with self.subTest(change=change):
-                batch = self.prefilled_batch([2048, 0], [128, 256])
-                batch.__dict__.update(change)
-                self.assertFalse(self.backend.can_run_prefill_cuda_graph(batch))
-        batch = self.prefilled_batch([2048], [600])
-        self.assertFalse(self.backend.can_run_prefill_cuda_graph(batch))
-
-    def test_prefix_replay_metadata_keeps_live_query_and_history_lengths(self):
-        runner = SimpleNamespace(
-            _is_full_backend=False,
-            _dcp_extend_active=False,
-            use_captured_attn_metadata=False,
-            model_runner=SimpleNamespace(attn_backend=self.backend),
-        )
-        batch = self.prefilled_batch([2048, 0], [256, 128], max_context=None)
-        with (
-            patch.object(
-                self.backend, "init_forward_metadata", side_effect=self.init_metadata
-            ) as init_metadata,
-            patch.object(self.backend, "resolve_prefill_shared_read_ends"),
-        ):
-            PrefillCudaGraphRunner._prepare_forward_metadata_for_replay(
-                runner,
-                batch,
-                SimpleNamespace(max_seq_len_override=4096),
-                SimpleNamespace(size=512),
-            )
-        metadata_batch = init_metadata.call_args.args[0]
-        self.assertIsNot(metadata_batch, batch)
-        self.assertIsNone(batch.max_seq_len_override)
-        self.assertEqual(metadata_batch.extend_prefix_lens_cpu, [2048, 0])
-        self.assertIs(metadata_batch.extend_prefix_lens, batch.extend_prefix_lens)
-        metadata = self.backend.forward_metadata
-        self.assertEqual(metadata.block_tables.shape, (2, 32))
-        self.assertEqual(metadata.c4_page_table.shape, (2, 32))
-        self.assertEqual(metadata.c128_page_table.shape, (2, 2))
-        self.assertEqual(metadata.seq_lens.tolist(), [2304, 128])
-        self.assertEqual(metadata.extend_seq_lens.tolist(), [256, 128])
-
-    def test_prefix_compressor_emits_only_newly_completed_groups(self):
-        batch = self.prefilled_batch([255, 2048], [2, 3])
-        self.backend.forward_metadata = SimpleNamespace(
-            actual_seq_lengths_q_pa=torch.tensor([0, 2, 5], dtype=torch.int32)
-        )
-        self.backend._build_npu_compress_metadata_prefill(batch)
-        metadata = self.backend.forward_metadata
-        self.assertEqual(metadata.start_pos.tolist(), [255, 2048])
-        self.assertEqual(metadata.seqused.tolist(), [2, 3])
-        self.assertEqual(metadata.positions_cmp_padding_c4.tolist(), [252, 0, 0])
-        self.assertEqual(metadata.positions_cmp_padding_c128.tolist(), [128, 0])
-        self.assertEqual(metadata.c4_loc.tolist(), [128])
-        self.assertEqual(metadata.c128_loc.tolist(), [256])
-
     def test_fixed_tables_keep_live_lengths(self):
         for seq_len in (64, 128, 300, 1024):
             with self.subTest(seq_len=seq_len):
@@ -214,98 +182,10 @@ class TestDsv4PrefillMaxContext(unittest.TestCase):
         self.assertEqual(metadata.c4_page_table.shape, (1, 32))
         self.assertEqual(metadata.c128_page_table.tolist(), [[7, 12]])
 
-    def test_fixed_tables_keep_multiple_request_lengths(self):
-        batch = self.batch([300, 212], 384)
-        metadata = self.init_metadata(batch)
-        self.assertEqual(metadata.block_tables.shape, (2, 3))
-        self.assertEqual(metadata.block_tables_swa.shape, (2, 3))
-        self.assertEqual(metadata.c4_page_table.shape, (2, 3))
-        self.assertEqual(metadata.c128_page_table.shape, (2, 1))
-        self.assertEqual(metadata.seq_lens.tolist(), [300, 212])
-        self.assertEqual(metadata.extend_seq_lens.tolist(), [300, 212])
-
-    def test_capture_scratch_respects_request_compressor_boundaries(self):
-        for lengths, context, c4_count, c128_count in (
-            ([384, 128], 384, 128, 4),
-            ([300, 212], 300, 128, 3),
-            ([127, 1], 127, 31, 0),
-        ):
-            with self.subTest(lengths=lengths):
-                batch = self.batch(lengths, context)
-                self.backend.prepare_prefill_graph_capture_batch(batch)
-                bundle = batch.out_cache_loc_dsv4
-                self.assertIs(bundle.out_full_loc, batch.out_cache_loc)
-                self.assertEqual(bundle.out_swa_loc.numel(), sum(lengths))
-                self.assertEqual(bundle.out_c4_loc.numel(), c4_count)
-                self.assertEqual(bundle.out_c128_loc.numel(), c128_count)
-                self.assertEqual(torch.count_nonzero(bundle.out_swa_loc).item(), 0)
-                self.assertEqual(torch.count_nonzero(bundle.out_c4_loc).item(), 0)
-                self.assertEqual(torch.count_nonzero(bundle.out_c128_loc).item(), 0)
-
-    def test_replay_metadata_keeps_graph_limit_off_serving_batch(self):
-        runner = SimpleNamespace(
-            _is_full_backend=False,
-            _dcp_extend_active=False,
-            use_captured_attn_metadata=False,
-            model_runner=SimpleNamespace(attn_backend=self.backend),
-        )
-        for lengths in ([128], [300, 212], [64, 64], [256]):
-            with self.subTest(lengths=lengths):
-                batch = self.batch(lengths)
-                static_batch = SimpleNamespace(max_seq_len_override=384)
-                with (
-                    patch.object(
-                        self.backend,
-                        "init_forward_metadata",
-                        side_effect=self.init_metadata,
-                    ) as init_metadata,
-                    patch.object(
-                        self.backend,
-                        "resolve_prefill_shared_read_ends",
-                        return_value=SharedReadEnds.PRE_REPLAY,
-                    ) as snapshot,
-                ):
-                    read_ends = (
-                        PrefillCudaGraphRunner._prepare_forward_metadata_for_replay(
-                            runner, batch, static_batch, SimpleNamespace(size=512)
-                        )
-                    )
-                metadata_batch = init_metadata.call_args.args[0]
-                self.assertIsNot(metadata_batch, batch)
-                self.assertIs(metadata_batch.seq_lens, batch.seq_lens)
-                self.assertEqual(metadata_batch.max_seq_len_override, 384)
-                self.assertIsNone(batch.max_seq_len_override)
-                snapshot.assert_called_once_with(metadata_batch, build_snapshot=True)
-                self.assertIs(read_ends, SharedReadEnds.PRE_REPLAY)
-                metadata = self.backend.forward_metadata
-                self.assertEqual(metadata.block_tables.shape, (len(lengths), 3))
-                self.assertEqual(metadata.c4_page_table.shape, (len(lengths), 3))
-                self.assertEqual(metadata.seq_lens.tolist(), lengths)
-
-    def test_unconfigured_replay_uses_serving_batch(self):
-        batch = self.batch(256)
-        runner = SimpleNamespace(
-            _is_full_backend=False,
-            _dcp_extend_active=False,
-            use_captured_attn_metadata=False,
-            model_runner=SimpleNamespace(attn_backend=self.backend),
-        )
-        with patch.object(
-            self.backend, "init_forward_metadata", side_effect=self.init_metadata
-        ) as init_metadata:
-            PrefillCudaGraphRunner._prepare_forward_metadata_for_replay(
-                runner,
-                batch,
-                SimpleNamespace(max_seq_len_override=None),
-                SimpleNamespace(size=256),
-            )
-        init_metadata.assert_called_once_with(batch)
-        self.assertEqual(self.backend.forward_metadata.block_tables.shape, (1, 2))
-
     def test_context_limit_is_per_request_including_prefix(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = False
-        runner._captured_attn_metadata_max_bs = None
+        runner._captured_attn_metadata_max_bs = 1
         runner._capture_chunked_prefix = False
         runner.prefill_backend_name = Backend.BREAKABLE
         runner.has_mha_companion_layers = False
@@ -318,8 +198,6 @@ class TestDsv4PrefillMaxContext(unittest.TestCase):
             ([384], [0], 384, True),
             ([384], [128], 256, True),
             ([385], [0], 385, False),
-            ([300, 212], [0, 0], 512, True),
-            ([385, 127], [0, 0], 512, False),
             ([449], [385], 64, False),
         ):
             with self.subTest(lengths=lengths, prefix_lengths=prefix_lengths):
