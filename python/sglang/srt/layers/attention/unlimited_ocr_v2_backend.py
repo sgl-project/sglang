@@ -13,22 +13,22 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import triton
 
-from sglang.kernels.ops.attention.unlimited_ocr_dash.attend import (
-    dash_sparse_attn,
-    dash_sparse_attn_decode,
-)
 from sglang.kernels.ops.attention.unlimited_ocr_dash.decode_meta import (
     local_union_fused,
+)
+from sglang.kernels.ops.attention.unlimited_ocr_dash.dispatch import (
+    dash_sparse_attn,
+    dash_sparse_attn_decode,
+    kbar_refresh_tail,
+    route_decode,
+    route_prefill,
+    win_bounds_decode,
 )
 from sglang.kernels.ops.attention.unlimited_ocr_dash.route import (
     SCAN_TILE,
     kbar_all_plan,
-    kbar_refresh_tail_triton,
     kbar_tail_plan,
     prefill_row2req,
-    route_decode_triton,
-    route_prefill_triton,
-    win_bounds_decode,
 )
 from sglang.srt.configs.model_config import get_unlimited_ocr_v2_sparse_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -55,6 +55,7 @@ from sglang.srt.layers.attention.unlimited_dash_ops.page_state import (
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.unlimited_ocr_v2_support import document_reuse as uocr_doc_reuse
+from sglang.srt.utils.device import is_device_stream_capturing
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -207,6 +208,14 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         self._cg_ready = False
 
         self._init_prefill_buffer_slots()
+        if torch.device(self.device).type == "mps":
+            from sglang.kernels.ops.attention.unlimited_ocr_dash import metal
+
+            metal.compile_kernels(
+                head_dim=head_dim,
+                index_dim=self.idx_head_dim,
+                block_size=self.block_size,
+            )
 
         logger.info(
             "[Unlimited-OCR v2] DASH sparse attention: block=%d local=%d "
@@ -401,7 +410,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         Capture sizes share a graph pool, so reused addresses could corrupt
         state embedded in earlier graphs.
         """
-        if torch.cuda.is_current_stream_capturing():
+        if is_device_stream_capturing(torch.device(self.device)):
             raise RuntimeError(
                 f"[Unlimited-OCR v2] {what} would be allocated during cuda graph "
                 "capture. Every cross-step buffer must be sized in "
@@ -1278,7 +1287,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
                 device=self.device,
                 out=self._kbar_plan_buf,
             )
-        kbar_refresh_tail_triton(
+        kbar_refresh_tail(
             kv_cache=kv,
             k_bar=k_bar,
             block_table=md.block_table,
@@ -1289,7 +1298,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         )
         img = self._image_allow_decode(md) if router.image_only else None
         win = self._scan_window(md) if img is not None else None
-        return route_decode_triton(
+        return route_decode(
             idx_q=idx_q,
             k_bar=k_bar,
             block_table=md.block_table,
@@ -1344,7 +1353,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
                 device=self.device,
                 out=row2req_out,
             )
-        kbar_refresh_tail_triton(
+        kbar_refresh_tail(
             kv_cache=kv,
             k_bar=k_bar,
             block_table=md.block_table,
@@ -1354,7 +1363,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
             plan=md.kbar_plan,
         )
         img = self._image_allow_prefill(md) if router.image_only else None
-        width, _, _ = route_prefill_triton(
+        width, _, _ = route_prefill(
             idx_q=idx_q,
             k_bar=k_bar,
             block_table=md.block_table,

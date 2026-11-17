@@ -1939,6 +1939,94 @@ def test_sm120_paged_decode_ragged_splits_are_cache_order_independent(
     assert error.mean().item() < 5e-4
 
 
+def test_sm120_paged_decode_graph_splits_follow_replay_lengths(monkeypatch):
+    """A large capture bound must not collapse shorter replay contexts into one split."""
+    sm120_forward_host.clear_launch_plans()
+    plans = []
+    original_resolve_plan = Sm120ForwardHost.resolve_plan
+
+    def record_plan(**kwargs):
+        plan = original_resolve_plan(**kwargs)
+        plans.append((kwargs["is_stream_capturing"], plan))
+        return plan
+
+    monkeypatch.setattr(Sm120ForwardHost, "resolve_plan", staticmethod(record_plan))
+    torch.manual_seed(1234)
+    # More than eight batch/head groups selects generic SplitKV, not transpose.
+    batch_size, num_q_heads, head_dim, page_size = 12, 6, 256, 64
+    context_bound, pages_per_request = 262144, 32
+    q = torch.randn(
+        batch_size, num_q_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    k_cache = torch.randn(
+        batch_size * pages_per_request,
+        page_size,
+        1,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v_cache = torch.randn_like(k_cache)
+    page_table = torch.zeros(
+        batch_size, context_bound // page_size, device="cuda", dtype=torch.int32
+    )
+    page_table[:, :pages_per_request] = torch.arange(
+        batch_size * pages_per_request, device="cuda", dtype=torch.int32
+    ).view(batch_size, pages_per_request)
+    cache_seqlens = torch.ones(batch_size, device="cuda", dtype=torch.int32)
+    cu_seqlens_q = torch.arange(batch_size + 1, device="cuda", dtype=torch.int32)
+    out = torch.empty_like(q)
+
+    def run():
+        return flash_attn_with_kvcache(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=1,
+            max_seqlen_k=context_bound,
+            causal=True,
+            num_splits=0,
+            out=out,
+        )
+
+    run()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+
+    # Correct output alone does not catch this performance regression.
+    # Check that eager keeps its fixed grain and capture uses live partitioning.
+    assert any(
+        not capturing and plan.split_kv_blocks_per_cta > 0 for capturing, plan in plans
+    )
+    captured_plans = [plan for capturing, plan in plans if capturing]
+    assert captured_plans
+    for plan in captured_plans:
+        assert plan.num_splits > 1
+        assert plan.split_qk_n and not plan.transpose_qk_pv
+        assert plan.split_kv_blocks_per_cta == 0
+
+    lengths = [2048, 1000, 513, 257, 63, 1, 1536, 64, 65, 1999, 700, 128]
+    for replay_lengths in (lengths, lengths[::-1]):
+        cache_seqlens.copy_(cache_seqlens.new_tensor(replay_lengths))
+        graph.replay()
+        torch.cuda.synchronize()
+        for index, length in enumerate(replay_lengths):
+            pages = page_table[index, :pages_per_request]
+            k = k_cache.index_select(0, pages).flatten(0, 1)[:length]
+            v = v_cache.index_select(0, pages).flatten(0, 1)[:length]
+            reference, _ = _attention_reference(q[index : index + 1], k, v)
+            _assert_attention_close(out[index : index + 1], reference)
+
+
 def test_sm120_paged_decode_transpose_is_cache_order_independent():
     """Gather and page-TMA transpose must not share a compiled specialization."""
     torch.manual_seed(20260729)

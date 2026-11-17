@@ -12,11 +12,12 @@ from sglang.kernels.ops.diffusion import (
     can_use_qknorm_complex_rope_cuda,
     fused_complex_rope,
     fused_layernorm_modulate,
+    fused_packed_silu_mul_bitexact,
     fused_silu_mul_bitexact,
     qknorm_complex_rope_cuda,
     qknorm_complex_rope_pack_,
     residual_gate_add,
-    rmsnorm_preserve_reduction,
+    residual_gate_add_sum2,
     tensors_equal,
 )
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_kv_triton import (
@@ -25,6 +26,7 @@ from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_kv_triton import (
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_triton import (
     qknorm_complex_rope,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
     get_current_replay_token,
 )
@@ -34,6 +36,9 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
+)
+from sglang.multimodal_gen.runtime.distributed.device_communicators.tp_peer_partial import (
+    staged_partials,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_parallel_rank,
@@ -83,7 +88,6 @@ _KV_PROJECT_INTO_FUSION = BitExactFusionGate(
 _QKV_PACK_FUSION = BitExactFusionGate(
     "Qwen-Image 2.1 packed Q/K/V projection written into the packed QKV buffer"
 )
-_QK_NORM_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm")
 _MODULATION_FUSION = BitExactFusionGate("Qwen-Image 2.1 LayerNorm modulation")
 
 
@@ -139,38 +143,22 @@ def build_layout(image_slots, image_shapes, axes_dims, device):
     )
 
 
-def apply_rope(x, rope):
-    fused = None
-    if _is_cuda and x.is_cuda and _ROPE_FUSION.can_attempt_once():
-        fused = fused_complex_rope(x, rope)
-        if _ROPE_FUSION.verified:
-            return fused
+def _eager_rope(x, rope):
     z = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    out = torch.view_as_real(z * rope[None, :, None]).flatten(-2).to(x.dtype)
-    if fused is not None:
-        return _ROPE_FUSION.accept_or_fallback(fused, out, logger=logger)
-    return out
+    return torch.view_as_real(z * rope[None, :, None]).flatten(-2).to(x.dtype)
 
 
-def apply_qk_norm(x, norm):
-    fused = None
-    if (
-        _is_cuda
-        and x.is_cuda
-        and x.dtype in (torch.float16, torch.bfloat16)
-        and _QK_NORM_FUSION.can_attempt_once()
-    ):
-        fused = rmsnorm_preserve_reduction(x, norm.weight, norm.variance_epsilon)
-        if _QK_NORM_FUSION.verified:
-            return fused
-    out = norm(x)
-    if fused is not None:
-        return _QK_NORM_FUSION.accept_or_fallback(fused, out, logger=logger)
-    return out
+def apply_rope(x, rope):
+    if _is_cuda and x.is_cuda:
+        return _ROPE_FUSION.run(
+            lambda: fused_complex_rope(x, rope),
+            lambda: _eager_rope(x, rope),
+            logger=logger,
+        )
+    return _eager_rope(x, rope)
 
 
 def apply_qk_norm_rope(x, norm, rope):
-    fused = None
     if (
         _is_cuda
         and x.is_cuda
@@ -178,25 +166,25 @@ def apply_qk_norm_rope(x, norm, rope):
         and can_use_qknorm_complex_rope_cuda(x.dtype, x.shape[-1])
         and _QK_ROPE_CUDA_FUSION.can_attempt_once()
     ):
-        fused = qknorm_complex_rope_cuda(x, norm.weight, rope, norm.variance_epsilon)
-        if _QK_ROPE_CUDA_FUSION.verified:
-            return fused
-        out = apply_rope(norm(x), rope)
-        return _QK_ROPE_CUDA_FUSION.accept_or_fallback(fused, out, logger=logger)
+        return _QK_ROPE_CUDA_FUSION.run(
+            lambda: qknorm_complex_rope_cuda(
+                x, norm.weight, rope, norm.variance_epsilon
+            ),
+            lambda: apply_rope(norm(x), rope),
+            logger=logger,
+        )
     if (
         _is_cuda
         and x.is_cuda
         and x.dtype in (torch.float16, torch.bfloat16)
         and x.shape[-1] == 128
-        and _QK_ROPE_FUSION.can_attempt_once()
     ):
-        fused = qknorm_complex_rope(x, norm.weight, rope, norm.variance_epsilon)
-        if _QK_ROPE_FUSION.verified:
-            return fused
-    out = apply_rope(norm(x), rope)
-    if fused is not None:
-        return _QK_ROPE_FUSION.accept_or_fallback(fused, out, logger=logger)
-    return out
+        return _QK_ROPE_FUSION.run(
+            lambda: qknorm_complex_rope(x, norm.weight, rope, norm.variance_epsilon),
+            lambda: apply_rope(norm(x), rope),
+            logger=logger,
+        )
+    return apply_rope(norm(x), rope)
 
 
 def can_project_into(layer, x):
@@ -263,20 +251,30 @@ def cat_outputs(outputs, dim=0):
     return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=dim)
 
 
+def projected_residual_gate_add(layer, hidden, residual, gate):
+    """``residual_gate_add(residual, layer(hidden), gate)``. On a two-rank TP
+    group the row-parallel ``layer``'s all-reduce is folded into the gate
+    kernel, which reads both ranks' partial sums."""
+    if type(layer) is RowParallelLinear and residual.dtype is torch.bfloat16:
+        partials = staged_partials(layer, hidden, residual)
+        if partials is not None:
+            out = residual_gate_add_sum2(residual, *partials, gate)
+            if out is not None:
+                return out
+            # the kernel declined these operands: reduce the staged partials
+            update = (partials[0] + partials[1]).view_as(residual)
+            return residual_gate_add(residual, update, gate)
+    return residual_gate_add(residual, layer(hidden)[0], gate)
+
+
 def apply_modulation(x, norm, scale):
-    fused = None
-    if (
-        x.is_cuda
-        and can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
-        and _MODULATION_FUSION.can_attempt_once()
-    ):
-        fused = fused_layernorm_modulate(x, scale.squeeze(1), None, norm.eps)
-        if _MODULATION_FUSION.verified:
-            return fused
-    out = norm(x) * (1 + scale)
-    if fused is not None:
-        return _MODULATION_FUSION.accept_or_fallback(fused, out, logger=logger)
-    return out
+    if x.is_cuda and can_use_fused_layernorm_modulate(x.dtype, x.shape[-1]):
+        return _MODULATION_FUSION.run(
+            lambda: fused_layernorm_modulate(x, scale.squeeze(1), None, norm.eps),
+            lambda: norm(x) * (1 + scale),
+            logger=logger,
+        )
+    return norm(x) * (1 + scale)
 
 
 class QwenImage21ZeroCenterRMSNorm(nn.Module):
@@ -368,14 +366,32 @@ class QwenImage21FeedForward(nn.Module):
         )
 
     def pack_gate_up_weights(self):
-        """Share one [2F, C] INT8 weight and [2F, 1] scale storage between gate_layer
-        and proj so the comfy_kitchen path projects both with one GEMM.
+        """Share gate/up storage for SM120 BF16 or comfy_kitchen INT8 projections.
 
-        As with ``pack_qkv_weights``, parameters keep their names and shapes and
-        no reference to the shared storage is kept. Layers that are not plain
-        comfy_kitchen INT8 projections are left alone.
+        Parameter names and shapes stay intact. Views are re-derived from the
+        parameters so offload can release the storage, as with packed QKV.
         """
         gate, up = self.gate_layer, self.proj
+        if (
+            all(
+                type(layer) is ColumnParallelLinear
+                and isinstance(layer.quant_method, UnquantizedLinearMethod)
+                and layer.bias is None
+                and not layer.gather_output
+                and layer.tp_size == 1
+                and layer.weight.is_cuda
+                and layer.weight.dtype is torch.bfloat16
+                and layer.weight.shape == (12288, 4096)
+                and layer.weight.is_contiguous()
+                for layer in (gate, up)
+            )
+            and _is_cuda
+            and torch.cuda.get_device_capability(gate.weight.device) == (12, 0)
+        ):
+            if _stacked_rows(gate.weight, up.weight) is None:
+                weight = torch.cat([gate.weight.data, up.weight.data], dim=0)
+                gate.weight.data, up.weight.data = weight.chunk(2, dim=0)
+            return
         if self.packed_gate_up() is not None:
             return
         if not (
@@ -425,7 +441,25 @@ class QwenImage21FeedForward(nn.Module):
         self.pack_gate_up_weights()
         return module
 
-    def forward(self, x):
+    def forward(self, x, use_packed_bf16=False, project_out=True):
+        # project_out=False returns ``out``'s input; the comfy_kitchen MLP never
+        # runs then, since it needs a TP group of one.
+        # GEMM width can change rounding. Only use the measured target lengths;
+        # exact/lossless and conditioning prefixes keep separate projections.
+        if (
+            use_packed_bf16
+            and not torch.compiler.is_compiling()
+            and x.dim() == 3
+            and x.shape[0] == 1
+            and x.shape[1] in (1024, 4096)
+            and can_project_into(self.gate_layer, x)
+            and can_project_into(self.proj, x)
+            and x.device == self.gate_layer.weight.device == self.proj.weight.device
+        ):
+            weight = _stacked_rows(self.gate_layer.weight, self.proj.weight)
+            if weight is not None:
+                hidden = fused_packed_silu_mul_bitexact(nn.functional.linear(x, weight))
+                return self.out(hidden)[0] if project_out else hidden
         # Storage-identity checks cannot be traced; a compiled graph keeps the
         # separate projections.
         packed = None if torch.compiler.is_compiling() else self.packed_gate_up()
@@ -434,19 +468,15 @@ class QwenImage21FeedForward(nn.Module):
                 x, *packed, self.gate_layer.quant_method.group_size, self.out
             )
         gate, value = self.gate_layer(x)[0], self.proj(x)[0]
-        fused = None
-        if (
-            _is_cuda
-            and gate.dtype is torch.bfloat16
-            and _SILU_MUL_FUSION.can_attempt_once()
-        ):
-            fused = fused_silu_mul_bitexact(gate, value)
-            if _SILU_MUL_FUSION.verified:
-                return self.out(fused)[0]
-        hidden = nn.functional.silu(gate) * value
-        if fused is not None:
-            hidden = _SILU_MUL_FUSION.accept_or_fallback(fused, hidden, logger=logger)
-        return self.out(hidden)[0]
+        if _is_cuda and gate.dtype is torch.bfloat16:
+            hidden = _SILU_MUL_FUSION.run(
+                lambda: fused_silu_mul_bitexact(gate, value),
+                lambda: nn.functional.silu(gate) * value,
+                logger=logger,
+            )
+        else:
+            hidden = nn.functional.silu(gate) * value
+        return self.out(hidden)[0] if project_out else hidden
 
 
 class QwenImage21Attention(nn.Module):
@@ -822,7 +852,9 @@ class QwenImage21Attention(nn.Module):
                 )
         return out, prefix_output
 
-    def forward(self, x, ropes, prefixes, layouts, caches, prefix_pad):
+    def forward(
+        self, x, ropes, prefixes, layouts, caches, prefix_pad, project_out=True
+    ):
         # batch target projections while retaining each sample's unpadded prefix
         packed = self._project_qkv_packed(x, layouts, caches)
         qkv = None
@@ -853,7 +885,10 @@ class QwenImage21Attention(nn.Module):
             )
             outputs.append(out)
             prefix_outputs.append(prefix_out)
-        return self.to_out[0](cat_outputs(outputs).flatten(2))[0], prefix_outputs
+        hidden = cat_outputs(outputs).flatten(2)
+        if not project_out:
+            return hidden, prefix_outputs
+        return self.to_out[0](hidden)[0], prefix_outputs
 
 
 class QwenImage21TransformerBlock(nn.Module):
@@ -881,6 +916,7 @@ class QwenImage21TransformerBlock(nn.Module):
         ropes,
         caches,
         prefix_pad,
+        use_packed_bf16_mlp=False,
     ):
         # Cache-DiT's UnifiedBlocks forwards the same args to every layer.
         # Slice here so prefix KV stays per-layer after that wrap.
@@ -894,6 +930,10 @@ class QwenImage21TransformerBlock(nn.Module):
             else None
             for state, cache in zip(prefix_states, caches, strict=True)
         ]
+        # two-rank TP: the block's row-parallel outputs skip their all-reduce
+        peer_partials = (
+            _is_cuda and get_tp_world_size() == 2 and not torch.compiler.is_compiling()
+        )
         attention, prefix_attentions = self.attn(
             apply_modulation(hidden_states, self.img_norm1, scale1),
             ropes,
@@ -901,13 +941,32 @@ class QwenImage21TransformerBlock(nn.Module):
             layouts,
             caches,
             prefix_pad,
+            project_out=not peer_partials,
         )
-        hidden_states = residual_gate_add(hidden_states, attention, gate1)
-        hidden_states = residual_gate_add(
-            hidden_states,
-            self.img_mlp(apply_modulation(hidden_states, self.img_norm2, scale2)),
-            gate2,
-        )
+        if peer_partials:
+            hidden_states = projected_residual_gate_add(
+                self.attn.to_out[0], attention, hidden_states, gate1
+            )
+            hidden_states = projected_residual_gate_add(
+                self.img_mlp.out,
+                self.img_mlp(
+                    apply_modulation(hidden_states, self.img_norm2, scale2),
+                    use_packed_bf16=use_packed_bf16_mlp,
+                    project_out=False,
+                ),
+                hidden_states,
+                gate2,
+            )
+        else:
+            hidden_states = residual_gate_add(hidden_states, attention, gate1)
+            hidden_states = residual_gate_add(
+                hidden_states,
+                self.img_mlp(
+                    apply_modulation(hidden_states, self.img_norm2, scale2),
+                    use_packed_bf16=use_packed_bf16_mlp,
+                ),
+                gate2,
+            )
         for state, attention in zip(prefix_states, prefix_attentions, strict=True):
             if attention is not None:
                 _, pg1, ps2, pg2 = prefix_modulation
@@ -1057,6 +1116,10 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
         prefix_pad=None,
         **kwargs,
     ):
+        forward_batch = get_forward_context().forward_batch
+        use_packed_bf16_mlp = forward_batch is not None and quality_allows(
+            forward_batch.sampling_params.quality, "high"
+        )
         if isinstance(encoder_hidden_states, list):
             encoder_hidden_states = encoder_hidden_states[0]
         if prefix_kv is not None:
@@ -1117,6 +1180,7 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
                 ropes,
                 prefix_caches,
                 prefix_pad,
+                use_packed_bf16_mlp=use_packed_bf16_mlp,
             )
         output = self.proj_out(self.norm_out(images, temb))
         if sp > 1:

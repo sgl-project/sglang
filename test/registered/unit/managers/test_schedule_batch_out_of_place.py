@@ -285,10 +285,16 @@ class TestForwardBatchPrefillCompletion(unittest.TestCase):
                         int(forward.orig_seq_lens[i]),
                     )
                 self.assertEqual(forward.contains_last_prefill_chunk, completing)
+                final_extends = [completing, True] if mixed else [completing]
+                self.assertEqual(forward.extend_is_final_cpu, final_extends)
                 incoming.extend_end = 4 if completing else 8 + output_len
                 self.assertEqual(forward.contains_last_prefill_chunk, completing)
+                self.assertEqual(forward.extend_is_final_cpu, final_extends)
                 self.assertEqual(
                     dataclasses.replace(forward).contains_last_prefill_chunk, completing
+                )
+                self.assertEqual(
+                    dataclasses.replace(forward).extend_is_final_cpu, final_extends
                 )
 
 

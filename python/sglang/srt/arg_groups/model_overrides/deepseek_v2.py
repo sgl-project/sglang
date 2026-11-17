@@ -20,17 +20,22 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
         return {}
     if cfg.enable_hisparse or cfg.enable_hierarchical_cache:
         raise ValueError("DSA DCP does not support HiSparse or HiCache.")
-    if cfg.disaggregation_mode != "null":
+    platform = get_platform()
+    if cfg.disaggregation_mode != "null" and not platform.is_npu:
         raise ValueError("DSA DCP does not support PD disaggregation.")
     if cfg.speculative_eagle_topk not in (None, 1):
         raise ValueError("DSA DCP requires --speculative-eagle-topk 1.")
-    # The DCP paths: trtllm on CUDA, triton on ROCm.
-    backend = "triton" if get_platform().is_hip else "trtllm"
-    overrides = {
-        name: backend
-        for name in ("dsa_prefill_backend", "dsa_decode_backend")
-        if getattr(cfg, name) is None
-    }
+    # NPU has its own DSA DCP attention path; these split backends are CUDA/ROCm.
+    overrides = {}
+    if not platform.is_npu:
+        backend = "triton" if platform.is_hip else "trtllm"
+        overrides.update(
+            {
+                name: backend
+                for name in ("dsa_prefill_backend", "dsa_decode_backend")
+                if getattr(cfg, name) is None
+            }
+        )
     if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in ("a2a", "fi_a2a"):
         overrides["dcp_replicate_q_proj"] = True
     return overrides
@@ -49,6 +54,8 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
     "LongcatFlashForCausalLM",
     "LongcatFlashForCausalLMNextN",
     "Dots3NoteForCausalLM",
+    "Xing4_0ForCausalLM",
+    "KimiK31ForConditionalGeneration",
 )
 def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     """Declare DeepSeek/DSA defaults; ordered CP, KV-cache, and MoE passes run in model_hook."""
@@ -56,6 +63,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     from sglang.srt.configs.model_config import (
         get_dsa_index_kpool,
         is_deepseek_dsa,
+        is_kimi_k31,
         unwrap_modelopt_quantization_config,
     )
 
@@ -99,7 +107,8 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     )
 
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
-        overrides.update(_dsa_dcp_overrides(cfg))
+        if not is_kimi_k31(hf_config):
+            overrides.update(_dsa_dcp_overrides(cfg))
         # Set attention backend for DeepSeek
         if is_attention_backend_not_set(cfg):
             overrides["attention_backend"] = "dsa"

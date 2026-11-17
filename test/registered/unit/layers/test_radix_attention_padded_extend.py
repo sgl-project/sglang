@@ -87,7 +87,6 @@ class TestPaddedExtendAttention(CustomTestCase):
     its attention metadata covers only the real rows."""
 
     def test_only_padded_extend_batches_are_narrowed(self):
-        q = torch.zeros(8, 2)
         cases = [
             (ForwardMode.EXTEND, 5, 5),
             (ForwardMode.EXTEND, 8, None),  # nothing padded
@@ -98,7 +97,7 @@ class TestPaddedExtendAttention(CustomTestCase):
         for mode, real, expected in cases:
             with self.subTest(mode=mode, real=real):
                 self.assertEqual(
-                    radix_attention.padded_extend_real_tokens(q, _batch(mode, real)),
+                    radix_attention.padded_extend_real_tokens(8, _batch(mode, real)),
                     expected,
                 )
 

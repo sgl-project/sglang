@@ -411,6 +411,7 @@ class FusedMoE(torch.nn.Module):
         enable_qwen35_fp8_deferred_finalize: bool = False,
         quant_method: Optional[FusedMoEMethodBase] = None,
         uses_expert_location: bool = True,
+        allow_fp8_blockwise_tail: bool = False,
     ):
         super().__init__()
         if params_dtype is None:
@@ -430,6 +431,7 @@ class FusedMoE(torch.nn.Module):
         self.num_experts = num_experts
         self.with_bias = with_bias
         self.num_fused_shared_experts = num_fused_shared_experts
+        self.allow_fp8_blockwise_tail = allow_fp8_blockwise_tail
 
         self.enable_flashinfer_cutlass_moe = (
             get_moe_runner_backend().is_flashinfer_cutlass()
@@ -475,8 +477,6 @@ class FusedMoE(torch.nn.Module):
         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
         self.reduce_results = reduce_results
         self.use_presharded_weights = use_presharded_weights
-
-        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
 
         self.use_flashinfer_trtllm_moe = (
             get_moe_runner_backend().is_flashinfer_trtllm()
@@ -540,14 +540,13 @@ class FusedMoE(torch.nn.Module):
             elif quant_config is not None:
                 gpu_method = quant_config.get_quant_method(self, prefix)
             else:
-                gpu_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
+                gpu_method = UnquantizedFusedMoEMethod()
             self.quant_method = KTEPWrapperMethod(gpu_method, kt_config)
         else:
             if self.quant_method is None and quant_config is not None:
                 self.quant_method = quant_config.get_quant_method(self, prefix)
             if self.quant_method is None:
                 self.quant_method = UnquantizedFusedMoEMethod(
-                    self.use_triton_kernels,
                     self.use_flashinfer_trtllm_moe,
                     self.use_deep_gemm,
                 )
@@ -701,7 +700,6 @@ class FusedMoE(torch.nn.Module):
         self.use_flashinfer_mxfp4_moe = (
             backend is not None and backend.is_flashinfer_mxfp4()
         )
-        self.use_triton_kernels = backend is not None and backend.is_triton_kernels()
         self.use_deep_gemm = backend is not None and backend.is_deep_gemm()
         self.use_flashinfer_trtllm_moe = backend is not None and (
             backend.is_flashinfer_trtllm() or backend.is_flashinfer_trtllm_routed()
@@ -912,9 +910,6 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             if not self.use_presharded_weights:
-                if not is_bias and self.use_triton_kernels:
-                    # do not transpose for bias
-                    loaded_weight = loaded_weight.transpose(-2, -1)
                 # When the buffer is padded (e.g., MXFP4 SM100 rounds
                 # intermediate up to 256), shard_size from the buffer may
                 # exceed the checkpoint's per-TP slice.  Derive the actual
@@ -1009,8 +1004,6 @@ class FusedMoE(torch.nn.Module):
                     not self.use_presharded_weights,
                 )
             elif not is_bias and not self.use_presharded_weights:
-                if self.use_triton_kernels:
-                    loaded_weight = loaded_weight.transpose(-2, -1)
                 # Derive shard size from the loaded weight so padded buffers
                 # do not cause out-of-bounds indexing into the checkpoint.
                 loaded_shard_size = loaded_weight.shape[shard_dim] // self.moe_tp_size
@@ -1258,6 +1251,17 @@ class FusedMoE(torch.nn.Module):
                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
             return
 
+        for local_expert_id in self._weight_loader_expert_ids(param, expert_id):
+            self._weight_loader_impl(
+                param=param,
+                loaded_weight=loaded_weight,
+                weight_name=weight_name,
+                shard_id=shard_id,
+                expert_id=local_expert_id,
+            )
+
+    def _weight_loader_expert_ids(self, param: torch.nn.Parameter, expert_id: int):
+        """Resolve destinations before online loaders allocate a source tensor."""
         global_expert_location_metadata = (
             get_global_expert_location_metadata() if self.uses_expert_location else None
         )
@@ -1266,14 +1270,7 @@ class FusedMoE(torch.nn.Module):
                 expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
                 if expert_id == -1:
                     return
-
-            self._weight_loader_impl(
-                param=param,
-                loaded_weight=loaded_weight,
-                weight_name=weight_name,
-                shard_id=shard_id,
-                expert_id=expert_id,
-            )
+            yield expert_id
             return
 
         require_global_experts = getattr(param, "_sglang_require_global_experts", False)
@@ -1305,44 +1302,18 @@ class FusedMoE(torch.nn.Module):
                 # routed slot can lie past _num_global_routed and map to the shared slot.
                 physical_expert_ids = self._local_routed_expert_ids(physical_expert_ids)
 
-        for physical_expert_id in physical_expert_ids:
-            self._weight_loader_physical(
-                param=param,
-                loaded_weight=loaded_weight,
-                weight_name=weight_name,
-                shard_id=shard_id,
-                expert_id=physical_expert_id,
-            )
-
-    def _weight_loader_physical(
-        self,
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-    ) -> None:
-        # WARN: This makes the `expert_id` mean "local" and "global" in different cases
-        if not getattr(param, "_sglang_require_global_experts", False):
-            expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
-            if expert_id < 0 or expert_id >= self.num_local_experts:
-                return
-
-        if isinstance(
-            self.quant_method,
-            KTEPWrapperMethod,
-        ):
-            if self.quant_method.num_gpu_experts != -1:
-                if expert_id >= self.quant_method.num_gpu_experts:
-                    return
-
-        self._weight_loader_impl(
-            param=param,
-            loaded_weight=loaded_weight,
-            weight_name=weight_name,
-            shard_id=shard_id,
-            expert_id=expert_id,
-        )
+        for expert_id in physical_expert_ids:
+            # Expert IDs are local unless this parameter explicitly requires
+            # global expert storage. Preserve EPLB replicas and shared slots.
+            if not getattr(param, "_sglang_require_global_experts", False):
+                expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
+                if expert_id < 0 or expert_id >= self.num_local_experts:
+                    continue
+            if isinstance(self.quant_method, KTEPWrapperMethod):
+                if self.quant_method.num_gpu_experts != -1:
+                    if expert_id >= self.quant_method.num_gpu_experts:
+                        continue
+            yield expert_id
 
     def _load_gguf_weight(
         self,
@@ -1469,8 +1440,6 @@ class FusedMoE(torch.nn.Module):
         # should be whatever dimension intermediate_size is
         is_transposed = getattr(param, "is_transposed", False)
         shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
-        if self.use_triton_kernels:
-            is_transposed = True
         if is_transposed:
             shard_dim = int(not shard_dim)
 
@@ -1713,9 +1682,6 @@ class FusedMoE(torch.nn.Module):
         # should be flipped. Required by GPTQ, compressed-tensors
         # should be whatever dimension intermediate_size is
         is_transposed = getattr(param, "is_transposed", False)
-
-        if self.use_triton_kernels:
-            is_transposed = True
         shard_dim = (
             SHARD_ID_TO_SHARDED_DIM[shard_id]
             if not is_transposed
