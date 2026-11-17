@@ -10,8 +10,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import torch
-
 from sglang.srt.managers.scheduler_components import (
     weight_updater as weight_updater_module,
 )
@@ -64,45 +62,28 @@ DP_ARGS = SERVER_ARGS + (
 NORM_WEIGHT = "model.norm.weight"
 
 
-def _enqueue_npu_work(iterations=256, size=4096):
-    """Queue real NPU work without waiting, like torch.cuda._sleep on CUDA."""
-    lhs = torch.randn(size, size, dtype=torch.float16, device="npu")
-    rhs = torch.randn(size, size, dtype=torch.float16, device="npu")
-    out = torch.empty_like(lhs)
-    for _ in range(iterations):
-        torch.mm(lhs, rhs, out=out)
-
-
 def _make_manager(events):
-    manager = object.__new__(SchedulerWeightUpdaterManager)
-    manager.tp_worker = SimpleNamespace(model_runner=SimpleNamespace(model=object()))
-    manager.draft_worker = None
-    manager.memory_saver_adapter = SimpleNamespace(
-        pause=lambda tag: events.append(("pause", tag)),
-        resume=lambda tag: events.append(("resume", tag)),
-    )
-    manager.flush_cache = lambda **kwargs: events.append(("flush", None)) or True
-    manager.is_fully_idle = lambda **kwargs: True
-    manager.scheduler = None
-    manager.offload_tags = set()
-    manager.stashed_model_static_state = None
-    manager.tp_cpu_group = object()
-    return manager
+    with patch.object(
+        weight_updater_module,
+        "get_parallel",
+        lambda: SimpleNamespace(tp_group=SimpleNamespace(cpu_group=object())),
+    ):
+        return SchedulerWeightUpdaterManager(
+            tp_worker=SimpleNamespace(model_runner=SimpleNamespace(model=object())),
+            draft_worker=None,
+            memory_saver_adapter=SimpleNamespace(
+                pause=lambda tag: events.append(("pause", tag)),
+                resume=lambda tag: events.append(("resume", tag)),
+            ),
+            flush_cache=lambda **kwargs: events.append(("flush", None)) or True,
+            is_fully_idle=lambda **kwargs: True,
+        )
 
 
 class TestNpuDeviceBarrier(CustomTestCase):
     def test_release_synchronizes_before_return(self):
-        torch.npu.set_device(0)
-        torch.npu.synchronize()
-
         events = []
         manager = _make_manager(events)
-
-        _enqueue_npu_work()
-        self.assertFalse(
-            torch.npu.current_stream().query(),
-            "helper failed to leave NPU work in flight",
-        )
 
         with (
             patch.object(
@@ -119,17 +100,18 @@ class TestNpuDeviceBarrier(CustomTestCase):
                 "torch.distributed.barrier",
                 lambda *args, **kwargs: events.append(("barrier", None)),
             ),
+            patch(
+                "torch.npu.synchronize",
+                lambda: events.append(("sync", None)),
+            ),
             # release_memory_occupation gates on the TP ranks being idle.
             patch("torch.distributed.all_reduce", lambda *args, **kwargs: None),
         ):
             manager.release_memory_occupation(SimpleNamespace(tags=["weights"]))
 
-        self.assertTrue(
-            torch.npu.current_stream().query(),
-            "release returned while NPU work was still in flight",
-        )
-        self.assertIn(
-            "pause", [kind for kind, _ in events], "weights were never released"
+        self.assertEqual(
+            [kind for kind, _ in events],
+            ["export", "barrier", "pause", "sync", "barrier"],
         )
 
     def test_resume_orders_restore_after_barrier(self):
@@ -155,18 +137,9 @@ class TestNpuDeviceBarrier(CustomTestCase):
         ):
             manager.resume_memory_occupation(SimpleNamespace(tags=["weights"]))
 
-        kinds = [kind for kind, _ in events]
-        self.assertIn("barrier", kinds, "resume did not join the TP ranks")
-        self.assertIn("import", kinds, "resume did not restore static state")
-        self.assertLess(
-            kinds.index("resume"),
-            kinds.index("barrier"),
-            f"state restored before the replica barrier: {events}",
-        )
-        self.assertLess(
-            kinds.index("barrier"),
-            kinds.index("import"),
-            f"state restored before all ranks finished: {events}",
+        self.assertEqual(
+            [kind for kind, _ in events],
+            ["resume", "barrier", "import"],
         )
         # resume_memory_occupation has no device-wide synchronize today; this
         # test locks the barrier/restore ordering that the current code provides.
