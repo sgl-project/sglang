@@ -1983,6 +1983,27 @@ class TestEstimatedPerfConstants(CustomTestCase):
             2.0 * kv_heads * head_dim * num_attn_layers * 2.0,
         )
 
+    def test_warns_when_hybrid_layer_split_cannot_be_determined(self):
+        with self.assertLogs(
+            "sglang.srt.managers.scheduler_components.metrics_reporter",
+            level="WARNING",
+        ) as cm:
+            self._init(_fake_model_config(num_attention_layers=4))
+        self.assertTrue(
+            any("hybrid attention/MLP layer split" in msg for msg in cm.output)
+        )
+
+    def test_no_warning_when_full_attention_layer_ids_present(self):
+        with self.assertNoLogs(
+            "sglang.srt.managers.scheduler_components.metrics_reporter",
+            level="WARNING",
+        ):
+            self._init(
+                _fake_model_config(
+                    num_attention_layers=4, full_attention_layer_ids=[0, 2]
+                )
+            )
+
     def test_mlp_flops_and_weight_bytes_shrink_with_tp_size(self):
         # intermediate_size (the MLP/FFN dimension) is sharded under tensor
         # parallelism the same way num_attention_heads/num_kv_heads already

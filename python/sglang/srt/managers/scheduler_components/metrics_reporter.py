@@ -612,6 +612,16 @@ class SchedulerMetricsReporter:
                 full_attention_layer_ids = getattr(
                     hf_text_config, "full_attention_layer_ids", None
                 )
+            if full_attention_layer_ids is None:
+                logger.warning(
+                    "Could not determine hybrid attention/MLP layer split for "
+                    "model %s (no recognized layers_block_type convention and "
+                    "no full_attention_layer_ids on model_config or "
+                    "hf_text_config); estimated MFU/MBU metrics will assume "
+                    "every layer is a full attention+MLP transformer layer, "
+                    "which may be inaccurate for hybrid architectures.",
+                    getattr(model_config, "model_path", type(model_config).__name__),
+                )
             num_attn_layers = (
                 float(len(full_attention_layer_ids))
                 if full_attention_layer_ids is not None
@@ -770,7 +780,10 @@ class SchedulerMetricsReporter:
             mlp_weight_mult = 3.0
             mlp_flops = 6.0 * hidden_size * moe_intermediate_size * active_expert_units
             mlp_weight_elems_per_layer = (
-                mlp_weight_mult * hidden_size * moe_intermediate_size * active_expert_units
+                mlp_weight_mult
+                * hidden_size
+                * moe_intermediate_size
+                * active_expert_units
             )
         else:
             # Dense (non-MoE) FFN FLOPs/weight-elems depend on whether the FFN is
