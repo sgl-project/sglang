@@ -1253,6 +1253,7 @@ def run_fixed_step_sde(
     seed: int,
     frame_start: int,
     dtype: torch.dtype,
+    forward_batch: Req | None = None,
     **forward_kwargs: Any,
 ) -> torch.Tensor:
     """Fixed-step SDE denoising of one chunk; history K/V is read but never committed."""
@@ -1261,7 +1262,9 @@ def run_fixed_step_sde(
     for step_index, (timestep, forward_timestep) in enumerate(
         schedules.begin_chunk(t_list, noise.device)
     ):
-        with set_forward_context(current_timestep=step_index, attn_metadata=None):
+        with set_forward_context(
+            current_timestep=step_index, attn_metadata=None, forward_batch=forward_batch
+        ):
             output = transformer(
                 latents.to(dtype),
                 forward_timestep,
@@ -1291,6 +1294,7 @@ def commit_clean_kv(
     dtype: torch.dtype,
     tokens_per_frame: int,
     window_frames: int | None,
+    forward_batch: Req | None = None,
     **forward_kwargs: Any,
 ) -> None:
     """Clean-refresh ``latent`` (no time embedding) and commit its K/V.
@@ -1299,7 +1303,9 @@ def commit_clean_kv(
     what the history keeps after its sink (None keeps everything).
     """
     chunk_tokens = latent.shape[2] * tokens_per_frame
-    with set_forward_context(current_timestep=0, attn_metadata=None):
+    with set_forward_context(
+        current_timestep=0, attn_metadata=None, forward_batch=forward_batch
+    ):
         transformer.write_clean_kv(
             latent.to(dtype), kv_slots=history.slots(chunk_tokens), **forward_kwargs
         )
@@ -1322,6 +1328,7 @@ class _RolloutContext(msgspec.Struct):
     geometry: CosmosDreamsGeometry
     device: torch.device
     dtype: torch.dtype
+    forward_batch: Req | None = None
     row_domain_ids: torch.Tensor | None = None
 
     @property
@@ -1471,6 +1478,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
             geometry=geometry,
             device=device,
             dtype=torch.bfloat16,
+            forward_batch=batch,
             row_domain_ids=None if row_domain_ids is None else row_domain_ids.to("cpu"),
         )
 
@@ -1710,6 +1718,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
             seed=seed,
             frame_start=frame_start,
             dtype=context.dtype,
+            forward_batch=context.forward_batch,
             text_length=context.text_length,
             fps=context.fps,
             action_latents=action,
@@ -1737,6 +1746,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
             dtype=context.dtype,
             tokens_per_frame=context.tokens_per_frame,
             window_frames=self.profile.window_frames,
+            forward_batch=context.forward_batch,
             text_length=context.text_length,
             frame_start=frame_idx,
             fps=context.fps,

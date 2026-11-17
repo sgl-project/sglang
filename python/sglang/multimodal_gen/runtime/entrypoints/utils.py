@@ -1,12 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-"""
-DiffGenerator module for sglang-diffusion.
-
-This module provides a consolidated interface for generating videos using
-diffusion models.
-"""
+"""Shared entrypoint helpers: build a Req from SamplingParams and materialize/save generated images, videos and actions."""
 
 import atexit
 import io
@@ -257,10 +252,6 @@ def _normalize_audio_to_numpy(audio: Any) -> np.ndarray | None:
     # 2. Handle (C, L) -> (L, C)
     if audio_np.ndim == 2 and audio_np.shape[0] < audio_np.shape[1]:
         audio_np = audio_np.transpose(1, 0)
-
-    # 3. Final safety check: if still 2D and channels (dim 1) is huge, something is wrong
-    if audio_np.ndim == 2 and audio_np.shape[1] > 256 and audio_np.shape[0] == 1:
-        audio_np = audio_np.flatten()
 
     return audio_np
 
