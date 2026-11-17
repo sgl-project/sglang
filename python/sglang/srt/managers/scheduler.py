@@ -412,7 +412,7 @@ from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_captur
 from sglang.srt.state_capturer.routed_experts import destroy_global_experts_capturer
 from sglang.srt.utils import (
     DynamicGradMode,
-    configure_gc_logger,
+    configure_gc_logging,
     configure_logger,
     freeze_gc,
     get_available_gpu_memory,
@@ -1548,6 +1548,12 @@ class Scheduler(
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
             shortest_prefill_aging_factor=get_schedule().shortest_prefill_aging_factor,
+            bounded_lpm_enabled=self.dllm_config is None,
+        )
+        self.policy._on_bounded_state_change = lambda active: (
+            self.waiting_queue.set_on_leave(
+                self.policy.retire_waiting_members if active else None
+            )
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
@@ -1614,9 +1620,7 @@ class Scheduler(
             else None
         )
 
-        # Configure GC logger
-        if envs.SGLANG_LOG_GC.get():
-            configure_gc_logger()
+        configure_gc_logging("Scheduler")
 
     def init_disaggregation(self):
         self.mm_receiver = None
@@ -2094,9 +2098,7 @@ class Scheduler(
             result_dict["rust_server_pid"] = os.getpid()
         result_dict["hicache_object_layout"] = self._hicache_l3_layout()
 
-        if get_serving().grpc_port is not None and not (
-            get_serving().smg_grpc_mode or get_serving().grpc_mode
-        ):
+        if get_serving().grpc_port is not None:
             result_dict["kv_event_sources"] = (
                 self.kv_events_publisher.local_kv_event_sources(
                     self.page_size * get_parallel().dcp_size
@@ -3280,16 +3282,20 @@ class Scheduler(
 
     def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
         for req in batch.reqs:
-            if not req.finished() or not (mm_inputs := req.multimodal_inputs):
-                continue
-            # For session requests, keep mm_inputs for the next request
-            if req.session:
-                if isinstance(req.finished_reason, FINISH_ABORT):
-                    req.release_mm_inputs_on_abort()
-                continue
-            # For non-session requests, clear features and mm_inputs
-            mm_inputs.release_features()
-            req.multimodal_inputs = None
+            if req.finished():
+                self._release_mm_inputs(req)
+
+    def _release_mm_inputs(self, req: Req) -> None:
+        if not (mm_inputs := req.multimodal_inputs):
+            return
+        # For session requests, keep mm_inputs for the next request
+        if req.session:
+            if isinstance(req.finished_reason, FINISH_ABORT):
+                req.release_mm_inputs_on_abort()
+            return
+        # For non-session requests, clear features and mm_inputs
+        mm_inputs.release_features()
+        req.multimodal_inputs = None
 
     def _create_generation_req(
         self, recv_req: TokenizedGenerateReqInput, *args, **kwargs
@@ -3354,7 +3360,6 @@ class Scheduler(
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
                 session_id=recv_req.session_id,
-                parent_session_id=recv_req.parent_session_id,
                 input_embeds=recv_req.input_embeds,
                 positional_embed_overrides=recv_req.positional_embed_overrides,
                 token_type_ids=recv_req.token_type_ids,
@@ -4688,12 +4693,22 @@ class Scheduler(
         # Requests no memory will ever come back for; aborted after the loop.
         unschedulable: List[Req] = []
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        bounded_active = self.policy._bounded_active
+        candidates = (
+            self.policy.admission_candidates(self.waiting_queue)
+            if bounded_active
+            else self.waiting_queue
+        )
+        for req in candidates:
+            if bounded_active and not self.policy.allows_admission(req):
+                break
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
             if chunk_parked or adder.budget_state() == AddReqResult.OTHER:
                 break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
+                if bounded_active:
+                    self.policy.mark_admission_skipped(req)
                 continue
 
             # A forward batch runs one pooling mode, so setwise readout requests
@@ -4703,6 +4718,8 @@ class Scheduler(
                 (req.token_indices_to_pool is not None)
                 != (adder.can_run_list[0].token_indices_to_pool is not None)
             ):
+                if bounded_active:
+                    self.policy.mark_admission_skipped(req)
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -4736,6 +4753,8 @@ class Scheduler(
                 req.time_stats.observe_storage_prefetch_ready(prefetch_done)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
+                    if bounded_active:
+                        self.policy.mark_admission_skipped(req)
                     continue
                 # Pop the L3-loaded span. Unified cache exposes its absolute
                 # start so cache-mode L2/L3 attribution survives L3-tail eviction.
@@ -4763,6 +4782,8 @@ class Scheduler(
             ):
                 if defer_cow_slot:
                     self._drop_unadmitted_match(req)
+                if bounded_active:
+                    self.policy.mark_admission_skipped(req)
                 continue
             if self.enable_hicache_storage and buffer_pipeline is not None:
                 staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
@@ -4770,6 +4791,8 @@ class Scheduler(
                 if not staging_ready:
                     if defer_cow_slot:
                         self._drop_unadmitted_match(req)
+                    if bounded_active:
+                        self.policy.mark_admission_skipped(req)
                     continue
             res = adder.add_one_req(
                 req,

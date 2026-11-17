@@ -1468,6 +1468,7 @@ class SchedulerDisaggregationPrefillMixin:
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
+            self._release_mm_inputs(req)
 
         return done_reqs
 
