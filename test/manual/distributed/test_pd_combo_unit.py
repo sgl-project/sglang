@@ -15,10 +15,10 @@ from sglang.srt.runtime_context import get_context, get_server_args
 from sglang.test.test_utils import CustomTestCase
 
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_pd_args(**overrides):
     """Build ServerArgs and run PD disaggregation validation.
@@ -44,9 +44,9 @@ def _make_server_checks_args(**overrides):
     """Run only the chunked-prefill divisibility rule from check_server_args."""
     args = ServerArgs(model_path="dummy", **overrides)
     if args.chunked_prefill_size > 0 and args.disaggregation_mode != "decode":
-        assert (
-            args.chunked_prefill_size % args.page_size == 0
-        ), "chunked_prefill_size must be divisible by page_size"
+        assert args.chunked_prefill_size % args.page_size == 0, (
+            "chunked_prefill_size must be divisible by page_size"
+        )
     return args
 
 
@@ -84,6 +84,7 @@ def _install_override(**fields):
 # ---------------------------------------------------------------------------
 # 1. PD + speculative (MTP) combinations
 # ---------------------------------------------------------------------------
+
 
 class TestPDSpeculativeCombos(CustomTestCase):
     """Validate PD disaggregation + speculative / MTP server-args rules."""
@@ -170,6 +171,7 @@ class TestPDSpeculativeCombos(CustomTestCase):
 # 2. PD + prefix cache combinations
 # ---------------------------------------------------------------------------
 
+
 class TestPDPrefixCacheCombos(CustomTestCase):
     """Validate PD disaggregation + prefix-cache / radix-cache rules."""
 
@@ -206,6 +208,7 @@ class TestPDPrefixCacheCombos(CustomTestCase):
 # ---------------------------------------------------------------------------
 # 3. PD + chunked-prefill combinations
 # ---------------------------------------------------------------------------
+
 
 class TestPDChunkedPrefillCombos(CustomTestCase):
     """Validate PD disaggregation + chunked-prefill rules."""
@@ -256,6 +259,7 @@ class TestPDChunkedPrefillCombos(CustomTestCase):
 # 4. PD + CUDA graph role assignment
 # ---------------------------------------------------------------------------
 
+
 class TestPDCudaGraphRoles(CustomTestCase):
     """Validate that PD mode disables the irrelevant CUDA graph phase."""
 
@@ -304,6 +308,7 @@ class TestPDCudaGraphRoles(CustomTestCase):
 # ---------------------------------------------------------------------------
 # 5. PD + DCP (decode context parallel) combinations
 # ---------------------------------------------------------------------------
+
 
 class TestPDDcpCombos(CustomTestCase):
     """Validate PD disaggregation + DCP rules."""
@@ -364,6 +369,7 @@ class TestPDDcpCombos(CustomTestCase):
 # 6. PD + load-balance method
 # ---------------------------------------------------------------------------
 
+
 class TestPDLoadBalanceMethod(CustomTestCase):
     """Validate PD load-balance method defaults and overrides."""
 
@@ -402,6 +408,7 @@ class TestPDLoadBalanceMethod(CustomTestCase):
 # ---------------------------------------------------------------------------
 # 7. PD + unified memory pool
 # ---------------------------------------------------------------------------
+
 
 class TestPDUnifiedMemoryCombos(CustomTestCase):
     """Validate PD disaggregation + unified memory pool rules."""
@@ -443,6 +450,7 @@ class TestPDUnifiedMemoryCombos(CustomTestCase):
 # 8. PD + transfer backend mooncake_tcp
 # ---------------------------------------------------------------------------
 
+
 class TestPDMooncakeTcpCombo(CustomTestCase):
     """Validate PD + mooncake_tcp transport backend rewriting."""
 
@@ -475,6 +483,7 @@ class TestPDMooncakeTcpCombo(CustomTestCase):
 # 9. PD + extra decode slots
 # ---------------------------------------------------------------------------
 
+
 class TestPDDecodeExtraSlots(CustomTestCase):
     """Validate PD decode extra-slots auto-sizing."""
 
@@ -505,6 +514,7 @@ class TestPDDecodeExtraSlots(CustomTestCase):
 # 10. Runtime context override smoke
 # ---------------------------------------------------------------------------
 
+
 class TestPDComboRuntimeContextOverride(CustomTestCase):
     """Smoke-test that PD combo overrides propagate to the runtime context."""
 
@@ -516,9 +526,7 @@ class TestPDComboRuntimeContextOverride(CustomTestCase):
         self.addCleanup(override.restore)
 
         self.assertEqual(get_server_args().disaggregation_mode, "decode")
-        self.assertEqual(
-            get_server_args().disaggregation_transfer_backend, "nixl"
-        )
+        self.assertEqual(get_server_args().disaggregation_transfer_backend, "nixl")
 
     def test_override_speculative_algorithm_propagates(self):
         override = _install_override(
