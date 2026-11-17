@@ -7,6 +7,7 @@ here is CPU/meta-device only -- no weights, no GPU.
 """
 
 import json
+import os
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -637,8 +638,50 @@ class TestLTX25DevVariant(unittest.TestCase):
         class _Args:
             model_variant = variant
             component_paths: dict = {}
+            revision = None
 
         return _Args()
+
+    @staticmethod
+    def _fake_hub_cache(cache_dir: str, *, with_full: bool) -> str:
+        """Lay out a hub cache entry (configs, empty weight files) for one repo."""
+        repo = os.path.join(cache_dir, "models--Lightricks--LTX-2.5-Diffusers")
+        snapshot = os.path.join(repo, "snapshots", "a" * 40)
+        components = ["transformer", "vae"] + (
+            ["transformer_full"] if with_full else []
+        )
+        for name in components:
+            os.makedirs(os.path.join(snapshot, name))
+            for filename in ("config.json", "diffusion_pytorch_model.safetensors"):
+                with open(os.path.join(snapshot, name, filename), "w") as f:
+                    f.write("{}")
+        with open(os.path.join(snapshot, "model_index.json"), "w") as f:
+            json.dump(
+                {
+                    "_class_name": "LTX2Pipeline",
+                    "transformer": ["diffusers", "LTX2VideoTransformer3DModel"],
+                    "vae": ["diffusers", "AutoencoderKLLTX2Video"],
+                },
+                f,
+            )
+        os.makedirs(os.path.join(repo, "refs"))
+        with open(os.path.join(repo, "refs", "main"), "w") as f:
+            f.write("a" * 40)
+        return snapshot
+
+    def _route_hub_id(self, *, with_full: bool):
+        import huggingface_hub
+
+        cls = self._pipeline_cls()
+        args = self._args("dev")
+        with tempfile.TemporaryDirectory() as cache_dir:
+            snapshot = self._fake_hub_cache(cache_dir, with_full=with_full)
+            with (
+                mock.patch.object(huggingface_hub.constants, "HF_HUB_CACHE", cache_dir),
+                mock.patch.object(huggingface_hub.constants, "HF_HUB_OFFLINE", True),
+            ):
+                cls._maybe_route_dev_transformer("Lightricks/LTX-2.5-Diffusers", args)
+        return snapshot, args
 
     def test_variant_aliases(self):
         cls = self._pipeline_cls()
@@ -649,8 +692,23 @@ class TestLTX25DevVariant(unittest.TestCase):
 
     def test_missing_weights_raises_a_clear_error(self):
         cls = self._pipeline_cls()
+        with tempfile.TemporaryDirectory() as model_dir:
+            with self.assertRaises(ValueError) as ctx:
+                cls._maybe_route_dev_transformer(model_dir, self._args("dev"))
+        self.assertIn("transformer_full", str(ctx.exception))
+
+    def test_hub_id_resolves_to_the_cached_snapshot(self):
+        """A hub id must be checked against its downloaded snapshot, not as a
+        relative directory, or `--model-variant dev` fails on a full download."""
+        snapshot, args = self._route_hub_id(with_full=True)
+        self.assertEqual(
+            args.component_paths["transformer"],
+            os.path.join(snapshot, "transformer_full"),
+        )
+
+    def test_hub_id_without_full_weights_raises_a_clear_error(self):
         with self.assertRaises(ValueError) as ctx:
-            cls._maybe_route_dev_transformer("/nonexistent/model", self._args("dev"))
+            self._route_hub_id(with_full=False)
         self.assertIn("transformer_full", str(ctx.exception))
 
     def test_explicit_component_path_wins(self):
