@@ -197,29 +197,21 @@ class BaseGrammarBackend:
     # compiled grammar holds per-vocabulary token tables, so an unbounded cache
     # leaks host memory whenever clients send a different json_schema / regex /
     # EBNF per request. The byte budget (--grammar-cache-limit-bytes) is the
-    # operator-facing bound: it is known before startup, whereas what an entry
-    # count costs depends on the schemas clients happen to send. The entry count
-    # stays only as a fixed backstop, mainly for backends that cannot report
-    # sizes. In-flight requests keep their own ``copy()`` of a grammar, so
-    # evicting an entry is safe.
+    # only bound: it is known before startup, whereas what an entry count costs
+    # depends on the schemas clients happen to send, and a count would bind
+    # before the budget for small grammars without covering xgrammar's own
+    # compiler cache. In-flight requests keep their own ``copy()`` of a grammar,
+    # so evicting an entry is safe.
     DEFAULT_CACHE_LIMIT_BYTES = 1 << 30
-    DEFAULT_CACHE_MAX_ENTRIES = 64
     # Charged per entry when the backend has no size API (outlines, llguidance).
     NOMINAL_GRAMMAR_BYTES = 1 << 20
 
-    def __init__(
-        self,
-        cache_limit_bytes: Optional[int] = None,
-        cache_max_entries: Optional[int] = None,
-    ):
+    def __init__(self, cache_limit_bytes: Optional[int] = None):
         self.executor = ThreadPoolExecutor()
         if cache_limit_bytes is None:
             cache_limit_bytes = self.DEFAULT_CACHE_LIMIT_BYTES
-        if cache_max_entries is None:
-            cache_max_entries = self.DEFAULT_CACHE_MAX_ENTRIES
-        # <= 0 disables the respective bound.
+        # <= 0 disables the bound.
         self.cache_limit_bytes = int(cache_limit_bytes)
-        self.cache_max_entries = int(cache_max_entries)
         self.cache: OrderedDict[Tuple[str, str], BaseGrammarObject] = OrderedDict()
         self._cache_entry_bytes: Dict[Tuple[str, str], int] = {}
         self.cache_size_bytes = 0
@@ -339,10 +331,7 @@ class BaseGrammarBackend:
         return size
 
     def _over_budget(self) -> bool:
-        return (
-            0 < self.cache_limit_bytes < self.cache_size_bytes
-            or 0 < self.cache_max_entries < len(self.cache)
-        )
+        return 0 < self.cache_limit_bytes < self.cache_size_bytes
 
     def set_cache(self, key: Tuple[str, str], value: BaseGrammarObject):
         if key in self._cache_entry_bytes:
@@ -358,9 +347,8 @@ class BaseGrammarBackend:
             evicted_key, _ = self.cache.popitem(last=False)
             self.cache_size_bytes -= self._cache_entry_bytes.pop(evicted_key, 0)
             logger.debug(
-                "Grammar cache over budget (%d bytes, %d entries); evicted %s grammar",
+                "Grammar cache over budget (%d bytes); evicted %s grammar",
                 self.cache_limit_bytes,
-                self.cache_max_entries,
                 evicted_key[0],
             )
 

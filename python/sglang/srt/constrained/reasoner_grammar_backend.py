@@ -459,10 +459,7 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         # wrapped backend's budget unless given one explicitly.
         if cache_limit_bytes is None:
             cache_limit_bytes = getattr(grammar_backend, "cache_limit_bytes", None)
-        super().__init__(
-            cache_limit_bytes=cache_limit_bytes,
-            cache_max_entries=getattr(grammar_backend, "cache_max_entries", None),
-        )
+        super().__init__(cache_limit_bytes=cache_limit_bytes)
         self.grammar_backend = grammar_backend
         self._budget_variant_keys: OrderedDict[Tuple[str, str], None] = OrderedDict()
         think_end_ids = reasoning_parser.detector.get_think_end_token_ids(tokenizer)

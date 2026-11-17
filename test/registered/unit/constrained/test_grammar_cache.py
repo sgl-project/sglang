@@ -60,10 +60,8 @@ class _DummyGrammar(BaseGrammarObject):
 class _StubBackend(BaseGrammarBackend):
     """Backend whose dispatch is synchronous and counts compilations."""
 
-    def __init__(self, cache_limit_bytes=None, cache_max_entries=None):
-        super().__init__(
-            cache_limit_bytes=cache_limit_bytes, cache_max_entries=cache_max_entries
-        )
+    def __init__(self, cache_limit_bytes=None):
+        super().__init__(cache_limit_bytes=cache_limit_bytes)
         self.compiled = []
 
     def dispatch_json(self, key_string: str) -> BaseGrammarObject:
@@ -81,43 +79,42 @@ def _keys(backend: BaseGrammarBackend):
     return [k[1] for k in backend.cache]
 
 
-class TestGrammarCacheEntryBound(CustomTestCase):
-    """The entry-count bound is a backstop behind the byte budget."""
+class TestGrammarCacheLRU(CustomTestCase):
+    """LRU behaviour under the byte budget; entries here cost 1 byte each
+    unless stated, so the budget doubles as an entry count."""
 
-    def test_default_bounds(self):
+    def test_default_budget(self):
         b = _StubBackend()
         self.assertEqual(
             b.cache_limit_bytes, BaseGrammarBackend.DEFAULT_CACHE_LIMIT_BYTES
         )
-        self.assertEqual(
-            b.cache_max_entries, BaseGrammarBackend.DEFAULT_CACHE_MAX_ENTRIES
-        )
         self.assertEqual(b.cache_size_bytes, 0)
+        self.assertFalse(hasattr(b, "cache_max_entries"))
 
-    def test_constructor_argument_overrides_entry_bound(self):
-        b = _StubBackend(cache_max_entries=7)
-        self.assertEqual(b.cache_max_entries, 7)
+    def test_constructor_argument_overrides_budget(self):
+        b = _StubBackend(cache_limit_bytes=7)
+        self.assertEqual(b.cache_limit_bytes, 7)
 
     def test_evicts_oldest_when_full(self):
-        b = _StubBackend(cache_max_entries=3)
-        _fill(b, 5)
+        b = _StubBackend(cache_limit_bytes=3)
+        _fill(b, 5, size=1)
         self.assertEqual(len(b.cache), 3)
         self.assertEqual(_keys(b), ["s2", "s3", "s4"])
 
     def test_hit_refreshes_recency(self):
-        b = _StubBackend(cache_max_entries=3)
-        _fill(b, 3)  # s0 s1 s2
+        b = _StubBackend(cache_limit_bytes=3)
+        _fill(b, 3, size=1)  # s0 s1 s2
         value, cached = b.get_cached_or_future_value(
             ("json", "s0"), require_reasoning=False
         )
         self.assertTrue(cached)
         self.assertIsInstance(value, _DummyGrammar)
-        b.set_cache(("json", "s3"), _DummyGrammar("s3"))  # should evict s1, not s0
+        b.set_cache(("json", "s3"), _DummyGrammar("s3", 1))  # evicts s1, not s0
         self.assertEqual(_keys(b), ["s2", "s0", "s3"])
 
     def test_hit_returns_copy_not_cached_instance(self):
-        b = _StubBackend(cache_max_entries=2)
-        original = _DummyGrammar("x")
+        b = _StubBackend(cache_limit_bytes=2)
+        original = _DummyGrammar("x", 1)
         b.set_cache(("json", "x"), original)
         value, cached = b.get_cached_or_future_value(
             ("json", "x"), require_reasoning=False
@@ -127,17 +124,18 @@ class TestGrammarCacheEntryBound(CustomTestCase):
         self.assertEqual(original.copies, 1)
 
     def test_eviction_does_not_affect_in_flight_copy(self):
-        b = _StubBackend(cache_max_entries=1)
-        b.set_cache(("json", "a"), _DummyGrammar("a"))
+        b = _StubBackend(cache_limit_bytes=1)
+        b.set_cache(("json", "a"), _DummyGrammar("a", 1))
         in_flight, _ = b.get_cached_or_future_value(
             ("json", "a"), require_reasoning=False
         )
-        b.set_cache(("json", "b"), _DummyGrammar("b"))  # evicts "a"
+        b.set_cache(("json", "b"), _DummyGrammar("b", 1))  # evicts "a"
         self.assertNotIn(("json", "a"), b.cache)
         self.assertEqual(in_flight.tag, "a")  # request still holds a usable grammar
 
     def test_miss_after_eviction_recompiles(self):
-        b = _StubBackend(cache_max_entries=1)
+        # dispatch_json yields size-less grammars, charged NOMINAL each
+        b = _StubBackend(cache_limit_bytes=NOMINAL)
         fut, cached = b.get_cached_or_future_value(
             ("json", "a"), require_reasoning=False
         )
@@ -151,22 +149,28 @@ class TestGrammarCacheEntryBound(CustomTestCase):
         fut2.result()
         self.assertEqual(b.compiled, ["a", "a"])
 
-    def test_zero_or_negative_disables_both_bounds(self):
+    def test_zero_or_negative_disables_the_bound(self):
         for v in (0, -1):
-            b = _StubBackend(cache_limit_bytes=v, cache_max_entries=v)
+            b = _StubBackend(cache_limit_bytes=v)
             _fill(b, 10, size=10 * NOMINAL)
             self.assertEqual(len(b.cache), 10)
 
+    def test_no_entry_count_bound(self):
+        """Only memory limits the cache: many small grammars all stay."""
+        b = _StubBackend(cache_limit_bytes=1 << 30)
+        _fill(b, 1000, size=1)
+        self.assertEqual(len(b.cache), 1000)
+
     def test_reset_clears(self):
-        b = _StubBackend(cache_max_entries=4)
-        _fill(b, 4)
+        b = _StubBackend(cache_limit_bytes=4)
+        _fill(b, 4, size=1)
         b.reset()
         self.assertEqual(len(b.cache), 0)
 
     def test_same_key_reinsert_keeps_single_entry(self):
-        b = _StubBackend(cache_max_entries=2)
+        b = _StubBackend(cache_limit_bytes=2)
         for _ in range(5):
-            b.set_cache(("json", "same"), _DummyGrammar("same"))
+            b.set_cache(("json", "same"), _DummyGrammar("same", 1))
         self.assertEqual(len(b.cache), 1)
 
 
@@ -174,33 +178,33 @@ class TestGrammarCacheByteBudget(CustomTestCase):
     """The byte budget is the primary bound (--grammar-cache-limit-bytes)."""
 
     def test_evicts_oldest_past_byte_budget(self):
-        b = _StubBackend(cache_limit_bytes=100, cache_max_entries=0)
+        b = _StubBackend(cache_limit_bytes=100)
         _fill(b, 3, size=40)  # 120 > 100 -> s0 goes
         self.assertEqual(_keys(b), ["s1", "s2"])
         self.assertEqual(b.cache_size_bytes, 80)
 
     def test_tracks_bytes_of_the_cached_grammars(self):
-        b = _StubBackend(cache_limit_bytes=0, cache_max_entries=0)
+        b = _StubBackend(cache_limit_bytes=0)
         b.set_cache(("json", "a"), _DummyGrammar("a", 7))
         b.set_cache(("regex", "b"), _DummyGrammar("b", 11))
         self.assertEqual(b.cache_size_bytes, 18)
 
     def test_unknown_size_is_charged_nominally(self):
-        b = _StubBackend(cache_limit_bytes=0, cache_max_entries=0)
+        b = _StubBackend(cache_limit_bytes=0)
         b.set_cache(("json", "none"), _DummyGrammar("none", None))
         b.set_cache(("json", "bad"), _DummyGrammar("bad", -5))
         b.set_cache(("json", "mock"), mock.MagicMock(spec=BaseGrammarObject))
         self.assertEqual(b.cache_size_bytes, 3 * NOMINAL)
 
     def test_invalid_grammar_costs_nothing(self):
-        b = _StubBackend(cache_limit_bytes=0, cache_max_entries=0)
+        b = _StubBackend(cache_limit_bytes=0)
         b.set_cache(("json", "bad"), InvalidGrammarObject("boom"))
         self.assertEqual(b.cache_size_bytes, 0)
 
     def test_single_oversized_entry_is_kept(self):
         """A grammar larger than the whole budget must still be cached, or a
         client repeating it would recompile on every request."""
-        b = _StubBackend(cache_limit_bytes=100, cache_max_entries=0)
+        b = _StubBackend(cache_limit_bytes=100)
         b.set_cache(("json", "small"), _DummyGrammar("small", 10))
         b.set_cache(("json", "huge"), _DummyGrammar("huge", 1000))
         self.assertEqual(_keys(b), ["huge"])
@@ -211,14 +215,14 @@ class TestGrammarCacheByteBudget(CustomTestCase):
         self.assertTrue(cached)
 
     def test_replacing_a_key_adjusts_the_charge(self):
-        b = _StubBackend(cache_limit_bytes=0, cache_max_entries=0)
+        b = _StubBackend(cache_limit_bytes=0)
         b.set_cache(("json", "k"), _DummyGrammar("k", 50))
         b.set_cache(("json", "k"), _DummyGrammar("k", 20))
         self.assertEqual(len(b.cache), 1)
         self.assertEqual(b.cache_size_bytes, 20)
 
     def test_discard_cache_releases_the_charge(self):
-        b = _StubBackend(cache_limit_bytes=0, cache_max_entries=0)
+        b = _StubBackend(cache_limit_bytes=0)
         _fill(b, 2, size=30)
         b.discard_cache(("json", "s0"))
         b.discard_cache(("json", "missing"))  # no-op
@@ -226,18 +230,13 @@ class TestGrammarCacheByteBudget(CustomTestCase):
         self.assertEqual(b.cache_size_bytes, 30)
 
     def test_reset_zeroes_the_charge(self):
-        b = _StubBackend(cache_limit_bytes=0, cache_max_entries=0)
+        b = _StubBackend(cache_limit_bytes=0)
         _fill(b, 3, size=30)
         b.reset()
         self.assertEqual(len(b.cache), 0)
         self.assertEqual(b.cache_size_bytes, 0)
         _fill(b, 1, size=5)  # usable again after reset
         self.assertEqual(b.cache_size_bytes, 5)
-
-    def test_entry_bound_still_applies_under_byte_budget(self):
-        b = _StubBackend(cache_limit_bytes=1 << 30, cache_max_entries=2)
-        _fill(b, 4, size=1)
-        self.assertEqual(_keys(b), ["s2", "s3"])
 
 
 def _tiny_xgrammar_backend(**kwargs) -> XGrammarGrammarBackend:
@@ -321,7 +320,7 @@ class TestReasonerGrammarBackendCache(CustomTestCase):
         """/flush_cache calls reset() on the outer backend only; with a
         reasoning parser the xgrammar compiler cache lives in the inner one."""
         parser, tokenizer = _reasoner_parts()
-        inner = _StubBackend(cache_limit_bytes=0, cache_max_entries=0)
+        inner = _StubBackend(cache_limit_bytes=0)
         inner.set_cache(("json", "inner"), _DummyGrammar("inner", 10))
         reasoner = ReasonerGrammarBackend(inner, parser, tokenizer)
         reasoner.set_cache(("json", "outer"), _DummyGrammar("outer", 10))
@@ -340,10 +339,9 @@ class TestReasonerGrammarBackendCache(CustomTestCase):
 
     def test_takes_budget_from_wrapped_backend_by_default(self):
         parser, tokenizer = _reasoner_parts()
-        inner = _StubBackend(cache_limit_bytes=777, cache_max_entries=9)
+        inner = _StubBackend(cache_limit_bytes=777)
         reasoner = ReasonerGrammarBackend(inner, parser, tokenizer)
         self.assertEqual(reasoner.cache_limit_bytes, 777)
-        self.assertEqual(reasoner.cache_max_entries, 9)
 
     def test_explicit_budget_wins(self):
         parser, tokenizer = _reasoner_parts()
@@ -362,7 +360,7 @@ class TestReasonerGrammarBackendCache(CustomTestCase):
 
     def test_byte_budget_applies_to_wrapped_grammars(self):
         parser, tokenizer = _reasoner_parts()
-        inner = _StubBackend(cache_limit_bytes=100, cache_max_entries=0)
+        inner = _StubBackend(cache_limit_bytes=100)
         reasoner = ReasonerGrammarBackend(inner, parser, tokenizer)
         for i in range(3):
             reasoner.set_cache(
