@@ -36,6 +36,15 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
+@pytest.fixture(autouse=True)
+def cpu_config_policy(monkeypatch):
+    # These admission tests must not inherit the test runner's GB10 memory policy.
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3_image.current_platform",
+        SimpleNamespace(is_cuda=lambda: False, is_rocm=lambda: False),
+    )
+
+
 def normalized_args(**overrides):
     # ServerArgs dataclass defaults without __post_init__ (no model load, no GPU
     # probe), then the sglang backend, the image pipeline config and every
@@ -94,6 +103,27 @@ def test_image_deployment_has_no_cfg_parallel():
     deployment = MiniMaxH3ImagePipelineConfig().get_model_deployment_config()
     assert not deployment.supports_cfg_parallel
     assert not deployment.auto_enable_cfg_parallel
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"component_attention_backends": {"transformer": "fp8_fa_sm120"}},
+        {"attention_backend": "fp8_fa_sm120"},
+    ],
+)
+def test_image_config_preserves_explicit_fp8_attention(override, dense_backend):
+    args = normalized_args(**override)
+    if dense_backend is not AttentionBackendEnum.FA:
+        with pytest.raises(ValueError, match="requires dense FlashAttention"):
+            args.pipeline_config.validate_server_args(args)
+        return
+    args.pipeline_config.validate_server_args(args)
+    assert args.component_attention_backends["transformer"] == "fp8_fa_sm120"
+
+    args.ring_degree = 2
+    with pytest.raises(ValueError, match="Ring parallelism requires FlashAttention"):
+        args.pipeline_config.validate_server_args(args)
 
 
 @pytest.mark.parametrize(
