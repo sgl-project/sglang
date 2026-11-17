@@ -387,10 +387,10 @@ def _scaled_tile(X, XS, W, WS, Sorted, Q, QS, Parts, Y, block, column, expert, l
         b_slots = gl.allocate_shared_memory(gl.uint32, [2, BN * BK // 8], gl.SwizzledSharedLayout(1, 1, 1, [0]))
     elif not DIRECT_B:
         b_shared = gl.allocate_shared_memory(gl.uint32, [BN * BK // 8], gl.SwizzledSharedLayout(1, 1, 1, [0]))
-        b_native = b_shared._reinterpret(gl.uint8, [BK // 2, BN], _packed_weight_layout(BN, BK))
+        b_native = b_shared.reinterpret(gl.uint8, [BK // 2, BN], _packed_weight_layout(BN, BK))
     bs_shared = gl.allocate_shared_memory(gl.uint32, [BN * BK // 128], gl.SwizzledSharedLayout(1, 1, 1, [0]))
     bs_layout: gl.constexpr = _paired_scale_layout(BN, BK, True)
-    bs_native = bs_shared._reinterpret(gl.uint8, [BN, BK // 32], bs_layout)
+    bs_native = bs_shared.reinterpret(gl.uint8, [BN, BK // 32], bs_layout)
     if M > 1536:
         as_layout: gl.constexpr = _paired_scale_layout(TM, BK, False)
     else:
@@ -412,7 +412,7 @@ def _scaled_tile(X, XS, W, WS, Sorted, Q, QS, Parts, Y, block, column, expert, l
                 a_shared.store(_word_bytes(a_words))
                 as_shared.store(_word_bytes(sa_words))
                 bs_shared.store(scales)
-                b_current = b_slots.index(base % 2)._reinterpret(gl.uint8, [BK // 2, BN], _packed_weight_layout(BN, BK))
+                b_current = b_slots.index(base % 2).reinterpret(gl.uint8, [BK // 2, BN], _packed_weight_layout(BN, BK))
                 a = a_shared.load(ad)
                 sa = as_shared.load(asl)
                 b = gl.amd.cdna4.async_copy.load_shared_relaxed(b_current, bd)
@@ -436,7 +436,7 @@ def _scaled_tile(X, XS, W, WS, Sorted, Q, QS, Parts, Y, block, column, expert, l
                 a_shared.store(_word_bytes(a_words))
                 as_shared.store(_word_bytes(sa_words))
                 bs_shared.store(scales)
-                b_current = b_slots.index(base % 2)._reinterpret(gl.uint8, [BK // 2, BN], _packed_weight_layout(BN, BK))
+                b_current = b_slots.index(base % 2).reinterpret(gl.uint8, [BK // 2, BN], _packed_weight_layout(BN, BK))
                 a = a_shared.load(ad)
                 sa = as_shared.load(asl)
                 b = gl.amd.cdna4.async_copy.load_shared_relaxed(b_current, bd)
@@ -546,9 +546,9 @@ def _shared_finish(X, XS, W, WS, Sorted, Parts, Records, Y, M: gl.constexpr, H: 
     a_shared = gl.allocate_shared_memory(gl.uint8, [TM, BK // 2], gl.SwizzledSharedLayout(16, 1, 8, [1, 0]))
     if not DIRECT:
         b_shared = gl.allocate_shared_memory(gl.uint32, [BN * BK // 8], gl.SwizzledSharedLayout(1, 1, 1, [0]))
-        b_native = b_shared._reinterpret(gl.uint8, [BK // 2, BN], _packed_weight_layout(BN, BK))
+        b_native = b_shared.reinterpret(gl.uint8, [BK // 2, BN], _packed_weight_layout(BN, BK))
     bs_shared = gl.allocate_shared_memory(gl.uint32, [BN * BK // 128], gl.SwizzledSharedLayout(1, 1, 1, [0]))
-    bs_native = bs_shared._reinterpret(gl.uint8, [BN, BK // 32], _paired_scale_layout(BN, BK, True))
+    bs_native = bs_shared.reinterpret(gl.uint8, [BN, BK // 32], _paired_scale_layout(BN, BK, True))
     as_shared = gl.allocate_shared_memory(gl.uint8, [TM, BK // 32], _paired_scale_layout(TM, BK, False))
     as_load: gl.constexpr = gl.BlockedLayout([1, 2], [32, 2], [WARPS, 1], [1, 0])
     scale_row = gl.convert_layout(row, gl.SliceLayout(1, as_load))
