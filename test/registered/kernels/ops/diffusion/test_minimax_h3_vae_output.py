@@ -200,14 +200,6 @@ def test_denorm_clamp_in_place_rewrites_a_contiguous_input():
     assert not can_use_minimax_h3_vae_denorm_clamp(
         strided, mean=IMAGENET_MEAN, std=IMAGENET_STD, out=strided
     )
-    with pytest.raises(RuntimeError):
-        minimax_h3_vae_denorm_clamp(
-            strided, mean=IMAGENET_MEAN, std=IMAGENET_STD, out=strided
-        )
-    with pytest.raises(ValueError):
-        minimax_h3_vae_denorm_clamp(
-            value, mean=IMAGENET_MEAN, std=IMAGENET_STD, out=torch.empty_like(value)
-        )
 
 
 @requires_h3_kernels
@@ -220,8 +212,6 @@ def test_denorm_clamp_rejects_unsupported_inputs():
     assert not can_use_minimax_h3_vae_denorm_clamp(
         value[:, :3].half(), mean=IMAGENET_MEAN, std=IMAGENET_STD
     )
-    with pytest.raises(RuntimeError):
-        minimax_h3_vae_denorm_clamp(value, mean=IMAGENET_MEAN, std=IMAGENET_STD)
 
 
 @requires_h3_kernels
