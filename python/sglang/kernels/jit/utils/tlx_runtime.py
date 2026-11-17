@@ -62,6 +62,7 @@ def add_missing_hip_options() -> None:
     with the uTLX codegen flags, to the AMDGPU code generator; a no-op on fbtriton.
     """
     import triton.backends.amd.compiler as hip
+
     # uTLX adds its HIPOptions fields when TLX is first imported; the subclass below must derive from those.
     import triton.language.extra.tlx  # noqa: F401
 
