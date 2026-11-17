@@ -178,10 +178,16 @@ class Gemma4ArFusion:
         row0 = min(self.rank * per_rank, num_tokens)
         return row0, min(num_tokens, row0 + per_rank) - row0
 
+    def partial_out(self, num_tokens: int) -> torch.Tensor:
+        """The symmetric storage a site reads its partial sums from. Pass it to
+        the producing linear (``RowParallelLinear(output_tensor=...)``) so the
+        GEMM writes it directly; a partial that lives elsewhere is copied in."""
+        return self.partial.tensor[:num_tokens]
+
     def _stage(self, partial: torch.Tensor) -> torch.Tensor:
-        T = partial.shape[0]
-        staged = self.partial.tensor[:T]
-        staged.copy_(partial)
+        staged = self.partial_out(partial.shape[0])
+        if partial.data_ptr() != staged.data_ptr():
+            staged.copy_(partial)
         return staged
 
     def site(
