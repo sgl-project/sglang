@@ -326,8 +326,9 @@ def sgl_router_command(
         "--port",
         str(port),
         # Workers tokenize and render chat themselves, so the router needs no
-        # tokenizer for the model under test.
-        "--no-tokenizer",
+        # tokenizer unless the extra args select cache-aware routing, which the
+        # router refuses to combine with --no-tokenizer.
+        *([] if "cache_aware" in extra_args else ["--no-tokenizer"]),
         "--request-timeout-secs",
         str(request_timeout_secs),
         # The stale-request reaper (600s by default) would cut a request the
