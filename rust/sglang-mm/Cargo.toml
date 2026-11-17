@@ -36,7 +36,7 @@ crate-type = ["cdylib", "rlib"]
 # `[package.metadata.sglang] features` above.
 default = []
 # Every PyO3 binding.
-python = ["dep:pyo3", "dep:numpy"]
+python = ["dep:pyo3", "dep:numpy", "dep:pyo3-build-config"]
 # Fan work out onto crate-owned rayon pools (see `common::par`). Off for the
 # rlib: sglang-server provides concurrency across requests and owns its core
 # budget, so preprocessing runs inline on the calling thread and rayon is not
@@ -64,3 +64,7 @@ serde_json = { workspace = true }
 # Native media fetch (stage 1 of the server MM pipeline); rustls so the
 # extension never links the system OpenSSL.
 ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
+
+[build-dependencies]
+# Only the `python` cdylib links against libpython (see build.rs).
+pyo3-build-config = { workspace = true, optional = true }

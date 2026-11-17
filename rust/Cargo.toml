@@ -30,6 +30,7 @@ async-stream = "0.3"
 bytes = "1"
 futures = "0.3"
 pyo3 = { version = "0.29.0", features = ["extension-module"] }
+pyo3-build-config = "0.29.0"
 # These versions define the generated public gRPC API. Update them together
 # and deliberately rather than changing bindings during an unrelated build.
 prost = "0.14"

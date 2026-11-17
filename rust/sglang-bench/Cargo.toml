@@ -53,6 +53,10 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 
+[build-dependencies]
+# Adds `-undefined dynamic_lookup` on macOS (see build.rs).
+pyo3-build-config = { workspace = true }
+
 [dev-dependencies]
 # The gRPC end-to-end test hosts a tonic mock of the api.v1 service.
 tokio-stream = { workspace = true }

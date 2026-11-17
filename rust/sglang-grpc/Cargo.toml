@@ -37,6 +37,10 @@ uuid = { workspace = true }
 prost-types = { workspace = true }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 
+[build-dependencies]
+# Adds `-undefined dynamic_lookup` on macOS (see build.rs).
+pyo3-build-config = { workspace = true }
+
 [dev-dependencies]
 # `ProstCodec` for the hand-rolled unary call in the metadata-service test.
 tonic-prost = { workspace = true }
