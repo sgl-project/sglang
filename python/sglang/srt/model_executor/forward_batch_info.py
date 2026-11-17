@@ -28,7 +28,6 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
-import logging
 import warnings
 from dataclasses import dataclass
 from functools import lru_cache
@@ -91,12 +90,9 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
-logger = logging.getLogger(__name__)
-
 # Warn-once flag for the deprecated skip_attn_backend_init kwarg; see
 # ForwardBatch.apply_deprecated_skip_attn_backend_init.
 _skip_attn_backend_init_warned = False
-_mrope_text_device_logged = False
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -707,6 +703,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_children: Optional[List[ForwardBatch]] = None
 
     attn_cp_metadata: Optional[BaseContextParallelMetadata] = None
+    # Capture-stable local views, populated only by PrefillCPBCGInput.prepare.
+    cp_positions: Optional[torch.Tensor] = None
+    cp_input_ids: Optional[torch.Tensor] = None
 
     # For decode context parallel.
     # NOTE: DecodeContextParallelMetadata is imported under TYPE_CHECKING only (see the
@@ -1028,6 +1027,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens=batch.encoder_lens,
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
             input_embeds=batch.input_embeds,
+            cp_positions=None,
+            cp_input_ids=None,
             replace_embeds=batch.replace_embeds,
             replace_positions=batch.replace_positions,
             # Scalar config / flags
@@ -1654,10 +1655,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         seq_lens_cpu = self.seq_lens_cpu
         batch_size = seq_lens_cpu.shape[0]
         mm_inputs = batch.multimodal_inputs
-        text_rows = self._text_only_mrope_positions(batch)
-        if text_rows is not None:
-            self.mrope_positions = text_rows
-            return
         rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         extend_lens = batch.extend_lens
         prefix_lens = batch.prefix_lens
@@ -1708,43 +1705,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mrope_positions_list,
             dim=1,
         ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
-
-    def _text_only_mrope_positions(
-        self, batch: ScheduleBatch
-    ) -> Optional[torch.Tensor]:
-        """The text-only rows _compute_mrope_positions_extend's loop builds: the same
-        values compute_position wrote into self.positions, repeated on the device.
-        None sends any other batch to the loop."""
-        global _mrope_text_device_logged
-        if not envs.SGLANG_OPT_MROPE_TEXT_DEVICE_POSITIONS.get():
-            return None
-        extend_lens = batch.extend_lens
-        prefix_lens = batch.prefix_lens
-        positions = self.positions
-        text_only = get_exec().deterministic.rl_on_policy_target is not None or all(
-            mm_input is None for mm_input in batch.multimodal_inputs
-        )
-        if (
-            batch.dllm_config is not None
-            or not text_only
-            or not isinstance(extend_lens, list)
-            or not isinstance(prefix_lens, list)
-            or self.extend_seq_lens_cpu != extend_lens
-            or self.extend_prefix_lens_cpu != prefix_lens
-            or positions is None
-            or positions.dim() != 1
-            or positions.numel() != sum(extend_lens)
-        ):
-            return None
-        if not _mrope_text_device_logged:
-            _mrope_text_device_logged = True
-            logger.info(
-                "Text-only extend mrope rows built on the device "
-                "(SGLANG_OPT_MROPE_TEXT_DEVICE_POSITIONS; first: %d requests, %d tokens)",
-                len(extend_lens),
-                positions.numel(),
-            )
-        return positions.to(torch.int64).unsqueeze(0).repeat(3, 1)
 
     def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
         if value == 0:
@@ -1821,12 +1781,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Larger prefills fall back to eager and keep the memory-efficient
         # SUM_LEN. global_num_tokens is identical across ranks (all-gathered),
         # so the decision is consistent cluster-wide.
+        #
+        # Opt-in: with the env set, an idle (zero-token) DP rank keeps SUM_LEN
+        # instead of being padded to the capture bucket, so the step runs
+        # eagerly with only the rows that exist.  Off keeps the MAX_LEN path
+        # used by GPU prefill on MoE-TP; turn on for EP prefill (e.g. Ascend
+        # ascend_ops).
         prefill_cg = get_exec().graph.cuda_graph_config.prefill
+        max_len_with_idle_allowed = (
+            min(global_num_tokens) > 0
+            if envs.SGLANG_ENABLE_PREFILL_GRAPH_IDLE_RANK_EAGER.get()
+            else True
+        )
         if (
             self.can_run_dp_prefill_cuda_graph
             and self.is_extend_in_batch
             and prefill_cg.bs
             and max(global_num_tokens) <= max(prefill_cg.bs)
+            and max_len_with_idle_allowed
             and not prefill_graph_tolerates_sum_len()
         ):
             dp_padding_mode = DpPaddingMode.MAX_LEN

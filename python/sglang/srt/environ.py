@@ -152,13 +152,6 @@ class EnvBool(EnvField):
         raise ValueError(f'"{value}" is not a valid boolean value')
 
 
-class EnvRuntimeBool(EnvBool):
-    """A runtime child cannot enable an optimization while its master is off."""
-
-    def get(self) -> bool:
-        return envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get() and super().get()
-
-
 class EnvInt(EnvField):
     def parse(self, value: str) -> int:
         try:
@@ -289,62 +282,8 @@ class Envs:
     SGLANG_ROLE_NAMESPACES_OUT = EnvStr(None)
     IS_H200 = EnvBool(False)
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
-    # Master switch of the runtime optimizations below; off, all of them keep main's paths.
+    # Explicit child values override this default for megakernel runtime optimizations.
     SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION = EnvBool(False)
-    # GDN ReplaySSM verify commit as the tiled Triton kernel (bitwise the stock commit,
-    # supported shapes only). Opt-in.
-    SGLANG_OPT_GDN_REPLAYSSM_TILED_COMMIT = EnvRuntimeBool(False)
-    # Verify commit: conv-window and PLE rollbacks as one multi-pair launch each (same
-    # bytes). Opt-in.
-    SGLANG_OPT_SPEC_COMMIT_MULTI_SCATTER = EnvRuntimeBool(False)
-    # EAGLE verify tree sampling as multi-CTA kernels (bitwise; fp32, <= 64 rows).
-    SGLANG_OPT_MULTI_CTA_VERIFY_TREE_SAMPLING = EnvRuntimeBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
-    # HiCache write-back eviction demotes without a host wait for the copies: the
-    # streams that next touch the freed pages or their host copies wait on them. Opt-in.
-    SGLANG_OPT_HICACHE_WRITE_BACK_ORDERED_DEMOTE = EnvRuntimeBool(False)
-    # Host-only Mamba checkpoint: read a running request's empty tracking slot from the
-    # host flag, not the device tensor. Opt-in.
-    SGLANG_OPT_MAMBA_CHECKPOINT_HOST_EMPTY_FLAG = EnvRuntimeBool(False)
-    # Compact verify support: the full-distribution top-p bound in two split-row launches. Opt-in.
-    SGLANG_OPT_SPEC_FUSED_TOP_P_MASS = EnvRuntimeBool(False)
-    # EAGLE draft extend top-1 by the sampler's argmax (same token unless NaN).
-    SGLANG_OPT_SPEC_DRAFT_TOP1_ARGMAX = EnvRuntimeBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
-    # Host-only Mamba checkpoints: fetch a state beside its anchor's in-flight load.
-    SGLANG_OPT_MAMBA_HOST_ONLY_CONCURRENT_FETCH = EnvRuntimeBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
-    # Graph-input staging through a JIT copy plan cached per destination layout.
-    SGLANG_OPT_CUDA_GRAPH_FIELD_COPY_PLAN = EnvRuntimeBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
-    # With the master: post-verify graph sets kept before eager (64 without it).
-    SGLANG_POST_VERIFY_MAX_GRAPH_KEYS = EnvInt(64)
-    # A text-only extend batch's mrope rows built on the device.
-    SGLANG_OPT_MROPE_TEXT_DEVICE_POSITIONS = EnvRuntimeBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
-    # Presize the post-verify graph pool with the largest batch's scratch.
-    SGLANG_OPT_POST_VERIFY_POOL_PRESIZE = EnvRuntimeBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
-    # Host-only Mamba checkpoints: the D2H copy does not block the host; a finished
-    # request's tracking slot is parked until it lands.
-    SGLANG_OPT_MAMBA_HOST_CHECKPOINT_NO_WAIT = EnvRuntimeBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
-    # HiCache Mamba side-state rows backed up / loaded by stream-ordered kernels.
-    SGLANG_OPT_HICACHE_MAMBA_SLOT_STATE_ASYNC = EnvRuntimeBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
-    # Host-evict a session's finished sub-agent sessions first (needs parent_session_id
-    # and a TreeCore with the residency bindings). Opt-in.
-    SGLANG_OPT_HICACHE_SUBAGENT_HOST_EVICT_FIRST = EnvRuntimeBool(False)
-    # Pinned PLE host table on transparent huge pages. Opt-in: needs THP.
-    SGLANG_OPT_PLE_PINNED_HUGEPAGE = EnvRuntimeBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
@@ -934,6 +873,12 @@ class Envs:
     # get_embedding_tp_kwargs); they must stay in lock-step. Currently only
     # applies to the Deepseek-V2 family (Deepseek V3.1, Kimi K2.5) + drafts.
     SGLANG_ENABLE_EMBED_REPLICATION = EnvBool(False)
+    # With a prefill graph enabled, a 0-token DP rank keeps SUM_LEN and the
+    # step runs eagerly with only the rows that exist, instead of padding the
+    # group to the capture bucket with a fabricated dummy request. Off by
+    # default (GPU prefill on MoE-TP keeps the MAX_LEN path); turn on for EP
+    # prefill (e.g. Ascend ascend_ops).
+    SGLANG_ENABLE_PREFILL_GRAPH_IDLE_RANK_EAGER = EnvBool(False)
     # Gated background transfers (distributed/device_communicators/
     # gated_transfer.py): force open a transfer gate whose pause has been held
     # this long, logging an error. A pause that never resumes means work the
@@ -959,14 +904,6 @@ class Envs:
     # ===================================================================
     # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
-    # With the master: CTA quota of the per-layer KV load; None keeps the stock one.
-    SGLANG_HICACHE_LOAD_BLOCK_QUOTA = EnvInt(None)
-    # With the master: CTA quota of the page_first Mamba state load.
-    SGLANG_HICACHE_MAMBA_LOAD_BLOCK_QUOTA = EnvInt(None)
-    # With the master: the Mamba host pool's GB of --hicache-size (sglang#47867).
-    SGLANG_HICACHE_MAMBA_SIZE_GB = EnvFloat(None)
-    # Seconds between cache-residency counter logs; 0 disables them.
-    SGLANG_HICACHE_RESIDENCY_LOG_INTERVAL = EnvInt(300)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
@@ -1502,6 +1439,8 @@ class Envs:
     # warmup. Opt-in: the extra forward needs transient activation headroom
     # that small-VRAM or tightly-packed configs may not have.
     SGLANG_FLASHINFER_AUTOTUNE_EXTEND = EnvBool(False)
+    # Opt-in BF16 GEMM dispatch for measured Cosmos3 GEN shapes on RTX PRO 6000.
+    SGLANG_OPT_COSMOS3_SM120_GEMM = EnvBool(False)
     SGLANG_ENABLE_FLUX3_PRIMS_TS_AUTOTUNE = EnvBool(False)
     SGLANG_OPT_FLUX3_PRIMS_TS_TUNING_BUCKETS = EnvTuple(tuple())
     SGLANG_USE_SAGE_ATTENTION_IMPL = EnvStr("")
