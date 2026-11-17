@@ -82,8 +82,8 @@ else
         IMAGE_BASE_ARG_SUFFIX="_ROCM720"
         IMAGE_STAGE_SUFFIX="-rocm720"
     else
-        # ROCm 7.0 (GPU_ARCH=gfx942 / gfx950 or no stamp) has no Dockerfile stage to read the AITER pin from.
-        echo "[CI-IMAGE] ERROR: unsupported image (GPU_ARCH='${IMAGE_GPU_ARCH}', HIP=${IMAGE_HIP_VERSION}); ROCm 7.0 images are no longer supported, use a rocm720, rocm724 or rocm10 image"
+        # No Dockerfile stage matches, e.g. a ROCm 7.0 image (GPU_ARCH=gfx942 / gfx950).
+        echo "[CI-IMAGE] ERROR: cannot match this image to a docker/rocm.Dockerfile stage (GPU_ARCH='${IMAGE_GPU_ARCH}', HIP=${IMAGE_HIP_VERSION}); use a rocm720, rocm724 or rocm10 image (ROCm 7.0 is no longer supported)"
         exit 1
     fi
     if [[ "${GPU_ARCH}" == "mi35x" ]]; then
