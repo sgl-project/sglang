@@ -2,6 +2,7 @@
 
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.tree_slots import index_slots
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -11,7 +12,8 @@ from unittest.mock import MagicMock, patch
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter
+from sglang.srt.mem_cache.kv.decl import STATE_PART
+from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.mem_cache.registry import (
     _RADIX_CACHE_REGISTRY,
     TreeCacheBuildContext,
@@ -74,7 +76,6 @@ def _make_ctx(
     # Static pools: the tree's slots follow the pool shape.
     params.token_to_kv_pool_allocator.storage = None
     params.sliding_window_size = 128
-    params.draft_swa_window = 0
     return TreeCacheBuildContext(
         server_args=server_args,
         params=params,
@@ -182,6 +183,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             ),
             page_size=64,
             sliding_window_size=128,
+            tree_slots=(TreeSlot(component="SWA", family=TREE_WINDOW, window=128),),
         )
         component = SWAComponent(
             MagicMock(),
@@ -264,6 +266,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         cache.tree_components = (ComponentType.FULL,) + (
             (ComponentType.MAMBA,) if has_state else ()
         )
+        index_slots(cache, cache.tree_components)
         cache.components = {component: object() for component in cache.tree_components}
         cache._components_tuple = tuple(cache.components.values())
         counter = MagicMock(name="layer_done_counter")

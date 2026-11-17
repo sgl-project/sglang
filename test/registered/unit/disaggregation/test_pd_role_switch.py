@@ -6,11 +6,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from sglang.srt import runtime_context as rc  # noqa: E402
 from sglang.srt.disaggregation import role_switch  # noqa: E402
 from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
+from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     PdRoleSwitchReqInput,
     PdRoleSwitchReqOutput,
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_components.request_list import (  # noqa: E402
+    IndexedReqList,
+    ListKind,
+    move,
+)
 from sglang.srt.server_args import ServerArgs  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -42,10 +48,12 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         rc.get_context().set_server_args(sa)
         s.server_args = sa
         s.is_fully_idle = MagicMock(return_value=idle)
+        s.request_lists = MagicMock(return_value={})
         teardown_patcher = patch.object(role_switch, "teardown_disaggregation")
         s.teardown_disaggregation = teardown_patcher.start()
         self.addCleanup(teardown_patcher.stop)
         s.init_disaggregation = MagicMock()
+        s.gc_freezer = MagicMock()
         s._sync_disaggregation_mode_to_subcomponents = MagicMock()
         s._event_loop_should_restart = False
         s._pd_role_switch_in_progress = False
@@ -152,6 +160,19 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         self.assertIn("not idle", out.message)
         s.teardown_disaggregation.assert_not_called()
 
+    def test_rejected_while_a_retract_pause_holds_requests(self):
+        s = self._scheduler(DisaggregationMode.DECODE)
+        # is_fully_idle skips held requests, so it still reports idle.
+        held = IndexedReqList(ListKind.PD_HELD)
+        move([MagicMock(owner_list=None)], held)
+        s.request_lists.return_value = {ListKind.PD_HELD: held}
+        out = Scheduler.handle_pd_role_switch(
+            s, PdRoleSwitchReqInput(new_role="prefill")
+        )
+        self.assertFalse(out.success)
+        self.assertTrue(out.safe_to_restore)
+        s.teardown_disaggregation.assert_not_called()
+
     def test_rejected_when_decode_graph_headroom_is_missing(self):
         s = self._scheduler(DisaggregationMode.PREFILL)
         s.tp_worker.get_decode_cuda_graph_bs.return_value = []
@@ -218,6 +239,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         self.assertTrue(s._event_loop_should_restart)
         # Flip to decode ensures decode CUDA graphs exist (idempotent capture).
         s.tp_worker.ensure_decode_cuda_graphs.assert_called_once()
+        s.gc_freezer.on_cache_reset.assert_called_once()
         # The in-progress guard is released after a successful flip.
         self.assertFalse(s._pd_role_switch_in_progress)
 
@@ -231,6 +253,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s.init_disaggregation.assert_called_once()
         # Flipping to prefill must not capture decode graphs.
         s.tp_worker.ensure_decode_cuda_graphs.assert_not_called()
+        s.gc_freezer.on_cache_reset.assert_called_once()
         self.assertTrue(s._event_loop_should_restart)
 
     def test_rejected_when_switch_in_progress(self):
@@ -349,6 +372,14 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
     all-to-all / pipeline parallelism are sized at startup and not rebuilt, so
     a flip with those on would silently deadlock. The PD arg hook must reject
     the combination up-front instead of failing at flip time."""
+
+    def setUp(self):
+        super().setUp()
+        # Rust-server mode does not serve /pd_role_switch, and its PD arg hook
+        # imports the transfer backend (mori here, not installed in CI) to
+        # check its bootstrap server, so pin the mode against an inherited
+        # SGLANG_RUST_SERVER=1.
+        self.enterContext(envs.SGLANG_RUST_SERVER.override(False))
 
     def _sa(self, **kw):
         base = dict(
@@ -616,6 +647,7 @@ class TestMooncakeBootstrapThreadRobustness(unittest.TestCase):
 
 def _radix_scheduler(disable_radix_cache):
     s = MagicMock()
+    s.request_lists.return_value = {}
     s.disable_radix_cache = disable_radix_cache
     tree = MagicMock()
     del tree.clear_storage_backend  # plain RadixCache has none

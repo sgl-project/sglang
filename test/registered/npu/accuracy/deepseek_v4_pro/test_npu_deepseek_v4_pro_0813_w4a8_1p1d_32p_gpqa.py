@@ -6,6 +6,8 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH,
+    assert_metrics,
+    run_bench_serving,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -13,7 +15,6 @@ register_npu_ci(
     est_time=4800,
     suite="",
     nightly=True,
-    disabled="accuracy testcase",
 )
 
 # Common environment variables shared by prefill/decode nodes
@@ -39,8 +40,10 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_COMMON_ENVS = {
     "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
     "HCCL_SOCKET_IFNAME": NIC_NAME,
     "GLOO_SOCKET_IFNAME": NIC_NAME,
+    # mtp
+    "SGLANG_ENABLE_SPEC_V2": "1",
+    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     # dspark
-    "SGLANG_DSPARK_FAST_KERNEL": "0",
     "SGLANG_DSPARK_FAST_SAMPLING": "0",
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "1800",
     "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "1800",
@@ -57,10 +60,22 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ENVS = {
 DEEPSEEK_V4_PRO_W4A8_PD_SEP_DECODE_ENVS = {
     **DEEPSEEK_V4_PRO_W4A8_PD_SEP_COMMON_ENVS,
     "DEEPEP_HCCL_BUFFSIZE": "1600",
-    # mtp
-    "SGLANG_ENABLE_SPEC_V2": "1",
-    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
 }
+
+# DSPARK speculative decoding arguments shared by the prefill and decode nodes:
+# the PD prefill worker prunes the draft to context-KV injection.
+DEEPSEEK_V4_PRO_W4A8_PD_SEP_SPECULATIVE_ARGS = [
+    "--speculative-algorithm",
+    "DSPARK",
+    "--speculative-draft-model-path",
+    DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH,
+    "--speculative-draft-model-quantization",
+    "modelslim",
+    "--speculative-draft-attention-backend",
+    "ascend",
+    "--speculative-num-draft-tokens",
+    6,
+]
 
 # Prefill node launch arguments
 DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ARGS = [
@@ -116,6 +131,7 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ARGS = [
     "write_through",
     "--max-total-tokens",
     140000,
+    *DEEPSEEK_V4_PRO_W4A8_PD_SEP_SPECULATIVE_ARGS,
 ]
 
 # Decode node launch arguments
@@ -155,17 +171,8 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_DECODE_ARGS = [
     1,
     2,
     8,
-    "--speculative-algorithm",
-    "DSPARK",
-    "--speculative-draft-model-path",
-    DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH,
-    "--speculative-draft-model-quantization",
-    "modelslim",
-    "--speculative-draft-attention-backend",
-    "ascend",
-    "--speculative-num-draft-tokens",
-    6,
     "--enable-metrics",
+    *DEEPSEEK_V4_PRO_W4A8_PD_SEP_SPECULATIVE_ARGS,
 ]
 
 # Model config for DSV4-Pro W4A8 32P PD-Sep deployment.
@@ -175,7 +182,7 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_MODEL_CONFIG = {
     "decode_args": DEEPSEEK_V4_PRO_W4A8_PD_SEP_DECODE_ARGS,
     "prefill_envs": DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ENVS,
     "decode_envs": DEEPSEEK_V4_PRO_W4A8_PD_SEP_DECODE_ENVS,
-    "router_args": ["--policy", "cache_aware"],
+    "router_args": [],
     "router_envs": {},
 }
 
@@ -198,12 +205,39 @@ class TestNPUDeepSeekV4ProW4A8PDSEPGPQAHigh(TestNpuAccuracyMultiNodePdSepTestCas
     # (reference: Pro W4A8 GPQA Diamond baseline is 0.85).
     accuracy = 0.85
     datasets = ["gpqa_diamond"]
+    # A single attempt: gsm8k's 3-retry budget would exceed the step timeout.
+    max_retries = 1
+    # Weekday nightly overrides this to gsm8k (baseline is provisional).
+    dataset_baselines = {
+        "gsm8k": 0.92,
+    }
     generation_config = DEEPSEEK_V4_PRO_W4A8_GENERATION_CONFIG_HIGH
     eval_batch_size = 64
+    min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 0%
 
     def test_npu_deepseek_v4_pro_w4a8_pd_sep_gpqa_high(self):
         """Run NPU accuracy test for DSV4-Pro W4A8 PD-Sep GPQA High mode."""
         self.run_accuracy()
+
+    def test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_l2_host_hit_rate(self):
+        """Run the 32k GSP bench; assert_metrics checks the host hit rate"""
+        # 3 groups x 32 prompts share a 28800-token system prompt (32k * 0.9)
+        # plus a 3200-token question, which exceeds L1 so evictions land in L2.
+        metrics = run_bench_serving(
+            host=self.host,
+            port=self.port,
+            model_path=self.model_config.get("model_path"),
+            dataset_name="generated-shared-prefix",
+            input_len=32000,
+            output_len=1024,
+            max_concurrency=32,
+            gsp_num_groups=3,
+            gsp_prompts_per_group=32,
+            seed=100,
+            warmup_requests=16,
+            cache_report=True,
+        )
+        assert_metrics(self, metrics)
 
 
 if __name__ == "__main__":

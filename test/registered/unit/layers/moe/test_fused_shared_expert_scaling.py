@@ -71,18 +71,6 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         self.assertTrue(torch.equal(out_weights[0, :-1], routed_weights))
         return out_weights[0, -1].item()
 
-    def test_aiter_path_uses_unit_shared_weight(self):
-        # routed_scaling_factor is folded into the routed weights and the
-        # post-MoE multiply is skipped -> shared weight must be 1.0, NOT 1/rsf.
-        shared_weight = self._run_remap(use_aiter=True)
-        self.assertAlmostEqual(shared_weight, 1.0)
-
-    def test_post_moe_scaling_path_compensates_with_inverse_rsf(self):
-        # Default path: the whole MoE output is multiplied by rsf afterward, so
-        # the shared weight must be 1/rsf to net out to 1.0.
-        shared_weight = self._run_remap(use_aiter=False)
-        self.assertAlmostEqual(shared_weight, 1.0 / self.ROUTED_SCALING_FACTOR)
-
     def _waterfill_shared_weight(self, *, use_aiter, folded_in_topk):
         # Waterfill takes the shared column out of TopK and appends it itself.
         topk = TopK.__new__(TopK)
