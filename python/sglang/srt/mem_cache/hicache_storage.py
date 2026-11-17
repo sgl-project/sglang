@@ -100,6 +100,9 @@ class HiCacheStorageExtraInfo:
     # Page hashes preceding the call's keys, from the sequence start;
     # prefix_keys + keys is one contiguous chain for KV batches and sidecars.
     prefix_keys: Optional[List[str]] = None
+    # A hinted read can include the request's kv_hints and a map from namespaced
+    # storage keys to unsigned KV event IDs (storage_key_to_event_hash). An
+    # empty map means no namespaced page could be bound to the hint.
     extra_info: Optional[dict] = None
 
 

@@ -131,6 +131,19 @@ def get_storage_hash_str(
     return get_hash_str(key, prior_hash, page_size=page_size)
 
 
+def get_event_hash_str(
+    key: Any,
+    prior_hash: Optional[str] = None,
+    page_size: Optional[int] = None,
+) -> str | List[str]:
+    """Extend the token hash chain used by KV events."""
+    if prior_hash is None and key.cache_salt is not None:
+        prior_hash = hashlib.sha256(
+            b"sglang-cache-salt-v1\0" + key.cache_salt.encode("utf-8")
+        ).hexdigest()
+    return get_hash_str(key, prior_hash, page_size=page_size)
+
+
 def hash_str_to_int64(hash_str: str) -> int:
     """Convert SHA256 hex string to signed 64-bit integer for events.
 
@@ -175,15 +188,13 @@ def compute_node_event_hash_values(node: Any, page_size: int) -> List[str]:
 
     if current is not None and current.event_hash_value:
         parent_hash = current.event_hash_value[-1]
-    elif node.key.cache_salt is not None:
-        parent_hash = hashlib.sha256(
-            b"sglang-cache-salt-v1\0" + node.key.cache_salt.encode("utf-8")
-        ).hexdigest()
     else:
         parent_hash = None
 
     for missing_node in reversed(missing_nodes):
-        hash_values = get_hash_str(missing_node.key, parent_hash, page_size=page_size)
+        hash_values = get_event_hash_str(
+            missing_node.key, parent_hash, page_size=page_size
+        )
         assert isinstance(hash_values, list)
         missing_node.event_hash_value = hash_values
         if hash_values:
