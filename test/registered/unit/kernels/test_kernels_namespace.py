@@ -34,6 +34,17 @@ def test_single_backend_resolves_without_backend():
     )
 
 
+def test_bf16_linear_backends_share_one_contract():
+    specs = K.registry.get("gemm.linear_bf16")
+    assert {spec.backend for spec in specs} == {
+        KernelBackend.CUTE_DSL,
+        KernelBackend.FLASHINFER,
+    }
+    sm120 = PlatformInfo(device_type="cuda", cuda_arch_major=12, cuda_arch_minor=0)
+    assert all(K.capabilities_satisfied(spec.capabilities, sm120) for spec in specs)
+    assert all(not K.capabilities_satisfied(spec.capabilities, _CPU) for spec in specs)
+
+
 def test_shuffle_weighted_sum_has_one_native_primary_backend():
     specs = K.registry.get("moe.shuffle_weighted_sum")
     assert len(specs) == 1

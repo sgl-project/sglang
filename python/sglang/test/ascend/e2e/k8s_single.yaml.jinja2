@@ -59,6 +59,12 @@ spec:
             value: "{{ sglang_is_in_ci }}"
           - name: TRANSFORMERS_VERSION_FOR_SGLANG
             value: "{{ transformers_version }}"
+          - name: SGLANG_USE_IMAGE
+            value: "{{ use_image_sglang }}"
+          - name: SGLANG_NPU_CONTAINER_PATCHES
+            value: "{{ container_patches }}"
+          - name: NPU_TEST_METHOD
+            value: "{{ test_method }}"
           command: ["/bin/bash", "-c"]
           args:
             - |
