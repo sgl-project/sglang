@@ -13,6 +13,7 @@ from typing import Iterable, Union
 import requests
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.test_ascend_utils import get_meta_service_process
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_gsm8k
 from sglang.test.server_fixtures.disaggregation_fixture import (
     SGL_ROUTER_REQUEST_TIMEOUT_SECS,
@@ -580,6 +581,11 @@ def launch_pd_mix_node(model_config):
 
     host_ip = get_host_ip()
     logger.info(f"Starting node, {host_ip=} {other_args=}")
+
+    # The npu_memcache MetaService was already started (and the L3 backend
+    # extra config built with the same node IP) when the test built its args
+    # via build_hicache_storage_extra_config.
+
     try:
         process = popen_launch_server(
             model_config["model_path"],
@@ -592,6 +598,9 @@ def launch_pd_mix_node(model_config):
     except Exception as e:
         raise RuntimeError(f"Failed to start node on {host_ip}: {e}")
 
+    # Expose the MetaService process (None when this node does not host it)
+    # so callers can stop it during tearDown.
+    process.meta_service_process = get_meta_service_process()
     return process
 
 
@@ -782,6 +791,10 @@ def launch_pd_separation_node(model_config):
     # if "--model-type" not in service_args:
     #     other_args.extend(["--model-type", "llm"])
 
+    # The npu_memcache MetaService was already started (and the L3 backend
+    # extra config built with the same node IP) when the test built its args
+    # via build_hicache_storage_extra_config.
+
     other_args.extend(service_args)
 
     try:
@@ -794,6 +807,9 @@ def launch_pd_separation_node(model_config):
     except Exception as e:
         raise RuntimeError(f"Failed to start {role} node on {host_ip}: {e}")
 
+    # Expose the MetaService process (None when this pod does not host it) so
+    # callers can stop it during tearDown.
+    process.meta_service_process = get_meta_service_process()
     return process
 
 

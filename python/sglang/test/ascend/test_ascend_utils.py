@@ -974,6 +974,11 @@ META_SERVICE_READY_POLL_INTERVAL = 5
 _meta_service_process = None
 
 
+def get_meta_service_process():
+    """Return the MetaService process started for L3 on this pod, if any."""
+    return _meta_service_process
+
+
 def is_port_listening(host: str, port: int) -> bool:
     """Return whether ``host:port`` accepts a TCP connection."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
