@@ -149,10 +149,10 @@ python -m sglang.launch_server \
   --disaggregation-mode decode \
   --port 30003
 # router
-python -m sglang_router.launch_router \
-  --pd-disaggregation \
-  --prefill http://$PREFILL_HOST:30002 \
-  --decode http://$DECODE_HOST:30003 \
+sgl-router \
+  --model-id Qwen/Qwen3-VL-8B-Instruct \
+  --no-tokenizer \
+  --worker-urls http://$PREFILL_HOST:30002 http://$DECODE_HOST:30003 \
   --port 8000
 
 ```
@@ -189,9 +189,9 @@ python -m sglang.launch_server \
   --port 30003
 
 # router
-python -m sglang_router.launch_router \
-  --pd-disaggregation \
-  --prefill http://$PREFILL_HOST:30002 \
-  --decode http://$DECODE_HOST:30003 \
+sgl-router \
+  --model-id Qwen/Qwen3-VL-8B-Instruct \
+  --no-tokenizer \
+  --worker-urls http://$PREFILL_HOST:30002 http://$DECODE_HOST:30003 \
   --port 8000
 ```

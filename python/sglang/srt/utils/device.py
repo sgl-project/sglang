@@ -25,7 +25,7 @@ import subprocess
 from collections import defaultdict
 from contextlib import contextmanager
 from ctypes import byref
-from functools import lru_cache, partial
+from functools import lru_cache
 from importlib.util import find_spec
 from typing import Any, Iterator, List, Optional, Tuple
 
@@ -291,66 +291,65 @@ def _check_cuda_device_version(
     )
 
 
-is_hopper_with_cuda_12_3 = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
+@lru_cache(maxsize=1)
+def is_hopper_with_cuda_12_3() -> bool:
+    return _check_cuda_device_version(
+        device_capability_majors=[9], cuda_version=(12, 3)
     )
-)
 
 
-is_blackwell_supported = is_blackwell = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version,
-        device_capability_majors=[10, 11, 12],
-        cuda_version=(12, 8),
+@lru_cache(maxsize=1)
+def is_blackwell_supported() -> bool:
+    return _check_cuda_device_version(
+        device_capability_majors=[10, 11, 12], cuda_version=(12, 8)
     )
-)
 
 
-is_sm120_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[12], cuda_version=(12, 8)
+is_blackwell = is_blackwell_supported
+
+
+@lru_cache(maxsize=1)
+def is_sm120_supported() -> bool:
+    return _check_cuda_device_version(
+        device_capability_majors=[12], cuda_version=(12, 8)
     )
-)
 
 
-is_sm100_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[10], cuda_version=(12, 8)
+@lru_cache(maxsize=1)
+def is_sm100_supported() -> bool:
+    return _check_cuda_device_version(
+        device_capability_majors=[10], cuda_version=(12, 8)
     )
-)
 
 
 # Datacenter Blackwell (SM100) plus SM110; excludes consumer Blackwell (SM120).
 # This is the arch set flash_attn.cute accepts for the absorbed-MLA qv argument.
-is_sm100_or_sm110_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version,
-        device_capability_majors=[10, 11],
-        cuda_version=(12, 8),
+@lru_cache(maxsize=1)
+def is_sm100_or_sm110_supported() -> bool:
+    return _check_cuda_device_version(
+        device_capability_majors=[10, 11], cuda_version=(12, 8)
     )
-)
 
 
-is_sm110_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[11], cuda_version=(12, 8)
+@lru_cache(maxsize=1)
+def is_sm110_supported() -> bool:
+    return _check_cuda_device_version(
+        device_capability_majors=[11], cuda_version=(12, 8)
     )
-)
 
 
-is_sm80_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[8], cuda_version=(11, 0)
+@lru_cache(maxsize=1)
+def is_sm80_supported() -> bool:
+    return _check_cuda_device_version(
+        device_capability_majors=[8], cuda_version=(11, 0)
     )
-)
 
 
-is_sm90_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
+@lru_cache(maxsize=1)
+def is_sm90_supported() -> bool:
+    return _check_cuda_device_version(
+        device_capability_majors=[9], cuda_version=(12, 3)
     )
-)
 
 
 # RTX Blackwell. Unlike is_sm120_supported(), this excludes SM121/GB10.
@@ -1281,11 +1280,14 @@ def get_compiler_backend(mode=None) -> str:
                 "NPU detected, but torchair package is not installed. "
                 "Please install torchair for torch.compile support on NPU."
             )
+        if mode == "npugraph_ex":
+            from sglang.srt.hardware_backend.npu.compile_backend import (
+                get_npugraph_ex_backend,
+            )
+
+            return get_npugraph_ex_backend()
         compiler_config = CompilerConfig()
         compiler_config.mode = "max-autotune"
-        if mode == "npugraph_ex":
-            compiler_config.mode = "reduce-overhead"
-            compiler_config.debug.run_eagerly = True
         npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
         return npu_backend
 
