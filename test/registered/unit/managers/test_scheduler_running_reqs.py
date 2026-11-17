@@ -402,6 +402,7 @@ class TestRunningReqsHooks(CustomTestCase):
             calc_priority=lambda waiting, *args, **kwargs: list(waiting),
             admission_candidates=lambda waiting: iter(waiting),
         )
+        s.spf_reserve_chunked_tail = False
         s.disagg_prefill_bootstrap_queue = None
         s.chunked_prefill_size = 8192
         s.dynamic_chunk_sizer = None

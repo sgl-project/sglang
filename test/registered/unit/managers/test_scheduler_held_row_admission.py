@@ -91,6 +91,7 @@ class TestHeldRowAdmission(CustomTestCase):
             admission_candidates=lambda waiting: iter(waiting),
         )
         s.policy.shortest_prefill_chunk_limit.return_value = None
+        s.spf_reserve_chunked_tail = False
         s.processed_tokens_counter = 0
         s.chunked_prefill_size = 8192
         s.dynamic_chunk_sizer = None

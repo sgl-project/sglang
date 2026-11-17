@@ -893,6 +893,7 @@ class PrefillAdder:
         prefill_tile_block_m: int = 64,
         request_retirer: Optional[RequestRetirer] = None,
         kv_awaiting_transfer: bool = False,
+        reserve_chunked_tail: bool = False,
     ):
         self.page_size = page_size
         # DCP donates a checkpoint only on the kernel chunk grid. A cut off
@@ -939,6 +940,7 @@ class PrefillAdder:
             tree_cache,
             num_mixed_decode_tokens=num_mixed_decode_tokens,
         )
+        self.memory_budget.reserve_unfinished_tail = reserve_chunked_tail
 
         self.req_states = None
         self.can_run_list = []

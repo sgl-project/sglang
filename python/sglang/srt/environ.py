@@ -711,6 +711,8 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
+    # Shortest-prefill-first: keep KV for a chunked request's unfinished tail.
+    SGLANG_SPF_RESERVE_CHUNKED_TAIL = EnvBool(False)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output

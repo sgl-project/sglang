@@ -109,6 +109,9 @@ class PrefillBudget:
     # True when admission prices each demand on the allocator rather than
     # against a remaining token count; such a budget has no `remaining_total`.
     prices_by_demand = False
+    # Commit a chunked request's unfinished tail in the total budget, so later
+    # requests cannot take the KV it still needs (shortest-prefill-first).
+    reserve_unfinished_tail = False
 
     def __init__(self, allocator, tree_cache, *, num_mixed_decode_tokens: int = 0):
         self.allocator = allocator
@@ -308,6 +311,11 @@ class PrefillBudget:
         )
         self.total_offset += immediate + max_new_tokens
         self.current_offset += immediate
+        if self.reserve_unfinished_tail and unfinished_input_len > 0:
+            # Allocated by later passes, so only the total budget carries it.
+            self.total_offset += (
+                self.ceil_paged_tokens(unfinished_input_len) + deferred_max_new_tokens
+            )
 
 
 class SWAPrefillBudget(PrefillBudget):
@@ -530,6 +538,8 @@ class SWAPrefillBudget(PrefillBudget):
             max_new_tokens,
             extra_tokens=extra_tokens,
             state_slots=state_slots,
+            unfinished_input_len=unfinished_input_len,
+            deferred_max_new_tokens=deferred_max_new_tokens,
         )
         # A continuation already owns its ring slot.
         if not (self.req_ring and is_chunked_continuation):

@@ -164,6 +164,7 @@ class TestAllPPLoras(CustomTestCase):
                 admission_candidates=mock.Mock(side_effect=iter),
                 allows_admission=mock.Mock(return_value=True),
             ),
+            spf_reserve_chunked_tail=False,
             processed_tokens_counter=0,
             disagg_prefill_bootstrap_queue=None,
             disagg_prefill_transfer_queue=None,
