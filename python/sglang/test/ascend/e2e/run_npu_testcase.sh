@@ -54,24 +54,19 @@ if python -c "import torch_npu" 2>/dev/null; then
     NPU_DEVICE=a3
   fi
   KERNEL_URL="https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGL_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGL_KERNEL_NPU_TAG}-torch${TORCH_VER}-py312-cann${CANN_VER}-${NPU_DEVICE}-$(arch).zip"
-  KERNEL_LOCAL_ZIP=/root/.cache/.cache/sgl-kernel-npu/kernel.zip
-  echo "Upgrade sgl_kernel_npu (tag ${SGL_KERNEL_NPU_TAG})"
+  echo "Upgrade sgl_kernel_npu from ${KERNEL_URL}"
   mkdir -p /tmp/sgl-kernel-npu && cd /tmp/sgl-kernel-npu
-  KERNEL_OK=0
-  if [ -f "${KERNEL_LOCAL_ZIP}" ]; then
-    echo "Use the runner-staged zip: ${KERNEL_LOCAL_ZIP}"
-    unzip -o "${KERNEL_LOCAL_ZIP}" && KERNEL_OK=1
-  elif wget -q --timeout=30 --tries=2 "${KERNEL_URL}"; then
-    unzip -o ./*.zip && KERNEL_OK=1
+  if wget -q "${KERNEL_URL}"; then
+    unzip -o ./*.zip
+    pip install --no-deps ./sgl_kernel_npu*.whl
+    cd /
+    rm -rf /tmp/sgl-kernel-npu
+    echo "sgl_kernel_npu upgraded to ${SGL_KERNEL_NPU_TAG}"
   else
+    cd /
+    rm -rf /tmp/sgl-kernel-npu
     echo "WARNING: failed to download ${KERNEL_URL}; keeping the image's sgl_kernel_npu."
   fi
-  if [ "${KERNEL_OK}" = "1" ]; then
-    pip install --no-deps ./sgl_kernel_npu*.whl
-    echo "sgl_kernel_npu upgraded to ${SGL_KERNEL_NPU_TAG}"
-  fi
-  cd /
-  rm -rf /tmp/sgl-kernel-npu
 fi
 
 PYTHON_FOR_SGLANG="python"
