@@ -62,6 +62,9 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
+if _is_npu:
+    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
 
 # The fused all-reduce epilogues have world-size-templated kernels for TP2 and TP4.
 _FUSED_MHC_TP_SIZES = (2, 4)
