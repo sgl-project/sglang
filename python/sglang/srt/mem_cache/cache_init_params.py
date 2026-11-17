@@ -45,9 +45,13 @@ class CacheInitParams:
 
     enable_mamba_extra_buffer: bool = False
     enable_mamba_extra_buffer_lazy: bool = False
+    request_mamba_only: bool = False
 
     pp_rank: int = 0
     pp_size: int = 1
+    # Rounds the PP loop lets a rank run ahead of the next (its pp_loop_size is
+    # pp_size + this); the HiCache PP-sync window matches it.
+    pp_async_batch_depth: int = 0
 
     attn_cp_rank: int = 0
     attn_cp_size: int = 1

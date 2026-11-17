@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     alloc_with_host_register,
     alloc_with_pin_memory,
+    alloc_with_pin_memory_npu,
     alloc_with_pin_memory_xpu,
 )
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
@@ -619,8 +620,8 @@ class TestHiCacheHostRegister(unittest.TestCase):
 
     def test_only_xpu_uses_the_null_checked_allocator(self):
         self.assertIs(ALLOC_MEMORY_FUNCS["xpu"], alloc_with_pin_memory_xpu)
-        for device in ("npu", "musa"):
-            self.assertIs(ALLOC_MEMORY_FUNCS[device], alloc_with_pin_memory)
+        self.assertIs(ALLOC_MEMORY_FUNCS["npu"], alloc_with_pin_memory_npu)
+        self.assertIs(ALLOC_MEMORY_FUNCS["musa"], alloc_with_pin_memory)
         # CUDA and ROCm ("cuda") keep the cudaHostRegister default.
         self.assertIs(ALLOC_MEMORY_FUNCS.default_factory(), alloc_with_host_register)
 

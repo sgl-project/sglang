@@ -99,6 +99,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
     bf16_gemm_dispatch,
 )
+from sglang.srt.layers.quantization.utils import validate_quant_param_compatibility
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -548,17 +549,27 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # Fresh attribute on a normal tensor/Parameter
         set_weight_attrs(param, {"weight_loader": loader})
 
-    def _bind_packed_weight_loaders(self, module):
+    @classmethod
+    def _bind_packed_weight_loaders(cls, module):
         """Bind packed-checkpoint-aware loaders to all relevant params of a merged module."""
-        for attr_name in ("weight", "weight_scale_inv", "weight_scale", "input_scale"):
+        for attr_name in (
+            "weight",
+            "weight_scale_inv",
+            "weight_scale",
+            "input_scale",
+            "qweight",
+            "qzeros",
+            "scales",
+            "g_idx",
+        ):
             param = getattr(module, attr_name, None)
             if param is None:
                 continue
             original_loader = getattr(param, "weight_loader", None)
             if original_loader is None:
                 continue
-            wrapped_loader = self._make_packed_weight_loader(module, original_loader)
-            self._override_weight_loader(param, wrapped_loader)
+            wrapped_loader = cls._make_packed_weight_loader(module, original_loader)
+            cls._override_weight_loader(param, wrapped_loader)
 
     @staticmethod
     def _get_split_sizes_for_param(module, param, loaded_shard_id):
@@ -582,7 +593,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # checkpoint-side split sizes must be expressed in packed units.
             packed_factor = param.packed_factor
             return [
-                module.output_sizes[idx] // packed_factor for idx in loaded_shard_id
+                round(module.output_sizes[idx] // packed_factor)
+                for idx in loaded_shard_id
             ]
 
         # Normal weight / non-block quant tensor
@@ -600,6 +612,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # Only intercept split-checkpoint tuple shards.
             # int shard_id and None should preserve original behavior.
             if isinstance(loaded_shard_id, tuple):
+                # Input-replicated / non-output-sharded parameters (such as GPTQ
+                # g_idx RowvLLMParameter) do not define output_dim and must pass
+                # straight through to the underlying loader instead of splitting.
+                if getattr(param, "output_dim", None) is None and not isinstance(
+                    param, PerTensorScaleParameter
+                ):
+                    return original_weight_loader(param, loaded_weight, loaded_shard_id)
+
                 split_sizes = cls._get_split_sizes_for_param(
                     module, param, loaded_shard_id
                 )
@@ -667,9 +687,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         *,
         parallel_group: LinearParallelGroup = "tp",
     ) -> MergedColumnParallelLinear:
-        # Qwen3.5 has separate in_proj_b and in_proj_a weights in the
-        # checkpoint, which are loaded into the fused in_proj_ba parameter
-        # via stacked_params_mapping with shard_id 0 and 1 respectively.
+        # Qwen3.5 stores in_proj_b and in_proj_a separately in checkpoints and
+        # fuses them into in_proj_ba via stacked_params_mapping (shard_id 0/1).
+        # Let quant_config decide quantized vs. unquantized init from explicit
+        # dynamic rules or checkpoint tensor precision, rather than shape.
         return MergedColumnParallelLinear(
             input_size=hidden_size,
             output_sizes=[num_v_heads, num_v_heads],
@@ -953,40 +974,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             projected_states_ba, _ = self.in_proj_ba(hs_bf16)
         return projected_states_qkvz, projected_states_ba
 
-    def _forward_xpu(
-        self,
-        backend: object,
-        projected_states_qkvz: torch.Tensor,
-        projected_states_ba: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ):
-        core_attn_out, z = backend.forward_fused_gdn(
-            self.attn,
-            forward_batch,
-            projected_states_qkvz,
-            projected_states_ba,
-        )
-
-        assert core_attn_out is not None, "XPU backend must support fused GDN"
-
-        z_shape_og = z.shape
-        # reshape input data into 2D tensor
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
-
-        # Add padding for DP-Attn
-        if core_attn_out.shape != z.shape:
-            core_attn_out_pad = torch.zeros_like(z)
-            core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
-            core_attn_out = core_attn_out_pad
-
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
-
-        output, _ = self.out_proj(core_attn_out)
-        return output
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1002,16 +989,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if _is_xpu and get_exec().mamba.linear_attn_backend == "intel_xpu":
-            from sglang.srt.model_executor.forward_context import get_attn_backend
-
-            backend = get_attn_backend()
-            backend = getattr(backend, "linear_attn_backend", backend)
-            if backend.supports_fused_gdn(self.attn, forward_batch):
-                return self._forward_xpu(
-                    backend, projected_states_qkvz, projected_states_ba, forward_batch
-                )
-
         use_strided_prefill_z = False
         packed_verify = False
         if forward_batch.forward_mode.is_target_verify():
@@ -1022,6 +999,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             packed_verify = getattr(backend, "supports_packed_verify", False)
         use_fused_proj_conv = (
             _gdn_decode_fused_proj_conv
+            and not (_is_xpu and get_exec().mamba.linear_attn_backend == "intel_xpu")
             and (forward_batch.forward_mode.is_decode() or packed_verify)
             and isinstance(projected_states_qkvz, torch.Tensor)
             and isinstance(projected_states_ba, torch.Tensor)
@@ -2059,6 +2037,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                     continue
 
                 name = name.replace(weight_name, param_name)
+                validate_quant_param_compatibility(name, params_dict)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -2072,6 +2051,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                validate_quant_param_compatibility(name, params_dict)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -2278,6 +2258,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 if "mlp.experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
+                validate_quant_param_compatibility(name, params_dict)
                 # Skip loading extra parameters for GPTQ/modelopt models.
                 if name.endswith(ignore_suffixes) and name not in params_dict:
                     continue
@@ -2390,6 +2371,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                         # This is an expert weight but not mapped to this rank, skip all remaining processing
                         continue
 
+                    validate_quant_param_compatibility(name, params_dict)
                     # Skip loading extra parameters for GPTQ/modelopt models.
                     if name.endswith(ignore_suffixes) and name not in params_dict:
                         continue
@@ -2544,6 +2526,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     continue
 
                 name = name.replace(weight_name, param_name)
+                validate_quant_param_compatibility(name, params_dict)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -2562,6 +2545,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
                     name = name.replace(r"model.visual.", r"visual.")
 
+                validate_quant_param_compatibility(name, params_dict)
                 # print(name, loaded_weight.shape)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
@@ -2869,6 +2853,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 if "mlp.experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
+                validate_quant_param_compatibility(name, params_dict)
                 # Skip loading extra parameters for GPTQ/modelopt models.
                 if name.endswith(ignore_suffixes) and name not in params_dict:
                     continue
@@ -2990,6 +2975,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
                         name = name.replace(r"model.visual.", r"visual.")
 
+                    validate_quant_param_compatibility(name, params_dict)
                     # Skip loading extra parameters for GPTQ/modelopt models.
                     if name.endswith(ignore_suffixes) and name not in params_dict:
                         continue
