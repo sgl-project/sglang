@@ -50,7 +50,6 @@ class Kandinsky6SRPipeline(ComposedPipelineBase):
             raise ValueError(
                 f"{self.model_path} is a k6_video SR bundle (it has a 'dit' component), "
                 "not an official Diffusers Kandinsky6SRPipeline repo. Use "
-                "kandinskylab/Kandinsky-6.0-VSR-5s-Diffusers or "
                 "kandinskylab/Kandinsky-6.0-VSR-distilled2steps-5s-Diffusers"
             )
         for name in self._optional_config_modules:

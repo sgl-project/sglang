@@ -288,7 +288,7 @@ async def download_mesh_content(
 
     file_path = job.get("file_path")
     if not file_path or not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Generation is still in-progress")
+        raise HTTPException(status_code=404, detail="Mesh output file not found")
 
     ext = os.path.splitext(file_path)[1].lower()
     media_type = {

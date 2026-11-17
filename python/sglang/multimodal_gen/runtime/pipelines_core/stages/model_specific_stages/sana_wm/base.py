@@ -2270,8 +2270,8 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         else:
             raise ValueError(
                 "SANA-WM is a TI2V world model and requires condition_image "
-                "for first-frame conditioning. Provide --image-path, "
-                "--condition-image, or the equivalent API image input."
+                "for first-frame conditioning. Provide --image-path "
+                "or the equivalent API image input."
             )
 
         batch.latents = latents

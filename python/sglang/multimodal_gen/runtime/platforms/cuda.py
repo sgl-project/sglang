@@ -1029,7 +1029,7 @@ class NonNvmlCudaPlatform(CudaPlatformBase):
 
     @classmethod
     def is_full_nvlink(cls, physical_device_ids: list[int]) -> bool:
-        logger.exception(
+        logger.info(
             "NVLink detection not possible, as context support was"
             " not found. Assuming no NVLink available."
         )

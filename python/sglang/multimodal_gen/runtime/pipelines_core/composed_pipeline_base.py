@@ -577,13 +577,13 @@ class ComposedPipelineBase(ABC):
                 and module_name in self._extra_config_module_map
             ):
                 extra_module_value = self._extra_config_module_map[module_name]
-                logger.warning(
-                    "model_index.json does not contain a %s module, but found {%s: %s} in _extra_config_module_map, adding to model_index.",
-                    module_name,
-                    module_name,
-                    extra_module_value,
-                )
                 if extra_module_value in declared_modules:
+                    logger.warning(
+                        "model_index.json does not contain a %s module, but found {%s: %s} in _extra_config_module_map, adding to model_index.",
+                        module_name,
+                        module_name,
+                        extra_module_value,
+                    )
                     logger.info(
                         "Using module %s for %s", extra_module_value, module_name
                     )
@@ -591,9 +591,9 @@ class ComposedPipelineBase(ABC):
                     continue
                 else:
                     raise ValueError(
-                        f"Required module key: {module_name} value: "
-                        f"{declared_modules.get(module_name)} was not found in "
-                        f"declared modules {declared_modules.keys()}"
+                        f"Required module {module_name!r} maps to "
+                        f"{extra_module_value!r} via _extra_config_module_map, but "
+                        f"model_index.json declares only {sorted(declared_modules)}"
                     )
 
         # all the component models used by the pipeline

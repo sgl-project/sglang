@@ -254,5 +254,5 @@ def _warn_about_missing_flashinfer():
     Exists to not cause a graph break during the compilation.
     """
     logger.warning_once(
-        "FlashInfer not available, using Triton fallback for RoPE",
+        "FlashInfer RoPE not available, using the PyTorch fallback",
     )
