@@ -387,10 +387,16 @@ def test_pipeline_load_repairs_only_its_requested_cached_subfolder(
     _populate_components(tmp_path / "T2VA", ("transformer",))
     selected = tmp_path / "Ref2VA"
     selected.mkdir()
+    external_text_encoder = index_name == "model_index.json"
+    local_components = ("transformer", "vae")
+    text_encoder = _h3_text_encoder_spec()
+    if not external_text_encoder:
+        local_components += ("text_encoder",)
+        text_encoder = text_encoder[:2]
     config = {
         "_class_name": "MiniMaxH3Ref2VAPipeline",
         "_diffusers_version": "0.37.0",
-        "text_encoder": _h3_text_encoder_spec(),
+        "text_encoder": text_encoder,
         "transformer": ["diffusers", "MiniMaxH3DiTModel"],
         "vae": ["diffusers", "AutoencoderKL"],
     }
@@ -399,14 +405,14 @@ def test_pipeline_load_repairs_only_its_requested_cached_subfolder(
     if cached in ("partial", "complete"):
         _populate_components(selected, ("vae",))
     if cached == "complete":
-        _populate_components(selected, ("transformer",))
+        _populate_components(selected, local_components)
     calls = []
 
     def snapshot_download(**kwargs):
         calls.append(kwargs)
         if not kwargs.get("local_files_only"):
             (selected / index_name).write_text(json.dumps(config))
-            _populate_components(selected, ("transformer", "vae"))
+            _populate_components(selected, local_components)
         return str(tmp_path)
 
     monkeypatch.setattr(hf_diffusers_utils, "snapshot_download", snapshot_download)
@@ -425,8 +431,8 @@ def test_pipeline_load_repairs_only_its_requested_cached_subfolder(
     )
     assert all(call["allow_patterns"] == ["Ref2VA/**"] for call in calls)
     assert all(call["revision"] == "a" * 40 for call in calls)
-    # The text encoder is an external component, not a missing local weight.
-    assert not (selected / "text_encoder").exists()
+    # modular indexes use local components; standard indexes can reference a repo
+    assert (selected / "text_encoder").exists() == (not external_text_encoder)
     assert not (tmp_path / "transformer").exists()
 
 
