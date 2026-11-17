@@ -24,7 +24,10 @@ from sglang.test.test_utils import (
 
 # Register for AMD CI - Kimi K2.5 accuracy test on MI35x (~60 min)
 register_amd_ci(
-    est_time=3600, suite="nightly-amd-accuracy-8-gpu-mi35x-kimi-k25", nightly=True
+    est_time=3600,
+    suite="nightly-amd-accuracy-8-gpu-mi35x-kimi-k25",
+    nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 KIMI_K25_MODEL_PATH = "moonshotai/Kimi-K2.5"
@@ -76,7 +79,7 @@ class TestKimiK25EvalMI35x(CustomTestCase):
                 num_questions=1319,
                 parallel=1319,
                 max_new_tokens=512,
-                host="http://127.0.0.1",
+                host="127.0.0.1",
                 port=int(self.base_url.split(":")[-1]),
             )
             metrics = run_eval_few_shot_gsm8k(args)

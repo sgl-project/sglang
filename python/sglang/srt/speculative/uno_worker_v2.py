@@ -8,21 +8,22 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.ops.sampling import argmax as sampling_argmax
+from sglang.kernels.ops.speculative.uno_tree import build_uno_tree_proposal
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_schedule, get_spec
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
 from sglang.srt.speculative.eagle_worker_common import (
+    STOCK_SPECULATIVE_RUNTIME_HOOKS,
+    bind_eagle_runtime_hooks,
     build_eagle_verify_input,
     run_eagle_verify,
 )
@@ -32,7 +33,6 @@ from sglang.srt.speculative.uno_cuda_graph_runner import (
     UnoDecodeCudaGraphRunner,
 )
 from sglang.srt.speculative.uno_info import UnoDraftInput, UnoForwardInput
-from sglang.srt.speculative.uno_tree import build_uno_tree_proposal
 from sglang.srt.speculative.uno_utils import (
     build_uno_draft_input,
     pack_uno_tree_result,
@@ -40,13 +40,10 @@ from sglang.srt.speculative.uno_utils import (
     sample_uno_candidates,
     sample_uno_clean_root,
 )
-from sglang.srt.utils.common import (
-    get_available_gpu_memory,
-    log_info_on_rank0,
-)
+from sglang.srt.utils.device import get_available_gpu_memory
+from sglang.srt.utils.log_utils import log_info_on_rank0
 
 if TYPE_CHECKING:
-    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.server_args import ServerArgs
@@ -58,11 +55,12 @@ logger = logging.getLogger(__name__)
 class UnoWorkerV2(BaseSpecWorker):
     """Single-model UNO worker with linear and native-EAGLE tree decode."""
 
+    _speculative_runtime_hooks = STOCK_SPECULATIVE_RUNTIME_HOOKS
+
     def __init__(
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -70,7 +68,6 @@ class UnoWorkerV2(BaseSpecWorker):
 
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.ps = ps
         self.nccl_port = nccl_port
 
         self._target_worker = target_worker
@@ -146,6 +143,9 @@ class UnoWorkerV2(BaseSpecWorker):
 
         if self.tree_mode:
             self._uno_draft_attn_backend = self._build_uno_draft_attn_backend()
+        self._speculative_runtime_hooks = bind_eagle_runtime_hooks(
+            self.target_worker, supports_sharded_verify=False
+        )
 
     def init_cuda_graphs(self):
         """Capture only the private F-wide tree-draft graph."""
@@ -300,7 +300,7 @@ class UnoWorkerV2(BaseSpecWorker):
             draft_token_num=self.forward_width,
         )
 
-        return ForwardBatch(
+        forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
             batch_size=len(prefix_lens),
             input_ids=input_ids,
@@ -315,6 +315,8 @@ class UnoWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.NULL,
             return_hidden_states_before_norm=False,
         )
+        self.model_runner.runner_ids.bind_own_plan(forward_batch)
+        return forward_batch
 
     def _run_target_block(
         self,
@@ -347,7 +349,7 @@ class UnoWorkerV2(BaseSpecWorker):
         if not need_top1:
             return result, None
 
-        predictions = torch.argmax(logits, dim=-1).view(
+        predictions = sampling_argmax(logits).view(
             forward_batch.batch_size,
             self.forward_width,
         )
@@ -572,6 +574,7 @@ class UnoWorkerV2(BaseSpecWorker):
             )
         eagle_result = run_eagle_verify(
             verify_batch,
+            speculative_runtime_hooks=self._speculative_runtime_hooks,
             target_worker=self.target_worker,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool_allocator=(self.model_runner.token_to_kv_pool_allocator),
@@ -789,18 +792,6 @@ class UnoWorkerV2(BaseSpecWorker):
             f"UNO expected an EXTEND or DECODE batch, got {batch.forward_mode}."
         )
 
-    def update_weights_from_disk(self, recv_req):
-        # The scheduler updates the target worker before calling the spec worker.
-        return True, "UNO has no separate draft weights."
-
-    def update_weights_from_ipc(self, recv_req):
-        # The scheduler updates the target worker before calling the spec worker.
-        return True, "UNO has no separate draft weights."
-
-    def update_weights_from_tensor(self, recv_req):
-        # This update route selects the spec worker instead of updating both.
-        return self.target_worker.update_weights_from_tensor(recv_req)
-
     @contextlib.contextmanager
     def _bind_uno_draft_runtime(self):
         target_attn_backend = self.model_runner.attn_backend
@@ -827,7 +818,10 @@ class UnoWorkerV2(BaseSpecWorker):
             else contextlib.nullcontext()
         )
         attn_context = (
-            forward_context(ForwardContext(attn_backend=self._uno_draft_attn_backend))
+            forward_context(
+                ForwardContext(attn_backend=self._uno_draft_attn_backend),
+                forward_batch=forward_batch,
+            )
             if self.tree_mode
             else contextlib.nullcontext()
         )

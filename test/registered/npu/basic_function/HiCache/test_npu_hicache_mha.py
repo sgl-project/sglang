@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
@@ -38,8 +39,8 @@ class TestAscendMhaHicache(CustomTestCase):
             "--attention-backend",
             "ascend",
             "--enable-hierarchical-cache",
-            "--hicache-ratio",
-            1.2,
+            "--hicache-size",
+            1 if _is_pr_pipeline else 10,
         ]
 
     def test_a_gsm8k(self):
@@ -49,6 +50,12 @@ class TestAscendMhaHicache(CustomTestCase):
                     model,
                     self.base_url,
                     timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                    env={
+                        **os.environ,
+                        "PYTORCH_NPU_ALLOC_CONF": (
+                            "expandable_segments:True,pin_memory_expandable_segments:True"
+                        ),
+                    },
                     other_args=[*self.common_args],
                 )
                 try:
@@ -62,7 +69,7 @@ class TestAscendMhaHicache(CustomTestCase):
                             num_questions=1319,
                             max_new_tokens=512,
                             parallel=128,
-                            host=f"http://{self.url.hostname}",
+                            host=self.url.hostname,
                             port=int(self.url.port),
                         )
                         metrics = run_eval_few_shot_gsm8k(args)

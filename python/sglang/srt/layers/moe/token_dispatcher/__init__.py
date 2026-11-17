@@ -1,7 +1,7 @@
-from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
-    AscendTPCombineInput,
-    AscendTPDispatcher,
-    AscendTPDispatchOutput,
+from sglang.srt.layers.moe.token_dispatcher.ascend_ops import (
+    AscendOpsCombineInput,
+    AscendOpsDispatcher,
+    AscendOpsDispatchOutput,
 )
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -12,6 +12,8 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputChecker,
     DispatchOutputFormat,
+    RoutewiseCombineInput,
+    RoutewiseLayout,
 )
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPConfig,
@@ -67,6 +69,8 @@ __all__ = [
     "DispatchOutput",
     "DispatchOutputFormat",
     "DispatchOutputChecker",
+    "RoutewiseCombineInput",
+    "RoutewiseLayout",
     "FlashinferDispatchOutput",
     "FlashinferDispatcher",
     "MooncakeCombineInput",
@@ -95,7 +99,7 @@ __all__ = [
     "DeepEPLLDispatchOutput",
     "DeepEPLLCombineInput",
     "DeepEPNormalCombineInput",
-    "AscendTPDispatcher",
-    "AscendTPDispatchOutput",
-    "AscendTPCombineInput",
+    "AscendOpsDispatcher",
+    "AscendOpsDispatchOutput",
+    "AscendOpsCombineInput",
 ]

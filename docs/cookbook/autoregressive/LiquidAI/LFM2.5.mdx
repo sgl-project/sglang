@@ -1,7 +1,6 @@
 ---
 title: LFM2.5
 description: "Deploy Liquid AI's LFM2.5 with SGLang — hybrid gated short conv + GQA models from 350M to the 8B-A1B MoE, plus LFM2.5-VL vision, with reasoning and Pythonic tool calling."
-tag: NEW
 ---
 
 ## Deployment

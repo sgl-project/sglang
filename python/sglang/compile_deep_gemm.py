@@ -17,8 +17,8 @@ import time
 
 import requests
 
-from sglang.srt.arg_groups.overrides import resolving_view
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.entrypoints.warmup import warmup
 from sglang.srt.environ import envs
@@ -65,7 +65,7 @@ async def warm_up_compile(
     disaggregation_mode: str, tokenizer_manager: TokenizerManager
 ):
     print("\nGenerate warm up request for compiling DeepGEMM...\n")
-    dp_size = get_parallel().dp_size
+    dp_size = get_parallel().num_dp_ranks
     base_ids = [0, 1, 2, 3]
     sampling_params = {
         "temperature": 0.0,

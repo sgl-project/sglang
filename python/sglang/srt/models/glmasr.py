@@ -18,6 +18,7 @@
 """Inference-only GLM-ASR-HF model compatible with HuggingFace weights."""
 
 import logging
+from array import array
 from typing import Any, Iterable, List, Optional, Tuple
 
 import torch
@@ -29,19 +30,16 @@ from transformers.models.glmasr.modeling_glmasr import (
 )
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
-from sglang.srt.utils import add_prefix
+from sglang.srt.multimodal.modality import Modality
 
 logger = logging.getLogger(__name__)
 
@@ -86,10 +84,9 @@ class GlmAsrForConditionalGeneration(nn.Module):
         self.language_model = LlamaForCausalLM(
             config.text_config, quant_config, prefix=add_prefix("model", prefix)
         )
-        self.pattern = MultiModalityDataPaddingPatternMultimodalTokens()
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        return self.pattern.pad_input_tokens(input_ids, mm_inputs)
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # The processor emits mel features as a batch of fixed-size 30s windows

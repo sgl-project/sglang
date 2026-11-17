@@ -38,9 +38,8 @@ class TestAscendDeepSeekMTP(CustomTestCase):
             32768,
             "--tp-size",
             16,
-            "--dp-size",
+            "--attn-dp-size",
             2,
-            "--enable-dp-attention",
             "--speculative-algorithm",
             "NEXTN",
             "--speculative-num-steps",
@@ -75,7 +74,7 @@ class TestAscendDeepSeekMTP(CustomTestCase):
                         num_questions=1319,
                         max_new_tokens=512,
                         parallel=128,
-                        host=f"http://{self.url.hostname}",
+                        host=self.url.hostname,
                         port=int(self.url.port),
                     )
 

@@ -51,7 +51,7 @@ export const config = {
   },
 
   benchmarkCommands: {
-    speed: `python3 -m sglang.bench_serving \\
+    speed: `python3 -m sglang.benchmark.serving \\
   --backend sglang-oai-chat \\
   --host {{CURL_HOST}} --port {{CURL_PORT}} \\
   --model {{MODEL_NAME}} \\
@@ -372,6 +372,22 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b200", variant: "default", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: false,
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--context-length 262144",
+        '--json-model-override-args \'{"rope_scaling":{"rope_type":"yarn","factor":2.0,"rope_theta":6000000,"partial_rotary_factor":0.5,"original_max_position_embeddings":131072}}\'',
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "default", quant: "fp4", strategy: "balanced", nodes: "single" },
+      verified: true,
       env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--trust-remote-code",

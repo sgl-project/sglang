@@ -101,7 +101,7 @@ struct UspMergeHeadsKernel {
     auto H = SymbolicSize{"local_heads"};
     auto D = SymbolicSize{"head_dim"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     TensorMatcher({W, S, B, H, D}).with_dtype<T>().with_device(device).verify(x);
     TensorMatcher({B, S, W, H, D}).with_dtype<T>().with_device(device).verify(out);
 

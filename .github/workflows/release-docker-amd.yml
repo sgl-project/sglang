@@ -18,7 +18,6 @@ on:
           - rocm10
           - rocm724
           - rocm720
-          - rocm700
 
 jobs:
   publish:
@@ -26,11 +25,11 @@ jobs:
     runs-on: amd-docker-scale
     environment: 'prod'
     strategy:
-      # Eight flavors publish independently: a failure in one must not cancel
-      # the others mid-push and leave the release tag with a partial image set.
+      # Six flavors publish independently: a failure in one must not cancel the
+      # others mid-push and leave the release tag with a partial image set.
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson((github.event_name == 'workflow_dispatch' && inputs.rocm_version != 'all' && inputs.rocm_version != '') && format('["{0}"]', inputs.rocm_version) || '["rocm700", "rocm720", "rocm724", "rocm10"]') }}
+        rocm_version: ${{ fromJson((github.event_name == 'workflow_dispatch' && inputs.rocm_version != 'all' && inputs.rocm_version != '') && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm720", "rocm724"]') }}
         gpu_arch: ['gfx942', 'gfx950']
         build_type: ['all']
     steps:
@@ -71,16 +70,7 @@ jobs:
           echo "Version: ${version}"
 
           gpu_arch_suffix=""
-          if [ "${{ matrix.rocm_version }}" = "rocm700" ]; then
-            if [ "${{ matrix.gpu_arch }}" = "gfx942" ]; then
-              rocm_tag="rocm700-mi30x"
-            elif [ "${{ matrix.gpu_arch }}" = "gfx950" ]; then
-              rocm_tag="rocm700-mi35x"
-            else
-              echo "Unsupported gfx arch"
-              exit 1
-            fi
-          elif [ "${{ matrix.rocm_version }}" = "rocm720" ] || [ "${{ matrix.rocm_version }}" = "rocm724" ]; then
+          if [ "${{ matrix.rocm_version }}" = "rocm720" ] || [ "${{ matrix.rocm_version }}" = "rocm724" ]; then
             gpu_arch_suffix="-${{ matrix.rocm_version }}"
             if [ "${{ matrix.gpu_arch }}" = "gfx942" ]; then
               rocm_tag="${{ matrix.rocm_version }}-mi30x"

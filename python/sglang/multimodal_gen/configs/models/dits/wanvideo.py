@@ -30,6 +30,10 @@ class WanVideoArchConfig(DiTArchConfig):
             r"^blocks\.(\d+)\.ffn\.net\.0\.proj\.(.*)$": r"blocks.\1.ffn.fc_in.\2",
             r"^blocks\.(\d+)\.ffn\.net\.2\.(.*)$": r"blocks.\1.ffn.fc_out.\2",
             r"^blocks\.(\d+)\.norm2\.(.*)$": r"blocks.\1.self_attn_residual_norm.norm.\2",
+            r"^blocks\.(\d+)\.attn1\.to_q_rot$": r"blocks.\1.q_rot",
+            r"^blocks\.(\d+)\.attn1\.to_k_rot$": r"blocks.\1.k_rot",
+            r"^blocks\.(\d+)\.attn1\.q_rot$": r"blocks.\1.q_rot",
+            r"^blocks\.(\d+)\.attn1\.k_rot$": r"blocks.\1.k_rot",
         }
     )
 

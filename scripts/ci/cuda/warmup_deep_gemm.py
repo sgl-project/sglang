@@ -43,21 +43,19 @@ FALLBACK_TIMEOUT_SEC = 600
 # cache key includes per-rank N/K (depends on tp/dp/ep) — must match each
 # model's `other_args` in test/registered/ or warmed shapes won't be hit.
 FALLBACK_ARGS: Dict[str, List[str]] = {
-    "deepseek-ai/DeepSeek-V3.2": ["--dp", "8", "--enable-dp-attention"],
-    "zai-org/GLM-5-FP8": ["--dp", "8", "--enable-dp-attention"],
+    "deepseek-ai/DeepSeek-V3.2": ["--attn-dp-size", "8"],
+    "zai-org/GLM-5-FP8": ["--attn-dp-size", "8"],
     "XiaomiMiMo/MiMo-V2-Flash": [
-        "--dp",
+        "--attn-dp-size",
         "2",
-        "--enable-dp-attention",
         "--attention-backend",
         "fa3",
     ],
     # --mm-enable-dp-encoder is required: without it DP0 runs the vision
     # encoder alone and DP1 deadlocks at the next collective.
     "XiaomiMiMo/MiMo-V2.5": [
-        "--dp",
+        "--attn-dp-size",
         "2",
-        "--enable-dp-attention",
         "--mm-enable-dp-encoder",
         "--attention-backend",
         "fa3",
@@ -77,7 +75,7 @@ CRASH_MARKERS = (
 # this warms the directory the server will actually compile into; duplicating
 # the default here is what let the two drift apart.
 os.environ["DG_JIT_CACHE_DIR"] = envs.SGLANG_DG_CACHE_DIR.get()
-os.environ["DG_JIT_USE_NVRTC"] = os.getenv("SGL_DG_USE_NVRTC", "0")
+os.environ["DG_JIT_USE_NVRTC"] = "1" if envs.SGLANG_DG_USE_NVRTC.get() else "0"
 
 BLOCK_SIZE = 128
 
@@ -120,7 +118,7 @@ def compute_deepseek_v2v3_shapes(config, tp):
     Shape derivation based on:
     - MoE: python/sglang/srt/layers/moe/fused_moe_triton/layer.py
     - MLA: python/sglang/srt/models/deepseek_v2.py
-    - FP8: python/sglang/kernels/ops/quantization/fp8_kernel.py
+    - FP8 GEMM: python/sglang/kernels/ops/gemm/fp8_kernel.py
     """
     shapes = []
 

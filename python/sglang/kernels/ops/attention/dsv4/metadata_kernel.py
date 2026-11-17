@@ -1,8 +1,68 @@
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
+
+
+@triton.jit
+def _fill_all_compressed_indices_kernel(
+    page_table,
+    seq_lens,
+    page_indices,
+    raw_indices,
+    PAGE_STRIDE: tl.constexpr,
+    TOPK: tl.constexpr,
+    RATIO: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    positions = tl.arange(0, BLOCK)
+    length = tl.load(seq_lens + row)
+    valid = (positions < length) & (positions < TOPK)
+    slots_per_page = PAGE_SIZE // RATIO
+    pages = tl.load(
+        page_table + row * PAGE_STRIDE + positions // slots_per_page,
+        mask=valid,
+        other=0,
+    )
+    slots = pages * slots_per_page + positions % slots_per_page
+    tl.store(
+        page_indices + row * TOPK + positions,
+        tl.where(valid, slots, -1),
+        positions < TOPK,
+    )
+    if raw_indices is not None:
+        tl.store(
+            raw_indices + row * TOPK + positions,
+            tl.where(valid, positions, -1),
+            positions < TOPK,
+        )
+
+
+def fill_all_compressed_indices(
+    page_table: torch.Tensor,
+    compressed_seq_lens: torch.Tensor,
+    page_indices: torch.Tensor,
+    *,
+    compress_ratio: int,
+    page_size: int,
+    raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """Fill all reachable slots; the caller guarantees compressed length <= top-k."""
+    topk = page_indices.shape[1]
+    _fill_all_compressed_indices_kernel[(compressed_seq_lens.numel(),)](
+        page_table,
+        compressed_seq_lens,
+        page_indices,
+        raw_indices,
+        page_table.stride(0),
+        topk,
+        compress_ratio,
+        page_size,
+        triton.next_power_of_2(topk),
+    )
 
 
 @triton.jit(do_not_specialize=["bs", "num_write_tokens", "c128_cur_max_seq_len"])
@@ -215,3 +275,68 @@ def init_compression_metadata(
         page_size,
         compute_page_indices,
     )
+
+
+@triton.jit
+def _low_ratio_metadata(
+    LENS,
+    LOC,
+    OUT1,
+    LEN1,
+    SPARSE1,
+    PAGE1,
+    OUT2,
+    LEN2,
+    SPARSE2,
+    PAGE2,
+    TOPK: tl.constexpr,
+    PADDED: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    length = tl.load(LENS + row).to(tl.int32)
+    loc = tl.load(LOC + row).to(tl.int64)
+    len1, len2 = tl.maximum(length, 1), tl.maximum(length >> 1, 1)
+    tl.store(OUT1 + row, loc)
+    tl.store(OUT2 + row, tl.where((length & 1) == 0, loc >> 1, -1))
+    tl.store(LEN1 + row, len1)
+    tl.store(LEN2 + row, len2)
+    tl.store(SPARSE1 + row, tl.minimum(len1, TOPK))
+    tl.store(SPARSE2 + row, tl.minimum(len2, TOPK))
+    cols = tl.arange(0, BLOCK)
+    tl.store(PAGE1 + row * PADDED + cols, -1, cols < PADDED)
+    tl.store(PAGE2 + row * PADDED + cols, -1, cols < PADDED)
+
+
+class LowRatioMetadata(NamedTuple):
+    """Per-request slots and lengths of the ratio-1 and ratio-2 compressed caches."""
+
+    c1_out_loc: torch.Tensor
+    c1_seq_lens: torch.Tensor
+    c1_sparse_lens: torch.Tensor
+    c1_page_indices: torch.Tensor
+    c2_out_loc: torch.Tensor
+    c2_seq_lens: torch.Tensor
+    c2_sparse_lens: torch.Tensor
+    c2_page_indices: torch.Tensor
+
+
+def build_low_ratio_metadata(seq_lens, out_loc, topk) -> LowRatioMetadata:
+    assert seq_lens.numel() == out_loc.numel()
+    rows = seq_lens.numel()
+    kw = dict(device=seq_lens.device, dtype=torch.int32)
+    padded = triton.cdiv(topk, 64) * 64
+    outputs = []
+    for _ in range(2):
+        outputs.extend(
+            [
+                torch.empty(rows, device=out_loc.device, dtype=torch.int64),
+                torch.empty(rows, **kw),
+                torch.empty(rows, **kw),
+                torch.empty((rows, padded), **kw),
+            ]
+        )
+    _low_ratio_metadata[(rows,)](
+        seq_lens, out_loc, *outputs, topk, padded, triton.next_power_of_2(padded)
+    )
+    return LowRatioMetadata(*outputs)

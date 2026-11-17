@@ -1,86 +1,71 @@
 import os
 import unittest
-from types import SimpleNamespace
-from urllib.parse import urlparse
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline, run_npu_pr_smoke
+from sglang.test.ascend.npu_eval_accuracy_kit import NPUGSM8KMixin
+from sglang.test.ascend.test_ascend_utils import QWEN3_8B_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="base-b-test-1-npu-a3")
-register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
+register_npu_ci(est_time=1800, suite="full-1-npu-a3", nightly=True)
 
-TEST_MODEL_MATRIX = {
-    "/root/.cache/modelscope/hub/models/Qwen/Qwen2.5-7B-Instruct": {
-        "accuracy": 0.84,
-        "latency": 150,
-        "output_throughput": 30,
-    },
-}
+COMPILE_ARGS = [
+    "--trust-remote-code",
+    "--mem-fraction-static",
+    "0.8",
+    "--attention-backend",
+    "ascend",
+    "--dtype",
+    "bfloat16",
+    "--enable-torch-compile",
+    # Capture buckets have to cover the eval's concurrency, otherwise decode
+    # falls back to eager and the compiled graphs are never replayed.
+    "--torch-compile-max-bs",
+    "32",
+    "--cuda-graph-max-bs-decode",
+    "32",
+]
 
+# Same as the TorchAir compile test: without it the ascend backend runs paged
+# attention through ATB, which has been observed to fail graph capture on A3.
 os.environ["ASCEND_USE_FIA"] = "true"
 
 
-class TestAscendTp1Bf16(CustomTestCase):
+class TestNpuCompileGraphTp1Bf16(CustomTestCase, NPUGSM8KMixin):
+    # Measured 0.970 on this model and harness; 0.94 leaves three points
+    # of margin. Compiling must not move accuracy.
+    gsm8k_score_threshold = 0.94
+    gsm8k_num_examples = 200
+    gsm8k_num_threads = 32
+    gsm8k_backend = "sgl_eval"
+    gsm8k_thinking = True
+    # At 2048 this model truncates 28% of its answers and scores 0.820;
+    # 8192 brings the truncated rate to 0.010.
+    gsm8k_max_tokens = 8192
+
     @classmethod
     def setUpClass(cls):
-        cls.models = TEST_MODEL_MATRIX.keys()
+        # Qwen3-8B, not the Qwen2.5-7B-Instruct of the sibling ACLGraph tests:
+        # sgl-eval's gsm8k prompt asks for the answer alone, which that model
+        # obeys literally and scores 0.32 on, leaving no usable bar.
+        cls.model = QWEN3_8B_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.url = urlparse(DEFAULT_URL_FOR_TEST)
-        cls.common_args = [
-            "--trust-remote-code",
-            "--mem-fraction-static",
-            0.6,
-            "--attention-backend",
-            "ascend",
-            "--disable-radix-cache",
-            "--enable-torch-compile",
-            "--watchdog-timeout",
-            30000,
-        ]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            # Compiling the decode graphs takes ~565s on this model, which the
+            # 600s default does not cover. 1500s matches the sibling NPU tests.
+            timeout=1500,
+            other_args=COMPILE_ARGS,
+        )
 
-    def test_a_gsm8k(self):
-        for model in self.models:
-            with self.subTest(model=model):
-                process = popen_launch_server(
-                    model,
-                    self.base_url,
-                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                    other_args=[
-                        *self.common_args,
-                    ],
-                )
-
-                try:
-                    if _is_pr_pipeline:
-                        run_npu_pr_smoke(self.base_url)
-                    else:
-                        print(f"##=== Testing accuracy: {model} ===##")
-
-                        args = SimpleNamespace(
-                            num_shots=5,
-                            data_path=None,
-                            num_questions=1319,
-                            max_new_tokens=512,
-                            parallel=32,
-                            host=f"http://{self.url.hostname}",
-                            port=int(self.url.port),
-                        )
-
-                        metrics = run_eval_few_shot_gsm8k(args)
-                        self.assertGreaterEqual(
-                            metrics["accuracy"],
-                            TEST_MODEL_MATRIX[model]["accuracy"],
-                        )
-                finally:
-                    kill_process_tree(process.pid)
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
 
 
 if __name__ == "__main__":

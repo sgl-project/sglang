@@ -10,7 +10,6 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateShape,
 )
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -27,10 +26,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     PhaseConfig,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_context, get_parallel, get_server_args
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 _parallel_override = get_parallel().override(attn_tp_size=1)
 _parallel_override.__enter__()
@@ -56,6 +57,7 @@ class GDNAttentionCase:
     prefix_lens: tuple[int, ...]
     extend_lens: tuple[int, ...] = ()
     linear_attn_prefill_backend: str | None = None
+    linear_attn_verify_backend: str | None = None
     mis_delimiter_indices: tuple[tuple[int, ...], ...] = ()
     conv_history_weight: float = 0.0
 
@@ -179,6 +181,7 @@ class TinyGDNModelConfig:
         self.swa_v_head_dim = head_dim
         self.is_encoder_decoder = False
         self.is_multimodal = False
+        self.model_is_mrope = False
         self.is_generation = True
         self.quantization = None
         self.is_hybrid_swa = False
@@ -226,7 +229,7 @@ class MockGDNModelRunner(ModelRunner):
         self.decode_attention_backend_str = case.backend
         self.draft_attention_backend = None
         self.gpu_id = 0
-        self.ps = ParallelState.trivial()
+        self.spec_algorithm = SpeculativeAlgorithm.NONE
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
@@ -258,6 +261,7 @@ class MockGDNModelRunner(ModelRunner):
             linear_attn_backend="triton",
             linear_attn_decode_backend=None,
             linear_attn_prefill_backend=case.linear_attn_prefill_backend,
+            linear_attn_verify_backend=case.linear_attn_verify_backend,
             max_running_requests=None,
             revision=None,
             speculative_algorithm=None,
@@ -317,19 +321,23 @@ class MockGDNModelRunner(ModelRunner):
             enable_memory_saver=False,
             enable_alt_stream=False,
         )
+        self.req_to_token_pool.state.bind_routes(self.token_to_kv_pool.layer_router)
+        # A static allocator: ids index the pools as they are.
         self.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=case.page_size,
             get_kvcache=lambda: self.token_to_kv_pool,
+            hands_out_virtual_ids=False,
+            state_id_spaces=lambda: {},
+            request_id_spaces=lambda: {},
         )
-        self.init_kv_index_translator()
-        self.attn_cp_size = 1
+        self.is_draft_worker = False
+        self.init_runner_ids()
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
         self.init_new_workspace = False
         self.is_hybrid_swa = False
         self.sliding_window_size = None
         self.use_mla_backend = False
-        self.is_draft_worker = False
         self._kernel_warmed_up = True
 
     @property
@@ -562,6 +570,8 @@ def _make_forward_batch(
             else None
         ),
     )
+    # Production batches take their KV ids from a plan (`init_new`).
+    runner.runner_ids.bind_own_plan(batch)
 
     if case.forward_mode.is_extend(include_draft_extend_v2=True):
         extend_seq_lens = torch.tensor(input_lens, dtype=torch.int32, device=device)
@@ -714,11 +724,11 @@ def _copy_gdn_parameters(
 
 
 def _ssm_states(fixture: GDNAttentionFixture) -> torch.Tensor:
-    return fixture.runner.req_to_token_pool.mamba2_layer_cache(0).temporal
+    return fixture.runner.req_to_token_pool.mamba_pool.mamba2_layer_cache(0).temporal
 
 
 def _conv_states(fixture: GDNAttentionFixture) -> torch.Tensor:
-    return fixture.runner.req_to_token_pool.mamba2_layer_cache(0).conv[0]
+    return fixture.runner.req_to_token_pool.mamba_pool.mamba2_layer_cache(0).conv[0]
 
 
 def _populate_gdn_prefix_state(fixture: GDNAttentionFixture) -> None:

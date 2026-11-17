@@ -37,7 +37,7 @@ sgl-kernel-npu/
 │       ├── op_host/               # Host-side code (validation, tiling, launch)
 │       │   ├── <op_name>.cpp
 │       │   └── tiling/            # Optional: tiling data
-│       └── op_kernel/             # Device-side code (Ascend C kernel on AICore)
+│       └── op_kernel/             # Device-side code (Ascend C kernel on AI Core)
 │           └── <op_name>_kernel.cpp
 ├── include/
 │   └── sgl_kenel_npu_ops.h        # C++ interface declarations
@@ -62,7 +62,7 @@ sgl-kernel-npu/
 
 A complete Ascend C operator consists of two parts:
 
-- **Device part**: Kernel code running on the NPU AICore, responsible for actual
+- **Device part**: Kernel code running on the NPU AI Core, responsible for actual
   computation. Written using the Ascend C API.
 - **Host part**: Code running on the CPU, responsible for parameter validation,
   data pre-processing, tiling, and kernel launch.
@@ -86,7 +86,7 @@ csrc/<op_name>/
 
 ### Step 2: Write the Device-side Kernel (op_kernel)
 
-Device-side code runs on AICore and follows the Ascend C programming model. The
+Device-side code runs on AI Core and follows the Ascend C programming model. The
 core structure is a class with `Init()` and `Process()` methods, plus an
 `extern "C"` entry function.
 
@@ -155,7 +155,7 @@ extern "C" __global__ __aicore__ void helloworld(
 
 **Key points:**
 
-- Class methods must be marked with `__aicore__`, indicating they run on AICore.
+- Class methods must be marked with `__aicore__`, indicating they run on AI Core.
 - Use `AscendC::TPipe` + `AscendC::TQue` to build a pipeline that overlaps data
   movement and computation.
 - The entry function must be declared `extern "C" __global__ __aicore__`. The

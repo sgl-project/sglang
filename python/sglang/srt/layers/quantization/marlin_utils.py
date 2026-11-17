@@ -30,7 +30,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sglang.kernels.ops.quantization.gptq_marlin import gptq_marlin_gemm
+    from sglang.kernels.ops.gemm.gptq_marlin import gptq_marlin_gemm
 
 logger = logging.getLogger(__name__)
 
@@ -70,9 +70,12 @@ def query_marlin_supported_quant_types(
     include_fp_type: bool = True,
     device_capability: Optional[int] = None,
 ):
+    if not _is_cuda:
+        return []
+
     if device_capability is None:
         major, minor = get_device_capability()
-        capability = major * 10 + minor
+        capability = major * 10 + minor if major is not None else None
         device_capability = -1 if capability is None else capability
 
     if device_capability < 80:
@@ -107,10 +110,9 @@ def _check_marlin_supported(
     has_zp: bool,
     device_capability: Optional[int] = None,
 ) -> tuple[bool, Optional[str]]:
-
     if device_capability is None:
         major, minor = get_device_capability()
-        capability = major * 10 + minor
+        capability = major * 10 + minor if major is not None else None
         device_capability = -1 if capability is None else capability
 
     supported_types = query_marlin_supported_quant_types(
@@ -165,7 +167,6 @@ def verify_marlin_supports_shape(
     input_size: int,
     group_size: int,
 ) -> None:
-
     # Validate output_size_per_partition
     if output_size_per_partition % GPTQ_MARLIN_MIN_THREAD_N != 0:
         raise ValueError(
@@ -210,20 +211,63 @@ def check_marlin_supports_shape(
     return True, None
 
 
-def check_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
-    output_size_per_partition = (
-        getattr(layer, "output_size_per_partition", None) or layer.output_size
-    )
-    input_size_per_partition = (
-        getattr(layer, "input_size_per_partition", None) or layer.input_size
-    )
+def _resolve_layer_marlin_partition_sizes(layer: LinearBase) -> tuple[int, int]:
+    output_size_per_partition = getattr(layer, "output_size_per_partition", None)
+    input_size_per_partition = getattr(layer, "input_size_per_partition", None)
 
+    if output_size_per_partition is None or input_size_per_partition is None:
+        from sglang.srt.distributed.utils import get_group_rank_size
+        from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+
+        _, tp_size = get_group_rank_size(getattr(layer, "tp_group", None))
+
+        if output_size_per_partition is None:
+            if isinstance(layer, ColumnParallelLinear) and tp_size:
+                output_size_per_partition = layer.output_size // tp_size
+            else:
+                output_size_per_partition = layer.output_size
+
+        if input_size_per_partition is None:
+            if isinstance(layer, RowParallelLinear) and tp_size:
+                input_size_per_partition = layer.input_size // tp_size
+            else:
+                input_size_per_partition = layer.input_size
+
+    return output_size_per_partition, input_size_per_partition
+
+
+def check_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
+    output_size_per_partition, input_size_per_partition = (
+        _resolve_layer_marlin_partition_sizes(layer)
+    )
     return check_marlin_supports_shape(
         output_size_per_partition=output_size_per_partition,
         input_size_per_partition=input_size_per_partition,
         input_size=layer.input_size,
         group_size=group_size,
     )[0]
+
+
+def verify_marlin_supports_layer(
+    layer: LinearBase, group_size: int, prefix: str = ""
+) -> None:
+    output_size_per_partition, input_size_per_partition = (
+        _resolve_layer_marlin_partition_sizes(layer)
+    )
+    try:
+        verify_marlin_supports_shape(
+            output_size_per_partition=output_size_per_partition,
+            input_size_per_partition=input_size_per_partition,
+            input_size=layer.input_size,
+            group_size=group_size,
+        )
+    except ValueError as e:
+        layer_desc = f"Layer '{prefix}'" if prefix else f"Layer {layer}"
+        raise ValueError(
+            f"{layer_desc} is quantized but incompatible with GPTQMarlin: {e} "
+            "If this layer is unquantized in the checkpoint, exclude it in "
+            "quantization_config.dynamic."
+        ) from e
 
 
 def check_moe_marlin_supports_layer(
@@ -313,7 +357,6 @@ def get_scale_perms():
 def marlin_permute_scales(
     s: torch.Tensor, size_k: int, size_n: int, group_size: int
 ) -> torch.Tensor:
-
     scale_perm, scale_perm_single = get_scale_perms()
     if group_size < size_k and group_size != -1:
         s = s.reshape((-1, len(scale_perm)))[:, scale_perm]
@@ -441,7 +484,6 @@ def maybe_warn_marlin_atomic_add_env():
 def should_use_atomic_add_reduce(
     m: int, n: int, k: int, device: torch.device, dtype: torch.dtype
 ) -> bool:
-
     # the performance of atomicAdd is better than global reduce
     # only when m*n is small and k is large
     if n >= 2048 or k < 2048 or device.type != "cuda":

@@ -1,15 +1,28 @@
 ---
 title: Wan2.2
+description: "Deploy Wan2.2 video generation models with SGLang - MoE architecture, cinematic aesthetics, and efficient 720P@24fps generation."
 metatags:
     description: "Deploy Wan2.2 video generation models with SGLang - MoE architecture, cinematic aesthetics, and efficient 720P@24fps generation."
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
-import { Wan22Deployment } from '/src/snippets/diffusion/wan22-deployment.jsx';
 
 <DiffusionModelTags tags={["video", "T2V / I2V / TI2V", "MoE", "720p @ 24 fps", "cinematic motion"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/Wan/wan22.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
+
+<a id="2-sglang-diffusion-installation" />
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [Wan2.2](https://github.com/Wan-Video/Wan2.2) extends the Wan family with timestep-specialized Mixture-of-Experts models and a unified 5B TI2V checkpoint. It targets cinematic composition, lighting, and complex motion while supporting text-to-video, image-to-video, and hybrid text/image conditioning.
 
@@ -21,12 +34,6 @@ for image-to-video generation. Use `Wan-AI/Wan2.2-I2V-A14B-Diffusers` when I2V
 quality is the priority.
 </Warning>
 
-## 2. SGLang-diffusion Installation
-
-SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
-
-Please refer to the [official SGLang-diffusion installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for installation instructions.
-
 ## 3. Model Deployment
 
 This section provides deployment configurations optimized for different hardware platforms and use cases.
@@ -35,20 +42,23 @@ This section provides deployment configurations optimized for different hardware
 
 The Wan2.2 series offers models in various sizes, architectures and input types, optimized for different hardware platforms. The recommended launch configurations vary by hardware and model size.
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model size. SGLang supports serving Wan2.2 on NVIDIA B200, H200, AMD MI300X, MI325X, MI355X GPUs and Ascend A2, A3 NPUs.
-
-<Wan22Deployment />
+Use the [command builder](#1-quick-start) above.
 
 ### 3.2 Configuration Tips
 
 See [Performance Optimization](/docs/sglang-diffusion/performance-optimization) for acceleration features and their runtime requirements.
 
-- `--vae-path`: Path to a custom VAE model or HuggingFace model ID (e.g., fal/FLUX.2-Tiny-AutoEncoder). If not specified, the VAE will be loaded from the main model path.
+- `--vae-path`: Path to a custom VAE model or HuggingFace model ID. If not specified, the VAE will be loaded from the main model path.
 - `--num-gpus {NUM_GPUS}`: Number of GPUs to use
-- `--tp-size {TP_SIZE}`: Tensor parallelism size (only for the encoder; should not be larger than 1 if text encoder offload is enabled, as layer-wise offload plus prefetch is faster)
+- `--tp-size {TP_SIZE}`: Tensor parallelism size. Depending on the pipeline it shards the DiT, the encoders, or both.
 - `--sp-degree {SP_SIZE}`: Sequence parallelism size (typically should match the number of GPUs)
 - `--ulysses-degree {ULYSSES_DEGREE}`: The degree of DeepSpeed-Ulysses-style SP in USP
 - `--ring-degree {RING_DEGREE}`: The degree of ring attention-style SP in USP
+
+Wan2.2 also supports the optional [UMT5 padding trim](/cookbook/diffusion/Wan/Wan2.1#optional-umt5-padding-trim).
+`SGLANG_DIFFUSION_WAN_TEXT_PADDING=max` remains the default; `longest` and
+`bucket` change encoder shapes and can change the generated video for the
+same seed. They do not shorten the DiT's input or denoising work.
 
 ## 4. Model Invocation
 
@@ -59,21 +69,13 @@ For more API usage and request examples, please refer to:
 
 #### 4.1.1 Launch a server and then send requests
 
-```shell Command
-sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --port 3000
-
-curl http://127.0.0.1:3000/v1/images/generations \
-  -o >(jq -r '.data[0].b64_json' | base64 --decode > example.png) \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $OPENAI_API_KEY" \
-  -d '{
-    "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
-    "prompt": "A cute baby sea otter",
-    "n": 1,
-    "size": "1024x1024",
-    "response_format": "b64_json"
-  }'
-```
+Use the Server and Request commands in the [command builder](#1-quick-start)
+for the selected checkpoint and T2V, I2V or TI2V mode. The request submits an
+asynchronous job to `POST /v1/videos`; it does not return base64 image data.
+Poll `GET /v1/videos/{video_id}` until `status` is `completed`, then download
+`GET /v1/videos/{video_id}/content` to an MP4 file. If the job is `failed`,
+inspect its error instead. See [Video generation](/docs/sglang-diffusion/api/openai_api#video-generation)
+for polling and download examples.
 
 #### 4.1.2 Generate a video without launching a server
 
@@ -212,7 +214,7 @@ sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
 
 #### 4.2.2 GPU Optimization
 
-- `--dit-cpu-offload`: Use CPU offload for DiT inference. Enable if run out of memory with FSDP.
+- `--dit-cpu-offload`: Keep DiT weights on the CPU and move them onto the GPU whole around each use. This takes the DiT out of FSDP, which shards only resident components.
 - `--text-encoder-cpu-offload`: Use CPU offload for text encoder inference. Enable if run out of memory with FSDP.
 - `--image-encoder-cpu-offload`: Use CPU offload for image encoder inference. Enable if run out of memory with FSDP.
 - `--vae-cpu-offload`: Use CPU offload for VAE. Enable if run out of memory.
@@ -297,10 +299,10 @@ Test Environment:
     ```
   </Tab>
 
-  <Tab title="Ascend A3">
+  <Tab title="Ascend A3 Series">
     **Server Command**:
     ```shell Command
-    #One A3 card has 2 npu chips. Using four A3 cards in benchmarking
+    #One A3 Series card has 2 npu chips. Using four A3 Series cards in benchmarking
     sglang serve \
       --model-path /models/Wan-AI/Wan2.2-T2V-A14B-Diffusers/ \
       --tp-size 2 \
@@ -399,11 +401,11 @@ Test Environment:
     ```
   </Tab>
 
-  <Tab title="Ascend A3">
+  <Tab title="Ascend A3 Series">
     **Server Command**:
 
     ```shell Command
-    #One A3 card has 2 npu chips. Using four A3 cards in benchmarking
+    #One A3 Series card has 2 npu chips. Using four A3 Series cards in benchmarking
     SGLANG_CACHE_DIT_FN=2 \
     SGLANG_CACHE_DIT_BN=1 \
     SGLANG_CACHE_DIT_WARMUP=4 \
@@ -459,3 +461,9 @@ Test Environment:
     ```
   </Tab>
 </Tabs>
+
+## 6. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="video" />

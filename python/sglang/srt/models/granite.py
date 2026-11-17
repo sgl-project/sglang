@@ -20,6 +20,7 @@
 """Inference-only Granite model compatible with HuggingFace weights."""
 
 import logging
+import traceback
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -38,6 +39,7 @@ from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -48,8 +50,6 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils import add_prefix, set_weight_attrs
-from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +79,9 @@ def build_attention_sinks(num_heads: int) -> nn.Parameter:
     attn_backend = get_exec().kernel.attention_backend
     sinks_dtype = torch.float32 if attn_backend == "trtllm_mha" else torch.bfloat16
     sinks = nn.Parameter(torch.empty(num_heads, dtype=sinks_dtype), requires_grad=False)
-    set_weight_attrs(sinks, {"weight_loader": sharded_weight_loader(0)})
+    set_weight_attrs(
+        sinks, {"weight_loader": sharded_weight_loader(0, parallel_group="tp")}
+    )
     return sinks
 
 
@@ -540,7 +542,7 @@ class GraniteForCausalLM(nn.Module):
 
         except Exception:
             logger.error(
-                f"Error getting weights by name {name} in GraniteForCausalLM: {get_exception_traceback()}"
+                f"Error getting weights by name {name} in GraniteForCausalLM: {traceback.format_exc()}"
             )
             return None
 

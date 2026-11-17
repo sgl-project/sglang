@@ -83,7 +83,9 @@ async def save_realtime_first_frame(
     else:
         target_path = os.path.join(uploads_dir, f"{session.id}_first_frame")
 
-    request.first_frame = await save_image_to_path(first_frame, target_path)
+    request.first_frame = await save_image_to_path(
+        first_frame, target_path, uploads_root=uploads_dir
+    )
 
 
 def build_realtime_sampling_params(

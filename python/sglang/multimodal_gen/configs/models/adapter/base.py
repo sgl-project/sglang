@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
-from typing import Any
 
 from sglang.multimodal_gen.configs.models.base import ArchConfig, ModelConfig
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
@@ -23,7 +22,9 @@ class AdapterArchConfig(ArchConfig):
             AttentionBackendEnum.FA,
             AttentionBackendEnum.AITER,
             AttentionBackendEnum.AITER_SAGE,
+            AttentionBackendEnum.AITER_QUANT,
             AttentionBackendEnum.TORCH_SDPA,
+            AttentionBackendEnum.AMX_ATTN,
             AttentionBackendEnum.VIDEO_SPARSE_ATTN,
             AttentionBackendEnum.VMOBA_ATTN,
             AttentionBackendEnum.SAGE_ATTN_3,
@@ -50,16 +51,3 @@ class AdapterConfig(ModelConfig):
 
     # sglang-diffusion Adapter-specific parameters
     prefix: str = ""
-
-    @staticmethod
-    def add_cli_args(parser: Any, prefix: str = "dit-config") -> Any:
-        """Add CLI arguments for AdapterConfig fields"""
-        parser.add_argument(
-            f"--{prefix}.prefix",
-            type=str,
-            dest=f"{prefix.replace('-', '_')}.prefix",
-            default=AdapterConfig.prefix,
-            help="Prefix for the Adapter",
-        )
-
-        return parser

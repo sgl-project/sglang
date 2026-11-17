@@ -4,12 +4,12 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 
 import numpy as np
 import torch
 
-from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.awq import AWQConfig
@@ -23,8 +23,9 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_device_capability, set_weight_attrs
+from sglang.srt.utils import get_device_capability
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
+    from sglang.srt.models.utils import WeightsMapper
 
 
 def get_weight_perm(num_bits: int):
@@ -87,10 +89,21 @@ class MoeWNA16Config(QuantizationConfig):
         self.linear_quant_method = linear_quant_method
         self.full_config = full_config
         self.use_marlin = False
+        self._gptq_config: Optional[GPTQConfig | GPTQMarlinConfig] = None
         # Avoid circular import
 
         if self.linear_quant_method == "gptq":
             self.use_marlin = GPTQMarlinConfig.is_gptq_marlin_compatible(full_config)
+            gptq_cfg_dict = dict(full_config)
+            gptq_cfg_dict.setdefault("bits", self.weight_bits)
+            gptq_cfg_dict.setdefault("group_size", self.group_size)
+            gptq_cfg_dict.setdefault("desc_act", False)
+            gptq_cfg_dict.setdefault("sym", not self.has_zp)
+            gptq_cfg_dict.setdefault("lm_head", self.lm_head_quantized)
+            cfg_cls = GPTQMarlinConfig if self.use_marlin else GPTQConfig
+            self._gptq_config = cfg_cls.from_config(gptq_cfg_dict)
+            if self._gptq_config.packed_modules_mapping:
+                self.packed_modules_mapping = self._gptq_config.packed_modules_mapping
         elif self.linear_quant_method == "awq":
             capability_tuple = get_device_capability()
             device_capability = (
@@ -191,6 +204,38 @@ class MoeWNA16Config(QuantizationConfig):
 
         return gptq_compatible or awq_compatible
 
+    @property
+    def uses_checkpoint_tensor_manifest(self) -> bool:
+        return self._gptq_config is not None
+
+    def _get_gptq_config(self) -> Optional[GPTQConfig | GPTQMarlinConfig]:
+        if self._gptq_config is None:
+            return None
+        if self.packed_modules_mapping:
+            self._gptq_config.packed_modules_mapping = self.packed_modules_mapping
+        return self._gptq_config
+
+    def set_checkpoint_tensor_names(
+        self, tensor_names: Optional[Iterable[str]]
+    ) -> None:
+        if self._gptq_config is not None:
+            self._gptq_config.set_checkpoint_tensor_names(tensor_names)
+
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper) -> None:
+        if self._gptq_config is not None:
+            self._gptq_config.apply_weight_name_mapper(hf_to_sglang_mapper)
+
+    def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
+        super().update_packed_modules_mapping(mapping)
+        if self._gptq_config is not None:
+            self._gptq_config.packed_modules_mapping = mapping
+
+    def is_linear_unquantized(self, prefix: str) -> bool:
+        gptq_config = self._get_gptq_config()
+        if gptq_config is not None:
+            return gptq_config.is_linear_unquantized(prefix)
+        return super().is_linear_unquantized(prefix)
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
@@ -204,14 +249,7 @@ class MoeWNA16Config(QuantizationConfig):
             return UnquantizedLinearMethod()
         elif isinstance(layer, LinearBase):
             if self.linear_quant_method == "gptq":
-                if self.use_marlin:
-                    return GPTQMarlinConfig.from_config(
-                        self.full_config
-                    ).get_quant_method(layer, prefix)
-                else:
-                    return GPTQConfig.from_config(self.full_config).get_quant_method(
-                        layer, prefix
-                    )
+                return self._get_gptq_config().get_quant_method(layer, prefix)
             elif self.linear_quant_method == "awq":
                 return AWQConfig.from_config(self.full_config).get_quant_method(
                     layer, prefix
@@ -225,6 +263,24 @@ class MoeWNA16Config(QuantizationConfig):
 
 def is_layer_skipped_quant(prefix: str, modules_to_not_convert: List[str]):
     return any(module_name in prefix for module_name in modules_to_not_convert)
+
+
+def _local_expert_ids(layer, expert_id: int) -> List[int]:
+    """This rank's slots for checkpoint expert ``expert_id``, as the layer maps it.
+
+    The qzeros are written here rather than through the layer's weight loader,
+    so they need the same expert placement: EPLB's physical replicas, then the
+    expert-parallel slice this rank stores.
+    """
+    metadata = get_global_expert_location_metadata()
+    if metadata is None or not layer.uses_expert_location:
+        physical = [expert_id]
+    else:
+        physical = metadata.logical_to_all_physical(layer.layer_id, expert_id)
+        if expert_id < metadata.num_logical_experts:
+            physical = layer._local_routed_expert_ids(physical)
+    local = (layer._map_global_expert_id_to_local_expert_id(p) for p in physical)
+    return [i for i in local if 0 <= i < layer.num_local_experts]
 
 
 class MoeWNA16Method(FusedMoEMethodBase):
@@ -453,8 +509,10 @@ class MoeWNA16Method(FusedMoEMethodBase):
             if not layer.quant_config.has_zp and "qzeros" in weight_name:
                 return
 
-            device = get_tp_group().device
-            tp_rank = get_parallel().tp_rank
+            tp_group = get_parallel().tp_group
+            device = tp_group.device
+            # The qzeros are split into moe_tp_size shards, one per MoE-TP rank.
+            moe_tp_rank = layer.moe_tp_rank
             loaded_weight = loaded_weight.to(device)
             shard_size = layer.intermediate_size_per_partition
 
@@ -494,15 +552,18 @@ class MoeWNA16Method(FusedMoEMethodBase):
             if "w13_qzeros" in weight_name:
                 tensor = loaded_weight.view(
                     layer.moe_tp_size, -1, loaded_weight.size(1)
-                )[tp_rank]
-                if shard_id == "w1":
-                    param.data[expert_id, : shard_size // 2] = tensor
-                else:
-                    param.data[expert_id, shard_size // 2 :] = tensor
+                )[moe_tp_rank]
+                for local_expert_id in _local_expert_ids(layer, expert_id):
+                    if shard_id == "w1":
+                        param.data[local_expert_id, : shard_size // 2] = tensor
+                    else:
+                        param.data[local_expert_id, shard_size // 2 :] = tensor
             elif "w2_qzeros" in weight_name:
-                param.data[expert_id] = loaded_weight.view(
+                tensor = loaded_weight.view(
                     loaded_weight.size(0), layer.moe_tp_size, -1
-                )[:, tp_rank]
+                )[:, moe_tp_rank]
+                for local_expert_id in _local_expert_ids(layer, expert_id):
+                    param.data[local_expert_id] = tensor
             else:
                 weight_loader(param, loaded_weight, weight_name, shard_id, expert_id)
 

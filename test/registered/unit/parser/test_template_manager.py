@@ -17,6 +17,7 @@ from sglang.srt.parser.template_detection import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2.0, suite="base-a-test-cpu")
 
@@ -30,12 +31,27 @@ class _DummyTokenizer:
         return {token: i for i, token in enumerate(self._vocab)}
 
 
-def _patch_hf_transformers_utils(get_tokenizer, get_config=None):
-    module = ModuleType("sglang.srt.utils.hf_transformers_utils")
+def _patch_hf_transformers(get_tokenizer, get_config=None):
+    module = ModuleType("sglang.srt.hf_transformers")
     module.get_tokenizer = get_tokenizer
     if get_config is not None:
         module.get_config = get_config
     return patch.dict(sys.modules, {module.__name__: module})
+
+
+_GRANITE_THINKING_TOGGLES = (
+    "{% set enable_thinking = enable_thinking if enable_thinking is defined else True %}\n"
+    "{% set truncate_history_thinking = truncate_history_thinking"
+    " if truncate_history_thinking is defined else True %}\n"
+)
+_GRANITE_DEFERRED_TOOL_LOADING = "{%- if tool.defer_loading is not defined or not tool.defer_loading %}{%- endif %}\n"
+_XML_TOOL_CALL_BLOCK = (
+    "<tool_call>\n<function=example_function_name>\n"
+    "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>\n</tool_call>"
+)
+_GRANITE_42_TEMPLATE = (
+    _GRANITE_THINKING_TOGGLES + _GRANITE_DEFERRED_TOOL_LOADING + _XML_TOOL_CALL_BLOCK
+)
 
 
 def _glm53_template(concat):
@@ -58,13 +74,52 @@ def _glm53_template(concat):
     )
 
 
-class TestTemplateManagerReasoningDetection(unittest.TestCase):
+class TestTemplateManagerReasoningDetection(CustomTestCase):
     def _detect(self, template, vocab):
         force, config = detect_reasoning_pattern(template)
         parser = detect_reasoning_parser(
             template, _DummyTokenizer(vocab), config, force
         )
         return force, config, parser
+
+    def test_lfm3_template_ignores_legacy_lfm2_vocab(self):
+        template = (
+            "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}"
+            "<think><tool_call><function=get_weather><parameter=city>Warsaw"
+            "</parameter></function></tool_call>"
+        )
+        vocab = ["<|tool_call_start|>", "<|tool_call_end|>", "<tool_call>"]
+        force, config, parser = self._detect(template, vocab)
+        self.assertEqual(parser, "qwen3")
+        self.assertEqual(
+            detect_tool_call_parser(template, _DummyTokenizer(vocab), config, force),
+            "qwen3_coder",
+        )
+
+    def test_iquest_template_wins_over_generic_think_and_xml_rules(self):
+        template = "<|iquest_assistant|><think><iquest_tool_call><arg_key><arg_value>"
+        force, config, parser = self._detect(template, [])
+        self.assertEqual(parser, "iquest_q1")
+        self.assertEqual(
+            detect_tool_call_parser(template, _DummyTokenizer([]), config, force),
+            "iquest_q1",
+        )
+
+    def test_gigachat35_gcml_template_wins_over_generic_think_tags(self):
+        """The GCML marker must map both parsers to gigachat35; the template also
+        carries <think>, so the rule has to outrank the generic deepseek-r1
+        think-tags fallback."""
+        template = """
+        {{- 'assistant<|role_sep|>\\n<think>' -}}
+        <｜GCML｜tool_calls>
+        """
+        vocab = ["<think>", "</think>", "<|role_sep|>\n"]
+        force, config, parser = self._detect(template, vocab)
+        self.assertEqual(parser, "gigachat35")
+        self.assertEqual(
+            detect_tool_call_parser(template, _DummyTokenizer(vocab), config, force),
+            "gigachat35",
+        )
 
     def test_qwen3_template_not_misclassified_as_glm45(self):
         template = """
@@ -99,6 +154,25 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
         )
         self.assertEqual(parser, "glm45")
 
+    def test_ling3_template_uses_ling3_parsers(self):
+        template = """
+        {% set enable_thinking = enable_thinking if enable_thinking is defined else true %}
+        {{ '<role>SYSTEM</role>' }}
+        {{ '<role>ASSISTANT</role>' }}
+        {{ '<|role_end|>' }}
+        <tool_call>{function-name}
+        <arg_key>{arg-key}</arg_key>
+        <arg_value>{arg-value}</arg_value>
+        </tool_call>
+        """
+        force, config, reasoning_parser = self._detect(template, [])
+        tool_call_parser = detect_tool_call_parser(
+            template, _DummyTokenizer([]), config, force
+        )
+
+        self.assertEqual(reasoning_parser, "ling3")
+        self.assertEqual(tool_call_parser, "ling3")
+
     def test_glm53_effort_template_resolves_glm_parsers(self):
         # Without an enable_thinking toggle the GLM-4.5 rule misses, and the
         # template used to fall through to deepseek-r1 + the xml_kv fallback
@@ -115,6 +189,13 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
                     ),
                     "glm47",
                 )
+
+    def test_glm53_effort_template_forces_reasoning(self):
+        vocab = ["<tool_call>", "<arg_key>", "<arg_value>", "<|user|>", "<|endoftext|>"]
+        force, config, _ = self._detect(_glm53_template("+"), vocab)
+
+        self.assertTrue(force)
+        self.assertEqual(config, ReasoningToggleConfig(special_case="always"))
 
     def test_interns1_detects_enable_thinking_default_true(self):
         template = """
@@ -526,6 +607,13 @@ class TestTemplateDetectionRuleMatrix(unittest.TestCase):
             None,  # special_case="always"
         ),
         (
+            "beam_channel_with_xml_tool_calls",
+            '<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="',
+            [],
+            "beam",
+            None,  # special_case="always"
+        ),
+        (
             "kimi_k2_with_tool_vocab",
             "{% set thinking = thinking if thinking is defined else true %}\n<think>",
             ["<|tool_calls_section_begin|>", "<|tool_calls_section_end|>"],
@@ -656,6 +744,12 @@ class TestToolCallParserDetection(unittest.TestCase):
                 "qwen",
             ),
             ("gpt_oss", "<|channel|>analysis<|message|>", [], "gpt-oss"),
+            (
+                "beam",
+                '<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="',
+                [],
+                "beam",
+            ),
             ("gemma4", "<|channel>content", [], "gemma4"),
             ("minimax_maps_to_m2", "<minimax:tool_call>", [], "minimax-m2"),
             (
@@ -832,6 +926,40 @@ class TestToolCallParserDetection(unittest.TestCase):
                 )
                 self.assertEqual(result, expected)
 
+    def test_granite_tool_parser_needs_xml_block_and_granite_signature(self):
+        cases = [
+            ("granite_4_2", _GRANITE_42_TEMPLATE, "granite_toolcall_parser"),
+            (
+                "nemotron_3_shared_xml_block",
+                _GRANITE_THINKING_TOGGLES + _XML_TOOL_CALL_BLOCK,
+                "qwen3_coder",
+            ),
+            (
+                "granite_signature_without_xml_block",
+                _GRANITE_THINKING_TOGGLES + _GRANITE_DEFERRED_TOOL_LOADING,
+                "qwen",
+            ),
+            (
+                "granite_4_0_json_tool_call",
+                "For each tool call, return a json object with function name and "
+                "arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n"
+                '{"name": <function-name>, "arguments": <args-json-object>}\n</tool_call>',
+                None,
+            ),
+            (
+                "granite_3_3_tool_call_token",
+                "respond only with <|tool_call|> followed by a JSON list of tools used.",
+                None,
+            ),
+        ]
+        for name, template, expected in cases:
+            with self.subTest(name=name):
+                force, config = detect_reasoning_pattern(template)
+                result = detect_tool_call_parser(
+                    template, _DummyTokenizer([]), config, force
+                )
+                self.assertEqual(result, expected)
+
     def test_glm45_rule_precedes_xml_kv_fallback(self):
         # The specific GLM-4.5 family check must run before the generic
         # xml_kv_tool_call fallback. Both currently map to "glm45", so the
@@ -864,6 +992,9 @@ class TestToolCallParserDetection(unittest.TestCase):
         self.assertLess(tool_index["hunyuan"], tool_index["xml_kv_tool_call"])
         self.assertLess(tool_index["poolside_v1"], tool_index["xml_kv_tool_call"])
         self.assertLess(tool_index["step3p5"], tool_index["qwen3_coder"])
+        self.assertLess(
+            tool_index["granite_toolcall_parser"], tool_index["qwen3_coder"]
+        )
         self.assertLess(tool_index["step3"], tool_index["deepseek_v3"])
         self.assertLess(tool_index["qwen3_coder"], tool_index["qwen"])
 
@@ -922,10 +1053,31 @@ def _declared(server_args, field):
     return resolution_result(server_args, field)
 
 
-class TestResolveAutoParsers(unittest.TestCase):
+class TestResolveAutoParsers(CustomTestCase):
     """Tests for resolve_auto_parsers()."""
 
     qwen3_template = "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}"
+    response_template = {
+        "start_anchor": "<assistant>",
+        "fields": {
+            "content": {"content": "text"},
+            "thinking": {
+                "open": "<think>",
+                "close": "</think>",
+            },
+            "tool_calls": {
+                "open": "<call>",
+                "close": "</call>",
+                "content": "json",
+                "transform": {
+                    "function": {
+                        "name": "tool",
+                        "arguments": "{content}",
+                    },
+                },
+            },
+        },
+    }
 
     def _make_server_args(
         self, reasoning_parser=None, tool_call_parser=None, chat_template=None
@@ -944,17 +1096,150 @@ class TestResolveAutoParsers(unittest.TestCase):
         args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
         tokenizer = _DummyTokenizer([], chat_template=self.qwen3_template)
 
-        with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
+        with _patch_hf_transformers(Mock(return_value=tokenizer)):
             resolve_auto_parsers(args)
 
         self.assertEqual(_declared(args, "reasoning_parser"), "qwen3")
         self.assertEqual(_declared(args, "tool_call_parser"), "qwen")
 
+    def test_uses_runtime_tokenizer_configuration(self):
+        args = ServerArgs(
+            model_path="weights-path",
+            tokenizer_path="tokenizer-path",
+            tokenizer_mode="slow",
+            tokenizer_backend="fastokens",
+            revision="tokenizer-revision",
+            reasoning_parser="auto",
+            tool_call_parser="auto",
+            trust_remote_code=True,
+        )
+        tokenizer = _DummyTokenizer([], chat_template=self.qwen3_template)
+        get_tokenizer = Mock(return_value=tokenizer)
+
+        with _patch_hf_transformers(get_tokenizer):
+            resolve_auto_parsers(args)
+
+        get_tokenizer.assert_called_once_with(
+            "tokenizer-path",
+            tokenizer_mode="slow",
+            trust_remote_code=True,
+            revision="tokenizer-revision",
+            tokenizer_backend="fastokens",
+        )
+
+    def test_existing_detection_takes_precedence_over_response_template(self):
+        args = self._make_server_args(
+            reasoning_parser="auto",
+            tool_call_parser="auto",
+        )
+        tokenizer = _DummyTokenizer([], chat_template=self.qwen3_template)
+        tokenizer.response_template = self.response_template
+
+        with _patch_hf_transformers(Mock(return_value=tokenizer)):
+            resolve_auto_parsers(args)
+
+        self.assertEqual(_declared(args, "reasoning_parser"), "qwen3")
+        self.assertEqual(_declared(args, "tool_call_parser"), "qwen")
+
+    def test_tool_only_auto_selects_granite_tool_parser(self):
+        args = self._make_server_args(tool_call_parser="auto")
+        tokenizer = _DummyTokenizer([], chat_template=_GRANITE_42_TEMPLATE)
+
+        with _patch_hf_transformers(Mock(return_value=tokenizer)):
+            resolve_auto_parsers(args)
+
+        self.assertEqual(_declared(args, "tool_call_parser"), "granite_toolcall_parser")
+        self.assertIsNone(_declared(args, "reasoning_parser"))
+
+    def test_response_template_fills_undetected_parsers(self):
+        args = self._make_server_args(
+            reasoning_parser="auto",
+            tool_call_parser="auto",
+        )
+        tokenizer = _DummyTokenizer([], chat_template="unrecognized")
+        tokenizer.response_template = self.response_template
+
+        with _patch_hf_transformers(Mock(return_value=tokenizer)):
+            resolve_auto_parsers(args)
+
+        self.assertEqual(_declared(args, "reasoning_parser"), "response_template")
+        self.assertEqual(_declared(args, "tool_call_parser"), "response_template")
+
+    def test_response_template_resolves_only_supported_parser_fields(self):
+        args = self._make_server_args(
+            reasoning_parser="auto",
+            tool_call_parser="auto",
+        )
+        tokenizer = _DummyTokenizer([], chat_template="unrecognized")
+        tokenizer.response_template = {
+            "start_anchor": "<assistant>",
+            "fields": {
+                "thinking": {"open": "<think>", "close": "</think>"},
+            },
+        }
+
+        with _patch_hf_transformers(Mock(return_value=tokenizer)):
+            resolve_auto_parsers(args)
+
+        self.assertEqual(
+            _declared(args, "reasoning_parser"),
+            "response_template",
+        )
+        self.assertIsNone(_declared(args, "tool_call_parser"))
+
+    def test_unsupported_response_template_is_ignored(self):
+        args = self._make_server_args(
+            reasoning_parser="auto",
+            tool_call_parser="auto",
+        )
+        tokenizer = _DummyTokenizer([], chat_template="unrecognized")
+        tokenizer.response_template = {
+            "start_anchor": "<assistant>",
+            "fields": {
+                "content": {"content": "text"},
+                "metadata": {
+                    "open": "<metadata>",
+                    "close": "</metadata>",
+                    "content": "json",
+                },
+            },
+        }
+
+        with _patch_hf_transformers(Mock(return_value=tokenizer)):
+            resolve_auto_parsers(args)
+
+        self.assertIsNone(_declared(args, "reasoning_parser"))
+        self.assertIsNone(_declared(args, "tool_call_parser"))
+
+    def test_response_template_with_undelimited_tool_field_is_ignored(self):
+        """A tool field without an opener leaves no text outside the calls, so
+        the tool parser could never be constructed; auto must not select it."""
+        args = self._make_server_args(
+            reasoning_parser="auto",
+            tool_call_parser="auto",
+        )
+        tokenizer = _DummyTokenizer([], chat_template="unrecognized")
+        tokenizer.response_template = {
+            "start_anchor": "<assistant>",
+            "fields": {
+                "tool_calls": {
+                    "content": "json",
+                    "transform": {"type": "function", "function": "{content}"},
+                },
+            },
+        }
+
+        with _patch_hf_transformers(Mock(return_value=tokenizer)):
+            resolve_auto_parsers(args)
+
+        self.assertIsNone(_declared(args, "reasoning_parser"))
+        self.assertIsNone(_declared(args, "tool_call_parser"))
+
     def test_resolves_reasoning_parser_only(self):
         args = self._make_server_args(reasoning_parser="auto", tool_call_parser=None)
         tokenizer = _DummyTokenizer([], chat_template=self.qwen3_template)
 
-        with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
+        with _patch_hf_transformers(Mock(return_value=tokenizer)):
             resolve_auto_parsers(args)
 
         self.assertEqual(_declared(args, "reasoning_parser"), "qwen3")
@@ -964,7 +1249,7 @@ class TestResolveAutoParsers(unittest.TestCase):
         args = self._make_server_args(reasoning_parser="qwen3", tool_call_parser="auto")
         tokenizer = _DummyTokenizer([], chat_template=self.qwen3_template)
 
-        with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
+        with _patch_hf_transformers(Mock(return_value=tokenizer)):
             resolve_auto_parsers(args)
 
         self.assertEqual(_declared(args, "reasoning_parser"), "qwen3")
@@ -985,7 +1270,7 @@ class TestResolveAutoParsers(unittest.TestCase):
         msgspec.Struct.__setattr__(
             args, "model_path", "nonexistent/model-does-not-exist-xyz"
         )
-        with _patch_hf_transformers_utils(
+        with _patch_hf_transformers(
             Mock(side_effect=RuntimeError("tokenizer unavailable")),
             Mock(side_effect=RuntimeError("config unavailable")),
         ):
@@ -998,7 +1283,7 @@ class TestResolveAutoParsers(unittest.TestCase):
         args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
         tokenizer = _DummyTokenizer([])
 
-        with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
+        with _patch_hf_transformers(Mock(return_value=tokenizer)):
             resolve_auto_parsers(args)
 
         self.assertIsNone(_declared(args, "reasoning_parser"))
@@ -1009,7 +1294,7 @@ class TestResolveAutoParsers(unittest.TestCase):
         tokenizer = _DummyTokenizer([])
         config = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
 
-        with _patch_hf_transformers_utils(
+        with _patch_hf_transformers(
             Mock(return_value=tokenizer), Mock(return_value=config)
         ):
             resolve_auto_parsers(args)
@@ -1022,7 +1307,7 @@ class TestResolveAutoParsers(unittest.TestCase):
         tokenizer = _DummyTokenizer([])
         config = SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
 
-        with _patch_hf_transformers_utils(
+        with _patch_hf_transformers(
             Mock(return_value=tokenizer), Mock(return_value=config)
         ):
             resolve_auto_parsers(args)
@@ -1037,7 +1322,7 @@ class TestResolveAutoParsers(unittest.TestCase):
             architectures=["KimiK3ForConditionalGeneration"], model_type="kimi_k3"
         )
 
-        with _patch_hf_transformers_utils(
+        with _patch_hf_transformers(
             Mock(return_value=tokenizer), Mock(return_value=config)
         ):
             resolve_auto_parsers(args)
@@ -1050,7 +1335,7 @@ class TestResolveAutoParsers(unittest.TestCase):
         tokenizer = _DummyTokenizer([])
         config = SimpleNamespace(architectures=None, model_type="kimi_k3")
 
-        with _patch_hf_transformers_utils(
+        with _patch_hf_transformers(
             Mock(return_value=tokenizer), Mock(return_value=config)
         ):
             resolve_auto_parsers(args)
@@ -1058,11 +1343,67 @@ class TestResolveAutoParsers(unittest.TestCase):
         self.assertEqual(_declared(args, "reasoning_parser"), "kimi_k3")
         self.assertEqual(_declared(args, "tool_call_parser"), "kimi_k3")
 
+    def test_bailing_architectures_and_model_types_use_ling3_parsers(self):
+        cases = (
+            (["BailingMoeV3VLForConditionalGeneration"], ""),
+            (None, "bailing_moe_v3_vl"),
+            (["BailingMoeV3ForCausalLM"], ""),
+            (None, "bailing_hybrid"),
+        )
+        for architectures, model_type in cases:
+            with self.subTest(architectures=architectures, model_type=model_type):
+                args = self._make_server_args(
+                    reasoning_parser="auto", tool_call_parser="auto"
+                )
+                tokenizer = _DummyTokenizer([])
+                config = SimpleNamespace(
+                    architectures=architectures, model_type=model_type
+                )
+
+                with _patch_hf_transformers(
+                    Mock(return_value=tokenizer), Mock(return_value=config)
+                ):
+                    resolve_auto_parsers(args)
+
+                self.assertEqual(_declared(args, "reasoning_parser"), "ling3")
+                self.assertEqual(_declared(args, "tool_call_parser"), "ling3")
+
+    def test_minimax_architectures_and_model_types_use_minimax_parsers(self):
+        cases = (
+            (["MiniMaxM3SparseForCausalLM"], "", "minimax-m3", "minimax-m3"),
+            (
+                ["MiniMaxM3SparseForConditionalGeneration"],
+                "",
+                "minimax-m3",
+                "minimax-m3",
+            ),
+            (None, "minimax_m3_vl", "minimax-m3", "minimax-m3"),
+            (["MiniMaxM2ForCausalLM"], "", "minimax", "minimax-m2"),
+            (None, "minimax_m2", "minimax", "minimax-m2"),
+        )
+        for architectures, model_type, reasoning, tool_call in cases:
+            with self.subTest(architectures=architectures, model_type=model_type):
+                args = self._make_server_args(
+                    reasoning_parser="auto", tool_call_parser="auto"
+                )
+                tokenizer = _DummyTokenizer([])
+                config = SimpleNamespace(
+                    architectures=architectures, model_type=model_type
+                )
+
+                with _patch_hf_transformers(
+                    Mock(return_value=tokenizer), Mock(return_value=config)
+                ):
+                    resolve_auto_parsers(args)
+
+                self.assertEqual(_declared(args, "reasoning_parser"), reasoning)
+                self.assertEqual(_declared(args, "tool_call_parser"), tool_call)
+
     def test_deepseek_arch_fallback_runs_when_tokenizer_load_fails(self):
         args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
         config = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
 
-        with _patch_hf_transformers_utils(
+        with _patch_hf_transformers(
             Mock(side_effect=RuntimeError("tokenizer unavailable")),
             Mock(return_value=config),
         ):
@@ -1081,7 +1422,7 @@ class TestResolveAutoParsers(unittest.TestCase):
         tokenizer = _DummyTokenizer([])
         get_config = Mock()
 
-        with _patch_hf_transformers_utils(Mock(return_value=tokenizer), get_config):
+        with _patch_hf_transformers(Mock(return_value=tokenizer), get_config):
             resolve_auto_parsers(args)
 
         get_config.assert_not_called()
@@ -1090,6 +1431,17 @@ class TestResolveAutoParsers(unittest.TestCase):
 
     def test_explicit_jinja_template_takes_precedence(self):
         tokenizer = _DummyTokenizer([], chat_template=None)
+        tokenizer.response_template = {
+            "start_anchor": "<assistant>",
+            "fields": {
+                "thinking": {"open": "<think>", "close": "</think>"},
+                "tool_calls": {
+                    "open": "<call>",
+                    "close": "</call>",
+                    "content": "json",
+                },
+            },
+        }
 
         with tempfile.NamedTemporaryFile("w", suffix=".jinja") as f:
             f.write(
@@ -1103,7 +1455,7 @@ class TestResolveAutoParsers(unittest.TestCase):
                 chat_template=f.name,
             )
 
-            with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
+            with _patch_hf_transformers(Mock(return_value=tokenizer)):
                 resolve_auto_parsers(args)
 
         self.assertEqual(_declared(args, "reasoning_parser"), "deepseek-v3")

@@ -28,6 +28,7 @@ register_amd_ci(
     est_time=7200,
     suite="nightly-amd-accuracy-8-gpu-deepseek-v32-tc",
     nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
@@ -91,7 +92,7 @@ class TestDeepseekV32TC(CustomTestCase):
             num_questions=1400,
             parallel=1400,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)

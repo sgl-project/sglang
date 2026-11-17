@@ -19,6 +19,7 @@ Arcee causal-LM structure used by SGLang, while the vision path uses the native
 SigLIP2 implementation and an Edge-specific spatial-merge projector.
 """
 
+from array import array
 from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -33,21 +34,18 @@ from sglang.srt.configs.cosmos3 import (
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     embed_mm_inputs,
+    pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    MultimodalDataItem,
-    MultimodalInputFormat,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.arcee import ArceeForCausalLM
 from sglang.srt.models.siglip2 import Siglip2Model
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.utils import add_prefix
+from sglang.srt.multimodal.modality import MultimodalInputFormat
 
 
 class Cosmos3EdgeVisionProjector(nn.Module):
@@ -212,11 +210,8 @@ class Cosmos3EdgeForConditionalGeneration(ArceeForCausalLM):
                 prefix=add_prefix("projector", prefix),
             )
 
-    def pad_input_ids(
-        self, input_ids: List[int], mm_inputs: MultimodalInputs
-    ) -> List[int]:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     @staticmethod
     def _as_tensor(value) -> Optional[torch.Tensor]:

@@ -51,7 +51,7 @@ from sglang.test.kernels.kv_canary._hand_oracle import (
     _hand_fold_partial,
 )
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 
@@ -796,6 +796,33 @@ class TestRealKvHash:
             real_kv_hash_mode=mode,
         )
 
+    @pytest.mark.parametrize("page_size", [1, 4])
+    def test_strided_real_kv_source_byte_equal(self, page_size: int) -> None:
+        """A strided source (``stride(0) > shape[1]``) folds the same hash as its packed copy.
+
+        The reference folds a contiguous clone; the CUDA kernel folds the strided view, whose
+        rows are followed by bytes it does not own. They agree only if the kernel steps rows
+        by ``stride(0)``.
+        """
+        sources_cuda = make_real_kv_sources(
+            count=2,
+            page_size=page_size,
+            row_gap=48,
+            device=_DEVICE,
+            fill_strategy="random_bytes",
+        )
+        assert all(s.tensor.stride(0) > s.tensor.shape[1] for s in sources_cuda)
+        sources_ref = clone_real_kv_sources(sources_cuda)
+
+        _run_write(
+            buf_pair=self.buf_pair,
+            input_ids=[10, 20, 30],
+            positions=[0, 1, 2],
+            out_cache_loc=[1, 6, 11],
+            real_kv_sources_pair=(sources_cuda, sources_ref),
+            real_kv_hash_mode=consts.RealKvHashMode.ALL,
+        )
+
     @pytest.mark.parametrize("count", [1, 2, 3, 4])
     def test_real_kv_sources_fold_1_to_4(self, count: int) -> None:
         """Folding ``count`` sources sequentially → CUDA matches ref for every count in {1..4}."""
@@ -810,45 +837,6 @@ class TestRealKvHash:
             real_kv_sources_pair=(sources_cuda, sources_ref),
             real_kv_hash_mode=consts.RealKvHashMode.ALL,
         )
-
-    def test_real_kv_source_above_4_raises(self) -> None:
-        """``len(real_kv_sources) > 4`` → host wrapper raises ValueError before launching."""
-        cuda_buf = make_canary_buf(device=_DEVICE)
-        plan = make_write_plan(
-            write_offsets=[0, 1],
-            seed_slot_indices=[-1],
-            num_valid_reqs=1,
-            device=_DEVICE,
-        )
-        input_ids = _int32_tensor([1])
-        positions = _int32_tensor([0])
-        out_cache_loc = _int32_tensor([0])
-        log = FakeViolationLog.allocate(device=_DEVICE)
-        sources = make_real_kv_sources(count=4, device=_DEVICE)
-        extra = make_real_kv_source(device=_DEVICE)
-        too_many = sources + (extra,)
-
-        with pytest.raises(ValueError, match="at most 4 RealKvSource"):
-            launch_canary_write_kernel(
-                context=VerifyOrWriteContext(
-                    canary_buf=cuda_buf,
-                    kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-                    violation_ring=log.ring,
-                    violation_write_index=log.write_index,
-                    slot_run_counter=log.slot_run_counter,
-                    kernel_run_counter=log.kernel_run_counter,
-                    enable_chain_position_assert=log.enable_chain_position_assert,
-                    real_kv_sources=too_many,
-                    real_kv_hash_mode=consts.RealKvHashMode.NONE,
-                ),
-                plan=plan,
-                input_ids=input_ids,
-                positions=positions,
-                out_cache_loc=out_cache_loc,
-                enable_write_input_assert=False,
-                expected_input_tokens=None,
-                expected_input_positions=None,
-            )
 
     @pytest.mark.parametrize(
         "mode,fold_fn,expected_hash",

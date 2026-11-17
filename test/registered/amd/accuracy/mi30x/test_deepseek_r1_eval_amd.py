@@ -29,7 +29,10 @@ from sglang.utils import download_and_cache_file, read_jsonl
 
 # Register for AMD CI - DeepSeek-R1 accuracy tests (~120 min)
 register_amd_ci(
-    est_time=7200, suite="nightly-amd-accuracy-8-gpu-deepseek-r1", nightly=True
+    est_time=7200,
+    suite="nightly-amd-accuracy-8-gpu-deepseek-r1",
+    nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 INVALID = -9999999
@@ -114,9 +117,8 @@ DEEPSEEK_R1_MODELS = [
         other_args=[
             "--chunked-prefill-size",
             "131072",
-            "--dp-size",
+            "--attn-dp-size",
             "8",
-            "--enable-dp-attention",
             "--mem-fraction-static",
             "0.85",
             "--trust-remote-code",

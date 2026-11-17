@@ -22,7 +22,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_resources
@@ -210,15 +210,11 @@ def _get_host_id() -> str:
 def process_tracing_init(
     otlp_endpoint, server_name, trace_modules: Optional[str] = None
 ):
+    """Initialize OpenTelemetry for this process. Idempotent."""
     global opentelemetry_initialized
     global get_cur_time_ns
     global tracer
     global global_trace_modules
-
-    if trace_modules is not None:
-        global_trace_modules = [
-            module.strip() for module in trace_modules.split(",") if module.strip()
-        ]
 
     if not opentelemetry_imported:
         opentelemetry_initialized = False
@@ -226,10 +222,21 @@ def process_tracing_init(
             "opentelemetry package is not installed!!! Please not enable tracing or install opentelemetry"
         )
 
+    if opentelemetry_initialized:
+        return
+
+    if trace_modules is not None:
+        global_trace_modules = [
+            module.strip() for module in trace_modules.split(",") if module.strip()
+        ]
+
     try:
+        # Priority: explicit server_name > OTEL_SERVICE_NAME > "sglang"
+        service_name = server_name or os.getenv("OTEL_SERVICE_NAME", "sglang")
+
         resource = Resource.create(
             attributes={
-                SERVICE_NAME: server_name,
+                SERVICE_NAME: service_name,
             }
         )
         tracer_provider = TracerProvider(
@@ -259,11 +266,16 @@ def process_tracing_init(
     if envs.SGLANG_TRACE_ASYNC.get():
         from sglang.srt.observability.trace_async import start_trace_exporter
 
-        start_trace_exporter(otlp_endpoint, server_name, trace_modules=trace_modules)
+        start_trace_exporter(otlp_endpoint, service_name, trace_modules=trace_modules)
 
 
 def get_global_tracing_enabled():
     return opentelemetry_initialized
+
+
+def fastapi_telemetry_disabled_kwargs() -> Dict[str, Any]:
+    # FastAPI traces every request under process_tracing_init's provider by default.
+    return {"telemetry": {"tracing": False, "metrics": False, "logs": False}}
 
 
 def get_otlp_span_exporter(endpoint):
@@ -283,15 +295,18 @@ def get_otlp_span_exporter(endpoint):
 
 
 # Should be called by each tracked thread.
+#
+# The thread_info table is ALWAYS populated (first-write-wins), even when
+# tracing is disabled, so get_thread_caller_info() (caller attribution
+# forwarded to Mooncake) stays readable regardless of the tracing switch. The
+# exporter callback is still gated on `opentelemetry_initialized`, so disabled
+# builds never push thread info.
 def trace_set_thread_info(
     thread_label: str,
     tp_rank: Optional[int] = None,
     dp_rank: Optional[int] = None,
     pp_rank: Optional[int] = None,
 ):
-    if not opentelemetry_initialized:
-        return
-
     pid = threading.get_native_id()
     if pid in threads_info:
         return
@@ -305,8 +320,33 @@ def trace_set_thread_info(
         pp_rank=pp_rank,
     )
 
-    if _on_thread_info_set is not None:
+    if opentelemetry_initialized and _on_thread_info_set is not None:
         _on_thread_info_set(threads_info[pid])
+
+
+def get_thread_caller_info() -> Optional[Tuple[str, str]]:
+    """Return the calling thread's ``(caller_id, caller_role)`` if it has
+    registered via ``trace_set_thread_info``; otherwise ``None``.
+
+    ``caller_role`` is the thread's ``thread_label`` (e.g. ``"Prefetch"`` /
+    ``"Backup"``). ``caller_id`` mirrors the rank+host segment of the scheduler
+    thread-span name (without the leading label, so it does not duplicate
+    ``caller_role``) and is forwarded to Mooncake so per-RPC spans attribute to
+    a specific dummy-client / TP rank. Returns ``None`` on threads that never
+    registered, so callers can omit the fields cleanly.
+    """
+    info = threads_info.get(threading.get_native_id())
+    if info is None:
+        return None
+    parts: List[str] = []
+    if info.tp_rank is not None:
+        parts.append(f"[TP {info.tp_rank}]")
+    if info.pp_rank is not None:
+        parts.append(f"[PP {info.pp_rank}]")
+    if info.dp_rank is not None:
+        parts.append(f"[DP {info.dp_rank}]")
+    parts.append(f"(host:{info.host_id[:8]} | pid:{info.pid})")
+    return " ".join(parts), info.thread_label
 
 
 class TraceReqContext:
@@ -799,7 +839,7 @@ class TraceReqContext:
         # set abort info into thread span
         if self.thread_context.thread_span:
             if abort_info:
-                from sglang.srt.managers.schedule_batch import BaseFinishReason
+                from sglang.srt.managers.req_types import BaseFinishReason
 
                 if isinstance(abort_info, BaseFinishReason):
                     abort_info = abort_info.to_json()

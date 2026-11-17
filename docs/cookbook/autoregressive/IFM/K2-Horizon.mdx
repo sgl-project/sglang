@@ -109,14 +109,14 @@ import { Playground } from "/src/snippets/_playground.jsx";
 - **Hardware and precision:** The current matrix covers NVIDIA H200 GPUs and BF16 checkpoints only.
 - **Parallelism:** Use TP1 for 0.9B, 3.7B, and 7B; TP2 for 32B and MoVA-36B-A4B; and TP8 for 375B-A23B. Each recipe stays within one node.
 - **Attention:** The verified base recipes select FlashAttention-3 with `--attention-backend fa3`.
-- **Revisions:** The recipes pin revisions `9b9ec1f7e17f62ed218df542687a144116219d84` (0.9B), `c177771836a4c460743c00002c22483f6f18d1eb` (3.7B), `69ada542b68fe13d767479db2ab9421baff88681` (7B), `e1fd0277713e4eefcd3416348fd6fedacf7f2392` (32B), `16d20c739c687c08423422d1a2fbba6c529014cd` (MoVA-36B-A4B), and `12812264242a14dce44aa7ae27f931ff4584bcbf` (375B-A23B).
+- **Revisions:** The recipes pin revisions `6fbc54f7e4dc9d9cd671351f51498a1958dd2a01` (0.9B), `fe504ef19c7efa3120a9352bcfa180aa133946de` (3.7B), `85d46bbaf6ecd844a8ef61991f6e492d4faf4179` (7B), `eff3d24a3a40360c6fd1a1dd5723ce6329d93484` (32B), `e5c131d4d0ae196f5041284a0f9262d713083901` (MoVA-36B-A4B), and `70d7c58c1f8a2fc523c861c2cf7d2d339d7a8a0c` (375B-A23B).
 - **Parsers:** The base recipes enable reasoning with `--reasoning-parser k2_horizon`. Enable `--tool-call-parser k2_horizon` from the **Parsers** card in the [Playground](#playground) when you need tool calling.
 - **MoVA-36B-A4B router provenance:** The MoVA-36B-A4B checkpoint's source xLLM router used two GEMM partitions. `--json-model-override-args '{"xllm_source_router_gemm_partitions":2}'` preserves its BF16 partial-GEMM rounding and FP32 reduction order; SGLang does not infer this source topology from runtime TP.
 - **375B-A23B loading:** The 375B-A23B recipe disables multithreaded weight loading with `--model-loader-extra-config '{"enable_multithread_load":false}'`.
 - **Playground features:** TP, EP, NGRAM, PD disaggregation, and HiCache are optional, unverified command overrides. The tool-call parser was functionally exercised separately.
 - **Deliberate omissions:** Context parallelism is unsupported or unvalidated for xLLM. DP-attention and alternate MoE backend selectors are not exposed until they are validated.
-- **Validation:** All six recipes completed native speed and full GSM8K evaluation on H200 using the K2 Horizon runtime support in [PR #37654](https://github.com/sgl-project/sglang/pull/37654).
-- **375B-A23B provenance:** The 375B-A23B benchmark launched a directly mounted checkpoint and passed revision `12812264242a14dce44aa7ae27f931ff4584bcbf` to the server. The other five launches used materialized Hugging Face snapshots at their pinned revisions.
+- **Validation:** The serving configuration for all six recipes completed native speed and full GSM8K evaluation on H200 using the K2 Horizon runtime support in [PR #37654](https://github.com/sgl-project/sglang/pull/37654).
+- **Benchmark provenance:** The results below were collected at revisions `9b9ec1f7e17f62ed218df542687a144116219d84` (0.9B), `c177771836a4c460743c00002c22483f6f18d1eb` (3.7B), `69ada542b68fe13d767479db2ab9421baff88681` (7B), `e1fd0277713e4eefcd3416348fd6fedacf7f2392` (32B), `16d20c739c687c08423422d1a2fbba6c529014cd` (MoVA-36B-A4B), and `12812264242a14dce44aa7ae27f931ff4584bcbf` (375B-A23B). The 375B-A23B benchmark launched a directly mounted checkpoint; the other five launches used materialized Hugging Face snapshots.
 
 ## 3. Benchmark results
 

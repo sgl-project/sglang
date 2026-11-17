@@ -10,7 +10,12 @@ import torch
 from torch import nn
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
@@ -52,6 +57,7 @@ def _make_options(**overrides):
     options = StartupWeightLoadOptions(
         device="cuda",
         is_cuda_platform=True,
+        is_npu=False,
         cuda_graph_enabled=True,
         prefill_cuda_graph_backend=Backend.FULL,
         is_draft_worker=False,
@@ -60,7 +66,7 @@ def _make_options(**overrides):
         attn_cp_size=1,
         dcp_size=1,
         pp_size=1,
-        dp_size=1,
+        num_dp_ranks=1,
         ep_size=1,
         cpu_offload_gb=0,
         offload_group_size=-1,
@@ -223,8 +229,12 @@ class TestStartupWeightLoadSelector(CustomTestCase):
         cases = (
             (
                 "non_cuda",
-                dict(options=_make_options(device="cpu", is_cuda_platform=False)),
-                "CUDA only",
+                dict(
+                    options=_make_options(
+                        device="cpu", is_cuda_platform=False, is_npu=False
+                    )
+                ),
+                "CUDA or NPU only",
             ),
             (
                 "graphs_disabled",
@@ -658,10 +668,8 @@ class _RunnerStartupManager:
 
 class TestModelRunnerStartupWeightLoadOwnership(CustomTestCase):
     def setUp(self):
-        # The code under test reads its config from the bags.
-        reset_context()
-        self.addCleanup(reset_context)
-        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        # The code under test reads its config and its rank from the context.
+        enter_scope(self, published_topology())
 
     @staticmethod
     def _runner(manager):
@@ -671,16 +679,7 @@ class TestModelRunnerStartupWeightLoadOwnership(CustomTestCase):
             elastic_ep_backend=None,
             is_ep_joiner=False,
         )
-        runner.ps = SimpleNamespace(tp_rank=0)
         return runner
-
-    def test_start_delegates_to_the_manager(self):
-        trace = []
-        runner = self._runner(_RunnerStartupManager(trace))
-
-        runner.start_startup_weight_load()
-
-        self.assertEqual(trace, ["start_prefetch"])
 
     def test_success_releases_ownership_after_the_barrier(self):
         trace = []
@@ -712,6 +711,7 @@ class _SchedulerWorker:
             forward_stream=object(),
             prewarm_sampling=lambda: trace.append("prewarm"),
             token_to_kv_pool=SimpleNamespace(post_capture_active=post_capture_active),
+            token_to_kv_pool_allocator=None,
             post_capture_resize_kv_pool=Mock(
                 side_effect=lambda *, draft_runners: trace.append("resize")
             ),
@@ -736,12 +736,16 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         # publishing a record rather than by standing one in.
         reset_context()
         publish(
-            ServerArgs(model_path="dummy", startup_weight_load_mode=mode),
+            ServerArgs(
+                model_path="dummy",
+                startup_weight_load_mode=mode,
+                pp_size=pp_size,
+            ),
             role="scheduler",
         )
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.enable_overlap = enable_overlap
-        scheduler.ps = SimpleNamespace(pp_size=pp_size)
+        scheduler.enable_unified_memory = False
         scheduler.init_tp_model_worker = lambda: setattr(scheduler, "tp_worker", worker)
         scheduler.maybe_init_draft_worker = lambda: setattr(
             scheduler, "draft_worker", draft_worker
@@ -758,6 +762,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         worker = _SchedulerWorker(trace, post_capture_active=True)
         draft_worker = (
             SimpleNamespace(
+                hicache_draft_plan=None,
                 prewarm_sampling=lambda: trace.append("draft_prewarm"),
                 _draft_model_runners=lambda: (worker.model_runner,),
             )
@@ -812,6 +817,10 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                     stream=stream_context, Stream=lambda priority: schedule_stream
                 ),
             ),
+            patch(
+                "sglang.srt.managers.scheduler.prewarm_graph_pool_borrow",
+                side_effect=lambda: trace.append("borrow_prewarm"),
+            ),
             self.assertRaisesRegex(RuntimeError, "stop after startup"),
         ):
             scheduler.init_model_worker()
@@ -830,6 +839,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                 "attention",
                 "capture",
                 "stream_enter",
+                "borrow_prewarm",
                 "prewarm",
                 "stream_exit",
                 "resize",
@@ -857,6 +867,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                 "attention",
                 "capture",
                 "stream_enter",
+                "borrow_prewarm",
                 "prewarm",
                 "stream_exit",
                 "resize",
@@ -872,6 +883,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                 "attention",
                 "capture",
                 "stream_enter",
+                "borrow_prewarm",
                 "draft_prewarm",
                 "stream_exit",
                 "resize",

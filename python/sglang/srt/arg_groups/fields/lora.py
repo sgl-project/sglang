@@ -1,11 +1,4 @@
-"""Config fields of the ``lora`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``lora`` bag, which is what ``get_lora()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``lora`` namespace."""
 
 from __future__ import annotations
 
@@ -24,10 +17,33 @@ from sglang.srt.arg_groups.arg_utils import (
 )
 from sglang.srt.arg_groups.argparse_actions import LoRAPathAction
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.utils.common import (
-    LORA_TARGET_ALL_MODULES,
-    SUPPORTED_LORA_TARGET_MODULES,
-)
+
+SUPPORTED_LORA_TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "q_a_proj",
+    "kv_a_proj_with_mqa",
+    "q_b_proj",
+    "kv_b_proj",
+    "wq_b",
+    "wk",
+    "weights_proj",
+    "gate_proj",
+    "self_attn.gate_proj",
+    "up_proj",
+    "down_proj",
+    "qkv_proj",
+    "gate_up_proj",
+    "embed_tokens",
+    "lm_head",
+    # Inkling attention projections (merged q/k/v/r and its row-parallel output).
+    "qkvr",
+    "wo_ud",
+]
+
+LORA_TARGET_ALL_MODULES = "all"
 
 
 class Lora(msgspec.Struct):
@@ -72,7 +88,7 @@ class Lora(msgspec.Struct):
     ] = None
     max_loras_per_batch: A[
         int,
-        "Maximum number of adapters for a running batch, include base-only request.",
+        "GPU pool capacity in distinct adapter IDs, including None for base-model requests. With pipeline parallelism, shared across all in-flight microbatches.",
     ] = 8
     lora_eviction_policy: A[
         str,
@@ -85,7 +101,7 @@ class Lora(msgspec.Struct):
         str,
         Arg(
             help="Choose the kernel backend for multi-LoRA serving.",
-            choices=["triton", "csgmv", "ascend", "torch_native"],
+            choices=["triton", "csgmv", "ascend", "torch_native", "triton_v2"],
         ),
     ] = "csgmv"
     max_lora_chunk_size: A[
@@ -115,5 +131,5 @@ class Lora(msgspec.Struct):
     ] = False
     lora_drain_wait_threshold: A[
         float,
-        "When any LoRA adapter request waits longer than this threshold (in seconds), the scheduler will selectively drain one running adapter to make room. This mitigates extreme tail latency under high or skewed workloads by preventing a small set of adapters from monopolizing batch slots. Set to 0 to disable draining (default).",
+        "For LoRA adapters whose requests wait longer than this threshold (seconds) and need a slot, selectively drain unpinned running adapters to make room. Draining is best effort: freed slots are not reserved and waiting time is not bounded. Set to 0 to disable draining (default).",
     ] = 0.0

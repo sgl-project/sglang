@@ -9,16 +9,23 @@ serves at one-worker speed -- so pin the call site instead of the symptom.
 `process_and_combine_mm_data_async` delegates straight to the sync function when
 no executor exists, so using it costs nothing until a model opts into
 concurrency.
+
+The token-space processor sends each media item, then expansion together with
+serving packaging, through `_run_mm_processor` to the same worker pool; the
+sglang wrapper reaches it through its core.
 """
 
 import ast
+import asyncio
 import pathlib
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=13, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 _MULTIMODAL_ROOT = (
     pathlib.Path(__file__).resolve().parents[4]
@@ -93,24 +100,68 @@ def test_every_call_site_can_await():
     )
 
 
-def test_default_worker_count_follows_the_preprocessing_path():
-    """The count is resolved per path, not pinned to a number.
-
-    Two workers overlap preprocessing that runs on the CPU, where the second
-    thread is real parallelism: 4.46 -> 6.08 req/s on H200 and 7.07 -> 8.76 on
-    GB300, full-page images at 32-way concurrency. On the GPU path the same
-    second worker only contends for the device the scheduler serves from --
-    flat on H200, and 9.30 -> 4.02 req/s on GB300.
-
-    Measuring one path gives the opposite answer from the other, so pinning a
-    single default here is what this asserts against.
-    """
-    from sglang.srt.multimodal.processors.base_processor import (
-        BaseMultimodalProcessor,
+@pytest.mark.parametrize("media_source", ["arguments", "request"])
+def test_sglang_entry_forwards_the_request_to_its_core(media_source):
+    from sglang.srt.multimodal.token_space_mm_process.serving_processor import (
+        TokenSpaceSGLangProcessor,
     )
 
-    assert BaseMultimodalProcessor.supports_mm_processor_concurrency is True
-    assert BaseMultimodalProcessor.auto_mm_processor_worker_num is None
+    wrapper = object.__new__(TokenSpaceSGLangProcessor)
+    wrapper._core = SimpleNamespace(process=AsyncMock(return_value=object()))
+    wrapper._image_device = "image device"
+    wrapper._video_preprocessing_device = None
+    request_obj = SimpleNamespace(video_data=["request video"], audio_data=["audio"])
+    media = (
+        {"video_data": ["video"], "audio_data": ["audio"]}
+        if media_source == "arguments"
+        else {}
+    )
+    output = asyncio.run(
+        wrapper.process_mm_data_async(
+            image_data=["image"],
+            input_text=[1, 101, 2],
+            request_obj=request_obj,
+            max_req_input_len=8,
+            **media,
+        )
+    )
+
+    assert output is wrapper._core.process.return_value
+    wrapper._core.process.assert_awaited_once_with(
+        ["image"],
+        media.get("video_data", request_obj.video_data),
+        ["audio"],
+        input_ids=[1, 101, 2],
+        package_output=wrapper._package_output,
+        image_device="image device",
+        video_device=None,
+        compute_mrope_positions=True,
+    )
+
+
+def test_expansion_and_packaging_share_one_worker_task():
+    from sglang.srt.multimodal.token_space_mm_process.process_strategy import (
+        TokenSpaceProcessStrategy,
+    )
+    from sglang.srt.multimodal.token_space_mm_process.processor import (
+        TokenSpaceProcessor,
+    )
+
+    processor = object.__new__(TokenSpaceProcessor)
+    processor.strategy = TokenSpaceProcessStrategy(None, None)
+    processor._load_media_lists = AsyncMock(return_value=([object()], [], []))
+    processor._run_mm_processor = AsyncMock(return_value="result")
+    package_output = object()
+
+    asyncio.run(
+        processor.process(["image"], input_ids=[1], package_output=package_output)
+    )
+
+    final = processor._run_mm_processor.await_args_list[-1]
+    assert final.args == (processor._build_output,)
+    assert final.kwargs["item_features"] == ["result"]
+    assert final.kwargs["package_output"] is package_output
+    assert processor._run_mm_processor.await_count == 2
 
 
 def _process_mm_data_overrides():
@@ -154,14 +205,22 @@ def test_overrides_take_the_worker_pools_processor_clone():
 # explicitly so that adding a processor forces a decision instead of silently
 # leaving it at one-worker speed.
 _NO_WORKER_POOL_ROUTE = {
+    # Runs its own image preprocessing to keep the raw token ids the Engram
+    # hasher needs; the shared chain would re-tokenize them.
+    "deepseek_v41.py",
     "dots_note_omni.py",
     "inkling.py",
+    # Expands audio placeholders and extracts per-clip features in io_executor.
+    "lfm3_audio.py",
     "lightonocr.py",
     "llava.py",
     "mimo_v2.py",
     "mimo_v2_asr.py",
     "minicpmv4_6.py",
     "moss_vl.py",
+    # Muse's custom media/artifact pipeline offloads preprocessing to io_executor
+    # in _preprocess_media_async and _run_preprocess_and_build_artifact_batch.
+    "muse_spark_omni.py",
     "nano_nemotron_vl.py",
     "voxtral.py",
     "whisper.py",
@@ -184,14 +243,20 @@ def test_processors_outside_the_worker_pool_are_declared():
             "async def process_mm_data_async" in source
             or "async def _process_special_format" in source
         )
-        if entry_points and "process_and_combine_mm_data_async" not in source:
+        # The token-space wrapper routes through its core's `_run_mm_processor`.
+        routed = (
+            "process_and_combine_mm_data_async" in source
+            or "_run_mm_processor" in source
+            or "self._core.process(" in source
+        )
+        if entry_points and not routed:
             unrouted.add(path.name)
 
     newly_unrouted = unrouted - _NO_WORKER_POOL_ROUTE
     assert not newly_unrouted, (
         "these processors reach preprocessing without going through the worker "
         "pool, so they will serve at one-worker speed; either route them through "
-        "`process_and_combine_mm_data_async` or add them to "
+        "`process_and_combine_mm_data_async` or `_run_mm_processor`, or add them to "
         f"_NO_WORKER_POOL_ROUTE with a reason: {sorted(newly_unrouted)}"
     )
     now_routed = _NO_WORKER_POOL_ROUTE - unrouted

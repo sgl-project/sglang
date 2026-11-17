@@ -1,8 +1,12 @@
+import hashlib
 import json
 import logging
 import re
+from collections import deque
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from functools import lru_cache
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -19,6 +23,8 @@ from sglang.srt.function_call.utils import (
 
 logger = logging.getLogger(__name__)
 
+_ARG_VALUE_END_TAG = "</arg_value>"
+
 
 class StreamState(str, Enum):
     """State machine states for XML to JSON streaming conversion."""
@@ -28,6 +34,147 @@ class StreamState(str, Enum):
     IN_KEY = "IN_KEY"
     WAITING_VALUE = "WAITING_VALUE"
     IN_VALUE = "IN_VALUE"
+
+
+# Root keywords that can constrain a property beyond its own `properties` entry.
+_ROOT_PROPERTY_CONSTRAINTS = (
+    "enum",
+    "const",
+    "allOf",
+    "anyOf",
+    "oneOf",
+    "not",
+    "if",
+    "$ref",
+    "$dynamicRef",
+    "$recursiveRef",
+    "patternProperties",
+    "dependentSchemas",
+    "dependencies",
+)
+
+
+def _argument_allows_null(
+    func_name: str, arg_key: str, defined_tools: List[Tool]
+) -> bool:
+    name2tool = {tool.function.name: tool for tool in defined_tools}
+    if func_name not in name2tool:
+        return False
+    parameters = name2tool[func_name].function.parameters
+    if not isinstance(parameters, dict) or any(
+        keyword in parameters for keyword in _ROOT_PROPERTY_CONSTRAINTS
+    ):
+        return False
+    properties = parameters.get("properties")
+    if not isinstance(properties, dict) or arg_key not in properties:
+        return False
+    return _null_validity(properties[arg_key], parameters, frozenset()) is True
+
+
+def _resolve_local_ref(ref: Any, root: Any) -> Any:
+    if not isinstance(ref, str) or not (ref == "#" or ref.startswith("#/")):
+        return None
+    target = root
+    try:
+        for part in ref[2:].split("/") if ref != "#" else []:
+            # A pointer that crosses an embedded `$id` resource is not resolved here.
+            if target is not root and isinstance(target, dict) and "$id" in target:
+                return None
+            part = part.replace("~1", "/").replace("~0", "~")
+            target = target[int(part)] if isinstance(target, list) else target[part]
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    return target
+
+
+def _all_valid(results: List[Optional[bool]]) -> Optional[bool]:
+    if False in results:
+        return False
+    return None if None in results else True
+
+
+def _any_valid(results: List[Optional[bool]]) -> Optional[bool]:
+    if True in results:
+        return True
+    return None if None in results else False
+
+
+def _null_validity(
+    schema: Any, root: Any, seen: frozenset[int], in_embedded_resource: bool = False
+) -> Optional[bool]:
+    """None when an unresolvable reference or a cycle leaves it undecided;
+    three-valued so ``not`` cannot turn an unknown into an allowed null."""
+    if isinstance(schema, bool):
+        return schema
+    if not isinstance(schema, dict) or id(schema) in seen:
+        return None
+    seen = seen | {id(schema)}
+    # Below an embedded `$id`, `#/...` refers to that resource, not to `root`.
+    in_embedded_resource = in_embedded_resource or (
+        "$id" in schema and schema is not root
+    )
+
+    def validity(branch: Any) -> Optional[bool]:
+        return _null_validity(branch, root, seen, in_embedded_resource)
+
+    results: List[Optional[bool]] = []
+    if "type" in schema:
+        schema_type = schema["type"]
+        results.append(
+            schema_type == "null"
+            or (isinstance(schema_type, list) and "null" in schema_type)
+            or schema.get("nullable") is True
+        )
+    if isinstance(schema.get("enum"), list):
+        results.append(None in schema["enum"])
+    if "const" in schema:
+        results.append(schema["const"] is None)
+    if "$ref" in schema:
+        results.append(
+            None
+            if in_embedded_resource
+            else validity(_resolve_local_ref(schema["$ref"], root))
+        )
+    if "$dynamicRef" in schema or "$recursiveRef" in schema:
+        results.append(None)
+    if isinstance(schema.get("anyOf"), list):
+        results.append(_any_valid([validity(branch) for branch in schema["anyOf"]]))
+    if isinstance(schema.get("oneOf"), list):
+        branches = [validity(branch) for branch in schema["oneOf"]]
+        matches = branches.count(True)
+        results.append(
+            False if matches > 1 else None if None in branches else matches == 1
+        )
+    if isinstance(schema.get("allOf"), list):
+        results.append(_all_valid([validity(branch) for branch in schema["allOf"]]))
+    if "not" in schema:
+        negated = validity(schema["not"])
+        results.append(None if negated is None else not negated)
+    if "if" in schema:
+        condition = validity(schema["if"])
+        then_valid = validity(schema.get("then", True))
+        else_valid = validity(schema.get("else", True))
+        if condition is None:
+            results.append(then_valid if then_valid == else_valid else None)
+        else:
+            results.append(then_valid if condition else else_valid)
+    return _all_valid(results)
+
+
+def _is_json_null(value: str) -> bool:
+    return value.strip() == "null"
+
+
+def _is_potential_json_null(value: str) -> bool:
+    """Whether a streamed value can still become ``null`` plus its end tag."""
+    stripped = value.lstrip()
+    tag_start = stripped.find("<")
+    if tag_start == -1:
+        return "null".startswith(stripped.rstrip())
+
+    value_part = stripped[:tag_start].rstrip()
+    tag_part = stripped[tag_start:]
+    return "null".startswith(value_part) and _ARG_VALUE_END_TAG.startswith(tag_part)
 
 
 def get_argument_type(
@@ -161,17 +308,25 @@ class Glm4MoeDetector(BaseFormatDetector):
     Uses a streaming state machine to convert XML to JSON incrementally for maximum speed.
     """
 
+    # Only the first opener can match (a later one sees a subset of the text), so
+    # anchoring to it keeps a failed search from rescanning from every opener.
     _STREAMING_PARTIAL_PATTERN = re.compile(
-        r"<tool_call>(.*?)(?:\\n|\n)(.*?)(</tool_call>|$)", re.DOTALL
+        r"\A(?:(?!<tool_call>).)*<tool_call>(.*?)(?:\\n|\n)(.*?)(</tool_call>|$)",
+        re.DOTALL,
     )
+    _TOOL_CALL_END_PATTERN = re.compile(r"</tool_call>|$")
 
     def __init__(self):
         super().__init__()
         self.bot_token = "<tool_call>"
         self.eot_token = "</tool_call>"
-        self.func_call_regex = r"<tool_call>.*?</tool_call>"
+        # An unclosed trailing call matches the second branch and yields "" (skipped
+        # by the caller), so findall does not rescan the tail from every opener.
+        self.func_call_regex = r"(<tool_call>.*?</tool_call>)|<tool_call>.*"
+        # Each split call starts at its opener, and a later opener sees a subset of
+        # the text, so anchoring keeps a failed search from rescanning per opener.
         self.func_detail_regex = re.compile(
-            r"<tool_call>(.*?)(?:\\n|\n)(.*)</tool_call>", re.DOTALL
+            r"\A<tool_call>(.*?)(?:\\n|\n)(.*)</tool_call>", re.DOTALL
         )
         self.func_arg_regex = re.compile(
             r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>",
@@ -181,7 +336,30 @@ class Glm4MoeDetector(BaseFormatDetector):
         self.current_tool_id = -1
         self.current_tool_name_sent = False
         self._streamed_raw_length = 0
+        self._open_call: Optional[Tuple[str, int]] = None
+        self._end_scan_pos = 0
         self._reset_streaming_state()
+
+    def _match_tool_call(self, text: str) -> Optional[Tuple[str, str, str, int]]:
+        """Same groups 1-3 and end(3) as `_STREAMING_PARTIAL_PATTERN.search(text)`.
+
+        While the call is open, text only grows at the end, so the name and args
+        start stay put and only the new tail needs scanning for the closer.
+        Rescanning the whole buffer every chunk is O(n^2) for a long arg.
+        """
+        if self._open_call is None:
+            match = self._STREAMING_PARTIAL_PATTERN.search(text)
+            if match is None:
+                return None
+            self._open_call = match.group(1), match.start(2)
+            self._end_scan_pos = match.start(2)
+        func_name_raw, args_start = self._open_call
+        end = self._TOOL_CALL_END_PATTERN.search(text, self._end_scan_pos)
+        if end.group():
+            self._open_call = None
+        else:
+            self._end_scan_pos = max(args_start, len(text) - len(self.eot_token) + 1)
+        return func_name_raw, text[args_start : end.start()], end.group(), end.end()
 
     def _reset_streaming_state(self) -> None:
         """Reset the streaming state machine for a new tool call."""
@@ -194,6 +372,7 @@ class Glm4MoeDetector(BaseFormatDetector):
         self._cached_value_type: Optional[str] = (
             None  # Cache the value type for consistency
         )
+        self._cached_value_allows_null = False
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a glm-4.5 / glm-4.6 format tool call."""
@@ -219,7 +398,7 @@ class Glm4MoeDetector(BaseFormatDetector):
                 func_detail = self.func_detail_regex.search(match_result)
                 if func_detail is None:
                     continue
-                func_name = func_detail.group(1) if func_detail.group(1) else ""
+                func_name = (func_detail.group(1) or "").strip()
                 func_args = func_detail.group(2) if func_detail.group(2) else ""
                 pairs = self.func_arg_regex.findall(func_args)
 
@@ -288,17 +467,22 @@ class Glm4MoeDetector(BaseFormatDetector):
         # Default to string (safest fallback)
         return "string"
 
-    def _format_value_complete(self, value: str, value_type: str) -> str:
+    def _format_value_complete(
+        self, value: str, value_type: str, allows_null: bool = False
+    ) -> str:
         """Format complete value based on type.
 
         Args:
             value: Raw value string
             value_type: Expected type ('string', 'number', 'object')
+            allows_null: Whether the argument schema explicitly permits null
 
         Returns:
             Properly formatted JSON value string
         """
         if value_type == "string":
+            if allows_null and _is_json_null(value):
+                return "null"
             # Ensure proper JSON string formatting with quotes
             return json.dumps(value, ensure_ascii=False)
         elif value_type == "number":
@@ -364,10 +548,14 @@ class Glm4MoeDetector(BaseFormatDetector):
                     self._cached_value_type = self._get_value_type(
                         func_name, self._current_key, tools
                     )
+                    self._cached_value_allows_null = (
+                        self._cached_value_type == "string"
+                        and _argument_allows_null(func_name, self._current_key, tools)
+                    )
 
             elif self._stream_state == StreamState.IN_VALUE:
-                if self._xml_tag_buffer.endswith("</arg_value>"):
-                    final_value = self._xml_tag_buffer[:-12]
+                if self._xml_tag_buffer.endswith(_ARG_VALUE_END_TAG):
+                    final_value = self._xml_tag_buffer[: -len(_ARG_VALUE_END_TAG)]
                     self._current_value += final_value
 
                     # Use cached value type for consistency
@@ -388,7 +576,9 @@ class Glm4MoeDetector(BaseFormatDetector):
                     else:
                         # Value was never started (empty or complete in one chunk)
                         json_output += self._format_value_complete(
-                            self._current_value, value_type
+                            self._current_value,
+                            value_type,
+                            self._cached_value_allows_null,
                         )
 
                     self._xml_tag_buffer = ""
@@ -396,8 +586,9 @@ class Glm4MoeDetector(BaseFormatDetector):
                     self._current_value = ""
                     self._value_started = False
                     self._cached_value_type = None  # Reset cached type
+                    self._cached_value_allows_null = False
                 else:
-                    closing_tag = "</arg_value>"
+                    closing_tag = _ARG_VALUE_END_TAG
                     is_potential_closing = len(self._xml_tag_buffer) <= len(
                         closing_tag
                     ) and closing_tag.startswith(self._xml_tag_buffer)
@@ -408,6 +599,13 @@ class Glm4MoeDetector(BaseFormatDetector):
                         value_type = self._cached_value_type or "string"
 
                         if value_type == "string":
+                            # Delay only the prefix needed to distinguish JSON null
+                            # from an ordinary nullable string such as "nullish".
+                            if (
+                                self._cached_value_allows_null
+                                and _is_potential_json_null(self._xml_tag_buffer)
+                            ):
+                                continue
                             if not self._value_started:
                                 json_output += '"'
                                 self._value_started = True
@@ -477,11 +675,9 @@ class Glm4MoeDetector(BaseFormatDetector):
         calls: list[ToolCallItem] = []
         try:
             # Try to match a partial or complete tool call
-            partial_match = self._STREAMING_PARTIAL_PATTERN.search(current_text)
+            partial_match = self._match_tool_call(current_text)
             if partial_match:
-                func_name_raw = partial_match.group(1)
-                func_args_raw = partial_match.group(2)
-                is_tool_end = partial_match.group(3)
+                func_name_raw, func_args_raw, is_tool_end, match_end = partial_match
 
                 # Only proceed if we have a non-empty function name
                 if func_name_raw is None or not func_name_raw.strip():
@@ -602,7 +798,7 @@ class Glm4MoeDetector(BaseFormatDetector):
                             )
 
                         # Remove the completed tool call from buffer
-                        self._buffer = current_text[partial_match.end(3) :]
+                        self._buffer = current_text[match_end:]
 
                         result = StreamingParseResult(normal_text="", calls=calls)
                         self.current_tool_id += 1
@@ -637,7 +833,15 @@ class Glm4MoeDetector(BaseFormatDetector):
             arg_type = get_argument_type(func_name, arg_key, tools)
             parsed_value, is_good_json = parse_arguments(arg_value, arg_type)
 
-            if arg_type == "string":
+            if (
+                arg_type == "string"
+                and is_good_json
+                and parsed_value is None
+                and _is_json_null(arg_value)
+                and _argument_allows_null(func_name, arg_key, tools)
+            ):
+                arguments[arg_key] = None
+            elif arg_type == "string":
                 # Only convert to string if explicitly defined as string type
                 if isinstance(parsed_value, str):
                     arguments[arg_key] = parsed_value
@@ -660,3 +864,493 @@ class Glm4MoeDetector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError()
+
+
+class _GlmTrieNode:
+    """Trie node with Aho-Corasick failure link."""
+
+    def __init__(self, node_id: int):
+        self.id = node_id
+        self.children: Dict[str, _GlmTrieNode] = {}
+        self.is_end = False
+        self.fail: _GlmTrieNode = None
+
+
+def _glm_build_trie_with_failure_links(
+    patterns: List[str],
+) -> tuple["_GlmTrieNode", List["_GlmTrieNode"]]:
+    """Build Trie and compute Aho-Corasick failure links."""
+    root = _GlmTrieNode(0)
+    all_nodes = [root]
+    next_id = 1
+
+    for pattern in patterns:
+        node = root
+        for char in pattern:
+            if char not in node.children:
+                new_node = _GlmTrieNode(next_id)
+                next_id += 1
+                all_nodes.append(new_node)
+                node.children[char] = new_node
+            node = node.children[char]
+        node.is_end = True
+
+    root.fail = root
+    queue = deque()
+    for child in root.children.values():
+        child.fail = root
+        queue.append(child)
+    while queue:
+        node = queue.popleft()
+        for char, child in node.children.items():
+            queue.append(child)
+            fail_node = node.fail
+            while fail_node != root and char not in fail_node.children:
+                fail_node = fail_node.fail
+            if char in fail_node.children and fail_node.children[char] != child:
+                child.fail = fail_node.children[char]
+            else:
+                child.fail = root
+            # A suffix match also completes a forbidden pattern.
+            if child.fail.is_end:
+                child.is_end = True
+
+    return root, all_nodes
+
+
+def _glm_get_transition(
+    node: "_GlmTrieNode", char: str, root: "_GlmTrieNode"
+) -> "_GlmTrieNode":
+    """Follow Aho-Corasick failure links to the next state."""
+    current = node
+    while True:
+        if char in current.children:
+            return current.children[char]
+        if current == root:
+            return root
+        current = current.fail
+
+
+def _glm_escape_char_class(s: str) -> str:
+    """Escape special characters for use in EBNF character class [...]."""
+    result = []
+    for c in s:
+        if c in r"\]^-":
+            result.append("\\" + c)
+        elif c == "\n":
+            result.append("\\n")
+        elif c == "\t":
+            result.append("\\t")
+        elif c == "\r":
+            result.append("\\r")
+        elif ord(c) < 32 or ord(c) > 126:
+            result.append(f"\\x{ord(c):02X}")
+        else:
+            result.append(c)
+    return "".join(result)
+
+
+def _glm_escape_string(c: str) -> str:
+    """Escape a character for use in EBNF string literal "..."."""
+    if c == '"':
+        return '\\"'
+    elif c == "\\":
+        return "\\\\"
+    elif c == "\n":
+        return "\\n"
+    elif c == "\t":
+        return "\\t"
+    elif c == "\r":
+        return "\\r"
+    elif ord(c) < 32 or ord(c) > 126:
+        return f"\\x{ord(c):02X}"
+    return c
+
+
+def _glm_any_string_exclude(rule_name: str, negative_strings) -> List[str]:
+    return list(_glm_cached_string_exclude(rule_name, tuple(negative_strings)))
+
+
+@lru_cache(maxsize=32)
+def _glm_cached_string_exclude(
+    rule_name: str, negative_strings: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Build EBNF that excludes forbidden substrings using Aho-Corasick states."""
+
+    if not negative_strings:
+        return (f"{rule_name} ::= [^]*",)
+    sorted_strings = sorted(set(s for s in negative_strings if s))
+    if not sorted_strings:
+        return (f"{rule_name} ::= [^]*",)
+    hash_input = "\x00".join(sorted_strings)
+    hash_prefix = hashlib.sha256(hash_input.encode("utf-8")).hexdigest()[:16]
+    root, all_nodes = _glm_build_trie_with_failure_links(sorted_strings)
+    all_pattern_chars: Set[str] = set()
+    for pattern in sorted_strings:
+        all_pattern_chars.update(pattern)
+
+    def state_name(node: "_GlmTrieNode") -> str:
+        return f"s_{hash_prefix}_{node.id}"
+
+    rules = []
+    rules.append(f"{rule_name} ::= {state_name(root)}")
+
+    for node in all_nodes:
+        if node.is_end:
+            continue
+
+        excluded_chars: List[str] = []
+        transitions_by_target: Dict[int, List[str]] = {}
+
+        for char in all_pattern_chars:
+            target = _glm_get_transition(node, char, root)
+            if target.is_end:
+                excluded_chars.append(char)
+            else:
+                if target.id not in transitions_by_target:
+                    transitions_by_target[target.id] = []
+                transitions_by_target[target.id].append(char)
+
+        alternatives = []
+
+        all_explicit_chars = set(excluded_chars)
+        for chars in transitions_by_target.values():
+            all_explicit_chars.update(chars)
+
+        if all_explicit_chars:
+            escaped = _glm_escape_char_class("".join(sorted(all_explicit_chars)))
+            alternatives.append(f"[^{escaped}] {state_name(root)}")
+        else:
+            alternatives.append(f"[^] {state_name(root)}")
+
+        for target_id in sorted(transitions_by_target.keys()):
+            chars = transitions_by_target[target_id]
+            target_node = next(n for n in all_nodes if n.id == target_id)
+            for char in sorted(chars):
+                alternatives.append(
+                    f'"{_glm_escape_string(char)}" {state_name(target_node)}'
+                )
+
+        alternatives.append('""')
+
+        rules.append(f"{state_name(node)} ::= {' | '.join(alternatives)}")
+
+    return tuple(rules)
+
+
+_GLM_XML_GRAMMAR_RULES = [
+    'basic_string ::= (([\\"] basic_string_1 [\\"]))',
+    'basic_string_1 ::= "" | [^"\\\\\\x00-\\x1F] basic_string_1 | "\\\\" escape basic_string_1',
+    'escape ::= ["\\\\//bfnrt] | "u" [A-Fa-f0-9]{4}',
+    'basic_integer ::= "-"? ("0" | [1-9] [0-9]*) ".0"?',
+    'basic_number ::= "-"? ("0" | [1-9] [0-9]*) ("." [0-9]+)? ([eE] [+-]? [0-9]+)?',
+    'basic_array ::= "[" ("" | ws basic_any (ws "," ws basic_any)*) ws "]"',
+    'basic_object ::= "{" ("" | ws basic_string ws ":" ws basic_any ( ws "," ws basic_string ws ":" ws basic_any)*) ws "}"',
+    "ws ::= [ \\n\\t]*",
+    "basic_any ::= basic_number | basic_string | basic_boolean | basic_null | basic_array | basic_object",
+    'basic_boolean ::= "true" | "false"',
+    'basic_null ::= "null"',
+]
+
+_GLM_TYPE_MAPPING = {
+    "string": "text_without_special_tokens",
+    "number": "basic_number",
+    "integer": "basic_number",
+    "boolean": "basic_boolean",
+    "null": "basic_null",
+    "array": "basic_array",
+    "object": "basic_object",
+}
+
+
+def _glm_hash_name(name: str) -> str:
+    return hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
+
+
+def _glm_get_value_rule(prop: Any) -> str:
+    if not isinstance(prop, dict):
+        return "text_without_special_tokens"
+    if "enum" in prop:
+        return _glm_handle_enum(prop)
+    if "type" in prop:
+        return _glm_handle_type(prop)
+    return "text_without_special_tokens"
+
+
+def _glm_escape_ebnf_string(s: str) -> str:
+    return json.dumps(s, ensure_ascii=False)[1:-1]
+
+
+def _glm_handle_enum(prop: dict) -> str:
+    enum_values = prop["enum"]
+
+    def format_enum_val(v: Any) -> str:
+        value = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+        return f'"{_glm_escape_ebnf_string(value)}"'
+
+    formatted_values = [format_enum_val(v) for v in enum_values]
+    if not formatted_values:
+        return "text_without_special_tokens"
+    enum_rule = " | ".join(formatted_values)
+    return f"({enum_rule})" if len(formatted_values) > 1 else enum_rule
+
+
+def _glm_handle_type(prop: dict) -> str:
+    prop_type = prop["type"]
+    if isinstance(prop_type, list):
+        type_rules = [
+            _GLM_TYPE_MAPPING.get(t, "text_without_special_tokens") for t in prop_type
+        ]
+        return " | ".join(type_rules) if type_rules else "text_without_special_tokens"
+    return _GLM_TYPE_MAPPING.get(prop_type, "text_without_special_tokens")
+
+
+def _glm_has_complete_properties(schema: Any) -> bool:
+    if not isinstance(schema, dict):
+        return schema is False
+    if any(
+        keyword in schema
+        for keyword in (
+            "$ref",
+            "$dynamicRef",
+            "patternProperties",
+            "dependentSchemas",
+            "if",
+            "then",
+            "else",
+        )
+    ) or any(
+        schema.get(keyword, False) is not False
+        for keyword in ("additionalProperties", "unevaluatedProperties")
+    ):
+        return False
+    branches = [
+        branch
+        for keyword in ("allOf", "anyOf", "oneOf")
+        for branch in schema.get(keyword, [])
+    ]
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        return not branches and (
+            bool(properties) or schema.get("additionalProperties") is False
+        )
+    if branches:
+        return all(_glm_has_complete_properties(branch) for branch in branches)
+    return schema.get("additionalProperties") is False
+
+
+def _glm_build_tool_call_rules(
+    non_terminal_name: str,
+    functions: list[Any],
+    special_tokens: "GlmSpecialTokenConfig",
+    chat_template_version: Literal["glm45", "glm47"],
+    required: bool = False,
+    parallel_tool_calls: bool = True,
+) -> list[str]:
+    """Build non-strict XML tool-call rules with shallow value constraints."""
+    if chat_template_version == "glm45":
+        extra_seperator = '"\\n"'
+    elif chat_template_version == "glm47":
+        extra_seperator = ""
+    else:
+        raise NotImplementedError(
+            f"Unsupported chat_template_version: {chat_template_version}"
+        )
+
+    repetition = (
+        ("+" if required else "*") if parallel_tool_calls else ("" if required else "?")
+    )
+    rules = [
+        f"{non_terminal_name} ::= ( {extra_seperator} tool_call_unit ){repetition}",
+        f'tool_call_unit ::= "{special_tokens.begin_of_tool_call}" single_tool_call "{special_tokens.end_of_tool_call}"',
+    ]
+
+    # Include the index to distinguish duplicate function names.
+    tool_alternatives = " | ".join(
+        f"call_{_glm_hash_name(func.name + str(function_index))}"
+        for function_index, func in enumerate(functions)
+    )
+    rules.append(f"single_tool_call ::= {tool_alternatives}")
+
+    # Group alternatives so nullable values remain inside the argument tags.
+    kv_template = f'"{special_tokens.begin_of_key}{{key}}{special_tokens.end_of_key}" {extra_seperator} "{special_tokens.begin_of_value}" ({{valrule}}) "{special_tokens.end_of_value}"'
+    kv_separator = extra_seperator
+
+    for function_index, func in enumerate(functions):
+        tool_name = _glm_escape_ebnf_string(func.name)
+        namehash = _glm_hash_name(func.name + str(function_index))
+        params = func.parameters or {}
+        properties = get_schema_properties(params)
+        if not _glm_has_complete_properties(params):
+            properties = {}
+
+        prop_kv_pairs = {}
+
+        for prop_name, prop_schema in properties.items():
+            # Composition branches can disagree on a property's value schema.
+            value_rule = (
+                "text_without_special_tokens"
+                if any(keyword in params for keyword in ("allOf", "anyOf", "oneOf"))
+                else _glm_get_value_rule(prop_schema)
+            )
+            pair = kv_template.format(
+                key=_glm_escape_ebnf_string(prop_name), valrule=value_rule
+            )
+            prop_kv_pairs[prop_name] = pair
+
+        # Non-strict arguments may be omitted, repeated, or emitted in any order.
+        all_props = list(properties.keys())
+
+        if all_props:
+            all_choices = " | ".join(prop_kv_pairs[k] for k in all_props)
+            arguments_rule = (
+                f"( ( {all_choices} ) ( {kv_separator} ( {all_choices} ) )* )?"
+            )
+        else:
+            arguments_rule = (
+                f'( "{special_tokens.begin_of_key}" text_without_special_tokens '
+                f'"{special_tokens.end_of_key}" {extra_seperator} '
+                f'"{special_tokens.begin_of_value}" text_without_special_tokens '
+                f'"{special_tokens.end_of_value}" {kv_separator} )*'
+            )
+
+        rules.append(
+            f'call_{namehash} ::= "{tool_name}" {extra_seperator} ( arguments_{namehash} {extra_seperator} )?'
+        )
+        rules.append(f"arguments_{namehash} ::= {arguments_rule}")
+
+    rules.extend(_GLM_XML_GRAMMAR_RULES)
+    return rules
+
+
+@dataclass
+class GlmSpecialTokenConfig:
+    begin_of_thinking: str = "<think>"
+    end_of_thinking: str = "</think>"
+    begin_of_tool_call: str = "<tool_call>"
+    end_of_tool_call: str = "</tool_call>"
+    begin_of_key: str = "<arg_key>"
+    end_of_key: str = "</arg_key>"
+    begin_of_value: str = "<arg_value>"
+    end_of_value: str = "</arg_value>"
+    assistant_token: str = "<|assistant|>"
+
+    def all_special_tokens(self) -> list[str]:
+        return vars(self).values()
+
+
+def generate_glm_grammar(
+    enable_thinking: bool,
+    functions: list[Any] | None,
+    special_tokens: GlmSpecialTokenConfig,
+    chat_template_version: Literal["glm45", "glm47"],
+    accommodate_chat_template: bool,
+    allow_multiple_assistant_turns: bool,
+    root_name: str = "root",
+    required: bool = False,
+    parallel_tool_calls: bool = True,
+) -> str:
+    ebnf_lines = [
+        f'{root_name} ::= assistant_turn ( "{special_tokens.assistant_token}" assistant_turn )*'
+        if allow_multiple_assistant_turns
+        else f"{root_name} ::= assistant_turn",
+        "assistant_turn ::= thinking_block text_block tool_call_blocks",
+    ]
+
+    thinking_exclusions = [
+        special_tokens.begin_of_tool_call,
+        special_tokens.end_of_tool_call,
+        special_tokens.begin_of_key,
+        special_tokens.end_of_key,
+        special_tokens.begin_of_value,
+        special_tokens.end_of_value,
+        special_tokens.end_of_thinking,
+    ]
+
+    if chat_template_version == "glm45":
+        extra_seperator = '"\\n"'
+    elif chat_template_version == "glm47":
+        extra_seperator = ""
+    else:
+        raise NotImplementedError(
+            f"Unsupported chat_template_version: {chat_template_version}"
+        )
+
+    if chat_template_version == "glm45":
+        if enable_thinking:
+            ebnf_lines.append(
+                rf'thinking_block ::= "\n{special_tokens.begin_of_thinking}" thinking_block_content "{special_tokens.end_of_thinking}"'
+            )
+
+            ebnf_lines.extend(
+                _glm_any_string_exclude("thinking_block_content", thinking_exclusions)
+            )
+        else:
+            if accommodate_chat_template:
+                ebnf_lines.append('thinking_block ::= ""')
+            else:
+                ebnf_lines.append(
+                    rf'thinking_block ::= "\n{special_tokens.begin_of_thinking}" "{special_tokens.end_of_thinking}"'
+                )
+    elif chat_template_version == "glm47":
+        if enable_thinking:
+            if accommodate_chat_template:
+                ebnf_lines.append(
+                    rf'thinking_block ::= thinking_block_content "{special_tokens.end_of_thinking}"'
+                )
+            else:
+                ebnf_lines.append(
+                    rf'thinking_block ::= "{special_tokens.begin_of_thinking}" thinking_block_content "{special_tokens.end_of_thinking}"'
+                )
+            ebnf_lines.extend(
+                _glm_any_string_exclude("thinking_block_content", thinking_exclusions)
+            )
+        else:
+            if accommodate_chat_template:
+                ebnf_lines.append('thinking_block ::= ""')
+            else:
+                ebnf_lines.append(
+                    rf'thinking_block ::= "{special_tokens.end_of_thinking}"'
+                )
+    else:
+        raise NotImplementedError(
+            f"Unsupported chat_template_version: {chat_template_version}"
+        )
+
+    ebnf_lines.extend(
+        _glm_any_string_exclude(
+            "text_without_special_tokens", special_tokens.all_special_tokens()
+        )
+    )
+
+    ebnf_lines.append(
+        f"text_block ::= ( {extra_seperator} text_without_special_tokens )?"
+    )
+
+    if functions:
+        ebnf_lines.extend(
+            _glm_build_tool_call_rules(
+                non_terminal_name="tool_call_blocks",
+                functions=functions,
+                special_tokens=special_tokens,
+                chat_template_version=chat_template_version,
+                required=required,
+                parallel_tool_calls=parallel_tool_calls,
+            )
+        )
+    else:
+        ebnf_lines.append('tool_call_blocks ::= ""')
+
+    non_terminals = {}
+    deduped_lines = []
+    for line in ebnf_lines:
+        assert "\n" not in line, "Each EBNF rule should be in a single line."
+        lhs = line.split("::=")[0].strip()
+        if lhs in non_terminals:
+            if non_terminals[lhs] == line:
+                continue
+            raise ValueError(f"Duplicate non-terminal found: {lhs}")
+        non_terminals[lhs] = line
+        deduped_lines.append(line)
+
+    return "\n".join(deduped_lines)

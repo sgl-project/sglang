@@ -1,4 +1,5 @@
 import copy
+from array import array
 from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
@@ -7,20 +8,17 @@ from torch import nn
 
 from sglang.srt.configs.points_v15_chat import POINTSV15ChatConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.models.qwen2_vl import Qwen2VisionPatchMerger, Qwen2VisionTransformer
-from sglang.srt.utils import add_prefix
+from sglang.srt.multimodal.modality import Modality
 
 
 class Qwen2VisionTransformerForNavitPOINTS(Qwen2VisionTransformer):
@@ -101,9 +99,8 @@ class POINTSV15ChatModel(nn.Module):
             prefix=add_prefix("vision_projector", prefix),
         )
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(

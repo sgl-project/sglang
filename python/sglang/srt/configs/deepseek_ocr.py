@@ -16,42 +16,14 @@ from transformers import (
 from sglang.srt.multimodal.customized_mm_processor_utils import (
     register_customized_processor,
 )
-from sglang.srt.sampling.custom_logit_processor import (
-    DeepseekOCRNoRepeatNGramLogitProcessor,
-)
 
 DeepseekOCRImage = Union[Image.Image, torch.Tensor]
 
 BASE_SIZE = 1024
-IMAGE_SIZE = 640
-CROP_MODE = True
+IMAGE_SIZE = 640  # DeepSeek-OCR local crop; OCR-2 uses OCR2_IMAGE_SIZE
+OCR2_IMAGE_SIZE = 768
 MIN_CROPS = 2
 MAX_CROPS = 6  # max:9; If your GPU memory is small, it is recommended to set it to 6.
-MAX_CONCURRENCY = 100  # If you have limited GPU memory, lower the concurrency count.
-NUM_WORKERS = 64  # image pre-process (resize/padding) workers
-PRINT_NUM_VIS_TOKENS = False
-SKIP_REPEAT = True
-MODEL_PATH = "deepseek-ai/DeepSeek-OCR"  # change to your model path
-
-NGRAM_NO_REPEAT_SIZE = 30
-NGRAM_NO_REPEAT_WINDOW = 90
-# Whitelist `<td>` and `</td>` token ids to allow table structures.
-NGRAM_NO_REPEAT_WHITELIST = (128821, 128822)
-
-DEFAULT_CUSTOM_LOGIT_PROCESSOR = DeepseekOCRNoRepeatNGramLogitProcessor.to_str()
-
-
-def get_default_ngram_custom_params() -> Dict[str, Any]:
-    """Return default custom params for the DeepSeek-OCR n-gram no repeat processor."""
-
-    return {
-        "ngram_size": NGRAM_NO_REPEAT_SIZE,
-        "window_size": NGRAM_NO_REPEAT_WINDOW,
-        "whitelist_token_ids": list(NGRAM_NO_REPEAT_WHITELIST),
-    }
-
-
-PROMPT = "<image>\n<|grounding|>Convert the document to markdown."
 
 
 def get_image_size(img: DeepseekOCRImage) -> Tuple[int, int]:
@@ -218,7 +190,11 @@ def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_
 
 
 def dynamic_preprocess(
-    image, min_num=MIN_CROPS, max_num=MAX_CROPS, image_size=640, use_thumbnail=False
+    image,
+    min_num=MIN_CROPS,
+    max_num=MAX_CROPS,
+    image_size=IMAGE_SIZE,
+    use_thumbnail=False,
 ):
     orig_width, orig_height = get_image_size(image)
     aspect_ratio = orig_width / orig_height
@@ -263,6 +239,28 @@ def dynamic_preprocess(
     return processed_images, target_aspect_ratio
 
 
+def is_ocr2_config(config) -> bool:
+    """Whether a checkpoint is DeepSeek-OCR-2.
+
+    Both checkpoints ship identical processor configs, so identity comes from the
+    model config: the DeepEncoder V2 vision encoder, or its 896-dim projector.
+    Both lookups are guarded because the projector clause is what covers derived
+    checkpoints that drop `model_name` -- reading it unguarded would raise before
+    that clause is reached.
+    """
+    vision_config = getattr(config, "vision_config", None)
+    projector_config = getattr(config, "projector_config", None)
+    return (
+        str(getattr(vision_config, "model_name", "")).lower() == "deepencoderv2"
+        or getattr(projector_config, "input_dim", None) == 896
+    )
+
+
+def local_crop_size(config) -> int:
+    """Local-crop pixel size: 768 for OCR-2, 640 for DeepSeek-OCR."""
+    return OCR2_IMAGE_SIZE if is_ocr2_config(config) else IMAGE_SIZE
+
+
 class DeepseekOCRProcessor(ProcessorMixin):
     tokenizer_class = ("LlamaTokenizer", "LlamaTokenizerFast")
     attributes = ["tokenizer"]
@@ -287,6 +285,8 @@ class DeepseekOCRProcessor(ProcessorMixin):
     ):
 
         self.candidate_resolutions = candidate_resolutions
+        # The checkpoint config carries the *global* base here, not the local
+        # crop; the SGLang processor patches the real crop size per model.
         self.image_size = candidate_resolutions[0][0]
         self.patch_size = patch_size
         self.image_mean = image_mean
@@ -339,7 +339,6 @@ class DeepseekOCRProcessor(ProcessorMixin):
 
     def format_messages_v2(self, messages: str, pil_images, max_req_input_len=-1):
         """play the role of format_messages_v2 and get_images_info in the last version"""
-        tokenized_data = []
         masked_tokenized_data = []  # labels
         images_list = []
         images_seq_mask = []
@@ -504,13 +503,6 @@ class DeepseekOCRProcessor(ProcessorMixin):
 
         return prepare
 
-    def find_all_indices(self, messages, target_value):
-        indices = []
-        for index, item in enumerate(messages):
-            if item == target_value:
-                indices.append(index)
-        return indices
-
     def tokenize_with_images(
         self,
         conversation: str,
@@ -543,18 +535,23 @@ class DeepseekOCRProcessor(ProcessorMixin):
             img_w, img_h = get_image_size(image)
             image_shapes.append((img_w, img_h))
 
-            if img_w <= 640 and img_h <= 640:
+            # Both official processors threshold on their own crop size (640 for
+            # OCR-1, 768 for OCR-2), which is what `image_size` holds here.
+            if img_w <= self.image_size and img_h <= self.image_size:
                 crop_ratio = [1, 1]
             else:
                 if cropping:
                     images_crop_raw, crop_ratio = dynamic_preprocess(
-                        image, image_size=IMAGE_SIZE
+                        image, image_size=self.image_size
                     )
                 else:
                     crop_ratio = [1, 1]
 
             """process the global view"""
-            if self.image_size <= 640 and not cropping:
+            # Upstream compares against the model's own crop constant, which is
+            # exactly what `image_size` holds, so the test is always true and the
+            # guard reduces to `not cropping`.
+            if not cropping:
                 image = resize_image(image, (self.image_size, self.image_size))
 
             global_view = pad_image(
