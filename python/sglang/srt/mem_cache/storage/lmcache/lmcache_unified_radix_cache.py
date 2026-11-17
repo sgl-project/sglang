@@ -562,7 +562,11 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         flow.anchor_node = latest.last_device_node
         flow.anchor_lock = self.inc_lock_ref(flow.anchor_node).to_dec_params()
         num_tokens = total_hit - local_hit
-        device_indices = self._allocate_external_slots(num_tokens)
+        device_indices = (
+            self._allocate_external_slots(num_tokens)
+            if latest.device_prefix_len >= local_hit
+            else None
+        )
         mamba_value = None
         allocated_mamba_for_load = False
         request_mamba_value = None
@@ -601,8 +605,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 self.token_to_kv_pool_allocator.state_slots.free(request_mamba_value)
             self._release_flow_anchor(flow)
             logger.debug(
-                "LMCache retrieve declined for %s: a parallel rank cannot allocate "
-                "%d GPU slots",
+                "LMCache retrieve declined for %s: a parallel rank lost its L1 "
+                "prefix or cannot allocate %d GPU slots",
                 flow.lookup.request_id,
                 num_tokens,
             )
