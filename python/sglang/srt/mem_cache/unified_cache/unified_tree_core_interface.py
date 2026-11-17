@@ -93,6 +93,41 @@ class RadixCacheWalkResult(msgspec.Struct, frozen=True, kw_only=True):
     prev_slot_indices: torch.Tensor
 
 
+class HostReclaimNode(msgspec.Struct, frozen=True):
+    """One exact resident FULL Host owner; only node_id is rank-local."""
+
+    node_id: NodeId
+    token_ids: tuple[int, ...]
+    extra_key: Optional[str]
+    cache_salt: Optional[str]
+    is_bigram: bool
+    host_tokens: int
+
+    @property
+    def identity(self):
+        return (
+            self.token_ids,
+            self.extra_key,
+            self.cache_salt,
+            self.is_bigram,
+            self.host_tokens,
+        )
+
+
+class HostReclaimCandidate(HostReclaimNode, frozen=True):
+    """A complete Host subtree, ordered children before parents.
+
+    ``host_tokens`` is the sum of all members, including the root. No backed
+    descendant can remain after the root loses its Host copy.
+    """
+
+    members: tuple[HostReclaimNode, ...]
+
+    @property
+    def identity(self):
+        return (*super().identity, tuple(member.identity for member in self.members))
+
+
 class BufferBackupSnapshot(msgspec.Struct, frozen=True):
     node_id: NodeId
     parent_node_id: NodeId
@@ -603,6 +638,22 @@ class UnifiedTreeCoreInterface(ABC):
     def end_insert(self) -> list[CacheAction | ComponentAction]:
         """Finish the insert (idempotent); returns still-pending actions to drain."""
         ...
+
+    def snapshot_host_reclaim(
+        self, excluded_node_ids: Sequence[NodeId]
+    ) -> list[HostReclaimCandidate]:
+        """Snapshot disjoint settled FULL Host subtrees, excluding source ancestors."""
+        raise NotImplementedError("Coordinated Host reclaim is not supported")
+
+    def validate_host_reclaim(self, candidates: Sequence[HostReclaimCandidate]) -> bool:
+        """Revalidate an exact batch without changing tree, slots, locks or LRU."""
+        raise NotImplementedError("Coordinated Host reclaim is not supported")
+
+    def commit_host_reclaim(
+        self, candidates: Sequence[HostReclaimCandidate]
+    ) -> Optional[DriveHostEvictionResult]:
+        """Validate all before releasing any FULL Host copy; None is a stale batch."""
+        raise NotImplementedError("Coordinated Host reclaim is not supported")
 
     @abstractmethod
     def drive_host_eviction(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import logging
 import threading
@@ -28,7 +29,7 @@ import torch
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
-from sglang.srt.managers.cache_controller import CacheOperation
+from sglang.srt.managers.cache_controller import CacheOperation, PrefetchAck
 from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     ShmTagExchange,
     fold_u64,
@@ -64,6 +65,10 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
 )
 from sglang.srt.mem_cache.capacity import owner_rows_ready
 from sglang.srt.mem_cache.common import RetractionBackup
+from sglang.srt.mem_cache.dsv41_decode_storage import (
+    DecodeStoragePoolPlan,
+    build_decode_storage_pool_plan,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -75,6 +80,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     PPPrefetchDecision,
     PrefetchOperation,
+    PrefetchSubmission,
 )
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
@@ -132,6 +138,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_model,
     get_observability,
+    get_parallel,
 )
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
 from sglang.srt.utils.common import ceil_align
@@ -503,6 +510,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        if getattr(self, "_decode_storage_device_reservations", None):
+            raise RuntimeError(
+                "Cannot reset while Decode storage FULL reservations are owned"
+            )
+        self._decode_storage_device_reservations: dict[int, torch.Tensor] = {}
         # In-flight restores still read their host slots; finish them first.
         self._discard_restore_backups()
         self.tree_core.reset()
@@ -1586,6 +1598,32 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
 
+    def _keeps_request_private_window(self) -> bool:
+        """Native CUDA C2 replay must keep its running FULL/SWA record coherent."""
+        if not self.supports_swa() or self.supports_mamba():
+            return False
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+        from sglang.srt.utils import is_hip
+
+        pool = self.token_to_kv_pool_allocator.get_kvcache()
+        parallel = get_parallel()
+        return (
+            type(pool) is DeepSeekV4TokenToKVPool
+            and not is_hip()
+            and torch.device(pool.device).type == "cuda"
+            and not pool._unified_kv
+            and pool.request_window is None
+            and pool.swa_req_ring_size is None
+            and parallel.attn_cp_size == 1
+            and parallel.pp_size == 1
+            and parallel.attn_dp_size == 1
+            and not parallel.dcp_enabled
+            and any(
+                state is not None and state.request_scoped and state.ratio == 2
+                for state in pool.compress_state_pools
+            )
+        )
+
     def lease_checkpoint_state_slots(self, reqs: Sequence[Req]):
         mamba = self.components.get(ComponentType.MAMBA)
         if self.disable or mamba is None:
@@ -1672,6 +1710,21 @@ class UnifiedRadixCache(BasePrefixCache):
                     req, is_finished=is_finished, insert_params=insert_params
                 )
             return
+
+        if not is_finished and self._keeps_request_private_window():
+            matched_len, _, _ = self.tree_core.match_full_device_prefix(
+                radix_key.page_aligned(self.page_size)
+            )
+            if matched_len > req.kv.cache_protected_len:
+                # Insert deduplicates incoming FULL/SWA before the row rebind.
+                # The active replay's private C2 state still describes its own
+                # window: keep that whole record, its lock and ownership until
+                # finish. Window eviction above still advances normally.
+                for comp in self._components_tuple:
+                    comp.cleanup_after_caching_req(
+                        req, is_finished=False, insert_params=insert_params
+                    )
+                return
 
         kv_indices = kv_indices_orig[:effective_cache_len]
 
@@ -2236,6 +2289,14 @@ class UnifiedRadixCache(BasePrefixCache):
             for node_id in action.node_ids:
                 self.buffer_pipeline.enqueue_backup_intent(node_id)
             return 0
+        # Ordinary write-through actions come from the same tree operation on
+        # every rank. Device-eviction walks can be rank-local; never add a vote
+        # to their write-back callbacks.
+        agree_allocation = (
+            self._agree_decode_host_backup
+            if not write_back and self._uses_decode_host_backup_consensus()
+            else None
+        )
         written = 0
         for node_id in action.node_ids:
             device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
@@ -2244,8 +2305,20 @@ class UnifiedRadixCache(BasePrefixCache):
             if device_value.numel() == 0 and not comp_xfers:
                 continue
             sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
+            backup_kwargs = {"agree_allocation": agree_allocation}
+            if agree_allocation is not None:
+                backup_kwargs["reclaim_excluded"] = list(action.node_ids) + [
+                    source
+                    for xfers in comp_xfers.values()
+                    for transfer in xfers
+                    for source in (transfer.nodes_to_load or ())
+                ]
             host_indices = self._execute_kv_backup(
-                node_id, device_value, comp_xfers, sidecar_xfers
+                node_id,
+                device_value,
+                comp_xfers,
+                sidecar_xfers,
+                **backup_kwargs,
             )
             if host_indices is None:
                 return 0
@@ -2280,11 +2353,134 @@ class UnifiedRadixCache(BasePrefixCache):
             CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
         )
 
-    def _execute_kv_backup(self, node_id, device_value, comp_xfers, sidecar_xfers):
+    def _uses_decode_host_backup_consensus(self) -> bool:
+        """The native C2 Decode write-through plan uses one logical Host owner.
+
+        Exact native pool identity excludes other hybrid/NPU implementations.
+        The predicate describes the layout and role, so CPU pool fixtures can
+        exercise the same Host transaction without constructing CUDA buffers.
+        """
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+        from sglang.srt.utils import is_hip
+
+        if (
+            self.cache_controller is None
+            or self.buffer_pipeline is not None
+            or self.host_memory_mode != "cache"
+            or self.cache_controller.write_policy != "write_through"
+            or get_disagg().disaggregation_mode != "decode"
+            or not self.supports_swa()
+            or self.supports_mamba()
+        ):
+            return False
+        pool = self.token_to_kv_pool_allocator.get_kvcache()
+        parallel = get_parallel()
+        return (
+            type(pool) is DeepSeekV4TokenToKVPool
+            and not is_hip()
+            and not pool._unified_kv
+            and pool.request_window is None
+            and pool.swa_req_ring_size is None
+            and parallel.attn_cp_size == 1
+            and parallel.pp_size == 1
+            and parallel.attn_dp_size == 1
+            and not parallel.dcp_enabled
+            and any(
+                state is not None and state.request_scoped and state.ratio == 2
+                for state in pool.compress_state_pools
+            )
+        )
+
+    def _agree_decode_host_backup(self, can_allocate: bool) -> bool:
+        verdict = torch.tensor([int(can_allocate)], dtype=torch.int32, device="cpu")
+        self._all_reduce_attn_groups(verdict, torch.distributed.ReduceOp.MIN)
+        return bool(verdict.item())
+
+    def _ensure_decode_host_capacity(self, num_tokens, excluded_node_ids=()) -> bool:
+        """Reclaim only common settled resident Host duplicates, before allocation.
+
+        Native Decode's backup and storage reservation are scheduler-thread
+        transactions. Agree on logical leaves and their eligibility before any
+        rank frees Host data; local LRU eviction could change subsequent votes.
+        """
+        pool = self.cache_controller.mem_pool_host
+        available = pool.available_size()
+        if self._agree_decode_host_backup(available >= num_tokens):
+            return True
+        try:
+            candidates = self.tree_core.snapshot_host_reclaim(excluded_node_ids)
+            local = {
+                (
+                    hashlib.sha256(msgspec.msgpack.encode(candidate.identity)).digest(),
+                    candidate.host_tokens,
+                ): candidate
+                for candidate in candidates
+            }
+        except Exception:
+            logger.exception("Decode Host reclaim snapshot failed")
+            local = None
+        if not self._agree_decode_host_backup(local is not None):
+            return False
+        report = (max(0, num_tokens - available), list(local))
+        if self.tp_world_size > 1:
+            group = self.attn_tp_group or self.tp_group
+            reports = [None] * torch.distributed.get_world_size(group)
+            torch.distributed.all_gather_object(reports, report, group=group)
+        else:
+            reports = [report]
+        common = set(reports[0][1])
+        for _, keys in reports[1:]:
+            common.intersection_update(keys)
+        needed = max(deficit for deficit, _ in reports)
+        selected, freed = [], 0
+        for key in reports[0][1]:
+            if key in common:
+                selected.append(local[key])
+                freed += key[1]
+                if freed >= needed:
+                    break
+        if freed < needed:
+            return False
+        try:
+            valid = self.tree_core.validate_host_reclaim(selected)
+        except Exception:
+            logger.exception("Decode Host reclaim validation failed")
+            valid = False
+        if not self._agree_decode_host_backup(valid):
+            return False
+        result = self.tree_core.commit_host_reclaim(selected)
+        if result is None:
+            # No cache operation runs between the unanimous vote and commit.
+            # Never continue with divergent trees if this invariant is broken.
+            raise RuntimeError("Decode Host reclaim changed after its commit vote")
+        self._apply_eviction_result(result)
+        return self._agree_decode_host_backup(pool.available_size() >= num_tokens)
+
+    def _execute_kv_backup(
+        self,
+        node_id,
+        device_value,
+        comp_xfers,
+        sidecar_xfers,
+        *,
+        agree_allocation=None,
+        reclaim_excluded=(),
+    ):
         """Execute Backup action."""
         kv_tokens = len(device_value)
         anchor_entry = self.cache_controller.mem_pool_host.anchor_entry
-        if (
+        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        aux_xfers.extend(sidecar_xfers)
+        if agree_allocation is not None:
+            # Reclaim only a jointly validated logical plan; rank-local LRU
+            # mutation here can change the backup action sequence across ranks.
+            if anchor_entry.host_pool.shared_allocation_domain is not None or any(
+                transfer.indices_from_pool != PoolName.KV for transfer in aux_xfers
+            ):
+                raise RuntimeError("Decode Host backup requires KV-derived sidecars")
+            if not self._ensure_decode_host_capacity(kv_tokens, reclaim_excluded):
+                return None
+        elif (
             anchor_entry.host_pool.shared_allocation_domain is None
             or anchor_entry.host_evict_fn is None
         ):
@@ -2293,11 +2489,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 needed = kv_tokens - host_avail
                 if self.evict_host(needed) < needed:
                     return None
-        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
-        aux_xfers.extend(sidecar_xfers)
         # Preserve the ordinary controller API when no shard owner is present.
         start_owner = self.tree_core.rotation_phase_of(node_id)
         shard_kwargs = {} if start_owner is None else {"start_owner": start_owner}
+        if agree_allocation is not None:
+            shard_kwargs["allocation_agreement"] = agree_allocation
         # Defer submission so the next flush can merge pending node backups.
         return self.cache_controller.write(
             device_value,
@@ -2444,16 +2640,39 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.dec_host_lock_ref(node_id, host_anchor_params)
                 return False
 
-        token_slot = self.slot_id(TREE_TOKEN)
-        if not owner_rows_ready(
-            self,
-            self.token_to_kv_pool_allocator,
-            kv_tokens,
-            lambda: self._pool_available(token_slot),
-        ):
-            self.dec_lock_ref(node_id, ancestor_lock_params)
-            self.dec_host_lock_ref(node_id, host_anchor_params)
-            return False
+        plan = getattr(req, "_decode_storage_pool_plan", None)
+        reserved = getattr(req, "_decode_storage_device_indices", None)
+        if plan is not None:
+            valid = self._decode_storage_plan_agrees(plan)
+            try:
+                plan.validate_transfers(
+                    [x for xfers in comp_xfers.values() for x in xfers] + sidecar_xfers
+                )
+            except ValueError:
+                valid = False
+            valid = valid and (
+                reserved is None
+                or (
+                    len(reserved) >= kv_tokens
+                    and self._decode_storage_device_reservations.get(id(reserved))
+                    is reserved
+                )
+            )
+            if not self._agree_decode_storage_allocation(valid):
+                self.dec_lock_ref(node_id, ancestor_lock_params)
+                self.dec_host_lock_ref(node_id, host_anchor_params)
+                return False
+        if reserved is None:
+            token_slot = self.slot_id(TREE_TOKEN)
+            if not owner_rows_ready(
+                self,
+                self.token_to_kv_pool_allocator,
+                kv_tokens,
+                lambda: self._pool_available(token_slot),
+            ):
+                self.dec_lock_ref(node_id, ancestor_lock_params)
+                self.dec_host_lock_ref(node_id, host_anchor_params)
+                return False
 
         # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
@@ -2462,12 +2681,24 @@ class UnifiedRadixCache(BasePrefixCache):
             host_indices=kv_xfer.host_indices,
             node_id=node_id,
             extra_pools=aux_xfers or None,
+            **(
+                {"device_indices": reserved[:kv_tokens]} if reserved is not None else {}
+            ),
         )
 
         self.dec_lock_ref(node_id, ancestor_lock_params)
         if device_indices is None:
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
+
+        if reserved is not None:
+            # The queued H2D now owns this span; cleanup must not free it.
+            self._take_decode_storage_device_reservation(reserved)
+            req._decode_storage_device_indices = None
+            if len(reserved) > kv_tokens:
+                self.token_to_kv_pool_allocator.full_attn_allocator.free(
+                    reserved[kv_tokens:]
+                )
 
         # Commit the loaded KV back onto the node + apply its emitted actions.
         self._commit_load_back(node_id, device_indices, kv_xfer, comp_xfers)
@@ -2621,6 +2852,244 @@ class UnifiedRadixCache(BasePrefixCache):
             return None
         return self.tree_core.rotation_base_of(node_id)
 
+    def _build_decode_storage_pool_plan(self) -> Optional[DecodeStoragePoolPlan]:
+        """The supported Decode L3 plan excludes every request-private pool."""
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+        pool = self.token_to_kv_pool_allocator.get_kvcache()
+        if not (
+            isinstance(pool, DeepSeekV4TokenToKVPool)
+            and get_disagg().disaggregation_mode == "decode"
+            and get_disagg().disaggregation_decode_enable_radix_cache
+            and self.enable_storage
+        ):
+            return None
+        if type(pool) is not DeepSeekV4TokenToKVPool:
+            raise ValueError(
+                "Decode storage requires the exact native pool implementation"
+            )
+        parallel = get_parallel()
+        cc = self.cache_controller
+        if (
+            cc is None
+            or cc.storage_backend_type not in ("file", "mooncake")
+            or self.host_memory_mode != "cache"
+            or cc.write_policy != "write_through"
+            or self.prefetch_stop_policy not in ("wait_complete", "timeout")
+            or self.buffer_pipeline is not None
+            or pool._unified_kv
+            or pool.request_window is not None
+            or pool.swa_req_ring_size is not None
+            or parallel.attn_cp_size != 1
+            or parallel.pp_size != 1
+            or parallel.attn_dp_size != 1
+            or parallel.dcp_enabled
+        ):
+            raise ValueError("Unsupported native Decode storage configuration")
+        if cc.storage_backend_type == "mooncake":
+            from sglang.srt.mem_cache.dsv4_storage_namespace import (
+                dsv4_mooncake_extra_config,
+            )
+
+            extra = cc.storage_config.extra_config
+            resolved = dsv4_mooncake_extra_config(pool, self.page_size, extra)
+            if any(
+                extra.get(key) != resolved[key]
+                for key in (
+                    "extra_backend_tag",
+                    "dsv4_cache_namespace_digest",
+                    "dsv4_cache_namespace_descriptor",
+                )
+            ):
+                raise ValueError(
+                    "Decode Mooncake storage namespace is not resolved or changed"
+                )
+        return build_decode_storage_pool_plan(
+            pool, self.page_size, self.sidecar_pool_specs
+        )
+
+    def decode_storage_pool_plan(self) -> Optional[DecodeStoragePoolPlan]:
+        """All native Decode ranks either share one plan or reject it together."""
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+        if not (
+            self.enable_storage
+            and get_disagg().disaggregation_mode == "decode"
+            and get_disagg().disaggregation_decode_enable_radix_cache
+            and isinstance(
+                self.token_to_kv_pool_allocator.get_kvcache(), DeepSeekV4TokenToKVPool
+            )
+        ):
+            return None
+        try:
+            plan = self._build_decode_storage_pool_plan()
+        except Exception:
+            logger.exception("Decode storage pool plan is unsupported")
+            plan = None
+        if not self._decode_storage_plan_vote(plan, plan is not None):
+            raise ValueError(
+                "Decode storage ranks disagree on the persistent pool plan"
+            )
+        return plan
+
+    def _decode_storage_plan_vote(self, plan, valid: bool) -> bool:
+        # One MIN carries all 256 fingerprint bits as min(x), -max(x), and a
+        # local validity vote. A rank-local schema failure cannot skip peers.
+        try:
+            digest = bytes.fromhex(plan.fingerprint)
+            words = [int.from_bytes(digest[i : i + 4], "big") for i in range(0, 32, 4)]
+        except Exception:
+            valid = False
+            words = [0] * 8
+        verdict = torch.tensor(
+            words + [-word for word in words] + [int(valid)], dtype=torch.int64
+        )
+        self._all_reduce_attn_groups(verdict, torch.distributed.ReduceOp.MIN)
+        values = verdict.tolist()
+        return bool(values[-1] and all(values[i] == -values[i + 8] for i in range(8)))
+
+    def _decode_storage_plan_agrees(self, plan: DecodeStoragePoolPlan) -> bool:
+        try:
+            valid = self._build_decode_storage_pool_plan() == plan
+        except Exception:
+            valid = False
+        return self._decode_storage_plan_vote(plan, valid)
+
+    def _agree_decode_storage_allocation(self, accepted: bool) -> bool:
+        verdict = torch.tensor(int(accepted), dtype=torch.int)
+        self._all_reduce_attn_groups(verdict, torch.distributed.ReduceOp.MIN)
+        return bool(verdict.item())
+
+    def decode_storage_requires_device_reservation(self) -> bool:
+        return self.decode_storage_pool_plan() is not None
+
+    def reserve_decode_storage_device(
+        self, num_tokens: int, *, pool_plan: Optional[DecodeStoragePoolPlan] = None
+    ) -> Optional[torch.Tensor]:
+        plan = pool_plan if pool_plan is not None else self.decode_storage_pool_plan()
+        if plan is None or not self._decode_storage_plan_agrees(plan):
+            return None
+        allocator = self.token_to_kv_pool_allocator.full_attn_allocator
+        size = torch.tensor(
+            [
+                num_tokens,
+                -num_tokens,
+                int(num_tokens > 0 and num_tokens % self.page_size == 0),
+                allocator.available_size(),
+            ],
+            dtype=torch.int64,
+        )
+        self._all_reduce_attn_groups(size, torch.distributed.ReduceOp.MIN)
+        if not (size[2].item() and size[0].item() == -size[1].item()):
+            return None
+        # Admission includes evictable FULL pages, but suffix preallocation
+        # reclaims them only after this L3 gap is reserved. Reclaim the same
+        # quota on every rank, even when their free capacity is asymmetric.
+        shortfall = max(0, num_tokens - size[3].item())
+        try:
+            if shortfall:
+                self.evict(EvictParams(num_tokens=shortfall))
+            indices = allocator.alloc(num_tokens)
+        except Exception:
+            logger.exception("Decode storage FULL reservation failed")
+            indices = None
+        if not self._agree_decode_storage_allocation(indices is not None):
+            if indices is not None:
+                allocator.free(indices)
+            return None
+        # These allocator-owned pages are not request rows or tree pages yet.
+        # Keep the exact original tensor as the ownership receipt.
+        self._decode_storage_device_reservations[id(indices)] = indices
+        return indices
+
+    def _take_decode_storage_device_reservation(self, indices: torch.Tensor) -> None:
+        owner = self._decode_storage_device_reservations.get(id(indices))
+        if owner is not indices:
+            raise ValueError("Unknown or already consumed Decode storage FULL receipt")
+        del self._decode_storage_device_reservations[id(indices)]
+
+    def release_decode_storage_device(self, indices: torch.Tensor) -> None:
+        self._take_decode_storage_device_reservation(indices)
+        self.token_to_kv_pool_allocator.full_attn_allocator.free(indices)
+
+    def full_transient_size(self) -> int:
+        """Actual FULL slots held by cache-owned, not-yet-redeemed receipts."""
+        return sum(
+            len(indices)
+            for indices in self._decode_storage_device_reservations.values()
+        )
+
+    def _reserve_decode_storage_prefetch(
+        self, request, prefetch_key, last_hash, prefix_keys, plan, excluded_node_ids=()
+    ) -> Optional[PrefetchOperation]:
+        cc = self.cache_controller
+        operation = PrefetchOperation(
+            request,
+            prefetch_key,
+            last_hash,
+            prefix_keys,
+            pool_transfers=plan.transfers(),
+        )
+        operation.decode_storage_pool_plan = plan
+        # Revalidate real objects. A prior lookup never guarantees a later read.
+        try:
+            operation.hash_value, operation.storage_hit_count = cc._storage_hit_query(
+                operation
+            )
+            accepted = operation.storage_hit_count >= len(prefetch_key)
+        except Exception:
+            logger.exception("Decode persistent-pool prefetch query failed")
+            accepted = False
+        if not self._agree_decode_storage_allocation(accepted):
+            return None
+        if (
+            self._uses_decode_host_backup_consensus()
+            and not self._ensure_decode_host_capacity(
+                len(prefetch_key), excluded_node_ids
+            )
+        ):
+            return None
+        try:
+            indices = cc.mem_pool_host.alloc(len(prefetch_key))
+        except Exception:
+            logger.exception("Decode storage Host reservation failed")
+            indices = None
+        if not self._agree_decode_storage_allocation(indices is not None):
+            if indices is not None:
+                cc.mem_pool_host.free(indices)
+            return None
+        operation.host_indices = indices
+        return operation
+
+    def _register_decode_storage_prefetch(self, request, operation) -> bool:
+        cc = self.cache_controller
+        queued = False
+        try:
+            cc.prefetch_buffer.put(operation)
+            queued = True
+        except Exception:
+            logger.exception("Decode storage IO registration failed")
+        if self._agree_decode_storage_allocation(queued):
+            return True
+        # Peers may already have an IO worker. Preserve the normal progressive
+        # ACK count/collectives and let terminal ACK release the unfinished tail.
+        operation.mark_terminate()
+        if not queued:
+            try:
+                cc._page_transfer(
+                    operation
+                )  # Terminated: no backend IO, normal zero ACKs.
+            finally:
+                cc.prefetch_sync_queue.put(
+                    PrefetchAck(
+                        rid=operation.request_id,
+                        operation=operation,
+                        completed_req=True,
+                    )
+                )
+        self._abandon_attempt(request)
+        return False
+
     def query_storage_hit_length(
         self,
         last_host_node_id: NodeId,
@@ -2629,12 +3098,24 @@ class UnifiedRadixCache(BasePrefixCache):
         prefix_keys: Optional[list[str]] = None,
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        *,
+        pool_plan: Optional[DecodeStoragePoolPlan] = None,
     ) -> int:
         """Probe L3 with the request namespace."""
+        plan = pool_plan if pool_plan is not None else self.decode_storage_pool_plan()
+        if plan is not None and not self._decode_storage_plan_agrees(plan):
+            return 0
+        permitted = (
+            self.enable_storage
+            and self.cache_controller is not None
+            and not self.cache_controller.prefetch_rate_limited()
+        )
+        if plan is not None and not self._agree_decode_storage_allocation(permitted):
+            return 0
         if (
             not self.enable_storage
             or self.cache_controller is None
-            or self.cache_controller.prefetch_rate_limited()
+            or (plan is None and self.cache_controller.prefetch_rate_limited())
         ):
             return 0
 
@@ -2644,7 +3125,10 @@ class UnifiedRadixCache(BasePrefixCache):
             is_bigram=self.tree_core.is_eagle,
             cache_salt=cache_salt,
         ).page_aligned(self.page_size)
-        if len(prefetch_key) < self.prefetch_threshold:
+        sufficient = len(prefetch_key) >= self.prefetch_threshold
+        if plan is not None:
+            sufficient = self._agree_decode_storage_allocation(sufficient)
+        if not sufficient:
             return 0
 
         operation = PrefetchOperation(
@@ -2652,8 +3136,15 @@ class UnifiedRadixCache(BasePrefixCache):
             prefetch_key,
             last_hash,
             prefix_keys,
+            pool_transfers=plan.transfers() if plan is not None else None,
         )
-        _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
+        try:
+            _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
+        except Exception:
+            if plan is None:
+                raise
+            logger.exception("Decode persistent-pool storage query failed")
+            storage_hit_count = 0
         storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
         self._all_reduce_attn_groups(
             storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
@@ -2674,9 +3165,14 @@ class UnifiedRadixCache(BasePrefixCache):
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
         storage_hit_end: Optional[int] = None,
+        pool_plan: Optional[DecodeStoragePoolPlan] = None,
     ) -> Optional[bool]:
         if not self.enable_storage or self.cache_controller is None:
             return
+
+        plan = pool_plan if pool_plan is not None else self.decode_storage_pool_plan()
+        if plan is not None and not self._decode_storage_plan_agrees(plan):
+            return False
 
         req_id = request.rid
         self.storage_prefetch_retries.cancel(req_id)
@@ -2732,14 +3228,20 @@ class UnifiedRadixCache(BasePrefixCache):
         stats = self._prefetch_outcome_stats
         if prefetch_length > 0:
             stats["attempts"] += 1
-        if prefetch_length < self.prefetch_threshold:
+        sufficient = prefetch_length >= self.prefetch_threshold
+        if plan is not None:
+            sufficient = self._agree_decode_storage_allocation(sufficient)
+        if not sufficient:
             if prefetch_length > 0:
                 stats["declined_too_short"] += 1
             # No lookup was issued, so no retry is armed: polling here would
             # spend the re-issue budget the admission-time device-hit-loss
             # re-query needs once the device match evicts while queued.
             return
-        if not buffer_mode and self.cache_controller.prefetch_rate_limited():
+        rate_limited = not buffer_mode and self.cache_controller.prefetch_rate_limited()
+        if plan is not None:
+            rate_limited = not self._agree_decode_storage_allocation(not rate_limited)
+        if rate_limited:
             stats["declined_rate_limited"] += 1
             # Paced: the limiter clears as transfers finish, not on the next pass.
             self.storage_prefetch_retries.poll_miss(req_id, storage_hit_end)
@@ -2753,7 +3255,7 @@ class UnifiedRadixCache(BasePrefixCache):
             else self.inc_host_lock_ref(last_host_node_id).to_dec_params()
         )
         comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
-        for ct in self.tree_components:
+        for ct in self.tree_components if plan is None else ():
             if ct == BASE_COMPONENT_TYPE:
                 continue
             # Size the component's staging now; it is allocated at hit time,
@@ -2788,21 +3290,43 @@ class UnifiedRadixCache(BasePrefixCache):
             if transfers:
                 comp_xfers[self.slot_id(TREE_TOKEN)] = transfers
         kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=None)
-        sidecar_xfers = self._build_sidecar_transfers(
-            CacheTransferPhase.PREFETCH, kv_xfer, comp_xfers
+        sidecar_xfers = (
+            plan.transfers()
+            if plan is not None
+            else self._build_sidecar_transfers(
+                CacheTransferPhase.PREFETCH, kv_xfer, comp_xfers
+            )
         )
 
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
-        submission = self.cache_controller.submit_prefetch(
-            request,
-            prefetch_key,
-            last_hash,
-            prefix_keys,
-            matched_prefix_tokens,
-            aux_xfers or None,
-            assume_stored=assume_stored,
-        )
+        reserved_decode = plan is not None and assume_stored
+        if plan is not None and not reserved_decode:
+            self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
+            return False
+        if reserved_decode:
+            operation = self._reserve_decode_storage_prefetch(
+                request,
+                prefetch_key,
+                last_hash,
+                prefix_keys,
+                plan,
+                excluded_node_ids=(last_host_node_id,),
+            )
+            if operation is None:
+                self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
+                return False
+            submission = PrefetchSubmission(operation=operation)
+        else:
+            submission = self.cache_controller.submit_prefetch(
+                request,
+                prefetch_key,
+                last_hash,
+                prefix_keys,
+                matched_prefix_tokens,
+                aux_xfers or None,
+                assume_stored=assume_stored,
+            )
         operation = submission.operation
         if operation is None:
             assert submission.decision is not None
@@ -2822,7 +3346,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.ongoing_prefetch[request] = _OngoingPrefetch(
             last_host_node_id,
             prefetch_key,
-            None,
+            operation.host_indices if reserved_decode else None,
             operation,
             anchor_lock_params,
             comp_xfers,
@@ -2840,6 +3364,11 @@ class UnifiedRadixCache(BasePrefixCache):
             # Cache mode reserves the requested span up front; buffer mode
             # grants occupancy later at hit-alloc time, sized to the hit.
             self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
+
+        if reserved_decode:
+            self._record_storage_prefetch_hit(request, len(prefetch_key))
+            self._account_prefetch_outcome(operation, revoked=False)
+            return self._register_decode_storage_prefetch(request, operation)
 
     def _start_storage_prefetch_wait(self, operation: PrefetchOperation) -> None:
         if (
@@ -3224,6 +3753,22 @@ class UnifiedRadixCache(BasePrefixCache):
         Returns true if prefetch success, or false when an all-or-nothing prefetch
         was discarded (the caller should then treat the prefetch as finished).
         """
+        plan = getattr(operation, "decode_storage_pool_plan", None)
+        if plan is not None:
+            valid = self._decode_storage_plan_agrees(plan)
+            try:
+                plan.validate_transfers(operation.pool_transfers or [])
+            except ValueError:
+                valid = False
+            if not self._agree_decode_storage_allocation(valid):
+                self._finish_storage_prefetch(request, 0, reason="dropped")
+                self._retire_ongoing_prefetch(
+                    request, host_indices[: operation.completed_tokens], None
+                )
+                self.prefetch_loaded_tokens_by_reqid[request] = 0
+                self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
+                return False
+
         # Sync completed tokens and per-pool hit pages across ATTN groups, taking
         # the minimum so every rank agrees on the same usable prefix length.
         #

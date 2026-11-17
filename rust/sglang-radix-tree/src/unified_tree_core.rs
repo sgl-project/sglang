@@ -56,6 +56,29 @@ fn next_coexist_reclaim_digest(current: i64, node_id: NodeId, component_idx: usi
 
 // ---- interface types ----
 
+/// Local handle, complete raw path, namespace, bigram flag and Host extent.
+/// Only the handle is rank-local; consumers coordinate on the remaining fields.
+pub type HostReclaimNode = (
+    NodeId,
+    Vec<i64>,
+    Option<String>,
+    Option<String>,
+    bool,
+    usize,
+);
+
+/// A whole resident Host subtree: root metadata, total extent, then all
+/// owners ordered by descending path length and lexical logical path.
+pub type HostReclaimCandidate = (
+    NodeId,
+    Vec<i64>,
+    Option<String>,
+    Option<String>,
+    bool,
+    usize,
+    Vec<HostReclaimNode>,
+);
+
 /// A node's position, topology, and FULL value length on a root-to-node path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TreePathNodeInfo {
@@ -3298,6 +3321,142 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         );
     }
 
+    fn host_reclaim_node_(&self, id: NodeIdx_) -> Option<HostReclaimNode> {
+        let node = self.arena.node(id);
+        if K::IS_BIGRAM
+            || !self.can_reclaim_coexisting_host_value_(id, FULL)
+            || node.is_host_locked()
+            || node.key.atom_len() == 0
+            || node.host_value(FULL).numel() != node.key.atom_len()
+            || self
+                .components
+                .iter()
+                .any(|c| c.component_type() != FULL && node.has_host_value(c.component_type()))
+        {
+            return None;
+        }
+        let mut path = Vec::new();
+        let mut cur = id;
+        while !self.arena.node(cur).is_root() {
+            path.push(self.arena.node(cur).key.as_ref());
+            cur = self.arena.node(cur).parent();
+        }
+        let atoms: Vec<_> = path.into_iter().rev().flatten().copied().collect();
+        let ns = node.namespace.as_ref();
+        Some((
+            node.id,
+            K::raw_token_ids(&atoms).into_owned(),
+            ns.extra_key.map(str::to_owned),
+            ns.cache_salt.map(str::to_owned),
+            false,
+            node.host_value(FULL).numel(),
+        ))
+    }
+
+    fn host_reclaim_candidate_(&self, id: NodeIdx_) -> Option<HostReclaimCandidate> {
+        let root = self.host_reclaim_node_(id)?;
+        let mut members = Vec::new();
+        let mut pending = vec![id];
+        while let Some(cur) = pending.pop() {
+            let node = self.arena.node(cur);
+            // Host-less intermediate nodes cannot hide a pinned or Host-only
+            // descendant from the closure validation.
+            if node.write_through_pending_id.is_some()
+                || node.is_load_back_pending()
+                || node.is_host_locked()
+                || self
+                    .components
+                    .iter()
+                    .any(|c| c.component_type() != FULL && node.has_host_value(c.component_type()))
+            {
+                return None;
+            }
+            if node.has_host_value(FULL) {
+                members.push(self.host_reclaim_node_(cur)?);
+            }
+            pending.extend(node.children.values().copied());
+        }
+        members.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.1.cmp(&b.1)));
+        let total = members.iter().map(|m| m.5).sum();
+        Some((root.0, root.1, root.2, root.3, root.4, total, members))
+    }
+
+    pub fn snapshot_host_reclaim(
+        &self,
+        excluded_ids: &[NodeId],
+    ) -> Result<Vec<HostReclaimCandidate>, NodeAccessError> {
+        let mut excluded = HashSet::new();
+        for id in excluded_ids {
+            let mut cur = self.arena.resolve(*id)?;
+            while !self.arena.node(cur).is_root() {
+                excluded.insert(cur);
+                cur = self.arena.node(cur).parent();
+            }
+        }
+        let mut roots: Vec<_> = self
+            .full_coexisting_host_nodes
+            .iter()
+            .filter(|id| !excluded.contains(id))
+            .filter_map(|id| self.host_reclaim_node_(id))
+            .collect();
+        roots.sort_by_key(|m| m.1.len());
+        let mut covered = HashSet::new();
+        let mut candidates = Vec::new();
+        for root in roots {
+            if covered.contains(&root.0) {
+                continue;
+            }
+            let id = self.arena.resolve(root.0).expect("snapshot Host owner");
+            if let Some(candidate) = self.host_reclaim_candidate_(id) {
+                if candidate
+                    .6
+                    .iter()
+                    .any(|m| self.arena.resolve(m.0).is_ok_and(|i| excluded.contains(&i)))
+                {
+                    continue;
+                }
+                covered.extend(candidate.6.iter().map(|m| m.0));
+                candidates.push(candidate);
+            }
+        }
+        Ok(candidates)
+    }
+
+    pub fn validate_host_reclaim(&self, candidates: &[HostReclaimCandidate]) -> bool {
+        let mut seen = HashSet::new();
+        candidates.iter().all(|candidate| {
+            self.arena.resolve(candidate.0).is_ok_and(|id| {
+                self.host_reclaim_candidate_(id).as_ref() == Some(candidate)
+                    && candidate.6.iter().all(|m| seen.insert(m.0))
+            })
+        })
+    }
+
+    pub fn commit_host_reclaim(
+        &mut self,
+        candidates: &[HostReclaimCandidate],
+    ) -> Option<EvictionStepResult> {
+        if !self.validate_host_reclaim(candidates) {
+            return None;
+        }
+        let mut result = EvictionStepResult::default();
+        for candidate in candidates {
+            for member in &candidate.6 {
+                let id = self.arena.resolve(member.0).expect("validated Host owner");
+                self.release_host_value_only_(
+                    id,
+                    FULL,
+                    &mut result.tracker,
+                    &mut result.device_frees,
+                    &mut result.host_frees,
+                    &mut result.cache_actions,
+                );
+                self.full_coexisting_host_nodes.discard(id);
+            }
+        }
+        Some(result)
+    }
+
     /// Evict a component's host-side resources.
     pub fn drive_host_eviction(
         &mut self,
@@ -3375,6 +3534,31 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.can_reclaim_coexisting_host_value_(node_id, component_type),
             "cannot reclaim coexisting {component_type:?} host value from node {node_id}"
         );
+        self.release_host_value_only_(
+            node_id,
+            component_type,
+            tracker,
+            device_frees,
+            host_frees,
+            cache_actions,
+        );
+        let victim_id = self.arena.node(node_id).id;
+        self.write_back_coexist_reclaim_digest = next_coexist_reclaim_digest(
+            self.write_back_coexist_reclaim_digest,
+            victim_id,
+            component_type.idx(),
+        );
+    }
+
+    fn release_host_value_only_(
+        &mut self,
+        node_id: NodeIdx_,
+        component_type: ComponentType,
+        tracker: &mut HashMap<ComponentType, usize>,
+        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
+    ) {
         if component_type == BASE_COMPONENT_TYPE {
             // BlockRemoved tracks Full host residency, not auxiliary slices.
             self.record_remove_event_(node_id, StorageMedium::Cpu);
@@ -3387,12 +3571,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             cache_actions,
             EvictLayer::Host,
             Some(tracker),
-        );
-        let victim_id = self.arena.node(node_id).id;
-        self.write_back_coexist_reclaim_digest = next_coexist_reclaim_digest(
-            self.write_back_coexist_reclaim_digest,
-            victim_id,
-            component_type.idx(),
         );
     }
 

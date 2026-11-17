@@ -912,3 +912,18 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
 def is_swa_req_ring(allocator) -> bool:
     return isinstance(allocator, SWATokenToKVPoolAllocator) and allocator.swa_req_ring
+
+
+def uses_swa_tail_prealloc(token_to_kv_pool, token_to_kv_pool_allocator) -> bool:
+    """Whether decode allocates a fresh window that prefill transfers in full."""
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    return (
+        (
+            token_to_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW)
+            is not None
+            or isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        )
+        and token_to_kv_pool_allocator.page_size > 1
+        and hasattr(token_to_kv_pool_allocator, "alloc_extend_swa_tail")
+    )

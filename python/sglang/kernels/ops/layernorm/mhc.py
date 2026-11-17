@@ -2682,7 +2682,9 @@ def hc_mix_stats_sinkhorn_bf16x3(
         BLOCK_K=_HC_MIX_BF16X3_BLOCK_K,
         BLOCK_M=block_m,
         num_warps=4,
-        num_stages=3,
+        # SM90 medium-prefill's three compensated dots vary across identical
+        # inputs with multistage pipelining; a single stage is repeatable.
+        num_stages=1 if hopper_medium else 3,
     )
     _hc_mix_reduce_sinkhorn_kernel[(m,)](
         part_mix,

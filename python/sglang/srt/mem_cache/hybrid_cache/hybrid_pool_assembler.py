@@ -6,6 +6,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
+from sglang.srt.mem_cache.allocator.swa import uses_swa_tail_prealloc
 from sglang.srt.mem_cache.device_pool_info import (
     IndexKeyLayout,
     MHABufferInfo,
@@ -55,7 +56,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import (
     ComponentType,
     tree_slot_ids,
 )
-from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
+from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel, get_serving
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -2115,6 +2116,15 @@ class _DeepSeekV4Strategy(StackStrategy):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
         )
+        # Decode receives a fresh SWA tail from prefill. Restoring a previous
+        # request's SWA/state would overwrite that transfer. Withhold its host
+        # binding so both tree cores skip SWA restore and its dependent sidecars.
+        fresh_decode_tail = (
+            get_disagg().disaggregation_mode == "decode"
+            and get_disagg().disaggregation_decode_enable_radix_cache
+            and any(r in (1, 2) for r in kvcache.compression_ratios)
+            and uses_swa_tail_prealloc(kvcache, params.token_to_kv_pool_allocator)
+        )
         # NPU drives C128 as an independent tree component, so adding a KV-derived
         # sidecar would duplicate transfers. Add that sidecar only on GPU.
         # The *_ROPE entries only resolve under unified fp8 kv; entry_map filters
@@ -2153,11 +2163,12 @@ class _DeepSeekV4Strategy(StackStrategy):
             )
             for name, src in _sidecar_srcs
             if name in host_pool_group.entry_map
+            and not (fresh_decode_tail and src == PoolName.SWA)
         ]
         component_host_pools = {
             ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
         }
-        if PoolName.SWA in host_pool_group.entry_map:
+        if not fresh_decode_tail and PoolName.SWA in host_pool_group.entry_map:
             component_host_pools[ComponentType.SWA] = host_pool_group.get_pool(
                 PoolName.SWA
             )

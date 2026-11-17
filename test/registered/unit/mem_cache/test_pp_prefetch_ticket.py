@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=19, suite="base-a-test-cpu")
@@ -117,6 +118,9 @@ class TestPrefetchAckSchema(unittest.TestCase):
 
 class TestPPPrefetchTicket(unittest.TestCase):
     def setUp(self):
+        context = get_context().override_server_args()
+        context.install()
+        self.addCleanup(context.restore)
         self.c = c = HybridCacheController.__new__(HybridCacheController)
         c.page_size = c.prefetch_threshold = 4
         c.storage_config = HiCacheStorageConfig(

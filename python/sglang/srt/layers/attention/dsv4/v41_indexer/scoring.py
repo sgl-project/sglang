@@ -10,6 +10,10 @@ from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention.deep_select import (
+    is_deep_select_supported,
+)
+from sglang.kernels.ops.attention.deep_select import topk as deep_select_topk
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import amax8_varlen
 from sglang.kernels.ops.attention.dsv4.candidate_scores import (
     can_use_candidate_scores,
@@ -677,9 +681,14 @@ def select_decode(
 ) -> None:
     k = min(topk, d.lmax)
     if isinstance(d, PagedDecodeScores):
-        assert d.plan is not None, "paged select_decode needs the top-k v2 plan"
-        idx = torch.empty((d.bs, k), dtype=torch.int32, device=d.scores.device)
-        topk_transform_paged_v2(d.scores, d.lens, None, idx, 1, d.plan)
+        if is_deep_select_supported():
+            # As in FullTopKIndexer, keep the retained set repeatable when FP4
+            # scores tie. Sorting SGL top-k v2's result cannot repair a varying set.
+            _, idx = deep_select_topk(d.scores, k, end=d.lens)
+        else:
+            assert d.plan is not None, "paged select_decode needs the top-k v2 plan"
+            idx = torch.empty((d.bs, k), dtype=torch.int32, device=d.scores.device)
+            topk_transform_paged_v2(d.scores, d.lens, None, idx, 1, d.plan)
         finish_paged_indexer_topk(
             idx,
             d.scores,

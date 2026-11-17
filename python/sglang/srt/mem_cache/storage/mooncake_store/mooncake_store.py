@@ -1,5 +1,6 @@
 import contextlib
 import ctypes
+import hashlib
 import json
 import logging
 import os
@@ -518,6 +519,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
     ):
         MooncakeBaseStore.__init__(self)
+        self._owns_dsv4_tcp_client = False
+        self._borrows_transfer_engine = False
         self.dcp_size = storage_config.dcp_size if storage_config is not None else 1
         MooncakeDistributedStore = self._import_mooncake_store()
         self._replicate_config_cls, self._supports_group_ids = (
@@ -659,6 +662,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     client_hostname = self.config.local_hostname
                     transfer_engine = None
 
+                self._borrows_transfer_engine = transfer_engine is not None
+                descriptor = (extra_config or {}).get("dsv4_cache_namespace_descriptor")
+                self._owns_dsv4_tcp_client = (
+                    isinstance(descriptor, dict)
+                    and descriptor.get("schema") == "sglang-dsv4-persistent-v2"
+                    and self.config.protocol == "tcp"
+                    and not self._borrows_transfer_engine
+                )
                 setup_kwargs = {}
                 if self.config.enable_ssd_offload:
                     setup_kwargs["enable_ssd_offload"] = True
@@ -800,11 +811,23 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.backup_bandwidth = []
 
         except ValueError as e:
+            self._cleanup_owned_client_after_init_error()
             logger.error("Configuration loading failed: %s", e)
             raise
         except Exception as exc:
+            self._cleanup_owned_client_after_init_error()
             logger.error("An error occurred while loading the configuration: %s", exc)
             raise
+
+    def _cleanup_owned_client_after_init_error(self):
+        if not self._owns_dsv4_tcp_client:
+            return
+        try:
+            self.close()
+        except Exception:
+            logger.exception(
+                "Failed to close owned Mooncake TCP client after setup error"
+            )
 
     @staticmethod
     def _iter_host_pool_buffers(host_pool: HostKVCache):
@@ -901,18 +924,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if host_pool_name == PoolName.KV:
             return
         if host_pool_name == PoolName.DRAFT:
-            self.registered_pools[host_pool_name] = host_pool
             super().register_buffer(host_pool.kv_buffer)
+            self.registered_pools[host_pool_name] = host_pool
             return
 
         # Keep a name->pool mapping so batch v2 can resolve PoolTransfer.name to
         # the corresponding host pool implementation at runtime.
-        self.registered_pools[host_pool_name] = host_pool
-
         # Non-anchor pools are either sidecar-specific pools with their own
         # accessor, or ordinary KV-like host pools used as SWA side pools.
         for buf in self._iter_host_pool_buffers(host_pool):
             super().register_buffer(buf)
+        self.registered_pools[host_pool_name] = host_pool
 
     def _tag_keys(self, keys: List[str]) -> List[str]:
         if self.config_prefix is None:
@@ -963,6 +985,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         """
         from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 
+        if getattr(self, "_persistent_pool_bundle", None) is not None:
+            return disabled_l3_layout(
+                "Persistent Mooncake pages require generation manifest resolution",
+                backend="mooncake",
+                page_size=page_size,
+            )
         pools = []
         layout = {
             "enabled": True,
@@ -1208,7 +1236,226 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         )
         return {k: ed[k] for k in keys if ed.get(k) is not None}
 
-    def batch_exists_v2(
+    def configure_persistent_pool_bundle(self, plan):
+        """Enable generation commits only for the controller's actual native plan."""
+        from sglang.srt.mem_cache.storage.dsv41_pool_bundle import Dsv41PoolBundle
+
+        bundle = Dsv41PoolBundle.from_plan(plan)
+        previous = getattr(self, "_persistent_pool_bundle", None)
+        if previous is not None and previous != bundle:
+            raise ValueError("Cannot change an active persistent Mooncake bundle")
+        sizes = {}
+        for name in bundle.names:
+            pool = self.registered_pools.get(name)
+            if pool is None:
+                raise ValueError(f"Unregistered persistent Mooncake pool: {name}")
+            indices = torch.arange(pool.page_size or 1, dtype=torch.int64, device="cpu")
+            _, page_sizes = self._build_pool_buffer_meta(
+                pool, indices, ["bundle-page"], 1, None
+            )
+            sizes[name] = self._bundle_buffer_size(page_sizes[0])
+            if sizes[name] <= 0:
+                raise ValueError("Persistent Mooncake pages must have physical bytes")
+        self._persistent_pool_bundle = bundle
+        self._persistent_pool_bundle_sizes = sizes
+        self._persistent_pool_bundle_namespace = json.dumps(
+            [self.config_prefix, self.mla_suffix], separators=(",", ":")
+        )
+
+    @staticmethod
+    def _bundle_buffer_size(sizes):
+        return sum(sizes) if isinstance(sizes, Sequence) else sizes
+
+    @staticmethod
+    def _bundle_buffer_sha256(ptrs, sizes):
+        if not isinstance(ptrs, Sequence):
+            ptrs, sizes = [ptrs], [sizes]
+        digest = hashlib.sha256()
+        for ptr, size in zip(ptrs, sizes, strict=True):
+            digest.update(ctypes.string_at(ptr, size))
+        return digest.hexdigest()
+
+    def _split_bundle_transfers(self, transfers):
+        bundle = self._persistent_pool_bundle
+        required = [t for t in transfers if t.name in bundle.names]
+        ordinary = [t for t in transfers if t.name not in bundle.names]
+        if not required:
+            return {}, ordinary
+        if (
+            len(required) != len(bundle.names)
+            or {str(t.name) for t in required} != set(bundle.names)
+            or any(t.hit_policy != PoolHitPolicy.ALL_PAGES for t in required)
+        ):
+            raise ValueError("Mooncake requires the complete persistent pool bundle")
+        return {str(t.name): t for t in required}, ordinary
+
+    def _load_persistent_manifest(self, key):
+        """Pin a complete generation; a publication hole is an ordinary miss.
+
+        put does not overwrite in Mooncake. The only replaceable key is this
+        manifest, never a generation object. Old generations remain readable.
+        """
+        bundle = self._persistent_pool_bundle
+        namespace = self._persistent_pool_bundle_namespace
+        manifest_key = bundle.manifest_key(key, namespace)
+        try:
+            size = self.store.get_size(manifest_key)
+            if not 0 < size <= 16384:
+                return None
+            payload = self.store.get(manifest_key)
+            if not isinstance(payload, bytes) or len(payload) != size:
+                return None
+            manifest = bundle.decode_manifest(payload, key)
+            if manifest is None:
+                return None
+            for name, obj in manifest["objects"].items():
+                if (
+                    obj["size"] != self._persistent_pool_bundle_sizes[name]
+                    or self.store.get_size(
+                        bundle.object_key(key, namespace, manifest["generation"], name)
+                    )
+                    != obj["size"]
+                ):
+                    return None
+            return manifest
+        except Exception:
+            logger.warning(
+                "Unable to resolve persistent Mooncake bundle", exc_info=True
+            )
+            return None
+
+    def batch_exists_v2(self, keys, pool_transfers=None, extra_info=None):
+        if getattr(self, "_persistent_pool_bundle", None) is None:
+            return self._batch_exists_v2_legacy(keys, pool_transfers, extra_info)
+        required, ordinary = self._split_bundle_transfers(pool_transfers or [])
+        if not required:
+            return self._batch_exists_v2_legacy(keys, ordinary, extra_info)
+        result = self._batch_exists_v2_legacy(keys, ordinary, extra_info)
+        boundary = 0
+        with self.request_context(**self._request_context_from_extra_info(extra_info)):
+            for key in keys:
+                if self._load_persistent_manifest(key) is None:
+                    break
+                boundary += 1
+        hit_count = dict(result.extra_pool_hit_pages)
+        for name in required:
+            if boundary:
+                hit_count[name] = boundary
+        endpoints = [p for p in result.restorable_prefix_pages if p <= boundary]
+        return PoolTransferResult(
+            endpoints[-1] if endpoints else 0, hit_count, endpoints
+        )
+
+    def _batch_io_v2(self, transfers, is_set, session_id=None):
+        if getattr(self, "_persistent_pool_bundle", None) is None:
+            return self._batch_io_v2_legacy(transfers, is_set, session_id)
+        required, ordinary = self._split_bundle_transfers(transfers)
+        results = self._batch_io_v2_legacy(ordinary, is_set, session_id)
+        if not required:
+            return results
+        bundle = self._persistent_pool_bundle
+        namespace = self._persistent_pool_bundle_namespace
+        keys = next(iter(required.values())).keys
+        metadata = {}
+        for name in bundle.names:
+            transfer = required[name]
+            pool = self.registered_pools[name]
+            if (
+                not keys
+                or transfer.keys != keys
+                or transfer.host_indices is None
+                or len(transfer.host_indices) != len(keys) * (pool.page_size or 1)
+            ):
+                raise ValueError("Persistent Mooncake pool keys/indices must align")
+            metadata[name] = self._build_pool_buffer_meta(
+                pool, transfer.host_indices, keys, 1, None
+            )
+            if any(
+                self._bundle_buffer_size(size)
+                != self._persistent_pool_bundle_sizes[name]
+                for size in metadata[name][1]
+            ):
+                raise ValueError("Persistent Mooncake physical page geometry changed")
+        success = []
+        for index, key in enumerate(keys):
+            manifest = self._load_persistent_manifest(key)
+            if is_set and manifest is not None:
+                success.append(True)
+                continue
+            if not is_set and manifest is None:
+                success.append(False)
+                continue
+            generation = uuid.uuid4().hex if is_set else manifest["generation"]
+            objects = {}
+            object_keys, ptrs, sizes = [], [], []
+            for name in bundle.names:
+                ptr, size = metadata[name][0][index], metadata[name][1][index]
+                object_keys.append(bundle.object_key(key, namespace, generation, name))
+                ptrs.append(ptr)
+                sizes.append(size)
+                if is_set:
+                    objects[name] = dict(
+                        size=self._bundle_buffer_size(size),
+                        sha256=self._bundle_buffer_sha256(ptr, size),
+                    )
+            if any(isinstance(ptr, Sequence) for ptr in ptrs):
+                ptrs = [list(p) if isinstance(p, Sequence) else [p] for p in ptrs]
+                sizes = [list(s) if isinstance(s, Sequence) else [s] for s in sizes]
+            if is_set:
+                group_ids = (
+                    [self._make_group_id(self._tag_keys([key])[0])] * len(object_keys)
+                    if self._can_use_group_semantics()
+                    else None
+                )
+                statuses = self._put_batch_zero_copy_impl(
+                    object_keys,
+                    ptrs,
+                    sizes,
+                    group_ids,
+                    session_ids=(
+                        [session_id] * len(object_keys)
+                        if session_id and self._supports_session_ids
+                        else None
+                    ),
+                )
+                complete = len(statuses) == len(object_keys) and all(
+                    s == 0 for s in statuses
+                )
+                complete = complete and all(
+                    self.store.get_size(obj_key) == self._bundle_buffer_size(size)
+                    for obj_key, size in zip(object_keys, sizes, strict=True)
+                )
+                if not complete:
+                    success.append(False)
+                    continue
+                # A concurrent complete writer is a valid canonical winner.
+                if self._load_persistent_manifest(key) is None:
+                    payload = bundle.encode_manifest(key, generation, objects)
+                    manifest_key = bundle.manifest_key(key, namespace)
+                    self.store.remove(manifest_key, force=True)
+                    self.store.put(manifest_key, payload)
+                # Never treat put(0) as proof of replacement: SDK puts are immutable.
+                success.append(self._load_persistent_manifest(key) is not None)
+            else:
+                statuses = self._get_batch_zero_copy_impl(object_keys, ptrs, sizes)
+                complete = len(statuses) == len(object_keys) and all(
+                    status == self._bundle_buffer_size(size)
+                    for status, size in zip(statuses, sizes, strict=True)
+                )
+                if complete:
+                    complete = all(
+                        self._bundle_buffer_sha256(ptr, size)
+                        == manifest["objects"][name]["sha256"]
+                        for name, ptr, size in zip(
+                            bundle.names, ptrs, sizes, strict=True
+                        )
+                    )
+                success.append(complete)
+        for name in required:
+            results[required[name].name] = list(success)
+        return results
+
+    def _batch_exists_v2_legacy(
         self,
         keys: List[str],
         pool_transfers: Optional[List[PoolTransfer]] = None,
@@ -1302,7 +1549,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         final_pages = restorable[-1] if restorable else 0
         return PoolTransferResult(final_pages, hit_count, restorable)
 
-    def _batch_io_v2(
+    def _batch_io_v2_legacy(
         self,
         transfers: List[PoolTransfer],
         is_set: bool,
@@ -1394,6 +1641,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             io_results = self._get_batch_zero_copy_impl(
                 all_key_strs, all_ptrs, all_sizes
             )
+            # The native get API returns bytes copied per object, including
+            # the sum of scatter buffers. A positive short read has already
+            # modified part of L2, but must never publish that page as complete.
+            if len(io_results) != len(all_sizes):
+                logger.error("Mooncake v2 get returned an unexpected object count")
+                io_results = [-1] * len(all_sizes)
+            else:
+                io_results = [
+                    (
+                        result
+                        if result == (sum(size) if isinstance(size, Sequence) else size)
+                        else -1
+                    )
+                    for result, size in zip(io_results, all_sizes)
+                ]
 
         results: dict = {}
         for name, key_multiplier, start, end in prepared:
@@ -1874,9 +2136,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return len(query_keys) // key_multiplier
 
     def close(self):
-        # MooncakeDistributedStore will automatically call the destructor, so
-        # it is unnecessary to close it manually.
-        pass
+        # Preserve legacy clients' destructor-managed lifecycle. In particular,
+        # a borrowed RDMA engine can also carry live PD transfers. Only the new
+        # namespaced native DSV4 TCP client has explicit close ownership here.
+        if not getattr(self, "_owns_dsv4_tcp_client", False) or getattr(
+            self, "_borrows_transfer_engine", False
+        ):
+            return
+        store = getattr(self, "store", None)
+        if store is None:
+            return
+        result = store.close()
+        if result != 0:
+            raise RuntimeError(f"Mooncake Store close failed with error code {result}")
+        self.store = None
+        getattr(self, "registered_pools", {}).clear()
 
     def clear(self) -> None:
         self.store.remove_all()

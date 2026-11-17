@@ -19,9 +19,9 @@ use crate::unified_lru_list::{TlruFloatConfig, TlruPromptEstimate};
 use crate::unified_tree_core::KvCacheEvent;
 use crate::unified_tree_core::{
     BufferBackupSnapshot, BufferBackupState, CacheAction, CacheActions, CacheInitParams,
-    CacheTransferPhase, DecLockRefParams, EvictLayer, EvictionStepResult, InsertParams,
-    InsertResult, InsertStepResult, MatchPrefixParams, MatchResult, PoolHitPolicy, PoolName,
-    PoolTransfer, PoolTransferResult, Req, UnifiedTreeCore,
+    CacheTransferPhase, DecLockRefParams, EvictLayer, EvictionStepResult, HostReclaimCandidate,
+    InsertParams, InsertResult, InsertStepResult, MatchPrefixParams, MatchResult, PoolHitPolicy,
+    PoolName, PoolTransfer, PoolTransferResult, Req, UnifiedTreeCore,
 };
 
 /// Translate only Rust panics; ordinary Python errors pass through unchanged.
@@ -2015,6 +2015,26 @@ macro_rules! tree_core_methods {
                 })
             }
 
+            fn snapshot_host_reclaim(&self, py: Python<'_>, excluded: Vec<NodeId>)
+                -> PyResult<Vec<HostReclaimCandidate>> {
+                py.detach(|| self.core().snapshot_host_reclaim(&excluded)).map_err(node_access_error)
+            }
+
+            fn validate_host_reclaim(&self, py: Python<'_>, candidates: Vec<HostReclaimCandidate>) -> bool {
+                py.detach(|| self.core().validate_host_reclaim(&candidates))
+            }
+
+            fn commit_host_reclaim(&self, py: Python<'_>, candidates: Vec<HostReclaimCandidate>)
+                -> PyResult<Option<HostEvictionResultBinding>> {
+                let result = py.detach(|| self.core().commit_host_reclaim(&candidates));
+                result.map(|result| Ok(HostEvictionResultBinding {
+                    tracker: tracker_to_py(result.tracker),
+                    new_device_frees: frees_to_py(py, result.device_frees)?,
+                    new_host_frees: frees_to_py(py, result.host_frees)?,
+                    cache_actions: cache_actions_to_py(py, result.cache_actions)?,
+                })).transpose()
+            }
+
             /// Evict up to num_tokens of one component's host resources.
             fn drive_host_eviction(
                 &self,
@@ -3385,6 +3405,20 @@ macro_rules! tree_core_binding {
             /// Release a node's device KV once its host copy exists.
             fn demote(&self, py: Python<'_>, node_id: NodeId) -> PyResult<DemoteResultBinding> {
                 catch_native_panic(|| self.inner.demote(py, node_id))
+            }
+
+            fn snapshot_host_reclaim(&self, py: Python<'_>, excluded: Vec<NodeId>)
+                -> PyResult<Vec<HostReclaimCandidate>> {
+                catch_native_panic(|| self.inner.snapshot_host_reclaim(py, excluded))
+            }
+
+            fn validate_host_reclaim(&self, py: Python<'_>, candidates: Vec<HostReclaimCandidate>) -> PyResult<bool> {
+                catch_native_panic(|| Ok(self.inner.validate_host_reclaim(py, candidates)))
+            }
+
+            fn commit_host_reclaim(&self, py: Python<'_>, candidates: Vec<HostReclaimCandidate>)
+                -> PyResult<Option<HostEvictionResultBinding>> {
+                catch_native_panic(|| self.inner.commit_host_reclaim(py, candidates))
             }
 
             /// Evict up to num_tokens of one component's host resources.
