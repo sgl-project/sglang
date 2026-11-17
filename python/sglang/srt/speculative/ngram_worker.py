@@ -10,11 +10,12 @@ from sglang.kernels.ops.speculative.cache_locs import (
 from sglang.kernels.ops.speculative.reconstruct_tree import (
     reconstruct_indices_from_tree_mask_func,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import (
     get_device,
@@ -25,6 +26,11 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.eagle_utils import eagle_sample
+from sglang.srt.speculative.eagle_worker_common import (
+    STOCK_SPECULATIVE_RUNTIME_HOOKS,
+    bind_eagle_runtime_hooks,
+    make_post_verify_io,
+)
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
@@ -74,6 +80,8 @@ def _derive_tree_links(
 
 
 class NGRAMWorker(BaseSpecWorker):
+    _speculative_runtime_hooks = STOCK_SPECULATIVE_RUNTIME_HOOKS
+
     def alloc_memory_pool(self, **kwargs):
         # The target memory pool does not exist yet when __init__ runs.
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
@@ -92,7 +100,6 @@ class NGRAMWorker(BaseSpecWorker):
         super().__init__()
 
         self.server_args = server_args
-        self.enable_overlap = not get_schedule().disable_overlap_schedule
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.page_size = get_schedule().page_size
@@ -150,6 +157,12 @@ class NGRAMWorker(BaseSpecWorker):
     def clear_cache_pool(self):
         self.ngram_corpus.reset()
         self._prev_decode_rids = set()
+
+    def init_attention_backends(self):
+        super().init_attention_backends()
+        self._speculative_runtime_hooks = bind_eagle_runtime_hooks(
+            self.target_worker, supports_sharded_verify=False
+        )
 
     def add_external_corpus(self, corpus_id: str, token_chunks: list[list[int]]) -> int:
         return self.ngram_corpus.load_external_corpus_named(corpus_id, token_chunks)
@@ -235,12 +248,9 @@ class NGRAMWorker(BaseSpecWorker):
         bs = len(batch.reqs)
         stride = self.draft_token_num
 
-        # Overlap mode processes results one iteration behind, so the last
-        # round's accepted tokens are not yet in req.output_ids and must be
-        # spliced in from spec_info. Sync mode and grammar batches process
-        # results before the next draft prep, so output_ids is already
-        # complete and splicing would duplicate the tail.
-        use_prev_tokens = self.enable_overlap and not batch.grammar_needs_sync()
+        # Splice the last round's accepted tokens until its result is processed;
+        # this launch is counted, so a count above one means it is not yet.
+        pending = [req.inflight_steps > 1 for req in batch.reqs]
 
         # Accept-independent prep, hoisted above the blocking .cpu() below.
         req_ids = [req.rid for req in batch.reqs]
@@ -259,7 +269,7 @@ class NGRAMWorker(BaseSpecWorker):
             for req in batch.reqs
         ]
 
-        if use_prev_tokens:
+        if any(pending):
             prev_token_ids, prev_accept_lens = (
                 batch.spec_info.accept_tokens,
                 batch.spec_info.accept_lens,
@@ -270,7 +280,9 @@ class NGRAMWorker(BaseSpecWorker):
             # Worker-level staging: written here at draft prep, consumed by
             # _update_ngram_corpus after verify within the same forward call.
             self.prev_token_ids = prev_token_ids.tolist()
-            self.prev_accept_lens = prev_accept_lens.tolist()
+            self.prev_accept_lens = [
+                n if p else 0 for n, p in zip(prev_accept_lens.tolist(), pending)
+            ]
             assert bs == len(self.prev_accept_lens)
         else:
             # _update_ngram_corpus still reads the staging; fill it empty.
@@ -281,11 +293,9 @@ class NGRAMWorker(BaseSpecWorker):
         batch_tokens = []
         total_lens = []
         for i in range(bs):
-            prev_tokens = (
-                self.prev_token_ids[i * stride : i * stride + self.prev_accept_lens[i]]
-                if use_prev_tokens
-                else []
-            )
+            prev_tokens = self.prev_token_ids[
+                i * stride : i * stride + self.prev_accept_lens[i]
+            ]
             check_token = self._efficient_concat_last_n(
                 input_tails[i],
                 output_tails[i] + prev_tokens,
@@ -396,20 +406,15 @@ class NGRAMWorker(BaseSpecWorker):
     def _update_ngram_corpus(self, batch: ScheduleBatch):
         batch_tokens = []
         i, stride = 0, self.draft_token_num
-        # Same splice condition as _prepare_draft_tokens: only overlap mode
-        # has accepted tokens missing from req.output_ids.
-        use_prev_tokens = self.enable_overlap and not batch.grammar_needs_sync()
         for req in batch.reqs:
             # FIXME: Whether to insert 'extend' into the cache or not, after testing,
             # there is not much difference, so we will not insert it for now.
             # if batch.forward_mode.is_extend():
             #     put_ids = req.origin_input_ids + req.output_ids
             # else:
-            prev_tokens = (
-                self.prev_token_ids[i * stride : i * stride + self.prev_accept_lens[i]]
-                if use_prev_tokens
-                else []
-            )
+            prev_tokens = self.prev_token_ids[
+                i * stride : i * stride + self.prev_accept_lens[i]
+            ]
             put_ids = self._efficient_concat_last_n(
                 list(req.origin_input_ids_unpadded[-self.max_trie_depth :]),
                 list(req.output_ids[-self.max_trie_depth :]) + prev_tokens,
@@ -472,17 +477,38 @@ class NGRAMWorker(BaseSpecWorker):
             maybe_detect_inf(
                 logits_output.next_token_logits, "verify: target model logits"
             )
-            (
-                predict,
-                accept_lens,
-                accept_index,
-            ) = eagle_sample(
-                verify_input,
-                batch,
-                logits_output,
-                grammar_mask,
-                watermark_state=self.model_runner.watermark_state,
-            )
+            if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+                post_verify_output = self._speculative_runtime_hooks.post_verify(
+                    make_post_verify_io(
+                        verify_input=verify_input,
+                        sampling_info=batch.sampling_info,
+                        sequence_lengths=batch.seq_lens,
+                        request_pool_indices=batch.req_pool_indices,
+                        device=batch.device,
+                        logits_output=logits_output,
+                        grammar_mask=grammar_mask,
+                        watermark=self.model_runner.watermark_state,
+                        # NGRAM watermark contexts use the full-mask layout.
+                        watermark_full_mask=True,
+                        return_logprob=batch.return_logprob,
+                        is_idle=batch.forward_mode.is_idle(),
+                    )
+                )
+                predict = post_verify_output.token_ids
+                accept_lens = post_verify_output.accepted_lengths
+                accept_index = post_verify_output.accepted_indices
+            else:
+                (
+                    predict,
+                    accept_lens,
+                    accept_index,
+                ) = eagle_sample(
+                    verify_input,
+                    batch,
+                    logits_output,
+                    grammar_mask,
+                    watermark_state=self.model_runner.watermark_state,
+                )
             new_seq_lens = batch.seq_lens + accept_lens
             commit_mamba_states_after_verify(
                 self.target_worker,

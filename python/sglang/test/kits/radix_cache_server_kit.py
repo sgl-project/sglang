@@ -3,17 +3,15 @@ import random
 import requests
 
 
-def gen_radix_tree(num_nodes=400, chunk_len=256):
+def gen_radix_tree(num_nodes=400, chunk_len=256, rng=random):
     num0 = num_nodes // 2
     num1 = num_nodes - num0
     nodes = [{"input_ids": [37] * 117, "decode_len": 217}]
     for _ in range(num0):
-        parent = random.choice(nodes)
-        unique_len = random.randint(0, chunk_len)
-        decode_len = random.randint(0, chunk_len)
-        token_id = random.randint(
-            0, 31999
-        )  # randint is inclusive; vocab_size-1 = 31999
+        parent = rng.choice(nodes)
+        unique_len = rng.randint(0, chunk_len)
+        decode_len = rng.randint(0, chunk_len)
+        token_id = rng.randint(0, 31999)  # randint is inclusive; vocab_size-1 = 31999
         child = {
             "input_ids": parent["input_ids"] + [token_id] * unique_len,
             "decode_len": decode_len,
@@ -21,12 +19,12 @@ def gen_radix_tree(num_nodes=400, chunk_len=256):
         nodes.append(child)
 
     while num1 > 0:
-        num_branch = random.randint(1, min(num1, 10))
-        parent = random.choice(nodes)
+        num_branch = rng.randint(1, min(num1, 10))
+        parent = rng.choice(nodes)
         for _ in range(num_branch):
-            unique_len = random.randint(0, chunk_len)
-            decode_len = random.randint(0, chunk_len)
-            token_id = random.randint(
+            unique_len = rng.randint(0, chunk_len)
+            decode_len = rng.randint(0, chunk_len)
+            token_id = rng.randint(
                 0, 31999
             )  # randint is inclusive; vocab_size-1 = 31999
             child = {
@@ -37,12 +35,13 @@ def gen_radix_tree(num_nodes=400, chunk_len=256):
 
         num1 -= num_branch
 
-    random.shuffle(nodes)
+    rng.shuffle(nodes)
     return nodes
 
 
-def run_radix_attention_test(base_url: str):
-    nodes = gen_radix_tree()
+def run_radix_attention_test(base_url: str, num_nodes=400, seed=None):
+    rng = random if seed is None else random.Random(seed)
+    nodes = gen_radix_tree(num_nodes=num_nodes, rng=rng)
     data = {
         "input_ids": [node["input_ids"] for node in nodes],
         "sampling_params": [

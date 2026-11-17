@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import (
     List,
+    Optional,
     Tuple,
 )
 
@@ -326,9 +327,20 @@ class SchedulerLogprobResultProcessor:
         output: LogitsProcessorOutput,
     ):
         """Attach logprobs to the return values."""
-        if output.next_token_logprobs is not None:
-            req.logprob.output_token_logprobs_val.append(output.next_token_logprobs[i])
-            req.logprob.output_token_logprobs_idx.append(next_token_ids[i])
+        self.append_output_token_logprobs(
+            req,
+            next_token_ids[i],
+            (
+                output.next_token_logprobs[i]
+                if output.next_token_logprobs is not None
+                else None
+            ),
+            row=i,
+            top_logprobs_val=output.next_token_top_logprobs_val,
+            top_logprobs_idx=output.next_token_top_logprobs_idx,
+            token_ids_logprobs_val=output.next_token_token_ids_logprobs_val,
+            token_ids_logprobs_idx=output.next_token_token_ids_logprobs_idx,
+        )
 
         # Only add input logprobs if there are input tokens to process
         # Note: For prefill-only requests with default logprob_start_len, this will be 0,
@@ -345,34 +357,39 @@ class SchedulerLogprobResultProcessor:
         else:
             self._initialize_empty_logprob_containers(req)
 
-        if (
-            req.logprob.top_logprobs_num > 0
-            and output.next_token_top_logprobs_val is not None
-        ):
-            # Guarded like next_token_logprobs above: a backend may leave the
-            # top-logprob fields unset even for a request that asked for them
-            # (indexing None raises TypeError).
-            req.logprob.output_top_logprobs_val.append(
-                output.next_token_top_logprobs_val[i]
-            )
-            req.logprob.output_top_logprobs_idx.append(
-                output.next_token_top_logprobs_idx[i]
-            )
+        return num_input_logprobs
 
+    @staticmethod
+    def append_output_token_logprobs(
+        req: Req,
+        token_id: int,
+        logprob: Optional[float],
+        *,
+        row: int = 0,
+        top_logprobs_val: Optional[list] = None,
+        top_logprobs_idx: Optional[list] = None,
+        token_ids_logprobs_val: Optional[list] = None,
+        token_ids_logprobs_idx: Optional[list] = None,
+    ) -> None:
+        """Append one output token's logprobs; list arguments are read at `row`,
+        and None (a backend may leave a field unset) appends nothing."""
+        if logprob is not None:
+            req.logprob.output_token_logprobs_val.append(logprob)
+            req.logprob.output_token_logprobs_idx.append(token_id)
+        if req.logprob.top_logprobs_num > 0 and top_logprobs_val is not None:
+            req.logprob.output_top_logprobs_val.append(top_logprobs_val[row])
+            req.logprob.output_top_logprobs_idx.append(top_logprobs_idx[row])
         if (
             req.logprob.token_ids_logprob is not None
-            and output.next_token_token_ids_logprobs_val is not None
+            and token_ids_logprobs_val is not None
         ):
-            # Convert GPU tensor to list if needed
-            logprobs_val = output.next_token_token_ids_logprobs_val[i]
+            logprobs_val = token_ids_logprobs_val[row]
             if isinstance(logprobs_val, torch.Tensor):
                 logprobs_val = logprobs_val.tolist()
             req.logprob.output_token_ids_logprobs_val.append(logprobs_val)
             req.logprob.output_token_ids_logprobs_idx.append(
-                output.next_token_token_ids_logprobs_idx[i]
+                token_ids_logprobs_idx[row]
             )
-
-        return num_input_logprobs
 
     def _initialize_empty_logprob_containers(self, req: Req) -> None:
         """
