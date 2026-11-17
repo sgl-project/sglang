@@ -9,6 +9,7 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -131,6 +132,10 @@ class TestSchedulePolicyHRRN(CustomTestCase):
 
 class TestShortestPrefillFirst(CustomTestCase):
     def setUp(self):
+        # The chunk reservation reads the encoder replay flag.
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
         self.policy = SchedulePolicy(
             policy="shortest-prefill-first",
             tree_cache=RadixCache.create_simulated(),
