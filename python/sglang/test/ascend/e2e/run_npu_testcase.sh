@@ -120,6 +120,11 @@ cp -r "${sglang_source_path}/python/sglang/test" "${test_util_path}"
 rm -rf "${test_util_path}/ci"
 cp -r "${sglang_source_path}/scripts/ci/npu/compat/ci" "${test_util_path}/ci"
 
+# The image predates the hf_transformers_patches refactor, but the test layer
+# imports this stdlib-only module (apply_all_hf_patches) at import time.
+cp -f "${sglang_source_path}/python/sglang/srt/utils/hf_transformers_patches.py" \
+  "${sglang_pkg_path}/sglang/srt/utils/hf_transformers_patches.py"
+
 # set environment of cann
 . /usr/local/Ascend/cann/set_env.sh
 . /usr/local/Ascend/nnal/atb/set_env.sh
