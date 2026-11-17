@@ -595,6 +595,9 @@ def merge_and_chunk_segments(
     Returns:
         (seg_weight_indices, seg_lens): Merged and chunked segments.
     """
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+
     seg_weight_indices: List[int] = []
     seg_lens: List[int] = []
     for wi, pl in zip(weight_indices, pruned_lens):
@@ -635,6 +638,11 @@ def build_lm_head_pass_segments(
     Returns:
         List of (seg_weight_indices, seg_lens) tuples, one per pass.
     """
+    if logprobs_chunk_size <= 0:
+        raise ValueError(
+            f"logprobs_chunk_size must be positive, got {logprobs_chunk_size}"
+        )
+
     # Expand to per-token weight index
     token_wi: List[int] = []
     for wi, pl in zip(weight_indices, pruned_lens):
