@@ -365,11 +365,6 @@ def kda_extend_in_graph(
             [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
         )
     )
-    if meta.num_tokens < KDA_CHUNK_SIZE:
-        # FlashInfer's short-seq prefill lets NaN in stale pad rows reach real rows.
-        pad_rows = meta.token_index >= meta.num_logical_tokens
-        for x in (q, k, v):
-            x.masked_fill_(pad_rows.view(-1, 1), 0)
     q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)
     k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
     v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
