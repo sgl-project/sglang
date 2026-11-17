@@ -82,7 +82,7 @@ pub(super) fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> 
     // Python `TokenizerManager._validate_one_request`.
     // A request above the server's mode raises in a CUDA graph captured for the lower mode.
     let requested = match &req.kind {
-        RequestKind::Generate(g) if g.return_hidden_states => HiddenStatesMode::Full,
+        RequestKind::Generate(g) => g.return_hidden_states,
         _ => HiddenStatesMode::Null,
     };
     if requested > limits.return_hidden_states_mode {

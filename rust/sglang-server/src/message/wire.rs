@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use sglang_api_types::api::v1 as api;
 
+use super::config::HiddenStatesMode;
 use super::multimodal::{MediaHints, MmDataInput, MmItem};
 use super::request::GenerateRequest;
 use super::sampling::{CustomParamValue, SamplingParams, WatermarkRequestConfig};
@@ -44,11 +45,12 @@ pub fn bool_or_list(v: api::BoolOrList) -> Option<OneOrMany<bool>> {
 /// so a string anywhere refuses the request, and is never read as a bool.
 pub fn return_hidden_states_or_list(
     v: api::BoolOrStringOrList,
-) -> Result<Option<OneOrMany<bool>>, Error> {
+) -> Result<Option<OneOrMany<HiddenStatesMode>>, Error> {
     use api::bool_or_string::Value as Mode;
     use api::bool_or_string_or_list::Value;
     let flag = |mode: api::BoolOrString| match mode.value {
-        Some(Mode::Flag(on)) => Ok(on),
+        Some(Mode::Flag(true)) => Ok(HiddenStatesMode::Full),
+        Some(Mode::Flag(false)) => Ok(HiddenStatesMode::Null),
         Some(Mode::Mode(mode)) if mode == "last" => Err(Error::Validation(
             "return_hidden_states \"last\" is not supported by the Rust server".into(),
         )),
@@ -56,7 +58,7 @@ pub fn return_hidden_states_or_list(
             "return_hidden_states must be a boolean or \"last\", got {mode:?}"
         ))),
         // JSON always carries a value; only a protobuf client can leave it unset.
-        None => Ok(false),
+        None => Ok(HiddenStatesMode::Null),
     };
     v.value
         .map(|v| match v {

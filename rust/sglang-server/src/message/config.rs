@@ -946,8 +946,9 @@ pub enum DisaggregationMode {
 
 /// How much of the hidden states a request asks for or a server allows,
 /// ordered like Python's `CaptureHiddenMode`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum HiddenStatesMode {
+    #[default]
     Null,
     Last,
     Full,
@@ -960,6 +961,17 @@ impl DisaggregationMode {
             Self::Null => "null",
             Self::Prefill => "prefill",
             Self::Decode => "decode",
+        }
+    }
+}
+
+/// Python's `ReturnHiddenStatesMode`: `false`, `"last"` or `true`.
+impl Serialize for HiddenStatesMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Null => serializer.serialize_bool(false),
+            Self::Last => serializer.serialize_str("last"),
+            Self::Full => serializer.serialize_bool(true),
         }
     }
 }

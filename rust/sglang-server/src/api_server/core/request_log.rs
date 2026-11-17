@@ -768,7 +768,10 @@ fn typed_fields(request: &GenerateRequest) -> Map<String, Value> {
         set("return_text_in_logprobs", value.into());
     }
     set("stream", request.stream.into());
-    set("return_hidden_states", request.return_hidden_states.into());
+    set(
+        "return_hidden_states",
+        serde_json::json!(request.return_hidden_states),
+    );
     set("bootstrap_host", request.bootstrap_host.clone().into());
     set("bootstrap_port", request.bootstrap_port.into());
     set("bootstrap_room", request.bootstrap_room.into());

@@ -16,7 +16,7 @@ use super::response::ResponseSink;
 use super::sampling::SamplingParams;
 use super::types::{OneOrMany, OneOrManyItem, TokenIds};
 use super::wire;
-use crate::message::config::ServerArgs;
+use crate::message::config::{HiddenStatesMode, ServerArgs};
 use crate::message::ids::Rid;
 use crate::utils::fsm::RequestState;
 use crate::utils::{environ::env_i64, error::Error};
@@ -516,7 +516,7 @@ pub fn into_requests(
                 token_ids_logprob: token_ids_logprob.filter(|ids| !ids.is_empty()),
                 // A client that asks for the mask is refused above.
                 return_sampling_mask: false,
-                return_hidden_states: return_hidden_states.unwrap_or(false),
+                return_hidden_states: return_hidden_states.unwrap_or_default(),
                 return_text_in_logprobs,
                 bootstrap_host,
                 bootstrap_port,
@@ -714,7 +714,7 @@ pub struct GenerateRequest {
     /// Rides the ring as the `token_ids_logprob` buffer, nil in the header.
     pub token_ids_logprob: Option<TokenIds>,
     pub return_sampling_mask: bool,
-    pub return_hidden_states: bool,
+    pub return_hidden_states: HiddenStatesMode,
     /// Decode logprob token ids to text in each `[logprob, token_id, text]` tuple
     /// (default leaves the text slot null). Deliberately NOT in the scheduler
     /// header — Python's `TokenizedGenerateReqInput` has no such field either;
@@ -1014,6 +1014,11 @@ pub(super) trait HeapBytes {
     fn heap_bytes(&self) -> usize;
 }
 impl HeapBytes for bool {
+    fn heap_bytes(&self) -> usize {
+        0
+    }
+}
+impl HeapBytes for HiddenStatesMode {
     fn heap_bytes(&self) -> usize {
         0
     }
@@ -1513,7 +1518,7 @@ mod tests {
             r#"return_hidden_states must be a boolean or "last", got "full""#
         );
         let (ps, _) = requests(r#"{"text": "hi", "return_hidden_states": true}"#).unwrap();
-        assert!(ps[0].return_hidden_states);
+        assert_eq!(ps[0].return_hidden_states, HiddenStatesMode::Full);
     }
 
     /// Client-supplied rid semantics mirror Python's `_normalize_batch`: a
@@ -1786,7 +1791,8 @@ mod tests {
         assert!(!ps[1].return_logprob);
         assert_eq!(ps[0].logprob_start_len, 0);
         assert_eq!(ps[1].logprob_start_len, 2);
-        assert!(ps[1].return_hidden_states);
+        assert_eq!(ps[0].return_hidden_states, HiddenStatesMode::Null);
+        assert_eq!(ps[1].return_hidden_states, HiddenStatesMode::Full);
 
         let err = requests(r#"{"text": ["a", "b"], "return_logprob": [true]}"#).unwrap_err();
         assert!(

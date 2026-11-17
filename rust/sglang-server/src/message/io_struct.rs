@@ -6,6 +6,7 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use super::config::HiddenStatesMode;
 use super::request::GenerateRequest;
 use super::sampling::SamplingParams;
 use super::types::{Tagged, control_messages, wire_struct};
@@ -33,7 +34,7 @@ wire_struct! {
         /// Not exposed by this server yet; the scheduler needs the slot filled.
         return_sampling_mask: bool,
         return_flat_raw_top_logprobs: bool,
-        return_hidden_states: bool,
+        return_hidden_states: HiddenStatesMode,
         /// Filler block (not exposed by this server yet): default/nil slots so
         /// the PD fields below land on their Python wire indices (25–31).
         return_routed_experts: bool,
@@ -1195,7 +1196,7 @@ mod tests {
             return_logprob: true,
             logprob_start_len: -1,
             top_logprobs_num: 3,
-            return_hidden_states: true,
+            return_hidden_states: HiddenStatesMode::Full,
             stream: true,
             ..Default::default()
         };
@@ -1275,6 +1276,28 @@ mod tests {
         let bytes = TokenizedGenerateReqInput::from(&radix).encode().unwrap();
         let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
         assert_eq!(val.as_array().unwrap()[20].as_str(), Some("s"));
+    }
+
+    /// The scheduler reads idx 16 as Python's `ReturnHiddenStatesMode`:
+    /// `false`, `true` (full) or the string `"last"`.
+    #[test]
+    fn header_return_hidden_states_is_bool_or_last() {
+        let slot = |mode| {
+            let req = GenerateRequest {
+                rid: "r1".into(),
+                input_ids: Some(vec![1]),
+                return_hidden_states: mode,
+                ..Default::default()
+            };
+            let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
+            let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+            let arr = val.as_array().expect("array");
+            assert_eq!(arr.len(), 47, "header ends at kv_hints");
+            arr[16].clone()
+        };
+        assert_eq!(slot(HiddenStatesMode::Null), rmpv::Value::from(false));
+        assert_eq!(slot(HiddenStatesMode::Full), rmpv::Value::from(true));
+        assert_eq!(slot(HiddenStatesMode::Last), rmpv::Value::from("last"));
     }
 
     /// Python's `KvHintsEnvelope` / `KvHintAction` are dict-shaped msgspec
