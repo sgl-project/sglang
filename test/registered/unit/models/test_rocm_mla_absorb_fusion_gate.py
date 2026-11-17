@@ -93,9 +93,6 @@ class TestFusedAbsorbGate(CustomTestCase):
 class TestAbsorbBmmConfig(CustomTestCase):
     def setUp(self):
         self.enterContext(envs.SGLANG_ROCM_ABSORB_BMM_MAX_WAVES_PER_EU.override(2))
-        self.enterContext(
-            envs.SGLANG_ROCM_ABSORB_BMM_DISABLE_HAND_CONFIG.override(False)
-        )
         self._saved = forward_mla_rocm._absorb_bmm_num_cu
         forward_mla_rocm._absorb_bmm_num_cu = 256
         self.addCleanup(
@@ -171,11 +168,6 @@ class TestAbsorbBmmConfig(CustomTestCase):
     def test_negative_compute_units_falls_back(self):
         forward_mla_rocm._absorb_bmm_num_cu = -1
         self.assertIsNone(_ABSORB_CONFIG(64, 256, 512))
-
-    def test_hand_config_can_be_disabled(self):
-        with envs.SGLANG_ROCM_ABSORB_BMM_DISABLE_HAND_CONFIG.override(True):
-            self.assertIsNone(_ABSORB_CONFIG(64, 256, 512))
-            self.assertIsNone(_ABSORB_CONFIG(16, 48, 512))
 
 
 _ROPE_HEAD_DIM = 64

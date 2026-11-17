@@ -176,8 +176,6 @@ def _absorb_bmm_config(heads: int, m: int, n: int) -> Optional[dict]:
     global _absorb_bmm_num_cu
     if m <= 0 or m > _ABSORB_BMM_DECODE_MAX_M:
         return None
-    if envs.SGLANG_ROCM_ABSORB_BMM_DISABLE_HAND_CONFIG.get():
-        return None
     if not _absorb_bmm_num_cu:
         _absorb_bmm_num_cu = get_device_core_count()
     num_cu = _absorb_bmm_num_cu

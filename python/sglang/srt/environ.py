@@ -1183,8 +1183,6 @@ class Envs:
     # A budget of four aborts compilation in the original gfx950 reproducer;
     # two avoids that failure. Zero disables the cap for tuning.
     SGLANG_ROCM_ABSORB_BMM_MAX_WAVES_PER_EU = EnvInt(2)
-    # Ignore the hand-tuned absorb-BMM config and let AITER choose its tuning.
-    SGLANG_ROCM_ABSORB_BMM_DISABLE_HAND_CONFIG = EnvBool(False)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
