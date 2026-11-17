@@ -29,7 +29,7 @@ def print_deprecated_warning(message: str):
     logger.warning(f"\033[1;33m{message}\033[0m")
 
 
-# Retiring a flag comes in four shapes, and which one you need depends on what
+# Retiring a flag comes in five shapes, and which one you need depends on what
 # the flag was and what replaced it:
 #
 #   * the flag is gone and there is no automatic translation
@@ -41,16 +41,19 @@ def print_deprecated_warning(message: str):
 #     valued flag whose one accepted value became a boolean
 #       -> `DeprecatedStoreConstAction` with `const_value=` (plus `nargs=None`
 #          and `choices=` for the latter);
+#   * an old valued flag whose every accepted value became its own boolean
+#       -> `DeprecatedChoiceToFlagAction` with `flags=`;
 #   * an old valued flag replaced by a renamed valued flag
 #       -> `DeprecatedAliasStoreAction`.
 #
-# The second and third have registrations today (`--disable-cuda-graph`,
-# `--enable-dp-attention`; `--monokernel-backend`). The other two are kept
-# because the shapes recur -- this package has retired flags of every one of
-# them -- and the fiddly parts (`nargs=0` on a boolean, where the const goes,
-# warn-and-continue versus `parser.error`) are what a reimplementation gets
-# wrong. Pass `new_flag=` so the warning tells the operator what to switch to;
-# that pointer is the whole point.
+# `DeprecatedAction` without `error_message=` (flags that became no-ops, e.g.
+# `--show-time-cost`), the second and the fourth have registrations today
+# (`--disable-cuda-graph`, `--enable-dp-attention`; `--monokernel-backend`).
+# The other shapes are kept because they recur -- this package has retired
+# flags of every one of them -- and the fiddly parts (`nargs=0` on a boolean,
+# where the const goes, warn-and-continue versus `parser.error`) are what a
+# reimplementation gets wrong. Pass `new_flag=` so the warning tells the
+# operator what to switch to; that pointer is the whole point.
 
 
 class DeprecatedAction(argparse.Action):
@@ -69,8 +72,8 @@ class DeprecatedAction(argparse.Action):
         if self.error_message is not None:
             parser.error(self.error_message)
         print_deprecated_warning(
-            f"The command line argument '{option_string}' is deprecated and "
-            "will be removed in future versions."
+            f"'{option_string}' is deprecated and has no effect. It will be "
+            "removed in a future release."
         )
 
 
@@ -131,6 +134,33 @@ class DeprecatedStoreConstAction(argparse.Action):
             f"release.{replacement}"
         )
         setattr(namespace, self.dest, self.const_value)
+
+
+class DeprecatedChoiceToFlagAction(argparse.Action):
+    """An old valued flag whose every accepted value became its own boolean.
+
+    `flags` maps each value to the (dest, new flag) it now sets; the old dest is
+    left unset, so it never reaches the config.
+    """
+
+    def __init__(self, option_strings, dest, flags, **kwargs):
+        self.flags = flags
+        super().__init__(
+            option_strings,
+            dest,
+            nargs=None,
+            choices=list(flags),
+            default=argparse.SUPPRESS,
+            **kwargs,
+        )
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        dest, new_flag = self.flags[values]
+        print_deprecated_warning(
+            f"'{option_string} {values}' is deprecated and will be removed in a "
+            f"future release. Use '{new_flag}' instead."
+        )
+        setattr(namespace, dest, True)
 
 
 class DeprecatedAliasStoreAction(argparse.Action):

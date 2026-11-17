@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use tch::Tensor;
 
 use super::*;
-use crate::components::{ComponentSet, FULL, MAMBA, SWA};
+use crate::components::{ComponentSet, FULL, Family, MAMBA, SWA, native_family};
 use crate::node::{NodeAccessError, ValueSlotIdx};
 use crate::test_utils::{accumulate_step, action_kinds, expect_action, matched_device_indices};
 
@@ -286,6 +286,10 @@ impl TreeComponent<Vec<i64>> for RecordingComponentForTest {
         SWA
     }
 
+    fn family(&self) -> Family {
+        native_family(self.component_type())
+    }
+
     fn refresh_lru(
         &self,
         _tree_core: &mut UnifiedTreeCore<Vec<i64>>,
@@ -408,6 +412,10 @@ impl TreeComponent<Vec<i64>> for CountingComponentForTest {
         SWA
     }
 
+    fn family(&self) -> Family {
+        native_family(self.component_type())
+    }
+
     fn refresh_lru(
         &self,
         _tree_core: &mut UnifiedTreeCore<Vec<i64>>,
@@ -499,6 +507,10 @@ impl TreeComponent<Vec<i64>> for LowPriorityComponentForTest {
         MAMBA
     }
 
+    fn family(&self) -> Family {
+        native_family(self.component_type())
+    }
+
     fn eviction_priority(&self, _is_leaf: bool) -> i64 {
         0
     }
@@ -578,6 +590,10 @@ struct SwaComponentForTest;
 impl TreeComponent<Vec<i64>> for SwaComponentForTest {
     fn component_type(&self) -> ComponentType {
         SWA
+    }
+
+    fn family(&self) -> Family {
+        native_family(self.component_type())
     }
 
     fn create_match_validator(
@@ -669,6 +685,10 @@ impl SwaEvictionComponentForTest {
 impl TreeComponent<Vec<i64>> for SwaEvictionComponentForTest {
     fn component_type(&self) -> ComponentType {
         SWA
+    }
+
+    fn family(&self) -> Family {
+        native_family(self.component_type())
     }
 
     fn eviction_priority(&self, is_leaf: bool) -> i64 {
@@ -2140,6 +2160,8 @@ fn insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'k, Vec<i
         namespace: Default::default(),
         value: Tensor::from_slice(value),
         mamba_value: None,
+        mamba_host_value: None,
+        allow_missing_mamba: false,
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
@@ -3130,6 +3152,57 @@ fn write_back_defers_swa_window_backup_until_eviction() {
 }
 
 #[test]
+fn buffer_only_insert_lists_each_unbacked_ancestor_once() {
+    for (buffer_only, inserted_len) in [(false, 0), (true, 0), (false, 2), (true, 2)] {
+        let mut tc = core();
+        // One node per token, so the path holds four unbacked nodes.
+        for n in 1..=4 {
+            let key: Vec<i64> = (0..n).collect();
+            tc.insert(&insert_params(&key, &key));
+        }
+        tc.set_hicache_enabled();
+        if buffer_only {
+            tc.set_host_memory_buffer_only();
+        }
+        tc.set_write_through_threshold(1);
+        let key: Vec<i64> = (0..5).collect();
+        let result = tc.insert(&InsertParams {
+            inserted_len,
+            ..insert_params(&key, &key)
+        });
+        let chains: Vec<Vec<NodeId>> = result
+            .cache_actions
+            .iter()
+            .filter_map(|action| action.as_any().downcast_ref::<BackupKV>())
+            .map(|backup| backup.node_ids.clone())
+            .collect();
+        let path: Vec<NodeId> = tc
+            .collect_path_info(&[result.last_device_node_id.unwrap()])
+            .unwrap()
+            .remove(0)
+            .iter()
+            .map(|node| node.node_id)
+            .collect();
+        // Nodes the request already inserted are not counted, so the first backup carries them.
+        let first = inserted_len + 1;
+        let expected: Vec<Vec<NodeId>> = if buffer_only {
+            // Later chains stop at the node the walk's previous backup ended on.
+            std::iter::once(path[..first].to_vec())
+                .chain(path[first..].iter().map(|&node| vec![node]))
+                .collect()
+        } else {
+            (first..=path.len())
+                .map(|len| path[..len].to_vec())
+                .collect()
+        };
+        assert_eq!(
+            chains, expected,
+            "buffer_only={buffer_only} inserted_len={inserted_len}"
+        );
+    }
+}
+
+#[test]
 fn backup_kv_action_stops_at_an_externally_stored_or_pending_ancestor() {
     let mut tc = core();
     tc.set_enable_external_cache_linker(true).unwrap();
@@ -3812,6 +3885,8 @@ fn bigram_insert_events_carry_pair_token_payloads() {
         namespace: Default::default(),
         value: Tensor::from_slice(&[10i64, 11]),
         mamba_value: None,
+        mamba_host_value: None,
+        allow_missing_mamba: false,
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
@@ -3845,6 +3920,10 @@ fn finish_write_through_emits_cpu_stored_events() {
     tc.set_hicache_enabled();
     tc.insert(&insert_params(&vec![1], &[10]));
     let leaf = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
+    tc.commit_backup(leaf, Tensor::from_slice(&[100i64]), HashMap::new())
+        .expect("live test node");
+    tc.mark_write_through_pending(vec![leaf], leaf)
+        .expect("live test node");
     let _ = tc.take_events();
     tc.finish_write_through(vec![leaf], leaf)
         .expect("live test node");
@@ -5050,6 +5129,46 @@ fn demote_rejects_unbackuped_and_evicted_nodes() {
             backuped: true,
         }) if node_id == leaf
     ));
+}
+
+// A write-back victim [1] whose D->H copy is queued but not acknowledged:
+// its host value is committed and it stays an unlocked D-leaf.
+fn leaf_with_write_in_flight(tc: &mut UnifiedTreeCore<Vec<i64>>) -> NodeId {
+    tc.insert(&insert_params(&vec![1], &[10]));
+    let leaf = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
+    tc.commit_backup(leaf, Tensor::from_slice(&[20i64]), HashMap::new())
+        .expect("live test node");
+    tc.mark_write_through_pending(vec![leaf], leaf)
+        .expect("live test node");
+    assert!(tc.inspect_is_device_evictable_leaf(leaf));
+    leaf
+}
+
+#[test]
+#[should_panic(expected = "while write Some(")]
+fn demote_panics_while_the_backup_still_reads_the_device_slots() {
+    let mut tc = write_back_core();
+    let leaf = leaf_with_write_in_flight(&mut tc);
+    let _ = tc.demote(leaf);
+}
+
+#[test]
+#[should_panic(expected = "in flight")]
+fn evicting_a_device_leaf_panics_while_its_write_is_in_flight() {
+    let mut tc = write_back_core();
+    let leaf = leaf_with_write_in_flight(&mut tc);
+    let _ = tc.evict_device_leaf(leaf, /* is_write_back = */ true);
+}
+
+#[test]
+fn demote_after_the_ack_frees_the_device_slots() {
+    let mut tc = write_back_core();
+    let leaf = leaf_with_write_in_flight(&mut tc);
+    tc.finish_write_through(vec![leaf], leaf)
+        .expect("live test node");
+    let step = tc.demote(leaf).expect("acked backup");
+    assert_eq!(step.tracker[&FULL], 1);
+    tc.sanity_check(&[], &[]);
 }
 
 #[test]
@@ -7413,6 +7532,8 @@ fn size_accessors_mirror_the_full_component_state() {
 #[test]
 fn swa_size_accessors_mirror_the_swa_component_state() {
     let mut tc = core();
+    // The accessors read the tree's window slot, so the tree needs one.
+    tc.register_component_(Arc::new(SwaComponentForTest));
     tc.component_state_mut(SWA).evictable_size = 2;
     tc.component_state_mut(SWA).protected_size = 1;
     assert_eq!(tc.swa_evictable_size(), 2);
@@ -9232,6 +9353,8 @@ fn sequence_insert_params<'k>(
         namespace: Default::default(),
         value: Tensor::from_slice(&kv),
         mamba_value,
+        mamba_host_value: None,
+        allow_missing_mamba: false,
         prev_prefix_len,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,

@@ -194,6 +194,63 @@ class TestDeepSeekRecipe(CustomTestCase):
             self.deepseek_recipe.encode(chat),
         )
 
+    def test_sliced_conversation_matches_full_prompt_prefix(self):
+        """Dropped prompt configuration breaks prefix parity for sliced histories."""
+        recipe = renderer.load_deepseek_recipe()
+        call = {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'},
+        }
+        for thinking in (True, False):
+            body = {
+                "messages": [
+                    {"role": "user", "content": "weather?"},
+                    {"role": "assistant", "content": "", "tool_calls": [call]},
+                    {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+                ],
+                "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+                "thinking": thinking,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "weather",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": {"answer": {"type": "string"}},
+                            "required": ["answer"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+            }
+            with self.subTest(thinking=thinking):
+                conversation = self.deepseek_recipe.convert(body, effort_budget=30)
+                full_ids = self.deepseek_recipe.encode_conversation(
+                    conversation, effort_budget=30
+                )
+                self.assertEqual(
+                    full_ids, self.deepseek_recipe.encode(body, effort_budget=30)
+                )
+                history = recipe.Conversation(
+                    conversation.messages[:2],
+                    thinking_mode=conversation.thinking_mode,
+                    tools=conversation.tools,
+                    tool_choice=conversation.tool_choice,
+                    reasoning_effort=conversation.reasoning_effort,
+                    response_schema=conversation.response_schema,
+                    response_regex=conversation.response_regex,
+                )
+                prefix_ids = self.deepseek_recipe.encode_conversation(
+                    history, effort_budget=30
+                )
+                think_token = "<think>" if thinking else "</think>"
+                self.assertEqual(
+                    prefix_ids[-2:], self._ids("<｜Assistant｜>", think_token)
+                )
+                self.assertEqual(full_ids[: len(prefix_ids) - 2], prefix_ids[:-2])
+
     def test_api_validation_surfaces_as_value_error(self):
         with self.assertRaises(ValueError):
             self.deepseek_recipe.encode(
@@ -203,6 +260,25 @@ class TestDeepSeekRecipe(CustomTestCase):
                     "reasoning_effort": "x",
                 }
             )
+
+    def test_fastokens_preserves_prompt_ids(self):
+        try:
+            from fastokens import Tokenizer, _ConfiguredTokenizerShim
+        except ImportError:
+            self.skipTest("fastokens is not installed")
+        if not hasattr(Tokenizer, "encode_segments"):
+            self.skipTest("fastokens has no segmented encoder")
+        candidate = renderer.DeepSeekRecipe(
+            "dsv41", _ConfiguredTokenizerShim(self.tokenizer)
+        )
+        self.assertIsNotNone(candidate._fast_prompt_tokenizer)
+        message = {"role": "user", "content": "中文 👩🏽‍💻 <think>x</think>"}
+        for thinking in (False, True):
+            body = {"messages": [message], "thinking": thinking}
+            with self.subTest(thinking=thinking):
+                self.assertEqual(
+                    candidate.encode(body), self.deepseek_recipe.encode(body)
+                )
 
 
 if __name__ == "__main__":

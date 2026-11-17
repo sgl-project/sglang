@@ -1,16 +1,29 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+    candidate_topk,
+    topk_among_blocks,
+)
+from sglang.kernels.ops.attention.dsv4.candidate_scores import (
+    _candidate_matmul,
+    can_use_candidate_scores,
+    candidate_scores,
+)
+from sglang.kernels.ops.attention.dsv4.candidate_table import CANDIDATE_BLOCK_SIZE
+from sglang.kernels.ops.quantization.fp4_fake_quant import fake_quant_fp4
 from sglang.kernels.ops.quantization.fp4_indexer_quant import (
     quantize_fp4_indexer_tensor,
 )
+from sglang.kernels.ops.quantization.fp4_to_fp8 import widen_fp4_to_fp8
 from sglang.srt.layers.attention.dsv4.v41_indexer import dense_blocks, scoring
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 def make_inputs(request_lengths, ratio=1, zero_queries=False, seed=17):
@@ -50,10 +63,8 @@ def make_inputs(request_lengths, ratio=1, zero_queries=False, seed=17):
     )
 
 
-def run_dense(inputs, *, publish_candidates, candidates):
-    """The plain top-k, or the CP source's own top-k plus its candidate blocks
-    (`publish_candidates`), or a CP consumer's top-k among `candidates`."""
-    data = scoring.DeepGEMMPrefillData(
+def prefill_data(inputs):
+    return scoring.DeepGEMMPrefillData(
         k_slots=torch.arange(inputs["kv"][0].shape[0], device="cuda"),
         request_starts=inputs["starts"],
         lens_per_request=[n for _, n in inputs["request_lengths"]],
@@ -63,6 +74,12 @@ def run_dense(inputs, *, publish_candidates, candidates):
         q_sf=inputs["q"][1],
         weights=inputs["weights"],
     )
+
+
+def run_dense(inputs, *, publish_candidates, candidates):
+    """The plain top-k, or the CP source's own top-k plus its candidate blocks
+    (`publish_candidates`), or a CP consumer's top-k among `candidates`."""
+    data = prefill_data(inputs)
     if publish_candidates:
         selected, blocks = dense_blocks._publish_prefill_blocks(
             data=data,
@@ -108,8 +125,12 @@ def request_blocks(inputs, candidates):
     return out
 
 
+def is_hopper():
+    return torch.cuda.get_device_capability()[0] == 9
+
+
 def dense_scores(inputs):
-    from deep_gemm import fp8_fp4_mqa_logits
+    from deep_gemm import fp8_fp4_mqa_logits, fp8_mqa_logits
 
     from sglang.kernels.ops.attention.dsv4.index_logits import (
         index_logits_dtype,
@@ -117,26 +138,90 @@ def dense_scores(inputs):
     )
 
     width = (max(n for _, n in inputs["request_lengths"]) + 3) // 4 * 4
-    # Score in the dtypes the indexer uses on this GPU, so the reference matches.
-    scores = fp8_fp4_mqa_logits(
-        inputs["q"],
-        inputs["kv"],
-        inputs["weights"].to(index_weights_dtype()),
-        inputs["starts"],
-        inputs["starts"] + inputs["lengths"],
-        False,
-        width,
-        logits_dtype=index_logits_dtype(),
-    ).float()
+    ends = inputs["starts"] + inputs["lengths"]
+    if is_hopper():
+        q, q_scale = widen_fp4_to_fp8(*inputs["q"])
+        kv = widen_fp4_to_fp8(*inputs["kv"])
+        scores = fp8_mqa_logits(
+            q, kv, inputs["weights"] * q_scale, inputs["starts"], ends, False, width
+        )
+    else:
+        # Score in the dtypes the indexer uses on this GPU, so the reference matches.
+        scores = fp8_fp4_mqa_logits(
+            inputs["q"],
+            inputs["kv"],
+            inputs["weights"].to(index_weights_dtype()),
+            inputs["starts"],
+            ends,
+            False,
+            width,
+            logits_dtype=index_logits_dtype(),
+        ).float()
     return scores.masked_fill_(
         torch.arange(width, device="cuda")[None, :] >= inputs["lengths"][:, None],
         -torch.inf,
     )
 
 
+def dequant_fp4(payload, scales):
+    from sglang.srt.layers.quantization.fp8 import DSV4_DEQUANT_FP4_TABLE
+
+    u = payload.view(torch.uint8)
+    codes = torch.stack([u & 15, u >> 4], dim=-1).flatten(-2).long()
+    exponents = scales.unsqueeze(-1).view(torch.uint8).double() - 127
+    table = DSV4_DEQUANT_FP4_TABLE.to(payload.device).double()
+    return table[codes] * torch.exp2(exponents).repeat_interleave(32, dim=-1)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestFp4ToFp8(CustomTestCase):
+    def test_exact_within_14_binades_of_the_largest_block(self):
+        # e4m3 holds every fp4 value scaled into [2**-9, 384]: a vector whose
+        # blocks span 15 binades loses its smallest nonzero codes.
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        payload = torch.randint(
+            -128, 128, (512, 64), dtype=torch.int8, device="cuda", generator=gen
+        )
+        for spread in (0, 1, 7, 14, 15, 19, 40):
+            with self.subTest(spread=spread):
+                top = torch.randint(100, 140, (512, 1), device="cuda", generator=gen)
+                offsets = torch.randint(
+                    0, spread + 1, (512, 4), device="cuda", generator=gen
+                )
+                offsets[:, 0], offsets[:, 1] = 0, spread
+                scales = (top - offsets).to(torch.uint8).view(torch.int32)[:, 0]
+                fp8, scale = widen_fp4_to_fp8(payload, scales)
+                widened = fp8.double() * scale.double()[:, None]
+                expected = dequant_fp4(payload, scales)
+                self.assertEqual(torch.equal(widened, expected), spread <= 14)
+                torch.testing.assert_close(
+                    widened, expected, rtol=0, atol=expected.abs().max().item() * 2**-17
+                )
+
+    def test_exact_at_the_smallest_and_largest_block_exponents(self):
+        # Exponent bytes down to 1, the smallest the format holds (the quantizers
+        # floor block amax well above that), so the fp32 scale 2**(top - 133) is
+        # subnormal below top = 7.
+        gen = torch.Generator(device="cuda").manual_seed(1)
+        payload = torch.randint(
+            -128, 128, (64, 64), dtype=torch.int8, device="cuda", generator=gen
+        )
+        for top in (1, 2, 5, 6, 7, 8, 30, 254):
+            with self.subTest(top=top):
+                scales = torch.full((64, 4), top, dtype=torch.uint8, device="cuda")
+                scales = scales.view(torch.int32)[:, 0]
+                fp8, scale = widen_fp4_to_fp8(payload, scales)
+                self.assertTrue(
+                    torch.equal(
+                        fp8.double() * scale.double()[:, None],
+                        dequant_fp4(payload, scales),
+                    )
+                )
+
+
 @unittest.skipUnless(
-    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10,
-    "requires SM100",
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] in (9, 10),
+    "requires SM90 or SM100",
 )
 class TestDensePrefillIndexer(CustomTestCase):
     def assert_topk(self, inputs, selected, scores):
@@ -309,8 +394,38 @@ class TestDensePrefillIndexer(CustomTestCase):
                 )
                 self.assertEqual(tuple(candidates.blocks.shape), block_shape)
 
+    @unittest.skipUnless(torch.cuda.is_available() and is_hopper(), "Hopper scores")
+    def test_hopper_scores_match_the_fp4_operands(self):
+        # Exact fp4 products with fp32 sums, about 1e-7 of the row's largest score
+        # on H200; the torch path rounds each head's score to bf16.
+        inputs = make_inputs([(33, 511), (257, 4097)])
+        q = dequant_fp4(*inputs["q"])
+        k = dequant_fp4(*inputs["kv"])
+        expected = (
+            (torch.einsum("rhd,nd->rhn", q, k).relu() * inputs["weights"][..., None])
+            .sum(1)
+            .float()
+        )
+        visible = (
+            torch.arange(k.shape[0], device="cuda")[None, :] - inputs["starts"][:, None]
+        )
+        visible = (visible >= 0) & (visible < inputs["lengths"][:, None])
+        tiles = scoring.score_tiles(prefill_data(inputs), inputs["kv"])
+        scores = torch.cat([logits for _, logits in tiles])
+        for row in range(q.shape[0]):
+            n = inputs["lengths"][row].item()
+            torch.testing.assert_close(
+                scores[row, :n],
+                expected[row, visible[row]],
+                rtol=0,
+                atol=expected[row].abs().max().item() * 2**-18,
+            )
+
     def test_score_budget_includes_allocation_padding(self):
-        from deep_gemm import fp8_fp4_mqa_logits
+        import deep_gemm
+
+        name = "fp8_mqa_logits" if is_hopper() else "fp8_fp4_mqa_logits"
+        kernel = getattr(deep_gemm, name)
 
         inputs = make_inputs([(13, 257)])
         expected = dense_scores(inputs)
@@ -320,13 +435,13 @@ class TestDensePrefillIndexer(CustomTestCase):
 
                 def checked_logits(*args, **kwargs):
                     before = torch.cuda.memory_allocated()
-                    logits = fp8_fp4_mqa_logits(*args, **kwargs)
+                    logits = kernel(*args, **kwargs)
                     allocations.append(torch.cuda.memory_allocated() - before)
                     return logits
 
                 with (
                     patch.object(scoring, "_DEEP_GEMM_SCORE_BUDGET_BYTES", budget),
-                    patch("deep_gemm.fp8_fp4_mqa_logits", new=checked_logits),
+                    patch(f"deep_gemm.{name}", new=checked_logits),
                 ):
                     selected, _ = run_dense(
                         inputs, publish_candidates=True, candidates=None
@@ -375,6 +490,239 @@ class TestDensePrefillIndexer(CustomTestCase):
                     torch.cuda.synchronize()
                     self.assertEqual(torch.cuda.memory_allocated(), baseline)
                 del inputs, candidates
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.version.hip is None, "requires NVIDIA CUDA"
+)
+class TestCandidateScores(CustomTestCase):
+    def make_case(self, heads=32, visible=129, *, fp4=False, seed=17):
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        padded = -(-visible // 64) * 64
+        if fp4:
+            q = fake_quant_fp4(
+                torch.randn(
+                    5, heads, 128, device="cuda", dtype=torch.bfloat16, generator=gen
+                )
+            )
+            k = fake_quant_fp4(
+                torch.randn(
+                    padded, 128, device="cuda", dtype=torch.bfloat16, generator=gen
+                )
+            )
+        else:
+            q = torch.randint(
+                -2, 3, (5, heads, 128), device="cuda", generator=gen
+            ).bfloat16()
+            k = torch.randint(
+                -2, 3, (padded, 128), device="cuda", generator=gen
+            ).bfloat16()
+        k[visible:] = 1024
+        weights = (
+            torch.randint(-2, 3, (5, heads), device="cuda", generator=gen).bfloat16()
+            / 4
+        )
+        newest = (visible - 1) // CANDIDATE_BLOCK_SIZE
+        blocks = torch.tensor(
+            [
+                [-1, -1, -1],
+                [0, -1, -1],
+                [0, 1, -1],
+                [0, 4, newest],
+                [newest, max(0, newest - 1), -1],
+            ],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        lens = torch.tensor(
+            [0, min(1, visible), min(11, visible), visible, visible],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        return q, k, weights, blocks, lens
+
+    def compact_reference(self, q, k, weights, blocks, lens, visible):
+        per_head = torch.einsum("bhd,nd->bhn", q, k)
+        full = (per_head.relu() * weights.unsqueeze(-1)).sum(1).float()[:, :visible]
+        positions = (
+            blocks.long()[:, :, None] * CANDIDATE_BLOCK_SIZE
+            + torch.arange(CANDIDATE_BLOCK_SIZE, device="cuda")
+        ).flatten(1)
+        valid = (positions >= 0) & (positions < lens[:, None]) & (positions < visible)
+        if visible:
+            compact = full.gather(1, positions.clamp(0, visible - 1))
+            compact = compact.masked_fill(~valid, -torch.inf)
+        else:
+            compact = torch.full(positions.shape, -torch.inf, device="cuda")
+        return full, compact
+
+    def check_pipeline(self, inputs, visible, topk):
+        q, k, weights, blocks, lens = inputs
+        full, expected_scores = self.compact_reference(*inputs, visible)
+        with patch.object(_candidate_matmul, "run", wraps=_candidate_matmul.run) as run:
+            compact = candidate_scores(q, k, weights, blocks, lens)
+        self.assertEqual(run.call_count, int(q.shape[0] > 0 and blocks.shape[1] > 0))
+        self.assertEqual(compact.dtype, torch.float32)
+        self.assertTrue(torch.equal(compact, expected_scores))
+        actual = candidate_topk(compact, blocks, topk)
+        expected = topk_among_blocks(full, lens, blocks, topk, CANDIDATE_BLOCK_SIZE)
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertEqual(actual.shape, (q.shape[0], topk))
+        self.assertTrue(
+            torch.equal(
+                (actual >= 0).sum(1), torch.isfinite(compact).sum(1).clamp_max(topk)
+            )
+        )
+        return compact
+
+    def test_candidate_pipeline_parity(self):
+        for heads in (16, 32, 64):
+            for visible in (129, 1025):
+                inputs = self.make_case(heads, visible)
+                for topk in (0, 7, 32):
+                    with self.subTest(heads=heads, visible=visible, topk=topk):
+                        self.check_pipeline(inputs, visible, topk)
+
+    def test_small_heads(self):
+        for heads in (1, 2, 4, 8, 9):
+            with self.subTest(heads=heads):
+                self.check_pipeline(self.make_case(heads), 129, 32)
+
+    def test_fp4_operands(self):
+        for visible in (129, 1025):
+            for seed in (0, 42, 123):
+                with self.subTest(visible=visible, seed=seed):
+                    self.check_pipeline(
+                        self.make_case(visible=visible, fp4=True, seed=seed), visible, 7
+                    )
+
+    def test_noncontiguous_operands(self):
+        inputs = []
+        for value in self.make_case():
+            if value.ndim == 1:
+                inputs.append(value)
+            else:
+                backing = torch.empty(
+                    (*value.shape[:-1], value.shape[-1] * 2),
+                    device=value.device,
+                    dtype=value.dtype,
+                )
+                view = backing[..., ::2]
+                view.copy_(value)
+                self.assertFalse(view.is_contiguous())
+                inputs.append(view)
+        self.check_pipeline(tuple(inputs), 129, 32)
+
+    def test_empty_inputs(self):
+        inputs = self.make_case()
+        q, k, weights, blocks, lens = inputs
+        cases = [
+            (q[:0], k, weights[:0], blocks[:0], lens[:0]),
+            (q, k, weights, blocks[:, :0], lens),
+            (q, k[:0], weights, blocks, torch.zeros_like(lens)),
+        ]
+        for case in cases:
+            visible = 129 if case[1].shape[0] else 0
+            with self.subTest(
+                rows=case[0].shape[0], blocks=case[3].shape[1], visible=visible
+            ):
+                self.check_pipeline(case, visible, 32)
+
+    def test_eligibility(self):
+        q, k, weights, _, _ = self.make_case()
+        self.assertTrue(can_use_candidate_scores(q, k, weights, 24, 129))
+        self.assertFalse(can_use_candidate_scores(q, k, weights, 24, 47))
+        self.assertFalse(can_use_candidate_scores(q, k, weights, 0, 129))
+        self.assertFalse(can_use_candidate_scores(q.float(), k, weights, 24, 129))
+        self.assertFalse(
+            can_use_candidate_scores(q.cpu(), k.cpu(), weights.cpu(), 24, 129)
+        )
+        with patch(
+            "sglang.kernels.ops.attention.dsv4.candidate_scores.is_cuda",
+            return_value=False,
+        ):
+            self.assertFalse(can_use_candidate_scores(q, k, weights, 24, 129))
+
+    def test_candidate_chunking(self):
+        inputs = self.make_case()
+        q, k, weights, blocks, lens = inputs
+        full, expected = self.compact_reference(*inputs, 129)
+        tok = torch.tensor([4, 0, 3, 1, 2], device="cuda")
+        request = scoring.RequestScores(
+            lc=129,
+            k=7,
+            columns=torch.arange(129, device="cuda"),
+            tok=tok,
+            lens=lens[tok],
+            slots=torch.arange(129, device="cuda"),
+        )
+        indexer = Mock()
+        indexer.scores.side_effect = AssertionError("full scoring was used")
+        budget = 2 * q.shape[1] * blocks.shape[1] * CANDIDATE_BLOCK_SIZE * 2
+        with patch.object(scoring, "_TORCH_SCORE_BUDGET_BYTES", budget):
+            chunks = list(
+                scoring._score_chunks(
+                    indexer=indexer,
+                    q=q,
+                    weights=weights,
+                    index_k=k,
+                    request=request,
+                    candidate_blocks=blocks,
+                )
+            )
+        self.assertEqual([chunk.tok.numel() for chunk in chunks], [2, 2, 1])
+        for chunk in chunks:
+            self.assertTrue(chunk.candidate_only)
+            self.assertTrue(torch.equal(chunk.scores, expected[chunk.tok]))
+            actual = candidate_topk(chunk.scores, blocks[chunk.tok], request.k)
+            reference = topk_among_blocks(
+                full[chunk.tok],
+                lens[chunk.tok],
+                blocks[chunk.tok],
+                request.k,
+                CANDIDATE_BLOCK_SIZE,
+            )
+            self.assertTrue(torch.equal(actual, reference))
+
+    def test_full_score_fallback(self):
+        q, k, weights, blocks, lens = self.make_case()
+        request = scoring.RequestScores(
+            lc=129,
+            k=7,
+            columns=torch.arange(129, device="cuda"),
+            tok=torch.arange(5, device="cuda"),
+            lens=lens,
+            slots=torch.arange(129, device="cuda"),
+        )
+
+        def full_scores(q, k, weights):
+            s = torch.einsum("bhd,nd->bhn", q, k)
+            return (s.relu() * weights.unsqueeze(-1)).sum(1).float()
+
+        indexer = Mock()
+        indexer.scores.side_effect = full_scores
+        too_wide = blocks.repeat(1, 4)
+        with patch.object(
+            _candidate_matmul, "run", side_effect=AssertionError("candidate launch")
+        ):
+            chunks = list(
+                scoring._score_chunks(
+                    indexer=indexer,
+                    q=q,
+                    weights=weights,
+                    index_k=k,
+                    request=request,
+                    candidate_blocks=too_wide,
+                )
+            )
+        self.assertTrue(indexer.scores.called)
+        expected = full_scores(q, k, weights)[:, :129]
+        expected = expected.masked_fill(
+            torch.arange(129, device="cuda")[None, :] >= lens[:, None], -torch.inf
+        )
+        for chunk in chunks:
+            self.assertFalse(chunk.candidate_only)
+            self.assertTrue(torch.equal(chunk.scores, expected[chunk.tok]))
 
 
 if __name__ == "__main__":

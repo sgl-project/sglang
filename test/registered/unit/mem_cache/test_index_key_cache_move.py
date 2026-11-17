@@ -28,6 +28,7 @@ def test_move_preserves_physical_layout(
         index_page_size=page_size,
         index_head_dim=head_dim,
         index_kpool=1,
+        index_key_bytes_per_token=head_dim,
     )
     torch.manual_seed(0)
     keys = torch.randint(0, 256, (num_tokens, head_dim), dtype=torch.uint8)

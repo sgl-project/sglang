@@ -486,7 +486,6 @@ def verify_tree_greedy_func(
     retrieve_next_token: torch.Tensor,
     retrieve_next_sibling: torch.Tensor,
     target_predict: torch.Tensor,
-    topk: int = -1,
     *,
     is_ngram: bool = False,
 ):

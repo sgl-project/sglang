@@ -106,11 +106,16 @@ class TestNgramAttention(unittest.TestCase):
                             layer.tp_q_head_num = heads
                             backend = object.__new__(AscendAttnBackend)
                             backend.use_mla = True
+                            backend.use_flash_mla = False
+                            backend.use_paged_mtp = False
+                            backend.use_quant_flash_attn = False
+                            backend.dense_mla_dcp_target = False
                             backend.graph_mode = False
                             backend.speculative_num_draft_tokens = d
                             backend.use_fias_v2_bsnd = False
                             backend.tp_q_head_num = heads
                             backend.model_dtype = dtype
+                            backend.nope_padding_dtype = dtype
                             backend.mtp_mask = torch.ones(
                                 2048, 2048, dtype=torch.bool, device="npu"
                             ).triu(1)
@@ -129,6 +134,7 @@ class TestNgramAttention(unittest.TestCase):
                                     2 * page,
                                 ),
                                 seq_lens_cpu_int=torch.tensor(lengths),
+                                seq_lens_cpu_list=lengths,
                             )
                             batch = SimpleNamespace(
                                 batch_size=bs,
@@ -292,6 +298,11 @@ class TestNgramAttention(unittest.TestCase):
         backend.use_sliding_window_kv_pool = False
         backend.is_hybrid_swa = False
         backend.is_draft_worker = False
+        backend.dense_mla_dcp_target = False
+        backend.dsa_dcp_target = False
+        backend.use_flash_mla = False
+        backend.use_paged_mtp = False
+        backend.use_quant_flash_attn = False
         backend.req_to_token = torch.arange(bs * 2 * page, device="npu").reshape(
             bs, 2 * page
         )
@@ -313,6 +324,7 @@ class TestNgramAttention(unittest.TestCase):
         ):
             live_bs = 1 if prefixes[1] == 1 else bs
             trees = tree.repeat(live_bs, 1, 1)
+            metadata.seq_lens.copy_(torch.tensor(prefixes, device="npu"))
             with patch(
                 "sglang.srt.hardware_backend.npu.attention.ascend_backend.get_parallel",
                 return_value=SimpleNamespace(dcp_enabled=False),
@@ -320,7 +332,7 @@ class TestNgramAttention(unittest.TestCase):
                 backend._apply_cuda_graph_metadata(
                     bs=bs,
                     req_pool_indices=torch.arange(bs, device="npu"),
-                    seq_lens=torch.tensor(prefixes, device="npu"),
+                    seq_lens=metadata.seq_lens,
                     seq_lens_cpu=torch.tensor(prefixes),
                     forward_mode=ForwardMode.TARGET_VERIFY,
                     spec_info=SimpleNamespace(
@@ -339,6 +351,9 @@ class TestNgramAttention(unittest.TestCase):
                 expected[b, 0, :, :prefix] = False
                 expected[b, 0, :, prefix : prefix + d] = ~tree
             torch.testing.assert_close(metadata.ngram_attn_mask.cpu(), expected)
+            torch.testing.assert_close(
+                metadata.seq_lens.cpu(), torch.tensor([p + d for p in prefixes])
+            )
             self.assertEqual(metadata.seq_lens_cpu_list, [p + d for p in prefixes])
             self.assertIsNone(metadata.seq_lens_cpu_int)
 
@@ -449,6 +464,11 @@ class TestNgramAttention(unittest.TestCase):
         )
         backend = object.__new__(AscendAttnBackend)
         backend.use_mla = False
+        backend.use_flash_mla = False
+        backend.use_paged_mtp = False
+        backend.use_quant_flash_attn = False
+        backend.use_fias_v2_bsnd = False
+        backend.dense_mla_dcp_target = False
         backend.is_hybrid_swa = False
         backend.speculative_num_draft_tokens = d
         backend.page_size = page
