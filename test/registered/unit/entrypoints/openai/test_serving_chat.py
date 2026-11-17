@@ -4205,6 +4205,20 @@ class ServingChatTestCase(CustomTestCase):
                 "meta_info": {
                     "id": "chatcmpl-test",
                     "prompt_tokens": 10,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": None,
+                    "output_token_logprobs": [],
+                    "output_token_logprobs_length": 0,
+                    "output_top_logprobs": [],
+                },
+                "index": 0,
+            }
+            yield {
+                "text": "Partial text",
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "prompt_tokens": 10,
                     "completion_tokens": 2,
                     "cached_tokens": 0,
                     "finish_reason": {
@@ -4270,18 +4284,33 @@ class ServingChatTestCase(CustomTestCase):
         # The last chunk should be "data: [DONE]\n\n"
         self.assertEqual(chunks[-1], "data: [DONE]\n\n")
 
-        # Check that there is an error chunk and a DONE chunk
-        self.assertEqual(len(chunks), 2)
-        self.assertIn("error", chunks[0])
+        # The error chunk follows the streamed content and precedes [DONE]
+        self.assertIn("Partial ", "".join(chunks[:-2]))
+        self.assertIn("error", chunks[-2])
 
     def test_streaming_abort_with_ids_enabled(self):
-        """Test that a terminal abort with input/output ids enabled yields only an error and [DONE]."""
+        """Test that a terminal abort with input/output ids enabled ends with only an error and [DONE]."""
         err_msg = "Aborted by scheduler"
         err_code = HTTPStatus.INTERNAL_SERVER_ERROR
 
         async def _mock_generate_abort():
             yield {
                 "text": "Partial ",
+                "prompt_token_ids": [4, 5, 6],
+                "output_ids": [1],
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": None,
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+            yield {
+                "text": "Partial text",
                 "prompt_token_ids": [4, 5, 6],
                 "output_ids": [1, 2, 3],
                 "meta_info": {
@@ -4338,14 +4367,14 @@ class ServingChatTestCase(CustomTestCase):
         chunks = loop.run_until_complete(run_stream())
 
         # Exactly one error chunk followed by [DONE]; no sglext ids leak.
-        self.assertIn("error", chunks[0])
-        self.assertEqual(chunks[1], "data: [DONE]\n\n")
+        error_idx = next(i for i, c in enumerate(chunks) if "error" in c)
+        self.assertEqual(chunks[error_idx + 1 :], ["data: [DONE]\n\n"])
         self.assertFalse(
-            any("input_ids" in c or "output_ids" in c for c in chunks),
+            any("input_ids" in c or "output_ids" in c for c in chunks[error_idx:]),
             "sglext ids event leaked after abort error",
         )
 
-        error_chunk_data = json.loads(chunks[0][len("data: ") :])
+        error_chunk_data = json.loads(chunks[error_idx][len("data: ") :])
         self.assertEqual(error_chunk_data["error"]["message"], err_msg)
         self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
 
@@ -4429,6 +4458,50 @@ class ServingChatTestCase(CustomTestCase):
             any(c.get("usage") is not None for c in after_error),
             "usage chunk dropped after error abort",
         )
+
+    def test_streaming_abort_before_first_chunk_is_an_http_error(self):
+        """An error abort before the first chunk (e.g. a full queue) is answered
+        with its status, as a non-streaming request is, not under HTTP 200."""
+        for status in (HTTPStatus.SERVICE_UNAVAILABLE, HTTPStatus.BAD_REQUEST):
+            with self.subTest(status=status):
+
+                async def _mock_generate_abort():
+                    yield {
+                        "text": "",
+                        "meta_info": {
+                            "id": "chatcmpl-test",
+                            "prompt_tokens": 10,
+                            "completion_tokens": 0,
+                            "cached_tokens": 0,
+                            "finish_reason": {
+                                "type": "abort",
+                                "status_code": status,
+                                "message": "The request queue is full.",
+                            },
+                        },
+                        "index": 0,
+                    }
+
+                self.tm.generate_request.return_value = _mock_generate_abort()
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    stream=True,
+                )
+                with patch(
+                    "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+                ) as conv_mock:
+                    conv_ins = Mock()
+                    conv_ins.get_prompt.return_value = "Test prompt"
+                    conv_mock.return_value = conv_ins
+                    response = get_or_create_event_loop().run_until_complete(
+                        self.chat.handle_request(req, self.fastapi_request)
+                    )
+
+                self.assertEqual(response.status_code, status)
+                error = json.loads(response.body)
+                self.assertEqual(error["message"], "The request queue is full.")
+                self.assertEqual(error["code"], status)
 
     def test_truncated_response_template_call_keeps_stop_without_arguments(self):
         self.chat.tool_call_parser = "response_template"

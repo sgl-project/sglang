@@ -1042,6 +1042,16 @@ class AnthropicServing:
                 ):
                     yield frame
                 return
+            except HTTPException as e:
+                # An error abort before the first chunk (e.g. queue full). This
+                # stream's 200 is already sent, so it stays an error event.
+                error_type = ERROR_TYPE_MAP.get(e.status_code, "api_error")
+                logger.warning(
+                    "Forwarding upstream stream error (%s): %s", error_type, e.detail
+                )
+                for frame in _flush_on_error(error_type, str(e.detail)):
+                    yield frame
+                return
             except Exception as e:
                 logger.exception("OpenAI stream raised mid-flight: %s", e)
                 for frame in _flush_on_error("api_error", "Internal server error"):

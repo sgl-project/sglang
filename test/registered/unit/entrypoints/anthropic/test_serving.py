@@ -1420,6 +1420,34 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertIn("tokenization failed", err["error"]["message"])
         self.assertEqual(types[-1], "message_stop")
 
+    def test_stream_pre_first_chunk_http_exception_emits_envelope(self):
+        """An error abort before any chunk (e.g. a full queue) stays an error
+        event on the stream, typed by its status."""
+
+        class _RefusingOpenAI(_FakeOpenAIServingChat):
+            def _generate_chat_stream(
+                self, adapted_request, processed_request, raw_request
+            ):
+                async def _gen():
+                    raise HTTPException(
+                        status_code=503, detail="The request queue is full."
+                    )
+                    yield  # pragma: no cover
+
+                return _gen()
+
+        serving = AnthropicServing(_RefusingOpenAI())
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+        self.assertEqual(
+            [e["type"] for e in events], ["message_start", "error", "message_stop"]
+        )
+        self.assertEqual(
+            events[1]["error"],
+            {"type": "overloaded_error", "message": "The request queue is full."},
+        )
+
     def test_server_tool_only_with_tool_choice_any_raises_400(self):
         """A request with only server-side tools cannot honor tool_choice=any."""
         serving = self._serving()

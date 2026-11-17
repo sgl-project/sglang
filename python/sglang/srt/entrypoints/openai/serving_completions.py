@@ -19,7 +19,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     SglExt,
     convert_json_schema_to_str,
 )
-from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.serving_base import (
+    OpenAIServingBase,
+    raise_error_abort,
+)
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     cached_tokens_details_from_dict,
@@ -354,7 +357,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 stream_offsets[index] = len(content["text"])
 
                 # Abort with an explicit error status_code is a system error
-                # (timeout, OOM, validation): emit a streaming error chunk.
+                # (queue full, timeout, OOM, validation): raised before the
+                # first chunk, so the handler answers it with its status;
+                # after it, a streaming error chunk.
                 # A graceful abort (no status_code, e.g. user-initiated via
                 # /abort_request or session lifecycle cleanup) falls through
                 # to the normal chunk path, matching the non-stream behavior
@@ -362,6 +367,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 if finish_reason_type == "abort" and isinstance(
                     finish_reason.get("status_code"), HTTPStatus
                 ):
+                    if not stream_started:
+                        raise_error_abort(finish_reason)
                     code = finish_reason["status_code"]
                     error = self.create_streaming_error_response(
                         finish_reason.get("message", "Generation aborted."),
