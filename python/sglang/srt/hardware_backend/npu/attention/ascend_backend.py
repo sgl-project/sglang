@@ -1625,6 +1625,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
             )
         return output
+
     def _forward_sparse_dcp_gathered(
         self,
         q_nope: torch.Tensor,

@@ -722,6 +722,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # the paged pool.
     npu_dcp_extend_gather: Optional[DcpExtendGatherPlan] = None
     npu_dcp_extend_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    # Prefetches issued on the side stream and not yet consumed, one per
+    # in-flight layer: (layer_id, completion event, the send tensors the
+    # in-flight collectives still read). The layer an entry was issued for
+    # consumes it; any other layer waits every entry out before gathering
+    # inline on the shared process group.
+    npu_dcp_extend_kv_prefetch: Optional[
+        List[Tuple[int, Any, List[Optional[torch.Tensor]]]]
+    ] = None
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
