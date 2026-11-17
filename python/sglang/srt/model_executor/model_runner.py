@@ -1241,8 +1241,209 @@ class ModelRunner:
         )
 
     def prewarm_sampling(self) -> SamplingPrewarmResult:
-        """Warm the sampling path after graph initialization."""
+        """Warm sampling, penalty, and logprob kernels after graph initialization."""
         self.sampling_prewarm_result = SamplingPrewarmResult()
+        if (
+            not getattr(self, "is_generation", False)
+            or getattr(self, "is_draft_worker", False)
+            or getattr(self, "sampler", None) is None
+            or get_exec().dllm.dllm_algorithm is not None
+        ):
+            return self.sampling_prewarm_result
+
+        device_str = str(getattr(self, "device", ""))
+        if not device_str.startswith("cuda") or not torch.cuda.is_available():
+            return self.sampling_prewarm_result
+
+        vocab_size = getattr(getattr(self, "model_config", None), "vocab_size", 0)
+        if not isinstance(vocab_size, int) or vocab_size <= 0:
+            return self.sampling_prewarm_result
+
+        raw_warmups = getattr(getattr(self, "server_args", None), "warmups", None)
+        requested_warmups = {
+            w.strip() for w in (raw_warmups or "").split(",") if w.strip()
+        }
+        warm_sampling = bool(requested_warmups & {"all", "sampling"})
+        warm_penalties = bool(requested_warmups & {"all", "penalties"})
+        warm_logprobs = bool(requested_warmups & {"all", "logprobs"})
+        if not (warm_sampling or warm_penalties or warm_logprobs):
+            return self.sampling_prewarm_result
+
+        tic = time.perf_counter()
+        device = torch.device(self.device)
+        enable_det = get_exec().deterministic.enable_deterministic_inference
+
+        try:
+            from sglang.srt.layers.logsumexp import (
+                FUSED_TOPK_MAX_K,
+                row_logsumexp,
+                row_logsumexp_topk,
+            )
+            from sglang.srt.sampling.penaltylib.repetition_penalty import (
+                apply_scaling_penalties,
+            )
+
+            # Run outside graph-pool borrow so persistent FlashInfer JIT / Triton /
+            # TorchInductor workspaces allocate in regular storage before KV sizing.
+            logits = pen_logits = scaling_penalties = lse_input = None
+            with (
+                torch.no_grad(),
+                envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(False),
+            ):
+                for bs in (1, 2):
+                    positions = torch.zeros(bs, dtype=torch.int64, device=device)
+                    seed = (
+                        torch.zeros(bs, dtype=torch.int64, device=device)
+                        if enable_det
+                        else None
+                    )
+                    top_k_logprob = min(5, vocab_size)
+
+                    if warm_sampling or warm_logprobs:
+                        # 1. Greedy + output top-logprobs
+                        logits = torch.zeros(
+                            (bs, vocab_size), dtype=torch.float32, device=device
+                        )
+                        greedy_info = SamplingBatchInfo(
+                            temperatures=torch.zeros(
+                                (bs, 1), dtype=torch.float32, device=device
+                            ),
+                            top_ps=torch.ones(bs, dtype=torch.float32, device=device),
+                            top_ks=torch.full(
+                                (bs,), vocab_size, dtype=torch.int32, device=device
+                            ),
+                            min_ps=torch.zeros(bs, dtype=torch.float32, device=device),
+                            is_all_greedy=True,
+                            is_any_greedy=True,
+                            need_top_p_sampling=False,
+                            need_top_k_sampling=False,
+                            need_min_p_sampling=False,
+                            vocab_size=vocab_size,
+                            sampling_seed=seed,
+                            device=device_str,
+                        )
+                        self.sampler(
+                            LogitsProcessorOutput(next_token_logits=logits),
+                            greedy_info,
+                            True,
+                            [top_k_logprob] * bs,
+                            [None] * bs,
+                            positions,
+                        )
+
+                    if warm_sampling:
+                        # 2. Non-greedy top-k + top-p + output top-logprobs
+                        #    Triggers LazyImport("flashinfer.sampling") + JIT compile of sampling.so
+                        k_val = min(20, vocab_size)
+                        logits = torch.zeros(
+                            (bs, vocab_size), dtype=torch.float32, device=device
+                        )
+                        topk_topp_info = SamplingBatchInfo(
+                            temperatures=torch.full(
+                                (bs, 1), 0.6, dtype=torch.float32, device=device
+                            ),
+                            top_ps=torch.full(
+                                (bs,), 0.95, dtype=torch.float32, device=device
+                            ),
+                            top_ks=torch.full(
+                                (bs,), k_val, dtype=torch.int32, device=device
+                            ),
+                            min_ps=torch.zeros(bs, dtype=torch.float32, device=device),
+                            is_all_greedy=False,
+                            is_any_greedy=False,
+                            need_top_p_sampling=True,
+                            need_top_k_sampling=True,
+                            need_min_p_sampling=False,
+                            vocab_size=vocab_size,
+                            sampling_seed=seed,
+                            max_top_k=k_val,
+                            device=device_str,
+                        )
+                        self.sampler(
+                            LogitsProcessorOutput(next_token_logits=logits),
+                            topk_topp_info,
+                            True,
+                            [top_k_logprob] * bs,
+                            [None] * bs,
+                            positions,
+                        )
+
+                        # 3. Non-greedy min-p + renorm (top_p_renorm_prob, top_k_renorm_prob, min_p_sampling_from_probs)
+                        k_minp = min(50, vocab_size)
+                        logits = torch.zeros(
+                            (bs, vocab_size), dtype=torch.float32, device=device
+                        )
+                        minp_info = SamplingBatchInfo(
+                            temperatures=torch.full(
+                                (bs, 1), 0.7, dtype=torch.float32, device=device
+                            ),
+                            top_ps=torch.full(
+                                (bs,), 0.95, dtype=torch.float32, device=device
+                            ),
+                            top_ks=torch.full(
+                                (bs,), k_minp, dtype=torch.int32, device=device
+                            ),
+                            min_ps=torch.full(
+                                (bs,), 0.05, dtype=torch.float32, device=device
+                            ),
+                            is_all_greedy=False,
+                            is_any_greedy=False,
+                            need_top_p_sampling=True,
+                            need_top_k_sampling=True,
+                            need_min_p_sampling=True,
+                            vocab_size=vocab_size,
+                            sampling_seed=seed,
+                            max_top_k=k_minp,
+                            device=device_str,
+                        )
+                        self.sampler(
+                            LogitsProcessorOutput(next_token_logits=logits),
+                            minp_info,
+                            False,
+                            [0] * bs,
+                            [None] * bs,
+                            positions,
+                        )
+
+                    if warm_penalties:
+                        # 4. @torch.compile(dynamic=True) repetition penalty (bs=1 static & bs=2 dynamic)
+                        pen_logits = torch.zeros(
+                            (bs, vocab_size), dtype=torch.float32, device=device
+                        )
+                        scaling_penalties = torch.ones(
+                            (bs, vocab_size), dtype=torch.float32, device=device
+                        )
+                        apply_scaling_penalties(pen_logits, scaling_penalties)
+
+                if warm_logprobs:
+                    # 5. Triton row_logsumexp & row_logsumexp_topk (prompt logprobs / scoring)
+                    lse_dtypes = [torch.float32]
+                    if getattr(self, "dtype", None) in (torch.bfloat16, torch.float16):
+                        lse_dtypes.append(self.dtype)
+                    max_fused_k = min(FUSED_TOPK_MAX_K, vocab_size)
+                    lse_ks = sorted({k for k in (1, 2, 5) if 1 <= k <= max_fused_k})
+                    for dt in lse_dtypes:
+                        lse_input = torch.zeros(
+                            (2, vocab_size), dtype=dt, device=device
+                        )
+                        row_logsumexp(lse_input)
+                        for k_lse in lse_ks:
+                            row_logsumexp_topk(lse_input, k_lse)
+
+                del logits, pen_logits, scaling_penalties, lse_input
+
+            torch.cuda.synchronize(device)
+            if get_parallel().tp_rank == 0:
+                logger.info(
+                    "Prewarmed sampling, penalty, and logprob kernels in %.2f s.",
+                    time.perf_counter() - tic,
+                )
+        except Exception:
+            logger.warning(
+                "Sampling kernel prewarm encountered an error; continuing startup.",
+                exc_info=True,
+            )
+
         return self.sampling_prewarm_result
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):

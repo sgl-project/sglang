@@ -428,6 +428,7 @@ async def lifespan(fast_api_app: FastAPI):
             get_disagg().disaggregation_mode,
             get_serving().warmups.split(","),
             _global_state.tokenizer_manager,
+            app_state=fast_api_app.state,
         )
         logger.info("Warmup ended")
 
@@ -2378,6 +2379,13 @@ async def _send_disaggregation_warmup_requests(
         )
 
 
+def _local_requests_session() -> requests.Session:
+    """Session for loopback self-requests unaffected by ambient HTTP_PROXY."""
+    session = requests.Session()
+    session.trust_env = False
+    return session
+
+
 def _execute_server_warmup(server_args: ServerArgs):
     headers = {}
     url = server_args.url()
@@ -2385,13 +2393,14 @@ def _execute_server_warmup(server_args: ServerArgs):
         headers["Authorization"] = f"Bearer {get_serving().api_key}"
 
     ssl_verify = ssl_verify_of(server_args)
+    session = _local_requests_session()
 
     # Wait until the server is launched
     success = False
     for _ in range(120):
         time.sleep(1)
         try:
-            res = requests.get(
+            res = session.get(
                 url + "/model_info", timeout=5, headers=headers, verify=ssl_verify
             )
             assert res.status_code == 200, f"{res=}, {res.text=}"
@@ -2510,9 +2519,10 @@ def _execute_server_warmup(server_args: ServerArgs):
 
     # Send a warmup request
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
+    defer_ready = _is_multi_tokenizer_worker()
     try:
         if get_disagg().disaggregation_mode == "null":
-            res = requests.post(
+            res = session.post(
                 url + request_name,
                 json=json_data,
                 headers=headers,
@@ -2520,7 +2530,8 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
-            _global_state.tokenizer_manager.server_status = ServerStatus.Up
+            if not defer_ready:
+                _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
@@ -2545,9 +2556,10 @@ def _execute_server_warmup(server_args: ServerArgs):
                     get_disagg().disaggregation_mode,
                     failed_status_codes,
                 )
-            _global_state.tokenizer_manager.server_status = (
-                ServerStatus.Up if not failed_status_codes else ServerStatus.UnHealthy
-            )
+            if failed_status_codes:
+                _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+            elif not defer_ready:
+                _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
     except Exception:
         last_traceback = traceback.format_exc()
@@ -2556,6 +2568,79 @@ def _execute_server_warmup(server_args: ServerArgs):
         return False
 
     return success
+
+
+def _is_multi_tokenizer_worker() -> bool:
+    """True when running inside a spawned multi-tokenizer HTTP worker process."""
+    if getattr(app, "is_single_tokenizer_mode", False):
+        return False
+    if get_main_process_id() is None:
+        return False
+    return get_serving().tokenizer_worker_num > 1
+
+
+def _sync_multi_worker_ready_barrier() -> bool:
+    """Wait until all multi-tokenizer HTTP workers finish startup warmup.
+
+    Returns True for the single leader worker responsible for cluster-wide
+    post-warmup actions (such as ``/freeze_gc`` on scheduler/detokenizer).
+    """
+    if not _is_multi_tokenizer_worker():
+        return True
+
+    main_pid = get_main_process_id()
+    num_workers = get_serving().tokenizer_worker_num
+    port = get_serving().port
+    startup_time = getattr(_global_state.tokenizer_manager, "startup_time", None)
+    import hashlib
+
+    token = hashlib.sha256(
+        f"{main_pid}:{port}:{startup_time!r}".encode("utf-8")
+    ).hexdigest()[:12]
+    barrier_dir = os.path.join(
+        tempfile.gettempdir(), f"sglang_ready_{main_pid}_{port}_{token}"
+    )
+    os.makedirs(barrier_dir, exist_ok=True)
+    my_pid = os.getpid()
+    marker_path = os.path.join(barrier_dir, str(my_pid))
+    with open(marker_path, "w", encoding="utf-8") as f:
+        f.write("ok")
+
+    warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
+    deadline = time.monotonic() + (warmup_timeout if warmup_timeout > 0 else 600)
+    live_pids: List[int] = [my_pid]
+    while time.monotonic() < deadline:
+        live_pids = []
+        try:
+            entries = os.listdir(barrier_dir)
+        except OSError:
+            entries = []
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            try:
+                os.kill(pid, 0)
+                live_pids.append(pid)
+            except OSError:
+                pass
+        if len(live_pids) >= num_workers:
+            break
+        if main_pid is not None:
+            try:
+                os.kill(main_pid, 0)
+            except OSError:
+                return False
+        time.sleep(0.05)
+    else:
+        logger.warning(
+            "Timed out waiting for all %d tokenizer workers to finish warmup "
+            "(%d ready); proceeding.",
+            num_workers,
+            len(live_pids),
+        )
+
+    return bool(live_pids) and my_pid == min(live_pids)
 
 
 def _tokenizer_worker_gc_callback(worker_id: int, gc_threshold) -> Callable[[], None]:
@@ -2578,8 +2663,9 @@ def _freeze_gc_after_server_warmup(server_args: ServerArgs):
     freeze_headers = {}
     if freeze_key:
         freeze_headers["Authorization"] = f"Bearer {freeze_key}"
+    session = _local_requests_session()
     try:
-        res = requests.post(
+        res = session.post(
             server_args.url() + "/freeze_gc",
             headers=freeze_headers,
             timeout=10,
@@ -2610,12 +2696,18 @@ def _wait_and_warmup(
     if not get_serving().skip_server_warmup and not skip_elastic_joiner_warmup:
         if not execute_warmup_func(server_args):
             return
-    else:
+
+    is_leader_worker = True
+    if _global_state.tokenizer_manager.server_status != ServerStatus.UnHealthy:
+        if _is_multi_tokenizer_worker():
+            _global_state.tokenizer_manager.server_status = ServerStatus.Starting
+            is_leader_worker = _sync_multi_worker_ready_barrier()
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
     if post_warmup_callback is not None:
         post_warmup_callback()
-    _freeze_gc_after_server_warmup(server_args)
+    if is_leader_worker:
+        _freeze_gc_after_server_warmup(server_args)
 
     # The server is ready for requests
     logger.info("The server is fired up and ready to roll!")

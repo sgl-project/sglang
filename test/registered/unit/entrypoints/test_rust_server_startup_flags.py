@@ -510,7 +510,15 @@ class _RecordingClient(rust_warmups._ListenerClient):
 
 @pytest.mark.parametrize("disaggregation_mode", ["null", "prefill"])
 @pytest.mark.parametrize(
-    ("name", "requests"), [("voice_chat", 511), ("prefill_shapes", 18)]
+    ("name", "requests"),
+    [
+        ("voice_chat", 511),
+        ("prefill_shapes", 25),
+        ("sampling", 6),
+        ("penalties", 3),
+        ("structured_output", 2),
+        ("radix_prefix", 5),
+    ],
 )
 def test_registered_warmups_send_forwardable_requests(
     disaggregation_mode, name, requests
