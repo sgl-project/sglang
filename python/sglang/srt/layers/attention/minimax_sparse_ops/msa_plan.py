@@ -15,7 +15,6 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any
 
 import torch
 
@@ -200,9 +199,7 @@ def msa_v1_qmul4_decode_capability() -> tuple[bool, str | None]:
     return True, None
 
 
-_prebuild: tuple[list[tuple[subprocess.Popen, Any]], threading.Thread, float] | None = (
-    None
-)
+_prebuild: threading.Thread | None = None
 
 
 def start_msa_v1_prebuild(
@@ -248,46 +245,66 @@ def start_msa_v1_prebuild(
     # builds need separate processes; the explicit arch keeps them off the GPU.
     major, minor = torch.cuda.get_device_capability()
     env = {**os.environ, "MM_SPARSE_TARGET_ARCH": f"{major}{minor}a"}
-    procs = []
-    for code in builds:
-        # A file, not a pipe: a pipe would block the build once it fills.
-        log = tempfile.TemporaryFile(mode="w+")
-        proc = subprocess.Popen(
-            [sys.executable, "-c", code],
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=log,
-        )
-        procs.append((proc, log))
+    device = torch.cuda.current_device()
 
-    def build_on_this_device():
-        # topk_select resolves its arch from the current device.
+    def build_and_reap():
+        # The worker owns every process and log immediately, including when
+        # model construction/weight loading fails before the explicit join.
+        procs = []
+        started = time.perf_counter()
         try:
-            build_topk_select()
+            for code in builds:
+                log = tempfile.TemporaryFile(mode="w+")
+                try:
+                    proc = subprocess.Popen(
+                        [sys.executable, "-c", code],
+                        env=env,
+                        stdout=subprocess.DEVNULL,
+                        stderr=log,
+                    )
+                except BaseException:
+                    log.close()
+                    raise
+                procs.append((proc, log))
+            # CUDA's current device is thread-local.
+            with torch.cuda.device(device):
+                build_topk_select()
         except Exception as error:
+            # Optional warmup must not make the lazy-loading path unavailable.
             logger.warning("MSA-v1 kernel prebuild failed: %s", error)
+        finally:
+            # Let compiler children finish and release their build locks instead
+            # of terminating just the Python parent midway through a build.
+            for proc, log in procs:
+                try:
+                    if proc.wait() != 0:
+                        log.seek(0)
+                        logger.warning(
+                            "MSA-v1 kernel prebuild failed: %s", log.read()[-2000:]
+                        )
+                finally:
+                    log.close()
+            logger.info(
+                "MSA-v1 kernel prebuild finished in %.1fs",
+                time.perf_counter() - started,
+            )
 
-    topk_thread = threading.Thread(target=build_on_this_device, daemon=True)
-    topk_thread.start()
-    _prebuild = (procs, topk_thread, time.perf_counter())
+    # Join on interpreter shutdown too: a failed model load can exit the
+    # scheduler before its normal precompile hook runs.
+    worker = threading.Thread(target=build_and_reap, daemon=False)
+    try:
+        worker.start()
+    except RuntimeError as error:
+        logger.warning("MSA-v1 kernel prebuild could not start: %s", error)
+        return
+    _prebuild = worker
 
 
 def wait_msa_v1_prebuild() -> None:
     global _prebuild
-    if _prebuild is None:
-        return
-    procs, topk_thread, started = _prebuild
-    _prebuild = None
-    topk_thread.join()
-    for proc, log in procs:
-        if proc.wait() != 0:
-            log.seek(0)
-            # The lazy loader retries the build and raises from its own call site.
-            logger.warning("MSA-v1 kernel prebuild failed: %s", log.read()[-2000:])
-        log.close()
-    logger.info(
-        "MSA-v1 kernel prebuild joined %.1fs after start", time.perf_counter() - started
-    )
+    if _prebuild is not None:
+        _prebuild.join()
+        _prebuild = None
 
 
 def _require_available(
