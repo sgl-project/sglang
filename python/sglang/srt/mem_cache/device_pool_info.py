@@ -203,7 +203,7 @@ class KVScaleLayout(Enum):
 
 
 class KVScaleBuffers(msgspec.Struct, frozen=True, kw_only=True):
-    # A single K scale tensor holds all layers on axis 0.
+    # NPU ModelSlim MXFP8 uses one K scale tensor with layers on axis 0.
     k: tuple[torch.Tensor, ...] | torch.Tensor
     v: tuple[torch.Tensor, ...]
     layout: KVScaleLayout
