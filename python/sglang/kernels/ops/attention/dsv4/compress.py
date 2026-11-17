@@ -150,7 +150,7 @@ _PREFILL_PLAN_BYTES = 24
 
 # ----------------------------------------------------------------------------
 # Plan dataclasses. The element at index 1 is the consumer for
-# `compress_fused_norm_rope_inplace` (which reads ragged_id / seq_len from a
+# `compress_norm_rope_store` (which reads ragged_id / seq_len from a
 # 16-byte plan tensor --- both DecodePlan and CompressPlan satisfy that layout).
 # ----------------------------------------------------------------------------
 

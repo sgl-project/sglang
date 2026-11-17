@@ -189,8 +189,8 @@ def _looks_like_ai_toolkit_flux_lora(state_dict: Mapping[str, torch.Tensor]) -> 
         for k in keys
     )
     has_single_blocks = any(
-        k.startswith("single_blocks.")
-        or k.startswith("base_model.model.single_blocks.")
+        k.startswith(("single_blocks.", "base_model.model.single_blocks."))
+        and (".linear1." in k or ".linear2." in k)
         for k in keys
     )
     has_lora_ab = _has_substring_key(keys, ".lora_A") or _has_substring_key(
@@ -325,7 +325,6 @@ def _convert_via_diffusers_candidates(
     state_dict: Mapping[str, torch.Tensor],
     candidate_names: tuple[str, ...],
     log: logging.Logger,
-    unavailable_warning: str,
     no_converter_warning: str,
     success_info: str,
     all_failed_warning: str,
@@ -371,9 +370,6 @@ def _convert_xlabs_ai_via_diffusers(
             "convert_xlabs_flux_lora_to_diffusers",
         ),
         log=log,
-        unavailable_warning=(
-            "[LoRAFormatAdapter] XLabs FLUX detected but diffusers is unavailable."
-        ),
         no_converter_warning=(
             "[LoRAFormatAdapter] No XLabs FLUX converter found in diffusers."
         ),
@@ -397,9 +393,6 @@ def _convert_kohya_flux_via_diffusers(
             "convert_kohya_flux_lora_to_diffusers",
         ),
         log=log,
-        unavailable_warning=(
-            "[LoRAFormatAdapter] Kohya FLUX detected but diffusers is unavailable."
-        ),
         no_converter_warning="[LoRAFormatAdapter] No Kohya FLUX converter found.",
         success_info="[LoRAFormatAdapter] Converted Kohya FLUX LoRA using {name}",
         all_failed_warning=(
@@ -448,9 +441,18 @@ def _convert_ai_toolkit_flux_lora(
     lora_keys = ("lora_A", "lora_B")
     attn_types = ("img_attn", "txt_attn")
 
+    def move_alpha(old_prefix: str, new_prefixes: list[str]) -> None:
+        # Per-module alpha follows the module it scales; split sections share it.
+        alpha = original_state_dict.pop(f"{old_prefix}.alpha", None)
+        if alpha is not None:
+            for new_prefix in new_prefixes:
+                out[f"{new_prefix}.alpha"] = alpha
+
     for sl in range(num_single_layers):
         single_block_prefix = f"single_blocks.{sl}"
         attn_prefix = f"single_transformer_blocks.{sl}.attn"
+        move_alpha(f"{single_block_prefix}.linear1", [f"{attn_prefix}.to_qkv_mlp_proj"])
+        move_alpha(f"{single_block_prefix}.linear2", [f"{attn_prefix}.to_out"])
 
         for lora_key in lora_keys:
             linear1_key = f"{single_block_prefix}.linear1.{lora_key}.weight"
@@ -467,6 +469,17 @@ def _convert_ai_toolkit_flux_lora(
 
     for dl in range(num_double_layers):
         transformer_block_prefix = f"transformer_blocks.{dl}"
+
+        for attn_type in attn_types:
+            proj_names = (
+                ["to_q", "to_k", "to_v"]
+                if attn_type == "img_attn"
+                else ["add_q_proj", "add_k_proj", "add_v_proj"]
+            )
+            move_alpha(
+                f"double_blocks.{dl}.{attn_type}.qkv",
+                [f"{transformer_block_prefix}.attn.{n}" for n in proj_names],
+            )
 
         for lora_key in lora_keys:
             for attn_type in attn_types:
@@ -514,6 +527,10 @@ def _convert_ai_toolkit_flux_lora(
             ("txt_attn.proj", "attn.to_add_out"),
         ]
         for org_proj, diff_proj in proj_mappings:
+            move_alpha(
+                f"double_blocks.{dl}.{org_proj}",
+                [f"{transformer_block_prefix}.{diff_proj}"],
+            )
             for lora_key in lora_keys:
                 original_key = f"double_blocks.{dl}.{org_proj}.{lora_key}.weight"
                 if original_key in original_state_dict:
@@ -522,10 +539,9 @@ def _convert_ai_toolkit_flux_lora(
                     )
                     out[diffusers_key] = original_state_dict.pop(original_key)
 
-    for key, tensor in original_state_dict.items():
-        new_key = key.replace("double_blocks.", "transformer_blocks.")
-        new_key = new_key.replace("single_blocks.", "single_transformer_blocks.")
-        out[new_key] = tensor
+    # Leftover double/single block keys (MLP, modulation) keep their original
+    # names so the arch config's param_names_mapping resolves them.
+    out.update(original_state_dict)
 
     extra_mappings = {
         "img_in": "x_embedder",

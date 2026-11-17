@@ -29,7 +29,6 @@ def _extension() -> Module:
         cuda_wrappers=[
             ("mxfp4_matvec", "mxfp4_matvec"),
             ("mxfp4_matvec_dual", "mxfp4_matvec_dual"),
-            ("mxfp4_marlin_repack", "mxfp4_marlin_repack"),
         ],
         extra_cuda_cflags=["--use_fast_math"],
     )
@@ -100,32 +99,3 @@ def prewarm_mxfp4_extension() -> None:
     """Build and load the extension before the server accepts requests."""
 
     _extension()
-
-
-def mxfp4_marlin_repack(
-    raw: torch.Tensor,
-    source_slots: torch.Tensor,
-    target_slots: torch.Tensor,
-    *,
-    role_bytes: int,
-    hidden_size: int,
-    intermediate_size: int,
-    w13: torch.Tensor,
-    w2: torch.Tensor,
-    w13_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
-) -> None:
-    """Repack raw GGUF objects into contiguous Marlin SoA cache tensors."""
-
-    _extension().mxfp4_marlin_repack(
-        raw,
-        source_slots,
-        target_slots,
-        role_bytes,
-        hidden_size,
-        intermediate_size,
-        w13,
-        w2,
-        w13_scale,
-        w2_scale,
-    )

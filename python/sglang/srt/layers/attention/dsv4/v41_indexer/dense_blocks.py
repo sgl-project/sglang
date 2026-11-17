@@ -11,9 +11,11 @@ import torch
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     amax_topk_blocks,
     candidate_block_mask,
+    candidate_topk,
     select_candidate_block_ids,
     topk_among_blocks,
 )
+from sglang.kernels.ops.attention.dsv4.index_logits import FLAT_LOGITS_WIDTH_ALIGN
 
 from .scoring import (
     DeepGEMMPrefillData,
@@ -23,6 +25,7 @@ from .scoring import (
     prefill_requests,
     score_tiles,
     select_decode,
+    topk_ragged,
     write_decode,
     write_prefill,
 )
@@ -64,16 +67,18 @@ class DenseBlocksBackend:
         req_to_token: torch.Tensor,
         candidate_topk_blocks: int,
         candidate_block_size: int,
-        use_deep_gemm_prefill: bool,
+        use_deep_gemm_publish: bool,
+        use_deep_gemm_consume: bool,
     ) -> None:
         self.token_to_kv_pool = token_to_kv_pool
         self.req_to_token = req_to_token
         self.topk_blocks = candidate_topk_blocks
         self.block_size = candidate_block_size
-        self.use_deep_gemm_prefill = use_deep_gemm_prefill
+        self.use_deep_gemm_publish = use_deep_gemm_publish
+        self.use_deep_gemm_consume = use_deep_gemm_consume
 
     def publish_prefill(self, inputs: PrefillInputs):
-        if self.use_deep_gemm_prefill:
+        if self.use_deep_gemm_publish:
             return self._deep_gemm_publish_prefill(inputs)
         return self._torch_publish_prefill(inputs)
 
@@ -82,7 +87,7 @@ class DenseBlocksBackend:
         inputs: PrefillInputs,
         published: Optional[BlockIds],
     ) -> None:
-        if self.use_deep_gemm_prefill:
+        if self.use_deep_gemm_consume:
             self._deep_gemm_consume_prefill(inputs, published)
         else:
             self._torch_consume_prefill(inputs, published)
@@ -144,7 +149,7 @@ class DenseBlocksBackend:
 
     def _deep_gemm_publish_prefill(self, inputs: PrefillInputs):
         inputs.reset_outputs()
-        data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
+        data = get_deep_gemm_prefill_data(inputs)
         if data is None:
             return None
         selected, blocks = _publish_prefill_blocks(
@@ -165,7 +170,7 @@ class DenseBlocksBackend:
         published: Optional[BlockIds],
     ) -> None:
         inputs.reset_outputs()
-        data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
+        data = get_deep_gemm_prefill_data(inputs)
         if data is None:
             return
         assert published is not None
@@ -187,7 +192,6 @@ class DenseBlocksBackend:
         for request, chunks in prefill_requests(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
-            req_to_token=self.req_to_token,
         ):
             for chunk in chunks:
                 picked.append(
@@ -219,20 +223,31 @@ class DenseBlocksBackend:
         inputs: PrefillInputs,
         published: Optional[BlockIds],
     ) -> None:
-        assert published is not None
+        if published is None:  # a DeepGEMM publish with no visible position
+            inputs.reset_outputs()
+            return
         for request, chunks in prefill_requests(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
-            req_to_token=self.req_to_token,
+            candidate_blocks=published.blocks,
+            candidate_block_size=self.block_size,
         ):
             for chunk in chunks:
-                idx = topk_among_blocks(
-                    chunk.scores,
-                    chunk.lens,
-                    published.blocks[chunk.tok],
-                    request.k,
-                    block_size=self.block_size,
-                )
+                if chunk.candidate_only:
+                    idx = candidate_topk(
+                        chunk.scores,
+                        published.blocks[chunk.tok],
+                        request.k,
+                        self.block_size,
+                    )
+                else:
+                    idx = topk_among_blocks(
+                        chunk.scores,
+                        chunk.lens,
+                        published.blocks[chunk.tok],
+                        request.k,
+                        block_size=self.block_size,
+                    )
                 write_prefill(
                     inputs, request, chunk, idx.masked_fill(idx < 0, request.lc)
                 )
@@ -246,14 +261,12 @@ def _publish_prefill_blocks(
     topk_blocks: int,
     block_size: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
-
     selected = data.empty_selection(topk)
     width = min(topk_blocks, -(-max(data.lens_per_request, default=0) // block_size))
     blocks = torch.full(
         (data.num_rows, width), -1, dtype=torch.int32, device=selected.device
     )
-    for tile, logits in score_tiles(data, kv, width_align=4):
+    for tile, logits in score_tiles(data, kv):
         _publish_tile_blocks(
             data=data,
             tile=tile,
@@ -262,11 +275,11 @@ def _publish_prefill_blocks(
             topk_blocks=topk_blocks,
             block_size=block_size,
         )
-        topk_transform_ragged_v2(
+        topk_ragged(
             logits,
             data.compress_lens[tile],
-            out_offsets=data.request_starts[tile],
-            out_indices=selected[tile],
+            out=selected[tile],
+            offsets=data.request_starts[tile],
         )
         # Free this tile's logits before the generator scores the next one.
         del logits
@@ -307,7 +320,9 @@ def _consume_prefill_blocks(
     block_size: int,
 ) -> torch.Tensor:
     selected = data.empty_selection(topk)
-    for tile, logits in score_tiles(data, kv, width_align=block_size):
+    # the block-aligned slices of `_consume_tile_blocks` stay within the logits width
+    assert FLAT_LOGITS_WIDTH_ALIGN % block_size == 0
+    for tile, logits in score_tiles(data, kv):
         _consume_tile_blocks(
             data=data,
             tile=tile,

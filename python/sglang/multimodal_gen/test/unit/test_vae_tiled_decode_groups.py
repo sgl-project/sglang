@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tiled decoding must communicate within its SP group under TP x SP."""
+"""ParallelTiledVAE tiling: SP-group communication under TP x SP, seam blending."""
 
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -64,3 +65,36 @@ def _decode_in_sp_group(rank, rendezvous):
 def test_tiled_decode_uses_its_sp_group(tmp_path):
     rendezvous = (tmp_path / "rendezvous").as_uri()
     mp.spawn(_decode_in_sp_group, args=(rendezvous,), nprocs=4)
+
+
+def _scale(x, w):
+    # The loop's tensor-times-Python-float runs in fp32 op-math on CUDA, which
+    # is what _blend reproduces. ROCm's fp16 tensor-times-scalar kernel does not
+    # round the same way (it matches multiplying by the weight rounded to fp16),
+    # so on ROCm spell out the fp32 multiply the reference stands for.
+    if torch.version.hip is not None and x.dtype == torch.float16:
+        return (x.float() * w).to(x.dtype)
+    return x * w
+
+
+def _blend_per_slice(a, b, blend_extent, dim):
+    blend_extent = min(a.shape[dim], b.shape[dim], blend_extent)
+    for i in range(blend_extent):
+        b.select(dim, i).copy_(
+            _scale(a.select(dim, a.shape[dim] - blend_extent + i), 1 - i / blend_extent)
+            + _scale(b.select(dim, i), i / blend_extent)
+        )
+    return b
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("dim", [-3, -2, -1])
+@pytest.mark.parametrize("blend_extent", [1, 7, 64, 100])
+def test_blend_matches_per_slice_loop(dtype, dim, blend_extent):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    generator = torch.Generator(device="cpu").manual_seed(0)
+    a = torch.randn(1, 3, 9, 70, 66, generator=generator).to(device, dtype)
+    b = torch.randn(1, 3, 9, 70, 66, generator=generator).to(device, dtype)
+    expected = _blend_per_slice(a, b.clone(), blend_extent, dim)
+    actual = common.ParallelTiledVAE._blend(a, b.clone(), blend_extent, dim)
+    assert torch.equal(actual, expected)

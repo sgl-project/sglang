@@ -704,12 +704,15 @@ class PerformanceValidator:
                 "skipping the host budget check"
             )
             return
+        tolerance = self.scenario.host_anon_tolerance
+        if tolerance is None:
+            tolerance = self.tolerances.host_anon
         if expected_load_mb is not None:
             self._assert_le(
                 "Load Peak Host Anon",
                 summary.load_peak_host_anon_mb,
                 expected_load_mb,
-                self.tolerances.host_anon,
+                tolerance,
                 min_abs_tolerance=256.0,
                 unit=" MiB",
             )
@@ -718,7 +721,7 @@ class PerformanceValidator:
                 "Runtime Peak Host Anon",
                 summary.runtime_peak_host_anon_mb,
                 expected_runtime_mb,
-                self.tolerances.host_anon,
+                tolerance,
                 min_abs_tolerance=256.0,
                 unit=" MiB",
             )
@@ -865,6 +868,16 @@ class PerformanceValidator:
                 tolerance,
                 min_abs_tolerance=min_abs_tolerance,
             )
+
+
+class ActionPerformanceValidator(PerformanceValidator):
+    """Action policies run no denoising loop, so only the denoise checks are skipped."""
+
+    def _validate_denoise_agg(self, summary: PerformanceSummary) -> None:
+        return None
+
+    def _validate_denoise_steps(self, summary: PerformanceSummary) -> None:
+        return None
 
 
 class VideoPerformanceValidator(PerformanceValidator):
@@ -1058,7 +1071,7 @@ VALIDATOR_REGISTRY = {
     "default": PerformanceValidator,
     "video": VideoPerformanceValidator,
     "mesh": MeshValidator,
-    "action": PerformanceValidator,
+    "action": ActionPerformanceValidator,
 }
 
 
@@ -1140,10 +1153,28 @@ def get_generate_fn(
         else:
             timeout = 1200.0
         deadline = time.time() + timeout
+        last_progress = 0
+        was_running = False
         while True:
             page = client.videos.list()  # type: ignore[attr-defined]
             item = next((v for v in page.data if v.id == video_id), None)
             status = getattr(item, "status", None) if item is not None else None
+            if item is not None:
+                progress = item.progress
+                assert isinstance(progress, int) and last_progress <= progress <= 100, (
+                    f"{case_id}: invalid video progress {last_progress} -> {progress}"
+                )
+                assert not (was_running and status == "queued"), (
+                    f"{case_id}: running video job returned to queued"
+                )
+                assert status != "completed" or progress == 100, (
+                    f"{case_id}: completed video job has progress={progress}"
+                )
+                assert status not in {"queued", "in_progress"} or progress < 100, (
+                    f"{case_id}: unfinished video job has progress={progress}"
+                )
+                last_progress = progress
+                was_running = was_running or status == "in_progress"
 
             if status == "completed":
                 job_completed = True
@@ -1736,6 +1767,7 @@ def get_generate_fn(
                 ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
             )
         )
+        observation_rows = int(extra.get("observation_rows", 0))
 
         def tensor_payload(array):
             return {
@@ -1755,7 +1787,18 @@ def get_generate_fn(
                 ),
                 axis=-1,
             )
-            return tensor_payload(image.astype(np.uint8))
+            image = image.astype(np.uint8)
+            if observation_rows:
+                # Frame stack [T, H, W, 3], oldest first (Praxis).
+                image = np.tile(image, (observation_rows, 1, 1, 1))
+            return tensor_payload(image)
+
+        def state_payload():
+            if "state_row" in extra:
+                # One valid pose row per frame, so the quaternion stays normalized.
+                row = np.asarray(extra["state_row"], dtype=np.float32)
+                return tensor_payload(np.tile(row, (max(observation_rows, 1), 1)))
+            return tensor_payload(np.linspace(-0.5, 0.5, state_dim, dtype=np.float32))
 
         rng = np.random.default_rng(int(extra.get("seed", 0)))
         request_id = f"{case_id}-{int(time.time() * 1000)}"
@@ -1770,9 +1813,7 @@ def get_generate_fn(
                         for index, camera in enumerate(camera_order)
                     },
                     "camera_order": list(camera_order),
-                    "state": tensor_payload(
-                        np.linspace(-0.5, 0.5, state_dim, dtype=np.float32)
-                    ),
+                    "state": state_payload(),
                     "noise": tensor_payload(
                         rng.standard_normal((action_horizon, action_dim)).astype(
                             np.float32

@@ -481,7 +481,7 @@ struct RouteRadix4Kernel {
     auto N_ = SymbolicSize{"num_experts"};
     auto K_ = SymbolicSize{"topk"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     auto score_dtype = SymbolicDType{};
     TensorMatcher({M_, N_})

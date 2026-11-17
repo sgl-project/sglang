@@ -8,9 +8,11 @@
 use crate::common::{self, fetch, par, token_layout};
 use crate::pipeline::{DecodedMedia, MmFamilyProcessor, PositionOutput, ProcessedItem};
 
-/// Per-request bounds. Every source consumes the aggregate budget;
-/// [`fetch::MAX_FETCH_BYTES`] additionally caps each remote I/O stream.
-pub const MAX_ITEMS_PER_REQUEST: usize = 64;
+/// Per-request media byte bound. Every source consumes this aggregate budget;
+/// [`fetch::MAX_FETCH_BYTES`] additionally caps each remote I/O stream. There
+/// is deliberately no item-count bound: like the Python frontend, a request
+/// may carry any number of items within the byte budget (per-modality counts
+/// are the server's `--limit-mm-data-per-request`).
 pub const MAX_REQUEST_BYTES: u64 = 1280 << 20;
 
 /// One raw image source from the request.
@@ -81,11 +83,6 @@ pub fn process(family: &dyn MmFamilyProcessor, input: MmInput) -> Result<Output,
     }
     if input.images.is_empty() {
         return Err("multimodal request without image sources".into());
-    }
-    if input.images.len() > MAX_ITEMS_PER_REQUEST {
-        return Err(format!(
-            "multimodal request exceeds {MAX_ITEMS_PER_REQUEST} media items"
-        ));
     }
     // Stage 1 (fetch) is blocking I/O and runs inline, sequentially — never on
     // the CPU pool, where a slow URL or file read would starve decode/resize
@@ -220,17 +217,19 @@ mod tests {
         assert_eq!(out.input_ids.len(), 5 + 3 * 3); // each placeholder → 4 tokens
     }
 
+    /// Only bytes are bounded per request: a request with more images than the
+    /// old 64-item cap processes in full, while the byte budget still rejects.
     #[test]
-    fn per_request_caps_enforced() {
+    fn per_request_bound_is_bytes_not_items() {
         let family = pipeline_from_spec(SPEC).unwrap();
-        let too_many = MmInput {
-            input_ids: vec![1],
-            images: (0..=MAX_ITEMS_PER_REQUEST)
-                .map(|_| ImageSource::Bytes(vec![]))
-                .collect(),
+        let n = 100;
+        let many = MmInput {
+            input_ids: vec![1; n],
+            images: (0..n).map(|_| ImageSource::Bytes(png(8, 8))).collect(),
         };
-        let err = process(family.as_ref(), too_many).err().unwrap();
-        assert!(err.contains("media items"), "{err}");
+        let out = process(family.as_ref(), many).unwrap();
+        assert_eq!(out.items.len(), n);
+        assert_eq!(out.input_ids.len(), 4 * n);
 
         let err = add_media_bytes(MAX_REQUEST_BYTES / 2, (MAX_REQUEST_BYTES / 2 + 1) as usize)
             .unwrap_err();

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm-ascend: https://github.com/vllm-project/vllm-ascend/blob/main/vllm_ascend/platform.py
 
-import os
 from functools import lru_cache
 from typing import Any
 
@@ -18,27 +17,11 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-def device_id_to_physical_device_id(device_id: int) -> int:
-    if "ASCEND_RT_VISIBLE_DEVICES" in os.environ:
-        device_ids = os.environ["ASCEND_RT_VISIBLE_DEVICES"].split(",")
-        if device_ids == [""]:
-            msg = (
-                "ASCEND_RT_VISIBLE_DEVICES is set to empty string, which means"
-                " NPU support is disabled"
-            )
-            raise RuntimeError(msg)
-        physical_device_id = device_ids[device_id]
-        return int(physical_device_id)
-    else:
-        return device_id
-
-
 class NPUPlatformBase(Platform):
     _enum = PlatformEnum.NPU
     device_name: str = "npu"
     device_type: str = "npu"
     dispatch_key: str = "NPU"
-    device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
 
     @classmethod
     @lru_cache(maxsize=1)
@@ -60,17 +43,6 @@ class NPUPlatformBase(Platform):
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         device_props = torch.npu.get_device_properties(device_id)
         return int(device_props.total_memory)
-
-    @classmethod
-    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
-        if enforce_eager:
-            logger.warning(
-                "To see benefits of async output processing, enable NPU "
-                "graph. Since, enforce-eager is enabled, async output "
-                "processor cannot be used"
-            )
-            return False
-        return True
 
     @classmethod
     def inference_mode(cls):

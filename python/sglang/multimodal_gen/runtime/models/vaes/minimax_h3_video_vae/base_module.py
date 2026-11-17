@@ -7,24 +7,22 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from diffusers.utils import logging
 from diffusers.utils.torch_utils import maybe_allow_in_graph
 
+from sglang.kernels.ops import diffusion as diffusion_ops
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding,
 )
 from sglang.kernels.ops.diffusion import try_fused_scaled_residual_add_exact
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 from .attention import Attention
-from .vit_utils import _env_flag, _vit_torch_compile_kwargs
-
-logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
 def _vit_norm_input(module, hidden_states):
-    if _env_flag("MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM", "1"):
+    if envs.MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM:
         return hidden_states.float()
     return hidden_states.to(getattr(module.weight, "dtype", hidden_states.dtype))
 
@@ -99,15 +97,8 @@ class FeedForward(nn.Module):
         )
 
         self.w2 = nn.Linear(inner_dim, dim_out, bias=bias)
-        self._compile_forward_enabled = _env_flag(
-            "MINIMAX_H3_VAE_DECODER_VIT_FF_TORCH_COMPILE", "0"
-        )
-        self._compile_forward_fatal = _env_flag(
-            "MINIMAX_H3_VAE_DECODER_VIT_FF_TORCH_COMPILE_FATAL", "0"
-        )
-        self._compiled_forward = None
 
-    def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.w1(hidden_states)
 
         if self.use_gated:
@@ -129,59 +120,6 @@ class FeedForward(nn.Module):
 
         hidden_states = _unfused_bias_linear(self.w2, hidden_states)
         return hidden_states
-
-    def _get_forward_impl(self):
-        if not self._compile_forward_enabled:
-            return self._forward_impl
-        if self._compiled_forward is not None:
-            return self._compiled_forward
-        if not hasattr(torch, "compile"):
-            message = (
-                "torch.compile is unavailable; falling back to eager ViT FeedForward"
-            )
-            if self._compile_forward_fatal:
-                raise RuntimeError(message)
-            logger.warning(f"[ViTFeedForward] {message}")
-            self._compile_forward_enabled = False
-            return self._forward_impl
-
-        kwargs = _vit_torch_compile_kwargs(
-            "MINIMAX_H3_VAE_DECODER_VIT_FF_TORCH_COMPILE"
-        )
-        try:
-            self._compiled_forward = torch.compile(self._forward_impl, **kwargs)
-            logger.info(f"[ViTFeedForward] torch.compile enabled kwargs={kwargs}")
-        except Exception as exc:
-            if self._compile_forward_fatal:
-                raise
-            logger.warning(
-                f"[ViTFeedForward] torch.compile setup failed: {type(exc).__name__}: {exc}; "
-                "falling back to eager"
-            )
-            self._compile_forward_enabled = False
-            self._compiled_forward = None
-            return self._forward_impl
-        return self._compiled_forward
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        forward_impl = self._get_forward_impl()
-        try:
-            return forward_impl(hidden_states)
-        except Exception as exc:
-            if (
-                self._compile_forward_enabled
-                and self._compiled_forward is not None
-                and forward_impl is self._compiled_forward
-                and not self._compile_forward_fatal
-            ):
-                logger.warning(
-                    f"[ViTFeedForward] compiled forward failed: {type(exc).__name__}: {exc}; "
-                    "disabling compile and retrying eager"
-                )
-                self._compile_forward_enabled = False
-                self._compiled_forward = None
-                return self._forward_impl(hidden_states)
-            raise
 
 
 class RotaryEmbeddingND(nn.Module):
@@ -296,7 +234,38 @@ class TransformerBlock(nn.Module):
         self,
         hidden_states: torch.FloatTensor,
         rotary_pos_emb: Optional[torch.FloatTensor] = None,
+        *,
+        fused_norm: bool = False,
+        pending: torch.Tensor | None = None,
+        pending_scale: torch.Tensor | None = None,
     ):
+        if fused_norm:
+            if pending is None:
+                normed = diffusion_ops.h3_vae_rmsnorm(
+                    hidden_states, self.norm1.weight, self.norm1.eps
+                )
+            else:
+                hidden_states, normed = diffusion_ops.h3_vae_scale_add_rmsnorm(
+                    hidden_states,
+                    pending,
+                    pending_scale,
+                    self.norm1.weight,
+                    self.norm1.eps,
+                )
+            attn_output = self.attn(normed, rotary_pos_emb)
+            hidden_states, normed = diffusion_ops.h3_vae_scale_add_rmsnorm(
+                hidden_states,
+                attn_output,
+                self.scale1,
+                self.norm2.weight,
+                self.norm2.eps,
+            )
+            pending = self.ff(normed)
+            # the next block consumes this scale after offload post-hooks release
+            # this block's storage, so keep an independent copy across that boundary
+            scale = self.scale2.clone() if self._forward_hooks else self.scale2
+            return hidden_states, pending, scale
+
         norm_hidden_states = self.norm1(_vit_norm_input(self.norm1, hidden_states)).to(
             hidden_states.dtype
         )

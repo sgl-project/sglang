@@ -47,12 +47,13 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
-from sglang.kernels.jit.utils import get_jit_cuda_arch
+from sglang.kernels.arch import current_arch
 from sglang.kernels.numerics import (
     cuda_rsqrtf,
     div_rn_f32,
     round_bf16_to_fp32,
 )
+from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
 from sglang.kernels.ops.diffusion.common.platform import is_cuda
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, fp8_max, fp8_min
 from sglang.kernels.ops.quantization.fp8_utils import fp8_dtype_to_triton
@@ -391,10 +392,9 @@ def _is_bf16_cuda(t: torch.Tensor) -> bool:
 
 
 def _qk_head_launch_config() -> tuple[int, int]:
-    arch = get_jit_cuda_arch()
-    if arch.major == 10 and arch.minor == 3:
+    if current_arch().is_sm(10, 3):
         return 32, 1
-    if arch.major * 10 + arch.minor >= 120:
+    if current_arch().is_sm_at_least(12):
         return 8, 4
     return 64, 2
 
@@ -509,6 +509,7 @@ def try_fused_fp32_layernorm_bf16(
     return output
 
 
+@replay_launches
 def fused_layernorm_modulate_raw(
     x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor | None, eps: float
 ) -> torch.Tensor:

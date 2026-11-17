@@ -937,6 +937,36 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertTrue(config.supports_input_partition("blocks.0.mlp.fc1", 256))
         self.assertFalse(config.supports_input_partition("blocks.0.mlp.fc1", 128))
 
+    def test_metadata_layer_names_relative_to_the_diffusion_model(self):
+        """Community INT8 converters name _quantization_metadata layers without the
+        tensors' model.diffusion_model. prefix; ComfyUI strips it before matching."""
+        from sglang.multimodal_gen.runtime.utils.quantization_utils import (
+            inspect_comfy_quant_markers,
+        )
+
+        layer = "blocks.0.attn.qkv_proj"
+        metadata = {
+            "_quantization_metadata": json.dumps(
+                {"layers": {layer: {"format": "int8_tensorwise"}}}
+            )
+        }
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as checkpoint:
+            save_file(
+                {
+                    f"model.diffusion_model.{layer}.weight": torch.ones(
+                        (2, 4), dtype=torch.int8
+                    ),
+                    f"model.diffusion_model.{layer}.weight_scale": torch.ones(2, 1),
+                },
+                checkpoint.name,
+                metadata=metadata,
+            )
+            markers = inspect_comfy_quant_markers([checkpoint.name])
+
+        self.assertEqual(
+            markers[f"model.diffusion_model.{layer}"]["format"], "int8_tensorwise"
+        )
+
     @patch(
         "sglang.multimodal_gen.runtime.layers.quantization.kitchen_w4a8."
         "w4a8_int8_linear",
@@ -1487,6 +1517,43 @@ class TestTransformerQuantHelpers(unittest.TestCase):
 
         self.assertIsInstance(quant_config, Fp8Config)
         self.assertEqual(quant_config.ignored_layers, ignored_layers)
+
+    def _resolve_online_quant_config(self, method, ignored_layers):
+        return _resolve_quant_config(
+            hf_config={},
+            server_args=self._make_server_args(
+                quantization=method,
+                quantization_ignored_layers=ignored_layers,
+            ),
+            safetensors_list=[],
+            component_model_path="/unused/component/path",
+        )
+
+    def test_online_quant_configs_accepting_ignored_layers_receive_them(self):
+        # The online methods that honour `ignored_layers` in their
+        # `get_quant_method` must be handed the CLI patterns.
+        ignored_layers = ["blocks.0.attn.out_proj", "condition_proj"]
+        for method in ("fp8", "mxfp4", "convrot_int8"):
+            with self.subTest(method=method):
+                quant_config = self._resolve_online_quant_config(method, ignored_layers)
+                self.assertEqual(quant_config.ignored_layers, ignored_layers)
+
+    def test_online_quant_config_without_ignored_layers_param_does_not_raise(self):
+        # Methods outside the online-quant set must be built without the
+        # kwarg rather than raising TypeError when the CLI flag is set.
+        quant_config = self._resolve_online_quant_config(
+            "mxfp4_npu", ["blocks.0.attn.out_proj"]
+        )
+        self.assertIsNotNone(quant_config)
+        self.assertFalse(hasattr(quant_config, "ignored_layers"))
+
+    def test_unset_ignored_layers_leaves_config_default(self):
+        # Omitting the kwarg when the flag is unset must match the previous
+        # behaviour of passing ignored_layers=None explicitly.
+        for ignored_layers in (None, []):
+            with self.subTest(ignored_layers=ignored_layers):
+                quant_config = self._resolve_online_quant_config("fp8", ignored_layers)
+                self.assertEqual(quant_config.ignored_layers, [])
 
     @patch(
         "sglang.multimodal_gen.runtime.loader.transformer_load_utils.build_nvfp4_config_from_safetensors_list",

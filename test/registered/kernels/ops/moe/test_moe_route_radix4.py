@@ -8,7 +8,7 @@ one stands in for on decode-sized batches while larger ones still go to it, so
 the test_*_aiter cases hold the kernel to matching it column for column, ties
 included; anything less and a token's routing would depend on the batch size.
 
-Run:  pytest test/registered/kernels/ops/moe/test_moe_route_radix4.py -v
+Run:  SGLANG_USE_AITER=1 pytest test/registered/kernels/ops/moe/test_moe_route_radix4.py -v
 """
 
 import sys
@@ -215,6 +215,60 @@ def _aiter_route(scores, bias, renormalize=True, scaling=2.5):
 requires_aiter = pytest.mark.skipif(
     aiter_biased_grouped_topk is None, reason="aiter is not installed"
 )
+
+
+@pytest.mark.parametrize(
+    "num_experts,topk,num_groups,topk_group,num_tokens",
+    [
+        (256, 8, 1, 1, 4),
+        (256, 8, 8, 4, 4),
+        (896, 16, 1, 1, 1024),
+        (896, 16, 1, 1, 1025),
+    ],
+)
+@pytest.mark.parametrize("radix4", [False, True])
+@requires_aiter
+def test_select_experts_preserves_offset_fp32_bias(
+    num_experts, topk, num_groups, topk_group, num_tokens, radix4
+):
+    """Both router dispatches must preserve an fp32 bias that bf16 would collapse."""
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe import topk as topk_module
+    from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+    from sglang.srt.runtime_context import get_context
+
+    if not topk_module._use_aiter:
+        pytest.skip("Requires SGLANG_USE_AITER=1 before importing the router.")
+
+    scores = torch.zeros((num_tokens, num_experts), dtype=torch.bfloat16, device="cuda")
+    bias = 16.0 + torch.arange(num_experts, dtype=torch.float32, device="cuda") * 1e-4
+    bias = bias.roll(num_experts // 2)
+    config = TopKConfig(
+        top_k=topk,
+        use_grouped_topk=True,
+        num_expert_group=num_groups,
+        topk_group=topk_group,
+        correction_bias=bias,
+        routed_scaling_factor=2.5,
+    )
+    with (
+        get_context().override_server_args(),
+        envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.override(False),
+        envs.SGLANG_K3_RADIX4_TOPK.override(radix4),
+    ):
+        weights, ids, _ = select_experts(
+            torch.zeros((num_tokens, 8), device="cuda"), scores, config
+        )
+    expected_ids = torch.arange(
+        num_experts // 2 - topk, num_experts // 2, device="cuda"
+    )
+    torch.testing.assert_close(
+        ids.sort(dim=-1).values,
+        expected_ids.expand_as(ids).to(ids.dtype),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(weights, torch.full_like(weights, 2.5 / topk))
 
 
 @requires_aiter

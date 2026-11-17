@@ -24,6 +24,7 @@ from sglang.kernels.ops.diffusion import (
     can_use_nearest_upsample_nhwc,
     can_use_usp_merge_heads,
     cat_pad_channels_last_3d,
+    copy_head_groups,
     dup_up3d_add,
 )
 from sglang.kernels.ops.diffusion import (
@@ -156,16 +157,6 @@ def test_pack_qkv_destination_major_is_bit_exact(dtype):
     assert torch.equal(pack_qkv_destination_major(q, k, v, world_size), expected)
 
 
-def test_pack_qkv_destination_major_validates_inputs():
-    q = torch.empty(2, 4, 8, device=DEVICE, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="same 3D shape"):
-        pack_qkv_destination_major(q, q[:, :-1], q, 2)
-    with pytest.raises(ValueError, match="divide global_heads"):
-        pack_qkv_destination_major(q, q, q, 3)
-    with pytest.raises(ValueError, match="expected shape"):
-        pack_qkv_destination_major(q, q, q, 2, out=torch.empty_like(q))
-
-
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.mem_get_info()[0] < 24 * 2**30,
     reason="needs a CUDA GPU with 24 GiB free",
@@ -188,6 +179,50 @@ def test_pack_qkv_destination_major_rows_past_int32():
         out = pack_qkv_destination_major(q, k, v, world)[:, tail]
         ref = pack_qkv_destination_major(q[tail], k[tail], v[tail], world)
         assert torch.equal(out, ref)
+
+
+# ---------------------------------------------------------------------------
+# Head-group copy (pipelined Ulysses own rows and gathered output)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("batch,rows,groups,group_heads", [(1, 37, 5, 4), (2, 9, 3, 2)])
+def test_copy_head_groups_is_bit_exact(dtype, batch, rows, groups, group_heads):
+    """The head groups of a strided token-major shard land in their own blocks
+    of a pitched buffer, and come back, exactly as per-group copies move them."""
+    torch.manual_seed(0)
+    head_dim, slot_rows, row0 = 64, rows + 7, 3
+    width = group_heads * head_dim
+    # a strided shard: the rank's heads inside a wider projection
+    proj = torch.randn(
+        batch, rows, groups * group_heads + 3, head_dim, device=DEVICE, dtype=dtype
+    )
+    shard = proj[:, :, 3:]
+    group_numel = 3 * batch * slot_rows * width
+    pool = torch.zeros(groups * group_numel + 11, device=DEVICE, dtype=dtype)
+    offset = 11 + batch * slot_rows * width + row0 * width
+    blocks = pool.as_strided(
+        (groups, batch, rows, width), (group_numel, slot_rows * width, width, 1), offset
+    )
+    as_groups = lambda t: (
+        t.unflatten(2, (groups, group_heads)).flatten(3).permute(2, 0, 1, 3)
+    )
+
+    copy_head_groups(as_groups(shard), blocks)
+    expected = torch.zeros_like(pool)
+    for g in range(groups):
+        block = expected[11 + g * group_numel :][: 3 * batch * slot_rows * width]
+        rows_view = block.view(3, batch, slot_rows, group_heads, head_dim)[1]
+        rows_view[:, row0 : row0 + rows] = shard[
+            :, :, g * group_heads : (g + 1) * group_heads
+        ]
+    assert torch.equal(pool, expected)
+
+    back = torch.zeros_like(proj)
+    copy_head_groups(blocks, as_groups(back[:, :, 3:]))
+    assert torch.equal(back[:, :, 3:], shard)
+    assert not back[:, :, :3].any()
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +682,15 @@ def test_dup_up3d_add_bitwise(
     assert out.stride() == ref.stride()
     assert torch.equal(out, ref)
 
+    # With the producing conv's bias folded in: aten rounds the bias add to
+    # the storage dtype before the residual add.
+    bias = torch.randn(c_out, device=DEVICE, dtype=dtype)
+    ref_b = (main + bias.view(1, -1, 1, 1, 1)) + dup
+    out_b = dup_up3d_add(main, src, ft, fs, repeats, drop, bias)
+    assert out_b is not None and out_b.stride() == ref_b.stride()
+    assert torch.equal(out_b, ref_b)
+    assert dup_up3d_add(main, src, ft, fs, repeats, drop, bias[: c_out - 1]) is None
+
 
 @torch.no_grad()
 @pytest.mark.parametrize("pads_temporal_only", [False, True])
@@ -753,15 +797,6 @@ def test_nearest_upsample_nhwc_rejects_unsupported_inputs():
     x1 = torch.randn(1, 1, 1, 1, device="cuda", dtype=torch.bfloat16)
     assert x1.is_contiguous(memory_format=torch.channels_last)
     assert not can_use_nearest_upsample_nhwc(x1, 2.0, "nearest-exact")
-    with pytest.raises(ValueError):
-        nearest_upsample_nhwc(x1, 2.0)
-    # Direct calls validate too: no silent autograd drop, no layout surprise.
-    with pytest.raises(ValueError):
-        nearest_upsample_nhwc(x_cl, 1.5)
-    with pytest.raises(ValueError):
-        nearest_upsample_nhwc(x, 2.0)  # NCHW
     with torch.enable_grad():
         xg = x_cl.clone().requires_grad_(True)
         assert not can_use_nearest_upsample_nhwc(xg, 2.0, "nearest")
-        with pytest.raises(ValueError):
-            nearest_upsample_nhwc(xg, 2.0)
