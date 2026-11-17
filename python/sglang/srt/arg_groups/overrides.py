@@ -40,7 +40,7 @@ from sglang.srt.arg_groups.model_override_base import (
     _invoke_provider,
     _register_for,
     attention_backends_of,
-    ep_joiner_of,
+    ep_offset_joiner_of,
     get_default_attn_backend,
     is_attention_backend_not_set,
     mamba_extra_buffer_of,
@@ -1635,9 +1635,7 @@ def _page_size_default(view: Any) -> dict:
 
 @register_post_process
 def _data_parallelism_defaults(view: Any) -> dict:
-    # Joiners run one DP rank of their own but keep the primary's dp_attention settings;
-    # same breadth as attn_dp_enabled_of, which the dp_lm_head validation below reads.
-    if num_dp_ranks_of(view) == 1 and not ep_joiner_of(view):
+    if num_dp_ranks_of(view) == 1 and not ep_offset_joiner_of(view):
         return {"enable_dp_lm_head": False}
     return {}
 

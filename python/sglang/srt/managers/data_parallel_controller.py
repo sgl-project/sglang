@@ -777,9 +777,7 @@ class DataParallelController:
                     rank_port_args = PortArgs.init_new(
                         server_args, dp_rank, worker_ports
                     )
-                    if get_exec().moe.is_ep_joiner:
-                        # Joiners run no tokenizer; ports derive from their own --port.
-                        # Outputs (offset-0 recovery included) go via the primary's.
+                    if get_exec().moe.is_ep_offset_joiner:
                         primary_addr = NetworkAddress.parse(
                             get_parallel().dist_init_addr
                         )

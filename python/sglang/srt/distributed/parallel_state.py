@@ -2499,7 +2499,7 @@ def _create_global_tcp_store(
             # deployment's store on the same port and mix barrier and map keys.
             raise RuntimeError(
                 f"Failed to create the global TCPStore at {master_ip}:"
-                f"{base_store_port} ({e}); Elastic EP scaling needs it. If another "
+                f"{base_store_port} ({e}); Elastic EP needs it. If another "
                 "deployment holds the port, set SGLANG_TCP_STORE_PORT."
             ) from e
         logger.warning(
@@ -2585,7 +2585,7 @@ def init_distributed_environment(
                 world_size,
                 dist_init_addr=distributed_init_method,
                 allow_dynamic_membership=recovered_rank or scalable,
-                required=backend == "mooncake" and scalable,
+                required=backend == "mooncake",
             )
 
     # set the local rank
