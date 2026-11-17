@@ -33,8 +33,9 @@ class CaptureProfileOptions:
 def create_cuda_capture_profile(options: CaptureProfileOptions):
     if options.per_shape:
         # SGLANG_GRAPH_BATCH_CAPTURE: the profiler is stepped once per
-        # captured shape (see FullCudaGraphBackend.capture_one and
-        # BreakableCudaGraphBackend.capture_one), so on_trace_ready writes
+        # captured shape (see FullCudaGraphBackend.capture_one,
+        # BreakableCudaGraphBackend.capture_one, and
+        # TcPiecewiseCudaGraphBackend.capture_one), so on_trace_ready writes
         # one chrome trace per shape.
         rank = get_parallel().tp_rank
         runner_name = options.runner_name
