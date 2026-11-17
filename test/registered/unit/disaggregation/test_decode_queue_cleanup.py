@@ -210,8 +210,8 @@ class TestHeldDestinationPublication(CustomTestCase):
         )
         scheduler = SimpleNamespace(
             scheduler_stage_metrics=None,
-            tree_cache=SimpleNamespace(linker=None),
             enable_decode_hicache=False,
+            tree_cache=SimpleNamespace(linker=None),
             disagg_decode_prealloc_queue=prealloc,
             disagg_decode_transfer_queue=queue,
             waiting_queue=IndexedReqList(ListKind.WAITING),
@@ -439,6 +439,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
             state=None,
             translate_kv_indices_for_transfer=lambda indices: indices,
             window_pool_names=lambda: (),
+            request_allocators={},
         )
         queue.kv_manager = SimpleNamespace(
             kv_args=SimpleNamespace(state_types=[], state_sub_pools=[])

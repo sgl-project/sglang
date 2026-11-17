@@ -438,7 +438,6 @@ async def _dispatch_job_async(
         await resources.aclose()
 
 
-# TODO: support image to video generation
 @router.post("", response_model=VideoResponse)
 async def create_video(
     request: Request,

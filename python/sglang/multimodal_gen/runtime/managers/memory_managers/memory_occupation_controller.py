@@ -73,8 +73,6 @@ def _move_unregistered_tensors(module: torch.nn.Module, device: str) -> None:
     for attr_name, attr_value in list(attrs.items()):
         if attr_name.startswith("_"):
             continue
-        if attr_name in {"_parameters", "_buffers", "_modules"}:
-            continue
 
         moved_value = move_tensors(attr_value)
         if moved_value is not attr_value:

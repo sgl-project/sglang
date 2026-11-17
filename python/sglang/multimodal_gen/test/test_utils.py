@@ -37,7 +37,7 @@ logger = init_logger(__name__)
 # NPU/ascend) is read from sgl-project/ci-data-diffusion, where the GT-gen workflows
 # publish.
 SGL_TEST_FILES_CI_DATA_REPO = "sgl-project/ci-data-diffusion"
-SGL_TEST_FILES_CI_DATA_REVISION = "62f587d8f3321a1b8a679a2339df8eeb20319b54"
+SGL_TEST_FILES_CI_DATA_REVISION = "4fe135ff3cb72fca12934948b7a6a26a23e535ff"
 
 # The NPU pin is kept as a separate branch so ascend GT can be bumped independently
 # when it's regenerated on its own cadence. 2173af2f re-generated the MiniMax-H3
@@ -326,36 +326,6 @@ def run_command(command: list[str]) -> bool:
             return True
         print(f"Command failed with exit code {process.returncode}", flush=True)
     return False
-
-
-# ---------------------------------------------------------------------------
-# GPU memory helpers (nvidia-smi)
-# ---------------------------------------------------------------------------
-
-
-def query_gpu_mem_used_mib(gpu_index: int = 0, required: bool = False) -> int | None:
-    """Return GPU memory usage in MiB via ``nvidia-smi``, or *None* on failure.
-
-    When *required* is ``True`` the function raises instead of returning ``None``.
-    """
-    try:
-        out = subprocess.check_output(
-            [
-                "nvidia-smi",
-                f"--id={gpu_index}",
-                "--query-gpu=memory.used",
-                "--format=csv,noheader,nounits",
-            ],
-            text=True,
-        ).strip()
-        return int(out.splitlines()[0].strip())
-    except Exception as e:
-        logger.warning(f"nvidia-smi memory query failed: {type(e).__name__}: {e}")
-        assert not required, (
-            "nvidia-smi memory query is unavailable; "
-            "cannot enforce GPU memory assertions."
-        )
-        return None
 
 
 def is_mp4(data: bytes) -> bool:

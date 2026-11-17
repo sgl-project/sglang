@@ -475,9 +475,7 @@ def _is_minicpm5(ctx):
 
 
 def _is_lfm2(ctx):
-    return (
-        ctx.has_text("<|tool_call_start|>") or ctx.has_vocab("<|tool_call_start|>")
-    ) and (ctx.has_text("<|tool_call_end|>") or ctx.has_vocab("<|tool_call_end|>"))
+    return ctx.has_text("<|tool_call_start|>") and ctx.has_text("<|tool_call_end|>")
 
 
 def _is_step3p5(ctx):
@@ -617,6 +615,11 @@ TOOL_CALL_PARSER_RULES = (
         name="xml_kv_tool_call", value="glm45", predicate=_is_xml_kv_tool_call
     ),
     DetectionRule(name="mimo", value="mimo", predicate=_is_mimo),
+    DetectionRule(
+        name="granite_toolcall_parser",
+        value="granite_toolcall_parser",
+        predicate=lambda ctx: _is_granite_thinking_parser(ctx) and _is_qwen3_coder(ctx),
+    ),
     DetectionRule(name="qwen3_coder", value="qwen3_coder", predicate=_is_qwen3_coder),
     DetectionRule(name="qwen", value="qwen", predicate=_is_qwen3),
     DetectionRule(name="deepseek_v3", value="deepseekv3", predicate=_is_deepseek_v3),

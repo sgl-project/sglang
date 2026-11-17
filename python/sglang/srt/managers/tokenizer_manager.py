@@ -151,6 +151,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
 from sglang.srt.multimodal.mm_utils import has_valid_data
+from sglang.srt.multimodal.token_space_mm_process.registry import (
+    register_token_space_models,
+)
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.multimodal.transport.cuda_vmm import CudaVmmFeatureTransport
@@ -213,7 +216,7 @@ from sglang.srt.speculative.spec_decoding_metrics import (
     populate_spec_info,
 )
 from sglang.srt.utils import (
-    configure_gc_warning,
+    configure_gc_logging,
     freeze_gc,
     get_bool_env_var,
     get_or_create_event_loop,
@@ -663,6 +666,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Initialize tokenizer and processor
         if self.model_config.is_multimodal and not get_disagg().language_model_only:
             import_processors("sglang.srt.multimodal.processors")
+            register_token_space_models()
             if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
                 import_processors(mm_process_pkg, overwrite=True)
             _processor = get_processor_wrapper()
@@ -905,8 +909,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             start_cpu_monitor_thread("tokenizer")
 
-        if get_observability().gc_warning_threshold_secs > 0.0:
-            configure_gc_warning(get_observability().gc_warning_threshold_secs)
+        configure_gc_logging("Tokenizer Manager")
         self.soft_watchdog = Watchdog.create(
             debug_name="TokenizerManager",
             watchdog_timeout=get_device().soft_watchdog_timeout,
@@ -1461,6 +1464,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if isinstance(obj, EmbeddingReqInput):
             self._validate_for_matryoshka_dim(obj)
 
+        self._validate_token_indices_to_pool(obj, input_ids)
+
         # Validate generation-specific fields
         if isinstance(obj, GenerateReqInput):
             self._validate_token_ids_logprob(obj)
@@ -1616,6 +1621,36 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             raise ValueError(
                 f"top_logprobs must be an integer in [0, {vocab_size}], "
                 f"got {top_logprobs_num!r}."
+            )
+
+    def _validate_token_indices_to_pool(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        input_ids: Optional[List[int]],
+    ) -> None:
+        # The forward indexes the prompt's hidden states with these positions;
+        # an empty list or an out-of-range position crashes it.
+        indices = obj.token_indices_to_pool
+        if indices is None:
+            return
+        # Only a prompt-only request reads these positions; any other request
+        # would ignore them.
+        if obj.sampling_params.get("max_new_tokens") != 0:
+            raise ValueError("token_indices_to_pool requires max_new_tokens=0.")
+        if input_ids is not None:
+            seq_len = len(input_ids)
+        elif obj.input_embeds is not None:
+            seq_len = len(obj.input_embeds)
+        else:
+            return
+        if (
+            not isinstance(indices, list)
+            or not indices
+            or any(type(i) is not int or not 0 <= i < seq_len for i in indices)
+        ):
+            raise ValueError(
+                "token_indices_to_pool must be a non-empty list of prompt "
+                f"positions in [0, {seq_len}), got {indices!r}."
             )
 
     def _validate_logprob_start_len(self, obj: GenerateReqInput) -> None:
@@ -2149,6 +2184,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
         is_stream = getattr(obj, "stream", False)
+        # 0.0 polls on the first output, catching a client lost while queued.
+        next_disconnect_poll = 0.0
         while True:
             try:
                 if request is None:
@@ -2248,17 +2285,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 yield out
                 break
 
+            # is_disconnected() costs an event-loop pass, so poll at most once per wait
+            # timeout; StreamingResponse cancels a disconnected stream without polling.
+            now = time.monotonic()
             if (
                 request is not None
                 and not obj.background
-                and await request.is_disconnected()
+                and now >= next_disconnect_poll
             ):
-                # Abort the request for disconnected requests (running)
-                self.abort_request(obj.rid)
-                # Use exception to kill the whole call stack and asyncio task
-                raise ValueError(
-                    f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
-                )
+                next_disconnect_poll = now + _REQUEST_STATE_WAIT_TIMEOUT
+                if await request.is_disconnected():
+                    # Abort the request for disconnected requests (running)
+                    self.abort_request(obj.rid)
+                    # Use exception to kill the whole call stack and asyncio task
+                    raise ValueError(
+                        f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
+                    )
 
             if is_stream:
                 # Record response sent time right before we send response.

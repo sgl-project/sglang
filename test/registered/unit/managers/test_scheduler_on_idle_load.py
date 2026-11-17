@@ -151,6 +151,8 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.load_inquirer = MagicMock()
         scheduler.enable_unified_memory = False
         scheduler.invariant_checker = MagicMock()
+        scheduler.gc_freezer = MagicMock()
+        scheduler.forward_ct = 0
         scheduler.pool_stats_observer = MagicMock()
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.token_to_kv_pool_allocator.verify_byte_accounting.return_value = []

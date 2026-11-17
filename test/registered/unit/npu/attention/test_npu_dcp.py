@@ -27,8 +27,8 @@ register_npu_ci(est_time=9, suite="base-a-test-npu")
 # report CPU while loading the modules under test.
 sys.modules.setdefault("sgl_kernel_npu", types.ModuleType("sgl_kernel_npu"))
 sys.modules.setdefault("torch_npu", MagicMock(name="torch_npu"))
-import sglang.srt.utils as _utils
-from sglang.srt.utils import device as _device_utils
+import sglang.srt.utils as _utils  # noqa: E402
+from sglang.srt.utils import device as _device_utils  # noqa: E402
 
 _real_is_npu = _device_utils.is_npu
 _real_utils_is_npu = _utils.is_npu
@@ -340,6 +340,82 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
                 speculative_num_draft_tokens=None,
                 scaling=1.0,
             )
+
+    def test_packed_fp8_uses_native_kernel_for_prefill_decode_and_verify(self):
+        q = torch.ones(2, 2, 512, dtype=torch.bfloat16)
+        rope = torch.zeros(2, 2, 64, dtype=torch.bfloat16)
+        packed = torch.zeros(3, 128, 1, 656, dtype=torch.float8_e4m3fn)
+        topk = torch.tensor([[[2, -1]], [[-1, -1]]], dtype=torch.int32)
+        # The packed kernel leaves zero output and max/sum for the empty row.
+        attention_out = q.clone()
+        attention_out[1].zero_()
+        mock_op = MagicMock(
+            return_value=(
+                attention_out,
+                torch.tensor([[[1.0, 1.0], [0.0, 0.0]]]),
+                torch.tensor([[[2.0, 2.0], [0.0, 0.0]]]),
+            )
+        )
+        for mode in ("prefill", "decode", "verify"):
+            with self.subTest(mode=mode):
+                mock_op.reset_mock()
+                metadata = SimpleNamespace(
+                    dcp_block_tables=torch.tensor([[1], [2]], dtype=torch.int32),
+                    dcp_seq_lens=torch.tensor([5, 6], dtype=torch.int32),
+                    dcp_spec_block_tables=torch.tensor([[1], [1]], dtype=torch.int32),
+                    dcp_spec_seq_lens=torch.tensor([7, 8], dtype=torch.int32),
+                )
+                verify = mode == "verify"
+                # Verify starts with one cumulative endpoint for two draft tokens.
+                query_lens = torch.tensor([1, 2] if mode == "decode" else [2])
+                expected_query_lens = torch.tensor(
+                    [2] if mode == "prefill" else [1, 2], dtype=torch.int32
+                )
+                if mode == "prefill":
+                    # Two query rows, one request, and one real KV length.
+                    metadata.dcp_block_tables = metadata.dcp_block_tables[:1]
+                    metadata.dcp_seq_lens = torch.tensor([128], dtype=torch.int32)
+                out, lse = forward_dcp_sparse_attention(
+                    q_nope=q,
+                    q_rope=rope,
+                    k_nope=packed,
+                    k_rope=packed[..., :0],
+                    topk_indices=topk,
+                    actual_seq_lengths_query=query_lens,
+                    forward_metadata=metadata,
+                    forward_batch=SimpleNamespace(forward_mode=_Mode(verify)),
+                    speculative_num_draft_tokens=2 if verify else None,
+                    scaling=0.25,
+                    fp8_attention=mock_op,
+                )
+                mock_op.assert_called_once()
+                call = mock_op.call_args.kwargs
+                self.assertIs(call["query"], q)
+                self.assertIs(call["query_rope"], rope)
+                self.assertEqual(call["packed_kv"].data_ptr(), packed.data_ptr())
+                self.assertEqual(call["packed_kv"].dtype, torch.uint8)
+                self.assertEqual(call["packed_kv"].shape, packed.shape)
+                self.assertIs(call["sparse_indices"], topk)
+                self.assertEqual(call["scale_value"], 0.25)
+                torch.testing.assert_close(
+                    call["actual_seq_lengths_query"], expected_query_lens
+                )
+                self.assertIs(
+                    call["block_table"],
+                    metadata.dcp_spec_block_tables
+                    if verify
+                    else metadata.dcp_block_tables,
+                )
+                self.assertIs(
+                    call["actual_seq_lengths_kv"],
+                    metadata.dcp_spec_seq_lens if verify else metadata.dcp_seq_lens,
+                )
+                self.assertTrue(torch.equal(out[0], q[0]))
+                self.assertTrue(torch.equal(out[1], torch.zeros_like(q[1])))
+                self.assertTrue(
+                    torch.allclose(lse[0], 1 + torch.log(torch.full((2,), 2.0)))
+                )
+                self.assertTrue(torch.isneginf(lse[1]).all())
 
     def test_verify_row_mismatch_fails_before_operator(self):
         q, rope, _, _, topk = self._inputs(2)

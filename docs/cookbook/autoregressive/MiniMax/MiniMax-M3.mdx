@@ -434,13 +434,13 @@ sglang serve \
 
 </Tabs>
 
-Then start the PD router, pointing it at the prefill bootstrap (URL plus its `--disaggregation-bootstrap-port`) and the decode endpoint:
+Then start the PD router, pointing it at both endpoints; `--model-id` is the workers' `--model-path`:
 
 ```bash PD router
-python3 -m sglang_router.launch_router \
-  --pd-disaggregation \
-  --prefill http://<prefill-host>:30000 8998 \
-  --decode http://<decode-host>:30001 \
+sgl-router \
+  --model-id <model-path> \
+  --no-tokenizer \
+  --worker-urls http://<prefill-host>:30000 http://<decode-host>:30001 \
   --policy round_robin \
   --host 0.0.0.0 --port 8000
 ```

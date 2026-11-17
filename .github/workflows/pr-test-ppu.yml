@@ -104,13 +104,13 @@ jobs:
     uses: ./.github/workflows/pr-gate.yml
     with:
       require-run-ci: true
-      require-label: run-ci-ppu
+      require-label: run-ci-ppu-extra
     secrets: inherit
 
   ppu-build:
     name: ppu-build
     needs: [check-changes, pr-gate]
-    if: needs.check-changes.outputs.ppu == 'true'
+    if: needs.check-changes.outputs.ppu == 'true' && needs.pr-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
@@ -168,7 +168,7 @@ jobs:
   ppu-sanity:
     name: ppu-sanity (${{ matrix.runner }})
     needs: [check-changes, pr-gate, ppu-build]
-    if: needs.check-changes.outputs.ppu == 'true'
+    if: needs.check-changes.outputs.ppu == 'true' && needs.pr-gate.outputs.opted-in != 'false'
     # Both PPU generations reuse the same wheels; each host supplies its own
     # runtime image and device, while checkpoints come from the shared NAS.
     strategy:
@@ -248,6 +248,7 @@ jobs:
         env:
           NEEDS_JSON: ${{ toJson(needs) }}
           PPU_IN_SCOPE: ${{ needs.check-changes.outputs.ppu }}
+          OPTED_IN: ${{ needs.pr-gate.outputs.opted-in }}
           BUILD_RESULT: ${{ needs.ppu-build.result }}
           SANITY_RESULT: ${{ needs.ppu-sanity.result }}
         run: |
@@ -255,12 +256,12 @@ jobs:
             printf '%s\n' '::error::A PPU CI dependency failed or was cancelled.'
             exit 1
           fi
-          if [[ "$PPU_IN_SCOPE" == "true" ]]; then
+          if [[ "$PPU_IN_SCOPE" == "true" && "$OPTED_IN" != "false" ]]; then
             if [[ "$BUILD_RESULT" != "success" || "$SANITY_RESULT" != "success" ]]; then
               printf '%s\n' '::error::PPU scope requires a successful native build and both PPU sanity files.'
               exit 1
             fi
             printf '%s\n' 'Native build and both PPU sanity files passed.'
           else
-            printf '%s\n' 'PPU is outside this run scope; no PPU tests were requested.'
+            printf '%s\n' 'PPU is outside this run scope or not opted in; no PPU tests were requested.'
           fi

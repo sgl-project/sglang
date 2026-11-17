@@ -6,6 +6,7 @@ from typing import List, NamedTuple, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_token_shard import get_dsa_token_shard_plan
 from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import (
     cumulative,
     plan_dsa_token_shard,
@@ -46,24 +47,28 @@ def create_npu_hadamard_128(head_dim: int, device) -> torch.Tensor:
     return (_create_hadamard_128_cpu().to(device=device) / (128**0.5)).contiguous()
 
 
-def _quantize_npu_indexer_activation(x, hadamard, dst_type):
+def _quantize_npu_indexer_activation(x, hadamard, dst_type, scale_type):
     assert x.dtype == torch.bfloat16 and x.shape[-1] == 128
     if x.numel() == 0:
         return (
             torch.empty_like(x, dtype=dst_type),
-            torch.empty(x.shape[:-1], dtype=torch.float32, device=x.device),
+            torch.empty(x.shape[:-1], dtype=scale_type, device=x.device),
         )
     rotated = x @ hadamard
     quantized, scale = torch_npu.npu_dynamic_quant(
         rotated.reshape(-1, 128), dst_type=dst_type
     )
-    return quantized.reshape(x.shape), scale.to(torch.float32).reshape(x.shape[:-1])
+    return quantized.reshape(x.shape), scale.to(scale_type).reshape(x.shape[:-1])
 
 
 def plan_indexer_query_shard(
     prefix_lens: List[int], extend_lens: List[int], tp_size: int, tp_rank: int
 ):
     """One attention-TP rank's share of an extend batch's indexer queries.
+
+    The token shard's partition, derived rather than recomputed: the token
+    shard skips this top-k's all-gather on the strength of both picking the
+    same rows, so they must not be two implementations.
 
     Returns ``(start, rows, num_real, cum_query_lens, key_lens)``.
     """
@@ -106,6 +111,36 @@ class _IndexerQueryShard(NamedTuple):
         out = topk_indices.new_empty((self.rows * self.tp_size, topk_indices.shape[-1]))
         attn_tp_all_gather_into_tensor(out, topk_indices.contiguous())
         return out[:num_tokens]
+
+    def resolve(
+        self, topk_indices: torch.Tensor, num_tokens: int, forward_batch
+    ) -> torch.Tensor:
+        """Full-width top-k, or this rank's own rows when the token shard will
+        slice the gathered tensor straight back to them anyway.
+
+        Sets ``npu_indexer_topk_is_local`` so attention knows which it got.
+        """
+        plan = get_dsa_token_shard_plan(forward_batch)
+        local = plan is not None
+        if local and (plan.rows != self.rows or plan.local_start != self.start):
+            # Same arithmetic, but the two sites read their inputs separately;
+            # if those ever drift, the gather stays correct where this would not.
+            print_info_once(
+                "DSA token-shard and indexer sharding disagree on the row range "
+                f"(plan {plan.local_start}+{plan.rows} against shard "
+                f"{self.start}+{self.rows}); keeping the top-k all-gather"
+            )
+            local = False
+        forward_batch.npu_indexer_topk_is_local = local
+        if not local:
+            return self.gather(topk_indices, num_tokens)
+        # Every rank logs, so a grep counts ranks: the output is identical either
+        # way, which makes this line the only evidence it ran.
+        print_info_once(
+            "DSA token-shard: skipping the indexer top-k all-gather; each rank "
+            "keeps the rows it scored"
+        )
+        return topk_indices
 
 
 def _build_indexer_query_shard(
@@ -438,7 +473,10 @@ class DSANPUIndexerMixin:
             )
         if use_quant_indexer:
             k, k_scale = _quantize_npu_indexer_activation(
-                k, pool.indexer_hadamard_128, pool.dtype
+                k,
+                pool.indexer_hadamard_128,
+                pool.index_k_store_dtype,
+                pool.index_k_scale_dtype,
             )
             pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
         pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
@@ -506,7 +544,12 @@ class DSANPUIndexerMixin:
             is_prefill
             and self.dsa_enable_prefill_cp
             and forward_batch.attn_cp_metadata is not None
+            and not use_quant_indexer
         ):
+            if use_quant_indexer:
+                raise RuntimeError(
+                    "DSANPUIndexerMixin.do_npu_cp_balance_indexer is not implemented for quantized indexer cache"
+                )
             topk_indices = self.do_npu_cp_balance_indexer(
                 q.view(-1, self.n_heads, self.head_dim),
                 past_key_states,
@@ -517,11 +560,11 @@ class DSANPUIndexerMixin:
             )
             return topk_indices
         else:
-            block_table = (
-                block_table[: actual_seq_lengths_q.size()[0]]
-                if is_prefill
-                else block_table
-            )
+            if is_prefill and uses_prefill_cp:
+                weights = weights.contiguous().view(-1, weights.shape[-1])
+                actual_seq_lengths_q = actual_seq_lengths_q.to(q.device)
+            elif is_prefill:
+                block_table = block_table[: actual_seq_lengths_q.size(0)]
             query = q.view(-1, self.n_heads, self.head_dim)
             # The full width for the gather, NOT query.shape[0] (already cut).
             num_query_tokens = bs
@@ -538,12 +581,23 @@ class DSANPUIndexerMixin:
                 query, query_scale = _quantize_npu_indexer_activation(
                     query,
                     pool.indexer_hadamard_128,
-                    pool.dtype,
+                    pool.index_k_store_dtype,
+                    pool.index_k_scale_dtype,
                 )
-                topk_indices = torch_npu.npu_quant_lightning_indexer(
+
+                if pool.index_k_store_dtype == torch.int8:
+                    # INT8 keys require FP16 weights
+                    op_weights = weights.to(torch.float16)
+                    # torch_npu.npu_quant_lightning_indexer is not working
+                    # for int8 cache in case of custom_ops imported
+                else:
+                    op_weights = weights
+
+                # custom_ops can replace the torch_npu alias with a different schema.
+                topk_indices = torch.ops.npu.npu_quant_lightning_indexer(
                     query=query,
                     key=past_key_states,
-                    weights=weights,
+                    weights=op_weights,
                     query_dequant_scale=query_scale,
                     key_dequant_scale=pool.get_index_k_scale_buffer(layer_id),
                     actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
@@ -574,7 +628,11 @@ class DSANPUIndexerMixin:
                     sparse_mode=3,
                 )[0].squeeze(1)
             if shard is not None:
-                topk_indices = shard.gather(topk_indices, num_query_tokens)
+                topk_indices = shard.resolve(
+                    topk_indices, num_query_tokens, forward_batch
+                )
+            else:
+                forward_batch.npu_indexer_topk_is_local = False
             # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
             return topk_indices
 

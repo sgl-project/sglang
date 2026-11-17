@@ -94,7 +94,9 @@ class TestQwen3NextFusedQKPrologue(CustomTestCase):
                         positions, qkv.clone()
                     )
                     torch.testing.assert_close(v, v_ref, atol=0, rtol=0)
-                    torch.testing.assert_close(gate, gate_ref, atol=0, rtol=0)
+                    torch.testing.assert_close(
+                        gate, gate_ref.reshape_as(gate), atol=0, rtol=0
+                    )
                     rotary_dim = layer.rotary_emb.rotary_dim
                     for name, out, ref, heads in (
                         ("q", q, q_ref, num_heads),

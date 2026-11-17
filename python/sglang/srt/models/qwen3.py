@@ -601,8 +601,9 @@ class Qwen3DecoderLayer(nn.Module):
             (attn, self.input_layernorm),
             (ffn, self.post_attention_layernorm),
         )
-        # Resolved on the first decode: the bpreshuffle happens at weight load.
-        self._decode_quant_formats = None
+        # Only aiter on gfx95 needs detection after weight loading.
+        # Other platforms can resolve the empty formats before tracing forward.
+        self._decode_quant_formats = None if (_use_aiter and _is_gfx95) else ("", "")
 
     @staticmethod
     def stage_facts(config: Qwen3Config, layer_id: int):

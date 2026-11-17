@@ -124,6 +124,7 @@ class TestDSABackendDPPadding(CustomTestCase):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
             out_cache_loc=torch.arange(rows),
+            out_cache_loc_is_physical=False,
             positions=torch.arange(rows),
             mha_return_lse=False,
             _attn_output=None,
@@ -253,6 +254,7 @@ class TestDSABackendDPPadding(CustomTestCase):
         )
         backend = SimpleNamespace(
             forward_metadata=metadata,
+            _trtllm_fused_q=False,
             kv_cache_dtype=torch.bfloat16,
             kv_layers=_routed(
                 SimpleNamespace(get_key_buffer=lambda _layer_id: torch.zeros((24, 3)))

@@ -31,7 +31,7 @@ import hashlib
 import warnings
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -70,7 +70,10 @@ from sglang.srt.utils import (
     support_triton,
 )
 from sglang.srt.utils.common import ceil_align
-from sglang.srt.utils.device import is_pin_memory_available
+from sglang.srt.utils.device import (
+    async_h2d_stack,
+    is_pin_memory_available,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -663,6 +666,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For multimodal
     mm_input_embeds: Optional[torch.Tensor] = None
 
+    # spec.BuiltMegakernel's draft_step_fold for this EAGLE draft round
+    draft_step_fold: Optional[Any] = None
+
     # Encoder-decoder cross-attention mask
     cross_attention_custom_mask: Optional[torch.Tensor] = None
 
@@ -684,6 +690,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Each DP rank's rows from a late-layer row switch on; None on steps that skip
     # the exchange.
     global_late_layer_num_tokens_cpu: Optional[List[int]] = None
+    global_late_layer_tail_graph_compatible: bool = False
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -696,6 +703,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_children: Optional[List[ForwardBatch]] = None
 
     attn_cp_metadata: Optional[BaseContextParallelMetadata] = None
+    # Capture-stable local views, populated only by PrefillCPBCGInput.prepare.
+    cp_positions: Optional[torch.Tensor] = None
+    cp_input_ids: Optional[torch.Tensor] = None
 
     # For decode context parallel.
     # NOTE: DecodeContextParallelMetadata is imported under TYPE_CHECKING only (see the
@@ -1017,6 +1027,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens=batch.encoder_lens,
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
             input_embeds=batch.input_embeds,
+            cp_positions=None,
+            cp_input_ids=None,
             replace_embeds=batch.replace_embeds,
             replace_positions=batch.replace_positions,
             # Scalar config / flags
@@ -1517,7 +1529,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
                 for i in range(batch_size)
             ]
-            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
+            mrope_delta_tensor = async_h2d_stack(mrope_deltas, device=device)
         next_input_positions = (
             (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
         )
@@ -1769,12 +1781,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Larger prefills fall back to eager and keep the memory-efficient
         # SUM_LEN. global_num_tokens is identical across ranks (all-gathered),
         # so the decision is consistent cluster-wide.
+        #
+        # Opt-in: with the env set, an idle (zero-token) DP rank keeps SUM_LEN
+        # instead of being padded to the capture bucket, so the step runs
+        # eagerly with only the rows that exist.  Off keeps the MAX_LEN path
+        # used by GPU prefill on MoE-TP; turn on for EP prefill (e.g. Ascend
+        # ascend_ops).
         prefill_cg = get_exec().graph.cuda_graph_config.prefill
+        max_len_with_idle_allowed = (
+            min(global_num_tokens) > 0
+            if envs.SGLANG_ENABLE_PREFILL_GRAPH_IDLE_RANK_EAGER.get()
+            else True
+        )
         if (
             self.can_run_dp_prefill_cuda_graph
             and self.is_extend_in_batch
             and prefill_cg.bs
             and max(global_num_tokens) <= max(prefill_cg.bs)
+            and max_len_with_idle_allowed
             and not prefill_graph_tolerates_sum_len()
         ):
             dp_padding_mode = DpPaddingMode.MAX_LEN
@@ -1944,13 +1968,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ):
             local_late_rows = model_runner.attn_backend.late_layer_num_tokens(self)
             if local_late_rows is not None:
-                late_rows = torch.empty(sync_group_size, dtype=torch.int64)
+                tail_graph_compatible = (
+                    self.forward_mode.is_idle()
+                    or self.forward_mode.is_extend_without_speculative()
+                )
+                late_layout = torch.empty(2 * sync_group_size, dtype=torch.int64)
                 all_gather_single(
-                    late_rows,
-                    torch.tensor([local_late_rows], dtype=torch.int64),
+                    late_layout,
+                    torch.tensor(
+                        [local_late_rows, tail_graph_compatible], dtype=torch.int64
+                    ),
                     group=get_parallel().tp_group.cpu_group,
                 )
-                self.global_late_layer_num_tokens_cpu = late_rows.tolist()
+                late_rows, tail_graph_votes = late_layout.view(-1, 2).T.tolist()
+                self.global_late_layer_num_tokens_cpu = late_rows
+                self.global_late_layer_tail_graph_compatible = all(tail_graph_votes)
 
         TboForwardBatchPreparer.prepare(
             batch=self, is_draft_worker=model_runner.is_draft_worker

@@ -1599,6 +1599,7 @@ class TestSizing(CustomTestCase):
                 mamba2_cache_params=SimpleNamespace(mamba_cache_per_req=1000)
             ),
             extra_mamba_cache_bytes_per_req=0,
+            extra_mamba_cache_bytes_per_request_row=0,
             _calculate_mamba_ratio=lambda: 2,
             model_config=SimpleNamespace(context_len=context_length or 4096),
         )
@@ -1638,10 +1639,13 @@ class TestSizing(CustomTestCase):
             hybrid_gdn_config=None,
             hybrid_kda_config=None,
             extra_mamba_cache_bytes_per_req=0,
+            extra_mamba_cache_bytes_per_request_row=0,
             attn_dp_size=1,
         )
         exec_ = SimpleNamespace(
-            mamba=SimpleNamespace(enable_linear_replayssm_spec=False)
+            mamba=SimpleNamespace(
+                enable_linear_replayssm_spec=False, decode_state_free_radix=False
+            )
         )
         with (
             patch.object(kvc_mod, "get_schedule", return_value=sched),

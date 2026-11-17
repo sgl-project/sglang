@@ -29,17 +29,15 @@ HW_MAPPING = {
     "mlu": HWBackend.MLU,
 }
 
-# Per-commit test suites (run on every PR).
-# Includes both base-a/b/c (always-on; pr-test.yml) and extra-a/b
-# (label-gated; pr-test-extra.yml). Tests are tagged per-commit regardless;
-# pr-test-extra.yml's `run-ci-nv-extra` PR label decides whether extra-* dispatches.
+# Per-commit test suites. On a PR, NVIDIA and AMD base suites run with `run-ci`;
+# their extra-* suites and every other hardware's suites also need that
+# hardware's `run-ci-<hw>-extra` label (scripts/ci/opt_in_ci_tiers.json).
 PER_COMMIT_SUITES = {
     HWBackend.CPU: [
         "base-a-test-cpu",
         "stage-a-test-cpu-intel",
         "stage-a-tp-test-cpu-intel",
         "stage-b-test-cpu-intel",
-        "extra-test-cpu-intel",
         "base-b-test-cpu-arm64",
     ],
     HWBackend.AMD: [
@@ -208,7 +206,6 @@ NIGHTLY_SUITES = {
         "nightly-perf-2-npu-a3",
         "nightly-perf-4-npu-a3",
         "nightly-perf-16-npu-a3",
-        "nightly-perf-16-npu-a3-cann910",
         "full-4-npu-a2",
         "full-1-npu-a3",
         "full-2-npu-a3",
@@ -250,6 +247,7 @@ OTHER_SUITES = {
         "weekly-test-4-gpu-b200",
         "weekly-test-8-gpu-h200",
         "weekly-test-8-gpu-b200",
+        "weekly-test-8-gpu-b300",
     ],
 }
 

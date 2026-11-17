@@ -1,6 +1,8 @@
 name: PR Test (MLX)
 
 on:
+  push:
+    branches: [ main ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:
@@ -60,6 +62,8 @@ jobs:
     needs: check-changes
     if: needs.check-changes.outputs.changes_exist == 'true'
     uses: ./.github/workflows/pr-gate.yml
+    with:
+      require-label: run-ci-mlx-extra
     secrets: inherit
 
   stage-a-unit-test-mlx:
@@ -74,6 +78,7 @@ jobs:
         (github.event_name == 'workflow_dispatch' &&
          inputs.target_stage == 'stage-a-unit-test-mlx')
       )
+      && needs.pr-gate.outputs.opted-in != 'false'
     runs-on: macos-26
     timeout-minutes: 60
     env:
@@ -173,6 +178,7 @@ jobs:
         (github.event_name == 'workflow_dispatch' &&
          inputs.target_stage == 'stage-a-unit-test-mps')
       )
+      && needs.pr-gate.outputs.opted-in != 'false'
     runs-on: macos-26
     timeout-minutes: 60
     env:

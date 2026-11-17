@@ -1600,7 +1600,14 @@ def _build_sidecar_host_pool(
         config.buffer_info,
         layer_mapping=config.device_to_host_layer,
         target_device_layer_num=root.layer_num,
-        num_host_pages=root_host_pool.page_num,
+        # A replicated index-K spans every rank's slots, so the host mirror
+        # pages the widened transfer indices untranslated. A sharded one does
+        # not, and keeps the per-rank page count.
+        num_host_pages=(
+            root_host_pool.page_num
+            if dsa_shards_index_k()
+            else root_host_pool.page_num * root_host_pool.dcp_size
+        ),
         transfer_page_size=root_host_pool.page_size,
         layout=root_host_pool.layout,
         buffer_device=root.device,
@@ -1608,6 +1615,9 @@ def _build_sidecar_host_pool(
         layer_sharded=root.layer_shard_enabled,
         dcp_size=root_host_pool.dcp_size if dsa_shards_index_k() else 1,
         dcp_rank=root_host_pool.dcp_rank if dsa_shards_index_k() else 0,
+        # One L3 key covers the anchor's widened page either way: a sharded
+        # mirror spends one page per rank, a replicated one spends dcp_size.
+        storage_pages_per_key=(1 if dsa_shards_index_k() else root_host_pool.dcp_size),
         allocator_type=_get_allocator_type(),
     )
     host.start_layer, host.end_layer = root.start_layer, root.end_layer
@@ -2028,13 +2038,6 @@ class StackStrategy:
         raise NotImplementedError
 
 
-def _delegate_c128_host_evict(cache, n: int) -> int:
-    """Delegate C128 host pressure to FULL leaf eviction.
-
-    For example, ``n`` C128 slots request ``n * 128`` FULL tokens."""
-    return cache.evict_host(n * 128, ComponentType.FULL)
-
-
 class _DeepSeekV4Strategy(StackStrategy):
     def owns(self, kvcache):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -2081,9 +2084,9 @@ class _DeepSeekV4Strategy(StackStrategy):
             storage_backend=storage_backend,
             host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
             device_swa_evict_fn=lambda n: _evict_swa_for_device_alloc(cache, n),
-            # _delegate_c128_host_evict converts C128 slots to FULL tokens.
+            # C128's host eviction counts reclaimed summary slots directly.
             host_c128_evict_fn=(
-                (lambda n: _delegate_c128_host_evict(cache, n))
+                (lambda n: cache.evict_host(n, ComponentType.C128))
                 if independent_c128
                 else None
             ),

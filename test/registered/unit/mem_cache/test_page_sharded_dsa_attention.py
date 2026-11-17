@@ -614,6 +614,7 @@ class TestShardedDSAIndexerWrite(unittest.TestCase):
             scale_fmt="ue8m0",
             is_neox_style=False,
             fused_indexer_hadamard=False,
+            skip_rope=False,
             k_norm=SimpleNamespace(
                 weight=torch.randn((128,), device=device, generator=generator),
                 bias=torch.randn((128,), device=device, generator=generator),
@@ -724,6 +725,8 @@ def _attention_backend(pool, req_to_token, device, prefill_impl="flashmla_sparse
     backend.flashmla_kv_num_q_heads_prefill = 64
     backend.flashmla_kv_format = "V32"
     backend.hisparse_coordinator = None
+    backend.flashmla_prefill_token_packing = False
+    backend._trtllm_fused_q = False
     backend.device_sm_major = (
         torch.cuda.get_device_capability()[0]
         if torch.device(device).type == "cuda"
@@ -946,10 +949,16 @@ def _real_indexer_topk(check, backends, batch, layer_id, query, weights):
         num_local_tokens=0,
         logits_with_pp_recv=False,
         use_prefill_lite_topk=False,
+        tp_split_min_rows=None,
         sm_count=torch.cuda.get_device_properties(check.device).multi_processor_count,
         _pad_heads_for_deep_gemm=dsa_indexer.Indexer._pad_heads_for_deep_gemm,
     )
-    for name in ("_with_real_sm_count", "_mask_init_and_local_tokens", "_mqa_logits"):
+    for name in (
+        "_with_real_sm_count",
+        "_mask_init_and_local_tokens",
+        "_mqa_logits",
+        "_indexer_tp_split",
+    ):
         setattr(indexer, name, MethodType(getattr(dsa_indexer.Indexer, name), indexer))
 
     class RecordingMetadata:

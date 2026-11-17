@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from sglang.srt.distributed.utils import reduce_scatter_single
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, find_available_port
 
@@ -104,19 +105,20 @@ def reduce_scatter_tensor_fn(rank, world_size):
     op = dist.ReduceOp.SUM
 
     for dtype in [torch.float32, torch.bfloat16, torch.float16]:
-        N, D = 4, 10
-        input_size = (world_size * N, D)
-        tensor = torch.randn(input_size, dtype=dtype)
+        # (2560, 4096) makes the input exceed the 32 MiB shm buffer, ending in a partial chunk.
+        for N, D in [(4, 10), (2560, 4096)]:
+            input_size = (world_size * N, D)
+            tensor = torch.randn(input_size, dtype=dtype)
 
-        output_size = (N, D)
-        output_tensor = torch.empty(output_size, dtype=dtype)
-        output_shm = torch.empty_like(output_tensor)
+            output_size = (N, D)
+            output_tensor = torch.empty(output_size, dtype=dtype)
+            output_shm = torch.empty_like(output_tensor)
 
-        dist.reduce_scatter_tensor(output_tensor, tensor, op=op)
+            reduce_scatter_single(output_tensor, tensor, op=op)
 
-        torch.ops.sgl_kernel.shm_reduce_scatter_tensor(output_shm, tensor, op)
+            torch.ops.sgl_kernel.shm_reduce_scatter_tensor(output_shm, tensor, op)
 
-        torch.testing.assert_close(output_tensor, output_shm)
+            torch.testing.assert_close(output_tensor, output_shm)
 
 
 def init_group(rank):

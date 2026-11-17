@@ -123,12 +123,14 @@ jobs:
     needs: check-changes
     if: needs.check-changes.outputs.changes_exist == 'true'
     uses: ./.github/workflows/pr-gate.yml
+    with:
+      require-label: run-ci-xpu-extra
     secrets: inherit
 
   # Runs the entire per-commit XPU test suite in one job (single install, single queue).
   stage-a-test-1-gpu-xpu:
     needs: [check-changes, pr-gate]
-    if: needs.check-changes.outputs.main_package == 'true'
+    if: needs.check-changes.outputs.main_package == 'true' && needs.pr-gate.outputs.opted-in != 'false'
     runs-on: intel-bmg
     env:
       DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
@@ -240,7 +242,7 @@ jobs:
   # ==================== Multimodal Gen ==================== #
   multimodal-gen-test-1-gpu-xpu:
     needs: [check-changes, pr-gate]
-    if: needs.check-changes.outputs.multimodal_gen == 'true'
+    if: needs.check-changes.outputs.multimodal_gen == 'true' && needs.pr-gate.outputs.opted-in != 'false'
     runs-on: bmg-multigen-models
     env:
       DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}

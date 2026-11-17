@@ -737,12 +737,6 @@ install_sglang_kernel() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
-install_sglang_router() {
-    $PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
-
-    mark_step_done "${FUNCNAME[0]}"
-}
-
 install_flashinfer_cubin() {
     if [ "$UNINSTALL_CUBIN" = false ]; then
         echo "flashinfer-cubin==${FLASHINFER_CUBIN_REQUIRED} already installed, skipping install"
@@ -850,9 +844,9 @@ install_extra_deps() {
     fi
 
     if [ "$IS_BLACKWELL" != "1" ]; then
-        # pyarrow 26 needs NumPy 2 at import, but lmms_eval pins numpy 1.26.4;
-        # drop the cap once lmms_eval allows NumPy 2.
-        $PIP_CMD install "lmms_eval==0.5.0" "pyarrow<26" $PIP_INSTALL_SUFFIX
+        # pyarrow 26 and ml-dtypes 0.6 need NumPy 2 at import, but lmms_eval pins
+        # numpy 1.26.4; drop the caps once lmms_eval allows NumPy 2.
+        $PIP_CMD install "lmms_eval==0.5.0" "pyarrow<26" "ml-dtypes<0.6" $PIP_INSTALL_SUFFIX
         # lmms_eval 0.5.0 pulls antlr4-python3-runtime==4.7.2, clobbering the
         # 4.9.3 that sgl-eval's latex2sympy2_extended needs (4.7.2 ImportError
         # at sgl-eval import). Pin it back so the nightly sgl-eval path works.
@@ -1014,7 +1008,6 @@ main() {
     install_sglang
     release_cargo_cache_lock
     install_sglang_kernel
-    install_sglang_router
     install_flashinfer_cubin
     download_flashinfer_cache
     stabilize_flashinfer_jit_paths
