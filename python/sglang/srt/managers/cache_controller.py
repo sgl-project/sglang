@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.mem_cache.cpp_utils.native_hash import ensure_native_hash
 from sglang.srt.mem_cache.hicache_key_scheme import (
     UnifiedKVPlan,
     namespace_digest,
@@ -730,6 +731,9 @@ class HiCacheController:
                 raise NotImplementedError(
                     "HiCache L3 with DCP requires a generic MLA page layout."
                 )
+        # Otherwise a failed native-hash build surfaces only as per-request lookup
+        # failures while every page keeps being written to storage.
+        ensure_native_hash()
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
         # left background threads alive. Attaching on top of them is unsafe.
