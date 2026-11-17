@@ -923,6 +923,8 @@ class Envs:
     # CTA quota of the MHA host pool's layer_first / page_first per-layer KV load; None
     # keeps the stock one. Measured useful range 8-16 (32 costs decode time).
     SGLANG_HICACHE_LOAD_BLOCK_QUOTA = EnvInt(None)
+    # CTA quota of the page_first HiCache Mamba state load; None keeps the stock kernel.
+    SGLANG_HICACHE_MAMBA_LOAD_BLOCK_QUOTA = EnvInt(None)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
