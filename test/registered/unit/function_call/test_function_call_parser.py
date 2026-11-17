@@ -3464,6 +3464,69 @@ class TestGlm4MoeDetector(CustomTestCase):
                 self.assertEqual(params, {"body": value})
                 self.assertIsInstance(params["body"], str)
 
+    def test_streaming_angle_bracket_at_value_end(self):
+        for value in ("<", "nul<"):
+            with self.subTest(value=value):
+                self.detector = Glm4MoeDetector()
+                text = (
+                    "<tool_call>api_fetch\n"
+                    f"<arg_key>body</arg_key>\n<arg_value>{value}</arg_value>\n"
+                    "</tool_call>"
+                )
+
+                tool_calls = self._collect_streaming_tool_calls(list(text))
+
+                self.assertEqual(
+                    json.loads(tool_calls[0]["parameters"]), {"body": value}
+                )
+
+    def test_streaming_json_quoted_strings_match_non_streaming(self):
+        for raw in ('"null"', '"hello"', '"123"', ' "null" ', " 'hello' "):
+            with self.subTest(raw=raw):
+                text = (
+                    "<tool_call>api_fetch\n"
+                    f"<arg_key>body</arg_key>\n<arg_value>{raw}</arg_value>\n"
+                    "</tool_call>"
+                )
+                expected = json.loads(
+                    self.detector.detect_and_parse(text, self.tools).calls[0].parameters
+                )
+
+                self.detector = Glm4MoeDetector()
+                tool_calls = self._collect_streaming_tool_calls(list(text))
+
+                self.assertEqual(json.loads(tool_calls[0]["parameters"]), expected)
+
+    def test_streaming_plain_string_is_not_deferred(self):
+        first = self.detector.parse_streaming_increment(
+            "<tool_call>api_fetch\n<arg_key>body</arg_key><arg_value>hello",
+            self.tools,
+        )
+
+        self.assertIn('"hello', "".join(call.parameters for call in first.calls))
+
+        last = self.detector.parse_streaming_increment(
+            " world</arg_value></tool_call>", self.tools
+        )
+        parameters = "".join(call.parameters for call in first.calls + last.calls)
+        self.assertEqual(json.loads(parameters), {"body": "hello world"})
+
+    def test_streaming_leading_whitespace_before_plain_value(self):
+        for value in ("  plain", " h<baéu", "  \\"):
+            with self.subTest(value=value):
+                self.detector = Glm4MoeDetector()
+                text = (
+                    "<tool_call>api_fetch\n"
+                    f"<arg_key>body</arg_key>\n<arg_value>{value}</arg_value>\n"
+                    "</tool_call>"
+                )
+
+                tool_calls = self._collect_streaming_tool_calls(list(text))
+
+                self.assertEqual(
+                    json.loads(tool_calls[0]["parameters"]), {"body": value}
+                )
+
     def _parse_raw_null_argument(self, parameters):
         """`x` from a raw `null` value: the non-streaming result, and the distinct
         streamed results over whole-chunk, per-character and every single cut."""

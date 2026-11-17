@@ -373,6 +373,7 @@ class Glm4MoeDetector(BaseFormatDetector):
             None  # Cache the value type for consistency
         )
         self._cached_value_allows_null = False
+        self._defer_quoted_value = False
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a glm-4.5 / glm-4.6 format tool call."""
@@ -483,6 +484,10 @@ class Glm4MoeDetector(BaseFormatDetector):
         if value_type == "string":
             if allows_null and _is_json_null(value):
                 return "null"
+            if value.lstrip().startswith(('"', "'")):
+                parsed, _ = parse_arguments(value, "string")
+                if isinstance(parsed, str):
+                    return json.dumps(parsed, ensure_ascii=False)
             # Ensure proper JSON string formatting with quotes
             return json.dumps(value, ensure_ascii=False)
         elif value_type == "number":
@@ -544,6 +549,7 @@ class Glm4MoeDetector(BaseFormatDetector):
                     self._current_value = ""
                     self._xml_tag_buffer = ""
                     self._value_started = False
+                    self._defer_quoted_value = False
                     # Determine and cache the value type at the start
                     self._cached_value_type = self._get_value_type(
                         func_name, self._current_key, tools
@@ -587,49 +593,75 @@ class Glm4MoeDetector(BaseFormatDetector):
                     self._value_started = False
                     self._cached_value_type = None  # Reset cached type
                     self._cached_value_allows_null = False
+                    self._defer_quoted_value = False
                 else:
                     closing_tag = _ARG_VALUE_END_TAG
-                    is_potential_closing = len(self._xml_tag_buffer) <= len(
-                        closing_tag
-                    ) and closing_tag.startswith(self._xml_tag_buffer)
+                    suffix_length = next(
+                        (
+                            size
+                            for size in range(
+                                min(len(self._xml_tag_buffer), len(closing_tag) - 1),
+                                0,
+                                -1,
+                            )
+                            if closing_tag.startswith(self._xml_tag_buffer[-size:])
+                        ),
+                        0,
+                    )
+                    content_end = len(self._xml_tag_buffer) - suffix_length
+                    content = self._xml_tag_buffer[:content_end]
+                    if not content:
+                        continue
+                    # Use cached value type for consistency
+                    value_type = self._cached_value_type or "string"
 
-                    if not is_potential_closing:
-                        content = self._xml_tag_buffer
-                        # Use cached value type for consistency
-                        value_type = self._cached_value_type or "string"
-
-                        if value_type == "string":
-                            # Delay only the prefix needed to distinguish JSON null
-                            # from an ordinary nullable string such as "nullish".
-                            if (
-                                self._cached_value_allows_null
-                                and _is_potential_json_null(self._xml_tag_buffer)
-                            ):
-                                continue
-                            if not self._value_started:
-                                json_output += '"'
-                                self._value_started = True
-                            if content:
-                                json_output += json.dumps(content, ensure_ascii=False)[
-                                    1:-1
+                    if value_type == "string":
+                        # A quoted JSON string must be parsed as a whole, just like
+                        # the non-streaming path. Plain strings still stream as bytes.
+                        if not self._value_started and not self._defer_quoted_value:
+                            candidate = self._current_value + content
+                            if candidate.lstrip().startswith(('"', "'")):
+                                self._defer_quoted_value = True
+                            elif not candidate.strip():
+                                self._current_value = candidate
+                                self._xml_tag_buffer = self._xml_tag_buffer[
+                                    content_end:
                                 ]
-                                self._current_value += content
-                                self._xml_tag_buffer = ""
-                        elif value_type == "number":
-                            if content:
-                                if not self._value_started:
-                                    self._value_started = True
-                                json_output += content
-                                self._current_value += content
-                                self._xml_tag_buffer = ""
-                        else:
-                            # For object/array types, output as-is
-                            if content:
-                                if not self._value_started:
-                                    self._value_started = True
-                                json_output += content
-                                self._current_value += content
-                                self._xml_tag_buffer = ""
+                                continue
+                        if self._defer_quoted_value:
+                            self._current_value += content
+                            self._xml_tag_buffer = self._xml_tag_buffer[content_end:]
+                            continue
+
+                        # Delay only the prefix needed to distinguish JSON null
+                        # from an ordinary nullable string such as "nullish".
+                        if self._cached_value_allows_null and _is_potential_json_null(
+                            self._xml_tag_buffer
+                        ):
+                            continue
+                        if not self._value_started:
+                            json_output += '"'
+                            self._value_started = True
+                            if self._current_value:
+                                json_output += json.dumps(
+                                    self._current_value, ensure_ascii=False
+                                )[1:-1]
+                        json_output += json.dumps(content, ensure_ascii=False)[1:-1]
+                        self._current_value += content
+                        self._xml_tag_buffer = self._xml_tag_buffer[content_end:]
+                    elif value_type == "number":
+                        if not self._value_started:
+                            self._value_started = True
+                        json_output += content
+                        self._current_value += content
+                        self._xml_tag_buffer = self._xml_tag_buffer[content_end:]
+                    else:
+                        # For object/array types, output as-is
+                        if not self._value_started:
+                            self._value_started = True
+                        json_output += content
+                        self._current_value += content
+                        self._xml_tag_buffer = self._xml_tag_buffer[content_end:]
 
         return json_output
 
