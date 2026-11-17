@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::message::detok::DetokMsg;
+use crate::message::detok::{DetokMsg, PROMPT_TAIL_LEN};
 use crate::message::ids::Rid;
 use crate::message::io_struct::{AbortReq, ControlRequest};
 use crate::message::request::{Request, RequestKind, SchedulerRequest};
@@ -326,6 +326,10 @@ impl Intake {
                         let _ = req.state.apply(Event::Error(e)); // → Failed
                         continue;
                     }
+                    if let Err(e) = self.seed_detok_prompt_tail(&req) {
+                        let _ = req.state.apply(Event::Error(e)); // → Failed
+                        continue;
+                    }
                     let _ = req.state.apply(Event::PreSendValidated); // → Queued
                 }
                 // Hand the request to the stage that answers it: the scheduler
@@ -391,6 +395,41 @@ impl Intake {
                 skip_special_tokens,
             })
             .is_ok()
+    }
+
+    /// Seed the detok shard's decoder with the prompt's trailing tokens, so the
+    /// first output token keeps its leading space on tokenizers whose decoder
+    /// strips one (Llama-2-style SentencePiece; sgl-project/sglang#51029).
+    /// Runs in `PreSendValidating`, not at `Register`: a text prompt has no
+    /// `input_ids` until the tokenizer pool returns, and every branch converges
+    /// here with the final ids. The scheduler cannot emit a chunk before the
+    /// request is pushed to it (the `Queued` arm, after this), so the seed
+    /// always lands before the first chunk. `validate_input_ids` already ran in
+    /// this arm, so the ids are in `[0, vocab_size)` and the `u32` cast is
+    /// exact. A failed send means the shard is gone — the request cannot be
+    /// answered — so it fails like a failed `Register`.
+    fn seed_detok_prompt_tail(&self, req: &Request) -> Result<(), Error> {
+        let RequestKind::Generate(g) = &req.kind else {
+            return Ok(());
+        };
+        let Some(input_ids) = g.input_ids.as_ref() else {
+            return Ok(());
+        };
+        let prompt_tail_ids: Vec<u32> = input_ids
+            .iter()
+            .rev()
+            .take(PROMPT_TAIL_LEN)
+            .rev()
+            .map(|&id| id as u32)
+            .collect();
+        self.senders
+            .detok_for(&req.rid)
+            .send(DetokMsg::SeedPromptTail {
+                rid: req.rid.clone(),
+                prompt_tail_ids,
+                skip_special_tokens: g.sampling_params.skip_special_tokens,
+            })
+            .map_err(|_| Error::Internal("detok shard gone".into()))
     }
 
     /// Hand a `Detokenize` request to its owning detok shard — the stage that

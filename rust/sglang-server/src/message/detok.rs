@@ -3,6 +3,13 @@
 use super::ids::Rid;
 use super::response::{ChunkEvent, ResponseSink};
 
+/// How many trailing prompt tokens seed a request's decoder
+/// ([`DetokMsg::SeedPromptTail`]). Same value as Python's `PROMPT_TAIL_LEN`
+/// (`python/sglang/srt/managers/incremental_detokenize.py`) and the
+/// `INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET` dynamo-tokenizers' `DecodeStream`
+/// keeps.
+pub(crate) const PROMPT_TAIL_LEN: usize = 5;
+
 /// Messages to a Detokenizer shard. `Register` carries the per-request sink for
 /// the shard's local `rid -> sink` map. The rid STRING is the identity: `Rid::hash`
 /// picks the shard (collisions there merely co-locate, which is harmless), but two
@@ -21,6 +28,29 @@ pub enum DetokMsg {
         /// `SamplingParams.no_stop_trim`: keep the matched stop; default trims it.
         no_stop_trim: bool,
         /// `SamplingParams.skip_special_tokens` for the output text.
+        skip_special_tokens: bool,
+    },
+    /// Seed the request's decoder with the prompt's trailing token ids, so the
+    /// first output token keeps its leading space on tokenizers whose decoder
+    /// strips one (Llama-2-style SentencePiece `Strip(" ", 1, 0)`). Without the
+    /// seed the first `step` decodes the first output token alone and the strip
+    /// removes its space; with it, the decode of prompt-tail + first token
+    /// minus the decode of the prompt tail leaves the space in place. Mirrors
+    /// Python's `build_detokenize_header` (`PROMPT_TAIL_LEN = 5`, same value as
+    /// [`PROMPT_TAIL_LEN`]); `DecodeStream` keeps the same suffix again.
+    ///
+    /// Sent by to-scheduler from `PreSendValidating`, once the prompt is
+    /// tokenized (a text prompt has no `input_ids` at `Register` time), and
+    /// always before the request is pushed to the scheduler — so before any
+    /// chunk for the rid can arrive. The shard applies it only while the
+    /// request is still queued: once streaming, replacing the decoder would
+    /// rewrite already-emitted text.
+    SeedPromptTail {
+        rid: Rid,
+        /// At most the last [`PROMPT_TAIL_LEN`] prompt token ids.
+        prompt_tail_ids: Vec<u32>,
+        /// `SamplingParams.skip_special_tokens` for the output text; the same
+        /// value `Register` carried.
         skip_special_tokens: bool,
     },
     /// One decode step's chunks for *this shard*. Batched because `from-scheduler` blocks

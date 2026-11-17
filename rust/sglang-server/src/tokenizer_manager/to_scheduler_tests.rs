@@ -578,6 +578,49 @@ fn over_context_request_deregisters_unless_its_cap_is_defaulted() {
     assert_eq!(sampling_params[0].as_i64(), Some(64), "max_new_tokens");
 }
 
+/// A generate request seeds its detok decoder with the prompt's trailing
+/// tokens before reaching the scheduler: `Register`, then `SeedPromptTail`
+/// carrying at most the last `PROMPT_TAIL_LEN` input ids (sgl-project/sglang#51029).
+/// The seed rides the same detok channel from this one thread, so FIFO orders
+/// it ahead of any chunk the scheduler can later emit for the rid.
+#[test]
+fn generate_request_seeds_the_detok_decoder_with_its_prompt_tail() {
+    use crate::message::detok::PROMPT_TAIL_LEN;
+    let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
+    let (tx, _rx) = mpsc::channel(8);
+    intake.drive(Request {
+        rid: "51".into(),
+        state: RequestState::Received,
+        sink: ResponseSink::Local(tx),
+        kind: RequestKind::Generate(Box::new(GenerateRequest {
+            rid: "51".into(),
+            input_ids: Some(vec![10, 11, 12, 13, 14, 15, 16]),
+            ..Default::default()
+        })),
+    });
+    assert!(
+        matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "51"),
+        "registered first",
+    );
+    assert!(
+        matches!(
+            detok_rx.try_recv(),
+            Ok(DetokMsg::SeedPromptTail { rid, prompt_tail_ids, skip_special_tokens: true })
+                if rid.as_str() == "51" && prompt_tail_ids == vec![12, 13, 14, 15, 16]
+        ),
+        "seed follows with the last {PROMPT_TAIL_LEN} prompt ids",
+    );
+    assert!(
+        detok_rx.try_recv().is_err(),
+        "no further detok message for this request"
+    );
+    assert_eq!(
+        consumer.drain(16).len(),
+        1,
+        "the request still reaches the scheduler"
+    );
+}
+
 /// A `Detokenize` request terminates at the detok stage, and the shard must
 /// see its `Register` BEFORE its `Decode` — the shard delivers the result
 /// through the sink registered under that rid, so a `Decode` that arrives
@@ -1035,7 +1078,9 @@ fn multimodal_sentinel_is_validated_after_expansion() {
     assert!(validate_input_ids(g, test_limits().vocab_size).is_ok());
 }
 
-/// A valid request is registered and handed onward — never deregistered.
+/// A valid request is registered and handed onward — never deregistered. The
+/// seed follows the registration: intake sends the prompt tail once the ids
+/// are final.
 #[test]
 fn admitted_request_keeps_registration() {
     let (mut intake, detok_rx, _consumer, _tm_tx, _mm_rx) = make_intake();
@@ -1045,6 +1090,14 @@ fn admitted_request_keeps_registration() {
     assert!(
         matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "9"),
         "expected Register for rid 9",
+    );
+    assert!(
+        matches!(
+            detok_rx.try_recv(),
+            Ok(DetokMsg::SeedPromptTail { rid, prompt_tail_ids, .. })
+                if rid.as_str() == "9" && prompt_tail_ids == vec![1, 2, 3]
+        ),
+        "expected the prompt-tail seed for rid 9",
     );
     assert!(
         detok_rx.try_recv().is_err(),
@@ -1094,10 +1147,12 @@ fn abort_deregisters_from_shard() {
 }
 
 /// A successful pool return (Queued, ids filled) is pushed to the channel, not
-/// rejected; its registration is untouched.
+/// rejected; its registration is untouched. The pool return is where a text
+/// prompt's ids first exist, so the shard sees exactly the prompt-tail seed —
+/// no deregister, and the request still reaches the scheduler.
 #[test]
 fn tokenized_return_pushes_without_deregister() {
-    let (intake, detok_rx, _consumer, tm_tx, _mm_rx) = make_intake();
+    let (intake, detok_rx, consumer, tm_tx, _mm_rx) = make_intake();
     let mut req = generate_req(15, SamplingParams::default());
     // Simulate a successful pool return: ids filled, PreSendValidating.
     if let RequestKind::Generate(g) = &mut req.kind {
@@ -1108,10 +1163,23 @@ fn tokenized_return_pushes_without_deregister() {
     drop(tm_tx);
     intake.run();
 
-    // Pushed to the channel; the shard sees nothing.
+    // Only the seed — never a deregister.
+    assert!(
+        matches!(
+            detok_rx.try_recv(),
+            Ok(DetokMsg::SeedPromptTail { rid, prompt_tail_ids, .. })
+                if rid.as_str() == "15" && prompt_tail_ids == vec![1, 2, 3]
+        ),
+        "a queued pool-return seeds the decoder",
+    );
     assert!(
         detok_rx.try_recv().is_err(),
-        "a queued pool-return must be pushed, not touch the shard",
+        "no deregister for a queued pool-return",
+    );
+    assert_eq!(
+        consumer.drain(16).len(),
+        1,
+        "a queued pool-return must be pushed to the scheduler",
     );
 }
 
