@@ -52,7 +52,6 @@ SERVER_ARGS = (
     "8",
 )
 QUEUE_ARGS = SERVER_ARGS[:-1] + ("1",)
-SHORT_PROMPT = PROMPTS[0]
 NORM_WEIGHT = "model.norm.weight"
 
 
@@ -61,7 +60,9 @@ class TestNpuPauseContinue(CustomTestCase):
     def setUpClass(cls):
         cls._server = npu_server(MODEL, extra_args=SERVER_ARGS, env=npu_rl_env())
         cls.base_url = cls._server.__enter__()
-        cls.baseline = generation_signature(cls.base_url, PROMPTS, max_new_tokens=16)
+        cls.baseline = generation_signature(
+            cls.base_url, (PROMPTS[0],), max_new_tokens=16
+        )
         cls.tensor_index = checkpoint_tensor_index(MODEL)
 
     @classmethod
@@ -79,7 +80,7 @@ class TestNpuPauseContinue(CustomTestCase):
             try:
                 results["response"] = generate(
                     self.base_url,
-                    SHORT_PROMPT,
+                    PROMPTS[0],
                     max_new_tokens=max_new_tokens,
                     timeout=300,
                 )
@@ -91,7 +92,7 @@ class TestNpuPauseContinue(CustomTestCase):
         return thread
 
     def test_pause_abort_returns_inflight(self):
-        request = start_stream(self.base_url, SHORT_PROMPT, max_new_tokens=512)
+        request = start_stream(self.base_url, PROMPTS[0], max_new_tokens=512)
         wait_for_first_token(request, label="pause(abort)")
 
         pause_generation(self.base_url, mode="abort")
@@ -113,10 +114,10 @@ class TestNpuPauseContinue(CustomTestCase):
         )
 
         continue_generation(self.base_url)
-        self.assertTrue(generate(self.base_url, SHORT_PROMPT, max_new_tokens=4))
+        self.assertTrue(generate(self.base_url, PROMPTS[0], max_new_tokens=4))
 
     def test_pause_retract_recomputes_kv(self):
-        request = start_stream(self.base_url, SHORT_PROMPT, max_new_tokens=64)
+        request = start_stream(self.base_url, PROMPTS[0], max_new_tokens=64)
         wait_for_first_token(request, label="pause(retract)")
 
         pause_generation(self.base_url, mode="retract")
@@ -139,7 +140,7 @@ class TestNpuPauseContinue(CustomTestCase):
         )
 
     def test_pause_in_place_freezes_output(self):
-        request = start_stream(self.base_url, SHORT_PROMPT, max_new_tokens=64)
+        request = start_stream(self.base_url, PROMPTS[0], max_new_tokens=64)
         wait_for_first_token(request, label="pause(in_place)")
 
         pause_generation(self.base_url, mode="in_place")
@@ -175,7 +176,7 @@ class TestNpuPauseContinue(CustomTestCase):
         original = load_checkpoint_tensor(self.tensor_index, NORM_WEIGHT)
         updated = original.new_full(original.shape, 0.5)
 
-        request = start_stream(self.base_url, SHORT_PROMPT, max_new_tokens=64)
+        request = start_stream(self.base_url, PROMPTS[0], max_new_tokens=64)
         wait_for_first_token(request, label="pause(update)")
 
         pause_generation(self.base_url, mode="in_place")
@@ -214,7 +215,7 @@ class TestNpuPauseContinue(CustomTestCase):
                 "frozen request did not complete after pause/update/continue",
             )
 
-            response = generate(self.base_url, SHORT_PROMPT, max_new_tokens=8)
+            response = generate(self.base_url, PROMPTS[0], max_new_tokens=8)
             self.assertEqual(
                 response["meta_info"]["weight_version"],
                 "paused-v1",
@@ -231,7 +232,7 @@ class TestNpuPauseContinue(CustomTestCase):
 
     def test_continue_without_pause_is_noop(self):
         continue_generation(self.base_url)
-        self.assertTrue(generate(self.base_url, SHORT_PROMPT, max_new_tokens=4))
+        self.assertTrue(generate(self.base_url, PROMPTS[0], max_new_tokens=4))
 
     def test_pause_twice_keeps_server_healthy(self):
         pause_generation(self.base_url, mode="abort")
@@ -243,7 +244,7 @@ class TestNpuPauseContinue(CustomTestCase):
         )
         self.assertEqual(second.status_code, 200, second.text)
         continue_generation(self.base_url)
-        self.assertTrue(generate(self.base_url, SHORT_PROMPT, max_new_tokens=4))
+        self.assertTrue(generate(self.base_url, PROMPTS[0], max_new_tokens=4))
 
 
 class TestNpuPauseContinueQueued(CustomTestCase):
@@ -253,7 +254,9 @@ class TestNpuPauseContinueQueued(CustomTestCase):
     def setUpClass(cls):
         cls._server = npu_server(MODEL, extra_args=QUEUE_ARGS, env=npu_rl_env())
         cls.base_url = cls._server.__enter__()
-        cls.baseline = generation_signature(cls.base_url, PROMPTS, max_new_tokens=16)
+        cls.baseline = generation_signature(
+            cls.base_url, (PROMPTS[0],), max_new_tokens=16
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -269,10 +272,10 @@ class TestNpuPauseContinueQueued(CustomTestCase):
         # Submit the first request and wait for its first token before starting
         # the second: with max-running-requests=1, arrival order decides which
         # request owns the running slot.
-        first = start_stream(self.base_url, SHORT_PROMPT, max_new_tokens=512)
+        first = start_stream(self.base_url, PROMPTS[0], max_new_tokens=512)
         wait_for_first_token(first, label="first request")
 
-        second = start_stream(self.base_url, SHORT_PROMPT, max_new_tokens=512)
+        second = start_stream(self.base_url, PROMPTS[0], max_new_tokens=512)
         # Give the second request time to reach the scheduler; it can only be
         # queued while the first request is running.
         time.sleep(0.5)
@@ -321,7 +324,7 @@ class TestNpuPauseContinueQueued(CustomTestCase):
             )
 
         continue_generation(self.base_url)
-        self.assertTrue(generate(self.base_url, SHORT_PROMPT, max_new_tokens=4))
+        self.assertTrue(generate(self.base_url, PROMPTS[0], max_new_tokens=4))
 
     def test_pause_in_place_freezes_running_and_queued(self):
         requests_ = self._start_two()

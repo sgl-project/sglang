@@ -5,10 +5,15 @@ import unittest
 from test_npu_memory_occupation import (
     MEMORY_ARGS,
     MODEL,
+    PROMPTS,
     _MemoryOccupationCases,
 )
 
-from sglang.test.ascend.test_npu_rl_utils import npu_rl_env, npu_server
+from sglang.test.ascend.test_npu_rl_utils import (
+    generation_signature,
+    npu_rl_env,
+    npu_server,
+)
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -24,6 +29,7 @@ class TestNpuMemoryOccupationPreload(_MemoryOccupationCases, CustomTestCase):
     def setUpClass(cls):
         cls._server = npu_server(MODEL, extra_args=MEMORY_ARGS, env=PRELOAD_ENV)
         cls.base_url = cls._server.__enter__()
+        cls.golden = generation_signature(cls.base_url, PROMPTS)
 
     @classmethod
     def tearDownClass(cls):

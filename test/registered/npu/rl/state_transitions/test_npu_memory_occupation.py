@@ -47,7 +47,6 @@ MEMORY_ARGS = (
 
 class _MemoryOccupationCases:
     def test_01_release_weights_frees_memory(self):
-        golden = generation_signature(self.base_url, PROMPTS)
         before = npu_free_bytes()
         released = False
 
@@ -75,12 +74,11 @@ class _MemoryOccupationCases:
         )
         self.assertEqual(
             generation_signature(self.base_url, PROMPTS),
-            golden,
+            self.golden,
             "output changed after release/resume of weights",
         )
 
     def test_release_all_then_resume_restores_output(self):
-        golden = generation_signature(self.base_url, PROMPTS)
         before = npu_free_bytes()
 
         release_memory(self.base_url, ["weights", "kv_cache"])
@@ -92,17 +90,15 @@ class _MemoryOccupationCases:
         resume_memory(self.base_url, ["weights", "kv_cache"])
 
         actual = generation_signature(self.base_url, PROMPTS)
-        self.assertEqual(actual, golden, "output changed after release/resume")
+        self.assertEqual(actual, self.golden, "output changed after release/resume")
 
     def test_staged_resume_restores_output(self):
-        golden = generation_signature(self.base_url, PROMPTS)
-
         release_memory(self.base_url, ["weights", "kv_cache"])
         resume_memory(self.base_url, ["weights"])
         resume_memory(self.base_url, ["kv_cache"])
 
         actual = generation_signature(self.base_url, PROMPTS)
-        self.assertEqual(actual, golden, "staged resume changed the output")
+        self.assertEqual(actual, self.golden, "staged resume changed the output")
 
 
 class TestNpuMemoryOccupation(_MemoryOccupationCases, CustomTestCase):
@@ -112,6 +108,7 @@ class TestNpuMemoryOccupation(_MemoryOccupationCases, CustomTestCase):
         # mempool-backed server repeatedly is what stresses the NPU driver.
         cls._server = npu_server(MODEL, extra_args=MEMORY_ARGS, env=npu_rl_env())
         cls.base_url = cls._server.__enter__()
+        cls.golden = generation_signature(cls.base_url, PROMPTS)
 
     @classmethod
     def tearDownClass(cls):
