@@ -438,6 +438,7 @@ class ProposalTests(unittest.TestCase):
     def test_seven_q_rows_include_actual_t1_and_six_tail_rows(self):
         for slots in (8,):
             c = MTPFirstController.__new__(MTPFirstController)
+            c.two_graphs = False
             c.native_selector, c.draft_slots = True, slots
             c.graph_used = {}
             c.selector_sampling = SimpleNamespace(is_all_greedy=False)
