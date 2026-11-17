@@ -1,4 +1,5 @@
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
@@ -116,7 +117,10 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         scheduler.scheduler_stage_metrics = None
         scheduler.load_publisher = MagicMock()
         scheduler.load_inquirer = MagicMock()
-        scheduler.tree_cache = SimpleNamespace(flush_pending_backups=MagicMock())
+        scheduler.tree_cache = SimpleNamespace(
+            flush_pending_backups=MagicMock(),
+            lease_checkpoint_state_slots=lambda reqs: nullcontext(),
+        )
         scheduler.running_reqs = KeyedReqList(ListKind.DECODING)
         scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         scheduler.invariant_checker = MagicMock()

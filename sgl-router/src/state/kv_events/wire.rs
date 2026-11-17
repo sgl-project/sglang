@@ -49,7 +49,7 @@ pub struct KvEventBatch {
 pub enum KvCacheEvent {
     /// `{"type": "BlockStored", "block_hashes", "parent_block_hash",
     /// "token_ids", "block_size", "lora_id", "medium"?, ...}`. Keys the
-    /// gateway does not route on (`session_id`) are ignored.
+    /// router does not route on (`session_id`) are ignored.
     BlockStored(BlockStored),
     /// `{"type": "BlockRemoved", "block_hashes", "medium"?}`.
     BlockRemoved(BlockRemoved),
@@ -89,7 +89,7 @@ pub struct BlockRemoved {
 /// Maximum number of block hashes a single decoded `BlockStored` /
 /// `BlockRemoved` event may carry. A misbehaving worker (or a corrupted
 /// frame) could otherwise prompt a multi-gigabyte allocation in the
-/// gateway. Workers are inside the trust boundary, so this is
+/// router. Workers are inside the trust boundary, so this is
 /// defense-in-depth — but the cost of *not* capping is unbounded memory
 /// amplification, so we cap.
 pub(crate) const MAX_HASHES_PER_EVENT: usize = 65_536;
@@ -130,7 +130,7 @@ const PAYLOAD_TOO_LARGE_TAG: &str = "kv_events::wire::PAYLOAD_TOO_LARGE";
 /// Caps the per-event `block_hashes` and `token_ids` lengths
 /// ([`MAX_HASHES_PER_EVENT`], [`MAX_TOKENS_PER_EVENT`]) so a misbehaving
 /// worker — or a corrupted msgpack length prefix — cannot trigger an
-/// unbounded allocation in the gateway.
+/// unbounded allocation in the router.
 pub fn decode_event_batch(bytes: &[u8]) -> Result<KvEventBatch, DecodeError> {
     match rmp_serde::from_slice::<KvEventBatch>(bytes) {
         Ok(b) => Ok(b),
@@ -381,7 +381,7 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
     where
         D: Deserializer<'de>,
     {
-        /// Map keys of a `KVCacheEvent` the gateway reads. Every other key
+        /// Map keys of a `KVCacheEvent` the router reads. Every other key
         /// (`session_id`, future additions) is skipped.
         enum EventField {
             Type,
@@ -568,7 +568,7 @@ mod tests {
     /// Write the `BlockStored` fields that follow `type`. `parent_block_hash`
     /// and `lora_id` have no default in the Python schema, so msgspec always
     /// emits them (nil when unset); `medium` is omitted when `None`; `extra`
-    /// adds string-valued keys the gateway must ignore.
+    /// adds string-valued keys the router must ignore.
     #[allow(clippy::too_many_arguments)]
     fn write_block_stored_fields(
         buf: &mut Vec<u8>,
@@ -1127,7 +1127,7 @@ mod tests {
     /// A `BlockStored` event whose `block_hashes` array prefix exceeds
     /// the per-event cap must be rejected with `PayloadTooLarge` so a
     /// misbehaving worker (or a corrupted msgpack length prefix) cannot
-    /// trigger an unbounded allocation in the gateway. We don't fill the
+    /// trigger an unbounded allocation in the router. We don't fill the
     /// whole array — the visitor refuses on the size_hint alone.
     #[test]
     fn block_stored_with_too_many_hashes_rejected() {
