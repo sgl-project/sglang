@@ -79,7 +79,7 @@ Every hardware follows one shape, `<tier>[-<stage>]-[<kind>-]test-<runner>[-<har
 - **Tier** — `base` or `extra` per commit, then `nightly`, `weekly`, or NPU's `full`. NVIDIA and AMD have both `base` and `extra`; every other hardware only has `extra`, which runs on a PR with its `run-ci-<hardware>-extra` label.
 - **Stage letter** — only where jobs run in stage order (NVIDIA, AMD, NPU); suites one job runs as a single pool have none (`extra-test-cpu-intel`).
 - **Kind** — optional, what the suite holds (`kernel-unit`, `diffusion`, `diffusion-unit`, `disaggregation`). It always comes before `test`, never after; on CUDA it is part of `stage` (`stage="base-b-diffusion"` → `base-b-diffusion-test-1-gpu-large`).
-- **Hardware** — omitted for NVIDIA, otherwise a suffix after the runner (`base-b-test-1-gpu-small-amd-mi35x`, `extra-b-test-2-npu-a3`, `nightly-accuracy-test-8-gpu-amd-mi35x-kimi-k3`).
+- **Hardware** — omitted for NVIDIA, otherwise a suffix after the runner (`base-b-test-1-gpu-small-amd-mi35x`, `extra-b-test-2-npu-a3`, `nightly-accuracy-test-8-gpu-amd-mi35x-kimi-k31-pro`).
 
 > CUDA nightly uses the same shape with `stage="nightly"` (e.g. `stage="nightly", runner_config="1-gpu-large"` → `nightly-test-1-gpu-large`) and **no** `nightly=True` — the stage name carries the cadence, and setting the flag makes the test silently never run. Legacy single-string `suite=` is left only for `stress` and some AMD/CPU/NPU pools.
 
