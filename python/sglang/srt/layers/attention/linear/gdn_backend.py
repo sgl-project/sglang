@@ -19,6 +19,7 @@ from sglang.kernels.ops.mamba.gdn_prefill_track import (
     gdn_track_conv_window,
     gdn_track_ssm_state,
 )
+from sglang.kernels.ops.mamba.kda_prefill_track import kda_track_ssm_state
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -1389,6 +1390,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ).transpose(0, 1)
         query, key, value = self._split_prefill_qkv(layer, mixed_qkv)
         g, beta = self._prefill_gates(layer, a, b)
+        # As in eager forward_extend: a snapshot-capable kernel writes each tracked
+        # row's FP32 chunk-boundary state, not the per-chunk states h.
+        h_track = None
+        if (
+            meta.track
+            and self.kernel_dispatcher.extend_kernel.supports_track_state_snapshot
+        ):
+            h_track = torch.empty(
+                (meta.max_seqs, *ssm_states.shape[1:]),
+                dtype=torch.float32,
+                device=ssm_states.device,
+            )
         core_attn_out, _, h = self.kernel_dispatcher.extend(
             q=query,
             k=key,
@@ -1400,8 +1413,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
             query_start_loc=meta.cu_seqlens,
             chunk_indices=meta.chunk_indices,
             chunk_offsets=meta.chunk_offsets,
+            track_state=h_track,
+            track_chunk_idx=meta.track_chunk_idx if h_track is not None else None,
         )
-        if meta.track:
+        if h_track is not None:
+            kda_track_ssm_state(
+                ssm_pool=ssm_states,
+                h_track=h_track,
+                track_mode=meta.track_mode,
+                track_dst=meta.track_dst,
+                cache_indices=meta.cache_indices,
+            )
+        elif meta.track:
             gdn_track_ssm_state(
                 ssm_pool=ssm_states,
                 h=h,
