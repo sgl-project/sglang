@@ -1534,7 +1534,19 @@ class PrefillAdder:
                             req, pool="load_back_budget"
                         )
                         return AddReqResult.NO_TOKEN
-                    promised_host_hit = req.host_hit_length
+                    # The integrity check below compares against what the
+                    # load actually promised to copy, not the whole host
+                    # hit: a joint-window host hit can include FULL rows
+                    # that are still device-resident (only blocked by a
+                    # host-only window/state entry), and those need no H2D.
+                    # init_load_back reports only the newly landed rows, so
+                    # promising host_hit_length here would abort legitimate
+                    # partial load-backs (issue #50892). full_load_tokens is
+                    # req.host_hit_length everywhere except the joint-window
+                    # branch, where it counts only the rows the FULL
+                    # transfer spec asked to copy — the same value the
+                    # budget above was reserved with.
+                    promised_full_load = full_load_tokens
                     with self.memory_budget.load_back_scope(**load_budget):
                         loaded = self.tree_cache.init_load_back(
                             InitLoadBackParams(
@@ -1547,13 +1559,13 @@ class PrefillAdder:
                     return AddReqResult.OTHER
                 req.host_loaded_length, req.last_node = loaded
                 state_slots = self._state_slots_for_req(req)
-                if 0 < req.host_loaded_length < promised_host_hit:
+                if 0 < req.host_loaded_length < promised_full_load:
                     raise RuntimeError(
                         "HiCache load-back must commit all promised FULL tokens or none: "
-                        f"req={req.rid} promised={promised_host_hit} "
+                        f"req={req.rid} promised={promised_full_load} "
                         f"loaded={req.host_loaded_length}"
                     )
-                if req.host_loaded_length > promised_host_hit:
+                if req.host_loaded_length > promised_full_load:
                     # A load can expose resident FULL behind host-only aux state; its
                     # H2D is queued, so keep the approved budget and shrink the work.
                     prefix_len = req.prefix_len + req.host_loaded_length
@@ -1577,8 +1589,11 @@ class PrefillAdder:
                         is_chunked,
                         self._replay_len(req, prefix_len),
                     )
-                elif req.host_loaded_length < promised_host_hit:
-                    # No FULL was loaded; recomputation may no longer fit.
+                elif req.host_loaded_length < promised_full_load:
+                    # No FULL was loaded although the transfer spec promised
+                    # some; recomputation may no longer fit. (loaded == 0 with
+                    # nothing promised means the whole hit was already
+                    # device-resident and stays usable as-is.)
                     admission = self._select_prefill_admission(
                         req,
                         total_tokens=total_tokens,

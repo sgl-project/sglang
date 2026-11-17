@@ -1,10 +1,19 @@
 import unittest
 from array import array
-from unittest.mock import patch
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import CacheAwarePolicy, SchedulePolicy
+from sglang.srt.managers.schedule_policy import (
+    AddReqResult,
+    CacheAwarePolicy,
+    PrefillAdder,
+    SchedulePolicy,
+    _PrefillAdmission,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -225,6 +234,118 @@ class TestShortestPrefillFirst(CustomTestCase):
                 256,
             )
         )
+
+
+class TestHiCacheLoadBackPromise(CustomTestCase):
+    """The load-back integrity check must compare against what the load
+    actually promised to copy, not the whole host hit.
+
+    Regression for #50892: on a joint-window (hybrid-SWA) model, a host hit
+    can include FULL rows that are still device-resident (only blocked by a
+    host-only window/state entry). Those rows need no H2D, so a legitimate
+    load-back lands fewer rows than ``req.host_hit_length`` — and the old
+    check aborted the whole scheduler over exactly that difference."""
+
+    # (host_hit, promised H2D rows, rows the cache reports as newly landed)
+    def _run(self, *, joint_window, host_hit, transfer_rows, loaded_rows):
+        adder = PrefillAdder.__new__(PrefillAdder)
+        adder.prefill_max_requests = None
+        adder.can_run_list = []
+        adder.tree_cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        adder.tree_cache.buffer_pipeline = None
+        adder.tree_cache.linker = None
+        adder.tree_cache.tree_core = SimpleNamespace(
+            build_hicache_transfers=Mock(
+                return_value=[SimpleNamespace(host_indices=list(range(transfer_rows)))]
+            )
+        )
+        adder.tree_cache.init_load_back = Mock(return_value=(loaded_rows, 7))
+        adder.tree_cache.load_back_is_cache_owned = Mock(return_value=False)
+        adder.memory_budget = SimpleNamespace(
+            load_back_needs_full_tokens=joint_window,
+            state_slots_fit=lambda _: True,
+            prepare_load_back=lambda **_: True,
+            load_back_scope=lambda **_: nullcontext(),
+        )
+        adder.prefill_delayer_single_pass = None
+        adder.kv_shard_scratch_spec = None
+        adder.per_req_token_overhead = 0
+        adder.dllm_config = None
+        adder.page_size = 1
+        adder.rem_chunk_tokens = None
+
+        req = Mock(spec=Req)
+        req.rid = "partial-load-back"
+        req.sampling_params = SimpleNamespace(max_new_tokens=8, ignore_eos=False)
+        req.output_ids = []
+        req.full_untruncated_fill_ids = list(range(64))
+        req.prefix_len = 0
+        req.host_hit_length = host_hit
+        req.window_host_hit_lengths = {}
+        req.last_node = 3
+        req.best_match_node = 7
+        req.needs_host_load_back.return_value = True
+        req.finished.return_value = False
+
+        admission = _PrefillAdmission(
+            prefix_len=0,
+            extend_len=64,
+            max_new_tokens=8,
+            is_chunked=False,
+            replay_len=0,
+        )
+        select_admission = Mock(return_value=admission)
+        commit = Mock()
+        with (
+            patch.object(adder, "_state_slots_for_req", return_value=0),
+            patch.object(adder, "_request_slot_reserve_for_req", return_value=0),
+            patch.object(adder, "_lock_node", lambda *_, **__: nullcontext()),
+            patch.object(adder, "_select_prefill_admission", select_admission),
+            patch.object(adder, "_kv_shard_reserve_scratch", return_value=True),
+            patch.object(adder, "_commit_prefill_admission", commit),
+            patch.object(adder, "budget_state", return_value=AddReqResult.CONTINUE),
+        ):
+            verdict = adder.add_one_req(
+                req, has_chunked_req=False, truncation_align_size=None
+            )
+        return verdict, req, select_admission
+
+    def test_partial_load_back_with_resident_full_rows_is_not_an_abort(self):
+        """Joint window: half the host hit's FULL rows are already on the
+        device. The transfer spec (and the reserved budget) covers only the
+        missing rows, and the load lands exactly those."""
+        verdict, req, _ = self._run(
+            joint_window=True, host_hit=64, transfer_rows=32, loaded_rows=32
+        )
+        self.assertIs(verdict, AddReqResult.CONTINUE)
+        self.assertEqual(req.host_loaded_length, 32)
+
+    def test_incomplete_load_back_still_aborts(self):
+        """A load that lands fewer rows than its transfer spec promised is a
+        genuine partial commit and must keep aborting."""
+        with self.assertRaises(RuntimeError) as ctx:
+            self._run(joint_window=True, host_hit=64, transfer_rows=32, loaded_rows=16)
+        self.assertIn("must commit all promised FULL tokens", str(ctx.exception))
+        self.assertIn("promised=32", str(ctx.exception))
+
+    def test_non_hybrid_promise_stays_the_whole_host_hit(self):
+        """Without the joint-window branch the promise remains the whole host
+        hit, so a short landing still aborts (original protection)."""
+        with self.assertRaises(RuntimeError) as ctx:
+            self._run(joint_window=False, host_hit=64, transfer_rows=64, loaded_rows=32)
+        self.assertIn("promised=64", str(ctx.exception))
+
+    def test_fully_resident_hit_needs_no_admission_recompute(self):
+        """Nothing to copy because the whole hit is device-resident: the load
+        lands zero rows without any promised transfer, so the request keeps
+        its host hit instead of being recomputed from scratch."""
+        verdict, req, select_admission = self._run(
+            joint_window=True, host_hit=64, transfer_rows=0, loaded_rows=0
+        )
+        self.assertIs(verdict, AddReqResult.CONTINUE)
+        # Only the initial admission selection ran; the elif recompute branch
+        # (host_hit_length=0) was for "promised rows landed none".
+        self.assertEqual(select_admission.call_count, 1)
 
 
 if __name__ == "__main__":
