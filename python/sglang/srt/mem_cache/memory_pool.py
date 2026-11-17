@@ -382,6 +382,8 @@ class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
     enable_mamba_extra_buffer_lazy: bool = False
+    # Static rows bind no request sub-pool units (`RequestTable.binds_row_units`).
+    binds_row_units: bool = False
     # Extra pre-allocation headroom (reserved for in-transfer decode requests).
     # 0 for a plain pool; the decode-flavored pool (DecodeReqToTokenPool) sets a
     # positive value. Declared here so callers can read it without getattr.
@@ -799,19 +801,15 @@ class MambaPool:
                             f"{L} < {min_len} (at least 16 and the draft tokens, "
                             f"{speculative_num_draft_tokens})"
                         )
-                # GDN speculative replay is request-lifetime scratch. KDA stays
-                # on every mamba slot unless host-only checkpoints index the
-                # ring by req_pool_idx (see replayssm_request_ring).
+                # GDN speculative replay is request-lifetime scratch, indexed by
+                # request row. KDA stays on every mamba slot unless host-only
+                # checkpoints index its ring by request row too.
                 self.replayssm_request_ring = bool(
-                    replayssm_request_ring
-                    and enable_linear_replayssm_spec
-                    and cache_params.is_kda
+                    enable_linear_replayssm_spec
+                    and (not cache_params.is_kda or replayssm_request_ring)
                 )
                 num_slots = (
-                    spec_state_size + 1
-                    if enable_linear_replayssm_spec
-                    and (not cache_params.is_kda or self.replayssm_request_ring)
-                    else size + 1
+                    spec_state_size + 1 if self.replayssm_request_ring else size + 1
                 )
                 # Decode records follow the SSM dtype. Spec-verify compact d/k
                 # records follow the activation dtype; g stays fp32.

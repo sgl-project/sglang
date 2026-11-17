@@ -940,11 +940,6 @@ class DeepseekMLARocmForwardMixin:
         llama_4_scaling,
         q_nope_unabsorbed=None,
     ):
-        # Cross-layer KV sharing: a consumer layer reads the provider's latent
-        # cache and must not write its own, because its latent is an all-zero
-        # placeholder. forward_mla.py has honoured this since 2dcd076e7a, but
-        # that commit never touched this ROCm copy, so on AMD the consumers
-        # overwrote the provider's cache with zeros.
         save_kv_cache = self.save_kv_cache
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:

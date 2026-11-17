@@ -268,6 +268,13 @@ def mamba_extra_buffer_lazy_of(cfg: Any) -> bool:
     )
 
 
+def mamba_path_state_cap_of(cfg: Any) -> int:
+    """The per-path Mamba state cap the tree enforces."""
+    if cfg.mamba_max_states_per_path is not None:
+        return cfg.mamba_max_states_per_path
+    return 1 if cfg.hybrid_cache_checkpoints_level < 3 else -1
+
+
 def collect_model_override_declarations(
     architecture: str, server_args: Any, hf_config: Any
 ) -> List[Tuple[str, Dict[str, Any]]]:
@@ -382,6 +389,9 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "MiniCPMV4_7ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        "Lfm3ForCausalLM",
+        "Lfm3VlForConditionalGeneration",
+        "Lfm3AudioForConditionalGeneration",
         "NemotronH_Omni_Reasoning_V3",
         "FalconH1ForCausalLM",
         "JetNemotronForCausalLM",
@@ -417,6 +427,9 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "Glm5NextForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        "Lfm3ForCausalLM",
+        "Lfm3VlForConditionalGeneration",
+        "Lfm3AudioForConditionalGeneration",
         "NemotronH_Omni_Reasoning_V3",
         # KDA-based: same MambaPool ping-pong machinery as GDN; requires the
         # KDA backend's track-snapshot writes (decode + extend) so donated
@@ -436,6 +449,13 @@ def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
     the configured linear-attention backend (pure read)."""
     from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
 
+    if get_platform().is_xpu:
+        return False
+    if hf_config.architectures[0] == "Lfm3ForCausalLM" and get_platform().is_hip:
+        # HIP has no extra-buffer hand-off for LFM3 conv-state checkpointing.
+        return False
+    if get_platform().is_xpu:
+        return False
     spec = get_linear_attn_spec(hf_config)
     if hf_config.architectures[0] in _MAMBA_EXTRA_BUFFER_ARCHS or (
         spec is not None and spec.support_mamba_cache_extra_buffer
@@ -535,13 +555,26 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
         checkpoint_allows_fp8 = getattr(
             get_dsa_config(hf_config), "dsa_fp8_kv_cache", True
         )
+        # gfx950 reports capability 9.x, but its triton/tilelang DSA kernels
+        # take fp8 KV and the gfx950-tuned sparse-MLA path requires it. The raw
+        # fp8 MLA layout is only read back on the aiter path (forward_mha.py).
+        hip_gfx95_fp8 = (
+            get_platform().is_hip
+            and is_gfx95_supported()
+            and envs.SGLANG_USE_AITER.get()
+            and view.dsa_prefill_backend in (None, "triton", "tilelang")
+            and view.dsa_decode_backend in (None, "triton", "tilelang")
+        )
         kv_cache_dtype = (
             "fp8_e4m3"
-            if major >= 10 and not has_attention_sinks and checkpoint_allows_fp8
+            if (major >= 10 or hip_gfx95_fp8)
+            and not has_attention_sinks
+            and checkpoint_allows_fp8
             else "bfloat16"
         )
         logger.warning(
-            f"Setting KV cache dtype to {kv_cache_dtype} for DeepSeek DSA on SM{major} device."
+            f"Setting KV cache dtype to {kv_cache_dtype} for DeepSeek DSA "
+            f"(device capability major {major})."
         )
     if kv_cache_dtype == "bf16":
         kv_cache_dtype = "bfloat16"
@@ -566,19 +599,21 @@ def _check_dsa_backend_constraints(
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
     chosen = {prefill_backend, decode_backend}
 
-    # A TRTLLM consumer makes the shared pool store raw FP8 rows, which the
+    # A TRTLLM or Prims-TS consumer makes the shared pool store raw FP8 rows, which the
     # other backend's scaled-FP8 / BF16 kernels cannot read.
     if (
         not hip
         and kv_cache_dtype == "fp8_e4m3"
         and disaggregation_mode == "null"
-        and (prefill_backend == "trtllm") != (decode_backend == "trtllm")
+        and (prefill_backend in ("trtllm", "prims_ts"))
+        != (decode_backend in ("trtllm", "prims_ts"))
     ):
         raise ValueError(
             f"FP8 KV with --dsa-prefill-backend {prefill_backend!r} and "
-            f"--dsa-decode-backend {decode_backend!r} is unsupported: trtllm "
-            "stores raw FP8 rows that the other backend cannot read. Use trtllm "
-            "for both, or --kv-cache-dtype bfloat16."
+            f"--dsa-decode-backend {decode_backend!r} is unsupported: trtllm and "
+            "prims_ts store raw FP8 rows that the other backend cannot read. "
+            "Use raw FP8 backends for both phases, or choose BF16-compatible "
+            "backends with --kv-cache-dtype bfloat16."
         )
 
     # The SM100/SM103/SM107 check is check_prims_ts_sparse_mla_support, at backend init.
