@@ -76,6 +76,7 @@ from sglang.srt.utils.device import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.beam_search.forward_inputs import BeamForwardInputs
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
@@ -488,6 +489,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     return_logprob: bool = False
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+    beam: Optional[BeamForwardInputs] = None
     spec_algorithm: SpeculativeAlgorithm = None
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
@@ -957,6 +959,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # block there). Use it directly.
         seq_lens_cpu = batch.seq_lens_cpu
 
+        beam = None
+        if batch.beam_tail is not None:
+            from sglang.srt.beam_search.forward_inputs import (
+                build_beam_forward_inputs,
+            )
+
+            beam = build_beam_forward_inputs(batch, model_runner)
+
         # TODO(seq-lens-removal): the whole ScheduleBatch seq_lens family
         # (incl. seq_lens_sum) is slated for removal in favor of kv-committed
         # lengths, so this init_new-time backfill onto the ScheduleBatch is
@@ -1040,6 +1050,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dp_prefill_cuda_graph_max_prefix_len=batch.dp_prefill_cuda_graph_max_prefix_len,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
+            beam=beam,
             contains_last_prefill_chunk=contains_last_prefill_chunk,
             extend_is_final_cpu=extend_is_final_cpu,
             spec_algorithm=batch.spec_algorithm,
@@ -1781,12 +1792,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Larger prefills fall back to eager and keep the memory-efficient
         # SUM_LEN. global_num_tokens is identical across ranks (all-gathered),
         # so the decision is consistent cluster-wide.
+        #
+        # Opt-in: with the env set, an idle (zero-token) DP rank keeps SUM_LEN
+        # instead of being padded to the capture bucket, so the step runs
+        # eagerly with only the rows that exist.  Off keeps the MAX_LEN path
+        # used by GPU prefill on MoE-TP; turn on for EP prefill (e.g. Ascend
+        # ascend_ops).
         prefill_cg = get_exec().graph.cuda_graph_config.prefill
+        max_len_with_idle_allowed = (
+            min(global_num_tokens) > 0
+            if envs.SGLANG_ENABLE_PREFILL_GRAPH_IDLE_RANK_EAGER.get()
+            else True
+        )
         if (
             self.can_run_dp_prefill_cuda_graph
             and self.is_extend_in_batch
             and prefill_cg.bs
             and max(global_num_tokens) <= max(prefill_cg.bs)
+            and max_len_with_idle_allowed
             and not prefill_graph_tolerates_sum_len()
         ):
             dp_padding_mode = DpPaddingMode.MAX_LEN
