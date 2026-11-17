@@ -505,6 +505,11 @@ void topk_sigmoid(
           gating_output.scalar_type() == at::ScalarType::BFloat16,
       "gating_output must be float32, float16, or bfloat16");
 
+  // Check contiguity
+  TORCH_CHECK(gating_output.is_contiguous(), "gating_output must be contiguous");
+  TORCH_CHECK(topk_weights.is_contiguous(), "topk_weights must be contiguous");
+  TORCH_CHECK(topk_indices.is_contiguous(), "topk_indices must be contiguous");
+
   // Check dimensions
   TORCH_CHECK(gating_output.dim() == 2, "gating_output must be 2D tensor [num_tokens, num_experts]");
   TORCH_CHECK(topk_weights.dim() == 2, "topk_weights must be 2D tensor [num_tokens, topk]");
@@ -541,6 +546,7 @@ void topk_sigmoid(
   const float* bias_ptr = nullptr;
   if (correction_bias.has_value()) {
     const torch::Tensor& bias_tensor = correction_bias.value();
+    TORCH_CHECK(bias_tensor.is_contiguous(), "correction_bias must be contiguous");
     TORCH_CHECK(bias_tensor.dim() == 1, "correction_bias must be 1D tensor [num_experts]");
     TORCH_CHECK(bias_tensor.size(0) == num_experts, "correction_bias size must match num_experts");
     TORCH_CHECK(

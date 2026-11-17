@@ -255,49 +255,39 @@ def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
     )
 
 
-def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
-    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
+def _act_and_mul(
+    op, input: torch.Tensor, out: torch.Tensor = None
+) -> torch.Tensor:
+    if not input.is_contiguous():
+        raise ValueError("input must be contiguous.")
+    if input.shape[-1] * input.dtype.itemsize % 16 != 0 or input.data_ptr() % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
     if out is not None:
         _check_shape(input, out)
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous.")
+        if out.data_ptr() % 16 != 0:
+            raise ValueError("The pointers must be multiple of 16 bytes.")
     else:
         out = torch.empty(
             input.shape[:-1] + (input.shape[-1] // 2,),
             device=input.device,
             dtype=input.dtype,
         )
-    torch.ops.sgl_kernel.silu_and_mul.default(out, input)
+    op(out, input)
     return out
+
+
+def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+    return _act_and_mul(torch.ops.sgl_kernel.silu_and_mul.default, input, out)
 
 
 def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
-    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
-        raise ValueError("The pointers must be multiple of 16 bytes.")
-    if out is not None:
-        _check_shape(input, out)
-    else:
-        out = torch.empty(
-            input.shape[:-1] + (input.shape[-1] // 2,),
-            device=input.device,
-            dtype=input.dtype,
-        )
-    torch.ops.sgl_kernel.gelu_tanh_and_mul.default(out, input)
-    return out
+    return _act_and_mul(torch.ops.sgl_kernel.gelu_tanh_and_mul.default, input, out)
 
 
 def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
-    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
-        raise ValueError("The pointers must be multiple of 16 bytes.")
-    if out is not None:
-        _check_shape(input, out)
-    else:
-        out = torch.empty(
-            input.shape[:-1] + (input.shape[-1] // 2,),
-            device=input.device,
-            dtype=input.dtype,
-        )
-    torch.ops.sgl_kernel.gelu_and_mul.default(out, input)
-    return out
+    return _act_and_mul(torch.ops.sgl_kernel.gelu_and_mul.default, input, out)
 
 
 if torch.version.hip is not None:

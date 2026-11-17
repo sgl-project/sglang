@@ -27,6 +27,22 @@ def moe_align_block_size(
     )
 
 
+def _check_topk_contiguous(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: Optional[torch.Tensor] = None,
+) -> None:
+    if not topk_weights.is_contiguous():
+        raise ValueError("topk_weights must be contiguous.")
+    if not topk_ids.is_contiguous():
+        raise ValueError("topk_ids must be contiguous.")
+    if not gating_output.is_contiguous():
+        raise ValueError("gating_output must be contiguous.")
+    if correction_bias is not None and not correction_bias.is_contiguous():
+        raise ValueError("correction_bias must be contiguous.")
+
+
 def topk_softmax(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -46,6 +62,7 @@ def topk_softmax(
         moe_softcapping: Tanh softcapping value (0.0 to disable)
         correction_bias: Per-expert bias correction [num_experts], must be float32 if provided
     """
+    _check_topk_contiguous(topk_weights, topk_ids, gating_output, correction_bias)
     torch.ops.sgl_kernel.topk_softmax.default(
         topk_weights,
         topk_ids,
@@ -73,6 +90,7 @@ def topk_sigmoid(
         renormalize: Whether to renormalize the top-k weights
         correction_bias: Per-expert bias correction [num_experts], must be float32 if provided
     """
+    _check_topk_contiguous(topk_weights, topk_ids, gating_output, correction_bias)
     torch.ops.sgl_kernel.topk_sigmoid.default(
         topk_weights,
         topk_ids,
