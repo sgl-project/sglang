@@ -1,6 +1,5 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
-import dataclasses
 import multiprocessing as mp
 import os
 import sys
@@ -377,36 +376,16 @@ def launch_pool_disagg_server(
             for inst_idx, gpu_ids in enumerate(gpu_lists):
                 num_role_gpus = len(gpu_ids)
 
-                # Per-role parallelism: use explicit overrides if set, else None (auto-derive)
-                role_par = server_args.get_role_parallelism(role_type)
-
-                role_overrides = {
-                    "disagg_role": role_type,
-                    "disagg_mode": True,
-                    "pool_work_endpoint": work_eps[inst_idx],
-                    "pool_result_endpoint": result_ep,
-                    "num_gpus": num_role_gpus,
-                    "warmup_mode": "request"
-                    if role_type == RoleType.ENCODER
-                    else "off",
-                    "scheduler_port": find_port(port_cursor),
-                    "master_port": find_port(port_cursor + 100),
-                    # Per-role parallelism (None = auto-derive from num_gpus)
-                    "tp_size": role_par["tp_size"],
-                    "sp_degree": role_par["sp_degree"],
-                    "ulysses_degree": role_par["ulysses_degree"],
-                    "ring_degree": role_par["ring_degree"],
-                }
-                port_cursor = role_overrides["master_port"] + 100
-
-                base_dict = {
-                    f.name: getattr(server_args, f.name)
-                    for f in dataclasses.fields(server_args)
-                    if f.init
-                }
-                base_dict.update(role_overrides)
-                base_dict.pop("pipeline_config", None)
-                role_args = ServerArgs.from_kwargs(**base_dict)
+                role_args = server_args.for_disagg_role(
+                    role_type,
+                    pool_work_endpoint=work_eps[inst_idx],
+                    pool_result_endpoint=result_ep,
+                    num_gpus=num_role_gpus,
+                    warmup_mode="request" if role_type == RoleType.ENCODER else "off",
+                    scheduler_port=find_port(port_cursor),
+                    master_port=find_port(port_cursor + 100),
+                )
+                port_cursor = role_args.master_port + 100
                 role_args_payload = ServerArgsPayload.capture(role_args)
 
                 # local_rank is a physical GPU id, independent of visible-device remapping
@@ -661,67 +640,13 @@ def launch_disagg_role(server_args: ServerArgs):
         start=server_args.scheduler_port + 100, avoid={server_args.scheduler_port}
     )
 
-    role_par = server_args.get_role_parallelism(role_type)
-    role_overrides = {
-        "disagg_role": role_type,
-        "disagg_mode": True,
-        "pool_work_endpoint": work_endpoint,
-        "pool_result_endpoint": result_endpoint,
-        "warmup_mode": "request" if role_type.is_input_encoder else "off",
-        "scheduler_port": internal_scheduler_port,
-        # Per-role parallelism (None = auto-derive from num_gpus)
-        "tp_size": role_par["tp_size"],
-        "sp_degree": role_par["sp_degree"],
-        "ulysses_degree": role_par["ulysses_degree"],
-        "ring_degree": role_par["ring_degree"],
-    }
-    role_tp = role_par["tp_size"] or 1
-    role_sp = role_par["sp_degree"] or 1
-    cfg_degree = (
-        server_args.cfg_parallel_degree if server_args.enable_cfg_parallel else 1
+    role_args = server_args.for_disagg_role(
+        role_type,
+        pool_work_endpoint=work_endpoint,
+        pool_result_endpoint=result_endpoint,
+        warmup_mode="request" if role_type.is_input_encoder else "off",
+        scheduler_port=internal_scheduler_port,
     )
-    cfg_parallel_explicit = server_args.is_arg_explicitly_set(
-        "enable_cfg_parallel"
-    ) or server_args.is_arg_explicitly_set("cfg_parallel_degree")
-    required_devices = role_tp * role_sp * cfg_degree * server_args.dp_size
-    if not cfg_parallel_explicit and (
-        required_devices > server_args.num_gpus
-        or server_args.num_gpus % required_devices != 0
-    ):
-        logger.warning(
-            "Disabling auto-enabled CFG parallel for %s role because tp=%d, "
-            "sp=%d, cfg=%d, dp=%d is incompatible with %d devices",
-            role_type.value,
-            role_tp,
-            role_sp,
-            cfg_degree,
-            server_args.dp_size,
-            server_args.num_gpus,
-        )
-        role_overrides["enable_cfg_parallel"] = False
-        role_overrides["cfg_parallel_degree"] = 1
-        cfg_degree = 1
-        required_devices = role_tp * role_sp * server_args.dp_size
-
-    if (
-        required_devices > server_args.num_gpus
-        or server_args.num_gpus % required_devices != 0
-    ):
-        raise ValueError(
-            f"Invalid parallelism for {role_type.value} role: "
-            f"tp={role_tp}, sp={role_sp}, cfg={cfg_degree}, "
-            f"dp={server_args.dp_size} requires groups of {required_devices} "
-            f"devices, but num_gpus={server_args.num_gpus}"
-        )
-
-    base_dict = {
-        f.name: getattr(server_args, f.name)
-        for f in dataclasses.fields(server_args)
-        if f.init
-    }
-    base_dict.update(role_overrides)
-    base_dict.pop("pipeline_config", None)
-    role_args = ServerArgs.from_kwargs(**base_dict)
     role_args_payload = ServerArgsPayload.capture(role_args)
 
     num_gpus = server_args.num_gpus

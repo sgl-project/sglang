@@ -102,7 +102,7 @@ def _load_npu_memory_pool_module():
         "sglang.srt.mem_cache",
         "sglang.srt.mem_cache.memory_pool",
         "sglang.srt.utils",
-        "sglang.srt.utils.common",
+        "sglang.srt.utils.device",
     ):
         sys.modules.setdefault(name, types.ModuleType(name))
 
@@ -121,8 +121,8 @@ def _load_npu_memory_pool_module():
     utils = sys.modules["sglang.srt.utils"]
     utils.get_bool_env_var = lambda _name, default: default == "True"
 
-    common = sys.modules["sglang.srt.utils.common"]
-    common.is_npu = lambda: False
+    device_utils = sys.modules["sglang.srt.utils.device"]
+    device_utils.is_npu = lambda: False
 
     module_path = (
         Path(__file__).resolve().parents[3]

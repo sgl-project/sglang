@@ -26,7 +26,10 @@ from sglang.multimodal_gen.configs.models.vaes.sana import SanaVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.stablediffusion3 import (
     StableDiffusion3VAEConfig,
 )
-from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEConfig
+from sglang.multimodal_gen.configs.models.vaes.wanvae import (
+    WanVAEArchConfig,
+    WanVAEConfig,
+)
 from sglang.multimodal_gen.configs.utils import update_config_from_args
 from sglang.multimodal_gen.runtime.distributed import parallel_state
 from sglang.multimodal_gen.runtime.distributed.utils import RankGenerator
@@ -35,7 +38,9 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     SpatialParallelConv2d,
     SpatialParallelConv3d,
     chunk_height_by_sizes,
+    fill_halo_rows_,
     gather_height_sizes,
+    halo_exchange,
     split_for_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
@@ -57,6 +62,7 @@ from sglang.multimodal_gen.runtime.models.vaes.ltx_2_vae import (
     _enable_ltx_decoder_spatial_parallel,
 )
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
+    AutoencoderKLWan,
     WanDecoder3d,
     WanDistAttentionBlock,
 )
@@ -81,6 +87,35 @@ class _DispatchProbeVAE(ParallelTiledVAE):
         raise AssertionError(
             "spatial_shard decode should not use parallel_tiled_decode"
         )
+
+
+def _fill_halo_rows_on_two_ranks(rank: int, rendezvous: str) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        group = SimpleNamespace(
+            rank_in_group=rank,
+            world_size=2,
+            ranks=[0, 1],
+            device_group=dist.group.WORLD,
+        )
+        height = (3, 2)[rank]
+        # gloo only sends default-contiguous tensors, so the shards stay NCDHW
+        x = torch.randn(
+            1, 5, 2, height, 4, generator=torch.Generator().manual_seed(rank)
+        )
+        reference, _, _ = halo_exchange(x, 1, parallel_group=group)
+        padded = torch.zeros(1, 5, 2, height + 2, 4)
+        padded[..., 1:-1, :] = x
+        fill_halo_rows_(padded, 1, parallel_group=group)
+        assert torch.equal(padded, reference)
+    finally:
+        dist.destroy_process_group()
 
 
 def _gather_heights_on_two_ranks(rank: int, rendezvous: str) -> None:
@@ -127,7 +162,11 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         self.assertFalse(should_use_spatial_shard_parallel_decode(VAEConfig()))
         self.assertFalse(should_use_spatial_shard_parallel_decode(QwenImageVAEConfig()))
         self.assertTrue(should_use_spatial_shard_parallel_decode(LTXVideoVAEConfig()))
-        self.assertTrue(should_use_spatial_shard_parallel_decode(WanVAEConfig()))
+        with patch(
+            "sglang.multimodal_gen.configs.models.vaes.wanvae.is_gfx1250_supported",
+            return_value=False,
+        ):
+            self.assertTrue(should_use_spatial_shard_parallel_decode(WanVAEConfig()))
 
         ltx23_config = LTXVideoVAEConfig()
         ltx23_config.arch_config.video_decoder_variant = "ltx_2_3"
@@ -156,6 +195,49 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
                 hunyuan_config, torch.empty(1, 16, 9, 96, 96), 2
             )
         )
+
+    def test_wan_auto_parallel_decode_keeps_gfx1250_fast_path(self):
+        # gfx1250's single-rank Wan VAE fast path beats spatial-shard decode;
+        # auto must not shard there, while an explicit spatial_shard still does.
+        with patch(
+            "sglang.multimodal_gen.configs.models.vaes.wanvae.is_gfx1250_supported",
+            return_value=True,
+        ):
+            config = WanVAEConfig()
+            self.assertFalse(
+                should_use_spatial_shard_parallel_decode(
+                    config, torch.empty(1, 16, 25, 90, 160), 2
+                )
+            )
+            config.parallel_decode_mode = "spatial_shard"
+            self.assertTrue(should_use_spatial_shard_parallel_decode(config))
+
+    def test_wan_vae_reports_parallel_decode_only_when_it_shards(self):
+        # DecodingStage replicates decode across cfg-parallel ranks when this is True;
+        # only auto mode on gfx1250 may turn it off, explicit modes keep the flag.
+        def wan_vae(mode: str) -> AutoencoderKLWan:
+            config = WanVAEConfig(
+                arch_config=WanVAEArchConfig(
+                    base_dim=8,
+                    z_dim=4,
+                    dim_mult=(1, 2, 2, 2),
+                    num_res_blocks=1,
+                    latents_mean=(0.0,) * 4,
+                    latents_std=(1.0,) * 4,
+                ),
+                load_encoder=False,
+                load_decoder=False,
+            )
+            config.parallel_decode_mode = mode
+            return AutoencoderKLWan(config)
+
+        target = "sglang.multimodal_gen.configs.models.vaes.wanvae.is_gfx1250_supported"
+        with patch(target, return_value=True):
+            self.assertFalse(wan_vae("auto").use_parallel_decode)
+            self.assertTrue(wan_vae("spatial_shard").use_parallel_decode)
+            self.assertTrue(wan_vae("patch").use_parallel_decode)
+        with patch(target, return_value=False):
+            self.assertTrue(wan_vae("auto").use_parallel_decode)
 
     def test_unsupported_vae_configs_opt_out_of_spatial_parallel_decode(self):
         configs = (Hunyuan3DVAEConfig(), LTXAudioVAEConfig())
@@ -291,6 +373,11 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         self.assertEqual(rank0.shape[-2], 3)
         self.assertEqual(rank1.shape[-2], 2)
         torch.testing.assert_close(torch.cat([rank0, rank1], dim=-2), x)
+
+    def test_halo_rows_filled_in_place_match_the_concatenated_halo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rendezvous = (Path(tmp) / "rendezvous").as_uri()
+            mp.spawn(_fill_halo_rows_on_two_ranks, args=(rendezvous,), nprocs=2)
 
     def test_height_sizes_are_gathered_on_the_host(self):
         with tempfile.TemporaryDirectory() as tmp:

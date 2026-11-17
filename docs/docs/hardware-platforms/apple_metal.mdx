@@ -98,6 +98,27 @@ The MLX backend supports two quantization paths on Apple Silicon:
    ```
    The MLX backend silently ignores `--quantization mlx_q4` when the model is already quantized in its HF config (path 1), so the same flag is safe to pass either way.
 
+## Unlimited-OCR v2
+
+[Unlimited-OCR-2](/cookbook/autoregressive/Baidu/Unlimited-OCR-2) runs on the standard PyTorch MPS runtime, without `SGLANG_USE_MLX`. The BF16 checkpoint is supported; quantized checkpoints are rejected on this path. DASH routing and sparse attention, the per-step page metadata, Page2D RoPE and the MoE experts run Metal kernels compiled with `torch.mps.compile_shader`; the remaining layers run PyTorch MPS operators.
+
+```bash
+sglang serve \
+  --model-path baidu/Unlimited-OCR-2 \
+  --device mps \
+  --chat-template unlimited-ocr \
+  --uocr-doc-split \
+  --enable-streaming-session \
+  --uocr-max-page-tokens 8000 \
+  --max-total-tokens 32768
+```
+
+- `--max-total-tokens` caps the KV pool. On a 16 GB Mac the default pool leaves too little memory for the vision encoder and the system starts swapping.
+- Requests that send `DeepseekOCRNoRepeatNGramLogitProcessor` as `custom_logit_processor` need `--enable-custom-logit-processor`.
+- Overlap scheduling and CUDA graphs are not available on MPS. The first request of each new image geometry also pays for compiling the PyTorch MPS graphs of the vision encoder.
+
+On an M5 MacBook Pro with 16 GB of memory, one document decodes at about 70 tokens/s.
+
 ## Benchmarking with Requests
 
 `sglang.benchmark.one_batch` calls the synchronous prefill/decode methods directly without going through the scheduler and the overlap code path.

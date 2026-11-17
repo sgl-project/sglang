@@ -36,11 +36,11 @@ from sglang.kernels.ops.diffusion.modulate.scale_shift_triton import (
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=75, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=75, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 # Nightly is not redundant: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1, which
 # expands the get_ci_test_range sweeps below.
-register_cuda_ci(est_time=50, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=50, stage="nightly", runner_config="1-gpu-small")
 register_amd_ci(est_time=38, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 DEVICE = "cuda"
@@ -722,3 +722,41 @@ def test_rmsnorm_scale_shift_per_token_guards():
     assert not can_use_rmsnorm_scale_shift_per_token(
         x, weight[:-1], scale, shift
     )  # weight size mismatch
+
+
+def _is_gfx1250() -> bool:
+    from sglang.srt.utils import is_gfx1250_supported
+
+    return torch.cuda.is_available() and is_gfx1250_supported()
+
+
+@pytest.mark.skipif(not _is_gfx1250(), reason="gfx1250 bf16 path")
+@pytest.mark.parametrize("scale_constant", [0, 1.0])
+@pytest.mark.parametrize(
+    "shift_shape,shift_dtype",
+    [
+        ("full", torch.bfloat16),
+        ("full", torch.float32),
+        ("bcast", torch.float32),
+        ("bcast", torch.bfloat16),
+    ],
+)
+def test_scale_shift_gfx1250_fp32_scale_is_bit_exact(
+    scale_constant, shift_shape, shift_dtype
+):
+    """On gfx1250 a bf16 ``x`` with an fp32 scale runs a dedicated kernel that
+    must equal the torch fallback (all-fp32 intermediates) cast to bf16."""
+    from sglang.kernels.ops.diffusion.common.fallback_torch import (
+        fuse_scale_shift_kernel_native,
+    )
+
+    torch.manual_seed(0)
+    L, C = 4099, 5120
+    x = torch.randn(1, L, C, device="cuda", dtype=torch.bfloat16)
+    scale = torch.randn(1, 1, C, device="cuda") * 0.1
+    rows = L if shift_shape == "full" else 1
+    shift = torch.randn(1, rows, C, device="cuda", dtype=shift_dtype)
+    out = fuse_scale_shift_kernel(x, scale, shift, scale_constant=scale_constant)
+    ref = fuse_scale_shift_kernel_native(x, scale, shift, scale_constant)
+    assert out.dtype == x.dtype
+    assert torch.equal(out, ref.to(x.dtype))

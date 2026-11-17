@@ -12,14 +12,17 @@ from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
 )
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import InvariantCheckLevel, envs
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+    require_mlp_tp_gather,
+)
 from sglang.srt.managers.overlap_utils import (
     CONFIDENCE_RELAY_RING_LAG,
     FutureMap,
     ResolvedConfidence,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
@@ -41,7 +44,6 @@ from sglang.srt.speculative.ragged_verify import (
     round_up_grid,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
-from sglang.srt.utils.common import require_mlp_tp_gather
 from sglang.srt.utils.invariants import (
     Bucket,
     Invariant,
@@ -62,7 +64,17 @@ class VerifyWindow(msgspec.Struct, frozen=True):
     verify_cache_loc_2d: torch.Tensor
     # The iteration's plan of `verify_cache_loc`: the draft block, the verify
     # and the target-hidden KV writes all take their ids from it.
-    kv_loc_plan: KVLocPlan
+    iteration_ids: IterationIds
+
+
+class VerifyTierResolution(msgspec.Struct, frozen=True):
+    tier_num_reqs: int
+    tier_num_tokens: Optional[int]
+    graph_num_tokens_floor: int
+    exceeds_captured_grid: bool
+    # None when the floor is empty, no ragged capture grid exists, or the tier
+    # exceeds the captured grid.
+    graph_num_tokens: Optional[int]
 
 
 class DSparkVerifyPlanner:
@@ -76,6 +88,7 @@ class DSparkVerifyPlanner:
         tp_rank: int,
         verify_num_draft_tokens: int,
         tp_sync: SpecTpSync,
+        online_confidence: bool = False,
     ) -> None:
         self.draft_model = draft_model
         self.gamma = gamma
@@ -88,6 +101,7 @@ class DSparkVerifyPlanner:
         )
 
         self._confidence_head = getattr(self.draft_model, "confidence_head", None)
+        self._online_confidence = online_confidence
 
         sts_path = get_spec().speculative_dspark_confidence_sts_path
         if sts_path and self._confidence_head is not None:
@@ -123,7 +137,8 @@ class DSparkVerifyPlanner:
             if tp_rank == 0:
                 logger.warning(
                     "DSpark STS calibration path given but no confidence head present "
-                    "(static mode / head-less checkpoint); ignoring %s.",
+                    "(static mode, or the online acceptance estimator, which "
+                    "calibrates itself); ignoring %s.",
                     sts_path,
                 )
 
@@ -135,15 +150,12 @@ class DSparkVerifyPlanner:
         self._is_verify_all = True
         self._uniform_layout_cache: dict = {}
         if self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
-            if self._confidence_head is None:
+            if not self.carries_confidence:
                 raise ValueError(
                     f"DSpark ragged-verify mode {self._ragged_verify_mode.value!r} "
-                    f"schedules per-request verify lengths from the draft confidence "
-                    f"head, but this DSpark draft checkpoint has no confidence head -- "
-                    f"the checkpoint is wrong/incomplete (it ships no "
-                    f"enable_confidence_head + trained confidence_head weights). Use a "
-                    f"draft checkpoint that includes the confidence head, or run "
-                    f"SGLANG_RAGGED_VERIFY_MODE=static."
+                    f"schedules per-request verify lengths from draft confidences, but "
+                    f"the draft has neither a confidence head nor the online "
+                    f"acceptance estimator. Run SGLANG_RAGGED_VERIFY_MODE=static."
                 )
             sps_table = build_sps_cost_table(
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
@@ -205,7 +217,7 @@ class DSparkVerifyPlanner:
 
     @property
     def carries_confidence(self) -> bool:
-        return self._confidence_head is not None
+        return self._confidence_head is not None or self._online_confidence
 
     @property
     def schedules_verify_budget(self) -> bool:
@@ -421,41 +433,18 @@ class DSparkVerifyPlanner:
                 )
             return None
         bs = int(verify_lens.shape[0])
-        tier_num_reqs = bs if global_num_reqs is None else global_num_reqs
-        if dp_tier_num_tokens is not None:
-            assert global_num_reqs is not None, (
-                "dp tier agreement requires the dp-global request count; "
-                "keying the tier off the local bs diverges across ranks"
-            )
-            tier_num_tokens = dp_tier_num_tokens
-        elif self._dynamic_graph_tier and budget is not None:
-            tier_num_tokens = local_verify_tier_num_tokens(
-                bs=tier_num_reqs,
-                verify_token_budget=budget,
-                verify_num_draft_tokens=self.verify_num_draft_tokens,
-                min_verify_len=self._schedule_cfg.min_verify_len,
-            )
-        else:
-            tier_num_tokens = None
-        if ragged_layout_exceeds_captured_grid(
-            num_reqs=tier_num_reqs,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            model_runner=self.model_runner,
-            tier_tokens_hint=tier_num_tokens,
-        ):
-            return None
-        graph_num_tokens_floor = verify_layout_graph_num_tokens_floor(
-            num_reqs=tier_num_reqs,
-            ragged_verify_mode=self._ragged_verify_mode,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            model_runner=self.model_runner,
-            tier_num_tokens=tier_num_tokens,
+        tier = self._resolve_verify_tier(
+            num_reqs=bs,
+            global_num_reqs=global_num_reqs,
+            dp_tier_num_tokens=dp_tier_num_tokens,
+            budget=budget,
         )
-        capture_num_tokens = ragged_capture_num_tokens(model_runner=self.model_runner)
-        if graph_num_tokens_floor > 0 and capture_num_tokens is not None:
-            graph_num_tokens = round_up_grid(graph_num_tokens_floor, capture_num_tokens)
+        if tier.exceeds_captured_grid:
+            return None
+        graph_num_tokens_floor = tier.graph_num_tokens_floor
+        if tier.graph_num_tokens is not None:
             return RaggedVerifyLayout.from_verify_lens_device(
-                verify_lens=verify_lens, graph_num_tokens=graph_num_tokens
+                verify_lens=verify_lens, graph_num_tokens=tier.graph_num_tokens
             )
         verify_lens_cpu = verify_lens.to("cpu").tolist()
         grid = verify_layout_grid(
@@ -489,14 +478,40 @@ class DSparkVerifyPlanner:
         # it does not touch the layout's own tier computation.
         if not self._align_verify_tokens_to_graph_tier or budget is None:
             return budget
-        tier_num_reqs = (
-            int(req_pool_indices.shape[0])
-            if global_num_reqs is None
-            else global_num_reqs
+        tier = self._resolve_verify_tier(
+            num_reqs=int(req_pool_indices.shape[0]),
+            global_num_reqs=global_num_reqs,
+            dp_tier_num_tokens=dp_tier_num_tokens,
+            budget=budget,
         )
+        if tier.graph_num_tokens is None:
+            return budget
+        return graph_tier_fill_budget(
+            graph_num_tokens=tier.graph_num_tokens,
+            bs=int(req_pool_indices.shape[0]),
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            min_verify_len=self._schedule_cfg.min_verify_len,
+        )
+
+    def _resolve_verify_tier(
+        self,
+        *,
+        num_reqs: int,
+        global_num_reqs: Optional[int],
+        dp_tier_num_tokens: Optional[int],
+        budget: Optional[int],
+    ) -> VerifyTierResolution:
+        """Single source for the ragged verify graph tier. Token sources, in
+        priority order: the DP-gathered cross-rank tier, the local
+        budget-derived tier (dynamic), or the full-block floor (None)."""
+        tier_num_reqs = num_reqs if global_num_reqs is None else global_num_reqs
         if dp_tier_num_tokens is not None:
+            assert global_num_reqs is not None, (
+                "dp tier agreement requires the dp-global request count; "
+                "keying the tier off the local bs diverges across ranks"
+            )
             tier_num_tokens = dp_tier_num_tokens
-        elif self._dynamic_graph_tier:
+        elif self._dynamic_graph_tier and budget is not None:
             tier_num_tokens = local_verify_tier_num_tokens(
                 bs=tier_num_reqs,
                 verify_token_budget=budget,
@@ -512,15 +527,26 @@ class DSparkVerifyPlanner:
             model_runner=self.model_runner,
             tier_num_tokens=tier_num_tokens,
         )
-        capture_num_tokens = ragged_capture_num_tokens(model_runner=self.model_runner)
-        if graph_num_tokens_floor <= 0 or capture_num_tokens is None:
-            return budget
-        graph_num_tokens = round_up_grid(graph_num_tokens_floor, capture_num_tokens)
-        return graph_tier_fill_budget(
-            graph_num_tokens=graph_num_tokens,
-            bs=int(req_pool_indices.shape[0]),
+        exceeds_captured_grid = ragged_layout_exceeds_captured_grid(
+            num_reqs=tier_num_reqs,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
-            min_verify_len=self._schedule_cfg.min_verify_len,
+            model_runner=self.model_runner,
+            tier_tokens_hint=tier_num_tokens,
+        )
+        capture_num_tokens = ragged_capture_num_tokens(model_runner=self.model_runner)
+        graph_num_tokens = (
+            round_up_grid(graph_num_tokens_floor, capture_num_tokens)
+            if not exceeds_captured_grid
+            and graph_num_tokens_floor > 0
+            and capture_num_tokens is not None
+            else None
+        )
+        return VerifyTierResolution(
+            tier_num_reqs=tier_num_reqs,
+            tier_num_tokens=tier_num_tokens,
+            graph_num_tokens_floor=graph_num_tokens_floor,
+            exceeds_captured_grid=exceeds_captured_grid,
+            graph_num_tokens=graph_num_tokens,
         )
 
     def _schedule_verify_lens(
@@ -801,7 +827,7 @@ def alloc_verify_window(
         positions_2d = torch.empty(
             (bs, verify_w), dtype=torch.int64, device=prefix_lens.device
         )
-    plan = model_runner.kv_index_translator.plan_uniform_extend(
+    plan = model_runner.runner_ids.plan_uniform_extend(
         req_pool_indices=batch.req_pool_indices,
         seq_lens=prefix_lens,
         seq_lens_cpu=seq_lens_cpu,
@@ -817,7 +843,7 @@ def alloc_verify_window(
         positions_2d=positions_2d,
         verify_cache_loc=verify_cache_loc,
         verify_cache_loc_2d=verify_cache_loc.view(bs, verify_w),
-        kv_loc_plan=plan,
+        iteration_ids=plan,
     )
 
 

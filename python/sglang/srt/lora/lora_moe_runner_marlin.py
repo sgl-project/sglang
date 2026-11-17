@@ -32,7 +32,7 @@ if _is_cuda:
     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
         get_scalar_type,
     )
-    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+    from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
         moe_align_block_size,
     )
     from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace

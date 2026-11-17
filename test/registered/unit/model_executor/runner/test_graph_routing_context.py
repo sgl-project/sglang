@@ -18,9 +18,7 @@ from sglang.srt.layers.moe.topk import TopK, fused_topk_torch_native
 from sglang.srt.layers.moe.utils import initialize_moe_config
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
     ForwardBatch,
-    ForwardMode,
     PPProxyTensors,
     enable_num_token_non_padded,
 )
@@ -30,6 +28,7 @@ from sglang.srt.model_executor.forward_context import (
     get_forward_context,
     has_forward_context,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -176,7 +175,6 @@ class TestGraphRoutingContext(CustomTestCase):
         runner.model_runner = model_runner
         runner.captured_req_width = 1
         runner.ragged_verify_mode = False
-        runner.enable_pdmux = False
         runner.pp_size = 1
         runner.dllm_uses_input_embeds = False
         runner.in_graph_metadata_prep_done = None
@@ -259,9 +257,7 @@ class TestGraphRoutingContext(CustomTestCase):
         runner.positions = torch.arange(4)
         runner.mrope_positions = torch.zeros((3, 4), dtype=torch.int64)
         runner.num_token_non_padded = torch.zeros(1, dtype=torch.int64)
-        model_runner.kv_index_translator = SimpleNamespace(
-            bind_runner_slots=lambda batch: None
-        )
+        model_runner.runner_ids = SimpleNamespace(bind_runner_slots=lambda batch: None)
         backend.init_forward_metadata_capture_cpu_graph = lambda *args: None
         for size in reversed(runner.capture_bs):
             runner.graphs[size], _ = runner.capture_one_batch_size(

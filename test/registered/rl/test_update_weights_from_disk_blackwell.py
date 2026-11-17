@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=606, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=745, stage="nightly", runner_config="4-gpu-b200")
 
 import time
 import unittest
@@ -14,9 +14,11 @@ from sglang.srt.constants import (
 )
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    admin_post,
     popen_launch_server,
 )
 
@@ -59,6 +61,7 @@ class UpdateWeightsFromDiskBase:
             *backend_test_suite.get("other_args", ()),
             "--enable-memory-saver",
             "--cuda-graph-backend-prefill=disabled",
+            *ADMIN_LAUNCH_ARGS_FOR_TEST,
         )
         return popen_launch_server(
             self.model,
@@ -77,7 +80,7 @@ class UpdateWeightsFromDiskBase:
         return response.json()
 
     def _post_json(self, endpoint, payload, timeout=None):
-        response = requests.post(
+        response = admin_post(
             f"{self.base_url}{endpoint}",
             json=payload,
             timeout=timeout or self.request_timeout,

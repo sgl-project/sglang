@@ -58,7 +58,7 @@ export const config = {
     b200:  "lmsysorg/sglang:dev-dsv41",
     b300:  "lmsysorg/sglang:dev-dsv41",
     gb300: "lmsysorg/sglang:dev-dsv41",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.22-rocm10-mi35x-20261021",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261111",
   },
 
   github: {
@@ -116,10 +116,10 @@ export const config = {
       router: {
         port: 8000,
         command:
-`sglang-router launch \\
-  --pd-disaggregation \\
-  --prefill http://<prefill-host>:{{PREFILL_PORT}} 8998 \\
-  --decode http://<decode-host>:{{DECODE_PORT}} \\
+`sgl-router \\
+  --model-id {{MODEL_NAME}} \\
+  --no-tokenizer \\
+  --worker-urls http://<prefill-host>:{{PREFILL_PORT}} http://<decode-host>:{{DECODE_PORT}} \\
   --host 0.0.0.0 --port {{ROUTER_PORT}}`,
       },
     },
@@ -354,7 +354,6 @@ export const config = {
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
-        "SGLANG_OPT_HIP_FLYDSL_MXFP8=1",
         "SGLANG_HIP_FP4_INDEXER_ROWGROUP=1",
       ],
       flags: [
@@ -392,7 +391,6 @@ export const config = {
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
-        "SGLANG_OPT_HIP_FLYDSL_MXFP8=1",
         "SGLANG_HIP_FP4_INDEXER_ROWGROUP=1",
         // Non-monokernel point. The monokernel refuses this layout.
         "SGLANG_HIP_DSV41_INDEX_K_PAGE8=1",
@@ -586,7 +584,6 @@ export const config = {
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
-        "SGLANG_OPT_HIP_FLYDSL_MXFP8=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -623,7 +620,6 @@ export const config = {
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
-        "SGLANG_OPT_HIP_FLYDSL_MXFP8=1",
       ],
       flags: [
         "--trust-remote-code",

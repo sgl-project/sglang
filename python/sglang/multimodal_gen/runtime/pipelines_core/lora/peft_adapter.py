@@ -254,11 +254,11 @@ def apply_peft_config(
             )
         compiled_patterns.append((expression, alpha))
 
-    suffix = ".lora_A.weight"
     for name in state_dict:
-        if not name.endswith(suffix):
+        base = name.removesuffix(".weight")
+        if not base.endswith(".lora_A"):
             continue
-        base = name[: -len(suffix)]
+        base = base.removesuffix(".lora_A")
         alpha = next(
             (alpha for pattern, alpha in compiled_patterns if pattern.match(base)), None
         )
@@ -278,12 +278,15 @@ def apply_peft_config(
     if not use_rslora:
         return normalized
 
-    suffix = ".lora_B.weight"
     pairs = 0
     for name, weight in state_dict.items():
-        if not name.endswith(suffix):
+        base = name.removesuffix(".weight")
+        if not base.endswith(".lora_B"):
             continue
-        lora_a = state_dict.get(f"{name[: -len(suffix)]}.lora_A.weight")
+        base = base.removesuffix(".lora_B")
+        lora_a = state_dict.get(
+            f"{base}.lora_A.weight", state_dict.get(f"{base}.lora_A")
+        )
         if lora_a is None or lora_a.ndim < 2 or lora_a.shape[-2] <= 0:
             raise ValueError(f"RSLoRA weight {name!r} has no valid rank-bearing A")
         normalized[name] = weight * math.sqrt(lora_a.shape[-2])

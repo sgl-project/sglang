@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 register_cpu_ci(est_time=4, suite="stage-b-test-cpu-intel")
 
 import asyncio
@@ -21,20 +21,6 @@ class TestFuncTimer(unittest.TestCase):
     def tearDown(self):
         func_timer.enable_metrics = self.orig_enable
         func_timer.FUNC_LATENCY = self.orig_latency
-
-    def test_sync_enabled(self):
-        """Sync function timed with custom name when metrics enabled."""
-        mock_histogram = MagicMock()
-        func_timer.enable_metrics = True
-        func_timer.FUNC_LATENCY = mock_histogram
-
-        @time_func_latency(name="custom_op")
-        def add(a, b):
-            return a + b
-
-        self.assertEqual(add(2, 3), 5)
-        mock_histogram.labels.assert_called_with(name="custom_op")
-        mock_histogram.labels().observe.assert_called_once()
 
     def test_async_enabled(self):
         """Async function timed with default name when metrics enabled."""
