@@ -2560,6 +2560,9 @@ class Envs:
     # Rust server
     # ===================================================================
     SGLANG_RUST_SERVER = EnvBool(False)
+    # Administrative native api.v1 Shutdown; also requires --admin-api-key
+    # and the owning launcher's installed SIGTERM/supervisor drain path.
+    SGLANG_ENABLE_NATIVE_SHUTDOWN_RPC = EnvBool(False)
     # Build a missing Rust extension from source (auto), require a bundled or
     # cached extension (never), or rebuild the local cache entry (force).
     SGLANG_RUST_BUILD_MODE = EnvStr("auto")
