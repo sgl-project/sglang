@@ -11,10 +11,10 @@ GSM8K test: the cookbook's MI355X TP8 / EP8 command with aiter attention, FP8
 KV cache and DFlash2, on the default Triton MXFP4 expert backend. A failure
 here and a pass there therefore points at the image path, not at the config.
 
-Eval harness: run_eval's mmmu (100 fixed samples across all MMMU subjects,
-"Answer: X" extraction), with thinking at reasoning effort xhigh and the same
-sampling as the GSM8K test. The muse reasoning parser keeps the trace in
-`reasoning_content`, so the answer is read from `content`.
+Eval harness: run_eval's mmmu on the full validation set (900 questions, all
+30 subjects; "Answer: X" extraction), with thinking at reasoning effort xhigh
+and the same sampling as the GSM8K test. The muse reasoning parser keeps the
+trace in `reasoning_content`, so the answer is read from `content`.
 
 Registry: nightly-accuracy-test-8-gpu-amd-mi35x-muse-spark-mmmu suite
 """
@@ -37,7 +37,7 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=3600,
+    est_time=1500,
     suite="nightly-accuracy-test-8-gpu-amd-mi35x-muse-spark-mmmu",
     nightly=True,
 )
@@ -49,8 +49,8 @@ MUSE_SPARK_DRAFT_PATH = os.environ.get(
     "MUSE_SPARK_DRAFT_PATH", "RadixArk/Muse-Spark-Open-DFlash2"
 )
 SERVER_LAUNCH_TIMEOUT = 9000
-# Measured 0.790 and 0.750 in two rocm10 runs (100 samples, real draft
-# acceptance); the lower score - 0.05, since 100 samples swing by ~0.04.
+# Full set: 0.751-0.787 over 7 runs on rocm10/rocm724/rocm720 (mean 0.765,
+# sd 0.013), so 0.70 is ~5 sd below the mean.
 BASELINE_ACCURACY = 0.70
 TP_SIZE = 8
 MAX_RUNNING_REQUESTS = 64
@@ -117,7 +117,7 @@ class TestMuseSparkMXFP4MMMUEvalMI35x(CustomTestCase):
                     base_url=base_url,
                     model=MUSE_SPARK_MODEL_PATH,
                     eval_name="mmmu",
-                    num_examples=100,
+                    num_examples=None,
                     num_threads=MAX_RUNNING_REQUESTS,
                     max_tokens=65536,
                     temperature=1.0,
