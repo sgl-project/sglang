@@ -198,9 +198,14 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
                 * processor.video_processor.merge_size
             )
             pixel_limits = qwen3_vl_video_pixel_limits(image_factor)
-        item_options = self._bound_item_video_options(
-            preprocess_kwargs, pixel_limits=pixel_limits
-        )
+        hf_video_keys = processor.video_processor.valid_kwargs.__annotations__
+        item_options = {
+            key: value
+            for key, value in self._bound_item_video_options(
+                preprocess_kwargs, pixel_limits=pixel_limits
+            ).items()
+            if key in QWEN_VIDEO_PREPROCESS_CONFIG_KEYS or key in hf_video_keys
+        }
         # kwargs already holds video_config (see resolve_media_options); the item's
         # own options override it for sampling and the HF processor alike.
         item_video_config = {
@@ -234,6 +239,14 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
                 if key not in QWEN_VIDEO_PREPROCESS_CONFIG_KEYS - {"fps"}
             }
             processor_kwargs["do_sample_frames"] = False
+        else:
+            processor_kwargs.update(
+                {
+                    key: value
+                    for key, value in item_options.items()
+                    if key in hf_video_keys
+                }
+            )
         processor_kwargs["return_metadata"] = True
         output = dict(
             processor.video_processor(
@@ -341,16 +354,25 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
         return output
 
     def merge_audio_features(self, item_features: list[dict]) -> dict:
-        return {
-            "input_features": torch.nn.utils.rnn.pad_sequence(
-                [features["input_features"][0].T for features in item_features],
+        merged = {}
+        if all("input_features" in features for features in item_features):
+            merged["input_features"] = torch.nn.utils.rnn.pad_sequence(
+                [
+                    feature.T
+                    for features in item_features
+                    for feature in features["input_features"]
+                ],
                 batch_first=True,
-            ).transpose(1, 2),
-            "feature_attention_mask": torch.nn.utils.rnn.pad_sequence(
-                [features["feature_attention_mask"][0] for features in item_features],
-                batch_first=True,
-            ),
-        }
+            ).transpose(1, 2)
+        merged["feature_attention_mask"] = torch.nn.utils.rnn.pad_sequence(
+            [
+                mask
+                for features in item_features
+                for mask in features["feature_attention_mask"]
+            ],
+            batch_first=True,
+        )
+        return merged
 
     def build_processor_output(
         self,
