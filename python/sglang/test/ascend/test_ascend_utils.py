@@ -11,7 +11,10 @@ import logging
 import os
 import pathlib
 import random
+import socket
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 from types import SimpleNamespace
@@ -959,3 +962,100 @@ def append_ld_library_path(*module_specs):
             lib_dir = lib_dir / lib_subdir
         new_entries.append(str(lib_dir))
     return ":".join(dict.fromkeys([*new_entries, *entries]))
+
+
+# npu_memcache MetaService ports (see mem_cache/storage/npu_memcache/README.md).
+META_SERVICE_PORT = 5000
+CONFIG_STORE_PORT = 6000
+META_METRICS_PORT = 8000
+META_SERVICE_READY_TIMEOUT = 120
+META_SERVICE_READY_POLL_INTERVAL = 1
+
+_meta_service_process = None
+
+
+def is_port_listening(host: str, port: int) -> bool:
+    """Return whether ``host:port`` accepts a TCP connection."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(1)
+        return sock.connect_ex((host, port)) == 0
+
+
+def build_hicache_storage_extra_config(world_size: int, protocol: str, dram_size: str):
+    """Start the node-local npu_memcache MetaService and return the L3 backend
+    config for ``--hicache-storage-backend-extra-config``.
+
+    The service is hosted on the current node, whose IP comes from
+    ``resolve_local_ip()`` (``POD_IP`` on k8s, loopback for single-machine
+    runs), so every process on the node targets the same endpoints. It is
+    started only once per process, and is skipped when the ports are already
+    served by another process on the same node.
+    """
+    global _meta_service_process
+    host = resolve_local_ip()
+    if _meta_service_process is None and not is_port_listening(host, META_SERVICE_PORT):
+        _meta_service_process = start_meta_service(host)
+    return json.dumps(
+        {
+            "meta_service_url": f"tcp://{host}:{META_SERVICE_PORT}",
+            "config_store_url": f"tcp://{host}:{CONFIG_STORE_PORT}",
+            "log_level": "info",
+            "world_size": world_size,
+            "protocol": protocol,
+            "dram_size": dram_size,
+        }
+    )
+
+
+def start_meta_service(host_ip: str):
+    """Start the npu_memcache MetaService before the model server.
+
+    The L3 npu_memcache backend connects to the Ascend MemCache MetaService
+    at startup, so it must already be listening. ``host_ip`` is the node IP
+    returned by ``resolve_local_ip()``, which is also what the L3 backend
+    extra config targets.
+
+    Returns the MetaService process.
+    """
+    meta_service_config = {
+        "meta_service_url": f"tcp://{host_ip}:{META_SERVICE_PORT}",
+        "config_store_url": f"tcp://{host_ip}:{CONFIG_STORE_PORT}",
+        "metrics_url": f"http://{host_ip}:{META_METRICS_PORT}",
+    }
+
+    # Materialize the config on the pod-local temp dir so runtime ports
+    # (chosen by the test case) are not baked into a checked-in file.
+    config_path = os.path.join(
+        tempfile.gettempdir(), "npu_memcache_metaservice_config.json"
+    )
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(meta_service_config, f, indent=4)
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "sglang.srt.mem_cache.storage.npu_memcache.start_meta_service",
+        "--config_path",
+        config_path,
+    ]
+    logger.info(f"Starting npu_memcache MetaService: {' '.join(cmd)}")
+    process = subprocess.Popen(cmd, start_new_session=True)
+
+    start_time = time.time()
+    while time.time() - start_time < META_SERVICE_READY_TIMEOUT:
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"npu_memcache MetaService exited with code "
+                f"{process.returncode} before it was ready"
+            )
+        if is_port_listening(host_ip, META_SERVICE_PORT):
+            logger.info(
+                f"npu_memcache MetaService is ready at {host_ip}:{META_SERVICE_PORT}"
+            )
+            return process
+        time.sleep(META_SERVICE_READY_POLL_INTERVAL)
+
+    raise RuntimeError(
+        f"Timed out after {META_SERVICE_READY_TIMEOUT}s waiting for "
+        f"npu_memcache MetaService at {host_ip}:{META_SERVICE_PORT}"
+    )
