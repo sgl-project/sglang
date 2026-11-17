@@ -4773,17 +4773,17 @@ class Scheduler(
             # On a shared memory the match takes no state slot: admission prices
             # it, and the slot is bound with the row. A request this pass leaves
             # queued drops the copy its match staged.
-            req.init_next_round_input(
-                self.tree_cache,
-                defer_cow_slot=shares_memory(self.token_to_kv_pool_allocator),
-            )
+            defer_cow_slot = shares_memory(self.token_to_kv_pool_allocator)
+            req.init_next_round_input(self.tree_cache, defer_cow_slot=defer_cow_slot)
             if adder.should_defer(req):
-                self._drop_unadmitted_match(req)
+                if defer_cow_slot:
+                    self._drop_unadmitted_match(req)
                 break
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
             ):
-                self._drop_unadmitted_match(req)
+                if defer_cow_slot:
+                    self._drop_unadmitted_match(req)
                 if bounded_active:
                     self.policy.mark_admission_skipped(req)
                 continue
@@ -4791,7 +4791,8 @@ class Scheduler(
                 staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
                 req.time_stats.observe_storage_staging_ready(staging_ready)
                 if not staging_ready:
-                    self._drop_unadmitted_match(req)
+                    if defer_cow_slot:
+                        self._drop_unadmitted_match(req)
                     if bounded_active:
                         self.policy.mark_admission_skipped(req)
                     continue
