@@ -73,6 +73,15 @@ if TYPE_CHECKING:
     # distinct (n_local, n_peer, dtype) staging pairs kept; each is two
     # slots and is never freed, so multi-resolution serving needs a cap
     SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS: int = 16
+    # device-IPC K/V gather for a 2-rank K/V-gather SP group; ROCm only and off
+    # by default while it is validated. Falls back to NCCL when unavailable.
+    SGLANG_DIFFUSION_IPC_KV_GATHER: bool = False
+    # distinct (shape, dtype) staging pairs kept; each is two slots and is
+    # never freed, so multi-resolution serving needs a cap
+    SGLANG_DIFFUSION_IPC_KV_GATHER_MAX_BUFFERS: int = 8
+    # debug: also gather over NCCL every call and count mismatches. Doubles the
+    # exchange cost, so this is for validation runs only.
+    SGLANG_DIFFUSION_IPC_KV_GATHER_CHECK: bool = False
     # two-rank TP on one host: a row-parallel layer's epilogue kernel reads both
     # ranks' partial sums instead of an all-reduced tensor. Set 0 to all-reduce.
     SGLANG_DIFFUSION_TP_PEER_PARTIALS: bool = True
@@ -412,6 +421,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS": _lazy_int(
         "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS", 16
+    ),
+    # device-IPC K/V gather for a 2-rank K/V-gather SP group
+    "SGLANG_DIFFUSION_IPC_KV_GATHER": _lazy_bool(
+        "SGLANG_DIFFUSION_IPC_KV_GATHER", "false"
+    ),
+    "SGLANG_DIFFUSION_IPC_KV_GATHER_MAX_BUFFERS": _lazy_int(
+        "SGLANG_DIFFUSION_IPC_KV_GATHER_MAX_BUFFERS", 8
+    ),
+    "SGLANG_DIFFUSION_IPC_KV_GATHER_CHECK": _lazy_bool(
+        "SGLANG_DIFFUSION_IPC_KV_GATHER_CHECK", "false"
     ),
     "SGLANG_DIFFUSION_TP_PEER_PARTIALS": _lazy_bool(
         "SGLANG_DIFFUSION_TP_PEER_PARTIALS", "true"
