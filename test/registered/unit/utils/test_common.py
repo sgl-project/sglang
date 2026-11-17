@@ -2,6 +2,7 @@ import gc
 import io
 import sys
 import unittest
+import weakref
 from array import array
 from unittest import mock
 
@@ -304,6 +305,20 @@ class TestFreezeGc(CustomTestCase):
     def test_applies_configured_threshold(self):
         freeze_gc("test", [700, 10, 1000])
         self.assertEqual(gc.get_threshold(), (700, 10, 1000))
+
+    def test_frees_cyclic_garbage_instead_of_freezing_it(self):
+        class Node:
+            pass
+
+        if gc.isenabled():
+            gc.disable()
+            self.addCleanup(gc.enable)
+        node = Node()
+        node.self_ref = node
+        alive = weakref.ref(node)
+        del node
+        freeze_gc("test")
+        self.assertIsNone(alive())
 
 
 if __name__ == "__main__":
