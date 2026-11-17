@@ -112,16 +112,22 @@ def _pp_held_key(bootstrap_room: int) -> str:
 
 class _PPStagingOutstanding(defaultdict):
     """_staging_outstanding under PP: also replicates whether each live room's
-    Success is held, because PP0 decides the release for every stage."""
+    Success is held, because PP0 decides the release for every stage. Every
+    mutator syncs the rooms it touches."""
 
     def __init__(self, kv_mgr: CommonKVManager):
         super().__init__(int)
         self._kv_mgr = kv_mgr
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def __setitem__(self, room: int, count: int) -> None:
         with self._lock:
             super().__setitem__(room, count)
+            self._sync(room)
+
+    def __delitem__(self, room: int) -> None:
+        with self._lock:
+            super().__delitem__(room)
             self._sync(room)
 
     def pop(self, room: int, *default):
@@ -130,8 +136,40 @@ class _PPStagingOutstanding(defaultdict):
             self._sync(room)
             return value
 
+    def setdefault(self, room: int, default: int = 0) -> int:
+        with self._lock:
+            value = super().setdefault(room, default)
+            self._sync(room)
+            return value
+
+    def update(self, *args, **kwargs) -> None:
+        with self._lock:
+            counts = dict(*args, **kwargs)
+            super().update(counts)
+            for room in counts:
+                self._sync(room)
+
+    def __ior__(self, other):
+        self.update(other)
+        return self
+
+    def popitem(self):
+        with self._lock:
+            room, count = super().popitem()
+            self._sync(room)
+            return room, count
+
+    def clear(self) -> None:
+        with self._lock:
+            rooms = list(self)
+            super().clear()
+            for room in rooms:
+                self._sync(room)
+
     def _sync(self, room: int) -> None:
         store = self._kv_mgr.request_status
+        # Staging chunks are counted only after the room's status exists, and a
+        # cleared room drops its held key with its status.
         if room not in store:
             return
         held = int(self._kv_mgr.staging_holds_success(room))
