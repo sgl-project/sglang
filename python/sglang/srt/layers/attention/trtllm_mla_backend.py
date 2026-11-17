@@ -863,10 +863,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # Never read max_seq from the GPU tensor (.max().item() blocks the
             # host on the stream backlog); max_seq only sizes the block table /
             # scheduling hint, so the static context bound is a safe fallback.
-            if getattr(forward_batch, "seq_lens_cpu", None) is not None:
-                max_seq = forward_batch.seq_lens_cpu.max().item()
-            else:
+            seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+            if seq_lens_cpu is None:
                 max_seq = self.max_context_len
+            elif seq_lens_cpu.numel() == 0:
+                max_seq = 1
+            else:
+                max_seq = seq_lens_cpu.max().item()
 
             seq_lens = forward_batch.seq_lens
 

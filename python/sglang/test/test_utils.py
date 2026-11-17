@@ -58,6 +58,16 @@ apply_all_hf_patches()
 # unittest.main turns DeprecationWarning back on in every test process.
 filter_noisy_warnings()
 
+ADMIN_API_KEY_FOR_TEST = "sk-admin-for-test"
+ADMIN_HEADERS_FOR_TEST = {"Authorization": f"Bearer {ADMIN_API_KEY_FOR_TEST}"}
+ADMIN_LAUNCH_ARGS_FOR_TEST = ("--admin-api-key", ADMIN_API_KEY_FOR_TEST)
+
+
+def admin_post(url: str, **kwargs) -> requests.Response:
+    """`requests.post` with the admin key, for a server launched with `ADMIN_LAUNCH_ARGS_FOR_TEST`."""
+    return requests.post(url, headers=ADMIN_HEADERS_FOR_TEST, **kwargs)
+
+
 # General test models
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
@@ -1037,6 +1047,7 @@ def get_benchmark_args(
     gsp_num_turns=1,
     header=None,
     max_concurrency=None,
+    admin_api_key=None,
 ):
     return SimpleNamespace(
         backend=backend,
@@ -1080,6 +1091,7 @@ def get_benchmark_args(
         header=header,
         max_concurrency=max_concurrency,
         ready_check_timeout_sec=0,
+        admin_api_key=admin_api_key,
     )
 
 
@@ -1101,6 +1113,7 @@ def run_bench_serving(
     device="auto",
     background_task: Optional[Callable[[str, asyncio.Event], Awaitable[None]]] = None,
     lora_name: Optional[str] = None,
+    admin_api_key: Optional[str] = None,
 ):
     if device == "auto":
         device = auto_config_device()
@@ -1142,6 +1155,7 @@ def run_bench_serving(
         seed=seed,
         device=device,
         lora_name=lora_name,
+        admin_api_key=admin_api_key,
     )
 
     async def _run():
