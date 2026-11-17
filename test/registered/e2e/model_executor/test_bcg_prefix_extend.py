@@ -13,7 +13,6 @@ import unittest
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -21,9 +20,10 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
-register_amd_ci(est_time=600, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=600, suite="extra-a-test-1-gpu-small-amd")
 
 _SERVER_ARGS = [
     "--trust-remote-code",
@@ -69,7 +69,7 @@ def _generate(base_url, text):
     }
 
 
-class TestBcgPrefixExtendMI35x(CustomTestCase):
+class TestBcgPrefixExtend(CustomTestCase):
     def _run(self, replay_prefix_extend):
         env = os.environ.copy()
         env["SGLANG_ROCM_BCG_PREFIX_EXTEND"] = "1" if replay_prefix_extend else "0"
@@ -90,7 +90,7 @@ class TestBcgPrefixExtendMI35x(CustomTestCase):
             ]
             return outputs
         finally:
-            kill_process_tree(process.pid)
+            terminate_and_kill_process_tree(process)
 
     def test_replay_matches_eager(self):
         eager = self._run(replay_prefix_extend=False)
