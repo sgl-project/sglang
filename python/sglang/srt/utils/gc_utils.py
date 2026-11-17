@@ -81,8 +81,8 @@ def _describe(obj) -> str:
 
 
 def refreeze_gc(context: str) -> collections.Counter:
-    """Unfreeze, collect, and freeze again; return the frozen objects that had
-    become cyclic garbage, by type."""
+    """Unfreeze, collect, and freeze again; return the frozen objects that are
+    cyclic garbage, by type."""
     gc.collect()
     gc.unfreeze()
     saved = len(gc.garbage)

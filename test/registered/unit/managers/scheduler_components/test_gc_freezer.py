@@ -113,7 +113,7 @@ class TestGCFreezer(CustomTestCase):
 
 
 class TestRefreezeGC(CustomTestCase):
-    def test_finds_and_frees_frozen_objects_that_became_cyclic_garbage(self):
+    def test_finds_and_frees_frozen_cyclic_garbage(self):
         root = _Node()
         for _ in range(10):
             _Node(root)

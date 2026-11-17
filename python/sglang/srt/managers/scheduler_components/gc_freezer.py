@@ -63,7 +63,7 @@ class GCFreezer:
         if not garbage:
             return
         message = (
-            f"{sum(garbage.values())} frozen objects had become cyclic garbage, "
+            f"{sum(garbage.values())} frozen objects are cyclic garbage, "
             f"which a frozen heap never frees; collected them now. "
             f"Most common: {garbage.most_common(5)}"
         )
