@@ -1604,6 +1604,9 @@ class TestDeclaredParts(CustomTestCase):
                 def scatter(*args):
                     conv_destinations.append(args[2])
 
+                def scatter_multi(pairs, rows, steps, track_rows, track_steps):
+                    conv_destinations.extend((rows, track_rows))
+
                 target = {
                     "gdn_circular": "gdn_replayssm_spec_decode.commit_gdn_replayssm_circular",
                     "gdn_fold": "gdn_replayssm_spec_fold.commit_gdn_replayssm_fold_after_verify",
@@ -1620,6 +1623,10 @@ class TestDeclaredParts(CustomTestCase):
                     patch(
                         "sglang.kernels.ops.mamba.mamba_state_scatter_triton.fused_conv_window_scatter_with_mask",
                         side_effect=scatter,
+                    ),
+                    patch(
+                        "sglang.kernels.ops.mamba.mamba_state_scatter_triton.fused_conv_window_scatter_multi",
+                        side_effect=scatter_multi,
                     ),
                 ):
                     commit_mamba_states_after_verify(

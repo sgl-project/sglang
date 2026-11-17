@@ -61,6 +61,9 @@ _TILED_COMMIT_WARPS = 1
 # built with the track snapshot is heavier, so with track rows the bound is lower.
 _TILED_COMMIT_MIN_PROGRAMS_PER_SM = 16
 _TILED_COMMIT_MIN_PROGRAMS_PER_SM_TRACK = 4
+# The multi-pair conv-window rollback moves its rows slower than the per-pair launch
+# and pays off through the launches it saves only up to this many requests.
+_CONV_MULTI_MAX_ROWS = 8
 
 
 @functools.lru_cache(maxsize=8)
@@ -1795,7 +1798,10 @@ def commit_gdn_replayssm_after_verify(
     read: the next verify overwrites them.
     """
     from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+        _conv_multi_eligible,
+        fused_conv_window_scatter_multi,
         fused_conv_window_scatter_with_mask,
+        int32_scatter_rows,
     )
 
     commit_gdn_replayssm_spec(
@@ -1829,7 +1835,38 @@ def commit_gdn_replayssm_after_verify(
         mamba_steps_to_track=mamba_steps_to_track,
         null_block_id=null_block_id,
     )
-    # Roll back the active conv state and snapshot its interval-crossing window.
+    # Roll back the active conv state and snapshot its interval-crossing window:
+    # one launch for every conv type and both row sets for small batches.
+    pairs = [
+        (conv_states, window)
+        for conv_states, window in zip(
+            spec_state.conv, spec_state.intermediate_conv_window
+        )
+        if conv_states.numel() > 0
+    ]
+    if (
+        src_indices_raw is None
+        and state_batch_indices.shape[0] <= _CONV_MULTI_MAX_ROWS
+        and _conv_multi_eligible(pairs)
+    ):
+        fused_conv_window_scatter_multi(
+            pairs,
+            state_batch_indices,
+            last_correct_step_indices,
+            mamba_track_indices,
+            mamba_steps_to_track,
+        )
+        return
+    # Otherwise the per-pair launches, on rows cast once.
+    state_batch_indices, last_correct_step_indices, src_indices_raw = (
+        int32_scatter_rows(
+            state_batch_indices, last_correct_step_indices, src_indices_raw
+        )
+    )
+    if mamba_track_indices is not None:
+        mamba_track_indices, mamba_steps_to_track, _ = int32_scatter_rows(
+            mamba_track_indices, mamba_steps_to_track, src_indices_raw
+        )
     for conv_states, intermediate_conv_window in zip(
         spec_state.conv, spec_state.intermediate_conv_window
     ):
