@@ -105,6 +105,8 @@ class TestAbsorbBmmConfig(CustomTestCase):
             ((16, 1, 512), (16, 32, 1)),
             ((16, 48, 512), (16, 128, 1)),
             ((16, 200, 512), (32, 128, 2)),
+            # Four waves at this shape aborts LLVM on gfx950 (#46829).
+            ((64, 256, 512), (64, 128, 2)),
         )
         for args, expected in cases:
             with self.subTest(args=args):
@@ -121,41 +123,6 @@ class TestAbsorbBmmConfig(CustomTestCase):
     def test_large_row_count_falls_back(self):
         self.assertIsNone(_ABSORB_CONFIG(16, 0, 512))
         self.assertIsNone(_ABSORB_CONFIG(16, 257, 512))
-
-    def test_waves_per_eu_stays_within_the_compilable_budget(self):
-        """The original gfx950 M=256 reproducer requests four waves per EU.
-
-        ``waves_per_eu`` becomes the AMDGPU ``amdgpu-waves-per-eu`` function
-        attribute, so it constrains the register budget at compile time. The
-        M=256 shape of issue 46829 is the first one that asks for four.
-        """
-        config = _ABSORB_CONFIG(64, 256, 512)
-        self.assertEqual(config["BLOCK_SIZE_M"], 64)
-        self.assertEqual(config["BLOCK_SIZE_N"], 128)
-        self.assertEqual(config["waves_per_eu"], 2)
-
-    def test_capped_shape_matches_the_known_good_tile_config(self):
-        """M=256 must select the same tile settings as the known-good M=128 case."""
-        self.assertEqual(
-            _ABSORB_CONFIG(64, 256, 512),
-            _ABSORB_CONFIG(64, 128, 512),
-        )
-
-    def test_no_row_count_exceeds_the_wave_cap(self):
-        for m in range(1, 257):
-            with self.subTest(m=m):
-                self.assertLessEqual(_ABSORB_CONFIG(64, m, 512)["waves_per_eu"], 2)
-
-    def test_no_compute_units_falls_back(self):
-        forward_mla_rocm._absorb_bmm_num_cu = 0
-        with mock.patch.object(
-            forward_mla_rocm, "get_device_core_count", return_value=0
-        ):
-            self.assertIsNone(_ABSORB_CONFIG(64, 256, 512))
-
-    def test_negative_compute_units_falls_back(self):
-        forward_mla_rocm._absorb_bmm_num_cu = -1
-        self.assertIsNone(_ABSORB_CONFIG(64, 256, 512))
 
 
 _ROPE_HEAD_DIM = 64

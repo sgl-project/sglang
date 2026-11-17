@@ -179,9 +179,6 @@ def _absorb_bmm_config(heads: int, m: int, n: int) -> Optional[dict]:
     if not _absorb_bmm_num_cu:
         _absorb_bmm_num_cu = get_device_core_count()
     num_cu = _absorb_bmm_num_cu
-    if num_cu <= 0:
-        # No device to tune for; let AITER pick its own config.
-        return None
     m_tiles_16 = cdiv(m, 16)
     block_n = 128
     while block_n > 32 and 4 * heads * m_tiles_16 * cdiv(n, block_n) < 3 * num_cu:
