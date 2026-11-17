@@ -13,6 +13,37 @@ External models can register themselves without modifying SGLang core files:
         uses_mamba_radix_cache=True,
         support_mamba_cache=True,
     ))
+
+Prefix caching keeps a request's linear attention (conv and recurrent) state in the
+radix tree as a copy of a state pool slot, and the strategy that takes those copies
+decides whether overlap scheduling can run:
+
+- ``no_buffer`` copies (or donates) the request's own slot when the scheduler
+  processes a batch's results. With overlap scheduling the next batch, which may
+  hold the same request, is already queued and advances that slot in place, so the
+  copy would hold a later state than its key. SGLang turns overlap scheduling off
+  for this strategy. It needs nothing from the backend.
+- ``extra_buffer`` (``support_mamba_cache_extra_buffer=True``) keeps overlap
+  scheduling: each request gets two track slots, and the scheduler picks the
+  tracked positions (in an extend, the last ``mamba_cache_chunk_size`` boundary of
+  its new tokens, relative to the extend start; in decode, every
+  ``mamba_track_interval`` tokens) and alternates between the slots. The backend
+  must fill a request's track slot with its state at the tracked position, in the
+  same forward, for every row of ``forward_batch.mamba_track_mask``:
+
+  - Extend: the conv state there, from the inputs before it
+    (``forward_metadata.track_conv_indices``; set ``conv_states_shape`` so its last
+    dim is the conv window length), and the recurrent state there, which
+    ``forward_batch.mamba_track_aligned_lens()`` new tokens into the extend need
+    not end (a kernel output at a chunk boundary).
+    ``MambaAttnBackendBase._track_mamba_state_extend`` copies it from per-chunk
+    states or the final state.
+  - Decode: the slot's states after the step;
+    ``MambaAttnBackendBase._track_mamba_state_decode`` copies them.
+
+  The destinations are ``MambaAttnBackendBase.state_tracking_indices``. A backend that
+  declares the strategy without filling the track slots leaves stale states in the
+  prefix cache, which later requests resume from.
 """
 
 from __future__ import annotations
@@ -35,6 +66,8 @@ class LinearAttnModelSpec:
     arch_names: list[str] = field(default_factory=list)
     uses_mamba_radix_cache: bool = True
     support_mamba_cache: bool = True
+    # Whether the backend fills the extra_buffer strategy's track slots (see the
+    # module docstring), which keeps overlap scheduling on with the radix cache.
     support_mamba_cache_extra_buffer: bool = False
     unwrap_text_config: bool = False  # call get_text_config() before isinstance check
     hybrid_backend_class_name: str | None = None
