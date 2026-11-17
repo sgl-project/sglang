@@ -19,10 +19,12 @@ Keep module scope limited to the standard library and import-neutral types.
 
 from __future__ import annotations
 
+import ctypes
 import io
 import logging
 import pickle
 import sys
+import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -129,6 +131,9 @@ class SchedulerProcessSpec:
     rank: int
     server_args: ServerArgsPayload
     pipe_writer: Connection
+    # CUDA ordinals of this rank's Ulysses peers when its exchanges will run
+    # over CUDA IPC (empty otherwise); see _enable_peer_access_early
+    ulysses_peer_devices: tuple[int, ...] = ()
 
 
 def bootstrap_scheduler_process(spec: SchedulerProcessSpec) -> None:
@@ -155,6 +160,7 @@ def bootstrap_scheduler_process(spec: SchedulerProcessSpec) -> None:
         from sglang.multimodal_gen.runtime.platforms import initialize_current_platform
 
         initialize_current_platform()
+        _enable_peer_access_early(spec.local_rank, spec.ulysses_peer_devices)
 
         from sglang.multimodal_gen.runtime.platforms.plugins import (
             apply_plugin_hooks,
@@ -176,6 +182,35 @@ def bootstrap_scheduler_process(spec: SchedulerProcessSpec) -> None:
         server_args=server_args,
         pipe_writer=spec.pipe_writer,
     )
+
+
+def _enable_peer_access_early(device: int, peers: tuple[int, ...]) -> None:
+    """Enable peer access to the Ulysses peers in the background, now.
+
+    The CUDA IPC exchange enables peer access to every peer on its first use,
+    which creates a context on each peer GPU: ~11.5 s for seven peers on
+    8x B200, every rank at once, and it holds up whatever CUDA work runs beside
+    it. Started here it overlaps this process's runtime imports instead of
+    sitting in the first request; the exchange's own enable then finds it done.
+    """
+    if not peers:
+        return
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return
+
+    def enable() -> None:
+        try:
+            cudart = ctypes.CDLL("libcudart.so")
+        except OSError:
+            return  # no unversioned runtime: the exchange cannot load it either
+        cudart.cudaSetDevice(device)
+        for peer in peers:
+            cudart.cudaDeviceEnablePeerAccess(peer, 0)
+        cudart.cudaGetLastError()
+
+    threading.Thread(target=enable, name="peer-access", daemon=True).start()
 
 
 def bootstrap_http_server_process(

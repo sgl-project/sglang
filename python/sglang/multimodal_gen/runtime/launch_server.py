@@ -137,10 +137,25 @@ def shutdown_scheduler_processes(
     _kill_alive_processes(alive, _WORKER_KILL_TIMEOUT_S)
 
 
+def _ulysses_peer_devices(server_args: ServerArgs, local_num_gpus: int) -> dict:
+    """Each local rank's Ulysses peers, when the node's GPUs form one Ulysses
+    group whose exchanges run over CUDA IPC (else none)."""
+    if (
+        server_args.nnodes != 1
+        or local_num_gpus < 2
+        or server_args.ulysses_degree != local_num_gpus
+        or not server_args.pipeline_config.ulysses_exchange_over_cuda_ipc(server_args)
+    ):
+        return {}
+    devices = range(local_num_gpus)
+    return {i: tuple(d for d in devices if d != i) for i in devices}
+
+
 def _start_scheduler_processes(
     server_args: ServerArgsPayload,
     ranks: list[tuple[int, int]],
     name_prefix: str,
+    ulysses_peer_devices: dict | None = None,
 ) -> list[mp.Process]:
     """Spawn a worker group, owning its pipes and children until all ranks are ready."""
     context = mp.get_context("spawn")
@@ -153,7 +168,13 @@ def _start_scheduler_processes(
                 reader, writer = context.Pipe(duplex=False)
                 pipes.enter_context(reader)
                 pipes.enter_context(writer)
-                spec = SchedulerProcessSpec(local_rank, rank, server_args, writer)
+                spec = SchedulerProcessSpec(
+                    local_rank,
+                    rank,
+                    server_args,
+                    writer,
+                    (ulysses_peer_devices or {}).get(local_rank, ()),
+                )
                 process = context.Process(
                     target=bootstrap_scheduler_process,
                     args=(spec,),
@@ -225,6 +246,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         server_args_payload,
         [(i, rank_offset + i) for i in range(local_num_gpus)],
         "sglang-diffusionWorker-",
+        _ulysses_peer_devices(server_args, local_num_gpus),
     )
 
     logger.debug("All workers are ready")
