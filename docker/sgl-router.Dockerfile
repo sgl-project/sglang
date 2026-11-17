@@ -16,17 +16,16 @@
 # below runs with `--locked`, so the image ships exactly the dependency
 # graph CI checked, tested, and license-audited.
 #
-# Published as lmsysorg/sglang-staging:sgl-router (main, nightly, by
-# nightly-sgl-router-docker.yml) and lmsysorg/sgl-router:v<version> + :latest
-# (`router-v*` tags, by release-sgl-router-docker.yml).
+# Published as lmsysorg/sgl-router (`:v<version>` and `:latest` from `router-v*`
+# tags by release-sgl-router-docker.yml); nightly-sgl-router-docker.yml pushes a
+# main build to lmsysorg/sglang-staging:sgl-router.
 #
 # Build (from the repo root):
 #   docker build -f docker/sgl-router.Dockerfile -t sgl-router:dev .
-# Run (the router is configured by flags; `--help` lists them):
+# Run (the router is configured by CLI flags only):
 #   docker run --rm -p 30000:30000 sgl-router:dev \
 #       --host 0.0.0.0 --port 30000 --model-id qwen3 \
-#       --worker-urls http://10.0.0.1:30000 http://10.0.0.2:30000 \
-#       --chat-routing reorg --policy cache_aware
+#       --worker-urls http://10.0.0.1:30000 http://10.0.0.2:30000
 #
 # Image budget: < 100 MB stripped (M6 acceptance). Verify with
 #   `docker image inspect sgl-router:dev --format '{{.Size}}'`.
@@ -122,7 +121,6 @@ FROM ${RUNTIME_BASE_IMAGE} AS runtime
 
 COPY --from=builder /work/sgl-router/target/release/sgl-router /usr/local/bin/sgl-router
 
-# The router's default listen port (`--port`); override with `-p` and `--port`.
 EXPOSE 30000
 
 # distroless `nonroot` runs as uid 65532. The router doesn't need root.
