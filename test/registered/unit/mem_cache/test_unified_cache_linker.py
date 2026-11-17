@@ -2032,7 +2032,9 @@ def test_prefix_device_indices_includes_private_linker_tail(device_len, tail_len
 
 @pytest.mark.parametrize("landed", [True, False])
 @pytest.mark.parametrize("metrics_enabled", [True, False])
-def test_finish_loads_releases_private_index_references(landed, metrics_enabled, caplog):
+def test_finish_loads_releases_private_index_references(
+    landed, metrics_enabled, caplog
+):
     """Completed batches release private indices and wait records even without metrics."""
     backend = _FakeLinker()
     backend.load_landed = landed
