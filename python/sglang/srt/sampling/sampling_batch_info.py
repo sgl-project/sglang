@@ -128,7 +128,7 @@ class SamplingBatchInfo:
     # Host-side upper bound on every row's top_k, or None when some row samples
     # from the whole vocabulary. Any value >= the true max stays exact, so
     # filter_batch keeps it unchanged (ScheduleBatch tightens it with
-    # refresh_top_k_flags).
+    # refresh_sampling_flags).
     max_top_k: Optional[int] = None
 
     @classmethod
@@ -147,18 +147,21 @@ class SamplingBatchInfo:
             .to(device, non_blocking=True)
             .view(-1, 1)
         )
+        top_ps_host = [r.sampling_params.top_p for r in reqs]
+        top_ks_host = [r.sampling_params.top_k for r in reqs]
+        min_ps_host = [r.sampling_params.min_p for r in reqs]
         top_ps = torch.tensor(
-            [r.sampling_params.top_p for r in reqs],
+            top_ps_host,
             dtype=torch.float,
             pin_memory=_pin,
         ).to(device, non_blocking=True)
         top_ks = torch.tensor(
-            [r.sampling_params.top_k for r in reqs],
+            top_ks_host,
             dtype=torch.int32,
             pin_memory=_pin,
         ).to(device, non_blocking=True)
         min_ps = torch.tensor(
-            [r.sampling_params.min_p for r in reqs],
+            min_ps_host,
             dtype=torch.float,
             pin_memory=_pin,
         ).to(device, non_blocking=True)
@@ -303,9 +306,7 @@ class SamplingBatchInfo:
             top_ks=top_ks,
             min_ps=min_ps,
             sampling_seed=sampling_seed,
-            need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
-            need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
-            **_top_k_flags([r.sampling_params.top_k for r in reqs]),
+            **_sampling_flags(top_ps_host, top_ks_host, min_ps_host),
             vocab_size=vocab_size,
             penalizer_orchestrator=penalizer_orchestrator,
             has_custom_logit_processor=has_custom_logit_processor,
@@ -647,15 +648,15 @@ class SamplingBatchInfo:
 
         self.adjusted_merge_batch(other)
 
-    def refresh_top_k_flags(self, top_ks: List[int]) -> None:
-        """Set the top-k flags from the rows' top_k, as from_schedule_batch does.
-
-        filter_batch leaves them as they were, which is safe but sticky: one
-        finished greedy row (top_k=1) keeps need_top_k_sampling on and max_top_k
-        None for the rest of the running batch. ScheduleBatch.filter_batch calls
-        this with its kept requests' top_k.
-        """
-        for name, value in _top_k_flags(top_ks).items():
+    def refresh_sampling_flags(
+        self,
+        *,
+        top_ps: List[float],
+        top_ks: List[int],
+        min_ps: List[float],
+    ) -> None:
+        """Set request-derived sampling flags from the kept batch rows."""
+        for name, value in _sampling_flags(top_ps, top_ks, min_ps).items():
             setattr(self, name, value)
 
     def _merge_processor_entries(
@@ -729,6 +730,18 @@ def _top_k_flags(top_ks: List[int]) -> Dict[str, Any]:
         "max_top_k": (
             max(top_ks) if top_ks and all(1 <= k < TOP_K_ALL for k in top_ks) else None
         ),
+    }
+
+
+def _sampling_flags(
+    top_ps: List[float],
+    top_ks: List[int],
+    min_ps: List[float],
+) -> Dict[str, Any]:
+    return {
+        "need_top_p_sampling": any(p != 1.0 for p in top_ps),
+        "need_min_p_sampling": any(p > 0 for p in min_ps),
+        **_top_k_flags(top_ks),
     }
 
 

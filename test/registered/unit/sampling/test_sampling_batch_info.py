@@ -849,9 +849,9 @@ class TestFromScheduleBatch(CustomTestCase):
             info.max_top_k,
         )
 
-    def test_refresh_top_k_flags_after_filter_matches_a_fresh_batch(self):
+    def test_refresh_sampling_flags_after_filter_matches_top_k_fresh_batch(self):
         """A finished greedy row (top_k=1) must not keep the running batch on the
-        top-k path: refresh_top_k_flags gives the kept rows the flags a batch
+        top-k path: refreshing gives the kept rows the flags a batch
         built from them would have."""
         cases = (
             # (top_ks, kept row, need_top_k_sampling, max_top_k after refresh)
@@ -872,7 +872,11 @@ class TestFromScheduleBatch(CustomTestCase):
                 # SamplingBatchInfo.filter_batch alone keeps the old, safe flags.
                 self.assertEqual(self._top_k_flags(info), before)
 
-                info.refresh_top_k_flags([top_ks[kept]])
+                info.refresh_sampling_flags(
+                    top_ps=[1.0],
+                    top_ks=[top_ks[kept]],
+                    min_ps=[0.0],
+                )
                 self.assertEqual(info.need_top_k_sampling, need_top_k)
                 self.assertEqual(info.max_top_k, max_top_k)
                 self.assertFalse(info.is_any_greedy)
@@ -882,7 +886,7 @@ class TestFromScheduleBatch(CustomTestCase):
                 fresh = SamplingBatchInfo.from_schedule_batch(fresh_batch, VOCAB_SIZE)
                 self.assertEqual(self._top_k_flags(info), self._top_k_flags(fresh))
 
-    def test_refresh_top_k_flags_reads_only_the_given_top_ks(self):
+    def test_refresh_sampling_flags_reads_only_the_given_params(self):
         """The flags come from the requests' top_k, not from the top_ks tensor, so
         a reassigned tensor cannot leave them stale."""
         batch = MagicMock()
@@ -891,12 +895,55 @@ class TestFromScheduleBatch(CustomTestCase):
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
         info.top_ks = torch.tensor([5, 5], dtype=torch.int32)
 
-        info.refresh_top_k_flags([TOP_K_ALL, 1])
+        info.refresh_sampling_flags(
+            top_ps=[1.0, 1.0],
+            top_ks=[TOP_K_ALL, 1],
+            min_ps=[0.0, 0.0],
+        )
 
         self.assertTrue(info.is_any_greedy)
         self.assertFalse(info.is_all_greedy)
         self.assertTrue(info.need_top_k_sampling)
         self.assertIsNone(info.max_top_k)
+
+    def test_refresh_sampling_flags_after_filter_matches_a_fresh_batch(self):
+        """Filtering must select the same sampling path as a fresh kept batch."""
+        reqs = [
+            self._make_req(top_p=0.9),
+            self._make_req(min_p=0.1),
+            self._make_req(),
+        ]
+        flags = (
+            "is_all_greedy",
+            "is_any_greedy",
+            "need_top_p_sampling",
+            "need_top_k_sampling",
+            "need_min_p_sampling",
+            "npu_top_k_top_p_eligible",
+            "max_top_k",
+        )
+        for kept in range(len(reqs)):
+            with self.subTest(kept=kept):
+                batch = MagicMock(reqs=reqs, device=DEVICE)
+                info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+
+                info.filter_batch([kept], torch.tensor([kept]))
+                self.assertTrue(info.need_top_p_sampling)
+                self.assertTrue(info.need_min_p_sampling)
+
+                params = reqs[kept].sampling_params
+                info.refresh_sampling_flags(
+                    top_ps=[params.top_p],
+                    top_ks=[params.top_k],
+                    min_ps=[params.min_p],
+                )
+
+                fresh_batch = MagicMock(reqs=[reqs[kept]], device=DEVICE)
+                fresh = SamplingBatchInfo.from_schedule_batch(fresh_batch, VOCAB_SIZE)
+                self.assertEqual(
+                    tuple(getattr(info, name) for name in flags),
+                    tuple(getattr(fresh, name) for name in flags),
+                )
 
     def test_no_logit_bias_when_all_none(self):
         """Test that logit_bias stays None when no request has logit_bias set."""

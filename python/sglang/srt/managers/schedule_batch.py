@@ -3414,8 +3414,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.return_hidden_states = self.return_hidden_states_mode.need_capture()
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
-        self.sampling_info.refresh_top_k_flags(
-            [req.sampling_params.top_k for req in self.reqs]
+        self.sampling_info.refresh_sampling_flags(
+            top_ps=[req.sampling_params.top_p for req in self.reqs],
+            top_ks=[req.sampling_params.top_k for req in self.reqs],
+            min_ps=[req.sampling_params.min_p for req in self.reqs],
         )
         if self.spec_info:
             self.spec_info.filter_batch(
