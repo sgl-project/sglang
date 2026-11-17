@@ -210,6 +210,14 @@ class SpeculativeAlgorithm(Enum):
             )
 
             return build_eagle_disagg_draft_input(batch, last_tokens_tensor, future_map)
+        if self.is_standalone():
+            from sglang.srt.speculative.standalone_disaggregation import (
+                build_standalone_disagg_draft_input,
+            )
+
+            return build_standalone_disagg_draft_input(
+                batch, last_tokens_tensor, future_map
+            )
         if self.is_dspark():
             from sglang.srt.speculative.dspark_disaggregation import (
                 build_dspark_disagg_draft_input,
