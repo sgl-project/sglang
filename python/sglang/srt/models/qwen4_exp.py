@@ -24,6 +24,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.attention.linear.utils import (
     select_verify_intermediate_state_indices,
 )
@@ -57,6 +58,7 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe import post_experts_output_is_complete
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -103,7 +105,11 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
-from sglang.srt.runtime_context import get_parallel, linear_attn_parallel_group
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_parallel,
+    linear_attn_parallel_group,
+)
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, logger
 
 _is_cuda = is_cuda()
@@ -1502,11 +1508,18 @@ class Qwen4ExpPLELayer(nn.Module):
         forward_batch: ForwardBatch,
         batch: _PLEBatch,
     ) -> torch.Tensor:
-        hidden_states = hidden_states[: batch.processed_tokens]
+        sp_active = layernorm_sp.runs_sp(_get_ple_forward_mode(forward_batch))
+        hidden_rows = hidden_states.shape[0] if sp_active else batch.processed_tokens
+        hidden_states = hidden_states[:hidden_rows]
         if self._prefetch_state is not None:
             embeddings = self._consume_prefetched_embeddings(forward_batch)
         else:
             embeddings = self.ple_embedding(batch, forward_batch)
+        if sp_active:
+            embeddings = _pad_token_rows(embeddings, batch.physical_tokens)
+            embeddings = layernorm_sp.shard_token_rows(
+                embeddings, group=get_parallel().tp_group
+            )
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
         token_count = hidden_states.shape[0]
@@ -1576,11 +1589,32 @@ class Qwen4ExpPLELayer(nn.Module):
             if can_fuse_qwen4_verify_conv(*conv_args):
                 output = fused_qwen4_verify_conv(*conv_args)
                 return _pad_token_rows(output, batch.physical_tokens)
-        conv_output = self._short_conv(
-            gated_value_normed,
-            forward_batch,
-            batch,
-        )
+        if sp_active:
+            full_conv_input = layernorm_sp.all_gather_token_rows(
+                gated_value_normed,
+                total_rows=batch.processed_tokens,
+                group=get_parallel().tp_group,
+            )
+            conv_output = self._short_conv(full_conv_input, forward_batch, batch)
+            conv_output = layernorm_sp.shard_token_rows(
+                _pad_token_rows(conv_output, batch.physical_tokens),
+                group=get_parallel().tp_group,
+            )
+            output = gated_value + conv_output
+            if not batch.use_decode_fast_path:
+                valid_tokens = layernorm_sp.shard_token_rows(
+                    _pad_token_rows(
+                        batch.valid_tokens.unsqueeze(-1), batch.physical_tokens
+                    ),
+                    group=get_parallel().tp_group,
+                )
+                output = torch.where(
+                    valid_tokens,
+                    output,
+                    torch.zeros_like(output),
+                )
+            return output
+        conv_output = self._short_conv(gated_value_normed, forward_batch, batch)
         output = gated_value + conv_output
         if not batch.use_decode_fast_path:
             output = torch.where(
@@ -1692,6 +1726,11 @@ def _prepare_decode_moe_comm(mlp):
     from sglang.srt.layers.moe.qwen4_decode import prepare_qwen4_decode_comm
 
     return prepare_qwen4_decode_comm(mlp)
+
+
+def _sp_moe_keeps_local_rows() -> bool:
+    a2a = get_moe_a2a_backend()
+    return a2a.is_deepep() or a2a.is_megamoe()
 
 
 class Qwen4ExpLayerExtensionMixin:
@@ -1896,11 +1935,32 @@ class Qwen4ExpLayerExtensionMixin:
             )
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
-                hidden_states = self.mlp(
-                    hidden_states,
-                    forward_batch,
-                    defer_finalize=ffn_exit.defer_moe_finalize,
-                )
+                if get_forward().sp_active:
+                    if _sp_moe_keeps_local_rows():
+                        with get_forward().scoped(sp_active=False):
+                            hidden_states = self.mlp(
+                                hidden_states,
+                                forward_batch,
+                                defer_finalize=False,
+                            )
+                    else:
+                        hidden_states = layernorm_sp.run_replicated_token_rows(
+                            hidden_states,
+                            lambda full_tokens: self.mlp(
+                                full_tokens,
+                                forward_batch,
+                                defer_finalize=False,
+                            ),
+                            output_is_tp_partial=not post_experts_output_is_complete(
+                                is_tp_path=True
+                            ),
+                        )
+                else:
+                    hidden_states = self.mlp(
+                        hidden_states,
+                        forward_batch,
+                        defer_finalize=ffn_exit.defer_moe_finalize,
+                    )
             else:
                 hidden_states = self.mlp(hidden_states)
         return ffn_exit.finish(hidden_states)
@@ -1945,7 +2005,14 @@ class Qwen4ExpLinearDecoderLayer(
         )
 
         if not forward_batch.forward_mode.is_idle():
-            hidden_states = self.linear_attn(hidden_states, forward_batch)
+            if get_forward().sp_active:
+                hidden_states = layernorm_sp.run_replicated_token_rows(
+                    hidden_states,
+                    lambda full_tokens: self.linear_attn(full_tokens, forward_batch),
+                    output_is_tp_partial=True,
+                )
+            else:
+                hidden_states = self.linear_attn(hidden_states, forward_batch)
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         return self._run_ffn_stage(hidden_states, forward_batch)
@@ -2146,11 +2213,23 @@ class Qwen4ExpAttentionDecoderLayer(
         )
 
         if not forward_batch.forward_mode.is_idle():
-            hidden_states = self.self_attention(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
+            if get_forward().sp_active:
+                hidden_states = layernorm_sp.run_replicated_token_rows(
+                    hidden_states,
+                    lambda full_tokens: self.self_attention(
+                        positions=positions,
+                        hidden_states=full_tokens,
+                        forward_batch=forward_batch,
+                    ),
+                    output_is_tp_partial=True,
+                    total_rows=positions.shape[-1],
+                )
+            else:
+                hidden_states = self.self_attention(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         return self._run_ffn_stage(hidden_states, forward_batch)
@@ -2349,6 +2428,22 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
 
+    @staticmethod
+    def _captured_hc_hidden_states(
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Optional[torch.Tensor]:
+        if not layernorm_sp.runs_sp(forward_batch.forward_mode):
+            return hidden_states
+        capture = forward_batch.capture_hidden_mode
+        if capture is None or not capture.need_capture():
+            return None
+        return layernorm_sp.sp_exit_gather(
+            hidden_states,
+            num_tokens=input_ids.shape[0],
+        )
+
     @torch.no_grad()
     def forward(
         self,
@@ -2374,6 +2469,11 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
             return model_output
         if isinstance(model_output, tuple):
             hidden_states, self.last_hc_hidden_states = model_output
+            self.last_hc_hidden_states = self._captured_hc_hidden_states(
+                self.last_hc_hidden_states,
+                input_ids,
+                forward_batch,
+            )
             return hidden_states
         return model_output
 

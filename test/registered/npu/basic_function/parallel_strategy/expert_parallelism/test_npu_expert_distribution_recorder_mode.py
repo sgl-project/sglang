@@ -11,11 +11,11 @@ from sglang.test.ascend.test_ascend_utils import (
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
-    ADMIN_API_KEY_FOR_TEST,
-    ADMIN_HEADERS_FOR_TEST,
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    admin_post,
     popen_launch_server,
 )
 
@@ -60,8 +60,7 @@ class TestExpertDistributionRecorderModeStatic(CustomTestCase):
                 "normal",
                 "--expert-distribution-recorder-mode",
                 cls.expert_distribution_recorder_mode,
-                "--admin-api-key",
-                ADMIN_API_KEY_FOR_TEST,
+                *ADMIN_LAUNCH_ARGS_FOR_TEST,
             ],
             env={
                 "PYTORCH_NPU_ALLOC_CONF": (
@@ -82,9 +81,8 @@ class TestExpertDistributionRecorderModeStatic(CustomTestCase):
 
     def test_recorder_mode(self):
         # Start recording
-        requests.post(
+        admin_post(
             f"{DEFAULT_URL_FOR_TEST}/start_expert_distribution_record",
-            headers=ADMIN_HEADERS_FOR_TEST,
         )
 
         response = requests.post(
@@ -105,15 +103,13 @@ class TestExpertDistributionRecorderModeStatic(CustomTestCase):
         )
 
         # Stop recording
-        requests.post(
+        admin_post(
             f"{DEFAULT_URL_FOR_TEST}/stop_expert_distribution_record",
-            headers=ADMIN_HEADERS_FOR_TEST,
         )
 
         # Export the .pt file
-        requests.post(
+        admin_post(
             f"{DEFAULT_URL_FOR_TEST}/dump_expert_distribution_record",
-            headers=ADMIN_HEADERS_FOR_TEST,
         )
 
         # Check distribution_recorder_files
