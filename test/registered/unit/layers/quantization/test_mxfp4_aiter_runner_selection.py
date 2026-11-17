@@ -49,7 +49,6 @@ class TestMxfp4AiterRunnerSelection(CustomTestCase):
             ("_aiter_k3_opt", False),
             ("_is_cpu", False),
             ("_is_xpu", False),
-            ("has_triton_kernels", False),
         ):
             stack.enter_context(patch.object(mxfp4_module, name, value))
         stack.enter_context(

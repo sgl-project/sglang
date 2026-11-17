@@ -11,7 +11,7 @@ Two flavors of fixtures coexist here:
   2. **Per-test multi-worker fixtures** (``router_binary`` +
      ``gpu_allocator``) — just enough infra for the acceptance tests in
      ``chat_completions/`` to bring up their own multi-worker
-     topologies. Backed by the ``infra.gateway.Gateway`` and
+     topologies. Backed by the ``infra.router.Router`` and
      ``infra.model_pool.spawn_worker`` helpers.
 
 Both sets share the same release binary (``SGL_ROUTER_BINARY`` overrides
@@ -37,15 +37,14 @@ import pytest
 
 logger = logging.getLogger(__name__)
 
-# Make `from infra import gateway, model_pool, model_specs` resolve from
+# Make `from infra import model_pool, model_specs, router` resolve from
 # tests under tests/e2e/ without requiring a sibling `__init__.py` chain.
-# Mirrors SMG's e2e_test/conftest.py sys.path setup.
 _E2E_DIR = Path(__file__).resolve().parent
 if str(_E2E_DIR) not in sys.path:
     sys.path.insert(0, str(_E2E_DIR))
 
 from infra import model_pool  # noqa: E402  (needs the sys.path entry above)
-from infra.gateway import router_binary_path  # noqa: E402
+from infra.router import router_binary_path  # noqa: E402
 
 MODEL = "Qwen/Qwen3-0.6B"
 SGLANG_PORT = 30000
@@ -356,7 +355,7 @@ def router_binary() -> Path:
     """Locate the release ``sgl-router`` binary or skip the session.
 
     Used by the multi-worker acceptance tests (which spawn their own
-    Gateway per test instead of using the session-scoped ``router``
+    Router per test instead of using the session-scoped ``router``
     fixture).
     """
     binary = router_binary_path()

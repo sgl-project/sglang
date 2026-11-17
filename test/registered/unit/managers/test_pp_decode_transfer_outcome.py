@@ -20,7 +20,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 )
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import FakeReq, decode_queue
+from sglang.test.scheduler_test_utils import FakeReq, decode_queue, leaving_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -116,7 +116,7 @@ def _transfer_queue(decode_reqs):
     queue._commit_transfer_to_req = MagicMock()
     queue._record_transfer_failure = MagicMock()
     queue.scheduler = SimpleNamespace(
-        request_retirer=MagicMock(),
+        request_retirer=leaving_retirer(),
         enable_decode_hicache=False,
         enable_hisparse=False,
         metrics_reporter=SimpleNamespace(enable_metrics=False),
