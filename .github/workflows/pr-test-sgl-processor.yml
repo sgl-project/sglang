@@ -63,22 +63,21 @@ jobs:
             echo "Processor-related changes detected; running checks."
           fi
 
-  # Missing labels fail here; reruns fetch current labels instead of replaying
-  # the original event's labels after /tag-run-ci-label adds run-ci.
+  # A draft or missing run-ci skips the checks; reruns fetch current labels
+  # instead of replaying the original event's labels after /tag-run-ci-label adds run-ci.
   sgl-processor-gate:
     name: ${{ github.event.action == 'labeled' && github.event.label.name != 'run-ci' && 'ignored-label-sgl-processor-gate' || 'sgl-processor-gate' }}
     needs: sgl-processor-changes
     if: needs.sgl-processor-changes.outputs.should_run == 'true'
     uses: ./.github/workflows/pr-gate.yml
     with:
-      require-run-ci: true
       # CPU checks do not need the shared GPU CI cooldown.
       cool-down-minutes: 0
 
   sgl-processor-lint:
     name: ${{ github.event.action == 'labeled' && github.event.label.name != 'run-ci' && 'ignored-label-sgl-processor-lint' || 'sgl-processor-lint' }}
     needs: [sgl-processor-changes, sgl-processor-gate]
-    if: needs.sgl-processor-changes.outputs.should_run == 'true'
+    if: (needs.sgl-processor-changes.outputs.should_run == 'true') && needs.sgl-processor-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -105,7 +104,7 @@ jobs:
   sgl-processor-test:
     name: ${{ github.event.action == 'labeled' && github.event.label.name != 'run-ci' && 'ignored-label-sgl-processor-test' || 'sgl-processor-test' }}
     needs: [sgl-processor-changes, sgl-processor-gate, sgl-processor-lint]
-    if: needs.sgl-processor-changes.outputs.should_run == 'true'
+    if: (needs.sgl-processor-changes.outputs.should_run == 'true') && needs.sgl-processor-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -152,6 +151,7 @@ jobs:
         env:
           CHANGES_RESULT: ${{ needs.sgl-processor-changes.result }}
           GATE_RESULT: ${{ needs.sgl-processor-gate.result }}
+          OPTED_IN: ${{ needs.sgl-processor-gate.outputs.opted-in }}
           SHOULD_RUN: ${{ needs.sgl-processor-changes.outputs.should_run }}
           LINT_RESULT: ${{ needs.sgl-processor-lint.result }}
           TEST_RESULT: ${{ needs.sgl-processor-test.result }}
@@ -164,6 +164,8 @@ jobs:
             echo "All processor checks passed."
           elif [[ "$SHOULD_RUN" == "false" && "$GATE_RESULT" == "skipped" && "$LINT_RESULT" == "skipped" && "$TEST_RESULT" == "skipped" ]]; then
             echo "No processor-related changes; checks skipped."
+          elif [[ "$GATE_RESULT" == "success" && "$OPTED_IN" == "false" && "$LINT_RESULT" == "skipped" && "$TEST_RESULT" == "skipped" ]]; then
+            echo "A draft or no run-ci; checks skipped."
           else
             echo "::error::Unexpected processor results: should_run=$SHOULD_RUN, gate=$GATE_RESULT, lint=$LINT_RESULT, test=$TEST_RESULT."
             exit 1

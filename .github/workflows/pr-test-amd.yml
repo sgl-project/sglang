@@ -164,7 +164,7 @@ jobs:
     secrets: inherit
   check-changes:
     needs: [call-gate]
-    if: always()
+    if: always() && needs.call-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-latest
     outputs:
       main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
@@ -272,11 +272,12 @@ jobs:
     needs: [check-changes, call-gate]
     # always() keeps the skipped call-gate on schedule runs from skipping this job.
     if: |
-      always() && !cancelled() &&
+      (always() && !cancelled() &&
       needs.check-changes.result == 'success' &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
       (github.event_name == 'schedule' || inputs.run_all_tests == true) &&
-      !(inputs.target_stage || inputs.target_stage_select)
+      !(inputs.target_stage || inputs.target_stage_select))
+      && needs.call-gate.outputs.opted-in != 'false'
     strategy:
       fail-fast: false
       matrix:
@@ -300,7 +301,7 @@ jobs:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
     needs: [check-changes, call-gate]
     if: |
-      always() && !cancelled() &&
+      (always() && !cancelled() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',base-a-sgl-kernel-unit-test-amd,')) ||
         (
@@ -308,7 +309,8 @@ jobs:
           (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
           needs.check-changes.outputs.sgl_kernel == 'true'
         )
-      )
+      ))
+      && needs.call-gate.outputs.opted-in != 'false'
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -354,7 +356,7 @@ jobs:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
     needs: [check-changes, call-gate]
     if: |
-      always() && !cancelled() &&
+      (always() && !cancelled() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',base-a-sgl-kernel-unit-test-2-gpu-amd,')) ||
         (
@@ -362,7 +364,8 @@ jobs:
           (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
           needs.check-changes.outputs.sgl_kernel == 'true'
         )
-      )
+      ))
+      && needs.call-gate.outputs.opted-in != 'false'
     runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -391,7 +394,7 @@ jobs:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
     needs: [check-changes, call-gate]
     if: |
-      always() && !cancelled() &&
+      (always() && !cancelled() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',base-a-test-1-gpu-small-amd,')) ||
         (
@@ -399,7 +402,8 @@ jobs:
           (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
-      )
+      ))
+      && needs.call-gate.outputs.opted-in != 'false'
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -424,7 +428,7 @@ jobs:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
     needs: [check-changes, call-gate]
     if: |
-      always() && !cancelled() &&
+      (always() && !cancelled() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',base-a-jit-kernel-unit-test-amd,')) ||
         (
@@ -432,7 +436,8 @@ jobs:
           (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
           needs.check-changes.outputs.jit_kernel == 'true'
         )
-      )
+      ))
+      && needs.call-gate.outputs.opted-in != 'false'
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -457,7 +462,7 @@ jobs:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
     needs: [check-changes, call-gate]
     if: |
-      always() && !cancelled() &&
+      (always() && !cancelled() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',base-a-jit-kernel-benchmark-test-amd,')) ||
         (
@@ -465,7 +470,8 @@ jobs:
           (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
           needs.check-changes.outputs.jit_kernel == 'true'
         )
-      )
+      ))
+      && needs.call-gate.outputs.opted-in != 'false'
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -491,12 +497,13 @@ jobs:
     name: wait-for-base-a-amd
     needs: [check-changes, call-gate]
     if: |
-      always() &&
+      (always() &&
       !cancelled() &&
       github.event_name == 'pull_request' &&
       !(inputs.target_stage || inputs.target_stage_select) &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
-      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped'))
+      && needs.call-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-latest
     outputs:
       base_a_result: ${{ steps.wait.outputs.result }}
@@ -591,7 +598,7 @@ jobs:
     name: ${{ format('base-b-test-1-gpu-small-amd-mi35x ({0}, {1})', matrix.rocm_version, matrix.runner) }}
     needs: [check-changes, call-gate, wait-for-base-b-amd]
     if: |
-      always() &&
+      (always() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',base-b-test-1-gpu-small-amd-mi35x,')) ||
         (
@@ -599,7 +606,8 @@ jobs:
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
-      )
+      ))
+      && needs.call-gate.outputs.opted-in != 'false'
     strategy:
       fail-fast: false
       matrix:
@@ -727,7 +735,7 @@ jobs:
     name: ${{ format('multimodal-gen-test-1-gpu-amd ({0}, linux-{1}-1gpu-sglang, {2})', matrix.rocm_version, inputs.runner_arch || 'mi300', matrix.part) }}
     needs: [check-changes, call-gate]
     if: |
-      always() && !cancelled() &&
+      (always() && !cancelled() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-1-gpu-amd,')) ||
         (
@@ -735,7 +743,8 @@ jobs:
           (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
-      )
+      ))
+      && needs.call-gate.outputs.opted-in != 'false'
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -877,7 +886,7 @@ jobs:
     name: ${{ format('multimodal-gen-test-2-gpu-amd ({0}, linux-{1}-2gpu-sglang, {2})', matrix.rocm_version, inputs.runner_arch || 'mi300', matrix.part) }}
     needs: [check-changes, call-gate]
     if: |
-      always() && !cancelled() &&
+      (always() && !cancelled() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-2-gpu-amd,')) ||
         (
@@ -885,7 +894,8 @@ jobs:
           (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
-      )
+      ))
+      && needs.call-gate.outputs.opted-in != 'false'
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -1024,13 +1034,14 @@ jobs:
     name: wait-for-base-b-amd
     needs: [check-changes, call-gate, wait-for-base-a-amd]
     if: |
-      always() &&
+      (always() &&
       !cancelled() &&
       github.event_name == 'pull_request' &&
       !(inputs.target_stage || inputs.target_stage_select) &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
       (needs.wait-for-base-a-amd.result == 'success' || needs.wait-for-base-a-amd.result == 'skipped') &&
-      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped'))
+      && needs.call-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-latest
     outputs:
       base_b_result: ${{ steps.wait.outputs.result }}
@@ -1052,7 +1063,7 @@ jobs:
     name: ${{ format('base-c-test-4-gpu-amd ({0}, linux-{1}-4gpu-sglang, {2})', matrix.rocm_version, inputs.runner_arch || 'mi300', matrix.part) }}
     needs: [check-changes, call-gate, wait-for-base-b-amd]
     if: |
-      always() &&
+      (always() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',base-c-test-4-gpu-amd,')) ||
         (
@@ -1060,7 +1071,8 @@ jobs:
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
-      )
+      ))
+      && needs.call-gate.outputs.opted-in != 'false'
     strategy:
       fail-fast: false
       matrix:
@@ -1102,7 +1114,7 @@ jobs:
     name: ${{ format('base-c-test-large-8-gpu-amd ({0}, linux-{1}-8gpu-sglang, {2})', matrix.rocm_version, inputs.runner_arch || 'mi300', matrix.part) }}
     needs: [check-changes, call-gate, wait-for-base-b-amd]
     if: |
-      always() &&
+      (always() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',base-c-test-large-8-gpu-amd,')) ||
         (
@@ -1110,7 +1122,8 @@ jobs:
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
-      )
+      ))
+      && needs.call-gate.outputs.opted-in != 'false'
     env:
       RUNNER_LABELS: ${{ format('linux-{0}-8gpu-sglang', inputs.runner_arch || 'mi300') }}
     strategy:
@@ -1151,7 +1164,7 @@ jobs:
     name: ${{ format('base-c-test-large-8-gpu-amd-mi35x ({0}, {1}, {2})', matrix.rocm_version, matrix.runner, matrix.part) }}
     needs: [check-changes, call-gate, wait-for-base-b-amd]
     if: |
-      always() &&
+      (always() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',base-c-test-large-8-gpu-amd-mi35x,')) ||
         (
@@ -1159,7 +1172,8 @@ jobs:
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
-      )
+      ))
+      && needs.call-gate.outputs.opted-in != 'false'
     strategy:
       fail-fast: false
       matrix:

@@ -7,6 +7,10 @@ is never re-run by /run-extra-ci <hardware>; a listed workflow that gates on ano
 label, or re-fires on `labeled`, cannot be recovered by a rerun.
 A null label is a selection of existing workflows with no extra opt-in gate;
 those workflows retain their existing event and path conditions.
+
+pr-gate.yml passes with `opted-in=false` instead of failing on a draft PR or
+one without `run-ci` or its tier label, so every job that needs it must skip on
+that output; only a `*finish` aggregator may run regardless.
 """
 
 import glob
@@ -33,6 +37,23 @@ def gate_labels(workflow: dict) -> set[str]:
             if label:
                 labels.add(label)
     return labels
+
+
+def jobs_ignoring_opt_in(workflow: dict) -> list[str]:
+    """Jobs that need a pr-gate.yml job but do not check its `opted-in`."""
+    jobs = workflow.get("jobs") or {}
+    gates = {name for name, job in jobs.items() if job.get("uses") == PR_GATE}
+    ignoring = []
+    for name, job in jobs.items():
+        needs = job.get("needs") or []
+        needs = {needs} if isinstance(needs, str) else set(needs)
+        if (
+            needs & gates
+            and not name.endswith("finish")
+            and "opted-in" not in str(job.get("if", ""))
+        ):
+            ignoring.append(name)
+    return ignoring
 
 
 def refires_on_labeled(workflow: dict) -> bool:
@@ -97,8 +118,15 @@ def main() -> int:
                     "listed, so /run-extra-ci never re-runs it"
                 )
 
+    for path, workflow in workflows.items():
+        for job in jobs_ignoring_opt_in(workflow):
+            errors.append(
+                f"{path}: job `{job}` needs pr-gate.yml but does not skip on "
+                "its `opted-in == 'false'`, so it runs on drafts and without run-ci"
+            )
+
     if errors:
-        print(f"ERROR: {TIERS_FILE} is out of sync with .github/workflows:")
+        print(f"ERROR: {TIERS_FILE} or a pr-gate.yml caller is out of sync:")
         for error in errors:
             print(f"  {error}")
         return 1

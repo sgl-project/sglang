@@ -446,7 +446,8 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     """
     Handles the /rerun-failed-ci command.
     Reruns workflows that ended in 'failure', 'skipped', 'cancelled' or
-    'timed_out', restarting only the jobs that didn't succeed.
+    'timed_out', restarting only the jobs that didn't succeed, and fully
+    reruns runs whose tests pr-gate skipped once the PR can run them.
     Returns True if action was taken, False otherwise.
     """
     if not user_perms.get("can_rerun_failed_ci", False):
@@ -509,8 +510,8 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     #
     #   Caveat: GitHub's `run.rerun()` reuses the original event payload, so
     #   a job skipped by an `if` on that payload skips again. The label gates
-    #   read live labels inside pr-gate.yml instead, so a missing label fails
-    #   the gate job and the run is recoverable by rerun once labeled.
+    #   read live labels inside pr-gate.yml instead, so a rerun once labeled
+    #   picks the label up.
     # - cancelled / timed_out: rerun_failed_jobs() as well. GitHub restarts
     #   every job that didn't succeed — cancelled ones included — plus their
     #   dependents, and carries the passing jobs over untouched. A full
@@ -522,20 +523,45 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     #   builds are success yet, full-rerun failure runs too — Build Wheel
     #   lives in pr-test-sgl-kernel.yml, consumers in pr-test.yml, and
     #   rerun_failed_jobs() is scoped to a single workflow run.
+    # - a run whose tests pr-gate skipped (green, or failed only in
+    #   pr-test-finish): run.rerun() once the PR has what that gate needs
+    #   (`run-ci`, not a draft, the workflow's opt-in labels), since
+    #   rerun_failed_jobs() would rerun at most the finish job.
     runs = _latest_run_per_workflow(_pr_workflow_runs(gh_repo, pr))
+    labels = {label.name for label in pr.get_labels()}
+    can_run = "run-ci" in labels and not pr.draft
+    tiers = _load_opt_in_tiers().values()
 
     rerun_count = 0
     for run in runs:
         if run.status != "completed":
             # A newer attempt is still in flight - nothing to recover.
             continue
-        if run.conclusion not in ("failure", "skipped", "cancelled", "timed_out"):
-            # action_required (fork PR awaiting approval) is deliberately left
-            # out: it needs an approval, not a rerun.
-            continue
-
-        print(f"Processing {run.conclusion} workflow: {run.name} (ID: {run.id})")
         try:
+            needed = {
+                t["label"]
+                for t in tiers
+                if t["label"] and _workflow_file(run) in t["workflows"]
+            }
+            ready = can_run and needed <= labels
+            if run.conclusion == "success" and not ready:
+                continue
+            if run.conclusion in ("success", "failure") and _skipped_at_gate(run):
+                if ready:
+                    print(
+                        f"Full rerun of {run.name} (ID: {run.id}): tests skipped at gate"
+                    )
+                    run.rerun()
+                    rerun_count += 1
+                else:
+                    print(f"Leaving {run.name}: its gate still skips the tests")
+                continue
+            if run.conclusion not in ("failure", "skipped", "cancelled", "timed_out"):
+                # action_required (fork PR awaiting approval) is deliberately
+                # left out: it needs an approval, not a rerun.
+                continue
+
+            print(f"Processing {run.conclusion} workflow: {run.name} (ID: {run.id})")
             if run.conclusion == "skipped" or (
                 sgl_kernel_changes and not kernel_wheel_built
             ):
@@ -558,7 +584,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
             comment.create_reaction("+1")
         return True
     else:
-        print("No failed, skipped, cancelled or timed-out workflows found to rerun.")
+        print("No workflow found to rerun.")
         return False
 
 
@@ -567,13 +593,27 @@ def _workflow_file(run):
     return run.path.split("@", 1)[0]
 
 
+# The pr-gate.yml step that runs only when it skips the caller's tests: a draft
+# PR, or one missing `run-ci` or the workflow's opt-in label.
+GATE_SKIP_STEP = "Skip tests"
+
+
+def _skipped_at_gate(run):
+    """True if pr-gate skipped this run's tests."""
+    return any(
+        step.name == GATE_SKIP_STEP and step.conclusion == "success"
+        for job in run.jobs()
+        for step in job.steps
+    )
+
+
 def _rerun_workflow_run(run):
     """Re-run one completed run, green ones included. Returns (acted, message)."""
     try:
-        if run.conclusion == "success":
-            # Nothing failed, so there are no jobs for rerun_failed_jobs() to
-            # target; the ask is an explicit re-run of green work.
-            print(f"  Full rerun of successful run {run.id}")
+        if run.conclusion == "success" or _skipped_at_gate(run):
+            # Nothing ran that rerun_failed_jobs() could target: a green run,
+            # or one whose tests the gate skipped (only its finish job failed).
+            print(f"  Full rerun of run {run.id} ({run.conclusion})")
             run.rerun()
         else:
             try:
@@ -594,7 +634,6 @@ def _rerun_tier_workflows(
     *,
     skip_missing=False,
     optional_workflows=(),
-    only_successful=False,
 ):
     """
     Re-run a registered selection's workflows for the current head SHA.
@@ -609,8 +648,6 @@ def _rerun_tier_workflows(
     missing runs. Selection-only entries can skip missing runs because existing
     workflows may use trigger-level path filters. Combined selections can name
     those files in optional_workflows while still reporting missing opt-in runs.
-    only_successful re-runs just the green runs: an opt-in run without its
-    label passes with its tests skipped, which /rerun-failed-ci never selects.
 
     Returns (acted, message); acted is True if any workflow was re-run or is
     already in flight.
@@ -640,10 +677,6 @@ def _rerun_tier_workflows(
                     "to create one.",
                 )
             )
-        elif only_successful and (
-            run.status != "completed" or run.conclusion != "success"
-        ):
-            continue
         elif run.status != "completed":
             results.append(
                 (
@@ -2087,8 +2120,7 @@ def main():
         if unknown:
             _reply_bad_tier_args(pr, comment, command, unknown, tiers)
             return
-    opt_in_tiers = [tiers[name] for name in tier_names if tiers[name]["label"]]
-    tier_labels = [tier["label"] for tier in opt_in_tiers]
+    tier_labels = [tiers[name]["label"] for name in tier_names if tiers[name]["label"]]
 
     if is_tag:
         handle_tag_run_ci(repo, pr, comment, user_perms, tier_labels=tier_labels)
@@ -2102,7 +2134,6 @@ def main():
     elif is_tag_and_rerun:
         # Perform both actions, but suppress individual reactions
         print(f"Processing combined command: {first_line} (tiers={tier_names})")
-        labels_before = {label.name for label in pr.get_labels()}
 
         tagged = handle_tag_run_ci(
             repo,
@@ -2122,33 +2153,8 @@ def main():
             repo, pr, comment, user_perms, react_on_success=False
         )
 
-        # An opt-in run from before its label passed with its tests skipped,
-        # so the failed-run retry above never sees it.
-        opted_in = False
-        newly_opted_in_workflows = list(
-            dict.fromkeys(
-                path
-                for tier in opt_in_tiers
-                if tier["label"] not in labels_before
-                for path in tier["workflows"]
-            )
-        )
-        if (
-            tagged
-            and newly_opted_in_workflows
-            and user_perms.get("can_rerun_failed_ci", False)
-        ):
-            opted_in, message = _rerun_tier_workflows(
-                repo,
-                pr,
-                newly_opted_in_workflows,
-                skip_missing=True,
-                only_successful=True,
-            )
-            print(message)
-
         # If at least one action was successful, add the reaction here
-        if tagged or rerun or opted_in:
+        if tagged or rerun:
             comment.create_reaction("+1")
             print("Combined command processed successfully; reaction added.")
         else:

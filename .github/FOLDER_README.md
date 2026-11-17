@@ -25,8 +25,10 @@ check each key for the step it gates.
 
 Each opt-in workflow passes `require-label: run-ci-<tier>` to `pr-gate.yml` and
 is registered under that tier in `scripts/ci/opt_in_ci_tiers.json`;
-`scripts/lint/check_opt_in_ci_tiers.py` checks the two agree. Without the label
-the gate passes with `opted-in=false` and the caller's test jobs skip.
+`scripts/lint/check_opt_in_ci_tiers.py` checks the two agree. Without the label,
+without `run-ci`, or on a draft PR, the gate passes with `opted-in=false` and
+the caller's test jobs skip. `pr-test-finish` then fails, so a PR cannot merge
+without running Base CI.
 
 `/rerun-test`, `/rerun-group` and `/run-cpu-ci` are gated on the commenter alone: either
 `cooldown_interval_minutes: 0`, or `write`/`admin` permission on the repo. Where

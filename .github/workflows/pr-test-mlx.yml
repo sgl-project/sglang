@@ -132,6 +132,7 @@ jobs:
     # Manual-only: no self hosted Apple Silicon runner is generally available; hosted runners are too small for e2e.
     if: |
       !cancelled() && inputs.target_stage == 'extra-e2e-test-mlx'
+      && needs.pr-gate.outputs.opted-in != 'false'
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 120
     env:
@@ -228,6 +229,7 @@ jobs:
     # Manual-only, same rationale as the MLX e2e stage above.
     if: |
       !cancelled() && inputs.target_stage == 'extra-e2e-test-mps'
+      && needs.pr-gate.outputs.opted-in != 'false'
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 120
     env:

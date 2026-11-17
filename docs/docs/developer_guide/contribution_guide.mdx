@@ -141,11 +141,11 @@ Users with permission are listed in the [CI_PERMISSIONS.json](https://github.com
 
 **PR authors** can use `/rerun-failed-ci` on their own PRs even if they are not listed in `CI_PERMISSIONS.json`. Selective reruns have additional rules because they execute PR code on self-hosted runners; see the permission table below.
 
-For CI to run on a pull request, it must have the "run-ci" label. Authorized users can add the label or rerun failed tests by commenting on the PR with one of these commands:
+For CI to run on a pull request, it must have the "run-ci" label and not be a draft. Otherwise every CI workflow skips its tests, and only `pr-test-finish` fails, so the PR cannot merge. Authorized users can add the label or rerun failed tests by commenting on the PR with one of these commands:
 
 - `/tag-run-ci-label [<hardware> ...]`: Adds the "run-ci" label, plus the opt-in label of each named hardware (see the hardware arguments below). Only **future** commits trigger CI; the current commit is unaffected. For example, `/tag-run-ci-label xeon npu` adds "run-ci", "run-ci-xeon-extra", and "run-ci-npu-extra".
-- `/rerun-failed-ci`: Reruns workflows from the latest commit with conclusion **failed, skipped, cancelled, or timed out**.
-- `/tag-and-rerun-ci [<hardware> ...]`: Adds the same labels as `/tag-run-ci-label`, retries completed unsuccessful workflows, and reruns the opt-in workflows whose label it just added, since their earlier runs skipped their tests.
+- `/rerun-failed-ci`: Reruns workflows from the latest commit with conclusion **failed, skipped, cancelled, or timed out**. Runs whose tests were skipped because the PR was a draft or lacked a label are rerun in full once the PR is ready and has the label.
+- `/tag-and-rerun-ci [<hardware> ...]`: Adds the same labels as `/tag-run-ci-label`, then does what `/rerun-failed-ci` does, which includes rerunning the runs whose tests were skipped for a label it just added.
 - `/run-ci [<hardware> ...]` (also `/run-base-ci`, `/rerun-base-ci`): With no argument, an alias of `/tag-and-rerun-ci`. With hardware arguments, adds the labels and reruns each named hardware's Base workflows for NVIDIA and AMD, or the only opt-in workflow for any other hardware, including runs that already succeeded. For example, `/run-ci nv xeon`.
 - `/run-extra-ci <hardware> [...]` (also `/rerun-extra-ci`): Adds the labels and reruns each named hardware's opt-in workflow, including successful runs. For example, `/run-extra-ci nv amd` or `/run-extra-ci xeon`.
 - `/run-full-ci <hardware> [...]` (also `/rerun-full-ci`): Base and Extra together for each named hardware; for hardware without a Base tier it is the same as `/run-extra-ci`.
@@ -155,7 +155,7 @@ For CI to run on a pull request, it must have the "run-ci" label. Authorized use
 
 Hardware arguments are `nv`, `amd`, `xeon`, `npu`, `xpu`, `musa`, `arm64`, `mlx`, `mlu`, and `ppu`; a registered tier name such as `nv-extra` is accepted as well. Every command takes several of them. NVIDIA and AMD have a Base tier, which runs on every PR with "run-ci", and an Extra tier that also needs "run-ci-nv-extra" or "run-ci-amd-extra". Every other hardware has only an Extra tier: its workflow runs on a PR only with "run-ci" and `run-ci-<hardware>-extra`, and needs no label on `main` pushes or schedules (MLU runs only on PRs and manual dispatch). Tiers are listed in [`scripts/ci/opt_in_ci_tiers.json`](https://github.com/sgl-project/sglang/blob/main/scripts/ci/opt_in_ci_tiers.json).
 
-An opt-in workflow on a PR without its label passes with its tests skipped, so it shows green rather than failed. Adding the label does not start a run: push a commit, or rerun it with `/run-ci <hardware>`.
+An opt-in workflow on a PR without its label passes with its tests skipped, so it shows green rather than failed. Adding a label or marking a draft ready does not start a run: push a commit, use `/rerun-failed-ci` or `/tag-and-rerun-ci` (both rerun the runs whose tests were skipped and can now run), rerun with `/run-ci <hardware>`, or use the "Re-run all jobs" button. "Re-run failed jobs" does not rerun skipped tests.
 
 Unknown hardware arguments are rejected before any label is added or workflow rerun, and `/run-extra-ci` and `/run-full-ci` need at least one. The per-tier commands such as `/run-nv-extra-ci` are removed and reply with their replacement. The shared `extra` tier and "run-ci-extra" label are retired, and the bare `extra` argument is rejected with migration guidance.
 
