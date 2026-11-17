@@ -1425,6 +1425,8 @@ class ModelConfig:
         attention.  Not every hybrid-SWA model uses them.
         """
         archs = self.hf_config.architectures or []
+        if "OpenAIPrivacyFilterForTokenClassification" in archs:
+            return True
         if any(a in SWA_SINK_ARCHS for a in archs):
             return True
 
@@ -2566,6 +2568,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "CLIPModel" in model_architectures
         or "BertModel" in model_architectures
         or "EmbeddingNemotron3Model" in model_architectures
+        or "OpenAIPrivacyFilterForTokenClassification" in model_architectures
         or "Contriever" in model_architectures
         or "BertForSequenceClassification" in model_architectures
         or "XLMRobertaModel" in model_architectures

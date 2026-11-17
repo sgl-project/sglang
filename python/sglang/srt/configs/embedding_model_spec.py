@@ -15,6 +15,7 @@ class EmbeddingTask(str, Enum):
     NONE = "none"
     EMBED = "embed"
     CLASSIFY = "classify"
+    TOKEN_CLASSIFY = "token_classify"
 
 
 class PoolingStrategy(str, Enum):
@@ -185,7 +186,37 @@ def embedding_support_matrix() -> list[dict[str, Any]]:
             **_embedding_nemotron3_spec().as_dict(),
         }
     )
+    rows.append(
+        {
+            "architecture": "OpenAIPrivacyFilterForTokenClassification",
+            **_openai_privacy_filter_spec().as_dict(),
+        }
+    )
     return rows
+
+
+def _openai_privacy_filter_spec() -> EmbeddingModelSpec:
+    return EmbeddingModelSpec(
+        family="openai_privacy_filter",
+        task=EmbeddingTask.TOKEN_CLASSIFY,
+        execution=EmbeddingExecution.ENCODER_ONLY,
+        attention=AttentionPattern.BIDIRECTIONAL,
+        pooling=PoolingStrategy.MODEL_DEFINED,
+        normalize=False,
+        postprocessor="token_logits",
+        tokenizer_special_tokens="model_default",
+        supports_dimensions=False,
+        supports_token_embeddings=False,
+        supports_multimodal=False,
+        requires_embedding_flag=False,
+        auto_enable_embedding=True,
+        bidirectional_attention=True,
+        bcg_prefill_policy=BCGPrefillPolicy.DEFAULT,
+        safe_disable_radix_cache=True,
+        safe_disable_chunked_prefill=True,
+        safe_disable_kv_cache=True,
+        encoder_only_attention=True,
+    )
 
 
 def _embedding_gemma2_spec() -> EmbeddingModelSpec:
@@ -338,6 +369,9 @@ def resolve_embedding_model_spec(
     """
 
     architecture_set = set(architectures or ())
+
+    if "OpenAIPrivacyFilterForTokenClassification" in architecture_set:
+        return _openai_privacy_filter_spec()
 
     if "EmbeddingGemma2Model" in architecture_set:
         return _embedding_gemma2_spec()

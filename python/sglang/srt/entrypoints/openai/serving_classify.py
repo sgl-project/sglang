@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
 
+from sglang.srt.configs.embedding_model_spec import EmbeddingTask
 from sglang.srt.entrypoints.openai.protocol import (
     ClassifyRequest,
     ClassifyResponse,
@@ -78,6 +79,11 @@ class OpenAIServingClassify(OpenAIServingBase):
 
     def _validate_request(self, request: ClassifyRequest) -> Optional[str]:
         """Validate that the input is not empty or whitespace only."""
+        spec = getattr(
+            self.tokenizer_manager.model_config, "embedding_model_spec", None
+        )
+        if spec is not None and spec.task == EmbeddingTask.TOKEN_CLASSIFY:
+            return "Token classification models return per-token logits; use /encode."
         if not (input := request.input):
             return "Input cannot be empty"
 

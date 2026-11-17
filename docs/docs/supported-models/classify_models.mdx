@@ -7,6 +7,44 @@ This document describes the `/v1/classify` API endpoint implementation in SGLang
 
 The classification API allows you to classify text inputs using classification models. This implementation follows the same format as vLLM's 0.7.0 classification API.
 
+## OpenAI Privacy Filter token classification
+
+`openai/privacy-filter` returns 33 BIOES class logits for **each input token**.
+Use the native `/encode` endpoint or `Engine.encode(input_ids=...)`; the
+sequence-level `/v1/classify` and OpenAI embeddings APIs do not describe this
+output format.
+
+The initial implementation supports unquantized weights on a single NVIDIA CUDA
+GPU, with FA3 or FA4 attention and Triton MoE. For an FA3-capable GPU on Linux:
+
+```bash
+sglang serve --model-path openai/privacy-filter \
+  --attention-backend fa3 --moe-runner-backend triton --tp-size 1
+```
+
+The architecture automatically enables embedding mode and disables radix cache,
+chunked prefill, and KV cache allocation. Every layer uses bidirectional local
+attention with a radius of 128 tokens and attention sinks.
+
+```python
+import requests
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("openai/privacy-filter")
+input_ids = tokenizer.encode("Email Jane at jane@example.com.")
+response = requests.post(
+    "http://127.0.0.1:30000/encode",
+    json={"input_ids": input_ids},
+)
+response.raise_for_status()
+logits = response.json()["embedding"]  # [len(input_ids), 33], unnormalized
+```
+
+Class indices follow the checkpoint's `id2label`. Keep the token IDs and offset
+mapping when reconstructing text spans. Apply the official Privacy Filter BIOES
+decoder and span postprocessing separately; per-token argmax is not a substitute
+for constrained Viterbi decoding. This endpoint does not return redacted text.
+
 ## API Endpoint
 
 ```text Output
