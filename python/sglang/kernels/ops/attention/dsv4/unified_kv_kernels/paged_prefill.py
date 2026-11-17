@@ -68,10 +68,12 @@ _is_gfx1250 = is_gfx1250_supported()
 # reads q/kv strides directly, so it needs none of the OPUS fixups below.
 try:
     from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
+
     _HAS_AITER_GFX1250 = _is_gfx1250
 except ImportError:
     pa_prefill_sparse = None
     _HAS_AITER_GFX1250 = False
+
 
 @triton.jit
 def _sparse_attn_v4_paged_prefill_kernel(
