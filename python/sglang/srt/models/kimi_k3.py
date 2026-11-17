@@ -512,6 +512,7 @@ def _uses_ep_a2a() -> bool:
         _a2a_backend.is_megamoe()
         or _a2a_backend.is_flashinfer_megamoe()
         or _a2a_backend.is_deepep()
+        or _a2a_backend.is_ascend_ops()
         or _a2a_backend.is_mooncake()
         or _a2a_backend.is_ascend_fuseep()
         or _a2a_backend.is_mori()
@@ -958,6 +959,7 @@ class KimiK3MoE(nn.Module):
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.mega_moe import (
             _configure_mega_moe_deep_gemm_num_sms,
+            _mega_moe_global_tokens_hint,
         )
 
         # Under SP-MoE these rows are this rank's shard of the batch; an unpadded
@@ -1011,6 +1013,7 @@ class KimiK3MoE(nn.Module):
                 recipe=(1, 1, 32),
                 activation="situ",
                 fast_math=True,
+                global_num_tokens=_mega_moe_global_tokens_hint(buf),
             )
         y = y[:num_tokens]
         if valid_token_count is not None:
@@ -3471,9 +3474,9 @@ class KimiK3LinearForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        if not _is_hip:
+        if not (_is_hip or _is_npu):
             # The CuTe DSL GEMM module imports cuda.bindings and cutlass at
-            # module level; neither ships on ROCm.
+            # module level; neither ships on ROCm or Ascend NPU.
             from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
                 register_tgv_m_ranges,
             )

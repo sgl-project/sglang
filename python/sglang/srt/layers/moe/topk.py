@@ -1913,6 +1913,8 @@ def _mask_topk_ids_padded_region(
 ) -> None:
     if num_token_non_padded is None:
         return
+    if topk_ids.shape[0] == 0:
+        return
     if not topk_ids.is_cuda:
         if _is_npu:
             return
