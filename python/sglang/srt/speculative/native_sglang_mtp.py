@@ -24,7 +24,10 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 class NativeSGLangMTP:
     def __init__(self, owner):
-        self.graph_requested = os.getenv("SGLANG_MTP_PREFIX_MTP_GRAPH", "0") == "1"
+        self.graph_requested = (
+            os.getenv("SGLANG_MTP_PREFIX_MTP_GRAPH", "0") == "1"
+            or os.getenv("SGLANG_MTP_PREFIX_TWO_DRAFT_GRAPHS", "0") == "1"
+        )
         self.graph_implementation = os.getenv(
             "SGLANG_MTP_PREFIX_MTP_GRAPH_IMPL", "native_bridge"
         )

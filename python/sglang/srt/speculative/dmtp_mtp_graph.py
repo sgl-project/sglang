@@ -97,6 +97,8 @@ class DMTPMTPGraphRunner:
                     output = self.forward(batch)
                 self.graphs[bs], self.outputs[bs] = graph, output
         torch.cuda.current_stream().wait_stream(stream)
+        if getattr(native, "tail", None) is not None:
+            native.tail.freeze_outputs()
 
     def bind(self, batch):
         ids = self.runner.runner_ids
@@ -152,6 +154,15 @@ class DMTPMTPGraphRunner:
             raise RuntimeError(
                 "DMTP MTP graph requires full normalized hidden without logits"
             )
+        tail = getattr(self.native, "tail", None)
+        if tail is not None:
+            bs = batch.batch_size
+            last = (
+                torch.arange(bs, device=batch.input_ids.device) * 8
+                + batch.spec_info.num_accept_tokens.long()
+                - 1
+            )
+            tail.forward(output.hidden_states.index_select(0, last))
         return output.hidden_states
 
     def replay(self, batch):
@@ -176,6 +187,8 @@ class DMTPMTPGraphRunner:
         with scoped_config(**mtp_config(self.native.owner)):
             self.backend.init_forward_metadata_out_graph(target, in_capture=True)
             self.graphs[bs].replay()
+        if getattr(self.native, "tail", None) is not None:
+            self.tail_result = self.native.tail.read(bs)
         return LogitsProcessorOutput(
             next_token_logits=None, hidden_states=self.outputs[bs]
         )

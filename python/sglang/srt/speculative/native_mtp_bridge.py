@@ -156,6 +156,17 @@ class NativeMTPBridge:
         self.hidden_by_req = torch.empty(size, self.width, dtype=dtype, device=device)
         self.anchor_by_req = torch.full((size,), -1, dtype=torch.int64, device=device)
         self.token_by_req = torch.full_like(self.anchor_by_req, -1)
+        if self.controller.two_graphs:
+            k = self.controller.mtp_tail.top_k
+            self.proposal_buffers = (
+                torch.empty(size, 1, dtype=torch.int64, device=device),
+                torch.empty(size, 1, k, dtype=torch.int64, device=device),
+                torch.empty(size, 1, k, dtype=torch.float32, device=device),
+                torch.empty(size, 8, self.width, dtype=dtype, device=device),
+            )
+            self.proposal_temperatures = torch.empty(size, device=device)
+            self.proposal_greedy = torch.empty(size, dtype=torch.bool, device=device)
+            self.proposal_valid = torch.zeros(size, dtype=torch.bool, device=device)
         self.verified_batches = set()
         self.graph_audit_count = 0
         self.hits = self.fallbacks = 0
@@ -194,6 +205,18 @@ class NativeMTPBridge:
         self.hidden_by_req.index_copy_(0, reqs.long(), hidden)
         self.anchor_by_req.index_copy_(0, reqs.long(), anchors.long())
         self.token_by_req.index_copy_(0, reqs.long(), tokens.long())
+        if self.controller.two_graphs:
+            self.proposal_valid.index_fill_(0, reqs.long(), False)
+
+    def seed_proposal(self, reqs, result):
+        indices = reqs.long()
+        bs = indices.numel()
+        for buffer, value in zip(self.proposal_buffers, result):
+            buffer.index_copy_(0, indices, value)
+        tail = self.controller.mtp_tail
+        self.proposal_temperatures.index_copy_(0, indices, tail.temperatures[:bs])
+        self.proposal_greedy.index_copy_(0, indices, tail.greedy_mask[:bs])
+        self.proposal_valid.index_fill_(0, indices, True)
 
     def t1(self, batch, block_ids):
         c = self.controller
@@ -208,7 +231,44 @@ class NativeMTPBridge:
         )
         c.sampling = c.validate_sampling(batch)
         c.hidden = self.hidden_by_req.index_select(0, c.req_indices)
-        c.prepare_t1(block_ids)
+        if c.two_graphs:
+            from sglang.srt.speculative.dspark_components.dspark_draft import (
+                resolve_greedy_mask,
+            )
+
+            tail = c.mtp_tail
+            if tail.signature() != tail.initial_signature:
+                raise RuntimeError(
+                    "DMTP prefetched T1 weights/layout changed; restart required"
+                )
+            temperature = (
+                c.selector_sampling.temperatures.reshape(-1).float().clamp_min(1e-5)
+            )
+            greedy = resolve_greedy_mask(
+                bs=c.req_indices.numel(),
+                sampling_info=c.selector_sampling,
+                device=c.req_indices.device,
+            )
+            valid = (
+                self.proposal_valid.index_select(0, c.req_indices).all()
+                & (
+                    self.proposal_temperatures.index_select(0, c.req_indices)
+                    == temperature
+                ).all()
+                & (self.proposal_greedy.index_select(0, c.req_indices) == greedy).all()
+            )
+            torch._assert_async(
+                valid, "DMTP prefetched T1 is stale or sampling parameters changed"
+            )
+            tokens, ids, q, c.prepared_embeds = (
+                buffer.index_select(0, c.req_indices)
+                for buffer in self.proposal_buffers
+            )
+            block_ids[:, 1].copy_(tokens[:, 0])
+            c.t1_sparse = (ids, q)
+            c.graph_used.update(t1_head=True, conditioner=True, t1_combined=True)
+        else:
+            c.prepare_t1(block_ids)
         c.q1 = None
 
     def can_graph(self, bs, cpu_prefix_hint):
@@ -235,6 +295,8 @@ class NativeMTPBridge:
             "MTP GPU commit counts/positions mismatch",
         )
         hidden = c.target_hidden(bs * 8).view(bs, 8, -1)
+        if c.two_graphs:
+            c.mtp_tail.stage(bonus, c.selector_sampling)
         hint = self.owner._draft_seq_lens_cpu_buf[:bs]
         if not self.can_graph(bs, hint):
             updated = self._fallback(candidates, bonus, hidden, locations, counts)
@@ -286,9 +348,17 @@ class NativeMTPBridge:
             c.graph_used["mtp_append"] = True
             self.hits += 1
         self.seed(c.req_indices, updated, next_positions, bonus)
+        if c.two_graphs:
+            proposal = (
+                self.graph.tail_result
+                if c.graph_used["mtp_append"]
+                else c.mtp_tail.forward(updated)
+            )
+            self.seed_proposal(c.req_indices, proposal)
         c.final_hidden = None
 
     def _check(self, batch, result, counts):
+        c = self.controller
         bs = batch.batch_size
         if (
             bs in self.verified_batches
@@ -342,6 +412,10 @@ class NativeMTPBridge:
             ref = runner.model.forward(
                 reference_batch.input_ids, reference_batch.positions, reference_batch
             ).hidden_states
+            if c.two_graphs:
+                last = torch.arange(bs, device=counts.device) * 8 + counts.long() - 1
+                reference = c.mtp_tail.forward(ref.index_select(0, last))
+                c.mtp_tail.check(self.graph.tail_result, reference)
         mask = (torch.arange(8, device=counts.device)[None] < counts[:, None]).reshape(
             -1
         )

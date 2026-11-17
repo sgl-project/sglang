@@ -46,6 +46,7 @@ class MTPFirstController:
             )
 
     def __init__(self, worker):
+        self.two_graphs = os.getenv("SGLANG_MTP_PREFIX_TWO_DRAFT_GRAPHS", "0") == "1"
         args = worker.server_args
         if (
             not 1 <= args.max_running_requests <= 32
@@ -111,6 +112,13 @@ class MTPFirstController:
     def init_graphs(self):
         if self.native.bridge is None:
             raise ValueError("T1 residual requires the native MTP bridge")
+        if self.two_graphs:
+            if (
+                self.worker._draft_sampler is not self.df_tail
+                or not self.native.bridge.graph.graphs
+            ):
+                raise RuntimeError("DMTP two-graph mode requires MTP and DF capture")
+            return
         from sglang.srt.speculative.dmtp_selector_graph import DMTPSelectorGraphs
 
         enabled = self.worker.draft_model_runner.decode_cuda_graph_runner is not None
@@ -319,6 +327,11 @@ class MTPFirstController:
                 anchor_rows,
                 anchors,
             )
+            if self.two_graphs:
+                self.validate_sampling(batch)
+                self.mtp_tail.stage(anchors, batch.sampling_info)
+                result = self.mtp_tail.forward(hidden.index_select(0, tails))
+                self.native.bridge.seed_proposal(batch.req_pool_indices, result)
         self.final_hidden = None
 
     @torch.no_grad()
@@ -328,9 +341,22 @@ class MTPFirstController:
 
     @torch.no_grad()
     def proposal(self, draft_hidden, block_ids, positions):
-        rest, ids, q = self.tail_selector.run(
-            draft_hidden[:, 2:], block_ids[:, 1], self.selector_sampling
-        )
+        if self.two_graphs:
+            if not self.graph_used.get("draft"):
+                raise RuntimeError(
+                    "DMTP two-graph selector requires the DF parent graph"
+                )
+            rest, ids, q = self.df_tail.read(draft_hidden.shape[0])
+            if draft_hidden.shape[0] not in self.df_checked:
+                reference = self.df_tail.forward(
+                    draft_hidden.flatten(0, 1), block_ids.flatten()
+                )
+                self.df_tail.check((rest, ids, q), reference)
+                self.df_checked.add(draft_hidden.shape[0])
+        else:
+            rest, ids, q = self.tail_selector.run(
+                draft_hidden[:, 2:], block_ids[:, 1], self.selector_sampling
+            )
         tokens = torch.cat((block_ids[:, 1:2], rest), dim=1)
         if not self.selector_sampling.is_all_greedy:
             t1_ids, t1_q = self.t1_sparse
@@ -338,7 +364,9 @@ class MTPFirstController:
                 torch.cat((t1_ids, ids), dim=1),
                 torch.cat((t1_q, q), dim=1),
             )
-        self.graph_used["tail_head"] = self.tail_selector.last_used
+        self.graph_used["tail_head"] = (
+            True if self.two_graphs else self.tail_selector.last_used
+        )
         self.t1_sparse = self.q1 = self.mixed = None
         return tokens
 

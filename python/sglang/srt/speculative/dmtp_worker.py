@@ -71,6 +71,10 @@ class DMTPWorkerV2(DFlashWorkerV2):
         return get_parallel().tp_rank
 
     def weight_update_runners(self):
+        if self._mtp_first.two_graphs:
+            raise NotImplementedError(
+                "DMTP prefetched proposals require restart for weight updates"
+            )
         return [
             *super().weight_update_runners(),
             ("dmtp_mtp", self._mtp_first.native.worker.model_runner),
@@ -114,9 +118,19 @@ class DMTPWorkerV2(DFlashWorkerV2):
     def _maybe_build_draft_sampler(self):
         # The native sampler would treat T1 as a DF proposal. DMTP's controller
         # keeps the explicit MTP T1 and samples only the six MASK hidden rows.
-        return None
+        return self._mtp_first.df_tail if self._mtp_first.two_graphs else None
 
     def init_cuda_graphs(self):
+        controller = self._mtp_first
+        if controller.two_graphs:
+            from sglang.srt.speculative.dmtp_graph_tails import DMTPGraphSamplingTail
+
+            controller.mtp_tail = DMTPGraphSamplingTail(controller, t1=True)
+            controller.df_tail = DMTPGraphSamplingTail(
+                controller, t1=False, scored_start=2
+            )
+            controller.df_checked = set()
+            controller.native.tail = controller.mtp_tail
         config = deepcopy(get_exec().graph.cuda_graph_config)
         config.decode.bs = list(range(1, get_schedule().max_running_requests + 1))
         with scoped_config(
@@ -124,6 +138,8 @@ class DMTPWorkerV2(DFlashWorkerV2):
             cuda_graph_config=config,
         ):
             super().init_cuda_graphs()
+        if controller.two_graphs:
+            controller.df_tail.freeze_outputs()
         runner = self.draft_model_runner.decode_cuda_graph_runner
         if runner is not None:
             widths = (
