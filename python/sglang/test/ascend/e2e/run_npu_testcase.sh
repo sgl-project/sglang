@@ -29,12 +29,6 @@ else
 fi
 echo "===== Install kubernetes - End ====="
 
-echo "===== Install blake3 - Begin ====="
-# sglang.srt.multimodal.cache.digest imports blake3 at module import time;
-# the nightly NPU images do not ship it.
-pip install blake3 -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
-echo "===== Install blake3 - End ====="
-
 PYTHON_FOR_SGLANG="python"
 PIP_FOR_SGLANG="pip"
 if [ -n "${TRANSFORMERS_VERSION_FOR_SGLANG}" ];then
