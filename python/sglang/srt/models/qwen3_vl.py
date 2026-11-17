@@ -1464,10 +1464,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, list, Optional[torch.cuda.Event]]]:
         device = self.visual.device
         device_index = device.index
-        dest_device_type = "npu" if _is_npu else "cuda"
-        if device.type == dest_device_type and device_index is None:
+        if device.type in ("cuda", "npu") and device_index is None:
             device_index = torch.cuda.current_device()
-        if device.type == dest_device_type:
+        if device.type in ("cuda", "npu"):
             parallel = get_parallel()
             consumer_count = max(parallel.tp_size, 1)
 
@@ -1476,7 +1475,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         feature_offset = 0
         for index in indices:
             item = items[index]
-            if device.type == dest_device_type:
+            if device.type in ("cuda", "npu"):
                 proxy = item.feature
                 model_specific_data = getattr(item, "model_specific_data", {})
                 pending_copy = model_specific_data.pop(
