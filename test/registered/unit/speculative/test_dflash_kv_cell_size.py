@@ -1,11 +1,12 @@
 import unittest
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-class TestScaleKvCellSizePerTokenForDFlash(unittest.TestCase):
+class TestScaleKvCellSizePerTokenForDFlash(CustomTestCase):
     """Sizing of the combined target+draft KV budget, including the HiSparse
     loc-space widening of the draft contribution."""
 

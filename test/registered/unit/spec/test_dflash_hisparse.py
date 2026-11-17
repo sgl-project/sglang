@@ -11,12 +11,14 @@ from sglang.srt.managers.hisparse_coordinator import (
     HiSparseCoordinator,
     HiSparseSpecSwapManager,
 )
+from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative import dflash_worker_v2
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.srt.speculative.draft_worker_common import make_draft_block_spec_info
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -24,6 +26,25 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class TestDFlashHiSparse(CustomTestCase):
+    def test_staged_bonus_tokens_follow_filtered_and_merged_requests(self):
+        """Staged requests carry relay indices, not empty idle-input token rows."""
+        future_map = FutureMap.__new__(FutureMap)
+        future_map.spec_algo = SpeculativeAlgorithm.DFLASH
+        future_map.device = torch.device("cpu")
+        future_map._deferred_relay = None
+        future_map.output_tokens_buf = torch.full((10,), -1, dtype=torch.int64)
+        future_map.output_tokens_buf[torch.tensor([2, 5, 8])] = torch.tensor(
+            [22, 55, 88]
+        )
+        staged = future_map.make_staged_spec_input(torch.tensor([5, 2, 8]))
+        staged.filter_batch(torch.tensor([2, 0]))
+        staged.merge_batch(future_map.make_staged_spec_input(torch.tensor([2])))
+        future_map._resolve_spec_extras(SimpleNamespace(spec_info=staged))
+
+        self.assertIsInstance(staged, DFlashDraftInputV2)
+        self.assertEqual(staged.bonus_tokens.tolist(), [88, 55, 22])
+        self.assertEqual(staged.bonus_tokens.dtype, torch.int64)
+
     def test_verify_preserves_host_kv_beyond_the_hot_buffer(self):
         """A second commit reads cleared mappings and overwrites accepted host KV.
 

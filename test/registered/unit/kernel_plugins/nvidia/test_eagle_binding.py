@@ -35,6 +35,7 @@ from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import eagle_megakernel, eagle_worker_v2
 from sglang.srt.speculative.eagle_megakernel import EagleMegakernel
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -862,7 +863,7 @@ class TestSpecRelayBypass(CustomTestCase):
         future_map = overlap_utils.FutureMap.__new__(overlap_utils.FutureMap)
         future_map._deferred_relay = None
         future_map.output_tokens_buf = torch.empty(8, dtype=torch.int64)
-        future_map.spec_algo = SimpleNamespace(is_ngram=lambda: False)
+        future_map.spec_algo = SpeculativeAlgorithm.EAGLE
         return future_map
 
     @staticmethod
