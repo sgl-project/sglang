@@ -163,6 +163,12 @@ service SglangService {
   rpc OpenAiStreamCompletions(OpenAiCompletionRequest) returns (stream OpenAiCompletionStreamResponse);
   rpc OpenAiChatCompletions(OpenAiChatCompletionRequest) returns (OpenAiChatCompletionResponse);
   rpc OpenAiStreamChatCompletions(OpenAiChatCompletionRequest) returns (stream OpenAiChatCompletionStreamResponse);
+  rpc OpenAiEmbeddings(OpenAiEmbeddingRequest) returns (OpenAiEmbeddingResponse);
+  rpc OpenAiClassify(OpenAiClassifyRequest) returns (OpenAiClassifyResponse);
+  rpc OpenAiScore(OpenAiScoreRequest) returns (OpenAiScoreResponse);
+  rpc OpenAiRerank(OpenAiRerankRequest) returns (OpenAiRerankResponse);
+  rpc OpenAiTokenize(OpenAiTokenizeRequest) returns (OpenAiTokenizeResponse);
+  rpc OpenAiDetokenize(OpenAiDetokenizeRequest) returns (OpenAiDetokenizeResponse);
 }
 
 message ListModelsRequest {}
