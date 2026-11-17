@@ -14,7 +14,7 @@ from sglang.srt.layers.logits_processor import (
     SamplingMaskStatus,
 )
 from sglang.srt.managers.req_types import FINISH_ABORT
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -49,14 +49,15 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
     metrics_reporter.forward_ct_decode = 0
     # A tree that leases no state slots ahead of the checkpoints.
     tree_cache = SimpleNamespace(
-        lease_checkpoint_state_slots=lambda reqs: nullcontext()
+        lease_checkpoint_state_slots=lambda reqs: nullcontext(), finish=Mock()
+    )
+    model_config = SimpleNamespace(
+        vocab_size=1000, think_end_ids=None, self_opened_think_start_ids=None
     )
     return SchedulerBatchResultProcessor(
         is_generation=True,
         disaggregation_mode=None,
-        model_config=SimpleNamespace(
-            think_end_ids=None, self_opened_think_start_ids=None
-        ),
+        model_config=model_config,
         token_to_kv_pool_allocator=Mock(),
         tree_cache=tree_cache,
         hisparse_coordinator=None,
@@ -67,7 +68,9 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         metrics_reporter=metrics_reporter,
         draft_worker=None,
         model_worker=Mock(),
-        logprob_result_processor=None,
+        logprob_result_processor=SchedulerLogprobResultProcessor(
+            model_config=model_config
+        ),
         output_streamer=Mock(),
         beam_coordinator=Mock(),
         request_retirer=release_only_retirer(tree_cache=tree_cache),
@@ -384,16 +387,11 @@ class TestAbortedFinalPrefill(CustomTestCase):
                 aborted.kv.req_pool_idx = 0
                 aborted.return_sampling_mask = sampling_status is not None
                 aborted.grammar = Mock()
-                batch = SimpleNamespace(
+                batch = ScheduleBatch(
                     reqs=[aborted, live],
-                    chunked_req=None,
-                    decoding_reqs=[],
                     return_logprob=True,
                     return_hidden_states=True,
                     return_hidden_states_mode=CaptureHiddenMode.LAST,
-                    spec_info=None,
-                    prefill_stats=None,
-                    dp_cooperation_info=None,
                 )
                 result = GenerationBatchResult(
                     logits_output=LogitsProcessorOutput(
@@ -410,15 +408,8 @@ class TestAbortedFinalPrefill(CustomTestCase):
                     extend_input_len_per_req=[2, 3],
                     extend_logprob_start_len_per_req=[0, 0],
                 )
-                cache = Mock(lease_checkpoint_state_slots=lambda reqs: nullcontext())
-                processor = replace(
-                    _make_processor(self, "last"),
-                    tree_cache=cache,
-                    request_retirer=release_only_retirer(cache),
-                    logprob_result_processor=SchedulerLogprobResultProcessor(
-                        model_config=SimpleNamespace(vocab_size=1000)
-                    ),
-                )
+                processor = _make_processor(self, "last")
+                cache = processor.tree_cache
 
                 def assert_clean_before_stream(*_):
                     self.assertFalse(aborted.output_ids)
