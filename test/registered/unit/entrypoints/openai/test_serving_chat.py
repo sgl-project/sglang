@@ -4040,6 +4040,47 @@ class ServingChatTestCase(CustomTestCase):
             tool_calls = payload["choices"][0]["delta"]["tool_calls"]
             self.assertEqual(tool_calls[0]["id"], "functions.get_weather:1")
 
+    def test_parallel_tool_calls_false_reaches_tool_call_parser(self):
+        """parallel_tool_calls=False must reach the FunctionCallParser built for
+        auto tool choice, else a second tool call in the same turn is returned."""
+        self.chat.tool_call_parser = "hermes"
+        tools = [{"type": "function", "function": {"name": "get_weather"}}]
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "weather in Hanoi and Tokyo?"}],
+            tools=tools,
+            parallel_tool_calls=False,
+            stream=True,
+        )
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+        ) as ParserMock:
+            ParserMock.return_value.has_tool_call.return_value = False
+            self.chat._process_tool_calls(
+                text="hi",
+                tools=tools,
+                finish_reason={"type": "stop", "matched": None},
+                parallel_tool_calls=False,
+            )
+            self.assertIs(ParserMock.call_args.kwargs["parallel_tool_calls"], False)
+
+            ParserMock.return_value.parse_stream_chunk.return_value = ("", [])
+
+            async def drain():
+                async for _ in self.chat._process_tool_call_stream(
+                    index=0,
+                    delta="x",
+                    parser_dict={},
+                    content={"meta_info": {"id": "chatcmpl-test"}},
+                    request=req,
+                    has_tool_calls={},
+                    created=0,
+                ):
+                    pass
+
+            get_or_create_event_loop().run_until_complete(drain())
+            self.assertIs(ParserMock.call_args.kwargs["parallel_tool_calls"], False)
+
     def test_dpsk_v32_encoding_path(self):
         """Test DeepSeek V3.2 encoding path detection and application."""
         from sglang.srt.parser.template_manager import TemplateManager

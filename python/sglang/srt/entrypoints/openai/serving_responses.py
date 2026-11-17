@@ -1214,6 +1214,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     request._response_parser_tool_grammar,
                     request._response_parser_grammar_start,
                 ),
+                parallel_tool_calls=request.parallel_tool_calls is not False,
             )
             detector_owns_format = self._tool_parser_owns_format(parser)
             should_try_native = not is_required or detector_owns_format
@@ -2341,6 +2342,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     request._response_parser_tool_grammar,
                     request._response_parser_grammar_start,
                 ),
+                parallel_tool_calls=request.parallel_tool_calls is not False,
             )
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if token_stream is None and self.reasoning_parser:
