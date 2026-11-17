@@ -3116,7 +3116,7 @@ class ServingChatTestCase(CustomTestCase):
             ("kimi_k3", "required", json_object, None, True),
             ("kimi_k3", named, json_schema, None, True),
             ("kimi_k3", "required", json_object, "a+", False),
-            (None, "required", json_object, None, True),
+            (None, "required", json_object, None, False),
         )
         for spec, tool_choice, response_format, regex, accepted in cases:
             _use_chat_encoding(self.chat, spec)
@@ -3142,9 +3142,6 @@ class ServingChatTestCase(CustomTestCase):
                 self.assertNotIn("json_schema", adapted.sampling_params)
                 self.assertIn("structural_tag", adapted.sampling_params)
                 kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
-                if spec is None:
-                    self.assertNotIn("response_format", kwargs)
-                    continue
                 self.assertEqual(
                     kwargs["response_format"]["type"], response_format["type"]
                 )

@@ -35,9 +35,6 @@ from sglang.srt.managers.scheduler_components.pause_state import (  # noqa: E402
     PauseState,
 )
 from sglang.srt.managers.scheduler_components.request_list import move  # noqa: E402
-from sglang.srt.observability.scheduler_stage_metrics import (  # noqa: E402
-    SchedulerStageMetricsRecorder,
-)
 from sglang.test.scheduler_test_utils import FakeReq, empty_request_lists  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -91,7 +88,6 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched.hisparse_coordinator = None
     sched.uocr_runtime = None
     sched.ipc_channels = Mock()
-    sched.scheduler_stage_metrics = SchedulerStageMetricsRecorder(enabled=False)
     sched.init_request_retirer()
     return sched
 

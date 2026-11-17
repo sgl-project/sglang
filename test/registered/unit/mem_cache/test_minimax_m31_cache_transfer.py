@@ -172,9 +172,8 @@ def test_pd_transfer_sends_the_suffix_with_all_scales(length, prefix):
     )
     src_storage, dst_storage = static_storage(src), static_storage(dst)
     src_args, dst_args = KVArgs(), KVArgs()
-    with get_context().override_server_args():
-        setup_state_kv_args(src_args, src_storage)
-        setup_state_kv_args(dst_args, dst_storage)
+    setup_state_kv_args(src_args, src_storage)
+    setup_state_kv_args(dst_args, dst_storage)
     assert src_args.state_types == [StateType.MINIMAX_INDEX_K]
 
     def state(args):

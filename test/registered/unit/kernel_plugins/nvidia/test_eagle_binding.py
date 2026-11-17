@@ -640,8 +640,6 @@ class TestEagleEntries(CustomTestCase):
                 target_spec = SimpleNamespace(
                     name="qwen3_5_verify",
                     build=MagicMock(return_value=built),
-                    tensor_verify_binding_kind=0,
-                    tensor_verify_build=None,
                     prepare=None,
                     max_rows=4,
                     numerics=SimpleNamespace(kind=SimpleNamespace(value="exact")),
