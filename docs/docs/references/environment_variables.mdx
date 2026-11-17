@@ -138,6 +138,11 @@ SGLang supports various environment variables that can be used to configure its 
   </thead>
   <tbody>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable the Kimi K3.1 GB300 runtime optimizations accompanying the NVIDIA megakernel: SGLang's DFLASH, custom all-reduce size, TRT-LLM MLA workspace and spec TP sync settings take their GB300 values, DCP push-combine rows per call rise from 1024 to 1536, K3 all-reduce fusion (`SGLANG_K3_AR_FUSION`) is forced on, and server argument resolution sets `CUDA_MODULE_LOADING=EAGER` and `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` for every spawned process. Unset child switches follow this value; explicitly set child values take precedence, including `0`. Existing backend and capability checks still apply. Simulation and debug controls remain independent. This does not enable the megakernel backend itself.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable the DSv4.1 DSpark and Qwen3.5 MTP runtime optimization groups accompanying NVIDIA megakernels, including EAGLE post-verify graphs and GDN prefill graphs. Unset child switches follow this value; explicitly set child values take precedence, including `0`. Existing backend and capability checks still apply. Simulation, fake/forced acceptance and skip-computation controls remain independent. This does not enable the megakernel backend itself.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
@@ -729,6 +734,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable strict memory checks while the scheduler is idle.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_GC_FROZEN_GARBAGE_CHECK</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>--gc-freeze-on-idle-secs</code>, check every idle freeze for frozen objects that are cyclic garbage and report them as a leak (raised under <code>SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE</code>). For tests.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NATIVE_MOVE_KV_CACHE</code></td>
@@ -2014,6 +2024,11 @@ SGLang supports various environment variables that can be used to configure its 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use the native Gemma RMSNorm forward (for Skywork-Reward-Gemma-2-27B-v0.2).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NPU_ENABLE_STATIC_KERNEL</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Compile static-shape kernels for the captured decode buckets. Requires <code>--enable-torch-compile</code> and decode graph capture, and <code>LOCAL_WORLD_SIZE</code> on more than one rank. Off by default because it adds a large startup cost.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
