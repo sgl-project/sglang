@@ -209,6 +209,16 @@ else:
     )
 
 
+def _eager_max_seqlen_k(forward_batch, draft_token_num: int, static_width: int) -> int:
+    if forward_batch.seq_lens.numel() == 0:
+        return 1 + draft_token_num
+    if forward_batch.seq_lens_cpu is not None:
+        return int(forward_batch.seq_lens_cpu.max().item()) + draft_token_num
+    # Use the static width to avoid rank-divergent D2H syncs.
+    # Top-k masks unused columns by cache_seqlens.
+    return static_width
+
+
 def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tensor:
     # Always normalize to (N_total, 1) layout, to avoid deadlock at deep_gemm.fp8_paged_mqa_logits
     if seqlens_32.dim() == 2:
@@ -1561,14 +1571,9 @@ class DeepseekSparseAttnBackend(
 
         cache_seqlens_int32 = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
-        if forward_batch.seq_lens_cpu is not None:
-            max_seqlen_k = int(
-                forward_batch.seq_lens_cpu.max().item() + draft_token_num
-            )
-        else:
-            # Use the static width to avoid rank-divergent D2H syncs.
-            # Top-k masks unused columns by cache_seqlens.
-            max_seqlen_k = self.req_to_token.shape[1]
+        max_seqlen_k = _eager_max_seqlen_k(
+            forward_batch, draft_token_num, self.req_to_token.shape[1]
+        )
         # [b, max_seqlen_k]
         page_table = self._gather_token_table(
             self.req_to_token_pool.req_to_token,
@@ -2033,21 +2038,18 @@ class DeepseekSparseAttnBackend(
         max_ctx_len = self.req_to_token.shape[1]
         # rewritten in full before every replay; the init-once metadata below would resume zeroed
         with self._memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_CUDA_GRAPH):
-            trtllm_num_q_heads = trtllm_padded_heads(self.num_q_heads)
-            if (
-                self._trtllm_fused_q
-                and trtllm_num_q_heads != self.num_q_heads
-                and self.dsa_decode_impl == "trtllm"
-            ):
-                self._trtllm_q_pad_graph = torch.zeros(
-                    (
-                        max_num_tokens,
-                        trtllm_num_q_heads,
-                        self.kv_lora_rank + self.qk_rope_head_dim,
-                    ),
-                    dtype=torch.float8_e4m3fn,
-                    device=self.device,
-                )
+            if self._trtllm_fused_q and self.dsa_decode_impl == "trtllm":
+                trtllm_num_q_heads = trtllm_padded_heads(self.num_q_heads)
+                if trtllm_num_q_heads != self.num_q_heads:
+                    self._trtllm_q_pad_graph = torch.zeros(
+                        (
+                            max_num_tokens,
+                            trtllm_num_q_heads,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                        ),
+                        dtype=torch.float8_e4m3fn,
+                        device=self.device,
+                    )
             if self._flashmla_kv_pad_q_in_place:
                 self._flashmla_kv_q_pad_graph = torch.zeros(
                     (

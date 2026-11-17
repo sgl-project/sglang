@@ -713,12 +713,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     kvc.server_args.indexer_kv_cache_dtype, dtype
                 )
                 if indexer_quant_mode == QUANT_MODE_TOKEN_INT8:
+                    if get_dsa_index_kpool(kvc.model_config.hf_config) > 1:
+                        raise ValueError(
+                            "INT8 indexer KV cache is not supported with NPU KPool."
+                        )
                     indexer_size_per_token = (
                         index_head_dim + torch._utils._element_size(torch.float16)
                     )
                     element_size = 1
                 else:
-                    indexer_size_per_token = index_head_dim
+                    indexer_size_per_token = ceil_div(
+                        index_head_dim, get_dsa_index_kpool(kvc.model_config.hf_config)
+                    )
                     element_size = torch._utils._element_size(dtype)
         memory_config = get_memory()
         indexer_ratio = 1
