@@ -195,6 +195,7 @@ _run_direct_dense = None
 _warp_splitk_tactic = None
 _run_warp_splitk_dense = None
 _enable_bf16_splitk_gemm = False
+_use_bf16_gemm_table = False
 _mm_bf16 = None
 _flashinfer_autotuner = None
 # CuTe DSL tactics lose to the hand tables and TGV/cuBLAS at M = 24/32.
@@ -431,6 +432,41 @@ def precompile_sm107_splitk_tactics() -> bool:
     )
 
 
+def _should_use_bf16_gemm_table() -> bool:
+    if not envs.SGLANG_OPT_BF16_GEMM_TABLE.get():
+        return False
+    if not _is_cuda:
+        logger.warning("SGLANG_OPT_BF16_GEMM_TABLE needs CUDA; ignored")
+        return False
+    if get_exec().deterministic.enable_deterministic_inference:
+        # Batch-invariant mode replaces aten::mm, so the table's entries,
+        # recorded against cuBLAS, would not match it.
+        logger.warning(
+            "SGLANG_OPT_BF16_GEMM_TABLE is ignored with "
+            "--enable-deterministic-inference"
+        )
+        return False
+    return True
+
+
+def pinned_bf16_linear(
+    x: torch.Tensor, weight: torch.Tensor, out: Optional[torch.Tensor] = None
+) -> Optional[torch.Tensor]:
+    """F.linear(x, weight) without bias through SGLANG_OPT_BF16_GEMM_TABLE, or
+    None (table off, shape not in it, or operands not eligible)."""
+    if (
+        not _use_bf16_gemm_table
+        or torch.compiler.is_compiling()
+        or not x.is_contiguous()
+        or x.dim() < 2
+    ):
+        return None
+    from sglang.kernels.ops.gemm.pinned_bf16_gemm import pinned_mm
+
+    y = pinned_mm(x.view(-1, x.shape[-1]), weight, out=out)
+    return None if y is None else y.view(*x.shape[:-1], weight.shape[0])
+
+
 def initialize_bf16_gemm_config() -> None:
     global _BF16_GEMM_BACKEND
     global _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
@@ -444,6 +480,9 @@ def initialize_bf16_gemm_config() -> None:
     global _active_warp_splitk_tactics
     global _mm_bf16, _flashinfer_autotuner
     global _skip_aiter_unquant
+    global _use_bf16_gemm_table
+
+    _use_bf16_gemm_table = _should_use_bf16_gemm_table()
 
     _skip_aiter_unquant = (
         _is_gfx95 and get_exec().deterministic.enable_deterministic_inference
@@ -692,6 +731,10 @@ def _bf16_gemm_dispatch_impl(
         assert bias is None
         return torch.addmm(addend, x, weight.t(), out=addend)
     else:
+        if _use_bf16_gemm_table and bias is None:
+            output = pinned_bf16_linear(x, weight)
+            if output is not None:
+                return output
         return F.linear(x, weight, bias)
 
     if addend is not None:
@@ -1027,6 +1070,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 return bf16_gemm_dispatch(x, layer.weight, bias)
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
 
+        if _use_bf16_gemm_table and bias is None:
+            output = pinned_bf16_linear(x, layer.weight)
+            if output is not None:
+                return output
         if bias is not None:
             # RowParallelLinear holds its bias on TP rank 0 only, and FlashInfer
             # syncs each tuning call across TP ranks.
@@ -1113,6 +1160,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 f"linear output has shape {output.shape}, expected "
                 f"{(x.shape[0], layer.weight.shape[0])}"
             )
+        if (
+            _use_bf16_gemm_table
+            and bias is None
+            and pinned_bf16_linear(x, layer.weight, out=output) is not None
+        ):
+            return output
         torch.mm(x, layer.weight.t(), out=output)
         if bias is not None:
             output.add_(bias)
