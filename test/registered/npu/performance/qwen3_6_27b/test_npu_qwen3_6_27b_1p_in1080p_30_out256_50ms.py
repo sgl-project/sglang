@@ -13,12 +13,6 @@ register_npu_ci(
     suite="nightly-perf-2-npu-a3",
     nightly=True,
 )
-# Temporary single-point verification suite: only this case runs here.
-register_npu_ci(
-    est_time=3600,
-    suite="nightly-perf-2-npu-a3-temp-qwen36-27b-mm",
-    nightly=True,
-)
 
 QWEN3_6_27B_1080P_ENVS = {
     "STREAMS_PER_DEVICE": "32",
