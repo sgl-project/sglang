@@ -395,7 +395,8 @@ def _run_page_first_staged_write_back_mha(
         element_size=element_dim * host_pool.dtype.itemsize,
     )
     assert host_pool.can_use_write_back_jit
-    if element_dim * host_pool.dtype.itemsize % 128 != 0:
+    # ROCm's direct copy tiles every 16-byte multiple (hicache._default_unroll)
+    if element_dim * host_pool.dtype.itemsize % 128 != 0 and not is_hip():
         assert not host_pool.can_use_jit
     assert host_pool.staging_page_capacity > 0
     if page_count > 64:
@@ -506,7 +507,8 @@ def _run_page_first_staged_write_back_mla(
         element_size=element_dim * host_pool.dtype.itemsize,
     )
     assert host_pool.can_use_write_back_jit
-    if element_dim * host_pool.dtype.itemsize % 128 != 0:
+    # ROCm's direct copy tiles every 16-byte multiple (hicache._default_unroll)
+    if element_dim * host_pool.dtype.itemsize % 128 != 0 and not is_hip():
         assert not host_pool.can_use_jit
     assert host_pool.staging_page_capacity > 0
     if page_count > 64:
