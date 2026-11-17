@@ -187,7 +187,9 @@ class InvalidGrammarObject(BaseGrammarObject):
         return f"InvalidGrammarObject(error_message={self.error_message!r})"
 
     def memory_size_bytes(self) -> int:
-        return 0  # only an error message; caching it costs nothing
+        # The scheduler caches failed compilations too, so a stream of distinct
+        # invalid grammars must still count against the budget.
+        return len(self.error_message.encode("utf-8", "replace"))
 
 
 class BaseGrammarBackend:
@@ -324,11 +326,17 @@ class BaseGrammarBackend:
         value = self.executor.submit(self._init_value_dispatch, key, require_reasoning)
         return value, False
 
-    def _charge_bytes(self, value: BaseGrammarObject) -> int:
+    @staticmethod
+    def key_bytes(key: Tuple[str, str]) -> int:
+        """Bytes the cache holds for the key itself (the schema / regex /
+        EBNF text); for an InvalidGrammarObject this is most of the entry."""
+        return sum(len(str(part).encode("utf-8", "replace")) for part in key)
+
+    def _charge_bytes(self, key: Tuple[str, str], value: BaseGrammarObject) -> int:
         size = value.memory_size_bytes()
         if not isinstance(size, int) or isinstance(size, bool) or size < 0:
-            return self.NOMINAL_GRAMMAR_BYTES
-        return size
+            size = self.NOMINAL_GRAMMAR_BYTES
+        return size + self.key_bytes(key)
 
     def _over_budget(self) -> bool:
         return 0 < self.cache_limit_bytes < self.cache_size_bytes
@@ -338,7 +346,7 @@ class BaseGrammarBackend:
             self.cache_size_bytes -= self._cache_entry_bytes[key]
         self.cache[key] = value
         self.cache.move_to_end(key)
-        size = self._charge_bytes(value)
+        size = self._charge_bytes(key, value)
         self._cache_entry_bytes[key] = size
         self.cache_size_bytes += size
         # The entry just inserted always stays, so an immediately repeated

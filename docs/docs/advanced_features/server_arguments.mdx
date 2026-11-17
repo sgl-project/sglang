@@ -770,7 +770,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--grammar-cache-limit-bytes`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Host-memory budget in bytes for the compiled-grammar cache (json_schema / regex / EBNF / structural tags). Least recently used grammars are evicted past it; the xgrammar backend applies the same limit to its own compiler cache. 0 or a negative value disables the bound. Entries are charged the size the backend reports (xgrammar `CompiledGrammar.memory_size_bytes`; a nominal 1 MiB for backends without a size API), so resident memory can run above the budget.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Host-memory budget in bytes for the compiled-grammar cache (json_schema / regex / EBNF / structural tags). Least recently used grammars are evicted past it; the xgrammar backend applies the same limit to its own compiler cache. 0 or a negative value disables the bound. Entries are charged the size the backend reports (xgrammar `CompiledGrammar.memory_size_bytes`; a nominal 1 MiB for backends without a size API) plus the key text; failed compilations are cached too and charged for their key and error text.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`1073741824` (1 GiB)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
