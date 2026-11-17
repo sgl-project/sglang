@@ -117,6 +117,7 @@ from sglang.multimodal_gen.runtime.layers.usp import (
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
+    get_forward_context_or_none,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -1209,6 +1210,24 @@ def _minimax_h3_attention_core_impl(
                 ),
             )
         else:
+            extra_kwargs = {}
+            if (
+                current_platform.is_npu()
+                and attention._attention_backend_enum is AttentionBackendEnum.FA
+                and not attention.prefix.startswith("blocks.")
+            ):
+                from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
+                    AscendFAMetadata,
+                )
+
+                context = get_forward_context_or_none()
+                metadata = context.attn_metadata if context is not None else None
+                if (
+                    isinstance(metadata, AscendFAMetadata)
+                    and metadata.precision is not None
+                ):
+                    # Keep the refiner native when the DiT selects SD precision.
+                    extra_kwargs["attn_metadata"] = AscendFAMetadata(precision="bf16")
             out = attention._attention_impl.forward_varlen(
                 q,
                 k,
@@ -1216,6 +1235,7 @@ def _minimax_h3_attention_core_impl(
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 cu_seqlens_host=cu_seqlens_host,
+                **extra_kwargs,
             )
     if ulysses_active:
         out = _usp_output_all_to_all(out[None], head_dim=2)[0]
@@ -1253,6 +1273,7 @@ class MiniMaxH3Attention(nn.Module):
         self.local_inner_dim = self.num_heads * self.head_dim
         self.softmax_scale = self.head_dim**-0.5
         self.prefix = prefix
+        self._quant_config = quant_config
         self._attention_impl = None
         self._attention_backend_enum: AttentionBackendEnum | None = None
         # attention initializes on the first real QKV tensors, after the
@@ -1362,6 +1383,7 @@ class MiniMaxH3Attention(nn.Module):
             num_kv_heads=self.num_heads,
             prefix=self.prefix,
             packed_trailing_padding=True,
+            quant_config=self._quant_config,
         )
         # Ring only supports _RING_ATTENTION_BACKENDS; keep the resolved enum
         # alongside the impl instance instead of a second get_attn_backend()
