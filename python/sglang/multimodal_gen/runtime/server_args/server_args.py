@@ -2309,7 +2309,8 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.minimax_h3_adaln_plan_width,
             help=(
                 "Widest timestep plan --minimax-h3-adaln-online sizes its slab "
-                "for. The default 4 covers every task; a deployment serving "
+                "for. Auto: 4 for video releases (covers every task), 2 for "
+                "image releases; a deployment serving "
                 "only t2va (2) or fl2va (3) can shrink the slab proportionally. "
                 "A request exceeding it is rejected rather than truncated."
             ),
@@ -2576,7 +2577,13 @@ class ServerArgs(DisaggServerArgsMixin):
             "--enable-cfg-parallel",
             action=StoreBoolean,
             default=None,
-            help="Enable cfg parallel at degree 2. Auto-enabled when num_gpus >= 2 and no SP flags are set. Use false to disable it explicitly.",
+            help="Enable CFG parallel at degree 2. When neither this flag nor "
+            "--cfg-parallel-size is set, it is auto-enabled (at the "
+            "deployment-config degree, default 2) for models that use CFG by "
+            "default and whose deployment config allows it, when num_gpus >= 2 is "
+            "divisible by dp x tp x that degree, no SP flags are set, and "
+            "--performance-mode is not manual. Use false to disable it "
+            "explicitly.",
         )
         parser.add_argument(
             "--cfg-parallel-size",
@@ -2603,7 +2610,8 @@ class ServerArgs(DisaggServerArgsMixin):
             "--hsdp-replicate-dim",
             type=int,
             default=ServerArgs.hsdp_replicate_dim,
-            help="The data parallelism size.",
+            help="Replicate dimension of the HSDP device mesh (replicate x shard) "
+            "used when sharding DiT weights with FSDP.",
         )
         parser.add_argument(
             "--hsdp-shard-dim",
@@ -2702,8 +2710,7 @@ class ServerArgs(DisaggServerArgsMixin):
             "graph. Prompt-conditioning is padded up to the smallest bucket "
             "that fits so different prompt lengths reuse one captured graph; "
             "warmup captures one graph per bucket. Defaults to "
-            f"{' '.join(map(str, DEFAULT_BCG_TEXT_BUCKETS))}. "
-            "Replaces the legacy SGLANG_BCG_TEXT_BUCKETS env var.",
+            f"{' '.join(map(str, DEFAULT_BCG_TEXT_BUCKETS))}.",
         )
 
         parser.add_argument(
@@ -2818,8 +2825,9 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.dit_layerwise_offload,
             help="Enable layerwise CPU offload with async H2D prefetch overlap for DiTs. "
             "It selects only the DiT layerwise group. Compatible with cache-dit: "
-            "skipped blocks are not streamed. Cannot be used together with "
-            "use_fsdp_inference. If legacy DiT offload flags are also provided, "
+            "skipped blocks are not streamed. FSDP (--use-fsdp-inference) does "
+            "not shard a layerwise-offloaded DiT; it applies only to resident "
+            "components. If legacy DiT offload flags are also provided, "
             "layerwise offload is the effective DiT mode.",
         )
         parser.add_argument(
@@ -3080,7 +3088,8 @@ class ServerArgs(DisaggServerArgsMixin):
             "--master-port",
             type=int,
             default=ServerArgs.master_port,
-            help="Master port for distributed inference. If not set, a random free port will be used.",
+            help="Master port for torch.distributed rendezvous (default: 30005). "
+            "If it is busy a nearby free port is chosen, unless --strict-ports is set.",
         )
         parser.add_argument(
             "--scheduler-port",
@@ -3186,7 +3195,7 @@ class ServerArgs(DisaggServerArgsMixin):
             "--webui-port",
             type=int,
             default=ServerArgs.webui_port,
-            help="Whether to use webui for better display",
+            help="Port for the Gradio web UI started by --webui (default: 12312).",
         )
         parser.add_argument(
             "--output-path",
