@@ -475,6 +475,42 @@ const RELAYED_BY: &[(&str, &[&str])] = &[
         "ResumeMemoryOccupationReqInput",
         &["/resume_memory_occupation"],
     ),
+    ("GetWeightsByNameReqInput", &["/get_weights_by_name"]),
+    (
+        "InitWeightsUpdateGroupReqInput",
+        &["/init_weights_update_group"],
+    ),
+    (
+        "DestroyWeightsUpdateGroupReqInput",
+        &["/destroy_weights_update_group"],
+    ),
+    (
+        "InitWeightsSendGroupForRemoteInstanceReqInput",
+        &["/init_weights_send_group_for_remote_instance"],
+    ),
+    (
+        "SendWeightsToRemoteInstanceReqInput",
+        &["/send_weights_to_remote_instance"],
+    ),
+    (
+        "UpdateWeightFromDiskReqInput",
+        &["/update_weights_from_disk"],
+    ),
+    (
+        "UpdateWeightsFromDistributedReqInput",
+        &["/update_weights_from_distributed"],
+    ),
+    (
+        "UpdateWeightsFromTensorReqInput",
+        &["/update_weights_from_tensor"],
+    ),
+    (
+        "UpdateWeightsFromIPCReqInput",
+        &["/update_weights_from_ipc"],
+    ),
+    ("BeginWeightUpdateReqInput", &["/begin_weight_update"]),
+    ("EndWeightUpdateReqInput", &["/end_weight_update"]),
+    ("PluginWeightUpdateReqInput", &["/plugin_weight_update"]),
     ("PauseGenerationReqInput", &["/pause_generation"]),
     ("ContinueGenerationReqInput", &["/continue_generation"]),
     ("PdRoleSwitchReqInput", &["/pd_role_switch"]),

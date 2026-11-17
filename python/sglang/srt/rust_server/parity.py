@@ -97,7 +97,6 @@ RUST_SERVER_IGNORED_BY_DESIGN: Dict[str, str] = {
     "tool_server": "/v1/responses is not served.",
     "enable_mis": "/v1/decisions is not served.",
     "dllm_algorithm": "/v1/decisions is not served.",
-    "engine_info_bootstrap_url": "/get_remote_instance_transfer_engine_info is not served.",
     "chunked_prefill_size": "/v1/score is not served.",
     "enable_streaming_session": "/open_session is not served.",
     "speculative_ngram_external_corpus_max_tokens": "/add_external_corpus is not served.",

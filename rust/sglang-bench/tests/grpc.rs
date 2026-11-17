@@ -210,6 +210,106 @@ impl SglangService for Mock {
     ) -> Result<Response<api::MemoryOccupationResponse>, Status> {
         Err(Status::unimplemented("resume_memory_occupation"))
     }
+    async fn get_weights_by_name(
+        &self,
+        _: Request<api::GetWeightsByNameRequest>,
+    ) -> Result<Response<api::GetWeightsByNameResponse>, Status> {
+        Err(Status::unimplemented("get_weights_by_name"))
+    }
+    async fn init_weights_update_group(
+        &self,
+        _: Request<api::InitWeightsUpdateGroupRequest>,
+    ) -> Result<Response<api::WeightGroupResponse>, Status> {
+        Err(Status::unimplemented("init_weights_update_group"))
+    }
+    async fn destroy_weights_update_group(
+        &self,
+        _: Request<api::DestroyWeightsUpdateGroupRequest>,
+    ) -> Result<Response<api::WeightGroupResponse>, Status> {
+        Err(Status::unimplemented("destroy_weights_update_group"))
+    }
+    async fn init_weights_send_group_for_remote_instance(
+        &self,
+        _: Request<api::InitWeightsSendGroupForRemoteInstanceRequest>,
+    ) -> Result<Response<api::WeightGroupResponse>, Status> {
+        Err(Status::unimplemented(
+            "init_weights_send_group_for_remote_instance",
+        ))
+    }
+    async fn send_weights_to_remote_instance(
+        &self,
+        _: Request<api::SendWeightsToRemoteInstanceRequest>,
+    ) -> Result<Response<api::WeightGroupResponse>, Status> {
+        Err(Status::unimplemented("send_weights_to_remote_instance"))
+    }
+    async fn get_remote_instance_transfer_engine_info(
+        &self,
+        _: Request<api::RemoteInstanceTransferEngineInfoRequest>,
+    ) -> Result<Response<api::RemoteInstanceTransferEngineInfoResponse>, Status> {
+        Err(Status::unimplemented(
+            "get_remote_instance_transfer_engine_info",
+        ))
+    }
+    async fn update_weights_from_disk(
+        &self,
+        _: Request<api::UpdateWeightsFromDiskRequest>,
+    ) -> Result<Response<api::UpdateWeightsFromDiskResponse>, Status> {
+        Err(Status::unimplemented("update_weights_from_disk"))
+    }
+    async fn update_weights_from_distributed(
+        &self,
+        _: Request<api::UpdateWeightsFromDistributedRequest>,
+    ) -> Result<Response<api::WeightUpdateResponse>, Status> {
+        Err(Status::unimplemented("update_weights_from_distributed"))
+    }
+    async fn update_weights_from_tensor(
+        &self,
+        _: Request<api::UpdateWeightsFromTensorRequest>,
+    ) -> Result<Response<api::WeightUpdateResponse>, Status> {
+        Err(Status::unimplemented("update_weights_from_tensor"))
+    }
+    async fn update_weights_from_ipc(
+        &self,
+        _: Request<api::UpdateWeightsFromIpcRequest>,
+    ) -> Result<Response<api::WeightUpdateResponse>, Status> {
+        Err(Status::unimplemented("update_weights_from_ipc"))
+    }
+    async fn begin_weight_update(
+        &self,
+        _: Request<api::BeginWeightUpdateRequest>,
+    ) -> Result<Response<api::WeightUpdateResponse>, Status> {
+        Err(Status::unimplemented("begin_weight_update"))
+    }
+    async fn end_weight_update(
+        &self,
+        _: Request<api::EndWeightUpdateRequest>,
+    ) -> Result<Response<api::WeightUpdateResponse>, Status> {
+        Err(Status::unimplemented("end_weight_update"))
+    }
+    async fn plugin_weight_update(
+        &self,
+        _: Request<api::PluginWeightUpdateRequest>,
+    ) -> Result<Response<api::PluginWeightUpdateResponse>, Status> {
+        Err(Status::unimplemented("plugin_weight_update"))
+    }
+    async fn load_lora_adapter(
+        &self,
+        _: Request<api::LoadLoraAdapterRequest>,
+    ) -> Result<Response<api::LoraUpdateResponse>, Status> {
+        Err(Status::unimplemented("load_lora_adapter"))
+    }
+    async fn load_lora_adapter_from_tensors(
+        &self,
+        _: Request<api::LoadLoraAdapterFromTensorsRequest>,
+    ) -> Result<Response<api::LoraUpdateResponse>, Status> {
+        Err(Status::unimplemented("load_lora_adapter_from_tensors"))
+    }
+    async fn unload_lora_adapter(
+        &self,
+        _: Request<api::UnloadLoraAdapterRequest>,
+    ) -> Result<Response<api::LoraUpdateResponse>, Status> {
+        Err(Status::unimplemented("unload_lora_adapter"))
+    }
     async fn freeze_gc(
         &self,
         _: Request<api::FreezeGcRequest>,
