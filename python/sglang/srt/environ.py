@@ -493,6 +493,10 @@ class Envs:
     # SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE (single combined trace) takes
     # precedence when both are set.
     SGLANG_GRAPH_BATCH_CAPTURE = EnvBool(False)
+    # Experimental: record a capture-time op map (graph node -> module path) per
+    # full CUDA graph into SGLANG_TORCH_PROFILER_DIR, and emit per-module spans
+    # on eager forwards while a torch profiler is active. See observability/op_trace.
+    SGLANG_ENABLE_OP_TRACE_MAP = EnvBool(False)
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
     # Allocator-history buffer for /start_profile activities=["MEM"]; the
     # default truncates long windows (each entry is one alloc/free event).

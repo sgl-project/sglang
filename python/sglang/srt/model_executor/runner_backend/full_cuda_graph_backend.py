@@ -17,7 +17,7 @@ torch.cuda.CUDAGraph per shape.
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -41,7 +41,8 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_capture_scope,
     graph_pool_replay_scope,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.observability.op_trace import capture as op_trace_capture
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -128,6 +129,10 @@ class FullCudaGraphBackend(BaseGraphBackend):
             enable=enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
         )
+        # The op map hooks are unvalidated under torch.compile, so skip them there.
+        self._op_trace_map = (
+            op_trace_capture.enabled() and not get_flags().capture.enable_torch_compile
+        )
 
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):
@@ -135,10 +140,14 @@ class FullCudaGraphBackend(BaseGraphBackend):
             self._pool = get_or_create_global_graph_memory_pool(self._device_module)
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
+        if self._op_trace_map:
+            op_trace_capture.register_model(self._cuda_graph_runner.model_runner.model)
         try:
             yield
         finally:
             self._capture_stream = None
+            if self._op_trace_map:
+                op_trace_capture.flush(tp_rank=get_parallel().tp_rank)
 
     def capture_one(
         self,
@@ -204,6 +213,7 @@ class FullCudaGraphBackend(BaseGraphBackend):
         with (
             graph_pool_capture_scope(),
             graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream),
+            self._op_trace_scope(shape_key),
         ):
             self._precarve.mint()
             out = forward_fn()
@@ -222,6 +232,18 @@ class FullCudaGraphBackend(BaseGraphBackend):
         self._outputs[shape_key] = out
         # Captured kernels can read tensors owned only by the dummy batch.
         self._capture_inputs[shape_key] = capture_inputs
+
+    def _op_trace_scope(self, shape_key: ShapeKey) -> AbstractContextManager:
+        # Entered inside the graph context so the graph is still under capture.
+        if not self._op_trace_map:
+            return nullcontext()
+        runner = self._cuda_graph_runner
+        return op_trace_capture.capture_scope(
+            runner=type(runner).__name__,
+            shape=repr(shape_key),
+            forward_mode=runner.capture_forward_mode.name,
+            size=shape_key.size,
+        )
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs

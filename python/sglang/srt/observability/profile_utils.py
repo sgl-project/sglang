@@ -17,6 +17,7 @@ from sglang.srt.model_executor.step_span_utils import (
     detailed_annotations_enabled,
     set_detailed_annotations_enabled,
 )
+from sglang.srt.observability.op_trace import capture as op_trace_capture
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device, get_parallel
 from sglang.srt.utils import is_npu
@@ -347,12 +348,16 @@ class _ProfilerTorch(_ProfilerConcreteBase):
                 else torch_npu.profiler.tensorboard_trace_handler(self.output_dir)
             ),
         )
+        if op_trace_capture.enabled():
+            op_trace_capture.set_eager_spans("CPU" in self.activities)
         self.torch_profiler.start()
 
     def stop(self):
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
 
         self.torch_profiler.stop()
+        if op_trace_capture.enabled():
+            op_trace_capture.set_eager_spans(None)
         if not _is_npu:
             # Build filename with only non-zero ranks to maintain backward compatibility
             filename_parts = [self.profile_id, f"TP-{get_parallel().tp_rank}"]
