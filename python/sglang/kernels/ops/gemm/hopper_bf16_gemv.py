@@ -55,7 +55,7 @@ def _jit_hopper_bf16_gemv_module(n: int, k: int) -> Module:
 
 
 def use_hopper_bf16_gemv(m: int, n: int, k: int) -> bool:
-    # Additional single-row BF16 shapes validated on RTX 5070 Ti.
+    # Additional single-row BF16 shapes
     if (
         current_arch().is_sm(12, 0)
         and m == 1
