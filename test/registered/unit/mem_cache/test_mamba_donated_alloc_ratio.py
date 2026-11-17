@@ -749,5 +749,61 @@ class TestExtraMambaCacheSizing(CustomTestCase):
                 )
 
 
+class TestHostOnlyEmptyTrackingSlot(CustomTestCase):
+    """A running request's host-only checkpoint takes the empty-slot decision of
+    the device read from the request's host flag, without a sync."""
+
+    @staticmethod
+    def _prepare(buffer, empty, keep_idx):
+        comp = object.__new__(MambaComponent)
+        comp.host_only_checkpoint = True
+        comp.checkpoints_level = 3
+        comp.cache = SimpleNamespace(
+            enable_mamba_extra_buffer=True,
+            is_swa_enabled=False,
+            req_to_token_pool=SimpleNamespace(
+                get_mamba_ping_pong_keep_idx=lambda req: req.kv.mamba_last_track_idx
+            ),
+        )
+        req = SimpleNamespace(
+            kv=SimpleNamespace(
+                mamba_last_track_seqlen=64,
+                mamba_last_track_idx=keep_idx,
+                mamba_ping_pong_track_buffer=buffer,
+                mamba_ping_pong_empty=empty,
+            )
+        )
+        params = InsertParams()
+        cache_len = comp.prepare_for_caching_req(
+            req, params, token_ids_len=100, is_finished=False
+        )
+        return cache_len, params
+
+    def test_empty_slot_decision_needs_no_device_read(self):
+        cuda = torch.cuda.is_available()
+        buffer = torch.tensor([5, -1], device="cuda" if cuda else "cpu")
+        for keep_idx, empty in ((0, False), (1, True)):
+            with self.subTest(keep_idx=keep_idx):
+                # The device read the host flag replaces.
+                self.assertEqual(int(buffer[keep_idx].item()) < 0, empty)
+                if cuda:
+                    torch.cuda.set_sync_debug_mode("error")
+                try:
+                    with patch.object(
+                        torch.Tensor, "item", side_effect=AssertionError("read")
+                    ):
+                        cache_len, params = self._prepare(
+                            buffer, [False, True], keep_idx
+                        )
+                finally:
+                    if cuda:
+                        torch.cuda.set_sync_debug_mode(0)
+                self.assertEqual(cache_len, 0 if empty else 64)
+                if empty:
+                    self.assertIsNone(params.mamba_host_src)
+                else:
+                    self.assertEqual(params.mamba_host_src.tolist(), [5])
+
+
 if __name__ == "__main__":
     unittest.main()

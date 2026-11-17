@@ -1033,9 +1033,12 @@ class MambaComponent(TreeComponent):
                         self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
                     )
                     src_slot = req.kv.mamba_ping_pong_track_buffer[keep_idx]
+                    # The host flag, not .item() behind the in-flight forward.
+                    empty = req.kv.mamba_ping_pong_empty[keep_idx]
                 else:
                     src_slot = req.kv.mamba_pool_idx
-                if int(src_slot.reshape(-1)[0].item()) < 0:
+                    empty = int(src_slot.reshape(-1)[0].item()) < 0
+                if empty:
                     return 0
                 self._stash_host_checkpoint_source(insert_params, src_slot)
                 return cache_len
