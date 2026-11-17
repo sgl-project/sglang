@@ -3143,6 +3143,7 @@ def select_experts(
         fold_scale_after_routing
         and apply_routed_scaling_factor_on_output
         and routed_scaling_factor is not None
+        and routed_scaling_factor != 1.0
     ):
         # Shared columns keep their own weight; only routed experts take this scale.
         num_routed_for_gate = top_k_for_gate - num_shared_topk_slots_for_gate
