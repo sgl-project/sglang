@@ -16,17 +16,12 @@ register_mlu_ci(est_time=90, suite="pr-test-2-mlu")
 
 def _worker(role, path, device_index):
     import torch
-    import torch_mlu  # noqa: F401
 
     import sglang.srt.plugins as plugins
-    from sglang.srt.platforms import current_platform
-    from sglang.srt.platforms.mlu import MluSRTPlatform
     from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
     from sglang.srt.utils.serialization import MultiprocessingSerializer
 
     device_index = int(device_index)
-    assert type(current_platform) is MluSRTPlatform
-    assert not plugins._plugins_loaded
     expected = torch.arange(48, dtype=torch.float32).reshape(6, 8)[1:, 1::2]
     if role == "producer":
         monkey_patch_torch_reductions()

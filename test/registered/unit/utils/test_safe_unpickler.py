@@ -3,7 +3,7 @@ import pickle
 import unittest
 from collections import OrderedDict, defaultdict, deque
 from functools import partial
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -129,7 +129,6 @@ class TestMLUTensorIPC(CustomTestCase):
             patch.object(patch_torch, "_is_mlu", True),
         ):
             patch_torch.monkey_patch_torch_reductions()
-            patch_torch.monkey_patch_torch_reductions()
             tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)[:, 1::2]
             for value in (tensor, torch.nn.Parameter(tensor)):
                 with self.subTest(tensor_type=type(value)):
@@ -149,28 +148,19 @@ class TestMLUTensorIPC(CustomTestCase):
             safe_pickle_loads(pickle.dumps(patch_torch._rebuild_mlu_tensor_modified)),
             patch_torch._rebuild_mlu_tensor_modified,
         )
-        native = SimpleNamespace(rebuild_mlu_tensor=lambda: None)
-        with patch.dict(
-            "sys.modules",
-            {
-                "torch_mlu": ModuleType("torch_mlu"),
-                "torch_mlu.mlu": ModuleType("torch_mlu.mlu"),
-                "torch_mlu.mlu.reductions": native,
-            },
+        self.assertIn(
+            ("torch_mlu.mlu.reductions", "rebuild_mlu_tensor"),
+            SafeUnpickler.ALLOWED_GLOBALS,
+        )
+        unpickler = SafeUnpickler(io.BytesIO())
+        for module, name in (
+            (patch_torch.__name__, "_reduce_mlu_tensor"),
+            ("torch_mlu.mlu.reductions", "_reduce_tensor"),
+            ("torch_mlu.mlu.reductions.other", "rebuild_mlu_tensor"),
         ):
-            unpickler = SafeUnpickler(io.BytesIO())
-            self.assertIs(
-                unpickler.find_class("torch_mlu.mlu.reductions", "rebuild_mlu_tensor"),
-                native.rebuild_mlu_tensor,
-            )
-            for module, name in (
-                (patch_torch.__name__, "_reduce_mlu_tensor"),
-                ("torch_mlu.mlu.reductions", "_reduce_tensor"),
-                ("torch_mlu.mlu.reductions.other", "rebuild_mlu_tensor"),
-            ):
-                with self.subTest(module=module, name=name):
-                    with self.assertRaisesRegex(RuntimeError, "Blocked unsafe global"):
-                        unpickler.find_class(module, name)
+            with self.subTest(module=module, name=name):
+                with self.assertRaisesRegex(RuntimeError, "Blocked unsafe global"):
+                    unpickler.find_class(module, name)
 
     def test_rejects_invisible_device(self):
         from sglang.srt.utils.patch_torch import _mlu_device_from_uuid

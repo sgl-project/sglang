@@ -1,4 +1,4 @@
-# Copyright 2023-2026 SGLang Team
+# Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -16,8 +16,8 @@ from typing import Callable, Union
 import torch
 from torch.multiprocessing import reductions
 
-from sglang.srt.utils.common import is_mlu, torch_release
-from sglang.srt.utils.device import is_musa, is_npu
+from sglang.srt.utils.common import torch_release
+from sglang.srt.utils.device import is_mlu, is_musa, is_npu
 
 _is_mlu = is_mlu()
 _is_npu = is_npu()

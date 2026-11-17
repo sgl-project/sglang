@@ -49,6 +49,7 @@ __all__ = [
     "is_xpu",
     "register_xpu_device_properties_for_dynamo",
     "is_npu",
+    "is_mlu",
     "is_host_cpu_x86",
     "is_host_cpu_arm64",
     "is_cpu",
