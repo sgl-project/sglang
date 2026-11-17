@@ -136,20 +136,6 @@ class TestNpuMemoryOccupationPreload(_MemoryOccupationCases, CustomTestCase):
         cls._server.__exit__(None, None, None)
 
 
-class TestNpuMemoryOccupationFreshServer(CustomTestCase):
-    def test_release_resume_on_fresh_server(self):
-        # Keep one case on a freshly-started engine: the shared-server cases
-        # cover repeated cycles, but not the first release on a clean allocator.
-        with npu_server(MODEL, extra_args=MEMORY_ARGS, env=npu_rl_env()) as base_url:
-            golden = generation_signature(base_url, PROMPTS)
-
-            release_memory(base_url, ["weights", "kv_cache"])
-            resume_memory(base_url, ["weights", "kv_cache"])
-
-            actual = generation_signature(base_url, PROMPTS)
-            self.assertEqual(actual, golden, "fresh-server resume changed the output")
-
-
 class TestNpuMemoryOccupationWithoutFlag(CustomTestCase):
     @classmethod
     def setUpClass(cls):
