@@ -317,7 +317,14 @@ def reserve_mla_split_host_memory(
     if v_width > 0:
         total_bytes += num_kv_rows * v_width * dtype.itemsize
 
-    num_indexer_rows = num_tokens * len(buffers.index_layer_indices)
+    # GLM-5.3-Flash index_kpool > 1 packs Indexer pages compressed
+    # (index_page_size < page_size).
+    num_index_tokens = (
+        num_pages * buffers.index_k.shape[2]
+        if buffers.index_k is not None
+        else num_tokens
+    )
+    num_indexer_rows = num_index_tokens * len(buffers.index_layer_indices)
     if buffers.index_k is not None:
         total_bytes += num_indexer_rows * buffers.index_width * dtype.itemsize
     if buffers.index_scales is not None:
