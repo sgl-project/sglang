@@ -59,7 +59,7 @@ _eagle_stub.per_step_draft_out_cache_loc = _per_step_draft_out_cache_loc
 sys.modules.setdefault("sglang.srt.speculative", ModuleType("sglang.srt.speculative"))
 sys.modules.setdefault("sglang.srt.speculative.eagle_utils", _eagle_stub)
 
-from sglang.srt.disaggregation.ascend.conn import AscendStateType
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     C4IndexerAscendBackendMixin,
     CompressorAscendBackendMixin,
@@ -352,7 +352,7 @@ class TestC4StateTransferLayout(unittest.TestCase):
                 req_pool._dsv4_allocator.get_kvcache.return_value = kv_pool
 
                 payloads = dsv4_state_payloads(req_pool, 0, 129, page_size=128)
-                rows = payloads[AscendStateType.DSV4_C4_STATE]()
+                rows = payloads[StateType.DSV4_C4_STATE]()
                 self.assertEqual(rows.tolist(), expected)
 
     @patch(
@@ -415,8 +415,6 @@ class TestC4StateTransferLayout(unittest.TestCase):
         return_value=False,
     )
     def test_a3_payload_follows_swa_pages_at_ring_and_page_boundaries(self, _):
-        from sglang.srt.disaggregation.ascend.conn import AscendStateType
-
         for ring_size, pages in ((8, [7, 3, 9]), (16, [2, 8, 5])):
             req_pool = self._a3_req_pool(ring_size, pages)
             # Exhaust short histories, then cross SWA page boundaries.
@@ -436,7 +434,7 @@ class TestC4StateTransferLayout(unittest.TestCase):
             for seq_len in seq_lens:
                 with self.subTest(ring_size=ring_size, seq_len=seq_len):
                     payloads = dsv4_state_payloads(req_pool, 2, seq_len, page_size=128)
-                    rows = payloads[AscendStateType.DSV4_C4_STATE]().tolist()
+                    rows = payloads[StateType.DSV4_C4_STATE]().tolist()
                     positions = range(max(0, seq_len - 8), seq_len)
                     expected = [
                         pages[pos // 128] * ring_size + pos % ring_size
@@ -447,8 +445,6 @@ class TestC4StateTransferLayout(unittest.TestCase):
 
     @patch("sglang.srt.hardware_backend.npu.utils.is_npu_arch35", return_value=False)
     def test_a3_payload_pairs_history_across_different_peer_rings(self, _):
-        from sglang.srt.disaggregation.ascend.conn import AscendStateType
-
         for src_ring, dst_ring in ((8, 16), (16, 8)):
             src_pages, dst_pages = [7, 3, 9], [2, 8, 5]
             src_req = self._a3_req_pool(src_ring, src_pages)
@@ -472,10 +468,10 @@ class TestC4StateTransferLayout(unittest.TestCase):
                                 dst_pages[pos // 128] * dst_ring + pos % dst_ring
                             ] = value
                         src_rows = dsv4_state_payloads(src_req, 2, seq_len, 128)[
-                            AscendStateType.DSV4_C4_STATE
+                            StateType.DSV4_C4_STATE
                         ]()
                         dst_rows = dsv4_state_payloads(dst_req, 2, seq_len, 128)[
-                            AscendStateType.DSV4_C4_STATE
+                            StateType.DSV4_C4_STATE
                         ]()
                         self.assertEqual(src_rows.dtype.name, "int32")
                         self.assertEqual(dst_rows.dtype.name, "int32")
@@ -487,7 +483,6 @@ class TestC4StateTransferLayout(unittest.TestCase):
 
     @patch("sglang.srt.hardware_backend.npu.utils.is_npu_arch35", return_value=False)
     def test_a3_transfer_rows_match_the_compressor_history(self, _):
-        from sglang.srt.disaggregation.ascend.conn import AscendStateType
         from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
             _build_explicit_state_block_table,
         )
@@ -504,7 +499,7 @@ class TestC4StateTransferLayout(unittest.TestCase):
             for seq_len in (0, 1, 4, 7, 8, 9, 13, 127, 128, 129, 255, 256, 257):
                 with self.subTest(ring_size=ring_size, seq_len=seq_len):
                     rows = dsv4_state_payloads(req_pool, 2, seq_len, page_size=128)[
-                        AscendStateType.DSV4_C4_STATE
+                        StateType.DSV4_C4_STATE
                     ]()
                     table = _build_explicit_state_block_table(
                         compress_ratio=4,

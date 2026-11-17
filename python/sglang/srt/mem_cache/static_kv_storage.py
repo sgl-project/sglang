@@ -910,7 +910,7 @@ def _static_state_entries(
     """A static pool's state entries in the order PD peers register them; a
     draft's state rides in the target's entries where the pool family shares
     them."""
-    from sglang.srt.disaggregation.base.conn import AscendStateType, StateType
+    from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.disaggregation.utils import remap_draft_layer_ids
     from sglang.srt.hardware_backend.npu.memory_pool_npu import (
         NPUMHATokenToKVPool,
@@ -1192,7 +1192,7 @@ def _static_state_entries(
         c128_ptrs, c128_lens, c128_item_lens = token_to_kv_pool.get_c128_kv_buf_infos()
         if c128_ptrs:
             add(
-                AscendStateType.DSV4_C128,
+                StateType.DSV4_C128,
                 c128_ptrs,
                 c128_lens,
                 c128_item_lens,
@@ -1204,7 +1204,7 @@ def _static_state_entries(
         c4_ptrs, c4_lens, c4_item_lens = token_to_kv_pool.get_c4_state_buf_infos()
         if c4_ptrs:
             add(
-                AscendStateType.DSV4_C4_STATE,
+                StateType.DSV4_C4_STATE,
                 c4_ptrs,
                 c4_lens,
                 c4_item_lens,

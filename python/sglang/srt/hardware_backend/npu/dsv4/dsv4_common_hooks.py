@@ -86,7 +86,7 @@ def dsv4_state_payloads(
 
     import numpy as np
 
-    from sglang.srt.disaggregation.ascend.conn import AscendStateType
+    from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
     seq_len = max(0, int(seq_len))
@@ -129,8 +129,8 @@ def dsv4_state_payloads(
         return rows.to(torch.int32).cpu().numpy()
 
     return {
-        AscendStateType.DSV4_C128: c128_kv_pages,
-        AscendStateType.DSV4_C4_STATE: c4_state_indices,
+        StateType.DSV4_C128: c128_kv_pages,
+        StateType.DSV4_C4_STATE: c4_state_indices,
     }
 
 

@@ -6,7 +6,7 @@ import numpy as np
 import numpy.typing as npt
 
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
-from sglang.srt.disaggregation.base.conn import AscendStateType, StateType
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVBootstrapServer,
@@ -21,7 +21,7 @@ from sglang.srt.utils.network import get_local_ip_auto
 logger = logging.getLogger(__name__)
 
 
-_DSV4_KVCACHE_STATE_TYPES = tuple(AscendStateType)
+_DSV4_KVCACHE_STATE_TYPES = (StateType.DSV4_C128, StateType.DSV4_C4_STATE)
 
 
 def _build_page_interleaved_dcp_plan(
@@ -204,11 +204,11 @@ class AscendKVManager(MooncakeKVManager):
             c128_start = sum(ratio == 128 for ratio in mla_ratios[:start_layer])
             c128_end = sum(ratio == 128 for ratio in mla_ratios[:end_layer])
 
-            if state_type == AscendStateType.DSV4_C128:
+            if state_type == StateType.DSV4_C128:
                 dst = dst_kv_ptrs[c128_start:c128_end]
                 return src_kv_ptrs, dst, len(src_kv_ptrs)
 
-            if state_type == AscendStateType.DSV4_C4_STATE:
+            if state_type == StateType.DSV4_C4_STATE:
                 # Layout: [attn_state_0..attn_{c4_full-1},
                 #          idx_state_0..idx_{c4_full-1}]
                 # Two groups, each c4_full entries; slice both by PP stage.
@@ -229,7 +229,7 @@ class AscendKVManager(MooncakeKVManager):
             # DSV4_C4_STATE).  The common _mla_slice_ptrs_for_pp assumes
             # SWA + C4 state are bundled (swa_L + 2*c4_full), so intercept
             # here and slice SWA KV by layer index directly.
-            if state_type == StateType.SWA and AscendStateType.DSV4_C4_STATE in (
+            if state_type == StateType.SWA and StateType.DSV4_C4_STATE in (
                 self.kv_args.state_types or []
             ):
                 dst = list(dst_kv_ptrs[start_layer:end_layer])
