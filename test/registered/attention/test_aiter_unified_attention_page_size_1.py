@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=90, suite="base-b-test-1-gpu-small-amd")
 
 
 class TestAiterUnifiedAttentionPageSize1(CustomTestCase, GSM8KMixin):
