@@ -6,7 +6,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 from sglang.srt.arg_groups.engram_config import EngramConfig
-from sglang.srt.layers.engram import _claim_group_slot
+from sglang.srt.layers.engram import _check_group_layout, _claim_group_slot
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -60,6 +60,16 @@ class TestEngramGroupStore(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "is not empty"):
                 _claim_group_slot(store, 2)
             self.assertFalse(os.path.exists(os.path.join(store, "deployment")))
+
+    def test_rejects_a_peer_with_another_table_layout(self):
+        mine = dict(num_embeddings=1024, dim=512, mxfp4=False)
+        _check_group_layout(mine, dict(mine), 1)
+        for peer in ({**mine, "mxfp4": True}, {**mine, "dim": 256}, None):
+            with (
+                self.subTest(peer=peer),
+                self.assertRaisesRegex(RuntimeError, "same Engram table"),
+            ):
+                _check_group_layout(mine, peer, 1)
 
 
 if __name__ == "__main__":

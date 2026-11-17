@@ -1009,6 +1009,7 @@ class _GroupShards(_PeerShards):
 
         drv = _get_cuda_driver()
         self.world = group_size
+        self.layout = dict(num_embeddings=num_embeddings, dim=dim, mxfp4=mxfp4)
         store = group_store
         if _group_slot is None:
             _group_slot = _claim_group_slot(store, self.world)
@@ -1049,6 +1050,7 @@ class _GroupShards(_PeerShards):
                 row_start=self.row_start,
                 rows=rows,
                 size=self.size,
+                layout=self.layout,
             ),
         )
 
@@ -1066,6 +1068,7 @@ class _GroupShards(_PeerShards):
         shards, bases = [], []
         for s in range(self.world):
             info = _wait_json(self._path(s, "handle"))
+            _check_group_layout(self.layout, info.get("layout"), s)
             _wait_json(self._path(s, "ready"))
             shards.append((info["row_start"], info["rows"]))
             bases.append(
@@ -1089,6 +1092,15 @@ class _GroupShards(_PeerShards):
             self.size / 2**30,
             self.kind,
             time.perf_counter() - t0,
+        )
+
+
+def _check_group_layout(mine: dict, peer: Optional[dict], slot: int) -> None:
+    if peer != mine:
+        raise RuntimeError(
+            f"engram group slot {slot} has table layout {peer}, this server has "
+            f"{mine}: every server of a group must load the same Engram table; "
+            "use an empty group_store for each deployment"
         )
 
 
@@ -1305,6 +1317,10 @@ class EngramEmbedding(nn.Module):
                 group_store=config.group_store,
             )
             self.row_start, self.rows = self.peer.row_start, self.peer.rows
+            self._derived_weight_cache_error = (
+                "Online weight updates are not supported with Engram group_shards: "
+                "other servers of the group read this server's table rows."
+            )
             weight, scale = self.peer.views()
             self.weight = nn.Parameter(weight, requires_grad=False)
             self.scale = nn.Parameter(scale, requires_grad=False)
