@@ -3917,7 +3917,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and not get_serving().skip_tokenizer_init,
                 finished=True,
             )
-        if getattr(state.obj, "return_sampling_mask", False):
+        if isinstance(state.obj, GenerateReqInput) and state.obj.return_sampling_mask:
             _add_sampling_mask_to_meta_info(meta_info, state, None, finished=True)
 
         output_ids = state.output_ids
