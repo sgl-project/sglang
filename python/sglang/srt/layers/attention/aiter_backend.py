@@ -47,6 +47,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_used_len,
 )
 from sglang.srt.utils import (
+    get_device_core_count,
     is_gfx95_supported,
     is_gfx1250_supported,
     print_info_once,
@@ -642,6 +643,7 @@ class AiterAttnBackend(AttentionBackend):
     # declare here to avoid CI failure in test_aiter_fp8_q_unified_attention.py
     use_mla_auto_kv_splits: bool = False
     use_aiter_triton_mla_decode: bool = False
+    gfx1250_mla_asm_decode: bool = False
 
     # Set in __init__; declared here for tests that build the backend without it
     # (test_aiter_fp8_kv_scales_paths.py).
@@ -802,6 +804,7 @@ class AiterAttnBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.runner_ids = model_runner.runner_ids
+        self.gfx1250_mla_asm_decode = self._init_gfx1250_mla_asm_decode(model_runner)
 
         # sliding window attention. Resolve the SWA pool rather than reading it
         # straight off the active pool: a frozen-KV MTP draft worker's active
@@ -1088,13 +1091,19 @@ class AiterAttnBackend(AttentionBackend):
             # Batches on SGLANG_AITER_MLA_DECODE_BACKEND=triton do not read
             # SGLANG_AITER_MLA_GLUON or SGLANG_AITER_MLA_PERSIST.
             if is_gfx1250_supported():
-                self.use_aiter_triton_mla_decode = self.mla_decode_backend == "triton"
+                self.use_aiter_triton_mla_decode = (
+                    self.mla_decode_backend == "triton"
+                    and not self.gfx1250_mla_asm_decode
+                )
                 logger.info(
                     "aiter gfx1250 Triton MLA decode is %s",
                     (
                         f"enabled (page size {self.page_size}, kernel block "
                         f"size {triton_mla_block_size(self.page_size)})"
                         if self.use_aiter_triton_mla_decode
+                        else "disabled (SGLANG_AITER_MLA_GFX1250_ASM=1 selects "
+                        "the ASM MLA decode)"
+                        if self.gfx1250_mla_asm_decode
                         else "disabled (SGLANG_AITER_MLA_DECODE_BACKEND resolved "
                         f"to {self.mla_decode_backend!r}; auto picks triton "
                         "with bf16 activations, no DCP, qk_rope_head_dim > 0)"
@@ -1263,7 +1272,10 @@ class AiterAttnBackend(AttentionBackend):
 
         Matches main's ``_use_mla_ps_kernel and dcp_world_size <= 1`` when ASM
         is off. DCP ASM needs the same buffers with fast_mode scheduling.
+        The gfx1250 ASM decode builds its own page table and needs neither.
         """
+        if self.gfx1250_mla_asm_decode:
+            return False
         return (_use_mla_ps_kernel and self.dcp_world_size <= 1) or (
             self.use_mla_dcp_asm and self.dcp_world_size > 1
         )
@@ -4677,16 +4689,21 @@ class AiterAttnBackend(AttentionBackend):
                         )
                     return output
                 elif layer.qk_head_dim != (kv_lora_rank + qk_rope_head_dim):
-                    K_Buffer = torch.index_select(K_Buffer, 0, kv_indices)
-                    kvc, k_pe = torch.split(
-                        K_Buffer, [kv_lora_rank, qk_rope_head_dim], dim=-1
-                    )
+                    if self.gfx1250_mla_asm_decode:
+                        kvc, k_pe = self.token_to_kv_pool.gather_kv_latent(
+                            layer.layer_id, kv_indices, q.dtype
+                        )
+                    else:
+                        K_Buffer = torch.index_select(K_Buffer, 0, kv_indices)
+                        kvc, k_pe = torch.split(
+                            K_Buffer, [kv_lora_rank, qk_rope_head_dim], dim=-1
+                        )
 
-                    if self.kv_cache_dtype == fp8_dtype:
-                        dtype = q.dtype
+                        if self.kv_cache_dtype == fp8_dtype:
+                            dtype = q.dtype
 
-                        kvc = kvc.to(dtype)
-                        k_pe = k_pe.to(dtype)
+                            kvc = kvc.to(dtype)
+                            k_pe = k_pe.to(dtype)
 
                     if (
                         self.use_fp8_prefill_attn
@@ -5517,6 +5534,155 @@ class AiterAttnBackend(AttentionBackend):
 
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
+    def _init_gfx1250_mla_asm_decode(self, model_runner) -> bool:
+        """State for aiter's non-persistent page-64 asm MLA decode on gfx1250.
+
+        On exactly when the pool is seg-packed (SGLANG_AITER_MLA_GFX1250_ASM):
+        the paged Gluon and Triton decode kernels read token-major pages, so
+        nothing can fall back once the pool has that layout.
+        """
+        if not getattr(self.token_to_kv_pool, "mla_seg_page_layout", False):
+            return False
+        if not (
+            is_gfx1250_supported()
+            and self.use_mla
+            and self.dcp_world_size <= 1
+            and self.page_size == 64
+            and self.num_head in (8, 16, 32, 64, 128)
+            and get_spec().speculative_algorithm is None
+            and model_runner.sliding_window_size is None
+        ):
+            raise ValueError(
+                "SGLANG_AITER_MLA_GFX1250_ASM: aiter's gfx1250 asm MLA decode "
+                "needs one CP rank, page size 64, 8/16/32/64/128 heads per rank "
+                f"and no speculative decoding; got num_head={self.num_head} "
+                f"page_size={self.page_size} dcp={self.dcp_world_size}"
+            )
+        from sglang.kernels.ops.kvcache.mla_seg_buffer import (
+            build_mla_page_table,
+            quant_pad_mla_q,
+        )
+
+        self._asm_mla_build_page_table = build_mla_page_table
+        self._asm_mla_quant_pad_q = quant_pad_mla_q
+        max_reqs, max_tokens = self.req_to_token.shape
+        max_pages = -(-max_tokens // self.page_size)
+        dev = self.device
+        self.asm_mla_kv_indptr = torch.zeros(
+            max_reqs + 1, dtype=torch.int32, device=dev
+        )
+        self.asm_mla_kv_indices = torch.zeros(
+            max_reqs * max_pages, dtype=torch.int32, device=dev
+        )
+        self.asm_mla_last_page_len = torch.ones(max_reqs, dtype=torch.int32, device=dev)
+        self.asm_mla_qo_indptr = torch.arange(
+            max_reqs + 1, dtype=torch.int32, device=dev
+        )
+        self.asm_mla_kv_scale_one = torch.ones(1, dtype=torch.float32, device=dev)
+        self.asm_mla_q_scale = (
+            self.asm_mla_kv_scale_one
+            if envs.SGLANG_AITER_MLA_GFX1250_ASM_STATIC_Q.get()
+            else None
+        )
+        self.asm_mla_cu_num = get_device_core_count(model_runner.gpu_id)
+        self.asm_mla_fixed_splits = envs.SGLANG_AITER_MLA_GFX1250_ASM_SPLITS.get()
+        # Allocated here, not on first use: a first use under graph capture
+        # would leave the tensor unwritten for later eager forwards.
+        self.asm_mla_split_indptr = {
+            s: torch.arange(0, (max_reqs + 1) * s, s, dtype=torch.int32, device=dev)
+            for s in range(1, 17)
+        }
+        self.asm_mla_first_layer_id = None
+        logger.info(
+            "aiter MLA decode: gfx1250 non-persistent asm, %d heads, %d CUs",
+            self.num_head,
+            self.asm_mla_cu_num,
+        )
+        return True
+
+    def _asm_mla_num_kv_splits(self, bs: int) -> int:
+        if self.asm_mla_fixed_splits > 0:
+            return min(16, self.asm_mla_fixed_splits)
+        # Measured on 96 CUs at 9k context: 8 splits at bs 4, 4 at 16, 2 at 32,
+        # 1 from 64 up, i.e. the power of two at or below (2/3 CUs) / bs.
+        target = (2 * self.asm_mla_cu_num // 3) // max(bs, 1)
+        return 1 << max(0, min(3, target.bit_length() - 1)) if target > 0 else 1
+
+    def _forward_gfx1250_asm_mla_decode(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        sinks,
+    ) -> torch.Tensor:
+        soft_cap = (
+            float(layer.logit_cap or 0.0)
+            if getattr(layer, "logit_capping_method", None) == "tanh"
+            else 0.0
+        )
+        if (
+            sinks is not None
+            or forward_batch.spec_info is not None
+            or soft_cap != 0
+            or layer.qk_head_dim != 576
+            or layer.v_head_dim != 512
+        ):
+            raise ValueError(
+                "gfx1250 asm MLA decode supports plain causal MLA only "
+                "(no sinks, soft cap or speculative decoding)"
+            )
+        bs = forward_batch.batch_size
+        num_heads = layer.tp_q_head_num
+        # Page table is per forward: build it at the first MLA layer from the
+        # graph-static batch tensors so CUDA graph replay refreshes it.
+        if self.asm_mla_first_layer_id is None:
+            self.asm_mla_first_layer_id = layer.layer_id
+        if layer.layer_id == self.asm_mla_first_layer_id:
+            self._asm_mla_build_page_table(
+                self.req_to_token,
+                forward_batch.req_pool_indices[:bs],
+                forward_batch.seq_lens[:bs],
+                self.page_size,
+                self.asm_mla_kv_indptr,
+                self.asm_mla_kv_indices,
+                self.asm_mla_last_page_len,
+            )
+        if q.dtype == fp8_dtype:
+            # Already rotated, cast and padded by the fused rope kernel.
+            q_fp8, q_scale = q, self.asm_mla_q_scale
+        else:
+            q_fp8, q_scale = self._asm_mla_quant_pad_q(
+                q.view(bs, num_heads, layer.qk_head_dim),
+                fp8_dtype,
+                self.asm_mla_q_scale,
+            )
+        # K is divided by k_scale before it is written to the cache.
+        if layer.k_scale is not None and layer.k_scale_float != 1.0:
+            kv_scale = layer.k_scale.reshape(1).float()
+        else:
+            kv_scale = self.asm_mla_kv_scale_one
+        splits = self._asm_mla_num_kv_splits(bs)
+        kv_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        o = q.new_empty((bs, num_heads, layer.v_head_dim), dtype=self.input_dtype)
+        mla_decode_fwd(
+            q_fp8,
+            kv_buffer.view(-1, self.page_size, 1, layer.qk_head_dim),
+            o,
+            self.asm_mla_qo_indptr[: bs + 1],
+            self.asm_mla_kv_indptr[: bs + 1],
+            self.asm_mla_kv_indices,
+            self.asm_mla_last_page_len[:bs],
+            1,
+            page_size=self.page_size,
+            nhead_kv=1,
+            sm_scale=layer.scaling,
+            num_kv_splits=splits,
+            num_kv_splits_indptr=self.asm_mla_split_indptr[splits][: bs + 1],
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+        )
+        return o.view(bs, num_heads * layer.v_head_dim)
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -5527,7 +5693,10 @@ class AiterAttnBackend(AttentionBackend):
         save_kv_cache=True,
         sinks=None,
     ):
-        q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+        # fp8 Q here is the fused rope kernel's padded asm-decode input; a
+        # reshape would copy it out of its padded rows.
+        if not (self.gfx1250_mla_asm_decode and q.dtype == fp8_dtype):
+            q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
         k_descale = None
         v_descale = None
@@ -5618,6 +5787,9 @@ class AiterAttnBackend(AttentionBackend):
                 )
 
         if self.use_mla:
+            if self.gfx1250_mla_asm_decode:
+                o = self._forward_gfx1250_asm_mla_decode(q, layer, forward_batch, sinks)
+                return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
             if self.dcp_world_size > 1 and not forward_batch.forward_mode.is_idle():
                 k_buffer = self.kv_layers.read(layer.layer_id).key()
                 return self._forward_decode_dcp(q, k_buffer, layer, k_descale)

@@ -346,7 +346,9 @@ class DeepseekMHARocmForwardMixin:
         dst_dtype: torch.dtype,
         forward_batch: ForwardBatch,
     ):
-        if _use_aiter_gfx95:
+        if _use_aiter_gfx95 or getattr(
+            get_token_to_kv_pool(), "mla_seg_page_layout", False
+        ):
             kv_a, k_pe = (
                 get_kv_layers()
                 .read(self.attn_mha.layer_id)
