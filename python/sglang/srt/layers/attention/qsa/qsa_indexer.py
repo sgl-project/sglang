@@ -77,6 +77,23 @@ def _exact_block_topk(
     return block_indices
 
 
+def _exact_decode_block_topk(
+    logits: torch.Tensor, lengths: torch.Tensor, topk: int
+) -> torch.Tensor:
+    """Top-k blocks of each decode row's first ``lengths`` scores (-1 padded), from
+    topk_v2's paged entry point without a page table."""
+    from sglang.kernels.ops.attention.dsv4.topk import (
+        plan_topk_v2,
+        topk_transform_paged_v2,
+    )
+
+    block_indices = logits.new_empty((logits.shape[0], topk), dtype=torch.int32)
+    topk_transform_paged_v2(
+        logits, lengths, None, block_indices, 1, plan_topk_v2(lengths)
+    )
+    return block_indices
+
+
 class QSAIndexer(MultiPlatformOp):
     """Config-driven fused-QK, weight-free sparse-attention indexer."""
 
@@ -591,7 +608,19 @@ class QSAIndexer(MultiPlatformOp):
             max_model_len,
             min_scored_len=self.block_topk if use_fast_topk else 0,
         )
-        if use_fast_topk:
+        # On gfx95 topk_v2 (exact in its default mode) replaces fast_topk, which drops
+        # members of an overfull threshold bin; the logits row stride must be a
+        # multiple of _TOPK_V2_ROW_ALIGNMENT.
+        use_topk_v2 = (
+            use_fast_topk
+            and is_gfx95_supported()
+            and logits.stride(0) % _TOPK_V2_ROW_ALIGNMENT == 0
+        )
+        if use_topk_v2:
+            block_indices = _exact_decode_block_topk(
+                logits, compressed_lengths.to(torch.int32), self.block_topk
+            )
+        elif use_fast_topk:
             # Decode rows start at zero, so compressed lengths double as row lengths;
             # skip the generic zero-fill + subtract.
             from sglang.kernels.ops.attention.fast_topk import fast_topk
