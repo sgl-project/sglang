@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from pathlib import Path
 from unittest.mock import Mock
 
 from sglang.srt.entrypoints.openai.protocol import V1RerankReqInput
@@ -304,6 +305,35 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
 
         self.assertEqual(res[1].document, "doc2")
         self.assertAlmostEqual(res[1].score, 0.3)  # 0.3 / (0.3+0.7) = 0.3
+
+    def test_qwen3_reranker_jinja_template_renders_think_suffix(self):
+        try:
+            import jinja2  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest("jinja2 is not installed")
+
+        template_path = (
+            Path(__file__).resolve().parents[3]
+            / "examples"
+            / "chat_template"
+            / "qwen3_reranker.jinja"
+        )
+        if not template_path.is_file():
+            self.skipTest(f"Template file not found: {template_path}")
+
+        raw_template = template_path.read_text(encoding="utf-8")
+        # Match TemplateManager._load_jinja_template newline normalization.
+        normalized_template = raw_template.strip("\n").replace("\\n", "\n")
+        expected_suffix = "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+        for tpl in (raw_template, normalized_template):
+            self.assertTrue(_is_qwen3_reranker_template(tpl))
+            rendered = _render_jinja_chat_template(
+                tpl, query="Q", document="D", instruct=None
+            )
+            self.assertIn("<Instruct>: Given a web search query", rendered)
+            self.assertIn("<Query>: Q\n<Document>: D<|im_end|>\n", rendered)
+            self.assertTrue(rendered.endswith(expected_suffix), repr(rendered))
 
 
 if __name__ == "__main__":

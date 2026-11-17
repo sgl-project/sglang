@@ -38,7 +38,10 @@ Judge whether the Document meets the requirements based on the Query and the Ins
 <Instruct>: {{ instruct | default("Given a web search query, retrieve relevant passages that answer the query.") }}
 <Query>: {{ messages[0]["content"] }}
 <Document>: {{ messages[1]["content"] }}<|im_end|>
-<|im_start|>assistant{{ '\\n' }}
+<|im_start|>assistant
+<think>
+
+</think>{{ '\n\n' }}
 """
 
 JINJA_ENV = ImmutableSandboxedEnvironment(autoescape=False)
