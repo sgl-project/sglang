@@ -38,6 +38,7 @@ _is_xpu = is_xpu()
 class DsparkDraftSampler:
     """The eager path's markov block, run as the draft cuda graph's tail."""
 
+    requires_per_step_sampling_params: bool = False
     verify_ids = None
 
     def __init__(

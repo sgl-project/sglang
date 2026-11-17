@@ -226,9 +226,10 @@ class TestDraftParamsRestage(CustomTestCase):
         )
         staged = []
         sampler = SimpleNamespace(
+            requires_per_step_sampling_params=False,
             stage_sampling_params=lambda **kw: staged.append(
                 (kw["bs"], kw["sampling_info"])
-            )
+            ),
         )
         info = SimpleNamespace(temperatures=torch.ones(4), top_ks=torch.ones(4))
 
@@ -242,13 +243,47 @@ class TestDraftParamsRestage(CustomTestCase):
         info.temperatures = info.temperatures[:3]  # rebound, as filter_batch does
         stage(sampler, 3, info)
         stage(sampler, 2, info)  # another bs
-        other = SimpleNamespace(stage_sampling_params=sampler.stage_sampling_params)
+        other = SimpleNamespace(
+            requires_per_step_sampling_params=False,
+            stage_sampling_params=sampler.stage_sampling_params,
+        )
         stage(other, 2, info)  # another sampler
         stage(other, 2, None)
         stage(other, 2, None)  # no sampling info twice: skipped
         self.assertEqual([bs for bs, _ in staged], [4, 3, 2, 2, 2])
         self.assertEqual(proposer.num_staged_params_skips, 2)
         self.assertEqual(proposer.num_staged_params_calls, 7)
+
+    def test_history_changes_are_staged_with_unchanged_sampling_parameters(
+        self,
+    ) -> None:
+        """Stateful samplers refresh histories even when temperature tensors match."""
+        history = torch.zeros(2, dtype=torch.long)
+        staged_history = torch.full_like(history, -1)
+
+        def stage_sampling_params(*, bs: int, sampling_info: None) -> None:
+            staged_history[:bs].copy_(history[:bs])
+
+        proposer = SimpleNamespace(
+            _staged_params_key=None,
+            num_staged_params_skips=0,
+            num_staged_params_calls=0,
+        )
+        sampler = SimpleNamespace(
+            requires_per_step_sampling_params=True,
+            stage_sampling_params=stage_sampling_params,
+        )
+        for request_count, output_length in ((2, 7), (2, 14), (1, 0), (2, 3)):
+            history.fill_(output_length)
+            DraftBlockProposer._stage_sampling_params(
+                proposer,
+                sampler,
+                bs=request_count,
+                sampling_info=None,
+            )
+            torch.testing.assert_close(
+                staged_history[:request_count], history[:request_count]
+            )
 
 
 if __name__ == "__main__":

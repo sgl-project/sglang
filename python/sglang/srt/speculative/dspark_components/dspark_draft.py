@@ -420,8 +420,7 @@ class DraftBlockProposer:
         self._draft_sampler = draft_sampler
 
     def _stage_sampling_params(self, draft_sampler, *, bs: int, sampling_info) -> None:
-        """The draft graph's sampling params, restaged only when the sampler, bs or
-        the batch's temperature / top-k tensors changed since the last stage."""
+        """Refresh per-step state, or cache parameters with stable tensor identities."""
         key = (
             draft_sampler,
             bs,
@@ -431,7 +430,8 @@ class DraftBlockProposer:
         staged = self._staged_params_key
         self.num_staged_params_calls += 1
         skip = (
-            staged is not None
+            not draft_sampler.requires_per_step_sampling_params
+            and staged is not None
             and staged[1] == bs
             and all(staged[i] is key[i] for i in (0, 2, 3))
         )
