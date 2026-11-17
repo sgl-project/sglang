@@ -93,4 +93,4 @@ class Device(msgspec.Struct):
         "check. Any request, including a /health or /health_generate probe, restarts the idle "
         "timer. At most every 10 minutes, an idle freeze also unfreezes first, so frozen "
         "garbage is freed and logged. Set to 0 to disable.",
-    ] = 0.0
+    ] = 1.0

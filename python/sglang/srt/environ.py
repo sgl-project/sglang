@@ -529,7 +529,7 @@ class Envs:
     # check raises or only warns.
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
-    SGLANG_ENABLE_GC_FROZEN_GARBAGE_CHECK = EnvBool(False)
+    SGLANG_ENABLE_GC_FROZEN_GARBAGE_CHECK = EnvBool(True)
     # The explicit environment variable still takes precedence over this CI
     # default, so production remains opt-in and CI remains opt-out if needed.
     SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK = EnvBool(_default_on_in_ci)
