@@ -2,7 +2,10 @@
 
 set -e
 
-PYTHON_ENV_FOR_EVALSCOPE=test_env_evalscope
+# Keep the venv at an absolute path: tests run from different working
+# directories, and a cwd-relative venv on a shared mount is easily left behind
+# by another image (with bin/python symlinked to a dead interpreter).
+PYTHON_ENV_FOR_EVALSCOPE=${EVALSCOPE_VENV_DIR:-${HOME}/.cache/sglang_evalscope_env}
 PYTHON_FOR_EVALSCOPE=${PYTHON_ENV_FOR_EVALSCOPE}/bin/python
 PIP_FOR_EVALSCOPE=${PYTHON_ENV_FOR_EVALSCOPE}/bin/pip
 EVALSCOPE_SOURCE_PATH=/root/.cache/.cache/evalscope
@@ -22,7 +25,9 @@ EVALSCOPE_INSTALL_TIMEOUT=1200
 if python -c "import evalscope" >/dev/null 2>&1; then
     echo "evalscope found in the system python, reuse it instead of installing."
     if ! ${PYTHON_FOR_EVALSCOPE} -c "import evalscope" >/dev/null 2>&1; then
-        python -m venv --system-site-packages ${PYTHON_ENV_FOR_EVALSCOPE}
+        # --clear removes a stale bin/python symlink; plain create leaves it
+        # dangling and pip bootstrap then fails with ENOENT on this path.
+        python -m venv --clear --system-site-packages ${PYTHON_ENV_FOR_EVALSCOPE}
     fi
     # Only skip the install when the env really imports evalscope.
     if ${PYTHON_FOR_EVALSCOPE} -c "import evalscope" >/dev/null 2>&1; then
@@ -37,7 +42,7 @@ if [ -x "${PYTHON_FOR_EVALSCOPE}" ] && ${PYTHON_FOR_EVALSCOPE} -c "import evalsc
     exit 0
 fi
 
-python -m venv ${PYTHON_ENV_FOR_EVALSCOPE}
+python -m venv --clear ${PYTHON_ENV_FOR_EVALSCOPE}
 
 echo "===== Install evalscope in virtual env - Begin ====="
 

@@ -39,6 +39,12 @@ logger = logging.getLogger(__name__)
 EVALSCOPE = "evalscope"
 BENCHMARK_TOOL_DEFAULT = EVALSCOPE
 
+# Must match the venv path used by run_evalscope.sh so both sides agree on the
+# interpreter regardless of the caller's working directory.
+EVALSCOPE_VENV_DIR = os.getenv("EVALSCOPE_VENV_DIR") or os.path.expanduser(
+    "~/.cache/sglang_evalscope_env"
+)
+
 PYTHON_FOR_TEST_TOOL = "test_env_transformers_tool/bin/python"
 if not os.path.exists(PYTHON_FOR_TEST_TOOL) or not os.access(
     PYTHON_FOR_TEST_TOOL, os.X_OK
@@ -241,7 +247,7 @@ def run_evalscope(
     install_cmd = f"/bin/bash {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'run_evalscope.sh')}"
     subprocess.run(install_cmd, shell=True, check=True)
 
-    python_bin = "test_env_evalscope/bin/python"
+    python_bin = os.path.join(EVALSCOPE_VENV_DIR, "bin", "python")
     cmd = f"{python_bin} {script_path}"
 
     logger.info(f"Command: {cmd}")
