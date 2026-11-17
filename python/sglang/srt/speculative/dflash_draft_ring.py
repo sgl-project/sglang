@@ -40,6 +40,7 @@ def draft_kv_ring_unsupported_reason(
     disaggregation_decode_host_receive_threshold: float = 1.0,
     enable_unified_memory: bool = False,
     dcp_size: int = 1,
+    draft_window_size: Optional[int] = None,
 ) -> Optional[str]:
     """Why a ring cannot serve this draft, or None. Loads the draft config only
     once the launch flags allow a ring."""
@@ -54,6 +55,8 @@ def draft_kv_ring_unsupported_reason(
         return "--enable-unified-memory places the draft KV in the target's pool"
     if draft_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
         return f"draft backend {draft_backend!r} has no window index path"
+    if draft_window_size is not None:
+        return "--speculative-draft-window-size keeps the compact draft table"
 
     from sglang.srt.configs.model_config import mla_attention_dcp_size
     from sglang.srt.speculative.dflash_utils import (
