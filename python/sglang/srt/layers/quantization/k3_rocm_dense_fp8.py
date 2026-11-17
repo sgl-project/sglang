@@ -12,7 +12,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, print_info_once
 
 _FP8 = torch.float8_e4m3fn
 _FP8_MAX = torch.finfo(_FP8).max
@@ -34,11 +34,17 @@ def resolve_scope(value: str, gfx95: bool, amd_monokernel: bool) -> str:
 
 
 def scope() -> str:
-    return resolve_scope(
-        envs.SGLANG_K3_TARGET_DENSE_FP8.get(),
+    value = envs.SGLANG_K3_TARGET_DENSE_FP8.get()
+    resolved = resolve_scope(
+        value,
         gfx95=is_gfx95_supported(),
         amd_monokernel=bool(get_exec().kernel.enable_amd_monokernel),
     )
+    print_info_once(
+        f"Kimi-K3 static FP8 dense linears: {resolved} "
+        f"(SGLANG_K3_TARGET_DENSE_FP8={value})"
+    )
+    return resolved
 
 
 def front_enabled() -> bool:
