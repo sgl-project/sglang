@@ -36,7 +36,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     NunchakuConfig,
     is_nunchaku_available,
 )
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import RotaryEmbedding
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    RotaryEmbedding,
+    _apply_rotary_emb,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -54,6 +57,7 @@ except Exception:
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
+_is_xpu = current_platform.is_xpu()
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
@@ -469,17 +473,24 @@ class ZImageAttention(nn.Module):
                     head_dim=self.head_dim,
                     allow_inplace=self.enable_zimage_qk_fusion,
                 )
-            q, k = self.rotary_emb(
-                query=q,
-                key=k,
-                complex_freqs=(
-                    rope_freqs_complex.unsqueeze(-2)
-                    if rope_freqs_complex is not None
-                    else None
-                ),
-                cos_sin_cache=rope_cos_sin_cache,
-                positions=rope_positions,
-            )
+            if rope_cos_sin_cache is None and freqs_cis is not None:
+                # No cache (XPU 2D table): Triton cos/sin kernel, as before #44753.
+                cos, sin = freqs_cis
+                assert cos.dim() == 2, f"expected a 2D RoPE table, got {cos.dim()}D"
+                q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
+                k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
+            else:
+                q, k = self.rotary_emb(
+                    query=q,
+                    key=k,
+                    complex_freqs=(
+                        rope_freqs_complex.unsqueeze(-2)
+                        if rope_freqs_complex is not None
+                        else None
+                    ),
+                    cos_sin_cache=rope_cos_sin_cache,
+                    positions=rope_positions,
+                )
 
         hidden_states = self.attn(
             q,
@@ -1287,6 +1298,9 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Return (cos_sin_cache, positions, freqs_complex) for one RoPE group."""
         cos, sin = freqs_cis
+        if _is_xpu and cos.dim() == 2:
+            # XPU: forward rotates a 2D table with the Triton cos/sin kernel, no cache.
+            return None, None, None
         cos_f32 = cos.to(dtype=torch.float32).contiguous()
         sin_f32 = sin.to(dtype=torch.float32).contiguous()
         if cos.dim() == 3:
