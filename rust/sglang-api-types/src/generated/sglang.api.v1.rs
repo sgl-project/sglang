@@ -1430,6 +1430,51 @@ pub struct HiddenStateRow {
     pub values: ::prost::alloc::vec::Vec<f64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HiddenStateRows {
+    #[prost(message, repeated, tag = "1")]
+    pub rows: ::prost::alloc::vec::Vec<HiddenStateRow>,
+}
+/// One entry of a `return_hidden_states: true` list: the prefill step gives
+/// one row per token (`matrix`), a decode step gives one row (`vector`).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HiddenStateItem {
+    #[prost(oneof = "hidden_state_item::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<hidden_state_item::Value>,
+}
+/// Nested message and enum types in `HiddenStateItem`.
+pub mod hidden_state_item {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(message, tag = "1")]
+        Vector(super::HiddenStateRow),
+        #[prost(message, tag = "2")]
+        Matrix(super::HiddenStateRows),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HiddenStateItems {
+    #[prost(message, repeated, tag = "1")]
+    pub items: ::prost::alloc::vec::Vec<HiddenStateItem>,
+}
+/// `meta_info.hidden_states`: `return_hidden_states: true` gives a list of
+/// items, `"last"` gives the final position's vector alone. Both are JSON
+/// arrays; the first element (an array or a number) tells them apart.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HiddenStates {
+    #[prost(oneof = "hidden_states::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<hidden_states::Value>,
+}
+/// Nested message and enum types in `HiddenStates`.
+pub mod hidden_states {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(message, tag = "1")]
+        Items(super::HiddenStateItems),
+        #[prost(message, tag = "2")]
+        Last(super::HiddenStateRow),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GenerateMetaInfo {
     /// The client's rid, byte-for-byte (`Rid::client_facing`).
     #[prost(string, tag = "1")]
@@ -1456,8 +1501,8 @@ pub struct GenerateMetaInfo {
     pub output_token_ids_logprobs: ::prost::alloc::vec::Vec<NullableTopLogprobs>,
     #[prost(message, repeated, tag = "10")]
     pub input_token_ids_logprobs: ::prost::alloc::vec::Vec<NullableTopLogprobs>,
-    #[prost(message, repeated, tag = "11")]
-    pub hidden_states: ::prost::alloc::vec::Vec<HiddenStateRow>,
+    #[prost(message, optional, tag = "11")]
+    pub hidden_states: ::core::option::Option<HiddenStates>,
     /// Seconds from normalized-request acceptance to the terminal output; only
     /// on the terminal frame.
     #[prost(double, optional, tag = "12")]

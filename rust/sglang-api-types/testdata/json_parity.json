@@ -384,6 +384,60 @@
     },
     {
       "type": "GenerateResponse",
+      "name": "hidden states keep a matrix item next to vector items",
+      "input": {
+        "text": "ok",
+        "meta_info": {
+          "id": "r",
+          "prompt_tokens": 2,
+          "completion_tokens": 2,
+          "finish_reason": null,
+          "hidden_states": [
+            [
+              [
+                0.5,
+                0.25
+              ],
+              [
+                1.5,
+                -2.0
+              ]
+            ],
+            [
+              0.125,
+              4.0
+            ]
+          ]
+        },
+        "output_ids": [
+          5
+        ]
+      },
+      "canonical": "{\"text\":\"ok\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":2,\"completion_tokens\":2,\"finish_reason\":null,\"hidden_states\":[[[0.5,0.25],[1.5,-2.0]],[0.125,4.0]],\"cached_tokens\":0,\"reasoning_tokens\":0,\"cached_tokens_details\":null,\"dp_rank\":null},\"output_ids\":[5]}"
+    },
+    {
+      "type": "GenerateResponse",
+      "name": "hidden states for the last position are one flat vector",
+      "input": {
+        "text": "ok",
+        "meta_info": {
+          "id": "r",
+          "prompt_tokens": 1,
+          "completion_tokens": 1,
+          "finish_reason": null,
+          "hidden_states": [
+            0.5,
+            0.25
+          ]
+        },
+        "output_ids": [
+          5
+        ]
+      },
+      "canonical": "{\"text\":\"ok\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":1,\"finish_reason\":null,\"hidden_states\":[0.5,0.25],\"cached_tokens\":0,\"reasoning_tokens\":0,\"cached_tokens_details\":null,\"dp_rank\":null},\"output_ids\":[5]}"
+    },
+    {
+      "type": "GenerateResponse",
       "name": "finish length",
       "input": {
         "text": "",

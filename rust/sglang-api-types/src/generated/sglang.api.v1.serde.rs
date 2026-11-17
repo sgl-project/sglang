@@ -8444,6 +8444,173 @@ impl<'de> ::serde::Deserialize<'de> for HiddenStateRow {
     }
 }
 
+impl ::serde::Serialize for HiddenStateRows {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.rows.iter())
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for HiddenStateRows {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(HiddenStateRows {
+            rows: <::prost::alloc::vec::Vec<HiddenStateRow> as ::serde::Deserialize>::deserialize(
+                deserializer,
+            )?,
+        })
+    }
+}
+
+impl ::serde::Serialize for HiddenStateItem {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.value {
+            Some(hidden_state_item::Value::Vector(v)) => v.serialize(serializer),
+            Some(hidden_state_item::Value::Matrix(v)) => v.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for HiddenStateItem {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = HiddenStateItem;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("one of the HiddenStateItem shapes")
+            }
+            fn visit_seq<A: ::serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut items: Vec<::serde_json::Value> = Vec::new();
+                while let Some(v) = seq.next_element::<::serde_json::Value>()? {
+                    items.push(v);
+                }
+                let shape = match items.first() {
+                    None => "empty",
+                    Some(::serde_json::Value::Array(inner))
+                        if inner.first().is_some_and(|x| x.is_array()) =>
+                    {
+                        "seq2"
+                    }
+                    Some(::serde_json::Value::Array(_)) => "seq",
+                    Some(::serde_json::Value::String(_)) => "str",
+                    Some(::serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => "int",
+                    Some(::serde_json::Value::Number(_)) => "float",
+                    Some(::serde_json::Value::Object(_)) => "map",
+                    Some(::serde_json::Value::Bool(_)) => "bool",
+                    Some(::serde_json::Value::Null) => "null",
+                };
+                let reparse = ::serde_json::Value::Array(items);
+                match shape {
+                    "int" | "float" | "empty" => {
+                        let v: HiddenStateRow = ::serde_json::from_value(reparse)
+                            .map_err(::serde::de::Error::custom)?;
+                        Ok(HiddenStateItem {
+                            value: Some(hidden_state_item::Value::Vector(v)),
+                        })
+                    }
+                    "seq" => {
+                        let v: HiddenStateRows = ::serde_json::from_value(reparse)
+                            .map_err(::serde::de::Error::custom)?;
+                        Ok(HiddenStateItem {
+                            value: Some(hidden_state_item::Value::Matrix(v)),
+                        })
+                    }
+                    other => Err(::serde::de::Error::custom(format!(
+                        "no HiddenStateItem array form takes {other} elements"
+                    ))),
+                }
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+impl ::serde::Serialize for HiddenStateItems {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.items.iter())
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for HiddenStateItems {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(HiddenStateItems {
+            items:
+                <::prost::alloc::vec::Vec<HiddenStateItem> as ::serde::Deserialize>::deserialize(
+                    deserializer,
+                )?,
+        })
+    }
+}
+
+impl ::serde::Serialize for HiddenStates {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.value {
+            Some(hidden_states::Value::Items(v)) => v.serialize(serializer),
+            Some(hidden_states::Value::Last(v)) => v.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for HiddenStates {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = HiddenStates;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("one of the HiddenStates shapes")
+            }
+            fn visit_seq<A: ::serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut items: Vec<::serde_json::Value> = Vec::new();
+                while let Some(v) = seq.next_element::<::serde_json::Value>()? {
+                    items.push(v);
+                }
+                let shape = match items.first() {
+                    None => "empty",
+                    Some(::serde_json::Value::Array(inner))
+                        if inner.first().is_some_and(|x| x.is_array()) =>
+                    {
+                        "seq2"
+                    }
+                    Some(::serde_json::Value::Array(_)) => "seq",
+                    Some(::serde_json::Value::String(_)) => "str",
+                    Some(::serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => "int",
+                    Some(::serde_json::Value::Number(_)) => "float",
+                    Some(::serde_json::Value::Object(_)) => "map",
+                    Some(::serde_json::Value::Bool(_)) => "bool",
+                    Some(::serde_json::Value::Null) => "null",
+                };
+                let reparse = ::serde_json::Value::Array(items);
+                match shape {
+                    "seq" | "seq2" | "empty" => {
+                        let v: HiddenStateItems = ::serde_json::from_value(reparse)
+                            .map_err(::serde::de::Error::custom)?;
+                        Ok(HiddenStates {
+                            value: Some(hidden_states::Value::Items(v)),
+                        })
+                    }
+                    "int" | "float" => {
+                        let v: HiddenStateRow = ::serde_json::from_value(reparse)
+                            .map_err(::serde::de::Error::custom)?;
+                        Ok(HiddenStates {
+                            value: Some(hidden_states::Value::Last(v)),
+                        })
+                    }
+                    other => Err(::serde::de::Error::custom(format!(
+                        "no HiddenStates array form takes {other} elements"
+                    ))),
+                }
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
 impl ::serde::Serialize for GenerateMetaInfo {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
@@ -8497,12 +8664,8 @@ impl ::serde::Serialize for GenerateMetaInfo {
                 &self.input_token_ids_logprobs,
             )?;
         }
-        if !self.hidden_states.is_empty() {
-            ::serde::ser::SerializeMap::serialize_entry(
-                &mut map,
-                "hidden_states",
-                &self.hidden_states,
-            )?;
+        if let Some(v) = &self.hidden_states {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "hidden_states", v)?;
         }
         if let Some(v) = &self.e2e_latency {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "e2e_latency", v)?;
@@ -8681,10 +8844,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                             if f_hidden_states.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("hidden_states"));
                             }
-                            f_hidden_states = Some(
-                                map.next_value::<Option<Vec<HiddenStateRow>>>()?
-                                    .unwrap_or_default(),
-                            );
+                            f_hidden_states = Some(map.next_value::<Option<HiddenStates>>()?);
                         }
                         "e2e_latency" => {
                             if f_e2e_latency.is_some() {
@@ -8779,7 +8939,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                     input_top_logprobs: f_input_top_logprobs.unwrap_or_default(),
                     output_token_ids_logprobs: f_output_token_ids_logprobs.unwrap_or_default(),
                     input_token_ids_logprobs: f_input_token_ids_logprobs.unwrap_or_default(),
-                    hidden_states: f_hidden_states.unwrap_or_default(),
+                    hidden_states: f_hidden_states.flatten(),
                     e2e_latency: f_e2e_latency.flatten(),
                     cached_tokens: f_cached_tokens.unwrap_or_default(),
                     reasoning_tokens: f_reasoning_tokens.unwrap_or_default(),

@@ -375,7 +375,7 @@ impl CoreOutput {
             );
         }
         if !extras.hidden_lens.is_empty() {
-            meta.hidden_states = hidden_state_rows(&extras.hidden_val, &extras.hidden_lens);
+            meta.hidden_states = Some(hidden_states(&extras.hidden_val, &extras.hidden_lens));
         }
         meta
     }
@@ -472,8 +472,9 @@ fn ragged_logprob_rows(
 }
 
 /// Reshape flat hidden-state values and per-row lengths into rows.
-fn hidden_state_rows(values: &[f32], lengths: &[u32]) -> Vec<api::HiddenStateRow> {
-    let mut rows = Vec::with_capacity(lengths.len());
+fn hidden_states(values: &[f32], lengths: &[u32]) -> api::HiddenStates {
+    use api::{hidden_state_item::Value as Item, hidden_states::Value};
+    let mut items = Vec::with_capacity(lengths.len());
     let mut offset = 0usize;
     for &length in lengths {
         let length = length as usize;
@@ -484,10 +485,14 @@ fn hidden_state_rows(values: &[f32], lengths: &[u32]) -> Vec<api::HiddenStateRow
             .copied()
             .map(f64::from)
             .collect();
-        rows.push(api::HiddenStateRow { values });
+        items.push(api::HiddenStateItem {
+            value: Some(Item::Vector(api::HiddenStateRow { values })),
+        });
         offset += length;
     }
-    rows
+    api::HiddenStates {
+        value: Some(Value::Items(api::HiddenStateItems { items })),
+    }
 }
 
 fn finish_reason(reason: &FinishReason) -> api::FinishReason {

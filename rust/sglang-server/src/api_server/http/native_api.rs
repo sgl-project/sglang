@@ -2650,7 +2650,7 @@ mod tests {
             input_top_logprobs: vec![Default::default()],
             output_token_ids_logprobs: vec![Default::default()],
             input_token_ids_logprobs: vec![Default::default()],
-            hidden_states: vec![Default::default()],
+            hidden_states: Some(Default::default()),
             e2e_latency: Some(0.0),
             cached_tokens: 0,
             reasoning_tokens: 0,
