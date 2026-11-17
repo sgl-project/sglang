@@ -2015,21 +2015,18 @@ class DeepseekSparseAttnBackend(
         max_ctx_len = self.req_to_token.shape[1]
         # rewritten in full before every replay; the init-once metadata below would resume zeroed
         with self._memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_CUDA_GRAPH):
-            trtllm_num_q_heads = trtllm_padded_heads(self.num_q_heads)
-            if (
-                self._trtllm_fused_q
-                and trtllm_num_q_heads != self.num_q_heads
-                and self.dsa_decode_impl == "trtllm"
-            ):
-                self._trtllm_q_pad_graph = torch.zeros(
-                    (
-                        max_num_tokens,
-                        trtllm_num_q_heads,
-                        self.kv_lora_rank + self.qk_rope_head_dim,
-                    ),
-                    dtype=torch.float8_e4m3fn,
-                    device=self.device,
-                )
+            if self._trtllm_fused_q and self.dsa_decode_impl == "trtllm":
+                trtllm_num_q_heads = trtllm_padded_heads(self.num_q_heads)
+                if trtllm_num_q_heads != self.num_q_heads:
+                    self._trtllm_q_pad_graph = torch.zeros(
+                        (
+                            max_num_tokens,
+                            trtllm_num_q_heads,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                        ),
+                        dtype=torch.float8_e4m3fn,
+                        device=self.device,
+                    )
             if self._flashmla_kv_pad_q_in_place:
                 self._flashmla_kv_q_pad_graph = torch.zeros(
                     (
