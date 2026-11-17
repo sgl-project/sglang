@@ -1495,30 +1495,62 @@ mod tests {
         }
     }
 
-    /// The schema takes `return_hidden_states: "last"` for the Python server;
-    /// this server refuses it, alone or anywhere in a batch list.
+    /// `return_hidden_states` is a mode per item: `false`, `true` (every
+    /// position) or `"last"`, alone or in a batch list. Any other string is
+    /// Python's error.
     #[test]
-    fn return_hidden_states_last_is_refused() {
-        for body in [
-            r#"{"text": "hi", "return_hidden_states": "last"}"#,
-            r#"{"text": "hi", "return_hidden_states": ["last"]}"#,
-            r#"{"text": ["a", "b"], "return_hidden_states": [false, "last"]}"#,
-        ] {
-            let err = requests(body).unwrap_err().to_string();
-            assert_eq!(
-                err, r#"return_hidden_states "last" is not supported by the Rust server"#,
-                "{body}"
-            );
-        }
+    fn return_hidden_states_is_a_mode_per_item() {
+        use HiddenStatesMode::{Full, Last, Null};
+        let modes = |body: &str| {
+            let (ps, _) = requests(body).unwrap();
+            ps.iter()
+                .map(|p| p.return_hidden_states)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(modes(r#"{"text": "hi"}"#), [Null]);
+        assert_eq!(
+            modes(r#"{"text": "hi", "return_hidden_states": true}"#),
+            [Full]
+        );
+        assert_eq!(
+            modes(r#"{"text": "hi", "return_hidden_states": "last"}"#),
+            [Last]
+        );
+        assert_eq!(
+            modes(r#"{"text": "hi", "return_hidden_states": ["last"]}"#),
+            [Last]
+        );
+        assert_eq!(
+            modes(r#"{"text": ["a", "b"], "return_hidden_states": [false, "last"]}"#),
+            [Null, Last]
+        );
+        assert_eq!(
+            modes(r#"{"text": ["a", "b"], "return_hidden_states": "last"}"#),
+            [Last, Last]
+        );
         let err = requests(r#"{"text": "hi", "return_hidden_states": "full"}"#)
             .unwrap_err()
             .to_string();
         assert_eq!(
             err,
-            r#"return_hidden_states must be a boolean or "last", got "full""#
+            "return_hidden_states must be a boolean or the string literal 'last'."
         );
-        let (ps, _) = requests(r#"{"text": "hi", "return_hidden_states": true}"#).unwrap();
-        assert_eq!(ps[0].return_hidden_states, HiddenStatesMode::Full);
+        // The HTTP handler asks for the same error before a stream starts.
+        let contract_error = |body: &str| {
+            let body: sglang_api_types::api::v1::GenerateRequest =
+                serde_json::from_str(body).unwrap();
+            body.return_hidden_states
+                .as_ref()
+                .and_then(wire::return_hidden_states_contract_error)
+        };
+        assert_eq!(
+            contract_error(r#"{"text": "hi", "return_hidden_states": ["last", "full"]}"#),
+            Some(err.as_str())
+        );
+        assert_eq!(
+            contract_error(r#"{"text": ["a", "b"], "return_hidden_states": [true, "last"]}"#),
+            None
+        );
     }
 
     /// Client-supplied rid semantics mirror Python's `_normalize_batch`: a

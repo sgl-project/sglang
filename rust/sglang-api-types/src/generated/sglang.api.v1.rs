@@ -1229,7 +1229,6 @@ pub struct GenerateRequest {
     pub token_ids_logprob: ::core::option::Option<TokenIdsOrList>,
     /// true: every position. false: none. "last": the final position's
     /// vector only. The schema takes any string; the server checks it.
-    /// `"last"` is served by the Python frontend only; the Rust server refuses it.
     #[prost(message, optional, tag = "10")]
     pub return_hidden_states: ::core::option::Option<BoolOrStringOrList>,
     #[prost(bool, optional, tag = "11")]

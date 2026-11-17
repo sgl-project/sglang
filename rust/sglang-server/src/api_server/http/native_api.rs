@@ -29,7 +29,9 @@ use crate::message::ids::Rid;
 use crate::message::request::GenerationPolicy;
 use crate::message::request::{GenerateRequest, into_requests};
 use crate::message::response::{CustomizedInfo, RequestStats};
-use crate::message::wire::{ClientMaxNewTokens, merge_preferred_sampling};
+use crate::message::wire::{
+    ClientMaxNewTokens, merge_preferred_sampling, return_hidden_states_contract_error,
+};
 use crate::utils::{
     environ,
     response::{error_response, error_value, sse_error_response, sse_response},
@@ -777,6 +779,15 @@ pub(super) fn generate_requests(
         Ok(body) => body,
         Err(error) => return Err((StatusCode::BAD_REQUEST, error.to_string(), false)),
     };
+    // A `return_hidden_states` string other than `"last"` is outside the
+    // contract too: a plain 400 even for a stream, as Python's is.
+    if let Some(message) = body
+        .return_hidden_states
+        .as_ref()
+        .and_then(return_hidden_states_contract_error)
+    {
+        return Err((StatusCode::BAD_REQUEST, message.into(), false));
+    }
     let stream = body.stream.unwrap_or(false);
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
     // payloads. `is_batch` = list form -> the response is a JSON array.

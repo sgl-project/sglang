@@ -32,7 +32,6 @@ message GenerateRequest {
   TokenIdsOrList token_ids_logprob = 9;
   // true: every position. false: none. "last": the final position's
   // vector only. The schema takes any string; the server checks it.
-  // `"last"` is served by the Python frontend only; the Rust server refuses it.
   BoolOrStringOrList return_hidden_states = 10;
   optional bool return_text_in_logprobs = 11;
   // PD bootstrap columns: a batch mixes bootstrapped and plain requests, so

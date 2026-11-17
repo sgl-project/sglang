@@ -477,7 +477,7 @@ fn auto_truncate_cannot_invert_min_and_max_new_tokens() {
 /// (Python `TokenizerManager._validate_one_request`).
 #[test]
 fn hidden_states_gated_on_server_support() {
-    use HiddenStatesMode::{Full, Null};
+    use HiddenStatesMode::{Full, Last, Null};
     let req = |want| {
         let mut r = generate_req(31, SamplingParams::default());
         if let RequestKind::Generate(g) = &mut r.kind {
@@ -485,6 +485,28 @@ fn hidden_states_gated_on_server_support() {
         }
         r
     };
+    // Request mode x server mode: refused exactly when the request is above
+    // the server, `not configured` on a server that captures nothing.
+    for server in [Null, Last, Full] {
+        let limits = Limits {
+            return_hidden_states_mode: server,
+            ..test_limits()
+        };
+        for want in [Null, Last, Full] {
+            let got = validate(&mut req(want), &limits).map_err(|e| e.to_string());
+            match (want > server, server) {
+                (false, _) => assert!(got.is_ok(), "{want:?} on {server:?}: {got:?}"),
+                (true, Null) => assert!(
+                    got.as_ref().is_err_and(|e| e.contains("not configured")),
+                    "{want:?} on {server:?}: {got:?}"
+                ),
+                (true, _) => assert!(
+                    got.as_ref().is_err_and(|e| e.contains("exceeds")),
+                    "{want:?} on {server:?}: {got:?}"
+                ),
+            }
+        }
+    }
     let disabled = test_limits();
     let err = validate(&mut req(Full), &disabled).unwrap_err();
     assert!(matches!(err, Error::Validation(_)));
