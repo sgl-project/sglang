@@ -12,14 +12,14 @@ Recognized permission keys:
 
 | Key | Grants |
 | --- | --- |
-| `can_tag_run_ci_label` | `/tag-run-ci-label`, `/tag-and-rerun-ci`, `/run-ci <hardware...>`, `/run-extra-ci`, `/run-full-ci`, `/run-<tier>-ci` |
-| `can_rerun_failed_ci` | `/rerun-failed-ci`, `/tag-and-rerun-ci`, `/run-ci <hardware...>`, `/run-extra-ci`, `/run-full-ci`, `/run-<tier>-ci` |
+| `can_tag_run_ci_label` | `/tag-run-ci-label`, `/tag-and-rerun-ci`, `/run-ci <hardware...>`, `/run-extra-ci`, `/run-full-ci` |
+| `can_rerun_failed_ci` | `/rerun-failed-ci`, `/tag-and-rerun-ci`, `/run-ci <hardware...>`, `/run-extra-ci`, `/run-full-ci` |
 | `cooldown_interval_minutes` | rate limit in `pr-gate.yml`; `0` also grants `/rerun-test`, `/rerun-group`, `/run-cpu-ci` |
 
 `/run-ci`, `/run-base-ci`, and `/rerun-base-ci` with no argument are aliases of
 `/tag-and-rerun-ci`: labeling and retrying each use their existing permission
-checks. With hardware arguments, they, `/run-extra-ci`, `/run-full-ci`, and
-`/run-<tier>-ci` add `run-ci` plus each selected tier's label, then rerun that
+checks. With hardware arguments, they, `/run-extra-ci`, and `/run-full-ci`
+add `run-ci` plus each selected tier's label, then rerun that
 selection's workflows for the current commit, green runs included; they require
 both permissions. Active runs are left alone.
 

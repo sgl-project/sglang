@@ -664,11 +664,11 @@ def _rerun_tier_workflows(
     return acted, "\n".join(message for _, message in results)
 
 
-def handle_run_tier_ci(gh_repo, pr, comment, user_perms, tier, *, additional_tiers=()):
+def handle_run_hardware_ci(gh_repo, pr, comment, user_perms, selected_tiers):
     """
-    Handles /run-<tier>-ci: add run-ci and any configured opt-in label,
-    then re-run only the selection's workflows, including successful runs.
-    Hardware full CI combines its base and extra tiers through additional_tiers.
+    Handles /run-ci, /run-extra-ci and /run-full-ci with hardware arguments:
+    add run-ci and each selected tier's opt-in label, then re-run only those
+    tiers' workflows, including successful runs.
 
     Gated on the same two permissions as the steps it performs (the label add
     needs can_tag_run_ci_label, the re-run can_rerun_failed_ci) rather than a
@@ -679,7 +679,6 @@ def handle_run_tier_ci(gh_repo, pr, comment, user_perms, tier, *, additional_tie
         print("Permission denied: can_rerun_failed_ci is false.")
         return False
 
-    selected_tiers = [tier, *additional_tiers]
     tier_labels = list(
         dict.fromkeys(t["label"] for t in selected_tiers if t["label"] is not None)
     )
@@ -1919,12 +1918,14 @@ KNOWN_COMMANDS = (
     "/rerun-failed-ci",
     "/rerun-group",
     "/rerun-test",
+    "/run-ci",
+    "/run-extra-ci",
     "/run-full-ci",
     "/run-cpu-ci",
 )
 
-# `/run-<tier>-ci` for each opt-in tier; `/rerun-<tier>-ci` is a silent alias.
-RUN_TIER_COMMAND = re.compile(r"^/(?:re)?run-([\w-]+)-ci$")
+# The removed `/run-<tier>-ci` spelling; matched only to point at its replacement.
+RETIRED_TIER_COMMAND = re.compile(r"^/(?:re)?run-([\w-]+)-ci$")
 
 # Commands that select a CI layer for the hardware named in their arguments.
 LAYER_COMMANDS = {
@@ -1948,6 +1949,18 @@ RETIRED_COMMANDS = {
 }
 
 
+def _retired_tier_command_hint(command, tiers):
+    match = RETIRED_TIER_COMMAND.match(command)
+    tier = match and match.group(1)
+    if tier not in tiers:
+        return None
+    if tier.endswith("-extra"):
+        replacement = f"/run-extra-ci {tier.removesuffix('-extra')}"
+    else:
+        replacement = f"/run-ci {tier}"
+    return f"`{command}` was removed. Use `{replacement}`."
+
+
 def handle_unknown_command(pr, comment, first_line, tiers):
     """
     Answer a comment addressed to this handler that matched no command.
@@ -1968,10 +1981,9 @@ def handle_unknown_command(pr, comment, first_line, tiers):
     except Exception as e:
         print(f"Failed to add reaction: {e}")
 
-    hint = RETIRED_COMMANDS.get(command)
+    hint = RETIRED_COMMANDS.get(command) or _retired_tier_command_hint(command, tiers)
     if hint is None:
-        known = KNOWN_COMMANDS + tuple(f"/run-{name}-ci" for name in tiers)
-        close = difflib.get_close_matches(command, known, n=1, cutoff=0.6)
+        close = difflib.get_close_matches(command, KNOWN_COMMANDS, n=1, cutoff=0.6)
         hint = f"Did you mean `{close[0]}`?" if close else None
 
     if hint is None:
@@ -2063,19 +2075,9 @@ def main():
         if unknown or not tier_names:
             _reply_bad_tier_args(pr, comment, command, unknown, tiers)
             return
-        first, *rest = (tiers[name] for name in tier_names)
-        handle_run_tier_ci(repo, pr, comment, user_perms, first, additional_tiers=rest)
-        return
-
-    run_tier_match = RUN_TIER_COMMAND.match(command)
-    run_tier = run_tier_match and tiers.get(run_tier_match.group(1))
-    if run_tier and len(tokens) != 1:
-        pr.create_issue_comment(
-            f"⛔ `{command}` accepts no arguments. Use `/run-ci <hardware...>`, "
-            "`/run-extra-ci <hardware...>` or `/run-full-ci <hardware...>` "
-            "to select hardware. No labels were added and no workflows were re-run."
+        handle_run_hardware_ci(
+            repo, pr, comment, user_perms, [tiers[name] for name in tier_names]
         )
-        comment.create_reaction("confused")
         return
 
     # Labeling commands resolve their arguments as /run-ci does.
@@ -2090,9 +2092,6 @@ def main():
 
     if is_tag:
         handle_tag_run_ci(repo, pr, comment, user_perms, tier_labels=tier_labels)
-
-    elif run_tier:
-        handle_run_tier_ci(repo, pr, comment, user_perms, run_tier)
 
     elif first_line.startswith(("/run-cpu-ci", "/rerun-cpu-ci")):
         handle_run_cpu_ci(repo, pr, comment, user_perms, token)

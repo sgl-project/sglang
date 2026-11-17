@@ -3,7 +3,7 @@
 
 The slash command handler labels a PR and re-runs exactly the workflows listed
 for a tier. A workflow that gates on a tier label but is missing from the list
-is never re-run by /run-<tier>-ci; a listed workflow that gates on another
+is never re-run by /run-extra-ci <hardware>; a listed workflow that gates on another
 label, or re-fires on `labeled`, cannot be recovered by a rerun.
 A null label is a selection of existing workflows with no extra opt-in gate;
 those workflows retain their existing event and path conditions.
@@ -18,7 +18,7 @@ import yaml
 
 TIERS_FILE = "scripts/ci/opt_in_ci_tiers.json"
 PR_GATE = "./.github/workflows/pr-gate.yml"
-# Tier names become `/run-<tier>-ci`; these spellings are taken by other commands.
+# Tier names are slash-command arguments; these spellings mean other commands.
 RESERVED_TIER_NAMES = {"base", "cpu", "extra", "failed", "full"}
 _TIER_NAME = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 
@@ -94,7 +94,7 @@ def main() -> int:
             if label in gate_labels(workflow) and path not in listed:
                 errors.append(
                     f"tier `{name}`: {path} gates on `{label}` but is not "
-                    f"listed, so /run-{name}-ci never re-runs it"
+                    "listed, so /run-extra-ci never re-runs it"
                 )
 
     if errors:
