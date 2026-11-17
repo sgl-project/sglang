@@ -278,6 +278,10 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             self, hf_config, _processor, processor_config=processor_config
         )
         self._cpu_executor_lock = threading.Lock()
+        # Embedded native servers already host Rust threads/CUDA. They must
+        # not fork a process pool from a preprocessing worker.
+        self._cpu_executor_start_method = kwargs.get("cpu_executor_start_method")
+        self._cpu_executor_workers = kwargs.get("cpu_executor_workers")
         self.cpu_executor = self._create_cpu_executor()
 
         # Each tokenizer worker is a separate process with its own CPU cache.
@@ -406,14 +410,15 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         super().shutdown()
 
     def _create_cpu_executor(self) -> concurrent.futures.ProcessPoolExecutor:
-        start_method = (
+        start_method = getattr(self, "_cpu_executor_start_method", None) or (
             "spawn"
             if self._feature_transport.mm_feature_transport == "cuda_vmm"
             else "fork"
         )
         return concurrent.futures.ProcessPoolExecutor(
             mp_context=mp.get_context(start_method),
-            max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
+            max_workers=getattr(self, "_cpu_executor_workers", None)
+            or int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
             initializer=_init_cpu_worker,
             initargs=(media_url_security_config(),),
         )

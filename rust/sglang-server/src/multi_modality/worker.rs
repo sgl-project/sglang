@@ -78,6 +78,9 @@ pub struct MmRequestInfo<'a> {
 /// any other exception a 500.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum MediaError {
+    /// Temporary bounded admission pressure (429 / RESOURCE_EXHAUSTED).
+    #[error("{0}")]
+    Capacity(String),
     /// Bad input from the client (400).
     #[error("{0}")]
     Client(String),
@@ -87,8 +90,9 @@ pub enum MediaError {
 }
 
 /// Multimodal processor shared by built-in and external implementations.
-/// Implementations run on the fixed Rust worker pool and must not retain
-/// request-scoped Python objects. `input_ids` arrive tokenized (the FSM runs
+/// Implementations run on the fixed Rust worker pool. The opt-in Python
+/// bridge transfers its result in an owned request buffer; implementations
+/// must never park request-scoped Python objects in an external RID registry. `input_ids` arrive tokenized (the FSM runs
 /// `Tokenizing` before `Encoding` for a text prompt), so a processor never
 /// tokenizes: it expands placeholders in ids. `mm` is the request's media,
 /// owned.
@@ -103,8 +107,29 @@ pub trait MmProcessor: Send + Sync {
     /// Reject a request's media before any of it is fetched, e.g. a modality
     /// the served model cannot encode. `Err` is a client error (400). Runs on
     /// an async worker, so it must not block.
-    fn check_media(&self, _mm: &MmData) -> Result<(), String> {
+    fn check_media(&self, mm: &MmData) -> Result<(), String> {
+        if mm.decoded.is_some() {
+            return Err("decoded_media is disabled for this processor".into());
+        }
         Ok(())
+    }
+
+    /// Optional same-host source import, on the bounded blocking admission pool.
+    fn prepare_decoded(&self, _input: &mut super::decoded::DecodedInput) -> Result<(), MediaError> {
+        Err(MediaError::Client(
+            "decoded_media is disabled for this processor".into(),
+        ))
+    }
+
+    /// Owned output of the existing Python processor. The default keeps the
+    /// native encoded-result path. This carrier owns its Python result through
+    /// queueing/rejection; no RID-keyed registry or public serialization.
+    fn process_direct(
+        &self,
+        _ids: &TokenIds,
+        _mm: &mut MmData,
+    ) -> Option<Result<(TokenIds, Vec<Buffer>), MediaError>> {
+        None
     }
 
     /// One I/O-backed source the processor already holds (e.g. in a cache),
@@ -406,6 +431,19 @@ fn process(
     input_ids: TokenIds,
     mut mm: MmData,
 ) -> Result<(TokenIds, Vec<Buffer>), Error> {
+    if let Some(output) = ctx.processor.process_direct(&input_ids, &mut mm) {
+        let (mut ids, buffers) = output.map_err(Error::Encode)?;
+        let original_len = ids.len();
+        if let Some(limits) = &ctx.limits {
+            fit_input(&mut ids, limits)?;
+            if ids.len() != original_len {
+                return Err(Error::Validation(
+                    "cannot auto-truncate decoded-media token layout".into(),
+                ));
+            }
+        }
+        return Ok((ids, buffers));
+    }
     let caller_hashes = std::mem::take(&mut mm.mm_hashes);
     let mut output = ctx
         .processor

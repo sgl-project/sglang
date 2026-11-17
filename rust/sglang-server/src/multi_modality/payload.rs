@@ -41,7 +41,13 @@ fn resolve_media_work_with_budget(
     mm: MmData,
     max_request_bytes: u64,
 ) -> Result<ResolvedMediaWork, MediaError> {
+    if mm.decoded.is_some() {
+        return Err(MediaError::Client(
+            "decoded media requires the decoded processor bridge".into(),
+        ));
+    }
     let MmData {
+        decoded: _,
         image_data,
         video_data,
         audio_data,

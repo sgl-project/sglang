@@ -2560,6 +2560,9 @@ class Envs:
     # Rust server
     # ===================================================================
     SGLANG_RUST_SERVER = EnvBool(False)
+    # Explicit same-Pod decoded media ingress; private shared memory-backed
+    # directory. Empty disables it. Native bridge is initially single-rank.
+    SGLANG_DECODED_MEDIA_SHM_ROOT = EnvStr("")
     # Build a missing Rust extension from source (auto), require a bundled or
     # cached extension (never), or rebuild the local cache entry (force).
     SGLANG_RUST_BUILD_MODE = EnvStr("auto")

@@ -151,6 +151,7 @@ fn buffer_to_py(py: Python<'_>, buffer: message::buffers::Buffer) -> PyResult<(S
 
     let shape = buffer.shape;
     let value = match buffer.store {
+        BufferStore::PythonOutput(output) => output,
         BufferStore::Inline(data) => match data {
             BufferData::I64(v) => shaped(py, v, &shape)?,
             BufferData::F32(v) => shaped(py, v, &shape)?,
@@ -248,6 +249,38 @@ impl Server {
                 })
             })
             .collect()
+    }
+
+    /// Opt-in decoded media bridge to the already registered Python processor.
+    #[pyo3(signature = (callback, root, workers, fallback_spec=None))]
+    pub fn start_decoded_mm_workers(
+        &self,
+        callback: Py<PyAny>,
+        root: &str,
+        workers: usize,
+        fallback_spec: Option<MmSpec>,
+    ) -> PyResult<()> {
+        if workers != 1 {
+            return Err(value_error(
+                "decoded media",
+                "the Python bridge requires one worker",
+            ));
+        }
+        let fallback = fallback_spec
+            .map(multi_modality::worker::MmContext::new)
+            .transpose()
+            .map_err(|e| value_error("native MM fallback", e))?
+            .map(|ctx| ctx.processor);
+        let processor = multi_modality::decoded::DecodedProcessor::new(
+            root,
+            self.rt.instance_id().to_owned(),
+            callback,
+            fallback,
+        )
+        .map_err(|e| value_error("decoded media", e))?;
+        self.rt
+            .start_mm_workers_with_processor(Arc::new(processor), workers, false);
+        Ok(())
     }
 
     /// Park up to `timeout_ms` for an incoming request so the idle scheduler loop

@@ -136,6 +136,10 @@ impl SglangService for GrpcService {
                 tracing::warn!(%error, "rejected request");
                 Status::invalid_argument(error.to_string())
             })?;
+        let decoded_receipts = payloads
+            .iter()
+            .filter_map(|r| r.mm.as_ref()?.decoded.as_ref().map(|d| d.consumed.clone()))
+            .collect::<Vec<_>>();
         client_max_new_tokens.mark(&mut payloads);
         // Python starts its request clock after normalization and before
         // tokenization / multimodal preprocessing; `e2e_latency` measures from
@@ -146,7 +150,7 @@ impl SglangService for GrpcService {
             .generate_batch(payloads, ReceivedAs::without_headers())
             .await
             .map_err(native_api::status)?;
-        Ok(Response::new(native_api::generate_stream(
+        let mut response = Response::new(native_api::generate_stream(
             calls,
             native_api::StreamOptions {
                 stream,
@@ -155,7 +159,17 @@ impl SglangService for GrpcService {
                 response_timeout: self.config.response_timeout,
                 created_at,
             },
-        )))
+        ));
+        if !decoded_receipts.is_empty()
+            && decoded_receipts
+                .iter()
+                .all(|r| r.load(std::sync::atomic::Ordering::Acquire))
+        {
+            response
+                .metadata_mut()
+                .insert("sglang-decoded-media-consumed", "true".parse().unwrap());
+        }
+        Ok(response)
     }
 
     async fn health_check(
@@ -511,6 +525,57 @@ mod tests {
             .output_ids
             .as_ref()
             .map_or(&[], |ids| ids.ids.as_slice())
+    }
+
+    /// Read completion is independent of token production. In particular, an
+    /// admitted/cancelled request whose reader never finished cannot emit ACK.
+    #[tokio::test]
+    async fn decoded_consumption_metadata_requires_the_reader_receipt() {
+        use crate::message::request::MmData;
+        use crate::multi_modality::{
+            decoded::DecodedInput,
+            worker::{MediaError, MmProcessOutput, MmProcessor},
+        };
+        struct Reader(bool);
+        impl MmProcessor for Reader {
+            fn process(&self, _: Vec<i64>, _: MmData) -> Result<MmProcessOutput, MediaError> {
+                unreachable!("this admission harness does not run model workers")
+            }
+            fn check_media(&self, _: &MmData) -> Result<(), String> {
+                Ok(())
+            }
+            fn prepare_decoded(&self, input: &mut DecodedInput) -> Result<(), MediaError> {
+                input
+                    .consumed
+                    .store(self.0, std::sync::atomic::Ordering::Release);
+                Ok(())
+            }
+        }
+        for complete in [true, false] {
+            let h = Harness::new(2, false, Duration::from_secs(1));
+            assert!(h.service.core.set_mm_processor(Arc::new(Reader(complete))));
+            let mut request = text_request("<image>", "decoded");
+            request.decoded_media = Some(
+                serde_json::from_value(serde_json::json!({
+                    "images": [{"width":2,"height":1,"row_stride_bytes":6,"pixel_format":"rgb8",
+                        "payload":{"mounted_shm":{"object_id":"unique-object-0123456789abcdef",
+                            "offset_bytes":0,"length_bytes":6,"engine_instance_id":"boot"}}}]
+                }))
+                .unwrap(),
+            );
+            let response = h.service.generate(Request::new(request)).await.unwrap();
+            assert_eq!(
+                response
+                    .metadata()
+                    .get("sglang-decoded-media-consumed")
+                    .map(|v| v.to_str().unwrap()),
+                complete.then_some("true")
+            );
+            let intake = h.next_generation().await;
+            assert!(intake.request.has_multimodal());
+            // No scheduler output was needed for this receipt.
+            drop(response);
+        }
     }
 
     #[tokio::test]

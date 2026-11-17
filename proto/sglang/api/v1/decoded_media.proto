@@ -1,69 +1,62 @@
 syntax = "proto3";
-
 package sglang.api.v1;
 
-// Draft wire vocabulary for already-decoded pixels, not model features.
-// Deliberately not attached to GenerateRequest yet: servers must not advertise
-// this input until admission, access control and consumption receipts exist.
-// Transport DTOs lower to the common DecodedMedia processor input; they must
-// not introduce model-specific preprocessing or tensor-adapter registries.
+// Optional same-host decoded media ingress, enabled by an operator-configured
+// private shared root. These are media samples, NOT model-ready features.
+// Model resize/normalization/patches/positions remain with existing processors.
+message DecodedMediaInput {
+  repeated DecodedImage images = 1;
+  repeated DecodedVideo videos = 2;
+  repeated DecodedAudio audios = 3;
+}
 message DecodedImage {
   uint32 width = 1;
   uint32 height = 2;
-  // Distance between successive row starts. Must be >= width * 3 for RGB_U8.
   uint64 row_stride_bytes = 3;
-  DecodedPixelFormat pixel_format = 4;
+  // Exactly "rgb8": upright interleaved HWC RGB, no alpha or EXIF transform.
+  string pixel_format = 4;
   MediaPayloadReference payload = 5;
 }
-
-enum DecodedPixelFormat {
-  DECODED_PIXEL_FORMAT_UNSPECIFIED = 0;
-  // Upright, interleaved HWC RGB, unsigned 8-bit samples, no alpha channel.
-  // The producer owns orientation/color conversion; the engine's existing
-  // processor still owns model resize, normalization, patches and positions.
-  DECODED_PIXEL_FORMAT_RGB_U8 = 1;
-}
-
-// Pixel semantics are independent of the storage backend. This draft proposes
-// one same-host backend; additional backends require explicit capabilities.
-// Neither a process-local pointer nor an internal Python pickle is a reference.
 message MediaPayloadReference {
-  oneof location {
-    MountedSharedMemoryRegion mounted_shm = 1;
-  }
+  MountedSharedMemoryRegion mounted_shm = 1;
 }
-
 message MountedSharedMemoryRegion {
-  // Opaque immutable object name under an operator-configured shared root.
-  // A single nonempty name, not a URL, absolute path, fd, or traversal path.
-  // Sidecar and engine containers must explicitly mount the same memory volume.
+  // Unique, unpredictable immutable object name under the configured shared
+  // root, 16..128 ASCII letters/digits/_/-. Never a URL/path/pointer. Publish
+  // complete bytes before Generate, never overwrite/truncate/reuse this name.
   string object_id = 1;
   uint64 offset_bytes = 2;
-  // Includes any padding inside the referenced region. Charge this length
-  // against per-request AND in-flight byte budgets before reading/mapping.
   uint64 length_bytes = 3;
-  // Must match the receiving engine's startup identity, preventing a reference
-  // prepared for an earlier process from being replayed after a restart.
+  // Must match GetServerInfo.instance_id from the receiving native runtime.
   string engine_instance_id = 4;
 }
-
-// Proposed preservation of frontend video sampling. This is not an implemented
-// video processor capability: Generate lowering and video routing remain TODO.
-// Never re-sample these frames implicitly or treat them as unrelated stills.
 message DecodedVideo {
+  // Already sampled: preserve this order; do not perform frame sampling again.
   repeated DecodedVideoFrame frames = 1;
+  // Source frame rate and source frame indices preserve temporal provenance.
+  // Initial processor bridge requires timestamps consistent with this clock.
+  double source_fps = 2;
+  uint64 source_frame_count = 3;
 }
-
 message DecodedVideoFrame {
   DecodedImage image = 1;
-  // Presentation time from the producer; frames remain in declared order.
-  // Validate nondecreasing times, positive dimensions, counts and byte budget.
   uint64 timestamp_us = 2;
+  uint64 source_frame_index = 3;
 }
-
-// Lifetime proposal (a release/receipt API is deliberately not invented here):
-// producer publishes immutable bytes before Generate and owns their cleanup;
-// consumer retains an ownership guard until every pixel reader has finished.
-// Abort acceptance, a dropped stream or a client timeout is NOT a read receipt.
-// The engine never unlinks a producer-owned object. MM/P/D cancellation and
-// restart cleanup must be defined before this source is exposed on Generate.
+message DecodedAudio {
+  // Interleaved [sample_frames, channels], little-endian IEEE float32 PCM.
+  // Finite samples in [-1,1]; the existing loader owns downmix/resampling.
+  string sample_format = 1; // Exactly "f32le".
+  uint32 sample_rate_hz = 2;
+  uint32 channels = 3;
+  uint64 sample_frames = 4;
+  MediaPayloadReference payload = 5;
+}
+// gRPC Generate response initial metadata contains
+// `sglang-decoded-media-consumed: true` ONLY after all referenced bytes have
+// been copied into engine-owned storage. It is a read receipt, not scheduler
+// retirement. No metadata/error/cancel/timeout is NOT a receipt. A producer may
+// unlink after a receipt; it must never mutate or reuse a published name. An
+// unacknowledged object needs producer/supervisor cleanup, not Abort inference.
+// The engine never unlinks producer-owned objects. Both containers must mount
+// the same memory-backed volume. This is CPU input transport, not GPU IPC/RDMA.

@@ -141,8 +141,8 @@ def settle_shm_buffers(buffers, *, admitted: bool) -> None:
     wrapper's, so a package's own ``_wrap_mm_result`` needs no knowledge of it."""
     import numpy as np
 
-    for value in buffers.values():
-        if isinstance(value, np.ndarray):
+    for name, value in buffers.items():
+        if name == "mm.python_output" or isinstance(value, np.ndarray):
             continue
         if admitted:
             value.release()

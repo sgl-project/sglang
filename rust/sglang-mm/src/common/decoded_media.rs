@@ -1,15 +1,13 @@
-//! Transport-independent import of already-decoded CPU RGB pixels.
+//! Transport-independent layout validation of decoded CPU RGB pixels.
 //!
-//! This is the processor seam for the proposed api.v1 shared-memory source,
+//! Layout checks for the opt-in api.v1 shared-memory source,
 //! not a shared-memory opener or a new model adapter. The ingress must first
 //! authorize the object, fence its engine instance and acquire its byte/lifetime
 //! leases. This module never opens caller-selected paths or maps mutable files.
 
 use std::ops::Range;
 
-use crate::pipeline::DecodedMedia;
-
-/// Upright HWC u8 RGB; model preprocessing remains with MmFamilyProcessor.
+/// Upright HWC u8 RGB; model preprocessing remains with existing processors.
 #[derive(Clone, Copy, Debug)]
 pub struct RgbImageLayout {
     pub width: u32,
@@ -66,54 +64,6 @@ impl RgbImageLayout {
     }
 }
 
-/// A validated, owned snapshot accepted by the existing processor interface.
-///
-/// An owned copy deliberately ends the dependency on a caller-owned mapping
-/// before asynchronous preprocessing. This draft does not claim zero-copy;
-/// mapping-backed processor views need a separate ownership/lifetime review.
-pub struct DecodedRgbImage {
-    media: DecodedMedia,
-}
-
-impl DecodedRgbImage {
-    /// Import an already-authorized buffer, compacting row padding if present.
-    /// This does not decode BMP/JPEG, resize, normalize, or expand token spans.
-    pub fn from_region(
-        layout: RgbImageLayout,
-        storage: &[u8],
-        offset: u64,
-        length: u64,
-        max_bytes: u64,
-    ) -> Result<Self, String> {
-        let range = layout.validate_region(storage.len() as u64, offset, length, max_bytes)?;
-        let (row_bytes, _, packed) = layout.sizes()?;
-        let row_bytes = usize::try_from(row_bytes).map_err(|_| "decoded RGB row exceeds usize")?;
-        let stride = usize::try_from(layout.row_stride_bytes)
-            .map_err(|_| "decoded RGB stride exceeds usize")?;
-        let packed = usize::try_from(packed).map_err(|_| "decoded RGB size exceeds usize")?;
-        let pixels = &storage[range];
-        let mut rgb = Vec::new();
-        rgb.try_reserve_exact(packed)
-            .map_err(|_| "decoded RGB allocation failed")?;
-        for row in 0..layout.height as usize {
-            let start = row * stride;
-            rgb.extend_from_slice(&pixels[start..start + row_bytes]);
-        }
-        Ok(Self {
-            media: DecodedMedia::Image {
-                rgb,
-                height: layout.height as usize,
-                width: layout.width as usize,
-            },
-        })
-    }
-
-    /// Hand the same common input to whichever processor the engine selected.
-    pub fn into_media(self) -> DecodedMedia {
-        self.media
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,15 +74,6 @@ mod tests {
             height: 2,
             row_stride_bytes: 4,
         }
-    }
-
-    #[test]
-    fn imports_rgb_rows_without_padding_or_redecoding() {
-        let storage = [99, 1, 2, 3, 0, 4, 5, 6, 99];
-        let image = DecodedRgbImage::from_region(layout(), &storage, 1, 7, 7).unwrap();
-        let DecodedMedia::Image { rgb, height, width } = image.into_media();
-        assert_eq!((height, width), (2, 1));
-        assert_eq!(rgb, [1, 2, 3, 4, 5, 6]);
     }
 
     #[test]

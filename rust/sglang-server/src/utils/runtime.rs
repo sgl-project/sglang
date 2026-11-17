@@ -114,6 +114,10 @@ impl DrainEndGate {
 const SHUTDOWN_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Runtime {
+    pub(crate) fn instance_id(&self) -> &str {
+        self.core.instance_id()
+    }
+
     /// The crash dump's requests (`None` without `--crash-dump-folder`).
     pub fn crash_dump_snapshot(&self) -> Option<Vec<u8>> {
         self.core.crash_dump_snapshot()

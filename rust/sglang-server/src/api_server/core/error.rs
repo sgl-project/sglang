@@ -92,6 +92,7 @@ pub(crate) enum CoreError {
 impl From<MediaError> for CoreError {
     fn from(error: MediaError) -> Self {
         match error {
+            MediaError::Capacity(message) => Self::Overloaded(message),
             MediaError::Client(message) => Self::InvalidArgument(message),
             MediaError::Server(message) => Self::Internal(message),
         }

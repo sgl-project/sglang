@@ -181,6 +181,90 @@ pub struct ErrorBody {
     #[prost(bool, optional, tag = "4")]
     pub retryable: ::core::option::Option<bool>,
 }
+/// Optional same-host decoded media ingress, enabled by an operator-configured
+/// private shared root. These are media samples, NOT model-ready features.
+/// Model resize/normalization/patches/positions remain with existing processors.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DecodedMediaInput {
+    #[prost(message, repeated, tag = "1")]
+    pub images: ::prost::alloc::vec::Vec<DecodedImage>,
+    #[prost(message, repeated, tag = "2")]
+    pub videos: ::prost::alloc::vec::Vec<DecodedVideo>,
+    #[prost(message, repeated, tag = "3")]
+    pub audios: ::prost::alloc::vec::Vec<DecodedAudio>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DecodedImage {
+    #[prost(uint32, tag = "1")]
+    pub width: u32,
+    #[prost(uint32, tag = "2")]
+    pub height: u32,
+    #[prost(uint64, tag = "3")]
+    pub row_stride_bytes: u64,
+    /// Exactly "rgb8": upright interleaved HWC RGB, no alpha or EXIF transform.
+    #[prost(string, tag = "4")]
+    pub pixel_format: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "5")]
+    pub payload: ::core::option::Option<MediaPayloadReference>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MediaPayloadReference {
+    #[prost(message, optional, tag = "1")]
+    pub mounted_shm: ::core::option::Option<MountedSharedMemoryRegion>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MountedSharedMemoryRegion {
+    /// Unique, unpredictable immutable object name under the configured shared
+    /// root, 16..128 ASCII letters/digits/\_/-. Never a URL/path/pointer. Publish
+    /// complete bytes before Generate, never overwrite/truncate/reuse this name.
+    #[prost(string, tag = "1")]
+    pub object_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub offset_bytes: u64,
+    #[prost(uint64, tag = "3")]
+    pub length_bytes: u64,
+    /// Must match GetServerInfo.instance_id from the receiving native runtime.
+    #[prost(string, tag = "4")]
+    pub engine_instance_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DecodedVideo {
+    /// Already sampled: preserve this order; do not perform frame sampling again.
+    #[prost(message, repeated, tag = "1")]
+    pub frames: ::prost::alloc::vec::Vec<DecodedVideoFrame>,
+    /// Source frame rate and source frame indices preserve temporal provenance.
+    /// Initial processor bridge requires timestamps consistent with this clock.
+    #[prost(double, tag = "2")]
+    pub source_fps: f64,
+    #[prost(uint64, tag = "3")]
+    pub source_frame_count: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DecodedVideoFrame {
+    #[prost(message, optional, tag = "1")]
+    pub image: ::core::option::Option<DecodedImage>,
+    #[prost(uint64, tag = "2")]
+    pub timestamp_us: u64,
+    #[prost(uint64, tag = "3")]
+    pub source_frame_index: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DecodedAudio {
+    /// Interleaved \[sample_frames, channels\], little-endian IEEE float32 PCM.
+    /// Finite samples in \[-1,1\]; the existing loader owns downmix/resampling.
+    ///
+    /// Exactly "f32le".
+    #[prost(string, tag = "1")]
+    pub sample_format: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "2")]
+    pub sample_rate_hz: u32,
+    #[prost(uint32, tag = "3")]
+    pub channels: u32,
+    #[prost(uint64, tag = "4")]
+    pub sample_frames: u64,
+    #[prost(message, optional, tag = "5")]
+    pub payload: ::core::option::Option<MediaPayloadReference>,
+}
 /// Python's `matched` key, `Union\[str, int, List[int]\]`: the three wire shapes
 /// are disjoint, so shape alone picks the arm (untagged).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -428,6 +512,10 @@ pub struct GenerateRequest {
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     #[prost(message, optional, tag = "36")]
     pub images_config: ::core::option::Option<ImagesConfig>,
+    /// Single prompt only; cannot mix with image_data/video_data/audio_data.
+    /// Optional decoded-media shared-memory path, disabled unless configured.
+    #[prost(message, optional, tag = "42")]
+    pub decoded_media: ::core::option::Option<DecodedMediaInput>,
     #[prost(bool, tag = "37")]
     pub return_prompt_token_ids: bool,
     #[prost(int64, tag = "38")]

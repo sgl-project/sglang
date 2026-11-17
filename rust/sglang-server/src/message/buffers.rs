@@ -133,6 +133,9 @@ impl From<Vec<u8>> for BufferData {
 /// Where a buffer's bytes live between the producer and the scheduler drain.
 #[derive(Debug)]
 pub enum BufferStore {
+    /// Existing processor output, owned until the scheduler drain takes it.
+    /// Dropping any rejected/cancelled/unqueued request drops this reference.
+    PythonOutput(pyo3::Py<pyo3::PyAny>),
     /// In-process: the `Vec` moves through the ring and numpy takes ownership
     /// of it at the boundary. Single-rank serving, or anything small.
     Inline(BufferData),
@@ -216,6 +219,7 @@ impl Buffer {
     #[cfg(test)]
     pub fn dtype(&self) -> DType {
         match &self.store {
+            BufferStore::PythonOutput(_) => panic!("Python processor output has no scalar dtype"),
             BufferStore::Inline(data) => data.dtype(),
             BufferStore::Shm { dtype, .. } => *dtype,
         }

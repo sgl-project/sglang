@@ -354,11 +354,57 @@ def _decode_bare_base64(value: str) -> bytes:
         ) from e
 
 
+@dataclass
+class DecodedAudio:
+    """Owned interleaved float PCM; model audio preprocessing remains unchanged."""
+
+    samples: np.ndarray
+    sample_rate_hz: int
+
+
+@dataclass
+class DecodedVideoFrames:
+    """Already sampled RGB frames and their source clock; never decode again."""
+
+    frames: list[np.ndarray]
+    timestamps_us: list[int]
+    source_fps: float
+    source_frame_count: int
+    source_frame_indices: list[int]
+
+    def as_processor_input(self):
+        return torch.from_numpy(np.stack(self.frames)).permute(0, 3, 1, 2), {
+            "fps": self.source_fps,
+            "duration": self.source_frame_count / self.source_fps,
+            "total_num_frames": self.source_frame_count,
+            "frames_indices": self.source_frame_indices,
+            "video_backend": "decoded_frames",
+        }
+
+
 def load_audio(
     audio_file: Union[str, bytes], sr: Optional[int] = None, mono: bool = True
 ) -> np.ndarray:
     if sr is None:
         sr = 16000
+
+    if isinstance(audio_file, DecodedAudio):
+        audio = audio_file.samples
+        if mono:
+            audio = audio.mean(axis=1)
+        if audio_file.sample_rate_hz != sr:
+            import torchaudio
+
+            tensor = torch.from_numpy(audio)
+            if tensor.ndim == 1:
+                tensor = tensor.unsqueeze(0)
+            else:
+                tensor = tensor.T
+            tensor = torchaudio.functional.resample(
+                tensor, audio_file.sample_rate_hz, sr
+            )
+            audio = tensor.squeeze(0).numpy() if mono else tensor.T.numpy()
+        return audio
 
     # Normalize input: resolve URL / base64 / file:// to bytes or path
     if isinstance(audio_file, bytes):
@@ -417,7 +463,6 @@ def load_audio(
 
     # Fallback: soundfile + torchaudio (ARM / no FFmpeg / torchcodec failure)
     import soundfile as sf
-    import torch
     import torchaudio
 
     try:
@@ -708,6 +753,8 @@ def get_video_bytes(video_file: Union[str, bytes, VideoData]) -> bytes:
 
 
 def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
+    if isinstance(video_file, DecodedVideoFrames):
+        return video_file
     if isinstance(video_file, VideoData):
         # preprocess_kwargs is consumed by the multimodal processor, not here.
         video_file = video_file.url

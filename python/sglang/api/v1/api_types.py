@@ -11,6 +11,8 @@ options exactly as the Rust server does. Decode with
 
 from __future__ import annotations
 
+import base64
+import binascii
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import msgspec
@@ -82,6 +84,17 @@ def _expect_str(v: Any, expected: str) -> str:
     raise _invalid_type(v, expected=expected)
 
 
+def _expect_bytes(v: Any, expected: str) -> bytes:
+    text = _expect_str(v, expected)
+    try:
+        data = base64.b64decode(text, validate=True)
+    except (ValueError, binascii.Error):
+        raise JsonContractError("invalid base64 bytes") from None
+    if base64.b64encode(data).decode("ascii") != text:
+        raise JsonContractError("invalid base64 bytes")
+    return data
+
+
 def _expect_seq(v: Any, expected: str) -> List[Any]:
     if isinstance(v, list):
         return v
@@ -127,6 +140,128 @@ class ErrorBody(msgspec.Struct, kw_only=True, frozen=True):
     def to_json_value(self) -> Dict[str, Any]:
         """Encode to a JSON-ready value (json.dumps-compatible)."""
         return encode_ErrorBody(self)
+
+
+class DecodedMediaInput(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.DecodedMediaInput: JSON object (unknown keys ignored)."""
+
+    images: List[DecodedImage] = []
+    videos: List[DecodedVideo] = []
+    audios: List[DecodedAudio] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "DecodedMediaInput":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_DecodedMediaInput(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_DecodedMediaInput(self)
+
+
+class DecodedImage(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.DecodedImage: JSON object (unknown keys ignored)."""
+
+    width: int = 0
+    height: int = 0
+    row_stride_bytes: int = 0
+    pixel_format: str = ""
+    payload: Optional[MediaPayloadReference] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "DecodedImage":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_DecodedImage(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_DecodedImage(self)
+
+
+class MediaPayloadReference(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.MediaPayloadReference: JSON object (unknown keys ignored)."""
+
+    mounted_shm: Optional[MountedSharedMemoryRegion] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "MediaPayloadReference":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_MediaPayloadReference(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_MediaPayloadReference(self)
+
+
+class MountedSharedMemoryRegion(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.MountedSharedMemoryRegion: JSON object (unknown keys ignored)."""
+
+    object_id: str = ""
+    offset_bytes: int = 0
+    length_bytes: int = 0
+    engine_instance_id: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "MountedSharedMemoryRegion":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_MountedSharedMemoryRegion(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_MountedSharedMemoryRegion(self)
+
+
+class DecodedVideo(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.DecodedVideo: JSON object (unknown keys ignored)."""
+
+    frames: List[DecodedVideoFrame] = []
+    source_fps: float = 0.0
+    source_frame_count: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "DecodedVideo":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_DecodedVideo(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_DecodedVideo(self)
+
+
+class DecodedVideoFrame(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.DecodedVideoFrame: JSON object (unknown keys ignored)."""
+
+    image: Optional[DecodedImage] = None
+    timestamp_us: int = 0
+    source_frame_index: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "DecodedVideoFrame":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_DecodedVideoFrame(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_DecodedVideoFrame(self)
+
+
+class DecodedAudio(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.DecodedAudio: JSON object (unknown keys ignored)."""
+
+    sample_format: str = ""
+    sample_rate_hz: int = 0
+    channels: int = 0
+    sample_frames: int = 0
+    payload: Optional[MediaPayloadReference] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "DecodedAudio":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_DecodedAudio(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_DecodedAudio(self)
 
 
 class FinishStop(msgspec.Struct, kw_only=True, frozen=True):
@@ -277,6 +412,7 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     routed_experts_start_len: int = 0
     return_sampling_mask: Optional[BoolOrList] = None
     modalities: Optional[OptionalStringList] = None
+    decoded_media: Optional[DecodedMediaInput] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateRequest":
@@ -1178,6 +1314,170 @@ def encode_ErrorBody(v: ErrorBody) -> Dict[str, Any]:
     return d
 
 
+def decode_DecodedMediaInput(value: Any) -> DecodedMediaInput:
+    m = _expect_map(value, expected="struct DecodedMediaInput")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "images":
+            kw["images"] = [] if x is None else [decode_DecodedImage(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "videos":
+            kw["videos"] = [] if x is None else [decode_DecodedVideo(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "audios":
+            kw["audios"] = [] if x is None else [decode_DecodedAudio(e) for e in _expect_seq(x, expected="a sequence")]
+    return DecodedMediaInput(**kw)
+
+
+def encode_DecodedMediaInput(v: DecodedMediaInput) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.images:
+        d["images"] = [encode_DecodedImage(e) for e in v.images]
+    if v.videos:
+        d["videos"] = [encode_DecodedVideo(e) for e in v.videos]
+    if v.audios:
+        d["audios"] = [encode_DecodedAudio(e) for e in v.audios]
+    return d
+
+
+def decode_DecodedImage(value: Any) -> DecodedImage:
+    m = _expect_map(value, expected="struct DecodedImage")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "width":
+            kw["width"] = _expect_uint(x, expected="u32")
+        elif key == "height":
+            kw["height"] = _expect_uint(x, expected="u32")
+        elif key == "row_stride_bytes":
+            kw["row_stride_bytes"] = _expect_uint(x, expected="u64")
+        elif key == "pixel_format":
+            kw["pixel_format"] = _expect_str(x, expected="a string")
+        elif key == "payload":
+            kw["payload"] = None if x is None else decode_MediaPayloadReference(x)
+    return DecodedImage(**kw)
+
+
+def encode_DecodedImage(v: DecodedImage) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["width"] = v.width
+    d["height"] = v.height
+    d["row_stride_bytes"] = v.row_stride_bytes
+    d["pixel_format"] = v.pixel_format
+    if v.payload is not None:
+        d["payload"] = encode_MediaPayloadReference(v.payload)
+    return d
+
+
+def decode_MediaPayloadReference(value: Any) -> MediaPayloadReference:
+    m = _expect_map(value, expected="struct MediaPayloadReference")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "mounted_shm":
+            kw["mounted_shm"] = None if x is None else decode_MountedSharedMemoryRegion(x)
+    return MediaPayloadReference(**kw)
+
+
+def encode_MediaPayloadReference(v: MediaPayloadReference) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.mounted_shm is not None:
+        d["mounted_shm"] = encode_MountedSharedMemoryRegion(v.mounted_shm)
+    return d
+
+
+def decode_MountedSharedMemoryRegion(value: Any) -> MountedSharedMemoryRegion:
+    m = _expect_map(value, expected="struct MountedSharedMemoryRegion")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "object_id":
+            kw["object_id"] = _expect_str(x, expected="a string")
+        elif key == "offset_bytes":
+            kw["offset_bytes"] = _expect_uint(x, expected="u64")
+        elif key == "length_bytes":
+            kw["length_bytes"] = _expect_uint(x, expected="u64")
+        elif key == "engine_instance_id":
+            kw["engine_instance_id"] = _expect_str(x, expected="a string")
+    return MountedSharedMemoryRegion(**kw)
+
+
+def encode_MountedSharedMemoryRegion(v: MountedSharedMemoryRegion) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["object_id"] = v.object_id
+    d["offset_bytes"] = v.offset_bytes
+    d["length_bytes"] = v.length_bytes
+    d["engine_instance_id"] = v.engine_instance_id
+    return d
+
+
+def decode_DecodedVideo(value: Any) -> DecodedVideo:
+    m = _expect_map(value, expected="struct DecodedVideo")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "frames":
+            kw["frames"] = [] if x is None else [decode_DecodedVideoFrame(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "source_fps":
+            kw["source_fps"] = _expect_float(x, expected="f64")
+        elif key == "source_frame_count":
+            kw["source_frame_count"] = _expect_uint(x, expected="u64")
+    return DecodedVideo(**kw)
+
+
+def encode_DecodedVideo(v: DecodedVideo) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.frames:
+        d["frames"] = [encode_DecodedVideoFrame(e) for e in v.frames]
+    d["source_fps"] = float(v.source_fps)
+    d["source_frame_count"] = v.source_frame_count
+    return d
+
+
+def decode_DecodedVideoFrame(value: Any) -> DecodedVideoFrame:
+    m = _expect_map(value, expected="struct DecodedVideoFrame")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "image":
+            kw["image"] = None if x is None else decode_DecodedImage(x)
+        elif key == "timestamp_us":
+            kw["timestamp_us"] = _expect_uint(x, expected="u64")
+        elif key == "source_frame_index":
+            kw["source_frame_index"] = _expect_uint(x, expected="u64")
+    return DecodedVideoFrame(**kw)
+
+
+def encode_DecodedVideoFrame(v: DecodedVideoFrame) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.image is not None:
+        d["image"] = encode_DecodedImage(v.image)
+    d["timestamp_us"] = v.timestamp_us
+    d["source_frame_index"] = v.source_frame_index
+    return d
+
+
+def decode_DecodedAudio(value: Any) -> DecodedAudio:
+    m = _expect_map(value, expected="struct DecodedAudio")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "sample_format":
+            kw["sample_format"] = _expect_str(x, expected="a string")
+        elif key == "sample_rate_hz":
+            kw["sample_rate_hz"] = _expect_uint(x, expected="u32")
+        elif key == "channels":
+            kw["channels"] = _expect_uint(x, expected="u32")
+        elif key == "sample_frames":
+            kw["sample_frames"] = _expect_uint(x, expected="u64")
+        elif key == "payload":
+            kw["payload"] = None if x is None else decode_MediaPayloadReference(x)
+    return DecodedAudio(**kw)
+
+
+def encode_DecodedAudio(v: DecodedAudio) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["sample_format"] = v.sample_format
+    d["sample_rate_hz"] = v.sample_rate_hz
+    d["channels"] = v.channels
+    d["sample_frames"] = v.sample_frames
+    if v.payload is not None:
+        d["payload"] = encode_MediaPayloadReference(v.payload)
+    return d
+
+
 def decode_Matched(value: Any) -> Matched:
     if isinstance(value, str):
         return value
@@ -1547,6 +1847,8 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
             kw["return_sampling_mask"] = None if x is None else decode_BoolOrList(x)
         elif key == "modalities":
             kw["modalities"] = None if x is None else decode_OptionalStringList(x)
+        elif key == "decoded_media":
+            kw["decoded_media"] = None if x is None else decode_DecodedMediaInput(x)
     return GenerateRequest(**kw)
 
 
@@ -1628,6 +1930,8 @@ def encode_GenerateRequest(v: GenerateRequest) -> Dict[str, Any]:
         d["return_sampling_mask"] = encode_BoolOrList(v.return_sampling_mask)
     if v.modalities is not None:
         d["modalities"] = encode_OptionalStringList(v.modalities)
+    if v.decoded_media is not None:
+        d["decoded_media"] = encode_DecodedMediaInput(v.decoded_media)
     return d
 
 

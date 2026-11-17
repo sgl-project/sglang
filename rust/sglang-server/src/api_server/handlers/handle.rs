@@ -239,6 +239,11 @@ impl CoreHandle {
         }
     }
 
+    /// Epoch of this native runtime, independent of launcher-provided fields.
+    pub(crate) fn instance_id(&self) -> &str {
+        &self.inner.instance_id
+    }
+
     /// Run `processor`'s media hooks during admission. The first processor
     /// installed wins; `false` if one already was.
     pub(crate) fn set_mm_processor(&self, processor: Arc<dyn MmProcessor>) -> bool {

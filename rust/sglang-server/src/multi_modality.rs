@@ -3,3 +3,5 @@
 pub mod encoded;
 pub mod payload;
 pub mod worker;
+
+pub mod decoded;
