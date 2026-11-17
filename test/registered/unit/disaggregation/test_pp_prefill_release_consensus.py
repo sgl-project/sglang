@@ -24,6 +24,7 @@ from sglang.srt.disaggregation import utils  # noqa: E402
 from sglang.srt.disaggregation.base import KVPoll  # noqa: E402
 from sglang.srt.disaggregation.common.conn import (  # noqa: E402
     CommonKVManager,
+    _pp_held_key,
     _PPStagingOutstanding,
 )
 from sglang.srt.disaggregation.pp_consensus_store import (  # noqa: E402
@@ -303,11 +304,28 @@ class TestPPPrefillReleaseConsensus(CustomTestCase):
             self.assertEqual(len(stage.disagg_prefill_transfer_queue), 1)
 
         self.pp1.kv_mgr._staging_outstanding[40] -= 1
-        self._replicated("held:40", [None, 0])
+        self._replicated(_pp_held_key(40), [None, 0])
         self._iterate()
         for stage in (self.pp0, self.pp1):
             self.assertEqual(list(stage.disagg_prefill_transfer_queue), [])
             self.assertEqual([rid for rid, _ in stage.streamed], ["x"])
+
+    def test_every_staging_counter_mutator_syncs_the_held_flag(self):
+        mgr = self.pp1.kv_mgr
+        mgr.defer_decode_allocation = False
+        mgr.staging_holds_success = partial(CommonKVManager.staging_holds_success, mgr)
+        counts = mgr._staging_outstanding = _PPStagingOutstanding(mgr)
+        self.pp1.store[41] = KVPoll.Transferring
+        for hold, release in (
+            (lambda: counts.__setitem__(41, 1), lambda: counts.pop(41)),
+            (lambda: counts.setdefault(41, 1), lambda: counts.__delitem__(41)),
+            (lambda: counts.update({41: 2}), lambda: counts.clear()),
+            (lambda: counts.__ior__({41: 1}), lambda: counts.popitem()),
+        ):
+            hold()
+            self.assertEqual(self.pp1.store[_pp_held_key(41)], 1)
+            release()
+            self.assertEqual(self.pp1.store[_pp_held_key(41)], 0)
 
     def test_idle_iteration_sends_nothing(self):
         self.assertEqual(self._iterate(), ([], []))
