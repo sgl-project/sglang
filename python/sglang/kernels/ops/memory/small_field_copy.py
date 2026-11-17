@@ -24,9 +24,9 @@ _ENTRIES = 7
 _RAW_KIND = {1: 0, 2: 1, 4: 2, 8: 3}
 # (dst dtype, src dtype) -> width-cast kind
 _CAST_KIND = {(torch.int64, torch.int32): 4, (torch.int32, torch.int64): 5}
-# The 16-byte launch with a block per field (SGLANG_Q35MF_BK_VEC_COPY), else the
+# The 16-byte launch with a block per field (SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED), else the
 # per-element launch, its bitwise reference; read once, fixed per process.
-_VEC = envs.SGLANG_Q35MF_BK_VEC_COPY.get()
+_VEC = envs.SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED.get()
 
 
 @cache_once
@@ -35,9 +35,7 @@ def _jit_small_field_copy_module() -> Module:
         "small_field_copy",
         cuda_files=["elementwise/small_field_copy.cuh"],
         cuda_wrappers=[
-            ("small_field_copy", "SmallFieldCopy::run"),
             ("small_field_copy_host_desc", "SmallFieldCopy::run_host_desc"),
-            ("small_field_copy_vec", "SmallFieldCopy::run_vec"),
             ("small_field_copy_host_desc_vec", "SmallFieldCopy::run_host_desc_vec"),
         ],
     )
@@ -103,17 +101,8 @@ def _describe(
     return desc
 
 
-def small_field_copy(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> bool:
-    desc = _describe(dsts, srcs)
-    if desc is None:
-        return False
-    module = _jit_small_field_copy_module()
-    run = module.small_field_copy_vec if _VEC else module.small_field_copy
-    return run(dsts[0], desc) == 0
-
-
 class SmallFieldCopyPlan:
-    """``small_field_copy`` for a caller whose destinations are the same views on
+    """One-launch copy for a caller whose destinations are the same views on
     every call (the caller keys one plan per destination layout).
 
     The first call validates every field and keeps the descriptor in a host
@@ -166,4 +155,4 @@ def _run_host_desc(anchor: torch.Tensor, desc: torch.Tensor) -> bool:
     return run(anchor, desc) == 0
 
 
-__all__ = ["SmallFieldCopyPlan", "small_field_copy"]
+__all__ = ["SmallFieldCopyPlan"]

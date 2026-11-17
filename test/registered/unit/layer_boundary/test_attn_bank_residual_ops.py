@@ -523,12 +523,17 @@ class TestAttnBankOnShards(CustomTestCase):
         with (
             patch.object(
                 attn_residual.AttnResidual, "forward_sp_all_gather", return_value=None
-            ),
+            ) as kernel,
             patch.object(comm_moves, "attn_tp_gather", all_gather),
         ):
             for gather in (None, lambda h: None):
+                kernel.reset_mock()
                 got = self.final_read(holder, gather)(self.hidden[2:])
                 torch.testing.assert_close(got[2:], every_row[2:], rtol=0, atol=0)
+                if gather is None:
+                    kernel.assert_not_called()
+                else:
+                    kernel.assert_called_once()
             got = self.final_read(holder, lambda h: tuned)(self.hidden[2:])
             self.assertIs(got, tuned)
         fused = torch.full((4, HIDDEN), 5.0)

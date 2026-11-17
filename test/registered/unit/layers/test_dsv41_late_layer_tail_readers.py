@@ -20,11 +20,8 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
 )
 from sglang.srt.model_executor import forward_batch_info
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.models.deepseek_common import decoder_swa_bounded_replay
 from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
     late_layer_dp_counts,
@@ -246,7 +243,8 @@ class TestLateLayerRowsUnderDpAttention(CustomTestCase):
         runner.attn_tp_sequence_sharded.return_value = False
 
         def idle_peer(out, local, group):
-            out.copy_(torch.cat([local, local.new_zeros(1)]))
+            # The idle peer has no tail rows and permits replay.
+            out.copy_(torch.cat([local, local.new_tensor([0, 1])]))
 
         with (
             self._dp_rank(0),

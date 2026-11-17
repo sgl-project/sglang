@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use sglang_api_types::runtime::v1 as proto;
+use sglang_runtime_v1_types as proto;
 
 fn regex_escape_literal(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());

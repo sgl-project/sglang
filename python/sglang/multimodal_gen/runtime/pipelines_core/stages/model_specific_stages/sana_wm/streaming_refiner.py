@@ -24,6 +24,9 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm_refiner_transformer impor
     unpack_latents,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.base import (
+    log_sana_wm_tensor_stats,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 from .refiner import (
@@ -32,7 +35,6 @@ from .refiner import (
     _as_additive_attention_mask,
     _forward_diffusers_video_block,
     _unwrap_diffusers_ltx2_refiner,
-    log_sana_wm_tensor_stats,
     sana_wm_skip_refiner_enabled,
 )
 

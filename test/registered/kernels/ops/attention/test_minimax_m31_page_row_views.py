@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.msa_v1.compact_dequant import (
+from sglang.kernels.ops.kvcache.msa_v1_compact_dequant import (
     dequant_nvfp4_page_table,
     gather_dequant_nvfp4_topk_pages_pair,
 )

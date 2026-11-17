@@ -6,7 +6,7 @@ lifetime and allocation unit share one sub-pool.
 """
 
 import math
-from typing import ClassVar, Optional, Sequence, Tuple, Union
+from typing import Any, ClassVar, Iterable, Optional, Sequence, Tuple, Union
 
 import msgspec
 import torch
@@ -44,7 +44,17 @@ class StateLifetime(msgspec.Struct, frozen=True, tag="state"):
         return (self.rank, 0)
 
 
-KVLifetime = Union[FullLifetime, WindowLifetime, StateLifetime]
+class RequestLifetime(msgspec.Struct, frozen=True, tag="request"):
+    """One unit per request row, held while the row is bound and never cached
+    by the prefix tree. Ranked with the windows, so it floats in the chain."""
+
+    rank: ClassVar[int] = 1
+
+    def retention(self) -> Tuple[int, float]:
+        return (self.rank, 0)
+
+
+KVLifetime = Union[FullLifetime, WindowLifetime, StateLifetime, RequestLifetime]
 
 
 def declares_lifetime_beside_full(model_config) -> bool:
@@ -76,10 +86,69 @@ class MHAGeometry(msgspec.Struct, frozen=True, kw_only=True):
     kv_cache_dtype: torch.dtype
 
 
-class MLAGeometry(msgspec.Struct, frozen=True, kw_only=True):
+# The stored latent row format of FP8 MLA with per-block scales: the FP8 NoPE
+# values, one FP32 scale per 128 of them, then the BF16 RoPE tail.
+FP8_DS_MLA = "fp8_ds_mla"
+
+
+class MLARowFormat(msgspec.Struct, frozen=True, kw_only=True):
+    """A stored latent row other than ``kv_lora_rank + qk_rope_head_dim``
+    values of the cache dtype: its format, its width in bytes, and whether its
+    block scales are rounded up to powers of two."""
+
+    name: str
+    row_bytes: int
+    scale_ue8m0: bool = False
+
+
+class MLAGeometry(msgspec.Struct, frozen=True, kw_only=True, repr_omit_defaults=True):
+    """One latent row per token per layer. ``row_format`` stores rows in another
+    format than the cache dtype's (None: plain rows). ``layer_major`` lays each
+    page out layer by layer -- a layer's rows of the page contiguous, a row
+    apart -- for readers that want a row-sized token stride within a page and
+    address pages by the page's stride; otherwise rows are token-major."""
+
     kv_lora_rank: int
     qk_rope_head_dim: int
     kv_cache_dtype: torch.dtype
+    row_format: Optional[MLARowFormat] = None
+    layer_major: bool = False
+
+    def row_bytes(self) -> int:
+        if self.row_format is not None:
+            return self.row_format.row_bytes
+        return (
+            self.kv_lora_rank + self.qk_rope_head_dim
+        ) * self.kv_cache_dtype.itemsize
+
+
+class IndexKeyGeometry(msgspec.Struct, frozen=True, kw_only=True):
+    """A sparse-attention indexer's keys: one blob per page, the page's keys
+    then their scales, as the paged index kernels read it. FP8 keys keep one
+    FP32 scale per 128 values; FP4 keys pack two values per byte and keep one
+    exponent byte per 32 values."""
+
+    index_head_dim: int
+    use_fp4: bool = False
+    quant_block_size: ClassVar[int] = 128
+
+    @property
+    def key_bytes_per_token(self) -> int:
+        return self.index_head_dim // 2 if self.use_fp4 else self.index_head_dim
+
+    @property
+    def bytes_per_token(self) -> int:
+        if self.use_fp4:
+            return self.index_head_dim // 2 + self.index_head_dim // 32
+        return self.index_head_dim + self.index_head_dim // self.quant_block_size * 4
+
+
+class StateReplay(msgspec.Struct, frozen=True, kw_only=True):
+    decode: bool
+    speculative: bool
+    is_kda: bool
+    cache_len: int
+    key_heads: int
 
 
 class StateGeometry(msgspec.Struct, frozen=True, kw_only=True):
@@ -88,6 +157,12 @@ class StateGeometry(msgspec.Struct, frozen=True, kw_only=True):
     temporal_state_shape: Tuple[int, ...]
     temporal_dtype: torch.dtype
     conv_slice_axis: int = 0
+    extra_parts: Tuple["TensorPartDecl", ...] = ()
+    # Payload a running request owns beside its slot and the prefix tree never
+    # caches; planned as the request sub-pool's entry (`RequestGeometry`).
+    request_parts: Tuple["TensorPartDecl", ...] = ()
+    scratch_parts: Tuple["TensorPartDecl", ...] = ()
+    replay: Optional[StateReplay] = None
 
     @classmethod
     def of(cls, cache_params) -> "StateGeometry":
@@ -103,7 +178,15 @@ class StateGeometry(msgspec.Struct, frozen=True, kw_only=True):
         )
 
 
-PartGeometry = Union[MHAGeometry, MLAGeometry, StateGeometry]
+class RequestGeometry(msgspec.Struct, frozen=True, kw_only=True):
+    """One request row's entry: the parts, each over its layers."""
+
+    parts: Tuple["TensorPartDecl", ...]
+
+
+PartGeometry = Union[
+    MHAGeometry, MLAGeometry, IndexKeyGeometry, StateGeometry, RequestGeometry
+]
 
 
 class KVPartDecl(msgspec.Struct, frozen=True, kw_only=True):
@@ -116,32 +199,88 @@ class KVLayerDecl(msgspec.Struct, frozen=True, kw_only=True):
     parts: Tuple[KVPartDecl, ...]
 
 
+class WindowLayers(msgspec.Struct, frozen=True, kw_only=True):
+    """Layers that attend through one window: their ids, their row geometry and
+    the window (``None`` when the model does not state it)."""
+
+    layer_ids: Tuple[int, ...]
+    geometry: Union[MHAGeometry, MLAGeometry]
+    window: Optional[int] = None
+
+
+class FullLayerParts(msgspec.Struct, frozen=True, kw_only=True):
+    """A part some full-attention layers keep beside their KV."""
+
+    layer_ids: Tuple[int, ...]
+    geometry: PartGeometry
+
+
+def window_sub_pool_name(window: Optional[int]) -> str:
+    """The sub-pool name of a window, from its own length alone: a window the
+    model does not state the length of is ``window``."""
+    return "window" if window is None else f"window_{window}"
+
+
+def primary_window(windows: Iterable[Optional[int]]) -> Optional[int]:
+    """Of the window lengths the target's layers declare, the one a
+    single-window reader sizes and retains by: the longest (a window that
+    states no length counts as longest). None without windows."""
+    windows = list(windows)
+    if not windows:
+        return None
+    return max(windows, key=lambda w: WindowLifetime(window=w).retention())
+
+
 def kv_layer_decls(
     *,
     full_layer_ids: Sequence[int],
     full_geometry: Union[MHAGeometry, MLAGeometry],
     window_layer_ids: Sequence[int] = (),
-    window_geometry: Optional[MHAGeometry] = None,
+    window_geometry: Optional[Union[MHAGeometry, MLAGeometry]] = None,
     window: Optional[int] = None,
+    windows: Sequence[WindowLayers] = (),
     state_layer_ids: Sequence[int] = (),
     state_geometry: Optional[StateGeometry] = None,
     checkpoint_interval: Optional[int] = None,
+    full_layer_parts: Sequence[FullLayerParts] = (),
 ) -> Tuple[KVLayerDecl, ...]:
     """One declaration per layer that stores anything, in layer order. A layer
-    may hold an attention part and a state part at once."""
-    assert not set(full_layer_ids) & set(window_layer_ids), (
-        "a layer attends either fully or through a window, not both"
+    may hold an attention part and a state part at once. Window layers come as
+    ``windows``, one group per window length, or as one group through the
+    ``window_*`` arguments. ``full_layer_parts`` are further parts full
+    layers keep with their KV, declared after it."""
+    windows = list(windows)
+    if window_layer_ids:
+        assert window_geometry is not None, "window layers need their geometry"
+        windows.append(
+            WindowLayers(
+                layer_ids=tuple(window_layer_ids),
+                geometry=window_geometry,
+                window=window,
+            )
+        )
+    attending = [set(full_layer_ids), *(set(w.layer_ids) for w in windows)]
+    assert sum(map(len, attending)) == len(set().union(*attending)), (
+        "a layer attends either fully or through one window"
+    )
+    assert len({w.window for w in windows}) == len(windows), (
+        "layers of one window length form one group"
     )
     parts = {}
     full = KVPartDecl(lifetime=FullLifetime(), geometry=full_geometry)
     for layer_id in full_layer_ids:
         parts.setdefault(layer_id, []).append(full)
-    if window_layer_ids:
-        assert window_geometry is not None, "window layers need their geometry"
+    for extra in full_layer_parts:
+        stray = set(extra.layer_ids) - set(full_layer_ids)
+        assert not stray, f"layers {sorted(stray)} keep a part beside no full KV"
+        part = KVPartDecl(lifetime=FullLifetime(), geometry=extra.geometry)
+        for layer_id in extra.layer_ids:
+            parts[layer_id].append(part)
+    for group in windows:
         part = KVPartDecl(
-            lifetime=WindowLifetime(window=window), geometry=window_geometry
+            lifetime=WindowLifetime(window=group.window), geometry=group.geometry
         )
-        for layer_id in window_layer_ids:
+        for layer_id in group.layer_ids:
             parts.setdefault(layer_id, []).append(part)
     if state_layer_ids:
         assert state_geometry is not None, "state layers need their geometry"
@@ -155,3 +294,244 @@ def kv_layer_decls(
         KVLayerDecl(layer_id=layer_id, parts=tuple(parts[layer_id]))
         for layer_id in sorted(parts)
     )
+
+
+class TensorPartDecl(msgspec.Struct, frozen=True, kw_only=True):
+    """One typed payload per id, optionally repeated over model layers.
+
+    ``shape`` excludes the id and layer axes. Layered tensors have shape
+    [layer, id, *shape]; request-wide tensors have shape [id, *shape].
+    ``slice_axis`` names the TP axis within shape, or None for replicated data.
+    """
+
+    name: str
+    shape: Tuple[int, ...]
+    dtype: torch.dtype
+    layer_ids: Tuple[int, ...] = ()
+    reset_value: Union[int, float] = 0
+    slice_axis: Optional[int] = None
+
+    def __post_init__(self):
+        if not self.name or any(n < 0 for n in self.shape):
+            raise ValueError(f"invalid tensor part {self.name!r}: {self.shape}")
+        if len(set(self.layer_ids)) != len(self.layer_ids):
+            raise ValueError(f"duplicate layers in tensor part {self.name!r}")
+        if self.slice_axis is not None and not 0 <= self.slice_axis < len(self.shape):
+            raise ValueError(f"invalid TP axis for tensor part {self.name!r}")
+
+    @property
+    def row_axis(self) -> int:
+        return int(bool(self.layer_ids))
+
+    @property
+    def row_bytes(self) -> int:
+        return math.prod(self.shape) * max(1, len(self.layer_ids)) * self.dtype.itemsize
+
+    def tensor_shape(self, rows: int) -> Tuple[int, ...]:
+        prefix = (len(self.layer_ids),) if self.layer_ids else ()
+        return (*prefix, rows, *self.shape)
+
+
+class ScratchDecl(msgspec.Struct, frozen=True, kw_only=True):
+    """Captured workspace with one row per active request, outside the chain."""
+
+    part: TensorPartDecl
+
+
+class DerivedPartDecl(msgspec.Struct, frozen=True, kw_only=True):
+    """Contiguous payload per physical page of a sub-pool.
+
+    Its shape describes one complete page blob; it is not interleaved with
+    token entries. Relocation and reset follow the owning physical page.
+    """
+
+    sub_pool: str
+    part: TensorPartDecl
+    wire: Optional[str] = None
+
+
+def with_state_replay(
+    geometry: StateGeometry,
+    replay: StateReplay,
+    *,
+    layer_ids: Tuple[int, ...],
+    speculative_num_draft_tokens: Optional[int],
+) -> StateGeometry:
+    """Declare ReplaySSM records in the coordinate space their kernels index."""
+    if not (replay.decode or replay.speculative):
+        return geometry
+    hv, value_dim, key_dim = geometry.temporal_state_shape
+    length = replay.cache_len
+    if length <= 0:
+        raise ValueError("ReplaySSM ring length must be positive")
+    if (
+        replay.speculative
+        and replay.is_kda
+        and (
+            length & (length - 1)
+            or (
+                speculative_num_draft_tokens is not None
+                and length < 2 * speculative_num_draft_tokens
+            )
+        )
+    ):
+        raise ValueError(
+            "KDA speculative ring needs a power-of-two length and room for two verify windows"
+        )
+    if replay.speculative and not replay.is_kda:
+        min_len = max(16, speculative_num_draft_tokens or 0)
+        if length & (length - 1) or length < min_len:
+            raise ValueError(
+                "GDN speculative ring needs a power-of-two length of at least "
+                f"{min_len} (16 and the draft tokens), got {length}"
+            )
+    dtype = geometry.conv_dtype if replay.speculative else geometry.temporal_dtype
+    ring = [
+        TensorPartDecl(
+            name="replayssm_d",
+            shape=(hv, length, value_dim),
+            dtype=dtype,
+            layer_ids=layer_ids,
+            slice_axis=0,
+        ),
+        TensorPartDecl(
+            name="replayssm_k",
+            shape=(replay.key_heads, length, key_dim),
+            dtype=dtype,
+            layer_ids=layer_ids,
+            slice_axis=0,
+        ),
+        TensorPartDecl(
+            name="replayssm_g",
+            shape=(hv, length, key_dim) if replay.is_kda else (hv, length),
+            dtype=torch.float32,
+            layer_ids=layer_ids,
+            slice_axis=0,
+        ),
+    ]
+    if replay.speculative and (replay.is_kda or dtype != torch.float32):
+        ring.extend(
+            (
+                TensorPartDecl(
+                    name="replayssm_rawv",
+                    shape=(hv, length, value_dim),
+                    dtype=geometry.conv_dtype,
+                    layer_ids=layer_ids,
+                    slice_axis=0,
+                ),
+                TensorPartDecl(
+                    name="replayssm_rawk",
+                    shape=(replay.key_heads, length, key_dim),
+                    dtype=geometry.conv_dtype,
+                    layer_ids=layer_ids,
+                    slice_axis=0,
+                ),
+            )
+        )
+    if replay.speculative and replay.is_kda:
+        ring.append(
+            TensorPartDecl(
+                name="replayssm_beta",
+                shape=(hv, length),
+                dtype=torch.float32,
+                layer_ids=layer_ids,
+                slice_axis=0,
+            )
+        )
+    extras, requests = list(geometry.extra_parts), list(geometry.request_parts)
+    if replay.speculative:
+        # A verify's ring never enters a checkpoint (each commit folds what it
+        # accepted into the state): it is the request's, not the slot's.
+        requests.extend(ring)
+        if not replay.is_kda:
+            requests.extend(
+                TensorPartDecl(name=name, shape=(), dtype=dtype)
+                for name, dtype in (
+                    ("replayssm_spec_write_pos", torch.int32),
+                    ("replayssm_cache_base", torch.int32),
+                    ("replayssm_is_flush", torch.int8),
+                )
+            )
+    else:
+        extras.extend(ring)
+    if replay.decode:
+        extras.append(
+            TensorPartDecl(name="replayssm_write_pos", shape=(), dtype=torch.int32)
+        )
+    return msgspec.structs.replace(
+        geometry,
+        replay=replay,
+        extra_parts=tuple(extras),
+        request_parts=tuple(requests),
+    )
+
+
+def with_state_ple(
+    geometry: StateGeometry,
+    *,
+    short_conv_layer_ids=(),
+    short_conv_state_shape=None,
+    ngram_context_len=0,
+    ngram_eos_token_id=0,
+    speculative_num_draft_tokens=None,
+) -> StateGeometry:
+    parts = []
+    if short_conv_layer_ids and short_conv_state_shape is not None:
+        parts.append(
+            TensorPartDecl(
+                name="short_conv",
+                shape=tuple(short_conv_state_shape),
+                dtype=geometry.conv_dtype,
+                layer_ids=tuple(short_conv_layer_ids),
+            )
+        )
+    if ngram_context_len:
+        parts.append(
+            TensorPartDecl(
+                name="ngram",
+                shape=(ngram_context_len,),
+                dtype=torch.int64,
+                reset_value=ngram_eos_token_id,
+            )
+        )
+    scratch = (
+        ()
+        if speculative_num_draft_tokens is None
+        else tuple(
+            msgspec.structs.replace(
+                part,
+                name=f"intermediate_{part.name}",
+                shape=(speculative_num_draft_tokens, *part.shape),
+            )
+            for part in parts
+        )
+    )
+    return msgspec.structs.replace(
+        geometry,
+        extra_parts=(*geometry.extra_parts, *parts),
+        scratch_parts=(*geometry.scratch_parts, *scratch),
+    )
+
+
+# The part every token KV view holds; derived parts get their own names.
+KV_PART = "kv"
+# A sparse-attention indexer's keys, beside a layer's KV in the same sub-pool.
+INDEX_K_PART = "index_k"
+# A request's recurrent state, one slot per request, in the state sub-pool.
+STATE_PART = "state"
+
+
+class Region(msgspec.Struct, frozen=True, kw_only=True):
+    """A sub-pool's device memory as a PD peer registers it: one entry per
+    buffer, and per entry the slices a peer of another TP size reads. A whole
+    page envelope has no slices: both peers must lay it out identically."""
+
+    ptrs: Tuple[int, ...]
+    lens: Tuple[int, ...]
+    item_lens: Tuple[int, ...]
+    dim_per_tensor: Tuple[int, ...] = ()
+    conv_shard_groups: Tuple[Any, ...] = ()
+    slice_outer_counts: Tuple[int, ...] = ()
+    layer_ids: Tuple[int, ...] = ()
+    # The token KV byte layout both peers must share, for views that have one.
+    kv_layout: Optional[str] = None

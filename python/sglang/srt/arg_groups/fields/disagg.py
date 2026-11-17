@@ -13,9 +13,9 @@ import msgspec
 from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
+    json_list_type,
 )
 from sglang.srt.arg_groups.choices import DISAGG_TRANSFER_BACKEND_CHOICES
-from sglang.srt.utils.common import json_list_type
 
 
 class Disagg(msgspec.Struct):
@@ -85,6 +85,12 @@ class Disagg(msgspec.Struct):
         Optional[str],
         'The InfiniBand devices for disaggregation transfer. Supports a single device (e.g., --disaggregation-ib-device mlx5_0), a shared comma-separated list (e.g., --disaggregation-ib-device mlx5_0,mlx5_1), a per-GPU JSON mapping (e.g., --disaggregation-ib-device \'{"0": "mlx5_0,mlx5_1", "1": "mlx5_2"}\'), or a path to a JSON file containing that mapping. Supported by Mooncake and NIXL UCX. Mapping keys are process-visible GPU IDs (after CUDA_VISIBLE_DEVICES); use HCA names without port suffixes for NIXL UCX. For NIXL UCX, a non-empty UCX_NET_DEVICES takes precedence over this option, including per-GPU mappings. Default is None, which preserves backend device selection.',
     ] = None
+    disaggregation_max_top_logprobs_num: A[
+        int,
+        "Largest top_logprobs_num a PD request can use: the width of the metadata "
+        "buffer that carries the first output token's top logprobs from prefill to "
+        "decode. Set the same value on both roles. Default is 128.",
+    ] = 128
     disaggregation_decode_enable_radix_cache: A[
         bool,
         "Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Incompatible with --enable-hisparse, --disaggregation-transfer-backend fake, and speculative algorithms other than EAGLE, EAGLE3, and DSPARK.",
@@ -167,18 +173,6 @@ class Disagg(msgspec.Struct):
         "When enabled, adaptively dispatch: multi-image requests go to encoder in language_only epd mode, single-image requests are processed locally.",
     ] = False
 
-    # -------------------------------------------------------------------------
-    # PD-Multiplexing
-    # -------------------------------------------------------------------------
-    enable_pdmux: A[
-        bool,
-        "Enable PD-Multiplexing, PD running on greenctx stream.",
-    ] = False
-    pdmux_config_path: A[
-        Optional[str],
-        "The path of the PD-Multiplexing config file.",
-    ] = None
-    sm_group_num: A[int, "Number of sm partition groups."] = 8
     disaggregation_decode_host_receive_threshold: A[
         float,
         "Device token usage fraction at which incoming KV is received in the decode retraction host pool, excluding evictable cache pages. Range [0, 1]; 1 disables host receive (default), 0 always uses host receive. Size with --hicache-size or --hicache-ratio; requires dense NHD MHA buffers (including separate paged SWA pools) and a transfer backend that supports host destinations. No built-in backend currently supports this.",

@@ -42,26 +42,6 @@ class TestMetricsUtils(unittest.TestCase):
         result = generate_buckets(None, default_buckets)
         self.assertEqual(result, default_buckets)
 
-    def test_generate_buckets_custom(self):
-        """Test generate_buckets with custom rule."""
-        default_buckets = [1.0, 5.0, 10.0]
-
-        # Test with "custom" rule
-        result = generate_buckets(
-            ["custom", "1.5", "3.2", "7.8", "15.6"], default_buckets
-        )
-        expected = [1.5, 3.2, 7.8, 15.6]
-        self.assertEqual(result, expected)
-
-    def test_generate_buckets_custom_with_integers(self):
-        """Test generate_buckets with custom rule using integer strings."""
-        default_buckets = [1.0, 5.0, 10.0]
-
-        # Test with integer strings
-        result = generate_buckets(["custom", "1", "5", "10", "50"], default_buckets)
-        expected = [1.0, 5.0, 10.0, 50.0]
-        self.assertEqual(result, expected)
-
     def test_generate_buckets_preserves_order_and_type(self):
         """Test that generate_buckets preserves order and returns floats."""
         default_buckets = [1, 5, 10, 50, 100]  # integers

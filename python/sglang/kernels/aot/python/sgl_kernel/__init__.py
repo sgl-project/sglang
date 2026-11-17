@@ -212,13 +212,3 @@ else:
 
     del _name
     del _DEBUG_EXPORT_NAMES
-
-    def create_greenctx_stream_by_value(*args, **kwargs):
-        from sgl_kernel.spatial import create_greenctx_stream_by_value as _impl
-
-        return _impl(*args, **kwargs)
-
-    def get_sm_available(*args, **kwargs):
-        from sgl_kernel.spatial import get_sm_available as _impl
-
-        return _impl(*args, **kwargs)

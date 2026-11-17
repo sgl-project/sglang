@@ -14,6 +14,7 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
     _FP8_MAX,
     _LOG2E,
     _PREFERRED_BLOCK_K,
+    _as_scaled_fp8_kv,
     _cu_count,
     _gfx950_sparse_mla_kv_splits,
     _gfx950_sparse_mla_num_warps,
@@ -101,8 +102,9 @@ def triton_sparse_mla_decode_splitk(
              transform_index_page_table_dcp (transform_index.py).
     returns: [1, bs, H, d_v] bf16, plus a [bs, H] fp32 base-2 LSE if return_lse
     """
+    kv, kv_scaled = _as_scaled_fp8_kv(kv, d_v, q_rope.shape[-1])
     is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
-    use_fp8_dot = is_fp8
+    use_fp8_dot = is_fp8 and not kv_scaled
     bs, H, d_v_in = q_nope.shape
     assert d_v_in == d_v
     d_tail = q_rope.shape[-1]
@@ -209,6 +211,7 @@ def triton_sparse_mla_decode_splitk(
                 USE_FP8_DOT=use_fp8_dot,
                 USE_TOPK_LENGTH=lengths is not None,
                 TOPK_TAIL_INVALID=lengths is not None,
+                KV_SCALED=kv_scaled,
                 BLOCK_H=BLOCK_H,
                 BLOCK_K=BLOCK_K,
                 USE_I64_PAGE=not (
@@ -271,6 +274,7 @@ def triton_sparse_mla_decode_splitk(
             BLOCK_K=BLOCK_K,
             topk_length_ptr=topk_length,
             USE_TOPK_LENGTH=lengths is not None,
+            KV_SCALED=kv_scaled,
             num_warps=split_num_warps,
             num_stages=2,
         )

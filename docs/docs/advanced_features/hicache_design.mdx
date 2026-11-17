@@ -174,6 +174,8 @@ When a backend is attached, HiCache hands it the host memory pools in a fixed or
 
 - **HiCacheFile**: A simple file-based storage backend for demonstration purposes.
 
+- **HiCacheFastFile**: A portable local-filesystem backend (`fast_file`) that keeps the `HiCacheFile` page format and adds direct page-first host-buffer I/O, parallel reads, atomic page publication, and background LRU eviction.
+
 Specifically, **LMCache**, an efficient KV cache layer for enterprise-scale LLM inference, provides an alternative solution to HiCache. Try LMCache [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/lmcache).
 
 ### External KV Router Integration
@@ -215,7 +217,7 @@ The startup handshake and `GET /get_hicache_l3_cache_layout` use the same layout
   - `page_first`: Optimized for I/O efficiency
   - `page_first_direct`: Groups all tokens of a given layer within a page, allowing transfers from L2 to GPU to be aggregated at the page-layer level
 
-- **`--hicache-storage-backend {file,mooncake,hf3fs,nixl,aibrix,dynamic}`**: Choose the storage backend for the L3 tier. Built-in backends: file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: `backend_name` (custom name), `module_path` (Python module path), `class_name` (backend class name). See [Unified Interfaces and Rich L3 Storage Backends](#unified-interfaces-and-rich-l3-storage-backends) for available backends.
+- **`--hicache-storage-backend {file,fast_file,mooncake,hf3fs,nixl,aibrix,dynamic}`**: Choose the storage backend for the L3 tier. Built-in backends: file, fast_file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: `backend_name` (custom name), `module_path` (Python module path), `class_name` (backend class name). See [Unified Interfaces and Rich L3 Storage Backends](#unified-interfaces-and-rich-l3-storage-backends) for available backends.
 
 - **`--enable-lmcache`**: Using LMCache as an alternative hierarchical cache solution.
 
