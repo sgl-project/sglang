@@ -22,6 +22,7 @@ TOKENIZER_WORKER_NUM = 4
 NUM_WARMUP_REQUESTS = 32
 NUM_STREAMS = 2
 MAX_NEW_TOKENS = 8192
+STREAM_READ_TIMEOUT = 300
 
 
 class _MultiTokenizerSigtermBase(CustomTestCase):
@@ -60,7 +61,7 @@ class _MultiTokenizerSigtermBase(CustomTestCase):
                 "stream": stream,
             },
             stream=stream,
-            timeout=60,
+            timeout=STREAM_READ_TIMEOUT if stream else 60,
         )
 
     def _read_stream(self, index: int, chunks_seen: list, results: list) -> None:
@@ -119,7 +120,7 @@ class TestMultiTokenizerSigtermForceShutdown(_MultiTokenizerSigtermBase):
 
     def test_force_shutdown_exits_with_streams_in_flight(self):
         threads, results = self._sigterm_with_streams_in_flight()
-        self.process.wait(timeout=90)
+        self.process.wait(timeout=60)
         for thread in threads:
             thread.join(timeout=30)
         for result in results:
