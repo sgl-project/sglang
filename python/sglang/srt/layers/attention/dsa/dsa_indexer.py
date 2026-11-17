@@ -100,6 +100,7 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
+from sglang.srt.utils.cuda_event_pool import wait_stream
 from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
@@ -1068,7 +1069,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         elif self.alt_stream is not None and is_cp_active(forward_batch):
             key = self._maybe_rotate(key)
             current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
+            wait_stream(self.alt_stream, current_stream)
             query = self._maybe_rotate(query)
 
             # Gather the full key on alt_stream so the CP all-gather overlaps
@@ -1077,7 +1078,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 key = get_cp_strategy().materialize_full_indexer_k_cache(
                     key, forward_batch
                 )
-            current_stream.wait_stream(self.alt_stream)
+            wait_stream(current_stream, self.alt_stream)
             return query, key, weights_raw
         else:
             query = self._maybe_rotate(query)
@@ -1241,7 +1242,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # wait_stream calls are ordered by issue position so each side waits only
         # on the GEMMs it consumes, not on the other side's fused kernel.
         current_stream = torch.cuda.current_stream()
-        self.alt_stream.wait_stream(current_stream)
+        wait_stream(self.alt_stream, current_stream)
 
         kw, _ = self.wk_weights_proj(x)
         key, weights_raw = kw.split([self.head_dim, self.n_heads], dim=-1)
@@ -1255,8 +1256,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             if num_tokens is not None:
                 q = q[:num_tokens]
 
-        current_stream.wait_stream(self.alt_stream)
-        self.alt_stream.wait_stream(current_stream)
+        wait_stream(current_stream, self.alt_stream)
+        wait_stream(self.alt_stream, current_stream)
         q_fp8, weights = fused_q_indexer_rope_first_quant(
             q.contiguous(),
             weights_raw,
@@ -1276,7 +1277,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 out_cache_loc=out_cache_loc,
             )
 
-        current_stream.wait_stream(self.alt_stream)
+        wait_stream(current_stream, self.alt_stream)
         return q_fp8, weights
 
     @staticmethod
