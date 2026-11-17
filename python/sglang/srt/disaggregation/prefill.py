@@ -110,6 +110,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
     get_schedule,
+    get_spec,
 )
 from sglang.srt.utils import is_npu, rank_consensus_checker
 from sglang.srt.utils.device import async_d2h
@@ -460,6 +461,7 @@ class PrefillBootstrapQueue:
             self.scheduler.model_config.num_hidden_layers,
             window_tails=storage.retained_window_lengths(),
             draft_kv_ring=self.draft_kv_ring,
+            empty_draft_kv_ring=get_spec().speculative_dflash_draft_kv_ring,
         )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
@@ -1468,6 +1470,7 @@ class SchedulerDisaggregationPrefillMixin:
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
+            self._release_mm_inputs(req)
 
         return done_reqs
 
@@ -1866,6 +1869,8 @@ class SchedulerDisaggregationPrefillMixin:
 
             def _draft_ring_payload():
                 ring = self.disagg_prefill_bootstrap_queue.draft_kv_ring
+                if ring is None:
+                    return None
                 return ring.transfer_rows(int(req.kv.req_pool_idx), seq_len)
 
             def _request_row_payload():
