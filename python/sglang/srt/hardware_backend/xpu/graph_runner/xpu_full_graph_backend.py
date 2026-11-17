@@ -17,6 +17,11 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 import torch
 from torch.profiler import ProfilerActivity, profile
 
+from sglang.srt.hardware_backend.xpu.xpu_scratchpad_patch import (
+    patch_sgl_kernel_scratchpad_buffers,
+    register_graph_scratchpad_owner,
+    unregister_graph_scratchpad_owner,
+)
 from sglang.srt.model_executor.runner_backend.base_graph_backend import (
     BaseGraphBackend,
 )
@@ -111,6 +116,8 @@ class FullXPUGraphBackend(BaseGraphBackend):
 
     @contextmanager
     def capture_session(self, stream: torch.xpu.Stream):
+        patch_sgl_kernel_scratchpad_buffers()
+        register_graph_scratchpad_owner(self)
         if self._pool is None:
             self._pool = get_or_create_global_graph_memory_pool(self._device_module)
         self._capture_stream = stream
@@ -198,3 +205,4 @@ class FullXPUGraphBackend(BaseGraphBackend):
         self._outputs.clear()
         self._output_buffer = None
         self._pool = None
+        unregister_graph_scratchpad_owner(self)
