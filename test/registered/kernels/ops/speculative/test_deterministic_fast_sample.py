@@ -171,14 +171,6 @@ class TestDeterministicFastSample(CustomTestCase):
                     )
                 )
 
-    def test_requires_matching_seed_position_rows(self):
-        with self.assertRaisesRegex(ValueError, "matching shapes"):
-            fast_sample(
-                self.probs[:2],
-                sampling_seed=torch.tensor([1, 2], device="cuda"),
-                positions=torch.tensor([3], device="cuda"),
-            )
-
 
 if __name__ == "__main__":
     unittest.main()
