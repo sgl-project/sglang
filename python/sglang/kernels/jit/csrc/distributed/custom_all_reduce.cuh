@@ -32,12 +32,23 @@
 
 #include <sgl_kernel/distributed/communicator.cuh>
 
+#ifdef USE_ROCM
+#include "two_shot_push_unrolled.cuh"
+#endif
+
 #include <tvm/ffi/extra/stl.h>
 #include <tvm/ffi/object.h>
 
 #include <cstdint>
 #include <cstring>
 #include <string>
+
+// Kept out of sgl_kernel/utils.cuh: every JIT build's cache key covers that
+// header's contents, so an edit there rebuilds every CUDA kernel.
+#ifdef USE_ROCM
+#define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
+#define cudaGetDevice hipGetDevice
+#endif
 
 namespace sglang {
 
@@ -146,7 +157,7 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllR
   const auto num_vecs = params.num_vecs;
   const auto num_threads = blockDim.x * gridDim.x;
   // Round-robin warps to blocks rather than giving each block a contiguous run.
-  // The grid is pinned to the counter array, so once `num_vecs` stops filling
+  // The grid is the plane's fixed default width, so once `num_vecs` stops filling
   // `gridDim * blockDim` a block-major index leaves the tail CTAs with nothing
   // to do; that happens over a whole 2x band of sizes, between the point where
   // `choose_block_size` gives up on 512 and the point where 1024 threads fill
@@ -208,7 +219,7 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllR
 
   PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
-  epoch.flip();
+  epoch.commit();
 }
 
 /// Chunk c of the flat tensor is owned by rank c. A slot (dst, src) holds two
@@ -317,7 +328,7 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_push_kernel(const __grid_constant__ AllR
 
   PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
-  epoch.flip();
+  epoch.commit();
 }
 
 template <typename Impl, typename T, uint32_t kWorldSize, bool kUsePDL>
@@ -328,12 +339,8 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_pull_kernel(const __grid_constant__ AllR
   const auto num_vecs = params.num_vecs;
   const auto impl = Impl{params};
   PDLWaitPrimary<kUsePDL>();
-  const auto barrier = distributed::Barrier<kWorldSize>{
-      params.ws.semaphores.data(),
-      params.rank,
-      /*num_arrives=*/2,
-  };
-  barrier.arrive_relaxed(/*n=*/0);
+  const auto barrier = distributed::Barrier<kWorldSize>{params.ws.semaphores.data(), params.rank};
+  barrier.arrive_relaxed();
   __syncthreads();
 
   const auto num_threads = blockDim.x * gridDim.x;
@@ -346,7 +353,7 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_pull_kernel(const __grid_constant__ AllR
 
   PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
-  barrier.arrive_relaxed(/*n=*/1);
+  barrier.arrive_relaxed();
 }
 
 template <typename Impl, typename T, uint32_t kWorldSize, bool kUsePDL>
@@ -361,12 +368,8 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_pull_kernel(const __grid_constant__ AllR
   const auto vec_offset = params.rank * avg_vecs + min(params.rank, rem_vecs);
   const auto impl = Impl{params, vec_offset};
   PDLWaitPrimary<kUsePDL>();
-  const auto barrier = distributed::Barrier<kWorldSize>{
-      params.ws.semaphores.data(),
-      params.rank,
-      /*num_arrives=*/2,
-  };
-  barrier.arrive_relaxed(/*n=*/0);
+  const auto barrier = distributed::Barrier<kWorldSize>{params.ws.semaphores.data(), params.rank};
+  barrier.arrive_relaxed();
   __syncthreads();
 
   const auto num_threads = blockDim.x * gridDim.x;
@@ -378,8 +381,13 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_pull_kernel(const __grid_constant__ AllR
   }
 
   PDLTriggerSecondary<kUsePDL>();
+#ifdef USE_ROCM
+  // s_barrier does not drain a wave's outstanding stores and the signalling
+  // thread's release covers only its own wave, so each wave publishes its own.
+  ptx::fence_release_sys();
+#endif
   __syncthreads();
-  barrier.arrive_rel_acq(/*n=*/1);
+  barrier.arrive_rel_acq();
 }
 
 template <uint32_t N>
@@ -407,6 +415,19 @@ inline auto choose_block_size(uint32_t num_threads) -> uint32_t {
   }
   return 1024u;
 }
+
+#ifdef USE_ROCM
+inline bool is_gfx1250() {
+  static const bool kIsGfx1250 = [] {
+    int device = 0;
+    CHECK_CUDA(cudaGetDevice(&device));
+    hipDeviceProp_t prop;
+    CHECK_CUDA(hipGetDeviceProperties(&prop, device));
+    return std::strncmp(prop.gcnArchName, "gfx1250", 7) == 0;
+  }();
+  return kIsGfx1250;
+}
+#endif
 
 template <typename T, uint32_t kWorldSize, bool kUsePDL>
 struct AllReduceKernel {
@@ -453,13 +474,26 @@ struct AllReduceKernel {
       };
       const auto kernel = two_shot ? all_reduce_2shot_push_kernel<T, kWorldSize, kUsePDL>
                                    : all_reduce_1shot_push_kernel<T, kWorldSize, kUsePDL>;
-      // the grid is bound to the counter array and must stay constant
       auto block_size = choose_block_size(num_vecs);
+#ifdef USE_ROCM
+      // MI350X: from 128 KB a full block per CU beats the narrower pick for
+      // 1shot_push (TP4/6 -4..-8%, TP8 up to -22%); 2shot_push does not gain
+      if (!two_shot && num_vecs >= 8192) block_size = 1024u;
+      if constexpr (kWorldSize <= 16) {
+        // the unrolled kernel gives every peer a warp; smaller grids take the per-vector kernel
+        const bool enough_warps = push.default_blocks * (kTwoShotPushThreads / device::kWarpThreads) >= kWorldSize - 1;
+        if (two_shot && is_gfx1250() && enough_warps && nbytes >= kTwoShotPushUnrolledMinBytes<kWorldSize>) {
+          LaunchKernel(push.default_blocks, kTwoShotPushThreads, stream)  //
+              .enable_pdl(kUsePDL)(all_reduce_2shot_push_unrolled_kernel<T, kWorldSize, kUsePDL, PushParams>, params);
+          return out;
+        }
+      }
+#endif
       if (two_shot) {
         // at least `kWorldSize - 1` warps in all, 1 for each peer
-        block_size = std::max(block_size, 32u * div_ceil(kWorldSize - 1, push.num_blocks));
+        block_size = std::max(block_size, 32u * div_ceil(kWorldSize - 1, push.default_blocks));
       }
-      LaunchKernel(push.num_blocks, block_size, stream)  //
+      LaunchKernel(push.default_blocks, block_size, stream)  //
           .enable_pdl(kUsePDL)(kernel, params);
       return out;
     }

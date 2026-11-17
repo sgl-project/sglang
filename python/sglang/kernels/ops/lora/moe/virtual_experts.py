@@ -760,7 +760,7 @@ def _merged_experts_fused_moe_lora_add_op(
     )
 
 
-from sglang.srt.utils.common import direct_register_custom_op
+from sglang.srt.utils.custom_op import direct_register_custom_op
 
 direct_register_custom_op(
     op_name="merged_experts_fused_moe_lora_add",

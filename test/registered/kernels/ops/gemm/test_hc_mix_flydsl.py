@@ -10,7 +10,7 @@ from sglang.srt.layers.hc_mix_flydsl import (
 )
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is None,
@@ -21,7 +21,8 @@ pytestmark = pytest.mark.skipif(
 def test_gated_residual_dispatch():
     if torch.cuda.get_device_properties().gcnArchName.split(":")[0] != "gfx950":
         pytest.skip("Requires gfx950")
-    from aiter.ops.flydsl.hc_mix import hc_mix
+    # The pinned AITER may predate the kernel; production gates on it the same way.
+    hc_mix = pytest.importorskip("aiter.ops.flydsl.hc_mix").hc_mix
 
     from sglang.srt.layers.hyperconnection import GatedResidual, HyperConnectionConfig
 
@@ -71,7 +72,8 @@ def test_gated_residual_dispatch_many_rows(rows):
     # Speculative verify passes carry requests x draft tokens rows.
     if torch.cuda.get_device_properties().gcnArchName.split(":")[0] != "gfx950":
         pytest.skip("Requires gfx950")
-    from aiter.ops.flydsl.hc_mix import hc_mix
+    # The pinned AITER may predate the kernel; production gates on it the same way.
+    hc_mix = pytest.importorskip("aiter.ops.flydsl.hc_mix").hc_mix
 
     from sglang.srt.layers.hyperconnection import GatedResidual, HyperConnectionConfig
 
