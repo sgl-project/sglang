@@ -251,8 +251,6 @@ class TestVisionParallelGroups(CustomTestCase):
                             in (
                                 "siglip",
                                 "qwen_merger",
-                                "glm4v_mlp",
-                                "glm4v_merger",
                                 "internvl_mlp",
                             )
                             else "attn_tp"
