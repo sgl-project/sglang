@@ -447,8 +447,11 @@ def handle_model_specific_adjustments(server_args: Any):
         run_post_process_pass(server_args, _deepseek_moe_quant_resolution)
         if get_platform().is_hip:
             if is_deepseek_dsa(hf_config) and not envs.SGLANG_OPT_USE_TOPK_V2.is_set():
-                # Prefer HIP top-k by default while honoring an explicit selection.
-                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                # Prefer HIP top-k by default while honoring an explicit selection;
+                # k-pool indexers take the top-k v2 kernel, which runs on HIP.
+                from sglang.srt.configs.model_config import get_dsa_index_kpool
+
+                envs.SGLANG_OPT_USE_TOPK_V2.set(get_dsa_index_kpool(hf_config) > 1)
             if not attn_dp_enabled_of(resolved_view(server_args)) and cfg.nnodes == 1:
                 # TODO (Hubert): Put this back later
                 # server_args.enable_aiter_allreduce_fusion = True

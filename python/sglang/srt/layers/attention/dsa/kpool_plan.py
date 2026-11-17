@@ -119,6 +119,9 @@ class KPoolWritePlan:
     pool_schedule_metadata: Optional[torch.Tensor] = None
     effective_n_per_batch: Optional[torch.Tensor] = None
     pool_topk_v2_plan: Optional[torch.Tensor] = None
+    # [B] last draft row's pool length + (num_draft_tokens - 1): the AITER next_n
+    # context length that covers every draft row of the request.
+    pool_context_lens_per_req: Optional[torch.Tensor] = None
 
 
 def _is_kpool_layout_enabled(kpool: int, physical_page_size: int) -> bool:
@@ -698,6 +701,10 @@ def _alloc_kpool_write_plan_buffers(
             pool_seqlens_per_q=torch.zeros(n_rows, dtype=torch.int32, device=device),
             seqlens_per_q=torch.zeros(n_rows, dtype=torch.int32, device=device),
         )
+        if is_hip():
+            verify_extras["pool_context_lens_per_req"] = torch.zeros(
+                max_bs, dtype=torch.int32, device=device
+            )
     if is_v2:
         verify_extras["effective_n_per_batch"] = torch.zeros(
             max_bs, dtype=torch.int32, device=device
@@ -790,6 +797,16 @@ def update_kpool_write_plan(
         num_draft_tokens=num_draft_tokens,
         index_page_size=index_page_size,
     )
+
+    if is_verify and plan.pool_context_lens_per_req is not None:
+        bs = write_start.shape[0]
+        torch.add(
+            plan.pool_seqlens_per_q[: bs * num_draft_tokens].view(bs, num_draft_tokens)[
+                :, -1
+            ],
+            num_draft_tokens - 1,
+            out=plan.pool_context_lens_per_req[:bs],
+        )
 
     if (
         is_v2

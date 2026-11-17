@@ -102,10 +102,14 @@ def aiter_paged_mqa_logits(
     *,
     preshuffle: bool,
     kv_block_size: int,
+    next_n: int = 1,
 ) -> torch.Tensor:
+    """With ``next_n > 1``, rows ``b * next_n + j`` form request ``b``:
+    ``seq_lens[b]`` and ``block_tables[b]`` are per request, and row ``j``
+    scores columns ``<= seq_lens[b] - next_n + j``."""
     from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
-    q_fp8 = q_fp8.unsqueeze(1)
+    q_fp8 = q_fp8.view(-1, next_n, q_fp8.shape[1], q_fp8.shape[2])
     batch_size, next_n, _, _ = q_fp8.shape
     logits = torch.empty(
         (batch_size * next_n, max_seq_len),

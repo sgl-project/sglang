@@ -322,11 +322,19 @@ class IndexerKPool(MultiPlatformOp):
             for name in ("wk", "weights_proj")
         )
 
-    def _get_q_k_fused_x_proj(self, q_lora: torch.Tensor, x: torch.Tensor):
+    def _get_q_k_fused_x_proj(
+        self, q_lora: torch.Tensor, x: torch.Tensor, norm_and_rotate: bool = True
+    ):
+        """``norm_and_rotate=False`` returns the fp32 key projection and the query
+        before its Hadamard rotation; the caller applies ``k_norm`` and the rotation."""
         from sglang.kernels.ops.attention.fla.layernorm_gated import _layer_norm_fwd
 
         d = self.head_dim
         proj = torch.mm(x, self.x_proj_weight.t(), out_dtype=torch.float32)
+        query, _ = self.wq_b(q_lora)
+        query = rearrange(query, "l (h d) -> l h d", d=d)
+        if not norm_and_rotate:
+            return query, proj[:, :d], proj[:, d : 2 * d], proj[:, 2 * d :]
         key = torch.empty(x.shape[0], d, dtype=torch.bfloat16, device=x.device)
         _layer_norm_fwd(
             proj[:, :d],
@@ -335,9 +343,7 @@ class IndexerKPool(MultiPlatformOp):
             self.k_norm.variance_epsilon,
             out=key,
         )
-        query, _ = self.wq_b(q_lora)
-        query = rotate_activation(rearrange(query, "l (h d) -> l h d", d=d))
-        return query, key, proj[:, d : 2 * d], proj[:, 2 * d :]
+        return rotate_activation(query), key, proj[:, d : 2 * d], proj[:, 2 * d :]
 
     def _can_overlap_prefill(
         self,
@@ -861,6 +867,44 @@ class IndexerKPool(MultiPlatformOp):
             topk_v2_plan=topk_v2_plan,
         )
 
+    @staticmethod
+    def _kpool_verify_next_n_layout(
+        forward_batch: ForwardBatch,
+        metadata: BaseIndexerMetadata,
+        pool_seqlens: torch.Tensor,
+        pool_block_tables: torch.Tensor,
+        n_real: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """AITER paged-MQA inputs that score each request's draft rows as one
+        ``next_n`` query, so every split of a request runs on one XCD.
+
+        A request's draft rows share one page table, so row ``b * next_n`` read
+        ``next_n`` rows wide is that request's table; blocks past its width
+        fall in the request's own duplicate rows and only feed columns the
+        kernel's ``max_model_len`` store mask drops.
+        """
+        plan = metadata.attn_metadata.kpool_write_plan
+        if (
+            not forward_batch.forward_mode.is_target_verify()
+            or plan is None
+            or plan.pool_context_lens_per_req is None
+        ):
+            return pool_seqlens, pool_block_tables, 1
+        next_n = plan.num_draft_tokens
+        if (
+            next_n <= 1
+            or n_real % next_n != 0
+            or pool_block_tables.shape[0] < n_real
+            or not pool_block_tables.is_contiguous()
+        ):
+            return pool_seqlens, pool_block_tables, 1
+        bs = n_real // next_n
+        return (
+            plan.pool_context_lens_per_req[:bs],
+            pool_block_tables[:n_real].view(bs, -1),
+            next_n,
+        )
+
     def _get_kpool_decode_metadata(
         self,
         metadata: BaseIndexerMetadata,
@@ -1108,15 +1152,21 @@ class IndexerKPool(MultiPlatformOp):
                 )
             from sglang.kernels.ops.attention.dsa import aiter_paged_mqa_logits
 
+            mqa_seqlens, mqa_block_tables, mqa_next_n = (
+                self._kpool_verify_next_n_layout(
+                    forward_batch, metadata, pool_seqlens, pool_block_tables, n_real
+                )
+            )
             logits = aiter_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
                 weights,
-                pool_seqlens,
-                pool_block_tables,
+                mqa_seqlens,
+                mqa_block_tables,
                 pool_max_seq_len,
                 preshuffle=True,
                 kv_block_size=block_kv,
+                next_n=mqa_next_n,
             )
         elif use_tilelang_paged_mqa:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
@@ -1629,9 +1679,17 @@ class IndexerKPool(MultiPlatformOp):
         num_draft_tokens = plan.num_draft_tokens
 
         fused_x_proj = self._use_fused_x_proj()
+        # On one stream, the k-pool write launch also applies the key LayerNorm and
+        # rotates and quantizes the query.
+        fuse_write_quant = (
+            fused_x_proj
+            and return_indices
+            and not enable_dual_stream
+            and self.head_dim == self.block_size
+        )
         if fused_x_proj:
             query, key, gate_score_maybe, head_weights = self._get_q_k_fused_x_proj(
-                q_lora, x
+                q_lora, x, norm_and_rotate=not fuse_write_quant
             )
         else:
             query, key, gate_score_maybe, head_weights = self._get_q_k_bf16(
@@ -1655,11 +1713,25 @@ class IndexerKPool(MultiPlatformOp):
 
         buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
 
-        def _compress_write() -> None:
+        fused_quant_args = {}
+        if fuse_write_quant:
+            fused_quant_args = dict(
+                key_norm=(
+                    self.k_norm.weight,
+                    self.k_norm.bias,
+                    self.k_norm.variance_epsilon,
+                ),
+                query=query,
+                head_weights=head_weights,
+                head_scale=self.n_heads**-0.5,
+                softmax_scale=self.softmax_scale,
+            )
+
+        def _compress_write():
             # Only rows covered by the write plan belong to verify sequences;
             # trailing MoE padding must not update per-request KPool state.
             num_write_tokens = plan.req.shape[0] * num_draft_tokens
-            kpool_write_tail_and_maybe_compress(
+            return kpool_write_tail_and_maybe_compress(
                 pool=pool,
                 buf=buf,
                 key=key[:num_write_tokens],
@@ -1677,9 +1749,12 @@ class IndexerKPool(MultiPlatformOp):
                 num_draft_tokens=num_draft_tokens,
                 round_scale=self.scale_fmt is not None,
                 effective_n_per_batch=plan.effective_n_per_batch,
+                **fused_quant_args,
             )
 
-        if enable_dual_stream:
+        if fuse_write_quant:
+            q_fp8, q_scale, weights = _compress_write()
+        elif enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
             if gate_score_maybe is not None and not fused_x_proj:
