@@ -62,6 +62,23 @@ class _DisabledAiterQuickAllReduce(_FakeAiterQuickAllReduce):
     disabled = True
 
 
+class _FusingAiterQuickAllReduce(_FakeAiterQuickAllReduce):
+    """A dispatcher with aiter#5670's fused all-reduce + add + RMSNorm."""
+
+    def __init__(self, group=None, device=None):
+        super().__init__(group, device)
+        self.fuses = True
+        self.fused_calls = 0
+
+    def should_fly_allreduce_rmsnorm(self, inp, residual, weight):
+        return self.fuses
+
+    def fly_allreduce_rmsnorm(self, inp, residual, weight, eps):
+        self.fused_calls += 1
+        added = inp + residual
+        return added * weight, added
+
+
 def _aiter_module(cls=None) -> types.ModuleType:
     module = types.ModuleType(_AITER_QR_MODULE)
     if cls is not None:
@@ -210,6 +227,48 @@ class TestQuickAllReduceAiterDispatcher(CustomTestCase):
         self.assertTrue(dispatcher.closed)
         self.assertIsNone(quick_reduce._flydsl_int4)
         self.assertTrue(quick_reduce.disabled)
+
+
+class TestQuickAllReduceFusedRMSNorm(CustomTestCase):
+    def test_fusion_needs_the_dispatchers_fused_kernel(self):
+        inp = torch.empty(MB, dtype=torch.bfloat16)
+        plain = _make_dispatcher_quick_reduce(_FakeAiterQuickAllReduce())
+        self.assertEqual(plain.fused_rmsnorm_max_size(), 0)
+        self.assertFalse(plain.should_fused_allreduce_rmsnorm(inp, inp, inp[:8]))
+
+        fusing = _make_dispatcher_quick_reduce(_FusingAiterQuickAllReduce())
+        self.assertEqual(fusing.fused_rmsnorm_max_size(), 2048 * MB)
+        self.assertTrue(fusing.should_fused_allreduce_rmsnorm(inp, inp, inp[:8]))
+
+    def test_fusion_stays_inside_the_quick_reduce_window(self):
+        """Below the INT4 minimum, or when aiter declines, the call is not fused."""
+        dispatcher = _FusingAiterQuickAllReduce()
+        quick_reduce = _make_dispatcher_quick_reduce(dispatcher)
+        small = torch.empty(MB // 2, dtype=torch.bfloat16)
+        inp = torch.empty(MB, dtype=torch.bfloat16)
+
+        self.assertFalse(
+            quick_reduce.should_fused_allreduce_rmsnorm(small, small, small)
+        )
+        dispatcher.fuses = False
+        self.assertFalse(quick_reduce.should_fused_allreduce_rmsnorm(inp, inp, inp))
+        dispatcher.fuses = True
+        dispatcher.accepts = False
+        self.assertFalse(quick_reduce.should_fused_allreduce_rmsnorm(inp, inp, inp))
+
+    def test_fused_call_goes_through_the_dispatcher(self):
+        dispatcher = _FusingAiterQuickAllReduce()
+        quick_reduce = _make_dispatcher_quick_reduce(dispatcher)
+        inp = torch.ones(MB, dtype=torch.bfloat16)
+        residual = torch.full_like(inp, 2.0)
+
+        normed, added = quick_reduce.fused_allreduce_rmsnorm(
+            inp, residual, torch.full_like(inp, 0.5), 1e-6
+        )
+
+        self.assertEqual(dispatcher.fused_calls, 1)
+        self.assertTrue(torch.equal(added, torch.full_like(inp, 3.0)))
+        self.assertTrue(torch.equal(normed, torch.full_like(inp, 1.5)))
 
 
 if __name__ == "__main__":

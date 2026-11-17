@@ -21,6 +21,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_hip,
+    print_info_once,
     print_warning_once,
     temp_set_env,
 )
@@ -324,6 +325,39 @@ class QuickAllReduce:
             self._ptr, inp, out, self.qr_quant_level.value, self.use_fp16_kernels
         )
         return out
+
+    def fused_rmsnorm_max_size(self) -> int:
+        """Largest all-reduce the dispatcher can fuse with add + RMSNorm, else 0.
+
+        The FlyDSL fused kernel stages through the QuickReduce workspace, not
+        the 64 MiB custom all-reduce pool, so a whole prefill chunk can fuse.
+        """
+        if self._flydsl_int4 is None or not hasattr(
+            self._flydsl_int4, "should_fly_allreduce_rmsnorm"
+        ):
+            return 0
+        return self.qr_max_size
+
+    def should_fused_allreduce_rmsnorm(
+        self, inp: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
+    ) -> bool:
+        """Whether the dispatcher's FlyDSL kernel fuses this all-reduce with add + RMSNorm."""
+        if not self.fused_rmsnorm_max_size() or not self.should_quick_allreduce(inp):
+            return False
+        return bool(
+            self._flydsl_int4.should_fly_allreduce_rmsnorm(inp, residual, weight)
+        )
+
+    def fused_allreduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(rmsnorm(allreduce(inp) + residual), allreduce(inp) + residual)``."""
+        print_info_once("FlyDSL fused all-reduce + add + RMSNorm serves a prefill call")
+        return self._flydsl_int4.fly_allreduce_rmsnorm(inp, residual, weight, eps)
 
     def close(self):
         if self._flydsl_int4 is not None:
