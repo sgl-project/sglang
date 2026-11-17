@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Union, cast
 import torch
 import tqdm
 
+from sglang.kernels.ops.memory.small_copy import write_host_ints
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.dllm.config import DllmConfig
@@ -76,6 +77,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
     _dp_tp_moe_masks_pad_rows,
+    _kernel_writes_metadata,
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
     get_required_capture_hidden_mode,
@@ -128,6 +130,7 @@ from sglang.srt.model_executor.runner_utils.shared_read_event import make_extern
 from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import UOCRDecodeGraphIO
 from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_spec
 from sglang.srt.utils import empty_context, get_available_gpu_memory
+from sglang.srt.utils.device import is_pin_memory_available
 from sglang.srt.utils.device_timer import device_timer_ctx
 
 try:
@@ -262,6 +265,26 @@ def _should_record_nolora_graph(model_runner, explicitly_requested=False) -> boo
     )
 
 
+# Arbitrary; only has to exceed any per-rank row count, so the DP pad-row mask
+# (SGLANG_OPT_MASK_DP_PAD_MOE) drops nothing.
+_DP_NO_PAD_ROWS = 1 << 30
+
+
+def _dp_real_num_tokens_per_rank(
+    *,
+    request_counts: Optional[list[int]],
+    tokens_per_request: int,
+    num_dp_ranks: int,
+    is_ragged: bool,
+) -> list[int]:
+    # Rank r's real rows are the leading request_counts[r] * tokens_per_request
+    # rows of its slice of the gathered MoE buffer; a ragged verify layout has
+    # no fixed width, so it masks nothing.
+    if is_ragged or request_counts is None or len(request_counts) != num_dp_ranks:
+        return [_DP_NO_PAD_ROWS] * num_dp_ranks
+    return [count * tokens_per_request for count in request_counts]
+
+
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     """Decode-phase CUDA graph runner.
 
@@ -298,6 +321,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     _skips_prefilled_inputs = False
     _prefilled_inputs: Optional[tuple] = None
     num_prefilled_input_skips = 0
+    # Set in __init__ under SGLANG_OPT_MASK_DP_PAD_MOE: [num_dp_ranks] int64, each
+    # rank's real (unpadded) token count; the captured DP pad-row mask reads it.
+    _dp_real_num_tokens_gpu: Optional[torch.Tensor] = None
     # SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW, read in __init__.
     _skip_glued_replay_view = False
 
@@ -344,6 +370,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.require_mlp_sync = (
             get_parallel().attn_dp_enabled or self.require_gathered_buffer
         )
+        if self.require_mlp_tp_gather and envs.SGLANG_OPT_MASK_DP_PAD_MOE.get():
+            # The capture run reads the initial value, which masks nothing.
+            self._dp_real_num_tokens_gpu = torch.full(
+                (self.num_dp_ranks,),
+                _DP_NO_PAD_ROWS,
+                dtype=torch.int64,
+                device=self.device,
+            )
         self.enable_two_batch_overlap = get_exec().overlap.enable_two_batch_overlap
         self.use_ngram_embedding = model_runner.ngram_embedding_manager.enabled
         self.speculative_algorithm = get_spec().speculative_algorithm
@@ -1466,11 +1500,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch.dp_local_start_pos = (
                         forward_batch.dp_local_num_tokens
                     ) = None
+                    # Nothing captured may write _dp_real_num_tokens_gpu: the
+                    # write would replay over the counts load_batch just set.
                     set_dp_buffer_len(
                         forward_batch.global_dp_buffer_len,
                         num_tokens,
                         forward_batch.dp_padding_mode.is_max_len(),
                         forward_batch.global_num_tokens_cpu,
+                        self._dp_real_num_tokens_gpu,
                     )
                     set_is_extend_in_batch(False)
 
@@ -1563,6 +1600,29 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if buf is not None and _dp_tp_moe_masks_pad_rows():
             buf.fill_(raw_num_token)
 
+    def _set_dp_real_num_tokens_per_rank(
+        self, forward_batch: ForwardBatch, *, is_ragged: bool
+    ) -> None:
+        buf = self._dp_real_num_tokens_gpu
+        if buf is None:
+            return
+        counts = _dp_real_num_tokens_per_rank(
+            request_counts=forward_batch.original_global_num_tokens_cpu,
+            tokens_per_request=self.captured_req_width,
+            num_dp_ranks=buf.shape[0],
+            is_ragged=is_ragged,
+        )
+        if _kernel_writes_metadata(buf.device):
+            write_host_ints((buf,), (counts,))
+        else:
+            # Pinned and non-blocking: a blocking copy would make the host wait
+            # for the previous step's graph on every step.
+            pin_memory = is_pin_memory_available(buf.device)
+            buf.copy_(
+                torch.tensor(counts, dtype=buf.dtype, pin_memory=pin_memory),
+                non_blocking=pin_memory,
+            )
+
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
             raise RuntimeError(
@@ -1614,6 +1674,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
             self._set_dp_real_num_tokens(self.raw_num_token)
+            self._set_dp_real_num_tokens_per_rank(forward_batch, is_ragged=is_ragged)
             self._copy_replay_inputs(forward_batch)
             if (
                 pp_proxy_tensors is not None
@@ -1723,6 +1784,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Padded tokens aren't read, so skip zeroing. Ragged input_ids arrive
         # from the planner already padded to the tier, invalid slots zeroed.
         self._set_dp_real_num_tokens(raw_num_token)
+        self._set_dp_real_num_tokens_per_rank(forward_batch, is_ragged=is_ragged)
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
                 forward_mode=self.capture_forward_mode,
