@@ -658,7 +658,8 @@ class SchedulePolicy:
             # Admission also charges the chunk a hit's encoder replay rows. It
             # re-matches the prefix, but a longer page-aligned match adds at most
             # as many replay rows as it drops extend tokens, so this still fits.
-            charge += PrefillAdder._replay_len(req, req.num_matched_prefix_tokens)
+            cached = len(req.origin_input_ids) + len(req.output_ids) - work
+            charge += PrefillAdder._replay_len(req, cached)
             if (
                 self._shortest_prefill_rank(req, processed_tokens) >= chunked_rank
                 or reserved + charge > budget - page_size
