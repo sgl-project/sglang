@@ -598,13 +598,23 @@ fn bad(msg: String) -> Error {
     Error::Validation(msg)
 }
 
-/// Python's float `repr`, valid only for NaN, +-inf and finite `|x| >= 1e16` (exponent form).
+/// Python's `repr(float)` over the values this message prints: non-finite, or
+/// finite past [`LOGIT_BIAS_ABS_MAX`], where `repr` is always the exponent form
+/// with a positive exponent. `{:e}` gives the same shortest round-trip digits.
 fn py_float_repr(x: f64) -> String {
     if x.is_nan() {
-        "nan".into()
-    } else {
-        format!("{x:e}").replacen('e', "e+", 1)
+        return "nan".to_owned();
     }
+    if x.is_infinite() {
+        return if x > 0.0 { "inf" } else { "-inf" }.to_owned();
+    }
+    // Below the bound `repr` takes the fixed-point form, which this does not
+    // write: `1e-5` would come back as `1e+-5`.
+    debug_assert!(
+        x.abs() > LOGIT_BIAS_ABS_MAX,
+        "repr of {x:e} is not exponent form"
+    );
+    format!("{x:e}").replacen('e', "e+", 1)
 }
 
 /// Widen a `str | [str]` API alias into the list form the internal field holds.
@@ -1233,8 +1243,8 @@ mod tests {
         let Err(err) = sp.normalize(false, TEST_VOCAB) else {
             panic!("1e39 is out of range but was accepted");
         };
-        // Python prints this JSON integer as an int; without serde_json's
-        // `arbitrary_precision` only the f64 reaches here, so it prints as a float.
+        // orjson reads an integer past 64 bits as a float, so Python's message
+        // prints this one the same way. Its `int` branch is Engine-API only.
         assert!(err.to_string().contains("got 1e+39 for token 0."), "{err}");
     }
 

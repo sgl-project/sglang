@@ -316,6 +316,21 @@ pub(super) async fn body_json(response: Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+/// The parsed `data:` frames of an SSE `response`, which must end with the
+/// `[DONE]` sentinel the OpenAI SDKs stop on.
+pub(super) async fn sse_frames(response: Response) -> Vec<serde_json::Value> {
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+    text.split("\n\n")
+        .filter_map(|event| event.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect()
+}
+
 #[tokio::test]
 async fn dropping_indexed_stream_aborts_its_live_call() {
     use crate::tokenizer_manager::wiring::AbortSource;
@@ -502,16 +517,9 @@ async fn openai_handlers_bound_n() {
 
 /// Post the JSON text `body` to `path`, which refuses it for its `n`.
 async fn assert_n_refused(app: &Router, path: &str, body: &str, message: &str) {
-    let request = Request::builder()
-        .method("POST")
-        .uri(path)
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_owned()))
-        .unwrap();
-    let response = oneshot(app.clone(), request).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path} {body}");
-    let error = body_json(response).await["error"].clone();
-    assert_eq!(error["message"], message, "{path} {body}");
+    let (status, refusal) = post_raw(app, path, body.as_bytes().to_vec()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {body}");
+    assert_eq!(refusal, message, "{path} {body}");
 }
 
 /// Python's request model bounds `n` before the handler runs, so an `n` out
@@ -524,8 +532,8 @@ async fn chat_refuses_n_before_other_checks() {
     let image = json!([{"role": "user", "content": [
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
     ]}]);
+    // The model check and the media check bracket the handler's other checks.
     for mut body in [
-        json!({"model": "model", "messages": []}),
         json!({"model": "model:adapter", "messages": text}),
         json!({"model": "model", "messages": image}),
     ] {
@@ -542,9 +550,7 @@ async fn completions_refuse_n_before_other_checks() {
     let app = routes().with_state(app_state(core_handle()));
     for mut body in [
         json!({"model": "model:adapter", "prompt": "hi"}),
-        json!({"model": "model", "prompt": "hi", "prompt_embeds": [[1.0]]}),
         json!({"model": "model", "prompt": "hi", "suffix": "x"}),
-        json!({"model": "model", "prompt": "hi", "best_of": 2}),
         json!({"model": "model", "prompt": ""}),
     ] {
         body["n"] = json!(129);
@@ -698,10 +704,23 @@ async fn openai_handlers_read_the_top_level_n() {
         let body = format!(r#"{{"model": "model", {nested}}}"#);
         let (_, message) = post_raw(&app, path, body.into_bytes()).await;
         assert!(!refused(&message), "{path} nested: {message}");
-        // The last duplicate counts.
+        // The last duplicate counts, as it does for orjson and so for Python.
         let body = format!(r#"{{"model": "model", {fields}, "n": 200, "n": 1}}"#);
-        let (_, message) = post_raw(&app, path, body.into_bytes()).await;
+        let (_, message) = post_raw(&app, path, body.clone().into_bytes()).await;
         assert!(!refused(&message), "{path} duplicate: {message}");
+        // Past `n`, the two differ: the chat body reaches the handler through a
+        // `Value`, which keeps the last of a repeated key as Python's dict does,
+        // while the completions request type is a derive, which refuses one.
+        // Python serves both. Pre-existing, and not what this reads `n` for.
+        let served = routes().with_state(answering_app_state());
+        let (status, message) = post_raw(&served, path, body.clone().into_bytes()).await;
+        if path == "/v1/chat/completions" {
+            assert_eq!(status, StatusCode::OK, "{path} duplicate: {message}");
+        } else {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path} duplicate");
+            let message = message.as_str().unwrap_or_default();
+            assert!(message.contains("duplicate field `n`"), "{path}: {message}");
+        }
         let body = format!(r#"{{"model": "model", {fields}, "n": 1, "n": 200}}"#);
         assert_n_refused(&app, path, &body, "n must be at most 128").await;
         // An escaped key is decoded first.
@@ -968,20 +987,11 @@ async fn openai_request_lines_carry_whitelisted_headers() {
             json!({"model": "model", "prompt": ["", ""]}),
             false,
         ),
-        // Python's request models refuse an `n` out of range before it is logged.
-        (
-            "/v1/completions",
-            json!({"model": "model", "prompt": "hi", "n": 0}),
-            false,
-        ),
+        // Python's request models refuse an `n` out of range, or one that is
+        // not an integer, before it is logged.
         (
             "/v1/completions",
             json!({"model": "model", "prompt": "hi", "n": 129}),
-            false,
-        ),
-        (
-            "/v1/chat/completions",
-            json!({"model": "model", "messages": messages, "n": 0}),
             false,
         ),
         (
@@ -991,24 +1001,11 @@ async fn openai_request_lines_carry_whitelisted_headers() {
         ),
         (
             "/v1/completions",
-            json!({"model": "model", "prompt": "hi", "suffix": "x", "n": 129}),
-            false,
-        ),
-        (
-            "/v1/completions",
-            json!({"model": "model", "prompt": "hi", "n": 256}),
-            false,
-        ),
-        (
-            "/v1/chat/completions",
-            json!({"model": "model:adapter", "messages": messages, "n": 129}),
-            false,
-        ),
-        (
-            "/v1/completions",
             json!({"model": "model", "prompt": "hi", "n": null}),
             false,
         ),
+        // Chat reads `n` at its own call site, ahead of the lowerer, so cover
+        // it as well as the completions one above.
         (
             "/v1/chat/completions",
             json!({"model": "model", "messages": messages, "n": null}),

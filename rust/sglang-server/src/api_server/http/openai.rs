@@ -286,13 +286,15 @@ fn model_error(model: &str, served_model_name: &str) -> Option<String> {
 
 /// Why a chat or completions body's `n` cannot be served, if it cannot:
 /// Python's request models refuse it outside `[1, OPENAI_MAX_N]` in field
-/// validation, before the handler runs, taking an integral float as an
-/// integer and refusing `null`, which the typed requests take as unset.
-/// (The content-type check and model-level `before` validators come
-/// earlier.) The typed requests hold a `u8`, so this reads the raw body as
-/// Python's HTTP server does, with orjson: every number as `f64` past 64
-/// bits. A number past `f64` and a body that is not UTF-8 fail to decode
-/// there, so they are left to the parse, as are other values.
+/// validation, before the handler runs, and refuse `null`, which the typed
+/// requests take as unset. (The content-type check and model-level `before`
+/// validators come earlier.) The typed requests hold a `u8`, so this reads
+/// the raw body as Python's HTTP server does, with orjson: every number as
+/// `f64` past 64 bits. Only the refusal is read off that number, over an
+/// integral float as Python's lax `int` reads it; a value within the bound
+/// is left to the parse, which takes no float at all. A number past `f64`
+/// and a body that is not UTF-8 fail to decode there, so they are left to
+/// the parse, as are other values.
 fn n_error(body: &[u8]) -> Option<String> {
     // Skipped strings are not checked for UTF-8, so check the whole body.
     let body = std::str::from_utf8(body).ok()?;
@@ -315,7 +317,8 @@ fn n_error(body: &[u8]) -> Option<String> {
 }
 
 /// A JSON object's last `n` member, as orjson keeps it, as its JSON text;
-/// the other members are skipped.
+/// the other members are skipped. `BodyRank` in `dp_relay.rs` is the same
+/// visitor over the two rank members.
 struct BodyN<'a>(Option<&'a serde_json::value::RawValue>);
 
 impl<'de> serde::Deserialize<'de> for BodyN<'de> {

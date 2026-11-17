@@ -95,11 +95,13 @@ async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Some(response) = lowered::chat(&state, &headers, &body).await {
-        return response;
-    }
+    // Ahead of the lowerer, which declines every `n` this refuses and would
+    // otherwise parse and clone the whole body first.
     if let Some(message) = n_error(&body) {
         return openai_error(StatusCode::BAD_REQUEST, message, false);
+    }
+    if let Some(response) = lowered::chat(&state, &headers, &body).await {
+        return response;
     }
     let ChatBody {
         request:
@@ -1189,7 +1191,7 @@ mod tests {
     use super::super::ChatFormatter;
     use super::super::test_utils::{
         answering_app_state_with, answering_app_state_with_item, answering_app_state_with_request,
-        body_json, chat_submitted, chunk, post_json, with_cached_tokens,
+        body_json, chat_submitted, chunk, post_json, sse_frames, with_cached_tokens,
     };
     use super::{
         OutputParsing, SamplingDefaults, chat_event_stream, chat_images, chat_logprobs,
@@ -1479,17 +1481,7 @@ mod tests {
                 body["stream_options"] = serde_json::json!({"include_usage": true});
                 let response = post_json(app.clone(), "/v1/chat/completions", body.clone()).await;
                 assert_eq!(response.status(), StatusCode::OK, "{body}");
-                let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
-                    .await
-                    .unwrap();
-                let sse = std::str::from_utf8(&bytes).unwrap();
-                assert!(sse.trim_end().ends_with("data: [DONE]"), "{sse}");
-                let frames: Vec<serde_json::Value> = sse
-                    .lines()
-                    .filter_map(|line| line.strip_prefix("data: "))
-                    .filter(|data| *data != "[DONE]")
-                    .map(|data| serde_json::from_str(data).unwrap())
-                    .collect();
+                let frames = sse_frames(response).await;
                 for index in 0..2 {
                     let deltas: Vec<&serde_json::Value> = frames
                         .iter()
@@ -1497,16 +1489,16 @@ mod tests {
                         .filter(|choice| choice["index"] == index)
                         .collect();
                     let streamed: String = deltas.iter().map(|c| output(&c["delta"])).collect();
-                    assert_eq!(streamed, text, "{sse}");
+                    assert_eq!(streamed, text, "{frames:?}");
                     let finishes: Vec<&serde_json::Value> = deltas
                         .iter()
                         .map(|choice| &choice["finish_reason"])
                         .filter(|finish| !finish.is_null())
                         .collect();
-                    assert_eq!(finishes, ["length"], "{sse}");
+                    assert_eq!(finishes, ["length"], "{frames:?}");
                 }
                 let usage = &frames.last().unwrap()["usage"];
-                assert_eq!(usage["completion_tokens"], tokens, "{sse}");
+                assert_eq!(usage["completion_tokens"], tokens, "{frames:?}");
             }
         }
     }

@@ -935,6 +935,8 @@ pub(crate) fn check_prompt_copies(
     fields: &[&serde_json::Value],
     n: usize,
 ) -> Result<(), Error> {
+    // The OpenAI routes bound `n` by the same cap before they copy, so this
+    // guards any other caller rather than them.
     if batch_size_exceeds_limit(n, *MAX_BATCH_REQS_PER_HTTP_REQ) {
         return Err(Error::Validation(format!(
             "batch size {n} exceeds the maximum of {}",
