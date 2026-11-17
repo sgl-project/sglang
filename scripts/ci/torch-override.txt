@@ -4,3 +4,6 @@
 torch==2.15.0
 torchaudio==2.11.1
 torchvision==0.29.2
+# Trial: a fresh venv resolves ml_dtypes 0.7 (numpy>=2), which the later lmms_eval
+# install (numpy==1.26.4) breaks; the runners' kept venv has an older ml_dtypes.
+ml-dtypes<0.6
