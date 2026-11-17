@@ -514,12 +514,13 @@ class MlaPrefillPsMetadata:
 
 
 def _kv_cache_is_vectorized_5d(pool) -> bool:
-    """Whether ``pool`` stores K/V in the SHUFFLE 5D layout. A pool with a
-    window sub-pool answers with its full view's layout, or its window view's
-    when it routes no full layers (a draft fused into the window sub-pool)."""
+    """Whether ``pool`` stores K/V in the SHUFFLE 5D layout. A pool answers
+    with its full view's layout, or its window view's when it routes no full
+    layers (a draft fused into the window sub-pool). A composite that wraps a
+    full view (hybrid linear attention) has no layout of its own."""
     router = pool.layer_router
-    if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
-        has_full = router.sub_pool(IdSpaceKind.FULL) is not None
+    has_full = router.sub_pool(IdSpaceKind.FULL) is not None
+    if has_full or router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
         pool = router.view(IdSpaceKind.FULL if has_full else IdSpaceKind.SLIDING_WINDOW)
     return getattr(pool, "kv_cache_layout", "nhd") == "vectorized_5d"
 
