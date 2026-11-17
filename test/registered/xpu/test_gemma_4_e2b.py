@@ -24,7 +24,7 @@ import unittest
 import openai
 import torch
 
-from sglang.srt.utils.common import is_xpu
+from sglang.srt.utils.device import is_xpu
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,

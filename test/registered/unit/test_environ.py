@@ -206,10 +206,12 @@ class TestRenamedEnvAliases(unittest.TestCase):
                 os.environ.pop(new, None)
             with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False):
                 value = field.get()
-        deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        deprecations = [w for w in caught if issubclass(w.category, FutureWarning)]
         return field, value, deprecations
 
-    def test_former_name_applies_with_a_deprecation_warning(self):
+    def test_former_name_applies_with_a_visible_warning(self):
+        """The warning must reach users: a DeprecationWarning raised from library
+        code is filtered out by Python's default warning filters."""
         for new, old in RENAMED_NV_MEGA_RUNTIME_CHILDREN.items():
             with self.subTest(new=new):
                 field, value, deprecations = self._read(new, {old: "1"})
@@ -263,6 +265,32 @@ class TestDeprecatedEnvRegistry(unittest.TestCase):
 
         self._apply(old_name, _DeprecatedEnv(replacement=new_name, transform=str.upper))
         self.assertEqual(os.environ[new_name], "ABC")
+
+
+class TestDocumentedBooleanKnobs(unittest.TestCase):
+    """Documented booleans must accept `true`/`false`: compared to "1" or "0" at the
+    read site, `true` was ignored and even turned the MLA RoPE fusion off."""
+
+    DOCUMENTED_DEFAULTS = {
+        "SGLANG_SKIP_P2P_CHECK": False,
+        "SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION": True,
+        "SGLANG_BLOCK_NONZERO_RANK_CHILDREN": True,
+    }
+
+    def test_default_and_true_false_spellings(self):
+        for name, default in self.DOCUMENTED_DEFAULTS.items():
+            field = vars(type(envs))[name]
+            with self.subTest(name=name), patch.dict(os.environ):
+                os.environ.pop(name, None)
+                self.assertIs(field.get(), default)
+                for value, expected in (
+                    ("true", True),
+                    ("1", True),
+                    ("false", False),
+                    ("0", False),
+                ):
+                    os.environ[name] = value
+                    self.assertIs(field.get(), expected)
 
 
 if __name__ == "__main__":
