@@ -6463,7 +6463,6 @@ class Scheduler(
             # be discarded; non-decode modes never offload.
             reqs_to_abort = retract_all(
                 reqs=retract_reqs,
-                tree_cache=self.tree_cache,
                 request_retirer=self.request_retirer,
                 offload_kv=False,
             )
