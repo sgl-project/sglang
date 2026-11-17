@@ -873,6 +873,12 @@ class Envs:
     # get_embedding_tp_kwargs); they must stay in lock-step. Currently only
     # applies to the Deepseek-V2 family (Deepseek V3.1, Kimi K2.5) + drafts.
     SGLANG_ENABLE_EMBED_REPLICATION = EnvBool(False)
+    # With a prefill graph enabled, a 0-token DP rank keeps SUM_LEN and the
+    # step runs eagerly with only the rows that exist, instead of padding the
+    # group to the capture bucket with a fabricated dummy request. Off by
+    # default (GPU prefill on MoE-TP keeps the MAX_LEN path); turn on for EP
+    # prefill (e.g. Ascend ascend_ops).
+    SGLANG_ENABLE_PREFILL_GRAPH_IDLE_RANK_EAGER = EnvBool(False)
     # Gated background transfers (distributed/device_communicators/
     # gated_transfer.py): force open a transfer gate whose pause has been held
     # this long, logging an error. A pause that never resumes means work the
