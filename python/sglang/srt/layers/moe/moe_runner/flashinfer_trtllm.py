@@ -166,8 +166,6 @@ def round_up_to_multiple(x: int, m: int) -> int:
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
-        FlashinferCombineInput,
-        FlashinferDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )

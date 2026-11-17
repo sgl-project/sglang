@@ -15,6 +15,9 @@ from typing import Any, ClassVar
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 COSMOS3_DEFAULT_GUIDANCE_SCALE = 4.0
 COSMOS3_EDGE_T2I_GUIDANCE_SCALE = 7.0
@@ -22,6 +25,9 @@ COSMOS3_EDGE_T2V_GUIDANCE_SCALE = 5.0
 COSMOS3_EDGE_T2V_WIDTH = 832
 COSMOS3_EDGE_T2V_HEIGHT = 480
 COSMOS3_EDGE_T2I_SIZE = 640
+# Spatial downsampling of the Wan VAE; Cosmos3LatentPreparationStage rejects
+# other sizes.
+COSMOS3_SIZE_MULTIPLE = 16
 
 # Image generation applies guidance only over a high-noise window; guiding the
 # low-noise steps degrades sample quality (Kynkaeaenniemi et al. 2024). Video
@@ -444,6 +450,11 @@ class Cosmos3SamplingParams(SamplingParams):
                     "'policy', 'forward_dynamics', or 'inverse_dynamics'."
                 )
             action_output = self.action_mode != "forward_dynamics"
+            if action_output and self.num_outputs_per_prompt > 1:
+                raise ValueError(
+                    "Cosmos3 policy and inverse-dynamics requests return one "
+                    "prediction per input; num_outputs_per_prompt must be 1"
+                )
 
         # Apply transfer per-hint defaults before the base resolves remaining
         # fields (e.g. flow_shift per mode), so an unset flow_shift can pick up
@@ -487,6 +498,41 @@ class Cosmos3SamplingParams(SamplingParams):
             self.return_frames = False
             self.output_file_name = None
             self.output_compression = 0
+
+    def _adjust_visual_fields(self, server_args, pipeline_config) -> None:
+        super()._adjust_visual_fields(server_args, pipeline_config)
+        self._align_resolution(pipeline_config)
+
+    def prepare_synthetic_warmup_request_for_queue(self, req, server_args) -> None:
+        # Warmup overwrites the dimensions after _adjust has run.
+        self._align_resolution(server_args.pipeline_config)
+
+    def _align_resolution(self, pipeline_config) -> None:
+        from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
+            Cosmos3Config,
+        )
+
+        # The simulation pipelines (Dreams, multiview, sim-auto) subclass
+        # Cosmos3Config and validate their own canvas.
+        if type(pipeline_config) is not Cosmos3Config:
+            return
+        if self.width is None or self.height is None:
+            return
+        if self.width <= 0 or self.height <= 0:
+            return
+        m = COSMOS3_SIZE_MULTIPLE
+        requested_size = (self.width, self.height)
+        self.width = max(m, self.width // m * m)
+        self.height = max(m, self.height // m * m)
+        if (self.width, self.height) != requested_size:
+            logger.warning(
+                "Cosmos3 requires dimensions divisible by %s; adjusted requested "
+                "resolution from %sx%s to %sx%s",
+                m,
+                *requested_size,
+                self.width,
+                self.height,
+            )
 
     def _validate(self) -> None:
         super()._validate()

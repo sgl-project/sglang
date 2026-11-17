@@ -270,8 +270,6 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
     )
     torch.testing.assert_close(actual, expected)
     indexer._use_fused_prep.assert_not_called()
-    # Sizing the RoPE cache reads positions.max() on the host: a device sync per layer.
-    assert indexer.apply_rope.call_args.kwargs["ensure_cos_sin_cache"] is False
     update = indexer.update_key_state_and_compress.call_args
     torch.testing.assert_close(update.args[0], hidden.unsqueeze(1))
     assert update.kwargs["state_stored"] is False
@@ -509,8 +507,7 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
     torch.testing.assert_close(v_cache.float(), initial_v.float(), equal_nan=True)
 
 
-@pytest.mark.parametrize("ensure_cos_sin_cache", [False, True])
-def test_qsa_apply_rope_cache_sizing_is_optional(ensure_cos_sin_cache):
+def test_qsa_apply_rope_does_not_size_rope_cache():
     class Sized(Exception):
         pass
 
@@ -523,10 +520,9 @@ def test_qsa_apply_rope_cache_sizing_is_optional(ensure_cos_sin_cache):
             SimpleNamespace(rotary_emb=rotary_emb),
             torch.arange(4),
             torch.zeros(4, 1, 4),
-            ensure_cos_sin_cache=ensure_cos_sin_cache,
         )
-    # Sizing reads positions.max() on the host: the CP path must skip it.
-    assert rotary_emb._ensure_cos_sin_cache_length.called is ensure_cos_sin_cache
+    # Sizing reads positions.max() on the host; the load-time reservation covers it.
+    rotary_emb._ensure_cos_sin_cache_length.assert_not_called()
 
 
 def test_qsa_cp_forward_metadata_joins_leftover_prefetch(monkeypatch):

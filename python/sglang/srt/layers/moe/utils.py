@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, IntEnum
@@ -207,9 +206,6 @@ class _MoeRunnerBackendPredicates:
     def is_ascend(self):
         return self.value == MoeRunnerBackend.ASCEND.value
 
-    def is_triton_kernels(self):
-        return self.value == MoeRunnerBackend.TRITON_KERNELS.value
-
     def is_flashinfer_trtllm(self):
         # experimental_sgl_trtllm shares the TRT-LLM FP8 kernels + layout, so it inherits
         # trtllm weight-prep here; divergent sites check is_experimental_sgl_trtllm() first.
@@ -278,7 +274,6 @@ class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     AUTO = "auto"
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
-    TRITON_KERNELS = "triton_kernel"
     ASCEND = "ascend"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     EXPERIMENTAL_SGL_TRTLLM = "experimental_sgl_trtllm"
@@ -1140,11 +1135,7 @@ def get_moe_padding_size(is_aiter_moe):
     if is_aiter_moe:
         return AITER_PADDING_SIZE
     else:
-        return (
-            TRITON_PADDING_SIZE
-            if bool(int(os.getenv("SGLANG_MOE_PADDING", "0")))
-            else 0
-        )
+        return TRITON_PADDING_SIZE if envs.SGLANG_MOE_PADDING.get() else 0
 
 
 def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
