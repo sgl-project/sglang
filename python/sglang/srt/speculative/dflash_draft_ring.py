@@ -52,7 +52,7 @@ def draft_kv_ring_unsupported_reason(
     dcp_size: int = 1,
     attn_cp_size: int = 1,
     enable_dp_attention: bool = False,
-    speculative_draft_window_size: Optional[int] = None,
+    draft_window_size: Optional[int] = None,
     is_cuda: bool = True,
 ) -> Optional[str]:
     """Why a ring cannot serve this draft, or None. Loads the draft config only
@@ -73,11 +73,13 @@ def draft_kv_ring_unsupported_reason(
             dcp_size=dcp_size,
             attn_cp_size=attn_cp_size,
             enable_dp_attention=enable_dp_attention,
-            speculative_draft_window_size=speculative_draft_window_size,
+            draft_window_size=draft_window_size,
             is_cuda=is_cuda,
         )
     if draft_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
         return f"draft backend {draft_backend!r} has no window index path"
+    if draft_window_size is not None:
+        return "--speculative-draft-window-size keeps the compact draft table"
 
     from sglang.srt.configs.model_config import mla_attention_dcp_size
     from sglang.srt.speculative.dflash_utils import (
@@ -106,7 +108,7 @@ def _mha_ring_unsupported_reason(
     dcp_size: int,
     attn_cp_size: int,
     enable_dp_attention: bool,
-    speculative_draft_window_size: Optional[int],
+    draft_window_size: Optional[int],
     is_cuda: bool,
 ) -> Optional[str]:
     if not is_cuda:
@@ -115,7 +117,7 @@ def _mha_ring_unsupported_reason(
         return "an MHA draft's ring has no context-parallel layout"
     if enable_dp_attention:
         return "an MHA draft's ring is not supported with DP attention"
-    if speculative_draft_window_size is not None:
+    if draft_window_size is not None:
         return "--speculative-draft-window-size keeps its own compact draft table"
 
     from sglang.srt.speculative.dflash_utils import (
