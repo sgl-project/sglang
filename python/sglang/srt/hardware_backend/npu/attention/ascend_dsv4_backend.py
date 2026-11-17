@@ -2365,16 +2365,14 @@ class LowRatioCompressAscendBackendMixin:
             return_softmax_lse=False,
         )
         if compress_ratio > 0:
-            graph_state = getattr(fm, "dsv4_prefill_graph_state", None)
-            if graph_state is not None:
-                topk = graph_state.topk_by_layer.get(layer.layer_id)
-            else:
-                topk = getattr(fm, f"c{compress_ratio}_topk_indices", None)
+            # Only index_source_layer_ids layers own an indexer; consumers in
+            # between reuse the most recent same-ratio source's output.
+            topk = self._dsv41_topk_for_layer(fm, layer.layer_id, compress_ratio)
             if topk is None:
                 raise RuntimeError(
                     f"DeepSeek-V4.1 ratio-{compress_ratio} attention has no "
-                    f"per-layer c{compress_ratio}_topk_indices; the indexer "
-                    "source layer must run before this layer."
+                    f"c{compress_ratio}_topk_indices; the indexer source layer "
+                    "must run before this layer."
                 )
             # Reserved by the operator; derived so the value stays live.
             compressed_lens = (forward_batch.seq_lens // compress_ratio).to(torch.int32)
@@ -2415,6 +2413,38 @@ class LowRatioCompressAscendBackendMixin:
 
     def _dsv41_low_ratios(self) -> list:
         return [r for r in self._dsv4_unique_compress_ratios if r in (1, 2)]
+
+    def _dsv41_topk_source_for(self, layer_id: int, ratio: int) -> Optional[int]:
+        """The last same-ratio index-source layer at or before ``layer_id``.
+
+        Only ``index_source_layer_ids`` layers carry an indexer.  Consumer
+        layers in between read the shared top-k published by that source, so
+        a per-layer lookup must resolve to the owning source rather than the
+        consumer's own id.
+        """
+        source = None
+        for candidate in self._dsv41_index_source_layers:
+            if candidate > layer_id:
+                continue
+            if not (0 <= candidate < len(self._dsv4_compress_ratios)):
+                continue
+            if self._dsv4_compress_ratios[candidate] != ratio:
+                continue
+            if source is None or candidate > source:
+                source = candidate
+        return source
+
+    def _dsv41_topk_for_layer(self, fm, layer_id: int, ratio: int):
+        """This layer's top-k: the owning source's staged buffer, else shared."""
+        graph_state = getattr(fm, "dsv4_prefill_graph_state", None)
+        topk = None
+        if graph_state is not None:
+            source_id = self._dsv41_topk_source_for(layer_id, ratio)
+            if source_id is not None:
+                topk = graph_state.topk_by_layer.get(source_id)
+        if topk is None:
+            topk = getattr(fm, f"c{ratio}_topk_indices", None)
+        return topk
 
     def _dsv41_candidate_ratio(self) -> Optional[int]:
         """The compression ratio of the layer that publishes candidate blocks."""

@@ -2691,6 +2691,42 @@ class TestV41PrefillGraphMetadata(unittest.TestCase):
         self.assertIs(state.topk_by_layer[4], second)
 
 
+class TestV41TopkSourceResolution(unittest.TestCase):
+    """Consumer layers read the last same-ratio index source's top-k."""
+
+    def _backend(self):
+        backend = _low_ratio_backend()
+        backend._dsv4_compress_ratios = [0, 1, 1, 2, 2, 1, 1, 2, 2]
+        backend._dsv41_index_source_layers = (1, 3, 5, 7)
+        return backend
+
+    def test_consumers_resolve_to_the_preceding_same_ratio_source(self):
+        backend = self._backend()
+        self.assertEqual(backend._dsv41_topk_source_for(2, 1), 1)
+        self.assertEqual(backend._dsv41_topk_source_for(4, 2), 3)
+        self.assertEqual(backend._dsv41_topk_source_for(6, 1), 5)
+        self.assertEqual(backend._dsv41_topk_source_for(8, 2), 7)
+        # A source layer resolves to itself; before any source there is none.
+        self.assertEqual(backend._dsv41_topk_source_for(3, 2), 3)
+        self.assertIsNone(backend._dsv41_topk_source_for(0, 1))
+        self.assertIsNone(backend._dsv41_topk_source_for(2, 2))
+
+    def test_consumer_reads_the_sources_staged_output(self):
+        backend = self._backend()
+        staged = torch.ones(3, dtype=torch.int32)
+        shared = torch.zeros(3, dtype=torch.int32)
+        fm = SimpleNamespace(
+            dsv4_prefill_graph_state=SimpleNamespace(topk_by_layer={3: staged}),
+            c2_topk_indices=shared,
+        )
+        self.assertIs(backend._dsv41_topk_for_layer(fm, 4, 2), staged)
+        self.assertIs(backend._dsv41_topk_for_layer(fm, 3, 2), staged)
+        # Eager metadata has no graph state: the shared attribute is the
+        # current source's output.
+        eager = SimpleNamespace(c2_topk_indices=shared)
+        self.assertIs(backend._dsv41_topk_for_layer(eager, 4, 2), shared)
+
+
 class TestV41DispatchMetadata(unittest.TestCase):
     """Capacity buffers must produce the same dispatch key set as eager."""
 
