@@ -138,3 +138,9 @@ def beam_retraction_order(sorted_indices: List[int], reqs: List[Req]) -> List[in
     return [i for i in sorted_indices if reqs[i].beam_group is not None] + [
         i for i in sorted_indices if reqs[i].beam_group is None
     ]
+
+
+def beam_decode_budget(req: Req, normal_budget: int) -> int:
+    group = req.beam_group
+    beam_budget = None if group is None else group.decode_slot_budget()
+    return normal_budget if beam_budget is None else beam_budget

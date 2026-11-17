@@ -21,6 +21,14 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
+class _DenseModelConfig:
+    hf_config = SimpleNamespace()
+    model_path = ""
+    vocab_size = 0
+    revision = None
+    is_draft_model = False
+
+
 class TestRemapKvMapping(CustomTestCase):
     def setUp(self):
         # 3 rows x 10 positions; every row maps to its own distinct slots.
@@ -197,7 +205,7 @@ class TestRetireReclaimsStagedOrphans(CustomTestCase):
         from sglang.srt.beam_search.coordinator import BeamCoordinator
 
         return BeamCoordinator(
-            model_config=SimpleNamespace(beam_trie_config=None),
+            model_config=_DenseModelConfig,
             spec_algorithm=None,
             dllm_enabled=False,
             max_req_len=0,

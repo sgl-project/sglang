@@ -22,10 +22,14 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.activation.softcap import softcap_inplace_logits
-from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
+from sglang.srt.beam_search.trie_config import (
+    TrieOutputHeadConfig,
+    get_beam_trie_config,
+)
 from sglang.srt.utils import is_cpu, is_npu
 
 if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
     from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -41,15 +45,15 @@ class BeamTrieHeadOutput(msgspec.Struct, frozen=True):
 
 
 def configure_model_trie_output_heads(
-    *,
     model: torch.nn.Module,
-    config: Optional[TrieOutputHeadConfig],
+    model_config: ModelConfig,
     device: str,
-    quantization: Optional[str],
+    *,
     lora_enabled: bool,
 ) -> bool:
     """Install the compact head on the model's LogitsProcessors when the setup
     allows it; returns whether it is on."""
+    config = get_beam_trie_config(model_config)
     if config is None:
         return False
     from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -60,17 +64,21 @@ def configure_model_trie_output_heads(
         reason = "device is not CUDA"
     elif get_parallel().tp_size != 1:
         reason = "TP size is not 1"
-    elif quantization is not None:
+    elif model_config.quantization is not None:
         reason = "the LM head is quantized"
     elif lora_enabled:
         reason = "LoRA is enabled"
     elif get_exec().deterministic.rl_on_policy_target is not None:
         reason = "an RL on-policy target is set"
+    elif get_exec().overlap.enable_two_batch_overlap:
+        reason = "two-batch overlap is enabled"
     enabled = reason is None
     configured = 0
     for module in model.modules():
         if isinstance(module, LogitsProcessor):
-            module.configure_beam_trie(config if enabled else None)
+            module.beam_trie_output_head = (
+                BeamTrieOutputHead(config, module.vocab_size) if enabled else None
+            )
             configured += 1
     if enabled and configured == 0:
         raise RuntimeError(
@@ -84,6 +92,26 @@ def configure_model_trie_output_heads(
             "Beam trie: compact SID output head off (%s); dense LM head", reason
         )
     return enabled
+
+
+def beam_trie_logits(
+    processor: LogitsProcessor,
+    hidden_states: torch.Tensor,
+    lm_head: VocabParallelEmbedding,
+    logits_metadata: LogitsMetadata,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Logits and full-vocabulary normalizer of a processor with a trie head.
+    Dense rows keep LM-head rounding like the compact head, so they bypass the
+    logits buffer."""
+    head_output = compute_beam_trie_logits(
+        processor, hidden_states, lm_head, logits_metadata
+    )
+    if head_output is None:
+        logits = processor._get_logits(
+            hidden_states, lm_head, logits_metadata, use_logits_buffer=False
+        )
+        return logits, None
+    return head_output.logits, head_output.normalizer
 
 
 def compute_beam_trie_logits(
@@ -172,7 +200,7 @@ def build_trie_row_levels(
         and batch.reqs
         and all(req.beam_group is not None for req in batch.reqs)
     ):
-        beam_trie_config = model_runner.model_config.beam_trie_config
+        beam_trie_config = get_beam_trie_config(model_runner.model_config)
         assert beam_trie_config is not None
         max_level = beam_trie_config.num_codebooks - 1
         row_levels = [

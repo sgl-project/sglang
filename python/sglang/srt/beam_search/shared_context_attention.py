@@ -219,7 +219,9 @@ def forward(
     forward_batch: ForwardBatch,
     kv_layers: KVLayerRouter,
 ) -> Optional[torch.Tensor]:
-    metadata = forward_batch.beam_attention_metadata
+    if forward_batch.beam is None:
+        return None
+    metadata = forward_batch.beam.attention_metadata
     if metadata is None:
         return None
     assert layer.logit_cap == 0

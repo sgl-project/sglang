@@ -778,7 +778,12 @@ class ModelRunner:
         )
         self.maybe_apply_post_load_model_transforms()
         self.maybe_init_lora_manager()
-        self.init_beam_trie_output_heads()
+        self.beam_trie_compact_enabled = configure_model_trie_output_heads(
+            self.model,
+            self.model_config,
+            self.device,
+            lora_enabled=self.lora_manager is not None,
+        )
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
         # after every post-load change to the model, before the KV cache is sized
@@ -1499,15 +1504,6 @@ class ModelRunner:
                 tp_rank=get_parallel().tp_rank,
                 is_ep_joiner=get_exec().moe.is_ep_joiner,
             )
-
-    def init_beam_trie_output_heads(self) -> None:
-        self.beam_trie_compact_enabled = configure_model_trie_output_heads(
-            model=self.model,
-            config=self.model_config.beam_trie_config,
-            device=self.device,
-            quantization=self.model_config.quantization,
-            lora_enabled=self.lora_manager is not None,
-        )
 
     def start_startup_weight_load(self) -> None:
         assert self.startup_weight_load is not None

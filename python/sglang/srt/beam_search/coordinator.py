@@ -54,6 +54,7 @@ from sglang.srt.beam_search.fork import (
     remap_kv_mapping,
 )
 from sglang.srt.beam_search.joint_select import joint_select, select_final_topk
+from sglang.srt.beam_search.trie_config import get_beam_trie_config
 from sglang.srt.beam_search.trie_constraint import BeamTrieConstraint
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -117,7 +118,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     _trie_selection_graph_cache: Optional[TrieSelectionGraphCache] = None
 
     def __post_init__(self) -> None:
-        config = self.model_config.beam_trie_config
+        config = get_beam_trie_config(self.model_config)
         if config is not None:
             self.trie_constraint = BeamTrieConstraint.load(
                 config, self.req_to_token_pool.device

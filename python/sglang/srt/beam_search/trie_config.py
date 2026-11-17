@@ -28,13 +28,17 @@ from __future__ import annotations
 
 import functools
 import logging
+import weakref
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import msgspec
 from safetensors import safe_open
 from transformers import PretrainedConfig
 from transformers.utils import cached_file
+
+if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -123,3 +127,22 @@ def discover_trie_output_head_config(
         )
     logger.info("Discovered model-native trie output head at %s", config.tensor_path)
     return config
+
+
+_beam_trie_configs: weakref.WeakKeyDictionary[
+    ModelConfig, Optional[TrieOutputHeadConfig]
+]
+_beam_trie_configs = weakref.WeakKeyDictionary()
+
+
+def get_beam_trie_config(model_config: ModelConfig) -> Optional[TrieOutputHeadConfig]:
+    """The model's trie output head, discovered once per ModelConfig."""
+    if model_config not in _beam_trie_configs:
+        _beam_trie_configs[model_config] = discover_trie_output_head_config(
+            model_config.hf_config,
+            model_config.model_path,
+            model_config.vocab_size,
+            model_config.revision,
+            is_draft_model=model_config.is_draft_model,
+        )
+    return _beam_trie_configs[model_config]

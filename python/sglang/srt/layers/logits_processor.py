@@ -17,7 +17,7 @@ import dataclasses
 import logging
 from contextlib import contextmanager
 from enum import IntEnum
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -38,11 +38,6 @@ from sglang.kernels.ops.sampling.softcap_row_argmax import (
     softcap_row_argmax,
 )
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
-from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
-from sglang.srt.beam_search.trie_output_head import (
-    BeamTrieOutputHead,
-    compute_beam_trie_logits,
-)
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
@@ -83,6 +78,9 @@ from sglang.srt.utils.device import (
     is_pin_memory_available,
     use_intel_amx_backend,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.beam_search.trie_output_head import BeamTrieOutputHead
 
 logger = logging.getLogger(__name__)
 
@@ -435,7 +433,9 @@ class LogitsMetadata:
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             is_prefill_only=forward_batch.is_prefill_only,
             attn_tp_sequence_sharded=forward_batch.attn_tp_sequence_sharded,
-            beam_trie_levels=forward_batch.beam_trie_levels,
+            beam_trie_levels=(
+                None if forward_batch.beam is None else forward_batch.beam.trie_levels
+            ),
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             dp_local_start_pos=forward_batch.dp_local_start_pos,
             dp_local_num_tokens=forward_batch.dp_local_num_tokens,
@@ -575,11 +575,6 @@ class LogitsProcessor(nn.Module):
             chunking_group = group.cpu_group
         self.input_logprob_processor = InputLogprobProcessor(
             self.vocab_size, chunking_group=chunking_group
-        )
-
-    def configure_beam_trie(self, config: Optional[TrieOutputHeadConfig]) -> None:
-        self.beam_trie_output_head = (
-            BeamTrieOutputHead(config, self.vocab_size) if config is not None else None
         )
 
     def enable_sharded_verify(self, *, temperature_keys: bool = False) -> None:
@@ -744,23 +739,15 @@ class LogitsProcessor(nn.Module):
                     mm_input_embeds=logits_metadata.mm_input_embeds,
                 )
             # Compute logits for both input and sampled tokens.
-            beam_output = (
-                compute_beam_trie_logits(self, pruned_states, lm_head, logits_metadata)
-                if self.beam_trie_output_head is not None
-                else None
-            )
-            if beam_output is None:
-                # A trie model keeps LM-head rounding on dense rows too, so they
-                # score like the compact head; the logits buffer is bypassed.
-                logits = self._get_logits(
-                    pruned_states,
-                    lm_head,
-                    logits_metadata,
-                    use_logits_buffer=self.beam_trie_output_head is None,
-                )
-                beam_normalizer = None
+            beam_normalizer = None
+            if self.beam_trie_output_head is None:
+                logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             else:
-                logits, beam_normalizer = beam_output.logits, beam_output.normalizer
+                from sglang.srt.beam_search.trie_output_head import beam_trie_logits
+
+                logits, beam_normalizer = beam_trie_logits(
+                    self, pruned_states, lm_head, logits_metadata
+                )
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
