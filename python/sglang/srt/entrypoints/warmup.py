@@ -166,3 +166,98 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
 
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+
+
+@warmup("system_prefix_seed")
+async def system_prefix_seed(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
+    """Seed the radix tree with the fixed system prefix's mamba boundary state.
+
+    OPT-IN ONLY (--warmups system_prefix_seed); the server does NOT run this
+    automatically. The seed renders with the template's DEFAULT kwargs,
+    which need not match real traffic: a template may emit different
+    system-block tokens per chat_template_kwargs (e.g. Qwen3.8 injects a
+    reasoning-effort preamble unless thinking is disabled), and a mismatched
+    seed pins a boundary state that no request ever hits while falsely
+    disengaging the cold-start gate (observed in production: the whole
+    workload ran cold at 3 mamba slots). Default operation is lazy: the
+    first real request cold-seeds the tree on its own token path, serialized
+    by the cold-start gate, which disengages on the first actual warm hit.
+    Only use this warmup when the traffic is known to render with the
+    template defaults.
+
+    Runs one text-only chat through the fixed system prefix to completion:
+    its finish-time donate is capped at the chunk-aligned boundary
+    (cap_mamba_donate_len) and lands on the shared boundary node, which the
+    insert path then permanently pins. Multimodal traffic shares the
+    system block too (image hash pad tokens only diverge at the first
+    image), so a text-only seed serves multimodal requests as well -- as long
+    as the render kwargs match.
+    """
+    from sglang.srt.system_prompt.system_prompt import resolve_system_prompt
+    from sglang.srt.system_prompt.token_seam import SystemPrefix
+
+    server_args = tokenizer_manager.server_args
+    system_text = resolve_system_prompt(server_args)
+    if system_text is None:
+        # Feature off (the startup probe may have disabled it after the
+        # launch-time flag check) -- nothing to seed.
+        return
+
+    # Mirror serving_chat's encode-kwarg detection so the seam here produces
+    # the same token stream as the serving path.
+    try:
+        auto_adds_specials = len(tokenizer_manager.tokenizer.encode("")) > 0
+    except Exception:
+        auto_adds_specials = True
+    encode_kwargs = {"add_special_tokens": False} if auto_adds_specials else {}
+
+    prefix = SystemPrefix(tokenizer_manager.tokenizer, system_text)
+    prefix.prepare(server_args.mamba_cache_chunk_size, encode_kwargs)
+    if not prefix.enabled:
+        logger.warning(
+            "system_prefix_seed warmup skipped: the seam probe rejected the "
+            "fixed prefix; the first requests will cold-start the boundary "
+            "state"
+        )
+        return
+
+    input_ids = prefix.split_request(
+        [
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": "hi"},
+        ],
+        encode_kwargs,
+    )
+    if input_ids is None:
+        logger.warning(
+            "system_prefix_seed warmup skipped: split_request fell back to "
+            "the full-render path; the first requests will cold-start the "
+            "boundary state"
+        )
+        return
+
+    generate_req_input = GenerateReqInput(
+        # dp_size copies so every dp rank's tree can get seeded (cache-aware
+        # routing may still co-locate them; any rank that misses out simply
+        # cold-starts its first request, whose finish then pins it).
+        input_ids=(
+            input_ids if server_args.dp_size == 1 else [input_ids] * server_args.dp_size
+        ),
+        sampling_params={"max_new_tokens": 1, "temperature": 0.0},
+        system_prefix_boundary=prefix.boundary_len,
+    )
+    if disaggregation_mode != "null":
+        generate_req_input.bootstrap_room = 0
+        generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
+
+    # Drain the generator so the request finishes server-side and the
+    # finish-time donate + pin actually run.
+    async for _ in tokenizer_manager.generate_request(generate_req_input, None):
+        pass
+    logger.info(
+        "system_prefix_seed warmup done: %d-token shared prefix cached and "
+        "pinned in the radix tree",
+        prefix.boundary_len,
+    )

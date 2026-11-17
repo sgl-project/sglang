@@ -423,10 +423,21 @@ async def lifespan(fast_api_app: FastAPI):
         )
 
     # Execute custom warmups
-    if get_serving().warmups is not None:
+    warmup_names = get_serving().warmups.split(",") if get_serving().warmups else []
+    # Fixed system prompt: NO automatic seed warmup. A startup seed renders
+    # with the template's DEFAULT kwargs, which need not match real traffic
+    # (a template may emit different system-block tokens per kwargs -- e.g.
+    # Qwen3.8 injects a reasoning-effort preamble unless thinking is
+    # disabled); a mismatched seed pins a boundary state nothing ever hits
+    # and falsely disengages the cold-start gate. Instead the first real
+    # request cold-seeds the tree on its own token path (the cold-start gate
+    # serializes it, then disengages on the first actual warm hit).
+    # Operators who know their traffic matches the default render can still
+    # opt in explicitly: --warmups system_prefix_seed.
+    if warmup_names:
         await execute_warmups(
             get_disagg().disaggregation_mode,
-            get_serving().warmups.split(","),
+            warmup_names,
             _global_state.tokenizer_manager,
         )
         logger.info("Warmup ended")

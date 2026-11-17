@@ -16,6 +16,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
+    get_server_args,
     mamba_cache_chunk_size,
     mamba_checkpoint_grid,
 )
@@ -69,6 +70,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.capacity import capacity_decision, create_prefill_budget
 from sglang.srt.mem_cache.common import match_kv_cache, touch_waiting_prefix
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.system_prompt.radix_patch import is_system_prefix_cold_seeder
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor import encoder_swa_replay
 
@@ -309,6 +311,9 @@ class SchedulePolicy:
 
         # Cache-agnostic policies sort without matching; match anyway so the load
         # snapshot sees num_matched_prefix_tokens. Decode never prefills.
+        # (Fixed-system-prompt warm/cold detection needs no match here: every
+        # admitted request is re-matched by init_next_round_input before any
+        # warm-detection consumer reads its fields.)
         if (
             not isinstance(policy, CacheAwarePolicy)
             and self.tree_cache.supports_fast_match_prefix()
@@ -817,6 +822,14 @@ class AddReqResult(Enum):
     UNSCHEDULABLE = auto()
 
 
+# Fixed-system-prompt cold-start gate: once this many distinct boundary states
+# have been stored with zero warm hits, the workload doesn't reuse shared
+# states and the gate stops serializing it (the mamba slot budget governs).
+# Aligned with the boundary-pin cap (should_pin_boundary_store): past the cap
+# no new boundary state gets pinned anyway.
+_GATE_STORE_DISENGAGE_CAP = 8
+
+
 @dataclass(frozen=True, slots=True)
 class _PrefillAdmission:
     prefix_len: int
@@ -874,6 +887,10 @@ def windows_retire_behind_checkpoints(tree_cache: Optional[BasePrefixCache]) -> 
 
 
 class PrefillAdder:
+    # One-shot 0-match head diagnostics counter (see _log_cold_head_diag).
+    # Class-level: the adder is rebuilt every scheduling pass.
+    _cold_head_diag_logged: int = 0
+
     def __init__(
         self,
         page_size: int,
@@ -968,6 +985,52 @@ class PrefillAdder:
 
         self.is_hybrid_swa = self.token_to_kv_pool_allocator.has_window_pool
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
+        # Fixed system prompt (--system-prompt): the slot budget, its warm/cold
+        # charging, and the waiting-queue headroom pre-check exist to protect
+        # the warm-steady-state pool sizing THIS feature creates. Without the
+        # flag every request is charged the full cold factor and the budget
+        # only throttles admission below the unpatched baseline (and can
+        # livelock once evictable slots accumulate), so the whole budget
+        # machinery is feature-gated: flag off -> exact baseline behavior.
+        self._system_prompt_budget = bool(get_server_args().system_prompt)
+
+        # Static (non-shared) hybrid mamba pool: no shared-gap token coupling
+        # (memory_budget.state_slot_cost == 0), but its slots are still
+        # exhaustible by ping-pong allocations. Track a slot-only admission
+        # budget for it (`_mamba_slot_budget_for_req` charges a cold request
+        # its full running+ping-pong slot count) so a cold burst can't
+        # over-admit past the pool and crash the fail-loud allocator. The
+        # SHARED pool (state_slot_cost > 0) is budgeted by the memory_budget
+        # itself (rem_state_slots); the static pool needs this adder-level
+        # count because its slots couple to no token budget at all.
+        # Only under --system-prompt (see above).
+        self._static_mamba_slots = (
+            self.memory_budget.state_slot_cost == 0
+            and self.is_hybrid_ssm_cache
+            and self._system_prompt_budget
+        )
+        self.rem_mamba_slots = None
+        if self._static_mamba_slots:
+            # HARD free slots only — deliberately NOT counting
+            # mamba_evictable_size(). On the shared pool the evictable part is
+            # cashed in by alloc_req_slots' explicit evict before allocation,
+            # but on the static pool the request's running mamba slot is
+            # allocated EARLIER, inside match_prefix's COW
+            # (finalize_match_result_in_cache), which can only draw from the
+            # hard free list — its internal evict-retry can be blocked by locks
+            # on the shared boundary node. Counting evictable here admits
+            # requests on phantom credit that then die in the match COW
+            # ("Can not alloc mamba cache"). Conservative but always realizable;
+            # evictable slots come back into play once running requests finish
+            # and their slots are freed.
+            self.rem_mamba_slots = (
+                self.tree_cache.req_to_token_pool.mamba_allocator.schedulable_available_size()
+            )
+
+        # Fixed system prompt cold-start gate: lazily-computed count of cold
+        # seeders in the running batch for this pass (see
+        # _cold_seeders_in_flight).
+        self._running_cold_seeder_count: Optional[int] = None
 
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
@@ -1118,6 +1181,15 @@ class PrefillAdder:
         their host-hit metadata may still describe an already consumed hit.
         The state owner includes initial tracking buffers. Future radix CoW
         checkpoints are allocated by the cache, outside request acquisition.
+
+        Fixed system prompt: the warm/cold charging lives in
+        ``StateStorage.pending_request_slots`` -- a warm request charges its
+        running slot only (sentinel ping-pong buffer), a cold one the full
+        running + tracking cost, so a cold request is never admitted on a
+        single free slot and then crash-allocating more. Match-time COW
+        blindness does not apply here: a shared memory defers its COW slot
+        to admission, and the static pool budgets through
+        ``_mamba_slot_budget_for_req(fresh_cow=...)`` instead.
         """
         if not self.memory_budget.has_state_slots:
             return 0
@@ -1138,6 +1210,187 @@ class PrefillAdder:
             has_req_pool_slot=req.kv.req_pool_idx is not None,
             prefill_tokens=req.prefix_len + extend_input_len,
         )
+
+    def cold_start_gate_defers(self, req: Req) -> bool:
+        """Whether the fixed-system-prompt cold-start gate defers `req`.
+
+        While no request has demonstrably MATCHED a cached boundary state,
+        cold seeders (boundary-carrying requests whose match did not reach a
+        cached boundary state) are serialized to one in flight -- it runs to
+        the boundary crossing, donates the shared state (pin-on-store locks
+        it), and every request matched after that classifies warm and flows
+        freely. Without the gate the whole first wave runs cold at the full
+        slot factor each and can exhaust the ratio-1-sized pool before any
+        request finishes donating (the crash-restart death spiral).
+
+        The gate disengages only once a match has actually REACHED a
+        boundary (``system_prefix_warm_hits``): a stored-but-never-hit state
+        proves nothing -- a boundary store from traffic whose tokens diverge
+        from the current requests' (template-kwargs-dependent rendering)
+        must not release the gate for everyone. Escape hatch: after
+        ``_GATE_STORE_DISENGAGE_CAP`` distinct boundary stores with zero
+        hits, the workload demonstrably doesn't reuse shared states
+        (per-request distinct heads); stop serializing it and let the mamba
+        slot budget (``_mamba_slot_budget_for_req`` charges the cold factor
+        slots per cold request against the pool) govern cold concurrency --
+        it adapts to any pool size and workload, no fixed fan-out constant.
+
+        The caller must SKIP the deferred request and keep admitting others
+        (never break the admission loop on this gate): a gated request
+        breaking the loop starves the warm requests behind it (observed:
+        #running-req pinned at 1 with a 50-deep queue).
+        """
+        if not self._cold_start_gate_active():
+            return False
+        self._log_cold_head_diag(req)
+        if self.tree_cache.system_prefix_warm_hits > 0 or (
+            self.tree_cache.system_prefix_boundary_stores
+            >= _GATE_STORE_DISENGAGE_CAP
+        ):
+            return False
+        if not is_system_prefix_cold_seeder(
+            req.system_prefix_boundary,
+            req.prefix_len,
+            req.mamba_branching_seqlen,
+        ):
+            return False
+        return self._cold_seeders_in_flight() >= 1
+
+    def _log_cold_head_diag(self, req: Req) -> None:
+        """One-shot diagnostic for boundary-carrying requests that match zero
+        prefix despite the injected fixed system block.
+
+        Such requests hold the full cold slot count each AND donate a state
+        on their own boundary path, so a workload of them squeezes the pool
+        (observed: 49 of 60 slots held by distinct-path tree states,
+        admission throttled to ~1 request per pass). The only
+        self-consistent explanations are a per-request ``extra_key``/
+        cache_salt (isolated radix key spaces) or a per-request distinct
+        token head -- this log settles which, up to 5 times per process, by
+        dumping the request's extra_key and first 32 input ids. Class-level
+        counter: the adder is rebuilt every scheduling pass, so an instance
+        attribute would reset and spam one line per pass (observed: 3299
+        lines in one run).
+        """
+        if PrefillAdder._cold_head_diag_logged >= 5:
+            return
+        if req.system_prefix_boundary is None or req.prefix_len > 0:
+            return
+        PrefillAdder._cold_head_diag_logged += 1
+        logger.info(
+            "[ColdHeadDiag] 0-match fixed-system-prompt request #%d: "
+            "extra_key=%r input_head=%s",
+            PrefillAdder._cold_head_diag_logged,
+            req.extra_key,
+            list(req.origin_input_ids[:32]),
+        )
+
+    def _cold_start_gate_active(self) -> bool:
+        # Feature off, no mamba pool to protect, or radix disabled (no
+        # boundary-reaching matches -- serializing there would throttle the
+        # whole server). Non-unified caches have no boundary-store
+        # accounting, so the gate is a no-op there.
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        return (
+            self._system_prompt_budget
+            and (self.memory_budget.has_state_slots or self._static_mamba_slots)
+            and not self.tree_cache.disable
+            and isinstance(self.tree_cache, UnifiedRadixCache)
+        )
+
+    def _cold_seeders_in_flight(self) -> int:
+        """Cold seeders in the running batch plus admitted this pass. The
+        running-batch scan is computed once per pass; `can_run_list` grows
+        within the pass so it is recounted per call."""
+        if self._running_cold_seeder_count is None:
+            self._running_cold_seeder_count = (
+                0
+                if self.running_batch is None
+                else sum(
+                    is_system_prefix_cold_seeder(
+                        r.system_prefix_boundary,
+                        r.prefix_len,
+                        r.mamba_branching_seqlen,
+                    )
+                    for r in self.running_batch.reqs
+                )
+            )
+        return self._running_cold_seeder_count + sum(
+            is_system_prefix_cold_seeder(
+                r.system_prefix_boundary,
+                r.prefix_len,
+                r.mamba_branching_seqlen,
+            )
+            for r in self.can_run_list
+        )
+
+    def _mamba_slot_budget_for_req(self, req: Req, fresh_cow: bool = False) -> int:
+        """Slot-count admission for the STATIC hybrid mamba pool (0 elsewhere).
+
+        The static pool has no shared-gap token coupling, so
+        `_state_slots_for_req` charges it nothing -- without this slot
+        budget a burst of cold requests (each allocating running + ping-pong =
+        cold_factor slots) over-admits past the pool and dies in the fail-loud
+        mamba allocator assert. Warm fixed-system-prompt requests hold a single
+        running slot (sentinel ping-pong), cold ones the full cold_factor —
+        matching `alloc_req_slots`' per-request accounting, so once the shared
+        boundary state is cached the budget admits up to the pool size again.
+        0 on the shared pool (its slots are budgeted via the token reserve),
+        for reqs that already hold a mamba slot, and on non-mamba / chunk-cache
+        paths (actual usage there is 1 slot per request, already covered).
+
+        ``fresh_cow`` is sampled by the scheduler BEFORE init_next_round_input:
+        the match-time COW sets ``req.kv.mamba_pool_idx`` before this budget runs,
+        so the ``pool_idx is None`` guard alone zeroes the charge for every
+        queued request — the budget never sees the COW's slot consumption and
+        rem stays high while the hard free list drains (the match-COW crash).
+        Without ``fresh_cow`` (other callers), fall back to the legacy guard."""
+        if not self._static_mamba_slots:
+            return 0
+        if not fresh_cow and req.kv.mamba_pool_idx is not None:
+            return 0
+        from sglang.srt.system_prompt import is_system_prefix_warm
+
+        # Matches the slots alloc_req_slots actually allocates: running slot
+        # plus the pool's initial tracking slots (1 + 2 overlap / 1 + 1 lazy).
+        req_pool = self.tree_cache.req_to_token_pool
+        cold_factor = 1 + req_pool.mamba_initial_tracking_slots
+        if is_system_prefix_warm(
+            req.system_prefix_boundary,
+            req.prefix_len,
+            req.mamba_branching_seqlen,
+        ):
+            return 1
+        return cold_factor
+
+    def _mamba_match_headroom(self) -> int:
+        """Slot budget a new request needs BEFORE its match-time mamba COW.
+
+        ``init_next_round_input`` COW-allocates the request's running mamba
+        slot BEFORE ``add_one_req``'s budget gate can reject it. With a deep
+        waiting queue ``alloc_group_begin(len(queue))`` over-requests and
+        degrades to per-request hard allocation, so consecutive match COWs can
+        drain the hard free list and die on free=0 even though the gate would
+        have answered NO_TOKEN one request later. The scheduler calls this
+        before pulling each new request: stop once the remaining slot budget
+        can't cover a worst-case (cold) request. 0 disables the pre-check
+        (no mamba pool, or --system-prompt off: the pre-check is part of the
+        feature's budget machinery and the unpatched baseline has none).
+        """
+        if not self._system_prompt_budget:
+            return 0
+        if not (self.memory_budget.state_slot_cost or self._static_mamba_slots):
+            return 0
+        if self.memory_budget.state_slot_cost:
+            # Shared pool: the pre-gate match COW allocates exactly ONE slot
+            # and the steady-state footprint is already covered by the token
+            # reserve — requiring the full cold factor here would withhold
+            # 1-2 slots of admission whenever the pool hovers near empty.
+            return 1
+        # Static pool: matches the slots alloc_req_slots actually allocates
+        # (1 + 2 overlap / 1 + 1 lazy); the worst case is a cold request.
+        return 1 + self.tree_cache.req_to_token_pool.mamba_initial_tracking_slots
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
@@ -1170,6 +1423,11 @@ class PrefillAdder:
     @capacity_decision
     def budget_state(self):
         no_token = self.chunked_req_waits or not self.memory_budget.admits_more()
+        # Static-pool slot budget: the shared pool's slot exhaustion is covered
+        # by admits_more() (state_slots_exhausted); the static pool's
+        # adder-level count needs its own gate here.
+        if not no_token and self.rem_mamba_slots is not None:
+            no_token = self.rem_mamba_slots <= 0
         if no_token:
             return AddReqResult.NO_TOKEN
 
@@ -1201,6 +1459,7 @@ class PrefillAdder:
         admitted_chunk_limit: Optional[int] = None,
         cached_tokens: Optional[int] = None,
         reuses_kv: bool = False,
+        mamba_gap_slots: int = 0,
     ):
         """Charge one admitted request against the prefill budgets.
 
@@ -1249,6 +1508,12 @@ class PrefillAdder:
             admitted_chunk_limit=admitted_chunk_limit,
             cached_tokens=prefix_len if cached_tokens is None else cached_tokens,
         )
+        # Static-pool slot debit: the shared pool's state slots are debited
+        # through memory_budget.reserve (state_slot_tokens); the static pool
+        # couples to no token budget, so `mamba_gap_slots` carries the actual
+        # slot count for its adder-level budget.
+        if self.rem_mamba_slots is not None and mamba_gap_slots:
+            self.rem_mamba_slots -= mamba_gap_slots
         self.rem_input_tokens -= compute_charge
 
         if self.dllm_config is not None:
@@ -1411,6 +1676,7 @@ class PrefillAdder:
             state_slots=self._state_slots_for_req(req),
             request_rows=self._request_rows_for_req(req),
             replay_len=self._replay_len(req, prefix_len),
+            mamba_gap_slots=self._mamba_slot_budget_for_req(req),
         )
         self._account_prefill_cache_admission(req, prefix_len)
 
@@ -1520,6 +1786,7 @@ class PrefillAdder:
             state_slots=self._state_slots_for_req(req),
             request_rows=self._request_rows_for_req(req),
             reuses_kv=reuses_kv,
+            mamba_gap_slots=self._mamba_slot_budget_for_req(req),
         )
 
         if self.memory_budget.prices_by_demand:
@@ -1656,6 +1923,7 @@ class PrefillAdder:
                 else 0
             ),
             admitted_chunk_limit=_rem_tokens,
+            mamba_gap_slots=self._mamba_slot_budget_for_req(req),
         )
 
         # Return if chunked prefill not finished
@@ -1825,6 +2093,7 @@ class PrefillAdder:
                 request_slot_reserve=self._request_slot_reserve_for_req(req),
                 admitted_chunk_limit=chunk_limit,
                 cached_tokens=req.prefix_len,
+                mamba_gap_slots=self._mamba_slot_budget_for_req(req),
             )
         else:
             if chunk_limit <= 0:
@@ -1860,6 +2129,7 @@ class PrefillAdder:
                     req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
                 ),
                 admitted_chunk_limit=chunk_limit,
+                mamba_gap_slots=self._mamba_slot_budget_for_req(req),
             )
 
         return self.budget_state()
@@ -1892,7 +2162,11 @@ class PrefillAdder:
 
     @capacity_decision
     def add_one_req(
-        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+        self,
+        req: Req,
+        has_chunked_req: bool,
+        truncation_align_size: Optional[int],
+        mamba_fresh_cow: bool = False,
     ):
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
             return AddReqResult.OTHER
@@ -2071,7 +2345,12 @@ class PrefillAdder:
                 ):
                     return AddReqResult.OTHER
 
-            self._commit_prefill_admission(req, admission, state_slots)
+            self._commit_prefill_admission(
+                req,
+                admission,
+                state_slots,
+                self._mamba_slot_budget_for_req(req, fresh_cow=mamba_fresh_cow),
+            )
 
         # This verdict controls the next candidate, not the committed request.
         return self.budget_state()
@@ -2218,7 +2497,11 @@ class PrefillAdder:
         )
 
     def _commit_prefill_admission(
-        self, req: Req, admission: _PrefillAdmission, state_slots: int
+        self,
+        req: Req,
+        admission: _PrefillAdmission,
+        state_slots: int,
+        mamba_gap_slots: int = 0,
     ) -> None:
         assert req.prefix_len == admission.prefix_len
         req.extend_end = admission.prefix_len + admission.extend_len
@@ -2256,6 +2539,7 @@ class PrefillAdder:
                 else 0
             ),
             admitted_chunk_limit=admission.chunk_limit,
+            mamba_gap_slots=mamba_gap_slots,
         )
         self._account_prefill_cache_admission(req, admission.prefix_len)
 

@@ -286,6 +286,21 @@ def ensure_mamba_capacity(
         return True
     if tree_holds_mamba:
         tree_cache.evict_for_alloc(KVDemand(state_slots=needed))
+    if not allocator.slots_fit(needed):
+        # Still short after eviction (e.g. a cold burst on a fresh tree with
+        # nothing to evict). Log with context so the subsequent fail-loud
+        # allocation failure is diagnosable; the PrefillAdder state-slot
+        # budget should normally prevent ever reaching this point.
+        logger.error(
+            "ensure_mamba_capacity: mamba pool short even after eviction: "
+            "need %d slots for %d reqs, %d free. With --system-prompt this "
+            "means the steady-state pool plan met a cold burst; the "
+            "admission budget should throttle it -- if it didn't, please "
+            "report.",
+            needed,
+            len(reqs),
+            allocator.available_size(),
+        )
     return allocator.slots_fit(needed)
 
 

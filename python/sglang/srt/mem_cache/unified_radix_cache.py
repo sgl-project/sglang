@@ -87,6 +87,7 @@ from sglang.srt.mem_cache.kv.plan import (
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
+from sglang.srt.system_prompt import is_new_boundary_store, should_pin_boundary_store
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
     CacheAction,
@@ -293,6 +294,16 @@ class UnifiedRadixCache(BasePrefixCache):
         self.enable_mamba_extra_buffer = (
             params.enable_mamba_extra_buffer if self.is_mamba_enabled else False
         )
+        # Fixed system prompt: how many boundary nodes have been permanently
+        # locked, how many boundary-key stores landed (see
+        # _pin_system_prefix_boundary), and how many prefix matches actually
+        # REACHED a request's boundary (a stored state that never gets hit
+        # proves nothing about the tree serving current traffic -- the
+        # cold-start gate disengages on hits, not stores). All reset by
+        # _reset_full.
+        self._system_prefix_pinned_count = 0
+        self._system_prefix_boundary_stores = 0
+        self._system_prefix_warm_hits = 0
         self.decoder_swa_bounded_replay = params.decoder_swa_bounded_replay
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
@@ -507,6 +518,11 @@ class UnifiedRadixCache(BasePrefixCache):
         self._discard_restore_backups()
         self.tree_core.reset()
         self.session_refs.reset()
+        # The pinned system-prefix boundary nodes died with the tree; the
+        # next boundary stores re-pin them.
+        self._system_prefix_pinned_count = 0
+        self._system_prefix_boundary_stores = 0
+        self._system_prefix_warm_hits = 0
 
         # Reset Controller.
         self.session.slots.clear()
@@ -1459,6 +1475,56 @@ class UnifiedRadixCache(BasePrefixCache):
             return DecLockRefResult()
         return self.tree_core.dec_lock_ref(node_id, params, skip_swa)
 
+    def _pin_system_prefix_boundary(self, req: Req, insert_key_len: int, result) -> None:
+        """Account and permanently lock a freshly-stored boundary state.
+
+        Every NEW boundary-key store bumps ``system_prefix_boundary_stores``
+        (the cold-start admission gate reads it to relax its serialization --
+        one seeding request in flight until the first store lands, then a
+        bounded fan-out), and is pinned (see ``should_pin_boundary_store``)
+        so mamba-slot pressure can never evict it. The caller must invoke
+        this right after ``insert`` returned, while ``result.last_device_node``
+        is valid.
+        """
+        if not is_new_boundary_store(
+            boundary=req.system_prefix_boundary,
+            insert_key_len=insert_key_len,
+            mamba_exist=result.mamba_exist,
+        ):
+            return
+        self._system_prefix_boundary_stores += 1
+        if not should_pin_boundary_store(
+            boundary=req.system_prefix_boundary,
+            insert_key_len=insert_key_len,
+            mamba_exist=result.mamba_exist,
+            pinned_count=self._system_prefix_pinned_count,
+        ):
+            return
+        self.inc_lock_ref(result.last_device_node)
+        self._system_prefix_pinned_count += 1
+        logger.info(
+            "Fixed system prompt: boundary state pinned at node %s (%d pinned)",
+            result.last_device_node,
+            self._system_prefix_pinned_count,
+        )
+
+    @property
+    def system_prefix_boundary_stores(self) -> int:
+        """How many distinct times a boundary-key mamba state was stored
+        (lifetime of the current tree; reset by _reset_full)."""
+        return self._system_prefix_boundary_stores
+
+    @property
+    def system_prefix_warm_hits(self) -> int:
+        """How many prefix matches reached a request's fixed-system-prompt
+        boundary (lifetime of the current tree; reset by _reset_full)."""
+        return self._system_prefix_warm_hits
+
+    def note_system_prefix_warm_hit(self) -> None:
+        """Record that a boundary-carrying request's match reached its
+        boundary -- the tree is demonstrably serving this traffic warm."""
+        self._system_prefix_warm_hits += 1
+
     def lock(
         self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
     ) -> Optional[TreeLock]:
@@ -1713,6 +1779,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             return
         req.kv.record_insert(page_aligned_len)
+        # Fixed system prompt: a NEW boundary-key mamba store (finished or
+        # unfinished donate) is the shared boundary state of this request's
+        # token path -- account it for the cold-start gate and pin it so
+        # mamba-slot pressure can never evict the only state warm requests
+        # depend on.
+        self._pin_system_prefix_boundary(
+            req, insert_key_len=page_aligned_len, result=result
+        )
 
         # Split the leaf at the prompt boundary so eviction can drop the output
         # KV without the prompt. prev_prefix_len keeps the overlapping indices
@@ -1746,7 +1820,20 @@ class UnifiedRadixCache(BasePrefixCache):
         new_last_node = result.last_device_node
         new_indices = self.path_device_indices(new_last_node)
         new_prefix_len = result.prefix_len
-        assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
+        # Fixed system prompt: the donated key is capped at the chunk-aligned
+        # system boundary (the mamba component's cache_len), which can sit
+        # BELOW the extent the request matched at admission — deep keys
+        # inserted by boundary-less requests extend the shared system node.
+        # The coverage assert and the protected-extent update below must
+        # tolerate that cap: pages in [page_aligned_len, cache_protected_len)
+        # belong to the matched node, and release_kv_cache frees from
+        # cache_protected_len, so shrinking would hand tree-referenced pages
+        # back to the allocator (silent KV corruption on later matches).
+        system_capped_key = (
+            req.system_prefix_boundary is not None
+            and page_aligned_len < req.kv.cache_protected_len
+        )
+        assert system_capped_key or req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
             f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
         )
         assert (
@@ -1775,7 +1862,14 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         # Update req fields
-        req.kv.protect_prefix(len(new_indices))
+        if system_capped_key:
+            # Keep the matched extent (see the comment at the assert above);
+            # the capped insert must not shrink the tree-owned range.
+            req.kv.cache_protected_len = max(
+                len(new_indices), req.kv.cache_protected_len
+            )
+        else:
+            req.kv.protect_prefix(len(new_indices))
         req.last_node = new_last_node
 
         # cleanup
