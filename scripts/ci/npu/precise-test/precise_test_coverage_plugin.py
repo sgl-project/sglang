@@ -15,7 +15,7 @@ server drains via its own SIGTERM path), waits a bounded time, then
 defers to the original SIGKILL implementation for whatever is left.
 
 All server teardowns in the coverage suites converge on the single
-sglang.srt.utils.common.kill_process_tree (re-exported by
+sglang.srt.utils.process.kill_process_tree (re-exported by
 sglang.srt.utils, bound into sglang.test.test_utils and the ascend e2e
 utils), so patching that one attribute covers base-b and base-c. The
 diffusion suites use their own
@@ -86,9 +86,9 @@ def _patch_module_kill_process_tree(module):
 
 
 def _patch_kill_process_tree():
-    import sglang.srt.utils.common as common
+    import sglang.srt.utils.process as process
 
-    _patch_module_kill_process_tree(common)
+    _patch_module_kill_process_tree(process)
 
 
 def _patch_multimodal_kill_process_tree():

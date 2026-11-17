@@ -17,7 +17,7 @@ from einops import rearrange, repeat
 from sglang.kernels.ops.mamba.triton_ops import mamba_chunk_scan_combined
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.srt.utils import get_device
-from sglang.srt.utils.common import is_hip
+from sglang.srt.utils.device import is_hip
 from sglang.utils import is_in_ci
 
 if is_hip():

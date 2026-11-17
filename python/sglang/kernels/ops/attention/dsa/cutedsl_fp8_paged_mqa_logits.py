@@ -386,8 +386,9 @@ class FP8MQALogitsKernel:
     ):
         # Derive KV and Scale views from fused buffer using CuTE ops.
         # Fused layout per physical block: [KV data (phys_block_kv*head_dim)] [Scales (phys_block_kv*4)]
+        # Blocks are kv_fused.stride[0] bytes apart, which may exceed the block size.
         phys_block_kv = self.phys_block_kv
-        phys_block_bytes = phys_block_kv * (self.head_dim + 4)
+        phys_block_stride = kv_fused.layout.stride[0]
         scale_offset_elems = phys_block_kv * self.head_dim  # in FP8 elements
 
         # Recast fused buffer to FP8 (same 1-byte elements, needed for MMA type inference)
@@ -401,7 +402,7 @@ class FP8MQALogitsKernel:
         # Each TMA loads one physical block; multiple TMAs fill a compute tile.
         kv_layout = cute.make_layout(
             (phys_block_kv, self.head_dim, num_phys_blocks),
-            stride=(self.head_dim, 1, phys_block_bytes),
+            stride=(self.head_dim, 1, phys_block_stride),
         )
         a = cute.make_tensor(kv_fp8.iterator, kv_layout)
 
@@ -409,7 +410,7 @@ class FP8MQALogitsKernel:
         # [phys_block_kv, num_phys_blocks] float32 (after recast)
         scale_fp8_layout = cute.make_layout(
             (phys_block_kv * 4, num_phys_blocks),
-            stride=(1, phys_block_bytes),
+            stride=(1, phys_block_stride),
         )
         scale_fp8 = cute.make_tensor(
             kv_fp8.iterator + scale_offset_elems, scale_fp8_layout

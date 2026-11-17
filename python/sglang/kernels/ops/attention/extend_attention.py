@@ -16,6 +16,7 @@ Memory-efficient attention for prefill.
 It supports page size = 1 and prefill with KV cache (i.e. extend).
 """
 
+import logging
 import math
 from typing import Optional
 
@@ -23,18 +24,22 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
+from sglang.kernels.ops.attention.dflash_block_splitkv import dflash_block_splitkv
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_cuda, is_gfx95_supported, is_gfx1250_supported, is_hip
-
-_is_cuda = is_cuda()
-if _is_cuda:
-    CUDA_CAPABILITY = torch.cuda.get_device_capability()
+from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported, is_hip
 
 _is_hip = is_hip()
 _is_gfx95 = _is_hip and is_gfx95_supported()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
+
+logger = logging.getLogger(__name__)
+
+# DFlash draft blocks (Muse Spark DFlash2 at TP8) on gfx950 take the split-KV kernel.
+_use_dflash_block_splitkv = _is_gfx95 and envs.SGLANG_ROCM_MUSE_DFLASH_SPLITKV.get()
+_dflash_block_splitkv_logged: set = set()
 
 try:
     _triton_version_parts = tuple(
@@ -92,7 +97,8 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
             BLOCK_M, BLOCK_N = (64, 64)
             num_warps = 4
     else:
-        if _is_cuda and CUDA_CAPABILITY[0] == 12:
+        arch = current_arch()
+        if arch.is_sm(12):
             # sm120 workstation Blackwell architecture (RTX Pro 6000) has a much smaller shared memory size (100K)
             if Lq <= 128:
                 BLOCK_M, BLOCK_N = (64, 128)
@@ -100,7 +106,7 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
                 BLOCK_M, BLOCK_N = (64, 64)
             else:
                 BLOCK_M, BLOCK_N = (32, 32)
-        elif _is_cuda and CUDA_CAPABILITY[0] == 10:
+        elif arch.is_sm(10):
             # Blackwell data-center architecture (GB200, B200, sm_100a)
             # sm_100a has different register constraints from Hopper; Hopper block sizes
             # cause PTX register exhaustion (>255 regs) for large head dims (Lq=512).
@@ -108,7 +114,7 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
                 BLOCK_M, BLOCK_N = (64, 64)
             else:
                 BLOCK_M, BLOCK_N = (16, 64)
-        elif _is_cuda and CUDA_CAPABILITY[0] >= 9:
+        elif arch.is_sm_at_least(9):
             # Hopper architecture (H100, etc.)
             if Lq <= 128:
                 BLOCK_M, BLOCK_N = (128, 64)
@@ -116,10 +122,10 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
                 BLOCK_M, BLOCK_N = (64, 64)
             else:
                 BLOCK_M, BLOCK_N = (32, 64)
-        elif _is_cuda and CUDA_CAPABILITY[0] >= 8:
+        elif arch.is_sm_at_least(8):
             # Ampere architecture (A100, etc.)
             # sm86/sm89 has a much smaller shared memory size (100K) than sm80 (160K)
-            if CUDA_CAPABILITY[1] == 9 or CUDA_CAPABILITY[1] == 6:
+            if arch.is_sm(8, 9) or arch.is_sm(8, 6):
                 if Lq <= 128:
                     BLOCK_M, BLOCK_N = (64, 128)
                 elif Lq <= 256:
@@ -970,6 +976,66 @@ def extend_attention_fwd(
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
+
+    # DFlash draft block: up to 64 requests x 8 query rows, 8 heads per KV head
+    # (1 or 2 KV heads), head_dim 128, non-causal, against an FP8 prefix cache. The generic
+    # kernel walks the whole window prefix in one program per (block, head);
+    # split-KV spreads it across workgroups, with BF16 probabilities for P.V.
+    # 2048-token window at 2 KV heads (TP4): 15.5 / 24.3 / 27.1 / 49.2 us at 8 / 12 / 16 / 32
+    # requests with 8 splits vs 87 / 97 / 91 / 192 us generic (16 splits: 17.9 / 24.4 / 30.7 / 55.9).
+    if (
+        _use_dflash_block_splitkv
+        and 1 <= batch_size <= 64
+        and Lq == Lk == Lv == 128
+        and k_extend.shape[1] in (1, 2)
+        and head_num == 8 * k_extend.shape[1]
+        and max_len_extend == 8
+        and q_extend.shape[0] == batch_size * 8
+        and not is_causal
+        and (sliding_window_size < 0 or sliding_window_size >= 8)
+        and q_extend.dtype == k_extend.dtype == v_extend.dtype == torch.bfloat16
+        and k_buffer.dtype == v_buffer.dtype == torch.float8_e4m3fn
+        and k_buffer.ndim == v_buffer.ndim == 3
+        and o_extend.is_contiguous()
+        and custom_mask is None
+        and sinks is None
+        and logit_cap <= 0
+        and xai_temperature_len <= 0
+        and score_mod is None
+        and aux_tensors is None
+        and lse_extend is None
+        and not skip_prefix
+        and not skip_extend
+        and not identity_kv_indices
+    ):
+        if k_buffer.data_ptr() not in _dflash_block_splitkv_logged:
+            _dflash_block_splitkv_logged.add(k_buffer.data_ptr())
+            logger.info(
+                "Muse DFlash split-KV16 active: Q=%s, window=%d, prefix_cache=%d, "
+                "BF16 probability PV",
+                tuple(q_extend.shape),
+                sliding_window_size,
+                k_buffer.data_ptr(),
+            )
+        dflash_block_splitkv(
+            q_extend,
+            k_extend,
+            v_extend,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kscale=k_scale,
+            vscale=v_scale,
+            softmax_scale=sm_scale,
+            splits=8 if k_extend.shape[1] == 2 else 16,
+            pv_bf16=True,
+            out=o_extend,
+            window_left=sliding_window_size,
+        )
+        return
+
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
     zero_prefix_shape = (
         head_num == 12
@@ -1056,8 +1122,8 @@ def extend_attention_fwd(
     stride_lse_bs = lse_extend.stride(0) if STORE_LSE else 0
     stride_lse_h = lse_extend.stride(1) if STORE_LSE else 0
 
-    # Compact grid: AMD/HIP-only optimization (parity with flash-attn's ragged-aware
-    # launch). Explicitly check _is_hip and allow env var override.
+    # Compact grid: HIP only (parity with flash-attn's ragged-aware launch);
+    # SGLANG_TRITON_COMPACT_EXTEND_ATTENTION=0 turns it off.
     use_compact_tile_grid = (
         _is_hip and envs.SGLANG_TRITON_COMPACT_EXTEND_ATTENTION.get()
     )
