@@ -1244,7 +1244,7 @@ class C4Indexer(nn.Module):
             from sgl_kernel import fused_q_indexer_rope_hadamard_fp4_quant
 
             return fused_q_indexer_rope_hadamard_fp4_quant(
-                q.contiguous(), weight, self.weight_scale, self.freqs_cis, positions
+                q, weight, self.weight_scale, self.freqs_cis, positions
             )
         if self.use_fp4_indexer:
             from sglang.kernels.ops.attention.dsv4 import (
