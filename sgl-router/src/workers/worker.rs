@@ -51,6 +51,8 @@ pub struct EngineProfile {
     pub openai: Option<Arc<OpenAiSettings>>,
     /// The engine's native gRPC port; `None` means gRPC clients cannot reach it.
     pub grpc_port: Option<u16>,
+    /// The engine's chat template renders a system message after the first.
+    pub supports_inline_system: bool,
 }
 
 impl From<WireProtocol> for EngineProfile {
@@ -60,6 +62,7 @@ impl From<WireProtocol> for EngineProfile {
             dp_ranks: 1,
             openai: None,
             grpc_port: None,
+            supports_inline_system: false,
         }
     }
 }
@@ -96,11 +99,8 @@ impl Drop for DpRankGuard {
     }
 }
 
-/// Parse a host from a worker URL. Matches SMG's `worker_builder.rs`
-/// fallback chain: parse as-is, retry with `http://` prefix if missing,
-/// fall back to `"localhost"` if both fail. The fallback is defensive —
-/// discovery code should never emit an unparsable URL — but a panic
-/// here would crash the whole router on a single bad config entry.
+/// Falls back to `"localhost"` rather than panicking: one bad config entry must
+/// not crash the router.
 fn parse_bootstrap_host(url: &str) -> String {
     if let Ok(parsed) = url::Url::parse(url) {
         if let Some(h) = parsed.host_str() {
@@ -256,6 +256,7 @@ pub struct Worker {
     /// Round-robin position over this worker's DP ranks.
     dp_rank_turn: AtomicUsize,
     openai: Option<Arc<OpenAiSettings>>,
+    supports_inline_system: bool,
 }
 
 impl Worker {
@@ -276,6 +277,7 @@ impl Worker {
             dp_ranks,
             openai,
             grpc_port,
+            supports_inline_system,
         } = profile.into();
         let breaker = match cb {
             Some(cfg) => Arc::new(CircuitBreaker::with_config(cfg)),
@@ -303,11 +305,16 @@ impl Worker {
             dp_rank_inflight: (0..dp_ranks.max(1)).map(|_| AtomicUsize::new(0)).collect(),
             dp_rank_turn: AtomicUsize::new(0),
             openai,
+            supports_inline_system,
         }
     }
 
     pub fn openai_settings(&self) -> Option<&Arc<OpenAiSettings>> {
         self.openai.as_ref()
+    }
+
+    pub fn supports_inline_system(&self) -> bool {
+        self.supports_inline_system
     }
 
     pub fn services(&self) -> BTreeSet<String> {

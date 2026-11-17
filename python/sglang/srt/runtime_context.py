@@ -722,6 +722,8 @@ class ForwardFlags:
         # ForwardBatch.attn_tp_sequence_sharded decision, stamped by the model
         # that slices); read by the benchmark routing override.
         "attn_tp_sequence_sharded": False,
+        # Physical token rows in TP rank order for the current Ascend MoE call.
+        "ascend_allgather_row_sizes": None,
     }
 
     # Read/written inside compiled graphs (vocab embedding, layer boundaries,
@@ -1241,9 +1243,7 @@ class _ServerArgsOverride:
         self._prev_publish_role = ctx._publish_role
         self._prev_parallel_config = ctx.parallel._config
         self._prev_capture = ctx.flags.capture.enable_torch_compile
-        from sglang.srt.arg_groups.overrides import (
-            declare_resolution,
-        )
+        from sglang.srt.arg_groups.overrides import declare_resolution
 
         server_args = ServerArgs(model_path="dummy")
         server_args.resolve_once()
@@ -1887,7 +1887,7 @@ class PlatformContext:
             raise AttributeError(
                 f"unknown platform fact {name!r}; known: {', '.join(known)}"
             )
-        overrides = object.__getattribute__(self, "_overrides")
+        overrides = self._overrides
         if name in overrides:
             return overrides[name]
         from sglang.srt.utils import device as _device
@@ -2095,8 +2095,8 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
     publisher, or `None` if publishing is disabled / misconfigured.
 
     This is the wire contract surfaced under the `kv_events` key on
-    `/server_info` so KV-aware routers (e.g. the SGLang model
-    gateway) can subscribe per-worker without operator-supplied port
+    `/server_info` so KV-aware routers (e.g. sgl-router) can
+    subscribe per-worker without operator-supplied port
     coordination. The router constructs the per-DP-rank SUB endpoint
     as tcp://<worker_host>:<endpoint_port_base + dp_rank> for
     every rank reported in dp_size.
