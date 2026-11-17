@@ -147,13 +147,20 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-# The sglang package comes from the image's site-packages (PYTHONPATH below is intentionally NOT prepended).
-# However, test helper modules shipped in the PR  must be available on top of whatever the image bundled,
-# so we rsync the checkout's python/sglang/test tree into site-packages before anything imports it.
-IMAGE_SGLANG_PKG="$(python -c 'import sglang, os; print(os.path.dirname(sglang.__file__))')"
-if [ -d "${IMAGE_SGLANG_PKG}/test" ] && [ -d "${sglang_source_path}/python/sglang/test" ]; then
-    echo "Syncing PR sglang/test → ${IMAGE_SGLANG_PKG}/test"
-    cp -r "${sglang_source_path}/python/sglang/test/ascend/"* "${IMAGE_SGLANG_PKG}/test/ascend/"
+# SGLANG_USE_IMAGE=true keeps importing sglang from the image's site-packages
+# (release data runs against the published image). The checkout's test helpers
+# still have to be visible on top of whatever the image bundled, so they are
+# copied into site-packages before anything imports them.
+# Every other caller keeps the community behavior and imports the checked-out
+# sglang, so the pod tests the commit under test.
+if [ "${SGLANG_USE_IMAGE:-}" = "true" ] || [ "${SGLANG_USE_IMAGE:-}" = "True" ]; then
+    IMAGE_SGLANG_PKG="$(python -c 'import sglang, os; print(os.path.dirname(sglang.__file__))')"
+    if [ -d "${IMAGE_SGLANG_PKG}/test" ] && [ -d "${sglang_source_path}/python/sglang/test" ]; then
+        echo "Syncing PR sglang/test → ${IMAGE_SGLANG_PKG}/test"
+        cp -r "${sglang_source_path}/python/sglang/test/"* "${IMAGE_SGLANG_PKG}/test/"
+    fi
+else
+    export PYTHONPATH="${sglang_source_path}/python${PYTHONPATH:+:${PYTHONPATH}}"
 fi
 
 # set environment of cann
