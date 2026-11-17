@@ -948,10 +948,16 @@ def _real_indexer_topk(check, backends, batch, layer_id, query, weights):
         num_local_tokens=0,
         logits_with_pp_recv=False,
         use_prefill_lite_topk=False,
+        tp_split_min_rows=None,
         sm_count=torch.cuda.get_device_properties(check.device).multi_processor_count,
         _pad_heads_for_deep_gemm=dsa_indexer.Indexer._pad_heads_for_deep_gemm,
     )
-    for name in ("_with_real_sm_count", "_mask_init_and_local_tokens", "_mqa_logits"):
+    for name in (
+        "_with_real_sm_count",
+        "_mask_init_and_local_tokens",
+        "_mqa_logits",
+        "_indexer_tp_split",
+    ):
         setattr(indexer, name, MethodType(getattr(dsa_indexer.Indexer, name), indexer))
 
     class RecordingMetadata:

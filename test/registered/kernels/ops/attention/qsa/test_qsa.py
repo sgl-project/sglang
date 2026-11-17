@@ -366,6 +366,7 @@ def test_qsa_glue_fetches_indexer_metadata_without_model_unwrap():
         token_to_kv_pool=None,
         req_to_token_pool=None,
         runner_ids=None,
+        plans_padded_extend_rows=False,
         needs_cpu_seq_lens=True,
     )
     hybrid = HybridLinearAttnBackend(
