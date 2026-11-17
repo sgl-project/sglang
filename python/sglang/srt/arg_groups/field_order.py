@@ -572,5 +572,9 @@ POSITIONAL_FIELD_ORDER = (
     "disaggregation_max_top_logprobs_num",
     "shortest_prefill_aging_factor",
     "enable_token_space_processor",
+    "indexer_kv_cache_dtype",
+    "enable_flashmla_prefill_token_packing",
+    "decode_state_free_radix_default",
+    "gc_freeze_on_idle_secs",
 )
 # fmt: on
