@@ -196,8 +196,7 @@ class DSV4CPBCGInput(PrefillCPBCGInput):
             forward_batch.input_ids_global.copy_(global_ids)
         else:
             forward_batch.input_ids_global = input_ids
-        if forward_batch.num_token_non_padded is not None:
-            assert self.num_token_non_padded is not None
+        if self.num_token_non_padded is not None:
             metadata = forward_batch.attn_cp_metadata
             logical_tokens = (
                 metadata.per_rank_logical_token or metadata.per_rank_actual_token
@@ -206,6 +205,8 @@ class DSV4CPBCGInput(PrefillCPBCGInput):
             assert strategy is not None
             self.num_token_non_padded.fill_(logical_tokens[strategy.cp_rank])
             forward_batch.num_token_non_padded = self.num_token_non_padded
+            if isinstance(strategy, InterleaveCPStrategy):
+                metadata.moe_local_token_count = self.num_token_non_padded
         self.live_local_tokens = live_local_tokens
 
         if isinstance(get_cp_strategy(), InterleaveCPStrategy):

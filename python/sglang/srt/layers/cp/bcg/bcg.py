@@ -325,6 +325,12 @@ def execute_prefill_cp_bcg(
             # so the next stage may replay or run eagerly on the same shard.
             return _slice_output_rows(local_output, cp_input.eager_local_tokens)
 
+        # The compact DSpark output has its own CP layout. Reuse the model's
+        # eager output adapter, which also publishes global injection indices.
+        get_tail = getattr(model, "_get_dspark_prefill_tail", None)
+        if get_tail is not None and get_tail(static_forward_batch) is not None:
+            return model.postprocess_cp_output(local_output, static_forward_batch)
+
         local_output = _slice_output_rows(local_output, cp_input.live_local_tokens)
         capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
         aux_hidden_states = None

@@ -89,6 +89,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
 from sglang.srt.layers.dp_attention import (
+    attn_cp_all_gather_into_tensor,
     attn_tp_all_reduce,
     dp_gather_replicate,
     dp_slot_in,
@@ -814,7 +815,11 @@ def deepseek_v4_attention_with_output(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
-    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    real_num_tokens = (
+        query.shape[0]
+        if is_cp_active(forward_batch)
+        else forward_batch.global_num_token_non_padded_cpu
+    )
 
     if real_num_tokens == 0:
         output.zero_()
@@ -824,7 +829,8 @@ def deepseek_v4_attention_with_output(
     key_value = key_value[:real_num_tokens]
 
     original_out_cache_loc = forward_batch.out_cache_loc
-    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    if not is_cp_active(forward_batch):
+        forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
 
     attn_backend = get_attn_backend()
     try:
@@ -857,7 +863,11 @@ bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
 
 def deepseek_v4_mega_attention_with_output(layer, query, output, attn_sink) -> None:
     forward_batch = get_tc_piecewise_forward_context().forward_batch
-    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    real_num_tokens = (
+        query.shape[0]
+        if is_cp_active(forward_batch)
+        else forward_batch.global_num_token_non_padded_cpu
+    )
     if real_num_tokens:
         layer._mega_core(
             query[:real_num_tokens],
@@ -878,7 +888,11 @@ def deepseek_v4_mega_attention_with_mxfp8_output(
     layer, query, data, scale, attn_sink
 ) -> None:
     forward_batch = get_tc_piecewise_forward_context().forward_batch
-    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    real_num_tokens = (
+        query.shape[0]
+        if is_cp_active(forward_batch)
+        else forward_batch.global_num_token_non_padded_cpu
+    )
     if real_num_tokens:
         # DeepGEMM writes packed scales at the TMA-aligned stride of the live rows,
         # while the captured wo_b reads them at the stride of the padded rows.
@@ -914,7 +928,13 @@ bcg_deepseek_v4_mega_attention_with_mxfp8_output = eager_on_graph(True)(
 def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
     # The compressor and prefill indexer sync with the host, like the attention.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
-    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    # CP collectives keep their captured physical extent, including on ranks
+    # with no real tail rows. The backend trims only the indexer's live queries.
+    real_num_tokens = (
+        x.shape[0]
+        if is_cp_active(forward_batch)
+        else forward_batch.global_num_token_non_padded_cpu
+    )
     if real_num_tokens == 0:
         return
     get_attn_backend().forward_low_ratio_sources(
@@ -950,7 +970,11 @@ def _low_ratio_sources_break(attn_backend, forward_batch) -> bool:
 def deepseek_v4_write_tail_source_kv(layer, x, positions) -> None:
     # Like the sources above: the compressor syncs with the host.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
-    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    real_num_tokens = (
+        x.shape[0]
+        if is_cp_active(forward_batch)
+        else forward_batch.global_num_token_non_padded_cpu
+    )
     get_attn_backend().write_tail_source_kv(
         layer=layer,
         x=x[:real_num_tokens],
@@ -4305,7 +4329,17 @@ class DeepseekV4Model(nn.Module):
                 if _is_cuda:
                     hidden_states = residual_batch.set_written(state, forward_batch)
                 input_ids = tail.rows(input_ids)
-                if not (
+                if tail.cp_metadata is not None:
+                    input_ids_global = input_ids
+                    if get_moe_a2a_backend().is_none():
+                        # TP MoE consumes the same rank-major layout as its hidden gather.
+                        input_ids_global = input_ids.new_empty(
+                            sum(tail.cp_metadata.per_rank_actual_token)
+                        )
+                        attn_cp_all_gather_into_tensor(
+                            input_ids_global, input_ids.contiguous()
+                        )
+                elif not (
                     get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
                 ):
                     input_ids_global = tail.rows(input_ids_global)
@@ -5157,7 +5191,9 @@ class DeepseekV4ForCausalLM(
             and self.model.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
-            return get_attn_backend().tail_forward_metadata.late_layer_tail
+            metadata = get_attn_backend().tail_forward_metadata
+            if metadata is not None:
+                return metadata.late_layer_tail
         return None
 
     def postprocess_cp_output(self, hidden_states, forward_batch):
@@ -5212,7 +5248,11 @@ class DeepseekV4ForCausalLM(
                 token_indices = tail.token_indices
             if tail.real_rows_count is not None:
                 # Fixed-capacity tail block from the prefill CUDA graph: drop padding.
-                n = tail.real_rows_count
+                n = (
+                    token_indices.numel()
+                    if tail.cp_metadata is not None
+                    else tail.real_rows_count
+                )
                 input_ids = input_ids[:n]
                 hidden_states = hidden_states[:n]
                 pre_hc_head = pre_hc_head[:n]

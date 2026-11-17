@@ -258,6 +258,18 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             )
 
 
+def supports_decoder_bounded_prefill_cp_bcg(cfg) -> bool:
+    # Fixed-capacity CUDA interleave tail, with paged SWA.
+    return (
+        cfg.disaggregation_mode == "prefill"
+        and cfg.enable_prefill_cp
+        and cfg.cp_strategy == "interleave"
+        and cfg.pp_size == cfg.dp_size == cfg.dcp_size == 1
+        and get_platform().is_cuda
+        and not cfg.enable_encoder_swa_bounded_replay
+    )
+
+
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     """Validate DeepSeek V4 context-parallel configuration."""
     cfg = resolving_view(server_args)
@@ -485,7 +497,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         (
             "prefill CP with the prefill CUDA graph",
             (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
-            and cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+            and cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+            and not supports_decoder_bounded_prefill_cp_bcg(cfg),
         ),
         (
             "the prefill CUDA graph",

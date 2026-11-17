@@ -196,6 +196,23 @@ class TestPlatformPrefillCPPolicy(CustomTestCase):
         ):
             validate_deepseek_v41_features(args)
 
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_dsv41_pd_prefill_cp_graph_allows_decoder_bounded_replay(self):
+        args = _cp_args(
+            model_type="deepseek_v41",
+            tp_size=4,
+            attn_cp_size=4,
+            disaggregation_mode="prefill",
+            enable_decoder_swa_bounded_replay=True,
+        )
+        _parse_disabled_prefill_graph_default(args)
+        validate_deepseek_v41_features(args)
+        apply_prefill_cp_cuda_graph_default(args)
+        self.assertEqual(
+            resolving_view(args).cuda_graph_config.prefill.backend, Backend.BREAKABLE
+        )
+        validate_deepseek_v41_features(args)
+
     def test_non_cp_and_decode_cp_are_not_rejected(self):
         for platform in ("is_hip", "is_npu", "is_musa"):
             facts = dict(is_hip=False, is_npu=False, is_musa=False)

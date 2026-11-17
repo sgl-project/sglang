@@ -55,10 +55,6 @@ def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
     # Pipeline parallelism is decided per strategy in its ``supports``.
     if not (cfg.enable_prefill_cp and resolved.attn_cp_size == cfg.tp_size):
         return False
-    # Decoder bounded-tail replay cannot capture CP rows yet. Feature validation
-    # runs before automatic CP graph selection, so keep its eager choice intact.
-    if cfg.enable_decoder_swa_bounded_replay:
-        return False
     prefill_attention_backend, _ = attention_backends_of(resolved)
     try:
         combination = (
@@ -70,4 +66,15 @@ def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
         return False
     if combination not in PREFILL_CP_BCG_SUPPORTED_COMBINATIONS:
         return False
+    if cfg.enable_decoder_swa_bounded_replay:
+        from sglang.srt.arg_groups.deepseek_v4_hook import (
+            supports_decoder_bounded_prefill_cp_bcg,
+        )
+
+        if combination[
+            1
+        ] != CPAttentionBackendKind.DSV4 or not supports_decoder_bounded_prefill_cp_bcg(
+            cfg
+        ):
+            return False
     return get_cp_bcg_input_type(*combination).supports(server_args)
