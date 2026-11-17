@@ -171,17 +171,35 @@ jobs:
             // after a commit, because GHA doesn't retrigger on `labeled`.
             const isReal = (run) => run && run.conclusion !== 'skipped';
 
+            // An Extra run from before `run-ci-nv-extra` passes with every
+            // test job skipped (pr-gate's opted-in=false), so a green run
+            // alone does not mean Extra tests ran.
+            const extraBookkeepingJob = /^(check-changes|call-gate|pr-test-extra-finish|notify-pr-states)( \/|$)/;
+            async function extraTestsRan(run) {
+              const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: run.id,
+                filter: 'latest',
+                per_page: 100,
+              });
+              return jobs.some((job) => job.conclusion !== 'skipped' && !extraBookkeepingJob.test(job.name));
+            }
+            const peTestsSkipped = isReal(peRun) && peRun.status === 'completed'
+              && peRun.conclusion === 'success' && !(await extraTestsRan(peRun));
+
             const missingCIText = ':x: **Missing `run-ci` label** -- add it to run CI tests.';
             const peBlockedByCIText = ':x: **Blocked** -- `run-ci` is required first.';
             const notNvExtraEnabledText = ':warning: **Not enabled** -- add `run-ci-nv-extra` label to opt in.';
             const stalePushText = ':warning: **Not run on latest push** -- push again to dispatch.';
+            const noExtraTestsText = (run) => `:warning: **No tests ran** in [Run #${run.id}](${run.html_url}) -- if it predates \`run-ci-nv-extra\`, \`/run-extra-ci nv\` reruns it.`;
             // A missing run usually means the paths filter excluded the PR,
             // but pull_request workflows can also be suppressed by GitHub
             // (for example, for merge conflicts or skip annotations).
             const amdNotTriggeredText = ':heavy_minus_sign: **No AMD PR run found for this commit**.';
 
             // Status icon: body otherwise looks uniformly "dispatched" even
-            // for gate-failed runs (call-gate exits on missing label).
+            // for gate-failed runs.
             function runIcon(run) {
               if (run.status !== 'completed') return ':hourglass_flowing_sand:';
               switch (run.conclusion) {
@@ -198,13 +216,15 @@ jobs:
             const ptText = isReal(ptRun)
               ? runLink(ptRun)
               : (!hasCI ? missingCIText : '_Not run yet_');
-            const peText = isReal(peRun)
+            const peText = isReal(peRun) && !peTestsSkipped
               ? runLink(peRun)
               : !hasCI
                 ? peBlockedByCIText
                 : !hasNvExtra
                   ? notNvExtraEnabledText
-                  : stalePushText;
+                  : peTestsSkipped
+                    ? noExtraTestsText(peRun)
+                    : stalePushText;
             const amdText = isReal(amdRun)
               ? runLink(amdRun)
               : amdNotTriggeredText;
