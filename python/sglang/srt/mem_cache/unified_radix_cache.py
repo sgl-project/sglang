@@ -756,6 +756,15 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_prefix_sharing(self) -> bool:
         return not self.disable
 
+    def forwards_kv_hints(self) -> bool:
+        controller = self.cache_controller
+        return (
+            self.enable_storage
+            and controller is not None
+            and controller.storage_backend is not None
+            and controller.storage_backend.consumes_kv_hints()
+        )
+
     @rank_consensus(
         same_params=["len(params.key)"],
         same_results=["result.prefix_len"],
@@ -2631,7 +2640,8 @@ class UnifiedRadixCache(BasePrefixCache):
         matched_prefix_tokens: Optional[list[int]],
         last_hash: Optional[str],
     ) -> Optional[dict[str, Any]]:
-        if kv_hints is None:
+        # Binding rehashes the whole prefix, so skip it unless a backend reads it.
+        if kv_hints is None or not kv_hints.actions or not self.forwards_kv_hints():
             return None
         metadata: dict[str, Any] = {"kv_hints": kv_hints}
         if key.extra_key is not None or key.cache_salt is not None:

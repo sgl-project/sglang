@@ -3281,9 +3281,11 @@ class Scheduler(
 
     def _record_kv_event_lora_name(self, req: Req, lora_name: Optional[str]) -> None:
         # Keyed by the final extra_key, so it must run after elastic namespacing.
-        # Ranks that consume hints also need the legacy LoRA namespace.
+        # The default event format namespaces only named LoRA keys, so a rank
+        # that binds hinted storage keys to event IDs needs the name as well.
         if (
-            self.kv_events_publisher.enable_kv_cache_events or req.kv_hints is not None
+            self.kv_events_publisher.enable_kv_cache_events
+            or (req.kv_hints is not None and self.tree_cache.forwards_kv_hints())
         ) and self.tree_cache.supports_prefix_sharing():
             self.kv_event_lora_names.register(req, lora_name)
 

@@ -12,9 +12,14 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCacheTransferMixin,
     DecodePrefixMatch,
 )
-from sglang.srt.managers.kv_hints import KvHintsEnvelope
+from sglang.srt.managers.kv_hints import KvHintAction, KvHintsEnvelope
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-from sglang.srt.mem_cache.events import KVCacheEventRecorder
+from sglang.srt.mem_cache.events import KVCacheEventRecorder, KvEventLoraNames
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorage,
+    HiCacheStorageFailureInjector,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
@@ -27,57 +32,103 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
+_MASK = (1 << 64) - 1
+_LORA_ID = "a" * 32
+_HINT = KvHintsEnvelope(
+    protocol_version="0.1",
+    message_id="decode-probe",
+    actions=[
+        KvHintAction(action_id="fetch", action_type="kv.fetch", action_version="1.0")
+    ],
+)
+
+
+def _lora_names(extra_key):
+    names = KvEventLoraNames()
+    if extra_key is not None:
+        names.register(SimpleNamespace(extra_key=extra_key, lora_id=_LORA_ID), "lora")
+    return names
+
+
+class _Backend(HiCacheStorage):
+    """A storage backend whose L3 lookups go to ``batch_exists``."""
+
+    def __init__(self, batch_exists, consumes_kv_hints=None):
+        self.batch_exists = batch_exists
+        self._consumes_kv_hints = consumes_kv_hints
+
+    def consumes_kv_hints(self) -> bool:
+        if self._consumes_kv_hints is None:
+            return super().consumes_kv_hints()
+        return self._consumes_kv_hints
+
+    def _unused(self, *args, **kwargs):
+        raise NotImplementedError
+
+    get = batch_get = set = batch_set = exists = _unused
+
+
+def _decode_probe(page_size, kv_events, batch_exists, consumes_kv_hints=True):
+    """A decode-side cache whose L3 lookups go to ``batch_exists``."""
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.tree_core = SimpleNamespace(
+        enable_storage=True, is_eagle=False, kv_events=kv_events
+    )
+    cache.page_size = cache.prefetch_threshold = page_size
+    cache._all_reduce_attn_groups = Mock()
+    cache.prefix_device_indices = lambda req: torch.arange(page_size)
+    cache.hicache_storage_pass_prefix_keys = False
+    cache.is_backuped = lambda node: True
+
+    controller = HybridCacheController.__new__(HybridCacheController)
+    controller.page_size = page_size
+    controller.prefetch_rate_limited = lambda: False
+    controller.storage_backend = _Backend(batch_exists, consumes_kv_hints)
+    cache.cache_controller = controller
+    harness = SimpleNamespace(
+        tree_cache=cache, scheduler=SimpleNamespace(enable_decode_hicache=True)
+    )
+    match = SimpleNamespace(host_hit_length=0, last_device_node=1, last_host_node=1)
+    return cache, lambda req: DecodeHiCachePreallocMixin._build_decode_prefix_match(
+        harness, req, match
+    )
+
+
 class TestDecodeHiCacheTreeCore(CustomTestCase):
-    def test_decode_probe_binds_salted_and_adapter_ids_on_a_nonpublishing_rank(self):
-        """A lookup before the first local storage operation can use published IDs."""
+    def test_decode_probe_binds_published_ids_on_a_nonpublishing_rank(self):
+        """A rank that publishes no events binds hinted keys to the published IDs."""
         page_size = 4
-        hint = KvHintsEnvelope(protocol_version="0.1", message_id="decode-probe")
-        publisher = KVCacheEventRecorder(
-            enabled=True, page_size=page_size, dynamo_format=True
-        )
-        follower = KVCacheEventRecorder(
-            enabled=False, page_size=page_size, dynamo_format=True
-        )
-        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-        cache.tree_core = SimpleNamespace(
-            enable_storage=True, is_eagle=False, kv_events=follower
-        )
-        cache.page_size = cache.prefetch_threshold = page_size
-        cache._all_reduce_attn_groups = Mock()
-        cache.prefix_device_indices = lambda req: torch.arange(page_size)
-        cache.hicache_storage_pass_prefix_keys = False
-        cache.is_backuped = lambda node: True
-
-        controller = HybridCacheController.__new__(HybridCacheController)
-        controller.page_size = page_size
-        controller.prefetch_rate_limited = lambda: False
-        cache.cache_controller = controller
-        harness = SimpleNamespace(
-            tree_cache=cache, scheduler=SimpleNamespace(enable_decode_hicache=True)
-        )
-        match = SimpleNamespace(host_hit_length=0, last_device_node=1, last_host_node=1)
-
-        for salt, adapter in (("tenant", None), (None, "adapter")):
-            with self.subTest(salt=salt, adapter=adapter):
-                tokens = array("q", range(3 * page_size))
-                key = RadixKey(tokens, extra_key=adapter, cache_salt=salt)
+        tokens = array("q", range(3 * page_size))
+        cases = [
+            (dynamo_format, salt, extra_key)
+            for dynamo_format in (True, False)
+            for salt, extra_key in (
+                ("tenant", None),
+                (None, "user-" + _LORA_ID),
+                ("tenant", "user-" + _LORA_ID),
+            )
+        ]
+        for dynamo_format, salt, extra_key in cases:
+            with self.subTest(dynamo_format=dynamo_format, salt=salt, lora=extra_key):
+                key = RadixKey(tokens, extra_key=extra_key, cache_salt=salt)
                 keys = get_storage_hash_str(key, page_size=page_size)
+                publisher = KVCacheEventRecorder(
+                    enabled=True,
+                    page_size=page_size,
+                    dynamo_format=dynamo_format,
+                    lora_names=_lora_names(extra_key),
+                )
                 publisher.record_store(
                     SimpleNamespace(
-                        key=key,
-                        parent=None,
-                        hash_value=keys,
-                        event_hash_value=None,
+                        key=key, parent=None, hash_value=keys, event_hash_value=None
                     )
                 )
                 event_ids = publisher.take()[0].block_hashes[1:]
-                expected = dict(
-                    zip(keys[1:], (value & ((1 << 64) - 1) for value in event_ids))
-                )
+                expected = {k: v & _MASK for k, v in zip(keys[1:], event_ids)}
 
                 def batch_exists(page_keys, info):
                     fields = info.extra_info
-                    if fields.get("kv_hints") != hint:
+                    if fields.get("kv_hints") != _HINT:
                         return 0
                     binding = fields.get("storage_key_to_event_hash", {})
                     return sum(
@@ -85,23 +136,135 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
                         for page in page_keys
                     )
 
-                controller.storage_backend = SimpleNamespace(batch_exists=batch_exists)
-                cache.get_last_hash_value = lambda node: keys[0]
+                follower = KVCacheEventRecorder(
+                    enabled=False,
+                    page_size=page_size,
+                    dynamo_format=dynamo_format,
+                    lora_names=_lora_names(extra_key),
+                )
+                cache, probe = _decode_probe(page_size, follower, batch_exists)
                 req = SimpleNamespace(
                     origin_input_ids=tokens,
-                    extra_key=adapter,
+                    extra_key=extra_key,
                     cache_salt=salt,
-                    kv_hints=hint,
+                    kv_hints=_HINT,
                 )
-                result = DecodeHiCachePreallocMixin._build_decode_prefix_match(
-                    harness, req, match
-                )
-                self.assertEqual(result.l3_storage_hit_length, 2 * page_size)
+                cache.get_last_hash_value = lambda node: keys[0]
+                self.assertEqual(probe(req).l3_storage_hit_length, 2 * page_size)
+
                 cache.get_last_hash_value = lambda node: "00" * 32
-                invalid_prefix = DecodeHiCachePreallocMixin._build_decode_prefix_match(
-                    harness, req, match
+                self.assertEqual(probe(req).l3_storage_hit_length, 0)
+
+    def test_default_format_binding_needs_the_lora_name_on_every_rank(self):
+        """Without the registered name, a follower's IDs miss a LoRA hint."""
+        page_size = 4
+        extra_key = "user-" + _LORA_ID
+        key = RadixKey(array("q", range(2 * page_size)), extra_key=extra_key)
+        keys = get_storage_hash_str(key, page_size=page_size)
+        publisher = KVCacheEventRecorder(
+            enabled=True, page_size=page_size, lora_names=_lora_names(extra_key)
+        )
+        publisher.record_store(
+            SimpleNamespace(
+                key=key, parent=None, hash_value=keys, event_hash_value=None
+            )
+        )
+        published = publisher.take()[0].block_hashes[1] & _MASK
+        for registered in (True, False):
+            with self.subTest(registered=registered):
+                follower = KVCacheEventRecorder(
+                    enabled=False,
+                    page_size=page_size,
+                    lora_names=_lora_names(extra_key if registered else None),
                 )
-                self.assertEqual(invalid_prefix.l3_storage_hit_length, 0)
+                bound = []
+                cache, probe = _decode_probe(
+                    page_size,
+                    follower,
+                    lambda page_keys, info: (
+                        bound.append(info.extra_info["storage_key_to_event_hash"]) or 0
+                    ),
+                )
+                cache.get_last_hash_value = lambda node: keys[0]
+                probe(
+                    SimpleNamespace(
+                        origin_input_ids=key.raw_token_ids(),
+                        extra_key=extra_key,
+                        cache_salt=None,
+                        kv_hints=_HINT,
+                    )
+                )
+                self.assertEqual(bound[0][keys[1]] == published, registered)
+
+    def test_decode_probe_skips_hint_metadata_unless_a_backend_reads_it(self):
+        """Hints reach only opted-in backends, and only when they request work."""
+        page_size = 4
+        tokens = array("q", range(2 * page_size))
+        cases = (
+            ("default backend", None, _HINT),
+            ("backend opted out", False, _HINT),
+            (
+                "hint has no actions",
+                True,
+                KvHintsEnvelope(protocol_version="0.1", message_id="m"),
+            ),
+        )
+        for name, consumes_kv_hints, hint in cases:
+            with self.subTest(name):
+                seen = []
+                cache, probe = _decode_probe(
+                    page_size,
+                    KVCacheEventRecorder(enabled=False, page_size=page_size),
+                    lambda page_keys, info: seen.append(info.extra_info) or 0,
+                    consumes_kv_hints=consumes_kv_hints,
+                )
+                cache.get_last_hash_value = lambda node: "00" * 32
+                with patch(
+                    "sglang.srt.mem_cache.unified_radix_cache.storage_key_to_event_hashes"
+                ) as bind:
+                    probe(
+                        SimpleNamespace(
+                            origin_input_ids=tokens,
+                            extra_key=None,
+                            cache_salt="tenant",
+                            kv_hints=hint,
+                        )
+                    )
+                bind.assert_not_called()
+                self.assertEqual(len(seen), 1)
+                self.assertNotIn("kv_hints", seen[0] or {})
+
+    def test_fault_injector_keeps_the_backend_opt_in(self):
+        """Test-only fault injection must not hide a backend's hint opt-in."""
+        for consumes_kv_hints in (None, True):
+            with self.subTest(consumes_kv_hints=consumes_kv_hints):
+                backend = _Backend(Mock(), consumes_kv_hints)
+                wrapped = HiCacheStorageFailureInjector(backend, 0.0, 0.0)
+                self.assertEqual(wrapped.consumes_kv_hints(), bool(consumes_kv_hints))
+
+    def test_scheduler_names_hinted_lora_keys_only_where_hints_are_bound(self):
+        """Non-publishing ranks keep LoRA names only for hints a backend reads."""
+        for publishes, has_hint, consumes, expected in (
+            (True, False, False, True),
+            (False, True, True, True),
+            (False, True, False, False),
+            (False, False, True, False),
+        ):
+            with self.subTest(publishes=publishes, hint=has_hint, consumes=consumes):
+                names = Mock()
+                scheduler = SimpleNamespace(
+                    kv_events_publisher=SimpleNamespace(
+                        enable_kv_cache_events=publishes
+                    ),
+                    tree_cache=SimpleNamespace(
+                        forwards_kv_hints=lambda: consumes,
+                        supports_prefix_sharing=lambda: True,
+                    ),
+                    kv_event_lora_names=names,
+                )
+                req = SimpleNamespace(kv_hints=_HINT if has_hint else None)
+                Scheduler._record_kv_event_lora_name(scheduler, req, "lora")
+                self.assertEqual(names.register.called, expected)
 
     def test_stale_prefetch_anchor_degrades_to_l2(self):
         tree_cache = SimpleNamespace(

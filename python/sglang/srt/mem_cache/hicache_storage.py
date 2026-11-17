@@ -100,9 +100,17 @@ class HiCacheStorageExtraInfo:
     # Page hashes preceding the call's keys, from the sequence start;
     # prefix_keys + keys is one contiguous chain for KV batches and sidecars.
     prefix_keys: Optional[List[str]] = None
-    # A hinted read can include the request's kv_hints and a map from namespaced
-    # storage keys to unsigned KV event IDs (storage_key_to_event_hash). An
-    # empty map means no namespaced page could be bound to the hint.
+    # Free-form per-call metadata. If the backend's consumes_kv_hints() is True,
+    # a lookup or read for a request whose kv_hints has actions also carries:
+    #   "kv_hints": the request's KvHintsEnvelope (a msgspec Struct). It is
+    #       caller-supplied and unauthenticated; validate it before acting on it.
+    #   "storage_key_to_event_hash": only for a request with cache_salt or
+    #       extra_key. Maps each storage key to its KV event block ID, as
+    #       unsigned 64-bit (events carry the same value as signed int64), in
+    #       this rank's event format whether or not it publishes events. An
+    #       empty map means the prefix could not be verified, so treat those
+    #       pages as unbound. Without the map, the ID is int(storage_key[:16], 16).
+    # Decode-side lookups carry request_id "__storage_hit_query__".
     extra_info: Optional[dict] = None
 
 
@@ -386,6 +394,14 @@ class HiCacheStorage(ABC):
     It abstracts the underlying storage mechanism, allowing different implementations to be used.
     """
 
+    def consumes_kv_hints(self) -> bool:
+        """Whether lookups and reads should carry request kv_hints in extra_info.
+
+        Off by default: binding storage keys to event IDs rehashes the
+        request's prefix on the scheduler.
+        """
+        return False
+
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host
@@ -665,6 +681,9 @@ class HiCacheStorageFailureInjector(HiCacheStorage):
                 logger.debug(f"Inject failure in {func_name}")
                 return True
         return False
+
+    def consumes_kv_hints(self) -> bool:
+        return self._backend.consumes_kv_hints()
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self._backend.register_mem_pool_host(mem_pool_host)

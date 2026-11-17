@@ -934,6 +934,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         share, including after the request finishes."""
         return True
 
+    def forwards_kv_hints(self) -> bool:
+        """Whether request ``kv_hints`` reach an attached storage backend."""
+        return False
+
     def available_and_evictable_str(self) -> str:
         available_size = self.token_to_kv_pool_allocator.available_size()
         if is_cp_sharded_padded():
