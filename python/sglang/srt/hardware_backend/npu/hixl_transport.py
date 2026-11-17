@@ -43,8 +43,9 @@ def _load_bridge():
         "connect": [pointer, string, integer],
         "read": [
             pointer,
-            string,
-            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(string),
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_uint64)),
+            ctypes.POINTER(ctypes.c_size_t),
             ctypes.c_size_t,
             integer,
         ],
@@ -181,19 +182,27 @@ class HixlExpertTransport:
                         row_bytes,
                     )
                 )
-        for rank, triples in by_peer.items():
-            payload = (ctypes.c_uint64 * len(triples))(*triples)
-            # ctypes releases the GIL while the native worker waits for DMA.
-            self._check(
-                self._lib.sgl_hixl_read(
-                    self._engine,
-                    self.remote[rank][0].encode(),
-                    payload,
-                    len(triples) // 3,
-                    self.timeout_ms,
-                ),
-                "READ",
-            )
+        if not by_peer:
+            return
+        peers = list(by_peer)
+        # Keep each descriptor array alive until every submitted READ completes.
+        payloads = [
+            (ctypes.c_uint64 * len(by_peer[rank]))(*by_peer[rank]) for rank in peers
+        ]
+        names = (ctypes.c_char_p * len(peers))(
+            *(self.remote[rank][0].encode() for rank in peers)
+        )
+        pointers = (ctypes.POINTER(ctypes.c_uint64) * len(peers))(*payloads)
+        counts = (ctypes.c_size_t * len(peers))(
+            *(len(by_peer[rank]) // 3 for rank in peers)
+        )
+        # ctypes releases the GIL while the native worker waits for all peers.
+        self._check(
+            self._lib.sgl_hixl_read(
+                self._engine, names, pointers, counts, len(peers), self.timeout_ms
+            ),
+            "READ",
+        )
 
     def drain(self):
         # The coordinator joins the sole read worker before calling this.
