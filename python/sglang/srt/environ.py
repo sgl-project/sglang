@@ -904,6 +904,10 @@ class Envs:
     # ===================================================================
     # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
+    # Host Mamba-state pool = hicache_ratio * this scale * device Mamba pool. With
+    # --hicache-size the byte budget is kept: the Mamba share is scaled and the KV
+    # share takes the difference, per PP stage relative to that stage's pools.
+    SGLANG_HICACHE_MAMBA_HOST_RATIO_SCALE = EnvFloat(1.0)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
