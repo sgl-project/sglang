@@ -26,7 +26,7 @@ from sglang.srt.disaggregation import decode as decode_module
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
-from sglang.srt.disaggregation.mode import DisaggregationMode, FAKE_BOOTSTRAP_HOST
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.disaggregation.utils import pre_alloc_fill_len, tail_transfer_input_len
 from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo

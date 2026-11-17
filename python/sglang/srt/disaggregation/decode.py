@@ -4331,7 +4331,9 @@ class SchedulerDisaggregationDecodeMixin:
             )
         )
 
-    def _verify_kv_checksums(self, batch: ScheduleBatch) -> None:
+    def _verify_kv_checksums(
+        self, batch: ScheduleBatch, *, filter_tensors: bool = True
+    ) -> None:
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if computer is None:
             return
@@ -4401,9 +4403,15 @@ class SchedulerDisaggregationDecodeMixin:
                 )
                 logger.error(msg)
                 self._handle_kv_checksum_mismatch(req, msg)
-        batch.filter_batch(
-            keep_indices=[i for i, bad in enumerate(mismatched) if not bad]
-        )
+        keep_indices = [i for i, bad in enumerate(mismatched) if not bad]
+        if filter_tensors:
+            batch.filter_batch(keep_indices=keep_indices)
+        else:
+            # Tail admission verifies before tensor-level batch preparation;
+            # only the request list exists at this point.
+            batch.reqs[:] = [
+                req for i, req in enumerate(batch.reqs) if i in keep_indices
+            ]
 
     def _handle_kv_checksum_mismatch(self, req: Req, msg: str) -> None:
         # A mismatch means the KV this worker received is not what prefill sent,
@@ -4456,14 +4464,22 @@ class SchedulerDisaggregationDecodeMixin:
             token_budget = min(token_budget, schedule.chunked_prefill_size)
         max_admit = min(num_not_used_batch, token_budget // tail)
 
+        # A retraction restored into the host pool leaves a completion event
+        # on the row. Finalize it before admission, or this request would be
+        # skipped here and skipped by the prebuilt path for being a tail req.
+        restores_ready = self._host_restores_ready()
         can_run_list: List[Req] = []
         for req in self.waiting_queue:
             if not _is_tail_transfer(req):
                 continue
-            # Phase 1: device-resident transfers only; a host restore rides
-            # the prebuilt path on a later iteration instead.
-            if len(can_run_list) < max_admit and (req.kv.restore_done_event is None):
-                can_run_list.append(req)
+            restoring = req.kv.restore_done_event is not None
+            if restoring and id(req) not in restores_ready:
+                continue
+            if len(can_run_list) >= max_admit:
+                continue
+            if restoring:
+                finish_restore_kv_cache(req, self.tree_cache)
+            can_run_list.append(req)
 
         if len(can_run_list) == 0:
             return None
@@ -4480,8 +4496,9 @@ class SchedulerDisaggregationDecodeMixin:
             self.spec_algorithm,
         )
         # Same verification gate the prebuilt admission runs before it caches
-        # any KV into the tree.
-        self._verify_kv_checksums(new_batch)
+        # any KV into the tree. Tail admission has not built its tensors yet,
+        # so reject mismatches at the request-list level only.
+        self._verify_kv_checksums(new_batch, filter_tensors=False)
         if new_batch.is_empty():
             return None
         new_batch.prepare_for_tail_extend()
