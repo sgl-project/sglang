@@ -102,7 +102,7 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -333,6 +333,7 @@ class Dots3MoE(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 parallel_group="replicated"
                 if get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_ascend_ops()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 else "tp",
             )
@@ -384,7 +385,9 @@ class Dots3MoE(nn.Module):
                 return_recv_hook=True,
             )
 
-        self._enable_deepep_moe = get_moe_a2a_backend().is_deepep()
+        self._enable_deepep_moe = (
+            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_ascend_ops()
+        )
 
     def get_moe_weights(self):
         return [
@@ -854,6 +857,7 @@ class Dots3AttentionMLA(nn.Module):
 
     def _get_kv_write_loc(self, forward_batch):
         swa_loc = None
+        backend = None
         if self.use_swa:
             backend = get_attn_backend()
             from sglang.srt.layers.attention.dots_hybrid_backend import (
@@ -880,7 +884,12 @@ class Dots3AttentionMLA(nn.Module):
                 swa_loc = backend.runner_ids.ids_in(
                     IdSpaceKind.SLIDING_WINDOW, out_cache_loc
                 )
-        return KVWriteLoc.for_batch(forward_batch, swa_loc=swa_loc)
+        return KVWriteLoc.for_batch(
+            forward_batch,
+            window_locs=window_write_locs(
+                None if backend is None else backend.runner_ids, swa_loc
+            ),
+        )
 
     def forward(
         self,
@@ -2309,8 +2318,12 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    @staticmethod
+    def sliding_layer_window_size(config):
+        return get_attention_sliding_window_size(config)
+
     def get_attention_sliding_window_size(self):
-        return get_attention_sliding_window_size(self.config)
+        return self.sliding_layer_window_size(self.config)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

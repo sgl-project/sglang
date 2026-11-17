@@ -1205,7 +1205,7 @@ class TestCPUGraph(CustomTestCase):
         self.assertEqual(received_kwargs, [{"get_embedding": True}])
 
     def test_mamba_cache_install_and_reset_uses_layer_router_state_part(self):
-        from sglang.srt.mem_cache.kv.router import STATE_PART
+        from sglang.srt.mem_cache.kv.decl import STATE_PART
         from sglang.srt.model_executor.cpu_graph_runner import (
             _get_mamba_pool,
             _install_cpu_compile_layer_caches,

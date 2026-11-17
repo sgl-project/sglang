@@ -44,6 +44,8 @@ class TritonGDNKernel(LinearAttnKernelBase):
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
     supports_strided_target_verify_qkv: bool = True
+    # The chunk kernel steps slots by the pool's stride(0) in int64.
+    extend_honors_slot_pitch: bool = True
 
     def packed_decode(
         self,

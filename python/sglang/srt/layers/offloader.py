@@ -117,6 +117,11 @@ def _get_resident_parameter_ids(module: torch.nn.Module):
             and hasattr(owner, "w_vc")
         ):
             resident.update(id(parameter) for parameter in projection.parameters())
+        # DSA indexer runs as an eager break in breakable prefill CUDA graph.
+        # Keep its parameters resident on device across replay outside functional_call.
+        indexer = getattr(owner, "indexer", None)
+        if isinstance(indexer, torch.nn.Module):
+            resident.update(id(parameter) for parameter in indexer.parameters())
     for parameter in module.parameters():
         if (
             not parameter.is_meta

@@ -35,7 +35,7 @@
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/utils.h>   // For RuntimeCheck
 
-#include <sgl_kernel/math.cuh>
+#include <sgl_kernel/activation.cuh>
 #include <sgl_kernel/runtime.cuh>  // For host::runtime::get_cc_major
 #include <sgl_kernel/type.cuh>     // For bf16_t, fp32_t
 #include <sgl_kernel/utils.cuh>    // For LaunchKernel
@@ -586,14 +586,14 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       cs_k[cs_base + cs_w_stride] = k_shift1;
       cs_k[cs_base + 2 * cs_w_stride] = k_new;
 
-      s_q[k] = device::math::silu_fast(q_acc);
-      s_k[k] = device::math::silu_fast(k_acc);
+      s_q[k] = device::activation::silu(q_acc);
+      s_k[k] = device::activation::silu(k_acc);
 
       const float g_raw = bf16_load(g, bos * g_row_stride + i_hv * kDimK + k) + dt_bias[hk];
       if constexpr (kUseLowerBound) {
-        s_decay[k] = __expf(lower_bound * device::math::sigmoid_fast(exp_a * g_raw));
+        s_decay[k] = __expf(lower_bound * device::activation::sigmoid(exp_a * g_raw));
       } else {
-        s_decay[k] = __expf(-exp_a * device::math::softplus_fast(g_raw));
+        s_decay[k] = __expf(-exp_a * device::activation::softplus(g_raw));
       }
     }
   } else {
@@ -613,14 +613,14 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       q_acc += bf16_load(x_q, bos * x_row_stride + hk) * fp32_at(w_q_t, (kKernelWidth - 1) * hkv_dim + hk);
       k_acc += bf16_load(x_k, bos * x_row_stride + hk) * fp32_at(w_k_t, (kKernelWidth - 1) * hkv_dim + hk);
 
-      s_q[k] = device::math::silu_fast(q_acc);
-      s_k[k] = device::math::silu_fast(k_acc);
+      s_q[k] = device::activation::silu(q_acc);
+      s_k[k] = device::activation::silu(k_acc);
 
       const float g_raw = bf16_load(g, bos * g_row_stride + i_hv * kDimK + k) + dt_bias[hk];
       if constexpr (kUseLowerBound) {
-        s_decay[k] = __expf(lower_bound * device::math::sigmoid_fast(exp_a * g_raw));
+        s_decay[k] = __expf(lower_bound * device::activation::sigmoid(exp_a * g_raw));
       } else {
-        s_decay[k] = __expf(-exp_a * device::math::softplus_fast(g_raw));
+        s_decay[k] = __expf(-exp_a * device::activation::softplus(g_raw));
       }
     }
   }
@@ -650,11 +650,11 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       cs_v[cs_base + 0] = v_shift0;
       cs_v[cs_base + cs_w_stride] = v_shift1;
       cs_v[cs_base + 2 * cs_w_stride] = v_new;
-      s_v[v] = device::math::silu_fast(v_acc);
+      s_v[v] = device::activation::silu(v_acc);
 
       if constexpr (kApplyOnorm && kPreloadOnormParams) {
         const int64_t onorm_idx = i_n * onormg_row_stride + i_hv * kDimV + v;
-        pre_onorm_gate = device::math::sigmoid_fast(bf16_load(onorm_g, onorm_idx));
+        pre_onorm_gate = device::activation::sigmoid(bf16_load(onorm_g, onorm_idx));
         pre_onorm_weight = onorm_weight[v];
       }
     }
@@ -670,11 +670,11 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
         v_acc += bf16_load(cs_v, cs_idx) * fp32_at(w_v_t, w * hvv_dim + hvv);
       }
       v_acc += bf16_load(x_v, bos * x_row_stride + hvv) * fp32_at(w_v_t, (kKernelWidth - 1) * hvv_dim + hvv);
-      s_v[v] = device::math::silu_fast(v_acc);
+      s_v[v] = device::activation::silu(v_acc);
 
       if constexpr (kApplyOnorm && kPreloadOnormParams) {
         const int64_t onorm_idx = i_n * onormg_row_stride + i_hv * kDimV + v;
-        pre_onorm_gate = device::math::sigmoid_fast(bf16_load(onorm_g, onorm_idx));
+        pre_onorm_gate = device::activation::sigmoid(bf16_load(onorm_g, onorm_idx));
         pre_onorm_weight = onorm_weight[v];
       }
     }
@@ -683,7 +683,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
   if (tid == 0) {
     const float beta_raw = bf16_load(beta, bos * beta_row_stride + i_hv);
     if constexpr (kApplyBetaSigmoid) {
-      s_beta = device::math::sigmoid_fast(beta_raw);
+      s_beta = device::activation::sigmoid(beta_raw);
     } else {
       s_beta = beta_raw;
     }
@@ -869,7 +869,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
           gate = pre_onorm_gate;
           weight = pre_onorm_weight;
         } else {
-          gate = device::math::sigmoid_fast(bf16_load(onorm_g, i_n * onormg_row_stride + i_hv * kDimV + tid));
+          gate = device::activation::sigmoid(bf16_load(onorm_g, i_n * onormg_row_stride + i_hv * kDimV + tid));
           weight = onorm_weight[tid];
         }
         const float y = raw_o * rstd * weight * gate;
@@ -894,7 +894,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
           gate = pre_onorm_gate;
           weight = pre_onorm_weight;
         } else {
-          gate = device::math::sigmoid_fast(bf16_load(onorm_g, i_n * onormg_row_stride + i_hv * kDimV + tid));
+          gate = device::activation::sigmoid(bf16_load(onorm_g, i_n * onormg_row_stride + i_hv * kDimV + tid));
           weight = onorm_weight[tid];
         }
         const float y = raw_o * rstd * weight * gate;
