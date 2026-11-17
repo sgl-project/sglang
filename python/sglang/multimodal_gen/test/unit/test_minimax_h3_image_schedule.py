@@ -42,6 +42,7 @@ def _stage_batch(task, steps):
         is_warmup=False,
         sigmas=None,
         timesteps=None,
+        rollout_stop_step_index=None,
     )
 
 

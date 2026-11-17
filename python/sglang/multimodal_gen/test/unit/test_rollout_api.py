@@ -898,6 +898,8 @@ class TestRolloutWithoutGeneratedOutput(unittest.TestCase):
         )
 
         stage = object.__new__(MiniMaxH3DecodingStage)
+        # verify_output tells image releases apart by a missing audio VAE
+        stage.audio_vae = object()
         trajectory_only = rollout_output_without_decode(self._request())
         self.assertTrue(stage.verify_output(trajectory_only, None).is_valid())
         # An empty output that is not a rollout trajectory still fails.

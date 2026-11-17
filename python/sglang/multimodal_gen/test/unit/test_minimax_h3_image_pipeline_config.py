@@ -372,7 +372,7 @@ def image_router(monkeypatch, tmp_path):
         monkeypatch.setattr(api_utils, "get_global_server_args", lambda: server)
         monkeypatch.setattr(image_api, "get_global_server_args", lambda: server)
         monkeypatch.setattr(image_api, "process_generation_batch", generate)
-        monkeypatch.setattr(image_api.cloud_storage, "upload_all_and_cleanup", upload)
+        monkeypatch.setattr(image_api, "_upload_and_cleanup_images", upload)
         app = FastAPI()
         app.include_router(image_api.router)
         return TestClient(app), admitted
