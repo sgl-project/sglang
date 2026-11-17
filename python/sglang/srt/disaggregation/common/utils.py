@@ -159,6 +159,44 @@ def group_concurrent_contiguous(
     return src_groups, dst_groups
 
 
+def contiguous_runs(
+    src_indices: npt.NDArray[np.integer], dst_indices: npt.NDArray[np.integer]
+) -> Tuple[npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+    """The runs of group_concurrent_contiguous as (src starts, dst starts,
+    lengths) arrays, without one Python list per run."""
+    src = np.asarray(src_indices, dtype=np.int64)
+    dst = np.asarray(dst_indices, dtype=np.int64)
+    if src.size == 0 or dst.size == 0:
+        return (np.empty((0,), dtype=np.int64),) * 3
+    if src.size != dst.size:
+        raise ValueError(
+            "contiguous_runs requires equal-length src/dst index arrays, "
+            f"got {src.size} and {dst.size}"
+        )
+    brk = np.flatnonzero((np.diff(src) != 1) | (np.diff(dst) != 1)) + 1
+    starts = np.concatenate(([0], brk))
+    lengths = np.diff(np.concatenate((starts, [src.size])))
+    return src[starts], dst[starts], lengths
+
+
+def transfer_blocks_from_runs(
+    src_ptr: int,
+    dst_ptr: int,
+    token_item_len: int,
+    runs: Tuple[npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.int64]],
+) -> List[Tuple[int, int, int]]:
+    """(src address, dst address, bytes) per run, as group_concurrent_contiguous's
+    callers build them."""
+    src_starts, dst_starts, lengths = runs
+    return list(
+        zip(
+            (src_ptr + src_starts * token_item_len).tolist(),
+            (dst_ptr + dst_starts * token_item_len).tolist(),
+            (lengths * token_item_len).tolist(),
+        )
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class DCPTokenTransferPlan:
     target_src_token_indices: npt.NDArray[np.int64]

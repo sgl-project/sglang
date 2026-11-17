@@ -41,9 +41,11 @@ from sglang.srt.disaggregation.common.utils import (
     TransferKVChunk,
     bind_thread_to_device,
     build_dcp_token_transfer_plan,
+    contiguous_runs,
     group_concurrent_contiguous,
     pack_int_lists,
     run_on_device,
+    transfer_blocks_from_runs,
     unpack_int_lists,
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
@@ -1602,7 +1604,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if packed is not None:
                     layer_srcs, src_units = packed
                     pack_offset_bytes += src_rows.size * width * len(src_ptrs)
-            groups = group_concurrent_contiguous(src_units, dst_units)
+            groups = contiguous_runs(src_units, dst_units)
             params += [
                 (src_ptr, dst_ptr, width, groups)
                 for src_ptr, dst_ptr in zip(layer_srcs, dst_ptrs)
@@ -1736,7 +1738,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         layers_params = []
         if src_token_indices.size:
-            target_groups = group_concurrent_contiguous(
+            target_groups = contiguous_runs(
                 src_token_indices,
                 plan.target_dst_token_indices,
             )
@@ -1772,7 +1774,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 raise ValueError(
                     "PD DCP with different draft TP sizes requires destination KV lengths"
                 )
-            draft_groups = group_concurrent_contiguous(
+            draft_groups = contiguous_runs(
                 plan.draft_src_token_indices,
                 plan.draft_dst_token_indices,
             )
@@ -1851,7 +1853,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 sliced_draft_params.extend(draft_to_pack)
             else:
                 packed_ptrs, packed_indices = packed
-                packed_groups = group_concurrent_contiguous(
+                packed_groups = contiguous_runs(
                     packed_indices, plan.draft_dst_token_indices
                 )
                 layers_params.extend(
@@ -1879,25 +1881,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     return ret
             return 0
 
-        def set_transfer_blocks(
-            src_ptr: int, dst_ptr: int, token_item_len: int, groups
-        ) -> List[Tuple[int, int, int]]:
-            src_groups, dst_groups = groups
-            return [
-                (
-                    src_ptr + int(src_group[0]) * token_item_len,
-                    dst_ptr + int(dst_group[0]) * token_item_len,
-                    len(src_group) * token_item_len,
-                )
-                for src_group, dst_group in zip(src_groups, dst_groups)
-            ]
-
         def process_layer(
             src_ptr: int, dst_ptr: int, token_item_len: int, groups
         ) -> int:
             return self._transfer_data(
                 mooncake_session_id,
-                set_transfer_blocks(src_ptr, dst_ptr, token_item_len, groups),
+                transfer_blocks_from_runs(src_ptr, dst_ptr, token_item_len, groups),
             )
 
         if self.enable_custom_mem_pool:
@@ -1917,7 +1906,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         transfer_blocks = []
         for layer_params in layers_params:
-            transfer_blocks.extend(set_transfer_blocks(*layer_params))
+            transfer_blocks.extend(transfer_blocks_from_runs(*layer_params))
         ret = self._transfer_data(mooncake_session_id, transfer_blocks)
         if ret != 0 or not sliced_draft_params:
             return ret
