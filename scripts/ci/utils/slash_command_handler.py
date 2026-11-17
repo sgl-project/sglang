@@ -1957,19 +1957,8 @@ KNOWN_COMMANDS = (
     "/run-cpu-ci",
 )
 
-# The removed `/run-<tier>-ci` spelling; matched only to point at its replacement.
-RETIRED_TIER_COMMAND = re.compile(r"^/(?:re)?run-([\w-]+)-ci$")
-
 # Commands that select a CI layer for the hardware named in their arguments.
-LAYER_COMMANDS = {
-    "/run-ci": "base",
-    "/run-base-ci": "base",
-    "/rerun-base-ci": "base",
-    "/run-extra-ci": "extra",
-    "/rerun-extra-ci": "extra",
-    "/run-full-ci": "full",
-    "/rerun-full-ci": "full",
-}
+LAYER_COMMANDS = {"/run-ci": "base", "/run-extra-ci": "extra", "/run-full-ci": "full"}
 
 
 # Removed commands, kept because they were documented long enough that muscle
@@ -1982,19 +1971,7 @@ RETIRED_COMMANDS = {
 }
 
 
-def _retired_tier_command_hint(command, tiers):
-    match = RETIRED_TIER_COMMAND.match(command)
-    tier = match and match.group(1)
-    if tier not in tiers:
-        return None
-    if tier.endswith("-extra"):
-        replacement = f"/run-extra-ci {tier.removesuffix('-extra')}"
-    else:
-        replacement = f"/run-ci {tier}"
-    return f"`{command}` was removed. Use `{replacement}`."
-
-
-def handle_unknown_command(pr, comment, first_line, tiers):
+def handle_unknown_command(pr, comment, first_line):
     """
     Answer a comment addressed to this handler that matched no command.
 
@@ -2014,7 +1991,7 @@ def handle_unknown_command(pr, comment, first_line, tiers):
     except Exception as e:
         print(f"Failed to add reaction: {e}")
 
-    hint = RETIRED_COMMANDS.get(command) or _retired_tier_command_hint(command, tiers)
+    hint = RETIRED_COMMANDS.get(command)
     if hint is None:
         close = difflib.get_close_matches(command, KNOWN_COMMANDS, n=1, cutoff=0.6)
         hint = f"Did you mean `{close[0]}`?" if close else None
@@ -2125,7 +2102,7 @@ def main():
     if is_tag:
         handle_tag_run_ci(repo, pr, comment, user_perms, tier_labels=tier_labels)
 
-    elif first_line.startswith(("/run-cpu-ci", "/rerun-cpu-ci")):
+    elif first_line.startswith("/run-cpu-ci"):
         handle_run_cpu_ci(repo, pr, comment, user_perms, token)
 
     elif first_line.startswith("/rerun-failed-ci"):
@@ -2194,7 +2171,7 @@ def main():
         )
 
     else:
-        handle_unknown_command(pr, comment, first_line, tiers)
+        handle_unknown_command(pr, comment, first_line)
 
 
 if __name__ == "__main__":

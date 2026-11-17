@@ -193,12 +193,9 @@ jobs:
             const tested = (run, skipped) => isReal(run) && !skipped;
 
             const missingCIText = ':x: **Missing `run-ci` label** -- add it to run CI tests.';
-            const peBlockedByCIText = ':x: **Blocked** -- `run-ci` is required first.';
-            const notNvExtraEnabledText = ':warning: **Not enabled** -- add `run-ci-nv-extra` label to opt in.';
             const stalePushText = ':warning: **Not run on latest push** -- push again to dispatch.';
             const draftText = ':warning: **Draft** -- mark the PR ready, then `/rerun-failed-ci` to run CI tests.';
             const noTestsText = (run) => `:warning: **No tests ran** in [Run #${run.id}](${run.html_url}) -- it predates the labels or the PR leaving draft; \`/rerun-failed-ci\` reruns it.`;
-            const skippedText = (run) => pr.draft ? draftText : !hasCI ? missingCIText : noTestsText(run);
             // A missing run usually means the paths filter excluded the PR,
             // but pull_request workflows can also be suppressed by GitHub
             // (for example, for merge conflicts or skip annotations).
@@ -218,27 +215,20 @@ jobs:
               }
             }
             const runLink = (run) => `${runIcon(run)} [Run #${run.id}](${run.html_url})`;
-            const ptText = tested(ptRun, ptSkipped)
-              ? runLink(ptRun)
-              : ptSkipped
-                ? skippedText(ptRun)
-                : (!hasCI ? missingCIText : '_Not run yet_');
-            const peText = tested(peRun, peSkipped)
-              ? runLink(peRun)
-              : pr.draft
-                ? draftText
-                : !hasCI
-                  ? peBlockedByCIText
-                  : !hasNvExtra
-                    ? notNvExtraEnabledText
-                    : peSkipped
-                      ? noTestsText(peRun)
-                      : stalePushText;
-            const amdText = tested(amdRun, amdSkipped)
-              ? runLink(amdRun)
-              : amdSkipped
-                ? skippedText(amdRun)
-                : amdNotTriggeredText;
+            // A row without a tested run says why, in the order the gate checks.
+            function rowText(run, skipped, optInLabel, noRunText) {
+              if (tested(run, skipped)) return runLink(run);
+              if (pr.draft) return draftText;
+              if (!hasCI) return missingCIText;
+              if (optInLabel && !labels.includes(optInLabel)) {
+                return `:warning: **Not enabled** -- add \`${optInLabel}\` label to opt in.`;
+              }
+              return skipped ? noTestsText(run) : noRunText;
+            }
+            const ptText = rowText(ptRun, ptSkipped, null, '_Not run yet_');
+            const peText = rowText(peRun, peSkipped, 'run-ci-nv-extra', stalePushText);
+            // No AMD run usually means its paths filter excluded the PR, not a label.
+            const amdText = amdRun ? rowText(amdRun, amdSkipped, null, amdNotTriggeredText) : amdNotTriggeredText;
 
             const outerStart = '<!-- pr-states:start -->';
             const outerEnd   = '<!-- pr-states:end -->';
