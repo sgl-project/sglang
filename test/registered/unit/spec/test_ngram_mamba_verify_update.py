@@ -269,7 +269,10 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
             )
 
         scatter.assert_called_once()
-        torch.testing.assert_close(scatter.call_args.args[4], batch.req_pool_indices)
+        # the PP source rows, cast once to the scatter's int32 rows
+        torch.testing.assert_close(
+            scatter.call_args.args[4], batch.req_pool_indices.int()
+        )
 
 
 class TestDelayedMambaCommitBatchPairing(CustomTestCase):

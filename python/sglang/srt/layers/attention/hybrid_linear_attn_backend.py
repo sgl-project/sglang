@@ -10,8 +10,11 @@ from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
     fused_replay_state_indices,
 )
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+    _state_multi_eligible,
     fused_conv_window_scatter_with_mask,
     fused_mamba_state_scatter_with_mask,
+    fused_state_scatter_multi,
+    int32_scatter_rows,
     scatter_mamba_states_after_mtp_verify,
     track_mamba_states_all_layers,
     track_mamba_states_if_needed,
@@ -1884,6 +1887,28 @@ def commit_ple_states_after_verify(
             )
         )
 
+    if not state_pairs:
+        return
+    # One launch for every side state and both row sets where it applies.
+    if src_indices_raw is None and _state_multi_eligible(state_pairs):
+        fused_state_scatter_multi(
+            state_pairs,
+            state_indices_tensor,
+            last_correct_step_indices,
+            mamba_track_indices,
+            mamba_steps_to_track,
+        )
+        return
+    # Otherwise the per-pair launches, on rows cast once.
+    state_indices_tensor, last_correct_step_indices, src_indices_raw = (
+        int32_scatter_rows(
+            state_indices_tensor, last_correct_step_indices, src_indices_raw
+        )
+    )
+    if mamba_track_indices is not None:
+        mamba_track_indices, mamba_steps_to_track, _ = int32_scatter_rows(
+            mamba_track_indices, mamba_steps_to_track, src_indices_raw
+        )
     scatter = HybridLinearAttnBackend._scatter_speculative_state_with_mask
     for state, intermediate_state in state_pairs:
         scatter(
