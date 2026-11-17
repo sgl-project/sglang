@@ -208,6 +208,23 @@ class DetokenizeState(msgspec.Struct):
                 raise RuntimeError(msg)
             logger.warning(msg)
 
+    def compact_skipped_ids(self, skipped_ids: AbstractSet[int]) -> None:
+        """Drop invisible IDs from the active window, keeping the raw stop ID."""
+        if not self.header.skip_special_tokens or not skipped_ids:
+            return
+        last = len(self.decode_ids) - 1
+        kept = []
+        removed_before_read = 0
+        for i in range(self.surr_offset, len(self.decode_ids)):
+            token = self.decode_ids[i]
+            # trim_matched_stop removes the terminal ID for an integer stop.
+            if token in skipped_ids and i != last:
+                removed_before_read += i < self.read_offset
+            else:
+                kept.append(token)
+        self.decode_ids[self.surr_offset :] = kept
+        self.read_offset -= removed_before_read
+
     def decode_inputs(
         self, *, finished_reason: Optional[Dict], trim_matched_stop: Callable
     ) -> Tuple[List[int], List[int]]:

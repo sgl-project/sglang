@@ -304,6 +304,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     ):
         bs = len(recv_obj.rids)
 
+        special_ids = frozenset(getattr(self.tokenizer, "all_special_ids", ()))
         read_ids, surr_ids, skip_list, space_list = [], [], [], []
         for i, s in enumerate(states):
             if s is None:
@@ -313,6 +314,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 skip_list.append(True)
                 space_list.append(True)
                 continue
+            s.compact_skipped_ids(special_ids)
             row_read_ids, row_surr_ids = s.decode_inputs(
                 finished_reason=recv_obj.finished_reasons[i],
                 trim_matched_stop=self.trim_matched_stop,

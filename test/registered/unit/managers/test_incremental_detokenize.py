@@ -394,6 +394,31 @@ class TestDetokenizeState(CustomTestCase):
 
             self.assertEqual("".join(texts), data.decode("utf-8", errors="replace"))
 
+    def test_incomplete_character_with_long_skipped_tail_and_stop(self):
+        for batch_decode in (True, False):
+            with self.subTest(batch_decode=batch_decode):
+                detok = _detokenizer()
+                detok.disable_tokenizer_batch_decode = not batch_decode
+                detok.tokenizer = _ByteTokenizer()
+                sent, texts = {}, []
+                rows = [[0xE4]] + [[BYTE_SPECIAL] * 2] * 1000
+                rows += [[0xB8], [0xAD], [0x21, BYTE_SPECIAL]]
+                for i, ids in enumerate(rows):
+                    final = i == len(rows) - 1
+                    obj = _output(
+                        sent,
+                        [("r", ids, _header([0x20]) if i == 0 else None, final)],
+                    )
+                    if final:
+                        obj.finished_reasons[0] = {
+                            "type": "stop",
+                            "matched": BYTE_SPECIAL,
+                        }
+                    texts += detok.handle_batch_token_id_out(obj).output_strs
+                self.assertEqual("".join(texts), "中!")
+                self.assertLess(detok.tokenizer.longest, 3 * MAX_UNCOMMITTED_IDS)
+                self.assertEqual(sent["r"], sum(map(len, rows)))
+
     def test_a_tail_that_never_completes_keeps_the_decode_window_bounded(self):
         for tail_id, skip, expected in [
             (0xE4, False, "\ufffd"),
