@@ -4773,16 +4773,67 @@ class TestGrpcServerArgs(CustomTestCase):
             handle_deprecated_args(sa)
 
     def test_native_grpc_rejects_http_auth(self):
-        sa = self._args(grpc_port=40000, api_key="secret")
-        with self.assertRaises(ValueError):
-            handle_deprecated_args(sa)
+        for rust_server in (False, True):
+            for shutdown_rpc in (False, True):
+                with (
+                    self.subTest(rust_server=rust_server, shutdown_rpc=shutdown_rpc),
+                    envs.SGLANG_RUST_SERVER.override(rust_server),
+                    envs.SGLANG_ENABLE_NATIVE_SHUTDOWN_RPC.override(shutdown_rpc),
+                ):
+                    sa = prepare_server_args(
+                        [
+                            "--model-path",
+                            "/unused/native-shutdown-model",
+                            "--grpc-port",
+                            "40000",
+                            "--api-key",
+                            "test-inference-key",
+                        ]
+                    )
+                    with self.assertRaises(ValueError):
+                        handle_deprecated_args(sa)
 
-    def test_native_grpc_rejects_admin_key_from_env(self):
-        sa = self._args(grpc_port=40000)
-        with envs.SGLANG_ADMIN_API_KEY.override("secret"):
-            handle_admin_api_key_env(sa)
-        with self.assertRaisesRegex(ValueError, "SGLANG_ADMIN_API_KEY"):
-            handle_deprecated_args(sa)
+    def test_native_grpc_admin_key_requires_opt_in_rust_shutdown(self):
+        for key_source in ("cli", "env"):
+            for rust_server, shutdown_rpc in (
+                (False, False),
+                (False, True),
+                (True, False),
+                (True, True),
+            ):
+                with (
+                    self.subTest(
+                        key_source=key_source,
+                        rust_server=rust_server,
+                        shutdown_rpc=shutdown_rpc,
+                    ),
+                    envs.SGLANG_RUST_SERVER.override(rust_server),
+                    envs.SGLANG_ENABLE_NATIVE_SHUTDOWN_RPC.override(shutdown_rpc),
+                    envs.SGLANG_ADMIN_API_KEY.override(
+                        "test-admin-key" if key_source == "env" else None
+                    ),
+                ):
+                    # Use the launcher's real CLI/ServerArgs path, then the
+                    # same pre-model hooks. No weights or fake config needed.
+                    argv = [
+                        "--model-path",
+                        "/unused/native-shutdown-model",
+                        "--grpc-port",
+                        "40000",
+                    ]
+                    if key_source == "cli":
+                        argv.extend(["--admin-api-key", "test-admin-key"])
+                    sa = prepare_server_args(argv)
+                    handle_admin_api_key_env(sa)
+                    if rust_server and shutdown_rpc:
+                        handle_deprecated_args(sa)
+                        self.assertEqual(
+                            resolution_result(sa, "admin_api_key"), "test-admin-key"
+                        )
+                        self.assertEqual(resolution_result(sa, "grpc_port"), 40000)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "SGLANG_ADMIN_API_KEY"):
+                            handle_deprecated_args(sa)
 
     def test_admin_key_env_resolves_before_the_grpc_check(self):
         from sglang.srt.arg_groups import pipeline

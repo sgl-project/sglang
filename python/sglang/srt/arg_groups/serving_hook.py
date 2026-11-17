@@ -427,7 +427,13 @@ def handle_deprecated_args(server_args: Any):
                 "Native gRPC does not yet support --tokenizer-worker-num > 1. "
                 "Unset --grpc-port or set --tokenizer-worker-num 1."
             )
-        if cfg.api_key or cfg.admin_api_key:
+        # The opt-in Rust Shutdown RPC authenticates its own admin key.
+        # Generate still bypasses HTTP auth, so inference keys remain invalid.
+        shutdown_admin_auth = (
+            envs.SGLANG_RUST_SERVER.get()
+            and envs.SGLANG_ENABLE_NATIVE_SHUTDOWN_RPC.get()
+        )
+        if cfg.api_key or (cfg.admin_api_key and not shutdown_admin_auth):
             raise ValueError(
                 "--grpc-port is incompatible with --api-key/--admin-api-key "
                 "(or SGLANG_ADMIN_API_KEY): "
