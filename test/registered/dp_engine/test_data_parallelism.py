@@ -7,10 +7,13 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import (
+    ADMIN_HEADERS_FOR_TEST,
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    admin_post,
     popen_launch_server,
 )
 
@@ -20,6 +23,7 @@ register_amd_ci(est_time=73, suite="stage-b-test-2-gpu-large-amd")
 
 class TestDataParallelism(CustomTestCase, GSM8KMixin):
     gsm8k_accuracy_thres = 0.7
+    flush_cache_headers = ADMIN_HEADERS_FOR_TEST
 
     @classmethod
     def setUpClass(cls):
@@ -29,7 +33,7 @@ class TestDataParallelism(CustomTestCase, GSM8KMixin):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--dp", 2],
+            other_args=["--dp", 2, *ADMIN_LAUNCH_ARGS_FOR_TEST],
         )
 
     @classmethod
@@ -37,7 +41,7 @@ class TestDataParallelism(CustomTestCase, GSM8KMixin):
         kill_process_tree(cls.process.pid)
 
     def test_update_weight(self):
-        response = requests.post(
+        response = admin_post(
             self.base_url + "/update_weights_from_disk",
             json={"model_path": DEFAULT_MODEL_NAME_FOR_TEST},
         )
@@ -48,7 +52,7 @@ class TestDataParallelism(CustomTestCase, GSM8KMixin):
         # pause a few seconds then send again
         time.sleep(1)
 
-        response = requests.post(
+        response = admin_post(
             self.base_url + "/update_weights_from_disk",
             json={"model_path": DEFAULT_MODEL_NAME_FOR_TEST},
         )

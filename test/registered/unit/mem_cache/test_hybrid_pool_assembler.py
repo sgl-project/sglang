@@ -75,6 +75,136 @@ from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
+class TestBlockGroupPrefetch(CustomTestCase):
+    def setUp(self):
+        self.pool = PoolName.DEEPSEEK_V4_C128
+        self.controller = SimpleNamespace(
+            page_size=128,
+            mem_pool_host=SimpleNamespace(
+                anchor_entry=SimpleNamespace(name=PoolName.KV),
+                entry_map={
+                    self.pool: SimpleNamespace(host_pool=SimpleNamespace(page_size=16))
+                },
+            ),
+            append_host_mem_release=MagicMock(),
+        )
+
+    def _transfer(self, **kwargs):
+        return PoolTransfer(
+            name=self.pool,
+            keys=["__placeholder__"] * 4,
+            hit_policy=PoolHitPolicy.BLOCK_GROUPS,
+            block_pages=16,
+            group_pages=1,
+            **kwargs,
+        )
+
+    def test_shared_allocation_counts_complete_blocks(self):
+        for hit_pages, slots in (
+            (0, 0),
+            (15, 0),
+            (16, 16),
+            (31, 16),
+            (32, 32),
+            (80, 64),
+        ):
+            for trimmed in (False, True):
+                with self.subTest(hit_pages=hit_pages, trimmed=trimmed):
+                    transfer = self._transfer()
+                    operation = SimpleNamespace(
+                        pool_transfers=[transfer],
+                        sidecar_hash_values=["original"] if trimmed else None,
+                        sidecar_hit_pages=hit_pages,
+                    )
+                    need_size = 0 if trimmed else hit_pages * 128
+                    requests, transfers = (
+                        HybridCacheController._shared_prefetch_requests(
+                            self.controller, operation, need_size
+                        )
+                    )
+                    self.assertEqual(
+                        requests, [(PoolName.KV, need_size), (self.pool, slots)]
+                    )
+                    self.assertIs(transfers[0], transfer)
+
+    def test_empty_block_plan_does_not_allocate_a_page(self):
+        transfer = self._transfer()
+        for keys in (None, []):
+            with self.subTest(keys=keys):
+                transfer.keys = keys
+                operation = SimpleNamespace(
+                    pool_transfers=[transfer], sidecar_hash_values=None
+                )
+                requests, _ = HybridCacheController._shared_prefetch_requests(
+                    self.controller, operation, 4096
+                )
+                self.assertEqual(requests[-1], (self.pool, 0))
+
+    def test_sync_rewrites_endpoints_and_releases_only_excess_slots(self):
+        hashes = [f"H{i}" for i in range(1, 65)]
+        for hit_pages, blocks in ((0, 0), (15, 0), (16, 1), (31, 1), (32, 2), (64, 4)):
+            with self.subTest(hit_pages=hit_pages):
+                release = self.controller.append_host_mem_release
+                release.reset_mock()
+                transfer = self._transfer(host_indices=torch.arange(64))
+                HybridCacheController._sync_trailing_keys(
+                    self.controller, [transfer], hashes, hit_pages
+                )
+                self.assertEqual(
+                    transfer.keys, [f"H{16 * i}" for i in range(1, blocks + 1)]
+                )
+                self.assertEqual(
+                    transfer.host_indices.tolist(), list(range(blocks * 16))
+                )
+                if blocks < 4:
+                    release.assert_called_once()
+                    freed = release.call_args.kwargs["extra_pools"]
+                    self.assertEqual(len(freed), 1)
+                    self.assertEqual(freed[0].name, self.pool)
+                    self.assertEqual(
+                        freed[0].host_indices.tolist(), list(range(blocks * 16, 64))
+                    )
+                else:
+                    release.assert_not_called()
+                release.reset_mock()
+                HybridCacheController._sync_trailing_keys(
+                    self.controller, [transfer], hashes, hit_pages
+                )
+                release.assert_not_called()
+
+    def test_sync_does_not_free_unallocated_or_derived_slots(self):
+        for derived in (False, True):
+            with self.subTest(derived=derived):
+                indices = torch.arange(64) if derived else None
+                transfer = self._transfer(
+                    host_indices=indices,
+                    indices_from_pool=PoolName.KV if derived else None,
+                )
+                HybridCacheController._sync_trailing_keys(
+                    self.controller, [transfer], [f"H{i}" for i in range(1, 33)], 32
+                )
+                self.assertEqual(transfer.keys, ["H16", "H32"])
+                self.assertIs(transfer.host_indices, indices)
+        self.controller.append_host_mem_release.assert_not_called()
+
+    def test_trailing_window_still_uses_last_hit_hashes(self):
+        transfer = PoolTransfer(
+            name=self.pool,
+            keys=["planned"] * 4,
+            host_indices=torch.arange(64),
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        HybridCacheController._sync_trailing_keys(
+            self.controller, [transfer], ["H1", "H2", "H3", "H4"], 2
+        )
+        self.assertEqual(transfer.keys, ["H1", "H2"])
+        self.assertEqual(transfer.host_indices.tolist(), list(range(32)))
+        freed = self.controller.append_host_mem_release.call_args.kwargs["extra_pools"][
+            0
+        ]
+        self.assertEqual(freed.host_indices.tolist(), list(range(32, 64)))
+
+
 class TestDeepSeekV4SWAPageLayout(CustomTestCase):
     def test_split_physical_rows_are_rejected_for_hicache_consumers(self):
         with self.assertRaisesRegex(ValueError, "direct SWA KV layout"):
