@@ -27,7 +27,7 @@ before the mixer runs.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from transformers.configuration_utils import PretrainedConfig
 
@@ -48,6 +48,17 @@ MTP_ARCH = "NemotronShortcutForCausalLMMTP"
 GDP_LAYER_TYPES = ("linear_attention", "shortcut_moe_gdp")
 ATTENTION_LAYER_TYPES = ("full_attention", "shortcut_moe_attn")
 MOE_LAYER_TYPES = ("shortcut_moe_gdp", "shortcut_moe_attn")
+
+# Model-variant switches that older exports omit, at the behavior they had.
+_VARIANT_DEFAULTS = {
+    "gdp_g_clamp_value": None,
+    "moe_router_bias_space": "score",
+    "moe_shortcut_disable_mtp": False,
+}
+
+
+def variant_setting(text_config: PretrainedConfig, name: str) -> Any:
+    return getattr(text_config, name, _VARIANT_DEFAULTS[name])
 
 
 def is_nemotron_shortcut_text_config(config: PretrainedConfig) -> bool:

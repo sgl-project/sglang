@@ -5,6 +5,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -20,6 +22,7 @@ from sglang.srt.layers.quantization.mxfp8_cutedsl_moe import (  # noqa: E402
 )
 from sglang.srt.models.nemotron_shortcut import (  # noqa: E402
     _check_clamped_relu2_backend,
+    route_logit_space,
 )
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -74,6 +77,25 @@ class TestMxfp8CuteDsl(CustomTestCase):
         config = MoeRunnerConfig(activation="silu", is_gated=True)
         with self.assertRaises(NotImplementedError):
             method.create_moe_runner(SimpleNamespace(), config)
+
+
+class TestLogitSpaceRouting(CustomTestCase):
+    def test_selects_on_biased_logits_and_weights_unbiased_scores(self):
+        # topk(logits + bias) picks experts {0, 2}; topk(sigmoid(logits) + bias)
+        # would pick {0, 1}, so this case tells the two bias spaces apart.
+        logits = torch.tensor([[4.0, 0.0, 3.5]])
+        bias = torch.tensor([0.0, 0.6, 0.0])
+        weights, ids = route_logit_space(
+            hidden_states=torch.zeros(1, 8),
+            gating_output=logits,
+            topk=2,
+            renormalize=True,
+            bias=bias,
+        )
+        self.assertEqual(ids.dtype, torch.int32)
+        self.assertEqual(sorted(ids[0].tolist()), [0, 2])
+        expected = logits[0, ids[0].long()].sigmoid()
+        torch.testing.assert_close(weights[0], expected / expected.sum())
 
 
 if __name__ == "__main__":

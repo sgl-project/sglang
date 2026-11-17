@@ -15,6 +15,7 @@ from sglang.srt.configs.nemotron_shortcut import (
     NemotronShortcutLayout,
     gdp_conv_dim,
     sdsa_index_head_dim,
+    variant_setting,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -114,6 +115,24 @@ class TestSdsaGating(CustomTestCase):
         draft = _config(arch="NemotronShortcutForCausalLMMTP")
         self.assertIsNone(sdsa_index_head_dim(draft))
         self.assertIsInstance(get_linear_attn_config(draft)[1], NemotronShortcutLayout)
+
+
+class TestVariantSettings(CustomTestCase):
+    def test_older_exports_keep_their_behavior(self):
+        config = _text_config()
+        self.assertIsNone(variant_setting(config, "gdp_g_clamp_value"))
+        self.assertEqual(variant_setting(config, "moe_router_bias_space"), "score")
+        self.assertFalse(variant_setting(config, "moe_shortcut_disable_mtp"))
+
+    def test_exported_switches_win(self):
+        config = _text_config(
+            gdp_g_clamp_value=20.0,
+            moe_router_bias_space="logit",
+            moe_shortcut_disable_mtp=True,
+        )
+        self.assertEqual(variant_setting(config, "gdp_g_clamp_value"), 20.0)
+        self.assertEqual(variant_setting(config, "moe_router_bias_space"), "logit")
+        self.assertTrue(variant_setting(config, "moe_shortcut_disable_mtp"))
 
 
 if __name__ == "__main__":

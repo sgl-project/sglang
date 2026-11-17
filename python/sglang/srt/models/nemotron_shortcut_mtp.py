@@ -15,7 +15,8 @@
 One repeated layer serves every speculative step (``mtp_use_repeated_layer``):
 the previous step's final-normed hidden state and the next token's embedding
 are RMS-normed, concatenated and projected, run through one shortcut
-attention + latent-MoE block on a plain residual, then final-normed. That
+attention + latent-MoE block (attention then MoE under
+``moe_shortcut_disable_mtp``) on a plain residual, then final-normed. That
 output both feeds the target's lm_head and is the next step's hidden state.
 The draft's attention is dense (the checkpoint's MTP indexer is not served),
 which only lowers acceptance beyond index_topk tokens.
@@ -30,6 +31,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.nemotron_shortcut import variant_setting
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -38,6 +40,7 @@ from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.nemotron_shortcut import (
+    NemotronShortcutMoEAttentionLayer,
     ShortcutMoELayer,
     load_nemotron_shortcut_weight,
     nemotron_shortcut_expert_params_mapping,
@@ -67,15 +70,20 @@ class NemotronShortcutMTPLayer(nn.Module):
             prefix=add_prefix("eh_proj", prefix),
         )
         # The draft worker's KV pool holds this one attention layer as layer 0.
-        self.block = ShortcutMoELayer(
-            config,
-            "shortcut_moe_attn",
-            0,
-            quant_config,
-            add_prefix("block", prefix),
-            wide_residual=False,
-            use_sdsa=False,
-        )
+        if variant_setting(config, "moe_shortcut_disable_mtp"):
+            self.block = NemotronShortcutMoEAttentionLayer(
+                config, 0, quant_config, add_prefix("block", prefix), use_sdsa=False
+            )
+        else:
+            self.block = ShortcutMoELayer(
+                config,
+                "shortcut_moe_attn",
+                0,
+                quant_config,
+                add_prefix("block", prefix),
+                wide_residual=False,
+                use_sdsa=False,
+            )
         self.final_layernorm = RMSNorm(hidden, eps=config.rms_norm_eps)
 
     def forward(
@@ -173,8 +181,13 @@ class NemotronShortcutForCausalLMMTP(nn.Module):
         }
         loaded: set[str] = set()
         for name, loaded_weight in weights:
-            # The draft attention is dense: the MTP indexer is not served.
-            if not name.startswith(_MTP_PREFIX) or ".indexer." in name:
+            # The draft attention is dense: the MTP indexer is not served. NVFP4
+            # KV-cache scales: the KV cache is served unquantized.
+            if (
+                not name.startswith(_MTP_PREFIX)
+                or ".indexer." in name
+                or name.endswith((".k_scale", ".v_scale"))
+            ):
                 continue
             load_nemotron_shortcut_weight(
                 params_dict,

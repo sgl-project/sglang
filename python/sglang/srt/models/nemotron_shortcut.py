@@ -12,11 +12,13 @@
 # limitations under the License.
 """Nemotron Shortcut: the GDP / SDSA hybrid text stack and the Pixtral vision tower.
 
-Not served yet: the MTP head and TP/EP > 1.
+Tensor parallel shards GDP and attention by head and the experts by intermediate
+size; the SDSA indexer, the MoE router and latent projections are replicated.
 """
 
 from __future__ import annotations
 
+import functools
 import logging
 from array import array
 from collections.abc import Iterable
@@ -32,8 +34,11 @@ from sglang.srt.configs.nemotron_shortcut import (
     GDP_LAYER_TYPES,
     MOE_LAYER_TYPES,
     gdp_conv_dim,
+    gdp_key_dim,
     gdp_value_dim,
+    variant_setting,
 )
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -93,10 +98,13 @@ class NemotronShortcutWideResidualRead(nn.Module):
         super().__init__()
         self.num_streams = config.wide_residual_num_streams
         self.logit = nn.Parameter(torch.empty(self.num_streams, dtype=torch.float32))
+        # Branches run in the model dtype also when the streams are FP32.
+        self.out_dtype = torch.get_default_dtype()
 
     def forward(self, streams: torch.Tensor) -> torch.Tensor:
         factors = torch.sigmoid(self.logit).to(streams.dtype)
-        return torch.matmul(factors, _split_streams(streams, self.num_streams))
+        read = torch.matmul(factors, _split_streams(streams, self.num_streams))
+        return read.to(self.out_dtype)
 
 
 class NemotronShortcutWideResidualConnection(nn.Module):
@@ -114,10 +122,12 @@ class NemotronShortcutWideResidualConnection(nn.Module):
             if config.wide_residual_learned_retention
             else None
         )
+        self.out_dtype = torch.get_default_dtype()
 
     def read(self, streams: torch.Tensor) -> torch.Tensor:
         factors = torch.sigmoid(self.read_logit).to(streams.dtype)
-        return torch.matmul(factors, _split_streams(streams, self.num_streams))
+        read = torch.matmul(factors, _split_streams(streams, self.num_streams))
+        return read.to(self.out_dtype)
 
     def write(self, streams: torch.Tensor, update: torch.Tensor) -> torch.Tensor:
         split = _split_streams(streams, self.num_streams)
@@ -196,9 +206,13 @@ class NemotronShortcutGDPMixer(nn.Module):
     ):
         super().__init__()
         n = config.gdp_num_householder
-        self.num_heads = config.gdp_num_heads
-        self.value_dim = gdp_value_dim(config)
-        self.conv_dim = gdp_conv_dim(config)
+        tp_size = get_parallel().tp_size
+        # This rank's heads; every per-head block of in_proj and conv1d is
+        # sharded on its own (gdp_in_proj_blocks).
+        self.num_heads = config.gdp_num_heads // tp_size
+        self.value_dim = gdp_value_dim(config) // tp_size
+        self.conv_dim = gdp_conv_dim(config) // tp_size
+        self.g_clamp_value = variant_setting(config, "gdp_g_clamp_value")
         # in_proj rows: [z, V_0..V_{n-1}, K_0..K_{n-1}, Q, b_0..b_{n-1}, a].
         self.split_sizes = [
             self.value_dim,
@@ -208,7 +222,7 @@ class NemotronShortcutGDPMixer(nn.Module):
         ]
         self.in_proj = ColumnParallelLinear(
             input_size=config.hidden_size,
-            output_size=sum(self.split_sizes),
+            output_size=sum(rows for rows, _ in gdp_in_proj_blocks(config)),
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("in_proj", prefix),
@@ -220,12 +234,12 @@ class NemotronShortcutGDPMixer(nn.Module):
         self.norm = RMSNormGated(
             self.value_dim,
             eps=config.gdp_norm_eps,
-            group_size=self.value_dim // config.gdp_num_groups,
+            group_size=config.gdp_head_dim,
             norm_before_gate=False,
             activation="swish",
         )
         self.out_proj = RowParallelLinear(
-            input_size=self.value_dim,
+            input_size=gdp_value_dim(config),
             output_size=config.hidden_size,
             bias=False,
             quant_config=quant_config,
@@ -233,8 +247,8 @@ class NemotronShortcutGDPMixer(nn.Module):
         )
         self.attn = RadixLinearAttention(
             layer_id=layer_id,
-            num_q_heads=config.gdp_num_groups,
-            num_k_heads=config.gdp_num_groups,
+            num_q_heads=self.num_heads,
+            num_k_heads=self.num_heads,
             num_v_heads=self.num_heads,
             head_q_dim=config.gdp_key_head_dim,
             head_k_dim=config.gdp_key_head_dim,
@@ -251,11 +265,52 @@ class NemotronShortcutGDPMixer(nn.Module):
     ) -> torch.Tensor:
         projected, _ = self.in_proj(hidden_states)
         z, mixed_vkq, b, a = projected.split(self.split_sizes, dim=-1)
+        if self.g_clamp_value is not None:
+            a = self._clamp_decay_input(a)
         core = self.attn(forward_batch, mixed_qkv=mixed_vkq.contiguous(), a=a, b=b)
         core = core.reshape(-1, self.value_dim)
         core = self.norm(core, z.contiguous())
         out, _ = self.out_proj(core)
         return out
+
+    def _clamp_decay_input(self, a: torch.Tensor) -> torch.Tensor:
+        """g.clamp_min(-c) applied through a: the kernels form
+        g = -exp(A_log) * softplus(a + dt_bias), so g >= -c is exactly
+        a <= log(expm1(c * exp(-A_log))) - dt_bias."""
+        bound = torch.expm1(self.g_clamp_value * torch.exp(-self.A_log))
+        upper = torch.log(bound.clamp_min(torch.finfo(torch.float32).tiny))
+        return torch.minimum(a.float(), upper - self.dt_bias).to(a.dtype)
+
+
+def gdp_in_proj_blocks(config: PretrainedConfig) -> list[tuple[int, int]]:
+    """in_proj's full-size row blocks as (rows, num_householder): each
+    householder slot of a block is head-major and sharded on its own."""
+    n = config.gdp_num_householder
+    heads = config.gdp_num_heads
+    return [
+        (gdp_value_dim(config), 1),
+        (n * gdp_value_dim(config), n),
+        (n * gdp_key_dim(config), n),
+        (gdp_key_dim(config), 1),
+        (n * heads, n),
+        (heads, 1),
+    ]
+
+
+def shard_gdp_rows(
+    loaded_weight: torch.Tensor, blocks: list[tuple[int, int]], rank: int, size: int
+) -> torch.Tensor:
+    """This rank's heads from every householder slot of every block."""
+    shards = []
+    offset = 0
+    for rows, householder in blocks:
+        per_slot = rows // householder
+        shard = per_slot // size
+        for slot in range(householder):
+            start = offset + slot * per_slot + rank * shard
+            shards.append(loaded_weight[start : start + shard])
+        offset += rows
+    return torch.cat(shards, dim=0)
 
 
 class NemotronShortcutAttention(nn.Module):
@@ -271,22 +326,24 @@ class NemotronShortcutAttention(nn.Module):
         use_sdsa: bool = True,
     ):
         super().__init__()
+        tp_size = get_parallel().tp_size
         self.head_dim = config.head_dim
-        self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
+        # This rank's query heads; the one KV head is replicated.
+        self.num_heads = config.num_attention_heads // tp_size
+        self.num_kv_heads = max(1, config.num_key_value_heads // tp_size)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
-            self.num_heads,
-            self.num_kv_heads,
+            config.num_attention_heads,
+            config.num_key_value_heads,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
-            input_size=self.q_size,
+            input_size=config.num_attention_heads * self.head_dim,
             output_size=config.hidden_size,
             bias=False,
             quant_config=quant_config,
@@ -349,6 +406,24 @@ class NemotronShortcutIndexer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("k_proj", prefix),
         )
+
+
+def route_logit_space(
+    *,
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """moe_router_bias_space="logit": select topk(logits + bias), weight by the
+    unbiased sigmoid scores (routed_scaling_factor is applied by the caller)."""
+    logits = gating_output.float()
+    topk_ids = torch.topk(logits + bias, k=topk, dim=-1, sorted=False)[1]
+    topk_weights = logits.gather(1, topk_ids).sigmoid()
+    if renormalize:
+        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+    return topk_weights, topk_ids.to(torch.int32)
 
 
 def _check_clamped_relu2_backend() -> None:
@@ -418,15 +493,23 @@ class NemotronShortcutMoE(nn.Module):
             routing_method_type=RoutingMethodType.DeepSeekV3,
             routed_scaling_factor=self.routed_scaling_factor,
         )
+        logit_space = variant_setting(config, "moe_router_bias_space") == "logit"
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
             layer_id=layer_id,
-            use_grouped_topk=True,
-            topk_group=1,
-            num_expert_group=1,
+            use_grouped_topk=not logit_space,
+            topk_group=None if logit_space else 1,
+            num_expert_group=None if logit_space else 1,
             renormalize=config.num_experts_per_tok > 1,
             scoring_func="sigmoid",
-            correction_bias=self.gate.e_score_correction_bias,
+            correction_bias=None if logit_space else self.gate.e_score_correction_bias,
+            custom_routing_function=(
+                functools.partial(
+                    route_logit_space, bias=self.gate.e_score_correction_bias
+                )
+                if logit_space
+                else None
+            ),
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=(
                 self.experts.should_fuse_routed_scaling_factor_in_topk
@@ -465,6 +548,8 @@ class NemotronShortcutMoE(nn.Module):
             if config.moe_shared_expert_intermediate_size is not None
             else None
         )
+        # Each rank's experts give a partial latent sum, reduced before fc2_norm.
+        self.reduce_routed = get_parallel().tp_size > 1
 
     def forward(
         self, routed_input: torch.Tensor, shared_input: torch.Tensor
@@ -476,6 +561,8 @@ class NemotronShortcutMoE(nn.Module):
         topk_output = self.topk(routed_input, router_logits)
         latent, _ = self.fc1_latent_proj(routed_input)
         routed = self.experts(latent, topk_output)
+        if self.reduce_routed:
+            routed = tensor_model_parallel_all_reduce(routed)
         if self.fc2_norm is not None:
             routed = self.fc2_norm(routed)
         out, _ = self.fc2_latent_proj(routed)
@@ -612,6 +699,36 @@ class ShortcutMoELayer(nn.Module):
         return self.moe_residual_connection.write(streams, update)
 
 
+class NemotronShortcutMoEAttentionLayer(nn.Module):
+    """Attention then latent MoE on a plain residual: the MTP block under
+    moe_shortcut_disable_mtp. Routed and shared experts both read the
+    post-attention state."""
+
+    def __init__(self, config, layer_id, quant_config, prefix, *, use_sdsa: bool):
+        super().__init__()
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.self_attn = NemotronShortcutAttention(
+            config,
+            layer_id,
+            quant_config,
+            prefix=add_prefix("self_attn", prefix),
+            use_sdsa=use_sdsa,
+        )
+        self.pre_moe_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.moe = NemotronShortcutMoE(
+            config, layer_id, quant_config, prefix=add_prefix("moe", prefix)
+        )
+
+    def forward(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        hidden_states = hidden_states + self.self_attn(
+            self.input_layernorm(hidden_states), forward_batch
+        )
+        moe_input = self.pre_moe_layernorm(hidden_states)
+        return hidden_states + self.moe(moe_input, moe_input)
+
+
 class NemotronShortcutTextModel(nn.Module):
     def __init__(
         self,
@@ -659,6 +776,8 @@ class NemotronShortcutTextModel(nn.Module):
         if input_embeds is None:
             input_embeds = self.embed_tokens(input_ids)
         streams = input_embeds.repeat(1, self.num_streams)
+        if self.config.residual_in_fp32:
+            streams = streams.float()
         for layer in self.layers:
             streams = layer(streams, forward_batch)
         return self.norm(self.residual_readout(streams))
@@ -698,9 +817,9 @@ class NemotronShortcutForConditionalGeneration(nn.Module):
         super().__init__()
         text_config = config.get_text_config()
         parallel = get_parallel()
-        if parallel.tp_size != 1 or parallel.moe_ep_size != 1:
+        if parallel.attn_tp_size != parallel.tp_size or parallel.moe_ep_size != 1:
             raise NotImplementedError(
-                "Nemotron Shortcut currently supports TP=1, EP=1 only."
+                "Nemotron Shortcut supports tensor parallel only (no DP attention, EP=1)."
             )
         self.config = config
         self.text_config = text_config
@@ -777,6 +896,7 @@ class NemotronShortcutForConditionalGeneration(nn.Module):
             self.text_config.n_routed_experts
         )
         params_dict = dict(self.named_parameters())
+        head_sharded = gdp_head_sharded_params(self, self.text_config)
         loaded: set[str] = set()
         vision_tower_weights = []
         for name, loaded_weight in weights:
@@ -788,7 +908,12 @@ class NemotronShortcutForConditionalGeneration(nn.Module):
                 )
                 continue
             load_nemotron_shortcut_weight(
-                params_dict, name, loaded_weight, loaded, expert_params_mapping
+                params_dict,
+                name,
+                loaded_weight,
+                loaded,
+                expert_params_mapping,
+                head_sharded=head_sharded,
             )
 
         if vision_tower_weights:
@@ -825,15 +950,55 @@ def nemotron_shortcut_expert_params_mapping(num_experts: int):
     )
 
 
+def gdp_head_sharded_params(
+    model: nn.Module, config: PretrainedConfig
+) -> dict[str, list[tuple[int, int]]]:
+    """GDP parameters loaded through shard_gdp_rows under TP, with their
+    full-size row blocks: in_proj and the block scales that follow its rows,
+    conv1d, and the per-head A_log, dt_bias and gated-norm weight."""
+    if get_parallel().tp_size == 1:
+        return {}
+    in_proj_blocks = gdp_in_proj_blocks(config)
+    heads = [(config.gdp_num_heads, 1)]
+    sharded = {}
+    for prefix, module in model.named_modules():
+        if not isinstance(module, NemotronShortcutGDPMixer):
+            continue
+        rows = module.in_proj.weight.shape[0]
+        for name, param in module.in_proj.named_parameters():
+            if param.dim() == 2 and param.shape[0] == rows:
+                sharded[f"{prefix}.in_proj.{name}"] = in_proj_blocks
+        sharded[f"{prefix}.conv1d.weight"] = in_proj_blocks[1:4]
+        sharded[f"{prefix}.A_log"] = heads
+        sharded[f"{prefix}.dt_bias"] = heads
+        sharded[f"{prefix}.norm.weight"] = [(gdp_value_dim(config), 1)]
+    return sharded
+
+
+def _fp8_linear_scale_name(params_dict, name: str) -> str:
+    """MXFP8 linear block scales: the checkpoint's weight_scale is
+    Fp8LinearMethod's weight_scale_inv."""
+    if name.endswith(".weight_scale") and name not in params_dict:
+        return name + "_inv"
+    return name
+
+
 def load_nemotron_shortcut_weight(
-    params_dict, name, loaded_weight, loaded, expert_params_mapping
+    params_dict,
+    name,
+    loaded_weight,
+    loaded,
+    expert_params_mapping,
+    head_sharded: Optional[dict[str, list[tuple[int, int]]]] = None,
 ) -> None:
     """Load one checkpoint tensor whose name already matches the module tree,
     stacking q/k/v into qkv_proj and routing per-expert tensors into FusedMoE."""
     if ".self_attn." in name and ".indexer." not in name:
         for param_name, weight_name, shard_id in _STACKED_QKV:
             if f".{weight_name}." in name:
-                mapped = name.replace(weight_name, param_name)
+                mapped = _fp8_linear_scale_name(
+                    params_dict, name.replace(weight_name, param_name)
+                )
                 param = params_dict[mapped]
                 param.weight_loader(param, loaded_weight, shard_id)
                 loaded.add(mapped)
@@ -864,9 +1029,21 @@ def load_nemotron_shortcut_weight(
                 loaded.add(mapped)
                 return
         raise KeyError(f"Unmapped Nemotron Shortcut expert weight: {name}")
+    name = _fp8_linear_scale_name(params_dict, name)
     if name not in params_dict:
         raise KeyError(f"Unexpected Nemotron Shortcut checkpoint weight: {name}")
     param = params_dict[name]
+    if head_sharded and name in head_sharded:
+        param.data.copy_(
+            shard_gdp_rows(
+                loaded_weight,
+                head_sharded[name],
+                rank=get_parallel().tp_rank,
+                size=get_parallel().tp_size,
+            ).view(param.shape)
+        )
+        loaded.add(name)
+        return
     weight_loader = getattr(param, "weight_loader", default_weight_loader)
     weight_loader(param, loaded_weight)
     loaded.add(name)
