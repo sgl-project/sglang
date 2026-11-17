@@ -614,6 +614,7 @@ class TestShardedDSAIndexerWrite(unittest.TestCase):
             scale_fmt="ue8m0",
             is_neox_style=False,
             fused_indexer_hadamard=False,
+            skip_rope=False,
             k_norm=SimpleNamespace(
                 weight=torch.randn((128,), device=device, generator=generator),
                 bias=torch.randn((128,), device=device, generator=generator),
