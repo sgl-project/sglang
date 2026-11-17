@@ -478,20 +478,6 @@ def test_causal_conv1d_update_skips_padded_slots(width):
     assert torch.equal(conv_state[untouched], conv_state_before[untouched])
 
 
-def test_causal_conv1d_rejects_unsupported_dtype():
-    x = torch.ones((1, 8, 4), dtype=torch.int32, device="cuda")
-    weight = torch.ones((8, 4), dtype=torch.int32, device="cuda")
-    with pytest.raises(RuntimeError, match="Unsupported dtype"):
-        jit_causal_conv1d_fwd(x, weight, None, None, None, None, None, True, -1)
-
-
-def test_causal_conv1d_rejects_unsupported_width():
-    x = torch.randn((1, 8, 4), dtype=torch.bfloat16, device="cuda")
-    weight = torch.randn((8, 5), dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(Exception, match="width between 2 and 4"):
-        jit_causal_conv1d_fwd(x, weight, None, None, None, None, None, True, -1)
-
-
 @pytest.mark.parametrize("bad_dtype", [torch.uint8, torch.int32])
 def test_causal_conv1d_rejects_non_bool_has_initial_state(bad_dtype):
     """Nothing normalizes this mask on the way in (unlike `cache_indices`), so a

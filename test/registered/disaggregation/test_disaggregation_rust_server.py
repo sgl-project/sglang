@@ -1,7 +1,7 @@
 """PD disaggregation with the embedded Rust server on both sides.
 
 Same 2-GPU layout as test_disaggregation_basic (prefill GPU 0, decode GPU 1,
-mini_lb in front), but prefill and decode run with ``SGLANG_RUST_SERVER=1`` —
+sgl-router in front), but prefill and decode run with ``SGLANG_RUST_SERVER=1`` --
 covering the Rust `/generate` bootstrap-field intake (scalar form via the gsm8k
 eval's single-prompt requests, per-item list form via the batch test), the
 positional scheduler-wire PD block, the KV bootstrap registry served on the
@@ -43,9 +43,7 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
         super().setUpClass()
         # Rust-server prefill serves the KV bootstrap registry on its api
         # listener (a separate --disaggregation-bootstrap-port is a launch
-        # error there), so point both sides' bootstrap port at it: decode's
-        # flag is its fallback for requests without a bootstrap_port field,
-        # which is what mini_lb sends when --prefill carries no port.
+        # error there), so point both sides' bootstrap port at it.
         cls.bootstrap_port = cls.prefill_port
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         # launch_all already exercises the PD-specific plumbing: the rust PD
@@ -67,7 +65,7 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
 
     def test_generate_stream_via_lb(self):
         # The scalar-bootstrap non-stream path is already covered 64x with an
-        # accuracy gate by test_gsm8k; what is unique here is mini_lb passing
+        # accuracy gate by test_gsm8k; what is unique here is the router passing
         # the decode node's SSE frames through under PD.
         response = requests.post(
             self.lb_url + "/generate",
