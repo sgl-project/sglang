@@ -17,6 +17,7 @@ limitations under the License.
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
@@ -646,6 +647,12 @@ class HiCacheController:
                 alive,
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
+        # The IO worker has exited, and it waited for every read it handed to
+        # its sidecar helper: the helper is idle and ends at once.
+        sidecar_executor = getattr(self, "_prefetch_sidecar_executor", None)
+        if sidecar_executor is not None:
+            sidecar_executor.shutdown(wait=True)
+            self._prefetch_sidecar_executor = None
         if self._storage_worker_failures:
             # The workers are joined, but one of them died: a flush fails the
             # rank here, a detach returns the error and the next tick raises.
@@ -1618,6 +1625,19 @@ class HiCacheController:
 
         Here, "batch" means a single unit of L3 read, not a "batch" in model forward.
         """
+        storage_config = getattr(self, "storage_config", None)
+        if (
+            len(kv_derived_transfers) > 0
+            and getattr(storage_config, "unified_suffixes", None) is not None
+        ):
+            return self._page_transfer_unified_kv_batch(
+                operation,
+                batch_hashes,
+                batch_host_indices,
+                extra_info,
+                kv_derived_transfers,
+            )
+
         # Read from KV pool.
         kv_hits = self.page_get_func(
             operation, batch_hashes, batch_host_indices, extra_info
@@ -1638,13 +1658,65 @@ class HiCacheController:
                 current_kv_derived_transfers, extra_info=extra_info
             )
             sidecar_hits = count_pool_hits(sidecar_results)
-            storage_config = getattr(self, "storage_config", None)
-            if getattr(storage_config, "unified_suffixes", None) is not None:
-                # Unified keys: a named pool that the backend did not report
-                # was not read, so none of its pages may be published. Under
-                # rank-suffix keys such a pool is ignored, as it always was.
-                for transfer in kv_derived_transfers:
-                    sidecar_hits.setdefault(transfer.name, 0)
+
+        # Clamp to minimal number of hits.
+        return min([kv_hits, *sidecar_hits.values()])
+
+    def _page_transfer_unified_kv_batch(
+        self,
+        operation: PrefetchOperation,
+        batch_hashes: List[str],
+        batch_host_indices: torch.Tensor,
+        extra_info: HiCacheStorageExtraInfo,
+        kv_derived_transfers: List[PoolTransfer],
+    ) -> int:
+        """Unified keys: read the KV-derived sidecar pools while the KV pool is read.
+
+        The pages of a pool beside the KV pool (the DFLASH draft KV pool) are
+        objects of their own, read into that pool's host memory, so the two
+        reads share no bytes. Both have finished when this returns or raises;
+        when both raise, the KV read's exception is the batch's. The helper
+        takes no layout lease: no pool with unified keys shares a host arena.
+        """
+        current_kv_derived_transfers = [
+            PoolTransfer(
+                name=transfer.name,
+                host_indices=batch_host_indices,
+                keys=batch_hashes,
+            )
+            for transfer in kv_derived_transfers
+        ]
+        executor = getattr(self, "_prefetch_sidecar_executor", None)
+        if executor is None:
+            # Created by the IO worker, its only user; the storage stop ends it.
+            executor = self._prefetch_sidecar_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="hicache-prefetch-sidecar"
+            )
+        sidecar_future = executor.submit(
+            self.storage_backend.batch_get_v2,
+            current_kv_derived_transfers,
+            extra_info=extra_info,
+        )
+        try:
+            kv_hits = self.page_get_func(
+                operation, batch_hashes, batch_host_indices, extra_info
+            )
+        except BaseException:
+            # The sidecar read writes host memory: wait for it before leaving.
+            sidecar_error = sidecar_future.exception()
+            if sidecar_error is not None:
+                logger.warning(
+                    "HiCache sidecar prefetch also failed for request %s: %r",
+                    operation.request_id,
+                    sidecar_error,
+                )
+            raise
+        sidecar_hits = count_pool_hits(sidecar_future.result())
+        # A named pool that the backend did not report was not read, so none
+        # of its pages may be published. Under rank-suffix keys such a pool is
+        # ignored, as it always was.
+        for transfer in kv_derived_transfers:
+            sidecar_hits.setdefault(transfer.name, 0)
 
         # Clamp to minimal number of hits.
         return min([kv_hits, *sidecar_hits.values()])
