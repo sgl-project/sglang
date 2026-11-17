@@ -297,8 +297,7 @@ class ConfidenceRelay(msgspec.Struct):
         if self.ring_pos < CONFIDENCE_RELAY_RING_LAG:
             return None
         slot = (self.ring_pos - CONFIDENCE_RELAY_RING_LAG) % CONFIDENCE_RELAY_RING_DEPTH
-        if not self.copy_done[slot].query():
-            return None
+        self.copy_done[slot].synchronize()
 
         idx_cpu = batch.req_pool_indices_cpu
         return ResolvedConfidence(
