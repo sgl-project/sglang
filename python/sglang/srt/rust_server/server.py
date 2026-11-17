@@ -461,6 +461,16 @@ class RustServer:
                 "embedding or reward model. Unset SGLANG_RUST_SERVER to serve it."
             )
 
+        if (
+            get_serving().tool_call_parser == "beam"
+            and get_exec().kernel.grammar_backend == "xgrammar"
+        ):
+            raise ValueError(
+                "Rust-server mode does not support --tool-call-parser beam with "
+                "--grammar-backend xgrammar: per-turn response-template grammar "
+                "is not implemented. Unset SGLANG_RUST_SERVER."
+            )
+
         # Force turn off HF tokenizers rayon's unpinned global thread pool.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         warmup_names = rust_server_warmup_names(get_serving().warmups)

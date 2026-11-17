@@ -5927,6 +5927,19 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
                         self._resolve([])
                     self._resolve([], rust_server=False)
 
+    def test_unsupported_per_turn_grammar_names_its_settings(self):
+        for args in (
+            ["--tool-call-parser", "beam"],
+            ["--tool-call-parser", "beam", "--grammar-backend", "xgrammar"],
+        ):
+            with self.subTest(args=args):
+                with self.assertRaisesRegex(
+                    ValueError, "--tool-call-parser beam.*--grammar-backend xgrammar"
+                ):
+                    self._resolve(args)
+                self._resolve(args, rust_server=False)
+        self._resolve(["--grammar-backend", "xgrammar"])
+
     def test_supported_environment_is_not_refused(self):
         with envs.SGLANG_LOG_REQUEST_HEADERS.override(("x-request-id",)):
             self._resolve([])

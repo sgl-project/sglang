@@ -131,6 +131,8 @@ RUST_SERVER_HANDLED_ELSEWHERE: Dict[str, str] = {
     "SGLANG_REQUEST_STATE_WAIT_TIMEOUT": "Refused when explicitly configured (rust_server_unsupported_args).",
     "SGLANG_MM_AVOID_RETOKENIZE": "Refused when explicitly configured (rust_server_unsupported_args).",
     "SGLANG_BATCH_TOKENIZER_OUTPUTS": "Refused when explicitly configured (rust_server_unsupported_args).",
+    "SGLANG_ENABLE_COLOCATED_BATCH_GEN": "Refused when explicitly configured: Rust does not send the Python batch blocker markers (rust_server_unsupported_args).",
+    "grammar_backend": "Per-turn Beam grammar is refused while scheduler grammar remains supported (rust_server_unsupported_args).",
     "context_length": "Passed as model_config.context_len (_build_server_args).",
     "language_model_only": "Passed as model_config.is_multimodal (_build_server_args).",
     "image_processor_backend": "Selects the HF image processor the Rust resize mirrors (RustMmFamily).",
@@ -149,8 +151,6 @@ RUST_SERVER_HANDLED_ELSEWHERE: Dict[str, str] = {
 # what a client or operator gets. Refuse or implement each, then drop it here.
 RUST_SERVER_KNOWN_GAPS: Dict[str, str] = {
     "speculative_num_draft_tokens": "No per-request speculative-decoding stats in meta_info (also behind the speculative_algorithm read, honored by name).",
-    "SGLANG_ENABLE_COLOCATED_BATCH_GEN": "Unverified: whether a batch's items are scheduled together.",
-    "grammar_backend": "Chat: the Rust chat route builds no per-turn response-template tool grammar.",
 }
 
 # Getters of the resolved config namespaces (``runtime_context``), whose

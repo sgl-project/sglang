@@ -180,6 +180,7 @@ RUST_SERVER_UNSUPPORTED_ENVS = (
     "SGLANG_REQUEST_STATE_WAIT_TIMEOUT",
     "SGLANG_MM_AVOID_RETOKENIZE",
     "SGLANG_BATCH_TOKENIZER_OUTPUTS",
+    "SGLANG_ENABLE_COLOCATED_BATCH_GEN",
 )
 
 
@@ -207,6 +208,8 @@ def rust_server_unsupported_args(
             is_set = value != default
         if is_set:
             offending.append(_field_to_cli_name(name))
+    if cfg.tool_call_parser == "beam" and cfg.grammar_backend in (None, "xgrammar"):
+        offending.append("--tool-call-parser beam with --grammar-backend xgrammar")
     # The Rust chat route applies only each tool's own `strict`.
     if envs.SGLANG_TOOL_STRICT_LEVEL.get() > 0:
         offending.append("SGLANG_TOOL_STRICT_LEVEL")
