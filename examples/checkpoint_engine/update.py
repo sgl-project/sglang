@@ -100,6 +100,7 @@ def req_inference(
     timeout: float = 300.0,
     uds: str | None = None,
     weight_version: str | None = None,
+    admin_api_key: str | None = None,
 ) -> Callable[[list[tuple[str, str]]], None]:
     rank = int(os.getenv("RANK", 0))
     src = rank // inference_parallel_size * inference_parallel_size
@@ -117,6 +118,11 @@ def req_inference(
                         "weight_version": weight_version,
                     },
                     timeout=timeout,
+                    headers=(
+                        {"Authorization": f"Bearer {admin_api_key}"}
+                        if admin_api_key
+                        else None
+                    ),
                 )
                 resp.raise_for_status()
 
@@ -197,6 +203,13 @@ if __name__ == "__main__":
     parser.add_argument("--update-method", type=str, default="broadcast")
     parser.add_argument("--uds", type=str, default=None)
     parser.add_argument("--weight-version", type=str, default=None)
+    parser.add_argument(
+        "--admin-api-key",
+        type=str,
+        default=os.getenv("SGLANG_ADMIN_API_KEY"),
+        help="The server's --admin-api-key, which /update_weights_from_ipc requires "
+        "(default: SGLANG_ADMIN_API_KEY).",
+    )
     args = parser.parse_args()
     rank = int(os.getenv("RANK"))
     world_size = int(os.getenv("WORLD_SIZE"))
@@ -205,6 +218,7 @@ if __name__ == "__main__":
         args.inference_parallel_size,
         uds=args.uds,
         weight_version=args.weight_version,
+        admin_api_key=args.admin_api_key,
     )
     ps = ParameterServer(auto_pg=True)
     ps._p2p_store = None
