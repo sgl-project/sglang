@@ -131,7 +131,7 @@ This section lists the oncalls for each hardware platform. The format is @github
 [@Kangyan-Zhou](https://github.com/Kangyan-Zhou) (Kangyan Zhou), [@ch-wan](https://github.com/ch-wan) (Cheng Wan), [@HanHan009527](https://github.com/HanHan009527) (hanhan), [@ishandhanani](https://github.com/ishandhanani) (Ishan Dhanani), [@ShangmingCai](https://github.com/ShangmingCai) (Shangming Cai), [@alisonshao](https://github.com/alisonshao) (Alison Shao).
 
 ### AMD GPUs
-[@saienduri](https://github.com/saienduri) (Sai Enduri), [@HaiShaw](https://github.com/HaiShaw) (Henry HAI)
+[@michaelzhang-ai](https://github.com/michaelzhang-ai) (Michael Zhang), [@HaiShaw](https://github.com/HaiShaw) (Henry HAI)
 
 ### Intel CPU and XPU
 [@mingfeima](https://github.com/mingfeima) (Mingfei Ma), [@DiweiSun](https://github.com/DiweiSun) (Diwei Sun)
