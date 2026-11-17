@@ -1068,12 +1068,6 @@ class DeepseekSparseAttnBackend(
         self._prims_ts_graph_rows: set[int] = set()
         self._prims_ts_causal = None
         if self.is_dsa_prims_nvfp4:
-            # Triton codec; imported only for the NVFP4 route.
-            from sglang.srt.layers.attention.dsa.prims_k_cache import (
-                cast_prims_query_into,
-            )
-
-            self._cast_prims_ts_query = cast_prims_query_into
             if (
                 self.dsa_index_topk != PRIMS_TS_TOPK
                 or self.physical_page_size != 64
@@ -3486,16 +3480,8 @@ class DeepseekSparseAttnBackend(
         # gets its own lengths. Captured forwards only read the buffer, which
         # the out-of-graph replay hook keeps current.
         lengths = self._prims_ts_nvfp4_lengths(rows, self._prims_ts_live_rows)
-        q8 = torch.empty(
-            (rows, layer.tp_q_head_num, 576),
-            dtype=torch.float8_e4m3fn,
-            device=q_nope.device,
-        )
-        self._cast_prims_ts_query(
-            q_nope.view(rows, layer.tp_q_head_num, 512),
-            q_rope.view(rows, layer.tp_q_head_num, 64),
-            q8,
-        )
+        # The FP8 route's fused concat + E4M3 cast; Prims-TS needs no head padding.
+        q8 = self._trtllm_q_fp8(q_nope, q_rope, layer.tp_q_head_num, pad_heads=False)
         out, _ = self._prims_ts.forward(
             q=q8,
             kv_cache=self.token_to_kv_pool.get_key_buffer(layer.layer_id),

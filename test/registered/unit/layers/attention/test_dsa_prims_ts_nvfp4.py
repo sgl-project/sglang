@@ -222,7 +222,13 @@ class TestPrimsTSNvfp4Forward(_NoCapture):
             get_key_buffer=lambda _layer_id: cache
         )
         casts = []
-        backend._cast_prims_ts_query = lambda n, r, out: casts.append((n, r, out))
+
+        def cast(q_nope, q_rope, heads, pad_heads=True):
+            out = torch.empty((q_nope.shape[0], heads, 576), dtype=torch.float8_e4m3fn)
+            casts.append((q_nope, q_rope, heads, pad_heads, out))
+            return out
+
+        backend._trtllm_q_fp8 = cast
         calls = []
 
         def launch(**kwargs):
@@ -249,7 +255,9 @@ class TestPrimsTSNvfp4Forward(_NoCapture):
         self.assertEqual((call["sm_scale"], call["kv_scale"]), (0.25, 1.0))
         self.assertEqual(call["q"].dtype, torch.float8_e4m3fn)
         (cast,) = casts
-        self.assertIs(cast[2], call["q"])
+        self.assertIs(cast[0], q_nope)
+        self.assertEqual(cast[2:4], (4, False))  # no head padding for Prims-TS
+        self.assertIs(cast[4], call["q"])
 
 
 class TestPrimsTSNvfp4Pool(unittest.TestCase):

@@ -5269,14 +5269,8 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         )
         kv_buffer = self.get_key_buffer(layer_id)
         if self.dsa_kv_cache_store_nvfp4:
-            from sglang.srt.layers.attention.dsa.prims_k_cache import (
-                dequantize_prims_k_cache_paged,
-            )
-
-            decoded = dequantize_prims_k_cache_paged(
-                kv_buffer, loc, dtype=dst_dtype or torch.bfloat16
-            )
-            return decoded[..., : self.kv_lora_rank], decoded[..., self.kv_lora_rank :]
+            # Only the MHA prefill paths read KV back, and prims_ts keeps MLA.
+            raise NotImplementedError("DSA NVFP4 KV is read only by prims_ts")
         dst_dtype = dst_dtype or self.dtype
         cache_k_nope = torch.empty(
             (loc.shape[0], 1, self.kv_lora_rank),

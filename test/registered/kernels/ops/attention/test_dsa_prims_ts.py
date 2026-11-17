@@ -35,6 +35,26 @@ def _sm100() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
 
 
+_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _expand_nvfp4_rows(kv: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
+    """FP32 [n, 576]: what the Prims-TS loader expands each 352 B row to. NoPE is
+    E2M1 (even feature in the low nibble) x its block's E4M3 scale (block b's at
+    byte 320 + 8*(b % 4) + b//4), rounded to E4M3; RoPE is E4M3 at bytes 256:320."""
+    rows = kv.view(-1, 352)[slots.long()]
+    packed = rows[:, :256]
+    codes = torch.stack([packed & 15, packed >> 4], dim=-1).view(-1, 512)
+    magnitude = torch.tensor(_E2M1, device=kv.device)[(codes & 7).long()]
+    values = torch.where((codes & 8) != 0, -magnitude, magnitude)
+    block = torch.arange(32, device=kv.device)
+    scales = rows[:, 320 + 8 * (block % 4) + block // 4].view(FP8).float()
+    nope = (values.view(-1, 32, 16) * scales[:, :, None]).view(-1, 512)
+    nope = nope.clamp(-448, 448).to(FP8).float()
+    rope = rows[:, 256:320].contiguous().view(FP8).float()
+    return torch.cat([nope, rope], dim=-1)
+
+
 def _require_prims_ts(case, heads: int = 96, kv_cache_format: str = "native"):
     if not _sm100():
         case.skipTest("Prims-TS sparse MLA needs SM100/SM103/SM107")
@@ -141,9 +161,10 @@ class TestPrimsTsNvfp4(CustomTestCase):
         route writes, against FP32 attention over the values its loader expands
         (E2M1 x block scale rounded to E4M3, E4M3 RoPE). Rows past their count are
         disabled with a zero length, as DP padding rows are."""
+        from sglang.kernels.ops.attention.mla_qk_prep import (
+            concat_and_cast_q_fp8_heads,
+        )
         from sglang.srt.layers.attention.dsa.prims_k_cache import (
-            cast_prims_query_into,
-            dequantize_prims_k_cache_paged,
             quantize_prims_k_cache_into,
         )
 
@@ -158,10 +179,10 @@ class TestPrimsTsNvfp4(CustomTestCase):
             torch.arange(ctx, device="cuda"),
         )
         q8 = torch.empty(rows, heads, DIM, dtype=FP8, device="cuda")
-        cast_prims_query_into(
+        concat_and_cast_q_fp8_heads(
+            q8,
             torch.randn(rows, heads, KV_LORA, generator=gen, device="cuda").bfloat16(),
             torch.randn(rows, heads, ROPE, generator=gen, device="cuda").bfloat16(),
-            q8,
         )
         live = rows - 1
         slots = torch.full((rows, TOPK), -1, dtype=torch.int32, device="cuda")
@@ -190,7 +211,7 @@ class TestPrimsTsNvfp4(CustomTestCase):
         ref_lse = torch.empty((live, heads), dtype=torch.float32, device="cuda")
         for r in range(live):
             valid = slots[r][slots[r] >= 0]
-            k = dequantize_prims_k_cache_paged(kv, valid, torch.float32)[:, 0]
+            k = _expand_nvfp4_rows(kv, valid)
             s = (qf[r] @ k.T) * SM_SCALE
             ref_lse[r] = torch.logsumexp(s, dim=-1)
             ref[r] = torch.softmax(s, dim=-1) @ k[:, :KV_LORA]
@@ -201,6 +222,44 @@ class TestPrimsTsNvfp4(CustomTestCase):
         # The zero-length row reads none of its indices.
         self.assertTrue(torch.all(out[live:] == 0))
         self.assertTrue(torch.all(torch.isneginf(lse[live:])))
+
+    def test_writer_layout_and_rounding(self):
+        """Blocks of E2M1 multiples of a power-of-two scale round-trip exactly;
+        other values land within one E2M1 step; -1 locations write nothing."""
+        from sglang.srt.layers.attention.dsa.prims_k_cache import (
+            quantize_prims_k_cache_into,
+        )
+
+        if not torch.cuda.is_available():
+            self.skipTest("needs CUDA")
+        gen = torch.Generator(device="cuda").manual_seed(7)
+        n = 64
+        grid = torch.tensor(_E2M1, device="cuda")
+        codes = torch.randint(0, 8, (n, 32, 16), generator=gen, device="cuda")
+        codes[:, :, 0] = 7  # amax = 6 x scale, so the stored scale is exact
+        sign = torch.where(
+            torch.rand(n, 32, 16, generator=gen, device="cuda") < 0.5, -1.0, 1.0
+        )
+        scale = 2.0 ** torch.randint(-6, 4, (n, 32, 1), generator=gen, device="cuda")
+        exact = (grid[codes] * sign * scale).view(n, KV_LORA)
+        rope = torch.randn(n, ROPE, generator=gen, device="cuda").bfloat16()
+        kv = torch.full((n + 1, 1, 352), 0xAB, dtype=torch.uint8, device="cuda")
+        loc = torch.arange(n, device="cuda")
+        quantize_prims_k_cache_into(exact.bfloat16(), rope, kv, loc)
+        got = _expand_nvfp4_rows(kv, loc)
+        torch.testing.assert_close(got[:, :KV_LORA], exact, atol=0, rtol=0)
+        torch.testing.assert_close(got[:, KV_LORA:], rope.float().to(FP8).float())
+        self.assertTrue(torch.all(kv[n] == 0xAB))
+
+        noisy = torch.randn(n, KV_LORA, generator=gen, device="cuda").bfloat16()
+        dropped = torch.cat([loc[:-1], loc.new_tensor([-1])])
+        quantize_prims_k_cache_into(noisy, rope, kv, dropped)
+        got = _expand_nvfp4_rows(kv, loc[:-1])[:, :KV_LORA].view(-1, 32, 16)
+        x = noisy[:-1].float().view(-1, 32, 16)
+        # E2M1 steps are at most 2 x scale = amax / 3; rounding is within one step.
+        step = x.abs().amax(-1, keepdim=True) / 3
+        self.assertTrue(torch.all((got - x).abs() <= step * 1.01 + 1e-6))
+        self.assertTrue(torch.all(kv[n] == 0xAB))
 
     def test_nvfp4_exact_plan_matches_reference(self):
         self._check_nvfp4_matches_reference(rows=8)
