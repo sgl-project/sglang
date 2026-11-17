@@ -1,7 +1,7 @@
 ---
 title: "Contributing to SGLang Diffusion"
 metatags:
-    description: "This guide outlines the requirements for contributing to the SGLang Diffusion module (sglang.multimodalgen)."
+    description: "This guide outlines the requirements for contributing to the SGLang Diffusion module (sglang.multimodal_gen)."
 ---
 
 This guide outlines the requirements for contributing to the SGLang Diffusion module (`sglang.multimodal_gen`).
@@ -66,11 +66,11 @@ For PRs that impact **latency**, **throughput**, or **memory usage**, you **shou
 Consider adding tests to the `pr-test` or `nightly-test` suites to safeguard your changes, especially for PRs that:
 
 - support a new model
-    - add a testcase for this new model to `testcase_configs.py`
+    - add a testcase for this new model to `test/server/gpu_cases.py` (e.g. `ONE_GPU_CASES` / `TWO_GPU_CASES`)
 - support or fix important features
 - significantly improve performance
 
-Please run the according testcase, then update/add the baseline to `perf_baselines.json` by following the instruction in console if applicable.
+Please run the according testcase, then add or update its baseline in the platform JSON under `test/server/perf_baselines/` (e.g. `h100.json`); run with `SGLANG_GEN_BASELINE=1` and follow the console instructions if applicable.
 
 See [test](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/test) for examples
 

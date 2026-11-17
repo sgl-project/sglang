@@ -59,7 +59,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=8, suite="extra-test-cpu-intel")
 
 
 class _FakeReq(SimpleNamespace):
@@ -151,6 +151,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.metrics_reporter = MagicMock()
         scheduler.metrics_reporter.current_scheduler_metrics_enabled = False
         scheduler.invariant_checker = MagicMock()
+        scheduler.gc_freezer = MagicMock()
         scheduler.kv_events_publisher = MagicMock()
         scheduler.beam_coordinator = MagicMock()
         scheduler.output_streamer = MagicMock()
