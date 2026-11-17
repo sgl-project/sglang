@@ -11,11 +11,17 @@ import time
 import weakref
 from collections import defaultdict
 from functools import lru_cache
+from typing import Union
 
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.storage.mmap import alloc_mmap
+from sglang.srt.mem_cache.storage.mmap import (
+    alloc_mmap,
+    hugetlb_pool_free_bytes,
+    tensor_uses_hugepage,
+)
+from sglang.srt.mem_cache.storage.mmap.mmap_allocator import hugepage_size_requested
 from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import is_hip
 
@@ -40,6 +46,23 @@ class HostTensorAllocator:
         self.dtype = dtype
         self.dims = dims
         return alloc_mmap(dims, dtype)
+
+    @classmethod
+    def free_hugetlb_bytes(cls) -> int:
+        """Free hugetlb-pool bytes allocate() could map from, else 0.
+
+        Only the base allocate() maps MAP_HUGETLB (alloc_mmap honors
+        SGLANG_HUGEPAGE_SIZE). A subclass that overrides allocate() gets its
+        memory elsewhere and is credited nothing unless it overrides this too.
+        """
+        if not cls.supports_hugetlb():
+            return 0
+        return hugetlb_pool_free_bytes()
+
+    @classmethod
+    def supports_hugetlb(cls) -> bool:
+        """Whether allocate() can honor the SGLANG hugepage policy."""
+        return cls.allocate is HostTensorAllocator.allocate
 
 
 class ShmHostTensorAllocator(HostTensorAllocator):
@@ -79,14 +102,48 @@ class ShmHostTensorAllocator(HostTensorAllocator):
         self.fds = []
 
 
+def _get_allocator_class_from_storage(
+    allocator_type: str,
+) -> type[HostTensorAllocator]:
+    """The allocator class a storage backend resolves to, without instantiation.
+
+    Each backend probe performs the third-party import the allocator's own
+    construction performs, so an unimportable backend raises here exactly as
+    get_allocator_from_storage() sees at instantiation (and falls back to the
+    default allocator); tensorcast's SCRATCH transfer mode resolves there too.
+    """
+    if allocator_type == "mooncake":
+        # MooncakeHostTensorAllocator.__init__ imports this.
+        from mooncake.store import MooncakeHostMemAllocator  # noqa: F401
+
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeHostTensorAllocator,
+        )
+
+        return MooncakeHostTensorAllocator
+    if allocator_type == "mori":
+        from sglang.srt.mem_cache.storage.umbp.umbp_host_allocator import (
+            UMBPHostTensorAllocator,
+            _import_umbp,
+        )
+
+        _import_umbp()
+        return UMBPHostTensorAllocator
+    if allocator_type == "shm":
+        return ShmHostTensorAllocator
+    if allocator_type == "tensorcast":
+        from sglang.srt.mem_cache.storage.tensorcast_store.host_allocator import (
+            tensorcast_host_allocator_class_from_runtime,
+        )
+
+        return tensorcast_host_allocator_class_from_runtime()
+    return HostTensorAllocator
+
+
 def get_allocator_from_storage(allocator_type):
     if allocator_type == "mooncake":
         try:
-            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-                MooncakeHostTensorAllocator,
-            )
-
-            return MooncakeHostTensorAllocator()
+            return _get_allocator_class_from_storage(allocator_type)()
         except ImportError:
             logger.warning(
                 "Mooncake's tensor allocator requires mooncake >= 0.3.8.post1. "
@@ -94,13 +151,9 @@ def get_allocator_from_storage(allocator_type):
                 "Fallback to use default allocator."
             )
             return HostTensorAllocator()
-    elif allocator_type == "mori":
+    if allocator_type == "mori":
         try:
-            from sglang.srt.mem_cache.storage.umbp.umbp_host_allocator import (
-                UMBPHostTensorAllocator,
-            )
-
-            return UMBPHostTensorAllocator()
+            return _get_allocator_class_from_storage(allocator_type)()
         except (ImportError, RuntimeError) as exc:
             logger.warning(
                 "UMBPHostTensorAllocator unavailable (%s). "
@@ -108,9 +161,7 @@ def get_allocator_from_storage(allocator_type):
                 exc,
             )
             return HostTensorAllocator()
-    elif allocator_type == "shm":
-        return ShmHostTensorAllocator()
-    elif allocator_type == "tensorcast":
+    if allocator_type == "tensorcast":
         try:
             from sglang.srt.mem_cache.storage.tensorcast_store.host_allocator import (
                 get_tensorcast_host_allocator_from_runtime,
@@ -122,8 +173,7 @@ def get_allocator_from_storage(allocator_type):
                 "TensorCast's tensor allocator requires tensorcast >= 0.1.1. Please install TensorCast by 'pip install tensorcast' or build from source by following https://tensorcast.ai/development/build-from-source/. Fallback to use default allocator"
             )
             return HostTensorAllocator()
-    else:
-        return HostTensorAllocator()
+    return _get_allocator_class_from_storage(allocator_type)()
 
 
 def get_allocator_type() -> str:
@@ -144,6 +194,16 @@ def get_allocator_type() -> str:
     return backend or "default"
 
 
+def get_allocator_class_from_storage(
+    allocator_type: str,
+) -> type[HostTensorAllocator]:
+    """Best-effort allocator class for preflight budget checks."""
+    try:
+        return _get_allocator_class_from_storage(allocator_type)
+    except (ImportError, RuntimeError):
+        return HostTensorAllocator
+
+
 def _cuda_host_register(
     buffer: torch.Tensor, registration_granularity_bytes: int | None = None
 ) -> None:
@@ -151,6 +211,11 @@ def _cuda_host_register(
     cudart = torch.cuda.cudart()
     base = buffer.data_ptr()
     total = buffer.numel() * buffer.element_size()
+    # cudaHostRegister requires hugetlb-backed ranges whose base or size are
+    # hugepage-aligned, so round the size up to the hugepage size.
+    hugepage_size = hugepage_size_requested() if tensor_uses_hugepage(buffer) else 0
+    if hugepage_size:
+        total = -(-total // hugepage_size) * hugepage_size
     chunk_limit_bytes = (
         max(envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB.get(), 1) * 1024**3
     )
@@ -164,26 +229,29 @@ def _cuda_host_register(
                 "registration_granularity_bytes must be positive, got "
                 f"{registration_granularity_bytes}"
             )
-        if registration_granularity_bytes > chunk_limit_bytes:
+        # Every internal boundary must align to both a complete copy unit and
+        # a hugepage. Rounding to either grid separately can break the other.
+        alignment_bytes = math.lcm(registration_granularity_bytes, hugepage_size or 1)
+        if alignment_bytes > chunk_limit_bytes:
             raise ValueError(
-                "Host registration granularity exceeds the configured chunk limit: "
+                "Host registration alignment exceeds the configured chunk limit: "
                 f"granularity={registration_granularity_bytes}, "
+                f"hugepage={hugepage_size}, alignment={alignment_bytes}, "
                 f"chunk_limit={chunk_limit_bytes}"
             )
-        chunk_bytes = (
-            chunk_limit_bytes // registration_granularity_bytes
-        ) * registration_granularity_bytes
+        chunk_bytes = (chunk_limit_bytes // alignment_bytes) * alignment_bytes
     registered_ranges: list[tuple[int, int]] = []
     try:
         offset = 0
         while offset < total:
             size = min(chunk_bytes, total - offset)
             ptr = base + offset
-            rc = int(cudart.cudaHostRegister(ptr, size, 0))
+            err = cudart.cudaHostRegister(ptr, size, 0)
+            rc = int(err)
             if rc != 0:
                 raise RuntimeError(
                     f"cudaHostRegister failed (rc={rc}, "
-                    f"{cudart.cudaGetErrorString(rc)}) at offset={offset} size={size} "
+                    f"{cudart.cudaGetErrorString(err)}) at offset={offset} size={size} "
                     f"(total={total}, chunk_limit={chunk_bytes}); host buffer is not "
                     f"pinned and device transfers may silently return stale data."
                 )
@@ -210,14 +278,15 @@ def _cuda_host_unregister_ranges(
 ) -> list[tuple[int, int]]:
     failed_ranges = []
     for ptr, size in reversed(registered_ranges):
-        rc = int(cudart.cudaHostUnregister(ptr))
+        err = cudart.cudaHostUnregister(ptr)
+        rc = int(err)
         if rc != 0:
             failed_ranges.append((ptr, size))
             logger.warning(
                 "cudaHostUnregister failed during %s (rc=%d, %s) for ptr=%#x size=%d",
                 operation,
                 rc,
-                cudart.cudaGetErrorString(rc),
+                cudart.cudaGetErrorString(err),
                 ptr,
                 size,
             )
@@ -469,6 +538,25 @@ def alloc_with_pin_memory(
     return buffer
 
 
+def alloc_with_pin_memory_npu(
+    dims: tuple,
+    dtype: torch.dtype,
+    device: str,
+    pin_memory: bool,
+    allocator: None,
+    registration_granularity_bytes: int | None = None,
+) -> torch.Tensor:
+    """
+    Allocate an NPU host tensor using the configured host-memory backend.
+    """
+    from sglang.srt.mem_cache.pool_host.npu_host_memory import get_host_memory_backend
+
+    backend = get_host_memory_backend()
+    if backend is not None:
+        return backend.alloc(dims, dtype, device, pin_memory, allocator)
+    return alloc_with_pin_memory(dims, dtype, device, pin_memory, allocator)
+
+
 def alloc_with_pin_memory_xpu(
     dims: tuple,
     dtype: torch.dtype,
@@ -557,8 +645,23 @@ def make_kernel_ptr_table(
 ALLOC_MEMORY_FUNCS = defaultdict(
     lambda: alloc_with_host_register,
     {
-        "npu": alloc_with_pin_memory,
+        "npu": alloc_with_pin_memory_npu,
         "musa": alloc_with_pin_memory,
         "xpu": alloc_with_pin_memory_xpu,
     },
 )
+
+
+def device_uses_allocator(device: Union[str, torch.device]) -> bool:
+    """Whether allocations for ``device`` go through the HostTensorAllocator.
+
+    npu/musa allocate with torch.empty(pin_memory=True) and never see it.
+    """
+    # ALLOC_MEMORY_FUNCS is keyed by device *type* string ("npu"/"musa"/...);
+    # an indexed "npu:0" string or a torch.device must collapse to the type
+    # first, or the defaultdict silently reports the host-register default.
+    if isinstance(device, torch.device):
+        key = device.type
+    else:
+        key = str(device).partition(":")[0]
+    return ALLOC_MEMORY_FUNCS[key] is alloc_with_host_register

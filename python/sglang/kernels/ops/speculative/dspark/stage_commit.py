@@ -1,4 +1,4 @@
-"""The deferred context-KV commit's staging in one launch: the verify rows' write
+"""The deferred draft KV store's staging in one launch: the verify rows' write
 locations, positions and (with a ring) state slots, and the gated commit lengths
 with zeros past the staged requests."""
 

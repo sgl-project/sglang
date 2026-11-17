@@ -49,14 +49,14 @@ See [Performance Optimization](/docs/sglang-diffusion/performance-optimization) 
 
 - `--vae-path`: Path to a custom VAE model or HuggingFace model ID (e.g., fal/FLUX.2-Tiny-AutoEncoder). If not specified, the VAE will be loaded from the main model path.
 - `--num-gpus`: Number of GPUs to use
-- `--tp-size`: Tensor parallelism size (only for the encoder; should not be larger than 1 if text encoder offload is enabled, as layer-wise offload plus prefetch is faster)
+- `--tp-size`: Tensor parallelism size; shards the FLUX DiT across GPUs. Text encoder offload does not require TP 1; see [Encoder Parallelism](/docs/sglang-diffusion/encoder_parallel) for encoder placement and sharding.
 - `--sp-degree`: Sequence parallelism size (typically should match the number of GPUs)
 - `--ulysses-degree`: The degree of DeepSpeed-Ulysses-style SP in USP
 - `--ring-degree`: The degree of ring attention-style SP in USP
 
 ### 3.3 Breakable CUDA graph for FLUX.1-dev
 
-For repeated `quality=lossless` requests, FLUX.1-dev supports breakable CUDA graph (BCG) execution with the native backend. BCG captures DiT segments during startup and replays them for the warmed resolutions. It can reduce recurring host launch overhead without enabling `torch.compile`.
+For repeated `quality=exact` requests, FLUX.1-dev supports breakable CUDA graph (BCG) execution with the native backend. BCG captures DiT segments during startup and replays them for the warmed resolutions. It can reduce recurring host launch overhead without enabling `torch.compile`.
 
 The following configuration was validated on two NVIDIA H200 GPUs with BF16 weights, PyTorch 2.13, and CUDA 13.0. Set `HF_TOKEN` to a Hugging Face token with access to the checkpoint before downloading it.
 
@@ -69,6 +69,7 @@ CUDA_VISIBLE_DEVICES=0,1 sglang generate \
   --enable-torch-compile false \
   --enable-breakable-cuda-graph \
   --warmup-resolutions 1024x1024 \
+  --warmup-sampling-params '{"quality": "exact"}' \
   --quality exact \
   --width 1024 --height 1024 \
   --num-inference-steps 50 --guidance-scale 3.5 --seed 42 \
@@ -77,7 +78,7 @@ CUDA_VISIBLE_DEVICES=0,1 sglang generate \
 
 Confirm `[Diffusion BCG] captured` in the log, then compare warmed request latency with eager execution on the same GPUs. Capture time and graph memory are additional startup costs. Add other served resolutions to `--warmup-resolutions`; a request with an uncaptured signature falls back to eager.
 
-FLUX.1-dev uses a fixed 512-token T5 conditioning sequence, so changing `--bcg-text-buckets` does not create additional prompt-length graphs. Its request-gated DiT fusions at `quality=high` and `lossless` cannot be combined with BCG: the runtime rejects those requests because the captured graph uses the lossless branches. FLUX.2 and quantized transformer overrides require separate validation.
+FLUX.1-dev uses a fixed 512-token T5 conditioning sequence, so changing `--bcg-text-buckets` does not create additional prompt-length graphs. BCG captures graphs only at the quality level of the warmup request, which is the server's default request level (`lossless`) unless `--warmup-sampling-params '{"quality": "exact"}'` sets it, as in the command above. A request at any other level (for example `high`, which mounts request-gated DiT fusions) has no captured graph and runs eager. FLUX.2 and quantized transformer overrides require separate validation.
 
 ## 4. API Usage
 
@@ -89,7 +90,7 @@ For complete API documentation, please refer to the [official API usage guide](/
 import base64
 from openai import OpenAI
 
-client = OpenAI(api_key="EMPTY", base_url="http://localhost:3000/v1")
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:30000/v1")
 
 response = client.images.generate(
     model="black-forest-labs/FLUX.1-dev",

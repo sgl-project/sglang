@@ -69,6 +69,11 @@ The same FL2VA / Ref2VA split applies in
 Review the license and usage terms in the MiniMax-H3 model card before production or commercial use. SGLang support does not grant additional model usage rights.
 </Warning>
 
+### Image checkpoints
+
+For the separate six-step text-to-image and editing checkpoint, see
+[MiniMax-H3-Image](/cookbook/diffusion/MiniMax/MiniMax-H3-Image).
+
 ## 3. Deployment details
 
 The builder accepts legal custom GPU counts and topologies, marking them
@@ -305,7 +310,7 @@ do not use it to generate consistency ground truth.
 
 The [ComfyUI plugin](/docs/sglang-diffusion/comfyui) can run H3 as a per-step
 DiT backend. ComfyUI keeps CLIP, VAE, and the sampler loop. SGLang loads only
-the transformer under `--comfyui-mode`.
+the transformer in ComfyUI integrated mode (the plugin sets `comfyui_mode`; there is no CLI flag).
 
 Copy `python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion` into ComfyUI
 `custom_nodes/`. Load a shipped graph and set `SGLDOptions.model_type` to
@@ -415,7 +420,7 @@ rank), so mixed-schedule serving does not re-read the checkpoint. Plan sets
 that exceed the host budget are simply recomputed on their next occurrence.
 Expert escape hatches live in environment variables:
 `SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS` resizes the GPU slab (needed
-only beyond 65 inference steps) and `SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32`
+only above 64 inference steps) and `SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32`
 computes the one-time projections in fp32 (experimental; not bit-comparable
 to resident weights, validate end-to-end before production). LoRA adapters
 that modify `adaln_proj` are rejected in both cache modes rather than
@@ -779,10 +784,13 @@ sglang serve \
   --port 30010
 ```
 
-`auto` merges an adapter into ordinary resident weights to avoid per-step LoRA
-matmuls. It keeps the dynamic path in two cases. One is FSDP-sharded weights,
-where a full gather can increase peak memory. The other is an adapter whose
-update would mostly round away in a BF16 merge. Distilled adapters such as the
+`auto` merges adapters into ordinary resident weights to avoid per-step LoRA
+matmuls. It keeps FSDP-sharded weights dynamic to avoid full-gather peaks, and
+uses dynamic execution for supported packed weights that cannot merge in place
+or adapter updates that would mostly round away in a BF16 merge. The same
+policy applies when activating multiple adapters through the
+[LoRA API](/docs/sglang-diffusion/api/openai_api#lora-management).
+Distilled adapters such as the
 Larry Turbo LoRA sit below a BF16 ulp of most weights, and a merge drops
 77–97% of their update in typical layers. Use `dynamic` when one resident
 server must switch repeatedly between base and LoRA output, and `merge` to
@@ -1173,9 +1181,11 @@ levels:
   every op, and VAE decode fuses the ViT decoder's per-head QK RMSNorm and
   RoPE into one launch, runs its attention on cuDNN SDPA and, on CUDA, decodes
   several spatial tiles per decoder forward (rounding-level differences only).
-- `"high"`: the audited accelerated path. Quality is guaranteed (the audited
-  Cache-DiT configuration measures SSIM 0.931 / PSNR 28.16 dB against
-  `exact`), but output is no longer bit-identical to the reference.
+- `"high"`: the audited accelerated path. Cache-DiT reuses the DiT stack's
+  output on a fixed step schedule: the first 15 of the 50 steps always run,
+  then every second step up to step 25, then every eighth. Quality is
+  guaranteed (the audited schedule measures SSIM 0.911 / PSNR 29.09 dB against
+  `lossless`), but output is no longer bit-identical to the reference.
 
 One resident server serves all three levels; a `quality: "high"` request
 mounts its audited Cache-DiT policy at the batch boundary, and a later
@@ -1250,23 +1260,25 @@ latency while keeping output closest to the same-seed exact trajectory.
 
 The measured trade-off is:
 
-| `quality` | Mean <br />inference <br />latency | Speedup | SSIM vs <br />exact | PSNR vs <br />exact | Expected <br />trade-off |
+| `quality` | Mean <br />inference <br />latency | Speedup | SSIM vs <br />lossless | PSNR vs <br />lossless | Expected <br />trade-off |
 | --- | ---: | ---: | ---: | ---: | --- |
-| `exact` | 75.10 s | 1.00× | 1.000 | exact | Native reference path |
-| `lossless` | Not separately measured | — | Same H3 denoise path | Same H3 denoise path | Fusion-only tier; VAE decode fuses QK RMSNorm + RoPE and uses cuDNN SDPA (rounding-level differences) |
-| `high` | 53.70 s | 1.40× | 0.931 | 28.16 dB | Smallest same-seed visual change |
+| `exact` | 71.84 s | 0.99× | 0.660 | 17.85 dB | Native reference path; a different sample from `lossless` |
+| `lossless` | 71.17 s | 1.00× | 1.000 | identical | Default; fusion-only tier (rounding-level differences in each operation) |
+| `high` | 35.80 s | 1.99× | 0.911 | 29.09 dB | Stays close to the same-seed `lossless` sample |
 
 These numbers use 1344×768, 124-frame, 24 fps T2VA with 50 inference steps,
 video flow shift 12, audio flow shift 3, and three fixed prompt/seed pairs on
 4×H200. The prompts cover a quiet detailed scene, fast multi-subject action,
 and a moving close-up portrait. `inference_time_s` is averaged across the three
-prompts; the quiet-scene point is itself the mean of two repeats.
+prompts.
 
-SSIM and PSNR compare decoded, frame-aligned output with the `exact`
+SSIM and PSNR compare decoded, frame-aligned output with the `lossless`
 result for the same prompt and seed. They measure trajectory deviation, not
 absolute perceptual quality: the `high` path can produce a different but
 still plausible realization. It also changes the joint audio-video denoise
-trajectory, while these two metrics cover video only.
+trajectory, while these two metrics cover video only. `exact` and `lossless`
+differ only by rounding inside each operation, but 50 denoising steps grow that
+into a different sample, so `exact` is not a usable reference for `high`.
 
 `quality: "high"` currently accepts only the exact workload and 4×H200
 deployment above; other hardware, task modes, request shapes, step counts, or
