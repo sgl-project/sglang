@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -19,6 +20,7 @@ from sglang.kernels.ops.quantization.fp4_indexer_quant import (
 )
 from sglang.kernels.ops.quantization.fp4_to_fp8 import widen_fp4_to_fp8
 from sglang.srt.layers.attention.dsv4.v41_indexer import dense_blocks, scoring
+from sglang.srt.layers.attention.dsv4.v41_indexer.types import PrefillInputs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -393,6 +395,92 @@ class TestDensePrefillIndexer(CustomTestCase):
                     selected, torch.full(shape, -1, dtype=torch.int32, device="cuda")
                 )
                 self.assertEqual(tuple(candidates.blocks.shape), block_shape)
+
+    @unittest.skipUnless(torch.cuda.is_available() and is_hopper(), "Hopper scores")
+    def test_hopper_consumer_selects_published_blocks(self):
+        # Cover the all-block, wide-candidate and physically compact paths.
+        # An invalid trailing candidate or wrong request offset must never be selected.
+        for context in (16, 25, 65):
+            with self.subTest(context=context):
+                cases = [(2, 3), (2, context)]
+                source = make_inputs(cases)
+                consumer = make_inputs(cases, seed=29)
+                consumer["kv"] = source["kv"]
+                source["topk"] = consumer["topk"] = 8
+                data = prefill_data(source)
+                rows = data.num_rows
+                positions = data.compress_lens.long() - 1
+                raw = torch.empty((rows, 8), device="cuda", dtype=torch.int32)
+                inputs = PrefillInputs(
+                    indexer=SimpleNamespace(index_topk=8),
+                    layer_id=0,
+                    compress_ratio=1,
+                    freqs_cis=torch.empty(0, device="cuda"),
+                    x=torch.empty((rows, 0), device="cuda"),
+                    q_lora=torch.empty((rows, 0), device="cuda"),
+                    positions=positions,
+                    req_rows=None,
+                    req_pool_indices=torch.arange(len(cases), device="cuda"),
+                    k_slots=data.k_slots,
+                    index_plans=None,
+                    kv_page_table=torch.empty(0, device="cuda"),
+                    seq_lens_cpu=data.lens_per_request,
+                    rows_per_request=data.rows_per_request,
+                    rows_per_request_device=torch.tensor(
+                        data.rows_per_request, device="cuda"
+                    ),
+                    out_raw_indices=raw,
+                    out_page_indices=torch.empty_like(raw),
+                )
+
+                gathers = []
+
+                def get_fp4_rows(_layer, slots):
+                    gathers.append(slots.numel())
+                    return tuple(value[slots] for value in source["kv"])
+
+                backend = dense_blocks.DenseBlocksBackend(
+                    token_to_kv_pool=SimpleNamespace(
+                        get_low_ratio_index_k_fp4=get_fp4_rows
+                    ),
+                    req_to_token=torch.empty(0, device="cuda"),
+                    candidate_topk_blocks=2,
+                    candidate_block_size=8,
+                    use_deep_gemm_publish=True,
+                    use_deep_gemm_consume=False,
+                    use_sm90_deep_gemm_consume=True,
+                )
+                with patch.object(
+                    scoring,
+                    "_index_q_and_weights",
+                    return_value=(*source["q"], source["weights"]),
+                ):
+                    published = backend.publish_prefill(inputs)
+                self.assert_topk(
+                    source,
+                    torch.where(raw >= 0, raw + data.request_starts[:, None], -1),
+                    dense_scores(source),
+                )
+                with patch.object(
+                    scoring,
+                    "_index_q_and_weights",
+                    return_value=(*consumer["q"], consumer["weights"]),
+                ):
+                    backend.consume_prefill(inputs, published)
+                scores = dense_scores(consumer)
+                columns = torch.arange(scores.shape[1], device="cuda")
+                member = (
+                    columns[None, :, None] // 8 == published.blocks[:, None, :]
+                ).any(-1)
+                selected = torch.where(raw >= 0, raw + data.request_starts[:, None], -1)
+                self.assert_topk(
+                    consumer, selected, scores.masked_fill(~member, -torch.inf)
+                )
+                torch.testing.assert_close(inputs.out_page_indices, selected)
+                self.assertEqual(
+                    gathers,
+                    [3 + context, rows * 16 if context >= 32 else 3 + context],
+                )
 
     @unittest.skipUnless(torch.cuda.is_available() and is_hopper(), "Hopper scores")
     def test_hopper_scores_match_the_fp4_operands(self):

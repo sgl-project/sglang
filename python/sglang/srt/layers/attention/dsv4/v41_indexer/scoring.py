@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention.dsv4.candidate_blocks import amax8_varlen
 from sglang.kernels.ops.attention.dsv4.candidate_scores import (
     can_use_candidate_scores,
     candidate_scores,
@@ -337,6 +338,21 @@ def topk_ragged(
     from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
 
     topk_transform_ragged_v2(logits, lens, out_offsets=offsets, out_indices=out)
+
+
+def select_prefill_block_ids(
+    logits: torch.Tensor,
+    lens: torch.Tensor,
+    nblocks: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Select size-8 blocks by their maximum score, keeping the newest block."""
+    width = (logits.shape[1] + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+    keys = logits.new_empty(
+        (logits.shape[0], (width + 3) // 4 * 4), dtype=torch.float32
+    )
+    amax8_varlen(logits, lens, out=keys)
+    topk_ragged(keys, nblocks, out=out, offsets=torch.zeros_like(nblocks))
 
 
 def dense_prefill_topk(
