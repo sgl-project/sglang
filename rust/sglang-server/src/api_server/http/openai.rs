@@ -202,12 +202,7 @@ async fn submit_generation(
 ) -> Result<CoreCall, Response> {
     let received = ReceivedAs::Typed(state.core.logged_headers(headers));
     match state.core.generate(request, received).await {
-        Ok(mut call) => {
-            if stream && let Err(error) = call.preflight().await {
-                return Err(openai_error(error.http_status(), error.to_string(), false));
-            }
-            Ok(call)
-        }
+        Ok(call) => Ok(call),
         // Same `error_response` rule: a committed stream gets 200 plus an
         // SSE error frame + `[DONE]`, not a unary 503 — but with the OpenAI
         // error shape, since this is the OpenAI frontend.
