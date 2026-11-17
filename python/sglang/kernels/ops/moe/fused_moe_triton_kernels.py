@@ -452,7 +452,9 @@ def fused_moe_kernel(
     if inactive_expert:
         # The down GEMM never reads inactive sorted or half-width intermediates.
         # Add/reduce outputs already hold their initial value and must stay intact.
-        if not (c_sorted or FUSE_SWIGLU or FUSE_ADD_TO_OUTPUT or FUSE_SUM_ALL_REDUCE):
+        if not (
+            (c_sorted or FUSE_SWIGLU) or (FUSE_ADD_TO_OUTPUT or FUSE_SUM_ALL_REDUCE)
+        ):
             write_zeros_to_output(
                 c_ptr,
                 stride_cm,
