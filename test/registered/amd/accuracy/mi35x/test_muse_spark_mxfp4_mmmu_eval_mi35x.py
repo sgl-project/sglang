@@ -16,7 +16,7 @@ Eval harness: run_eval's mmmu (100 fixed samples across all MMMU subjects,
 sampling as the GSM8K test. The muse reasoning parser keeps the trace in
 `reasoning_content`, so the answer is read from `content`.
 
-Registry: nightly-amd-accuracy-8-gpu-mi35x-muse-spark-mmmu suite
+Registry: nightly-accuracy-test-8-gpu-amd-mi35x-muse-spark-mmmu suite
 """
 
 import os
@@ -38,7 +38,7 @@ from sglang.test.test_utils import (
 
 register_amd_ci(
     est_time=3600,
-    suite="nightly-amd-accuracy-8-gpu-mi35x-muse-spark-mmmu",
+    suite="nightly-accuracy-test-8-gpu-amd-mi35x-muse-spark-mmmu",
     nightly=True,
 )
 

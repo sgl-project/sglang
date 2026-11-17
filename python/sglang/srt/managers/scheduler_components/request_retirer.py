@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Callable, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.scheduler_components.exit_ledger import record_exit
 from sglang.srt.managers.utils import make_abort_req
@@ -12,6 +14,8 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.runtime_context import get_disagg
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.beam_search.coordinator import BeamCoordinator
@@ -138,6 +142,26 @@ class RequestRetirer:
         self.send_abort_output(
             make_abort_req(req, finished_reason=reason.to_json()), req
         )
+
+    def abandon(self, req: Req, error: Exception) -> None:
+        """Take out a request whose release raised `error`, freeing nothing.
+        A failed release is a bug: CI raises it."""
+        if envs.SGLANG_IS_IN_CI.get():
+            raise error
+        logger.error(
+            f"Release of request {req.rid} (bootstrap room {req.bootstrap_room}) "
+            "failed; abandoning what it holds",
+            exc_info=error,
+        )
+        if req.owner_list is None:
+            return
+        _leave_owner_list(req)
+        record_exit(req, "abandon")
+
+    def settle_output(self, req: Req) -> None:
+        """Take a released request out of the list holding its final output;
+        its release already recorded the exit."""
+        _leave_owner_list(req)
 
     def _detach(self, req: Req) -> None:
         """Drop an aborted request from the components tracking it and free its
