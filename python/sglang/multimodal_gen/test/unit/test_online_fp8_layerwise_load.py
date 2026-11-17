@@ -73,8 +73,14 @@ class TestOnlineFp8LayerwiseLoad(unittest.TestCase):
                     )
 
                 reference = load(WeightLoadPlan(checkpoint_load_device=device), False)
+                # ROCm per-tensor quantization produces scalar weight scales.
+                # Give them a dimension before reinterpreting their bytes.
                 expected = {
-                    name: value.detach().cpu().contiguous().view(torch.uint8)
+                    name: value.detach()
+                    .cpu()
+                    .contiguous()
+                    .unsqueeze(0)
+                    .view(torch.uint8)
                     for name, value in reference.state_dict().items()
                 }
                 del reference
@@ -113,7 +119,7 @@ class TestOnlineFp8LayerwiseLoad(unittest.TestCase):
                     self.assertEqual(tensor.device.type, "cpu")
                 for name, value in model.state_dict().items():
                     torch.testing.assert_close(
-                        value.detach().contiguous().view(torch.uint8),
+                        value.detach().contiguous().unsqueeze(0).view(torch.uint8),
                         expected[name],
                         rtol=0,
                         atol=0,
