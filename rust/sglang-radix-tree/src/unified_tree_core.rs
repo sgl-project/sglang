@@ -679,6 +679,9 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) namespaced_event_hashes: HashMap<NodeId, Vec<HashDigest>>,
     /// Hit count at which a node earns a host write-through backup.
     pub(crate) write_through_threshold: i64,
+    /// The per-path Mamba cap also counts host copies and frees the host
+    /// copies of the states it caps (decided at HiCache init).
+    pub(crate) mamba_path_cap_counts_host: bool,
 
     /// Per-component monotonic sources for lock-segment UUIDs.
     pub(crate) component_uuid_counters: [i64; NUM_COMPONENT_TYPES],
@@ -1067,6 +1070,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             kv_event_queue: Vec::new(),
             namespaced_event_hashes: HashMap::new(),
             write_through_threshold: params.write_through_threshold,
+            mamba_path_cap_counts_host: false,
             component_uuid_counters: COMPONENT_UUID_INITIAL_VALUES,
             device: params.device,
             empty_device_indices: Tensor::empty([0], (Kind::Int64, params.device)),
@@ -3911,6 +3915,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     pub fn set_write_through_threshold(&mut self, value: i64) {
         self.write_through_threshold = value;
+    }
+
+    /// Make the per-path Mamba cap count and free host copies; decided at HiCache init.
+    pub fn set_mamba_path_cap_counts_host(&mut self, enabled: bool) {
+        self.mamba_path_cap_counts_host = enabled;
     }
 
     pub fn enable_storage(&self) -> bool {
