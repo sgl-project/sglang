@@ -182,6 +182,65 @@ class TestModelOptNvfp4Sm90Runner(CustomTestCase):
                 del held
                 self.assertLess(split, 8 << 20)
 
+    def test_repack_in_place_matches_a_separate_repack_bitwise(self):
+        """The loader writes checkpoint bytes into the repacked buffers, so the repack must read a copy, never bytes it
+        has already overwritten. At real shapes, after load and after an in-place reload under a captured graph, the
+        buffers must equal a repack of separate checkpoint tensors into new buffers bit for bit, and the graph must
+        replay the eager output bit for bit. Fails on a repack that reads the views it writes."""
+        from sglang.kernels.ops.quantization.nvfp4_sm90_repack import (
+            repack_modelopt_nvfp4_moe_for_sm90,
+        )
+
+        names = (
+            "w13_weight",
+            "w13_weight_scale",
+            "w13_weight_scale_2",
+            "w2_weight",
+            "w2_weight_scale",
+            "w2_weight_scale_2",
+        )
+        for e, h, i in ((256, 2560, 640), (256, 6144, 256)):
+            with self.subTest(hidden=h, intermediate=i):
+                method, layer = self._layer(e, h, i)
+                experts = layer.nvfp4_sm90_experts
+                g = torch.Generator(device="cuda").manual_seed(0)
+                x = torch.randn((64, h), generator=g, device="cuda").bfloat16()
+                ids = torch.randint(0, e, (64, TOPK), generator=g, device="cuda")
+                w = torch.rand((64, TOPK), generator=g, device="cuda")
+                topk = StandardTopKOutput(
+                    topk_weights=w,
+                    topk_ids=ids.int(),
+                    router_logits=torch.zeros((64, e), device="cuda"),
+                )
+                dispatch = StandardDispatchOutput(
+                    hidden_states=x, hidden_states_scale=None, topk_output=topk
+                )
+                graph = None
+                for seed in (1, 2):
+                    if seed == 2:
+                        method.restore_weights_before_loading(layer)
+                    ck = _fill(layer, seed=seed)
+                    method.process_weights_after_loading(layer)
+                    self.assertIs(layer.nvfp4_sm90_experts, experts)
+                    ref = repack_modelopt_nvfp4_moe_for_sm90(
+                        *(ck[n].clone() for n in names)
+                    )
+                    for f in ("w13", "w2", "gs13", "gs2"):
+                        self.assertTrue(
+                            torch.equal(getattr(experts, f), getattr(ref, f)), f
+                        )
+                    del ref, ck
+                    eager = method.apply(layer, dispatch).hidden_states.clone()
+                    if graph is None:
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph):
+                            graph_out = method.apply(layer, dispatch).hidden_states
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    self.assertTrue(torch.equal(graph_out, eager))
+                del method, layer, experts, graph, graph_out
+                torch.cuda.empty_cache()
+
     def test_rejects_eplb(self):
         with get_exec().moe.override(enable_eplb=True):
             with self.assertRaisesRegex(ValueError, "enable-eplb"):
