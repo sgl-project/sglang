@@ -2033,18 +2033,30 @@ def test_prefix_device_indices_includes_private_linker_tail(device_len, tail_len
 
 
 @pytest.mark.parametrize("landed", [True, False])
-def test_finish_loads_releases_private_index_references(landed, caplog):
+@pytest.mark.parametrize("metrics_enabled", [True, False])
+def test_finish_loads_releases_private_index_references(landed, metrics_enabled, caplog):
+    """Completed batches release private indices and wait records even without metrics."""
     backend = _FakeLinker()
     backend.load_landed = landed
+    backend.layer_done_counter = counter = LayerWiseLoadCounter(1)
+    metrics = _RecordingRadixCacheMetrics() if metrics_enabled else None
     wrapper = UnifiedCacheLinkerWrapper(
-        _cache_for_wrapper(_all_reduce_attn_groups=lambda value, op: None), backend
+        _cache_for_wrapper(
+            _all_reduce_attn_groups=lambda value, op: None, metrics_collector=metrics
+        ),
+        backend,
     )
     wrapper.inflight_load_rids = ["rid"]
     wrapper.private_load_indices["rid"] = torch.arange(4)
-    wrapper.start_layer_wise_loading()
+    index = wrapper.start_layer_wise_loading()
+    # The forward recorded a blocked layer wait for this batch.
+    counter.blocked_seconds[index] = 0.25
 
     assert wrapper.finish_loads() == ([] if landed else ["rid"])
     assert wrapper.private_load_indices == {}
+    assert counter.blocked_seconds == {}
+    if metrics is not None:
+        assert metrics.observations(metrics.linker_forward_wait_seconds) == [0.25]
     assert ("External linker load failed" in caplog.text) is (not landed)
 
 

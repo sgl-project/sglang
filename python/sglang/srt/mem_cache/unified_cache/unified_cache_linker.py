@@ -944,14 +944,14 @@ class UnifiedCacheLinkerWrapper:
             [int(self.cache_linker.finish_layer_wise_loading(index))],
             dtype=torch.int,
         )
+        finish_wait = time.perf_counter() - start
+        counter = self.cache_linker.layer_done_counter
+        forward_wait = (
+            counter.pop_blocked_seconds(index)
+            if isinstance(counter, LayerWiseLoadCounter)
+            else None
+        )
         if self.metrics is not None:
-            finish_wait = time.perf_counter() - start
-            counter = self.cache_linker.layer_done_counter
-            forward_wait = (
-                counter.pop_blocked_seconds(index)
-                if isinstance(counter, LayerWiseLoadCounter)
-                else None
-            )
             self.metrics.observe_linker_load_waits(forward_wait, finish_wait)
         self.cache._all_reduce_attn_groups(landed, torch.distributed.ReduceOp.MIN)
         for rid in rids:
