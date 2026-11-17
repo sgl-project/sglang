@@ -127,14 +127,12 @@ jobs:
             /opt/venv/bin/hf download --repo-type dataset allenai/olmOCR-bench \
               --local-dir /sglang-checkout/olmOCR-bench'
 
-      - name: PR CI suites (stage-a + stage-b, 1-GPU XPU)
-        # Same suites and budget as pr-test-xpu.yml.
+      - name: PR CI suite (extra-test-1-gpu-xpu)
+        # Same suite and budget as pr-test-xpu.yml.
         timeout-minutes: 180
         run: |
           touch github_summary_ci.md
           suites=extra-test-1-gpu-xpu
-          # Release branch cut: one call per suite, so each metrics file maps to one suite.
-          if [ "${{ inputs.ref != '' }}" = true ]; then suites="${suites/,/ }"; fi
           for suite in $suites; do
             docker exec ci_sglang_xpu bash -c "
               source /opt/venv/bin/activate &&
@@ -149,7 +147,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Kernel-wheel nightly suite (1-GPU XPU)
-        # Run even if the PR CI suites failed; skip only on cancel.
+        # Run even if the PR CI suite failed; skip only on cancel.
         if: success() || failure()
         timeout-minutes: 240
         run: |
