@@ -425,7 +425,7 @@ class GlmImageAR(PipelineStage):
 
         Args:
             prompt: The text prompt with shape info (e.g., "description<sop>36 24<eop>")
-            condition_images: Optional list of condition images for i2i
+            image: Optional list of condition images for i2i
 
         Returns:
             Tuple of the D16 prior token IDs, optional source-image token IDs,

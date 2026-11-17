@@ -85,7 +85,11 @@ class TestHeldRowAdmission(CustomTestCase):
         move([final_chunk], s.chunked_reqs)
         s.min_free_slots_delayer = None
         s.invariant_checker = Mock()
-        s.policy = Mock(calc_priority=lambda waiting, *args, **kwargs: list(waiting))
+        s.policy = Mock(
+            _bounded_active=False,
+            calc_priority=lambda waiting, *args, **kwargs: list(waiting),
+            admission_candidates=lambda waiting: iter(waiting),
+        )
         s.policy.shortest_prefill_chunk_limit.return_value = None
         s.processed_tokens_counter = 0
         s.chunked_prefill_size = 8192
@@ -183,6 +187,74 @@ class TestHeldRowAdmission(CustomTestCase):
         self.assertIsNone(new_batch)
         self.assertIs(s.chunked_req, parked)
         self.assertEqual(list(s.waiting_queue), [waiting])
+
+
+class TestBoundedV2SkippedAdmission(TestHeldRowAdmission):
+    def test_each_temporary_skip_can_use_fixed_next_batch(self):
+        from sglang.srt.managers.schedule_policy import SchedulePolicy
+        from sglang.srt.mem_cache.radix_cache import RadixCache
+
+        for reason in ("lora", "pooling", "prefetch", "device_hit_loss", "staging"):
+            with self.subTest(reason=reason):
+                running = [_Req(True), _Req(True)]
+                final_chunk = _Req(True)
+                waiting = [_Req(False) for _ in range(130)]
+                blocked = set(waiting[:64])
+                for i, req in enumerate(running + [final_chunk] + waiting):
+                    req.rid = str(i)
+                    req.num_matched_prefix_tokens = 0
+                    req.lora_id = "loaded"
+                    req.finished = lambda: False
+                    req.cache_request_handle = req
+                    req.time_stats = Mock()
+                s = self._scheduler(
+                    DisaggregationMode.NULL, running, final_chunk, waiting
+                )
+                s.policy = SchedulePolicy(
+                    "lpm", RadixCache.create_simulated(), False, False, False
+                )
+                s.policy._should_start_bounded_batch = Mock(return_value=True)
+                s.policy._compute_prefix_matches = Mock(return_value=set())
+                s.policy._touch_waiting_prefixes = Mock()
+                s.policy.shortest_prefill_chunk_limit = Mock(return_value=None)
+                if reason == "lora":
+                    s.enable_lora = True
+                    s.lora_drainer = None
+                    s.can_schedule_lora_req = lambda req, _: req not in blocked
+                elif reason == "pooling":
+                    for req in blocked:
+                        req.token_indices_to_pool = [0]
+                else:
+                    s.enable_hicache_storage = True
+                    s.tree_cache.check_prefetch_progress = lambda req: (
+                        reason != "prefetch" or req not in blocked
+                    )
+                    s.tree_cache.pop_prefetch_loaded_span = lambda _: (0, 0)
+                    s._prefetch_after_device_hit_loss = lambda req: (
+                        reason == "device_hit_loss" and req in blocked
+                    )
+                    if reason == "staging":
+                        s.tree_cache.buffer_pipeline = SimpleNamespace(
+                            prepare_staged_prefetch=lambda req: req not in blocked
+                        )
+
+                def capture(can_run_list, *args, **kwargs):
+                    raise _BatchBuilt(list(can_run_list))
+
+                with (
+                    get_context().override_server_args(
+                        pp_max_micro_batch_size=NUM_ROWS
+                    ),
+                    patch.object(ScheduleBatch, "init_new", side_effect=capture),
+                    patch("sglang.srt.managers.scheduler.set_time_batch"),
+                ):
+                    with self.assertRaises(_BatchBuilt) as built:
+                        s._get_new_batch_prefill_raw(None, ScheduleBatch(reqs=running))
+                self.assertEqual(built.exception.args[0], [final_chunk, waiting[64]])
+                self.assertTrue(s.policy._bounded_next_selected)
+                self.assertTrue(
+                    all(req not in blocked for req in built.exception.args[0])
+                )
 
 
 if __name__ == "__main__":

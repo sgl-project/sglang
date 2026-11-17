@@ -335,6 +335,8 @@ class Envs:
     # ===================================================================
     # HTTP server and health
     # ===================================================================
+    # --admin-api-key when the flag is not given; the bundled clients send it as well.
+    SGLANG_ADMIN_API_KEY = EnvStr(None, secret=True)
     # Decompress request bodies tagged with `x-body-compressed`.
     SGLANG_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)
     # Override parsed request fields from headers.
@@ -452,6 +454,8 @@ class Envs:
     # ===================================================================
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
+    # sgl-router binary the PD fixture launches: a path, or a name looked up on PATH
+    SGLANG_TEST_PD_ROUTER_BINARY = EnvStr("sgl-router")
     SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB = EnvFloat(0.0)
     SGLANG_TEST_SCRIPTED_RUNTIME = EnvBool(False)
     SGLANG_TEST_SCRIPTED_RUNTIME_IPC_ADDR = EnvStr(None)
@@ -872,6 +876,12 @@ class Envs:
     # get_embedding_tp_kwargs); they must stay in lock-step. Currently only
     # applies to the Deepseek-V2 family (Deepseek V3.1, Kimi K2.5) + drafts.
     SGLANG_ENABLE_EMBED_REPLICATION = EnvBool(False)
+    # With a prefill graph enabled, a 0-token DP rank keeps SUM_LEN and the
+    # step runs eagerly with only the rows that exist, instead of padding the
+    # group to the capture bucket with a fabricated dummy request. Off by
+    # default (GPU prefill on MoE-TP keeps the MAX_LEN path); turn on for EP
+    # prefill (e.g. Ascend ascend_ops).
+    SGLANG_ENABLE_PREFILL_GRAPH_IDLE_RANK_EAGER = EnvBool(False)
     # Gated background transfers (distributed/device_communicators/
     # gated_transfer.py): force open a transfer gate whose pause has been held
     # this long, logging an error. A pause that never resumes means work the
@@ -958,6 +968,11 @@ class Envs:
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
+    # "te" (classic mooncake.engine) or "tent" (native `tent` module).
+    SGLANG_MOONCAKE_TRANSFER_ENGINE = EnvStr("te")
+    # JSON object deep-merged into the generated TENT config, e.g.
+    # '{"transports": {"rdma": {"numa_penalties": [1.0, 1.5, 10.0]}}}'.
+    SGLANG_TENT_CONFIG_OVERRIDE = EnvStr(None)
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(True)
     SGLANG_FAILED_SESSION_PROBE_INTERVAL_S = EnvFloat(30.0)
     SGLANG_FAILED_SESSION_PROBE_MAX_INTERVAL_S = EnvFloat(300.0)
@@ -1427,6 +1442,8 @@ class Envs:
     # warmup. Opt-in: the extra forward needs transient activation headroom
     # that small-VRAM or tightly-packed configs may not have.
     SGLANG_FLASHINFER_AUTOTUNE_EXTEND = EnvBool(False)
+    # Opt-in BF16 GEMM dispatch for measured Cosmos3 GEN shapes on RTX PRO 6000.
+    SGLANG_OPT_COSMOS3_SM120_GEMM = EnvBool(False)
     SGLANG_ENABLE_FLUX3_PRIMS_TS_AUTOTUNE = EnvBool(False)
     SGLANG_OPT_FLUX3_PRIMS_TS_TUNING_BUCKETS = EnvTuple(tuple())
     SGLANG_USE_SAGE_ATTENTION_IMPL = EnvStr("")
@@ -1564,6 +1581,13 @@ class Envs:
     # sections, the SASS is unchanged; like the flag above, it gets its own
     # cache entry.
     SGLANG_JIT_ENABLE_LINEINFO = EnvBool(False)
+    # In-kernel event tracing (sgl_kernel/debug/trace.cuh), debugging only:
+    # "iket" builds every JIT module with NVIDIA IKET placeholders (4-byte
+    # records, 30 event names per translation unit), "iket-extended" with
+    # 8-byte records; "naive" records %clock cycles into a buffer owned by
+    # sglang.kernels.jit.debug.trace, "naive-debug" also detects overwritten
+    # records. Like the flags above, it gets its own cache entry.
+    SGLANG_JIT_DEBUG_TRACE = EnvStr(None)
     # Drop the GB/s and TFLOPS columns from the benchmark marker's table.
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH = EnvBool(False)
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_FLOPS = EnvBool(False)
@@ -1654,6 +1678,7 @@ class Envs:
     SGLANG_MINICPM_DENSE_AS_SPARSE = EnvBool(False)
     SGLANG_MINICPM_FORCE_DENSE = EnvBool(False)
 
+    SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
     # value, e.g. "torch" / "torch_compile" / "triton" / "helion" / "aot"); unset =
     # auto-select by priority. "torch" flips all fused ops to their pure-torch
