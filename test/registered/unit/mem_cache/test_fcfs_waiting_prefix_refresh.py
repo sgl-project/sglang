@@ -101,8 +101,8 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
         ]
 
     def test_lru_evicts_the_prefix_furthest_from_admission(self):
-        # gds keeps Full KV in recency order, so it takes the same refresh.
-        for policy in ("lru", "gds"):
+        # state_cost keeps Full KV in recency order, so it takes the same refresh.
+        for policy in ("lru", "state_cost"):
             with self.subTest(policy=policy):
                 self.assertEqual(self._run_and_evict_one_prefix(policy), [4, 0])
 

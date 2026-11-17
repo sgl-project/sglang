@@ -48,7 +48,14 @@ from sglang.srt.utils.invariants import expect_host, resolve_level
 _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
+# Keeps verdicts apart from the untagged objects the stages exchange.
+_RELEASE_VERDICT_TAG = 1
+
 if TYPE_CHECKING:
+    from sglang.srt.managers.io_struct import (
+        ReleaseMemoryOccupationReqInput,
+        ReleaseMemoryOccupationReqOutput,
+    )
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardLaunch
     from sglang.srt.observability.forward_pass_metrics import FpmTiming
@@ -132,6 +139,7 @@ class SchedulerPPMixin:
     # the stages compare, and their digest up to this iteration (`init_pp_loop_state`).
     _pp_checked_allocator: Optional[ChainAllocator] = None
     _pp_capacity_digest: Optional[bytes] = None
+    _pp_release_reqs_awaiting_verdict: Tuple[ReleaseMemoryOccupationReqInput, ...] = ()
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -243,6 +251,7 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
+                self._pp_answer_release_requests()
 
                 self.pp_outputs = next_pp_outputs
                 if cur_batch:
@@ -401,6 +410,7 @@ class SchedulerPPMixin:
                     )
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
+                self._pp_answer_release_requests()
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -603,6 +613,7 @@ class SchedulerPPMixin:
                         send_transfer_work = []
                     if cur_batch and not cur_batch.forward_mode.is_prebuilt():
                         self._pp_send_proxy_to_next_stage(result)
+                self._pp_answer_release_requests()
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -698,6 +709,7 @@ class SchedulerPPMixin:
             str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
         ] = defaultdict(deque)
         self._pp_capacity_send_work: List[P2PWork] = []
+        self._pp_release_verdict_send_work: List[P2PWork] = []
         self._pp_init_stage_capacity()
 
     def _pp_init_stage_capacity(self: Scheduler) -> None:
@@ -897,11 +909,17 @@ class SchedulerPPMixin:
         return next_pp_outputs, next_batch_result, d2h_event
 
     def _pp_send_reqs_to_next_stage(self: Scheduler, recv_reqs: List) -> List[P2PWork]:
-        return self._pp_send_pyobj_to_next_stage(
+        work = self._pp_send_pyobj_to_next_stage(
             strip_mm_features_for_pp_relay(recv_reqs), async_send=True
         )
+        # The next stage receives a verdict only once it has these requests.
+        work += self._pp_release_verdict_send_work
+        self._pp_release_verdict_send_work = []
+        return work
 
-    def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
+    def _pp_send_pyobj_to_next_stage(
+        self: Scheduler, data, async_send: bool = False, tag: int = 0
+    ):
         p2p_work = []
         if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
             dp_offset = (
@@ -918,10 +936,47 @@ class SchedulerPPMixin:
                 * get_parallel().tp_size
                 + dp_offset,
                 async_send=async_send,
+                tag=tag,
             )
         return p2p_work
 
-    def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
+    def _pp_pass_release_verdict(
+        self: Scheduler,
+        output: ReleaseMemoryOccupationReqOutput,
+        recv_req: ReleaseMemoryOccupationReqInput,
+    ) -> None:
+        """Fold this stage's verdict into the earlier stages' and send it on."""
+        if self.pp_group.is_first_rank:
+            first_stage_released = output.success
+            if first_stage_released:
+                self._pp_release_reqs_awaiting_verdict += (recv_req,)
+            else:
+                # A busy pipeline stalls if this stage waits on a later one.
+                self.send_control_output(output, recv_req)
+        else:
+            first_stage_released, earlier = self._pp_recv_pyobj_from_prev_stage(
+                tag=_RELEASE_VERDICT_TAG
+            )
+            if not earlier.success:
+                output = earlier
+        if not self.pp_group.is_last_rank:
+            self._pp_release_verdict_send_work += self._pp_send_pyobj_to_next_stage(
+                [first_stage_released, output],
+                async_send=True,
+                tag=_RELEASE_VERDICT_TAG,
+            )
+        elif first_stage_released:
+            # Blocking: the first stage is idle and receives at the end of its iteration.
+            self._pp_send_pyobj_to_next_stage([output], tag=_RELEASE_VERDICT_TAG)
+
+    def _pp_answer_release_requests(self: Scheduler) -> None:
+        """Blocks on the last stage, so runs after the iteration's sends."""
+        for recv_req in self._pp_release_reqs_awaiting_verdict:
+            (verdict,) = self._pp_recv_pyobj_from_prev_stage(tag=_RELEASE_VERDICT_TAG)
+            self.send_control_output(verdict, recv_req)
+        self._pp_release_reqs_awaiting_verdict = ()
+
+    def _pp_recv_pyobj_from_prev_stage(self: Scheduler, tag: int = 0):
         if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
             dp_offset = (
                 get_parallel().attn_dp_rank
@@ -936,6 +991,7 @@ class SchedulerPPMixin:
                 * get_parallel().tp_size
                 + dp_offset,
                 get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
+                tag=tag,
             )
         else:
             data = None
@@ -1027,7 +1083,17 @@ class SchedulerPPMixin:
             p2p_work.extend(
                 self.pp_group.send_tensor_dict(
                     tensor_dict=tensor_dict,
-                    all_gather_group=(self.attn_tp_group),
+                    # Send last-stage outputs in full to stage 0 to avoid an
+                    # AllGather on the model group during graph replay.
+                    # The forward direction stays sharded for proxy messages.
+                    all_gather_group=(
+                        None
+                        if _is_npu
+                        and get_parallel().pp_size == 2
+                        and self.pp_group.is_last_rank
+                        and msg_type == "output"
+                        else self.attn_tp_group
+                    ),
                     async_send=async_send,
                 )
             )
@@ -1098,7 +1164,13 @@ class SchedulerPPMixin:
     ) -> Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]:
         return self._pp_recv_typed_dict(
             expected_kind="output",
-            all_gather_group=(self.attn_tp_group),
+            all_gather_group=(
+                None
+                if _is_npu
+                and get_parallel().pp_size == 2
+                and self.pp_group.is_first_rank
+                else self.attn_tp_group
+            ),
         )
 
     def _pp_make_skip_output_result(
@@ -1263,6 +1335,16 @@ class SchedulerPPMixin:
             )
 
             next_draft_input = make_next_draft_input(
+                bonus_tokens=next_token_ids,
+                new_seq_lens=batch.seq_lens,
+            )
+            batch.spec_info = next_draft_input
+        elif batch.spec_algorithm.is_dflash():
+            from sglang.srt.speculative.draft_worker_common import (
+                make_draft_input_v2,
+            )
+
+            next_draft_input = make_draft_input_v2(
                 bonus_tokens=next_token_ids,
                 new_seq_lens=batch.seq_lens,
             )
@@ -1818,8 +1900,12 @@ class SchedulerPPMixin:
             with torch.profiler.record_function("send_recv_res_dict"):
                 recv_dict = self.pp_group.send_recv_tensor_dict(
                     send_tensor_dict=send_dict,
-                    send_all_gather_group=all_gather_group,
-                    recv_all_gather_group=all_gather_group,
+                    send_all_gather_group=(
+                        None if self.pp_group.is_last_rank else all_gather_group
+                    ),
+                    recv_all_gather_group=(
+                        None if self.pp_group.is_first_rank else all_gather_group
+                    ),
                 )
             _handle_recv_dict(recv_dict)
         elif send_dict is not None:

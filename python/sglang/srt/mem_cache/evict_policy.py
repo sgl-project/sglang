@@ -82,9 +82,12 @@ class TLRUStrategy(EvictionStrategy):
         return (-1 if tel_safe else 0, node.last_access_time)
 
 
-class GDSStrategy(EvictionStrategy):
-    """GreedyDual-Size over recurrent-state checkpoints (FlashState,
-    https://flashstate.ai).
+class StateCostStrategy(EvictionStrategy):
+    """State-only, cost-based eviction of recurrent-state checkpoints, inspired by
+    FlashStates:
+      paper: https://www.alphaxiv.org/abs/2611.flashstate
+      code: https://github.com/FutureMLS-Lab/FlashStates
+      project page: https://flashstates.ai
 
     A checkpoint's priority is its stamp, the eviction watermark at its last use,
     plus the prefill it costs to rebuild from the nearest shallower checkpoint.
@@ -92,13 +95,17 @@ class GDSStrategy(EvictionStrategy):
     get_priority matches LRUStrategy.
     """
 
-    # Defaults are FlashState's GLM-5.3-Flash fit, in seconds; only the ratio
-    # d/e affects the order, and other models may want their own.
+    # Defaults are the GLM-5.3-Flash prefill-time fit published by FlashStates, in
+    # seconds; only the ratio d/e affects the order, and other models may want
+    # their own.
+    #   paper: https://www.alphaxiv.org/abs/2611.flashstate
+    #   code: https://github.com/FutureMLS-Lab/FlashStates
+    #   project page: https://flashstates.ai
     def __init__(self, d: float = 1.862e-5, e: float = 3.33e-6):
         if not (math.isfinite(d) and math.isfinite(e)) or min(d, e) < 0 or d == e == 0:
             raise ValueError(
-                "--radix-eviction-policy gds requires finite, non-negative 'd' and "
-                f"'e' with at least one positive, got d={d}, e={e}."
+                "--radix-eviction-policy state_cost requires finite, non-negative "
+                f"'d' and 'e' with at least one positive, got d={d}, e={e}."
             )
         self.d = d
         self.e = e

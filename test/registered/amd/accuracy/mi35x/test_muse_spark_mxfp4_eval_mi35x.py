@@ -19,7 +19,7 @@ keeps the trace in `reasoning_content` and the answer in `content`.
 Temperature 1.0 and top_p 1.0 with a fixed seed: greedy decoding lets the
 thinking loop until truncation.
 
-Registry: nightly-amd-accuracy-8-gpu-mi35x-muse-spark suite
+Registry: nightly-accuracy-test-8-gpu-amd-mi35x-muse-spark suite
 """
 
 import os
@@ -41,7 +41,7 @@ from sglang.test.test_utils import (
 
 register_amd_ci(
     est_time=3600,
-    suite="nightly-amd-accuracy-8-gpu-mi35x-muse-spark",
+    suite="nightly-accuracy-test-8-gpu-amd-mi35x-muse-spark",
     nightly=True,
 )
 
