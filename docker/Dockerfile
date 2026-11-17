@@ -575,7 +575,8 @@ COPY docker/configs/.zshrc /root/.zshrc
 # libtasn1-6:      CVE-2025-13151
 # dpkg:            CVE-2025-6297
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --upgrade "urllib3>=2.6.3" "pillow>=12.1.1"
+    uv pip install --upgrade "urllib3>=2.6.3" "pillow>=12.1.1,<13" \
+    && uv pip check
 RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
     apt-get update && apt-get install -y --only-upgrade \
     binutils binutils-common binutils-x86-64-linux-gnu libbinutils \
