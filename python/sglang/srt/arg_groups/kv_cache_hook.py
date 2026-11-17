@@ -601,10 +601,10 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         assert not (
             cfg.disaggregation_transfer_backend == "mooncake"
             and cfg.speculative_algorithm is not None
-            and not get_platform().is_cuda
+            and not (get_platform().is_cuda and cfg.speculative_algorithm == "DFLASH")
         ), (
             "--enable-unified-memory with PD disaggregation supports speculative "
-            "decoding with the Mooncake transfer backend on CUDA only."
+            "decoding with the Mooncake transfer backend for DFLASH on CUDA only."
         )
         # This flag also selects decode's non-blocking metadata readback, which
         # records a receive as in flight before its destination is published.

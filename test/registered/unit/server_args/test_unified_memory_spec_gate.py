@@ -166,10 +166,11 @@ class TestUnifiedMemorySpecGate(CustomTestCase):
             for topk in (2, 4):
                 self.assertFalse(_accepts(algorithm, topk=topk), f"{algorithm} {topk}")
 
-    def test_pd_speculative_decoding_over_mooncake_needs_cuda(self):
-        """Both PD roles require CUDA when Mooncake carries a speculative draft."""
+    def test_pd_speculative_decoding_over_mooncake_is_dflash_on_cuda(self):
+        """Both PD roles admit a speculative draft over Mooncake only for DFLASH
+        on CUDA; each refused algorithm is accepted without PD."""
         for mode in ("prefill", "decode"):
-            for algorithm in ("DFLASH", "EAGLE", None):
+            for algorithm in ("DFLASH", "DSPARK", "EAGLE", "EAGLE3", None):
                 for is_cuda in (True, False):
                     with self.subTest(mode=mode, algorithm=algorithm, cuda=is_cuda):
                         with override_platform(is_cuda=is_cuda):
@@ -180,7 +181,14 @@ class TestUnifiedMemorySpecGate(CustomTestCase):
                                 disaggregation_transfer_backend="mooncake",
                                 pp_size=1,
                             )
-                        self.assertEqual(accepted, is_cuda or algorithm is None)
+                            accepted_without_pd = _accepts(
+                                algorithm, draft_backend="trtllm_mha"
+                            )
+                        self.assertTrue(accepted_without_pd)
+                        self.assertEqual(
+                            accepted,
+                            algorithm is None or (is_cuda and algorithm == "DFLASH"),
+                        )
 
     def test_buffer_only_hicache_refused_under_pipeline_parallelism(self):
         """Unified memory with more than one pipeline stage refuses buffer_only
