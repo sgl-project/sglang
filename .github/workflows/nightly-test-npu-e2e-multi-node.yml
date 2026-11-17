@@ -40,6 +40,11 @@ on:
         required: true
         type: string
         description: path of test case file
+      test_method:
+        required: false
+        type: string
+        default: ''
+        description: "Single test method to run inside test_case, formatted as Class.method. Empty runs every test in the file."
       image:
         required: false
         type: string
@@ -59,11 +64,21 @@ on:
         type: string
         default: '{}'
         description: 'JSON run metadata {branch_label, workflow_name, create_time}, recorded once at workflow start'
+      container_patches:
+        required: false
+        type: string
+        default: ""
+        description: "Comma separated container patch sets under scripts/ci/npu/patches. Empty keeps the image untouched."
       accuracy_dataset:
         required: false
         type: string
         default: ''
         description: 'Accuracy dataset injected into pods as NPU_ACCURACY_DATASET (gsm8k on weekdays, gpqa_diamond on weekends)'
+      use_image_sglang:
+        required: false
+        type: string
+        default: ''
+        description: "If 'true', pods import sglang from the image's site-packages instead of the checkout mounted at /root/sglang/python. Empty/false uses the checkout (nightly default)."
       sgl_router_artifact:
         required: false
         type: string
@@ -224,6 +239,18 @@ jobs:
             --kube-job-name-prefix ${KUBE_JOB_NAME} \
             --run-id ${{ github.run_id }}"
 
+          container_patches="${{ inputs.container_patches }}"
+          if [ "$container_patches" != "" ]; then
+            # The value is appended to a string that is later eval'ed, so it
+            # must be strictly validated here instead of only inside the pods.
+            if ! echo "${container_patches}" | grep -Eq '^[a-z0-9_]+(\.[a-z0-9_]+)*(,[a-z0-9_]+(\.[a-z0-9_]+)*)*$'; then
+              echo "Invalid container_patches: ${container_patches}"
+              exit 1
+            fi
+            echo "Container patches: ${container_patches}"
+            CMD="${CMD} --container-patches ${container_patches}"
+          fi
+
           accuracy_dataset="${{ inputs.accuracy_dataset }}"
           case "${accuracy_dataset}" in
             ""|gsm8k|gpqa_diamond) ;;
@@ -231,6 +258,27 @@ jobs:
           esac
           if [ -n "${accuracy_dataset}" ]; then
             CMD="${CMD} --accuracy-dataset ${accuracy_dataset}"
+          fi
+
+          use_image_sglang="${{ inputs.use_image_sglang }}"
+          case "${use_image_sglang}" in
+            ""|true|false) ;;
+            *) echo "Unsupported use_image_sglang: ${use_image_sglang}"; exit 1 ;;
+          esac
+          if [ -n "${use_image_sglang}" ]; then
+            CMD="${CMD} --use-image-sglang ${use_image_sglang}"
+          fi
+
+          # Restrict the run to one unittest method inside test_case. The value
+          # ends up in the pod's env, so only plain dotted identifiers pass.
+          test_method="${{ inputs.test_method }}"
+          if [ -n "${test_method}" ]; then
+            if ! echo "${test_method}" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$'; then
+              echo "Invalid test_method: ${test_method}"
+              exit 1
+            fi
+            echo "Test method: ${test_method}"
+            CMD="${CMD} --test-method ${test_method}"
           fi
 
           if [ "$prefill_decode_deployment" = "separation" ];then
@@ -260,6 +308,16 @@ jobs:
 
           echo "Run command: ${CMD}"
           eval "${CMD}"
+
+      - name: Upload metrics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npu-metrics-${{ inputs.test_config_name }}
+          # output/<branch>-<create_time>-<run_id>-<run_attempt>/<workflow>/<test_type>/<case>
+          path: /root/.cache/tests/output/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${{ inputs.test_type }}/*
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Post process
         if: always()

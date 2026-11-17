@@ -6,6 +6,15 @@ if [ ! -f "${sglang_source_path}/${test_case}" ];then
   exit 0
 fi
 
+# Optional single test method ("Class.method") injected as NPU_TEST_METHOD;
+# empty runs every test defined in the test case file.
+test_method="${NPU_TEST_METHOD:-}"
+test_method_args=()
+if [ -n "${test_method}" ]; then
+  echo "Restricting run to test method: ${test_method}"
+  test_method_args=("${test_method}")
+fi
+
 # Leave the image WORKDIR (/sgl-workspace): the sglang repo cloned there can
 # shadow the installed package on sys.path.
 cd "${sglang_source_path}"
@@ -16,6 +25,104 @@ export HF_MODULES_CACHE="${HF_MODULES_CACHE:-/tmp/hf_modules}"
 
 echo "NPU info:"
 npu-smi info
+
+# Apply the declarative container patch sets requested by the workflow
+# (SGLANG_NPU_CONTAINER_PATCHES, comma separated set names). Patch sets live in
+# scripts/ci/npu/patches/<name>.sh and an empty value is a no-op.
+#
+# Notes:
+#   * The set name comes from a workflow input, so only names matching
+#     ^[a-z0-9_]+(\.[a-z0-9_]+)*$ (dots allowed for version suffixes, e.g.
+#     mooncake_memfabric_1.3.1) that resolve to a file in the patch directory
+#     are executed.
+#   * Patch resources are cached in the pod-local filesystem (PATCH_CACHE_DIR,
+#     /tmp by default) instead of the shared disk, so the pods never race on
+#     the same file. Each pod downloads once and reuses it for re-runs.
+#   * A per-set marker keyed by the file checksum makes re-runs idempotent.
+#   * Patch sets download packages from the public internet, which is slow from
+#     the cluster; pip defaults to the domestic mirror (override with
+#     PIP_INDEX_URL) while apt mirrors are handled per set.
+#   * Any failure aborts the run: a half patched cluster produces results that
+#     cannot be trusted.
+#
+# The block runs in a subshell so set -euo pipefail applies only here.
+if [ -n "${SGLANG_NPU_CONTAINER_PATCHES:-}" ]; then
+    echo "===== Apply container patches - Begin ====="
+    (
+        set -euo pipefail
+
+        PATCH_DIR="${sglang_source_path}/scripts/ci/npu/patches"
+        PATCH_CACHE_DIR="${PATCH_CACHE_DIR:-/tmp/sglang_npu_patch_cache}"
+        PATCH_STATE_FILE="${PATCH_STATE_FILE:-/tmp/sglang_npu_patches_applied.json}"
+        REQUESTED="${SGLANG_NPU_CONTAINER_PATCHES}"
+
+        # Pods reach PyPI over a slow international link; every patch set
+        # downloads wheels, so default to the domestic mirror.
+        export PIP_INDEX_URL="${PIP_INDEX_URL:-https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple}"
+
+        APPLIED_JSON=""
+        NORMALIZED=""
+        while IFS= read -r set_name; do
+            set_name="$(echo "${set_name}" | tr -d '[:space:]')"
+            if [ -z "${set_name}" ]; then
+                continue
+            fi
+
+            if ! echo "${set_name}" | grep -Eq '^[a-z0-9_]+(\.[a-z0-9_]+)*$'; then
+                echo "Invalid container patch set name: ${set_name}" >&2
+                exit 1
+            fi
+
+            patch_file="${PATCH_DIR}/${set_name}.sh"
+            if [ ! -f "${patch_file}" ]; then
+                echo "Container patch set not found: ${patch_file}" >&2
+                exit 1
+            fi
+
+            patch_sha="$(sha256sum "${patch_file}" | awk '{print $1}')"
+            patch_version="$(grep -m1 '^# PATCH_VERSION:' "${patch_file}" | sed 's/^# PATCH_VERSION:[[:space:]]*//' || true)"
+            patch_version="${patch_version:-unknown}"
+            marker="/tmp/.sglang_npu_patch_${set_name}_${patch_sha}"
+
+            if [ -f "${marker}" ]; then
+                echo "Container patch set already applied, skip: ${set_name}"
+                patch_status="skipped"
+            else
+                echo "===== Apply container patch set: ${set_name} - Begin ====="
+                mkdir -p "${PATCH_CACHE_DIR}/${set_name}"
+                PATCH_CACHE_DIR="${PATCH_CACHE_DIR}/${set_name}" bash "${patch_file}"
+                echo "===== Apply container patch set: ${set_name} - End ====="
+                touch "${marker}"
+                patch_status="applied"
+            fi
+
+            if [ -n "${APPLIED_JSON}" ]; then
+                APPLIED_JSON="${APPLIED_JSON},"
+                NORMALIZED="${NORMALIZED},"
+            fi
+            NORMALIZED="${NORMALIZED}${set_name}"
+            APPLIED_JSON="${APPLIED_JSON}{\"set\": \"${set_name}\", \"version\": \"${patch_version}\", \"sha256\": \"${patch_sha}\", \"status\": \"${patch_status}\"}"
+        done <<< "$(echo "${REQUESTED}" | tr ',' '\n')"
+
+        cat > "${PATCH_STATE_FILE}" <<EOF
+{
+  "requested": "${NORMALIZED}",
+  "host": "${HOSTNAME:-unknown}",
+  "recorded_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "patches": [${APPLIED_JSON}]
+}
+EOF
+
+        echo "Container patch state written to ${PATCH_STATE_FILE}"
+        cat "${PATCH_STATE_FILE}"
+    ) || {
+        echo "Failed to apply the requested container patches."
+        exit 1
+    }
+    echo "===== Apply container patches - End ====="
+else
+    echo "No container patch set requested, skip."
+fi
 
 echo "===== Install kubernetes - Begin ====="
 KUBERNETES_PKG_PATH_SOURCE=/root/.cache/.cache/kubernetes
@@ -109,8 +216,14 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-# Run the checkout's sglang; the image only supplies the environment.
-export PYTHONPATH="${sglang_source_path}/python${PYTHONPATH:+:${PYTHONPATH}}"
+# The sglang package comes from the image's site-packages (PYTHONPATH below is intentionally NOT prepended).
+# However, test helper modules shipped in the PR  must be available on top of whatever the image bundled,
+# so we rsync the checkout's python/sglang/test tree into site-packages before anything imports it.
+IMAGE_SGLANG_PKG="$(python -c 'import sglang, os; print(os.path.dirname(sglang.__file__))')"
+if [ -d "${IMAGE_SGLANG_PKG}/test" ] && [ -d "${sglang_source_path}/python/sglang/test" ]; then
+    echo "Syncing PR sglang/test → ${IMAGE_SGLANG_PKG}/test"
+    cp -r "${sglang_source_path}/python/sglang/test/ascend/"* "${IMAGE_SGLANG_PKG}/test/ascend/"
+fi
 
 # set environment of cann
 . /usr/local/Ascend/cann/set_env.sh
@@ -122,6 +235,8 @@ source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bi
 export SGLANG_DSPARK_A5_EXTRA_OPS_SO=/usr/local/Ascend/extra-ops/vllm_ascend_C.cpython-312-x86_64-linux-gnu.so
 export ASCEND_CUSTOM_OPP_PATH=/usr/local/Ascend/extra-ops/vendors/custom_transformer/:$ASCEND_CUSTOM_OPP_PATH
 export LD_LIBRARY_PATH=/usr/local/Ascend/extra-ops/vendors/custom_transformer/op_api/lib:$LD_LIBRARY_PATH
+
+export TORCH_EXTENSIONS_DIR=/tmp/torch_extensions
 
 echo "Running test case ${test_case}"
 tc_name=${test_case##*/}
@@ -138,10 +253,10 @@ echo "Log path: ${log_path}"
 
 if [ "${TROUBLE_SHOTTING}" = "true" ] || [ "${TROUBLE_SHOTTING}" = "True" ];then
     echo "TROUBLE_SHOTTING=true, the pod will keep alive for four hour."
-    ( ${PYTHON_FOR_SGLANG} -u "${sglang_source_path}/${test_case}" 2>&1 || true ) | tee -a "${log_path}/${tc_name}.log"
+    ( ${PYTHON_FOR_SGLANG} -u "${sglang_source_path}/${test_case}" "${test_method_args[@]}" 2>&1 || true ) | tee -a "${log_path}/${tc_name}.log"
     sleep 14400
 else
-    ${PYTHON_FOR_SGLANG} -u "${sglang_source_path}/${test_case}" 2>&1 | tee -a "${log_path}/${tc_name}.log"
+    ${PYTHON_FOR_SGLANG} -u "${sglang_source_path}/${test_case}" "${test_method_args[@]}" 2>&1 | tee -a "${log_path}/${tc_name}.log"
 fi
 echo "Finished test case ${test_case}"
 
@@ -150,6 +265,11 @@ if [ -n "${METRICS_DATA_FILE}" ]; then
     # Archive the test log into the output directory for result collection
     cp "${log_path}/${tc_name}.log" "${METRICS_DATA_FILE}/test_output.log"
     echo "Metrics log saved to ${METRICS_DATA_FILE}/test_output.log"
+    # Record which container patch sets (if any) produced this result.
+    if [ -f "/tmp/sglang_npu_patches_applied.json" ]; then
+        cp /tmp/sglang_npu_patches_applied.json "${METRICS_DATA_FILE}/patch_info.json"
+        echo "Container patch info saved to ${METRICS_DATA_FILE}/patch_info.json"
+    fi
 fi
 
 source_plog_path="/root/ascend/log/debug/plog"
