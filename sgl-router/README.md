@@ -63,7 +63,7 @@ Pull the container image (multi-arch, amd64 and arm64; see
 
 ```bash
 docker pull lmsysorg/sgl-router:latest            # latest release
-docker pull lmsysorg/sglang-staging:sgl-router    # built from main every night
+docker pull lmsysorg/sgl-router:nightly           # built from main every night
 docker run --rm -p 30000:30000 lmsysorg/sgl-router:latest --help
 ```
 
@@ -415,8 +415,8 @@ releases. Each release ships as:
 - a PyPI package, `pip install sgl-router`, whose wheel (linux x86_64 and
   aarch64) puts the `sgl-router` binary on `PATH`.
 
-`lmsysorg/sglang-staging:sgl-router` is built from main every night, and the
-SGLang images build the router from their own source. The crate itself is not
+`lmsysorg/sgl-router:nightly` is built from main every night, and the SGLang
+images build the router from their own source. The crate itself is not
 published to crates.io.
 `sgl-router --version` prints the version a binary was built from.
 

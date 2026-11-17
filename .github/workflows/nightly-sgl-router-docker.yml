@@ -14,6 +14,6 @@ jobs:
     if: github.repository == 'sgl-project/sglang'
     uses: ./.github/workflows/_sgl-router-docker.yml
     with:
-      image_repo: lmsysorg/sglang-staging
-      tags: sgl-router
+      image_repo: lmsysorg/sgl-router
+      tags: nightly
     secrets: inherit
