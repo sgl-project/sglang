@@ -65,6 +65,7 @@ PAGED_URL = f"{_HOST}:{find_available_port(int(_PORT) + 100)}"
 
 class _PagedMatchesUnpaged:
     model: str
+    prompts = PROMPTS
     #: False for MoE kernels that are not batch-invariant: compare the median logprob difference
     #: per prompt, decode ones up to the first greedy token the servers differ on.
     exact = True
@@ -77,12 +78,13 @@ class _PagedMatchesUnpaged:
     def setUpClass(cls):
         # Both servers boot and score at the same time.
         with ThreadPoolExecutor(2) as pool:
-            reference = pool.submit(_reference, cls.model, cls.server_args)
+            reference = pool.submit(_reference, cls.model, cls.server_args, cls.prompts)
             paged = pool.submit(
                 _serve_and_score,
                 cls.model,
                 PAGED_URL,
                 [*cls.server_args, *cls.paged_extra_args, *PAGED_ARGS],
+                prompts=cls.prompts,
             )
             cls.reference, cls.paged = reference.result(), paged.result()
 
@@ -94,7 +96,7 @@ class _PagedMatchesUnpaged:
 
     def _assert_match(self, reference, paged):
         decode_compared = decode_total = 0
-        for prompt, ref, got in zip(PROMPTS, reference, paged):
+        for prompt, ref, got in zip(self.prompts, reference, paged):
             with self.subTest(prompt=prompt[:30]):
                 if self.exact:
                     self.assertEqual(got, ref)
@@ -276,12 +278,14 @@ def _cache_outcomes(log):
 _references = {}
 
 
-def _reference(model, server_args=()):
+def _reference(model, server_args=(), prompts=PROMPTS):
     """The unpaged server's scores, once per model and arguments: the classes of one model
     share them."""
-    key = (model, tuple(server_args))
+    key = (model, tuple(server_args), tuple(prompts))
     if key not in _references:
-        _references[key] = _serve_and_score(model, DEFAULT_URL_FOR_TEST, [*server_args])
+        _references[key] = _serve_and_score(
+            model, DEFAULT_URL_FOR_TEST, [*server_args], prompts=prompts
+        )
     return _references[key]
 
 
@@ -303,7 +307,7 @@ def _mem_fraction_for_experts(model, share):
     return (weights - experts + share * experts + (2 << 30)) / free
 
 
-def _serve_and_score(model, base_url, other_args, log=None, env=None):
+def _serve_and_score(model, base_url, other_args, log=None, env=None, prompts=PROMPTS):
     """With ``log``, the server's output is copied into it; ``env`` adds to the server's
     environment."""
     args = SERVER_ARGS
@@ -321,8 +325,8 @@ def _serve_and_score(model, base_url, other_args, log=None, env=None):
     )
     try:
         return {
-            "single": [_generate(base_url, [p])[0] for p in PROMPTS],
-            "batch": _generate(base_url, PROMPTS),
+            "single": [_generate(base_url, [p])[0] for p in prompts],
+            "batch": _generate(base_url, prompts),
         }
     finally:
         terminate_and_kill_process_tree(process)

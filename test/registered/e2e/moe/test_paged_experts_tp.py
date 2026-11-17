@@ -4,6 +4,7 @@ import unittest
 
 from test_paged_experts import (
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE,
+    PROMPTS,
     _PagedMatchesUnpaged,
 )
 
@@ -18,6 +19,12 @@ class TestPagedExpertsTp2(_PagedMatchesUnpaged, CustomTestCase):
     server_args = ("--tp-size", "2", "--moe-runner-backend", "triton")
     # Each service uses two GPUs: the reference occupies 0,1 and the paged one 2,3.
     paged_extra_args = ("--base-gpu-id", "2")
+    prompts = [
+        *PROMPTS,
+        "Explain the connections in the following passage. "
+        + "The ocean carries heat, rivers shape the land, and forests store carbon. "
+        * 64,
+    ]
 
 
 if __name__ == "__main__":
