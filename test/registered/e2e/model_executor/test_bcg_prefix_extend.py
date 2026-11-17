@@ -9,6 +9,8 @@ itself produces.
 """
 
 import os
+import re
+import tempfile
 import unittest
 
 import requests
@@ -23,7 +25,8 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_amd_ci(est_time=600, suite="extra-a-test-1-gpu-small-amd")
+# MI35x only: the logprob tolerance was measured on MI355X.
+register_amd_ci(est_time=600, suite="nightly-amd-1-gpu-mi35x", nightly=True)
 
 _SERVER_ARGS = [
     "--trust-remote-code",
@@ -48,6 +51,9 @@ _QUESTIONS = [
 _MAX_NEW_TOKENS = 4
 # Two eager runs differ by up to 0.04 in first-token logprob.
 _LOGPROB_TOL = 0.1
+_CACHED_PREFIX_REPLAY = re.compile(
+    r"Prefill batch.*#cached-token: [1-9][0-9]*.*cuda graph: True"
+)
 
 
 def _generate(base_url, text):
@@ -73,12 +79,14 @@ class TestBcgPrefixExtend(CustomTestCase):
     def _run(self, replay_prefix_extend):
         env = os.environ.copy()
         env["SGLANG_ROCM_BCG_PREFIX_EXTEND"] = "1" if replay_prefix_extend else "0"
+        log = tempfile.TemporaryFile(mode="w+")
         process = popen_launch_server(
             DEFAULT_MLA_MODEL_NAME_FOR_TEST,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=_SERVER_ARGS,
             env=env,
+            return_stdout_stderr=(log, log),
         )
         try:
             requests.post(DEFAULT_URL_FOR_TEST + "/flush_cache", timeout=60)
@@ -88,13 +96,18 @@ class TestBcgPrefixExtend(CustomTestCase):
             outputs += [
                 _generate(DEFAULT_URL_FOR_TEST, _PREFIX + "\n" + q) for q in _QUESTIONS
             ]
-            return outputs
         finally:
             terminate_and_kill_process_tree(process)
+        log.seek(0)
+        replays = len(_CACHED_PREFIX_REPLAY.findall(log.read()))
+        log.close()
+        return outputs, replays
 
     def test_replay_matches_eager(self):
-        eager = self._run(replay_prefix_extend=False)
-        replay = self._run(replay_prefix_extend=True)
+        eager, eager_replays = self._run(replay_prefix_extend=False)
+        replay, replay_replays = self._run(replay_prefix_extend=True)
+        self.assertEqual(eager_replays, 0)
+        self.assertGreater(replay_replays, 0)
         for i, (e, r) in enumerate(zip(eager, replay)):
             with self.subTest(request=i):
                 if i > 0:
