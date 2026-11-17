@@ -17,8 +17,6 @@ import gguf
 import numpy as np
 import torch
 
-from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.models import dflash
 from sglang.srt.hf_transformers.config import get_config
 from sglang.srt.hf_transformers.dflash_gguf import (
     build_plain_dflash_gguf_config,
@@ -28,6 +26,8 @@ from sglang.srt.hf_transformers.gguf_native import (
     has_native_gguf_support,
     read_gguf_architecture,
 )
+from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.models import dflash
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
