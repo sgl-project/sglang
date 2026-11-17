@@ -38,6 +38,13 @@ class HunYuanImageAttentionMeta:
     seq_lens: List[int]
     num_image_tokens: int
     first_step: bool
+    # Length of the step-invariant prefix whose K/V is cached; None disables it.
+    prefix_len: Optional[int] = None
+    # Separates cached prefixes of CFG halves that share one attention module.
+    cache_slot: int = 0
+    # Per-row (start, end, causal) segments from build_attention_segments;
+    # None keeps the masked SDPA path.
+    attn_segments: Optional[tuple] = None
 
 
 def create_hunyuan_image_attention_meta(
@@ -256,10 +263,130 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-class ImageKVCacheManager:
-    """Full attention over the text+image sequence (no KV caching); packed
-    ``[tokens, heads, dim]`` inputs, 4-D bool mask.
+def build_attention_segments(seq_len: int, image_slices: List[slice]):
+    """Split ``[0, seq_len)`` into ``(start, end, causal)`` segments that
+    reproduce the causal mask with bidirectional image blocks.
+
+    A row in an image block ``[s, e)`` sees keys ``[0, e)``; any other row ``i``
+    sees keys ``[0, i]``. Returns None when blocks overlap, which keeps the
+    masked path.
     """
+    segments = []
+    pos = 0
+    for block in sorted(image_slices, key=lambda s: s.start):
+        if block.start < pos:
+            return None
+        if block.start > pos:
+            segments.append((pos, block.start, True))
+        segments.append((block.start, block.stop, False))
+        pos = block.stop
+    if pos < seq_len:
+        segments.append((pos, seq_len, True))
+    return tuple(segments)
+
+
+def segmented_attention(query, key, value, segments, attend):
+    """Mask-free attention over ``build_attention_segments`` segments.
+
+    ``query`` is ``[bs, q_len, heads, dim]`` for the last ``q_len`` of the
+    ``k_len`` positions in ``key``/``value`` (``[bs, k_len, kv_heads, dim]``).
+    ``attend(q, k, v, causal)`` takes ``[n, heads, dim]`` with the causal mask
+    aligned to the bottom right, so queries ``[a, e)`` against keys ``[0, e)``
+    see exactly ``[0, i]``.
+    """
+    bs, q_len = query.shape[:2]
+    k_len = key.shape[1]
+    q_offset = k_len - q_len
+    out = torch.empty_like(query)
+    for b in range(bs):
+        if segments[b][-1][1] != k_len:
+            raise ValueError(
+                f"segments end at {segments[b][-1][1]}, but there are {k_len} keys"
+            )
+        for start, end, causal in segments[b]:
+            if end <= q_offset:
+                continue
+            start = max(start, q_offset)
+            out[b, start - q_offset : end - q_offset] = attend(
+                query[b, start - q_offset : end - q_offset],
+                key[b, :end],
+                value[b, :end],
+                causal,
+            )
+    return out
+
+
+@lru_cache(maxsize=1)
+def _hopper_flash_attn_varlen():
+    # FA3 runs on sm90 only; elsewhere the masked SDPA path is kept.
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
+        return None
+    try:
+        from sglang.kernels.ops.attention.flash_attention import (
+            flash_attn_varlen_func,
+        )
+    except ImportError:
+        return None
+    return flash_attn_varlen_func
+
+
+@lru_cache(maxsize=256)
+def _cu_seqlens(n: int, device: torch.device) -> torch.Tensor:
+    # one upload per length and device; callers must not mutate the result
+    return torch.tensor([0, n], dtype=torch.int32, device=device)
+
+
+def _flash_attend(q, k, v, causal):
+    nq, nk = q.shape[0], k.shape[0]
+    return _hopper_flash_attn_varlen()(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        cu_seqlens_q=_cu_seqlens(nq, q.device),
+        cu_seqlens_k=_cu_seqlens(nk, q.device),
+        max_seqlen_q=nq,
+        max_seqlen_k=nk,
+        softmax_scale=q.shape[-1] ** -0.5,
+        causal=causal,
+    )
+
+
+def _masked_sdpa(query, key, value, attention_mask):
+    # [bs, seq, heads, dim] in and out; GQA K/V are expanded for SDPA.
+    repeat_num = query.shape[2] // key.shape[2]
+    query = query.transpose(1, 2).contiguous()
+    key = repeat_kv(key.transpose(1, 2).contiguous(), repeat_num)
+    value = repeat_kv(value.transpose(1, 2).contiguous(), repeat_num)
+    attn_output = F.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=attention_mask.contiguous(),
+        dropout_p=0.0,
+        is_causal=False,
+        scale=1.0 / (query.shape[-1] ** 0.5),
+    )
+    return attn_output.transpose(1, 2).contiguous()
+
+
+class ImageKVCacheManager:
+    """Attention over the text+image sequence; packed ``[tokens, heads, dim]``
+    inputs, 4-D bool mask.
+
+    With ``prefix_len`` set, the step-invariant prefix K/V is cached per
+    ``cache_slot`` on the first step. Later steps pass only the suffix tokens as
+    queries and attend to ``[cached prefix K/V, suffix K/V]``; the mask rows
+    must then cover just the suffix, with all prefix columns. With
+    ``attn_segments`` set on Hopper, attention runs as FA3 calls per segment
+    instead of SDPA with the dense mask.
+    """
+
+    def __init__(self):
+        self._prefix_kv: dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def clear(self):
+        """Release cached prefix storage after a generation finishes."""
+        self._prefix_kv.clear()
 
     def __call__(self, query, key, value, attn_metadata, attention_mask=None):
         total_tokens = query.shape[0]
@@ -268,30 +395,76 @@ class ImageKVCacheManager:
 
         head_num_per_rank = query.shape[1]
         kv_head_num_per_rank = key.shape[1]
-        repeat_num = head_num_per_rank // kv_head_num_per_rank
         head_dim = query.shape[2]
 
         query = query.reshape(bs, q_len, head_num_per_rank, head_dim)
         key = key.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
         value = value.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
 
-        query = query.transpose(1, 2).contiguous()
-        key = key.transpose(1, 2).contiguous()
-        value = value.transpose(1, 2).contiguous()
+        if attn_metadata.prefix_len is not None:
+            key, value = self._prefix_kv_step(key, value, attn_metadata)
 
-        key = repeat_kv(key, repeat_num)
-        value = repeat_kv(value, repeat_num)
+        if (
+            attn_metadata.attn_segments is not None
+            and query.is_cuda
+            and _hopper_flash_attn_varlen() is not None
+        ):
+            attn_output = segmented_attention(
+                query, key, value, attn_metadata.attn_segments, _flash_attend
+            )
+        else:
+            attn_output = _masked_sdpa(query, key, value, attention_mask)
+        return attn_output.reshape(total_tokens, head_num_per_rank, head_dim)
 
-        attn_output = F.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask.contiguous(),
-            dropout_p=0.0,
-            is_causal=False,
-            scale=1.0 / (query.shape[-1] ** 0.5),
+    def _prefix_kv_step(self, key, value, attn_metadata):
+        """Store the prefix K/V on the first step; afterwards prepend it to the
+        suffix K/V. Inputs and outputs are ``[bs, seq, heads, dim]``.
+        """
+        slot = attn_metadata.cache_slot
+        prefix_len = attn_metadata.prefix_len
+        if attn_metadata.first_step:
+            # Slicing a contiguous prefix can still retain the full-sequence
+            # allocation (notably when bs == 1). Own compact storage so the
+            # generation cache does not pin the step's full K/V tensors.
+            self._prefix_kv[slot] = (
+                key[:, :prefix_len].clone(),
+                value[:, :prefix_len].clone(),
+            )
+            return key, value
+
+        if slot not in self._prefix_kv:
+            raise RuntimeError(f"no cached prefix K/V for cache_slot={slot}")
+        prefix_k, prefix_v = self._prefix_kv[slot]
+        return (
+            torch.cat([prefix_k, key], dim=1),
+            torch.cat([prefix_v, value], dim=1),
         )
 
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(total_tokens, head_num_per_rank, head_dim)
-        return attn_output
+
+def split_suffix_inputs(
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    custom_pos_emb: Tuple[torch.Tensor, torch.Tensor],
+    prefix_len: int,
+) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Keep only the rows after ``prefix_len``. ``hidden_states`` is packed
+    ``[bs * seq, hidden]``, the mask is ``[bs, 1, seq, seq]``, and the RoPE
+    tables are ``[bs, seq, head_dim]``.
+    """
+    bs, _, seq_len, _ = attention_mask.shape
+    hidden = hidden_states.reshape(bs, seq_len, -1)[:, prefix_len:]
+    cos, sin = custom_pos_emb
+    return (
+        hidden.reshape(-1, hidden.shape[-1]),
+        attention_mask[:, :, prefix_len:, :],
+        (cos[:, prefix_len:], sin[:, prefix_len:]),
+    )
+
+
+def pad_prefix_rows(suffix_out: torch.Tensor, bs: int, prefix_len: int) -> torch.Tensor:
+    """Re-expand suffix outputs to full ``[bs * seq, hidden]`` with zero prefix
+    rows; callers only read image positions, which all lie in the suffix.
+    """
+    out = suffix_out.reshape(bs, -1, suffix_out.shape[-1])
+    pad = out.new_zeros(bs, prefix_len, out.shape[-1])
+    return torch.cat([pad, out], dim=1).reshape(-1, out.shape[-1])

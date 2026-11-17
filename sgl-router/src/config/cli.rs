@@ -67,6 +67,11 @@ pub struct ModelArgs {
     #[arg(long)]
     pub model_id: String,
 
+    /// Extra `model` value rewritten to --model-id in the forwarded body (repeatable),
+    /// preserving a LoRA suffix. /v1/models lists only --model-id.
+    #[arg(long = "model-alias", value_name = "MODEL")]
+    pub model_alias: Vec<String>,
+
     /// Local tokenizer.json or HuggingFace repo id. Defaults to --model-id; honors HF_TOKEN / HF_HOME.
     #[arg(long)]
     pub tokenizer_path: Option<String>,
@@ -169,7 +174,7 @@ pub struct ServerArgs {
     /// Upper bound on the backoff between retries, in milliseconds.
     #[arg(long, default_value_t = ProxyConfig::default().max_backoff_ms)]
     pub retry_max_backoff_ms: u64,
-    /// PD: return decode's stream only once prefill completes, as sgl-model-gateway does.
+    /// PD: return decode's stream only once prefill completes.
     #[arg(long)]
     pub pd_stream_after_prefill: bool,
 
@@ -658,6 +663,7 @@ impl Cli {
                         .unwrap_or_else(|| self.model.model_id.clone())
                 }),
                 id: self.model.model_id,
+                aliases: self.model.model_alias,
                 disable_input_ids_forwarding: self.model.disable_input_ids_forwarding,
                 tokenizer: TokenizerConfig {
                     backend: self.model.tokenizer_backend,
@@ -1546,6 +1552,23 @@ mod tests {
         .unwrap();
         assert_eq!(c.model.id, "Qwen/Qwen3-0.6B");
         assert_eq!(c.model.tokenizer_path.as_deref(), Some("Qwen/Qwen3-0.6B"));
+        assert!(c.model.aliases.is_empty());
+    }
+
+    #[test]
+    fn model_alias_is_repeatable() {
+        let c = into_config(&[
+            "--model-id",
+            "org/repo",
+            "--model-alias",
+            "/weights-repo/snapshots/abc",
+            "--model-alias",
+            "repo",
+            "--worker-urls",
+            "http://x:30000",
+        ])
+        .unwrap();
+        assert_eq!(c.model.aliases, ["/weights-repo/snapshots/abc", "repo"]);
     }
 
     #[test]
@@ -1877,7 +1900,7 @@ mod tests {
     }
 
     /// Multiple `--selector` terms AND-join into one comma-separated
-    /// label selector (matches the Python router's space-separated form).
+    /// label selector.
     #[test]
     fn k8s_plain_selector_joins_multiple_terms() {
         let c = into_config_owned(with_model(&[

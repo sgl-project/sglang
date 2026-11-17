@@ -15,8 +15,8 @@ SGLang supports the following Ascend inference hardware:
 
 | Hardware                  | Devices | Dies per card | Memory configuration                            |
 | ------------------------- | ------- | ------------- | ----------------------------------------------- |
-| Ascend A3 Series Products | 16      | 2             | 8(cards) × 2(dies/card) × 64(GB/die)            |
-| Ascend 950PR/DT Series    | 8       | 1             | 8(cards) × 1(die/card) — HBM depends on the chip |
+| A3 Series Products | 16      | 2             | 8(cards) × 2(dies/card) × 64(GB/die)            |
+| 950PR/DT Series    | 8       | 1             | 8(cards) × 1(die/card) — HBM depends on the chip |
 
 <Note>
 Throughout these docs, **A3 Series** and **950PR/DT Series** are used as shorthand for the hardware above.

@@ -7,18 +7,20 @@ import copy
 import logging
 from typing import Any
 
-from sglang.srt.arg_groups.overrides import (
-    declare_resolution,
+from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
-    post_capture_kv_sizing_planned,
     resolved_view,
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.arg_groups.overrides import (
+    declare_resolution,
+    post_capture_kv_sizing_planned,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
-from sglang.srt.utils.common import get_device_memory_capacity
+from sglang.srt.utils.device import get_device_memory_capacity
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +119,9 @@ def handle_gpu_memory_settings(server_args: Any):
                     decode_cuda_graph_config.max_bs = 160
         elif gpu_mem < 60 * 1024:
             # A100 (40GB), L40,
-            # (chunked_prefill_size 4k, max_bs 32 if tp < 4 else 160)
+            # (chunked_prefill_size 4k, max_bs 128 if tp < 4 else 160)
+            # Measured on L40S with Qwen3 0.6B to 8B. Decode above the cap runs
+            # eager, and graphs up to bs=128 cost the 8B 1% of its KV pool.
             if cfg.chunked_prefill_size is None:
                 declare_resolution(
                     server_args,
@@ -126,7 +130,7 @@ def handle_gpu_memory_settings(server_args: Any):
                 )
             if decode_cuda_graph_config.max_bs is None:
                 if cfg.tp_size < 4:
-                    decode_cuda_graph_config.max_bs = 32
+                    decode_cuda_graph_config.max_bs = 128
                 else:
                     decode_cuda_graph_config.max_bs = 160
         elif gpu_mem < 90 * 1024:
@@ -209,20 +213,29 @@ def handle_gpu_memory_settings(server_args: Any):
         # Reuse decode_cuda_graph_config.bs for cpu graph and use torch_compile_max_bs for cpu graph batch size limit,
         # as cpu graph is based on torch.compile
         if decode_cuda_graph_config.bs is not None:
+            max_bs = max(decode_cuda_graph_config.bs)
             declare_resolution(
                 server_args,
                 "_handle_gpu_memory_settings",
-                torch_compile_max_bs=max(decode_cuda_graph_config.bs),
+                torch_compile_max_bs=max_bs,
             )
+            decode_cuda_graph_config.max_bs = max_bs
         else:
-            # If decode_cuda_graph_config.bs is not set, we will preferentially use torch_compile_max_bs
-            # to generate decode_cuda_graph_config.bs
+            # If decode_cuda_graph_config.bs is not set, an explicit decode.max_bs takes
+            # precedence over the default torch_compile_max_bs
+            if (Phase.DECODE, "max_bs") in getattr(
+                server_args, "_cuda_graph_config_locked", set()
+            ):
+                max_bs = decode_cuda_graph_config.max_bs
+            else:
+                max_bs = cfg.torch_compile_max_bs
+
             declare_resolution(
                 server_args,
                 "_handle_gpu_memory_settings",
-                torch_compile_max_bs=cfg.torch_compile_max_bs
-                or decode_cuda_graph_config.max_bs,
+                torch_compile_max_bs=max_bs,
             )
+            decode_cuda_graph_config.max_bs = max_bs
             decode_cuda_graph_config.bs = generate_cpu_graph_batch_sizes(server_args)
 
         assert cfg.torch_compile_max_bs > 0, (

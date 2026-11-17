@@ -120,7 +120,8 @@ framework-specific optimization workflow.
 - Locations: `quality_gate.py`, `fused_ln_modulate.py`, `denoising.py`,
   `decoding.py`, `fast_path_gate.py`, `flux2_vae_cuda_opt.py`, and
   `wan_vae_cuda_opt.py`.
-- Behavior: `quality="lossless"` is the default exact reference path.
+- Behavior: `quality="exact"` is the bit-exact reference path; `lossless` is
+  the default.
   `quality="lossless"` and `quality="high"` mount the same validated but
   non-bit-exact DiT fusions and decode-scoped VAE rewrites. `high` is
   cumulative and may additionally enable model-owned approximate paths.
@@ -384,6 +385,8 @@ framework-specific optimization workflow.
   good on a mismatch. The denorm kernel runs in place when the decode stage
   owns the frames.
 - Under `quality=lossless` / `high` (`VaeFastPathGate`, decode scoped): the
+  ViT decoder blocks fuse each scaled residual add into the next RMSNorm
+  (`vae_vit.py`, CUDA only, rounding-level differences), and the
   tiled decode runs up to `vae_config.decoder_tile_batch` (64) spatial tiles
   and `vae_config.window_batch` (1) temporal windows per decoder forward, in
   the original order. Batching changes cuBLAS/cuDNN algorithm selection, so it

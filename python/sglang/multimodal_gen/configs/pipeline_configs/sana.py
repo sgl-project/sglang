@@ -28,9 +28,9 @@ from sglang.multimodal_gen.configs.models.encoders.base import EncoderConfig
 from sglang.multimodal_gen.configs.models.encoders.gemma2 import Gemma2Config
 from sglang.multimodal_gen.configs.models.vaes.sana import SanaVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
     SpatialImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 
 def sana_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
@@ -48,7 +48,10 @@ class SanaPipelineConfig(SpatialImagePipelineConfig):
     should_use_guidance: bool = False
     enable_autocast: bool = False
 
-    # DC-AE does not support tiling or SP VAE decode yet.
+    # Tiled decode is supported (--vae-tiling) but kept off by default: DC-AE
+    # is a 32x-compression autoencoder and tile seam quality / the benefit of
+    # diffusers' default 512 tile have not been validated. SP VAE decode is
+    # not supported.
     vae_tiling: bool = False
     vae_sp: bool = False
     vae_precision: str = "fp32"

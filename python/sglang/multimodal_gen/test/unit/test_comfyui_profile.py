@@ -16,27 +16,13 @@ from safetensors.torch import save_file
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.registry import get_pipeline_class
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
-)
 from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (
     get_comfyui_checkpoint_spec,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.server_args.server_args import set_global_server_args
-from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
-    ensure_distributed_env_defaults,
-)
 
 HEADS, HEAD_DIM, LAYERS, SINGLE_LAYERS = 4, 16, 2, 2
-
-
-def _ensure_single_process_parallel_runtime() -> None:
-    if model_parallel_is_initialized():
-        return
-    ensure_distributed_env_defaults()
-    maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
 
 
 def _shrink(arch) -> None:
@@ -118,7 +104,7 @@ def _write_comfyui_flux_checkpoint(
 
 
 @pytest.fixture(scope="module")
-def comfyui_flux_pipeline():
+def comfyui_flux_pipeline(single_process_model_parallel):
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
 
@@ -138,7 +124,6 @@ def comfyui_flux_pipeline():
     )
     _shrink(server_args.pipeline_config.dit_config.arch_config)
     set_global_server_args(server_args)
-    _ensure_single_process_parallel_runtime()
 
     pipeline = get_pipeline_class("FluxPipeline")(
         model_path=checkpoint, server_args=server_args
@@ -232,11 +217,11 @@ def test_comfyui_flux_guidance_embeds_follows_checkpoint_keys():
         assert dit_config.arch_config.guidance_embeds is with_guidance
 
 
+@pytest.mark.usefixtures("single_process_model_parallel")
 def test_comfyui_flux_schnell_checkpoint_loads_without_guidance_embedder():
     """Regression test for the ComfyUI-mode loader always assuming
     guidance_embeds=True: a FLUX.1-schnell-shaped checkpoint (no guidance_in.*
     tensors) must load on its own, not just dev-shaped ones."""
-    _ensure_single_process_parallel_runtime()
 
     from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
     from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model

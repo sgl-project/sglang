@@ -5,7 +5,7 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.layer_boundary import layer_stack
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models import nemotron_h as model
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci

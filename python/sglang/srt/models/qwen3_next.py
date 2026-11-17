@@ -9,9 +9,11 @@ from torch import nn
 
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
+from sglang.kernels.ops.attention.qk_gemma_norm_rope import qk_gemma_norm_rope
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat,
 )
+from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -29,6 +31,10 @@ from sglang.srt.layers.layer_boundary import (
     declare_ffn,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual.add_norm import (
+    Fp8Input,
+    NormQuantReadout,
+)
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -40,9 +46,12 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.utils import validate_quant_param_compatibility
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
+from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
+from sglang.srt.layers.utils.layer_list import make_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -62,7 +71,6 @@ from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
 from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import (
     LazyValue,
-    add_prefix,
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
@@ -70,8 +78,6 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
-    make_layers,
-    set_weight_attrs,
 )
 
 logger = logging.getLogger(__name__)
@@ -82,8 +88,10 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # The fused attention prologue is a gfx950-only aiter op; gate the arch here so
-# other HIP devices never take the fused path (and never pay a double qkv_proj).
+# other HIP devices never take the fused path.
 _use_fused_prologue = _use_aiter and is_gfx95_supported()
+# The Triton prologue (qk_gemma_norm_rope) is validated on gfx950 only.
+_use_triton_prologue = _is_hip and is_gfx95_supported()
 _is_amx_available = cpu_has_amx_support()
 
 
@@ -106,6 +114,27 @@ def _fused_attention_prologue():
     return fused_attention_qk_norm_rope, fused_attention_qk_norm_rope_supported
 
 
+def _supports_triton_prologue(
+    *, rope: nn.Module, head_dim: int, attn_output_gate: bool
+) -> bool:
+    # The Triton prologue follows the native split + GemmaRMSNorm + neox RoPE
+    # (fallback kernel, fp32 cos/sin cache) rounding; it needs power-of-two
+    # head_dim and rotary_dim / 2.
+    return (
+        _use_triton_prologue
+        and attn_output_gate
+        and type(rope) is RotaryEmbedding
+        and rope.use_fallback_kernel
+        # RL on-policy forces the native RoPE to match the trainer bitwise.
+        and not rope._force_native
+        and rope.is_neox_style
+        and rope.cos_sin_cache.dtype == torch.float32
+        and rope.rotary_dim % 2 == 0
+        and (rope.rotary_dim // 2) & (rope.rotary_dim // 2 - 1) == 0
+        and head_dim & (head_dim - 1) == 0
+    )
+
+
 if _is_npu:
     from sgl_kernel_npu.fla.utils import (
         fused_qkvzba_split_reshape_cat as fused_qkvzba_split_reshape_cat_npu,
@@ -115,6 +144,30 @@ if _is_npu:
     )
 
     fused_qkvzba_split_reshape_cat = fused_qkvzba_split_reshape_cat_npu
+
+
+def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
+    quant_method = getattr(linear, "quant_method", None)
+    return quant_method.__class__.__name__ == "Fp8LinearMethod" and (
+        getattr(quant_method, "block_quant", False)
+        or getattr(quant_method, "use_mxfp8", False)
+    )
+
+
+def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
+    """Pick the member of a fused-AR output tuple that ``linear`` can consume."""
+    if not isinstance(hidden_states, tuple):
+        return hidden_states
+    if len(hidden_states) == 3:
+        hs_bf16, hs_fp8, hs_scale = hidden_states
+        if _linear_accepts_fp8_tuple(linear):
+            return (hs_fp8, hs_scale)
+        return hs_bf16
+    if len(hidden_states) == 2 and _linear_accepts_fp8_tuple(linear):
+        return hidden_states
+    raise TypeError(
+        f"{linear.__class__.__name__} cannot consume fused AR quant tuple input"
+    )
 
 
 class Qwen3GatedDeltaNet(nn.Module):
@@ -185,12 +238,8 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         # Override weight_loader for packed checkpoint format.
         # Must capture original_loader BEFORE overwriting.
-        self._override_weight_loader(
-            self.in_proj_qkvz, self._make_packed_weight_loader(self.in_proj_qkvz)
-        )
-        self._override_weight_loader(
-            self.in_proj_ba, self._make_packed_weight_loader(self.in_proj_ba)
-        )
+        self._bind_packed_weight_loaders(self.in_proj_qkvz)
+        self._bind_packed_weight_loaders(self.in_proj_ba)
 
         # Conv1d weight loader setup
         query_key_settings = (self.key_dim, 0, False)
@@ -285,12 +334,18 @@ class Qwen3GatedDeltaNet(nn.Module):
         ModelWeightParameter exposes weight_loader as a read-only property
         backed by _weight_loader, while plain parameters store it as a
         regular attribute.  This helper handles both cases."""
+        if new_loader is None:
+            return
         for attr_name in (
             "weight",
             "weight_scale_inv",
             "weight_scale",
             "input_scale",
             "weight_offset",
+            "qweight",
+            "qzeros",
+            "scales",
+            "g_idx",
         ):
             param = getattr(module, attr_name, None)
             if param is None:
@@ -300,19 +355,55 @@ class Qwen3GatedDeltaNet(nn.Module):
             else:
                 param.weight_loader = new_loader
 
+    @classmethod
+    def _bind_packed_weight_loaders(cls, module):
+        """Bind packed-checkpoint-aware loaders to all present params on a module."""
+        for attr_name in (
+            "weight",
+            "weight_scale_inv",
+            "weight_scale",
+            "input_scale",
+            "weight_offset",
+            "qweight",
+            "qzeros",
+            "scales",
+            "g_idx",
+        ):
+            param = getattr(module, attr_name, None)
+            if param is None:
+                continue
+            original_loader = getattr(param, "weight_loader", None)
+            if original_loader is None:
+                continue
+            wrapped_loader = cls._make_packed_weight_loader(module, original_loader)
+            if hasattr(param, "_weight_loader"):
+                param._weight_loader = wrapped_loader
+            else:
+                param.weight_loader = wrapped_loader
+
     @staticmethod
-    def _make_packed_weight_loader(module):
+    def _make_packed_weight_loader(module, original_loader=None):
         """Create a weight_loader that does contiguous TP slicing for fused
         (packed-format) checkpoint weights (shard_id=None), and delegates
         to the standard MergedColumnParallelLinear loader for split checkpoint
         weights (shard_id=int/tuple)."""
-        original_loader = module.weight.weight_loader
+        if original_loader is None:
+            weight = getattr(module, "weight", None)
+            original_loader = getattr(weight, "weight_loader", None)
 
         def weight_loader(param, loaded_weight, loaded_shard_id=None):
             if loaded_shard_id is None:
                 # Fused checkpoint: weight is in packed (per-head-group)
                 # format. Do contiguous TP slice like ColumnParallelLinear.
                 output_dim = getattr(param, "output_dim", None)
+                if (
+                    output_dim is None
+                    and loaded_weight.numel() == 1
+                    and param.data.shape != loaded_weight.shape
+                    and original_loader is not None
+                ):
+                    original_loader(param, loaded_weight, loaded_shard_id)
+                    return
                 group = module.tp_group
                 if (
                     output_dim is not None
@@ -340,6 +431,10 @@ class Qwen3GatedDeltaNet(nn.Module):
                     param.data.copy_(loaded_weight)
             else:
                 # Split checkpoint (int or tuple shard_id) → standard path
+                if original_loader is None:
+                    raise AttributeError(
+                        f"{type(module).__name__} parameter has no original weight_loader"
+                    )
                 original_loader(param, loaded_weight, loaded_shard_id)
 
         return weight_loader
@@ -423,7 +518,20 @@ class Qwen3GatedDeltaNet(nn.Module):
         else:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
 
-        seq_len, _ = hidden_states.shape
+        # With Fp8Input.TUPLE_AND_BF16 declared, the boundary hands down a
+        # (bf16, fp8, scale) triple: an FP8 in_proj_qkvz takes (fp8, scale)
+        # directly, while the small in_proj_ba gating projection is not
+        # block-quantized and takes the bf16 side-output.
+        if isinstance(hidden_states, tuple):
+            hs_shape = hidden_states[0]
+            hs_qkvz = _select_fused_ar_input_for_linear(
+                hidden_states, self.in_proj_qkvz
+            )
+            hs_ba = _select_fused_ar_input_for_linear(hidden_states, self.in_proj_ba)
+        else:
+            hs_shape = hs_qkvz = hs_ba = hidden_states
+
+        seq_len, _ = hs_shape.shape
         if (
             self.alt_stream is not None
             and get_is_capture_mode()
@@ -431,13 +539,13 @@ class Qwen3GatedDeltaNet(nn.Module):
         ):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            projected_states_qkvz, _ = self.in_proj_qkvz(hs_qkvz)
             with torch.cuda.stream(self.alt_stream):
-                projected_states_ba, _ = self.in_proj_ba(hidden_states)
+                projected_states_ba, _ = self.in_proj_ba(hs_ba)
             current_stream.wait_stream(self.alt_stream)
         else:
-            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            projected_states_qkvz, _ = self.in_proj_qkvz(hs_qkvz)
+            projected_states_ba, _ = self.in_proj_ba(hs_ba)
         return projected_states_qkvz, projected_states_ba
 
     def forward(
@@ -568,8 +676,23 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        # Declare the fused AR+RMSNorm+per-group-quant read only when the
+        # consuming projection can take the (fp8, scale) pair; otherwise the
+        # boundary keeps the plain AR+RMSNorm path.
+        # Only the aiter path can serve a quantized read, so every other
+        # backend keeps the plain tensor.
+        accepts_fp8_input = _use_aiter and _linear_accepts_fp8_tuple(
+            self.linear_attn.in_proj_qkvz
+        )
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
+            (
+                declare_attn(
+                    read=NormQuantReadout(
+                        fp8_input=Fp8Input.TUPLE_AND_BF16 if accepts_fp8_input else None
+                    )
+                ),
+                self.input_layernorm,
+            ),
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
@@ -729,8 +852,21 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
+        # Declare the fused AR+RMSNorm+per-group-quant read only when the
+        # consuming projection can take the (fp8, scale) pair; otherwise the
+        # boundary keeps the plain AR+RMSNorm path.
+        # Only the aiter path can serve a quantized read, so every other
+        # backend keeps the plain tensor.
+        accepts_fp8_input = _use_aiter and _linear_accepts_fp8_tuple(self.qkv_proj)
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
+            (
+                declare_attn(
+                    read=NormQuantReadout(
+                        fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None
+                    )
+                ),
+                self.input_layernorm,
+            ),
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
@@ -741,6 +877,11 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         )
 
         self.alt_stream = alt_stream
+        self.use_triton_prologue = _supports_triton_prologue(
+            rope=self.rotary_emb,
+            head_dim=self.head_dim,
+            attn_output_gate=self.attn_output_gate,
+        )
 
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
@@ -764,7 +905,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         k = k_by_head.view(k.shape)
         return q, k
 
-    def forward_prepare_fused(self, positions, hidden_states):
+    def forward_prepare_fused(self, positions, qkv):
         # gfx950 single-launch prologue: [Q||gate] split + Q/K GemmaRMSNorm +
         # partial RoPE. Returns None when unavailable or unsupported so the
         # caller falls back to the native prologue.
@@ -772,7 +913,6 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         if ops is None:
             return None
         fused_prologue, prologue_supported = ops
-        qkv, _ = self.qkv_proj(hidden_states)
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         ok, _ = prologue_supported(
             qkv, self.q_norm.weight, self.k_norm.weight, positions, cos_sin_cache
@@ -789,8 +929,24 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             gate.reshape(-1, self.q_size),
         )
 
-    def forward_prepare_native(self, positions, hidden_states):
-        qkv, _ = self.qkv_proj(hidden_states)
+    def forward_prepare_triton(self, positions, qkv):
+        rope = self.rotary_emb
+        if rope.cos_sin_cache.device != qkv.device:
+            rope.cos_sin_cache = rope.cos_sin_cache.to(qkv.device)
+        return qk_gemma_norm_rope(
+            qkv,
+            positions,
+            rope.cos_sin_cache,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.q_norm.variance_epsilon,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            rope.rotary_dim,
+        )
+
+    def forward_prepare_native(self, positions, qkv):
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
@@ -799,7 +955,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
             q, gate = torch.chunk(q_gate, 2, dim=-1)
             q = q.reshape(*orig_shape, -1)
-            gate = gate.reshape(*orig_shape, -1)
+            # gate stays as 3D strided view; fused_sigmoid_mul handles it directly
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             gate = None
@@ -808,8 +964,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v, gate
 
-    def forward_prepare_npu(self, positions, hidden_states, forward_batch):
-        qkv, _ = self.qkv_proj(hidden_states)
+    def forward_prepare_npu(self, positions, qkv, forward_batch):
         # Calculate first full attention layer ID based on config
         if self.attn.layer_id == (self.config.full_attention_interval - 1):
             self.rotary_emb.get_cos_sin_with_position(positions)
@@ -835,39 +990,42 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
+        # Computed once: a fused prologue that turns out unsupported falls back
+        # to the next one on the same qkv.
+        qkv, _ = self.qkv_proj(
+            _select_fused_ar_input_for_linear(hidden_states, self.qkv_proj)
+        )
         fused = None
         if _use_fused_prologue and self.attn_output_gate:
-            fused = self.forward_prepare_fused(positions, hidden_states)
+            fused = self.forward_prepare_fused(positions, qkv)
         if fused is not None:
             q, k, v, gate = fused
+        elif self.use_triton_prologue:
+            q, k, v, gate = self.forward_prepare_triton(positions, qkv)
         elif (
             not _is_npu
             or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
             or not self.attn_output_gate
         ):
-            q, k, v, gate = self.forward_prepare_native(
-                positions=positions,
-                hidden_states=hidden_states,
-            )
+            q, k, v, gate = self.forward_prepare_native(positions=positions, qkv=qkv)
         else:
             q, k, v, gate = self.forward_prepare_npu(
                 positions=positions,
-                hidden_states=hidden_states,
+                qkv=qkv,
                 forward_batch=forward_batch,
             )
 
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            if _is_hip:
-                from sglang.kernels.ops.elementwise.elementwise import (
-                    fused_sigmoid_mul,
+            if _is_cuda or _is_hip:
+                # round_sigmoid keeps CUDA bit-identical to torch sigmoid-then-mul.
+                attn_output = fused_sigmoid_mul(
+                    attn_output, gate, inplace=True, round_sigmoid=_is_cuda
                 )
-
-                attn_output = fused_sigmoid_mul(attn_output, gate)
             else:
-                gate = torch.sigmoid(gate)
-                attn_output = attn_output * gate
+                gate = gate.reshape(gate.shape[0], -1)
+                attn_output = attn_output * torch.sigmoid(gate)
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -1213,6 +1371,7 @@ class Qwen3NextForCausalLM(nn.Module):
                     continue
 
                 replaced_name = name.replace(weight_name, param_name)
+                validate_quant_param_compatibility(replaced_name, params_dict)
                 # Skip loading extra bias for GPTQ models.
                 if replaced_name.endswith(".bias") and replaced_name not in params_dict:
                     continue
@@ -1254,6 +1413,7 @@ class Qwen3NextForCausalLM(nn.Module):
                     )
                     break
                 else:
+                    validate_quant_param_compatibility(name, params_dict)
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue

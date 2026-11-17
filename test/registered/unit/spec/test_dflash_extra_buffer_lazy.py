@@ -15,7 +15,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import override_platform
 from sglang.srt.speculative import dflash_info
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -58,8 +58,8 @@ class TestValidateMambaExtraBufferLazyDflash(CustomTestCase):
     def test_dspark_still_accepted(self):
         self._validate(_lazy_view(speculative_algorithm="DSPARK"))
 
-    def test_pd_disaggregation_still_rejected(self):
-        with self.assertRaisesRegex(AssertionError, "PD disaggregation"):
+    def test_pd_decode_still_rejected(self):
+        with self.assertRaisesRegex(AssertionError, "PD decode worker"):
             self._validate(_lazy_view(disaggregation_mode="decode"))
 
     def test_track_interval_must_cover_draft_tokens(self):

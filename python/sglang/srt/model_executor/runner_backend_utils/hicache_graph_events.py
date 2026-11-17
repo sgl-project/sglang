@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
     rt,

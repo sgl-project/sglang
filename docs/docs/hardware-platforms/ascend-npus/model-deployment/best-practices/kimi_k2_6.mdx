@@ -19,20 +19,20 @@ The optimal configurations on this page are validated with the image `quay.io/as
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Kimi-K2.6 | Ascend A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 20ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-20ms) |
+| Kimi-K2.6 | A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 20ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-20ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Kimi-K2.6 | Ascend A3 Series Products | 16 | PD Mixed | 64k+1k | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-16p-in64k-out1k-100ms) |
-| Kimi-K2.6 | Ascend A3 Series Products | 16 | PD Disaggregation | 128k+1k | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-100ms) |
-| Kimi-K2.6 | Ascend A3 Series Products | 16 | PD Disaggregation | 128k+1k (90% prefix cache hit rate) | 100ms | 5s | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-prefix90-100ms) |
-| Kimi-K2.6 | Ascend A3 Series Products | 16 | PD Disaggregation | 64k+1.5k | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-100ms) |
-| Kimi-K2.6 | Ascend A3 Series Products | 16 | PD Disaggregation | 64k+1.5k (90% prefix cache hit rate) | 100ms | 3s | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-prefix90-100ms) |
-| Kimi-K2.6 | Ascend A3 Series Products | 8 | PD Mixed | 1024x1024 (30)+1024 | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1024x1024-30-out1024-50ms) |
-| Kimi-K2.6 | Ascend A3 Series Products | 8 | PD Mixed | 1080p_30+256 | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1080p-30-out256-50ms) |
-| Kimi-K2.6 | Ascend A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-50ms) |
+| Kimi-K2.6 | A3 Series Products | 16 | PD Mixed | 64k+1k | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-16p-in64k-out1k-100ms) |
+| Kimi-K2.6 | A3 Series Products | 16 | PD Disaggregation | 128k+1k | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-100ms) |
+| Kimi-K2.6 | A3 Series Products | 16 | PD Disaggregation | 128k+1k (90% prefix cache hit rate) | 100ms | 5s | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-prefix90-100ms) |
+| Kimi-K2.6 | A3 Series Products | 16 | PD Disaggregation | 64k+1.5k | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-100ms) |
+| Kimi-K2.6 | A3 Series Products | 16 | PD Disaggregation | 64k+1.5k (90% prefix cache hit rate) | 100ms | 3s | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-prefix90-100ms) |
+| Kimi-K2.6 | A3 Series Products | 8 | PD Mixed | 1024x1024 (30)+1024 | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1024x1024-30-out1024-50ms) |
+| Kimi-K2.6 | A3 Series Products | 8 | PD Mixed | 1080p_30+256 | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1080p-30-out256-50ms) |
+| Kimi-K2.6 | A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-50ms) |
 
 ## Optimal Configuration
 
@@ -42,7 +42,7 @@ The optimal configurations on this page are validated with the image `quay.io/as
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -147,7 +147,7 @@ done
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -166,7 +166,7 @@ python -m sglang.bench_serving \
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -325,15 +325,17 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
 #   <your decode ip>: decode node IP address
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
-    --policy cache_aware
+    --request-timeout-secs 1800 \
+    --stale-request-timeout-secs 1800
 ```
 
 #### Benchmark
@@ -341,7 +343,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -359,7 +361,7 @@ python -m sglang.bench_serving \
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -521,15 +523,17 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
 #   <your decode ip>: decode node IP address
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
-    --policy cache_aware
+    --request-timeout-secs 1800 \
+    --stale-request-timeout-secs 1800
 ```
 
 #### Benchmark
@@ -540,7 +544,7 @@ We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
     --host 127.0.0.1 \
@@ -559,7 +563,7 @@ python -m sglang.bench_serving \
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -716,15 +720,17 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
 #   <your decode ip>: decode node IP address
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
-    --policy cache_aware
+    --request-timeout-secs 1800 \
+    --stale-request-timeout-secs 1800
 ```
 
 #### Benchmark
@@ -732,7 +738,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -750,7 +756,7 @@ python -m sglang.bench_serving \
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -908,15 +914,15 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
 #   <your decode ip>: decode node IP address
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip>:8001 \
     --host 127.0.0.1 \
-    --port 6688 \
-    --policy cache_aware
+    --port 6688
 ```
 
 #### Benchmark
@@ -927,7 +933,7 @@ We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
     --host 127.0.0.1 \
@@ -948,7 +954,7 @@ python -m sglang.bench_serving \
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 8
 
@@ -1038,7 +1044,7 @@ python3 -m sglang.launch_server \
 We tested it based on the `IMAGE` dataset with 1024x1024 resolution.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name image \
     --backend sglang-oai-chat \
     --host 127.0.0.1 \
@@ -1059,7 +1065,7 @@ python -m sglang.bench_serving \
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 8
 
@@ -1147,7 +1153,7 @@ python3 -m sglang.launch_server \
 We tested it based on the `IMAGE` dataset with 1920x1080 resolution.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name image \
     --backend sglang-oai-chat \
     --host 127.0.0.1 \
@@ -1168,7 +1174,7 @@ python -m sglang.bench_serving \
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 8
 
@@ -1262,7 +1268,7 @@ python3 -m sglang.launch_server \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -1280,7 +1286,7 @@ python -m sglang.bench_serving \
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 8
 
@@ -1373,7 +1379,7 @@ python3 -m sglang.launch_server \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \

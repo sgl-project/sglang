@@ -1,17 +1,19 @@
 # SGLang processor
 
 A thin wrapper over Dynamo's frontend crates (`dynamo-renderer`,
-`dynamo-tokenizers`, `dynamo-parsers`), shared by SGLang's Rust hosts.
+`dynamo-tokenizers`, `dynamo-parsers`, `dynamo-multimodal`), shared by SGLang's
+Rust hosts.
 
 **Rule.** Each feature calls Dynamo directly. SGLang code exists only where
 Dynamo differs from SGLang's Python serving behavior, or lacks a model; that
 code names the Python source it mirrors. Hosts own request types, sampling,
 validation, transport and runtime.
 
-Hosts use the re-exported `dynamo_protocols`, `dynamo_renderer` and
-`dynamo_tokenizers` so their Dynamo versions match the processor's.
+Hosts use the re-exported `dynamo_protocols`, `dynamo_renderer`,
+`dynamo_tokenizers` and `dynamo_multimodal` so their Dynamo versions match the
+processor's.
 
-The `render`, `tokenizer` and `parser` features (all default) gate each
+The `render`, `tokenizer`, `parser` and `mm` features (all default) gate each
 component and its Dynamo crate, so a host that only renders and tokenizes
 skips `dynamo-parsers`.
 
@@ -22,6 +24,7 @@ src/
   render/          chat request -> prompt
     models/        model-specific SGLang code
     legacy/        conversation.py templates
+  mm/              image bytes + prompt ids -> model inputs
   parser/          engine output -> chat events
   deepseek_output.rs  DeepSeek-V4 / V4.1 output ids -> reasoning, content, tool calls
   openai/          OpenAI requests over /generate
@@ -59,13 +62,14 @@ setting and picks one per request.
 select_chat_formatter(&ChatFormatterOptions) -> (Option<ChatFormatter>, Option<String>)
 load_chat_formatter(tokenizer_config, model_path, model_type, chat_template) -> Result<ChatFormatter, TemplateError>
 ChatFormatter::render_prompt(&dyn OAIChatLikeRequest) -> Result<RenderedPrompt, TemplateError>
-ChatFormatter::render_request(serde_json::Value, &default_kwargs) -> Result<(RenderedPrompt, String), TemplateError>  // DeepSeek-V4, V4.1, GLM-5.3, Kimi K3, Qwen3.8
+ChatFormatter::render_request(serde_json::Value, &default_kwargs) -> Result<(RenderedPrompt, String), TemplateError>  // DeepSeek-V4, V4.1, GLM-5.3, Kimi K3, MiniMax-M3, Qwen3.8, StepFun
 ChatFormatter::deepseek_v4(v41, tokenizer_json) -> Result<ChatFormatter, String>
 ChatFormatter::encode_request(serde_json::Value, &default_kwargs) -> Option<Result<Vec<u32>, TemplateError>>  // DeepSeek-V4, V4.1
 ChatFormatter::resolve_thinking(&mut kwargs, tools_enabled, named_tool_choice) -> Option<bool>
 ChatFormatter::stop_strs() -> Option<OneOrMany<String>>
 requested_effort(&body) -> Option<&Value>
 requested_thinking(&body) -> Option<bool>
+extract_images(&messages) -> Vec<String>
 ```
 
 `select_chat_formatter` (`selection.rs`) picks a formatter from
@@ -77,7 +81,9 @@ native formatters.
 | DeepSeek V4, V4.1 | `models/deepseek_v4.rs` on deepseek-recipe |
 | GLM-5.3, GLM-5.3-Flash | `models/glm53.rs` on the checkpoint's Jinja template, picked by the template |
 | Kimi K3 | `models/kimi_k3.rs` on Dynamo's K3 formatter |
+| MiniMax-M3, MiniMax-M3.1-Flash | `models/minimax_m3.rs` on the checkpoint's Jinja template, picked by `model_type` (`minimax_m3_vl`), or by the template without a `config.json` |
 | Qwen3.8 (Max, 27B, Flash-Next) | `models/qwen38.rs` on the checkpoint's Jinja template, picked by the template |
+| Step-3.5-Flash, Step-3.7-Flash, Step-5-Preview | `models/step3p5.rs` on the checkpoint's Jinja template, picked by the template |
 | DeepSeek V3.2, Inkling, other Dynamo native models | Dynamo native formatter, with SGLang's thinking defaults |
 | Everything else | `load_chat_formatter` |
 
@@ -92,8 +98,8 @@ Jinja and native formatters. It keeps Dynamo's segments so Kimi K3 can encode
 with `encode_segments`.
 `render_request` takes the SGLang request body, because DeepSeek-V4 and V4.1 read
 `task`, `continue_final_message` and the `reasoning` object, which
-`OAIChatLikeRequest` lacks, and GLM-5.3 and Qwen3.8 build their template context from it as
-SGLang does. It returns the continuation prefix separately, since
+`OAIChatLikeRequest` lacks, and GLM-5.3, MiniMax-M3, Qwen3.8 and StepFun build their
+template context from it as SGLang does. It returns the continuation prefix separately, since
 SGLang tokenizes it on its own. `default_kwargs` are the server's
 `--default-chat-template-kwargs`, which apply after the request's own values.
 On a DeepSeek formatter, `render_prompt` rebuilds the body from the trait; on
@@ -111,14 +117,30 @@ once, for the renderer and DeepSeek-V4 and V4.1 alike. The SGLang additions hook
 | `thinking.rs` | `parser/template_detection.py` | Reads the Jinja template's thinking toggle and its default; `resolve_thinking` writes that default into the kwargs before rendering. |
 | `legacy/` | `parser/conversation.py` | Replaces Dynamo: a native port of `Conversation.get_prompt()`, the built-in templates, and model-path inference. |
 | `models/deepseek_v4.rs` | `entrypoints/openai/serving_deepseek_recipe.py`, `parser/deepseek_recipe_renderer.py` | Replaces the OAI formatter. It applies SGLang's request semantics (thinking, request and default effort, the env effort, V4.1 numeric budgets, the final assistant turn, `task`, the handler's tool dumps) around deepseek-recipe's Chat Completions conversion and V4 / V4.1 encodings. Media is left to the engine. |
-| `models/pydantic_dump.rs` | `protocol.py` | The message, tool-call and tool dumps that GLM-5.3, Kimi K3 and Qwen3.8 render from. |
+| `models/pydantic_dump.rs` | `protocol.py` | The message, tool-call and tool dumps that GLM-5.3, Kimi K3, MiniMax-M3, Qwen3.8 and StepFun render from. |
+| `models/template_context.rs` | `serving_chat.py` (`_apply_jinja_template`) | Hands MiniMax-M3's and StepFun's templates the messages SGLang prepared, under a private context key the template is wrapped to read, so Dynamo's content rewrites never reach them. |
 | `models/glm53.rs` | `serving_chat.py` (`_process_messages`, `_apply_jinja_template`), `template_detection.py` | Picked by the template (`_is_glm53`). Builds the template context SGLang builds (message and tool dumps, parsed tool arguments, kwargs over the effort, server defaults), then renders it with Dynamo's Jinja formatter, text parts concatenated as the template does. Media, a `chat_template` kwarg, `-0` and U+001C..U+001F in assistant content are left to the engine. |
 | `models/kimi_k25.rs` | the Kimi K2.5 checkpoint's tool encoder | Adds `tools_ts_str` (TypeScript tool declarations) to the kwargs before the Jinja render. |
 | `models/kimi_k3.rs` | `serving_chat.py` (`_prepare_kimi_k3_messages`, `_encode_messages`), the checkpoint's `encoding_k3.py` | Replaces the OAI formatter's request handling. It prepares the messages, tools, thinking effort, `tool_choice` and `response_format` as SGLang does, then calls Dynamo's `KimiK3Formatter`. Shapes Dynamo renders differently are left to the engine. |
+| `models/minimax_m3.rs` | `serving_chat.py` (`_validate_minimax_m3_request`, `_normalize_minimax_m3_request`, `_canonicalize_tool_message_order`, `_apply_jinja_template`), `template_detection.py` | Picked by `model_type == "minimax_m3_vl"` (`is_minimax_m3`), or by the template (`_is_minimax_m3`) without a `config.json`, for M3 and M3.1. Rejects what SGLang's M3 contract rejects (the `thinking` type, a `reasoning_effort` outside low/medium/high/xhigh/max, a `root` message not first, unanswered or unmatched tool calls), maps `thinking` onto `thinking_mode` and settles the effort before and after the server defaults, sorts tool results into tool-call order, and renders with Dynamo's Jinja formatter, tool-argument floats printed as Python prints them. Media, `tool_reference` parts in tool results or alone in a turn, floats in tool schemas, `-0` in tool arguments, tool arguments nested beyond serde_json's recursion limit, and a `chat_template` kwarg are left to the engine. |
 | `models/qwen38.rs` | `serving_chat.py` (`_process_messages`, `_apply_jinja_template`), `jinja_template_utils.py` | Picked by the template. Builds the template context SGLang builds (message, tool and tool-call dumps, content as the template's content format takes it, kwargs over the effort, server defaults), then renders it with Dynamo's Jinja formatter. A later system turn fails as the template makes it fail, where Dynamo would demote it. Media, a `chat_template` kwarg, and text or numbers that Python's `trim` or `json.dumps` treat unlike Dynamo's are left to the engine. |
+| `models/step3p5.rs` | `serving_chat.py` (`_validate_request`, `_process_messages`, `_apply_jinja_template`), `protocol.py` (`ReasoningEffortType`), `jinja_template_utils.py` | Picked by the template (its `tool_response` turn, `<im_patch>` and Qwen3-Coder tool-call tags), for Step-3.5-Flash, Step-3.7-Flash and Step-5-Preview. Rejects what SGLang rejects before rendering (empty messages, a `tool_choice` naming no tool, invalid or non-object tool arguments, an effort outside the tiers and [0, 0.99], kwargs `apply_chat_template` takes itself, the request's own `chat_template`), reads a numeric-string effort as the float pydantic makes it, builds the template context SGLang builds (message, tool and tool-call dumps, content as the template's content format takes it, kwargs over the effort, server defaults) and renders it with Dynamo's Jinja formatter, which prints argument scalars and floats as Python does. Media, `-0` in tool arguments or schemas, tool arguments nested beyond serde_json's recursion limit, a server-default `chat_template` kwarg, and `bos_token`, `eos_token` or `unk_token` kwargs (Dynamo's own win over them) are left to the engine. |
+
+`extract_images` (`media.rs`) lists a chat's image sources (`image_url` and
+`input_image` parts) in message then part order, any role, as Python's
+`process_content_for_template_format` collects `image_data`, so a host can hand
+them to `mm` in the order the rendered placeholders appear.
 
 `stop_strs` returns the legacy template's stop strings; Jinja and native
 formatters have none, as in Python.
+
+MiniMax template overrides retain the checkpoint's request rules, but
+`content_format.rs` detects the replacement template's content format as Python
+does. String templates receive text parts joined with spaces; OpenAI-format
+templates receive the individual parts. The renderer restores these prepared
+messages in the template context so Dynamo cannot flatten or wrap them again.
+Unknown content formats and non-empty parts lists containing only empty text
+retain the host fallback.
 
 **Parity.** Each `tests/fixtures/parity/<model>.json` holds requests that
 SGLang's Python serving path rendered and tokenized, written by
@@ -126,6 +148,44 @@ SGLang's Python serving path rendered and tokenized, written by
 add a model, follow the
 [`processor-model-parity`](../../.claude/skills/processor-model-parity/SKILL.md)
 skill.
+MiniMax cases can additionally carry `chat_template` to exercise a server-side
+template override with the same checkpoint tokenizer.
+
+## mm
+
+```rust
+MmProcessor::from_spec(ProcessorSpec) -> Result<MmProcessor, ProcessorError>
+MmProcessor::process(input_ids, images: &[&[u8]]) -> Result<MmOutput, ProcessorError>
+```
+
+`from_spec` builds Dynamo's family processor from a spec SGLang resolved from
+the model's loaded HF processor (`rust_server/multimodal.py::RustMmProcessor.resolve_spec`,
+which applies `--image-processor-backend` and `--mm-process-config`). An error
+means Dynamo cannot serve that spec, and the host should refuse to start.
+
+`process` (`mod.rs`) is Dynamo's pipeline in order: the content hash of the
+encoded bytes, `decode_rgb`, `process_item`, `layout`, `apply_layout` and
+`positions`. It returns the placeholder-expanded ids, one feature tensor and its
+named aux tensors per image, the inclusive item offsets, and the positions. It
+takes prompt ids, not text, and it fetches nothing: tokenizing, fetching and the
+prompt length ceiling stay with the host. Dynamo is built without its `parallel`
+and `fetch` features, so `process` spawns no threads
+(`tests/mm_single_thread.rs`).
+
+Families: Qwen-VL (Qwen2-VL, Qwen2.5-VL, Qwen3-VL (+MoE), Qwen3.5 (+MoE)).
+The only SGLang step is in `mod.rs`, mirroring `utils/common.py::_load_image`:
+decode without an EXIF transpose, under PIL's decompression-bomb limit.
+
+To add a family, Dynamo implements its `process_item` and `ProcessorSpec` arm,
+SGLang's Python gate resolves its spec, and a parity fixture checks it.
+
+**Parity.** Each `tests/fixtures/mm_parity/<model>.json` holds cases that
+SGLang's Python CPU path processed, each with the spec SGLang's gate resolved
+for it, written by
+`tests/scripts/generate_mm_parity.py`: PIL decode and the image processor's CPU
+kernels, under the recorded Pillow version. `tests/mm_parity.rs` checks the
+expanded ids, offsets, grids, M-RoPE positions and feature bytes of every case,
+over the images in `tests/fixtures/mm_parity/images/`.
 
 ## parser
 

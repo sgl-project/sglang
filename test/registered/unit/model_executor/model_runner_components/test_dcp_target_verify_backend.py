@@ -72,6 +72,7 @@ def _kimi_k3_mode(algorithm: str) -> str:
         speculative_algorithm=algorithm,
         dcp_replicate_q_proj=False,
         dcp_comm_backend="nccl",
+        enable_prefill_cp=False,
     )
     with (
         patch.object(kimi_k3, "resolving_view", return_value=cfg),

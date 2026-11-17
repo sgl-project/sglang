@@ -171,9 +171,10 @@ async def process_asr_chunk(
     is_last: bool,
     raw_request: Optional[Request] = None,
     routing_key: Optional[str] = None,
+    rendered_text: Optional[str] = None,
 ) -> str:
     """Run inference on one audio chunk. Shared by the HTTP and WebSocket paths."""
-    prompt = adapter.prompt_template + state.get_prefix_text()
+    prompt = (rendered_text or adapter.prompt_template) + state.get_prefix_text()
 
     chunk_request = GenerateReqInput(
         text=prompt,

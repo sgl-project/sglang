@@ -19,15 +19,15 @@ The optimal configurations on this page are validated with the image `quay.io/as
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| MiMo-V2-Flash | Ascend A3 Series Products | 16 | PD Disaggregation | 16k+1k | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-16p-in16k-out1k-tpot-20ms) |
-| MiMo-V2-Flash | Ascend A3 Series Products | 16 | PD Disaggregation | 32k+1k | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-16p-in32k-out1k-tpot-20ms) |
+| MiMo-V2-Flash | A3 Series Products | 16 | PD Disaggregation | 16k+1k | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-16p-in16k-out1k-tpot-20ms) |
+| MiMo-V2-Flash | A3 Series Products | 16 | PD Disaggregation | 32k+1k | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-16p-in32k-out1k-tpot-20ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| MiMo-V2-Flash | Ascend A3 Series Products | 16 | PD Disaggregation | 16k+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-16p-in16k-out1-ttft-5s) |
-| MiMo-V2-Flash | Ascend A3 Series Products | 16 | PD Disaggregation | 32k+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-16p-in32k-out1-ttft-5s) |
+| MiMo-V2-Flash | A3 Series Products | 16 | PD Disaggregation | 16k+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-16p-in16k-out1-ttft-5s) |
+| MiMo-V2-Flash | A3 Series Products | 16 | PD Disaggregation | 32k+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-16p-in32k-out1-ttft-5s) |
 
 ## Optimal Configuration
 
@@ -37,7 +37,7 @@ The optimal configurations on this page are validated with the image `quay.io/as
 
 **Model**: MiMo-V2-Flash
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -185,16 +185,15 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
 #   <your decode ip>: decode node IP address
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip>:8001 \
     --host 127.0.0.1 \
-    --port 6688 \
-    --health-check-interval-secs 3600 --mini-lb
+    --port 6688
 ```
 
 #### Benchmark
@@ -202,7 +201,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -220,7 +219,7 @@ python -m sglang.bench_serving \
 
 **Model**: MiMo-V2-Flash
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -368,16 +367,15 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
 #   <your decode ip>: decode node IP address
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip>:8001 \
     --host 127.0.0.1 \
-    --port 6688 \
-    --health-check-interval-secs 3600 --mini-lb
+    --port 6688
 ```
 
 #### Benchmark
@@ -385,7 +383,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -403,7 +401,7 @@ python -m sglang.bench_serving \
 
 **Model**: MiMo-V2-Flash
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -551,16 +549,15 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
 #   <your decode ip>: decode node IP address
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip>:8001 \
     --host 127.0.0.1 \
-    --port 6688 \
-    --health-check-interval-secs 3600 --mini-lb
+    --port 6688
 ```
 
 #### Benchmark
@@ -568,7 +565,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -586,7 +583,7 @@ python -m sglang.bench_serving \
 
 **Model**: MiMo-V2-Flash
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -734,16 +731,15 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
 #   <your decode ip>: decode node IP address
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip>:8001 \
     --host 127.0.0.1 \
-    --port 6688 \
-    --health-check-interval-secs 3600 --mini-lb
+    --port 6688
 ```
 
 #### Benchmark
@@ -751,7 +747,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \

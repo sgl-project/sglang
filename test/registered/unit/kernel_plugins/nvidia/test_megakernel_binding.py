@@ -13,8 +13,6 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
 
-BACKEND = "sglang.srt.model_executor.forward_context.get_attn_backend"
-
 
 class Pool:
     uniform_fp8 = False
@@ -52,7 +50,7 @@ def backend(pool):
 class TestMegakernelBinding(CustomTestCase):
     def test_the_view_is_the_running_forwards_backend_and_pool(self):
         pool = Pool()
-        with patch(BACKEND, return_value=backend(pool)):
+        with patch.object(mb, "get_attn_backend", return_value=backend(pool)):
             view = mb.MegakernelBinding(model=torch.nn.Module()).forward_view()
         self.assertEqual(view.metadata.core_attn_metadata, "core")
         self.assertIs(view.kv_pool.pool, pool)
@@ -63,7 +61,7 @@ class TestMegakernelBinding(CustomTestCase):
         model.engram_hasher = SimpleNamespace(history=torch.zeros(5, 3))
         binding = mb.MegakernelBinding(model=model)
         attn_backend = backend(Pool())
-        with patch(BACKEND, return_value=attn_backend):
+        with patch.object(mb, "get_attn_backend", return_value=attn_backend):
             binding.forward_view()
             self.assertIs(binding.engram_history(), model.engram_hasher.history)
             binding.assert_live()
@@ -71,9 +69,9 @@ class TestMegakernelBinding(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "engram_history"):
                 binding.assert_live()
         binding = mb.MegakernelBinding(model=torch.nn.Module())
-        with patch(BACKEND, return_value=backend(Pool())):
+        with patch.object(mb, "get_attn_backend", return_value=backend(Pool())):
             binding.forward_view()
-        with patch(BACKEND, return_value=backend(Pool())):
+        with patch.object(mb, "get_attn_backend", return_value=backend(Pool())):
             with self.assertRaisesRegex(RuntimeError, "kv_pool"):
                 binding.assert_live()
 
@@ -83,7 +81,7 @@ class TestMegakernelBinding(CustomTestCase):
         attn_backend = backend(pool)
         attn_backend.use_fused_topk = True
         binding = mb.MegakernelBinding(model=torch.nn.Module())
-        with patch(BACKEND, return_value=attn_backend):
+        with patch.object(mb, "get_attn_backend", return_value=attn_backend):
             view = binding.forward_view()
             cache = view.kv_pool.get_key_buffer(1)
             self.assertIs(cache, pool.keys[1])
@@ -103,7 +101,7 @@ class TestMegakernelBinding(CustomTestCase):
         storage = torch.empty((8, 1, 576), dtype=torch.float8_e4m3fn)
         pool.keys[1] = storage[::2]
         binding = mb.MegakernelBinding(model=torch.nn.Module())
-        with patch(BACKEND, return_value=backend(pool)):
+        with patch.object(mb, "get_attn_backend", return_value=backend(pool)):
             view = binding.forward_view()
             self.assertFalse(view.use_fused_topk)
             view.kv_pool.get_key_buffer(1)
