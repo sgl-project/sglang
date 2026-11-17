@@ -11,7 +11,7 @@ points are a reference, not a like-for-like comparison.
 MiniMaxAI/MiniMax-M3.1-Flash (~250 GB) must already be in the node's HF cache:
 a cold download through hf_xet does not finish within the server start timeout.
 
-Registry: nightly-perf-8-gpu-mi35x-minimax-m31-flash-agentx suite
+Registry: nightly-perf-test-8-gpu-amd-mi35x-minimax-m31-flash-agentx suite
 """
 
 import unittest
@@ -23,7 +23,7 @@ from sglang.test.ci.ci_register import register_amd_ci
 # measurement window (this row has no warmup grace).
 register_amd_ci(
     est_time=9000,
-    suite="nightly-perf-8-gpu-mi35x-minimax-m31-flash-agentx",
+    suite="nightly-perf-test-8-gpu-amd-mi35x-minimax-m31-flash-agentx",
     nightly=True,
 )
 
