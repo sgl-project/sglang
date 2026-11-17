@@ -681,7 +681,7 @@ def test_pool_configurator_only_merges_dspark_target_cache(
             )
         else:
             config._build_ascend_mla_kv_pool(
-                max_total_num_tokens=256, is_dsa_model=False
+                max_total_num_tokens=256, max_running_requests=4, is_dsa_model=False
             )
     constructor.assert_called_once()
     requested = flash_mla_env == "1" and dspark and not is_draft

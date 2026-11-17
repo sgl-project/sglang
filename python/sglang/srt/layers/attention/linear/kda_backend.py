@@ -1288,6 +1288,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
         speculative `intermediate_ssm` scratch so the central post-verify rollback
         (update_mamba_state_after_mtp_verify) can commit the accepted-length state.
         """
+        if mixed_qkv.shape[0] == 0:
+            return mixed_qkv.new_empty((1, 0, layer.num_v_heads, layer.head_v_dim))
         fm = self.forward_metadata
         seq_len = mixed_qkv.shape[0]
         query_start_loc = fm.query_start_loc
