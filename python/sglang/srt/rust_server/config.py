@@ -90,11 +90,6 @@ def _build_server_args(
         "prefill": ext.DisaggregationMode.Prefill,
         "decode": ext.DisaggregationMode.Decode,
     }[get_disagg().disaggregation_mode]
-    grpc_port = (
-        None
-        if get_serving().smg_grpc_mode or get_serving().grpc_mode
-        else get_serving().grpc_port
-    )
     deployment_info = {
         "disaggregation_bootstrap_port": get_disagg().disaggregation_bootstrap_port,
         "node_rank": get_parallel().node_rank,
@@ -128,7 +123,7 @@ def _build_server_args(
         ),
         # Every Rust listener of the deployment (`RustServer.gather_server_endpoints`).
         "rust_server_endpoints": scheduler.rust_server_endpoints,
-        "node_listeners": _node_listeners(grpc_port=grpc_port),
+        "node_listeners": _node_listeners(grpc_port=get_serving().grpc_port),
     }
     # `/v1/loads` reads this rank's slot of the scheduler's shared-memory
     # snapshots directly, from the file on this node even under multi-node DP;
@@ -160,9 +155,7 @@ def _build_server_args(
             if get_serving().enable_http2
             else None
         ),
-        # The shared field is also populated for legacy SMG mode; only forward
-        # it when it selects SGLang's native gRPC transport.
-        grpc_port=grpc_port,
+        grpc_port=get_serving().grpc_port,
         grpc_response_timeout_secs=get_serving().grpc_response_timeout_secs,
         api_key=get_serving().api_key,
         admin_api_key=get_serving().admin_api_key,
@@ -226,6 +219,7 @@ def _build_server_args(
         ),
         allow_auto_truncate=get_serving().allow_auto_truncate,
         enable_return_hidden_states=sa.enable_return_hidden_states,
+        return_hidden_states_mode=sa.return_hidden_states_mode,
         # Not a `server_args` field: `TokenizerManager` derives it, and the
         # rust ingress needs the same number for its total-token check.
         num_reserved_tokens=compute_num_reserved_tokens(),
