@@ -35,7 +35,13 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
-register_cuda_ci(est_time=90, stage="extra-b", runner_config="4-gpu-b200")
+# SM90 only, like the model's gate; 8 GPUs cover TP2, TP4 and TP8
+register_cuda_ci(est_time=120, stage="extra-b", runner_config="8-gpu-h200")
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
+    reason="the Gemma-4 all-reduce fusion runs on SM90 only",
+)
 
 HIDDENS = [5376, 4096]  # Gemma-4 31B, and one more block width
 EPS = 1e-6
