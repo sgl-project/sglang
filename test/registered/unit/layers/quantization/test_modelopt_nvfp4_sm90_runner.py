@@ -156,6 +156,32 @@ class TestModelOptNvfp4Sm90Runner(CustomTestCase):
         # The four layers' experts, one layer's transient copy and the allocator's rounding.
         self.assertLess(grown, 4 * per_layer + 1.5 * per_layer + (64 << 20))
 
+    def test_load_leaves_no_split_free_segments(self):
+        """Weight setup must not free memory between persistent allocations: each later layer then splits the freed
+        segments, and empty_cache cannot return a split segment, so the KV pool loses it. On Qwen3.8-Flash-Next-NVFP4
+        at TP2 EP2 that cost 1.25GB per GPU against Marlin. Fails when create_weights allocates the checkpoint-layout
+        experts and then rebinds them to the repacked buffers. Shapes are Qwen3.8-Flash-Next at EP2 and GLM-5.3 at
+        TP8, with a 30MB allocation per layer for the rest of the layer's weights."""
+        for e, h, i in ((256, 2560, 640), (256, 6144, 256)):
+            with self.subTest(hidden=h, intermediate=i):
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                key = "inactive_split_bytes.all.current"
+                start = torch.cuda.memory_stats()[key]
+                held = []
+                for _ in range(4):
+                    method, layer = self._layer(e, h, i)
+                    other = torch.empty(30 << 20, dtype=torch.uint8, device="cuda")
+                    held.append((method, layer, other))
+                for k, (method, layer, _) in enumerate(held):
+                    _fill(layer, seed=k)
+                    method.process_weights_after_loading(layer)
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                split = torch.cuda.memory_stats()[key] - start
+                del held
+                self.assertLess(split, 8 << 20)
+
     def test_rejects_eplb(self):
         with get_exec().moe.override(enable_eplb=True):
             with self.assertRaisesRegex(ValueError, "enable-eplb"):
