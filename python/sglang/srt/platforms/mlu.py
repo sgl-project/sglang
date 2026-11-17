@@ -123,7 +123,6 @@ class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
             server_args.sampling_backend = "pytorch"
         if server_args.page_size is None:
             server_args.page_size = 16
-        server_args.disable_custom_all_reduce = True
 
     def get_default_attention_backend(self) -> str:
         return "mlu"
