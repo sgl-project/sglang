@@ -55,13 +55,14 @@ logger = logging.getLogger(__name__)
 def allocate_distinct_stream(device_module, avoid_streams):
     """Draw a stream that aliases none of ``avoid_streams``.
 
-    CUDA/HIP streams come from a fixed round-robin pool, so a fresh ``Stream()``
-    may hand back one that is already in use.
+    CUDA/HIP and XPU streams come from a fixed round-robin pool, so a fresh
+    ``Stream()`` may hand back one that is already in use. ``stream_id`` names
+    the pool slot on every backend (XPU streams have no ``cuda_stream``).
     """
-    avoid = {stream.cuda_stream for stream in avoid_streams}
+    avoid = {stream.stream_id for stream in avoid_streams}
     for _ in range(65):
         stream = device_module.Stream(priority=0)
-        if stream.cuda_stream not in avoid:
+        if stream.stream_id not in avoid:
             return stream
     raise RuntimeError("Unable to allocate a distinct stream")
 

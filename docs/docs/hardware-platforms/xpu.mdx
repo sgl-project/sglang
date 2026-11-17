@@ -335,6 +335,46 @@ Unsupported features are refused at startup. If startup fails with
 With P/D disaggregation, DCP on XPU skips the DCP pack fast path: the pack
 kernel runs only on CUDA, so KV is transferred per token instead.
 
+## Pipeline Parallelism (PP) for Long Context on Intel XPU
+
+Pipeline parallelism splits the model's layers into stages, one per card. Each
+stage passes only the hidden states at its boundary to the next, so different
+chunks of one long prompt are prefilled by different cards at the same time.
+On PCIe-connected Arc Pro B60 cards it cuts time-to-first-token for long prompts
+more than TP does, because TP all-reduces every layer over PCIe:
+
+```bash
+python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --device xpu \
+    --attention-backend intel_xpu --pp-size 4 \
+    --chunked-prefill-size 4096 --mem-fraction-static 0.80
+```
+
+For Llama-3.1-8B-Instruct, a 123K-token prompt reaches its first token in 43 s at
+PP2, 25 s at PP4 and 18 s at PP8, against 29 s at TP4. The
+[B60 case study](../advanced_features/pipeline_parallelism#case-study-on-intel-arc-pro-b60)
+has the full table and the tuning results.
+
+- Tested with Llama-3.1-8B-Instruct (PP2, PP4, PP8 and TP2 × PP2, prompts up to
+  126K tokens; at PP2 also with the full decode graph,
+  `--cuda-graph-backend-decode full`) and with the MoE model
+  Qwen3-30B-A3B-Instruct-2507 (PP4, prompts up to 131K tokens).
+- Pass `--attention-backend intel_xpu`. With the default `triton` backend, chunked
+  prefill over a long prefix is far slower: a 32K-token prompt on PP2 takes 145 s,
+  against 6 s with `intel_xpu`.
+- Everything in the [pipeline parallelism guide](../advanced_features/pipeline_parallelism)
+  applies on XPU. That covers `--pp-size` alone or with `--tp-size`, chunked prefill,
+  `--enable-dynamic-chunking` with `SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR`,
+  `SGLANG_PP_LAYER_PARTITION`, and PP communication on a dedicated stream
+  (`SGLANG_PP_COMM_OVERLAP=1`).
+- Dynamic chunking profiles prefills of up to 1.25× `--chunked-prefill-size` at
+  startup. On 24 GB cards, keep `--mem-fraction-static` at 0.80 or lower for an
+  8K-12K initial chunk. Otherwise the probe runs out of memory, and dynamic chunking
+  turns itself off while the server keeps serving with fixed chunks.
+- oneCCL allocates its PP transfer buffers outside PyTorch. Leave about 2 GB free on
+  every card after the KV pool (the `available_gpu_mem` the server logs at startup);
+  with less, the first PP transfers can stall instead of failing. Lower
+  `--mem-fraction-static` if a PP server hangs on its first request.
+
 ## Memory Saver (release/resume memory occupation) on Intel XPU [Experimental]
 
 SGLang can temporarily release most of the GPU memory it holds — model weights

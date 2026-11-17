@@ -691,10 +691,8 @@ class SchedulerPPMixin:
         # scheduler stream. Otherwise they stay on the current stream.
         self.pp_comm_stream = None
         self.pp_comm_stream_ctx = nullcontext()
-        if (
-            envs.SGLANG_PP_COMM_OVERLAP.get()
-            and torch.cuda.is_available()
-            and str(self.device).startswith("cuda")
+        if envs.SGLANG_PP_COMM_OVERLAP.get() and str(self.device).startswith(
+            ("cuda", "xpu")
         ):
             self.pp_comm_stream = allocate_distinct_stream(
                 self.device_module,
@@ -702,7 +700,8 @@ class SchedulerPPMixin:
             )
             self.pp_comm_stream_ctx = self.device_module.stream(self.pp_comm_stream)
             logger.info(
-                "PP tensor communication overlap enabled on a dedicated CUDA stream"
+                "PP tensor communication overlap enabled on a dedicated "
+                f"{self.device} stream"
             )
 
         self._pp_tensor_dict_inbox: Dict[
