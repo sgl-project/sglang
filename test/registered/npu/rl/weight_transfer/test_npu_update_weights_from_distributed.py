@@ -16,6 +16,7 @@ from sglang.srt.managers.io_struct import InitWeightsUpdateGroupReqInput
 from sglang.srt.utils import init_custom_process_group
 from sglang.test.ascend import test_npu_rl_weights as weights
 from sglang.test.ascend.test_npu_rl_utils import (
+    admin_headers,
     assert_logprob_signature_equal,
     begin_weight_update,
     checkpoint_manifest,
@@ -134,6 +135,7 @@ class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
                 "backend": "hccl",
             },
             timeout=600,
+            headers=admin_headers(),
         )
         thread.join(timeout=600)
 
@@ -146,6 +148,7 @@ class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
             base_url + "/destroy_weights_update_group",
             json={"group_name": group_name},
             timeout=120,
+            headers=admin_headers(),
         )
         self.assertEqual(response.status_code, 200, response.text)
         torch.distributed.destroy_process_group(pg)
@@ -167,6 +170,7 @@ class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
                         "flush_cache": True,
                     },
                     timeout=1800,
+                    headers=admin_headers(),
                 )
                 result["status"] = response.status_code
                 result["text"] = response.text
@@ -239,6 +243,7 @@ class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
                 "flush_cache": True,
             },
             timeout=300,
+            headers=admin_headers(),
         )
         try:
             end_weight_update(self.lane_url)
@@ -259,6 +264,7 @@ class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
             self.lane_url + "/destroy_weights_update_group",
             json={"group_name": group_name},
             timeout=120,
+            headers=admin_headers(),
         )
         self.assertEqual(first.status_code, 200, first.text)
         torch.distributed.destroy_process_group(pg)
@@ -267,6 +273,7 @@ class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
             self.lane_url + "/destroy_weights_update_group",
             json={"group_name": group_name},
             timeout=120,
+            headers=admin_headers(),
         )
         self.assertEqual(second.status_code, 400, second.text)
         payload = second.json()

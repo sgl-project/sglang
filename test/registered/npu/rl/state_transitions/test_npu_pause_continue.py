@@ -12,6 +12,7 @@ import requests
 
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
 from sglang.test.ascend.test_npu_rl_utils import (
+    admin_headers,
     begin_weight_update,
     checkpoint_tensor_index,
     continue_generation,
@@ -237,6 +238,7 @@ class TestNpuPauseContinue(CustomTestCase):
         second = requests.post(
             self.base_url + "/pause_generation",
             json={"mode": "abort"},
+            headers=admin_headers(),
             timeout=120,
         )
         self.assertEqual(second.status_code, 200, second.text)

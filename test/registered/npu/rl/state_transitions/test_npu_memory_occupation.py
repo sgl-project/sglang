@@ -51,9 +51,11 @@ class _MemoryOccupationCases:
     def test_01_release_weights_frees_memory(self):
         golden = generation_signature(self.base_url, PROMPTS)
         before = npu_free_bytes()
+        released = False
 
         try:
             release_memory(self.base_url, ["weights"])
+            released = True
             after_release = npu_free_bytes()
             self.assertGreater(
                 after_release - before,
@@ -64,7 +66,8 @@ class _MemoryOccupationCases:
             # offloaded; /model_info only reads server metadata.
             get(self.base_url, "/model_info")
         finally:
-            resume_memory(self.base_url, ["weights"])
+            if released:
+                resume_memory(self.base_url, ["weights"])
 
         reallocated = after_release - npu_free_bytes()
         self.assertGreater(

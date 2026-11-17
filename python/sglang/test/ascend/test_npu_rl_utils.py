@@ -69,6 +69,11 @@ def _is_ascend_950() -> bool:
 # The memory saver cannot free HBM with expandable segments, which CI enables
 # for the whole job.
 RL_SERVER_ENV = {"PYTORCH_NPU_ALLOC_CONF": "expandable_segments:False"}
+ADMIN_API_KEY = "sk-admin-for-test"
+
+
+def admin_headers() -> Dict[str, str]:
+    return {"Authorization": f"Bearer {ADMIN_API_KEY}"}
 
 
 def npu_rl_env() -> Dict[str, str]:
@@ -159,6 +164,10 @@ def npu_server(
     """
     port = port or find_available_port(30000)
     base_url = f"http://127.0.0.1:{port}"
+    env = dict(env or {})
+    # Override, don't inherit: CI may export SGLANG_ADMIN_API_KEY for other
+    # auth tests, and the server must use the key our headers send.
+    env["SGLANG_ADMIN_API_KEY"] = ADMIN_API_KEY
     # Warm the test process's NPU context while the cards are idle; the first
     # in-process mem_get_info() call is otherwise paid while the server is
     # starting. Then wait for the previous server to hand HBM back on every
@@ -211,7 +220,12 @@ def post(
     timeout: float = DEFAULT_TIMEOUT,
     expect: int = 200,
 ) -> requests.Response:
-    response = requests.post(base_url + path, json=payload or {}, timeout=timeout)
+    response = requests.post(
+        base_url + path,
+        json=payload or {},
+        headers=admin_headers(),
+        timeout=timeout,
+    )
     if expect is not None and response.status_code != expect:
         raise RuntimeError(
             f"POST {path} returned {response.status_code}: {response.text[:800]}"
@@ -226,7 +240,7 @@ def get(
     timeout: float = 30,
     expect: int = 200,
 ) -> requests.Response:
-    response = requests.get(base_url + path, timeout=timeout)
+    response = requests.get(base_url + path, headers=admin_headers(), timeout=timeout)
     if expect is not None and response.status_code != expect:
         raise RuntimeError(
             f"GET {path} returned {response.status_code}: {response.text[:800]}"
@@ -259,6 +273,7 @@ def release_memory(
         response = requests.post(
             base_url + "/release_memory_occupation",
             json={"tags": list(tags)},
+            headers=admin_headers(),
             timeout=timeout,
         )
         if response.status_code == 200:
