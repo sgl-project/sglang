@@ -366,15 +366,7 @@ class TestVerifySharedKV(CustomTestCase):
             self.assertFalse(_should_use_verify_shared_kv(qwen, 1, False, True))
 
 
-# FP8 q/probability rounding is materially larger than BF16 dot rounding.
-BF16_ERR = 1e-2
-# Triton 3.4 on ROCm 7.0 aborts gfx950 FP8 dots (triton-lang/triton#8278).
-FP8_DOT_OK = get_hip_version()[:2] != (7, 0)
-
 MLA = dict(h_q=12, h_kv=1, d=576, dv=512, l_ext=8, causal=True, mla=True)
-
-# Kimi-K3.1's MLA5 draft: a TP8 rank's 12 heads over a 1024-key window.
-MLA5_WINDOW = dict(MLA, prefix_lens=(3000, 1500, 5), window=1023)
 
 
 def _inputs(case, cache_dtype):
@@ -394,30 +386,6 @@ def _inputs(case, cache_dtype):
 def _scale(case):
     # MLA scales by the 128 + 64 qk head of the target, not the latent width.
     return (128 + 64) ** -0.5 if case["mla"] else case["d"] ** -0.5
-
-
-def _reference(case, inputs):
-    """fp32 attention of each draft row over its request's prefix and causal block,
-    the cache read exactly (FP8 values are exact in fp32); the window keeps the
-    keys of [p - window, p]."""
-    q, k, v, k_buffer, v_buffer, _, kv_indptr, kv_indices = inputs
-    h_q, h_kv, l_ext, window = case["h_q"], case["h_kv"], case["l_ext"], case["window"]
-    bounds = kv_indptr.tolist()
-    out = []
-    for b in range(len(bounds) - 1):
-        locs = kv_indices[bounds[b] : bounds[b + 1]]
-        prefix = locs.numel()
-        rows = slice(b * l_ext, (b + 1) * l_ext)
-        keys = torch.cat([k_buffer[locs].float(), k[rows].float()])
-        vals = torch.cat([v_buffer[locs].float(), v[rows].float()])
-        q_rows = q[rows].float().unflatten(1, (h_kv, h_q // h_kv))
-        s = torch.einsum("lkgd,tkd->kglt", q_rows, keys) * _scale(case)
-        q_pos = (prefix + torch.arange(l_ext, device="cuda"))[:, None]
-        k_pos = torch.arange(prefix + l_ext, device="cuda")[None, :]
-        seen = (k_pos <= q_pos) & (k_pos >= q_pos - window)
-        p = torch.softmax(s.masked_fill(~seen, float("-inf")), dim=-1)
-        out.append(torch.einsum("kglt,tkd->lkgd", p, vals).flatten(1, 2))
-    return torch.cat(out)
 
 
 def _extend(case, inputs, kernel=extend_attention_fwd):
@@ -448,6 +416,51 @@ def _extend(case, inputs, kernel=extend_attention_fwd):
     )
     assert ran is True or kernel is extend_attention_fwd
     return out
+
+
+@unittest.skipUnless(is_hip(), "ROCm DFLASH draft kernels")
+class TestDraftAttention(CustomTestCase):
+    def test_verify_matches_extend(self):
+        """The draft's verify kernel as DFLASH runs it: a 6-token block, a 1024-key
+        window and BF16 dots over an FP8 cache."""
+        case = dict(MLA, mla=False, prefix_lens=(600, 1024, 1100), l_ext=6, window=1024)
+        inputs = _inputs(case, torch.float8_e4m3fn)
+        actual = _extend(case, inputs, kernel=verify_mla_draft_fwd)
+        expected = _extend(case, inputs)
+        torch.testing.assert_close(actual, expected, atol=8e-2, rtol=2e-2)
+
+
+# FP8 q/probability rounding is materially larger than BF16 dot rounding.
+BF16_ERR = 1e-2
+# Triton 3.4 on ROCm 7.0 aborts gfx950 FP8 dots (triton-lang/triton#8278).
+FP8_DOT_OK = get_hip_version()[:2] != (7, 0)
+
+# Kimi-K3.1's MLA5 draft: a TP8 rank's 12 heads over a 1024-key window.
+MLA5_WINDOW = dict(MLA, prefix_lens=(3000, 1500, 5), window=1023)
+
+
+def _reference(case, inputs):
+    """fp32 attention of each draft row over its request's prefix and causal block,
+    the cache read exactly (FP8 values are exact in fp32); the window keeps the
+    keys of [p - window, p]."""
+    q, k, v, k_buffer, v_buffer, _, kv_indptr, kv_indices = inputs
+    h_q, h_kv, l_ext, window = case["h_q"], case["h_kv"], case["l_ext"], case["window"]
+    bounds = kv_indptr.tolist()
+    out = []
+    for b in range(len(bounds) - 1):
+        locs = kv_indices[bounds[b] : bounds[b + 1]]
+        prefix = locs.numel()
+        rows = slice(b * l_ext, (b + 1) * l_ext)
+        keys = torch.cat([k_buffer[locs].float(), k[rows].float()])
+        vals = torch.cat([v_buffer[locs].float(), v[rows].float()])
+        q_rows = q[rows].float().unflatten(1, (h_kv, h_q // h_kv))
+        s = torch.einsum("lkgd,tkd->kglt", q_rows, keys) * _scale(case)
+        q_pos = (prefix + torch.arange(l_ext, device="cuda"))[:, None]
+        k_pos = torch.arange(prefix + l_ext, device="cuda")[None, :]
+        seen = (k_pos <= q_pos) & (k_pos >= q_pos - window)
+        p = torch.softmax(s.masked_fill(~seen, float("-inf")), dim=-1)
+        out.append(torch.einsum("kglt,tkd->lkgd", p, vals).flatten(1, 2))
+    return torch.cat(out)
 
 
 def _backend_extend(case, inputs, bf16_dot):
@@ -513,7 +526,7 @@ def _backend_extend(case, inputs, bf16_dot):
 
 
 @unittest.skipUnless(is_hip(), "ROCm DFLASH draft kernels")
-class TestDraftAttention(CustomTestCase):
+class TestDraftBackendDispatch(CustomTestCase):
     def test_fp8_cache_bf16_dot_matches_fp32(self):
         inputs = _inputs(MLA5_WINDOW, fp8_dtype)
         ref = _reference(MLA5_WINDOW, inputs)
@@ -525,15 +538,6 @@ class TestDraftAttention(CustomTestCase):
             # The default still runs FP8 q and probabilities over an FP8 cache.
             default = _backend_extend(MLA5_WINDOW, inputs, bf16_dot=False)
             assert not torch.equal(default, out)
-
-    def test_verify_matches_extend(self):
-        """The draft's verify kernel as DFLASH runs it: a 6-token block, a 1024-key
-        window and BF16 dots over an FP8 cache."""
-        case = dict(MLA, mla=False, prefix_lens=(600, 1024, 1100), l_ext=6, window=1024)
-        inputs = _inputs(case, torch.float8_e4m3fn)
-        actual = _extend(case, inputs, kernel=verify_mla_draft_fwd)
-        expected = _extend(case, inputs)
-        torch.testing.assert_close(actual, expected, atol=8e-2, rtol=2e-2)
 
 
 if __name__ == "__main__":
