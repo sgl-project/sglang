@@ -37,6 +37,10 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl, is_hip_runtime
+from sglang.kernels.ops.attention.linear.kda_verify_gfx950 import (
+    kda_verify_gfx950,
+    kda_verify_gfx950_supported,
+)
 
 # V-tile width of the fused verify kernel. Tuned on B200 at T=5 with
 # benchmark/kernels/bench_kda_verify_sweep.py; any power of two is
@@ -419,6 +423,11 @@ def fused_kda_conv_gating_verify_kernel(
     # tile in a later wave would read what i_v == 0 had overwritten.
 
 
+# The gfx950 FlyDSL kernel replaces the Triton ring path when it supports the call.
+KDA_VERIFY_GFX950 = True
+KDA_VERIFY_GFX950_BLOCK_V = None
+
+
 def fused_kda_conv_gating_verify(
     mixed_qkv: torch.Tensor,
     conv_weight: torch.Tensor,
@@ -503,6 +512,19 @@ def fused_kda_conv_gating_verify(
         and 3 <= B <= 16
     ):
         BV = KDA_VERIFY_BLOCK_V_HIP
+    if (
+        is_hip_runtime()
+        and cache_ring
+        and num_warps == 1
+        and T == 6
+        and H == HV == 16
+        and K == V == 128
+        and conv_weight.dtype == torch.float32
+        and B <= 16
+    ):
+        # ReplaySSM ring on MI355X, us per call vs the unfused pair: B2 12.5 vs 13.1,
+        # B6 16.1 vs 18.3, B12 23.0 vs 24.7, B16 25.3 vs 26.9.
+        BV = 8 if B <= 4 else 16 if B <= 8 else 32
     NV = triton.cdiv(V, BV)
 
     a2 = a.reshape(seq_len, HV * K)
@@ -556,6 +578,59 @@ def fused_kda_conv_gating_verify(
     else:
         max_cache_len = 0
         stride_rawv_slot = stride_rawk_slot = stride_g_slot = stride_beta_slot = 0
+
+    if (
+        KDA_VERIFY_GFX950
+        and is_hip_runtime()
+        and cache_ring
+        and intermediate_states_buffer is None
+        and kda_verify_gfx950_supported(
+            mixed_qkv=mixed_qkv,
+            conv_weight=conv_weight,
+            conv_bias=conv_bias,
+            conv_state=conv_state,
+            intermediate_conv_window=intermediate_conv_window,
+            a=a2,
+            b=b2,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            ssm_states=ssm_states,
+            T=T,
+            num_q_heads=H,
+            num_v_heads=HV,
+            head_k_dim=K,
+            head_v_dim=V,
+            lower_bound=lower_bound,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+    ):
+        o_gfx950 = kda_verify_gfx950(
+            mixed_qkv=mixed_qkv,
+            conv_weight=conv_weight,
+            conv_state=conv_state,
+            conv_state_indices=conv_state_indices,
+            intermediate_conv_window=intermediate_conv_window,
+            intermediate_state_indices=intermediate_state_indices,
+            a2=a2,
+            b2=b2,
+            A_log=A_log.reshape(-1),
+            dt_bias=dt_bias.reshape(-1),
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            scale=scale,
+            T=T,
+            num_q_heads=H,
+            num_v_heads=HV,
+            lower_bound=lower_bound,
+            replayssm_rawv=replayssm_rawv,
+            replayssm_rawk=replayssm_rawk,
+            replayssm_g=replayssm_g,
+            replayssm_beta=replayssm_beta,
+            ring_indices=ring_indices,
+            block_v=KDA_VERIFY_GFX950_BLOCK_V,
+        )
+        if o_gfx950 is not None:
+            return o_gfx950.view(1, seq_len, HV, V)
 
     grid = (NV, B * HV)
     # PDL (sm90+): chain behind the producer qkv-projection GEMM and signal the
