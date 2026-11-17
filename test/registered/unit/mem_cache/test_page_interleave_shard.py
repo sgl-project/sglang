@@ -2007,11 +2007,23 @@ class TestShardSendFilter(CustomTestCase):
         )
 
     def test_empty_chunk_is_skipped_unless_final(self):
-        # One page per owner 0..3, sent as two 2-page chunks.
+        # One page per owner 0..3, sent as two 2-page chunks. GQA staging keeps
+        # the empty chunk: decode fans in one arrival per shard writer. MLA never
+        # stages, so it still skips.
         pages = np.array(_chain_pages(base=0, n_pages=4), dtype=np.int64)
-        for rank, expect_skip in ((3, [True, False]), (1, [False, False])):
+        for rank, staging, mla, expect_skip in (
+            (3, False, False, [True, False]),
+            (1, False, False, [False, False]),
+            (3, True, False, [False, False]),
+            (3, True, True, [True, False]),
+        ):
             sender = SimpleNamespace(
-                kv_mgr=SimpleNamespace(kv_shard_rank=rank, kv_shard_size=N),
+                kv_mgr=SimpleNamespace(
+                    kv_shard_rank=rank,
+                    kv_shard_size=N,
+                    enable_staging=staging,
+                    is_mla_backend=mla,
+                ),
                 curr_idx=0,
                 num_kv_indices=len(pages),
             )

@@ -31,7 +31,7 @@ from sglang.test.test_utils import (
     is_in_ci,
 )
 
-register_xpu_ci(est_time=1200, suite="nightly-kernel-main-test-4-gpu-xpu", nightly=True)
+register_xpu_ci(est_time=1500, suite="nightly-kernel-main-test-4-gpu-xpu", nightly=True)
 
 _XPU_DEVICE_COUNT = torch.xpu.device_count() if torch.xpu.is_available() else 0
 _SKIP_REASON = f"KV sharding PD needs 4 XPUs, found {_XPU_DEVICE_COUNT}"
@@ -227,6 +227,23 @@ class TestDisaggregationKVCacheShardingGqaCpXpu(
         "--cp-strategy",
         "zigzag",
     ]
+
+
+@unittest.skipUnless(_XPU_DEVICE_COUNT >= 4 or is_in_ci(), _SKIP_REASON)
+class TestDisaggregationKVCacheShardingGqaCpStagedXpu(
+    TestDisaggregationKVCacheShardingGqaCpXpu
+):
+    """The GQA-CP stripes packed through the Mooncake staging buffer, as the XPU
+    docs recommend: each CP rank writes its own pages of every chunk's region."""
+
+    extra_prefill_env = {
+        **_KVCacheShardingXpuMixin.extra_prefill_env,
+        "SGLANG_DISAGG_STAGING_BUFFER": "1",
+    }
+    extra_decode_env = {
+        **_KVCacheShardingXpuMixin.extra_decode_env,
+        "SGLANG_DISAGG_STAGING_BUFFER": "1",
+    }
 
 
 if __name__ == "__main__":

@@ -3564,6 +3564,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         wait_event=None,
         indices_event=None,
         trace_ctx=None,
+        chunk_slice: Optional[slice] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -3601,6 +3602,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 wait_event=wait_event,
                 indices_event=indices_event,
                 send_record=self.send_record(bootstrap_room),
+                chunk_slice=chunk_slice,
             )
         )
         return None

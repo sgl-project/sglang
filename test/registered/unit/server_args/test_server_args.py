@@ -4845,6 +4845,21 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
                 envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(), "python"
             )
 
+    def test_staging_with_sharding_is_admitted_only_on_mooncake(self):
+        # Only the Mooncake sender places each shard writer's pages in the chunk.
+        for backend, error in (("mooncake", None), ("nixl", "only supported on")):
+            with self.subTest(backend=backend):
+                args = self._rounding_args(
+                    raw_mem_fraction=0.8, resolved_mem_fraction=0.8
+                )
+                args.disaggregation_transfer_backend = backend
+                with envs.SGLANG_DISAGG_STAGING_BUFFER.override(True):
+                    if error is None:
+                        handle_kv_cache_sharding(args, 80 * 1024)
+                    else:
+                        with self.assertRaisesRegex(ValueError, error):
+                            handle_kv_cache_sharding(args, 80 * 1024)
+
     def test_unsharded_launch_keeps_the_general_backend_default(self):
         args = self._args(enable_kv_cache_sharding=False)
         with patch.dict(os.environ):

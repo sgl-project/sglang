@@ -1,5 +1,6 @@
 import concurrent.futures
 import ctypes
+import functools
 import unittest
 from collections import defaultdict
 from queue import SimpleQueue
@@ -11,6 +12,10 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
+from sglang.srt.disaggregation.common.staging_buffer import (
+    sharded_staging_transfer_blocks,
+)
+from sglang.srt.disaggregation.common.staging_handler import DecodeStagingHandler
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
@@ -517,7 +522,7 @@ class TestMooncakeEarlySend(CustomTestCase):
         for last in (False, True):
             with self.subTest(last=last):
                 ready = MagicMock()
-                manager = MagicMock()
+                manager = MagicMock(kv_shard_size=1)
                 sender = object.__new__(MooncakeKVSender)
                 vars(sender).update(
                     kv_mgr=manager,
@@ -622,6 +627,9 @@ class TestMooncakeEarlySend(CustomTestCase):
             note_send_finished=MagicMock(),
         )
         manager.check_status = lambda room: manager.request_status[room]
+        manager._staging_route = functools.partial(
+            MooncakeKVManager._staging_route, manager
+        )
         return manager, queue
 
     def test_worker_waits_before_reading_kv(self):
@@ -756,6 +764,198 @@ class TestMooncakeStagingDeviceType(unittest.TestCase):
             MooncakeKVManager._init_staging_allocator(manager)
 
         self.assertEqual(init_allocator.call_args.kwargs["device_type"], "xpu")
+
+
+class TestShardedStaging(CustomTestCase):
+    """KV sharding over prefill CP with staging: every CP rank writes its own
+    pages into one whole-chunk staging region, which decode scatters once."""
+
+    def test_shard_writers_rebuild_the_single_writer_chunk_layout(self):
+        page_size, token_bytes, slabs, chunk_pages = 4, 6, 6, 7
+        page_bytes = page_size * token_bytes
+        slab_bytes = chunk_pages * page_bytes
+        rng = np.random.default_rng(0)
+        expected = rng.integers(0, 256, slabs * slab_bytes, dtype=np.uint8)
+        pages_of = expected.reshape(slabs, chunk_pages, page_bytes)
+        # Uneven ownership, with consecutive runs that must merge into one block.
+        owned = {0: [0, 1, 4], 1: [2, 3, 5, 6]}
+        for slab_pairs in (
+            [(s, s) for s in range(slabs)],
+            [(s, slabs - 1 - s) for s in range(slabs)],  # PP slot remap
+        ):
+            with self.subTest(remapped=slab_pairs[0] != (0, 0)):
+                dst = np.zeros_like(expected)
+                for positions in owned.values():
+                    src = np.stack(
+                        [pages_of[s_dst][positions] for _, s_dst in slab_pairs]
+                    ).reshape(-1)
+                    blocks = sharded_staging_transfer_blocks(
+                        src_ptr=0,
+                        dst_ptr=0,
+                        page_positions=np.array(positions),
+                        slab_pairs=[(i, d) for i, (_, d) in enumerate(slab_pairs)],
+                        src_slab_bytes=len(positions) * page_bytes,
+                        dst_slab_bytes=slab_bytes,
+                        page_bytes=page_bytes,
+                    )
+                    runs = 1 + int(np.count_nonzero(np.diff(positions) != 1))
+                    self.assertEqual(len(blocks), slabs * runs)
+                    for s, d, n in blocks:
+                        dst[d : d + n] = src[s : s + n]
+                np.testing.assert_array_equal(dst, expected)
+
+    def test_staged_send_places_owned_pages_in_the_chunk_region(self):
+        """A shard writer sizes and offsets its blocks by the whole chunk, not by
+        the pages it owns; otherwise its pages land in the wrong slots."""
+        page_size, head_dim, layers, total_heads = 4, 3, 2, 2
+        kv = [torch.empty(16, total_heads, head_dim, dtype=torch.bfloat16)] * layers
+        token_bytes = head_dim * 2  # decode TP 2 receives one bf16 head
+        page_bytes, chunk_pages = page_size * token_bytes, 7
+        positions, owned_pages = np.array([0, 1, 4]), np.array([5, 6, 9])
+        chunk_slab = chunk_pages * page_bytes
+        needed = 2 * layers * chunk_slab
+        sent = []
+        manager = SimpleNamespace(
+            kv_buffer_tensors={
+                "k_buffers": kv,
+                "v_buffers": kv,
+                "page_size": page_size,
+            },
+            kv_args=SimpleNamespace(
+                total_kv_head_num=total_heads, engine_rank=0, kv_layer_ids=[]
+            ),
+            attn_tp_size=1,
+            pp_size=1,
+            _transfer_data=lambda session, blocks: sent.extend(blocks) or 0,
+        )
+        staging = SimpleNamespace(fits=lambda nbytes: True, get_ptr=lambda: 1 << 30)
+        with patch(
+            "sglang.srt.disaggregation.common.staging_buffer.gather_all_layers_to_staging"
+        ) as gather:
+            for dst_size, expected_ret in ((needed - 1, -1), (needed, 0)):
+                sent.clear()
+                ret = MooncakeKVManager.send_kvcache_staged(
+                    manager,
+                    "session",
+                    owned_pages,
+                    1 << 40,
+                    dst_size,
+                    1,
+                    2,
+                    page_size * token_bytes,
+                    [],
+                    staging_buffer=staging,
+                    page_positions=positions,
+                    chunk_num_pages=chunk_pages,
+                )
+                self.assertEqual(ret, expected_ret)
+        gather.assert_called_once()
+        own_slab = len(owned_pages) * page_bytes
+        self.assertEqual(
+            sent,
+            [
+                (
+                    (1 << 30) + slab * own_slab + packed * page_bytes,
+                    (1 << 40) + slab * chunk_slab + position * page_bytes,
+                    count * page_bytes,
+                )
+                for slab in range(2 * layers)
+                for packed, position, count in ((0, 0, 2), (2, 4, 1))
+            ],
+        )
+
+    def test_decode_expects_one_writer_per_prefill_cp_rank_for_sharded_gqa(self):
+        handler = object.__new__(DecodeStagingHandler)
+        for mla, sharded, cp, prefill_tp, expected in (
+            (False, True, 2, 1, 2),
+            (False, False, 2, 1, 1),  # unsharded CP: only CP rank 0 sends
+            (True, True, 1, 1, 1),  # MLA shards over attention TP, not CP
+            (False, True, 2, 4, 4),  # 2 head-slice writers per CP rank
+        ):
+            with self.subTest(mla=mla, sharded=sharded, prefill_tp=prefill_tp):
+                handler.decode_tp = 2
+                handler.kv_manager = SimpleNamespace(
+                    pp_size=1, attn_cp_size=1, is_mla_backend=mla
+                )
+                receiver = SimpleNamespace(
+                    prefill_info=SimpleNamespace(
+                        attn_tp_size=prefill_tp,
+                        pp_size=1,
+                        attn_cp_size=cp,
+                        enable_kv_cache_sharding=sharded,
+                    )
+                )
+                self.assertEqual(handler.num_writers_for(receiver), expected)
+
+    def test_empty_sharded_chunk_routes_to_staging_instead_of_being_skipped(self):
+        """A short prompt can leave one CP rank with no page at all; skipping its
+        empty chunk left decode waiting for that writer until the 300 s timeout."""
+        manager = SimpleNamespace(
+            is_mla_backend=False,
+            is_hybrid_mla_backend=False,
+            attn_tp_size=1,
+            enable_staging=True,
+        )
+        staged = SimpleNamespace(
+            dst_attn_tp_size=2, staging_base_ptr=1 << 20, staging_total_size=1 << 24
+        )
+        same_tp = SimpleNamespace(
+            dst_attn_tp_size=1, staging_base_ptr=1 << 20, staging_total_size=1 << 24
+        )
+        empty = np.empty(0, dtype=np.int32)
+        for target, chunk_slice, expected in (
+            (staged, slice(0, 1), (True, False)),  # sharded writer must report
+            (staged, None, (True, True)),  # unsharded empty chunk: nothing to do
+            (same_tp, slice(0, 1), (False, True)),  # no staging for equal TP
+        ):
+            with self.subTest(staged=target is staged, sharded=chunk_slice is not None):
+                chunk = TransferKVChunk(
+                    7, empty, empty, True, 0, None, chunk_slice=chunk_slice
+                )
+                route = MooncakeKVManager._staging_route(
+                    manager,
+                    kv_chunk=chunk,
+                    target_info=target,
+                    staging_strategy=object(),
+                    is_dcp_transfer=False,
+                )
+                self.assertEqual(route, expected)
+
+    def test_shard_writer_reports_the_whole_chunk_even_without_pages(self):
+        for owned in ([33, 35], []):
+            with self.subTest(owned=owned):
+                strategy = MagicMock()
+                strategy.check_ready.return_value = (True, 1, 4096, 0, 0)
+                strategy.transfer.return_value = 0
+                manager = SimpleNamespace(send_chunk_ready=MagicMock())
+                req = SimpleNamespace(
+                    mooncake_session_id="s", room=7, endpoint="e", dst_port=1
+                )
+                chunk = TransferKVChunk(
+                    7,
+                    np.arange(len(owned), dtype=np.int32),
+                    np.array(owned, dtype=np.int64),
+                    False,
+                    None,
+                    None,
+                    chunk_slice=slice(32, 64),
+                )
+                target = SimpleNamespace(
+                    staging_base_ptr=1 << 20, staging_total_size=1 << 24
+                )
+                ret, deferred = MooncakeKVManager._do_staging_transfer(
+                    manager, strategy, chunk, req, target, None, None, None
+                )
+                self.assertEqual((ret, deferred), (0, False))
+                strategy.check_ready.assert_called_once_with(req, 32, 32)
+                if owned:
+                    kwargs = strategy.transfer.call_args.kwargs
+                    np.testing.assert_array_equal(kwargs["page_positions"], [1, 3])
+                    self.assertEqual(kwargs["chunk_num_pages"], 32)
+                else:
+                    strategy.transfer.assert_not_called()
+                ready = manager.send_chunk_ready.call_args.kwargs
+                self.assertEqual((ready["page_start"], ready["num_pages"]), (32, 32))
 
 
 if __name__ == "__main__":
