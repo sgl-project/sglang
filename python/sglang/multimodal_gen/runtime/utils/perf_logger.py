@@ -17,6 +17,9 @@ from dateutil.tz import UTC
 
 import sglang
 import sglang.multimodal_gen.envs as envs
+from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
+    RequestCancelledError,
+)
 from sglang.multimodal_gen.runtime.observability.metrics import get_metrics
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -51,7 +54,7 @@ class MemorySnapshot:
         }
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(eq=False)
 class RequestMetrics:
     """Performance metrics for a single request, including timings and memory snapshots."""
 
@@ -126,15 +129,15 @@ def get_git_commit_hash() -> str:
         if not commit_hash:
             commit_hash = (
                 subprocess.check_output(
-                    ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+                    ["git", "rev-parse", "HEAD"],
+                    stderr=subprocess.DEVNULL,
+                    cwd=os.path.dirname(os.path.abspath(sglang.__file__)),
                 )
                 .strip()
                 .decode("utf-8")
             )
-        _CACHED_COMMIT_HASH = commit_hash
         return commit_hash
     except (subprocess.CalledProcessError, FileNotFoundError):
-        _CACHED_COMMIT_HASH = "N/A"
         return "N/A"
 
 
@@ -343,6 +346,9 @@ class StageProfiler:
         execution_time_s = time.perf_counter() - self.start_time
 
         if exc_type:
+            # each rank stops a cancelled request; the worker logs it once
+            if issubclass(exc_type, RequestCancelledError):
+                return False
             self.logger.error(
                 "[%s] Error during execution after %.4f ms: %s",
                 self.stage_name,
@@ -440,7 +446,7 @@ class PerformanceLogger:
     def log_request_summary(
         cls,
         metrics: "RequestMetrics",
-        tag: str = "total_inference_time",
+        tag: str = "pipeline_stage_metrics",
     ):
         """logs the stage metrics and total duration for a completed request
         to the performance_log file.
@@ -464,7 +470,7 @@ class PerformanceLogger:
         record = RequestPerfRecord(
             metrics.request_id,
             commit_hash=get_git_commit_hash(),
-            tag="pipeline_stage_metrics",
+            tag=tag,
             stages=formatted_stages,
             steps=metrics.steps,
             total_duration_ms=metrics.total_duration_ms,

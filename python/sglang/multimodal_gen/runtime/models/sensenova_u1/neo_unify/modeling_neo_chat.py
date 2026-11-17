@@ -930,6 +930,10 @@ class NEOChatModel(PreTrainedModel):
                     "noise_scale_embedder"
                 ](noise_level)
 
+        # the CFG window for every step, read to the host once
+        cfg_window = (
+            (timesteps >= cfg_interval[0]) & (timesteps <= cfg_interval[1])
+        ).tolist()
         for step_i in range(num_steps):
             t = timesteps[step_i]
             t_next = timesteps[step_i + 1]
@@ -970,7 +974,7 @@ class NEOChatModel(PreTrainedModel):
                 image_size=image_size,
             )
 
-            if t >= cfg_interval[0] and t <= cfg_interval[1] and cfg_scale > 1:
+            if cfg_window[step_i] and cfg_scale > 1:
                 v_pred_uncondition = self._t2i_predict_v(
                     image_embeds,
                     indexes_image_uncondition,

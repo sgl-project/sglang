@@ -20,6 +20,7 @@ def build_canary_server_args(
         "--cuda-graph-backend-prefill=disabled",
         "--context-length",
         "16384",
+        *mode_cfg.server_args,
         *extra_server_args,
     ]
     if mode_cfg.json_model_override_args is not None:

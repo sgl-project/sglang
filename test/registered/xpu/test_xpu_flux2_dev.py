@@ -52,7 +52,12 @@ XPU_FLUX2_CASES = [
                 "bf16",
             ],
             # The xpu_b60.json baseline for this case records device time.
-            env_vars={"SGLANG_DIFFUSION_SYNC_STAGE_PROFILING": "1"},
+            # Layerwise offload overlaps per-step H2D weight copies on the copy
+            # engine; re-enable copy offload that the CI container disables.
+            env_vars={
+                "SGLANG_DIFFUSION_SYNC_STAGE_PROFILING": "1",
+                "UR_L0_V2_FORCE_DISABLE_COPY_OFFLOAD": "0",
+            },
         ),
         DiffusionSamplingParams(
             prompt="A curious raccoon in a top hat, oil painting",

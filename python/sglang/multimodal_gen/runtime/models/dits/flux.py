@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -880,7 +880,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 RowParallelLinear if shard_single_block else ColumnParallelLinear
             )
             proj_out_kwargs = (
-                {"input_is_parallel": True}
+                {"input_is_parallel": True, "input_sizes": [dim, self.mlp_hidden_dim]}
                 if shard_single_block
                 else {"gather_output": True}
             )
@@ -892,8 +892,6 @@ class FluxSingleTransformerBlock(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.proj_out" if prefix else "proj_out",
             )
-            if shard_single_block:
-                self._patch_proj_out_weight_loader()
             self.attn = FluxAttention(
                 query_dim=dim,
                 dim_head=attention_head_dim,
@@ -905,30 +903,6 @@ class FluxSingleTransformerBlock(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.attn" if prefix else "attn",
             )
-
-    def _patch_proj_out_weight_loader(self) -> None:
-        dim, mlp_dim = self.local_dim, self.local_mlp_hidden_dim
-        tp_rank = self.proj_out.tp_rank
-
-        def _loader(param, loaded_weight):
-            input_dim = getattr(param, "input_dim", None)
-            if input_dim is not None:
-                # checkpoint columns are [attn_full | mlp_full], while TP consumes [attn_shard | mlp_shard]
-                attn_cols = loaded_weight.narrow(input_dim, tp_rank * dim, dim)
-                mlp_cols = loaded_weight.narrow(
-                    input_dim,
-                    self.tp_size * dim + tp_rank * mlp_dim,
-                    mlp_dim,
-                )
-                param.data.copy_(torch.cat([attn_cols, mlp_cols], dim=input_dim))
-            else:
-                param.data.copy_(loaded_weight)
-
-        self.proj_out.weight_loader = _loader
-        if hasattr(self.proj_out.weight, "_weight_loader"):
-            self.proj_out.weight._weight_loader = _loader
-        else:
-            self.proj_out.weight.weight_loader = _loader
 
     def forward(
         self,
@@ -1187,6 +1161,13 @@ class FluxTransformerBlock(nn.Module):
         return encoder_hidden_states, hidden_states
 
 
+def _add_control_residual(hidden_states, residuals, index):
+    # Residuals are the image-token shard on the compute dtype; None skips a block.
+    if index < len(residuals) and residuals[index] is not None:
+        return hidden_states + residuals[index]
+    return hidden_states
+
+
 class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     The Transformer model introduced in Flux.
@@ -1319,6 +1300,8 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         guidance: torch.Tensor = None,
         freqs_cis: torch.Tensor = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        controlnet_block_samples: Optional[List[Optional[torch.Tensor]]] = None,
+        controlnet_single_block_samples: Optional[List[Optional[torch.Tensor]]] = None,
     ) -> Union[torch.Tensor, Transformer2DModelOutput]:
         """
         The [`FluxTransformer2DModel`] forward method.
@@ -1335,18 +1318,9 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             guidance (`torch.Tensor`):
                 Guidance embeddings.
             joint_attention_kwargs (`dict`, *optional*):
-                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
-                `self.processor` in
-                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+                Internal attention metadata (such as `attn_mask_meta`) passed along to the attention layers.
 
         """
-        if (
-            joint_attention_kwargs is not None
-            and joint_attention_kwargs.get("scale", None) is not None
-        ):
-            logger.warning(
-                "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
-            )
         hidden_states, _ = self.x_embedder(hidden_states)
 
         # Only pass guidance to time_text_embed if the model supports it
@@ -1410,23 +1384,22 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
         freqs_cis = hoisted_freqs_cis
 
-        if (
-            joint_attention_kwargs is not None
-            and "ip_adapter_image_embeds" in joint_attention_kwargs
-        ):
-            ip_adapter_image_embeds = joint_attention_kwargs.pop(
-                "ip_adapter_image_embeds"
-            )
-            ip_hidden_states = self.encoder_hid_proj(ip_adapter_image_embeds)
-            joint_attention_kwargs.update({"ip_hidden_states": ip_hidden_states})
-
         forward_batch = get_forward_context().forward_batch
         spectrum_enabled = forward_batch is not None and forward_batch.enable_spectrum
         run_transformer_blocks = (
             self.begin_spectrum_step() if spectrum_enabled else True
         )
+        if (
+            controlnet_block_samples is not None
+            or controlnet_single_block_samples is not None
+        ) and (
+            len(self.transformer_blocks) != self.config.num_layers
+            or len(self.single_transformer_blocks) != self.config.num_single_layers
+        ):
+            # Block wrappers (e.g. cache-dit) break the index mapping.
+            raise ValueError("ControlNet residuals need the unwrapped block lists")
         if run_transformer_blocks:
-            for block in self.transformer_blocks:
+            for index, block in enumerate(self.transformer_blocks):
                 encoder_hidden_states, hidden_states = block(
                     hidden_states=hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
@@ -1436,7 +1409,11 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     joint_attention_kwargs=joint_attention_kwargs,
                     num_replicated_prefix=num_replicated_prefix,
                 )
-            for block in self.single_transformer_blocks:
+                if controlnet_block_samples is not None:
+                    hidden_states = _add_control_residual(
+                        hidden_states, controlnet_block_samples, index
+                    )
+            for index, block in enumerate(self.single_transformer_blocks):
                 encoder_hidden_states, hidden_states = block(
                     hidden_states=hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
@@ -1446,6 +1423,10 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     joint_attention_kwargs=joint_attention_kwargs,
                     num_replicated_prefix=num_replicated_prefix,
                 )
+                if controlnet_single_block_samples is not None:
+                    hidden_states = _add_control_residual(
+                        hidden_states, controlnet_single_block_samples, index
+                    )
             if spectrum_enabled:
                 self.spectrum_record_features(hidden_states)
         else:

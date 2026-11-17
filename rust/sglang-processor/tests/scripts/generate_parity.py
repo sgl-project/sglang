@@ -5,7 +5,10 @@ Each fixture names a checkpoint (`model`, `revision`, optionally the server's
 `default_chat_template_kwargs`. This validates and renders every case with
 `OpenAIServingChat` on that checkpoint and records the prompt and its token ids,
 or the error SGLang raises, plus the `config.json` fields the processor reads
-and the Jinja template a checkpoint renders with.
+and the Jinja template a checkpoint renders with, with the special tokens its
+context carries. The tokenizer comes from SGLang's `get_tokenizer`.
+
+MiniMax cases may also supply `chat_template` for a server-side template override.
 
 Run from rust/sglang-processor in a SGLang Python environment with the
 checkpoints cached:
@@ -22,7 +25,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from huggingface_hub import snapshot_download
-from transformers import AutoTokenizer
 
 # Fixtures must not depend on the generating machine's environment.
 os.environ["SGLANG_DEFAULT_THINKING"] = "false"
@@ -32,12 +34,13 @@ os.environ["SGLANG_DSV41_REASONING_EFFORT"] = ""
 from sglang.srt.entrypoints.openai import chat_encoding
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.hf_transformers.tokenizer import get_tokenizer
+from sglang.srt.parser.jinja_template_utils import detect_jinja_template_content_format
 from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures/parity"
-DSV4_PROFILE = chat_encoding.DSV4_REASONING_EFFORT_PROFILE_OVERRIDE
 
 
 class RecordingTokenizer:
@@ -68,10 +71,15 @@ def serving_chat(model, path, revision, config, tokenizer, tool_call_parser):
     """The state `OpenAIServingChat.__init__` resolves for this checkpoint, without
     a reasoning parser. Served text-only: the processor leaves media to the engine."""
     server = object.__new__(OpenAIServingChat)
+    hf_config = SimpleNamespace(
+        model_type=config.get("model_type"),
+        architectures=config.get("architectures"),
+    )
     server.tokenizer_manager = SimpleNamespace(
         tokenizer=tokenizer,
         processor=None,
-        model_config=SimpleNamespace(is_multimodal=False),
+        model_path=path,
+        model_config=SimpleNamespace(is_multimodal=False, hf_config=hf_config),
     )
     server.template_manager = TemplateManager()
     server.template_manager.load_chat_template(server.tokenizer_manager, None, model)
@@ -79,26 +87,13 @@ def serving_chat(model, path, revision, config, tokenizer, tool_call_parser):
     server.reasoning_parser = None
     server._reasoning_detector = None
     server.is_gpt_oss = server.is_gemma4 = False
+    server.is_minimax_m3 = config.get("model_type") == "minimax_m3_vl"
     server.chat_encoding_spec = chat_encoding.resolve_chat_encoding_spec(
-        hf_config=SimpleNamespace(
-            model_type=config.get("model_type"),
-            architectures=config.get("architectures"),
-        ),
+        hf_config=hf_config,
         tokenizer=tokenizer,
         tool_call_parser=tool_call_parser,
     )
-    server._dsv4_reasoning_effort_profile = (
-        chat_encoding.resolve_dsv4_reasoning_effort_profile(
-            model_path=path, revision=revision, override=config.get(DSV4_PROFILE)
-        )
-        if server.chat_encoding_spec == "dsv4"
-        else None
-    )
-    server._dsv41_default_reasoning_effort = (
-        chat_encoding.default_dsv41_reasoning_effort_from_env(None)
-        if server.chat_encoding_spec == "dsv41"
-        else None
-    )
+    server._encoding_adapter = server._build_chat_encoding_adapter()
     server._tokenizer_auto_adds_specials = len(tokenizer.encode("")) > 0
     server._prompt_text_round_trip_is_lossy = server._probe_prompt_text_round_trip()
     server._chat_template_cache = OrderedDict()
@@ -117,11 +112,8 @@ def generate(fixture_path):
     # The server args `_validate_request` reads.
     reset_context()
     publish(ServerArgs(model_path=path), role="tokenizer")
-    tok = RecordingTokenizer(
-        AutoTokenizer.from_pretrained(
-            path, local_files_only=True, trust_remote_code=True
-        )
-    )
+    # SGLang's loader, whose fixes for transformers v5 the engine's tokenizer gets.
+    tok = RecordingTokenizer(get_tokenizer(path, trust_remote_code=True))
     server = serving_chat(
         fixture["model"],
         path,
@@ -130,21 +122,42 @@ def generate(fixture_path):
         tok,
         fixture.get("tool_call_parser"),
     )
-    # What the processor reads from config.json; the resolved profile stands in
-    # for the checkpoint's encoder file so the Rust test runs offline.
+    # What the processor reads from config.json.
     fixture["config"] = {
         key: config[key] for key in ("model_type", "architectures") if key in config
     }
-    if server._dsv4_reasoning_effort_profile:
-        fixture["config"][DSV4_PROFILE] = server._dsv4_reasoning_effort_profile
     fixture["bos_token_id"] = tok.bos_token_id
-    # Jinja checkpoints render with their template; keep it so the test runs offline.
+    # Jinja checkpoints render with their template; keep it so the test runs offline,
+    # with the special tokens the template context carries.
     if server.chat_encoding_spec is None:
         fixture["chat_template"] = tok.chat_template
-    inputs = ("name", "request", "default_chat_template_kwargs", "known_gap")
+        fixture["special_tokens"] = {
+            name: getattr(tok, name)
+            for name in ("bos_token", "eos_token", "unk_token")
+            if getattr(tok, name) is not None
+        }
+    inputs = (
+        "name",
+        "request",
+        "default_chat_template_kwargs",
+        "known_gap",
+        "chat_template",
+    )
     fixture["cases"] = [{k: c[k] for k in inputs if k in c} for c in fixture["cases"]]
     for case in fixture["cases"]:
         tok.texts.clear()
+        # A server-side --chat-template override keeps the checkpoint's model
+        # type, but content normalization follows the replacement template.
+        if "chat_template" in case and not server.is_minimax_m3:
+            raise ValueError(
+                "Per-case chat templates are currently supported for MiniMax-M3"
+            )
+        if server.is_minimax_m3:
+            template = case.get("chat_template", fixture["chat_template"])
+            tok.tokenizer.chat_template = template
+            server.template_manager._jinja_template_content_format = (
+                detect_jinja_template_content_format(template)
+            )
         server.default_chat_template_kwargs = case.get("default_chat_template_kwargs")
         try:
             request = ChatCompletionRequest(**copy.deepcopy(case["request"]))
@@ -164,7 +177,12 @@ def generate(fixture_path):
             case["error"] = f"{type(error).__name__}: {error}"
             continue
         case.update(
-            prompt="".join(tok.texts),
+            # An encoding adapter tokenizes with its own library, not `encode`.
+            prompt=(
+                tok.decode(ids, skip_special_tokens=False)
+                if server._encoding_adapter is not None
+                else "".join(tok.texts)
+            ),
             token_count=len(ids),
             token_sha256=hashlib.sha256(
                 b"".join(i.to_bytes(4, "little") for i in ids)
@@ -176,6 +194,7 @@ def generate(fixture_path):
         "tool_call_parser",
         "config",
         "bos_token_id",
+        "special_tokens",
         "chat_template",
     )
     head = {k: fixture[k] for k in keys if k in fixture}

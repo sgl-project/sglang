@@ -39,13 +39,14 @@ from sglang.srt.models.deepseek_common.moe_transport import (
 from sglang.srt.models.deepseek_v2 import MoEOutput
 from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE, AttnOutput
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models import deepseek_v2
 
 _is_gfx95_supported = is_gfx95_supported()
+_is_gfx1250_supported = is_gfx1250_supported()
 
 
 def _prepare_ffn_input(layer, hidden_states, residual, post, comb, forward_batch):
@@ -224,6 +225,7 @@ class NonCudaDecoderMixin:
                 self._next_layer.input_layernorm,
                 accepts_mxfp8=self._next_layer.self_attn.accepts_mxfp8_swizzled_input(),
                 hc=self._next_layer.attn_hc,
+                accepts_mxfp8_deepgemm=self._next_layer.self_attn.accepts_deepgemm_mxfp8_input(),
             )
 
     def forward(
@@ -268,7 +270,7 @@ class NonCudaDecoderMixin:
                 self.hc_sinkhorn_iters,
                 input_norm_weight,
                 self.input_layernorm.variance_epsilon,
-                fn_transpose=False,
+                fn_transpose=_is_gfx1250_supported,
             )
         if fused is not None:
             residual, hidden_states, post, comb, norm_fused = fused
@@ -460,16 +462,18 @@ class NonCudaDecoderMixin:
     def op_gather_a(self, state):
         local = state.pop("hidden_states_mlp_input")
         state.do_shared_local = shared_expert_runs_locally(self.mlp)
-        state.global_hidden, state.gather_event, state.shared_local = (
-            _tbo_gather_moe_input(
-                self.mlp,
-                local,
-                state.forward_batch,
-                state.tbo_subbatch_index,
-                state.do_shared_local,
-            )
+        (
+            state.global_hidden,
+            state.gather_event,
+            state.shared_local,
+            state.gather_keepalive,
+        ) = _tbo_gather_moe_input(
+            self.mlp,
+            local,
+            state.forward_batch,
+            state.tbo_subbatch_index,
+            state.do_shared_local,
         )
-        state.gather_keepalive = local
 
     def op_gather_b(self, state):
         torch.cuda.current_stream().wait_event(state.pop("gather_event"))
@@ -485,7 +489,7 @@ class NonCudaDecoderMixin:
     def op_combine_a(self, state):
         output = state.pop("global_expert_out")
         state.local_out, state.combine_event = _tbo_combine_moe_output(
-            output, state.tbo_subbatch_index
+            output, state.forward_batch, state.tbo_subbatch_index
         )
         state.combine_keepalive = output
 
