@@ -1,10 +1,11 @@
 """aiter fused QK-norm + RoPE + KV-cache write used by Qwen3 decode on ROCm.
 
 ``aiter_fused_qk_norm_rope_set_kv`` hands the kernel sglang's NHD
-(slots, num_kv_heads, head_dim) pool buffers. Guards: q and the K/V written at
-``out_cache_loc`` match QK-norm + RoPE computed with the reference modules, and
-no other cache slot is written. An fp8 cache must hold what the unfused write
-stores, x / scale cast to fp8.
+(slots, num_kv_heads, head_dim) pool buffers, or its vectorized_5d ones, which
+are aiter's shuffle layout. Guards: q and the K/V written at ``out_cache_loc``
+match QK-norm + RoPE computed with the reference modules, and no other cache
+slot is written. An fp8 cache must hold what the unfused write stores,
+x / scale cast to fp8.
 """
 
 import os
@@ -21,6 +22,8 @@ HEAD_DIM = 128
 EPS = 1e-6
 MAX_POS = 8192
 NUM_SLOTS = 4096
+# The vectorized_5d page: a multiple of x, 16 elements per 16 bytes for fp8.
+BLOCK_SIZE = 16
 # Qwen3-VL text config: interleaved 3D mRoPE over a 128-dim head.
 MROPE_SCALING = {
     "rope_type": "default",
@@ -77,6 +80,7 @@ class TestQwen3AiterFusedQKNormRopeSetKV(CustomTestCase):
         kv_dtype=torch.bfloat16,
         k_scale=1.0,
         v_scale=1.0,
+        vectorized_5d=False,
     ):
         num_tokens = positions.shape[-1]
         q_norm, k_norm = self._norm(), self._norm()
@@ -88,10 +92,46 @@ class TestQwen3AiterFusedQKNormRopeSetKV(CustomTestCase):
         )
         # MHATokenToKVPool keeps fp8 in uint8 storage; so do these buffers.
         store_dtype = torch.uint8 if kv_dtype.itemsize == 1 else kv_dtype
-        k_cache = torch.zeros(
-            NUM_SLOTS, num_kv_heads, HEAD_DIM, dtype=store_dtype, device=self.device
-        )
-        v_cache = torch.zeros_like(k_cache)
+        if vectorized_5d:
+            x, blocks = 16 // kv_dtype.itemsize, NUM_SLOTS // BLOCK_SIZE
+            k_cache = torch.zeros(
+                blocks,
+                num_kv_heads,
+                HEAD_DIM // x,
+                BLOCK_SIZE,
+                x,
+                dtype=store_dtype,
+                device=self.device,
+            )
+            v_cache = torch.zeros(
+                blocks,
+                num_kv_heads,
+                BLOCK_SIZE // x,
+                HEAD_DIM,
+                x,
+                dtype=store_dtype,
+                device=self.device,
+            )
+        else:
+            k_cache = torch.zeros(
+                NUM_SLOTS, num_kv_heads, HEAD_DIM, dtype=store_dtype, device=self.device
+            )
+            v_cache = torch.zeros_like(k_cache)
+
+        def read(slot_ids):
+            """K and V at ``slot_ids`` as (tokens, num_kv_heads, HEAD_DIM)."""
+            if not vectorized_5d:
+                return k_cache[slot_ids].view(kv_dtype), v_cache[slot_ids].view(
+                    kv_dtype
+                )
+            from sglang.kernels.ops.kvcache.shuffle_5d_cache import (
+                launch_gather_shuffle_5d_to_linear,
+            )
+
+            return launch_gather_shuffle_5d_to_linear(
+                k_cache.view(kv_dtype), v_cache.view(kv_dtype), slot_ids
+            )
+
         slots = torch.randperm(NUM_SLOTS - 1, device=self.device)[:num_tokens] + 1
 
         q = self.qwen3.aiter_fused_qk_norm_rope_set_kv(
@@ -119,8 +159,7 @@ class TestQwen3AiterFusedQKNormRopeSetKV(CustomTestCase):
         q_ref, k_ref = rotary_emb.forward_native(positions, q_ref, k_ref)
         k_ref = k_ref.view(num_tokens, num_kv_heads, HEAD_DIM)
         v_ref = v_ref.reshape(num_tokens, num_kv_heads, HEAD_DIM)
-        k_out = k_cache[slots].view(kv_dtype)
-        v_out = v_cache[slots].view(kv_dtype)
+        k_out, v_out = read(slots)
 
         torch.testing.assert_close(q, q_ref, atol=TOL, rtol=TOL)
         if kv_dtype == torch.bfloat16:
@@ -141,8 +180,10 @@ class TestQwen3AiterFusedQKNormRopeSetKV(CustomTestCase):
             )
         untouched = torch.ones(NUM_SLOTS, dtype=torch.bool, device=self.device)
         untouched[slots] = False
-        self.assertFalse(k_cache[untouched].any().item(), "K written to other slots")
-        self.assertFalse(v_cache[untouched].any().item(), "V written to other slots")
+        k_rest, v_rest = read(torch.nonzero(untouched).flatten())
+        k_rest, v_rest = k_rest.view(store_dtype), v_rest.view(store_dtype)
+        self.assertFalse(k_rest.any().item(), "K written to other slots")
+        self.assertFalse(v_rest.any().item(), "V written to other slots")
 
     def test_rope_nhd_cache(self):
         if not self.qwen3._has_fused_qk_norm_rope:
@@ -184,6 +225,52 @@ class TestQwen3AiterFusedQKNormRopeSetKV(CustomTestCase):
                             v_scale,
                         )
 
+    def test_rope_vectorized_5d_cache(self):
+        if not self.qwen3._has_fused_qk_norm_rope:
+            self.skipTest("aiter fused_qk_norm_rope kernel unavailable")
+        torch.manual_seed(0)
+        rotary_emb = self._rope()
+        for num_heads, num_kv_heads in ((32, 8), (8, 2)):
+            for num_tokens in (1, 7, 64, 256):
+                with self.subTest(heads=(num_heads, num_kv_heads), tokens=num_tokens):
+                    positions = torch.randint(
+                        0, MAX_POS, (num_tokens,), device=self.device
+                    )
+                    self._check(
+                        rotary_emb,
+                        positions,
+                        num_heads,
+                        num_kv_heads,
+                        vectorized_5d=True,
+                    )
+
+    def test_rope_vectorized_5d_fp8_cache(self):
+        if not self.qwen3._has_fused_qk_norm_rope:
+            self.skipTest("aiter fused_qk_norm_rope kernel unavailable")
+        torch.manual_seed(0)
+        rotary_emb = self._rope()
+        for k_scale, v_scale in FP8_KV_SCALES:
+            for num_heads, num_kv_heads in ((32, 8), (8, 2)):
+                for num_tokens in (1, 7, 64, 256):
+                    with self.subTest(
+                        scales=(k_scale, v_scale),
+                        heads=(num_heads, num_kv_heads),
+                        tokens=num_tokens,
+                    ):
+                        positions = torch.randint(
+                            0, MAX_POS, (num_tokens,), device=self.device
+                        )
+                        self._check(
+                            rotary_emb,
+                            positions,
+                            num_heads,
+                            num_kv_heads,
+                            self.fp8,
+                            k_scale,
+                            v_scale,
+                            vectorized_5d=True,
+                        )
+
     def test_mrope_nhd_cache(self):
         if not self.qwen3._has_fused_qk_norm_mrope:
             self.skipTest("aiter fused_qk_norm_mrope kernel unavailable")
@@ -223,6 +310,31 @@ class TestQwen3AiterFusedQKNormRopeSetKV(CustomTestCase):
                             k_scale,
                             v_scale,
                         )
+
+    def test_mrope_vectorized_5d_cache(self):
+        if not self.qwen3._has_fused_qk_norm_mrope:
+            self.skipTest("aiter fused_qk_norm_mrope kernel unavailable")
+        torch.manual_seed(0)
+        rotary_emb = self._mrope()
+        for kv_dtype, k_scale, v_scale in (
+            (torch.bfloat16, 1.0, 1.0),
+            (self.fp8, 0.5, 2.0),
+        ):
+            for num_tokens in (1, 7, 64):
+                with self.subTest(kv_dtype=kv_dtype, tokens=num_tokens):
+                    positions = torch.randint(
+                        0, MAX_POS, (3, num_tokens), device=self.device
+                    )
+                    self._check(
+                        rotary_emb,
+                        positions,
+                        32,
+                        8,
+                        kv_dtype,
+                        k_scale,
+                        v_scale,
+                        vectorized_5d=True,
+                    )
 
     def test_host_kv_scale(self):
         host_kv_scale = self.qwen3._host_kv_scale

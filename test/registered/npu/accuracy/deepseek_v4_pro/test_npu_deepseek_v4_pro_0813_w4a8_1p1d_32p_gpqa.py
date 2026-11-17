@@ -15,7 +15,6 @@ register_npu_ci(
     est_time=4800,
     suite="",
     nightly=True,
-    disabled="accuracy testcase",
 )
 
 # Common environment variables shared by prefill/decode nodes
@@ -41,8 +40,10 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_COMMON_ENVS = {
     "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
     "HCCL_SOCKET_IFNAME": NIC_NAME,
     "GLOO_SOCKET_IFNAME": NIC_NAME,
+    # mtp
+    "SGLANG_ENABLE_SPEC_V2": "1",
+    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     # dspark
-    "SGLANG_DSPARK_FAST_KERNEL": "0",
     "SGLANG_DSPARK_FAST_SAMPLING": "0",
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "1800",
     "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "1800",
@@ -59,10 +60,22 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ENVS = {
 DEEPSEEK_V4_PRO_W4A8_PD_SEP_DECODE_ENVS = {
     **DEEPSEEK_V4_PRO_W4A8_PD_SEP_COMMON_ENVS,
     "DEEPEP_HCCL_BUFFSIZE": "1600",
-    # mtp
-    "SGLANG_ENABLE_SPEC_V2": "1",
-    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
 }
+
+# DSPARK speculative decoding arguments shared by the prefill and decode nodes:
+# the PD prefill worker prunes the draft to context-KV injection.
+DEEPSEEK_V4_PRO_W4A8_PD_SEP_SPECULATIVE_ARGS = [
+    "--speculative-algorithm",
+    "DSPARK",
+    "--speculative-draft-model-path",
+    DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH,
+    "--speculative-draft-model-quantization",
+    "modelslim",
+    "--speculative-draft-attention-backend",
+    "ascend",
+    "--speculative-num-draft-tokens",
+    6,
+]
 
 # Prefill node launch arguments
 DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ARGS = [
@@ -118,6 +131,7 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ARGS = [
     "write_through",
     "--max-total-tokens",
     140000,
+    *DEEPSEEK_V4_PRO_W4A8_PD_SEP_SPECULATIVE_ARGS,
 ]
 
 # Decode node launch arguments
@@ -157,17 +171,8 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_DECODE_ARGS = [
     1,
     2,
     8,
-    "--speculative-algorithm",
-    "DSPARK",
-    "--speculative-draft-model-path",
-    DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH,
-    "--speculative-draft-model-quantization",
-    "modelslim",
-    "--speculative-draft-attention-backend",
-    "ascend",
-    "--speculative-num-draft-tokens",
-    6,
     "--enable-metrics",
+    *DEEPSEEK_V4_PRO_W4A8_PD_SEP_SPECULATIVE_ARGS,
 ]
 
 # Model config for DSV4-Pro W4A8 32P PD-Sep deployment.
@@ -177,7 +182,7 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_MODEL_CONFIG = {
     "decode_args": DEEPSEEK_V4_PRO_W4A8_PD_SEP_DECODE_ARGS,
     "prefill_envs": DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ENVS,
     "decode_envs": DEEPSEEK_V4_PRO_W4A8_PD_SEP_DECODE_ENVS,
-    "router_args": ["--policy", "cache_aware"],
+    "router_args": [],
     "router_envs": {},
 }
 
@@ -200,6 +205,12 @@ class TestNPUDeepSeekV4ProW4A8PDSEPGPQAHigh(TestNpuAccuracyMultiNodePdSepTestCas
     # (reference: Pro W4A8 GPQA Diamond baseline is 0.85).
     accuracy = 0.85
     datasets = ["gpqa_diamond"]
+    # A single attempt: gsm8k's 3-retry budget would exceed the step timeout.
+    max_retries = 1
+    # Weekday nightly overrides this to gsm8k (baseline is provisional).
+    dataset_baselines = {
+        "gsm8k": 0.92,
+    }
     generation_config = DEEPSEEK_V4_PRO_W4A8_GENERATION_CONFIG_HIGH
     eval_batch_size = 64
     min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 0%

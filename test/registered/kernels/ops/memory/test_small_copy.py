@@ -6,10 +6,7 @@ import torch
 
 from sglang.kernels.ops.memory import small_field_copy as small_field_copy_module
 from sglang.kernels.ops.memory.small_copy import _small_copy_kernel, try_small_copy
-from sglang.kernels.ops.memory.small_field_copy import (
-    SmallFieldCopyPlan,
-    small_field_copy,
-)
+from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -191,7 +188,7 @@ def _raw_bits(tensor):
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class TestSmallFieldCopy(CustomTestCase):
-    """small_field_copy must match try_small_copy: same bytes, same refusals."""
+    """SmallFieldCopyPlan must match try_small_copy: same bytes, same refusals."""
 
     def test_bits_match_reference_copy(self):
         for n, strided in itertools.product((0, 1, 8, 128, 4096), (False, True)):
@@ -212,7 +209,7 @@ class TestSmallFieldCopy(CustomTestCase):
                     refs.append(torch.zeros_like(dsts[-1]))
                 for chunk in range(0, len(dsts), 5):
                     self.assertTrue(
-                        small_field_copy(
+                        SmallFieldCopyPlan()(
                             dsts[chunk : chunk + 5], srcs[chunk : chunk + 5]
                         )
                     )
@@ -232,10 +229,10 @@ class TestSmallFieldCopy(CustomTestCase):
                 d0 = torch.empty(n, device="cuda", dtype=torch.int32)
                 backing = torch.full((3, n + 5), -7, device="cuda", dtype=torch.int64)
                 d1 = backing[:, :n]
-                self.assertTrue(small_field_copy([d0, d1], [s0, s1]))
+                self.assertTrue(SmallFieldCopyPlan()([d0, d1], [s0, s1]))
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
-                    self.assertTrue(small_field_copy([d0, d1], [s0, s1]))
+                    self.assertTrue(SmallFieldCopyPlan()([d0, d1], [s0, s1]))
                 for _ in range(3):
                     s0.add_(17)
                     s1.add_(13)
@@ -247,20 +244,20 @@ class TestSmallFieldCopy(CustomTestCase):
     def test_refusals_leave_destinations_untouched(self):
         x = torch.arange(17, device="cuda")
         y = torch.full_like(x, -1)
-        self.assertFalse(small_field_copy([x[1:], y[:16]], [x[:-1], x[:16]]))
-        self.assertFalse(small_field_copy([x, y], [y, x]))
-        self.assertFalse(small_field_copy([x[:8], x[4:12]], [y[:8], y[:8]]))
+        self.assertFalse(SmallFieldCopyPlan()([x[1:], y[:16]], [x[:-1], x[:16]]))
+        self.assertFalse(SmallFieldCopyPlan()([x, y], [y, x]))
+        self.assertFalse(SmallFieldCopyPlan()([x[:8], x[4:12]], [y[:8], y[:8]]))
         self.assertTrue(torch.equal(x, torch.arange(17, device="cuda")))
         self.assertTrue(bool((y == -1).all()))
         self.assertFalse(
-            small_field_copy(
+            SmallFieldCopyPlan()(
                 [torch.empty(2, dtype=torch.complex64, device="cuda")] * 2,
                 [torch.empty(2, dtype=torch.complex64, device="cuda")] * 2,
             )
         )
         a = torch.empty(2)
-        self.assertFalse(small_field_copy([a, a], [a, a]))
-        self.assertTrue(small_field_copy([x, y], [x, y]))
+        self.assertFalse(SmallFieldCopyPlan()([a, a], [a, a]))
+        self.assertTrue(SmallFieldCopyPlan()([x, y], [x, y]))
 
     def test_plan_refreshes_sources_and_revalidates(self):
         """A plan copies from each call's sources, re-validates a source whose layout
@@ -390,7 +387,6 @@ class TestSmallFieldCopy(CustomTestCase):
                         srcs.append(src if rows > 1 else src.reshape(cols))
                         backings.append(b)
                     with mock.patch.object(small_field_copy_module, "_VEC", vec):
-                        self.assertTrue(small_field_copy(dsts, srcs))
                         plan = SmallFieldCopyPlan()
                         self.assertTrue(plan(dsts, srcs))
                         self.assertTrue(plan(dsts, srcs))
@@ -402,8 +398,8 @@ class TestSmallFieldCopy(CustomTestCase):
         with mock.patch.object(small_field_copy_module, "_VEC", True):
             x = torch.arange(17, device="cuda")
             y = torch.full_like(x, -1)
-            self.assertFalse(small_field_copy([x[1:], y[:16]], [x[:-1], x[:16]]))
-            self.assertFalse(small_field_copy([x, y], [y, x]))
+            self.assertFalse(SmallFieldCopyPlan()([x[1:], y[:16]], [x[:-1], x[:16]]))
+            self.assertFalse(SmallFieldCopyPlan()([x, y], [y, x]))
             self.assertTrue(torch.equal(x, torch.arange(17, device="cuda")))
             self.assertTrue(bool((y == -1).all()))
             src = torch.randn(56, 4096, device="cuda").bfloat16()

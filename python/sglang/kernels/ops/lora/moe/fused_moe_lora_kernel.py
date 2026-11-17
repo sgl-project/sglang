@@ -4,14 +4,11 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.utils.common import is_blackwell_supported, is_sm90_supported
-
-# Import SGLang's standard PDL support detection
-
 
 _LORA_PTR_DICT: dict[tuple[int, ...], torch.Tensor] = {}
 
@@ -242,7 +239,7 @@ def _fused_moe_lora_shrink(
 ) -> None:
     w1_lora_a_stacked = lora_a_stacked[0]
 
-    use_gdc = is_sm90_supported() or is_blackwell_supported()
+    use_gdc = current_arch().supports_pdl
     shrink_config = {
         "BLOCK_SIZE_M": block_size_m,
         "BLOCK_SIZE_N": block_size_n,
@@ -351,7 +348,7 @@ def _fused_moe_lora_expand(
         -1, a_intermediate_cache1.shape[3]
     )
 
-    use_gdc = is_sm90_supported() or is_blackwell_supported()
+    use_gdc = current_arch().supports_pdl
     expand_config = {
         "BLOCK_SIZE_M": block_size_m,
         "BLOCK_SIZE_N": block_size_n,
@@ -599,75 +596,9 @@ def _fused_moe_lora_fake(
     return
 
 
-def _fused_moe_lora_shrink_fake(
-    a_intermediate_cache1: torch.Tensor,
-    qcurr_hidden_states: torch.Tensor,
-    lora_a_stacked: list[torch.Tensor],
-    topk_weights: torch.Tensor,
-    sorted_token_ids: torch.Tensor,
-    expert_ids: torch.Tensor,
-    num_tokens_post_padded: torch.Tensor,
-    top_k_num: int,
-    lora_ids: torch.Tensor,
-    adapter_enabled: torch.Tensor,
-    device: torch.device,
-    N: int,
-    M: int,
-    EM: int,
-    K: int,
-    num_tokens: int,
-    num_experts: int,
-    num_slices: int,
-    block_size_m: int,
-    block_size_n: int,
-    block_size_k: int,
-    group_size_m: int,
-    num_warps: int,
-    num_stages: int,
-    split_k: int,
-    mul_routed_weight: bool = False,
-) -> None:
-    return
-
-
-def _fused_moe_lora_expand_fake(
-    output: torch.Tensor,
-    a_intermediate_cache1: torch.Tensor,
-    b_intermediate_cache1: torch.Tensor,
-    lora_b_stacked: list[torch.Tensor],
-    topk_weights: torch.Tensor,
-    sorted_token_ids: torch.Tensor,
-    expert_ids: torch.Tensor,
-    num_tokens_post_padded: torch.Tensor,
-    top_k_num: int,
-    lora_ids: torch.Tensor,
-    adapter_enabled: torch.Tensor,
-    device: torch.device,
-    N: int,
-    M: int,
-    EM: int,
-    K: int,
-    num_tokens: int,
-    num_experts: int,
-    num_slices: int,
-    max_lora_rank: int,
-    w1_output_dim_size: int,
-    block_size_m: int,
-    block_size_n: int,
-    block_size_k: int,
-    group_size_m: int,
-    num_warps: int,
-    num_stages: int,
-    split_k: int,
-    mul_routed_weight: bool = False,
-    offset: int = 0,
-) -> None:
-    return
-
-
 # Register as SGLang custom ops following the same pattern as other ops
 try:
-    from sglang.srt.utils.common import direct_register_custom_op
+    from sglang.srt.utils.custom_op import direct_register_custom_op
 
     direct_register_custom_op(
         op_name="fused_moe_lora",
@@ -676,26 +607,8 @@ try:
         fake_impl=_fused_moe_lora_fake,
     )
 
-    direct_register_custom_op(
-        op_name="fused_moe_lora_shrink",
-        op_func=_fused_moe_lora_shrink,
-        mutates_args=["a_intermediate_cache1"],
-        fake_impl=_fused_moe_lora_shrink_fake,
-    )
-
-    direct_register_custom_op(
-        op_name="fused_moe_lora_expand",
-        op_func=_fused_moe_lora_expand,
-        mutates_args=["output", "b_intermediate_cache1"],
-        fake_impl=_fused_moe_lora_expand_fake,
-    )
-
     # Export through torch.ops.sglang namespace
     fused_moe_lora = torch.ops.sglang.fused_moe_lora
-    fused_moe_lora_shrink = torch.ops.sglang.fused_moe_lora_shrink
-    fused_moe_lora_expand = torch.ops.sglang.fused_moe_lora_expand
 
 except AttributeError:
     fused_moe_lora = _fused_moe_lora
-    fused_moe_lora_shrink = _fused_moe_lora_shrink
-    fused_moe_lora_expand = _fused_moe_lora_expand

@@ -1,5 +1,6 @@
 import asyncio
 import os
+import traceback
 from concurrent.futures.process import BrokenProcessPool
 from typing import Dict, List, Optional, Union
 
@@ -19,6 +20,12 @@ from sglang.srt.models.llava import (
 )
 from sglang.srt.models.llavavid import LlavaVidForCausalLM
 from sglang.srt.models.mistral import Mistral3ForConditionalGeneration
+from sglang.srt.multimodal.media_io import (
+    CLIENT_MEDIA_EXCEPTIONS,
+    ImageData,
+    get_image_bytes,
+    load_image,
+)
 from sglang.srt.multimodal.mm_utils import (
     ensure_numpy,
     expand2square,
@@ -26,14 +33,7 @@ from sglang.srt.multimodal.mm_utils import (
 )
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.utils import (
-    CLIENT_MEDIA_EXCEPTIONS,
-    ImageData,
-    get_image_bytes,
-    load_image,
-    logger,
-)
-from sglang.utils import get_exception_traceback
+from sglang.srt.utils import logger
 
 
 class LlavaImageProcessor(BaseMultimodalProcessor):
@@ -100,13 +100,13 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         except CLIENT_MEDIA_EXCEPTIONS as error:
             raise ValueError(f"Error while processing image: {error}") from error
         except Exception:
-            logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())
+            logger.error("Exception in TokenizerManager:\n" + traceback.format_exc())
             raise
 
     async def _fetch_remote_image_bytes(self, url):
         # Fetch a remote image's compressed bytes in the io thread pool, retrying
-        # only transient network failures. Each attempt is bounded by
-        # REQUEST_TIMEOUT inside download_remote_media, so total time is bounded.
+        # only transient network failures. Each attempt is bounded by the media
+        # URL timeout inside download_remote_media, so total time is bounded.
         loop = asyncio.get_running_loop()
         max_retries = max(0, int(os.environ.get("SGLANG_MM_LOAD_MAX_RETRIES", "2")))
         delay = 0.5
@@ -289,12 +289,14 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
 
 class LlavaMultimodalProcessor(BaseMultimodalProcessor):
     """
-    This is a wrapper class used to identify the multimodal processor for Llava architectures' vision model.
+    Identifies the multimodal processor for Llava architectures' vision model;
+    constructing this class returns an instance of that processor.
     """
 
     models = [LlavaForConditionalGeneration, Mistral3ForConditionalGeneration]
 
-    def _get_sgl_processor_cls(self, model_type: str):
+    @staticmethod
+    def _get_sgl_processor_cls(model_type: str):
         if model_type == "clip_vision_model":
             return LlavaImageProcessor
         if hf_name := HF_MAPPING_NAMES.get(model_type):
@@ -308,33 +310,15 @@ class LlavaMultimodalProcessor(BaseMultimodalProcessor):
             f"Cannot find corresponding multimodal processor registered in sglang for model type `{model_type}`"
         )
 
-    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+    def __new__(cls, hf_config, server_args, _processor, *args, **kwargs):
         assert hasattr(hf_config, "vision_config")
         assert hasattr(hf_config, "text_config")
-        self.vision_config = hf_config.vision_config
-        self.text_config = hf_config.text_config
-        self.hf_config = hf_config
 
-        if vision_type := getattr(self.vision_config, "model_type"):
-            self.inner = self._get_sgl_processor_cls(vision_type)(
+        if vision_type := getattr(hf_config.vision_config, "model_type"):
+            return cls._get_sgl_processor_cls(vision_type)(
                 hf_config, server_args, _processor, *args, **kwargs
             )
         else:
             raise ValueError(
                 f"Required `vision_config.model_type` is not found in hf_config: `{hf_config}`"
             )
-
-    async def process_mm_data_async(self, *args, **kwargs):
-        return await self.inner.process_mm_data_async(*args, **kwargs)
-
-    def finalize_cache_identities(self, output: MultimodalProcessorOutput) -> None:
-        self.inner.finalize_cache_identities(output)
-
-    def preprocess_fingerprint_payload(self):
-        return self.inner.preprocess_fingerprint_payload()
-
-    def clear_preprocess_cache(self) -> None:
-        self.inner.clear_preprocess_cache()
-
-    def shutdown(self) -> None:
-        self.inner.shutdown()

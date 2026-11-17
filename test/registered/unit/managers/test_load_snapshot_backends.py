@@ -330,6 +330,13 @@ class TestZmqReaderOwner(CustomTestCase):
 
     CALLERS = ("TokenizerManager", "MultiTokenizerRouter", "DataParallelController")
 
+    def setUp(self):
+        super().setUp()
+        # These are the Python server's callers. The Rust server runs no zmq
+        # collector (`test_should_use_zmq` covers it), so pin the mode against
+        # an inherited SGLANG_RUST_SERVER=1.
+        self.enterContext(envs.SGLANG_RUST_SERVER.override(False))
+
     def _owners(self, **overrides):
         """Publish a config and return the callers that claim the socket."""
         fields = dict(
