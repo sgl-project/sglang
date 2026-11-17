@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from typing import Optional, Sequence
 
@@ -28,9 +27,6 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 # XPU ops only when no CUDA/ROCm backend is present, matching the imports below.
 _use_xpu_mamba_ops = _is_xpu and not (_is_cuda or _is_hip)
-transfer_state_per_layer_direct_pf_lf = None
-transfer_state_all_layer_direct_lf_pf = None
-transfer_mamba_state = None
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
@@ -49,19 +45,10 @@ elif _is_xpu:
         transfer_kv_per_layer_direct_pf_lf,
     )
 if _is_npu:
-    from sgl_kernel_npu.kvcacheio import TransferDirection
-
-    try:
-        from sgl_kernel_npu.kvcacheio import transfer_mamba_state
-    except ImportError:
-        transfer_mamba_state = None
-    try:
-        from sgl_kernel_npu.kvcacheio import (
-            transfer_state_all_layer_direct_lf_pf,
-            transfer_state_per_layer_direct_pf_lf,
-        )
-    except ImportError:
-        pass
+    from sgl_kernel_npu.operators.mem_cache.memfabric.kv_transfer import (
+        transfer_kv_all_layer_kv_split_lf_pf,
+        transfer_kv_per_layer_kv_split_pf_lf,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -69,19 +56,6 @@ logger = logging.getLogger(__name__)
 # Caps the XPU slot-stacking buffer at ~1% of a 24 GB Arc Pro B60, inside the
 # device headroom mem-fraction-static leaves; arbitrary, not measured.
 _XPU_STACK_CHUNK_BYTES = 256 << 20
-
-_NPU_HICACHE_MAMBA_IO_ENV = "SGLANG_NPU_HICACHE_MAMBA_IO"
-_NPU_HICACHE_MAMBA_IO_MODES = {"sync", "async"}
-
-
-def _npu_hicache_mamba_io_mode() -> str:
-    mode = os.getenv(_NPU_HICACHE_MAMBA_IO_ENV, "sync").strip().lower()
-    if mode not in _NPU_HICACHE_MAMBA_IO_MODES:
-        raise ValueError(
-            f"{_NPU_HICACHE_MAMBA_IO_ENV} must be one of "
-            f"{sorted(_NPU_HICACHE_MAMBA_IO_MODES)}, got {mode!r}."
-        )
-    return mode
 
 
 class MambaPoolHost(HostKVCache):
@@ -106,6 +80,7 @@ class MambaPoolHost(HostKVCache):
     # skip __init__, still read an empty pair rather than raising.
     slot_state_device_tensors: tuple = ()
     slot_state_buffers: tuple = ()
+    _npu_state_transfer_views: tuple = ()
 
     def __init__(
         self,
@@ -238,35 +213,175 @@ class MambaPoolHost(HostKVCache):
         ]
 
         self.kv_buffer = self.init_kv_buffer()
-        self._configure_npu_mamba_io()
+        self._init_npu_state_transfer()
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
         self.clear()
 
-    def _configure_npu_mamba_io(self) -> None:
-        mode = _npu_hicache_mamba_io_mode()
-        if mode == "sync":
-            logger.info("NPU HiCache Mamba state transfer mode: sync torch fallback.")
+    @staticmethod
+    def _as_npu_transfer_view5(tensor):
+        """Collapse [A, B, *S] to [A, P, 1, 1, W] as a pure view, or None
+        when the trailing dims are not mergeable. `view` never copies, unlike
+        `reshape`, which could silently duplicate the whole buffer."""
+        try:
+            return tensor.view(tensor.shape[0], tensor.shape[1], 1, 1, -1)
+        except RuntimeError:
+            return None
+
+    def _init_npu_state_transfer(self) -> None:
+        """Pre-build the per-component views the kernel_ascend path submits.
+
+        kv_exchange-backed transfers require SGLANG_HICACHE_HOST_MEM_BACKEND=acl
+        or memfabric; anything else is a configuration error. Missing operators
+        already failed at import time.
+        """
+        self._npu_state_transfer_views = ()
+        if not _is_npu:
             return
 
-        required_ops = (
-            transfer_state_per_layer_direct_pf_lf,
-            transfer_state_all_layer_direct_lf_pf,
-        )
-        required_torch_ops = (
-            "transfer_state_per_layer_direct_pf_lf",
-            "transfer_state_all_layer_direct_lf_pf",
-        )
-        if any(op is None for op in required_ops) or any(
-            not hasattr(torch.ops.npu, op_name) for op_name in required_torch_ops
+        # Device [L, P, 1, 1, W] / host [P, L, 1, 1, W] with page_size = 1:
+        # one slot per page, trailing state shape collapsed to width W.
+        views = []
+
+        def add(name, key, dev, host):
+            if dev is None or host is None:
+                raise RuntimeError(
+                    f"NPU kernel_ascend Mamba transfers cannot address "
+                    f"component {name!r} in place: its per-slot payload is "
+                    f"not contiguous."
+                )
+            views.append((name, key, dev, host))
+
+        if self.temporal_state_elem_size > 0:
+            add(
+                "temporal",
+                None,
+                self._as_npu_transfer_view5(self.buffer_info.temporal),
+                self._as_npu_transfer_view5(self.temporal_buffer),
+            )
+        for i in range(len(self.conv_state_shapes)):
+            add(
+                f"conv_{i}",
+                None,
+                self._as_npu_transfer_view5(self.buffer_info.conv[i]),
+                self._as_npu_transfer_view5(self.conv_buffer[i]),
+            )
+        # Draft layers: separate single-layer device allocations targeting the
+        # draft layer range of the shared host pool.
+        n_main = self.buffer_info.temporal.shape[0]
+        temporal_host_v = self._as_npu_transfer_view5(self.temporal_buffer)
+        conv_host_vs = [self._as_npu_transfer_view5(buf) for buf in self.conv_buffer]
+        for depth, draft_info in enumerate(self.mtp_draft_buffer_infos):
+            host_layer = n_main + depth
+            if draft_info.temporal.numel():
+                add(
+                    "temporal_draft",
+                    depth,
+                    self._as_npu_transfer_view5(draft_info.temporal),
+                    temporal_host_v.narrow(1, host_layer, 1),
+                )
+            for i in range(len(self.conv_state_shapes)):
+                if draft_info.conv[i].numel():
+                    add(
+                        f"conv_{i}_draft",
+                        depth,
+                        self._as_npu_transfer_view5(draft_info.conv[i]),
+                        conv_host_vs[i].narrow(1, host_layer, 1),
+                    )
+        # Side states: no layer axis, so a single-layer component covers them.
+        # unsqueeze is a pure view op, so the payload checks stay meaningful.
+        for i, (state, buf) in enumerate(
+            zip(self.slot_state_device_tensors, self.slot_state_buffers)
         ):
-            raise RuntimeError(
-                "NPU HiCache Mamba async state transfer requires "
-                "the per-layer PF->LF and all-layer LF->PF direct operators "
-                "from sgl-kernel-npu."
+            if not state.numel() or not buf.numel():
+                continue
+            add(
+                f"side_{i}",
+                None,
+                self._as_npu_transfer_view5(state.unsqueeze(0)),
+                self._as_npu_transfer_view5(buf.unsqueeze(1)),
             )
 
-        logger.info("NPU HiCache Mamba state transfer mode: native async.")
+        self._npu_state_transfer_views = tuple(views)
+        logger.info(
+            "NPU HiCache Mamba state transfer mode: "
+            "npu_state_transfer (kv_exchange, %d components).",
+            len(views),
+        )
+
+    def _npu_transfer_indices(self, host_indices, device_indices):
+        di = device_indices.reshape(-1).to(
+            dtype=torch.int64, device=self._buffer_device
+        )
+        hi = host_indices.reshape(-1).to(
+            dtype=torch.int64, device=self._buffer_device
+        )
+        return di, hi
+
+    def _load_to_device_npu_state(self, host_indices, device_indices, layer_id) -> None:
+        """H2D via kv_exchange, one submission per state component.
+
+        The per-layer call covers one layer of every main component plus, on
+        layer 0, the side states; draft layers ride their own single-layer
+        component on the matching pool layer id.
+        """
+        di, hi = self._npu_transfer_indices(host_indices, device_indices)
+        if di.numel() == 0:
+            return
+        n_main = self.buffer_info.temporal.shape[0]
+        empty_dev = torch.empty(0, device=self._buffer_device)
+        empty_host = torch.empty(0)
+        for name, key, dev, host in self._npu_state_transfer_views:
+            if name.endswith("_draft"):
+                # Draft components submit once, on their own layer call. Their
+                # host view is pre-narrowed to that single layer, so the layer
+                # offset is already folded into the view and both operands
+                # address layer 0.
+                if layer_id != n_main + key:
+                    continue
+                device_layer_id = host_layer_id = 0
+            else:
+                if name.startswith("side_"):
+                    if layer_id != 0:
+                        continue
+                    device_layer_id, host_layer_id = 0, 0
+                elif layer_id >= n_main:
+                    continue
+                else:
+                    device_layer_id = host_layer_id = layer_id
+            transfer_kv_per_layer_kv_split_pf_lf(
+                device_indices=di,
+                host_indices=hi,
+                device_k=dev,
+                host_k=host,
+                device_v=empty_dev,
+                host_v=empty_host,
+                page_size=1,
+                device_layer_id=device_layer_id,
+                host_layer_id=host_layer_id,
+            )
+
+    def _backup_from_device_npu_state(self, host_indices, device_indices) -> None:
+        """D2H via kv_exchange: one all-layer call per state component."""
+        di, hi = self._npu_transfer_indices(host_indices, device_indices)
+        if di.numel() == 0:
+            return
+        empty_dev = torch.empty(0, device=self._buffer_device)
+        empty_host = torch.empty(0)
+        for _, _, dev, host in self._npu_state_transfer_views:
+            # Main views keep the full layer axis and fill host layers from 0;
+            # draft/side host views are pre-narrowed to one layer, so they too
+            # start at host layer 0.
+            transfer_kv_all_layer_kv_split_lf_pf(
+                device_indices=di,
+                host_indices=hi,
+                device_k=dev,
+                host_k=host,
+                device_v=empty_dev,
+                host_v=empty_host,
+                page_size=1,
+                host_layer_start=0,
+            )
 
     def init_kv_buffer(self):
         _host_alloc = ALLOC_MEMORY_FUNCS[self._buffer_device.type]
@@ -534,22 +649,6 @@ class MambaPoolHost(HostKVCache):
                 layer_id=layer_id,
                 page_size=1,
             )
-        elif io_backend == "kernel_ascend":
-            if _npu_hicache_mamba_io_mode() == "async":
-                transfer_state_per_layer_direct_pf_lf(
-                    src=src,
-                    dst=dst,
-                    src_indices=src_indices,
-                    dst_indices=dst_indices,
-                    layer_id=layer_id,
-                )
-            else:
-                host_indices = src_indices.to(dtype=torch.int64, device=src.device)
-                device_indices = dst_indices.to(dtype=torch.int64, device=dst.device)
-                values = (
-                    src.select(1, layer_id).index_select(0, host_indices).select(1, 0)
-                )
-                dst.index_copy_(0, device_indices, values.to(device=dst.device))
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
@@ -667,49 +766,6 @@ class MambaPoolHost(HostKVCache):
                 dst_indices=dst_indices,
                 page_size=1,
             )
-        elif io_backend == "kernel_ascend":
-            if not isinstance(src_layers, torch.Tensor):
-                # Packed drafts live in separate allocations; the NPU bulk
-                # kernels require a single contiguous layer-first tensor.
-                host_indices = dst_indices.to(dtype=torch.int64, device=dst.device)
-                for layer_id, src in enumerate(src_layers):
-                    device_indices = src_indices.to(
-                        dtype=torch.int64, device=src.device
-                    )
-                    values = src.index_select(0, device_indices).to(device=dst.device)
-                    dst[:, layer_id, 0].index_copy_(0, host_indices, values)
-            elif _npu_hicache_mamba_io_mode() == "async":
-                transfer_state_all_layer_direct_lf_pf(
-                    device_states=[src_layers],
-                    host_states=[dst],
-                    device_indices=src_indices,
-                    host_indices=dst_indices,
-                )
-            elif transfer_mamba_state is not None:
-                # NPU: mirror the load path — the dedicated kernel transfers all
-                # layers at once via a single 2D strided copy
-                # (device layer-first -> host page-first).
-                transfer_mamba_state(
-                    device_buf=src_layers,
-                    host_buf=dst,
-                    device_indices=src_indices,
-                    host_indices=dst_indices,
-                    direction=TransferDirection.D2H,
-                )
-            else:
-                # Per-layer fallback when the dedicated kernel is unavailable.
-                device_indices = src_indices.to(
-                    dtype=torch.int64, device=src_layers.device
-                )
-                host_indices = dst_indices.to(dtype=torch.int64, device=dst.device)
-                values = (
-                    src_layers.index_select(1, device_indices)
-                    .movedim(0, 1)
-                    .unsqueeze(2)
-                    .contiguous()
-                    .to(device=dst.device)
-                )
-                dst.index_copy_(0, host_indices, values)
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
@@ -737,36 +793,16 @@ class MambaPoolHost(HostKVCache):
         # Side state is not per-layer, so it rides on the first layer's call --
         # before that layer's completion event, which is what every reader of a
         # restored slot waits on.
-        if layer_id == 0:
-            self._transfer_slot_states(host_indices, device_indices, to_device=True)
-        if (
-            io_backend == "kernel_ascend"
-            and transfer_mamba_state is not None
-            and not self.mtp_draft_buffer_infos
-        ):
-            # NPU: transfer all layers at once via dedicated kernel.
-            # layer_id == 0 covers every layer, so later calls must skip.
-            if layer_id == 0:
-                # no ssm state on conv-only models: a 0-size batched
-                # transfer errors, same guard as the per-layer path below
-                if self.temporal_state_elem_size > 0:
-                    transfer_mamba_state(
-                        device_buf=self.buffer_info.temporal,
-                        host_buf=self.temporal_buffer,
-                        device_indices=device_indices,
-                        host_indices=host_indices,
-                        direction=TransferDirection.H2D,
-                    )
-                for conv_idx in range(len(self.conv_state_shapes)):
-                    transfer_mamba_state(
-                        device_buf=self.buffer_info.conv[conv_idx],
-                        host_buf=self.conv_buffer[conv_idx],
-                        device_indices=device_indices,
-                        host_indices=host_indices,
-                        direction=TransferDirection.H2D,
-                    )
+        if io_backend == "kernel_ascend":
+            # NPU: kv_exchange covers every state component, side states
+            # included (they ride layer 0), so the torch ride-along below must
+            # not run.
+            self._load_to_device_npu_state(host_indices, device_indices, layer_id)
+
         else:
             # no ssm state on conv-only models: nothing to transfer
+            if layer_id == 0:
+                self._transfer_slot_states(host_indices, device_indices, to_device=True)
             if self.temporal_state_elem_size > 0:
                 self._copy_tensor_pf_lf(
                     src=self.temporal_buffer,
@@ -801,6 +837,11 @@ class MambaPoolHost(HostKVCache):
             if self.mtp_draft_buffer_infos
             else self.buffer_info.conv
         )
+        if io_backend == "kernel_ascend":
+            # NPU: kv_exchange covers side states as components, so
+            # the torch tail below must not run.
+            self._backup_from_device_npu_state(host_indices, device_indices)
+            return
         if io_backend == "kernel" and host_indices.device != device_indices.device:
             # The mamba JIT kernel wants both index tensors on the device;
             # the staged MHA/MLA write path hands us CPU host indices.
