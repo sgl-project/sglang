@@ -141,10 +141,10 @@ logger = logging.getLogger(__name__)
 # must agree on it.
 _MHC_POST_MULT_VALUE = 2.0
 
-# Conservative cap, not the crossover: at GLM-5.3-Flash's hc_mult=4 and
-# hidden_size=4096 the fusion wins to 16 tokens and reaches parity at 24, with
-# 17-23 unmeasured. Past it the pre-norm GEMM drops mhc_pre's split-K kernel.
-_MHC_FUSED_BOUNDARY_MAX_TOKENS = 16
+# At GLM-5.3-Flash's hc_mult=4 and hidden_size=4096 on MI355X, post + pre goes
+# from 12.6 to 10.6 us at 36 tokens, 14.1 to 13.2 at 96 and 18.5 to 17.6 at 192.
+# At 288 tokens it is slower (21.8 -> 25.1 us): the fused GEMM has no split-K.
+_MHC_FUSED_BOUNDARY_MAX_TOKENS = 192
 
 # Measured at 8 and 16 KDA heads per rank: on H200 the fused decode kernel wins
 # below this many (token, head) blocks and the unfused packed chain streams the

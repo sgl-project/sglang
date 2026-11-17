@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import functools
 import logging
 import time
 from enum import Enum
@@ -88,7 +89,7 @@ _skip_aiter_unquant = False
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.ops.triton.gemm_a16w16 import gemm_a16w16 as _aiter_triton_a16w16
-    from aiter.tuned_gemm import tgemm
+    from aiter.tuned_gemm import get_GEMM_A16W16_tuned_config, tgemm
 
 if _is_gfx95:
     from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
@@ -137,8 +138,19 @@ def register_gfx950_unquantized_gemm_shapes(
     _gfx950_triton_a16w16_shapes.update(tuple(s) for s in triton_a16w16)
 
 
-def _prefer_triton_a16w16(x: torch.Tensor, weight: torch.Tensor) -> bool:
-    """Return whether the Triton BF16 path supports this decode shape."""
+@functools.lru_cache(maxsize=4096)
+def _has_tuned_a16w16(m: int, n: int, k: int, bias: bool) -> bool:
+    return (
+        get_GEMM_A16W16_tuned_config(m, n, k, bias, torch.bfloat16, torch.bfloat16)
+        is not None
+    )
+
+
+def _prefer_triton_a16w16(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None
+) -> bool:
+    """Return whether the Triton BF16 path supports this decode shape: a
+    registered exact shape, or a small-K decode shape no tuned row covers."""
     if x.dim() != 2 or weight.dim() != 2:
         return False
     k = weight.shape[1]
@@ -155,7 +167,13 @@ def _prefer_triton_a16w16(x: torch.Tensor, weight: torch.Tensor) -> bool:
         and weight.dtype == torch.bfloat16
         and x.shape[1] == k
         and (
-            (0 < k <= _A16W16_TRITON_MAX_K and 0 < x.shape[0] <= max_m)
+            (
+                0 < k <= _A16W16_TRITON_MAX_K
+                and 0 < x.shape[0] <= max_m
+                and not _has_tuned_a16w16(
+                    x.shape[0], weight.shape[0], k, bias is not None
+                )
+            )
             or (x.shape[0], weight.shape[0], k) in _gfx950_triton_a16w16_shapes
         )
         and weight.shape[0] > 0
@@ -1006,7 +1024,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             and not _skip_aiter_unquant
             and type(layer.weight.data) is torch.Tensor
         ):
-            if _is_gfx95 and _prefer_triton_a16w16(x, layer.weight):
+            if _is_gfx95 and _prefer_triton_a16w16(x, layer.weight, bias):
                 return _aiter_triton_a16w16(x, layer.weight, bias, dtype=x.dtype)
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 

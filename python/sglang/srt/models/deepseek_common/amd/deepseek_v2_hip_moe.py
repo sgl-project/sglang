@@ -10,13 +10,37 @@ import torch
 from sglang.srt.models.deepseek_common.utils import _use_aiter
 
 if _use_aiter:
+    from sglang.kernels.ops.gemm.router_gemv_hip import (
+        ROCM_GLM_ROUTER_MAX_TOKENS,
+        rocm_gemv_split_k_max_tokens,
+    )
     from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_max_tokens
     from sglang.srt.layers.rocm_linear_utils import rocm_dsv3_router_split_k
 
 
 def router_max_tokens(gate, config, is_hash_moe: bool) -> int:
     """Rows up to which the split-K router serves gate (a MoEGate), -1 when it never does:
-    V4.1 only, DSv4 keeps aiter's router GEMM and gate."""
+    V4.1 and single-group sigmoid routing (GLM-5.3-Flash), whose Triton router sums the
+    partials; DSv4 keeps aiter's router GEMM and gate."""
+    if (
+        _use_aiter
+        and not gate.is_deepseek_v4
+        and not is_hash_moe
+        and getattr(config, "scoring_func", None) == "sigmoid"
+        and getattr(config, "topk_method", None) == "noaux_tc"
+        and (getattr(config, "n_group", None) or 1) == 1
+        and (getattr(config, "topk_group", None) or 1) == 1
+    ):
+        if (
+            rocm_gemv_split_k_max_tokens(
+                n=config.n_routed_experts,
+                k=config.hidden_size,
+                weight_dtype=gate.weight.dtype,
+            )
+            < 0
+        ):
+            return -1
+        return ROCM_GLM_ROUTER_MAX_TOKENS
     if not (
         _use_aiter
         and gate.is_deepseek_v4
