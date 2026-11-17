@@ -75,6 +75,8 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         """With the external linker, every PD batch build retires reads before
         admission; deferred prefetches start only on passes that may start new
         storage reads."""
+        # With HiCache off, the event gate reads get_memory().enable_flexkv.
+        enter_scope(self, published_topology())
         s = self.scheduler
         s.enable_hierarchical_cache = False
         s.enable_hicache_storage = False
