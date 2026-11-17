@@ -525,9 +525,11 @@ class Envs:
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     # Scheduler state checks. BUSY runs the busy pool check (its value also sets
     # the log verbosity). IDLE runs no check of its own: it picks whether a leak
-    # found by the idle pool checks or the KV page check raises or only warns.
+    # found by the idle pool checks, the KV page check, or the GC frozen-garbage
+    # check raises or only warns.
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
+    SGLANG_ENABLE_GC_FROZEN_GARBAGE_CHECK = EnvBool(False)
     # The explicit environment variable still takes precedence over this CI
     # default, so production remains opt-in and CI remains opt-out if needed.
     SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK = EnvBool(_default_on_in_ci)
@@ -1305,6 +1307,7 @@ class Envs:
     # ===================================================================
     # Ascend NPU
     # ===================================================================
+    SGLANG_NPU_ENABLE_STATIC_KERNEL = EnvBool(False)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     # Requantize plain block-FP8 (fp32-scale) checkpoints to MXFP8 at load
     # time for arch35 (Ascend 950) Linear and MoE MXFP8 GEMMs. Disabled keeps

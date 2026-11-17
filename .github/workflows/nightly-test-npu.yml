@@ -335,27 +335,70 @@ jobs:
       matrix:
         test_config:
           # deepseek_v4_flash performance tests
-          - name: deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms
+          # There is a conflict among dspark, dp and cp; temporarily use deepseek_v4_flash performance off_cp tests
+#          - name: deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+          # deepseek_v4_flash performance off_cp tests
+          - name: deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms_off_cp
             prefill_size: 1
             decode_size: 1
             router_size: 1
-            test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms.py
+            test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms_off_cp.py
             test_type: 'perf'
             prefill_decode_deployment: 'separation'
           # deepseek_v4_flash accuracy tests
-          - name: deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa
+          # There is a conflict among dspark, dp and cp; temporarily use deepseek_v4_flash accuracy off_cp&off_dspark tests
+#          - name: deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa.py
+#            test_type: 'accuracy'
+#            prefill_decode_deployment: 'separation'
+          # deepseek_v4_flash accuracy off_cp tests
+          - name: deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa_off_cp
             prefill_size: 1
             decode_size: 1
             router_size: 1
-            test_case: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa.py
+            test_case: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa_off_cp.py
+            test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
+          # deepseek_v4_flash accuracy off_dspark tests
+          - name: deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa_off_dspark
+            prefill_size: 1
+            decode_size: 1
+            router_size: 1
+            test_case: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa_off_dspark.py
             test_type: 'accuracy'
             prefill_decode_deployment: 'separation'
           # deepseek_v4_pro accuracy tests
-          - name: deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa
+          # There is a conflict among dspark, dp and cp; temporarily use deepseek_v4_pro accuracy off_cp&off_dspark tests
+#          - name: deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa
+#            prefill_size: 2
+#            decode_size: 2
+#            router_size: 1
+#            test_case: test/registered/npu/accuracy/deepseek_v4_pro/test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa.py
+#            test_type: 'accuracy'
+#            prefill_decode_deployment: 'separation'
+          # deepseek_v4_pro accuracy off_dspark tests
+          - name: deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa_off_dspark
             prefill_size: 2
             decode_size: 2
             router_size: 1
-            test_case: test/registered/npu/accuracy/deepseek_v4_pro/test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa.py
+            test_case: test/registered/npu/accuracy/deepseek_v4_pro/test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa_off_dspark.py
+            test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
+          # deepseek_v4_pro accuracy off_cp tests
+          - name: deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa_off_cp
+            prefill_size: 2
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/npu/accuracy/deepseek_v4_pro/test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa_off_cp.py
             test_type: 'accuracy'
             prefill_decode_deployment: 'separation'
           # glm_5_3 accuracy tests (2 prefill + 2 decode nodes)
