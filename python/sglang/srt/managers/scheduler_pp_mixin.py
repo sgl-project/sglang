@@ -61,18 +61,26 @@ if TYPE_CHECKING:
     from sglang.srt.observability.forward_pass_metrics import FpmTiming
 
 
-def _plan_decode_transfers(sizes: list[int], source: int, capacity: int) -> list[int]:
+def _plan_decode_transfers(
+    sizes: list[int], source: int, capacity: int, min_size: int = 1
+) -> list[int]:
     """How many rows the retired source can donate to each pipeline slot."""
     loads = sizes.copy()
     transfers = [0] * len(loads)
-    while True:
+    while loads[source] > min_size:
+        available = loads[source] - min_size
         smallest = min(loads)
-        if smallest >= capacity or loads[source] <= smallest + 1:
-            return transfers
+        if smallest + available < min_size:
+            # The donor may have enough rows to top up a live slot only.
+            smallest = min(size for size in loads if size + available >= min_size)
+        count = max(1, min_size - smallest)
+        if smallest + count > capacity or loads[source] <= smallest + 1:
+            break
         target = loads.index(smallest)
-        loads[source] -= 1
-        loads[target] += 1
-        transfers[target] += 1
+        loads[source] -= count
+        loads[target] += count
+        transfers[target] += count
+    return transfers
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
@@ -158,7 +166,8 @@ class SchedulerPPMixin:
                 running.merge_batch(incoming)
             self._pp_incoming[slot] = None
 
-        if running.batch_size() < 2:
+        parallel = get_parallel()
+        if running.batch_size() <= parallel.pp_min_micro_batch_size:
             return running
         loads = []
         for resident, launched, pending in zip(
@@ -177,7 +186,10 @@ class SchedulerPPMixin:
             loads.append(size)
         loads[slot] = running.batch_size()
         transfers = _plan_decode_transfers(
-            loads, slot, get_parallel().pp_max_micro_batch_size
+            loads,
+            slot,
+            parallel.pp_max_micro_batch_size,
+            parallel.pp_min_micro_batch_size,
         )
         remaining = loads[slot]
         for target, count in enumerate(transfers):

@@ -28,6 +28,29 @@ class TestPPAutoBalance(unittest.TestCase):
             self.assertEqual(sum(sizes), sum(initial))
             self.assertLessEqual(max(sizes) - min(sizes), 1)
 
+    def test_minimum_split_size(self):
+        self.assertEqual(_plan_decode_transfers([4, 0, 0, 0], 0, 4), [0, 1, 1, 1])
+        self.assertEqual(_plan_decode_transfers([4, 0, 0, 0], 0, 4, 2), [0, 2, 0, 0])
+        self.assertEqual(_plan_decode_transfers([3, 0, 0, 0], 0, 4, 2), [0] * 4)
+        self.assertEqual(_plan_decode_transfers([3, 0, 1, 0], 0, 4, 2), [0, 0, 1, 0])
+        self.assertEqual(_plan_decode_transfers([4, 0, 0, 0], 0, 1, 2), [0] * 4)
+
+    def test_minimum_size_config(self):
+        from sglang.srt.server_args import ServerArgs
+
+        self.assertEqual(ServerArgs(model_path="dummy").pp_min_micro_batch_size, 1)
+        for minimum, maximum in ((0, 4), (3, 2)):
+            with self.subTest(minimum=minimum, maximum=maximum):
+                args = ServerArgs(
+                    model_path="dummy",
+                    pp_size=4,
+                    enable_pp_auto_balance=True,
+                    pp_min_micro_batch_size=minimum,
+                    pp_max_micro_batch_size=maximum,
+                )
+                with self.assertRaisesRegex(ValueError, "--pp-min-micro-batch-size"):
+                    args.check_server_args()
+
     def test_handoff_preserves_rows_and_sampling_history(self):
         import torch
 
@@ -94,9 +117,13 @@ class TestPPAutoBalance(unittest.TestCase):
         scheduler._pp_incoming = [None] * 4
         with patch(
             "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
-            return_value=SimpleNamespace(pp_max_micro_batch_size=8),
+            return_value=SimpleNamespace(
+                pp_max_micro_batch_size=8, pp_min_micro_batch_size=3
+            ),
         ):
             scheduler._pp_balance_decode(0, donor)
+            self.assertEqual(len(donor.reqs), 4)
+            self.assertIsNone(scheduler._pp_incoming[3])
             self.assertEqual(prefill.reqs, reqs[:2])
             self.assertTrue(all(b.is_empty() for b in scheduler.running_mbs[1:]))
             batches = [donor, *(b for b in scheduler._pp_incoming if b is not None)]

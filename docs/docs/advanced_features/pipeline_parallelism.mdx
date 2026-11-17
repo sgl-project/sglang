@@ -25,6 +25,8 @@ When requests finish at different lengths, a few microbatches can retain most of
 
 This option is disabled by default. It supports colocated autoregressive generation with PP greater than one. LoRA, HiSparse, diffusion models, and speculative decoding require the default scheduler.
 
+Use `--pp-min-micro-batch-size` (default `1`) to set how many requests each side must retain after a transfer. With four pipeline slots and a minimum of `2`, a slot holding four requests can donate two to an empty slot. Both pairs continue decoding. A microbatch that shrinks below the minimum as requests finish continues normally.
+
 ## Guidance about Dynamic Chunking
 
 ### Why Dynamic Chunking

@@ -311,6 +311,16 @@ def check_server_args(server_args: Any):
         "pp_max_micro_batch_size must be a positive integer or None (for auto-compute). "
         f"Got: {cfg.pp_max_micro_batch_size}"
     )
+    if cfg.pp_min_micro_batch_size < 1:
+        raise ValueError("--pp-min-micro-batch-size must be at least 1.")
+    if (
+        cfg.enable_pp_auto_balance
+        and cfg.pp_max_micro_batch_size is not None
+        and cfg.pp_min_micro_batch_size > cfg.pp_max_micro_batch_size
+    ):
+        raise ValueError(
+            "--pp-min-micro-batch-size cannot exceed --pp-max-micro-batch-size."
+        )
 
     assert not (cfg.disable_cuda_graph_padding and cfg.enable_torch_compile), (
         "--disable-cuda-graph-padding is incompatible with --enable-torch-compile. "
