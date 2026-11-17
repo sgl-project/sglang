@@ -750,6 +750,8 @@ def _fused_moe_kernel_sequence(
         and block_shape is not None
         and len(block_shape) == 2
         and block_shape[1] == 128
+        # The fused tail emits 128-wide groups; refined TP down scales may not.
+        and (w2_block_shape is None or w2_block_shape[1] == 128)
         and a2_scale is None
         and swiglu_limit is None
         and hooks is None
