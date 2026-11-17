@@ -965,11 +965,11 @@ def append_ld_library_path(*module_specs):
 
 
 # npu_memcache MetaService ports (see mem_cache/storage/npu_memcache/README.md).
-META_SERVICE_PORT = 5000
-CONFIG_STORE_PORT = 6000
-META_METRICS_PORT = 8000
+META_SERVICE_PORT = 5007
+CONFIG_STORE_PORT = 6007
+META_METRICS_PORT = 8007
 META_SERVICE_READY_TIMEOUT = 120
-META_SERVICE_READY_POLL_INTERVAL = 1
+META_SERVICE_READY_POLL_INTERVAL = 5
 
 _meta_service_process = None
 
