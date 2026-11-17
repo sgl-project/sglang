@@ -128,7 +128,14 @@ RUN git clone https://github.com/sgl-project/sglang --branch ${SGLANG_TAG} /sgl-
 # The PD tests launch sgl-router in front of the prefill and decode servers.
 # Built at the toolchain sgl-router pins, which is removed with the target to
 # keep the image small.
-RUN bash /sgl-workspace/sglang/sgl-router/scripts/build.sh /usr/local/bin/sgl-router --cleanup
+RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none \
+    && export PATH="/root/.cargo/bin:${PATH}" \
+    && cd /sgl-workspace/sglang/sgl-router \
+    && rustup toolchain install \
+    && CARGO_TARGET_DIR=/tmp/sgl-router-target cargo build --locked --release --bin sgl-router \
+    && install -m 0755 /tmp/sgl-router-target/release/sgl-router /usr/local/bin/sgl-router \
+    && rm -rf /root/.cargo /root/.rustup /tmp/sgl-router-target
 
 ENV ASCEND_HOME_PATH=/usr/local/Ascend/cann-${CANN_VERSION}
 

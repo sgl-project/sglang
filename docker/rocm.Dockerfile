@@ -876,7 +876,12 @@ RUN find /sgl-workspace/sglang/python/sglang/srt/layers/quantization/configs/ \
 
 # sgl-router, the PD router. Built at the toolchain sgl-router pins, which is
 # removed with the target and the crate cache; the default toolchain above stays.
-RUN bash /sgl-workspace/sglang/sgl-router/scripts/build.sh /usr/local/bin/sgl-router --cleanup
+RUN cd /sgl-workspace/sglang/sgl-router \
+    && rustup toolchain install \
+    && CARGO_TARGET_DIR=/tmp/sgl-router-target cargo build --locked --release --bin sgl-router \
+    && install -m 0755 /tmp/sgl-router-target/release/sgl-router /usr/local/bin/sgl-router \
+    && rustup toolchain uninstall "$(rustup show active-toolchain | cut -d' ' -f1)" \
+    && rm -rf /tmp/sgl-router-target /root/.cargo/registry /root/.cargo/git
 
 # -----------------------
 # TileLang

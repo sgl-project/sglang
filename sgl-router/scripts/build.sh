@@ -1,10 +1,12 @@
 #!/bin/bash
 # Build the release sgl-router binary from this checkout and install it at <dest>.
 #
-# The one build recipe for the SGLang images and CI. docker/sgl-router.Dockerfile
-# keeps its own cargo-chef build for layer caching, and the PyPI wheel is built
-# by maturin; both use the same toolchain pin, lockfile, and PCRE2_SYS_STATIC
-# setting as this script.
+# The build recipe for CI and for the images built from the checkout they run in
+# (docker/Dockerfile, Dockerfile.cu134). The npu, rocm, and xpu images git-clone
+# their source at a branch or tag that may predate this script, so they build
+# inline. docker/sgl-router.Dockerfile keeps its own cargo-chef build for layer
+# caching, and the PyPI wheel is built by maturin; both use the same toolchain
+# pin, lockfile, and PCRE2_SYS_STATIC setting as this script.
 #
 # Usage: build.sh <dest> [--cleanup]
 #   <dest>     path of the installed binary, e.g. /usr/local/bin/sgl-router

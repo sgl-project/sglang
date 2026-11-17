@@ -416,8 +416,8 @@ releases. Each release ships as:
   aarch64) puts the `sgl-router` binary on `PATH`.
 
 `lmsysorg/sglang-staging:sgl-router` is built from main every night, and the
-SGLang images build the router from their own source with
-`scripts/build.sh`. The crate itself is not published to crates.io.
+SGLang images build the router from their own source. The crate itself is not
+published to crates.io.
 `sgl-router --version` prints the version a binary was built from.
 
 Releases are made manually:
