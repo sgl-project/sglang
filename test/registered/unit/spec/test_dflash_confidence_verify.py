@@ -2,6 +2,7 @@
 confidence, acceptance stops at the planned verify length, and the confidence
 feature reads the selector row each draft token came from."""
 
+import sys
 import types
 
 import pytest
@@ -323,3 +324,7 @@ def test_compact_is_refused_on_a_target_backend_without_ragged_verify(monkeypatc
             init_backends(False)
     with envs.SGLANG_RAGGED_VERIFY_MODE.override("cap-accept"):
         init_backends(False)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

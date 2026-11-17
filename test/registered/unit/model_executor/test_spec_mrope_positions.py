@@ -1,8 +1,10 @@
 """mRoPE positions of a speculative forward when a ragged target verify packs a
 different number of tokens per request."""
 
+import sys
 import types
 
+import pytest
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -57,3 +59,7 @@ def test_multimodal_ragged_verify_adds_each_requests_delta():
     )
     expected = torch.tensor([6, 7, 20, 39, 40, 41, 0, 0])
     assert (mrope == expected).all()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
