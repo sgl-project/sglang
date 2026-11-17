@@ -159,12 +159,36 @@ class Spec(msgspec.Struct):
             "--mem-fraction-static to convert it into KV capacity. Default follows "
             "--kv-cache-dtype.",
             choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16"],
+            resolvable=True,
+        ),
+    ] = None
+    speculative_dspark_lm_head_dtype: A[
+        Optional[str],
+        Arg(
+            help="DSPARK only. Quantized dtype for the draft's projection through the "
+            "target lm_head; the weight is quantized once and cached (about one extra "
+            "byte per lm_head parameter). 'fp8' runs torch._scaled_mm and requires "
+            "gfx95x; 'mxfp8' runs FlashInfer's CuTe DSL mm_mxfp8 and requires "
+            "Blackwell. Target verify logits are unaffected. Default keeps the "
+            "lm_head's own dtype.",
+            choices=["fp8", "mxfp8"],
+            resolvable=True,
         ),
     ] = None
     speculative_draft_window_size: A[
         Optional[int],
         "Sliding window size for the draft model. Honored by Llama EAGLE-3 (`LlamaForCausalLMEagle3`), DFLASH, and the built-in EAGLE/MTP draft-decode path on the Triton and FlashInfer draft backends; other EAGLE-3 backends (e.g. MLA-based drafters) silently ignore it. For Llama EAGLE-3, the drafter only attends to the most recent N keys (verifier hidden states + its own outputs); the verifier is unaffected. For DFLASH, the draft worker keeps a recent target-token window in its local KV cache (paged backends may retain up to one extra page on the left for alignment). For the built-in EAGLE/MTP draft, each draft-decode step attends to a --speculative-draft-sink-size sink plus the most recent N tokens, leaving the target verify pass unchanged; it is ignored (with a warning) if the draft model has a native sliding window of its own. Default is full attention/context.",
     ] = None
+    speculative_dflash_draft_kv_ring: A[
+        bool,
+        Arg(
+            help="(Resolved) A DFLASH draft keeps its KV in a per-request ring of "
+            "window + verify-block rows. On for an all-sliding-window MLA draft on "
+            "trtllm_mla / cutedsl_mla unless SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=0.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = False
     speculative_draft_sink_size: A[
         Optional[int],
         "Number of leading 'attention sink' tokens the draft always attends to, in addition to the --speculative-draft-window-size recent window (StreamingLLM-style). Honored only by the built-in EAGLE/MTP draft-decode path on the Triton and FlashInfer draft backends; the Llama EAGLE-3 and DFLASH windows ignore it. 0/unset => pure recent window. Requires --speculative-draft-window-size.",
@@ -180,7 +204,7 @@ class Spec(msgspec.Struct):
     speculative_moe_a2a_backend: A[
         Optional[str],
         Arg(
-            help="Choose the backend for MoE A2A in speculative decoding. Defaults to --moe-a2a-backend, except flashinfer_megamoe defaults the draft to none (draft layers are typically unquantized, which flashinfer_megamoe's global-expert-id dispatch doesn't support).",
+            help="Choose the backend for MoE A2A in speculative decoding. Defaults to --moe-a2a-backend, except flashinfer_megamoe defaults the draft to none (draft layers are typically unquantized, which flashinfer_megamoe's global-expert-id dispatch doesn't support). ascend_ops is supported on NPU and uses --moe-ascend-ops-config. 'flashinfer' is a deprecated alias for 'flashinfer_nvlink_one_sided'.",
             choices=[
                 "none",
                 "deepep",
@@ -188,11 +212,12 @@ class Spec(msgspec.Struct):
                 "nixl",
                 "mori",
                 "ascend_fuseep",
-                "flashinfer",
+                "flashinfer_nvlink_one_sided",
+                "flashinfer",  # Deprecated alias for "flashinfer_nvlink_one_sided"
                 "megamoe",
                 "deepep_v2",
                 "pplx",
-                "ascend_tp",
+                "ascend_ops",
             ],
             resolvable=True,
         ),
@@ -204,11 +229,7 @@ class Spec(msgspec.Struct):
             "mxf4xmxf4 MMA type (see --enable-w4a4-mxfp4-megamoe). Pass "
             "--no-speculative-enable-w4a4-mxfp4-megamoe to keep the draft on "
             "fp8xfp4 (W4A8) while the target runs W4A4. Same as "
-            "--enable-w4a4-mxfp4-megamoe if unset. A draft that runs MXFP4 "
-            "MegaMoE with a different MMA type from the target may allocate an "
-            "additional MegaMoE symmetric buffer after the KV pool is sized; "
-            "lower --mem-fraction-static if CUDA-graph capture runs out of "
-            "memory.",
+            "--enable-w4a4-mxfp4-megamoe if unset.",
             action=argparse.BooleanOptionalAction,
         ),
     ] = None
@@ -217,6 +238,7 @@ class Spec(msgspec.Struct):
         Arg(
             help="The quantization method for speculative model.",
             choices=QUANTIZATION_CHOICES,
+            resolvable=True,
         ),
     ] = None
     # Internal provenance used after the public draft quantization inherits the

@@ -198,33 +198,6 @@ def _hunyuan_pack_qkv_reference(
     )
 
 
-class MixedRowParallelLinear(RowParallelLinear):
-    def __init__(self, input_sizes: list[int], output_size: int, **kwargs):
-        self.input_sizes = input_sizes
-        super().__init__(sum(input_sizes), output_size, **kwargs)
-
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        input_dim = getattr(param, "input_dim", None)
-        if input_dim is not None:
-            shards = []
-            offset = 0
-            for input_size in self.input_sizes:
-                loaded_shard = loaded_weight.narrow(input_dim, offset, input_size)
-                shard_size = input_size // self.tp_size
-                loaded_shard = loaded_shard.narrow(
-                    input_dim, self.tp_rank * shard_size, shard_size
-                )
-                shards.append(loaded_shard)
-                offset += input_size
-            loaded_weight = torch.cat(shards, dim=input_dim)
-        if len(loaded_weight.shape) == 0:
-            loaded_weight = loaded_weight.reshape(1)
-        param.data.copy_(loaded_weight)
-
-    def weight_loader_v2(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        self.weight_loader(param, loaded_weight)
-
-
 class MMDoubleStreamBlock(nn.Module):
     """
     A multimodal DiT block with separate modulation for text and image/video,
@@ -516,9 +489,10 @@ class MMSingleStreamBlock(nn.Module):
         )
 
         # Combined projection and MLP output
-        self.linear2 = MixedRowParallelLinear(
-            [hidden_size, mlp_hidden_dim],
+        self.linear2 = RowParallelLinear(
+            hidden_size + mlp_hidden_dim,
             hidden_size,
+            input_sizes=[hidden_size, mlp_hidden_dim],
             bias=True,
             input_is_parallel=True,
             params_dtype=dtype,
@@ -832,16 +806,23 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
             ow // self.patch_size[2],
         )
 
-        # Get rotary embeddings
-        freqs_cos, freqs_sin = get_rotary_pos_embed(
-            (tt * get_sp_world_size(), th, tw),
-            self.hidden_size,
-            self.num_attention_heads,
-            self.rope_dim_list,
-            self.rope_theta,
+        # Get rotary embeddings, built on the host and uploaded once per request
+        rope_cache = (
+            {}
+            if forward_batch is None
+            else forward_batch.extra.setdefault("_hunyuanvideo_rope", {})
         )
-        freqs_cos = freqs_cos.to(x.device)
-        freqs_sin = freqs_sin.to(x.device)
+        rope_key = (tt, th, tw, x.device)
+        if rope_key not in rope_cache:
+            freqs_cos, freqs_sin = get_rotary_pos_embed(
+                (tt * get_sp_world_size(), th, tw),
+                self.hidden_size,
+                self.num_attention_heads,
+                self.rope_dim_list,
+                self.rope_theta,
+            )
+            rope_cache[rope_key] = (freqs_cos.to(x.device), freqs_sin.to(x.device))
+        freqs_cos, freqs_sin = rope_cache[rope_key]
         # Prepare modulation vectors
         vec = self.time_in(t)
 

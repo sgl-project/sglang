@@ -315,6 +315,22 @@ fn render_kv_tiers(kv: &KvIndexMetrics, block_size: u32) -> String {
         "sgl_router_cache_pending_prefix_hits_total {}\n",
         kv.tree.pending().hits(),
     ));
+    out.push_str(
+        "# HELP sgl_router_cache_pending_prefix_followed_total Requests routed to a worker because of its pending stake (a stake deeper than any KV-event match).\n",
+    );
+    out.push_str("# TYPE sgl_router_cache_pending_prefix_followed_total counter\n");
+    out.push_str(&format!(
+        "sgl_router_cache_pending_prefix_followed_total {}\n",
+        kv.tree.pending().followed(),
+    ));
+    out.push_str(
+        "# HELP sgl_router_cache_pending_prefix_capped_total Prefix lookups that --cache-pending-prefix-max-followers left without a pending candidate, so the request routed by confirmed matches or load.\n",
+    );
+    out.push_str("# TYPE sgl_router_cache_pending_prefix_capped_total counter\n");
+    out.push_str(&format!(
+        "sgl_router_cache_pending_prefix_capped_total {}\n",
+        kv.tree.pending().capped(),
+    ));
 
     out.push_str(
         "# HELP sgl_router_kv_tree_accounting_errors_total Times the tree's per-tier occupancy bookkeeping contradicted itself. Always 0 on a correct tree. Nonzero means sgl_router_kv_tree_blocks understates what the tree holds, and can drop a worker's series entirely — which the gauge's own HELP would have you read as a worker that publishes nothing.\n",

@@ -41,6 +41,8 @@ if _HAS_MLX:
     from sglang.srt.hardware_backend.mlx.model_runner_stub import (
         MlxModelRunnerStub,
     )
+    from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+    from sglang.test.tree_slots import tree_slots_of
 
 
 def _arch(hybrid):
@@ -124,10 +126,7 @@ def _hybrid_stub_for_initialize(
 
 
 def _fake_req():
-    return SimpleNamespace(
-        inflight_middle_chunks=0,
-        kv=ReqKvInfo(),
-    )
+    return SimpleNamespace(kv=ReqKvInfo())
 
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
@@ -278,9 +277,11 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
         with _arch(hybrid=True), _published(stub):
             stub.initialize()
         pool = stub.req_to_token_pool
+        tree_slots = tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
-            SimpleNamespace(enable_mamba_extra_buffer=False),
+            SimpleNamespace(enable_mamba_extra_buffer=False, tree_slots=tree_slots),
+            tree_slots[0],
         )
         aux_capacity = pool.auxiliary_state_pool.available_size()
         for _ in range(3 * aux_capacity):

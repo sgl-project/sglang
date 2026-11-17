@@ -134,7 +134,7 @@ class TestDeepseekV4ProFp4(CustomTestCase):
         cmd = [
             "python3",
             "-m",
-            "sglang.bench_one_batch_server",
+            "sglang.benchmark.one_batch_server",
             "--model",
             "None",
             "--base-url",

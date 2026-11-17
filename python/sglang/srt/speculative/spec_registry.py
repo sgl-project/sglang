@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Callable, Dict, Optional, Type
 
 import torch
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
@@ -127,7 +127,7 @@ class CustomSpecAlgo:
         runtime states never exceed their startup width. Overrides must not
         return less than ``server_args.speculative_num_draft_tokens``.
         """
-        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.arg_groups.model_override_base import resolving_view
 
         return resolving_view(server_args).speculative_num_draft_tokens
 

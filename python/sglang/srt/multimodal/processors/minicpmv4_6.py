@@ -26,16 +26,13 @@ import torch
 import torchvision.transforms.functional as F
 from PIL import Image
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.minicpmv import MiniCPMV4_6ForConditionalGeneration
 from sglang.srt.multimodal.cache import (
     CONTENT_HASH_PREFIX,
     resolve_multimodal_item_hash,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
