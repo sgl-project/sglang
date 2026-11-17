@@ -73,9 +73,9 @@ class Parallel(msgspec.Struct):
     enable_pp_auto_balance: A[
         bool, "Redistribute active decode requests across pipeline microbatches."
     ] = False
-    pp_min_micro_batch_size: A[
+    pp_auto_balance_min_micro_batch_size: A[
         int,
-        "Minimum requests to leave in both microbatches after a PP auto-balance transfer.",
+        "With --enable-pp-auto-balance, keep at least this many requests in each microbatch involved in a transfer.",
     ] = 1
     pp_async_batch_depth: A[
         int,

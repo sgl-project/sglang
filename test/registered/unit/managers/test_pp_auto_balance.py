@@ -38,18 +38,35 @@ class TestPPAutoBalance(unittest.TestCase):
     def test_minimum_size_config(self):
         from sglang.srt.server_args import ServerArgs
 
-        self.assertEqual(ServerArgs(model_path="dummy").pp_min_micro_batch_size, 1)
+        self.assertEqual(
+            ServerArgs(model_path="dummy").pp_auto_balance_min_micro_batch_size, 1
+        )
         for minimum, maximum in ((0, 4), (3, 2)):
             with self.subTest(minimum=minimum, maximum=maximum):
                 args = ServerArgs(
                     model_path="dummy",
                     pp_size=4,
                     enable_pp_auto_balance=True,
-                    pp_min_micro_batch_size=minimum,
+                    pp_auto_balance_min_micro_batch_size=minimum,
                     pp_max_micro_batch_size=maximum,
                 )
-                with self.assertRaisesRegex(ValueError, "--pp-min-micro-batch-size"):
+                with self.assertRaisesRegex(
+                    ValueError, "--pp-auto-balance-min-micro-batch-size"
+                ):
                     args.check_server_args()
+
+    def test_minimum_is_ignored_without_auto_balance(self):
+        from sglang.srt.server_args import ServerArgs
+
+        args = ServerArgs(
+            model_path="dummy",
+            served_model_name="dummy",
+            chunked_prefill_size=-1,
+            pp_size=4,
+            disable_overlap_schedule=True,
+            pp_auto_balance_min_micro_batch_size=0,
+        )
+        args.check_server_args()
 
     def test_handoff_preserves_rows_and_sampling_history(self):
         import torch
@@ -118,7 +135,7 @@ class TestPPAutoBalance(unittest.TestCase):
         with patch(
             "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
             return_value=SimpleNamespace(
-                pp_max_micro_batch_size=8, pp_min_micro_batch_size=3
+                pp_max_micro_batch_size=8, pp_auto_balance_min_micro_batch_size=3
             ),
         ):
             scheduler._pp_balance_decode(0, donor)

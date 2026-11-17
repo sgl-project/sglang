@@ -167,7 +167,8 @@ class SchedulerPPMixin:
             self._pp_incoming[slot] = None
 
         parallel = get_parallel()
-        if running.batch_size() <= parallel.pp_min_micro_batch_size:
+        min_size = parallel.pp_auto_balance_min_micro_batch_size
+        if running.batch_size() <= min_size:
             return running
         loads = []
         for resident, launched, pending in zip(
@@ -189,7 +190,7 @@ class SchedulerPPMixin:
             loads,
             slot,
             parallel.pp_max_micro_batch_size,
-            parallel.pp_min_micro_batch_size,
+            min_size,
         )
         remaining = loads[slot]
         for target, count in enumerate(transfers):
