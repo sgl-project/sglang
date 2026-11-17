@@ -309,6 +309,7 @@ def test_compact_is_refused_on_a_target_backend_without_ragged_verify(monkeypatc
         worker = types.SimpleNamespace(
             _draft_worker=types.SimpleNamespace(init_attention_backends=lambda: None),
             draft_parallel_layout=None,
+            draft_kv_ring=None,
             model_runner=types.SimpleNamespace(
                 model_config=None,
                 attn_backend=types.SimpleNamespace(
