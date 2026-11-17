@@ -37,7 +37,7 @@ Accuracy runs before the companion performance benchmark in the same workflow
 job. A correctness failure therefore skips performance, while a green result
 lets the benchmark reuse the cached checkpoint and the same scarce runner slot.
 
-Registry: nightly-amd-8-gpu-mi35x-glm52-fp8 suite
+Registry: nightly-test-8-gpu-amd-mi35x-glm52-fp8 suite
 """
 
 import unittest
@@ -51,7 +51,7 @@ from sglang.test.test_utils import ModelLaunchSettings
 # FP8 checkpoint dominates startup, then GSM8K 5-shot at TP8)
 register_amd_ci(
     est_time=5400,
-    suite="nightly-amd-8-gpu-mi35x-glm52-fp8",
+    suite="nightly-test-8-gpu-amd-mi35x-glm52-fp8",
     nightly=True,
 )
 

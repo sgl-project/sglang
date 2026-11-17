@@ -17,7 +17,7 @@ Launch config mirrors ~/run_qwen3.5_mxfp4_perf.sh (tp=2, aiter + unified attn +
 flydsl, allreduce fusion). MXFP4 is MI35x-only, so this is not registered on
 mi30x.
 
-Registry: nightly-amd-accuracy-8-gpu-mi35x-qwen35-mxfp4 suite
+Registry: nightly-accuracy-test-8-gpu-amd-mi35x-qwen35-mxfp4 suite
 """
 
 import os
@@ -42,7 +42,9 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=14400, suite="nightly-amd-accuracy-8-gpu-mi35x-qwen35-mxfp4", nightly=True
+    est_time=14400,
+    suite="nightly-accuracy-test-8-gpu-amd-mi35x-qwen35-mxfp4",
+    nightly=True,
 )
 
 # Local checkpoints on the MI35x runner; overridable for other hosts.

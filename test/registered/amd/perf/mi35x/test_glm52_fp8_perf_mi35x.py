@@ -10,7 +10,7 @@ This runs after the GLM-5.2 accuracy test in the same ROCm 7.2 job. The
 checkpoint is therefore already cached, accuracy gates performance, and the
 two tests consume one scarce 8-GPU MI35x slot rather than two.
 
-Registry: nightly-perf-8-gpu-mi35x-glm52-fp8 suite
+Registry: nightly-perf-test-8-gpu-amd-mi35x-glm52-fp8 suite
 """
 
 import os
@@ -23,7 +23,7 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 register_amd_ci(
     est_time=5400,
-    suite="nightly-perf-8-gpu-mi35x-glm52-fp8",
+    suite="nightly-perf-test-8-gpu-amd-mi35x-glm52-fp8",
     nightly=True,
 )
 

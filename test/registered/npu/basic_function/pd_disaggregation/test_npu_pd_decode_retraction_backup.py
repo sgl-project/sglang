@@ -35,8 +35,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 
-register_npu_ci(est_time=400, suite="base-b-test-17-npu-a3")
-register_npu_ci(est_time=400, suite="nightly-17-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="nightly-test-17-npu-a3", nightly=True)
 
 # Explicitly selected on the decode server; the NPU backend then forces
 # hicache_io_backend=kernel_ascend and hicache_mem_layout=page_first_direct.

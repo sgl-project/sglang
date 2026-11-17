@@ -42,7 +42,7 @@ JSON_SCHEMA = json.dumps(
     }
 )
 
-register_npu_ci(est_time=360, suite="nightly-npu-a3-merged", nightly=True)
+register_npu_ci(est_time=360, suite="nightly-test-npu-a3-merged", nightly=True)
 
 
 class TestNpuConstrainedJsonWhitespace(CustomTestCase):

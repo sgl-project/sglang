@@ -217,7 +217,7 @@ jobs:
 
   # =============================================== extra-b (4-gpu) ===============================================
   # 4-GPU tests that CUDA runs in extra-b. Same container env as the
-  # stage-c-test-4-gpu-amd job in pr-test-amd.yml.
+  # base-c-test-4-gpu-amd job in pr-test-amd.yml.
   extra-b-test-4-gpu-amd:
     name: ${{ format('extra-b-test-4-gpu-amd ({0}, linux-{1}-4gpu-sglang)', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300') }}
     needs: [call-gate]

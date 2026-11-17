@@ -4,7 +4,7 @@ Tests the AMD Quark `gpt-oss-120b-w-mxfp4-a-fp8` checkpoint (MXFP4
 weights + static per-tensor FP8 activations) using few-shot completion
 benchmark on MI45x.
 
-Registry: nightly-amd-1-gpu-mi45x suite
+Registry: nightly-test-1-gpu-amd-mi45x suite
 """
 
 import ast
@@ -29,7 +29,7 @@ from sglang.test.test_utils import (
 from sglang.utils import download_and_cache_file, read_jsonl
 
 # Register for AMD CI - MI45x GPT-OSS W4A8 MXFP4-FP8 accuracy test (~15 min)
-register_amd_ci(est_time=900, suite="nightly-amd-1-gpu-mi45x", nightly=True)
+register_amd_ci(est_time=900, suite="nightly-test-1-gpu-amd-mi45x", nightly=True)
 
 INVALID = -9999999
 

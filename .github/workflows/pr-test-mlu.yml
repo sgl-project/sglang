@@ -41,8 +41,8 @@ jobs:
       fail-fast: false
       matrix:
         suite:
-          - pr-test-1-mlu
-          - pr-test-2-mlu
+          - extra-test-1-mlu
+          - extra-test-2-mlu
     runs-on:
       group: mlu-ci
       labels: mlu-pr

@@ -165,7 +165,7 @@ jobs:
           cd test
           python3 run_suite.py \
             --hw musa \
-            --suite nightly-musa-1-gpu \
+            --suite nightly-test-1-gpu-musa \
             --nightly \
             --timeout-per-file 7200
 

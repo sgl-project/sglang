@@ -49,7 +49,7 @@ class TestPPUCISuite(CustomTestCase):
             test
             for test in tests
             if test.backend == HWBackend.PPU
-            and test.effective_suite == "stage-a-test-1-gpu-ppu"
+            and test.effective_suite == "extra-test-1-gpu-ppu"
             and not test.disabled
         ]
         self.assertCountEqual(

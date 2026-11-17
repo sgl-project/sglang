@@ -128,7 +128,7 @@ jobs:
     secrets: inherit
 
   # Runs the entire per-commit XPU test suite in one job (single install, single queue).
-  stage-a-test-1-gpu-xpu:
+  extra-test-1-gpu-xpu:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true' && needs.pr-gate.outputs.opted-in != 'false'
     runs-on: intel-bmg
@@ -198,7 +198,7 @@ jobs:
             --timeout-override kv_canary/test_self_unit_plan_input.py=120
             --timeout-override kernels/ops/kvcache/test_hisparse.py=120
         run: |
-          docker exec -e SGLANG_IS_IN_CI=true ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu,stage-b-test-1-gpu-xpu --timeout-per-file 600 --retry-timeout-increase 0 --enable-retry ${XPU_TIMEOUT_OVERRIDES}"
+          docker exec -e SGLANG_IS_IN_CI=true ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite extra-test-1-gpu-xpu --timeout-per-file 600 --retry-timeout-increase 0 --enable-retry ${XPU_TIMEOUT_OVERRIDES}"
 
       - name: Cleanup container
         if: always()
@@ -330,7 +330,7 @@ jobs:
 
   finish:
     if: always()
-    needs: [stage-a-test-1-gpu-xpu, multimodal-gen-test-1-gpu-xpu, pr-gate]
+    needs: [extra-test-1-gpu-xpu, multimodal-gen-test-1-gpu-xpu, pr-gate]
     runs-on: ubuntu-latest
     steps:
       - name: Check job status

@@ -1214,7 +1214,7 @@ def _detect_npu(full_path, registrations):
                 f"NPU suite `{suite or '(multi-node)'}` of `{full_path}` has no a3 job calling "
                 f"`_npu-pr-test-stage.yml`, the only NPU stage /rerun-test "
                 f"runs (the perf/accuracy single-node stage, multi-node, "
-                f"base-a, and a2/a5 suites are not supported)."
+                f"extra-a, and a2/a5 suites are not supported)."
             )
         elif r.disabled is not None:
             out.append(

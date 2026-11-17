@@ -3,7 +3,7 @@
 Tests deepseek-ai/DeepSeek-V4-Flash with DSV4 attention backend
 using few-shot completion benchmark on MI45x.
 
-Registry: nightly-amd-1-gpu-mi45x-deepseek-v4-flash suite
+Registry: nightly-test-1-gpu-amd-mi45x-deepseek-v4-flash suite
 """
 
 import ast
@@ -30,7 +30,7 @@ from sglang.utils import download_and_cache_file, read_jsonl
 # Register for AMD CI - MI45x DeepSeek-V4-Flash accuracy test (~60 min)
 register_amd_ci(
     est_time=3600,
-    suite="nightly-amd-1-gpu-mi45x-deepseek-v4-flash",
+    suite="nightly-test-1-gpu-amd-mi45x-deepseek-v4-flash",
     nightly=True,
 )
 

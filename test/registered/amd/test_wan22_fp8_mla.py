@@ -25,7 +25,7 @@ from sglang.test.ci.ci_register import register_amd_ci
 
 logger = logging.getLogger(__name__)
 
-register_amd_ci(est_time=3600, suite="nightly-amd-fp8-mla-diffusion", nightly=True)
+register_amd_ci(est_time=3600, suite="nightly-fp8-mla-diffusion-test-amd", nightly=True)
 
 MODEL = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
 FP8_ENV = {"SGLANG_DIFFUSION_AITER_FP8_ATTN": "1"}

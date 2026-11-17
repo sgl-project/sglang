@@ -25,7 +25,7 @@ GLOBAL_SERVER_PROCESS = None
 GLOBAL_SERVER_INITIALIZED = False
 OUTPUT_DIR = "./profiler_dir"
 
-register_npu_ci(est_time=1600, suite="nightly-npu-a3-merged", nightly=True)
+register_npu_ci(est_time=1600, suite="nightly-test-npu-a3-merged", nightly=True)
 
 
 class TestNpuApi(CustomTestCase):

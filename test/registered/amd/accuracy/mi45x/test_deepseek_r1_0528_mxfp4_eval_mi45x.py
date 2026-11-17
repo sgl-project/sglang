@@ -3,7 +3,7 @@
 Tests amd/DeepSeek-R1-0528-MXFP4 quantized model with triton attention
 using few-shot completion benchmark on MI45x.
 
-Registry: nightly-amd-1-gpu-mi45x-deepseek-r1-0528-mxfp4 suite
+Registry: nightly-test-1-gpu-amd-mi45x-deepseek-r1-0528-mxfp4 suite
 """
 
 import ast
@@ -30,7 +30,7 @@ from sglang.utils import download_and_cache_file, read_jsonl
 # Register for AMD CI - MI45x DeepSeek-R1-0528-MXFP4 accuracy test (~60 min)
 register_amd_ci(
     est_time=3600,
-    suite="nightly-amd-1-gpu-mi45x-deepseek-r1-0528-mxfp4",
+    suite="nightly-test-1-gpu-amd-mi45x-deepseek-r1-0528-mxfp4",
     nightly=True,
 )
 

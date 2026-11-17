@@ -28,7 +28,7 @@ has thinking permanently enabled and routes its answer through
 empty and score 0. Scoring raw completions keeps this test measuring what it
 is meant to measure -- whether the ROCm kernels produce correct tokens.
 
-Registry: nightly-amd-accuracy-8-gpu-mi35x-kimi-k3 suite
+Registry: nightly-accuracy-test-8-gpu-amd-mi35x-kimi-k3 suite
 """
 
 import os
@@ -51,7 +51,7 @@ from sglang.test.test_utils import (
 # Register for AMD CI - Kimi K3 accuracy test on MI35x (~150 min: the 1.5 TB
 # MXFP4 checkpoint dominates startup, then 1319 GSM8K questions at TP8)
 register_amd_ci(
-    est_time=9000, suite="nightly-amd-accuracy-8-gpu-mi35x-kimi-k3", nightly=True
+    est_time=9000, suite="nightly-accuracy-test-8-gpu-amd-mi35x-kimi-k3", nightly=True
 )
 
 KIMI_K3_MODEL_PATH = os.environ.get("KIMI_K3_MODEL_PATH", "moonshotai/Kimi-K3")

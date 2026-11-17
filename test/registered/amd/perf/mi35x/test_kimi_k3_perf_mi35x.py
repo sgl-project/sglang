@@ -12,7 +12,7 @@ measure Kimi-K3 throughput on MI35x.
 #32548 reports the reference numbers to compare against: 102.5 tok/s/GPU at
 concurrency 2 rising to 612.3 at concurrency 32, non-speculative.
 
-Registry: nightly-perf-8-gpu-mi35x-kimi-k3 suite
+Registry: nightly-perf-test-8-gpu-amd-mi35x-kimi-k3 suite
 """
 
 import os
@@ -25,7 +25,9 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 # Register for AMD CI - Kimi K3 perf benchmark on MI35x (~150 min: the 1.56 TB
 # MXFP4 checkpoint dominates startup before any batch is timed)
-register_amd_ci(est_time=9000, suite="nightly-perf-8-gpu-mi35x-kimi-k3", nightly=True)
+register_amd_ci(
+    est_time=9000, suite="nightly-perf-test-8-gpu-amd-mi35x-kimi-k3", nightly=True
+)
 
 KIMI_K3_MODEL_PATH = os.environ.get("KIMI_K3_MODEL_PATH", "moonshotai/Kimi-K3")
 RESULT_DIR = "performance_results_kimi_k3_mi35x"
