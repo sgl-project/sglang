@@ -655,6 +655,11 @@ class SchedulePolicy:
         for req in waiting_queue:
             work = self._shortest_prefill_work(req)
             charge = _ceil_div(work, page_size) * page_size
+            # Admission also charges the chunk a hit's encoder replay rows. It
+            # re-matches the prefix, but a longer page-aligned match adds at most
+            # as many replay rows as it drops extend tokens, so this still fits.
+            cached = len(req.origin_input_ids) + len(req.output_ids) - work
+            charge += PrefillAdder._replay_len(req, cached)
             if (
                 self._shortest_prefill_rank(req, processed_tokens) >= chunked_rank
                 or reserved + charge > budget - page_size
@@ -1254,7 +1259,8 @@ class PrefillAdder:
             self.reprocessed_log_hit_tokens += prefix_len
             self.reprocessed_log_input_tokens += raw_extend_input_len
 
-    def _replay_len(self, req: Req, prefix_len: int) -> int:
+    @staticmethod
+    def _replay_len(req: Req, prefix_len: int) -> int:
         if (
             get_exec().features.enable_encoder_swa_bounded_replay
             and encoder_swa_replay.resets_swa_window(req)
