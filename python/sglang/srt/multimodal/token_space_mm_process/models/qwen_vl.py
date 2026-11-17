@@ -28,6 +28,17 @@ from sglang.srt.multimodal.token_space_mm_process.serving_spec import (
 )
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
+_ITEM_VIDEO_LAYOUT_KEYS = frozenset(
+    {
+        "video_metadata",
+        "patch_size",
+        "merge_size",
+        "temporal_patch_size",
+        "device",
+        "return_tensors",
+    }
+)
+
 
 # Adapted from the serving defaults in sglang.srt.multimodal.processors.qwen_vl.QwenVLImageProcessor.__init__.
 class QwenTokenSpaceServingSpec(TokenSpaceServingSpec):
@@ -183,7 +194,9 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
     def process_video(
         self, video, processor, preprocess_kwargs, video_metadata=None, **kwargs
     ):
-        if kwargs.pop("use_audio_in_video", False):
+        if kwargs.pop("use_audio_in_video", False) or preprocess_kwargs.get(
+            "use_audio_in_video", False
+        ):
             raise ValueError("Qwen token expansion does not support use_audio_in_video")
         kwargs.pop("seconds_per_chunk", None)
         kwargs.pop("position_id_per_seconds", None)
@@ -204,7 +217,8 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
             for key, value in self._bound_item_video_options(
                 preprocess_kwargs, pixel_limits=pixel_limits
             ).items()
-            if key in QWEN_VIDEO_PREPROCESS_CONFIG_KEYS or key in hf_video_keys
+            if key not in _ITEM_VIDEO_LAYOUT_KEYS
+            and (key in QWEN_VIDEO_PREPROCESS_CONFIG_KEYS or key in hf_video_keys)
         }
         # kwargs already holds video_config (see resolve_media_options); the item's
         # own options override it for sampling and the HF processor alike.

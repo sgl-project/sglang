@@ -1016,6 +1016,45 @@ class TestQwenTokenizedMedia(CustomTestCase):
                         from_request[key], qwen_options_only[key]
                     )
 
+    @patch("sglang.srt.multimodal.qwen_vl_media_processing.is_cpu", return_value=True)
+    def test_item_video_options_cannot_change_the_processor_layout(self, _is_cpu):
+        frames = (
+            torch.arange(8 * 64 * 64 * 3)
+            .remainder(251)
+            .to(torch.uint8)
+            .reshape(8, 64, 64, 3)
+        )
+        layout_options = {
+            "video_metadata": {"fps": 8, "total_num_frames": 8},
+            "patch_size": 8,
+            "merge_size": 4,
+            "temporal_patch_size": 4,
+            "return_tensors": "np",
+        }
+        for processor_class, patch_size, model_type in (
+            (Qwen2_5_VLProcessor, 14, "qwen2_5_vl"),
+            (Qwen3VLProcessor, 16, "qwen3_vl"),
+        ):
+            with self.subTest(model_type=model_type):
+                processor = _make_hf_processor(
+                    processor_class, patch_size, model_type=model_type
+                )
+                processor._core.strategy.video_config = {"fps": 8.0}
+                with_layout = _process_media(
+                    processor,
+                    videos=[_VideoDecoder(frames, fps=8)],
+                    preprocess_kwargs={"videos": [{"max_frames": 4, **layout_options}]},
+                )
+                without_layout = _process_media(
+                    processor,
+                    videos=[_VideoDecoder(frames, fps=8)],
+                    preprocess_kwargs={"videos": [{"max_frames": 4}]},
+                )
+                for key in ("pixel_values_videos", "video_grid_thw"):
+                    self.assert_tensor_bytes_equal(
+                        with_layout[key], without_layout[key]
+                    )
+
     def test_frame_tensor_items_keep_their_own_qwen_options(self):
         for processor_class, patch_size, model_type, frames, item_options in (
             (
@@ -1142,6 +1181,13 @@ class TestQwenTokenizedMedia(CustomTestCase):
         processor._core.strategy.video_config = {"use_audio_in_video": True}
         with self.assertRaisesRegex(ValueError, "use_audio_in_video"):
             _process_media(processor, videos=[object()])
+        processor._core.strategy.video_config = {}
+        with self.assertRaisesRegex(ValueError, "use_audio_in_video"):
+            _process_media(
+                processor,
+                videos=[object()],
+                preprocess_kwargs={"videos": [{"use_audio_in_video": True}]},
+            )
 
     def test_video_preprocess_kwargs_cannot_raise_configured_limits(self):
         strategy = _make_hf_processor(Qwen3VLProcessor, 16)._core.strategy
