@@ -21,7 +21,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _FLAT_KEYS = (
     "output_token_sampling_mask_flat",
-    "output_token_sampling_mask_lengths",
+    "output_token_sampling_mask_row_lengths",
     "output_token_sampling_logprobs_flat",
 )
 # The output sampling masks of three batches, one row of token ids per output token.

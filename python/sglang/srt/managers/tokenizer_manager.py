@@ -455,16 +455,43 @@ def _build_flat_top_logprobs_fields(
     }
 
 
+def _build_flat_top_logprobs_fields_from_arrays(
+    side: str,
+    val_arr: np.ndarray,
+    idx_arr: np.ndarray,
+    null_prefix: int,
+    return_b64: bool = False,
+) -> Dict[str, Any]:
+    """Build the flat response fields from [rows, k] arrays (see
+    `_build_flat_top_logprobs_fields` for the field semantics)."""
+    fields: Dict[str, Any] = {}
+    if return_b64:
+        fields[f"{side}_top_logprobs_val_flat_b64"] = pybase64.b64encode(
+            val_arr.tobytes()
+        ).decode("utf-8")
+        fields[f"{side}_top_logprobs_idx_flat_b64"] = pybase64.b64encode(
+            idx_arr.tobytes()
+        ).decode("utf-8")
+        fields[f"{side}_top_logprobs_val_flat_b64_dtype"] = "float32"
+        fields[f"{side}_top_logprobs_idx_flat_b64_dtype"] = "int32"
+    else:
+        fields[f"{side}_top_logprobs_val_flat"] = val_arr.reshape(-1).tolist()
+        fields[f"{side}_top_logprobs_idx_flat"] = idx_arr.reshape(-1).tolist()
+    fields[f"{side}_top_logprobs_shape"] = [val_arr.shape[0], val_arr.shape[1]]
+    fields[f"{side}_top_logprobs_null_prefix"] = null_prefix
+    return fields
+
+
 def _build_flat_sampling_mask_fields(
     chunks: List[SamplingMaskChunk], return_b64: bool
 ) -> Dict[str, Any]:
-    """A finished request's sampling masks as flat arrays, base64 with dtype markers if ``return_b64``."""
+    """A finished request's sampling masks as flat arrays; base64 if ``return_b64``."""
     fields: Dict[str, Any] = {
         "output_token_sampling_mask_length": sum(len(c.lengths) for c in chunks)
     }
     for name, attr, dtype in (
         ("output_token_sampling_mask_flat", "token_ids", np.int32),
-        ("output_token_sampling_mask_lengths", "lengths", np.int32),
+        ("output_token_sampling_mask_row_lengths", "lengths", np.int32),
         ("output_token_sampling_logprobs_flat", "logprobs", np.float32),
     ):
         values = np.concatenate(
@@ -472,7 +499,7 @@ def _build_flat_sampling_mask_fields(
         )
         if return_b64:
             fields[f"{name}_b64"] = pybase64.b64encode(values.tobytes()).decode("utf-8")
-            fields[f"{name}_b64_dtype"] = np.dtype(dtype).name
+            fields[f"{name}_b64_dtype"] = values.dtype.name
         else:
             fields[name] = values.tolist()
     return fields
@@ -508,33 +535,6 @@ def _add_sampling_mask_to_meta_info(
                 return_b64=state.obj.return_flat_raw_sampling_mask_b64,
             )
         )
-
-
-def _build_flat_top_logprobs_fields_from_arrays(
-    side: str,
-    val_arr: np.ndarray,
-    idx_arr: np.ndarray,
-    null_prefix: int,
-    return_b64: bool = False,
-) -> Dict[str, Any]:
-    """Build the flat response fields from [rows, k] arrays (see
-    `_build_flat_top_logprobs_fields` for the field semantics)."""
-    fields: Dict[str, Any] = {}
-    if return_b64:
-        fields[f"{side}_top_logprobs_val_flat_b64"] = pybase64.b64encode(
-            val_arr.tobytes()
-        ).decode("utf-8")
-        fields[f"{side}_top_logprobs_idx_flat_b64"] = pybase64.b64encode(
-            idx_arr.tobytes()
-        ).decode("utf-8")
-        fields[f"{side}_top_logprobs_val_flat_b64_dtype"] = "float32"
-        fields[f"{side}_top_logprobs_idx_flat_b64_dtype"] = "int32"
-    else:
-        fields[f"{side}_top_logprobs_val_flat"] = val_arr.reshape(-1).tolist()
-        fields[f"{side}_top_logprobs_idx_flat"] = idx_arr.reshape(-1).tolist()
-    fields[f"{side}_top_logprobs_shape"] = [val_arr.shape[0], val_arr.shape[1]]
-    fields[f"{side}_top_logprobs_null_prefix"] = null_prefix
-    return fields
 
 
 class InputFormat(Enum):
