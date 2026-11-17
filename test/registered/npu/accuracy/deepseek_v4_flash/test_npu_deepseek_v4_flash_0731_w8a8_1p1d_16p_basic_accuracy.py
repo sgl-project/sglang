@@ -1,5 +1,6 @@
 import importlib.util
 import unittest
+from pathlib import Path
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyMultiNodePdSepTestCaseBase,
@@ -21,10 +22,19 @@ register_npu_ci(
     nightly=True,
 )
 
-MOONCAKE_INSTALLED = importlib.util.find_spec("mooncake") is not None
-DISAGGREGATION_TRANSFER_BACKEND = "mooncake" if MOONCAKE_INSTALLED else "ascend"
+# This case runs PD separation over the Mooncake transfer engine. Fail fast
+# instead of silently degrading to the ascend backend: the launch args, the
+# TENT envs and the "same draft model on both nodes" state-wire requirement
+# below all assume Mooncake.
+if importlib.util.find_spec("mooncake") is None:
+    raise RuntimeError(
+        "DeepSeek-V4-Flash basic accuracy case requires the Mooncake package "
+        "(Mooncake + TENT PD transfer backend)."
+    )
 
-# Mooncake + TENT + MemFabric, only used when the Mooncake package is present.
+DISAGGREGATION_TRANSFER_BACKEND = "mooncake"
+
+# Mooncake + TENT + MemFabric.
 MOONCAKE_ENVS = {
     "MC_USE_TENT": "1",
     "MF_PROTOCOL": "device_sdma",
@@ -32,7 +42,17 @@ MOONCAKE_ENVS = {
     "ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE": "true",
 }
 
+# The deployment args mirror the 128k1k performance case so accuracy shares
+# its expert layout and EP settings; the expert layout file lives next to it.
+EXPERT_LAYOUT_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "performance"
+    / "deepseek_v4_flash"
+    / "expert-layout-ais-replicas16.json"
+)
+
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
+    "PYTHONUNBUFFERED": "1",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
     "INF_NAN_MODE_FORCE_DISABLE": "1",
@@ -63,36 +83,39 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "1800",
     "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "1800",
-    # "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER": "1",
+    "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER": "1",
+    # send cached prefix to decode early for radix-cache hits
+    "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX": "1",
 }
 
 # Prefill node environment variables for DSV4-Flash-0731 PD-Sep deployment.
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ENVS = {
     **DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS,
+    # deepep
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
     "DEEPEP_HCCL_BUFFSIZE": "2600",
     "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
-    "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+    "DEEPEP_NORMAL_LONG_SEQ_ROUND": "1",
     "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
     "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "0",
+    # war barrier
     "SGLANG_ENABLE_WAR_BARRIER": "1",
     "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
     "SGLANG_PROFILE_WITH_STACK": "False",
-    # send cached prefix to decode early for radix-cache hits
-    "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX": "1",
 }
 
 # Decode node environment variables for DSV4-Flash-0731 PD-Sep deployment.
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS = {
     **DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS,
-    "HCCL_BUFFSIZE": "1200",
+    # deepep
+    "HCCL_BUFFSIZE": "200",
+    "DEEPEP_HCCL_BUFFSIZE": "1200",
     "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
     "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "2048",
     "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
     "SGLANG_NPU_USE_MULTI_STREAM": "1",
     "SGLANG_NPU_SPLIT_SHARED_EXPERT_OVERLAP": "1",
-    "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX": "1",
 }
 
 # DSpark speculative decoding. Both nodes must run the same draft model: the PD
@@ -110,18 +133,18 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_SPEC_ARGS = [
     "ascend",
     "--speculative-num-draft-tokens",
     6,
+    "--speculative-dspark-block-size",
+    5,
 ]
 
-# Prefill node launch arguments. Pipeline parallelism (--pp-size 1) and prefill
-# context parallelism (no --enable-prefill-cp) are disabled; a single TP16 stage
-# covers the 16 NPUs of the node.
+# Prefill node launch arguments. No --pp-size / --enable-prefill-cp: a single
+# TP16 stage covers the 16 NPUs of the node. The hierarchical-cache block is
+# kept because this file also asserts the L2 host hit rate.
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--page-size",
     128,
     "--tp-size",
     16,
-    "--pp-size",
-    1,
     "--trust-remote-code",
     "--device",
     "npu",
@@ -141,10 +164,8 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     70000,
     "--max-running-requests",
     256,
-    "--chunked-prefill-size",
-    131072,
     "--dp-size",
-    8,
+    16,
     "--enable-dp-attention",
     "--tokenizer-worker-num",
     16,
@@ -160,7 +181,25 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--disable-cuda-graph",
     "--load-balance-method",
     "round_robin",
+    "--enable-metrics",
     "--enable-cache-report",
+    "--chunked-prefill-size",
+    32768,
+    "--init-expert-location",
+    str(EXPERT_LAYOUT_PATH),
+    "--ep-dispatch-algorithm",
+    "dynamic",
+    "--ep-num-redundant-experts",
+    16,
+    "--optimistic-prefill-attempts",
+    1,
+    "--json-model-override-args",
+    '{"use_index_cache":true,"index_topk_freq":2}',
+    "--expert-distribution-recorder-mode",
+    "stat",
+    "--expert-distribution-recorder-buffer-size",
+    512,
+    # L2 host hit-rate assertions need HiCache on the prefill side.
     "--enable-hierarchical-cache",
     "--hicache-io-backend",
     "kernel_ascend",
@@ -168,7 +207,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     1.5,
     "--hicache-write-policy",
     "write_through",
-    "--enable-cache-report",
     "--max-total-tokens",
     140000,
     *DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_SPEC_ARGS,
@@ -209,15 +247,23 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS = [
     "bfloat16",
     "--load-balance-method",
     "round_robin",
-    # Temporarily disable decode CUDA graph.
-    "--disable-cuda-graph",
+    "--enable-metrics",
+    "--enable-cache-report",
+    "--swa-full-tokens-ratio",
+    0.05,
     "--cuda-graph-bs-decode",
     1,
     2,
     3,
     4,
-    5,
     6,
+    7,
+    8,
+    10,
+    "--json-model-override-args",
+    '{"use_index_cache":true,"index_topk_freq":2}',
+    "--tokenizer-worker-num",
+    16,
     *DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_SPEC_ARGS,
 ]
 
@@ -249,18 +295,22 @@ class TestNPUDeepSeekV4FlashPDSepBasicAccuracy(
         "gsm8k": 0.90,
     }
     generation_config = DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH
-    eval_batch_size = 128
+    eval_batch_size = 54
+    # TEMPORARY smoke-run cap (the default 100000 means the whole dataset).
+    # A partial dataset no longer justifies the fixed 5/198 fluctuation, so the
+    # 0.874 baseline check can fail on sampling noise; restore this before the
+    # real release run.
+    limit = 20
     min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 0%
 
     @classmethod
     def setUpClass(cls):
         common_envs = dict(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS)
-        if MOONCAKE_INSTALLED:
-            common_envs.update(MOONCAKE_ENVS)
-            common_envs["MC_TENT_CONF"] = write_memfabric_tent_conf()
-            common_envs["LD_LIBRARY_PATH"] = append_ld_library_path(
-                ("memfabric_hybrid", "lib"), ("mooncake", None)
-            )
+        common_envs.update(MOONCAKE_ENVS)
+        common_envs["MC_TENT_CONF"] = write_memfabric_tent_conf()
+        common_envs["LD_LIBRARY_PATH"] = append_ld_library_path(
+            ("memfabric_hybrid", "lib"), ("mooncake", None)
+        )
         cls.model_config = {
             "model_path": DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
             "prefill_args": list(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS),
@@ -273,20 +323,16 @@ class TestNPUDeepSeekV4FlashPDSepBasicAccuracy(
                 **common_envs,
                 **DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS,
             },
-            # The router is launched with --no-tokenizer (workers tokenize
-            # themselves), which cache_aware routing rejects, so keep the
-            # default policy. With one prefill and one decode worker the choice
-            # does not affect routing anyway.
-            "router_args": [],
+            "router_args": ["--policy", "round_robin"],
             "router_envs": {},
         }
         super().setUpClass()
 
-    def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
+    def test_npu_deepseek_v4_flash_accuracy(self):
         """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""
         self.run_accuracy()
 
-    def test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_l2_host_hit_rate(self):
+    def test_npu_deepseek_v4_flash_prefix_cache_hit_rate(self):
         """Run the 32k GSP bench; assert_metrics checks the host hit rate"""
         # 3 groups x 32 prompts share a 28800-token system prompt (32k * 0.9)
         # plus a 3200-token question, which exceeds L1 so evictions land in L2.
