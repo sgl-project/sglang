@@ -311,7 +311,7 @@ class SchedulerPPMixin:
         if early_send:
             self.disagg_prefill_early_sent_rids = set()
             self.disagg_prefill_early_send_pending = deque()
-            self.disagg_prefill_early_send_stats = {"early": 0, "waited": 0}
+            self.disagg_prefill_early_send_stats = {"early": 0, "deferred": 0}
             logger.info(
                 "PP PD prefill: each stage sends a request's last KV chunk when its "
                 "own forward ends (SGLANG_PP_PD_PREFILL_EARLY_SEND)."
@@ -410,12 +410,11 @@ class SchedulerPPMixin:
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
                     if early_send:
-                        # Its early sends must be made and ended first. The forward
-                        # just launched stays queued, so the GPU keeps busy.
+                        # Its early sends must be made first. The forward just
+                        # launched stays queued, so the GPU keeps busy.
                         self._pp_pd_flush_early_sends(
                             max(self.mbs[next_mb_id].forward_iter, self.forward_ct - 1)
                         )
-                        self._pp_pd_settle_early_sends(self.mbs[next_mb_id])
                     self._pp_process_batch_result(
                         self.mbs[next_mb_id],
                         next_batch_result,

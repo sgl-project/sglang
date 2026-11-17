@@ -3531,8 +3531,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
-        # A last chunk without aux_index leaves the aux to another PP stage
-        # (SGLANG_PP_PD_PREFILL_EARLY_SEND).
+        # Only an early send leaves a last chunk's aux to another PP stage.
+        assert (
+            not is_last_chunk
+            or aux_index is not None
+            or envs.SGLANG_PP_PD_PREFILL_EARLY_SEND.get()
+        )
 
         if (
             bootstrap_room not in self.request_status

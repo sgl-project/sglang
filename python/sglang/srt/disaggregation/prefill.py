@@ -1289,7 +1289,12 @@ class SchedulerDisaggregationPrefillMixin:
                 self.batch_result_processor._maybe_collect_customized_info(
                     i, req, logits_output
                 )
-                self.checkpoint_disagg_prefill(req)
+                if self._early_sent_transfer_running(req):
+                    # The checkpoint's dedup may free pages this stage's transfer
+                    # still reads; the release after the transfer publishes them.
+                    self.disagg_prefill_early_send_stats["deferred"] += 1
+                else:
+                    self.checkpoint_disagg_prefill(req)
                 move(
                     [req],
                     self.disagg_prefill_transfer_queue,
@@ -1593,7 +1598,9 @@ class SchedulerDisaggregationPrefillMixin:
 
     def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
         """Release an aborted request when its last prefill result is safe."""
-        self._settle_early_sent_last_chunk(req, forget=True)
+        # An early-sent last chunk still in flight is released like any other
+        # in-flight chunk of an aborted request.
+        self._forget_early_sent_last_chunk(req)
         owns_resources = (
             req.kv.holds_kv or req.kv.holds_mamba or req.metadata_buffer_index >= 0
         )
@@ -1866,40 +1873,27 @@ class SchedulerDisaggregationPrefillMixin:
         self.disagg_prefill_early_sent_rids.add(req.rid)
         stats = self.disagg_prefill_early_send_stats
         stats["early"] += 1
-        if stats["early"] % 4096 == 1:
+        if stats["early"] & (stats["early"] - 1) == 0:  # 1, 2, 4, ... sends
             logger.info(
                 "PP PD prefill early send: %d last chunks sent at forward end; "
-                "%d results waited for their transfer.",
+                "%d results deferred their checkpoint to the transfer's end.",
                 stats["early"],
-                stats["waited"],
+                stats["deferred"],
             )
 
-    def _pp_pd_settle_early_sends(self: Scheduler, batch: ScheduleBatch) -> None:
-        """Before batch's result: its early sends must end on this stage, as the
-        result's radix checkpoint (dedup) may free pages they still read."""
-        for req in batch.reqs:
-            self._settle_early_sent_last_chunk(req)
-
-    def _settle_early_sent_last_chunk(
-        self: Scheduler, req: Req, forget: bool = False
-    ) -> bool:
-        """Whether req's last chunk already left at forward end; if so, first wait
-        until this stage's transfer of it ends."""
+    def _early_sent_transfer_running(self: Scheduler, req: Req) -> bool:
+        """Whether req's last chunk left at forward end and this stage's transfer
+        of it has not ended yet. Never waits."""
         if req.rid not in self.disagg_prefill_early_sent_rids:
             return False
-        if forget:
-            self.disagg_prefill_early_sent_rids.discard(req.rid)
-        status = req.disagg_kv_sender.kv_mgr.request_status
-        waited = False
-        while status.get(req.bootstrap_room) not in (
-            None,
-            KVPoll.Success,
-            KVPoll.Failed,
-        ):
-            waited = True
-            time.sleep(PREFILL_INPUT_POLL_INTERVAL_S)
-        if waited:
-            self.disagg_prefill_early_send_stats["waited"] += 1
+        status = req.disagg_kv_sender.kv_mgr.request_status.get(req.bootstrap_room)
+        return status not in (None, KVPoll.Success, KVPoll.Failed)
+
+    def _forget_early_sent_last_chunk(self: Scheduler, req: Req) -> bool:
+        """Whether req's last chunk already left at forward end."""
+        if req.rid not in self.disagg_prefill_early_sent_rids:
+            return False
+        self.disagg_prefill_early_sent_rids.discard(req.rid)
         return True
 
     def send_kv_chunk(
@@ -1908,7 +1902,7 @@ class SchedulerDisaggregationPrefillMixin:
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
     ) -> None:
-        if last_chunk and self._settle_early_sent_last_chunk(req, forget=True):
+        if last_chunk and self._forget_early_sent_last_chunk(req):
             return  # Sent when this stage's forward of it ended.
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if last_chunk and computer is not None:

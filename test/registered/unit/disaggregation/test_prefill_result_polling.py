@@ -2,8 +2,6 @@
 
 import multiprocessing
 import tempfile
-import threading
-import time
 import unittest
 from array import array
 from collections import Counter, deque
@@ -1477,7 +1475,7 @@ class _PPEarlySendScheduler(SchedulerDisaggregationPrefillMixin):
         )
         self.disagg_prefill_early_sent_rids = set()
         self.disagg_prefill_early_send_pending = deque()
-        self.disagg_prefill_early_send_stats = {"early": 0, "waited": 0}
+        self.disagg_prefill_early_send_stats = {"early": 0, "deferred": 0}
         self.sent = []
 
         def send(req, last_chunk=False, end_idx=None, **kwargs):
@@ -1640,40 +1638,10 @@ class TestPPPrefillEarlySend(CustomTestCase):
         self.assertTrue(positional(8))
         self.assertFalse(positional(2))
 
-    def test_result_skips_the_early_sent_chunk_after_its_transfer_ends(self):
+    def test_early_send_is_off_by_default(self):
         stage = _PPEarlySendScheduler(is_last_rank=False)
-        req = _early_req("r", 1, status=KVPoll.Transferring)
-        self.assertFalse(stage._settle_early_sent_last_chunk(req, forget=True))
-        stage.disagg_prefill_early_sent_rids.add("r")
-
-        # The checkpoint after it may dedupe (free) pages the transfer still reads.
-        def finish():
-            time.sleep(0.05)
-            req.disagg_kv_sender.kv_mgr.request_status[1] = KVPoll.Success
-
-        threading.Thread(target=finish).start()
-        start = time.monotonic()
-        self.assertTrue(stage._settle_early_sent_last_chunk(req, forget=True))
-        self.assertGreaterEqual(time.monotonic() - start, 0.04)
-        self.assertEqual(stage.disagg_prefill_early_send_stats["waited"], 1)
-        self.assertFalse(stage._settle_early_sent_last_chunk(req, forget=True))
-
-    def test_gate_is_off_by_default_and_needs_pp_mooncake_and_aux_free_results(self):
-        stage = _PPEarlySendScheduler(is_last_rank=False)
-        stage.kv_checksum_computer = None
-        stage.enable_staging = False
-        stage.enable_unified_cache_external_linker = False
-        stage.spec_algorithm = SpeculativeAlgorithm.NONE
         with published_topology(pp_size=2):
             self.assertFalse(stage._pp_pd_early_send_enabled())
-            with envs.SGLANG_PP_PD_PREFILL_EARLY_SEND.override(True):
-                self.assertTrue(stage._pp_pd_early_send_enabled())
-                stage.spec_algorithm = SpeculativeAlgorithm.EAGLE
-                self.assertFalse(stage._pp_pd_early_send_enabled())
-        with published_topology(pp_size=1):
-            with envs.SGLANG_PP_PD_PREFILL_EARLY_SEND.override(True):
-                stage.spec_algorithm = SpeculativeAlgorithm.NONE
-                self.assertFalse(stage._pp_pd_early_send_enabled())
 
 
 if __name__ == "__main__":

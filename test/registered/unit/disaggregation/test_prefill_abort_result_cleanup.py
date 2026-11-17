@@ -258,7 +258,7 @@ class TestPrefillCompleteResult(CustomTestCase):
 
 class TestEarlySentLastChunkResult(CustomTestCase):
     """SGLANG_PP_PD_PREFILL_EARLY_SEND: a PP stage already sent the last chunk when
-    its forward ended; the result waits for that transfer and sends nothing."""
+    its forward ended; the result sends nothing and never waits for it."""
 
     def setUp(self):
         super().setUp()
@@ -268,66 +268,38 @@ class TestEarlySentLastChunkResult(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
 
-    @staticmethod
-    def _early_sent(scheduler, req, order):
-        req.bootstrap_room = 5
-        req.disagg_kv_sender.kv_mgr = SimpleNamespace(
-            request_status=SimpleNamespace(
-                get=lambda room: order.append("transfer ended") or KVPoll.Success
-            )
-        )
-        scheduler.disagg_prefill_early_sent_rids = {req.rid}
-
     @patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
-    def test_result_skips_the_early_sent_send(self, checkpoint):
-        for early_sent in (True, False):
-            with self.subTest(early_sent=early_sent):
+    def test_result_defers_its_checkpoint_while_the_early_send_runs(self, checkpoint):
+        # The checkpoint's dedup may free pages the transfer still reads.
+        for status, checkpointed in (
+            (KVPoll.Transferring, False),
+            (KVPoll.Success, True),
+            (None, True),  # not early-sent: the result sends the last chunk
+        ):
+            with self.subTest(status=status):
+                checkpoint.reset_mock()
                 scheduler = _Scheduler()
                 del scheduler.send_kv_chunk  # the real one, over a stub transfer
                 scheduler._send_kv_chunk = Mock()
                 scheduler.kv_checksum_computer = None
+                scheduler.disagg_prefill_early_send_stats = {"deferred": 0}
                 req = _Req()
                 req.to_finish = None
                 req.pending_bootstrap = False
                 req.time_stats.set_prefill_transfer_queue_entry_time = Mock()
-                order = []
-                if early_sent:
-                    self._early_sent(scheduler, req, order)
-                # The checkpoint may dedupe (free) pages the transfer still reads:
-                # the PP loop settles the batch's early sends before its result.
-                checkpoint.side_effect = lambda *args: order.append("checkpoint")
+                if status is not None:
+                    req.bootstrap_room = 5
+                    req.disagg_kv_sender.kv_mgr = SimpleNamespace(
+                        request_status={5: status}
+                    )
+                    scheduler.disagg_prefill_early_sent_rids = {req.rid}
                 batch = _batch(req)
                 move([req], scheduler.prefill_launched_reqs)
-                scheduler._pp_pd_settle_early_sends(batch)
                 scheduler.process_batch_result_disagg_prefill(batch, _result())
-                self.assertEqual(req.output_ids, [11])
                 self.assertIn(req, scheduler.disagg_prefill_transfer_queue)
+                self.assertEqual(checkpoint.called, checkpointed)
+                self.assertEqual(scheduler._send_kv_chunk.called, status is None)
                 self.assertFalse(scheduler.disagg_prefill_early_sent_rids)
-                if early_sent:
-                    self.assertEqual(order[:2], ["transfer ended", "checkpoint"])
-                    scheduler._send_kv_chunk.assert_not_called()
-                else:
-                    self.assertEqual(order, ["checkpoint"])
-                    scheduler._send_kv_chunk.assert_called_once_with(
-                        req, last_chunk=True, end_idx=None
-                    )
-
-    @patch("sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache")
-    def test_aborted_result_waits_for_its_early_sent_transfer(self, release):
-        scheduler = _Scheduler()
-        req = _Req()
-        order = []
-        self._early_sent(scheduler, req, order)
-
-        def free(*args, **kwargs):
-            order.append("release")
-            _free_req(*args, **kwargs)
-
-        release.side_effect = free
-        scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
-        self.assertTrue(req.finished())
-        self.assertEqual(order, ["transfer ended", "release"])
-        self.assertFalse(scheduler.disagg_prefill_early_sent_rids)
 
 
 class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
