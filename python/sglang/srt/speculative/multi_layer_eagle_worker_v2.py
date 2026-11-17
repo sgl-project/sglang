@@ -24,6 +24,7 @@ import torch
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+from sglang.srt.layers.dp_attention import require_gathered_buffer
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_backend_context,
@@ -32,7 +33,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -40,6 +41,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
+from sglang.srt.observability.profile_utils import build_step_span_name
 from sglang.srt.runtime_context import (
     get_device,
     get_schedule,
@@ -63,6 +65,7 @@ from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
     bind_eagle_runtime_hooks,
     build_eagle_verify_input,
+    check_draft_branch_tail_copy,
     prepare_for_draft,
     prepare_for_draft_extend,
     run_eagle_verify,
@@ -87,12 +90,7 @@ from sglang.srt.speculative.spec_utils import (
     sample_draft_proposal,
     select_top_k_tokens,
 )
-from sglang.srt.utils import (
-    get_available_gpu_memory,
-    is_cpu,
-    is_npu,
-    require_gathered_buffer,
-)
+from sglang.srt.utils import get_available_gpu_memory, is_cpu, is_npu
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -100,7 +98,6 @@ from sglang.srt.utils.async_probe import (
 )
 from sglang.srt.utils.common import fast_topk
 from sglang.srt.utils.nvtx_utils import profile_range
-from sglang.srt.utils.profile_utils import build_step_span_name
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -154,11 +151,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         )
 
         self._rebuild_topk1_chain_buffers()
-
-        # Set constant
-        EagleDraftInput.ALLOC_LEN_PER_DECODE = max(
-            self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
-        )
 
         # Retain the target's attention topology when swapping TP groups.
         self.parallel_layout = resolve_draft_parallel_layout(
@@ -216,6 +208,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             memory_pool_config=memory_pool_config,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        )
+        check_draft_branch_tail_copy(
+            self.draft_runner.token_to_kv_pool, self.topk, get_schedule().page_size
         )
         self.init_lm_head()
         self._init_boundary_kv_fix_state()

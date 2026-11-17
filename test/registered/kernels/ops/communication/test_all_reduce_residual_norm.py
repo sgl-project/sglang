@@ -57,7 +57,7 @@ def _init():
         max_push_blocks=512,
     )
     assert not comm.disabled
-    all_reduce_fusion.register_comm(comm.obj)
+    all_reduce_fusion.register_comm(lambda: comm.obj, world_size=comm.world_size)
     register_comm_cleanup(comm)
     return coord
 

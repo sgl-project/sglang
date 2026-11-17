@@ -35,23 +35,28 @@ nothing in this module executes.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
+import torch.distributed as dist
 
-from sglang.srt.runtime_context import (
-    get_flags,
-    get_forward,
-    get_parallel,
-)
+from sglang.srt.runtime_context import get_flags, get_forward, get_parallel
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.device import get_device
 
 # Architectures whose decoder layers route attention/MLP through
 # layer boundaries with the standard participant linears, and for which SP
 # has been validated. Other models reject --enable-layernorm-sp at construction.
 # The mechanism is generic; extend the allowlist as families are validated.
 MUSE_SP_ARCHITECTURES = frozenset({"MuseSparkForConditionalGeneration"})
-SP_SUPPORTED_ARCHITECTURES = MUSE_SP_ARCHITECTURES | frozenset({"Qwen3ForCausalLM"})
+SP_SUPPORTED_ARCHITECTURES = MUSE_SP_ARCHITECTURES | frozenset(
+    {
+        "Qwen3ForCausalLM",
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
+    }
+)
 
 
 def is_muse_spark_architecture(architecture: Optional[str]) -> bool:
@@ -62,19 +67,30 @@ def initialize_layernorm_sp(*, model_config) -> None:
     """Materialize ``flags.sp.enabled``; runs once per worker after distributed
     setup, alongside ``initialize_dp_attention``."""
     architectures = model_config.hf_config.architectures
-    get_flags().sp.enabled = bool(
+    architecture = architectures[0] if architectures else None
+    enabled = bool(
         get_parallel().enable_layernorm_sp
-        and architectures
-        and architectures[0] in SP_SUPPORTED_ARCHITECTURES
+        and architecture in SP_SUPPORTED_ARCHITECTURES
     )
+    get_flags().sp.enabled = enabled
 
 
 def layernorm_sp_enabled() -> bool:
     return get_flags().sp.enabled
 
 
-def runs_sp(forward_mode) -> bool:
-    """Whether this forward runs SP: an enabled model, prefill only.
+def runs_sp(forward_mode, num_tokens: Optional[int] = None) -> bool:
+    """Whether this forward runs SP: an enabled model, prefill only, and more
+    than --layernorm-sp-min-tokens tokens (0, the default, admits every pass).
+
+    ``num_tokens`` is the pass's token count, before the entry scatter. Every
+    in-tree caller passes it, so the entry scatter, the layer-boundary entry and
+    the exit gathers take the same decision for one pass. In a captured prefill
+    graph the entry decides on the bucket size while the exit gather outside
+    the graph sees the real count; they agree because the threshold is a
+    captured bucket (checked at resolution, ``handle_layernorm_sp``). A caller
+    that asks only about decode / verify passes may omit the count: those
+    never run SP. An extend pass without it raises.
 
     Code outside the CUDA-graph-captured region must use this and not
     ``get_forward().sp_active``: Python writes made inside that region do not
@@ -82,7 +98,15 @@ def runs_sp(forward_mode) -> bool:
     """
     from sglang.srt.model_executor.forward_mode import ForwardMode
 
-    return layernorm_sp_enabled() and forward_mode == ForwardMode.EXTEND
+    if not (layernorm_sp_enabled() and forward_mode == ForwardMode.EXTEND):
+        return False
+    if num_tokens is None:
+        raise ValueError(
+            "runs_sp needs num_tokens (the pass's token count) for an extend pass: "
+            "without it the caller skips --layernorm-sp-min-tokens and, on a pass "
+            "at or under the threshold, disagrees with the entry and exit gathers."
+        )
+    return num_tokens > get_parallel().layernorm_sp_min_tokens
 
 
 class _SPForwardState:
@@ -107,6 +131,84 @@ def sp_num_tokens() -> int:
     return _sp_state.num_tokens
 
 
+def _group_size_rank(group) -> tuple[int, int]:
+    if hasattr(group, "world_size"):
+        return int(group.world_size), int(group.rank_in_group)
+    return dist.get_world_size(group), dist.get_rank(group)
+
+
+def shard_token_rows(tensor: torch.Tensor, *, group=None) -> torch.Tensor:
+    """Pad and locally select this TP rank's contiguous token-row shard."""
+    group = group or get_parallel().tp_group
+    world_size, rank = _group_size_rank(group)
+    padded_rows = ceil_align(tensor.shape[0], world_size)
+    if padded_rows != tensor.shape[0]:
+        tensor = torch.nn.functional.pad(
+            tensor, (0, 0, 0, padded_rows - tensor.shape[0])
+        )
+    return tensor.tensor_split(world_size, dim=0)[rank].contiguous()
+
+
+def all_gather_token_rows(
+    local_rows: torch.Tensor, *, total_rows: Optional[int] = None, group=None
+) -> torch.Tensor:
+    """Gather equal token-row shards and optionally trim collective padding."""
+    group = group or get_parallel().tp_group
+    world_size, _ = _group_size_rank(group)
+    output = local_rows.new_empty(
+        (local_rows.shape[0] * world_size, *local_rows.shape[1:])
+    )
+    local_rows = local_rows.contiguous()
+    if hasattr(group, "all_gather_into_tensor"):
+        group.all_gather_into_tensor(output, local_rows)
+    else:
+        dist.all_gather_into_tensor(output, local_rows, group=group)
+    return output if total_rows is None else output[:total_rows]
+
+
+def reduce_scatter_token_rows(
+    full_partial: torch.Tensor, *, group=None
+) -> torch.Tensor:
+    """Pad, sum and scatter token rows across a TP group."""
+    group = group or get_parallel().tp_group
+    world_size, _ = _group_size_rank(group)
+    padded_rows = ceil_align(full_partial.shape[0], world_size)
+    if padded_rows != full_partial.shape[0]:
+        full_partial = torch.nn.functional.pad(
+            full_partial, (0, 0, 0, padded_rows - full_partial.shape[0])
+        )
+    output = full_partial.new_empty(
+        (padded_rows // world_size, *full_partial.shape[1:])
+    )
+    full_partial = full_partial.contiguous()
+    if hasattr(group, "reduce_scatter_tensor"):
+        group.reduce_scatter_tensor(output, full_partial)
+    else:
+        dist.reduce_scatter_tensor(output, full_partial, group=group)
+    return output
+
+
+def run_replicated_token_rows(
+    hidden_states: torch.Tensor,
+    compute: Callable[[torch.Tensor], torch.Tensor],
+    *,
+    output_is_tp_partial: bool,
+    total_rows: Optional[int] = None,
+    group=None,
+) -> torch.Tensor:
+    """Run a full-row-only operation while the surrounding region stays SP.
+
+    Sum partial TP output while scattering it; locally shard complete output.
+    """
+    group = group or get_parallel().tp_group
+    full_rows = all_gather_token_rows(hidden_states, total_rows=total_rows, group=group)
+    with get_forward().scoped(sp_active=False):
+        full_output = compute(full_rows)
+    if output_is_tp_partial:
+        return reduce_scatter_token_rows(full_output, group=group)
+    return shard_token_rows(full_output, group=group)
+
+
 # --- entry scatter / exit gather (once per forward, at the boundary) ----------
 def sp_entry_scatter(hidden_states: torch.Tensor) -> torch.Tensor:
     """Shard the replicated ``[M, h]`` hidden states along the token dim.
@@ -116,31 +218,23 @@ def sp_entry_scatter(hidden_states: torch.Tensor) -> torch.Tensor:
     """
     num_tokens = hidden_states.shape[0]
     set_sp_num_tokens(num_tokens)
-    tp_group = get_parallel().tp_group
-    tp_size = tp_group.world_size
-    if tp_size == 1:
+    group = get_parallel().tp_group
+    if group.world_size == 1:
         return hidden_states
-    padded = ceil_align(num_tokens, tp_size)
-    if padded != num_tokens:
-        hidden_states = torch.nn.functional.pad(
-            hidden_states, (0, 0, 0, padded - num_tokens)
-        )
-    return hidden_states.tensor_split(tp_size)[tp_group.rank_in_group].contiguous()
+    return shard_token_rows(hidden_states, group=group)
 
 
 def sp_exit_gather(hidden_states: torch.Tensor, num_tokens: int) -> torch.Tensor:
     """g: all-gather the per-rank shards back to the full sequence along dim 0,
     then narrow to ``num_tokens`` (dropping the entry-scatter padding)."""
-    tp_group = get_parallel().tp_group
-    tp_size = tp_group.world_size
-    if tp_size == 1:
+    group = get_parallel().tp_group
+    if group.world_size == 1:
         return hidden_states[:num_tokens]
-    hidden_states = hidden_states.contiguous()
-    output = hidden_states.new_empty(
-        (hidden_states.shape[0] * tp_size, *hidden_states.shape[1:])
+    return all_gather_token_rows(
+        hidden_states,
+        total_rows=num_tokens,
+        group=group,
     )
-    tp_group.all_gather_into_tensor(output, hidden_states)
-    return output[:num_tokens]
 
 
 def maybe_exit_gather(
@@ -156,7 +250,7 @@ def maybe_exit_gather(
     and the predicate from ``runs_sp``, so this stays correct on CUDA graph
     replay, where the writes made inside the captured region do not re-execute.
     """
-    if not runs_sp(forward_mode) or input_ids is None:
+    if input_ids is None or not runs_sp(forward_mode, input_ids.shape[0]):
         return hidden_states, hidden_states_before_norm
     num_tokens = input_ids.shape[0]
     hidden_states = sp_exit_gather(hidden_states, num_tokens=num_tokens)
@@ -184,6 +278,40 @@ except Exception:
     _HAS_TORCH_SYMM_MEM_FUSED = False
 
 
+# --- NPU (Ascend) MC2 fused matmul+collective fast-path -----------------------
+# CANN >= 8.0.RC2 fused ops: npu_mm_reduce_scatter_base == ReduceScatter(x1 @ x2),
+# npu_all_gather_base_mm == allgather(x1) @ x2; probed once at import.
+_HAS_NPU_MC2_FUSED = False
+_npu_mm_reduce_scatter_base = None
+_npu_all_gather_base_mm = None
+if is_npu():
+    try:
+        import torch_npu  # noqa: F401
+
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+        # arch35 (Ascend 950) MC2 fused ops accumulate at lower GEMM precision
+        # and regress model accuracy; keep the plain collective fallback there.
+        _npu_mm_reduce_scatter_base = getattr(
+            torch_npu, "npu_mm_reduce_scatter_base", None
+        )
+        _npu_all_gather_base_mm = getattr(torch_npu, "npu_all_gather_base_mm", None)
+        _HAS_NPU_MC2_FUSED = (
+            _npu_mm_reduce_scatter_base is not None
+            and _npu_all_gather_base_mm is not None
+            and not is_npu_arch35()
+        )
+    except Exception:
+        _HAS_NPU_MC2_FUSED = False
+
+
+def _npu_hccl_comm_name() -> str:
+    """HCCL handle (``hcom``) of the TP group, consumed by the MC2 fused ops."""
+    tp_group = get_parallel().tp_group
+    backend = tp_group.device_group._get_backend(torch.device(get_device()))
+    return backend.get_hccl_comm_name(tp_group.rank)
+
+
 def sp_fused_matmul_eligible(linear) -> bool:
     """Whether the selected fused matmul+collective path applies.
 
@@ -191,16 +319,20 @@ def sp_fused_matmul_eligible(linear) -> bool:
     path. Both require an unquantized, bias-free bf16/fp16 linear. The decision
     depends only on static layer properties and is identical across TP ranks.
     """
-    if (
-        not (_HAS_TORCH_SYMM_MEM_FUSED or getattr(linear, "_sp_use_cutlass", False))
-        or linear.bias is not None
-    ):
+    if linear.bias is not None:
         return False
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
     if not isinstance(linear.quant_method, UnquantizedLinearMethod):
         return False
-    return linear.weight.dtype in (torch.bfloat16, torch.float16)
+    if linear.weight.dtype not in (torch.bfloat16, torch.float16):
+        return False
+    if is_npu():
+        # CANN MC2 fused ops are 2-D-only (matmul over 2-D [m, k] x [k, n]).
+        return _HAS_NPU_MC2_FUSED and linear.weight.ndim == 2
+    if getattr(linear, "_sp_use_cutlass", False):
+        return True
+    return _HAS_TORCH_SYMM_MEM_FUSED
 
 
 def column_parallel_g_matmul(
@@ -215,7 +347,21 @@ def column_parallel_g_matmul(
     """
     num_tokens = sp_num_tokens()
     if sp_fused_matmul_eligible(linear):
-        if getattr(linear, "_sp_use_cutlass", False):
+        if is_npu():
+            # CANN MC2: allgather(input shard) @ weight.t(), then narrow.
+            try:
+                mm_out, _ = _npu_all_gather_base_mm(
+                    input_parallel.contiguous(),
+                    linear.weight.t().contiguous(),
+                    _npu_hccl_comm_name(),
+                    linear.tp_group.world_size,
+                )
+                return mm_out[:num_tokens]
+            except Exception:
+                # CANN MC2 unavailable for this shape/dtype: fall through to the
+                # plain all-gather + matmul below (symm_mem is CUDA-only).
+                pass
+        elif getattr(linear, "_sp_use_cutlass", False):
             from sglang.kernels.ops.communication.sp_collective_gemm import (
                 all_gather_matmul,
             )
@@ -229,14 +375,15 @@ def column_parallel_g_matmul(
                 get_parallel().tp_group.device_group,
                 workspace=sp_collective_gemm_workspace,
             )[:num_tokens]
-        group_name = get_parallel().tp_group.device_group.group_name
-        _, mm_outputs = torch.ops.symm_mem.fused_all_gather_matmul(
-            input_parallel.contiguous(),
-            [linear.weight.t()],
-            gather_dim=0,
-            group_name=group_name,
-        )
-        return mm_outputs[0][:num_tokens]
+        else:
+            group_name = get_parallel().tp_group.device_group.group_name
+            _, mm_outputs = torch.ops.symm_mem.fused_all_gather_matmul(
+                input_parallel.contiguous(),
+                [linear.weight.t()],
+                gather_dim=0,
+                group_name=group_name,
+            )
+            return mm_outputs[0][:num_tokens]
     gathered = sp_exit_gather(input_parallel, num_tokens=num_tokens)
     return linear.quant_method.apply(linear, gathered, bias)
 
@@ -257,7 +404,22 @@ def row_parallel_gbar_matmul(linear, input_: torch.Tensor, bias) -> torch.Tensor
     if padded != num_tokens:
         x = torch.nn.functional.pad(x, (0, 0, 0, padded - num_tokens))
     if sp_fused_matmul_eligible(linear):
-        if getattr(linear, "_sp_use_cutlass", False):
+        if is_npu():
+            # CANN MC2: ReduceScatter(x @ weight.t()). x's padded token dim is
+            # already a multiple of tp_size (required by the fused op).
+            try:
+                return _npu_mm_reduce_scatter_base(
+                    x,
+                    linear.weight.t().contiguous(),
+                    _npu_hccl_comm_name(),
+                    tp_size,
+                    reduce_op="sum",
+                )
+            except Exception:
+                # CANN MC2 unavailable for this shape/dtype: fall through to
+                # matmul + plain reduce-scatter below (symm_mem is CUDA-only).
+                pass
+        elif getattr(linear, "_sp_use_cutlass", False):
             from sglang.kernels.ops.communication.sp_collective_gemm import (
                 matmul_reduce_scatter,
             )
@@ -271,14 +433,15 @@ def row_parallel_gbar_matmul(linear, input_: torch.Tensor, bias) -> torch.Tensor
                 get_parallel().tp_group.device_group,
                 workspace=sp_collective_gemm_workspace,
             )
-        group_name = get_parallel().tp_group.device_group.group_name
-        return torch.ops.symm_mem.fused_matmul_reduce_scatter(
-            x,
-            linear.weight.t(),
-            "sum",
-            scatter_dim=0,
-            group_name=group_name,
-        )
+        else:
+            group_name = get_parallel().tp_group.device_group.group_name
+            return torch.ops.symm_mem.fused_matmul_reduce_scatter(
+                x,
+                linear.weight.t(),
+                "sum",
+                scatter_dim=0,
+                group_name=group_name,
+            )
     full = linear.quant_method.apply(linear, x, bias)
     output = full.new_empty((padded // tp_size, *full.shape[1:]))
     get_parallel().tp_group.reduce_scatter_tensor(output, full)

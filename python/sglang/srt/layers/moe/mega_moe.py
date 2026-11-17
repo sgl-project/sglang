@@ -52,9 +52,8 @@ _is_hip = is_hip()
 
 
 def _use_amd_flydsl_mega_moe() -> bool:
-    # aiter MegaMoEv2 exists only on ROCm; the platform check keeps the env from
-    # diverting a CUDA run into a path whose kernels it does not have.
-    return _is_hip and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
+    # DeepGEMM MegaMoE has no ROCm kernels: megamoe on ROCm is aiter MegaMoEv2.
+    return _is_hip and get_moe_a2a_backend().is_megamoe()
 
 
 def _mega_moe_mma_type(experts) -> str:
@@ -109,10 +108,12 @@ def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None
     # SGLang's pre-dispatch requires 16-byte input SF rows (hidden % 512).
     # The pinned DeepGEMM FP8/FP4 path copies intermediate scales separately
     # from token TMA loads, so intermediate % 128 suffices, including V4.1
-    # Flash's 2304-wide intermediate dimension.
+    # Flash's 2304-wide intermediate dimension. The MXFP4 path writes and loads
+    # the intermediate SFs MN-major (token-contiguous) as well, so it needs the
+    # same 128 only.
     # Keep the existing restrictions on the other MMA paths.
     scale_group = 16 if mma_type == "nvfp4xnvfp4" else 32
-    align = 128 if mma_type in ("fp8xfp4", "fp8xfp8") else 16 * scale_group
+    align = 128 if mma_type in ("fp8xfp4", "fp8xfp8", "mxf4xmxf4") else 16 * scale_group
     hidden_align = 16 * scale_group
     if hidden % hidden_align != 0 or intermediate % align != 0:
         raise ValueError(
@@ -165,7 +166,36 @@ def _get_mega_moe_symm_buffer(
                 activation=activation,
             )
             _MEGA_MOE_SYMM_BUFFER[key] = buf
+            # Only the SM100 kernels read the SM locality map.
+            # Cache it and stop the MLOPart MPS helper, which blocks cuda-checkpoint.
+            if is_sm100_supported():
+                _destroy_mega_moe_localizer()
     return buf
+
+
+def _destroy_mega_moe_localizer() -> None:
+    """Stop DeepGEMM's MLOPart helper and wait for its MPS daemon and server to exit;
+    `deep_gemm.destroy_localizer` returns before the server frees its device memory."""
+    import deep_gemm
+    import psutil
+
+    mps = []
+    try:
+        from deep_gemm.utils import mlopart
+
+        helper = mlopart._mlopart
+        if helper is not None:
+            mps = psutil.Process(helper.client.pid).children(recursive=True)
+    except (ImportError, AttributeError, psutil.Error):
+        pass
+    deep_gemm.destroy_localizer()
+    # On B300 a 5 s pause was enough for the MPS server to free its memory;
+    # not tuned further.
+    _, alive = psutil.wait_procs(mps, timeout=5)
+    if alive:
+        logger.warning(
+            f"MLOPart MPS processes still running after 5 s: {[p.pid for p in alive]}"
+        )
 
 
 def is_mega_moe_experts_ready(experts) -> bool:
@@ -212,8 +242,7 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
 def should_fuse_mega_moe_shared_experts(moe: DeepseekV2MoE) -> bool:
     # DeepGEMM's in-kernel shared expert takes FP8 weights on SM100 fp8xfp4 only.
     return (
-        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS.get()
-        and get_moe_a2a_backend().is_megamoe()
+        get_moe_a2a_backend().is_megamoe()
         and getattr(moe.experts, "_mega_moe_weights_built", False)
         and is_sm100_supported()
         and _mega_moe_mma_type(moe.experts) == "fp8xfp4"
@@ -322,6 +351,10 @@ def allocate_mega_moe_buffers(model: torch.nn.Module) -> None:
             f"{len(buffers)}, "
             f"{sum(b.buffer.nbytes for b in buffers.values()) / (1 << 30):.2f} GB"
         )
+    if _is_mega_moe_localization_enabled():
+        # Localization (re)started the MLOPart helper. The stop on buffer creation
+        # misses a reused buffer (MTP draft) and one created at the first forward.
+        _destroy_mega_moe_localizer()
 
 
 MEGA_MOE_INPUT_TAG = "_mega_moe_input_in_buffer"
@@ -678,7 +711,7 @@ def run_mega_routed_experts(
 
 def _mega_moe_global_tokens_hint(buf) -> Optional[int]:
     counts = get_dp_global_num_tokens()
-    if not counts or len(counts) != buf.group.size():
+    if not counts or buf.group.size() % len(counts) != 0:
         return None
     if get_is_capture_mode() or is_dsa_enable_prefill_cp():
         return None
@@ -845,7 +878,11 @@ def build_mega_moe_shared_weights(
 
 
 def _is_mega_moe_localization_enabled() -> bool:
-    return envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE.get() and _device_sm == 107
+    return envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE.get() and _device_sm in [
+        100,
+        103,
+        107,
+    ]
 
 
 def _transform_mega_moe_shared_sf(linear) -> torch.Tensor:

@@ -10,7 +10,7 @@ on:
         type: string
         default: ''
       job_filter:
-        description: 'Select which job to run (leave empty or "all" to run all jobs)'
+        description: 'Comma-separated job ids to run, e.g. "nightly-test-4-npu-a3,nightly-acc-test-2-npu-a3" (leave empty or "all" to run all jobs)'
         required: false
         type: string
         default: 'all'
@@ -24,11 +24,15 @@ on:
         required: false
         type: string
         default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-950'
-      skip_install_flag:
-        description: 'Indicates whether to skip the installation of sglang, defaulting to false.'
+      accuracy_dataset:
+        description: 'Force the dataset of multi-node accuracy cases. "auto" keeps the weekday rule (gsm8k Mon-Fri, gpqa_diamond on weekends).'
         required: false
-        type: string
-        default: 'true'
+        type: choice
+        options:
+          - auto
+          - gsm8k
+          - gpqa_diamond
+        default: 'auto'
   workflow_call:
     inputs:
       ref:
@@ -37,7 +41,7 @@ on:
         type: string
         default: ''
       job_filter:
-        description: 'Select which job to run (leave empty or "all" to run all jobs)'
+        description: 'Comma-separated job ids to run, e.g. "nightly-test-4-npu-a3,nightly-acc-test-2-npu-a3" (leave empty or "all" to run all jobs)'
         required: false
         type: string
         default: 'all'
@@ -51,8 +55,8 @@ on:
         required: false
         type: string
         default: ''
-      skip_install_flag:
-        description: 'Indicates whether to skip the installation of sglang, defaulting to false.'
+      accuracy_dataset:
+        description: 'Force the dataset of multi-node accuracy cases (gsm8k/gpqa_diamond). Empty or "auto" keeps the weekday rule.'
         required: false
         type: string
         default: ''
@@ -67,8 +71,8 @@ jobs:
       job_filter: ${{ steps.set-vars.outputs.job_filter }}
       image_a3: ${{ steps.set-vars.outputs.image_a3 }}
       image_a5: ${{ steps.set-vars.outputs.image_a5 }}
-      skip_install_flag: ${{ steps.set-vars.outputs.skip_install_flag }}
       run_start_metadata: ${{ steps.set-vars.outputs.run_start_metadata }}
+      accuracy_dataset: ${{ steps.set-vars.outputs.accuracy_dataset }}
     steps:
       # When triggered by PR, no inputs parameters are used. The latest community code is tested by default.
       - name: Set image config
@@ -77,17 +81,15 @@ jobs:
           # Pass untrusted PR metadata through environment variables to avoid shell‑script interpolation,
           # mitigating script injection risks from fork branch names.
           HEAD_LABEL: ${{ github.event.pull_request.head.label }}
+          JOB_FILTER: ${{ inputs.job_filter }}
         run: |
           if [ -z "${{ inputs.ref }}" ]; then
             echo "ref=" >> $GITHUB_OUTPUT
           else
             echo "ref=${{ inputs.ref }}" >> $GITHUB_OUTPUT
           fi
-          if [ -z "${{ inputs.job_filter }}" ]; then
-            echo "job_filter=all" >> $GITHUB_OUTPUT
-          else
-            echo "job_filter=${{ inputs.job_filter }}" >> $GITHUB_OUTPUT
-          fi
+          JOB_FILTER="$(echo "${JOB_FILTER}" | tr -d '[:space:]')"
+          echo "job_filter=${JOB_FILTER:-all}" | tee -a $GITHUB_OUTPUT
           if [ -z "${{ inputs.image_a3 }}" ]; then
             echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3" >> $GITHUB_OUTPUT
           else
@@ -97,11 +99,6 @@ jobs:
             echo "image_a5=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-950" >> $GITHUB_OUTPUT
           else
             echo "image_a5=${{ inputs.image_a5 }}" >> $GITHUB_OUTPUT
-          fi
-          if [ -z "${{ inputs.skip_install_flag }}" ]; then
-            echo "skip_install_flag=false" >> $GITHUB_OUTPUT
-          else
-            echo "skip_install_flag=${{ inputs.skip_install_flag }}" >> $GITHUB_OUTPUT
           fi
           # If the nightly pipeline is triggered by a PR, this variable takes the source branch label of the PR;
           # otherwise, it uses the branch or tag name of the current ref.
@@ -116,14 +113,37 @@ jobs:
           RUN_START_METADATA="$(python3 -c "import json,sys; print(json.dumps({'branch_label':sys.argv[1],'workflow_name':sys.argv[2],'create_time':sys.argv[3]}))" "$BRANCH_LABEL" "${{ github.workflow }}" "$(date -u -d '+8 hours' +%Y%m%d-%H%M)")"
           # Write to GITHUB_OUTPUT and print to the log in one command.
           echo "run_start_metadata=${RUN_START_METADATA}" | tee -a $GITHUB_OUTPUT
+          # Multi-node accuracy dataset: an explicit input wins; otherwise gsm8k
+          # (200-sample cap) on weekdays and gpqa_diamond on weekends. The cron
+          # fires at 16:00 UTC, i.e. 00:00 the next day in Beijing, so resolve
+          # the weekday in Asia/Shanghai.
+          ACCURACY_DATASET_INPUT="${{ inputs.accuracy_dataset }}"
+          case "${ACCURACY_DATASET_INPUT}" in
+            gsm8k|gpqa_diamond)
+              ACCURACY_DATASET="${ACCURACY_DATASET_INPUT}"
+              ;;
+            ""|auto)
+              ACCURACY_DOW="$(TZ=Asia/Shanghai date +%u)"
+              if [ "${ACCURACY_DOW}" -le 5 ]; then
+                ACCURACY_DATASET="gsm8k"
+              else
+                ACCURACY_DATASET="gpqa_diamond"
+              fi
+              ;;
+            *)
+              echo "Unsupported accuracy_dataset: ${ACCURACY_DATASET_INPUT}"
+              exit 1
+              ;;
+          esac
+          echo "accuracy_dataset=${ACCURACY_DATASET}" | tee -a $GITHUB_OUTPUT
 
-  nightly-1-npu-a3:
-    name: nightly-1-npu-a3
-    if: ${{ !cancelled() }}
+  nightly-test-1-npu-a3:
+    name: nightly-test-1-npu-a3
+    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-1-npu-a3,')) }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
-      self_name: nightly-1-npu-a3
+      self_name: nightly-test-1-npu-a3
       runner_config: linux-aarch64-a3-2-
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       run_timeout_minutes: '90'
@@ -132,13 +152,13 @@ jobs:
       skip_pr_test_health_check: 'true'
     secrets: inherit
 
-  nightly-2-npu-a3:
-    name: nightly-2-npu-a3
-    if: ${{ !cancelled() }}
+  nightly-test-2-npu-a3:
+    name: nightly-test-2-npu-a3
+    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-2-npu-a3,')) }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
-      self_name: nightly-2-npu-a3
+      self_name: nightly-test-2-npu-a3
       runner_config: linux-aarch64-a3-2-
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       run_timeout_minutes: '90'
@@ -147,14 +167,14 @@ jobs:
       skip_pr_test_health_check: 'true'
     secrets: inherit
 
-  # The nightly-4-npu-a3 suite is split across 2 parallel partition jobs, mirroring base-b-test-4-npu-a3 in the PR pipeline.
-  nightly-4-npu-a3:
-    name: nightly-4-npu-a3
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
+  # The nightly-test-4-npu-a3 suite is split across 2 parallel partition jobs, mirroring extra-b-test-4-npu-a3 in the PR pipeline.
+  nightly-test-4-npu-a3:
+    name: nightly-test-4-npu-a3
+    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-4-npu-a3,')) }}
+    needs: [set-image-config, sgl-router-build-aarch64]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
-      self_name: nightly-4-npu-a3
+      self_name: nightly-test-4-npu-a3
       runner_config: linux-aarch64-a3-4-
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       run_timeout_minutes: '120'
@@ -162,15 +182,17 @@ jobs:
       partitions: '{"size":2,"arr":[0,1]}'
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
+      sgl_router: true
+      sgl_router_artifact: ${{ needs.sgl-router-build-aarch64.outputs.artifact_name }}
     secrets: inherit
 
-  nightly-8-npu-a3:
-    name: nightly-8-npu-a3
-    if: ${{ !cancelled() }}
+  nightly-test-8-npu-a3:
+    name: nightly-test-8-npu-a3
+    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-8-npu-a3,')) }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
-      self_name: nightly-8-npu-a3
+      self_name: nightly-test-8-npu-a3
       runner_config: linux-aarch64-a3-8-
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       run_timeout_minutes: '60'
@@ -179,13 +201,13 @@ jobs:
       skip_pr_test_health_check: 'true'
     secrets: inherit
 
-  nightly-16-npu-a3:
-    name: nightly-16-npu-a3
-    if: ${{ !cancelled() }}
+  nightly-test-16-npu-a3:
+    name: nightly-test-16-npu-a3
+    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-16-npu-a3,')) }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
-      self_name: nightly-16-npu-a3
+      self_name: nightly-test-16-npu-a3
       runner_config: linux-aarch64-a3-16-
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       run_timeout_minutes: '120'
@@ -194,15 +216,15 @@ jobs:
       skip_pr_test_health_check: 'true'
     secrets: inherit
 
-  nightly-perf-2-npu-a3:
-    name: nightly-perf-2-npu-a3
-    if: ${{ !cancelled() }}
+  nightly-perf-test-2-npu-a3:
+    name: nightly-perf-test-2-npu-a3
+    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-perf-test-2-npu-a3,')) }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a3-800t-2
       test_type: 'perf'
-      test_suite: nightly-perf-2-npu-a3
+      test_suite: nightly-perf-test-2-npu-a3
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
@@ -210,15 +232,15 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  nightly-perf-4-npu-a3:
-    name: nightly-perf-4-npu-a3
-    if: ${{ !cancelled() }}
+  nightly-perf-test-4-npu-a3:
+    name: nightly-perf-test-4-npu-a3
+    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-perf-test-4-npu-a3,')) }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a3-800t-4
       test_type: 'perf'
-      test_suite: nightly-perf-4-npu-a3
+      test_suite: nightly-perf-test-4-npu-a3
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
@@ -226,15 +248,15 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  nightly-perf-16-npu-a3:
-    name: nightly-perf-16-npu-a3
-    if: ${{ !cancelled() }}
+  nightly-perf-test-16-npu-a3:
+    name: nightly-perf-test-16-npu-a3
+    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-perf-test-16-npu-a3,')) }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a3-800t-16
       test_type: 'perf'
-      test_suite: nightly-perf-16-npu-a3
+      test_suite: nightly-perf-test-16-npu-a3
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
@@ -244,15 +266,15 @@ jobs:
       test_timeout_minutes: '180'
 
   # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
-  nightly-acc-2-npu-a3:
-    name: nightly-acc-2-npu-a3
-    if: ${{ !cancelled() }}
+  nightly-acc-test-2-npu-a3:
+    name: nightly-acc-test-2-npu-a3
+    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-test-2-npu-a3,')) }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a3-2-
       test_type: 'accuracy'
-      test_suite: nightly-acc-2-npu-a3
+      test_suite: nightly-acc-test-2-npu-a3
       is_nightly_pipeline_job: true
       partitions: '{"size":4,"arr":[0,1,2,3]}'
       skip_pr_test_health_check: 'true'
@@ -261,15 +283,15 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  nightly-acc-16-npu-a3:
-    name: nightly-acc-16-npu-a3
-    if: ${{ !cancelled() }}
+  nightly-acc-test-16-npu-a3:
+    name: nightly-acc-test-16-npu-a3
+    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-test-16-npu-a3,')) }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a3-16-
       test_type: 'accuracy'
-      test_suite: nightly-acc-16-npu-a3
+      test_suite: nightly-acc-test-16-npu-a3
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
@@ -277,84 +299,130 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  nightly-acc-4-npu-a5:
-     name: nightly-acc-4-npu-a5
-     if: ${{ !cancelled() }}
+  nightly-acc-test-4-npu-a5:
+     name: nightly-acc-test-4-npu-a5
+     if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-test-4-npu-a5,')) }}
      needs: [set-image-config]
      uses: ./.github/workflows/_npu-single-node-test-stage.yml
      with:
        runner: linux-amd64-a5-4
        test_type: 'accuracy'
-       test_suite: nightly-acc-4-npu-a5
+       test_suite: nightly-acc-test-4-npu-a5
        is_nightly_pipeline_job: true
        skip_pr_test_health_check: 'true'
        image: ${{ needs.set-image-config.outputs.image_a5 }}
        install_sglang_deps: false
        device_type_for_deps: 'a5'
        run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+
+  # The router the PD tests in nightly-test-4-npu-a3 and nightly-poc-multi-node-tests launch.
+  sgl-router-build-aarch64:
+    if: ${{ needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-4-npu-a3,') || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-tests,') }}
+    needs: [set-image-config]
+    uses: ./.github/workflows/_pr-test-sgl-router-build.yml
+    with:
+      runs_on: ubuntu-22.04-arm
+      artifact_name: sgl-router-aarch64-nightly-npu
+    secrets: inherit
+
   nightly-poc-multi-node-tests:
     name: multi-node-poc
-    if: ${{ !cancelled() }}
-    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3]
+    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-tests,')) }}
+    needs: [set-image-config, nightly-perf-test-2-npu-a3, nightly-perf-test-4-npu-a3, nightly-perf-test-16-npu-a3, nightly-acc-test-2-npu-a3, nightly-acc-test-16-npu-a3, sgl-router-build-aarch64]
     strategy:
       fail-fast: false
       max-parallel: 1
       matrix:
         test_config:
-          # glm5_1 performance tests
-          # Disable test case temporarily due to feature refactor in PR #38293.
-          # - name: glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms
-          #   prefill_size: 2
-          #   decode_size: 2
-          #   router_size: 1
-          #   test_case: test/registered/npu/performance/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms.py
-          #   test_type: 'perf'
-          #   prefill_decode_deployment: 'separation'
-          # - name: glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms_aime26
-          #   prefill_size: 2
-          #   decode_size: 2
-          #   router_size: 1
-          #   test_case: test/registered/npu/accuracy/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms_aime26.py
-          #   test_type: 'accuracy'
-          #   prefill_decode_deployment: 'separation'
           # deepseek_v4_flash performance tests
-          - name: deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms
+          # There is a conflict among dspark, dp and cp; temporarily use deepseek_v4_flash performance off_cp tests
+#          - name: deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+          # deepseek_v4_flash performance off_cp tests
+          - name: deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms_off_cp
             prefill_size: 1
             decode_size: 1
             router_size: 1
-            test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms.py
+            test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms_off_cp.py
             test_type: 'perf'
             prefill_decode_deployment: 'separation'
           # deepseek_v4_flash accuracy tests
-          - name: deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa
+          # There is a conflict among dspark, dp and cp; temporarily use deepseek_v4_flash accuracy off_cp&off_dspark tests
+#          - name: deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa.py
+#            test_type: 'accuracy'
+#            prefill_decode_deployment: 'separation'
+          # deepseek_v4_flash accuracy off_cp tests
+          - name: deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa_off_cp
             prefill_size: 1
             decode_size: 1
             router_size: 1
-            test_case: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa.py
+            test_case: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa_off_cp.py
+            test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
+          # deepseek_v4_flash accuracy off_dspark tests
+          - name: deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa_off_dspark
+            prefill_size: 1
+            decode_size: 1
+            router_size: 1
+            test_case: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa_off_dspark.py
             test_type: 'accuracy'
             prefill_decode_deployment: 'separation'
           # deepseek_v4_pro accuracy tests
-          - name: deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa
+          # There is a conflict among dspark, dp and cp; temporarily use deepseek_v4_pro accuracy off_cp&off_dspark tests
+#          - name: deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa
+#            prefill_size: 2
+#            decode_size: 2
+#            router_size: 1
+#            test_case: test/registered/npu/accuracy/deepseek_v4_pro/test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa.py
+#            test_type: 'accuracy'
+#            prefill_decode_deployment: 'separation'
+          # deepseek_v4_pro accuracy off_dspark tests
+          - name: deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa_off_dspark
             prefill_size: 2
             decode_size: 2
             router_size: 1
-            test_case: test/registered/npu/accuracy/deepseek_v4_pro/test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa.py
+            test_case: test/registered/npu/accuracy/deepseek_v4_pro/test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa_off_dspark.py
             test_type: 'accuracy'
             prefill_decode_deployment: 'separation'
-          # glm_5_2 accuracy tests (2 prefill + 2 decode nodes)
-          - name: glm_5_2_w8a8_2p2d_32p_dcp_gpqa
+          # deepseek_v4_pro accuracy off_cp tests
+          - name: deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa_off_cp
             prefill_size: 2
             decode_size: 2
             router_size: 1
-            test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_2p2d_32p_dcp_gpqa.py
+            test_case: test/registered/npu/accuracy/deepseek_v4_pro/test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa_off_cp.py
             test_type: 'accuracy'
             prefill_decode_deployment: 'separation'
-          - name: glm_5_2_w8a8_2p2d_32p_pcp_gpqa
+          # glm_5_3 accuracy tests (2 prefill + 2 decode nodes)
+          - name: glm_5_3_w8a8_1p1d_32p_pcp_gpqa
             prefill_size: 2
             decode_size: 2
             router_size: 1
-            test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_2p2d_32p_pcp_gpqa.py
+            test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_pcp_gpqa.py
             test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
+          - name: glm_5_3_w8a8_1p1d_32p_dcp_gpqa
+            prefill_size: 2
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_dcp_gpqa.py
+            test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
+          # glm_5_3 performance tests (2 prefill + 2 decode nodes)
+          - name: glm_5_3_w8a8_1p1d_32p_in128k_out1k_prefix90_20ms
+            prefill_size: 2
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/npu/performance/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_in128k_out1k_prefix90_20ms.py
+            test_type: 'perf'
             prefill_decode_deployment: 'separation'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
@@ -366,24 +434,25 @@ jobs:
       router_size: ${{ matrix.test_config.router_size }}
       test_case: ${{ matrix.test_config.test_case }}
       image: ${{ needs.set-image-config.outputs.image_a3 }}
-      install_sglang_from_source: false
       prefill_decode_deployment: ${{ matrix.test_config.prefill_decode_deployment }}
       transformers_version: ''
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+      accuracy_dataset: ${{ matrix.test_config.test_type == 'accuracy' && needs.set-image-config.outputs.accuracy_dataset || '' }}
+      sgl_router_artifact: ${{ needs.sgl-router-build-aarch64.outputs.artifact_name }}
 
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
-    if: ${{ !cancelled() }}
-    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
+    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-mix-tests,')) }}
+    needs: [set-image-config, nightly-perf-test-2-npu-a3, nightly-perf-test-4-npu-a3, nightly-perf-test-16-npu-a3, nightly-acc-test-2-npu-a3, nightly-acc-test-16-npu-a3, nightly-poc-multi-node-tests]
     strategy:
       fail-fast: false
       max-parallel: 1
       matrix:
         test_config:
-          # glm_5_2 accuracy tests
-          # - name: glm_5_2_w8a8_16p_gpqa
+          # glm_5_3 accuracy tests
+          # - name: glm_5_3_w8a8_16p_gpqa
           #   node_size: 2
-          #   test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_16p_gpqa.py
+          #   test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_16p_gpqa.py
           #   test_type: 'accuracy'
           # kimi_k3 accuracy tests
           - name: kimi_k3_w4a8_32p_gpqa
@@ -411,25 +480,25 @@ jobs:
       node_size: ${{ matrix.test_config.node_size }}
       test_case: ${{ matrix.test_config.test_case }}
       image: ${{ needs.set-image-config.outputs.image_a3 }}
-      install_sglang_from_source: false
       prefill_decode_deployment: 'mix'
       transformers_version: ''
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+      accuracy_dataset: ${{ matrix.test_config.test_type == 'accuracy' && needs.set-image-config.outputs.accuracy_dataset || '' }}
 
   check-all-jobs:
     if: ${{ !cancelled() }}
     needs:
-      - nightly-1-npu-a3
-      - nightly-2-npu-a3
-      - nightly-4-npu-a3
-      - nightly-8-npu-a3
-      - nightly-16-npu-a3
-      - nightly-perf-2-npu-a3
-      - nightly-perf-4-npu-a3
-      - nightly-perf-16-npu-a3
-      - nightly-acc-2-npu-a3
-      - nightly-acc-16-npu-a3
-      - nightly-acc-4-npu-a5
+      - nightly-test-1-npu-a3
+      - nightly-test-2-npu-a3
+      - nightly-test-4-npu-a3
+      - nightly-test-8-npu-a3
+      - nightly-test-16-npu-a3
+      - nightly-perf-test-2-npu-a3
+      - nightly-perf-test-4-npu-a3
+      - nightly-perf-test-16-npu-a3
+      - nightly-acc-test-2-npu-a3
+      - nightly-acc-test-16-npu-a3
+      - nightly-acc-test-4-npu-a5
       - nightly-poc-multi-node-tests
       - nightly-poc-multi-node-mix-tests
     runs-on: ubuntu-latest
@@ -442,18 +511,18 @@ jobs:
           # single-node suites are reported per suite; overall status is success if none failed
           single_result="success"
           for r in \
-            "${{ needs.nightly-1-npu-a3.result }}" \
-            "${{ needs.nightly-2-npu-a3.result }}" \
-            "${{ needs.nightly-4-npu-a3.result }}" \
-            "${{ needs.nightly-8-npu-a3.result }}" \
-            "${{ needs.nightly-16-npu-a3.result }}" \
-            "${{ needs.nightly-perf-2-npu-a3.result }}" \
-            "${{ needs.nightly-perf-4-npu-a3.result }}" \
-            "${{ needs.nightly-perf-16-npu-a3.result }}" \
-            "${{ needs.nightly-acc-2-npu-a3.result }}" \
-            "${{ needs.nightly-acc-16-npu-a3.result }}"; do
+            "${{ needs.nightly-test-1-npu-a3.result }}" \
+            "${{ needs.nightly-test-2-npu-a3.result }}" \
+            "${{ needs.nightly-test-4-npu-a3.result }}" \
+            "${{ needs.nightly-test-8-npu-a3.result }}" \
+            "${{ needs.nightly-test-16-npu-a3.result }}" \
+            "${{ needs.nightly-perf-test-2-npu-a3.result }}" \
+            "${{ needs.nightly-perf-test-4-npu-a3.result }}" \
+            "${{ needs.nightly-perf-test-16-npu-a3.result }}" \
+            "${{ needs.nightly-acc-test-2-npu-a3.result }}" \
+            "${{ needs.nightly-acc-test-16-npu-a3.result }}"; do
             # TEMP: A5 power maintenance - line below disabled; when restoring, move '; do' back onto the a5 line
-            # "${{ needs.nightly-acc-4-npu-a5.result }}"; do
+            # "${{ needs.nightly-acc-test-4-npu-a5.result }}"; do
             if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then
               single_result="failure"
             fi
@@ -474,18 +543,18 @@ jobs:
           echo "| Group | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
           for entry in \
-            "nightly-1-npu-a3:${{ needs.nightly-1-npu-a3.result }}" \
-            "nightly-2-npu-a3:${{ needs.nightly-2-npu-a3.result }}" \
-            "nightly-4-npu-a3:${{ needs.nightly-4-npu-a3.result }}" \
-            "nightly-8-npu-a3:${{ needs.nightly-8-npu-a3.result }}" \
-            "nightly-16-npu-a3:${{ needs.nightly-16-npu-a3.result }}" \
-            "nightly-perf-2-npu-a3:${{ needs.nightly-perf-2-npu-a3.result }}" \
-            "nightly-perf-4-npu-a3:${{ needs.nightly-perf-4-npu-a3.result }}" \
-            "nightly-perf-16-npu-a3:${{ needs.nightly-perf-16-npu-a3.result }}" \
-            "nightly-acc-2-npu-a3:${{ needs.nightly-acc-2-npu-a3.result }}" \
-            "nightly-acc-16-npu-a3:${{ needs.nightly-acc-16-npu-a3.result }}"; do
+            "nightly-test-1-npu-a3:${{ needs.nightly-test-1-npu-a3.result }}" \
+            "nightly-test-2-npu-a3:${{ needs.nightly-test-2-npu-a3.result }}" \
+            "nightly-test-4-npu-a3:${{ needs.nightly-test-4-npu-a3.result }}" \
+            "nightly-test-8-npu-a3:${{ needs.nightly-test-8-npu-a3.result }}" \
+            "nightly-test-16-npu-a3:${{ needs.nightly-test-16-npu-a3.result }}" \
+            "nightly-perf-test-2-npu-a3:${{ needs.nightly-perf-test-2-npu-a3.result }}" \
+            "nightly-perf-test-4-npu-a3:${{ needs.nightly-perf-test-4-npu-a3.result }}" \
+            "nightly-perf-test-16-npu-a3:${{ needs.nightly-perf-test-16-npu-a3.result }}" \
+            "nightly-acc-test-2-npu-a3:${{ needs.nightly-acc-test-2-npu-a3.result }}" \
+            "nightly-acc-test-16-npu-a3:${{ needs.nightly-acc-test-16-npu-a3.result }}"; do
             # TEMP: A5 power maintenance - line below disabled; when restoring, move '; do' back onto the a5 line
-            # "nightly-acc-4-npu-a5:${{ needs.nightly-acc-4-npu-a5.result }}"; do
+            # "nightly-acc-test-4-npu-a5:${{ needs.nightly-acc-test-4-npu-a5.result }}"; do
             suite="${entry%%:*}"
             r="${entry##*:}"
             echo "| ${suite} | $(group_icon ${r}) ${r} |" >> $GITHUB_STEP_SUMMARY

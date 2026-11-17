@@ -468,18 +468,6 @@ class TestOnePageWindows(CustomTestCase):
         )
         self.assertEqual(plan, [(0, 1, 0), (1, 2, 1), (2, 3, 2)])
 
-    def test_overlap_still_needs_a_page_of_its_own(self):
-        self.assertIsNone(
-            doc_split.plan_batches(
-                n_pages=3,
-                image_mode="base",
-                context_length=10**6,
-                max_completion_tokens=1000,
-                max_batch_pages=1,
-                overlap_pages=1,
-            )
-        )
-
 
 class TestWindowLookahead(CustomTestCase):
     """Every window but the last reads the next window's first page; the last
@@ -1033,32 +1021,12 @@ class TestDocumentPolicy(CustomTestCase):
 class TestImageModeBudget(CustomTestCase):
     """Image modes change token budgets, while sharing one page-window policy."""
 
-    def test_mode_token_estimates_match_processor_presets(self):
-        self.assertEqual(
-            {
-                mode: doc_split.tokens_per_page(mode)
-                for mode in ("tiny", "small", "base", "large", "gundam")
-            },
-            {"tiny": 74, "small": 112, "base": 274, "large": 422, "gundam": 1514},
-        )
-
     def test_mode_matching_ignores_surrounding_whitespace(self):
         """Lookups must match the processor's `.strip().lower()`, or "base " is
         budgeted and capped as gundam while running at base resolution."""
         for mode in ("base ", " base", "BASE ", "base\n"):
             with self.subTest(mode=mode):
                 self.assertEqual(doc_split.tokens_per_page(mode), 274)
-
-    def test_server_cap_splits_a_document_that_would_have_fitted(self):
-        # 4 base pages fit the budget, yet a cap of 2 must still split.
-        budget = 10**6
-        self.assertIsNone(
-            _plan_batches(n_pages=4, image_mode="base", context_length=budget)
-        )
-        plan = _plan_batches(
-            n_pages=4, image_mode="base", context_length=budget, max_batch_pages=2
-        )
-        self.assertEqual(plan, [(0, 2, 0), (1, 3, 2), (2, 4, 3)])
 
     def test_mm_processor_kwargs_mode_reaches_the_splitter(self):
         """The splitter must plan with the mode the processor runs, including

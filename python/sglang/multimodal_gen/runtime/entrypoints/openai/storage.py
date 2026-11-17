@@ -113,6 +113,18 @@ class CloudStorage:
                 logger.warning(f"Failed to remove temporary file {file_path}: {e}")
         return url
 
+    async def upload_all_and_cleanup(self, paths: list[str]) -> list[Optional[str]]:
+        """``upload_and_cleanup`` of every path, concurrently."""
+        results = await asyncio.gather(
+            *(self.upload_and_cleanup(path) for path in paths),
+            return_exceptions=True,
+        )
+        # join every upload before a cancellation or failure permits directory cleanup
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        return results
+
 
 # Global instance
 cloud_storage = CloudStorage()

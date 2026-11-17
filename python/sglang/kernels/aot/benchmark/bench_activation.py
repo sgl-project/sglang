@@ -13,7 +13,7 @@ import triton
 import triton.testing
 from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
-from sglang.utils import is_in_ci
+from sglang.srt.environ import envs
 
 # Optional vLLM import
 try:
@@ -24,7 +24,7 @@ except ImportError:
     vllm_ops = None
     VLLM_AVAILABLE = False
 
-IS_CI = is_in_ci()
+IS_CI = envs.SGLANG_IS_IN_CI.get()
 
 # gelu_quick is only available on HIP/ROCm platforms
 try:

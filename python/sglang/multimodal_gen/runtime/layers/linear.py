@@ -277,6 +277,41 @@ def apply_unquantized_linear(
     )
 
 
+def pack_rows_into_one_buffer(params: list[torch.Tensor]) -> None:
+    """Move the tensors into consecutive rows of one new buffer and leave each a
+    view of its rows, so one GEMM can read them all (``rows_of_one_buffer``).
+    Only the views hold the buffer: moving or offloading a layer frees it."""
+    with torch.no_grad():
+        packed = torch.cat([param.data for param in params])
+    offset = 0
+    for param in params:
+        rows = param.shape[0]
+        param.data = packed[offset : offset + rows]
+        offset += rows
+
+
+def rows_of_one_buffer(parts: list[torch.Tensor]) -> torch.Tensor | None:
+    """``torch.cat(parts)`` without a copy while the parts are still consecutive
+    rows of one buffer; None once a move, load or offload gave one its own."""
+    first = parts[0]
+    storage = first.untyped_storage().data_ptr()
+    offset = first.storage_offset()
+    for part in parts:
+        if (
+            not part.is_contiguous()
+            or part.untyped_storage().data_ptr() != storage
+            or part.storage_offset() != offset
+            or part.dtype != first.dtype
+            or part.shape[1:] != first.shape[1:]
+        ):
+            return None
+        offset += part.numel()
+    rows = sum(part.shape[0] for part in parts)
+    return first.as_strided(
+        (rows, *first.shape[1:]), first.stride(), first.storage_offset()
+    )
+
+
 def apply_amx_packed_linear(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -585,9 +620,6 @@ class ColumnParallelLinear(LinearBase):
         )
 
         self.gather_output = gather_output
-
-        if output_sizes is None:
-            output_sizes = [output_size]
 
         assert self.quant_method is not None
         self.quant_method.create_weights(
@@ -1342,6 +1374,32 @@ class RowParallelLinear(LinearBase):
         output_bias = self.bias if self.skip_bias_add else None
 
         return output, output_bias
+
+    def supports_partial_into(self, input_: torch.Tensor) -> bool:
+        """Whether ``partial_into`` runs the GEMM ``forward`` runs on this input."""
+        bias = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        return (
+            type(self.quant_method) is UnquantizedLinearMethod
+            and current_platform.is_cuda()
+            # an out= GEMM is not differentiable
+            and not torch.is_grad_enabled()
+            and self.input_is_parallel
+            and input_.dim() >= 2
+            and input_.dtype == self.weight.dtype
+            and (
+                bias is None or (bias.dtype == input_.dtype and input_.is_contiguous())
+            )
+        )
+
+    def partial_into(self, input_: torch.Tensor, out: torch.Tensor) -> None:
+        """This rank's partial sum of ``forward``, before the all-reduce, written
+        into the 2D ``out``: the mm / addmm that ``F.linear`` lowers to."""
+        bias = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        rows = input_.reshape(-1, input_.shape[-1])
+        if bias is None:
+            torch.mm(rows, self.weight.t(), out=out)
+        else:
+            torch.addmm(bias, rows, self.weight.t(), out=out)
 
     def extra_repr(self) -> str:
         s = f"input_features={self.input_size_per_partition}"

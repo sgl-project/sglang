@@ -1,3 +1,7 @@
+# syntax=docker/dockerfile:1
+
+ARG ENABLE_SGL_NVIDIA_MEGA=1
+
 ARG CUDA_VERSION=13.0.3
 ARG UV_VERSION=latest
 ARG PYTHON_VERSION=3.12
@@ -9,7 +13,7 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
 ARG TARGETARCH
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
-ARG SGL_KERNEL_VERSION=0.4.9
+ARG SGL_KERNEL_VERSION=0.4.11
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
@@ -18,7 +22,7 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.7.2
+ARG FLASHINFER_VERSION=0.7.4
 ARG MOONCAKE_VERSION=0.3.14
 ARG MSCCLPP_VERSION=sglang-v0.10.1
 
@@ -168,7 +172,7 @@ ENV LANG=en_US.UTF-8 \
 #     |                  \-> halops_wheel (prebuilt wheel download)
 #     |
 #     +-- devtools_builder (independent)
-#     +-- gateway_builder  (independent, only needs gateway source)
+#     +-- router_builder   (independent, only needs router source)
 #     |
 #     v
 #   framework (combines all artifacts)
@@ -209,7 +213,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY python/pyproject.toml /tmp/sglang_deps/python/pyproject.toml
 COPY rust/sglang-grpc      /tmp/sglang_deps/rust/sglang-grpc
 COPY rust/sglang-mm        /tmp/sglang_deps/rust/sglang-mm
-COPY rust/sglang-api-types /tmp/sglang_deps/rust/sglang-api-types
+COPY rust/sglang-runtime-v1-types /tmp/sglang_deps/rust/sglang-runtime-v1-types
 
 # Install sglang dependencies (torch, transformers, etc.).
 # Generate constraints.txt to prevent reinstalling these deps in later stages.
@@ -369,33 +373,27 @@ RUN sh -c "$(curl --retry 3 --retry-delay 2 -fsSL https://raw.githubusercontent.
     && git clone --depth 1 https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
 
 ########################################################
-# PARALLEL STAGE 5: Gateway Builder (starts from base)
+# PARALLEL STAGE 5: Router Builder (starts from base)
 ########################################################
-# Builds sgl-model-gateway in isolation so Python-only changes
+# Builds sgl-router in isolation so Python-only changes
 # don't trigger a full Rust recompilation.
-FROM base AS gateway_builder
-
-ARG GITHUB_ARTIFACTORY
-ARG BRANCH_TYPE
-ARG SGL_VERSION
-ARG USE_LATEST_SGLANG
+FROM base AS router_builder
 
 WORKDIR /build
 
-# Copy ONLY the gateway source (not the full repo)
-COPY sgl-model-gateway /build/sgl-model-gateway
+# sgl-router and the rust/ workspace that holds its path dependencies
+COPY sgl-router /build/sgl-router
+COPY rust /build/rust
 
-# Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain
-RUN --mount=type=cache,target=/root/.cache/uv \
-    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
+# Install Rust at sgl-router's pinned toolchain, build the binary, then clean up
+RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain none \
     && export PATH="/root/.cargo/bin:${PATH}" \
-    && uv pip install maturin \
-    && cd /build/sgl-model-gateway/bindings/python \
-    && ulimit -n 65536 && maturin build --release --features vendored-openssl --out /build/gateway_wheels \
-    && cd /build/sgl-model-gateway \
-    && cargo build --release --bin sgl-model-gateway --features vendored-openssl \
-    && cp target/release/sgl-model-gateway /build/sgl-model-gateway-bin \
-    && rm -rf /root/.cargo /root/.rustup /build/sgl-model-gateway/target /build/sgl-model-gateway/bindings/python/target
+    && cd /build/sgl-router \
+    && rustup toolchain install \
+    && cargo build --locked --release --bin sgl-router \
+    && cp target/release/sgl-router /build/sgl-router-bin \
+    && rm -rf /root/.cargo /root/.rustup /build/sgl-router/target
 
 ########################################################
 ########## Final Framework Image ######################
@@ -594,6 +592,21 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
 FROM scratch AS local_src
 COPY . /src
 
+# A Git ADD resolves main before cache lookup, unlike RUN git clone. Select the
+# empty stage when disabled so those builds do not need access to the Mega repo.
+FROM scratch AS mega_source_0
+WORKDIR /src
+
+FROM scratch AS mega_source_1
+ARG SGL_NVIDIA_MEGA_REPO="https://github.com/sgl-project/sgl-nvidia-mega.git"
+# Keep the legacy commit argument as a fallback for existing build scripts.
+ARG SGL_NVIDIA_MEGA_COMMIT
+# Explicit REF takes precedence; otherwise use the legacy commit or main.
+ARG SGL_NVIDIA_MEGA_REF=${SGL_NVIDIA_MEGA_COMMIT:-main}
+ADD --keep-git-dir=true ${SGL_NVIDIA_MEGA_REPO}#${SGL_NVIDIA_MEGA_REF} /src/
+
+FROM mega_source_${ENABLE_SGL_NVIDIA_MEGA} AS mega_source
+
 FROM framework AS framework_final
 
 ARG BRANCH_TYPE
@@ -651,28 +664,25 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 ENV SGLANG_RUST_BUILD_MODE=never
 
 
-# Install pre-built gateway artifacts from parallel builder
-COPY --from=gateway_builder /build/sgl-model-gateway-bin /opt/sglang/bin/sgl-model-gateway
-COPY --from=gateway_builder /build/gateway_wheels /tmp/gateway_wheels
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --reinstall /tmp/gateway_wheels/*.whl \
-    && rm -rf /tmp/gateway_wheels
+# Install the pre-built router from the parallel builder
+COPY --from=router_builder /build/sgl-router-bin /opt/sglang/bin/sgl-router
 
 # sgl-nvidia-mega: the NVIDIA megakernel plugin, inert unless a server passes
 # --enable-nvidia-megakernel. Installed with CUDA >= 12.9 only (its kernels are
 # SM103, compiled at runtime); disable with --build-arg ENABLE_SGL_NVIDIA_MEGA=0.
-ARG ENABLE_SGL_NVIDIA_MEGA=1
-ARG SGL_NVIDIA_MEGA_REPO="https://github.com/sgl-project/sgl-nvidia-mega.git"
-ARG SGL_NVIDIA_MEGA_COMMIT="54b428921749fef89fcbd043000f839ac9cc4638"
-RUN --mount=type=cache,target=/root/.cache/uv \
+ARG ENABLE_SGL_NVIDIA_MEGA
+RUN --mount=type=bind,from=mega_source,source=/src,target=/tmp/mega-src \
+    --mount=type=cache,target=/root/.cache/uv \
     if [ "${ENABLE_SGL_NVIDIA_MEGA}" != "1" ]; then \
         echo "[sgl-nvidia-mega] skip (ENABLE_SGL_NVIDIA_MEGA=${ENABLE_SGL_NVIDIA_MEGA})"; \
     elif ! printf '%s\n' 12.9 "${CUDA_VERSION}" | sort -V -C; then \
         echo "[sgl-nvidia-mega] skip (CUDA_VERSION=${CUDA_VERSION} < 12.9)"; \
     else \
-        git clone "${SGL_NVIDIA_MEGA_REPO}" /sgl-workspace/sgl-nvidia-mega \
+        mkdir -p /sgl-workspace/sgl-nvidia-mega \
+        && cp -a /tmp/mega-src/. /sgl-workspace/sgl-nvidia-mega/ \
         && cd /sgl-workspace/sgl-nvidia-mega \
-        && git checkout -f "${SGL_NVIDIA_MEGA_COMMIT}" \
+        && git rev-parse HEAD > /sgl-workspace/sgl-nvidia-mega.commit \
+        && echo "[sgl-nvidia-mega] revision=$(cat /sgl-workspace/sgl-nvidia-mega.commit)" \
         && uv pip install --no-deps -e . \
         && cd / \
         && python3 -c "from importlib.metadata import entry_points; assert any(e.name == 'nvidia_megakernel' for e in entry_points(group='sglang.srt.plugins')), 'sgl-nvidia-mega plugin not registered'"; \
@@ -695,169 +705,3 @@ LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
       ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
       ai.sglang.build.url="${SGLANG_BUILD_URL}" \
       ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
-
-########################################################
-########## Runtime Image ##############################
-########################################################
-#
-# PURPOSE: Production runtime environment with JIT support
-#
-# This stage creates a production-ready image containing:
-# - Pre-installed SGLang and CUDA dependencies
-# - Full CUDA toolchain for JIT compilation (DeepGEMM, Triton, FlashInfer)
-# - Optimized for inference workloads and deployment
-# - Smaller than framework (no dev tools like vim, tmux, nsight, etc.)
-#
-# Use this stage when you need:
-# - Production deployment of SGLang
-# - JIT compilation support for FP8/microscaling kernels
-# - Ready-to-run inference server environment
-#
-# Note: Uses devel base for complete NVCC toolchain required by DeepGEMM JIT
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS runtime
-
-ARG CUDA_VERSION
-ARG TARGETARCH
-ARG GDRCOPY_VERSION=2.5.1
-ARG PYTHON_VERSION
-
-ENV DEBIAN_FRONTEND=noninteractive \
-    CUDA_HOME=/usr/local/cuda \
-    GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/ \
-    SGLANG_RUST_BUILD_MODE=never
-
-# Add GKE default lib and bin locations + CUDA compiler paths for FlashInfer JIT
-ENV PATH="${PATH}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm/bin" \
-    LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
-
-# Install runtime dependencies (devel base provides gcc/g++/build tools)
-RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
-    apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
-    wget \
-    # Core system utilities
-    ca-certificates \
-    netcat-openbsd \
-    curl \
-    ffmpeg \
-    git \
-    # Runtime libraries
-    libopenmpi3 \
-    libnuma1 \
-    numactl \
-    libibverbs1 \
-    libibumad3 \
-    librdmacm1 \
-    libnl-3-200 \
-    libnl-route-3-200 \
-    ibverbs-providers \
-    libgoogle-glog0v6t64 \
-    libunwind8 \
-    libboost-system1.83.0 \
-    libboost-thread1.83.0 \
-    libboost-filesystem1.83.0 \
-    libgrpc++1.51t64 \
-    libprotobuf32t64 \
-    libhiredis1.1.0 \
-    libcurl4 \
-    libczmq4 \
-    libfabric1 \
-    libssl-dev \
-    # RDMA runtime
-    rdma-core \
-    infiniband-diags \
-    perftest \
-    # Build tools for JIT compilation
-    ninja-build \
-    # NCCL packages needed for pynccl_allocator JIT compilation (-lnccl)
-    libnccl2 \
-    libnccl-dev \
-    # GPG key verification
-    gnupg2 \
-    linux-libc-dev \
-    && for py in python python3; do \
-        rm -f /usr/bin/$py \
-        && printf '#!/bin/sh\nexec /opt/sglang/bin/python "$@"\n' > /usr/bin/$py \
-        && chmod +x /usr/bin/$py; \
-    done \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
-
-# create virtual env for sglang to avoid conflict with system python packages
-COPY --from=uv /uv /uvx /usr/local/bin/
-COPY --from=base /opt/python /opt/python
-ENV UV_PYTHON_INSTALL_DIR=/opt/python \
-    UV_PYTHON_PREFERENCE=only-managed \
-    UV_LINK_MODE=copy \
-    VIRTUAL_ENV=/opt/sglang
-RUN UV_PYTHON_DOWNLOADS=never uv venv --python ${PYTHON_VERSION} /opt/sglang \
-    && /opt/sglang/bin/python -VV
-ENV PATH="/opt/sglang/bin:${PATH}"
-
-# Set up locale
-RUN apt-get update && apt-get install -y --no-install-recommends locales \
-    && locale-gen en_US.UTF-8 \
-    && rm -rf /var/lib/apt/lists/*
-
-ENV LANG=en_US.UTF-8 \
-    LANGUAGE=en_US:en \
-    LC_ALL=en_US.UTF-8
-
-# Fix Trivy-reported CVEs (see framework stage for full CVE list)
-RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
-    apt-get update && apt-get install -y --only-upgrade \
-    binutils binutils-common binutils-x86-64-linux-gnu libbinutils \
-    libctf0 libctf-nobfd0 libgprofng0 libsframe1 \
-    libgnutls30t64 \
-    libpam-modules libpam-modules-bin libpam-runtime libpam0g \
-    libsqlite3-0 libtasn1-6 \
-    dpkg dpkg-dev libdpkg-perl \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy Python site-packages from framework (already cleaned of __pycache__/tests/pyc files)
-COPY --from=framework_final /opt/sglang/lib/python3.12/site-packages /opt/sglang/lib/python3.12/site-packages
-COPY --from=framework_final /opt/sglang/bin/pip* /opt/sglang/bin/
-
-# Copy SGLang workspace
-COPY --from=framework_final /sgl-workspace /sgl-workspace
-
-# Copy sgl-model-gateway binary
-COPY --from=framework_final /opt/sglang/bin/sgl-model-gateway /opt/sglang/bin/sgl-model-gateway
-
-# Copy sglang binary
-COPY --from=framework_final /opt/sglang/bin/sglang /opt/sglang/bin/sglang
-
-# Copy py-spy binary
-COPY --from=framework_final /opt/sglang/bin/py-spy /opt/sglang/bin/py-spy
-
-# Copy cache for kernels from kernels community
-COPY --from=framework_final /root/.cache/huggingface /root/.cache/huggingface
-COPY --from=framework_final /root/.cache/sglang /root/.cache/sglang
-
-# Copy GDRCopy runtime libraries (but not the build artifacts)
-COPY --from=framework_final /usr/lib/*-linux-gnu/libgdrapi.so* /usr/lib/
-COPY --from=framework_final /usr/bin/gdrcopy_* /usr/bin/
-COPY --from=framework_final /usr/src/gdrdrv-2.5.1 /usr/src/gdrdrv-2.5.1
-
-# Fix DeepEP IBGDA symlink in runtime
-RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so \
-    && ldconfig
-
-WORKDIR /sgl-workspace/sglang
-
-# Keep build provenance at the end so metadata changes do not invalidate build layers.
-ARG SGLANG_BUILD_COMMIT=unknown
-ARG SGLANG_BUILD_URL=
-ARG SGLANG_IMAGE_TAG=local/sglang:dev
-ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
-    SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
-    SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
-LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
-      org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
-      org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
-      org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
-      ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
-      ai.sglang.build.url="${SGLANG_BUILD_URL}" \
-      ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
-
-# Default command
-CMD ["/bin/bash"]
