@@ -582,7 +582,11 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             )
         if cache_2d.shape[0] == 0:
             return
-        kv_compress_epilog(buf, cache_2d, slot_mapping)
+        kv_compress_epilog(
+            buf,
+            cache_2d,
+            slot_mapping,
+        )
 
     def set_swa_key_buffer_radix_fused_norm_rope(
         self,
