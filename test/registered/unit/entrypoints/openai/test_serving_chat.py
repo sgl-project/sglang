@@ -852,12 +852,12 @@ class ServingChatTestCase(CustomTestCase):
         self.tm.server_args.tool_call_parser = "auto"
         self.tm.server_args.reasoning_parser = "auto"
         self.tm._config_overrides.update(
-            {"tool_call_parser": "qwen25", "reasoning_parser": None}
+            {"tool_call_parser": "qwen", "reasoning_parser": None}
         )
 
         chat = OpenAIServingChat(self.tm, self.template_manager)
 
-        self.assertEqual(chat.tool_call_parser, "qwen25")
+        self.assertEqual(chat.tool_call_parser, "qwen")
         self.assertIsNone(chat.reasoning_parser)
         self.assertEqual(self.tm.server_args.tool_call_parser, "auto")
 
@@ -3850,7 +3850,7 @@ class ServingChatTestCase(CustomTestCase):
     def test_required_tool_choice_json_fallback_tolerates_odd_shapes(self):
         """Parsers without a structural tag keep the JSON array fallback, but a
         non-array payload degrades instead of raising an opaque TypeError."""
-        self.chat.tool_call_parser = "glm45"
+        self.chat.tool_call_parser = "glm"
         tools = [
             {
                 "type": "function",

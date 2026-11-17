@@ -192,7 +192,6 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "quantization",
                     "dp_size",
                     "attn_dp_size",
-                    "enable_dp_attention",
                     "enable_attn_tp_input_scattered",
                     "enable_dp_lm_head",
                     "enable_tp_lm_head_all_to_all",
@@ -4324,8 +4323,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             {
                                 "attention_backend": "dsa",
                                 "page_size": 64,
-                                "attn_dp_size": 1,
-                                "dp_size": 1,
                                 "moe_dense_tp_size": 1,
                                 "moe_a2a_backend": "deepep",
                                 "ep_size": 8,
@@ -4356,11 +4353,22 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                 ),
                                 None,
                             )
-                            self.assertEqual(result["attn_dp_size"], attn_dp_size)
                             self.assertEqual(result["attn_cp_size"], expected_cp)
                             self.assertNotIn("moe_dense_tp_size", result)
                             self.assertNotIn("ep_size", result)
                             self.assertNotIn("moe_a2a_backend", result)
+                        # --dp-size N no longer means attention DP here.
+                        with self.assertRaisesRegex(ValueError, "use --attn-dp-size 2"):
+                            _deepseek_family_overrides(
+                                _args(
+                                    enable_prefill_cp=True,
+                                    cp_strategy="interleave",
+                                    tp_size=8,
+                                    dp_size=2,
+                                    attn_dp_size=1,
+                                ),
+                                None,
+                            )
 
         # MLA path on sm100: trtllm_mla fill (all three backends unset)
         with patch(

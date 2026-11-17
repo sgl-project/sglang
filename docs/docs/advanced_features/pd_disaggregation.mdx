@@ -690,7 +690,7 @@ python3 -m sglang.launch_server \
         --disaggregation-bootstrap-port 8996 \
         --base-gpu-id 0 \
         --disable-radix-cache \
-        --disable-cuda-graph \
+        --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --moe-a2a-backend deepep --deepep-mode normal \
         # 2>&1 | tee $SGLANG_LOG_PATH
 ```

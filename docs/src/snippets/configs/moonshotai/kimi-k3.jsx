@@ -2561,7 +2561,7 @@ export const config = {
         "--enable-dense-mlp-attn-tp",
         "--disable-radix-cache",
         "--disable-custom-all-reduce",
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph", "--disable-prefill-cuda-graph",
         "--mem-fraction-static 0.85",
         "--chunked-prefill-size 4096",
         "--max-running-requests 16",

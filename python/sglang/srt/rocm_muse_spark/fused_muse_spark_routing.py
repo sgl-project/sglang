@@ -22,33 +22,10 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.environ import envs
 from sglang.srt.rocm_muse_spark.base_fused_op import BaseFusedOp
 from sglang.srt.utils import fast_topk
 from sglang.srt.utils.custom_op import register_custom_op
-
-
-class _EnvFlag:
-    """Minimal environment-variable flag reader: these three names are
-    the only ones this module reads."""
-
-    def __init__(self, name: str) -> None:
-        self._name = name
-
-    def get(self) -> bool:
-        import os
-
-        return os.environ.get(self._name, "0") == "1"
-
-
-class _Envs:
-    SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = _EnvFlag(
-        "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS"
-    )
-    SGLANG_SIMULATE_UNIFORM_EXPERTS = _EnvFlag("SGLANG_SIMULATE_UNIFORM_EXPERTS")
-    USE_TRITON_ROUTER_SUM = _EnvFlag("SGLANG_USE_TRITON_ROUTER_SUM")
-
-
-envs = _Envs()
 
 
 @triton.jit
@@ -833,7 +810,7 @@ class FusedMuseSparkRouting(BaseFusedOp):
 
         topk_scores = scores.gather(1, topk_indices.long())
 
-        if envs.USE_TRITON_ROUTER_SUM.get():
+        if envs.SGLANG_USE_CUSTOM_ROUTER_SUM.get():
             from sglang.srt.rocm_muse_spark.triton_sum import triton_sum
 
             score_sum = triton_sum(topk_scores, dim=-1, keepdim=True)

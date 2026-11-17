@@ -28,7 +28,8 @@ class TestAscendOffloadModes(CustomTestCase):
         cls.url = urlparse(DEFAULT_URL_FOR_TEST)
         cls.common_args = [
             "--trust-remote-code",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
             "--mem-fraction-static",
             0.9,
             "--attention-backend",

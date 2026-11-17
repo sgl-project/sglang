@@ -2715,7 +2715,7 @@ class ParseFunctionCallReq(BaseReq, kw_only=True):
         default_factory=list
     )  # A list of available function tools (name, parameters, etc.).
     tool_call_parser: Optional[str] = (
-        None  # Specify the parser type, e.g. 'llama3', 'qwen25', or 'mistral'. If not specified, tries all.
+        None  # Specify the parser type, e.g. 'llama3', 'qwen', or 'mistral'. If not specified, tries all.
     )
 
 
