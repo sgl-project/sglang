@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import logging
+from contextlib import closing
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
@@ -126,9 +127,9 @@ class WeightUpdater:
         weights/parameters online, and broadcasts them to the inference
         engine through the `_model_update_group` process group.
         """
-        assert torch.distributed.is_initialized(), (
-            "Default torch process group must be initialized"
-        )
+        assert (
+            torch.distributed.is_initialized()
+        ), "Default torch process group must be initialized"
         assert group_name != "", "Group name cannot be empty"
 
         rank = rank_offset + self.tp_rank
@@ -229,16 +230,22 @@ class WeightUpdater:
                 DefaultModelLoader.Source.init_new(config, self.get_model())
             )
             if weight_name_filter is not None:
-                iter = (
-                    (name, weight) for name, weight in iter if weight_name_filter(name)
-                )
+
+                def filtered(source):
+                    with closing(source):
+                        for name, weight in source:
+                            if weight_name_filter(name):
+                                yield name, weight
+
+                iter = filtered(iter)
 
             return iter
 
         def model_load_weights(model, iter):
             # Expert loaders may copy in parallel; restore before any thread writes.
-            DefaultModelLoader.restore_weights_before_loading(model, target_device)
-            loader.load_weights_and_postprocess(model, iter, target_device)
+            with closing(iter):
+                DefaultModelLoader.restore_weights_before_loading(model, target_device)
+                loader.load_weights_and_postprocess(model, iter, target_device)
             return model
 
         with set_default_torch_dtype(self.model_config.dtype):

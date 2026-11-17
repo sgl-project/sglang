@@ -110,6 +110,43 @@ class TestPrefetchCheckpoints(CustomTestCase):
             for name in without:
                 torch.testing.assert_close(without[name], with_pf[name])
 
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_iterator_prefetch_stops_on_close_and_load_error(self, _):
+        for factory in (
+            safetensors_weights_iterator,
+            buffered_multi_thread_safetensors_weights_iterator,
+        ):
+            with self.subTest(iterator=factory.__name__):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    paths = self._create_safetensors_files(tmpdir, num_shards=1)
+                    handle = MagicMock()
+                    with patch(
+                        "sglang.srt.model_loader.weight_utils._prefetch_all_checkpoints",
+                        return_value=handle,
+                    ):
+                        iterator = factory(paths, prefetch=True)
+                        next(iterator)
+                        iterator.close()
+                    handle.stop.assert_called_once()
+                    if factory is buffered_multi_thread_safetensors_weights_iterator:
+                        handle.cancel.assert_called_once()
+
+                    handle.reset_mock()
+                    handle.stop.side_effect = TimeoutError("cleanup")
+                    with (
+                        patch(
+                            "sglang.srt.model_loader.weight_utils._prefetch_all_checkpoints",
+                            return_value=handle,
+                        ),
+                        patch(
+                            "safetensors.safe_open",
+                            side_effect=ValueError("load failed"),
+                        ),
+                        self.assertRaisesRegex(ValueError, "load failed"),
+                    ):
+                        list(factory(paths, prefetch=True))
+                    handle.stop.assert_called_once()
+
     def test_prefetch_rejects_invalid_thread_count(self):
         with self.assertRaisesRegex(ValueError, "num_threads"):
             _prefetch_all_checkpoints(["dummy.safetensors"], num_threads=0)
