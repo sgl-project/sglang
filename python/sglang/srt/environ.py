@@ -252,6 +252,14 @@ class InvariantCheckLevel(IntEnum):
     STRICT = 2
 
 
+def _k31_gb_best(best: Any, default: Any) -> Callable[[], Any]:
+    return lambda: (
+        best
+        if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get()
+        else default
+    )
+
+
 class Envs:
     # Organization principles for this registry:
     # - Put every field in exactly one topical section. Prefer an existing
@@ -284,6 +292,8 @@ class Envs:
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
     # Explicit child values override this default for megakernel runtime optimizations.
     SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION = EnvBool(False)
+    # Kimi K3.1 GB300 runtime optimizations; explicitly set children win.
+    SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION = EnvBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
@@ -328,6 +338,9 @@ class Envs:
     # In seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging.
     # Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache e.g. deep gemm
     SGLANG_WARMUP_TIMEOUT = EnvFloat(-1)
+    # Largest M the startup bf16 GEMM warmup covers (the prefill chunk; about
+    # 13 s of startup on K3.1); 0 disables it. Unset: 16384 on Kimi-K3.1, else 0.
+    SGLANG_WARMUP_BF16_GEMM_MAX_M = EnvInt(None)
     SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
     SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
     SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvStr("")
@@ -512,9 +525,11 @@ class Envs:
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     # Scheduler state checks. BUSY runs the busy pool check (its value also sets
     # the log verbosity). IDLE runs no check of its own: it picks whether a leak
-    # found by the idle pool checks or the KV page check raises or only warns.
+    # found by the idle pool checks, the KV page check, or the GC frozen-garbage
+    # check raises or only warns.
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
+    SGLANG_ENABLE_GC_FROZEN_GARBAGE_CHECK = EnvBool(False)
     # The explicit environment variable still takes precedence over this CI
     # default, so production remains opt-in and CI remains opt-out if needed.
     SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK = EnvBool(_default_on_in_ci)
@@ -873,6 +888,12 @@ class Envs:
     # get_embedding_tp_kwargs); they must stay in lock-step. Currently only
     # applies to the Deepseek-V2 family (Deepseek V3.1, Kimi K2.5) + drafts.
     SGLANG_ENABLE_EMBED_REPLICATION = EnvBool(False)
+    # With a prefill graph enabled, a 0-token DP rank keeps SUM_LEN and the
+    # step runs eagerly with only the rows that exist, instead of padding the
+    # group to the capture bucket with a fabricated dummy request. Off by
+    # default (GPU prefill on MoE-TP keeps the MAX_LEN path); turn on for EP
+    # prefill (e.g. Ascend ascend_ops).
+    SGLANG_ENABLE_PREFILL_GRAPH_IDLE_RANK_EAGER = EnvBool(False)
     # Gated background transfers (distributed/device_communicators/
     # gated_transfer.py): force open a transfer gate whose pause has been held
     # this long, logging an error. A pause that never resumes means work the
@@ -1267,6 +1288,7 @@ class Envs:
     # ===================================================================
     # Ascend NPU
     # ===================================================================
+    SGLANG_NPU_ENABLE_STATIC_KERNEL = EnvBool(False)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     # Requantize plain block-FP8 (fp32-scale) checkpoints to MXFP8 at load
     # time for arch35 (Ascend 950) Linear and MoE MXFP8 GEMMs. Disabled keeps
@@ -1390,6 +1412,7 @@ class Envs:
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
+    SGLANG_TRTLLM_MLA_WORKSPACE_MB = EnvInt(_k31_gb_best(256, 150))
     # Use FlashInfer's fused atomic CUTLASS/CuTe DSL MoE finalize.
     SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(False)
     # Experimental Nemotron small-M NVFP4 path; validated only on SM120.
@@ -1710,7 +1733,7 @@ class Envs:
     SGLANG_HIP_VMM_HANDLE_TYPE = EnvStr("auto")
     # Default per-direction workspace cap for CustomAllReduceV2; explicit
     # constructor sizes take precedence over this.
-    SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
+    SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(_k31_gb_best(32 * 1024, 16 * 1024))
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
     # See docs/references/environment_variables.
@@ -1815,6 +1838,41 @@ class Envs:
     # The DFLASH draft KV ring (speculative/dflash_draft_ring.py); resolved at
     # startup to off where it does not fit.
     SGLANG_ENABLE_DFLASH_DRAFT_KV_RING = EnvBool(True)
+    # Disable the compact-slot SWA window lookup for compact MLA drafts.
+    SGLANG_DISABLE_DFLASH_COMPACT_SWA_WINDOW = EnvBool(False)
+    # Gather DFLASH candidate top-k in one multicast all-gather.
+    SGLANG_OPT_DFLASH_FUSED_CANDIDATE_AG = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
+    )
+    # Capture the DFLASH aux append (draft KV) as CUDA graphs.
+    SGLANG_OPT_DFLASH_AUX_GRAPH = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
+    )
+    # Build the DFLASH Mamba commit indices in one kernel on preallocated buffers.
+    SGLANG_OPT_DFLASH_COMMIT_METADATA = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
+    )
+    # Replay the DFLASH aux graph on a side stream over the draft prep.
+    SGLANG_OPT_DFLASH_AUX_OVERLAP = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
+    )
+    # Defer the TP gather of an unsoftcapped target-verify vocab shard. The DFLASH
+    # sampled and megakernel accept paths defer it unless this is set to 0.
+    SGLANG_OPT_DFLASH_DEFER_PLAIN_GATHER = EnvBool(False)
+    # Capture the megakernel post-verify tail as CUDA graphs.
+    SGLANG_OPT_DFLASH_MEGAKERNEL_TAIL_GRAPH = EnvBool(False)
+    # Split the DFLASH draft's context fc across TP by output columns.
+    SGLANG_OPT_DFLASH_TP_AUX_FC = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
+    )
+    # Prefetch the DFLASH draft's small tensors into L2 in its graph.
+    SGLANG_OPT_DFLASH_DRAFT_L2_PREFETCH = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
+    )
+    # Batch DFLASH decode's small device copies into one SM kernel.
+    SGLANG_OPT_DFLASH_BATCHED_SMALL_COPY = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
+    )
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
@@ -1828,7 +1886,7 @@ class Envs:
     # and numbers, each negatable with a leading "-": "all,-dspark-plan,-dspark-draft".
     # The default syncs only the startup memory probes: ranks compute every per-step
     # decision alike. If TP ranks still diverge or hang, set "all" and report a repro.
-    SGLANG_SPEC_TP_SYNC = EnvStr("init")
+    SGLANG_SPEC_TP_SYNC = EnvStr(_k31_gb_best("all,-dflash-accept-greedy", "init"))
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
@@ -1899,6 +1957,11 @@ class Envs:
     # mamba pool ratio accordingly. Frees one resident slot per running request,
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+    # Hybrid-SSM PD decode with --disaggregation-decode-enable-radix-cache: the
+    # radix tree keeps FULL KV only, since prefill sends each request's final
+    # recurrent state and no tree-held state is ever read. Unset: the model's
+    # default (on for Kimi-K3.1); 0 or 1 forces it.
+    SGLANG_DECODE_STATE_FREE_RADIX = EnvBool(None)
     # Opt-in: store radix mamba checkpoints only in the hicache host pool.
     # Matched prefixes and donated checkpoints then occupy no GPU mamba slot,
     # so the pool ratio is the live slot plus the ping-pong slots extra-buffer
@@ -2481,7 +2544,7 @@ class Envs:
     # the regular all-reduce path. Auto-enabled on SM100/SM103 when
     # CustomAllReduceV2 with multicast is available; set 0/1 to override in
     # either direction. See srt/layers/communication/k3_ar_fusion.py.
-    SGLANG_K3_AR_FUSION = EnvBool(False)
+    SGLANG_K3_AR_FUSION = EnvBool(SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get)
     # K3 SP-MoE fused residual + reduce-scatter and matching all-gather over
     # CustomAllReduceV2's MNNVL push workspace. Auto-probed for checked-in
     # TP4/TP8 GB300 and TP16 GB200/GB300 tuning; set 0/1 to override. See
@@ -2493,7 +2556,7 @@ class Envs:
     # Rows per call up to SGLANG_DCP_PUSH_COMBINE_MAX_ROWS. See
     # kernels/ops/attention/dcp_push_combine.py.
     SGLANG_ENABLE_DCP_PUSH_COMBINE = EnvBool(True)
-    SGLANG_DCP_PUSH_COMBINE_MAX_ROWS = EnvInt(1024)
+    SGLANG_DCP_PUSH_COMBINE_MAX_ROWS = EnvInt(_k31_gb_best(1536, 1024))
     # Keep K3's post-MoE residual stream token-sharded between consecutive
     # SP-MoE layers. The next attention-residual aggregation and snapshot
     # bank write run on the local shard, then only the normalized attention

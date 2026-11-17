@@ -2368,6 +2368,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     or rc
                 )
             elif self._is_generic_kvcache_state_type(st):
+                if st in (StateType.DRAFT_RING, StateType.REQUEST_ROW) and not (
+                    src_data_ptrs and dst_data_ptrs
+                ):
+                    # A side without the draft (a PP stage, or a peer whose
+                    # draft KV ring resolved off) registered empty slots.
+                    continue
                 is_qwen4_qsa_state = st in (
                     StateType.QSA_PENDING,
                     StateType.QSA_COMPRESSED,
