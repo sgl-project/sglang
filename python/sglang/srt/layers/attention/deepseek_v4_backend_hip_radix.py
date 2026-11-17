@@ -36,9 +36,6 @@ from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     HEAD_DIM as SWAPAB_HEAD_DIM,
 )
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
-    MAX_BATCH as SWAPAB_MAX_BATCH,
-)
-from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     NUM_HEADS as SWAPAB_NUM_HEADS,
 )
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
@@ -56,7 +53,12 @@ from sglang.kernels.ops.attention.dsv4.opus_sparse_prefill_hip import (
     combined_to_csr,
     opus_sparse_prefill,
 )
-from sglang.kernels.ops.attention.dsv4.swapab_gluon_hip import swapab_attention
+from sglang.kernels.ops.attention.dsv4.swapab_gluon_hip import (
+    MAX_BATCH as SWAPAB_MAX_BATCH,
+)
+from sglang.kernels.ops.attention.dsv4.swapab_gluon_hip import (
+    swapab_attention,
+)
 from sglang.kernels.plugin_kernels.amd.spec import StepMetadata
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.amd.binding import is_metadata_unread
