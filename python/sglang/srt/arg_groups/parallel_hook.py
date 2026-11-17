@@ -254,13 +254,6 @@ def handle_shared_experts_tp(server_args: Any):
         )
 
 
-_KIMI_K3_ARCHITECTURES = (
-    "KimiK3ForConditionalGeneration",
-    "KimiK31ForConditionalGeneration",
-    "KimiK3LinearForCausalLM",
-)
-
-
 _KDA_WEIGHT_SHARD_LOAD_FORMATS_REFUSED = (
     "sharded_state",
     "presharded",
@@ -319,10 +312,13 @@ def handle_kda_weight_shard(server_args: Any):
         raise ValueError(
             "--kda-weight-shard-size requires a Kimi-K3 model configuration."
         )
-    architecture = model_config_of(server_args).hf_config.architectures[0]
-    if architecture not in _KIMI_K3_ARCHITECTURES:
+    from sglang.srt.configs.model_config import is_kimi_k3
+
+    hf_config = model_config_of(server_args).hf_config
+    if not is_kimi_k3(hf_config):
         raise ValueError(
-            f"--kda-weight-shard-size is only supported for Kimi-K3 (got {architecture})."
+            "--kda-weight-shard-size is only supported for Kimi-K3 "
+            f"(got {hf_config.architectures[0]})."
         )
     graph = cfg.cuda_graph_config
     for phase in ("prefill", "decode"):
