@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU contracts for the full H3 image loop, using real packed layouts."""
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,10 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
     PackedBranchInputs,
     minimax_h3_image_denoise_loop,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
+    MiniMaxH3RolloutCollector,
+    MiniMaxH3RolloutCtx,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (
     minimax_h3_packed_sequence,
@@ -333,3 +338,101 @@ def test_state_dependent_predictions_use_fp32_euler_deltas(dtype):
         expected = expected + (sigma_values[step] - sigma_values[step + 1]) * velocity
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert len(model.calls) == len(sigmas) - 1
+
+
+# The released grid's kind of sigmas: no step is a power of two apart.
+_ROLLOUT_SIGMAS = [1.0, 0.9675236940383911, 0.75, 0.23200887441635132, 0.0]
+
+
+def _rollout_ctx(*, sde_type, noise_level, sde_step_indices):
+    batch = SimpleNamespace(
+        rollout_sde_type=sde_type,
+        rollout_noise_level=noise_level,
+        rollout_sde_step_indices=sde_step_indices,
+        rollout_log_prob_no_const=False,
+    )
+    return MiniMaxH3RolloutCtx(
+        batch=batch,
+        generator=torch.Generator().manual_seed(7),
+        sigmas_video=_ROLLOUT_SIGMAS,
+        collector=MiniMaxH3RolloutCollector(sigmas_video=_ROLLOUT_SIGMAS),
+    )
+
+
+def _state_dependent_model():
+    return _BufferModel(state_scale=0.3, time_scale=0.7)
+
+
+def test_rollout_step_outside_the_noise_window_is_the_serving_step():
+    """A deterministic rollout step that rounds unlike serving trains on states serving never visits."""
+    positive = _inputs(3, 0.25)
+    # Constant rows would hide a last-bit difference between two forms of the update.
+    initial_rows = torch.randn(
+        (positive.packed["img_pos"].numel(), 96),
+        generator=torch.Generator().manual_seed(3),
+    )
+    serving = _run(
+        _state_dependent_model(),
+        positive,
+        sigmas=_ROLLOUT_SIGMAS,
+        initial_video_rows=initial_rows,
+    )
+    rollout_ctx = _rollout_ctx(sde_type="cps", noise_level=0.8, sde_step_indices=[])
+
+    rolled = _run(
+        _state_dependent_model(),
+        positive,
+        sigmas=_ROLLOUT_SIGMAS,
+        initial_video_rows=initial_rows,
+        rollout_ctx=rollout_ctx,
+    )
+
+    assert torch.equal(rolled, serving)
+    trajectory = rollout_ctx.collector.build_trajectory_data()
+    assert torch.equal(trajectory.dit_trajectory.latents[0, -1], serving)
+    assert not trajectory.rollout_log_probs.any()
+
+
+@pytest.mark.parametrize(
+    "sde_type,noise_level", [("cps", 0.8), ("sde", 0.7)], ids=["cps", "sde"]
+)
+def test_rollout_noisy_step_is_the_transition_the_trainer_scores(sde_type, noise_level):
+    """The trainer rebuilds this density from the recorded latents and sigmas; step 0 sits at sigma == 1."""
+    model = _state_dependent_model()
+    rollout_ctx = _rollout_ctx(
+        sde_type=sde_type, noise_level=noise_level, sde_step_indices=[0, 2]
+    )
+    _run(model, _inputs(3, 0.25), sigmas=_ROLLOUT_SIGMAS, rollout_ctx=rollout_ctx)
+
+    trajectory = rollout_ctx.collector.build_trajectory_data()
+    latents = trajectory.dit_trajectory.latents[0]
+    assert torch.isfinite(latents).all()
+    assert trajectory.rollout_log_probs[0, 1] == 0
+    for step in (0, 2):
+        sigma, next_sigma = _ROLLOUT_SIGMAS[step], _ROLLOUT_SIGMAS[step + 1]
+        sample = latents[step]
+        # the trainer's convention: noise - clean
+        model_output = -model.calls[step]["prediction"]
+        if sde_type == "cps":
+            std = next_sigma * math.sin(noise_level * math.pi / 2)
+            mean = (sample - sigma * model_output) * (1 - next_sigma) + (
+                sample + model_output * (1 - sigma)
+            ) * math.sqrt(next_sigma**2 - std**2)
+        else:
+            # FlowGRPO replaces sigma == 1 by the grid's second sigma.
+            divisor = 1 - (_ROLLOUT_SIGMAS[1] if sigma == 1.0 else sigma)
+            std_dev_t = math.sqrt(sigma / divisor) * noise_level
+            dt = next_sigma - sigma
+            mean = (
+                sample * (1 + std_dev_t**2 / (2 * sigma) * dt)
+                + model_output * (1 + std_dev_t**2 * (1 - sigma) / (2 * sigma)) * dt
+            )
+            std = std_dev_t * math.sqrt(-dt)
+        log_prob = (
+            -((latents[step + 1] - mean) ** 2) / (2 * std**2)
+            - math.log(std)
+            - math.log(math.sqrt(2 * math.pi))
+        ).mean()
+        torch.testing.assert_close(
+            trajectory.rollout_log_probs[0, step], log_prob, rtol=1e-4, atol=1e-4
+        )

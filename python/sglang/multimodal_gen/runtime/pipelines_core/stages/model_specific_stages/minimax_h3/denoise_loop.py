@@ -691,6 +691,7 @@ def minimax_h3_image_denoise_loop(
     prepare_branch: Callable[[MiniMaxH3DenoiseBranch], None] | None = None,
     adaln_sigmas: Sequence[float] | None = None,
     prewarm_both_tasks: bool = False,
+    rollout_ctx=None,
 ) -> torch.Tensor:
     """Return fp32 image rows after ``len(sigmas) - 1`` positive-branch steps.
 
@@ -703,6 +704,8 @@ def minimax_h3_image_denoise_loop(
     cache can hold it; the extra plans do not add model forwards or Euler steps.
     ``prewarm_both_tasks`` also reserves the other image task's plans when
     both tasks are declared and the cache can hold both grids.
+    ``rollout_ctx`` steps the target rows through the rollout transition and
+    records them and each step's log-prob.
     """
     sigmas = [float(sigma) for sigma in sigmas]
     cond_t = float(imgvid_cond_noise_aug_for_inference)
@@ -763,6 +766,14 @@ def minimax_h3_image_denoise_loop(
     slots = model.prepare_adaln_plans(plan_timesteps)
     sigma_values = torch.tensor(sigmas, dtype=torch.float32, device=device)
     sigma_deltas = sigma_values[:-1] - sigma_values[1:]
+    if rollout_ctx is not None:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
+            minimax_h3_rollout_update_image_target,
+        )
+
+        # FlowGRPO's sigma_max, as FlowRolloutController takes it: the grid's second sigma.
+        rollout_ctx.batch._h3_rollout_sigma_max = sigmas[min(1, num_steps)]
+        rollout_ctx.collector.record_initial(video_rows[n_cond:].detach().clone())
 
     for step in range(num_steps):
         if n_cond:
@@ -790,7 +801,30 @@ def minimax_h3_image_denoise_loop(
                     else model_forward(model, kwargs, step)
                 )
             target_rows = video_rows[n_cond:]
-            target_rows.copy_(target_rows + sigma_deltas[step] * video[n_cond:].float())
+            velocity = video[n_cond:].float()
+            if rollout_ctx is None:
+                target_rows.copy_(target_rows + sigma_deltas[step] * velocity)
+            else:
+                (
+                    updated,
+                    log_prob_sum,
+                    log_prob_count,
+                    rollout_ctx.noise_buffer,
+                ) = minimax_h3_rollout_update_image_target(
+                    target_rows,
+                    velocity,
+                    sigma_curr=sigmas[step],
+                    sigma_next=sigmas[step + 1],
+                    sigma_delta=sigma_deltas[step],
+                    batch=rollout_ctx.batch,
+                    generator=rollout_ctx.generator,
+                    loop_step_index=step,
+                    noise_buffer=rollout_ctx.noise_buffer,
+                )
+                target_rows.copy_(updated)
+                rollout_ctx.collector.record_step(
+                    target_rows.detach().clone(), log_prob_sum, log_prob_count
+                )
         if on_step is not None:
             on_step(step)
     return video_rows

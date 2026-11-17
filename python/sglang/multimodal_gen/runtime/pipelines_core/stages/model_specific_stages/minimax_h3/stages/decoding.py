@@ -482,7 +482,11 @@ class MiniMaxH3DecodingStage(DecodingStage):
                 height,
             )
             pixels = minimax_h3_resize_image_output(pixels, width, height)
-        return OutputBatch(output=pixels, metrics=batch.metrics)
+        return OutputBatch(
+            output=pixels,
+            rollout_trajectory_data=batch.rollout_trajectory_data,
+            metrics=batch.metrics,
+        )
 
     @skip_decode_if_requested
     @torch.no_grad()

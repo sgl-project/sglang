@@ -112,6 +112,17 @@ class MiniMaxH3ImageSamplingParams(SamplingParams):
             if self.min_generation_area is not None:
                 self._canonical_request()
         super()._validate()
+        if self.rollout:
+            if self._reference_paths():
+                raise ValueError(
+                    "MiniMax H3 image rollout supports t2i only: the references of "
+                    "an edit are not returned for the trainer to replay"
+                )
+            if self.rollout_stop_step_index is not None:
+                raise ValueError(
+                    "MiniMax H3 image rollout runs every step of the PDD grid; "
+                    "rollout_stop_step_index is not supported"
+                )
         if self.quality not in ("exact", "lossless"):
             raise ValueError("MiniMax H3 image supports quality='exact' or 'lossless'")
         if (

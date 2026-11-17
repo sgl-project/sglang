@@ -173,6 +173,47 @@ def test_real_denoise_loop_from_stage_state_to_rgb(server, task):
     assert output.audio is None
 
 
+@pytest.mark.skipif(
+    torch.cuda.is_available(),
+    reason="CPU-only weight-free test; it mixes CPU and CUDA tensors on GPU hosts",
+)
+def test_rollout_request_returns_its_trajectory_and_conditioning(server):
+    """The trainer replays a rollout from the decode output: each step's latents and the DiT's conditioning."""
+    req = prepare_request(
+        server,
+        MiniMaxH3ImageSamplingParams(
+            prompt="p",
+            width=64,
+            height=32,
+            seed=17,
+            num_inference_steps=6,
+            rollout=True,
+            rollout_sde_type="cps",
+            rollout_noise_level=0.8,
+            rollout_sde_step_indices=[1, 2],
+        ),
+    )
+    req.extra[TEXT] = make_req(server).extra[TEXT]
+    MiniMaxH3TimestepPreparationStage().forward(req, server)
+    MiniMaxH3LatentPreparationStage().forward(req, server)
+    MiniMaxH3DenoisingStage(ZeroVelocityModel()).forward(req, server)
+
+    output = MiniMaxH3DecodingStage(RecordingVAE(), None).forward(req, server)
+
+    trajectory = output.rollout_trajectory_data
+    # 6 steps of the 2 target rows of a 64x32 image, and the initial noise
+    assert trajectory.dit_trajectory.latents.shape == (1, 7, 2, 96)
+    noisy_steps = (trajectory.rollout_log_probs[0] != 0).tolist()
+    assert noisy_steps == [False, True, True, False, False, False]
+    conditioning = trajectory.denoising_env.pos_cond_kwargs
+    assert set(conditioning) == {
+        "encoder_hidden_states",
+        "h3_packed_layout",
+        "h3_token_tags",
+    }
+    assert conditioning["encoder_hidden_states"].shape == (3, 5120)
+
+
 def _pattern(latent_h, latent_w):
     generator = torch.Generator().manual_seed(3)
     return torch.rand((1, 3, latent_h * 16, latent_w * 16), generator=generator)

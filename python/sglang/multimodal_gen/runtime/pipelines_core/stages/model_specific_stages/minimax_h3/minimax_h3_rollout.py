@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Rollout (RL) helpers for MiniMax H3 video-only denoising."""
+"""Rollout (RL) helpers for MiniMax H3 denoising: the video target rows, or an image's."""
 
 from __future__ import annotations
 
@@ -151,6 +151,43 @@ def minimax_h3_rollout_update_video_target(
     )
 
 
+def minimax_h3_rollout_update_image_target(
+    image_target: torch.Tensor,
+    velocity: torch.Tensor,
+    *,
+    sigma_curr: float,
+    sigma_next: float,
+    sigma_delta: torch.Tensor,
+    batch,
+    generator: torch.Generator,
+    loop_step_index: int,
+    noise_buffer: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """The rollout update of an image's target rows; returns what the video update returns.
+
+    A deterministic step is the image loop's Euler update with its fp32
+    ``sigma_delta``, so it equals a serving request's step bit for bit.
+    """
+    if (
+        _effective_sde_type(batch, loop_step_index) == "ode"
+        or batch.rollout_noise_level == 0.0
+    ):
+        updated = image_target + sigma_delta * velocity
+        log_prob_sum = torch.zeros(1, device=updated.device, dtype=torch.float32)
+        log_prob_count = updated.new_tensor([float(updated.numel())])
+        return updated, log_prob_sum, log_prob_count, noise_buffer
+    return minimax_h3_rollout_update_video_target(
+        image_target,
+        velocity,
+        sigma_curr=sigma_curr,
+        sigma_next=sigma_next,
+        batch=batch,
+        generator=generator,
+        loop_step_index=loop_step_index,
+        noise_buffer=noise_buffer,
+    )
+
+
 @dataclass
 class MiniMaxH3RolloutCtx:
     """Per-denoise-loop rollout state for H3."""
@@ -238,5 +275,6 @@ class MiniMaxH3RolloutCollector:
 __all__ = [
     "MiniMaxH3RolloutCollector",
     "MiniMaxH3RolloutCtx",
+    "minimax_h3_rollout_update_image_target",
     "minimax_h3_rollout_update_video_target",
 ]

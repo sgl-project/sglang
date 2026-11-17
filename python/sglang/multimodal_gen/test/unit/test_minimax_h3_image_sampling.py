@@ -167,6 +167,8 @@ def test_request_steps(override, steps):
         ({"num_outputs_per_prompt": 2}, "one image"),
         ({"min_generation_area": 512}, "min_generation_area"),
         ({"seed": -1}, "seed"),
+        ({"rollout": True, "image_path": "reference.png"}, "rollout supports t2i only"),
+        ({"rollout": True, "rollout_stop_step_index": 2}, "rollout_stop_step_index"),
     ],
 )
 def test_invalid_image_requests_fail_at_constructor(override, match):

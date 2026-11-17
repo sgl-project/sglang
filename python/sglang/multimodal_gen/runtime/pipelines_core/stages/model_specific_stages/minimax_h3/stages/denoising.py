@@ -128,6 +128,37 @@ def _image_branch_inputs(
     return PackedBranchInputs(packed=packed, text_embeddings=hidden, token_tags=tags)
 
 
+def _image_rollout_ctx(*, batch: Req, plan: Any, positive: Any, device: torch.device):
+    """Rollout state of an image request: its noise generator, and the conditioning the trainer replays."""
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
+        MiniMaxH3RolloutCollector,
+        MiniMaxH3RolloutCtx,
+    )
+
+    sigmas = [float(sigma) for sigma in batch.sigmas]
+    return_step_indices = batch.rollout_return_step_indices
+    collector = MiniMaxH3RolloutCollector(
+        sigmas_video=sigmas,
+        return_step_indices=(
+            None if return_step_indices is None else set(return_step_indices)
+        ),
+    )
+    collector.pos_cond_kwargs = {
+        "encoder_hidden_states": positive.text_embeddings.detach().cpu(),
+        "h3_packed_layout": {
+            key: value.detach().cpu() if isinstance(value, torch.Tensor) else value
+            for key, value in positive.packed.items()
+        },
+        "h3_token_tags": positive.token_tags.detach().cpu(),
+    }
+    return MiniMaxH3RolloutCtx(
+        batch=batch,
+        generator=torch.Generator(device=device).manual_seed(int(plan.seed)),
+        sigmas_video=sigmas,
+        collector=collector,
+    )
+
+
 def _validate_keyframe_payload(plan: Any, keyframe: Any) -> None:
     """Reject stale/middle/reordered keyframe payloads at the DiT sink."""
 
@@ -981,6 +1012,13 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             # Noised anchors from draw 2 of the request generator (image_noise.py).
             anchors = minimax_h3_image_anchor_rows(batch, rows)
         initial_rows = torch.cat((anchors, state["initial_video_rows"]), dim=0)
+        rollout_ctx = (
+            _image_rollout_ctx(
+                batch=batch, plan=plan, positive=positive, device=self.device
+            )
+            if batch.rollout
+            else None
+        )
         with self.use_declared_component(
             component_name="transformer", module=self.transformer
         ) as transformer:
@@ -1029,7 +1067,12 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     device=self.device,
                     on_step=on_step,
                     step_profiler=partial(self._profile_denoising_step, batch=batch),
+                    rollout_ctx=rollout_ctx,
                 )
+        if rollout_ctx is not None:
+            batch.rollout_trajectory_data = (
+                rollout_ctx.collector.build_trajectory_data()
+            )
         target = output[positive.packed["update_mask"].to(output.device)]
         batch.latents = minimax_h3_unpatchify_video_tokens(
             target,
