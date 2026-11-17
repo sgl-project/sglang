@@ -512,9 +512,12 @@ class ZImageAttention(nn.Module):
             )
 
         pad_heads = 0
-        # Layers that bypass Ulysses attend locally over all heads, so the head
-        # count does not have to divide the Ulysses degree for them.
-        if not (skip_sequence_parallel_override or self.attn.skip_sequence_parallel):
+        # Only the Ulysses exchange splits the heads over the ranks. Layers that
+        # bypass it, and the K/V gather exchange, keep every head local and
+        # accept a head count that does not divide the degree.
+        if self.attn.sp_attention_mode == "ulysses" and not (
+            skip_sequence_parallel_override or self.attn.skip_sequence_parallel
+        ):
             pad_heads = -q.shape[2] % get_ulysses_parallel_world_size()
         if pad_heads:
             if q.shape[2] != k.shape[2]:

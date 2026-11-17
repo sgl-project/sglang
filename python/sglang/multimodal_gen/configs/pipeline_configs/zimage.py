@@ -188,20 +188,22 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
         base, remainder = divmod(total, parts)
         return [base + int(rank < remainder) for rank in range(parts)]
 
-    def _zimage_latent_hw(self, batch) -> tuple[int, int]:
-        """Return the latent height and width the SP plan shards."""
-        raw_latent_shape = getattr(batch, "raw_latent_shape", None)
-        if raw_latent_shape is not None and len(raw_latent_shape) >= 5:
-            return int(raw_latent_shape[3]), int(raw_latent_shape[4])
-        ratio = self.vae_config.arch_config.spatial_compression_ratio
-        return int(batch.height // ratio), int(batch.width // ratio)
-
     def _build_zimage_sp_plan(self, batch) -> dict:
         """Build an SP plan that preserves native spatial layout for Z-Image."""
         sp_size = get_sp_world_size()
         rank = get_sp_parallel_rank()
 
-        H, W = self._zimage_latent_hw(batch)
+        raw_latent_shape = getattr(batch, "raw_latent_shape", None)
+        if raw_latent_shape is not None and len(raw_latent_shape) >= 5:
+            H = int(raw_latent_shape[3])
+            W = int(raw_latent_shape[4])
+        else:
+            H = int(
+                batch.height // self.vae_config.arch_config.spatial_compression_ratio
+            )
+            W = int(
+                batch.width // self.vae_config.arch_config.spatial_compression_ratio
+            )
 
         # ZImage patchifies [C, F, H, W] latents in native F/H/W order, so shard
         # native H or W directly.
@@ -271,55 +273,8 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
         }
         return plan
 
-    def _sp_plan_cache_key(self, batch) -> tuple:
-        """Every input the plan reads, so a cache hit cannot hide a changed layout."""
-        cache_dit = (
-            batch.enable_cache_dit
-            if batch.enable_cache_dit is not None
-            else envs.SGLANG_CACHE_DIT_ENABLED
-        )
-        captions = (batch.prompt_seq_lens, batch.negative_prompt_seq_lens)
-        return (
-            get_sp_world_size(),
-            get_sp_parallel_rank(),
-            get_ulysses_parallel_world_size(),
-            self._zimage_latent_hw(batch),
-            self._allow_unpadded_sp,
-            torch.is_grad_enabled(),
-            torch.compiler.is_compiling(),
-            batch.enable_teacache,
-            batch.enable_spectrum,
-            cache_dit,
-            batch.do_classifier_free_guidance,
-            tuple(
-                None if lens is None else tuple(tuple(row) for row in lens)
-                for lens in captions
-            ),
-        )
-
     def _get_zimage_sp_plan(self, batch) -> dict:
-        """Return the SP plan for this request, built once per distinct input set.
-
-        The shard and the gather must agree on the sharded axis. The axis follows
-        from the pad count, which the unpadded layout can change, so a request that
-        asked for one axis must not later be answered with the other.
-        """
-        key = self._sp_plan_cache_key(batch)
-        cached = batch.extra.get("zimage_sp_plan")
-        if cached is not None and cached[0] == key:
-            return cached[1]
-        plan = self._build_zimage_sp_plan(batch)
-        axis_key = (key[0], key[1], key[3])
-        axis = batch.extra.get("zimage_sp_axis")
-        if axis is not None and axis[0] == axis_key and axis[1] != plan["shard_axis"]:
-            raise ValueError(
-                "Z-Image sequence parallel plan changed its sharded axis from "
-                f"{axis[1]} to {plan['shard_axis']} within one request; the shard "
-                "and the gather would disagree"
-            )
-        batch.extra["zimage_sp_axis"] = (axis_key, plan["shard_axis"])
-        batch.extra["zimage_sp_plan"] = (key, plan)
-        return plan
+        return self._build_zimage_sp_plan(batch)
 
     def _pad_text_embed_for_dit(self, embed: torch.Tensor) -> torch.Tensor:
         target_len = self._ceil_to_multiple(embed.shape[0], self.SEQ_LEN_MULTIPLE)
