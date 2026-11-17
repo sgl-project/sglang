@@ -144,7 +144,7 @@ def _mxfp4_quant_rows(
     tl.store(x_fp4_ptr + out_offs, out_tensor, mask=out_mask)
 
     bs_offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    bs_offs_n = pid_n
+    bs_offs_n = pid_n + tl.arange(0, 1)
 
     if SHUFFLE:
         bs_offs_0 = bs_offs_m[:, None] // 32
