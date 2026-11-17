@@ -2348,6 +2348,80 @@ class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
         assert len(layer1_keys) == 0, f"layer 1 dumps should be filtered: {layer1_keys}"
 
 
+class TestNonIntrusiveTags(_NonIntrusiveTestBase):
+    """Tests for the ``tags`` argument of ``register_non_intrusive_dumper``."""
+
+    @staticmethod
+    def _build_model(layer_name: str = "layer") -> torch.nn.Module:
+        class Root(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                setattr(self, layer_name, torch.nn.Linear(4, 4))
+                self._layer_name = layer_name
+
+            def forward(self, x):
+                return getattr(self, self._layer_name)(x)
+
+        return Root()
+
+    def test_tags_attached_to_every_dump(self, tmp_path):
+        d = self._make_dumper(tmp_path)
+        model = self._build_model()
+        d.register_non_intrusive_dumper(model, tags={"runner": "draft"})
+
+        with d.capture_output() as captured:
+            model(torch.randn(2, 4))
+
+        assert len(captured) > 0
+        for key, entry in captured.items():
+            assert entry["meta"]["runner"] == "draft", key
+
+    def test_no_tags_leaves_dumps_unchanged(self, tmp_path):
+        d = self._make_dumper(tmp_path)
+        model = self._build_model()
+        d.register_non_intrusive_dumper(model)
+
+        with d.capture_output() as captured:
+            model(torch.randn(2, 4))
+
+        assert len(captured) > 0
+        for key, entry in captured.items():
+            assert "runner" not in entry["meta"], key
+
+    def test_tags_are_bound_per_registration(self, tmp_path):
+        """Two models in one process keep their own tags when their forwards interleave."""
+        d = self._make_dumper(tmp_path)
+        draft = self._build_model("draft_layer")
+        target = self._build_model("target_layer")
+        d.register_non_intrusive_dumper(draft, tags={"runner": "draft"})
+        d.register_non_intrusive_dumper(target, tags={"runner": "target"})
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            draft(x)
+            target(x)
+            draft(x)
+
+        P = self._PREFIX
+        assert captured[f"{P}draft_layer.output"]["meta"]["runner"] == "draft"
+        assert captured[f"{P}target_layer.output"]["meta"]["runner"] == "target"
+
+    def test_tags_attached_to_core_fields(self, tmp_path):
+        d = _make_test_dumper(tmp_path, non_intrusive_mode="core")
+
+        class Root(torch.nn.Module):
+            def forward(self, forward_batch):
+                return forward_batch.input_ids.float()
+
+        model = Root()
+        d.register_non_intrusive_dumper(model, tags={"runner": "target"})
+
+        with d.capture_output() as captured:
+            model(_make_forward_batch())
+
+        assert captured["input_ids"]["meta"]["runner"] == "target"
+
+
 class TestDumperE2E:
     def test_step_and_non_intrusive_hooks(self, tmp_path):
         base_url = DEFAULT_URL_FOR_TEST

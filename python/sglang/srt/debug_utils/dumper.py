@@ -417,12 +417,16 @@ class _Dumper:
     def register_non_intrusive_dumper(
         self,
         model: "torch.nn.Module",
+        *,
+        tags: Optional[dict[str, Any]] = None,
     ) -> Optional["_NonIntrusiveDumper"]:
         self._http_manager  # noqa: B018
         mode = self._config.non_intrusive_mode
         if mode == "off":
             return None
-        non_intrusive = _NonIntrusiveDumper(dumper=self, model=model, mode=mode)
+        non_intrusive = _NonIntrusiveDumper(
+            dumper=self, model=model, mode=mode, tags=tags
+        )
         self._non_intrusives.append(non_intrusive)
         return non_intrusive
 
@@ -662,9 +666,11 @@ class _NonIntrusiveDumper:
         dumper: _Dumper,
         model: "torch.nn.Module",
         mode: str,
+        tags: Optional[dict[str, Any]] = None,
     ):
         self._dumper = dumper
         self._mode = mode
+        self._tags: dict[str, Any] = dict(tags) if tags else {}
         self._handles: list = []
         self._core_fields: frozenset[str] = frozenset().union(
             *(p.core_fields() for p in _plugins)
@@ -750,10 +756,12 @@ class _NonIntrusiveDumper:
         ).items():
             effective_key = key or sub_name.rsplit(".", 1)[-1]
             if effective_key in self._core_fields:
-                self._dumper.dump(effective_key, item)
+                self._dumper.dump(effective_key, item, **self._tags)
             elif self._mode == "all":
                 parts = [p for p in (module_name, sub_name, key) if p]
-                self._dumper.dump(self._NAME_PREFIX + ".".join(parts), item)
+                self._dumper.dump(
+                    self._NAME_PREFIX + ".".join(parts), item, **self._tags
+                )
 
     @staticmethod
     def _convert_value(value, *, skip_forward_batch: bool = False) -> dict[str, Any]:

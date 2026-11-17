@@ -1504,7 +1504,14 @@ class ModelRunner:
 
         if dumper.may_enable:
             dumper.apply_source_patches()
-            dumper.register_non_intrusive_dumper(self.model)
+            dumper.register_non_intrusive_dumper(
+                self.model,
+                tags=(
+                    {"runner": "draft" if self.is_draft_worker else "target"}
+                    if self.spec_algorithm.is_speculative()
+                    else None
+                ),
+            )
 
         # Pre-expand RoPE cache before CUDA Graph capture
         reserve_rope_cache_for_long_sequences(
