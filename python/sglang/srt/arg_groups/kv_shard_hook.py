@@ -313,11 +313,14 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             "fancy index. Got --disaggregation-transfer-backend "
             f"{cfg.disaggregation_transfer_backend!r}."
         )
-    if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+    if (
+        envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        and cfg.disaggregation_transfer_backend != "mooncake"
+    ):
         raise ValueError(
-            "--enable-kv-cache-sharding is incompatible with "
-            "SGLANG_DISAGG_STAGING_BUFFER (the staging path assumes "
-            "contiguous send slices)."
+            "--enable-kv-cache-sharding with SGLANG_DISAGG_STAGING_BUFFER is "
+            "only supported on the mooncake transfer backend; the nixl staging "
+            "path assumes contiguous send slices."
         )
 
     if use_mla_backend(server_args):

@@ -20,7 +20,8 @@ class TransferKVChunk:
 
     room: int
     prefill_kv_indices: npt.NDArray[np.int32]
-    index_slice: slice
+    # A slice, or under KV sharding this rank's owned page positions.
+    index_slice: Union[slice, npt.NDArray[np.int64]]
     is_last_chunk: bool
     prefill_aux_index: Optional[int]
     state_indices: Optional[List]
@@ -38,6 +39,8 @@ class TransferKVChunk:
     # The room's send record this chunk was counted in when queued (a
     # `SendRecord`); the worker reports the chunk finished to it only.
     send_record: Optional[object] = None
+    # KV sharding only: the whole chunk's page positions.
+    chunk_slice: Optional[slice] = None
 
 
 def bind_thread_to_device(gpu_id: int) -> None:

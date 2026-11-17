@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 STAGING_WATERMARK_WAIT_S = 0.001
 
 if TYPE_CHECKING:
+    import numpy as np
+    import numpy.typing as npt
+
     from sglang.srt.disaggregation.decode import DecodeRequest
 
 
@@ -145,7 +148,7 @@ class DecodeStagingHandler:
         )
 
     def num_writers_for(self, receiver) -> int:
-        """Compute all TP and PP writers expected for a staging chunk."""
+        """Compute all TP, PP and KV-shard writers expected for a staging chunk."""
         prefill_info = receiver.prefill_info
         prefill_tp = prefill_info.attn_tp_size
         if prefill_tp > self.decode_tp:
@@ -153,7 +156,14 @@ class DecodeStagingHandler:
         else:
             tp_writers = 1
         pp_writers = prefill_info.pp_size // self.kv_manager.pp_size
-        return tp_writers * pp_writers
+        # Non-MLA KV shards over prefill CP; each CP rank writes its own pages.
+        shard_writers = (
+            prefill_info.attn_cp_size // self.kv_manager.attn_cp_size
+            if prefill_info.enable_kv_cache_sharding
+            and not self.kv_manager.is_mla_backend
+            else 1
+        )
+        return tp_writers * pp_writers * shard_writers
 
     @classmethod
     def create(cls, kv_manager, scheduler, tp_rank: int) -> DecodeStagingHandler:
@@ -777,6 +787,9 @@ class PrefillStagingStrategy:
         dst_staging_ptr: int,
         dst_staging_size: int,
         target_info,
+        *,
+        page_positions: Optional[npt.NDArray[np.int64]] = None,
+        chunk_num_pages: Optional[int] = None,
     ) -> int:
         """Execute staged transfer (gather + RDMA).
 
@@ -798,6 +811,8 @@ class PrefillStagingStrategy:
                     if target_info.staging is not None
                     else None
                 ),
+                page_positions=page_positions,
+                chunk_num_pages=chunk_num_pages,
             )
         except Exception as e:
             raise RuntimeError(
