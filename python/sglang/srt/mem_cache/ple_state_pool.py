@@ -114,7 +114,9 @@ class ShortConvPool:
 
     def reset_slots(self, indices: torch.Tensor) -> None:
         if self.conv_state is not None and indices.numel() > 0:
-            self.conv_state[:, indices] = 0
+            # index_fill_, not `conv_state[:, indices] = 0`: a Python scalar
+            # through an index tensor syncs the host.
+            self.conv_state.index_fill_(1, indices.to(torch.int64), 0)
 
     def copy_slots(self, src_index: torch.Tensor, dst_index: torch.Tensor) -> None:
         if self.conv_state is not None:
@@ -229,7 +231,9 @@ class NGramPool:
 
     def reset_slots(self, indices: torch.Tensor) -> None:
         if self.context is not None and indices.numel() > 0:
-            self.context[indices.to(dtype=torch.long)] = self.eos_token_id
+            # index_fill_, not `context[indices] = eos`: a Python scalar
+            # through an index tensor syncs the host.
+            self.context.index_fill_(0, indices.to(dtype=torch.long), self.eos_token_id)
 
     def copy_slots(self, src_index: torch.Tensor, dst_index: torch.Tensor) -> None:
         if self.context is not None:

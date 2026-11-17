@@ -161,6 +161,37 @@ class TestPLEStateCoordinates(unittest.TestCase):
         )
         self.assertEqual(storage.accounting_violations(), [])
 
+    def test_reset_slots_fills_the_slot_axis_of_each_ple_part(self):
+        """Each PLE part resets along its own slot axis: the short-conv pool's
+        slot sits behind a layer dim, the ngram pool's is the leading one. A
+        reset that reads the wrong axis wipes live slots and spares the dead
+        one, and both pools take their reset value from a host scalar, so the
+        axis is easy to get wrong while the shapes still line up."""
+        from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
+
+        conv_pool = ShortConvPool(
+            size=4,
+            state_shape=(1, 2),
+            layer_ids=[0, 1],
+            dtype=torch.float32,
+            device="cpu",
+        )
+        conv_pool.conv_state.fill_(7.0)
+        conv_pool.reset_slots(torch.tensor([2], dtype=torch.int32))
+        for layer in range(conv_pool.conv_state.shape[0]):
+            self.assertEqual(float(conv_pool.conv_state[layer][2].sum()), 0.0)
+            for slot in (0, 1, 3):
+                self.assertEqual(
+                    float(conv_pool.conv_state[layer][slot].sum()), 7.0 * 1 * 2
+                )
+
+        ngram = NGramPool(size=4, context_len=2, eos_token_id=17, device="cpu")
+        ngram.context.fill_(5)
+        ngram.reset_slots(torch.tensor([2], dtype=torch.int32))
+        self.assertEqual(ngram.context[2].tolist(), [17, 17])
+        for slot in (0, 1, 3):
+            self.assertEqual(ngram.context[slot].tolist(), [5, 5])
+
     def test_ascend_graph_metadata_checkpoints_static_ple_state(self):
         """Capture and replay save both PLE parts to the recurrent checkpoint rows."""
         from sglang.srt.mem_cache.kv.decl import STATE_PART
