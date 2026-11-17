@@ -9,6 +9,7 @@ from sglang.srt.managers.scheduler_components.gc_freezer import GCFreezer
 from sglang.srt.managers.scheduler_components.state_check import Severity
 from sglang.srt.utils.gc_utils import refreeze_gc
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -20,7 +21,7 @@ class _Node:
             parent.children.append(self)
 
 
-class TestGCFreezer(unittest.TestCase):
+class TestGCFreezer(CustomTestCase):
     def setUp(self):
         self.now = [100.0]
         self.forward_ct = [7]
@@ -38,11 +39,10 @@ class TestGCFreezer(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def _freezer(self, *, freeze_on_idle_secs, check_frozen_garbage=False):
+    def _freezer(self, *, freeze_on_idle_secs, enable_frozen_garbage_check=False):
         freezer = GCFreezer(
             freeze_on_idle_secs=freeze_on_idle_secs,
-            check_frozen_garbage=check_frozen_garbage,
-            get_forward_ct=lambda: self.forward_ct[0],
+            enable_frozen_garbage_check=enable_frozen_garbage_check,
         )
         freezer._reporter = self.gc_ops.reporter
         return freezer
@@ -52,17 +52,17 @@ class TestGCFreezer(unittest.TestCase):
         return [c for c in self.gc_ops.mock_calls if c[0] in names]
 
     def _two_idle_periods(self, freezer):
-        freezer._on_idle()
+        freezer.on_idle(self.forward_ct[0])
         self.now[0] += 4.9
-        freezer._on_idle()
+        freezer.on_idle(self.forward_ct[0])
         self.assertEqual(self._gc_calls(), [])
         self.now[0] += 0.1
         for _ in range(3):
-            freezer._on_idle()
+            freezer.on_idle(self.forward_ct[0])
         self.forward_ct[0] += 1
-        freezer._on_idle()
+        freezer.on_idle(self.forward_ct[0])
         self.now[0] += 5.0
-        freezer._on_idle()
+        freezer.on_idle(self.forward_ct[0])
 
     def test_idle_freeze_collects_then_freezes_once_per_idle_period(self):
         self._two_idle_periods(self._freezer(freeze_on_idle_secs=5.0))
@@ -79,7 +79,7 @@ class TestGCFreezer(unittest.TestCase):
 
         self.gc_ops.reset_mock()
         self._two_idle_periods(
-            self._freezer(freeze_on_idle_secs=5.0, check_frozen_garbage=True)
+            self._freezer(freeze_on_idle_secs=5.0, enable_frozen_garbage_check=True)
         )
         self.assertEqual(self._gc_calls(), [call.refreeze_gc("Scheduler")] * 2)
         self.assertEqual(
@@ -87,10 +87,14 @@ class TestGCFreezer(unittest.TestCase):
             [Severity.LEAK] * 2,
         )
 
-    def test_cache_reset_refreezes_only_while_freezing(self):
+    def test_cache_reset_unfreezes_and_the_next_idle_check_freezes(self):
         self._freezer(freeze_on_idle_secs=0.0).on_cache_reset()
         self.assertEqual(self._gc_calls(), [])
-        self._freezer(freeze_on_idle_secs=5.0).on_cache_reset()
+        freezer = self._freezer(freeze_on_idle_secs=5.0)
+        freezer.on_idle(self.forward_ct[0])
+        freezer.on_cache_reset()
+        self.assertEqual(self._gc_calls(), [call.unfreeze()])
+        freezer.on_idle(self.forward_ct[0])
         self.assertEqual(
             self._gc_calls(),
             [call.unfreeze(), call.collect(), call.freeze_gc("Scheduler")],
@@ -108,7 +112,7 @@ class TestGCFreezer(unittest.TestCase):
         self.assertEqual(warned, [False, False, True, False, True])
 
 
-class TestRefreezeGC(unittest.TestCase):
+class TestRefreezeGC(CustomTestCase):
     def test_finds_and_frees_frozen_objects_that_became_cyclic_garbage(self):
         root = _Node()
         for _ in range(10):

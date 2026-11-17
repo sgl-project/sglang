@@ -239,6 +239,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         self.assertTrue(s._event_loop_should_restart)
         # Flip to decode ensures decode CUDA graphs exist (idempotent capture).
         s.tp_worker.ensure_decode_cuda_graphs.assert_called_once()
+        s.gc_freezer.on_cache_reset.assert_called_once()
         # The in-progress guard is released after a successful flip.
         self.assertFalse(s._pd_role_switch_in_progress)
 
@@ -252,6 +253,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s.init_disaggregation.assert_called_once()
         # Flipping to prefill must not capture decode graphs.
         s.tp_worker.ensure_decode_cuda_graphs.assert_not_called()
+        s.gc_freezer.on_cache_reset.assert_called_once()
         self.assertTrue(s._event_loop_should_restart)
 
     def test_rejected_when_switch_in_progress(self):

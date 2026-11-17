@@ -89,6 +89,8 @@ class Device(msgspec.Struct):
         float,
         "After the scheduler has been idle this many seconds, run a full garbage collection "
         "and freeze the surviving objects, so later collections do not scan them. Runs once per "
-        "idle period; at most every 10 minutes, an idle freeze also unfreezes first, so frozen "
+        "idle period. A cache flush or PD role switch unfreezes the heap until the next idle "
+        "check. Any request, including a /health or /health_generate probe, restarts the idle "
+        "timer. At most every 10 minutes, an idle freeze also unfreezes first, so frozen "
         "objects that became garbage are freed and logged. Set to 0 to disable.",
     ] = 0.0

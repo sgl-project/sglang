@@ -216,6 +216,8 @@ from sglang.srt.speculative.spec_decoding_metrics import (
     populate_spec_info,
 )
 from sglang.srt.utils import (
+    configure_gc_logging,
+    freeze_gc,
     get_bool_env_var,
     get_or_create_event_loop,
     kill_process_tree,
@@ -228,7 +230,6 @@ from sglang.srt.utils.cudacore_pyspy_dump_utils import (
     pyspy_dump_schedulers,
     trigger_cuda_user_coredump,
 )
-from sglang.srt.utils.gc_utils import configure_gc_logging, freeze_gc
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.srt.utils.weight_versions import (

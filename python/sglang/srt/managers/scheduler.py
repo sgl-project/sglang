@@ -413,7 +413,9 @@ from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_captur
 from sglang.srt.state_capturer.routed_experts import destroy_global_experts_capturer
 from sglang.srt.utils import (
     DynamicGradMode,
+    configure_gc_logging,
     configure_logger,
+    freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
     get_int_env_var,
@@ -429,7 +431,6 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import TypeBasedDispatcher
 from sglang.srt.utils.device import is_confidential_compute, is_npu
-from sglang.srt.utils.gc_utils import configure_gc_logging, freeze_gc
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_versions import record_weight_version_events
@@ -2833,11 +2834,8 @@ class Scheduler(
         """Freeze the heap when idle; warn on heap growth and frozen garbage."""
         self.gc_freezer = GCFreezer(
             freeze_on_idle_secs=get_device().gc_freeze_on_idle_secs,
-            check_frozen_garbage=envs.SGLANG_ENABLE_GC_FROZEN_GARBAGE_CHECK.get(),
-            get_forward_ct=lambda: self.forward_ct,
+            enable_frozen_garbage_check=envs.SGLANG_ENABLE_GC_FROZEN_GARBAGE_CHECK.get(),
         )
-        for check in self.gc_freezer.checks():
-            self.invariant_checker.register(check)
 
     def init_rank_consensus_checker(self) -> None:
         groups = []
@@ -6038,6 +6036,7 @@ class Scheduler(
             self.token_to_kv_pool_allocator.flush_opportunistic()
 
         self.invariant_checker.run(CheckPhase.IDLE)
+        self.gc_freezer.on_idle(self.forward_ct)
 
         # metrics every 30s
         self.metrics_reporter._maybe_log_idle_metrics()
@@ -6294,6 +6293,7 @@ class Scheduler(
             if self.metrics_reporter.is_stats_logging_rank:
                 logger.info("Cache flushed successfully!")
             self.invariant_checker.run(CheckPhase.FLUSH)
+            self.gc_freezer.on_cache_reset()
             success = True
         else:
             logging.warning(
