@@ -106,7 +106,7 @@ LORA_MERGE_MODES = ("auto", "merge", "dynamic")
 MAX_SCHEDULER_RPC_TIMEOUT_S = 2_147_483
 # Mirrors AttentionBackend.supports_ring_rotation; the name-level check
 # runs before backend classes are importable on every platform.
-RING_CAPABLE_ATTENTION_BACKENDS = ("fa", "sage_attn")
+RING_CAPABLE_ATTENTION_BACKENDS = ("fa", "sage_attn", "aiter")
 
 
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
@@ -200,8 +200,10 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "comfy-org/ideogram-4",
         "efficient-large-model/sana1.5_1.6b_1024px_diffusers",
         "efficient-large-model/sana-video_2b_480p_diffusers",
+        "efficient-large-model/sana-video_2.0_5b_720p",
         "sana1.5_1.6b_1024px_diffusers",
         "sana-video_2b_480p_diffusers",
+        "sana-video_2.0_5b_720p",
         "fal/ideogram-v4-fast",
         "fal/ideogram-v4-instant",
         "flux.1-dev",
@@ -269,6 +271,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "QwenImage21PipelineConfig",
         "SanaPipelineConfig",
         "SanaVideoPipelineConfig",
+        "SanaVideo2PipelineConfig",
         "ZImagePipelineConfig",
         "Flux2KleinPipelineConfig",
     }
@@ -373,7 +376,6 @@ class ServerArgs(DisaggServerArgsMixin):
     # data parallelism
     # number of data parallelism groups
     dp_size: int = 1
-    # number of gpu in a dp group
     # cfg parallel (None = auto-decide based on num_gpus)
     enable_cfg_parallel: Optional[bool] = None
     # number of GPUs in each CFG parallel group (None = auto, 1 = disabled, N > 1 = enabled)
@@ -504,17 +506,17 @@ class ServerArgs(DisaggServerArgsMixin):
     enable_torch_compile: bool = False
     regional_compile: bool = False
 
-    # Breakable CUDA graph (BCG): capture the DiT forward as CUDA-graph
-    # segments split at attention modules (SP all-to-all / dynamic attention
-    # stay eager). Mutually exclusive with --enable-torch-compile and
-    # Cache-DiT; BCG takes priority when more than one is requested.
-    #
     # PyTorch's two approximate numerics defaults, set explicitly per worker
     # (see runtime/utils/numerics_policy.py). They are process-global, so they
     # cannot follow a request's quality level; the defaults keep PyTorch's own
     # values so the exact tier's speed is unchanged.
     allow_cudnn_tf32: bool = True
     allow_bf16_reduced_precision_reduction: bool = True
+    # Breakable CUDA graph (BCG): capture the DiT forward as CUDA-graph
+    # segments split at attention modules (SP all-to-all / dynamic attention
+    # stay eager). Mutually exclusive with --enable-torch-compile and
+    # Cache-DiT; BCG takes priority when more than one is requested.
+    #
     # BCG graphs are resolution-specific: every warmup resolution is captured at
     # warmup so serving never triggers a fresh capture. None resolves in
     # _adjust_breakable_cuda_graph_support (on for opted-in pipelines).
@@ -764,7 +766,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
         Falls back to :data:`DEFAULT_BCG_TEXT_BUCKETS` when ``--bcg-text-buckets``
         is unset, so both prompt padding and warmup capture share one source of
-        truth instead of the legacy ``SGLANG_BCG_TEXT_BUCKETS`` env var.
+        truth.
         """
         raw = self.bcg_text_buckets
         if not raw:
@@ -856,7 +858,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 "FLUX.1-dev, FLUX.2-Klein, FLUX.3 Image Klein, "
                 "Ideogram-4, jdopensource/JoyAI-Echo, Lightricks/LTX-2, "
                 "LongCat-Image, MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
-                "Qwen/Qwen-Image-2.1, SANA1.5, SANA-Video, "
+                "Qwen/Qwen-Image-2.1, SANA1.5, SANA-Video, SANA-Video 2.0, "
                 "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image.",
                 pipeline_config_name,
                 self.model_path,
@@ -1165,10 +1167,7 @@ class ServerArgs(DisaggServerArgsMixin):
         device_total_memory_gb = (
             current_platform.get_device_total_memory() / BYTES_PER_GB
         )
-        if (
-            "H200" in device_name
-            or device_total_memory_gb >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB
-        ):
+        if device_total_memory_gb >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB:
             logger.info(
                 "Automatically set ltx2_two_stage_device_mode=resident for high-memory CUDA GPU (%s, %.2f GiB total)",
                 device_name,
@@ -2970,7 +2969,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 "'original' keeps official two-stage semantics without premerged stage2, "
                 "'resident' keeps both transformers resident on GPU and runs stage 2 "
                 "on the one with the distilled LoRA merged in. "
-                "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise original."
+                "Default is auto: resident on CUDA GPUs with at least 130 GiB, otherwise original."
             ),
         )
         parser.add_argument(
@@ -4207,15 +4206,6 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"({self.ring_degree} * {self.ulysses_degree} = {self.ring_degree * self.ulysses_degree})"
             )
 
-        if os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() == "true":
-            has_sp = self.sp_degree > 1
-            has_tp = self.tp_size > 1
-            if has_sp and has_tp:
-                logger.warning(
-                    "cache-dit is enabled with hybrid parallelism (SP + TP). "
-                    "Proceeding anyway (SGLang integration may support this mode)."
-                )
-
     def _validate_cfg_parallel(self):
         if not self.enable_cfg_parallel:
             return
@@ -4283,9 +4273,5 @@ def set_global_server_args(server_args: ServerArgs):
 
 def get_global_server_args() -> ServerArgs:
     if _global_server_args is None:
-        # in ci, usually when we test custom ops/modules directly,
-        # we don't set the sgl_diffusion config. In that case, we set a default
-        # config.
-        # TODO(will): may need to handle this for CI.
         raise ValueError("Global sgl_diffusion args is not set.")
     return _global_server_args
