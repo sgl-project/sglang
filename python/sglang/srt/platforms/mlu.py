@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 
@@ -77,17 +77,3 @@ class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
 
     def get_dispatch_key_name(self) -> str:
         return "mlu"
-
-    def register_tensor_ipc_reducers(self) -> bool:
-        from sglang.srt.utils.mlu_ipc import register_mlu_reductions
-
-        register_mlu_reductions()
-        # The built-in patch uses CUDA device UUIDs, which do not identify MLUs.
-        return True
-
-    def get_tensor_ipc_rebuild_fn(
-        self, module: str, name: str
-    ) -> Callable[..., torch.Tensor] | None:
-        from sglang.srt.utils.mlu_ipc import get_tensor_ipc_rebuild_fn
-
-        return get_tensor_ipc_rebuild_fn(module, name)

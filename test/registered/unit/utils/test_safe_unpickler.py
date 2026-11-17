@@ -3,14 +3,11 @@ import pickle
 import unittest
 from collections import OrderedDict, defaultdict, deque
 from functools import partial
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
-from sglang.srt.platforms.cpu import CpuSRTPlatform
-from sglang.srt.platforms.mlu import MluSRTPlatform
-from sglang.srt.utils import serialization
 from sglang.srt.utils.serialization import (
     MultiprocessingSerializer,
     SafeUnpickler,
@@ -114,47 +111,60 @@ class TestSafeUnpickler(CustomTestCase):
             with self.subTest(payload=payload):
                 self.assertIs(safe_pickle_loads(payload), Modality.IMAGE)
 
-    def test_platform_rebuild_deserializes_tensor(self):
-        """A backend tensor payload must deserialize without general-plugin loading."""
 
-        class Platform(CpuSRTPlatform):
-            def get_tensor_ipc_rebuild_fn(self, module, name):
-                if (module, name) == ("example_backend.reductions", "rebuild_tensor"):
-                    return torch.tensor
-                return None
+class TestMLUTensorIPC(CustomTestCase):
+    def test_registration_preserves_cpu_tensors_and_parameters(self):
+        from multiprocessing.reduction import ForkingPickler
 
-        # GLOBAL + REDUCE reconstructs a tensor from the arguments ((1, 2),).
-        payload = b"cexample_backend.reductions\nrebuild_tensor\n((I1\nI2\nttR."
-        with patch.object(serialization, "current_platform", Platform()):
-            restored = safe_pickle_loads(payload)
-        self.assertTrue(torch.equal(restored, torch.tensor([1, 2])))
+        from torch.multiprocessing.reductions import reduce_tensor
 
-    def test_platform_default_does_not_allow_unknown_global(self):
-        """Declining a backend global must not fall back to unrestricted imports."""
-        with patch.object(serialization, "current_platform", CpuSRTPlatform()):
-            with self.assertRaisesRegex(RuntimeError, "Blocked unsafe global"):
-                safe_pickle_loads(b"cos\nsystem\n.")
+        from sglang.srt.utils import patch_torch
 
-    def test_mlu_rebuild_allowlist_is_exact(self):
-        """MLU payloads resolve rebuilds without allowing other backend globals."""
-        from sglang.srt.utils import mlu_ipc
-
-        native = SimpleNamespace(rebuild_mlu_tensor=lambda: None)
+        native = SimpleNamespace(
+            _reduce_tensor=reduce_tensor, rebuild_mlu_tensor=lambda: None
+        )
         with (
             patch.dict("sys.modules", {"torch_mlu.mlu.reductions": native}),
-            patch.object(serialization, "current_platform", MluSRTPlatform()),
+            patch.dict(ForkingPickler._extra_reducers),
+            patch.object(patch_torch, "_is_mlu", True),
         ):
-            self.assertIs(
-                safe_pickle_loads(pickle.dumps(mlu_ipc._rebuild_mlu_tensor_modified)),
-                mlu_ipc._rebuild_mlu_tensor_modified,
-            )
+            patch_torch.monkey_patch_torch_reductions()
+            patch_torch.monkey_patch_torch_reductions()
+            tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)[:, 1::2]
+            for value in (tensor, torch.nn.Parameter(tensor)):
+                with self.subTest(tensor_type=type(value)):
+                    restored = MultiprocessingSerializer.deserialize(
+                        MultiprocessingSerializer.serialize(value)
+                    )
+                    self.assertIs(type(restored), type(value))
+                    self.assertTrue(torch.equal(restored, value))
+                    self.assertEqual(restored.device.type, "cpu")
+                    self.assertEqual(restored.stride(), value.stride())
+                    self.assertEqual(restored.requires_grad, value.requires_grad)
+
+    def test_rebuild_allowlist_is_exact(self):
+        from sglang.srt.utils import patch_torch
+
+        self.assertIs(
+            safe_pickle_loads(pickle.dumps(patch_torch._rebuild_mlu_tensor_modified)),
+            patch_torch._rebuild_mlu_tensor_modified,
+        )
+        native = SimpleNamespace(rebuild_mlu_tensor=lambda: None)
+        with patch.dict(
+            "sys.modules",
+            {
+                "torch_mlu": ModuleType("torch_mlu"),
+                "torch_mlu.mlu": ModuleType("torch_mlu.mlu"),
+                "torch_mlu.mlu.reductions": native,
+            },
+        ):
             unpickler = SafeUnpickler(io.BytesIO())
             self.assertIs(
                 unpickler.find_class("torch_mlu.mlu.reductions", "rebuild_mlu_tensor"),
                 native.rebuild_mlu_tensor,
             )
             for module, name in (
-                (mlu_ipc.__name__, "register_mlu_reductions"),
+                (patch_torch.__name__, "_reduce_mlu_tensor"),
                 ("torch_mlu.mlu.reductions", "_reduce_tensor"),
                 ("torch_mlu.mlu.reductions.other", "rebuild_mlu_tensor"),
             ):
@@ -162,21 +172,16 @@ class TestSafeUnpickler(CustomTestCase):
                     with self.assertRaisesRegex(RuntimeError, "Blocked unsafe global"):
                         unpickler.find_class(module, name)
 
-    def test_builtin_globals_and_storage_loader_take_precedence(self):
-        """Backend lookup must not replace built-ins or the restricted storage loader."""
+    def test_rejects_invisible_device(self):
+        from sglang.srt.utils.patch_torch import _mlu_device_from_uuid
 
-        class Platform(CpuSRTPlatform):
-            def get_tensor_ipc_rebuild_fn(self, module, name):
-                raise AssertionError("Built-in globals must not consult the backend")
-
-        with patch.object(serialization, "current_platform", Platform()):
-            restored = safe_pickle_loads(b"cbuiltins\nset\n((I1\nI2\nttR.")
-            self.assertEqual(restored, {1, 2})
-            unpickler = serialization.SafeUnpickler(io.BytesIO())
-            self.assertIs(
-                unpickler.find_class("torch.storage", "_load_from_bytes"),
-                serialization._safe_load_torch_storage,
-            )
+        device_api = SimpleNamespace(
+            device_count=lambda: 1,
+            get_device_properties=lambda i: SimpleNamespace(uuid="card-b"),
+        )
+        with patch.object(torch, "mlu", device_api, create=True):
+            with self.assertRaisesRegex(RuntimeError, "'card-a' is not visible"):
+                _mlu_device_from_uuid("card-a")
 
 
 if __name__ == "__main__":
