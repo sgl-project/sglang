@@ -1,5 +1,8 @@
 name: Nightly Test (NPU)
 on:
+  pull_request:
+    branches:
+      - main
   schedule:
     - cron: '0 16 * * *'  # Execute at 0:00 a.m. Beijing Time every day
   workflow_dispatch:
@@ -139,7 +142,7 @@ jobs:
 
   nightly-1-npu-a3:
     name: nightly-1-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-1-npu-a3,')) }}
+    if: false # TEMP: only the GLM-5.3 DCP/PCP 32p single-point accuracy suite is under validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -154,7 +157,7 @@ jobs:
 
   nightly-2-npu-a3:
     name: nightly-2-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-2-npu-a3,')) }}
+    if: false # TEMP: only the GLM-5.3 DCP/PCP 32p single-point accuracy suite is under validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -170,7 +173,7 @@ jobs:
   # The nightly-4-npu-a3 suite is split across 2 parallel partition jobs, mirroring base-b-test-4-npu-a3 in the PR pipeline.
   nightly-4-npu-a3:
     name: nightly-4-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-4-npu-a3,')) }}
+    if: false # TEMP: only the GLM-5.3 DCP/PCP 32p single-point accuracy suite is under validation
     needs: [set-image-config, sgl-router-build-aarch64]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -188,7 +191,7 @@ jobs:
 
   nightly-8-npu-a3:
     name: nightly-8-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-8-npu-a3,')) }}
+    if: false # TEMP: only the GLM-5.3 DCP/PCP 32p single-point accuracy suite is under validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -203,7 +206,7 @@ jobs:
 
   nightly-16-npu-a3:
     name: nightly-16-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-16-npu-a3,')) }}
+    if: false # TEMP: only the GLM-5.3 DCP/PCP 32p single-point accuracy suite is under validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -218,7 +221,7 @@ jobs:
 
   nightly-perf-2-npu-a3:
     name: nightly-perf-2-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-perf-2-npu-a3,')) }}
+    if: false # TEMP: only the GLM-5.3 DCP/PCP 32p single-point accuracy suite is under validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -234,7 +237,7 @@ jobs:
 
   nightly-perf-4-npu-a3:
     name: nightly-perf-4-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-perf-4-npu-a3,')) }}
+    if: false # TEMP: only the GLM-5.3 DCP/PCP 32p single-point accuracy suite is under validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -250,7 +253,7 @@ jobs:
 
   nightly-perf-16-npu-a3:
     name: nightly-perf-16-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-perf-16-npu-a3,')) }}
+    if: false # TEMP: only the GLM-5.3 DCP/PCP 32p single-point accuracy suite is under validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -268,7 +271,7 @@ jobs:
   # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
   nightly-acc-2-npu-a3:
     name: nightly-acc-2-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-2-npu-a3,')) }}
+    if: false # TEMP: only the GLM-5.3 DCP/PCP 32p single-point accuracy suite is under validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -285,7 +288,7 @@ jobs:
 
   nightly-acc-16-npu-a3:
     name: nightly-acc-16-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-16-npu-a3,')) }}
+    if: false # TEMP: only the GLM-5.3 DCP/PCP 32p single-point accuracy suite is under validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -301,7 +304,7 @@ jobs:
 
   nightly-acc-4-npu-a5:
      name: nightly-acc-4-npu-a5
-     if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-4-npu-a5,')) }}
+     if: false # TEMP: only the GLM-5.3 DCP/PCP 32p single-point accuracy suite is under validation
      needs: [set-image-config]
      uses: ./.github/workflows/_npu-single-node-test-stage.yml
      with:
@@ -317,7 +320,7 @@ jobs:
 
   # The router the PD tests in nightly-4-npu-a3 and nightly-poc-multi-node-tests launch.
   sgl-router-build-aarch64:
-    if: ${{ needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-4-npu-a3,') || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-tests,') }}
+    if: false # TEMP: only the GLM-5.3 DCP/PCP 32p single-point accuracy suite is under validation
     needs: [set-image-config]
     uses: ./.github/workflows/_pr-test-sgl-router-build.yml
     with:
@@ -327,7 +330,7 @@ jobs:
 
   nightly-poc-multi-node-tests:
     name: multi-node-poc
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-tests,')) }}
+    if: false # TEMP: only the GLM-5.3 DCP/PCP 32p single-point accuracy suite is under validation
     needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3, sgl-router-build-aarch64]
     strategy:
       fail-fast: false
@@ -394,7 +397,7 @@ jobs:
 
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-mix-tests,')) }}
+    if: false # TEMP: only the GLM-5.3 DCP/PCP 32p single-point accuracy suite is under validation
     needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
     strategy:
       fail-fast: false
@@ -432,8 +435,42 @@ jobs:
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
       accuracy_dataset: ${{ matrix.test_config.test_type == 'accuracy' && needs.set-image-config.outputs.accuracy_dataset || '' }}
 
-  check-all-jobs:
+  # TEMP: single-case validation of the merged GLM-5.3 DCP/PCP accuracy case.
+  # Runs on PR (pull_request to main) and on manual dispatch; every other job is
+  # gated with `if: false`. Remove this job and the gates once the case is verified.
+  tmp-validate-glm53-rotate:
+    name: tmp-glm53-rotate-accuracy
     if: ${{ !cancelled() }}
+    needs: [set-image-config]
+    strategy:
+      fail-fast: false
+      matrix:
+        test_config:
+          - name: glm_5_3_w8a8_1p1d_32p_gpqa
+            prefill_size: 2
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_gpqa.py
+            test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
+    uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
+    with:
+      runner: linux-amd64-cpu-4
+      test_type: ${{ matrix.test_config.test_type }}
+      test_config_name: ${{ matrix.test_config.name }}
+      prefill_size: ${{ matrix.test_config.prefill_size }}
+      decode_size: ${{ matrix.test_config.decode_size }}
+      router_size: ${{ matrix.test_config.router_size }}
+      test_case: ${{ matrix.test_config.test_case }}
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      prefill_decode_deployment: ${{ matrix.test_config.prefill_decode_deployment }}
+      transformers_version: ''
+      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+      accuracy_dataset: ${{ needs.set-image-config.outputs.accuracy_dataset }}
+      sgl_router_artifact: ''
+
+  check-all-jobs:
+    if: false # TEMP: only the GLM-5.3 DCP/PCP 32p single-point accuracy suite is under validation
     needs:
       - nightly-1-npu-a3
       - nightly-2-npu-a3
