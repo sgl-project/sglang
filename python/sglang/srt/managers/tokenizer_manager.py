@@ -1021,6 +1021,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
                     await self._send_one_request(tokenized_obj)
+                    if isinstance(obj.input_ids, list) and isinstance(
+                        tokenized_obj.input_ids, array
+                    ):
+                        obj.input_ids = tokenized_obj.input_ids
                     async for response in self._wait_one_response(obj, request):
                         yield response
                 else:

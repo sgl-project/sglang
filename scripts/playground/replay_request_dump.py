@@ -12,6 +12,7 @@ import glob
 import json
 import time
 import traceback
+from array import array
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import datetime
@@ -48,6 +49,8 @@ def normalize_request_data(json_data):
     for field in ["image_data", "video_data", "audio_data"]:
         if field in json_data and json_data[field] is not None:
             json_data[field] = normalize_mm_data(json_data[field])
+    if isinstance(json_data.get("input_ids"), array):
+        json_data["input_ids"] = json_data["input_ids"].tolist()
     return json_data
 
 

@@ -4,6 +4,7 @@ requests that carry a watermark field are redacted."""
 
 import json
 import unittest
+from array import array
 from unittest import mock
 
 import msgspec
@@ -205,6 +206,16 @@ class TestRequestLogRedaction(CustomTestCase):
         self.assertIs(redact_watermark_secrets(ids_tuple), ids_tuple)
         redacted = redact_watermark_secrets([{"watermark_key": SECRET}])
         self.assertEqual(redacted, [{"watermark_key": "<redacted>"}])
+
+    def test_dispatched_array_input_ids_log_like_a_list(self):
+        listed, dispatched = _request(5000), _request(5000)
+        dispatched.input_ids = array("q", dispatched.input_ids)
+        for fn in (
+            request_logger._dataclass_to_string_truncated,
+            request_logger._transform_data_for_logging,
+        ):
+            self.assertEqual(fn(dispatched), fn(listed), fn.__name__)
+        json.dumps(request_logger._transform_data_for_logging(dispatched))
 
 
 if __name__ == "__main__":

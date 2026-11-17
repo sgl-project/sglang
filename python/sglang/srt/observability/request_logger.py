@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from array import array
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.constants import ROUTING_KEY_HEADER
@@ -405,6 +406,8 @@ def _dataclass_to_string_truncated(
 ) -> str:
     if skip_names is None:
         skip_names = set()
+    if isinstance(data, array):
+        data = data.tolist()
     if isinstance(data, str):
         if len(data) > max_length:
             half_length = max_length // 2
@@ -448,6 +451,8 @@ def _transform_data_for_logging(
 ) -> Any:
     if skip_names is None:
         skip_names = set()
+    if isinstance(data, array):
+        data = data.tolist()
     if isinstance(data, str):
         if len(data) > max_length:
             half_length = max_length // 2
