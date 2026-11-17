@@ -1064,7 +1064,10 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 prior_token_drop.unsqueeze(-1), 0
             )
         else:
-            prior_embedding[prior_token_drop] *= 0.0
+            # select, not a boolean-mask write: its nonzero syncs the host
+            prior_embedding = torch.where(
+                prior_token_drop.unsqueeze(-1), prior_embedding * 0.0, prior_embedding
+            )
 
         prior_hidden_states = self.prior_projector(prior_embedding)
         # SP: when latents are H-sharded, hidden_states has fewer patches than prior_hidden_states.

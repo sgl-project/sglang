@@ -16,12 +16,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.jit.utils import (
-    cache_once,
-    get_jit_cuda_arch,
-    load_jit,
-    make_cpp_args,
-)
+from sglang.kernels.arch import current_arch
+from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -35,8 +31,9 @@ DEFAULT_NUM_ITERS = 5
 
 
 def _sm_ver() -> int:
-    arch = get_jit_cuda_arch()
-    return arch.major * 100 + arch.minor * 10
+    cuda = current_arch().cuda
+    assert cuda is not None, "the LPLB CUDA solver needs an NVIDIA GPU"
+    return cuda.sm_version * 10
 
 
 @cache_once

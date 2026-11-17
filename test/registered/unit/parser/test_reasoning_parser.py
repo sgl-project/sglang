@@ -24,7 +24,7 @@ from sglang.srt.parser.reasoning_parser_names import REASONING_PARSER_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestBaseReasoningFormatDetector(CustomTestCase):
@@ -1090,6 +1090,17 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
                         self._feed(DeepSeekR1Detector(), text, chunk_size), expected
                     )
 
+    def test_tool_start_before_think_end_ends_reasoning(self):
+        """A tool call opened inside the think block, with the think end after it,
+        must end reasoning at the tool marker at every chunk width and one-shot,
+        where the grammar also ends it; it must not turn into reasoning text."""
+        tool_call = '<tool_call>{"x":1}</tool_call>'
+        self._assert_invariant(
+            Qwen3Detector,
+            f"<think>thinking{tool_call}</think>answer",
+            ("thinking", f"{tool_call}</think>answer"),
+        )
+
     def test_text_before_think_token_is_chunk_dependent(self):
         """Accepted divergence, inherited from main: text before `<think>` lands
         in reasoning or content depending on where the chunk boundary falls."""
@@ -1183,6 +1194,18 @@ class TestMiniMaxM3Detector(CustomTestCase):
     def test_plain_reply_untouched(self):
         result = self._detector().detect_and_parse("Just a normal answer.")
         self.assertEqual(result.normal_text, "Just a normal answer.")
+
+    def test_only_m3_declares_a_self_opened_think_start(self):
+        tokenizer = type(
+            "Tok", (), {"encode": lambda self, text, add_special_tokens: [len(text)]}
+        )()
+        self.assertEqual(
+            self._detector().get_self_opened_think_start_token_ids(tokenizer),
+            [len("<mm:think>")],
+        )
+        self.assertIsNone(
+            Qwen3Detector().get_self_opened_think_start_token_ids(tokenizer)
+        )
 
     def test_real_reasoning_block_non_stream(self):
         result = self._detector().detect_and_parse(
@@ -1703,6 +1726,33 @@ class TestMuseSparkReasoningParser(CustomTestCase):
             "<|start|>assistant to=user<|message|>No tool needed.<|eot|>",
             (f"Consider {quoted}.", "No tool needed."),
         )
+
+
+_ERNIE5_TOOL_CALL = (
+    "<ernie:tool_call>\n"
+    '<invoke name="get_weather">\n'
+    '<parameter name="city">Beijing</parameter>\n'
+    "</invoke>\n"
+    "</ernie:tool_call>"
+)
+
+
+class TestErnie5_5ReasoningParser(CustomTestCase):
+    def test_splits_the_think_block(self):
+        parser = ReasoningParser("ernie55")
+        reasoning, content = parser.parse_non_stream(
+            "<ernie:think>weighing it up</ernie:think>the answer"
+        )
+        self.assertEqual(reasoning.strip(), "weighing it up")
+        self.assertEqual(content.strip(), "the answer")
+
+    def test_a_tool_call_closes_an_open_think_block(self):
+        parser = ReasoningParser("ernie55")
+        reasoning, content = parser.parse_non_stream(
+            "<ernie:think>I need a tool" + _ERNIE5_TOOL_CALL
+        )
+        self.assertIn("I need a tool", reasoning)
+        self.assertIn("<ernie:tool_call>", content)
 
 
 class TestReasoningParserNames(CustomTestCase):

@@ -329,7 +329,7 @@ sglang serve \
   --cuda-graph-max-bs-decode 28 \
   --device npu \
   --attention-backend ascend \
-  --disable-fast-image-processor \
+  --image-processor-backend pil \
   --tp-size 2 \
   --host 0.0.0.0 \
   --port 30020 \
@@ -370,7 +370,7 @@ python fetch_images.py \
 
 ## Port Convention
 
-Result endpoints are derived deterministically from the head node's `--scheduler-port` (default: 5555):
+Result endpoints are derived deterministically from the head node's `--scheduler-port` (pass an explicit port other than 5555: unless `--strict-ports` is set, the value 5555, whether default or passed, is randomized within 5555-5655, and an occupied port is moved to another free port):
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -413,6 +413,8 @@ Result endpoints are derived deterministically from the head node's `--scheduler
 
 Role instances derive their result endpoint automatically from `--disagg-server-addr`. No manual endpoint configuration needed.
 
+Pass `--strict-ports` to the head and to every worker so that a busy port fails at startup instead of silently diverging from the addresses in `--*-urls`/`--disagg-server-addr`.
+
 ## Transfer Mechanism
 
 Tensor data between adjacent roles is transferred via a P2P transfer engine. The DiffusionServer routes control messages and request metadata; tensors flow directly between workers. Uploaded reference files are forwarded inline as request metadata.
@@ -436,6 +438,22 @@ pip install mooncake-transfer-engine
 6. **Receiver** loads the tensors on its transfer stream and executes its stages. Receive prefetch can overlap the previous request's compute.
 
 Decoder results (final output) flow back through DiffusionServer as raw ZMQ frames to the HTTP client.
+
+### Failure Isolation
+
+The head rejects malformed scheduler requests and duplicate active request IDs
+without replacing the original request. Each scheduler message carries one
+request; use concurrent API calls for independent requests, or `n` for multiple
+outputs from one request.
+
+Tensor decoding errors fail only the associated request when its ID can be
+recovered. Results without an identifiable request are logged and discarded;
+affected requests still rely on `--disagg-timeout`. Reported worker errors release
+their scheduling capacity and reserved receive slots so later requests can run.
+
+Keep scheduler and worker ports on a trusted private network. This error handling
+does not make the pickle-based scheduler protocol safe for untrusted clients, or
+provide durable jobs and transparent recovery after a head restart.
 
 ### RDMA Flags
 
@@ -502,7 +520,12 @@ Set `--disagg-p2p-hostname` to the actual IP on each machine. For multi-machine,
   </tbody>
 </table>
 
-If not specified, parallelism is auto-derived from `--num-gpus`.
+Role-specific flags take precedence over explicitly set generic flags such as
+`--tp-size` and `--sp-degree`. Otherwise, parallelism is auto-derived for each
+role's `--num-gpus` (or its GPU list in the Python pool API). Automatic CFG,
+sequence-parallel and HSDP choices from the parent configuration are not reused
+for a role with a different device count. Explicit incompatible settings still
+raise an error; they are not silently reduced to fit.
 
 ## Other Options
 
@@ -551,7 +574,7 @@ if __name__ == "__main__":
     launch_pool_disagg_server(
         server_args,
         encoder_gpus=[[0]],
-        denoiser_gpus=[[1, 2, 3, 4], [5, 6, 7, 8]],
+        denoiser_gpus=[[1, 2, 3, 4]],
         decoder_gpus=[[0]],
     )
 ```
@@ -585,4 +608,6 @@ PENDING → ENCODER_WAITING → ENCODER_RUNNING → ENCODER_DONE
                                     DECODER_WAITING → DECODER_RUNNING → DONE
 ```
 
-Any state can transition to `FAILED` or `TIMED_OUT`.
+With split encoding (a separate image encoder pool), `ENCODER_DONE` → `IMAGE_ENCODER_WAITING` → `IMAGE_ENCODER_RUNNING` → `IMAGE_ENCODER_DONE` → `DENOISING_WAITING`. In GLM-Image distributed mode the request finishes at `DENOISING_DONE` → `DONE`.
+
+Any non-terminal state can transition to `FAILED` or `TIMED_OUT`.

@@ -24,9 +24,11 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
-        op="embeddings.engram_gather_peer",
+        op="embeddings.engram_rows_to_token_major",
         backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.embeddings.engram_gather:engram_gather_peer",
+        target=(
+            "sglang.kernels.ops.embeddings.engram_gather:engram_rows_to_token_major"
+        ),
     )
 )
 
