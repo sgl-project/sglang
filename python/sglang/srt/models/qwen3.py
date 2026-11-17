@@ -9,7 +9,10 @@ from sglang.kernels.ops.attention.qk_norm_rope import qk_norm_rope
 from sglang.kernels.ops.attention.table_qk_norm_rope import table_qk_norm_rope_
 from sglang.srt.environ import envs
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
-from sglang.srt.layers.last_layer_ffn import eligible_batch, select_attention_rows
+from sglang.srt.layers.last_layer_ffn import (
+    configure_last_layer_ffn,
+    prepare_last_layer_ffn,
+)
 from sglang.srt.layers.layer_boundary import (
     NORM_QUANT_READOUT,
     append_stages,
@@ -41,9 +44,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_kv_layers
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.model_executor.runner_utils.prefill_graph import (
-    is_in_prefill_graph_scope,
-)
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -541,7 +541,6 @@ class Qwen3DecoderLayer(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
-        self.is_last_ffn = layer_id == config.num_hidden_layers - 1
         self.hidden_size = config.hidden_size
         if (
             hasattr(config, "rope_parameters")
@@ -695,11 +694,6 @@ class Qwen3DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
-        if self.is_last_ffn and forward_batch.last_layer_ffn_indices is not None:
-            hidden_states = select_attention_rows(
-                hidden_states, forward_batch, forward_batch.last_layer_ffn_indices
-            )
-            forward_batch.last_layer_ffn_pruned = True
         hidden_states = self.ffn_boundary.prepare(
             hidden_states,
             forward_batch,
@@ -830,21 +824,11 @@ class Qwen3ForCausalLM(nn.Module):
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
-        # Skip only terminal FFN rows unused by next-token generation.
-        self.enable_last_layer_ffn_pruning = (
-            envs.SGLANG_ENABLE_LAST_LAYER_FFN_PRUNING.get()
-        )
-        self._ffn_pruning_supported = (
-            type(self) is Qwen3ForCausalLM
-            and config.model_type == "qwen3"
-            and quant_config is None
-            and _is_cuda
-            and get_parallel().tp_size == 1
-            and self.pp_group.world_size == 1
-            and not get_parallel().enable_dp_attention
-            and get_parallel().attn_cp_size == 1
-            and get_exec().graph.cuda_graph_config.prefill.backend
-            in (Backend.DISABLED, Backend.BREAKABLE)
+        configure_last_layer_ffn(
+            self,
+            supported_architecture=type(self) is Qwen3ForCausalLM
+            and config.model_type == "qwen3",
+            quant_config=quant_config,
         )
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -860,30 +844,9 @@ class Qwen3ForCausalLM(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        graph_rows = forward_batch.last_layer_ffn_graph_rows
-        if graph_rows:
-            # The selected graph already produces compact rows. The runner has
-            # staged live indices before replay; do not replace their storage.
-            forward_batch.last_layer_ffn_pruned = True
-        else:
-            forward_batch.last_layer_ffn_indices = None
-            forward_batch.last_layer_ffn_pruned = False
-        if (
-            not graph_rows
-            and not is_in_prefill_graph_scope()
-            and self.enable_last_layer_ffn_pruning
-            and self._ffn_pruning_supported
-            and not get_embedding
-            and input_embeds is None
-            and not self.capture_aux_hidden_states
-            and not self.model.layers_to_capture
-            and not torch.compiler.is_compiling()
-            and not torch.cuda.is_current_stream_capturing()
-            and eligible_batch(forward_batch)
-        ):
-            forward_batch.last_layer_ffn_indices = (
-                torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
-            ).long()
+        graph_rows = prepare_last_layer_ffn(
+            self, forward_batch, get_embedding=get_embedding, input_embeds=input_embeds
+        )
         hidden_states = self.model(
             input_ids,
             positions,

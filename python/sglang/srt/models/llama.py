@@ -32,6 +32,10 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dual_gemm import DualGemm
+from sglang.srt.layers.last_layer_ffn import (
+    configure_last_layer_ffn,
+    prepare_last_layer_ffn,
+)
 from sglang.srt.layers.layer_boundary import (
     append_stages,
     declare_attn,
@@ -598,6 +602,12 @@ class LlamaForCausalLM(nn.Module):
         ]
 
         self.capture_aux_hidden_states = False
+        configure_last_layer_ffn(
+            self,
+            supported_architecture=type(self) is LlamaForCausalLM
+            and config.model_type == "llama",
+            quant_config=quant_config,
+        )
 
     def _init_model(
         self,
@@ -617,6 +627,9 @@ class LlamaForCausalLM(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> LogitsProcessorOutput:
+        graph_rows = prepare_last_layer_ffn(
+            self, forward_batch, get_embedding=get_embedding, input_embeds=input_embeds
+        )
         hidden_states = self.model(
             input_ids,
             positions,
@@ -625,6 +638,8 @@ class LlamaForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+        if graph_rows:
+            hidden_states = hidden_states[: forward_batch.batch_size]
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
@@ -637,6 +652,7 @@ class LlamaForCausalLM(nn.Module):
                     self.lm_head,
                     forward_batch,
                     aux_hidden_states,
+                    last_layer_ffn_pruned=forward_batch.last_layer_ffn_pruned,
                 )
             else:
                 return self.pooler(hidden_states, forward_batch)

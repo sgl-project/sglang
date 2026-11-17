@@ -1,4 +1,4 @@
-"""Last-layer FFN row selection for dense Qwen2 and Qwen3."""
+"""Shared last-layer FFN row selection for supported dense decoders."""
 
 import torch
 
@@ -100,3 +100,57 @@ def stage_graph_indices(buffer, seq_lens, rows):
     buffer[:bs].sub_(1)
     if bs < rows:
         buffer[bs:rows].zero_()
+
+
+def configure_last_layer_ffn(model, *, supported_architecture, quant_config):
+    """An explicit architecture opt-in, restricted to the validated layouts."""
+    from sglang.srt.environ import envs
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+    from sglang.srt.runtime_context import get_exec, get_parallel
+    from sglang.srt.utils import is_cuda
+
+    model.enable_last_layer_ffn_pruning = (
+        envs.SGLANG_ENABLE_LAST_LAYER_FFN_PRUNING.get()
+    )
+    model._ffn_pruning_supported = (
+        supported_architecture
+        and quant_config is None
+        and is_cuda()
+        and get_parallel().tp_size == 1
+        and model.pp_group.world_size == 1
+        and not get_parallel().enable_dp_attention
+        and get_parallel().attn_cp_size == 1
+        and get_exec().graph.cuda_graph_config.prefill.backend
+        in (Backend.DISABLED, Backend.BREAKABLE)
+    )
+
+
+def prepare_last_layer_ffn(model, batch, *, get_embedding=False, input_embeds=None):
+    """Plan selected rows once, before entering the shared layer boundaries."""
+    from sglang.srt.model_executor.runner_utils.prefill_graph import (
+        is_in_prefill_graph_scope,
+    )
+
+    graph_rows = batch.last_layer_ffn_graph_rows
+    if graph_rows:
+        batch.last_layer_ffn_pruned = True
+    else:
+        batch.last_layer_ffn_indices = None
+        batch.last_layer_ffn_pruned = False
+    if (
+        not graph_rows
+        and not is_in_prefill_graph_scope()
+        and model.enable_last_layer_ffn_pruning
+        and model._ffn_pruning_supported
+        and not get_embedding
+        and input_embeds is None
+        and not model.capture_aux_hidden_states
+        and not model.model.layers_to_capture
+        and not torch.compiler.is_compiling()
+        and not torch.cuda.is_current_stream_capturing()
+        and eligible_batch(batch)
+    ):
+        batch.last_layer_ffn_indices = (
+            torch.cumsum(batch.extend_seq_lens, dim=0) - 1
+        ).long()
+    return graph_rows
