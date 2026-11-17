@@ -343,8 +343,9 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             model=self.model,
             max_tokens=2048,
             messages=messages,
-            temperature=0.9,
-            top_p=0.9,
+            # Greedy: at temperature 0.9 the 1B model writes the call as a
+            # Python dict (single quotes) in ~2-9% of runs, which isn't a tool call.
+            temperature=0,
             stream=True,
             tools=tools,
         )
