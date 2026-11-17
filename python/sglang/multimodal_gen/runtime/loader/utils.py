@@ -368,22 +368,36 @@ def _clean_hf_config_inplace(model_config: dict) -> None:
         model_config.pop(key, None)
 
 
+def _parse_hf_cache_path(model_path: str) -> tuple[str, str, str] | None:
+    """(repo_id, revision, subfolder) of a path inside the HF cache, else None.
+
+    Matches the cache layout models--{org}--{repo}/snapshots/{revision}/{subfolder}.
+    """
+    match = re.search(
+        r"models--([^/\\]+)--([^/\\]+)[/\\]snapshots[/\\]([^/\\]+)(?:[/\\](.*))?",
+        model_path,
+    )
+    if not match:
+        return None
+    repo_id = f"{match.group(1)}/{match.group(2)}"
+    subfolder = (match.group(4) or "").replace("\\", "/").strip("/")
+    return repo_id, match.group(3), subfolder
+
+
 def _try_redownload_missing_shards(model_path: str, missing: list[str]) -> bool:
     """Try to re-download missing safetensors shards from HuggingFace Hub.
 
-    Parses the repo_id and revision from the HF cache path structure
-    (models--{org}--{repo}/snapshots/{revision}) and calls hf_hub_download
-    for each missing shard. Returns True if all shards were recovered.
+    Parses the repo_id, revision and component subfolder from the HF cache path
+    (models--{org}--{repo}/snapshots/{revision}/{subfolder}) and calls
+    hf_hub_download for each missing shard. Returns True if all shards were
+    recovered.
     """
     try:
-        match = re.search(
-            r"models--([^/\\]+)--([^/\\]+)[/\\]snapshots[/\\]([^/\\]+)", model_path
-        )
-        if not match:
+        parsed = _parse_hf_cache_path(model_path)
+        if parsed is None:
             return False
 
-        repo_id = f"{match.group(1)}/{match.group(2)}"
-        revision = match.group(3)
+        repo_id, revision, subfolder = parsed
         logger.warning(
             "Incomplete checkpoint for %s (revision %.8s) — missing shards: %s. "
             "Attempting auto-repair via HuggingFace Hub...",
@@ -392,7 +406,9 @@ def _try_redownload_missing_shards(model_path: str, missing: list[str]) -> bool:
             missing,
         )
         for shard in missing:
-            hf_hub_download(repo_id=repo_id, filename=shard, revision=revision)
+            # Shard names in a component's index are relative to that component.
+            filename = f"{subfolder}/{shard}" if subfolder else shard
+            hf_hub_download(repo_id=repo_id, filename=filename, revision=revision)
         logger.info("Auto-repair succeeded for %s.", repo_id)
         return True
     except Exception as e:
@@ -647,11 +663,20 @@ def _list_safetensors_files(
                     glob.glob(os.path.join(str(model_path), "*.safetensors"))
                 )
             else:
+                parsed = _parse_hf_cache_path(model_path)
+                if parsed is not None:
+                    repo_id, revision, subfolder = parsed
+                    include = f" --include '{subfolder}/*'" if subfolder else ""
+                    hint = (
+                        "Re-download the checkpoint (e.g. "
+                        f"`hf download {repo_id} --revision {revision}{include}`)."
+                    )
+                else:
+                    hint = f"Re-download the checkpoint that provides '{model_path}'."
                 raise RuntimeError(
                     f"Checkpoint at '{model_path}' is incomplete — the following "
                     f"shard(s) listed in the index are missing from disk: "
-                    f"{missing}. Re-download the checkpoint (e.g. "
-                    f"`huggingface-cli download {os.path.basename(model_path)}`)."
+                    f"{missing}. {hint}"
                 )
 
         if not raw_candidates:
