@@ -64,7 +64,6 @@ class NPUACLFormat(IntEnum):
 
 
 def _call_once(fn: Callable):
-
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         if getattr(fn, "_has_been_called", False):
@@ -350,17 +349,6 @@ def npu_format_cast(
     return torch.ops.npu.npu_format_cast(tensor, acl_format.value)
 
 
-from sglang.srt.hardware_backend.npu.stream_management import (
-    get_indexer_weight_stream,
-    get_routed_stream,
-    get_share_stream,
-    process_routed_expert,
-    process_shared_expert,
-    set_routed_stream,
-    set_share_stream,
-    wait_routed_stream,
-    wait_share_stream,
-)
 
 
 def init_zbal(world_size, gpu_id, world_rank, do_check=True):
@@ -451,5 +439,3 @@ def lazy_init_zbal_gva_mem(
         logger.error("[ZBAL] zbal lazy init failed!")
         sys.exit(-1)
     return res
-
-

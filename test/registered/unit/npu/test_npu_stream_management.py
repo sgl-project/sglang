@@ -3,9 +3,11 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
-import torch
+from sglang.test.ci.ci_register import register_cpu_ci
 
-from sglang.srt.hardware_backend.npu import stream_management as sm
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+from sglang.srt.hardware_backend.npu import stream_management as sm  # noqa: E402
 
 
 class TestNpuStreamManagement(unittest.TestCase):
@@ -43,7 +45,6 @@ class TestNpuStreamManagement(unittest.TestCase):
     def test_process_shared_expert_creates_stream(self, mock_dev_mod):
         dev = MagicMock()
         stream = MagicMock()
-        ctx = MagicMock()
         dev.Stream.return_value = stream
         dev.current_stream.return_value = MagicMock()
         dev.stream.return_value.__enter__ = MagicMock(return_value=None)
