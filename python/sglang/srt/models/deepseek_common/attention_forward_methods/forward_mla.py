@@ -14,7 +14,10 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import is_graph_dsa_split_op_surface
-from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
+from sglang.srt.layers.attention.dsa_backend import (
+    prepare_kv_for_attention,
+    uses_raw_fp8_dsa_kv_layout,
+)
 from sglang.srt.layers.attention.graph_utils import padded_extend_real_tokens
 from sglang.srt.layers.cp.interleave import (
     DSAInterleaveCPIndexerOverlap,
@@ -28,7 +31,10 @@ from sglang.srt.layers.dcp import (
     dcp_push_combine_fits,
     dcp_push_combine_reduce,
 )
-from sglang.srt.layers.dcp.layout import dsa_shards_index_k
+from sglang.srt.layers.dcp.layout import (
+    dsa_shards_index_k,
+    is_mla_dcp_lse_base_on_e,
+)
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.lora.utils import kv_b_lora_correction
@@ -93,12 +99,6 @@ def _select_local_dcp_heads_for_autotune(
     return attn_output.narrow(1, rank * num_local_heads, num_local_heads)
 
 
-def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
-    if attention_backend == "dsa":
-        return dsa_shards_index_k()
-    return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
-
-
 @eager_on_graph(True)
 def bcg_dcp_extend_kv_gather(
     token_to_kv_pool,
@@ -114,9 +114,11 @@ def bcg_dcp_extend_kv_gather(
         forward_batch = get_forward_batch()
     metadata = forward_batch.attn_dcp_metadata
     if metadata.dcp_extend_prefix_lens_sum == 0:
-        # No prefix KV on any DCP rank: skip the collective.
-        metadata.dcp_kv_buffer[..., :kv_lora_rank] = k_nope
-        metadata.dcp_kv_buffer[..., kv_lora_rank:] = k_pe
+        # No prefix KV on any DCP rank: skip the collective. The buffer holds the
+        # real tokens; a replayed k_nope/k_pe is padded to the bucket.
+        num_tokens = metadata.dcp_kv_buffer.shape[0]
+        metadata.dcp_kv_buffer[..., :kv_lora_rank] = k_nope[:num_tokens]
+        metadata.dcp_kv_buffer[..., kv_lora_rank:] = k_pe[:num_tokens]
         return
     all_gather_kv_cache_for_mla_extend(
         token_to_kv_pool,
@@ -133,15 +135,6 @@ def bcg_dcp_extend_kv_gather(
 
 if _is_cuda:
     from sglang.kernels.ops.gemm import bmm_fp8
-
-
-def should_defer_dsa_cp_kv_gather(
-    *,
-    dsa_prefill_cp: bool,
-    fuse_rope_for_trtllm_mla: bool,
-) -> bool:
-    """Compatibility predicate imported by the unchanged ROCm MLA path."""
-    return dsa_prefill_cp and fuse_rope_for_trtllm_mla
 
 
 def _apply_attention_output_gate(module, attn_output, gate):
@@ -1154,8 +1147,8 @@ class DeepseekMLAForwardMixin:
             return False
         if self.current_attention_backend in ("dsa", "nsa"):
             return (
-                get_exec().kernel.dsa_decode_backend == "trtllm"
-                or get_exec().kernel.dsa_prefill_backend == "trtllm"
+                uses_raw_fp8_dsa_kv_layout(get_exec().kernel.dsa_decode_backend)
+                or uses_raw_fp8_dsa_kv_layout(get_exec().kernel.dsa_prefill_backend)
             ) and get_attn_backend().kv_cache_dtype == torch.float8_e4m3fn
 
         return (

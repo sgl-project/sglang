@@ -543,18 +543,12 @@ class DiffusersPipeline(ComposedPipelineBase):
     def _apply_attention_backend(
         self, pipe: DiffusionPipeline, server_args: ServerArgs
     ) -> None:
-        """Apply attention backend setting from pipeline config or server_args.
+        """Apply the attention backend setting from server_args.
 
         See: https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends
         Available backends: flash, _flash_3_hub, sage, xformers, native, etc.
         """
         backend = server_args.attention_backend
-
-        if backend is None:
-            backend = getattr(
-                server_args.pipeline_config, "diffusers_attention_backend", None
-            )
-
         if backend is None:
             return
 
