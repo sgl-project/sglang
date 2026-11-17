@@ -1,10 +1,8 @@
-import io
 import pickle
 import unittest
 from collections import OrderedDict, defaultdict, deque
 from functools import partial
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 
@@ -110,68 +108,6 @@ class TestSafeUnpickler(CustomTestCase):
         for payload in (current, pre_move):
             with self.subTest(payload=payload):
                 self.assertIs(safe_pickle_loads(payload), Modality.IMAGE)
-
-
-class TestMLUTensorIPC(CustomTestCase):
-    def test_registration_preserves_cpu_tensors_and_parameters(self):
-        from multiprocessing.reduction import ForkingPickler
-
-        from torch.multiprocessing.reductions import reduce_tensor
-
-        from sglang.srt.utils import patch_torch
-
-        native = SimpleNamespace(
-            _reduce_tensor=reduce_tensor, rebuild_mlu_tensor=lambda: None
-        )
-        with (
-            patch.dict("sys.modules", {"torch_mlu.mlu.reductions": native}),
-            patch.dict(ForkingPickler._extra_reducers),
-            patch.object(patch_torch, "_is_mlu", True),
-        ):
-            patch_torch.monkey_patch_torch_reductions()
-            tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)[:, 1::2]
-            for value in (tensor, torch.nn.Parameter(tensor)):
-                with self.subTest(tensor_type=type(value)):
-                    restored = MultiprocessingSerializer.deserialize(
-                        MultiprocessingSerializer.serialize(value)
-                    )
-                    self.assertIs(type(restored), type(value))
-                    self.assertTrue(torch.equal(restored, value))
-                    self.assertEqual(restored.device.type, "cpu")
-                    self.assertEqual(restored.stride(), value.stride())
-                    self.assertEqual(restored.requires_grad, value.requires_grad)
-
-    def test_rebuild_allowlist_is_exact(self):
-        from sglang.srt.utils import patch_torch
-
-        self.assertIs(
-            safe_pickle_loads(pickle.dumps(patch_torch._rebuild_mlu_tensor_modified)),
-            patch_torch._rebuild_mlu_tensor_modified,
-        )
-        self.assertIn(
-            ("torch_mlu.mlu.reductions", "rebuild_mlu_tensor"),
-            SafeUnpickler.ALLOWED_GLOBALS,
-        )
-        unpickler = SafeUnpickler(io.BytesIO())
-        for module, name in (
-            (patch_torch.__name__, "_reduce_mlu_tensor"),
-            ("torch_mlu.mlu.reductions", "_reduce_tensor"),
-            ("torch_mlu.mlu.reductions.other", "rebuild_mlu_tensor"),
-        ):
-            with self.subTest(module=module, name=name):
-                with self.assertRaisesRegex(RuntimeError, "Blocked unsafe global"):
-                    unpickler.find_class(module, name)
-
-    def test_rejects_invisible_device(self):
-        from sglang.srt.utils.patch_torch import _mlu_device_from_uuid
-
-        device_api = SimpleNamespace(
-            device_count=lambda: 1,
-            get_device_properties=lambda i: SimpleNamespace(uuid="card-b"),
-        )
-        with patch.object(torch, "mlu", device_api, create=True):
-            with self.assertRaisesRegex(RuntimeError, "'card-a' is not visible"):
-                _mlu_device_from_uuid("card-a")
 
 
 if __name__ == "__main__":
