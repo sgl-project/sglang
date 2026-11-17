@@ -8,6 +8,8 @@ branch is bitwise that all-reduce's; the norms round where the Triton boundary k
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -31,16 +33,44 @@ if TYPE_CHECKING:
 # one 256-thread block holds a row, 4 bf16 vectors per thread
 _MAX_HIDDEN = 256 * 4 * 8
 
+logger = logging.getLogger(__name__)
+_LOG_DECISIONS = os.environ.get("SGLANG_ROCM_MUSE_AR_BOUNDARY_LOG", "0") == "1"
+# vec: per-vector exchange; unrolled: from kTwoShotPushUnrolledMinBytes the plain unrolled 2shot_push's
+# exchange; factored: segment sums travel with the reduced rows, elementwise boundary on every rank
+_KERNEL_MODES = {"vec": 0, "unrolled": 1, "factored": 2}
+_MODE = _KERNEL_MODES[os.environ.get("SGLANG_ROCM_MUSE_AR_BOUNDARY_KERNEL", "vec")]
+_logged: set = set()
+
+
+def _log_once(key, msg: str) -> None:
+    if _LOG_DECISIONS and key not in _logged:
+        _logged.add(key)
+        logger.warning("AR boundary: %s", msg)
+
 
 @cache_once
 def _jit_module(world_size: int) -> Module:
-    args = make_cpp_args(world_size, is_arch_support_pdl())
+    args = make_cpp_args(world_size, is_arch_support_pdl(), _MODE)
+    _log_once("jit", f"kernel mode={_MODE}")
     return load_jit(
         "muse_all_reduce_norm_residual_hip",
         *args,
         cuda_files=["muse_spark/all_reduce_norm_residual_hip.cuh"],
         cuda_wrappers=[("run", f"MuseAllReduceNormResidualKernel<{args}>::run")],
     )
+
+
+def _factored_layout(hidden: int, world_size: int) -> tuple[int, int] | None:
+    """(segments, pieces) per row of the factored kernel, or None where it falls back to the
+    per-vector one: a segment is a warp of 32 lanes times kTwoShotPushReduceUnroll 16-byte
+    vectors, a piece 32 lanes times 2, and a lane per piece gathers the row's sums."""
+    reduce_unroll = 8 if world_size <= 4 else 4
+    seg_elems = 32 * reduce_unroll * 8
+    if hidden % seg_elems:
+        return None
+    segs = hidden // seg_elems
+    pieces = segs * reduce_unroll // 2
+    return (segs, pieces) if pieces <= 32 else None
 
 
 def _boundary_form_supported(boundary: FusedPostNormResidualPreNorm) -> bool:
@@ -94,14 +124,22 @@ class AllReduceAttnBoundary:
             ).use_hier
         ):
             return False
-        # a slot holds the partial and the reduced copy of each rank's rows
+        # a slot holds the partial and the reduced copy of each rank's rows (+ segment sums)
         rows_per_rank = -(-num_rows // comm.world_size)
-        return 2 * rows_per_rank * row_bytes <= comm._max_push_size
+        return rows_per_rank * self._slot_row_bytes(comm.world_size) <= comm._max_push_size
+
+    def _slot_row_bytes(self, world_size: int) -> int:
+        hidden = self._boundary._hidden_size
+        layout = _factored_layout(hidden, world_size) if _MODE == 2 else None
+        sums = 16 * layout[0] * layout[1] if layout else 0
+        return 2 * hidden * 2 + sums
 
     def applicable(self, stream: torch.Tensor) -> bool:
         if not self._form_supported:
+            _log_once("form", "off: boundary form or arch not supported")
             return False
         if stream.dtype != torch.float32 or not stream.is_contiguous():
+            _log_once(("stream", stream.dtype), f"off: stream {stream.dtype}")
             return False
         num_rows = stream.shape[0]
         if num_rows == 0:
@@ -112,12 +150,17 @@ class AllReduceAttnBoundary:
 
         comm = self._comm()
         if not isinstance(comm, CustomAllReduceV2) or comm.disabled:
+            _log_once("comm", f"off: tp ca_comm is {type(comm).__name__}")
             return False
         # capture and eager read different heuristics of the comm's config
         key = (num_rows, comm._can_use_graph())
         applies = self._applies.get(key)
         if applies is None:
             applies = self._applies[key] = self._decide(comm, num_rows)
+            _log_once(
+                key,
+                f"rows={num_rows} graph={key[1]} {'FUSED' if applies else 'plain'}",
+            )
         return applies
 
     def __call__(
