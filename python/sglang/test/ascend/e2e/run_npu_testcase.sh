@@ -109,8 +109,17 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-# Run the checkout's sglang; the image only supplies the environment.
-export PYTHONPATH="${sglang_source_path}/python${PYTHONPATH:+:${PYTHONPATH}}"
+# Use the image's sglang; only overlay the checkout's test utilities.
+sglang_pkg_path=/sgl-workspace/sglang/python
+ascend_test_util_path=${sglang_pkg_path}/sglang/test/ascend
+mkdir -p "${ascend_test_util_path}"
+mv "${ascend_test_util_path}" "${ascend_test_util_path}_bak" 2>/dev/null || true
+cp -r "${sglang_source_path}/python/sglang/test/ascend" "${ascend_test_util_path}"
+
+# Keep the image-compatible test/ci snapshot, mirroring the single-node stage.
+ci_test_util_path=${sglang_pkg_path}/sglang/test/ci
+if [ -d "${ci_test_util_path}" ]; then mv "${ci_test_util_path}" "${ci_test_util_path}_bak"; fi
+cp -r "${sglang_source_path}/scripts/ci/npu/compat/ci" "${ci_test_util_path}"
 
 # set environment of cann
 . /usr/local/Ascend/cann/set_env.sh
@@ -122,6 +131,8 @@ source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bi
 export SGLANG_DSPARK_A5_EXTRA_OPS_SO=/usr/local/Ascend/extra-ops/vllm_ascend_C.cpython-312-x86_64-linux-gnu.so
 export ASCEND_CUSTOM_OPP_PATH=/usr/local/Ascend/extra-ops/vendors/custom_transformer/:$ASCEND_CUSTOM_OPP_PATH
 export LD_LIBRARY_PATH=/usr/local/Ascend/extra-ops/vendors/custom_transformer/op_api/lib:$LD_LIBRARY_PATH
+
+${PYTHON_FOR_SGLANG} -c "import sglang; print('sglang from:', sglang.__file__)"
 
 echo "Running test case ${test_case}"
 tc_name=${test_case##*/}
