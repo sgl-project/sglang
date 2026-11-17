@@ -380,5 +380,57 @@ def test_target_only_triton_matches_reference():
         assert torch.equal(actual[name].cpu(), want), name
 
 
+@pytest.mark.skipif(torch.version.cuda is None, reason="UNO compact path requires CUDA")
+@pytest.mark.parametrize("requests", [1, 16, 68])
+def test_uno_fused_top_p_mass_matches_the_compiled_bound(requests, monkeypatch):
+    """SGLANG_OPT_SPEC_FUSED_TOP_P_MASS: the compiled bound up to fp32 summation order,
+    and the same kept supports."""
+    from sglang.kernels.ops.speculative.top_p_mass import top_p_for_top_k_support
+    from sglang.srt.speculative import uno_utils
+    from sglang.srt.speculative.dflash_utils import _adjust_top_p_for_top_k
+
+    width, vocab, max_top_k = 4, 248320, 20
+    rows = requests * width
+    g = torch.Generator(device="cuda").manual_seed(requests)
+    logits = torch.randn(rows, vocab, generator=g, device="cuda") * 2.5
+    peaks = torch.randint(0, vocab, (rows, 8), generator=g, device="cuda")
+    logits.scatter_add_(1, peaks, torch.rand(rows, 8, generator=g, device="cuda") * 12)
+    temperatures = 0.5 + torch.rand(requests, 1, generator=g, device="cuda")
+    top_ks = torch.randint(2, max_top_k + 1, (requests,), generator=g, device="cuda")
+    top_ps = 0.6 + 0.4 * torch.rand(requests, generator=g, device="cuda")
+
+    topk_logits = torch.topk(logits, max_top_k, dim=-1).values
+    expanded_t = temperatures.repeat_interleave(width, dim=0)
+    valid = torch.arange(max_top_k, device="cuda")[None, :] < top_ks.repeat_interleave(
+        width
+    ).view(rows, 1)
+    scaled = (topk_logits / expanded_t).masked_fill(~valid, float("-inf"))
+    want = _adjust_top_p_for_top_k(
+        scaled, logits, top_ps.repeat_interleave(width).view(rows, 1), expanded_t
+    )
+    got = top_p_for_top_k_support(
+        topk_logits, logits, temperatures, top_ks, top_ps, width
+    )
+    torch.testing.assert_close(got, want, rtol=1e-5, atol=0)
+
+    supports = {}
+    for fused in (False, True):
+        monkeypatch.setattr(uno_utils, "_FUSED_TOP_P_MASS", fused)
+        supports[fused] = _build_sparse_target_support_tensors(
+            next_token_logits=logits,
+            temperatures=temperatures,
+            top_ks=top_ks,
+            top_ps=top_ps,
+            batch_size=requests,
+            forward_width=width,
+            max_top_k=max_top_k,
+        )
+    assert torch.equal(supports[False][0], supports[True][0])
+    assert torch.equal(supports[False][1] > 0, supports[True][1] > 0)
+    torch.testing.assert_close(
+        supports[True][1], supports[False][1], rtol=1e-5, atol=1e-7
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
