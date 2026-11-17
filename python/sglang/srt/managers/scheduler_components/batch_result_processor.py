@@ -135,6 +135,7 @@ def _rows_to_lists(rows: List[torch.Tensor]) -> List[list]:
     # `.tolist()` is a blocking device-to-host copy; read them back together.
     if (
         len(rows) < 2
+        or rows[0].device.type == "cpu"
         or any(row.dim() != 1 for row in rows)
         or len({row.dtype for row in rows}) > 1
     ):
