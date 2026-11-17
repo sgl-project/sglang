@@ -97,7 +97,7 @@ class NPUSwigluDeepEPKernel(BaseActivation):
 
             self._kernel = swiglu_oai_quant
         else:
-            from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
+            from sgl_kernel_npu.operators.activation import swiglu_quant
 
             self._kernel = swiglu_quant
 
@@ -135,7 +135,7 @@ class NPUSitu(BaseActivation):
         beta: float = 4.0,
         linear_beta: Optional[float] = 25.0,
     ):
-        from sgl_kernel_npu.activation.situ import situ
+        from sgl_kernel_npu.operators.activation import situ
 
         self.situ = situ
         self.need_quant = need_quant
@@ -195,9 +195,9 @@ class NPUGeluAndMul(BaseActivation):
 
 class NPUSwigluOAI(BaseActivation):
     def __init__(self, moe_runner_config=None):
-        from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai_triton
+        from sgl_kernel_npu.operators.activation import swiglu_oai
 
-        self._kernel = swiglu_oai_triton
+        self._kernel = swiglu_oai
         self._moe_runner_config = moe_runner_config
 
     def _apply_activation(self, hidden_states: torch.Tensor):

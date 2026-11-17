@@ -333,10 +333,10 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
 
 
 if _is_npu:
-    from sgl_kernel_npu.norm.split_qkv_rmsnorm_mrope import (
-        triton_split_qkv_rmsnorm_mrope,
+    from sgl_kernel_npu.operators.norm import (
+        split_qkv_rmsnorm_mrope,
+        split_qkvgate_gemma_rmsnorm_rope,
     )
-    from sgl_kernel_npu.operators.norm import split_qkvgate_gemma_rmsnorm_rope
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
@@ -1548,7 +1548,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         if positions.ndim == 1:
             positions = positions.expand(3, -1)
         cos_sin = rotary_emb.cos_sin_cache[positions].to(qkv)
-        q, k, v, gate = triton_split_qkv_rmsnorm_mrope(
+        q, k, v, gate = split_qkv_rmsnorm_mrope(
             qkv=qkv,
             q_weight=self.q_norm.gemma_weight,
             k_weight=self.k_norm.gemma_weight,

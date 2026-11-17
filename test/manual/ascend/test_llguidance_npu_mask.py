@@ -76,12 +76,12 @@ def _install_npu_mock():
     if not hasattr(torch, "npu"):
         torch.npu = types.ModuleType("torch_npu_mock")
     torch.npu.is_available = lambda: True
+    if "sgl_kernel_npu" not in sys.modules:
+        sys.modules["sgl_kernel_npu"] = MagicMock()
+
     sys.modules["sgl_kernel_npu.operators.sampler"] = MagicMock(
         apply_token_bitmask=fake_ops.apply_token_bitmask
     )
-
-    if "sgl_kernel_npu" not in sys.modules:
-        sys.modules["sgl_kernel_npu"] = MagicMock()
 
     return fake_ops
 
