@@ -49,9 +49,13 @@ source sglang-metal/bin/activate
 uv pip install --upgrade pip
 uv run python/sglang/kernels/aot/setup_metal.py install
 
-# Install sglang python package along with diffusion support
+# Install sglang for LLM / MLX serving and tests (lighter than all_mps; skips diffusion deps).
+# If Rust/cargo is not installed, set SGLANG_BUILD_RUST_EXTS=none to skip optional Rust extensions.
 rm -f python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
-uv pip install -e "python[all_mps]"
+SGLANG_BUILD_RUST_EXTS=none uv pip install -e "python[srt_mps,test]"
+
+# Or install with diffusion support as well (requires Rust/cargo unless SGLANG_BUILD_RUST_EXTS=none is set):
+# uv pip install -e "python[all_mps]"
 ```
 
 ## Launch of the Serving Engine
