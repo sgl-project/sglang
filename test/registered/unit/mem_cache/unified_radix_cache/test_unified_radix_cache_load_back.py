@@ -920,7 +920,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         self._release_ongoing_load_back_locks(cache)
 
     @requires_full_mamba_ps1
-    def test_host_only_second_load_back_on_inflight_anchor_retries(self):
+    def test_host_only_load_back_on_inflight_anchor(self):
         cache, allocator, req_to_token_pool = self._build_hicache_fixture(
             tree_core_backend="python"
         )
@@ -936,12 +936,12 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
             req_to_token_pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
             req.kv.mamba_pool_idx = None
             req.last_node = cache.root_node_handle()
+            req.mamba_host_hit_length = 1
             return req
 
-        first, second = make_req(), make_req()
         # First load restores the KV, so only the host mamba hit routes the
-        # second request into load-back.
-        second.mamba_host_hit_length = 1
+        # later requests into load-back.
+        first, needs_kv, state_only = make_req(), make_req(), make_req()
         with mock.patch.object(
             cache.components[ComponentType.MAMBA],
             "_mamba_host_only_checkpoint",
@@ -949,15 +949,31 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         ):
             self.assertTrue(cache.load_back(leaf, req=first))
             mamba_avail = req_to_token_pool.mamba_allocator.available_size()
+            # A fetch that still reads KV from host waits for the in-flight load.
             loaded = cache.init_load_back(
-                InitLoadBackParams(best_match_node=leaf, host_hit_length=0, req=second)
+                InitLoadBackParams(
+                    best_match_node=leaf, host_hit_length=1, req=needs_kv
+                )
             )
             self.assertIsNone(loaded)
-            self.assertIsNone(second.kv.mamba_pool_idx)
+            self.assertIsNone(needs_kv.kv.mamba_pool_idx)
             self.assertEqual(
                 req_to_token_pool.mamba_allocator.available_size(), mamba_avail
             )
+            # A state-only fetch loads its own slot beside it, with its own receipt.
+            loaded = cache.init_load_back(
+                InitLoadBackParams(
+                    best_match_node=leaf, host_hit_length=0, req=state_only
+                )
+            )
+            self.assertEqual(loaded[1], leaf)
+            self.assertIsNotNone(state_only.kv.mamba_pool_idx)
+            self.assertLess(
+                req_to_token_pool.mamba_allocator.available_size(), mamba_avail
+            )
+            self.assertEqual(len(cache.ongoing_load_back[leaf]), 2)
             self._finish_pending_loads(cache)
+            self.assertNotIn(leaf, cache.ongoing_load_back)
         self._release_ongoing_load_back_locks(cache)
 
     @requires_full_mamba_ps1
@@ -1301,6 +1317,54 @@ class TestInflightAnchorStillLoads(CustomTestCase):
             InitLoadBackParams(best_match_node=7, host_hit_length=1, req=req),
         )
         self.assertEqual(loaded, (2, 7))
+
+
+class TestHostOnlyConcurrentFetch(CustomTestCase):
+    def _init_load_back(self, *, evicted, host_hit, window_hit):
+        from types import SimpleNamespace
+
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        loads = []
+        cache = SimpleNamespace(
+            buffer_pipeline=None,
+            linker=None,
+            _mamba_host_only_checkpoint=lambda: True,
+            ongoing_load_back={7: [object()]},
+            tree_core=SimpleNamespace(
+                is_full_device_evicted=lambda _node_id: evicted,
+                collect_full_device_indices=lambda *_a, **_k: torch.tensor([1, 2]),
+            ),
+            load_back=lambda *a, **k: loads.append(a) or True,
+        )
+        req = SimpleNamespace(
+            last_node=3,
+            rid="r",
+            mamba_host_hit_length=1,
+            window_host_hit_lengths={"swa": window_hit},
+        )
+        loaded = UnifiedRadixCache.init_load_back(
+            cache,
+            InitLoadBackParams(best_match_node=7, host_hit_length=host_hit, req=req),
+        )
+        return loaded, loads
+
+    def test_only_a_state_only_fetch_goes_beside_the_inflight_anchor(self):
+        cases = [
+            (dict(evicted=False, host_hit=0, window_hit=0), True),
+            (dict(evicted=True, host_hit=0, window_hit=0), False),
+            (dict(evicted=False, host_hit=1, window_hit=0), False),
+            (dict(evicted=False, host_hit=0, window_hit=1), False),
+        ]
+        for kwargs, state_only in cases:
+            with self.subTest(**kwargs):
+                loaded, loads = self._init_load_back(**kwargs)
+                if state_only:
+                    self.assertEqual(loaded, (2, 7))
+                    self.assertEqual(len(loads), 1)
+                else:
+                    self.assertIsNone(loaded)
+                    self.assertEqual(loads, [])
 
 
 define_config_test_classes(UnifiedRadixCacheLoadBackSuite, globals())

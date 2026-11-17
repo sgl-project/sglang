@@ -4577,9 +4577,16 @@ class UnifiedRadixCache(BasePrefixCache):
             # ongoing_load_back is keyed by anchor. A host-only mamba
             # checkpoint stays off the device after its load, so another
             # request can reach this anchor before the first H->D is acked.
+            # A state-only fetch may go beside it: its H->D fills only the request's
+            # own slot, and the load stream orders it after the anchor's.
             if (
                 self._mamba_host_only_checkpoint()
                 and best_match_node_id in self.ongoing_load_back
+                and not (
+                    params.host_hit_length == 0
+                    and not any(req.window_host_hit_lengths.values())
+                    and not self.tree_core.is_full_device_evicted(best_match_node_id)
+                )
             ):
                 return None
             if self.load_back(best_match_node_id, mem_quota, req=req):
