@@ -19,9 +19,9 @@ use crate::unified_lru_list::{TlruFloatConfig, TlruPromptEstimate};
 use crate::unified_tree_core::KvCacheEvent;
 use crate::unified_tree_core::{
     BufferBackupSnapshot, BufferBackupState, CacheAction, CacheActions, CacheInitParams,
-    CacheTransferPhase, DecLockRefParams, EvictLayer, EvictionStepResult, InsertParams,
-    InsertResult, InsertStepResult, MatchPrefixParams, MatchResult, PoolHitPolicy, PoolName,
-    PoolTransfer, PoolTransferResult, Req, UnifiedTreeCore,
+    CacheResidencyOptions, CacheTransferPhase, DecLockRefParams, EvictLayer, EvictionStepResult,
+    InsertParams, InsertResult, InsertStepResult, MatchPrefixParams, MatchResult, PoolHitPolicy,
+    PoolName, PoolTransfer, PoolTransferResult, Req, UnifiedTreeCore,
 };
 
 /// Translate only Rust panics; ordinary Python errors pass through unchanged.
@@ -2002,6 +2002,27 @@ macro_rules! tree_core_methods {
                     .map_err(node_access_error)
             }
 
+            /// Set the cache-residency switches (all off by default).
+            fn configure_cache_residency(&self, py: Python<'_>, host_evict_first: bool) {
+                let options = CacheResidencyOptions { host_evict_first };
+                py.detach(|| self.core().configure_cache_residency(options));
+            }
+
+            /// Cumulative residency counters, by name.
+            fn cache_residency_stats(&self, py: Python<'_>) -> HashMap<&'static str, u64> {
+                let stats = py.detach(|| self.core().cache_residency_stats());
+                HashMap::from([
+                    ("host_evict_first_marked", stats.host_evict_first_marked),
+                    ("host_evict_first_full_tokens", stats.host_evict_first_full_tokens),
+                    ("host_evict_first_mamba_states", stats.host_evict_first_mamba_states),
+                ])
+            }
+
+            /// Mark finished nodes host evict-first; returns the nodes newly marked.
+            fn mark_host_evict_first(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> usize {
+                py.detach(|| self.core().mark_host_evict_first(node_ids))
+            }
+
             /// Release a node's device KV once its host copy exists.
             fn demote(&self, py: Python<'_>, node_id: NodeId) -> PyResult<DemoteResultBinding> {
                 let result = py
@@ -3380,6 +3401,24 @@ macro_rules! tree_core_binding {
                 copied: Vec<NodeId>,
             ) -> PyResult<usize> {
                 catch_native_panic(|| self.inner.mark_write_back_queued(py, node_id, copied))
+            }
+
+            /// Set the cache-residency switches (all off by default).
+            fn configure_cache_residency(&self, py: Python<'_>, host_evict_first: bool) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.configure_cache_residency(py, host_evict_first);
+                    Ok(())
+                })
+            }
+
+            /// Cumulative residency counters, by name.
+            fn cache_residency_stats(&self, py: Python<'_>) -> PyResult<HashMap<&'static str, u64>> {
+                catch_native_panic(|| Ok(self.inner.cache_residency_stats(py)))
+            }
+
+            /// Mark finished nodes host evict-first; returns the nodes newly marked.
+            fn mark_host_evict_first(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<usize> {
+                catch_native_panic(|| Ok(self.inner.mark_host_evict_first(py, node_ids)))
             }
 
             /// Release a node's device KV once its host copy exists.

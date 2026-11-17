@@ -488,6 +488,7 @@ class Engine(EngineScoreMixin, EngineBase):
         session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
+        parent_session_id: Optional[str] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -526,6 +527,7 @@ class Engine(EngineScoreMixin, EngineBase):
             external_trace_header=external_trace_header,
             rid=rid,
             session_id=session_id,
+            parent_session_id=parent_session_id,
             session_params=session_params,
             priority=priority,
         )
@@ -599,6 +601,7 @@ class Engine(EngineScoreMixin, EngineBase):
         session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
+        parent_session_id: Optional[str] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -637,6 +640,7 @@ class Engine(EngineScoreMixin, EngineBase):
             external_trace_header=external_trace_header,
             rid=rid,
             session_id=session_id,
+            parent_session_id=parent_session_id,
             session_params=session_params,
             priority=priority,
         )
