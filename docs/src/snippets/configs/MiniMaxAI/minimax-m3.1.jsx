@@ -114,14 +114,18 @@ const cfg = {
 -H 'Content-Type: application/json' \\
 -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
 
+  // Blackwell needs a CUDA 13.4 toolkit for the MSA kernels. The cu134 nightly is
+  // published for arm64 only, so GB300 / GB200 use it and x86 B300 / B200 keep the
+  // CUDA 13.4 dev image. Hopper does not use MSA and runs the cu130 nightly. AMD
+  // support is not in main yet, so MI350X / MI355X keep their dev image.
   dockerImages: {
     b300:  "lmsysorg/sglang:dev-minimax-m31-flash",
-    gb300: "lmsysorg/sglang:dev-minimax-m31-flash",
-    gb200: "lmsysorg/sglang:dev-minimax-m31-flash",
+    gb300: "lmsysorg/sglang:nightly-cu134",
+    gb200: "lmsysorg/sglang:nightly-cu134",
     b200:  "lmsysorg/sglang:dev-minimax-m31-flash",
-    h200:  "lmsysorg/sglang:dev-minimax-m31-flash",
-    mi355x: "lmsysorg/sglang:dev-minimax-m31-flash-mi35x ",
-    mi350x: "lmsysorg/sglang:dev-minimax-m31-flash-mi35x ",
+    h200:  "lmsysorg/sglang:dev",
+    mi355x: "lmsysorg/sglang:dev-minimax-m31-flash-mi35x",
+    mi350x: "lmsysorg/sglang:dev-minimax-m31-flash-mi35x",
   },
 
   github: {
