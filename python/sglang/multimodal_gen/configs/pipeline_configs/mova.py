@@ -47,7 +47,6 @@ class MOVAPipelineConfig(PipelineConfig):
     )
 
     # MOVA specific
-    audio_vae_type: str = "dac"
     boundary_ratio: float | None = 0.9
 
     # temporal alignment: MOVA expects (num_frames - 1) % 4 == 0

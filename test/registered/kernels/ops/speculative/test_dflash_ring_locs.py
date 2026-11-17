@@ -1,4 +1,5 @@
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -24,6 +25,9 @@ def test_block_locs_match_ring_locs(dcp):
         dcp_size=dcp,
         req_to_token_rows=9,
         device="cuda",
+        window_left=1023,
+        dcp_rank=0,
+        pool=SimpleNamespace(maybe_get_custom_mem_pool=lambda: None),
     )
     req_pool_indices = torch.tensor([3, 7, 1, 8], dtype=torch.int32, device="cuda")
     prefix = torch.tensor([5000, 700, 3, 0], dtype=torch.int64, device="cuda")
