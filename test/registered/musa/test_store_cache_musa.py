@@ -76,18 +76,29 @@ def test_musa_cache_store_is_graph_safe() -> None:
     assert torch.equal(v_cache[indices], v)
 
 
-def test_memory_pool_routes_musa_store_through_public_triton_kernel() -> None:
+def test_musa_cache_store_keeps_asymmetric_kv_on_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     if not is_musa():
         pytest.skip("MUSA is required")
 
-    row_dim = 64
+    row_dim = 16
+    v_row_dim = 8
     k = torch.randn((8, row_dim), dtype=torch.bfloat16, device="musa")
-    v = torch.randn((8, row_dim), dtype=torch.bfloat16, device="musa")
+    v = torch.randn((8, v_row_dim), dtype=torch.bfloat16, device="musa")
     k_cache = torch.zeros((32, row_dim), dtype=torch.bfloat16, device="musa")
-    v_cache = torch.zeros((32, row_dim), dtype=torch.bfloat16, device="musa")
-    k_cache.requires_grad_(True)
-    v_cache.requires_grad_(True)
-    indices = torch.arange(8, device="musa", dtype=torch.int32)
+    v_cache = torch.zeros((32, v_row_dim), dtype=torch.bfloat16, device="musa")
+    indices = torch.tensor(
+        [3, 7, 11, 15, 19, 23, 27, 31], device="musa", dtype=torch.int32
+    )
+
+    def fail_triton_store(*args: object, **kwargs: object) -> None:
+        raise AssertionError("asymmetric MUSA KV rows must use the fallback")
+
+    monkeypatch.setattr(
+        "sglang.srt.mem_cache.memory_pool._set_kv_buffer_prefix_valid_impl",
+        fail_triton_store,
+    )
 
     _set_kv_buffer_impl(
         k,
@@ -99,10 +110,16 @@ def test_memory_pool_routes_musa_store_through_public_triton_kernel() -> None:
         store_dtype=torch.bfloat16,
         device_module=torch.musa,
         size_limit=k_cache.shape[0],
+        alt_stream=None,
+        v_row_dim=v_row_dim,
     )
     torch.musa.synchronize()
 
     assert torch.equal(k_cache[indices.long()], k)
     assert torch.equal(v_cache[indices.long()], v)
-    assert k_cache.grad_fn is None
-    assert v_cache.grad_fn is None
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
