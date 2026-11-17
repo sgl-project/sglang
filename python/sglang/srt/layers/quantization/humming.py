@@ -86,6 +86,54 @@ def _lazy_import_humming():
     HummingWeightSchema = _HummingWeightSchema
 
 
+def _get_dense_fp32_stream_k_tuning(layer, compute_config):
+    if not envs.SGLANG_HUMMING_USE_FP32_STREAM_K_REDUCE.get():
+        return None
+    meta = layer.humming_metas[""]
+    is_supported_dtype = (
+        meta.a_dtype.num_bits == 16
+        and str(meta.c_dtype) == "float16"
+        and str(meta.b_dtype) == "float8e4m3"
+    )
+    has_supported_scales = (
+        meta.is_block_weight_scale
+        and not meta.has_input_scale_2
+        and not meta.is_channel_weight_scale_2
+        and not meta.is_tensor_weight_scale_2
+        and not meta.has_zero_point
+    )
+    if not is_supported_dtype or not has_supported_scales:
+        return None
+    if compute_config["use_f16_accum"]:
+        raise ValueError(
+            "SGLANG_HUMMING_USE_FP32_STREAM_K_REDUCE requires "
+            "SGLANG_HUMMING_USE_F16_ACCUM=false."
+        )
+
+    configs = HummingMethod.get_default_tuning_configs(layer, **compute_config)
+    selected = []
+    for low, high, tuning in configs:
+        tuning = dict(tuning)
+        if tuning.get("use_stream_k", True) and tuning.get("mma_type") in (
+            "mma",
+            "wgmma",
+        ):
+            tuning["use_fp32_stream_k_reduce"] = True
+        selected.append((low, high, tuning))
+    if not any(tuning.get("use_fp32_stream_k_reduce") for _, _, tuning in selected):
+        return None
+
+    from humming.kernel.humming import HummingKernel
+
+    if not getattr(HummingKernel, "supports_dense_fp32_stream_k_reduce", False):
+        raise RuntimeError(
+            "SGLANG_HUMMING_USE_FP32_STREAM_K_REDUCE requires a Humming build "
+            "with dense FP16 FP32 Stream-K reduction support. "
+            "The indexed-only FP32 reduction option is insufficient."
+        )
+    return json.dumps(selected)
+
+
 def _expand_tensor_scale_attrs(tensors_attrs, stack_size, num_experts=None):
     # Native Humming schemas describe runtime scalars. Keep one checkpoint scale
     # per logical shard until convert_humming merges the loaded tensors.
@@ -815,6 +863,7 @@ class HummingLinearMethod(LinearMethodBase):
         self.force_weight_schema = quant_config.force_weight_schema
         self.force_input_schema = quant_config.force_input_schema
         self.is_online_quant = self.quant_config.is_online_quant
+        self.tuning_config = None
 
     def prepare_weight_loader(self, layer: torch.nn.Module, weight_loader: Callable):
         def new_weight_loader(
@@ -1015,6 +1064,7 @@ class HummingLinearMethod(LinearMethodBase):
             "gemm_type": "dense",
         }
         self.compute_config = json.dumps(compute_config)
+        self.tuning_config = _get_dense_fp32_stream_k_tuning(layer, compute_config)
 
     def apply(
         self,
@@ -1028,6 +1078,7 @@ class HummingLinearMethod(LinearMethodBase):
             inputs=flatten_inputs,
             compute_config=self.compute_config,
             hadamard_block_size=self.weight_schema.hadamard_block_size,
+            tuning_config=self.tuning_config,
         )
         output = output.view(*x.shape[:-1], output.size(-1))
         return output
