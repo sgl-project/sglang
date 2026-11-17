@@ -53,6 +53,10 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    DENOISING_LOOP_STATE,
+    get_forward_context_or_none,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -61,6 +65,7 @@ from sglang.multimodal_gen.runtime.models.dits.common import (
     layernorm_modulate_bitexact,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 _is_cuda = current_platform.is_cuda()
@@ -127,6 +132,20 @@ def _longcat_norm_modulate(
     )
 
 
+def _longcat_modulation(norm, emb, cache, chunks):
+    if (
+        cache is not None
+        and type(norm.linear) is nn.Linear
+        and type(norm.silu) is nn.SiLU
+        and not norm.silu.inplace
+        and getattr(norm, "emb", None) is None
+    ):
+        values = cache.get(id(norm))
+        if values is not None:
+            return values
+    return norm.linear(norm.silu(emb)).chunk(chunks, dim=1)
+
+
 class _LongCatAdaLayerNormZero(AdaLayerNormZero):
     def forward(
         self,
@@ -135,21 +154,24 @@ class _LongCatAdaLayerNormZero(AdaLayerNormZero):
         class_labels: Optional[torch.LongTensor] = None,
         hidden_dtype: Optional[torch.dtype] = None,
         emb: Optional[torch.Tensor] = None,
+        modulation_cache: Optional[dict] = None,
     ):
         if self.emb is not None:
             emb = self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)
-        emb = self.linear(self.silu(emb))
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(
-            6, dim=1
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            _longcat_modulation(self, emb, modulation_cache, 6)
         )
         x = _longcat_norm_modulate(self.norm, x, scale_msa, shift_msa)
         return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
 
 class _LongCatAdaLayerNormZeroSingle(AdaLayerNormZeroSingle):
-    def forward(self, x: torch.Tensor, emb: Optional[torch.Tensor] = None):
-        emb = self.linear(self.silu(emb))
-        shift_msa, scale_msa, gate_msa = emb.chunk(3, dim=1)
+    def forward(
+        self, x: torch.Tensor, emb: Optional[torch.Tensor] = None, modulation_cache=None
+    ):
+        shift_msa, scale_msa, gate_msa = _longcat_modulation(
+            self, emb, modulation_cache, 3
+        )
         return _longcat_norm_modulate(self.norm, x, scale_msa, shift_msa), gate_msa
 
 
@@ -627,13 +649,16 @@ class _SingleTransformerBlock(nn.Module):
         image_rotary_emb=None,
         cos_sin_cache=None,
         positions=None,
+        modulation_cache=None,
         **kwargs,
     ):
         text_seq_len = encoder_hidden_states.shape[1]
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
         residual = hidden_states
-        norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
+        norm_hidden_states, gate = self.norm(
+            hidden_states, emb=temb, modulation_cache=modulation_cache
+        )
         gelu_in_projection = FUSED_LINEAR_GELU.is_enabled(self) and can_use_linear_gelu(
             self.proj_mlp, norm_hidden_states
         )
@@ -706,13 +731,16 @@ class _TransformerBlock(nn.Module):
         image_rotary_emb=None,
         cos_sin_cache=None,
         positions=None,
+        modulation_cache=None,
         **kwargs,
     ):
         norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
-            hidden_states, emb=temb
+            hidden_states, emb=temb, modulation_cache=modulation_cache
         )
         norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = (
-            self.norm1_context(encoder_hidden_states, emb=temb)
+            self.norm1_context(
+                encoder_hidden_states, emb=temb, modulation_cache=modulation_cache
+            )
         )
 
         attn_output, context_attn_output = self.attn(
@@ -904,6 +932,72 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
 
         self.layer_names = ["transformer_blocks", "single_transformer_blocks"]
 
+    def _time_conditioning(self, hidden_states):
+        if (
+            torch.compiler.is_compiling()
+            or torch.is_grad_enabled()
+            or not hidden_states.is_cuda
+        ):
+            return None
+        context = get_forward_context_or_none()
+        if context is None or context.current_timestep < 0:
+            return None
+        batch = context.forward_batch
+        if (
+            batch is None
+            or not batch.do_classifier_free_guidance
+            or hidden_states.shape[0] != 1
+        ):
+            return None
+        server_args = get_global_server_args()
+        if (
+            server_args.enable_breakable_cuda_graph
+            or server_args.enable_cfg_parallel
+            or server_args.sp_degree != 1
+            or self.layerwise_offload_managers
+            or torch.cuda.is_current_stream_capturing()
+            or not all(
+                type(block) is _TransformerBlock and "forward" not in vars(block)
+                for block in self.transformer_blocks
+            )
+            or not all(
+                type(block) is _SingleTransformerBlock and "forward" not in vars(block)
+                for block in self.single_transformer_blocks
+            )
+        ):
+            return None
+        # Keep the native one-row projections and reuse each layer's weights
+        # across timesteps. The denoising stage clears this request-local state.
+        state = batch.extra.setdefault(DENOISING_LOOP_STATE, {}).setdefault(
+            "longcat_modulations", {}
+        )
+        key = (hidden_states.dtype, hidden_states.device)
+        entry = state.get(id(self))
+        if entry is None or entry[0] is not batch.timesteps or entry[1] != key:
+            timesteps = batch.timesteps.to(
+                device=hidden_states.device, dtype=hidden_states.dtype
+            ).flatten()
+            embeddings = [
+                self.time_embed(t.reshape(1), hidden_states.dtype) for t in timesteps
+            ]
+            activations = [torch.nn.functional.silu(value) for value in embeddings]
+            by_step = [{} for _ in embeddings]
+            norms = [(block.norm1, 6) for block in self.transformer_blocks]
+            norms += [(block.norm1_context, 6) for block in self.transformer_blocks]
+            norms += [(block.norm, 3) for block in self.single_transformer_blocks]
+            for norm, chunks in norms:
+                if (
+                    type(norm.linear) is nn.Linear
+                    and type(norm.silu) is nn.SiLU
+                    and not norm.silu.inplace
+                    and getattr(norm, "emb", None) is None
+                ):
+                    for values, activation in zip(by_step, activations):
+                        values[id(norm)] = norm.linear(activation).chunk(chunks, dim=1)
+            entry = (batch.timesteps, key, embeddings, by_step)
+            state[id(self)] = entry
+        return entry[2][context.current_timestep], entry[3][context.current_timestep]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -918,7 +1012,14 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         hidden_states, _ = self.x_embedder(hidden_states)
 
         # Raw scheduler timestep in [0, 1000] — fed directly (see module docstring).
-        temb = self.time_embed(timestep.to(hidden_states.dtype), hidden_states.dtype)
+        conditioning = self._time_conditioning(hidden_states)
+        if conditioning is None:
+            temb = self.time_embed(
+                timestep.to(hidden_states.dtype), hidden_states.dtype
+            )
+            modulation_cache = None
+        else:
+            temb, modulation_cache = conditioning
 
         encoder_hidden_states, _ = self.context_embedder(encoder_hidden_states)
 
@@ -940,6 +1041,7 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 image_rotary_emb=image_rotary_emb,
                 cos_sin_cache=cos_sin_cache,
                 positions=positions,
+                modulation_cache=modulation_cache,
             )
 
         for block in self.single_transformer_blocks:
@@ -950,6 +1052,7 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 image_rotary_emb=image_rotary_emb,
                 cos_sin_cache=cos_sin_cache,
                 positions=positions,
+                modulation_cache=modulation_cache,
             )
 
         hidden_states = self.norm_out(hidden_states, temb)
