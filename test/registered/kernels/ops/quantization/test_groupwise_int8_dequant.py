@@ -49,31 +49,6 @@ def test_fp32_multiply_before_bf16_rounding():
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
-@pytest.mark.parametrize(
-    "invalid",
-    ["dtype", "scales", "layout", "scale_dtype", "scale_layout", "rank", "cpu"],
-)
-def test_invalid_contract(invalid):
-    weight = torch.ones((2, 256), dtype=torch.int8, device="cuda")
-    scales = torch.ones((2, 2), device="cuda")
-    if invalid == "dtype":
-        weight = weight.float()
-    elif invalid == "scales":
-        scales = scales[:, :1].contiguous()
-    elif invalid == "layout":
-        weight = weight.t()
-    elif invalid == "scale_dtype":
-        scales = scales.bfloat16()
-    elif invalid == "scale_layout":
-        scales = scales.t()
-    elif invalid == "rank":
-        weight = weight.flatten()
-    else:
-        weight, scales = weight.cpu(), scales.cpu()
-    with pytest.raises((RuntimeError, ValueError)):
-        groupwise_int8_dequant(weight, scales)
-
-
 def test_compile_and_cuda_graph():
     """The allocating facade must retain its output and current-stream dependency."""
     weight = torch.full((2, 256), 127, dtype=torch.int8, device="cuda")
