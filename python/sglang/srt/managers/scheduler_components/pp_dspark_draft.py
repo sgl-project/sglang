@@ -31,6 +31,25 @@ def snapshot_pp_dspark_batch(batch: ScheduleBatch) -> ScheduleBatch:
     snapshot = copy.copy(batch)
     snapshot.reqs = batch.reqs[:]
     snapshot.req_pool_indices = batch.req_pool_indices.clone()
+    if hasattr(batch, "spec_info"):
+        snapshot.spec_info = _snapshot_draft_input(batch.spec_info)
+    return snapshot
+
+
+def _snapshot_draft_input(draft_input: object) -> object:
+    snapshot = copy.copy(draft_input)
+    for name in (
+        "topk_p",
+        "topk_index",
+        "bonus_tokens",
+        "new_seq_lens",
+        "hidden_states",
+        "nxt_kv_lens_cpu",
+        "future_indices",
+    ):
+        value = getattr(draft_input, name, None)
+        if isinstance(value, torch.Tensor):
+            setattr(snapshot, name, value.clone())
     return snapshot
 
 
@@ -119,10 +138,16 @@ class PPDSparkDraftCoordinator:
         draft_input: object,
         pp_outputs: Optional[PPProxyTensors] = None,
     ) -> None:
+        snapshot = snapshot_pp_dspark_batch(batch)
+        batch_spec_info = getattr(batch, "spec_info", None)
         self._pending.append(
             PPDSparkDraftWork(
-                batch=snapshot_pp_dspark_batch(batch),
-                draft_input=draft_input,
+                batch=snapshot,
+                draft_input=(
+                    snapshot.spec_info
+                    if draft_input is batch_spec_info
+                    else draft_input
+                ),
                 pp_outputs=pp_outputs,
             )
         )

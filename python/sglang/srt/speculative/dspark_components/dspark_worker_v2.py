@@ -1819,9 +1819,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                 blocks.append(anchor.expand(self.query_token_num))
                 tokens.append(anchor.expand(self.gamma))
                 continue
-            validate_identities(
-                [PPDSparkIdentity.from_req(req)], [candidate.identity.to_wire()]
-            )
+            expected_identity = PPDSparkIdentity.from_req(req)
+            if candidate.identity != expected_identity:
+                anchor = batch.spec_info.bonus_tokens[i]
+                blocks.append(anchor.expand(self.query_token_num))
+                tokens.append(anchor.expand(self.gamma))
+                continue
             candidate.draft_block_ids.record_stream(stream)
             candidate.draft_tokens.record_stream(stream)
             blocks.append(candidate.draft_block_ids)

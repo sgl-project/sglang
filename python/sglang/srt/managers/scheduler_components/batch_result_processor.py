@@ -319,7 +319,18 @@ class SchedulerBatchResultProcessor:
         still in the batch. A row whose request left after launch (finished,
         retracted, or aborted) commits and streams nothing, and only advances the
         offsets that index the result by batch row."""
-        return [self.still_in_batch(req) for req in batch.reqs]
+        commit_mask = getattr(batch, "pp_result_commit_mask", None)
+        if commit_mask is None:
+            return [self.still_in_batch(req) for req in batch.reqs]
+        if len(commit_mask) != len(batch.reqs):
+            raise RuntimeError(
+                "PP result commit mask does not match the forward batch: "
+                f"mask_rows={len(commit_mask)}, batch_rows={len(batch.reqs)}."
+            )
+        return [
+            bool(commit_mask[row]) and self.still_in_batch(req)
+            for row, req in enumerate(batch.reqs)
+        ]
 
     @staticmethod
     def _reqs_still_in_batch(

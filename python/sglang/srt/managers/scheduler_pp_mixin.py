@@ -139,6 +139,7 @@ class PPBatchMetadata:
     # composition that actually ran the forward.
     fwd_batch: Optional[ScheduleBatch] = None
     dspark_commit_state: Optional[object] = None
+    dspark_identities: Tuple[object, ...] = ()
     speculative_num_draft_tokens: Optional[int] = None
     verify_out_cache_loc: Optional[torch.Tensor] = None
     # Rank-local; never sent over the wire.
@@ -704,6 +705,113 @@ class SchedulerPPMixin:
             self.last_mbs[mb_id] = None
         self.last_batch = None
         self.cur_batch_for_debug = None
+
+    def _pp_sync_committed_snapshot_to_running_slots(
+        self: Scheduler,
+        committed: ScheduleBatch,
+        committed_identities=(),
+    ) -> None:
+        committed_rows = {req.rid: i for i, req in enumerate(committed.reqs)}
+        committed_generations = {
+            identity.rid: identity.generation for identity in committed_identities
+        }
+        if set(committed_generations) != set(committed_rows):
+            raise RuntimeError(
+                "Committed PP DSpark rows require matching frozen identities: "
+                f"rows={tuple(committed_rows)}, "
+                f"identities={tuple(committed_generations)}."
+            )
+
+        for live in self.running_mbs:
+            live_rows = []
+            source_rows = []
+            for live_row, req in enumerate(live.reqs):
+                source_row = committed_rows.get(req.rid)
+                if source_row is None:
+                    continue
+                expected_generation = committed_generations[req.rid]
+                live_generation = (
+                    int(req.bootstrap_room),
+                    int(req.retraction_count),
+                )
+                if live_generation != expected_generation:
+                    continue
+                live_rows.append(live_row)
+                source_rows.append(source_row)
+
+            if not live_rows:
+                continue
+
+            if tuple(req.rid for req in live.reqs) == tuple(
+                req.rid for req in committed.reqs
+            ) and len(live_rows) == len(live.reqs):
+                live.spec_info = committed.spec_info
+                live.seq_lens = committed.seq_lens
+                live.seq_lens_cpu = committed.seq_lens_cpu
+                live.seq_lens_sum = committed.seq_lens_sum
+                live.orig_seq_lens = committed.orig_seq_lens
+                live.input_ids = committed.input_ids
+                continue
+
+            live.spec_info = live.spec_info.merge_committed_rows(
+                committed.spec_info,
+                live_rows=live_rows,
+                committed_rows=source_rows,
+            )
+            live_index = torch.tensor(
+                live_rows, dtype=torch.int64, device=live.seq_lens.device
+            )
+            committed_index = torch.tensor(
+                source_rows, dtype=torch.int64, device=committed.seq_lens.device
+            )
+            live.seq_lens = live.seq_lens.clone()
+            live.seq_lens.index_copy_(
+                0,
+                live_index,
+                committed.seq_lens.index_select(0, committed_index).to(
+                    device=live.seq_lens.device
+                ),
+            )
+            if live.seq_lens_cpu is not None and committed.seq_lens_cpu is not None:
+                live.seq_lens_cpu = live.seq_lens_cpu.clone()
+                live.seq_lens_cpu[live_rows] = committed.seq_lens_cpu[source_rows]
+                live.seq_lens_sum = int(live.seq_lens_cpu.sum())
+            else:
+                live.seq_lens_cpu = None
+                live.seq_lens_sum = None
+            if live.orig_seq_lens is not None and committed.orig_seq_lens is not None:
+                live_index = live_index.to(device=live.orig_seq_lens.device)
+                committed_index = committed_index.to(
+                    device=committed.orig_seq_lens.device
+                )
+                live.orig_seq_lens = live.orig_seq_lens.clone()
+                live.orig_seq_lens.index_copy_(
+                    0,
+                    live_index,
+                    committed.orig_seq_lens.index_select(0, committed_index).to(
+                        device=live.orig_seq_lens.device
+                    ),
+                )
+            else:
+                live.orig_seq_lens = None
+            live.input_ids = None
+
+    @staticmethod
+    def _pp_all_dspark_rows_live(
+        live_batch: ScheduleBatch,
+        frozen_identities: Tuple[object, ...],
+    ) -> bool:
+        live_generations = {
+            req.rid: (
+                int(req.bootstrap_room),
+                int(req.retraction_count),
+            )
+            for req in live_batch.reqs
+        }
+        return all(
+            live_generations.get(identity.rid) == identity.generation
+            for identity in frozen_identities
+        )
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = (
@@ -1384,7 +1492,6 @@ class SchedulerPPMixin:
                 make_next_draft_input,
             )
             from sglang.srt.speculative.dspark_components.dspark_pp import (
-                PPDSparkIdentity,
                 validate_identities,
             )
 
@@ -1397,21 +1504,17 @@ class SchedulerPPMixin:
             validate_identities(
                 commit_state.identities, pp_outputs["dspark_identities"]
             )
-            validate_identities(
-                commit_state.identities,
-                [PPDSparkIdentity.from_req(req).to_wire() for req in batch.reqs],
-            )
             fwd_rids = tuple(req.rid for req in fwd_batch.reqs)
-            live_rids = tuple(req.rid for req in batch.reqs)
-            if fwd_rids != live_rids:
-                raise RuntimeError(
-                    "Replicated PP DSpark batch changed while its result was in "
-                    f"flight: forward_rids={fwd_rids}, live_rids={live_rids}."
-                )
+            frozen_identities = mb_metadata.dspark_identities or commit_state.identities
+            all_forward_rows_live = SchedulerPPMixin._pp_all_dspark_rows_live(
+                batch, frozen_identities
+            )
 
             new_seq_lens = pp_outputs["dspark_new_seq_lens"]
             accept_lens = pp_outputs.tensors.get("dspark_accept_lens")
-            if accept_lens is None or not self.pp_group.is_last_rank:
+            if all_forward_rows_live and (
+                accept_lens is None or not self.pp_group.is_last_rank
+            ):
                 self.model_worker.commit_pp_draft_context(
                     state=commit_state,
                     rids=fwd_rids,
@@ -1423,16 +1526,14 @@ class SchedulerPPMixin:
                 bonus_tokens=pp_outputs["dspark_bonus_tokens"],
                 new_seq_lens=new_seq_lens,
             )
-            batch.spec_info = next_draft_input
-            batch.seq_lens = new_seq_lens
-            if batch.seq_lens_cpu is not None:
-                batch.seq_lens_cpu = new_seq_lens.to("cpu")
-                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
             fwd_batch.spec_info = next_draft_input
             fwd_batch.seq_lens = new_seq_lens
+            if fwd_batch.seq_lens_cpu is not None:
+                fwd_batch.seq_lens_cpu = new_seq_lens.to("cpu")
+                fwd_batch.seq_lens_sum = int(fwd_batch.seq_lens_cpu.sum())
 
             is_decode = accept_lens is not None
-            if is_decode:
+            if is_decode and all_forward_rows_live:
                 dspark_draft.on_relayed_proposals(
                     fwd_batch,
                     next_draft_input,
@@ -1557,14 +1658,34 @@ class SchedulerPPMixin:
 
     def _pp_result_process_batch(self: Scheduler, mb_id: int) -> ScheduleBatch:
         metadata = self.mb_metadata[mb_id]
-        if metadata is not None and metadata.fwd_batch is not None:
-            return metadata.fwd_batch
-        return self.mbs[mb_id]
+        process_batch = (
+            metadata.fwd_batch
+            if metadata is not None and metadata.fwd_batch is not None
+            else self.mbs[mb_id]
+        )
+        identities = metadata.dspark_identities if metadata is not None else ()
+        if identities:
+            live_generations = {
+                req.rid: (
+                    int(req.bootstrap_room),
+                    int(req.retraction_count),
+                )
+                for req in self.mbs[mb_id].reqs
+            }
+            process_batch.pp_result_commit_mask = tuple(
+                live_generations.get(identity.rid) == identity.generation
+                for identity in identities
+            )
+            process_batch.pp_dspark_identities = identities
+        return process_batch
 
     def _pp_process_batch_result(
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
     ):
         self.process_batch_result(batch, output_result)
+        identities = getattr(batch, "pp_dspark_identities", ())
+        if identities:
+            self._pp_sync_committed_snapshot_to_running_slots(batch, identities)
 
     def _pp_is_replicated_dspark_batch(self: Scheduler, batch: ScheduleBatch) -> bool:
         return (
@@ -2152,6 +2273,11 @@ class SchedulerPPMixin:
                     can_run_cuda_graph=result.can_run_cuda_graph,
                     fwd_batch=_pp_snapshot_forward_batch(cur_batch),
                     dspark_commit_state=result.pp_dspark_commit_state,
+                    dspark_identities=(
+                        tuple(result.pp_dspark_commit_state.identities)
+                        if result.pp_dspark_commit_state is not None
+                        else ()
+                    ),
                     speculative_num_draft_tokens=(result.speculative_num_draft_tokens),
                     verify_out_cache_loc=result.spec_verify_out_cache_loc,
                     fpm_timing=result.fpm_timing,

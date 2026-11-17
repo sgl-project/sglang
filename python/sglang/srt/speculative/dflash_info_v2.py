@@ -1,6 +1,7 @@
 """DFLASH spec-v2 overlap scheduling data structures."""
 
 import contextlib
+import copy
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -269,3 +270,55 @@ class DFlashDraftInputV2(SpecInput):
         self.hidden_states = torch.cat(
             [self.hidden_states, spec_info.hidden_states], dim=0
         )
+
+    def merge_committed_rows(
+        self,
+        committed: "DFlashDraftInputV2",
+        *,
+        live_rows: List[int],
+        committed_rows: List[int],
+    ) -> "DFlashDraftInputV2":
+        """Return live state with selected rows replaced by committed content."""
+        if len(live_rows) != len(committed_rows):
+            raise ValueError("Committed DSpark row mappings must have equal lengths")
+        if not live_rows:
+            return self
+
+        merged = copy.copy(self)
+        for field in (
+            "topk_p",
+            "topk_index",
+            "bonus_tokens",
+            "new_seq_lens",
+            "hidden_states",
+        ):
+            live_tensor = getattr(self, field)
+            committed_tensor = getattr(committed, field)
+            if live_tensor.shape[1:] != committed_tensor.shape[1:]:
+                raise RuntimeError(
+                    f"Cannot merge DSpark field {field}: "
+                    f"live_shape={tuple(live_tensor.shape)}, "
+                    f"committed_shape={tuple(committed_tensor.shape)}"
+                )
+            live_index = torch.tensor(
+                live_rows, dtype=torch.int64, device=live_tensor.device
+            )
+            committed_index = torch.tensor(
+                committed_rows,
+                dtype=torch.int64,
+                device=committed_tensor.device,
+            )
+            value = live_tensor.clone()
+            value.index_copy_(
+                0,
+                live_index,
+                committed_tensor.index_select(0, committed_index).to(
+                    device=live_tensor.device
+                ),
+            )
+            setattr(merged, field, value)
+
+        merged.nxt_kv_lens_cpu = None
+        merged.nxt_kv_lens_sum = None
+        merged.future_indices = None
+        return merged
