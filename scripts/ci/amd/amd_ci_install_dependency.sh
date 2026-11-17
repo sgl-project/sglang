@@ -56,21 +56,20 @@ fi
 # below and the AITER pin lookup further down need the flavor, and they have to
 # agree, so detect it once here.
 #
-# Prefer GPU_ARCH stamped into the image (gfx950-rocm724, gfx942, ...).
+# Prefer GPU_ARCH stamped into the image (gfx950-rocm724, gfx942-rocm1000, ...).
 # Images built before that ENV existed: 724 stages already set
 # PIP_CONSTRAINT and HSA_ENABLE_IPC_MODE_LEGACY; remaining HIP 7.2* is
-# 720; else 7.0. Do not key off torch 2.11 — 720 may ship that later.
+# 720. Do not key off torch 2.11 — 720 may ship that later.
 IMAGE_TORCH_VERSION=$(docker exec "$CI_CONTAINER_NAME" python3 -c 'import torch; print(torch.__version__)')
 IMAGE_HIP_VERSION=$(docker exec "$CI_CONTAINER_NAME" python3 -c 'import torch; print(torch.version.hip or "")')
 IMAGE_GPU_ARCH=$(docker exec "$CI_CONTAINER_NAME" printenv GPU_ARCH 2>/dev/null || true)
-if [[ "${IMAGE_GPU_ARCH}" =~ ^(gfx942|gfx950|gfx1250)(-rocm720|-rocm724|-rocm1000|-rocm1010)?$ ]]; then
+if [[ "${IMAGE_GPU_ARCH}" =~ ^(gfx942|gfx950|gfx1250)-(rocm720|rocm724|rocm1000|rocm1010)$ ]]; then
     echo "[CI-IMAGE] Image GPU_ARCH=${IMAGE_GPU_ARCH}"
     case "${IMAGE_GPU_ARCH}" in
         *-rocm724) IMAGE_BASE_ARG_SUFFIX="_ROCM724"; IMAGE_STAGE_SUFFIX="-rocm724" ;;
         *-rocm720) IMAGE_BASE_ARG_SUFFIX="_ROCM720"; IMAGE_STAGE_SUFFIX="-rocm720" ;;
         *-rocm1000) IMAGE_BASE_ARG_SUFFIX="_ROCM1000"; IMAGE_STAGE_SUFFIX="-rocm1000" ;;
         *-rocm1010) IMAGE_BASE_ARG_SUFFIX="_ROCM1010"; IMAGE_STAGE_SUFFIX="-rocm1010" ;;
-        *)         IMAGE_BASE_ARG_SUFFIX=""; IMAGE_STAGE_SUFFIX="" ;;
     esac
     IMAGE_GFX="${IMAGE_GPU_ARCH%-*}"
 else
@@ -83,8 +82,9 @@ else
         IMAGE_BASE_ARG_SUFFIX="_ROCM720"
         IMAGE_STAGE_SUFFIX="-rocm720"
     else
-        IMAGE_BASE_ARG_SUFFIX=""
-        IMAGE_STAGE_SUFFIX=""
+        # ROCm 7.0 (GPU_ARCH=gfx942 / gfx950 or no stamp) has no Dockerfile stage to read the AITER pin from.
+        echo "[CI-IMAGE] ERROR: unsupported image (GPU_ARCH='${IMAGE_GPU_ARCH}', HIP=${IMAGE_HIP_VERSION}); ROCm 7.0 images are no longer supported, use a rocm720, rocm724 or rocm10 image"
+        exit 1
     fi
     if [[ "${GPU_ARCH}" == "mi35x" ]]; then
         IMAGE_GFX="gfx950"
