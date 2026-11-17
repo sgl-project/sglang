@@ -316,6 +316,7 @@ class TestAdalnPerfStats(CustomTestCase):
         model._resolved_attention_backend = None
         stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
         stage.transformer = model
+        stage.stochastic_sampling = False
         stage._component_residency_manager = None
         stage._maybe_enable_cache_dit_and_torch_compile = lambda *args: None
         stage._finish_active_component_use = lambda: None
