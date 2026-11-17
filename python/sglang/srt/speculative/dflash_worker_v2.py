@@ -92,6 +92,7 @@ from sglang.srt.speculative.dflash_draft_l2_prefetch import (
 )
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
+    draft_kv_ring_is_paged,
     draft_kv_ring_rows_per_req_from_config,
 )
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -1129,7 +1130,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             window_left=get_dflash_attention_sliding_window_size(draft_hf_config),
             dcp_rank=parallel.attn_dcp_rank,
             pool=pool,
+            page_size=(
+                pool.page_size if draft_kv_ring_is_paged(draft_hf_config) else None
+            ),
         )
+        self.draft_kv_ring.warm_block_locs(req_to_token_rows, self.block_size)
         if parallel.tp_rank == 0:
             logger.info(
                 "DFLASH draft KV ring: %d rows per request per rank (%d positions), "
