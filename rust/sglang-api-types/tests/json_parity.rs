@@ -88,6 +88,22 @@ fn fixtures_decode_to_their_canonical_bytes() {
             "SendWeightsToRemoteInstanceRequest" => {
                 check::<api::SendWeightsToRemoteInstanceRequest>(&name, input, canonical)
             }
+            "AnthropicMessagesRequest" => {
+                check::<api::AnthropicMessagesRequest>(&name, input, canonical)
+            }
+            "AnthropicMessagesResponse" => {
+                check::<api::AnthropicMessagesResponse>(&name, input, canonical)
+            }
+            "AnthropicStreamEvent" => check::<api::AnthropicStreamEvent>(&name, input, canonical),
+            "AnthropicErrorResponse" => {
+                check::<api::AnthropicErrorResponse>(&name, input, canonical)
+            }
+            "AnthropicCountTokensRequest" => {
+                check::<api::AnthropicCountTokensRequest>(&name, input, canonical)
+            }
+            "AnthropicCountTokensResponse" => {
+                check::<api::AnthropicCountTokensResponse>(&name, input, canonical)
+            }
             "OllamaChatRequest" => check::<api::OllamaChatRequest>(&name, input, canonical),
             "OllamaChatResponse" => check::<api::OllamaChatResponse>(&name, input, canonical),
             "OllamaGenerateRequest" => check::<api::OllamaGenerateRequest>(&name, input, canonical),
