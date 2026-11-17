@@ -55,9 +55,9 @@ from sglang.srt.runtime_context import get_spec, get_stream
 from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
+    is_npu,
     is_sm100_supported,
     is_sm120,
-    is_npu,
 )
 
 logger = logging.getLogger(__name__)
