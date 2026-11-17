@@ -44,12 +44,23 @@ class SimulatedCUDA(Platform):
         return self.shared_memory
 
 
+class SimulatedROCm(SimulatedCUDA):
+    _enum = PlatformEnum.ROCM
+    device_name = "CPU-test-simulated-ROCm"
+
+
 @pytest.fixture
 def make_server(monkeypatch, tmp_path):
     def make(
-        memory_gib=80, *, config=None, device_names=None, shared_memory=False, **kwargs
+        memory_gib=80,
+        *,
+        config=None,
+        device_names=None,
+        shared_memory=False,
+        platform_cls=SimulatedCUDA,
+        **kwargs,
     ):
-        platform = SimulatedCUDA(memory_gib, shared_memory=shared_memory)
+        platform = platform_cls(memory_gib, shared_memory=shared_memory)
         monkeypatch.setattr(args_module, "current_platform", platform)
         monkeypatch.setattr(auto_tune_module, "current_platform", platform)
         monkeypatch.setattr(image_config, "current_platform", platform)
@@ -216,6 +227,34 @@ def test_image_server_modes_keep_offload_parallel_and_compile_off(make_server, m
         assert getattr(args, name) == 1
     # FA is requested through the generic explicit-request path the loader enforces.
     assert args.requested_component_attention_backend("transformer") == "fa"
+
+
+def test_rocm_requests_aiter_as_the_dense_attention(make_server):
+    # ROCm has no FA3: FA would fall back to torch SDPA and fail at first use.
+    args = make_server(140, platform_cls=SimulatedROCm)
+    assert args.requested_component_attention_backend("transformer") == "aiter"
+    explicit = make_server(140, platform_cls=SimulatedROCm, attention_backend="aiter")
+    assert explicit.requested_component_attention_backend("transformer") == "aiter"
+
+
+@pytest.mark.parametrize(
+    "platform_cls,rejected", [(SimulatedCUDA, "aiter"), (SimulatedROCm, "fa")]
+)
+def test_dense_attention_backend_is_platform_specific(
+    make_server, platform_cls, rejected
+):
+    with pytest.raises(ValueError, match="requires dense FlashAttention"):
+        make_server(140, platform_cls=platform_cls, attention_backend=rejected)
+
+
+def test_rocm_rejects_ring_parallelism(make_server):
+    # Ring layouts select FA, which ROCm cannot run; either check rejects them.
+    with pytest.raises(
+        ValueError, match="requires dense FlashAttention|ring parallelism requires FA"
+    ):
+        make_server(
+            140, platform_cls=SimulatedROCm, num_gpus=2, sp_degree=2, ring_degree=2
+        )
 
 
 def _layout(args):

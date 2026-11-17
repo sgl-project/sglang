@@ -440,7 +440,9 @@ def muse_glimmer_bilinear_pos_embed_lookup(
     weight_parts: List[List[torch.Tensor]] = [[] for _ in range(4)]
 
     for t, h, w in grid_thw.tolist():
-        t, h, w = int(t), int(h), int(w)
+        # Matches the trainer reference, which samples the position grid with
+        # `meshgrid(pos_h, pos_w, indexing="xy")`: height and width swap roles.
+        t, h, w = int(t), int(w), int(h)
         h_grid = (torch.arange(h, device=device).float() + 0.5) * (side / h) - 0.5
         w_grid = (torch.arange(w, device=device).float() + 0.5) * (side / w) - 0.5
 

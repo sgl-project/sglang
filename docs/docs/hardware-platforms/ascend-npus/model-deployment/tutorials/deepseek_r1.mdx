@@ -38,7 +38,7 @@ covered by this document and may introduce breaking changes.
 <Note>
 The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
 mode, and workload. For parameter details, see
-[Feature descriptions](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#feature-descriptions); for
+[Parameter Reference](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#parameter-reference); for
 recommended configurations for each deployment scenario, see [Best practices](#best-practices).
 </Note>
 
