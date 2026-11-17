@@ -1508,7 +1508,9 @@ class Qwen4ExpPLELayer(nn.Module):
         forward_batch: ForwardBatch,
         batch: _PLEBatch,
     ) -> torch.Tensor:
-        sp_active = layernorm_sp.runs_sp(_get_ple_forward_mode(forward_batch))
+        sp_active = layernorm_sp.runs_sp(
+            _get_ple_forward_mode(forward_batch), batch.physical_tokens
+        )
         hidden_rows = hidden_states.shape[0] if sp_active else batch.processed_tokens
         hidden_states = hidden_states[:hidden_rows]
         if self._prefetch_state is not None:
@@ -2434,7 +2436,7 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
         input_ids: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> Optional[torch.Tensor]:
-        if not layernorm_sp.runs_sp(forward_batch.forward_mode):
+        if not layernorm_sp.runs_sp(forward_batch.forward_mode, input_ids.shape[0]):
             return hidden_states
         capture = forward_batch.capture_hidden_mode
         if capture is None or not capture.need_capture():
