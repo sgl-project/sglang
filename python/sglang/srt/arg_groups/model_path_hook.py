@@ -275,17 +275,18 @@ def handle_load_format(server_args: Any):
             "that selects IPC loading automatically."
         )
 
-    # EAGLE, EAGLE3 and DSPARK load draft weights locally and bind shared weights
-    # after the target runner has attached its cache.
+    # These paths use the cache only for the target runner.
     if cfg.weight_cache_mode != "off" and cfg.speculative_algorithm not in (
         None,
         "EAGLE",
         "EAGLE3",
         "DSPARK",
+        "STANDALONE",
+        "NGRAM",
     ):
         raise ValueError(
-            "--weight-cache-mode supports speculative decoding with EAGLE, "
-            f"EAGLE3 and DSPARK only (got {cfg.speculative_algorithm}). Set "
+            "--weight-cache-mode supports speculative decoding with EAGLE, EAGLE3, "
+            f"DSPARK, STANDALONE and NGRAM only (got {cfg.speculative_algorithm}). Set "
             "--weight-cache-mode off to use this speculative algorithm."
         )
 

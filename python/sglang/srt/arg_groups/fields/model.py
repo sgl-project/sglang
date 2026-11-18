@@ -396,7 +396,7 @@ class Model(msgspec.Struct):
             "(the first start is slower). For fast recovery, run the standalone "
             "daemon (python -m sglang.srt.weight_cache.daemon) and connect with "
             "'client'. 'client': connect to existing daemon and load via IPC. "
-            "With EAGLE, EAGLE3 or DSPARK, only the target uses the weight cache.",
+            "With EAGLE, EAGLE3, DSPARK, STANDALONE or NGRAM, only the target uses the weight cache.",
             choices=["off", "daemon", "client"],
         ),
     ] = "off"
