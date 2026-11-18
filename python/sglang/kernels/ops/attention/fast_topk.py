@@ -54,7 +54,8 @@ def fast_topk(
     score      : CUDA fp32 tensor [B, L]
     lengths    : CUDA int32 tensor [B]
     topk       : number of indices per row; 512 or 2048
-    row_starts : optional CUDA int32 tensor [B]; defaults to zeros
+    row_starts : optional CUDA int32 tensor [B]; if omitted, every row starts at 0
+                 and no tensor is allocated
 
     Returns
     -------
