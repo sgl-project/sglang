@@ -100,6 +100,10 @@ class _SolTestCase(CustomTestCase):
         self._patch("_aiter_block_tiles", lambda operands, mode: (BLOCK_TILE,))
         self._patch("_aiter_ragged_kv", lambda operands, mode, block_tile: self.ragged)
         self._patch("_aiter_q_multiplier", lambda softmax_scale: softmax_scale)
+        self._patch(
+            "_aiter_block_scale_storage",
+            lambda scale, *args, **kwargs: torch.empty_like(scale),
+        )
         self._patch("_aiter_mxfp4_k_view", lambda k, descale: k)
         self._patch("_aiter_mxfp4_v_view", lambda v, descale, seqlen: v)
         self._patch("_aiter_mxfp6_k_view", lambda k, descale, *shape: (k, descale))
@@ -162,6 +166,9 @@ class _SolTestCase(CustomTestCase):
         mask = torch.ones(q.shape[0], q.shape[2], q_tiles, blocks, dtype=torch.bool)
         routing = {key: None for key in _ROUTING_KEYS}
         routing["block_attn_mask"] = mask
+        routing["mean_k_scale"] = torch.zeros(
+            q.shape[0], blocks, k.shape[2], k.shape[3] // 32, dtype=torch.uint8
+        )
         return routing
 
     def _operands(self, seqlen=SEQUENCE, dtype=torch.bfloat16):
@@ -587,6 +594,55 @@ class TestSolTrailingPad(_SolTestCase):
 
 class TestSolAgainstRealAiter(CustomTestCase):
     """Routing and recipe contracts against the installed AITER build."""
+
+    @unittest.skipUnless(
+        aiter_sol_dispatch.AITER_SOL_AVAILABLE and torch.cuda.is_available(),
+        "requires a GPU and an aiter that ships mha_v4_sol",
+    )
+    def test_mxfp8_pooled_key_scale_has_zeroed_lookahead(self):
+        """Pooled K scales must remain mapped beyond the final 128-row tile."""
+        query = torch.randn(
+            1, SEQUENCE, HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16
+        )
+        original_prepare = aiter_sol_dispatch._aiter_sol_prepare
+        original_packed = aiter_sol_dispatch._aiter_mha_v4_packed
+        source_scales = []
+
+        def prepare(*args, **kwargs):
+            routing = original_prepare(*args, **kwargs)
+            source_scales.append(routing["mean_k_scale"])
+            return routing
+
+        def packed(*args, **kwargs):
+            scale = kwargs["mean_k_scale"]
+            torch.testing.assert_close(scale, source_scales[-1], rtol=0, atol=0)
+            end = (scale.storage_offset() + scale.numel()) * scale.element_size()
+            row_bytes = scale[0, 0].numel() * scale.element_size()
+            tile_rows = ((scale.shape[1] + 127) // 128) * 128
+            storage = torch.empty(0, device=scale.device, dtype=torch.uint8)
+            storage.set_(
+                scale.untyped_storage(), 0, (scale.untyped_storage().nbytes(),)
+            )
+            tail = storage[end:]
+            self.assertGreater(tail.numel(), (tile_rows - scale.shape[1]) * row_bytes)
+            self.assertFalse(tail.any().item())
+            return original_packed(*args, **kwargs)
+
+        with (
+            patch.object(aiter_sol_dispatch, "_aiter_sol_prepare", prepare),
+            patch.object(aiter_sol_dispatch, "_aiter_mha_v4_packed", packed),
+        ):
+            for tile in (None, (64, 64)):
+                with self.subTest(tile=tile):
+                    aiter_sol_dispatch.check_sol_attn_build(
+                        "mxfp8", device=query.device, block_tile=tile
+                    )
+                    output, _ = aiter_sol_dispatch.sol_attn_bshd(
+                        query, query, query, recipe="mxfp8", block_tile=tile
+                    )
+                    torch.cuda.synchronize()
+                    self.assertEqual(output.shape, query.shape)
+                    self.assertTrue(output.isfinite().all().item())
 
     @unittest.skipUnless(
         aiter_sol_dispatch.AITER_SOL_AVAILABLE and torch.cuda.is_available(),

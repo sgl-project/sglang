@@ -65,6 +65,9 @@ _aiter_block_tile = None
 _aiter_kv_tile_for_q_tile = None
 _aiter_block_tiles = None
 _aiter_ragged_kv = None
+_aiter_block_scale_storage = None
+_aiter_scale_tile_rows = None
+_aiter_scale_lookahead_rows = None
 _aiter_mxfp4_k_view = None
 _aiter_mxfp4_v_view = None
 _aiter_mxfp6_k_view = None
@@ -109,6 +112,13 @@ if USE_AITER:
             quantize_mxfp8_q,
             quantize_v_mxfp4_fp6_p,
             quantize_v_mxfp6_fp6_p,
+        )
+        from aiter.ops.mha_v4_quant import (
+            MHA_V4_KV_SCALE_LOOKAHEAD_ROWS as _aiter_scale_lookahead_rows,
+        )
+        from aiter.ops.mha_v4_quant import MHA_V4_KV_TILE_ROWS as _aiter_scale_tile_rows
+        from aiter.ops.mha_v4_quant import (
+            block_scale_storage as _aiter_block_scale_storage,
         )
         from aiter.ops.triton.attention.utils import sol_prepare as _aiter_sol_prepare
 
@@ -681,6 +691,19 @@ def sol_attn_routing_fused(
     }
 
 
+def _with_scale_lookahead(scale: torch.Tensor) -> torch.Tensor:
+    # xDiT #980: MXFP8 reads past the last pooled scale tile; remove this copy
+    # when AITER's sol_prepare supplies the same lookahead storage.
+    backed = _aiter_block_scale_storage(
+        scale,
+        *scale.shape,
+        _aiter_scale_tile_rows,
+        lookahead_rows=_aiter_scale_lookahead_rows,
+    )
+    backed.copy_(scale)
+    return backed
+
+
 def _head_cost_from_routing(routing: dict[str, Any]) -> torch.Tensor:
     """Per-head count of exactly-computed KV blocks, float32 (nheads_q,)."""
     # (batch, nheads_q, num_q_tiles, num_kv_blocks) bool
@@ -784,7 +807,11 @@ def sol_attn_bshd(
         mean_v=routing["mean_v"],
         block_bitmap=routing["block_bitmap"],
         # None where the pooled operand reuses the source descale.
-        mean_k_scale=routing["mean_k_scale"],
+        mean_k_scale=(
+            _with_scale_lookahead(routing["mean_k_scale"])
+            if recipe.name == "mxfp8"
+            else routing["mean_k_scale"]
+        ),
         mean_v_scale=routing["mean_v_scale"],
         block_tile=block_tile,
         v_pack=getattr(_AiterAttentionPack, recipe.v_pack),
