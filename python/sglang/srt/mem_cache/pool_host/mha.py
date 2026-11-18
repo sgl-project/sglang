@@ -53,7 +53,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
-from sglang.srt.mem_cache.pool_host.npu_host_memory import reserve_mha_host_memory
+from sglang.srt.mem_cache.pool_host.npu_host_memory import acl_host_memory_enabled
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
@@ -165,6 +165,10 @@ class MHATokenToKVPoolHost(HostKVCache):
         page_unified_layout: PageUnifiedLayout | None = None,
         host_token_capacity: int | None = None,
     ):
+        if buffer_info.device.type == "npu" and not acl_host_memory_enabled():
+            raise RuntimeError(
+                "NPU MHA HiCache transfers require ACL-registered host memory"
+            )
         if _is_xpu:
             require_kvcacheio_ops(
                 pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
@@ -318,15 +322,6 @@ class MHATokenToKVPoolHost(HostKVCache):
         return self.get_size_per_token() // 2
 
     def init_kv_buffer(self):
-        if self._transfer_device.type == "npu" and self.layout == "page_first_direct":
-            reserve_mha_host_memory(
-                num_pages=self.page_num,
-                page_size=self.page_size,
-                num_layers=self.layer_num,
-                head_num=self.head_num,
-                head_dim=self.head_dim,
-                dtype=self.dtype,
-            )
         if self.layout == "layer_first":
             dims = (2, self.layer_num, self.size, self.head_num, self.head_dim)
         elif self.layout == "page_first":

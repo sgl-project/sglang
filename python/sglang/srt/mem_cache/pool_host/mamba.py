@@ -19,10 +19,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
-from sglang.srt.mem_cache.pool_host.npu_host_memory import (
-    ascendc_io_enabled,
-    reserve_mamba_host_memory,
-)
+from sglang.srt.mem_cache.pool_host.npu_host_memory import acl_host_memory_enabled
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -103,6 +100,10 @@ class MambaPoolHost(HostKVCache):
         self.buffer_info = buffer_info
         self.device_pool = None
         self._buffer_device = buffer_info.temporal.device
+        if self._buffer_device.type == "npu" and not acl_host_memory_enabled():
+            raise RuntimeError(
+                "NPU kernel_ascend Mamba transfers require ACL-registered host memory"
+            )
         self.mtp_draft_buffer_infos = tuple(mtp_draft_buffer_infos)
         self.page_size = 1
 
@@ -216,10 +217,6 @@ class MambaPoolHost(HostKVCache):
             for layers in self.conv_device_layers
         ]
 
-        if self._buffer_device.type == "npu":
-            reserve_mamba_host_memory(
-                num_slots=self.size, bytes_per_slot=self.size_per_token
-            )
         self.kv_buffer = self.init_kv_buffer()
         self._init_npu_state_transfer()
         self._init_write_back_staging_buffers()
@@ -229,20 +226,12 @@ class MambaPoolHost(HostKVCache):
     def _init_npu_state_transfer(self) -> None:
         """Pre-build the per-component views the kernel_ascend path submits.
 
-        kv_exchange-backed transfers require SGLANG_HICACHE_HOST_MEM_BACKEND=acl
-        or memfabric; anything else is a configuration error. Missing operators
-        already failed at import time.
+        Missing operators already failed at import time.
         """
         self._npu_state_transfer_views = ()
         self._npu_h2d_transfer_views = {}
         if not _is_npu:
             return
-        if not ascendc_io_enabled():
-            raise RuntimeError(
-                "NPU kernel_ascend Mamba transfers require acl or memfabric "
-                "registered host memory"
-            )
-
         # Device [L, P, 1, 1, W] / host [P, L, 1, 1, W] with page_size = 1:
         # one slot per page, trailing state shape collapsed to width W.
         views = []

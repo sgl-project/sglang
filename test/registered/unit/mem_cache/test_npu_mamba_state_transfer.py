@@ -1,27 +1,13 @@
-import sys
 import unittest
-from types import ModuleType, SimpleNamespace
-from unittest.mock import MagicMock, Mock, patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 
 import sglang.srt.mem_cache.pool_host.mamba as mamba_pool_host
-import sglang.srt.mem_cache.pool_host.npu_host_memory as npu_host_memory
-from sglang.srt.mem_cache.device_pool_info import (
-    MLABufferInfo,
-    MLASplitBuffers,
-    MambaStateBufferInfo,
-)
+from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.pool_host.mamba import (
     MambaPoolHost,
-)
-from sglang.srt.mem_cache.pool_host.npu_host_memory import (
-    MemfabricHostMemoryBackend,
-    hybrid_host_allocation_bytes,
-    mha_host_allocation_bytes,
-    mla_host_allocation_bytes,
-    mamba_host_allocation_bytes,
-    reserve_hybrid_host_memory,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -71,7 +57,7 @@ def _make_draft_info(num_slots):
     )
 
 
-def _npu_state_transfer_gates(backend=True):
+def _npu_state_transfer_gates():
     """Patch the module so _init_npu_state_transfer runs on CPU.
 
     The operator names only exist as module attributes on NPU, so the patches
@@ -91,16 +77,12 @@ def _npu_state_transfer_gates(backend=True):
             object(),
             create=True,
         ),
-        patch(
-            "sglang.srt.mem_cache.pool_host.mamba.ascendc_io_enabled",
-            return_value=backend,
-        ),
     )
 
 
-def _init_npu_state_transfer(pool, backend=True):
-    gates = _npu_state_transfer_gates(backend=backend)
-    with gates[0], gates[1], gates[2], gates[3]:
+def _init_npu_state_transfer(pool):
+    gates = _npu_state_transfer_gates()
+    with gates[0], gates[1], gates[2]:
         pool._init_npu_state_transfer()
     return pool
 
@@ -116,11 +98,6 @@ class TestNPUMambaStateTransferConfig(unittest.TestCase):
         pool = _make_pool()
         pool._init_npu_state_transfer()
         self.assertEqual(pool._npu_state_transfer_views, ())
-
-    def test_unmapped_host_memory_raises(self):
-        pool = _make_pool()
-        with self.assertRaises(RuntimeError):
-            _init_npu_state_transfer(pool, backend=False)
 
     def test_slot_strided_host_view_stays_valid(self):
         pool = _make_pool()
@@ -472,199 +449,6 @@ class TestNPUMambaStateTransferViews(unittest.TestCase):
                 self.assertTrue(
                     torch.equal(host[hi[t], l].reshape(-1), dev[l, di[t]].reshape(-1))
                 )
-
-
-class TestNPUMambaHostReservation(unittest.TestCase):
-    def test_mla_estimate_includes_drafts_indexer_and_padding_page(self):
-        buffers = MLASplitBuffers(
-            k=None,
-            v=None,
-            index_k=torch.empty(1),
-            index_scales=torch.empty(1),
-            index_layer_indices=(0,),
-            k_width=8,
-            v_width=4,
-            index_width=2,
-        )
-        info = MLABufferInfo(
-            buffers=buffers,
-            data_ptrs=None,
-            layer_indices=(0, 1),
-            device_layer_num=2,
-            page_size=4,
-            kv_lora_rank=8,
-            qk_rope_head_dim=4,
-            kv_cache_dim=12,
-            dtype=torch.float16,
-            device=torch.device("cpu"),
-        )
-        pool = SimpleNamespace(
-            layer_num=2,
-            layer_shard_enabled=False,
-            kv_cache_dim=12,
-            host_capacity_tokens=None,
-            size=10,
-            get_device_pool_infos=lambda: (SimpleNamespace(buffer_info=info),),
-        )
-        mamba_info = MambaStateBufferInfo(
-            temporal=torch.empty(1, 10, 2), conv=(torch.empty(1, 10, 2),)
-        )
-        mamba_pool = SimpleNamespace(host_capacity_tokens=None, size=10)
-        for layout in ("page_first_kv_split", "layer_first_kv_split"):
-            with self.subTest(layout=layout), (
-                patch.object(
-                    npu_host_memory,
-                    "get_memory",
-                    return_value=SimpleNamespace(
-                        hicache_mem_layout=layout, hicache_ratio=2, hicache_size=0
-                    ),
-                ),
-                patch.object(
-                    npu_host_memory,
-                    "get_parallel",
-                    return_value=SimpleNamespace(dcp_enabled=False),
-                ),
-            ):
-                total = mla_host_allocation_bytes(
-                    pool,
-                    info,
-                    draft_count=1,
-                    device_capacity=10,
-                    host_to_device_ratio=2,
-                    host_size=0,
-                    page_size=4,
-                )
-                # 6 pages x 4 tokens: three K/V layers plus one indexer layer.
-                self.assertEqual(total, 24 * (3 * (8 + 4) * 2 + 2 * 2 + 4))
-                kv_bytes, mamba_bytes = hybrid_host_allocation_bytes(
-                    kv_pool=pool,
-                    kv_host_size=None,
-                    kv_draft_pools=(object(),),
-                    page_size=4,
-                    mamba_pool=mamba_pool,
-                    mamba_info=SimpleNamespace(buffer_info=mamba_info),
-                    mamba_host_size=0,
-                    mamba_draft_pools=(),
-                )
-                self.assertEqual(kv_bytes, total)
-                self.assertGreater(mamba_bytes, 0)
-
-        # A fixed host budget is converted to pages from the logical MLA row
-        # width, while the allocation uses the physical split-buffer widths.
-        with (
-            patch.object(
-                npu_host_memory,
-                "get_memory",
-                return_value=SimpleNamespace(
-                    hicache_mem_layout="page_first_kv_split"
-                ),
-            ),
-            patch.object(
-                npu_host_memory,
-                "get_parallel",
-                return_value=SimpleNamespace(dcp_enabled=True, attn_dcp_size=2),
-            ),
-            patch(
-                "sglang.srt.mem_cache.pool_host.base.sync_fixed_hicache_size",
-                return_value=17,
-            ) as sync_size,
-        ):
-            total = mla_host_allocation_bytes(
-                pool,
-                info,
-                draft_count=1,
-                device_capacity=10,
-                host_to_device_ratio=2,
-                host_size=0.001,
-                page_size=8,
-            )
-        sync_size.assert_called_once_with(int(0.001 * 1e9 // 80), 0.001)
-        self.assertEqual(total, 20 * (3 * (8 + 4) * 2 + 2 * 2 + 4))
-
-    def test_mha_estimate_includes_draft_layer_and_padding_page(self):
-        info = SimpleNamespace(
-            buffers=SimpleNamespace(k=(object(), object())),
-            head_num=2,
-            head_dim=4,
-            v_head_dim=4,
-            dtype=torch.float16,
-            scales=None,
-        )
-        with patch.object(npu_host_memory, "MHABufferInfo", SimpleNamespace):
-            total = mha_host_allocation_bytes(
-                info,
-                draft_count=1,
-                device_capacity=10,
-                host_to_device_ratio=2,
-                host_size=0,
-                page_size=4,
-            )
-        self.assertEqual(total, 6 * 4 * 2 * 3 * 2 * 4 * 2)
-
-    def test_estimate_includes_draft_side_state_and_padding_slot(self):
-        info = MambaStateBufferInfo(
-            temporal=torch.empty(2, 5, 2, 4),
-            conv=(torch.empty(2, 5, 2, 4),),
-            extra_checkpoint_buffers=(torch.empty(5, 6),),
-        )
-        draft = _make_draft_info(4)
-        total = mamba_host_allocation_bytes(
-            info,
-            (draft,),
-            device_capacity=4,
-            host_to_device_ratio=2,
-            host_size=0,
-        )
-        pool = _make_pool(
-            num_layers=2, draft_infos=(draft,), side_states=info.extra_checkpoint_buffers
-        )
-        pool.size = 9
-        pool.conv_state_elem_sizes = [8]
-        self.assertEqual(total, sum(pool.get_mapping_lengths()))
-        self.assertEqual(total, 9 * (3 * (32 + 32) + 24))
-
-    def test_first_kv_reservation_includes_later_mamba_blocks(self):
-        backend = MemfabricHostMemoryBackend()
-        backend._pool = Mock()
-        backend._pool.initialize.return_value = 0
-        backend._pool.empty.side_effect = lambda dims, dtype: torch.empty(
-            dims, dtype=dtype
-        )
-        backend._offload_module = SimpleNamespace(
-            OffloadConfig=SimpleNamespace, Scene=SimpleNamespace(LOCAL=0)
-        )
-        names = (
-            "sgl_kernel_npu",
-            "sgl_kernel_npu.operators",
-            "sgl_kernel_npu.operators.mem_cache",
-            "sgl_kernel_npu.operators.mem_cache.memfabric",
-        )
-        modules = {name: ModuleType(name) for name in names}
-        for module in modules.values():
-            module.__path__ = []
-        host_memory_name = f"{names[-1]}.host_memory"
-        modules[host_memory_name] = ModuleType(host_memory_name)
-        modules[host_memory_name].set_memfabric_pool = Mock()
-        with (
-            patch.dict(sys.modules, modules),
-            patch.object(
-                npu_host_memory, "get_host_memory_backend", return_value=backend
-            ),
-            patch.object(
-                npu_host_memory.torch,
-                "npu",
-                SimpleNamespace(current_device=lambda: 0),
-                create=True,
-            ),
-        ):
-            reserve_hybrid_host_memory(kv_bytes=20, mamba_bytes=30)
-        config = backend._pool.initialize.call_args.args[0]
-        self.assertEqual((config.reserve_size, config.alloc_size), (50, 50))
-        with patch.object(backend, "_register_block"):
-            backend.alloc((20,), torch.uint8, "cpu", True, None)
-            backend.ensure_capacity(30, 0)  # Mamba declares its own blocks.
-            backend.alloc((30,), torch.uint8, "cpu", True, None)
-        self.assertEqual(backend._allocated_bytes, 50)
 
 
 if __name__ == "__main__":
