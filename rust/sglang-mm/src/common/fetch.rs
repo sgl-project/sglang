@@ -14,6 +14,13 @@ use base64::Engine;
 /// use their caller's whole-request budget instead.
 pub const MAX_FETCH_BYTES: u64 = 64 << 20;
 
+/// Per-request media byte bound. Every source consumes this aggregate budget;
+/// [`MAX_FETCH_BYTES`] additionally caps each remote I/O stream. There
+/// is deliberately no item-count bound: like the Python frontend, a request
+/// may carry any number of items within the byte budget (per-modality counts
+/// are the server's `--limit-mm-data-per-request`).
+pub const MAX_REQUEST_BYTES: u64 = 1280 << 20;
+
 /// Charge granularity of a streaming read: the most an in-flight source can
 /// over-charge a shared [`ByteBudget`] by.
 const CHUNK_BYTES: u64 = 256 << 10;

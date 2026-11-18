@@ -21,8 +21,9 @@ use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use bytes::Bytes;
-use sglang_mm::common::fetch::{ByteBudget, fetch_bytes_budgeted, fetch_local_file_budgeted};
-use sglang_mm::driver::MAX_REQUEST_BYTES;
+use sglang_mm::common::fetch::{
+    ByteBudget, MAX_REQUEST_BYTES, fetch_bytes_budgeted, fetch_local_file_budgeted,
+};
 use tokio::sync::Semaphore;
 
 use crate::message::request::{GenerateRequest, MmData, ProcessorFetch};
@@ -47,11 +48,8 @@ static PERMITS: LazyLock<Arc<Semaphore>> =
 /// (`TokenizerManager._validate_mm_limits`). Unset means no per-modality limit,
 /// as in Python. Python has no fixed item cap, and neither does this.
 ///
-/// [`MAX_REQUEST_BYTES`] is enforced while fetching, here rather than in
-/// `sglang_mm::driver::process`, where every source would already be resident.
-/// It bounds buffered media bytes regardless of the item count. The driver
-/// keeps its own byte check as the backstop for callers without a prefetch
-/// layer.
+/// [`MAX_REQUEST_BYTES`] is enforced while fetching, before every source is
+/// resident. It bounds buffered media bytes regardless of the item count.
 pub async fn prefetch_all(
     requests: &mut [GenerateRequest],
     modality_limits: &[(String, usize)],

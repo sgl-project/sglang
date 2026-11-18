@@ -1,6 +1,5 @@
 from types import SimpleNamespace
 
-import numpy as np
 from tokenizers import Tokenizer, decoders
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import WhitespaceSplit
@@ -110,18 +109,3 @@ def make_processor(case, config, image_processor_cls=None):
         hf_config, server_args, processor, None, skip_mm_pool=True
     )
 
-
-def snapshot(input_ids, output):
-    return {
-        "input_ids": tuple(input_ids),
-        "grids": tuple(
-            tuple(item.image_grid_thw.flatten().tolist()) for item in output.mm_items
-        ),
-        "offsets": tuple(item.offsets[0] for item in output.mm_items),
-        "features": np.concatenate(
-            [item.feature.detach().cpu().numpy() for item in output.mm_items]
-        ),
-        "mrope": output.mrope_positions.detach().cpu().numpy(),
-        "delta": int(output.mrope_position_delta.item()),
-        "tokens": (output.im_start_id, output.im_token_id, output.im_end_id),
-    }

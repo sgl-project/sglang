@@ -45,7 +45,7 @@ pub use multi_modality::encoded::{
 pub use multi_modality::payload::{ResolvedMediaWork, resolve_media_work};
 pub use multi_modality::worker::{MediaError, MmProcessOutput, MmProcessor, MmRequestInfo};
 pub use sglang_mm::common::fetch::ByteBudget as MediaByteBudget;
-pub use sglang_mm::pipeline::{Tensor, TensorData};
+pub use sglang_mm::tensor::{Tensor, TensorData};
 
 use std::sync::Arc;
 

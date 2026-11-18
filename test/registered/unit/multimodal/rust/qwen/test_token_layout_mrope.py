@@ -1,10 +1,7 @@
-"""Qwen placeholder expansion, offsets, and M-RoPE parity.
+"""Qwen M-RoPE parity.
 
-Covers ``layout_by_placeholder`` / ``apply_layout`` in
-``rust/sglang-mm/src/common/token_layout.rs`` and ``mrope_image_only`` in
-``rust/sglang-mm/src/qwen_vl/mod.rs`` (via the
-``_core.qwen_vl.process_mm`` and ``mrope_image_only_py``
-bindings), against ``BaseMultimodalProcessor`` expansion/offsets and
+Covers ``mrope_image_only`` in ``rust/sglang-mm/src/qwen_vl/mod.rs`` (via the
+``_core.qwen_vl.mrope_image_only_py`` binding), against
 ``MRotaryEmbedding.get_rope_index``.
 """
 
@@ -21,13 +18,10 @@ from sglang.test.test_utils import CustomTestCase
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _mm_rust_utils import (  # noqa: E402
     IMAGE_TOKEN_ID,
-    PROCESSOR_CONFIGS,
     VIDEO_TOKEN_ID,
     VISION_END_ID,
     VISION_START_ID,
-    image_bytes,
     load_core,
-    spec_json,
 )
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -36,37 +30,10 @@ QWEN_CORE = getattr(load_core(), "qwen_vl", None)
 
 
 @unittest.skipUnless(
-    QWEN_CORE and hasattr(QWEN_CORE, "process_mm"),
-    "sglang-mm native Qwen driver not built",
+    QWEN_CORE and hasattr(QWEN_CORE, "mrope_image_only_py"),
+    "sglang-mm native Qwen bindings not built",
 )
 class TestQwenPromptGeometry(CustomTestCase):
-    def test_placeholder_expansion_and_offsets(self):
-        from sglang.srt.multimodal.processors.base_processor import (
-            BaseMultimodalProcessor,
-        )
-
-        config = PROCESSOR_CONFIGS["qwen2_5_vl"]
-        for image_count in (1, 2):
-            ids = [7]
-            for _ in range(image_count):
-                ids.extend((VISION_START_ID, IMAGE_TOKEN_ID, VISION_END_ID, 8))
-            images = [image_bytes(96 + 8 * i, 80, i) for i in range(image_count)]
-            with self.subTest(image_count=image_count):
-                actual_ids, _, grids, _, offsets, _, _ = QWEN_CORE.process_mm(
-                    ids, images, spec_json(config)
-                )
-                counts = [t * h * w // config["merge_size"] ** 2 for t, h, w in grids]
-                expected_ids = BaseMultimodalProcessor._expand_input_ids(
-                    ids, counts, IMAGE_TOKEN_ID
-                )
-                self.assertEqual(actual_ids, expected_ids)
-                self.assertEqual(
-                    offsets,
-                    BaseMultimodalProcessor.get_mm_items_offset(
-                        torch.tensor(expected_ids), IMAGE_TOKEN_ID
-                    ),
-                )
-
     def test_mrope_matches_model_reference(self):
         """The single Rust image-only M-RoPE must match ``get_rope_index``
         for every native Qwen family (image-only makes them coincide)."""

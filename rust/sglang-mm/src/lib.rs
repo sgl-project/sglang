@@ -7,12 +7,10 @@
 //!   MM worker path — no pyo3 in that dependency graph.
 
 pub mod common;
-pub mod driver;
 pub mod dsv41;
 pub mod inkling;
-pub mod pipeline;
 pub mod qwen_vl;
-pub mod registry;
+pub mod tensor;
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
