@@ -14,7 +14,6 @@ Run:  SGLANG_USE_AITER=1 pytest test/registered/kernels/ops/moe/test_moe_route_r
 import inspect
 import sys
 from collections import defaultdict
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -282,8 +281,9 @@ def test_select_experts_sorts_only_for_a_staged_layer(staged):
     for any other consumer (EP, another runner) the fused sort is pure overhead,
     so the router emits and registers it only when the layer staged a request."""
     from sglang.srt.environ import envs
-    from sglang.srt.layers.moe import aiter_presort
+    from sglang.srt.layers.moe import route_sort
     from sglang.srt.layers.moe import topk as topk_module
+    from sglang.srt.layers.moe.moe_runner import aiter_route_sort
     from sglang.srt.layers.moe.topk import TopKConfig, select_experts
     from sglang.srt.runtime_context import get_context
 
@@ -301,20 +301,22 @@ def test_select_experts_sorts_only_for_a_staged_layer(staged):
         routed_scaling_factor=2.5,
     )
     registrations = []
+    consumer = aiter_route_sort.AiterRouteSortConsumer()
     with (
         get_context().override_server_args(),
         envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.override(False),
         envs.SGLANG_K3_RADIX4_TOPK.override(True),
-        patch.object(aiter_presort, "_registrar", return_value=registrations.append),
+        patch.object(aiter_route_sort, "_registrar", return_value=registrations.append),
+        patch.object(consumer, "takes_sort", return_value=True),
     ):
         if staged:
-            aiter_presort.stage(SimpleNamespace(takes_presort=lambda m: True))
+            route_sort.stage(consumer)
         try:
             _, ids, _ = select_experts(
                 torch.zeros((m, 8), device="cuda"), scores, config
             )
         finally:
-            aiter_presort.clear()
+            route_sort.clear(consumer)
     if staged:
         assert len(registrations) == 2 and registrations[1] is None
         assert registrations[0]["topk_ids_ptr"] == ids.data_ptr()
@@ -720,12 +722,12 @@ _SITU_MODES = {
 }
 
 
-def _requires_presort_aiter():
-    from sglang.srt.layers.moe import aiter_presort
+def _requires_route_sort_aiter():
+    from sglang.srt.layers.moe.moe_runner import aiter_route_sort
 
-    if not aiter_presort.available():
+    if not aiter_route_sort.available():
         pytest.skip("AITER without register_presorted_moe (ROCm/aiter#6484)")
-    return aiter_presort
+    return aiter_route_sort
 
 
 def _k3_fused_moe_call(m, mode, device, num_experts, model_dim, inter_dim):
@@ -774,11 +776,11 @@ class _LookupReached(Exception):
 
 @pytest.mark.parametrize("mode", list(_SITU_MODES))
 @pytest.mark.parametrize("m", [1, 100, 512])
-def test_presort_gate_asks_aiter_what_fused_moe_asks(mode, m, monkeypatch):
-    """The gate mirrors how _fused_moe_impl derives its get_2stage_cfgs call, so
+def test_aiter_route_sort_asks_aiter_what_fused_moe_asks(mode, m, monkeypatch):
+    """The consumer mirrors how _fused_moe_impl derives its get_2stage_cfgs call, so
     the call fused_moe itself makes is the reference: any drift on AITER's side
     fails here instead of silently registering sorts AITER drops."""
-    aiter_presort = _requires_presort_aiter()
+    aiter_route_sort = _requires_route_sort_aiter()
     import aiter.fused_moe as aiter_fused_moe
 
     for name, value in _SITU_MODES[mode].items():
@@ -796,9 +798,9 @@ def test_presort_gate_asks_aiter_what_fused_moe_asks(mode, m, monkeypatch):
     with patch.object(aiter_fused_moe, "get_2stage_cfgs", lookup):
         with pytest.raises(_LookupReached):
             aiter_fused_moe.fused_moe(**call)
-    gate = aiter_presort.PresortGate()
-    gate.observe(call)
-    ours = signature.bind(**gate.cfg_args(m))
+    consumer = aiter_route_sort.AiterRouteSortConsumer()
+    consumer.observe(call)
+    ours = signature.bind(**consumer.cfg_args(m))
     seen[0].apply_defaults()
     ours.apply_defaults()
     assert ours.arguments == seen[0].arguments
@@ -810,10 +812,11 @@ def test_select_experts_sorts_only_where_aiter_takes_it(mode, monkeypatch):
     registers its sort exactly on the batch sizes whose config is the BM=16
     aux-sort pipeline; elsewhere (e.g. stock A4W4's BM=32 rows at 65-256
     tokens) AITER would sort again, so the router skips it."""
-    aiter_presort = _requires_presort_aiter()
+    aiter_route_sort = _requires_route_sort_aiter()
     from aiter.fused_moe import get_2stage_cfgs
 
     from sglang.srt.environ import envs
+    from sglang.srt.layers.moe import route_sort
     from sglang.srt.layers.moe import topk as topk_module
     from sglang.srt.layers.moe.topk import TopKConfig, select_experts
     from sglang.srt.runtime_context import get_context
@@ -822,9 +825,9 @@ def test_select_experts_sorts_only_where_aiter_takes_it(mode, monkeypatch):
         pytest.skip("Requires SGLANG_USE_AITER=1 before importing the router.")
     for name, value in _SITU_MODES[mode].items():
         monkeypatch.setenv(name, value)
-    gate = aiter_presort.PresortGate()
+    consumer = aiter_route_sort.AiterRouteSortConsumer()
     # The lookup needs the weights' shapes and tags only.
-    gate.observe(
+    consumer.observe(
         _k3_fused_moe_call(
             1, mode, "meta", num_experts=NUM_EXPERTS, model_dim=MODEL_DIM, inter_dim=384
         )
@@ -840,7 +843,7 @@ def test_select_experts_sorts_only_where_aiter_takes_it(mode, monkeypatch):
     sizes = [1, 16, 64, 65, 128, 256, 512]
     expected = {}
     for m in sizes:
-        metadata = get_2stage_cfgs(**gate.cfg_args(m))
+        metadata = get_2stage_cfgs(**consumer.cfg_args(m))
         expected[m] = bool(metadata.output_aux) and int(metadata.block_m) == BM
     registered = {}
     for m in sizes:
@@ -851,14 +854,14 @@ def test_select_experts_sorts_only_where_aiter_takes_it(mode, monkeypatch):
             envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.override(False),
             envs.SGLANG_K3_RADIX4_TOPK.override(True),
             patch.object(
-                aiter_presort, "_registrar", return_value=registrations.append
+                aiter_route_sort, "_registrar", return_value=registrations.append
             ),
         ):
-            aiter_presort.stage(gate)
+            route_sort.stage(consumer)
             try:
                 select_experts(torch.zeros((m, 8), device="cuda"), scores, config)
             finally:
-                aiter_presort.clear()
+                route_sort.clear(consumer)
         registered[m] = len(registrations) == 2
     assert registered == expected
 

@@ -1,6 +1,6 @@
-"""The radix-4 router registers its fused MoE sort only on the batch sizes where
-AITER's fused_moe will consume it: those whose resolved config is the BM=16
-aux-sort pipeline."""
+"""The radix-4 router hands its fused MoE sort to AITER only on the batch sizes
+where AITER's fused_moe will consume it: those whose resolved config is the
+BM=16 aux-sort pipeline."""
 
 import sys
 import unittest
@@ -10,7 +10,8 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.layers.moe import aiter_presort, route_quant_handoff
+from sglang.srt.layers.moe import route_quant_handoff, route_sort
+from sglang.srt.layers.moe.moe_runner import aiter_route_sort
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -98,27 +99,29 @@ def _bm16_up_to_64(**kwargs):
 
 
 def _patch_cfg_api(lookup):
-    return patch.object(aiter_presort, "_cfg_api", return_value=_fake_cfg_api(lookup))
+    return patch.object(
+        aiter_route_sort, "_cfg_api", return_value=_fake_cfg_api(lookup)
+    )
 
 
-def _route(gate, m, registrations):
-    """One routing call of a layer that staged gate, with the kernel stubbed."""
+def _route(consumer, m, registrations):
+    """One routing call of a layer that staged consumer, with the kernel stubbed."""
     ids = torch.zeros((m, TOPK), dtype=torch.int32)
     weights = torch.zeros((m, TOPK))
     aux = {"M": m, "topk_ids_ptr": ids.data_ptr()}
     route_with_sort = MagicMock(return_value=(weights, ids, aux))
     sort_ws = SimpleNamespace(get=lambda device: torch.zeros(4, dtype=torch.int32))
     with (
-        patch.object(aiter_presort, "_registrar", return_value=registrations.append),
-        patch.object(aiter_presort, "get_buffer", return_value=sort_ws),
+        patch.object(aiter_route_sort, "_registrar", return_value=registrations.append),
+        patch.object(route_sort, "get_buffer", return_value=sort_ws),
         patch.object(
-            aiter_presort.moe_route_radix4, "route_radix4_with_sort", route_with_sort
+            route_sort.moe_route_radix4, "route_radix4_with_sort", route_with_sort
         ),
     ):
-        aiter_presort.stage(gate)
+        route_sort.stage(consumer)
         try:
             route_quant_handoff.bind_select_experts(None, fused_routing_ok=True)
-            hit = aiter_presort.try_route_and_register(
+            hit = route_sort.try_route_sort_fused(
                 torch.zeros((m, NUM_EXPERTS)),
                 torch.zeros(NUM_EXPERTS),
                 topk=TOPK,
@@ -130,7 +133,7 @@ def _route(gate, m, registrations):
     return hit, route_with_sort.call_count
 
 
-class TestPresortGate(CustomTestCase):
+class TestAiterRouteSortConsumer(CustomTestCase):
     def setUp(self):
         self.lookup = MagicMock(side_effect=_bm16_up_to_64)
         patcher = _patch_cfg_api(self.lookup)
@@ -139,31 +142,31 @@ class TestPresortGate(CustomTestCase):
 
     def test_registers_the_sort_only_where_aiter_picks_bm16(self):
         """AITER sorts again on a BM=32 batch, so the fused sort is skipped there."""
-        gate = aiter_presort.PresortGate()
-        gate.observe(_fused_moe_call(1))
+        consumer = aiter_route_sort.AiterRouteSortConsumer()
+        consumer.observe(_fused_moe_call(1))
         registrations = []
-        hit, launches = _route(gate, 16, registrations)
+        hit, launches = _route(consumer, 16, registrations)
         self.assertIsNotNone(hit)
         self.assertEqual(launches, 1)
-        hit, launches = _route(gate, 128, registrations)
+        hit, launches = _route(consumer, 128, registrations)
         self.assertIsNone(hit)
         self.assertEqual(launches, 0)
         self.assertEqual([r["M"] for r in registrations], [16])
 
     def test_declines_before_it_has_seen_the_layers_fused_moe_call(self):
         registrations = []
-        hit, _ = _route(aiter_presort.PresortGate(), 16, registrations)
+        hit, _ = _route(aiter_route_sort.AiterRouteSortConsumer(), 16, registrations)
         self.assertIsNone(hit)
         self.assertEqual(registrations, [])
         self.lookup.assert_not_called()
 
     def test_asks_aiter_once_per_batch_size(self):
         """A host-only cached answer per M, so a captured graph keeps its own."""
-        gate = aiter_presort.PresortGate()
-        gate.observe(_fused_moe_call(4))
-        gate.observe(_fused_moe_call(8, a1_scale=torch.ones(1)))  # first call wins
+        consumer = aiter_route_sort.AiterRouteSortConsumer()
+        consumer.observe(_fused_moe_call(4))
+        consumer.observe(_fused_moe_call(8, a1_scale=torch.ones(1)))  # first call wins
         self.assertEqual(
-            [gate.takes_presort(m) for m in (16, 16, 128, 128, 16)],
+            [consumer.takes_sort(m) for m in (16, 16, 128, 128, 16)],
             [True, True, False, False, True],
         )
         self.assertEqual(
@@ -178,13 +181,13 @@ class TestPresortGate(CustomTestCase):
             {"activation": _ActivationType.Silu, "swiglu_limit": 7.0},
         ):
             with self.subTest(overrides=sorted(overrides)):
-                gate = aiter_presort.PresortGate()
-                gate.observe(_fused_moe_call(1, **overrides))
-                self.assertFalse(gate.takes_presort(1))
+                consumer = aiter_route_sort.AiterRouteSortConsumer()
+                consumer.observe(_fused_moe_call(1, **overrides))
+                self.assertFalse(consumer.takes_sort(1))
         self.lookup.assert_not_called()
 
 
-class TestPresortGateAiterAnswers(CustomTestCase):
+class TestAiterRouteSortConsumerAiterAnswers(CustomTestCase):
     def test_bm16_config_without_the_aux_sort_pipeline_declines(self):
         """Only the aux-sort pipeline reads a presort: AITER's A16W4 SiTUv2 rows
         are BM=16 without it, and a full_impl config returns before any sort."""
@@ -196,26 +199,26 @@ class TestPresortGateAiterAnswers(CustomTestCase):
                 self.subTest(metadata=metadata),
                 _patch_cfg_api(MagicMock(return_value=metadata)),
             ):
-                gate = aiter_presort.PresortGate()
-                gate.observe(_fused_moe_call(1))
-                self.assertFalse(gate.takes_presort(1))
+                consumer = aiter_route_sort.AiterRouteSortConsumer()
+                consumer.observe(_fused_moe_call(1))
+                self.assertFalse(consumer.takes_sort(1))
 
     def test_a_config_aiter_rejects_turns_the_layer_off(self):
         lookup = MagicMock(side_effect=NotImplementedError("no backend"))
         with _patch_cfg_api(lookup):
-            gate = aiter_presort.PresortGate()
-            gate.observe(_fused_moe_call(1))
-            self.assertFalse(gate.takes_presort(1))
-            self.assertFalse(gate.takes_presort(2))
+            consumer = aiter_route_sort.AiterRouteSortConsumer()
+            consumer.observe(_fused_moe_call(1))
+            self.assertFalse(consumer.takes_sort(1))
+            self.assertFalse(consumer.takes_sort(2))
         self.assertEqual(lookup.call_count, 1)
 
     def test_wrong_lookup_arguments_are_not_swallowed(self):
         lookup = MagicMock(side_effect=TypeError("unexpected keyword argument"))
         with _patch_cfg_api(lookup):
-            gate = aiter_presort.PresortGate()
-            gate.observe(_fused_moe_call(1))
+            consumer = aiter_route_sort.AiterRouteSortConsumer()
+            consumer.observe(_fused_moe_call(1))
             with self.assertRaises(TypeError):
-                gate.takes_presort(1)
+                consumer.takes_sort(1)
 
     def test_aiter_without_the_config_lookup_is_unsupported(self):
         """An AITER with register_presorted_moe but no get_2stage_cfgs cannot say
@@ -229,12 +232,12 @@ class TestPresortGateAiterAnswers(CustomTestCase):
         with patch.dict(
             sys.modules, {"aiter": fake_aiter, "aiter.fused_moe": fake_fused_moe}
         ):
-            self.assertIsNone(aiter_presort._cfg_api.__wrapped__())
+            self.assertIsNone(aiter_route_sort._cfg_api.__wrapped__())
         with (
-            patch.object(aiter_presort, "_registrar", return_value=lambda aux: None),
-            patch.object(aiter_presort, "_cfg_api", return_value=None),
+            patch.object(aiter_route_sort, "_registrar", return_value=lambda aux: None),
+            patch.object(aiter_route_sort, "_cfg_api", return_value=None),
         ):
-            self.assertFalse(aiter_presort.available())
+            self.assertFalse(aiter_route_sort.available())
 
 
 if __name__ == "__main__":

@@ -1,23 +1,15 @@
-"""Hand AITER's fused_moe the BM=16 sort the radix-4 router writes on ROCm.
+"""AITER's side of the fused route+sort (layers/moe/route_sort.py).
 
-At decode and verify batch sizes AITER's fused_moe spends one or two launches on
-moe_sorting, which also zeroes its output. route_radix4_with_sort emits both from
-the routing launch; register_presorted_moe (ROCm/aiter#6484) hands that sort to
-the next fused_moe call, which uses it when the call's topk tensors, M and
-block_m match and ignores it otherwise.
+AITER's fused_moe spends one or two launches on moe_sorting, which also zeroes
+its output. register_presorted_moe (ROCm/aiter#6484) hands it the BM=16 sort
+the radix-4 router writes instead, for the next fused_moe call, which uses it
+when the call's topk tensors, M and block_m match and ignores it otherwise.
 
 AITER takes the sort only where the kernel config it resolves for the batch is
 its BM=16 aux-sort pipeline, and sorts again elsewhere, so each layer's
-PresortGate asks AITER's own config lookup (get_2stage_cfgs) per batch size.
-
-Only a Kimi-K3 MoE layer whose experts take the sort asks for it, through the
-consume-once stash in route_quant_handoff, so the shared routing functions keep
-their signatures:
-
-    KimiK3MoE.forward           stage(gate) before routing, clear() after the layer
-    biased_grouped_topk_gpu     try_route_and_register() replaces route_radix4
-                                when the staged gate takes the batch
-    AiterRunnerCore.run         hands the gate its fused_moe arguments
+AiterRouteSortConsumer asks AITER's own config lookup (get_2stage_cfgs) per
+batch size. AiterRunnerCore.route_sort_consumer() hands one to the layer and
+AiterRunnerCore.run shows it the layer's fused_moe arguments.
 """
 
 from __future__ import annotations
@@ -27,14 +19,7 @@ import math
 from types import SimpleNamespace
 from typing import Callable, Optional, Tuple
 
-import torch
-
 from sglang.kernels.jit.utils import cache_once
-from sglang.kernels.ops.moe import moe_route_radix4
-from sglang.srt.layers import zero_copy_context
-from sglang.srt.layers.moe import route_quant_handoff
-from sglang.srt.runtime_context import get_buffer
-from sglang.srt.utils import is_device_stream_capturing
 
 logger = logging.getLogger(__name__)
 
@@ -86,20 +71,6 @@ def available() -> bool:
     """Whether this AITER can take a presort (register_presorted_moe) and tell
     which batch sizes will use it (get_2stage_cfgs)."""
     return _registrar() is not None and _cfg_api() is not None
-
-
-def stage(gate: PresortGate) -> None:
-    """Ask the next radix-4 routing call for the fused sort, on the batch sizes
-    the layer's gate takes. The caller pairs this with clear() after the layer
-    (try/finally)."""
-    route_quant_handoff.stage_aiter_presort(gate)
-
-
-def clear() -> None:
-    """Drop the request and a registration that no fused_moe consumed, as
-    AITER's caller contract requires."""
-    route_quant_handoff.clear()
-    _registrar()(None)
 
 
 # fused_moe arguments that do not change the config get_2stage_cfgs resolves, or
@@ -232,12 +203,13 @@ def _cfg_args(lookup: dict, m: int) -> dict:
     return dict(token=api.get_padded_M(m), q_dtype_a=quant_dtype_a, **args)
 
 
-class PresortGate:
-    """Whether a layer's fused_moe takes the router's sort at a batch size.
+class AiterRouteSortConsumer:
+    """Whether a layer's fused_moe takes the router's sort at a batch size
+    (route_sort.RouteSortConsumer).
 
     AITER uses a registered sort only where the config it resolves for the batch
     runs its aux-sort pipeline at block_m == PRESORTED_MOE_BLOCK_M (16); a BM=32
-    row, say, sorts again and the fused sort is wasted work. The gate asks
+    row, say, sorts again and the fused sort is wasted work. It asks
     get_2stage_cfgs with the arguments _fused_moe_impl derives from the layer's
     fused_moe call, which it learns from the first call (observe()); until then
     it declines. A config fused_moe re-resolves at call time (an unsupported
@@ -262,13 +234,22 @@ class PresortGate:
         else:
             self._lookup = lookup
 
-    def takes_presort(self, m: int) -> bool:
+    def takes_sort(self, m: int) -> bool:
         if self._lookup is None or m == 0:
             return False
         hit = self._by_m.get(m)
         if hit is None:
             hit = self._by_m[m] = self._resolve(m)
         return hit
+
+    def accept(self, sort: dict) -> None:
+        """Register the router-written sort for the next fused_moe call."""
+        _registrar()(sort)
+
+    def drop(self) -> None:
+        """Drop a registration that no fused_moe consumed, as AITER's caller
+        contract requires."""
+        _registrar()(None)
 
     def cfg_args(self, m: int) -> dict:
         """The get_2stage_cfgs arguments of the layer's fused_moe at M tokens."""
@@ -298,89 +279,3 @@ class PresortGate:
 def _warn_declined(reason: str) -> None:
     # Every K3 layer shares the reason, so say it once.
     logger.warning(f"radix-4 fused MoE sort off: {reason}")
-
-
-class _SortWorkspaces:
-    """The sort's arrival counters per (device, stream): launches in flight on
-    two streams must not share them. A captured graph keeps its capture stream's
-    counters, so it must not replay alongside eager launches on that stream."""
-
-    def __init__(self) -> None:
-        self.by_stream: dict[tuple[torch.device, int], torch.Tensor] = {}
-
-    def get(self, device: torch.device) -> Optional[torch.Tensor]:
-        """The current stream's counters, or None when they would first be
-        allocated inside a graph capture, where they are only zeroed when that
-        one graph replays."""
-        key = (device, torch.cuda.current_stream(device).cuda_stream)
-        ws = self.by_stream.get(key)
-        if ws is None:
-            if is_device_stream_capturing(device):
-                _warn_captured_without_workspace()
-                return None
-            ws = moe_route_radix4.new_sort_workspace(device)
-            self.by_stream[key] = ws
-        return ws
-
-
-@cache_once
-def _warn_captured_without_workspace() -> None:
-    # A graph captured here keeps the unfused router (and AITER's own sort) on
-    # every replay, which otherwise only shows up as a slower step.
-    logger.warning(
-        "radix-4 fused MoE sort skipped: first use on this stream is a CUDA graph "
-        "capture; run the router once eagerly on the capture stream first"
-    )
-
-
-def _published_moe_output(n_tokens: int) -> Optional[torch.Tensor]:
-    """The MoE output buffer the model published, when the kernel can zero it.
-
-    AITER only trusts the zeroing when this is also the output fused_moe gets.
-    """
-    out = zero_copy_context.ctx.moe_output
-    if (
-        out is not None
-        and out.dim() == 2
-        and out.shape[0] == n_tokens
-        and out.shape[1] % 8 == 0
-        and out.dtype == torch.bfloat16
-        and out.is_contiguous()
-        and out.data_ptr() % 16 == 0
-    ):
-        return out
-    return None
-
-
-def try_route_and_register(
-    scores: torch.Tensor,
-    bias: torch.Tensor,
-    *,
-    topk: int,
-    renormalize: bool,
-    routed_scaling_factor: float,
-) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-    """Route with the fused sort and register it for the next fused_moe call
-    when the staged layer's gate takes this batch size. Returns (weights, ids) on a hit,
-    None otherwise (the caller runs route_radix4).
-
-    Caller must have checked moe_route_radix4.covered().
-    """
-    gate, num_token_non_padded = route_quant_handoff.take_aiter_presort()
-    if gate is None or not gate.takes_presort(scores.shape[0]):
-        return None
-    sort_ws = get_buffer("aiter_presort_sort_ws", _SortWorkspaces).get(scores.device)
-    if sort_ws is None:
-        return None
-    weights, ids, aux = moe_route_radix4.route_radix4_with_sort(
-        scores=scores,
-        bias=bias,
-        topk=topk,
-        renormalize=renormalize,
-        routed_scaling_factor=routed_scaling_factor,
-        sort_ws=sort_ws,
-        moe_buf=_published_moe_output(scores.shape[0]),
-        num_token_non_padded=num_token_non_padded,
-    )
-    _registrar()(aux)
-    return weights, ids

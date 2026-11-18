@@ -81,7 +81,7 @@ from sglang.srt.layers.linear import (
     resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import aiter_presort, route_quant_handoff
+from sglang.srt.layers.moe import route_quant_handoff, route_sort
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import (
@@ -656,18 +656,11 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             self.experts.runner_backend,
             routing_method_type=self.experts.routing_method_type,
         )
-        # Ask the radix-4 router for AITER fused_moe's sort only where it can be
-        # consumed: AITER drops it under an expert mask (EP), other runners never
-        # see it, and the gate checks AITER's block_m per batch size.
-        self._aiter_presort = (
-            aiter_presort.PresortGate()
-            if (
-                envs.SGLANG_K3_RADIX4_TOPK.get()
-                and self.experts.runner_backend is not None
-                and self.experts.runner_backend.is_aiter()
-                and self.experts.moe_ep_size == 1
-                and aiter_presort.available()
-            )
+        # Ask the radix-4 router to also write the experts' MoE sort only when
+        # their runner consumes one; the runner decides per batch size.
+        self._route_sort_consumer = (
+            self.experts.runner.route_sort_consumer()
+            if envs.SGLANG_K3_RADIX4_TOPK.get() and self.experts.runner is not None
             else None
         )
 
@@ -1551,8 +1544,8 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         if self._route_quant_fuse_eligible:
             route_quant_handoff.stage(routed_input, layer=self.experts)
         try:
-            # The radix-4 route+sort launch zeroes the published latent for
-            # fused_moe, so route inside the block too.
+            # The fused route+sort launch zeroes the published latent for the
+            # experts, so route inside the block too.
             with zero_copy_context.set_moe_output(latent):
                 topk_output = self.topk(hidden_states, router_logits)
                 expert_output = self.experts(routed_input, topk_output)
@@ -1834,8 +1827,8 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             # the FFN read already ran the front on this rank's rows (shard_front)
             return self._forward_row_front(prefix_sum)
         hidden_states = hidden_states.view(-1, hidden_size)
-        if self._aiter_presort is not None:
-            aiter_presort.stage(self._aiter_presort)
+        if self._route_sort_consumer is not None:
+            route_sort.stage(self._route_sort_consumer)
         try:
             if cp_shard_rows:
                 return self._forward_cp_shard_rows(hidden_states)
@@ -1850,10 +1843,9 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                     valid_token_count=valid_token_count,
                 )
         finally:
-            # A presort that no fused_moe consumed must not outlive this layer
-            # (AITER's contract).
-            if self._aiter_presort is not None:
-                aiter_presort.clear()
+            # A sort that no experts call consumed must not outlive this layer.
+            if self._route_sort_consumer is not None:
+                route_sort.clear(self._route_sort_consumer)
         return out.view(num_tokens, hidden_size)
 
 
