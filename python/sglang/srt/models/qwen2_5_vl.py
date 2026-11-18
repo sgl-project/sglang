@@ -442,8 +442,10 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
             index = torch.arange(grid_t * llm_grid_h * llm_grid_w).reshape(
                 grid_t, llm_grid_h, llm_grid_w
             )
-            pad_h = vit_merger_window_size - llm_grid_h % vit_merger_window_size
-            pad_w = vit_merger_window_size - llm_grid_w % vit_merger_window_size
+            # Minimal padding leaves no fully empty windows, so cumulative
+            # window boundaries are already unique and need no GPU dedup.
+            pad_h = (-llm_grid_h) % vit_merger_window_size
+            pad_w = (-llm_grid_w) % vit_merger_window_size
             num_windows_h = (llm_grid_h + pad_h) // vit_merger_window_size
             num_windows_w = (llm_grid_w + pad_w) // vit_merger_window_size
             index_padded = F.pad(index, (0, pad_w, 0, pad_h), "constant", -100)
@@ -516,7 +518,6 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
             device=x.device,
             dtype=torch.int32,
         )
-        cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
 
         # Move window_index to the same device as x before using it to index x
         window_index = window_index.to(device=x.device)
@@ -602,17 +603,12 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
         window_index, cu_window_seqlens = self.get_window_index(grid_thw)
-        cu_window_layout = tuple(
-            value
-            for index, value in enumerate(cu_window_seqlens)
-            if index == 0 or value != cu_window_seqlens[index - 1]
-        )
+        cu_window_layout = tuple(cu_window_seqlens)
         cu_window_seqlens = torch.tensor(
             cu_window_seqlens,
             device=x.device,
             dtype=torch.int32,
         )
-        cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
 
         window_index = window_index.to(device=x.device)
         reverse_indices = permute_inv(window_index)
