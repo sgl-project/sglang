@@ -285,7 +285,6 @@ export const AgentX = ({ data: input }) => {
     return "";
   };
   const noteText = (S) => ({
-    "rename-dp-attention": <>Flags are mirrored from the submission image: <code style={S.code}>--enable-dp-attention</code> with <code style={S.code}>--dp-size</code> / <code style={S.code}>--data-parallel-size</code>. Newer SGLang deprecates them in favor of <code style={S.code}>--attn-dp-size</code> (<a style={S.a} href="https://github.com/sgl-project/sglang/pull/41818">#41818</a>).</>,
     "rename-mamba-strategy": <>Flags are mirrored from the submission image: <code style={S.code}>--mamba-scheduler-strategy</code> is the older spelling of <code style={S.code}>--mamba-radix-cache-strategy</code> (<a style={S.a} href="https://github.com/sgl-project/sglang/pull/28151">#28151</a>). Current SGLang accepts only the new name.</>,
     "hicache-size": <><code style={S.code}>--hicache-size</code> is host DRAM per rank in GB, sized to SemiAnalysis's nodes. Scale it to your host memory.</>,
     efa: <><code style={S.code}>MOONCAKE_PROTOCOL=efa</code> reflects SemiAnalysis's AWS-EFA B300 cluster. Use <code style={S.code}>rdma</code> on InfiniBand.</>,
@@ -299,7 +298,6 @@ export const AgentX = ({ data: input }) => {
     const env = Object.assign({}, ...blocks.map((b) => b.env || {}));
     const text = JSON.stringify(blocks);
     return [
-      names.has("--enable-dp-attention") && "rename-dp-attention",
       names.has("--mamba-scheduler-strategy") && "rename-mamba-strategy",
       names.has("--hicache-size") && "hicache-size",
       env.MOONCAKE_PROTOCOL === "efa" && "efa",
