@@ -3,7 +3,7 @@
 Tests DeepSeek-V3.2 with DP=8 + TP=8 + dp-attention using few-shot
 completion benchmark on MI35x.
 
-Registry: nightly-amd-accuracy-8-gpu-mi35x-deepseek-v32-dp suite
+Registry: nightly-accuracy-test-8-gpu-amd-mi35x-deepseek-v32-dp suite
 """
 
 import unittest
@@ -25,7 +25,7 @@ from sglang.test.test_utils import (
 # Register for AMD CI - MI35x DeepSeek-V3.2 DP accuracy test
 register_amd_ci(
     est_time=3600,
-    suite="nightly-amd-accuracy-8-gpu-mi35x-deepseek-v32-dp",
+    suite="nightly-accuracy-test-8-gpu-amd-mi35x-deepseek-v32-dp",
     nightly=True,
     disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
