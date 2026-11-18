@@ -12,7 +12,7 @@ import torch
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention import aiter_mla_gluon as mod
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -448,89 +448,100 @@ class TestMlaDcpAsmDecode(CustomTestCase):
 
 
 class TestFp8QAsmSelection(CustomTestCase):
-    def _selected(self, **overrides):
+    def _skip_reason(self, **overrides):
         from sglang.srt.layers.attention.aiter_backend import (
-            _fp8_q_asm_mla_selected,
+            _fp8_q_asm_mla_skip_reason,
         )
 
         kwargs = dict(
-            enabled=True,
-            num_head=12,
-            head_pad_mode="zero",
-            kv_cache_dtype=fp8_dtype,
-            decode_backend="asm",
+            gfx950=True,
+            zero_padded_h12_fp8=True,
             verify_backend="asm",
             dcp_world_size=1,
             is_draft_worker=False,
             verify_qlen=1,
-            gfx95=True,
         )
         kwargs.update(overrides)
-        return _fp8_q_asm_mla_selected(**kwargs)
+        return _fp8_q_asm_mla_skip_reason(**kwargs)
 
-    def test_off_by_default(self):
-        self.assertFalse(envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM.default)
-        self.assertFalse(self._selected(enabled=False))
-
-    def test_verify_window_bound(self):
-        self.assertTrue(self._selected(verify_qlen=1))
-        for qlen in (0, 5, 8):
+    def test_decode_and_folded_windows_are_selected(self):
+        for qlen in (1, 5, 6, 7, 8):
             with self.subTest(qlen=qlen):
-                self.assertFalse(self._selected(verify_qlen=qlen))
+                self.assertIsNone(self._skip_reason(verify_qlen=qlen))
 
     def test_refuses_broken_2_to_4_token_windows(self):
-        for max_qlen in (4, 8):
-            for qlen in (2, 3, 4):
-                with self.subTest(qlen=qlen, max_qlen=max_qlen):
-                    self.assertFalse(
-                        self._selected(verify_qlen=qlen, max_verify_qlen=max_qlen)
-                    )
-
-    def test_folded_window_is_opt_in(self):
-        self.assertEqual(envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM_MAX_QLEN.default, 4)
-        for qlen in (5, 8):
+        for qlen in (2, 3, 4):
             with self.subTest(qlen=qlen):
-                self.assertTrue(self._selected(verify_qlen=qlen, max_verify_qlen=8))
-        self.assertFalse(self._selected(verify_qlen=8, max_verify_qlen=7))
+                self.assertIn("ROCm/aiter#7007", self._skip_reason(verify_qlen=qlen))
 
-    def test_rejects_window_beyond_the_fold(self):
-        for max_qlen in (0, 9):
-            with self.subTest(max_qlen=max_qlen):
-                with self.assertRaises(ValueError):
-                    self._selected(max_verify_qlen=max_qlen)
-
-    def test_disabled_ignores_max_window(self):
-        for max_qlen in (0, 9):
-            with self.subTest(max_qlen=max_qlen):
-                self.assertFalse(
-                    self._selected(enabled=False, max_verify_qlen=max_qlen)
-                )
+    def test_refuses_windows_beyond_the_fold(self):
+        for qlen in (0, 9, 16):
+            with self.subTest(qlen=qlen):
+                self.assertIsNotNone(self._skip_reason(verify_qlen=qlen))
 
     def test_requires_gfx950_h12_zero_pad_fp8(self):
-        for override in (
-            dict(gfx95=False),
-            dict(num_head=8),
-            dict(num_head=16),
-            dict(head_pad_mode="repeat"),
-            dict(head_pad_mode="none"),
-            dict(kv_cache_dtype=torch.bfloat16),
-        ):
-            with self.subTest(**override):
-                self.assertFalse(self._selected(**override))
+        self.assertIsNotNone(self._skip_reason(gfx950=False))
+        self.assertIsNotNone(self._skip_reason(zero_padded_h12_fp8=False))
 
-    def test_requires_asm_for_decode_and_verify(self):
-        self.assertFalse(self._selected(decode_backend="gluon"))
-        self.assertFalse(self._selected(verify_backend="gluon"))
+    def test_requires_asm_verify(self):
+        self.assertIsNotNone(self._skip_reason(verify_backend="gluon"))
 
     def test_dcp_keeps_its_own_route(self):
-        self.assertFalse(self._selected(dcp_world_size=2))
+        self.assertIsNotNone(self._skip_reason(dcp_world_size=2))
+
+    def test_draft_worker_keeps_the_module_route(self):
+        self.assertIsNotNone(self._skip_reason(is_draft_worker=True))
+
+
+class TestZeroPaddedH12Fp8Shape(CustomTestCase):
+    def test_only_twelve_zero_padded_heads_over_fp8(self):
+        self.assertTrue(
+            mod.is_zero_padded_h12_fp8_mla(
+                head_pad_mode="zero", num_head=12, kv_cache_dtype=fp8_dtype
+            )
+        )
+        for kwargs in (
+            dict(head_pad_mode="zero", num_head=8, kv_cache_dtype=fp8_dtype),
+            dict(head_pad_mode="zero", num_head=16, kv_cache_dtype=fp8_dtype),
+            dict(head_pad_mode="repeat", num_head=12, kv_cache_dtype=fp8_dtype),
+            dict(head_pad_mode="none", num_head=12, kv_cache_dtype=fp8_dtype),
+            dict(head_pad_mode="zero", num_head=12, kv_cache_dtype=torch.bfloat16),
+        ):
+            with self.subTest(**kwargs):
+                self.assertFalse(mod.is_zero_padded_h12_fp8_mla(**kwargs))
+
+
+class TestIsGfx950Supported(CustomTestCase):
+    """The fp8-Q ASM route is gfx950 only: an exact arch match, not a gfx95 prefix."""
+
+    def _is_gfx950(self, hip):
+        from sglang.srt.utils import device
+
+        device.is_gfx950_supported.cache_clear()
+        try:
+            with mock.patch(
+                "sglang.kernels.arch.current_arch",
+                return_value=mock.Mock(hip=hip),
+            ):
+                return device.is_gfx950_supported()
+        finally:
+            device.is_gfx950_supported.cache_clear()
+
+    def test_exact_arch(self):
+        self.assertTrue(self._is_gfx950(mock.Mock(gcn_arch="gfx950")))
+        for arch in ("gfx942", "gfx951", "gfx9500", "gfx1250"):
+            with self.subTest(arch=arch):
+                self.assertFalse(self._is_gfx950(mock.Mock(gcn_arch=arch)))
+
+    def test_false_off_hip(self):
+        self.assertFalse(self._is_gfx950(None))
 
 
 class TestFp8QAsmPersistScope(CustomTestCase):
-    """SGLANG_OPT_HIP_MLA_FP8_Q_ASM must not turn persistence on for the process.
+    """SGLANG_AITER_MLA_DECODE_BACKEND=asm_fp8q must not turn persistence on for the process.
     Under SGLANG_AITER_MLA_PERSIST=0, other backends and the module defaults stay off."""
 
-    def _build(self, *, num_draft_tokens, is_draft_worker=False):
+    def _build(self, *, num_draft_tokens, is_draft_worker=False, gfx950=True):
         from types import SimpleNamespace
 
         from sglang.srt.configs.model_config import AttentionArch
@@ -575,6 +586,7 @@ class TestFp8QAsmPersistScope(CustomTestCase):
                 speculative_num_steps=1,
                 speculative_attention_mode="decode",
             ),
+            override_platform(is_gfx950=gfx950),
             mock.patch.object(aiter_backend, "is_gfx95_supported", return_value=True),
             mock.patch.object(
                 aiter_backend, "prefer_mla_gluon_decode", return_value=True
@@ -587,9 +599,7 @@ class TestFp8QAsmPersistScope(CustomTestCase):
         from sglang.srt.layers.attention import aiter_backend
 
         with (
-            envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM.override(True),
-            envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM_MAX_QLEN.override(8),
-            envs.SGLANG_AITER_MLA_DECODE_BACKEND.override("asm"),
+            envs.SGLANG_AITER_MLA_DECODE_BACKEND.override("asm_fp8q"),
             envs.SGLANG_AITER_MLA_VERIFY_BACKEND.override("asm"),
             envs.SGLANG_AITER_MLA_AUTO_KV_SPLITS.override(False),
             mock.patch.object(aiter_backend, "_use_mla_ps_kernel", False),
@@ -617,15 +627,34 @@ class TestFp8QAsmPersistScope(CustomTestCase):
             self.assertFalse(draft.use_mla_fp8_q_asm)
             self.assertFalse(draft._use_mla_decode_persist_metadata())
 
+    def test_route_needs_asm_fp8q_on_gfx950(self):
+        from sglang.srt.layers.attention import aiter_backend
+
+        with (
+            envs.SGLANG_AITER_MLA_VERIFY_BACKEND.override("asm"),
+            envs.SGLANG_AITER_MLA_AUTO_KV_SPLITS.override(False),
+            mock.patch.object(aiter_backend, "_use_mla_ps_kernel", False),
+            mock.patch.object(aiter_backend, "fast_mode", False),
+            mock.patch.object(aiter_backend, "intra_batch_mode", False),
+        ):
+            with envs.SGLANG_AITER_MLA_DECODE_BACKEND.override("asm"):
+                plain_asm = self._build(num_draft_tokens=8)
+            with envs.SGLANG_AITER_MLA_DECODE_BACKEND.override("asm_fp8q"):
+                other_arch = self._build(num_draft_tokens=8, gfx950=False)
+
+            self.assertFalse(plain_asm.use_mla_fp8_q_asm)
+            self.assertFalse(other_arch.use_mla_fp8_q_asm)
+            # asm_fp8q that does not take the route behaves as asm.
+            self.assertEqual(other_arch.mla_decode_backend, "asm")
+            self.assertFalse(other_arch._use_mla_decode_persist_metadata())
+
     def test_persist_auto_splits_still_set_the_module_modes(self):
         """Under PERSIST=1 with auto KV splits, draft extend reads the module modes with a
         split cap of -1, so the opt-in must not keep them on the non-auto schedule."""
         from sglang.srt.layers.attention import aiter_backend
 
         with (
-            envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM.override(True),
-            envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM_MAX_QLEN.override(8),
-            envs.SGLANG_AITER_MLA_DECODE_BACKEND.override("asm"),
+            envs.SGLANG_AITER_MLA_DECODE_BACKEND.override("asm_fp8q"),
             envs.SGLANG_AITER_MLA_VERIFY_BACKEND.override("asm"),
             envs.SGLANG_AITER_MLA_AUTO_KV_SPLITS.override(True),
             mock.patch.object(aiter_backend, "_use_mla_ps_kernel", True),
@@ -642,9 +671,12 @@ class TestFp8QAsmPersistScope(CustomTestCase):
 
 
 class TestFp8QAsmLaunchMatchesPlan(CustomTestCase):
-    """Decode and verify launch with the schedule their metadata was planned with."""
+    """The opt-in launches with the schedule its metadata was planned with;
+    the default route launches exactly as before the opt-in existed."""
 
-    def _launch_kwargs(self, *, verify, auto_kv_splits):
+    def _launch_kwargs(
+        self, *, verify, auto_kv_splits, fp8_q_asm=True, launch_has_fast_mode=True
+    ):
         from sglang.srt.layers.attention import aiter_backend
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 
@@ -657,7 +689,7 @@ class TestFp8QAsmLaunchMatchesPlan(CustomTestCase):
         be.mla_kernel_num_head_padded = 16
         be.dcp_world_size = 1
         be.use_mla_dcp_asm = False
-        be.use_mla_fp8_q_asm = True
+        be.use_mla_fp8_q_asm = fp8_q_asm
         be.use_mla_auto_kv_splits = auto_kv_splits
         be.mla_decode_backend = "asm"
         be.mla_verify_backend = "asm"
@@ -675,10 +707,24 @@ class TestFp8QAsmLaunchMatchesPlan(CustomTestCase):
             return_value=torch.zeros(qlen, 12, 512)
         )
         q = torch.zeros(qlen, 12, 576, dtype=torch.bfloat16)
+        # The opt-in runs under PERSIST=0 (module modes off); the default route
+        # needs PERSIST=1, whose modes the auto KV split block sets.
+        module_fast_mode, module_intra_batch_mode = (
+            (False, False)
+            if fp8_q_asm
+            else ((True, False) if auto_kv_splits else (False, True))
+        )
         with (
-            mock.patch.object(aiter_backend, "_use_mla_ps_kernel", False),
-            mock.patch.object(aiter_backend, "fast_mode", False),
-            mock.patch.object(aiter_backend, "intra_batch_mode", False),
+            mock.patch.object(aiter_backend, "_use_mla_ps_kernel", not fp8_q_asm),
+            mock.patch.object(aiter_backend, "fast_mode", module_fast_mode),
+            mock.patch.object(
+                aiter_backend, "intra_batch_mode", module_intra_batch_mode
+            ),
+            mock.patch.object(
+                aiter_backend,
+                "_mla_decode_fwd_has_fast_mode",
+                launch_has_fast_mode,
+            ),
             mock.patch.object(
                 aiter_backend, "prefer_mla_gluon_decode", return_value=True
             ),
@@ -700,26 +746,59 @@ class TestFp8QAsmLaunchMatchesPlan(CustomTestCase):
                 be._forward_mla_decode(q, _layer(), mock.Mock(), k_descale=1.0)
         return be._mla_decode_fwd_with_head_pad.call_args.kwargs
 
-    def test_launch_takes_the_planned_intra_batch_mode(self):
-        """Under PERSIST=0 the module intra_batch_mode is off, but the opt-in plans
-        with the PERSIST=1 schedule (intra_batch_mode on); the launch must match."""
+    def test_opt_in_launches_with_the_planned_schedule(self):
+        """Under PERSIST=0 the module modes are off, but the opt-in plans with the
+        PERSIST=1 schedule; the launch must take the same fast and intra-batch modes."""
         for verify in (False, True):
-            with self.subTest(verify=verify):
-                kwargs = self._launch_kwargs(verify=verify, auto_kv_splits=False)
-                self.assertTrue(kwargs["intra_batch_mode"])
+            for auto_kv_splits, planned in (
+                (False, (False, True)),
+                (True, (True, False)),
+            ):
+                with self.subTest(verify=verify, auto_kv_splits=auto_kv_splits):
+                    kwargs = self._launch_kwargs(
+                        verify=verify, auto_kv_splits=auto_kv_splits
+                    )
+                    self.assertEqual(
+                        (kwargs["fast_mode"], kwargs["intra_batch_mode"]), planned
+                    )
 
-    def test_auto_kv_splits_reach_the_kernel_as_none(self):
+    def test_opt_in_skips_fast_mode_on_an_older_aiter(self):
+        """An aiter whose mla_decode_fwd has no fast_mode must not get one."""
+        kwargs = self._launch_kwargs(
+            verify=True, auto_kv_splits=False, launch_has_fast_mode=False
+        )
+        self.assertNotIn("fast_mode", kwargs)
+        self.assertTrue(kwargs["intra_batch_mode"])
+
+    def test_opt_in_auto_kv_splits_reach_the_kernel_as_none(self):
         """mla_decode_fwd reads -1 as a real split count; None lets aiter pick."""
         for verify in (False, True):
             with self.subTest(verify=verify):
                 kwargs = self._launch_kwargs(verify=verify, auto_kv_splits=True)
                 self.assertIsNone(kwargs["num_kv_splits"])
-                self.assertFalse(kwargs["intra_batch_mode"])
+
+    def test_default_route_launch_is_unchanged(self):
+        """With the opt-in off, PERSIST=1 decode and verify launch with the module
+        intra_batch_mode, no fast_mode, and verify keeps the planned split cap."""
+        for auto_kv_splits in (False, True):
+            for verify, num_kv_splits in (
+                (False, None if auto_kv_splits else 32),
+                (True, -1 if auto_kv_splits else 32),
+            ):
+                with self.subTest(verify=verify, auto_kv_splits=auto_kv_splits):
+                    kwargs = self._launch_kwargs(
+                        verify=verify,
+                        auto_kv_splits=auto_kv_splits,
+                        fp8_q_asm=False,
+                    )
+                    self.assertNotIn("fast_mode", kwargs)
+                    self.assertEqual(kwargs["intra_batch_mode"], not auto_kv_splits)
+                    self.assertEqual(kwargs["num_kv_splits"], num_kv_splits)
 
 
 class TestFp8QAsmQueryCast(CustomTestCase):
     def _run_decode(
-        self, *, enabled, qlen, query_dtype=torch.bfloat16, persistent=True, q_max=1.0
+        self, *, enabled, qlen, query_dtype=torch.bfloat16, persistent=True
     ):
         from sglang.srt.layers.attention import aiter_backend
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
@@ -735,7 +814,7 @@ class TestFp8QAsmQueryCast(CustomTestCase):
         be.use_mla_fp8_q_asm = enabled
         be.q_scale = torch.tensor([1.0])
         layer = mock.Mock(tp_q_head_num=12, v_head_dim=512)
-        q = torch.linspace(-q_max, q_max, steps=2 * 12 * 576).view(2, 12, 576)
+        q = torch.linspace(-1.0, 1.0, steps=2 * 12 * 576).view(2, 12, 576)
         q = q.to(query_dtype)
         q_scale = torch.tensor(0.25)
 
@@ -743,9 +822,8 @@ class TestFp8QAsmQueryCast(CustomTestCase):
             out.fill_(2)
 
         def static_quant(x, scale):
-            # Saturating static quant, as the GPU kernel does.
-            finfo = torch.finfo(fp8_dtype)
-            return (x.float() / scale).clamp(finfo.min, finfo.max).to(fp8_dtype), scale
+            # Stands in for aiter's static quant; its saturation is aiter's contract.
+            return (x.float() / scale).to(fp8_dtype), scale
 
         with (
             mock.patch.object(
@@ -753,7 +831,7 @@ class TestFp8QAsmQueryCast(CustomTestCase):
             ) as kernel,
             mock.patch.object(
                 aiter_backend, "scaled_fp8_quant", side_effect=static_quant
-            ),
+            ) as quant,
             mock.patch.object(aiter_backend, "is_gfx95_supported", return_value=True),
             mock.patch.object(aiter_backend, "_use_mla_ps_kernel", False),
         ):
@@ -772,43 +850,48 @@ class TestFp8QAsmQueryCast(CustomTestCase):
         self.assertEqual(out.shape, (2, 12, 512))
         self.assertEqual(out.dtype, torch.bfloat16)
         self.assertTrue(torch.all(out == 2).item())
-        return q, q_in, kernel.call_args.kwargs["q_scale"], q_scale
+        return q, q_in, kernel.call_args.kwargs["q_scale"], q_scale, be, quant
 
-    def test_bf16_q_is_cast_inside_the_window(self):
+    def test_opt_in_quantizes_with_the_static_q_scale(self):
+        """The opt-in route takes the quant kernel and the backend's resident q scale."""
         for qlen in (1, 8):
             with self.subTest(qlen=qlen):
-                q, q_in, scale, _ = self._run_decode(enabled=True, qlen=qlen)
+                q, q_in, scale, _, be, quant = self._run_decode(enabled=True, qlen=qlen)
                 self.assertEqual(q_in.dtype, fp8_dtype)
                 torch.testing.assert_close(
                     q_in[:, :12].float(), q.to(fp8_dtype).float()
                 )
-                self.assertEqual(scale.item(), 1.0)
+                self.assertIs(scale, be.q_scale)
+                quant.assert_called_once()
 
-    def test_cast_saturates_out_of_range_q(self):
-        """A query beyond the fp8 range must saturate, not turn into NaN."""
-        _, q_in, _, _ = self._run_decode(enabled=True, qlen=1, q_max=1000.0)
-        self.assertFalse(torch.isnan(q_in.float()).any().item())
+    def test_default_wide_window_keeps_plain_cast(self):
+        """With the opt-in off, a >4-token window keeps the plain fp8 cast at a fresh
+        unit scale, as before the opt-in; the quant kernel is not called."""
+        q, q_in, scale, _, be, quant = self._run_decode(enabled=False, qlen=8)
+        quant.assert_not_called()
+        self.assertTrue(
+            torch.equal(
+                q_in[:, :12].view(torch.uint8), q.to(fp8_dtype).view(torch.uint8)
+            )
+        )
+        self.assertEqual(scale.item(), 1.0)
+        self.assertIsNot(scale, be.q_scale)
 
     def test_non_persistent_call_keeps_bf16_query(self):
         """Draft extend under PERSIST=0 has no persist metadata and keeps its bf16 query."""
-        _, q_in, scale, original_scale = self._run_decode(
+        _, q_in, scale, original_scale, _, _ = self._run_decode(
             enabled=True, qlen=4, persistent=False
         )
         self.assertEqual(q_in.dtype, torch.bfloat16)
         self.assertIs(scale, original_scale)
 
     def test_default_route_preserves_bf16_query_and_scale(self):
-        _, q_in, scale, original_scale = self._run_decode(enabled=False, qlen=4)
+        _, q_in, scale, original_scale, _, _ = self._run_decode(enabled=False, qlen=4)
         self.assertEqual(q_in.dtype, torch.bfloat16)
         self.assertIs(scale, original_scale)
 
-    def test_wide_window_keeps_existing_fp8_cast(self):
-        _, q_in, scale, _ = self._run_decode(enabled=False, qlen=8)
-        self.assertEqual(q_in.dtype, fp8_dtype)
-        self.assertEqual(scale.item(), 1.0)
-
     def test_fp8_query_preserves_existing_scale(self):
-        _, q_in, scale, original_scale = self._run_decode(
+        _, q_in, scale, original_scale, _, _ = self._run_decode(
             enabled=True, qlen=8, query_dtype=fp8_dtype
         )
         self.assertEqual(q_in.dtype, fp8_dtype)

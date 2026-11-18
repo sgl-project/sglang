@@ -9,7 +9,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=12, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=12, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 _HAS_GPU = torch.cuda.is_available()
 NUM_TOKENS, NUM_HEADS, HEAD_SIZE, BLOCK_SIZE, NUM_BLOCKS = 37, 8, 128, 16, 8

@@ -80,7 +80,22 @@ When you need to profile prefill or decode workers in PD disaggregation mode, pl
 
 ## Router Integration
 
-For deploying PD disaggregation at scale with load balancing and fault tolerance, SGLang provides a router. The router can distribute requests between prefill and decode instances using various routing policies. For detailed information on setting up routing with PD disaggregation, including configuration options and deployment patterns, see the [SGLang Model Gateway (former Router)](./sgl_model_gateway#prefill-decode-disaggregation).
+For deploying PD disaggregation at scale with load balancing and fault tolerance, SGLang provides a router. The router can distribute requests between prefill and decode instances using various routing policies.
+
+The router is the `sgl-router` binary. It is pre-installed on the `PATH` of the SGLang Docker images; otherwise install it with `pip install sgl-router`, or see [installing sgl-router](/docs/advanced_features/dp_dpa_router_guide#quick-start-for-sgl-router) for the container image and building from source.
+
+Launch it in front of the prefill and decode servers:
+
+```bash Command
+sgl-router \
+  --model-id meta-llama/Llama-3.1-8B-Instruct \
+  --no-tokenizer \
+  --worker-urls http://127.0.0.1:30000 http://127.0.0.1:30001 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+`--worker-urls` lists the prefill and decode servers together: the router reads each server's role and the prefill bootstrap port from the server itself. `--model-id` must match the servers' model name, which is their `--served-model-name`, or their `--model-path` when that flag is not set. `--no-tokenizer` leaves tokenization to the servers. Wait for `curl http://127.0.0.1:8000/readiness` to return HTTP 200, which means both servers are registered. For routing policies, Kubernetes service discovery, and the other flags, see `sgl-router --help` and the [sgl-router README](https://github.com/sgl-project/sglang/blob/main/sgl-router/README.md).
 
 ### Responses API under HTTP PD
 
@@ -216,7 +231,7 @@ python -m sglang.launch_server \
   --port 30001 \
   --base-gpu-id 1 \
   --disaggregation-ib-device mlx5_roce0
-python -m sglang_router.launch_router --pd-disaggregation --prefill http://127.0.0.1:30000 --decode http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
+sgl-router --model-id meta-llama/Llama-3.1-8B-Instruct --no-tokenizer --worker-urls http://127.0.0.1:30000 http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
 ```
 
 ### DeepSeek Multi-Node
@@ -455,10 +470,10 @@ python -m sglang.launch_server \
   --disaggregation-ib-device mlx5_3,mlx5_4
 
 # Router
-python -m sglang_router.launch_router \
-  --pd-disaggregation \
-  --prefill http://127.0.0.1:30000 \
-  --decode http://127.0.0.1:30001 \
+sgl-router \
+  --model-id $MODEL_PATH \
+  --no-tokenizer \
+  --worker-urls http://127.0.0.1:30000 http://127.0.0.1:30001 \
   --host 0.0.0.0 --port 8000
 ```
 
@@ -498,7 +513,7 @@ python -m sglang.launch_server \
   --port 30001 \
   --base-gpu-id 1 \
   --disaggregation-transfer-backend nixl
-python -m sglang_router.launch_router --pd-disaggregation --prefill http://127.0.0.1:30000 --decode http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
+sgl-router --model-id meta-llama/Llama-3.1-8B-Instruct --no-tokenizer --worker-urls http://127.0.0.1:30000 http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
 ```
 
 ### DeepSeek Multi-Node
@@ -669,7 +684,7 @@ python3 -m sglang.launch_server \
         --disaggregation-bootstrap-port 8996 \
         --base-gpu-id 0 \
         --disable-radix-cache \
-        --disable-cuda-graph \
+        --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --moe-a2a-backend deepep --deepep-mode normal \
         # 2>&1 | tee $SGLANG_LOG_PATH
 ```
@@ -739,14 +754,12 @@ python3 -m sglang.launch_server \
 #### router
 
 ```bash
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://127.0.0.1:10000 \
-    --decode  http://127.0.0.1:10001 \
+sgl-router \
+    --model-id /path/to/MiMo-V2-Flash-w8a8-all-0512 \
+    --no-tokenizer \
+    --worker-urls http://127.0.0.1:10000 http://127.0.0.1:10001 \
     --host 127.0.0.1 \
-    --port 9903 \
-    --health-check-interval-secs 3600 \
-    --mini-lb \
+    --port 9903
 ```
 
 ### DeepSeek Multi-Node
@@ -853,9 +866,9 @@ done
 #### router
 
 ```bash
-python -m  sglang_router.launch_router --prefill ${P_IP}:8000 \
---decode ${D_IP}:8001 \
---host ${D_IP} --port 6688 \
---pd-disaggregation \
---health-check-interval-secs 3600 \
+sgl-router \
+--model-id /path/to/deepseekr1_w4a8_pertoken \
+--no-tokenizer \
+--worker-urls http://${P_IP}:8000 http://${D_IP}:8001 \
+--host ${D_IP} --port 6688
 ```

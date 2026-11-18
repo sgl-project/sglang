@@ -101,8 +101,8 @@ class UnifiedMambaSlotAllocator:
     def alloc(self, need_size: int):
         return self._take(need_size)  # VIRTUAL ids
 
-    def free(self, free_index: torch.Tensor):
-        return self._multi_ended_allocator.free(free_index)
+    def free(self, free_index: torch.Tensor, *, owned: bool = False):
+        return self._multi_ended_allocator.free(free_index, owned=owned)
 
     def clear(self):
         return self._multi_ended_allocator.clear()

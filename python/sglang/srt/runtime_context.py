@@ -1855,6 +1855,7 @@ _PLATFORM_PROBES: Dict[str, str] = {
     "is_sm120": "is_sm120_supported",
     "is_blackwell": "is_blackwell_supported",
     "is_gfx95": "is_gfx95_supported",
+    "is_gfx950": "is_gfx950_supported",
     "is_hopper_with_cuda_12_3": "is_hopper_with_cuda_12_3",
     "has_amx": "cpu_has_amx_support",
     "has_flashinfer": "is_flashinfer_available",
@@ -1887,7 +1888,7 @@ class PlatformContext:
             raise AttributeError(
                 f"unknown platform fact {name!r}; known: {', '.join(known)}"
             )
-        overrides = object.__getattribute__(self, "_overrides")
+        overrides = self._overrides
         if name in overrides:
             return overrides[name]
         from sglang.srt.utils import device as _device
@@ -2095,8 +2096,8 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
     publisher, or `None` if publishing is disabled / misconfigured.
 
     This is the wire contract surfaced under the `kv_events` key on
-    `/server_info` so KV-aware routers (e.g. the SGLang model
-    gateway) can subscribe per-worker without operator-supplied port
+    `/server_info` so KV-aware routers (e.g. sgl-router) can
+    subscribe per-worker without operator-supplied port
     coordination. The router constructs the per-DP-rank SUB endpoint
     as tcp://<worker_host>:<endpoint_port_base + dp_rank> for
     every rank reported in dp_size.

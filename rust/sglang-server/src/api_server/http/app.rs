@@ -9,7 +9,7 @@ use axum::Router;
 
 use super::generate_hook::GenerateHook;
 use super::{
-    auth, dp_relay, hicache, info, loads, metrics, native_api, openai, pre_generate,
+    auth, connections, dp_relay, hicache, info, loads, metrics, native_api, openai, pre_generate,
     request_decompression,
 };
 use crate::HttpLayer;
@@ -232,26 +232,24 @@ pub async fn serve(
             return;
         }
     };
-    // `with_connect_info` exposes the peer address to the access-log middleware.
+    if let Some(http2) = &server_args.http2 {
+        tracing::info!(
+            max_concurrent_streams = http2.max_concurrent_streams,
+            initial_connection_window_size = http2.initial_connection_window_size,
+            "HTTP/2 (h2c) enabled on the HTTP listener, beside HTTP/1.1"
+        );
+    }
     // Once a drain ends, stop accepting, let the requests still on open
     // connections finish (the last bytes of the drained responses, or one
     // that raced the close), close idle keep-alive connections, and return.
     let graceful = drain.clone();
-    let serve = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
+    let serve = connections::serve(listener, app, server_args.http2.as_ref(), async move {
         if graceful.drain_ended().await == DrainEnd::Drained {
             tracing::info!("drain: no request left in flight; closing the HTTP listener");
         }
     });
     tokio::select! {
-        r = serve => {
-            if let Err(e) = r {
-                tracing::error!(error = %e, "axum serve exited");
-            }
-        }
+        () = serve => {}
         // Dropping `serve` closes the listener without waiting; the requests
         // still in flight end with the api runtime.
         () = drain.drain_close_deadline() => {
