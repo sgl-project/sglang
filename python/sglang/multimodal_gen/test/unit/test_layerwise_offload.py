@@ -348,6 +348,32 @@ def shared_store_manager(monkeypatch, tmp_path):
     assert pool not in shared_pinned_store._LOCKS
 
 
+@pytest.mark.parametrize(
+    "stored,incoming,should_share",
+    [
+        pytest.param(0x00000000, 0x80000000, False, id="signed-zero"),
+        pytest.param(0x7FC00001, 0x7FC00001, True, id="same-nan"),
+        pytest.param(0x7FC00001, 0x7FC00002, False, id="different-nan-payload"),
+    ],
+)
+def test_shared_store_requires_identical_weight_bytes(
+    shared_store_manager, stored, incoming, should_share
+):
+    create, _ = shared_store_manager
+
+    def load(bits):
+        def set_bias(model):
+            model.blocks[0].bias.detach().view(torch.uint32)[0] = bits
+
+        return create(set_bias)
+
+    assert load(stored)._shared_cpu_weights
+    follower = load(incoming)
+    assert bool(follower._shared_cpu_weights) is should_share
+    bias_bits = follower.get_cpu_weight("blocks.0.bias").view(torch.uint32)
+    assert bias_bits[0].item() == incoming
+
+
 @pytest.mark.parametrize("writeback", ["update", "sync"])
 @pytest.mark.parametrize("pin_headroom", [True, False])
 def test_shared_store_writeback_preserves_peer_weights(

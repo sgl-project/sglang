@@ -1,61 +1,12 @@
-"""Named pinned host stores that co-resident instances serve from one copy.
+"""Share layerwise pinned CPU weights between processes on the same host.
 
-The layerwise offload weight store has to be anonymous shared memory: it is the
-only form cudaHostRegister accepts that can also be shared between processes.
-sglang creates it with an anonymous memfd, so every instance on the host gets
-its own copy of the whole component -- 62.28 GB for H3's transformer, 46.18 GB
-for its text encoder.
+The creator holds the owner lock exclusively. Followers hold the users lock
+shared. Under the decision mutex, the last participant or next creator can
+reclaim a generation only after taking both locks exclusively. The manifest
+identifies the segments to unlink, including after a SIGKILL.
 
-Naming the segment turns those into one copy per component. Three things have
-to hold for that to be stable, and each of them was learned the hard way:
-
-1. The name has to outlive the creating process's tracker.
-   `multiprocessing.SharedMemory(create=True)` registers the segment with a
-   resource_tracker, which unlinks everything it registered when its process
-   exits. In a serve process tree that tracker belongs to a short-lived parent,
-   so the segments were unlinked while the creator was still serving: a later
-   instance found the name free, created a second full pool under the same
-   names, and the first pool survived only as unreachable pages. /dev/shm held
-   two 109 GiB generations, and the two instances shared nothing. Every create
-   now unregisters itself (Python 3.12 has no `track=False`).
-
-2. A generation may only be replaced when nothing is reading it.
-   Two locks answer that, and neither is ever converted:
-     <base>.owner  held exclusively for its whole life by the one process that
-                   is allowed to create a generation
-     <base>.users  held shared for its whole life by every process serving a
-                   generation
-   Reclaiming the segments requires holding both exclusively at once, which is
-   only possible when no creator and no follower is alive. A short-lived
-   <base>.decide mutex serialises the decision itself, so the users lock can be
-   tested and dropped without a race.
-   An earlier version had the creator hold one lock exclusively and followers
-   take that same lock shared -- which flock refuses. The followers fell
-   through to a lockless join, and the next creator went on to unlink a
-   generation three live instances were still reading.
-
-3. A generation has to be reclaimed, and only one process may ever do it.
-   Holding both locks proves there are no participants left, so the creator
-   unlinks the previous generation's segments -- listed in a manifest -- before
-   creating its own. Without this the orphaned pages stay until reboot.
-   A named segment also outlives its readers, so the participant that leaves
-   last runs the same check on its way out and unlinks the generation there,
-   rather than leaving the whole component to a next start that may never come.
-   Leaving is either a signal -- a unit stops with SIGTERM to every process in
-   it, so the release runs from a handler -- or a return, which a
-   multiprocessing child makes through `os._exit` and a finalizer. SIGKILL
-   reaches neither, and the next creator reclaims instead.
-
-   create    the creator allocates each segment, fills it, registers it, then
-             publishes its marker.
-   attach    a follower waits for the marker before opening the segment, so it
-             can never read a half-filled store, and waits for one the creator
-             has not reached yet instead of allocating a second copy.
-   verify    the follower compares the store against the weights *it* loaded
-             from disk. The key only has to be structural, because a store
-             holding different bytes is rejected rather than trusted.
-   miss      the creator stopped advancing, or the bytes differ: the follower
-             closes the segment and its caller allocates privately.
+The creator publishes a ready marker after registering each filled segment.
+Followers wait for the marker and verify their checkpoint bytes before reuse.
 """
 
 import ctypes
@@ -67,6 +18,7 @@ import signal
 import time
 import weakref
 from multiprocessing import resource_tracker, shared_memory, util
+from pathlib import Path
 
 import torch
 
@@ -74,21 +26,16 @@ logger = logging.getLogger(__name__)
 
 MARKER_DIR = "/tmp/sglang-shared-stores"
 
-# A creator that is alive but slow -- CPU-starved, or faulting its first layer
-# off a cold network mount -- keeps advancing, so followers keep waiting. Only
-# a creator with no progress for this long is given up on.
+# Wait while a slow creator continues to publish layers.
 STALL_TIMEOUT_S = 90.0
 MAX_WAIT_S = 900.0
 
-# The decision covers unlinking a whole dead generation, which is fast; a peer
-# stuck here is a peer that will never finish.
 DECIDE_TIMEOUT_S = 120.0
 
 _LIVE: dict[int, "SharedStore"] = {}
 _POOL_REFS: dict[str, int] = {}
 _LOCKS: dict[str, list[int]] = {}
 _ROLE: dict[str, bool | None] = {}
-_FILLED: dict[str, int] = {}
 _STATS: dict[str, dict[str, int]] = {}
 _LEAVING: set[str] = set()
 _TERM_HOOKED = False
@@ -179,12 +126,7 @@ def _decide_lock(fd: int) -> bool:
 
 
 def join_pool(pool: str) -> bool | None:
-    """Decide whether this process creates the pool's generation or joins it.
-
-    True means create, False means attach to what is there, and None means the
-    pool cannot be joined at all: the caller then allocates privately, which is
-    always correct but costs the memory the pool exists to save.
-    """
+    """Return True for the creator, False for a follower, or None on timeout."""
     if pool in _ROLE:
         return _ROLE[pool]
     os.makedirs(MARKER_DIR, exist_ok=True)
@@ -227,19 +169,8 @@ def join_pool(pool: str) -> bool | None:
 
 
 def _release_and_die(signum: int, _frame) -> None:
-    """Release every pool this process holds, then die the way the signal meant.
-
-    Needed because the exit that actually happens is a signal: a systemd unit
-    stops with `KillMode=control-group`, so SIGTERM goes to every process in it
-    -- this worker included -- and the default action kills it before any exit
-    hook runs. Whichever handler was installed before is restored and re-raised,
-    so a process that already owns this signal keeps owning it.
-    """
-    # A unit stop delivers more than one SIGTERM and a Python handler is re-entered
-    # between bytecodes, sometimes before the block below takes effect (a pending
-    # call is already queued). The inner call ends by re-raising the signal, which
-    # would kill the process in the middle of the release the outer call is still
-    # running, so it must not run at all -- blocking alone is not enough.
+    """Release pool seats and deliver the signal to the previous handler."""
+    # A second signal can re-enter this handler before the signal mask is set.
     global _RELEASING
     if _RELEASING:
         return
@@ -256,15 +187,7 @@ def _release_and_die(signum: int, _frame) -> None:
 
 
 def _note_leave(pool: str) -> None:
-    """Arrange for `leave_pool` to run when this process goes away.
-
-    Neither of the two exits here is a normal one. A signal: the unit is stopped
-    with SIGTERM to every process in it, so nothing Python-level runs and a
-    handler is the only way to release the generation in time. A clean return: a
-    multiprocessing child leaves through `os._exit`, which skips every `atexit`
-    hook, and `util.Finalize` is what that path does run. SIGKILL reaches
-    neither, and the next creator reclaims instead.
-    """
+    """Cover signal termination and multiprocessing's os._exit path."""
     global _TERM_HOOKED
     if not _TERM_HOOKED:
         _TERM_HOOKED = True
@@ -284,19 +207,9 @@ def _note_leave(pool: str) -> None:
 def leave_pool(pool: str) -> bool:
     """Give up this process's seat, reclaiming the generation if it was the last.
 
-    A name in /dev/shm outlives its readers -- the kernel frees an anonymous
-    memfd when its last holder exits, but a named segment stays until something
-    alive unlinks it -- so the participant that leaves last does it, on the same
-    proof the creator uses: hold `<base>.owner` and `<base>.users` exclusively
-    at once, which no live participant can be holding.
-
-    This runs under `<base>.decide`, the mutex `join_pool` decides under, and
-    that is what makes releasing our own seat safe: the seat has to go before
-    the exclusive test can mean anything, and without the mutex a process
-    starting inside that window would take the pool for empty and the segments
-    would be pulled from under readers it never saw.
-
-    Returns whether a generation was reclaimed.
+    Under the decision lock, release our seat and test for remaining readers.
+    On timeout, drop only our seat. The next creator or last participant can
+    then acquire both locks and reclaim the segments.
     """
     held = _LOCKS.pop(pool, None)
     _ROLE.pop(pool, None)
@@ -304,20 +217,19 @@ def leave_pool(pool: str) -> bool:
         return False
 
     owner_path, users_path, decide_path, _, _ = _pool_paths(pool)
-    decide_fd = os.open(decide_path, os.O_CREAT | os.O_RDWR, 0o600)
-    opened = [decide_fd]
+    opened = []
     reclaimed = False
     try:
+        decide_fd = os.open(decide_path, os.O_CREAT | os.O_RDWR, 0o600)
+        opened.append(decide_fd)
         if not _decide_lock(decide_fd):
             return False
-        for fd in held:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+        while held:
+            os.close(held.pop())
         owner_fd = os.open(owner_path, os.O_CREAT | os.O_RDWR, 0o600)
+        opened.append(owner_fd)
         users_fd = os.open(users_path, os.O_CREAT | os.O_RDWR, 0o600)
-        opened += [owner_fd, users_fd]
+        opened.append(users_fd)
         if _try_lock(owner_fd, fcntl.LOCK_EX) and _try_lock(users_fd, fcntl.LOCK_EX):
             released = _reclaim(pool)
             reclaimed = bool(released)
@@ -329,7 +241,7 @@ def leave_pool(pool: str) -> bool:
                     pool,
                 )
     finally:
-        for fd in opened:
+        for fd in held + opened:
             try:
                 os.close(fd)
             except OSError:
@@ -390,11 +302,8 @@ def _note_segment(pool: str, name: str) -> None:
 
 def _publish_progress(pool: str) -> None:
     _, _, _, progress, _ = _pool_paths(pool)
-    tmp = f"{progress}.tmp.{os.getpid()}"
     try:
-        with open(tmp, "w") as handle:
-            handle.write(str(_FILLED.get(pool, 0)))
-        os.replace(tmp, progress)
+        Path(progress).touch()
     except OSError:
         pass
 
@@ -526,11 +435,8 @@ def begin(key: str, nbytes: int, verify, pool: str) -> SharedStore | None:
             _leave_unused_pool(pool)
             return None
 
-    # Every SharedMemory construction registers the name with this process's
-    # resource_tracker, attaching as much as creating, and the tracker unlinks
-    # whatever it registered when this process exits. That is not this store's
-    # lifetime -- the pool lock is -- so every attach has to let go of it, or
-    # one instance leaving would pull the segment out from under the others.
+    # Python 3.12 has no track=False. A worker's resource tracker must not
+    # unlink shared segments while another worker is using them.
     try:
         resource_tracker.unregister(shm._name, "shared_memory")
     except Exception:
@@ -554,26 +460,18 @@ def begin(key: str, nbytes: int, verify, pool: str) -> SharedStore | None:
     if stats["joined"] == 1:
         logger.info("shared pinned store %s: attached %s for %s", pool, name, key)
 
-    # A store that cannot be confirmed is never used; refusing costs a private
-    # allocation, trusting it would cost wrong weights.
     try:
-        if not verify(shm.buf):
-            logger.warning(
-                "shared pinned store %s holds different weights than this "
-                "process loaded; falling back to a private allocation",
-                pool,
-            )
-            shm.close()
-            stats["refused"] += 1
-            _leave_unused_pool(pool)
-            return None
+        matches = verify(shm.buf)
     except Exception as exc:
         logger.warning("shared pinned store %s could not be verified (%s)", pool, exc)
-        shm.close()
-        stats["refused"] += 1
-        _leave_unused_pool(pool)
-        return None
-    return SharedStore(shm, False, key, nbytes, pool)
+    else:
+        if matches:
+            return SharedStore(shm, False, key, nbytes, pool)
+        logger.warning("shared pinned store %s holds different weights", pool)
+    shm.close()
+    stats["refused"] += 1
+    _leave_unused_pool(pool)
+    return None
 
 
 def commit(store: SharedStore) -> bool:
@@ -590,7 +488,6 @@ def commit(store: SharedStore) -> bool:
         if store.created:
             with open(marker, "w") as handle:
                 handle.write(name)
-            _FILLED[store.pool] = _FILLED.get(store.pool, 0) + 1
             _publish_progress(store.pool)
     except OSError:
         logger.warning("shared pinned store %s: could not publish %s", store.pool, name)

@@ -502,7 +502,8 @@ def _store_holds(buf, dtype, offsets, contiguous_weights) -> bool:
         source = local_weight.flatten()
         if source.device.type != "cpu":
             source = source.to("cpu")
-        if not torch.equal(store[off : off + source.numel()], source):
+        stored = store[off : off + source.numel()]
+        if not torch.equal(stored.view(torch.uint8), source.view(torch.uint8)):
             return False
     return True
 

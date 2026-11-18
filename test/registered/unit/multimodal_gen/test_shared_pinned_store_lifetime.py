@@ -1,28 +1,16 @@
-"""Lifetime of the named layerwise pinned stores, without a device.
+"""Cross-process ownership, registration and cleanup of shared pinned stores."""
 
-`begin()` and `commit()` are the device half of the pool: they fill a segment
-and register it. This drives the lifetime half -- who owns a generation, who
-may replace it, and who releases it -- through `join_pool` / `leave_pool` in
-real child processes, which needs no GPU.
-
-Each child takes a store per key the way a serving process does, and is held
-open by the parent until the parent says otherwise, so every check below sees
-one arrangement at a time:
-
-  * the first process owns the pool and the second joins it;
-  * a participant that leaves while another is still serving reclaims nothing;
-  * the participant that leaves last releases the whole generation;
-  * a participant killed outright reaches no exit hook, so its generation is
-    left behind -- and the next creator reclaims it.
-"""
-
+import fcntl
 import gc
 import multiprocessing
 import os
+import signal
 import sys
 import time
 import uuid
+from contextlib import closing, suppress
 from multiprocessing import shared_memory
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -55,139 +43,69 @@ def _segment_path(name: str) -> str:
     return os.path.join("/dev/shm", name)
 
 
-def _present(names: list[str]) -> bool:
-    return all(os.path.exists(_segment_path(name)) for name in names)
-
-
-def _wait_for_gate(gate: str) -> None:
-    deadline = time.monotonic() + DEADLINE_S
-    while time.monotonic() < deadline:
-        if os.path.exists(gate):
-            return
-        time.sleep(0.05)
-
-
-def _hold(pool: str, report: str, gate: str) -> None:
-    """Join the pool without taking a store, and report the role it was given."""
-    role = store.join_pool(pool)
-    with open(report, "w") as handle:
-        handle.write({True: "creator", False: "follower", None: "none"}[role])
-    _wait_for_gate(gate)
-
-
-def _serve(pool: str, keys: list[str], report: str, gate: str) -> None:
-    """Own or join the pool, take a store per key, then wait to be released.
-
-    Returning from here is what a serving process does when it is asked to shut
-    down, so it is also what runs the finalizer that releases the pool.
-
-    `commit()` is what publishes a creator's marker, and it needs a device to
-    register the segment first. There is none here, so the marker -- the only
-    part of publishing that a follower waits on -- is written directly.
-    """
+def _serve(pool, keys, accept, report, done):
     role = store.join_pool(pool)
     outcomes = []
-    for key in keys:
-        held = store.begin(key, SEGMENT_BYTES, lambda buf: True, pool=pool)
-        if held is None:
-            outcomes.append("private")
-        else:
-            outcomes.append("created" if held.created else "joined")
-            if held.created:
-                name, marker = store._names(key)
-                with open(marker, "w") as handle:
-                    handle.write(name)
-    with open(report, "w") as handle:
-        handle.write(f"{'creator' if role else 'follower'}:{','.join(outcomes)}")
-    _wait_for_gate(gate)
+    # Exercise the real publish path in CPU-only workers.
+    with patch.object(store, "_register", return_value=True):
+        for key in keys:
+            held = store.begin(key, SEGMENT_BYTES, lambda _: accept, pool=pool)
+            if held is None:
+                outcomes.append("private")
+            else:
+                assert store.commit(held)
+                outcomes.append("created" if held.created else "joined")
+    report.send((role, outcomes))
+    report.close()
+    assert done.wait(DEADLINE_S)
 
 
-def _join_one(key: str, pool: str, accept: bool, report: str, gate: str) -> None:
-    """Take a single store, reporting what the pool was willing to give."""
-    held = store.begin(key, SEGMENT_BYTES, lambda buf: accept, pool=pool)
-    if held is None:
-        outcome = "private"
-    else:
-        outcome = "created" if held.created else "joined"
-    with open(report, "w") as handle:
-        handle.write(outcome)
-    _wait_for_gate(gate)
-
-
-def _serve_pools(pools: list[str], report: str, gate: str) -> None:
-    """Serve several pools at once, the way one worker serves several components."""
-    for pool in pools:
-        store.join_pool(pool)
-        for index in range(3):
-            key = f"{pool}:{index}"
-            held = store.begin(key, SEGMENT_BYTES, lambda buf: True, pool=pool)
-            if held is not None and held.created:
-                name, marker = store._names(key)
-                with open(marker, "w") as handle:
-                    handle.write(name)
-    with open(report, "w") as handle:
-        handle.write("serving")
-    _wait_for_gate(gate)
-
-
-def _start(tmp_path, target, *args):
-    token = uuid.uuid4().hex[:8]
-    report = tmp_path / f"{token}.report"
-    gate = tmp_path / f"{token}.gate"
-    proc = multiprocessing.get_context("fork").Process(
-        target=target, args=(*args, str(report), str(gate))
-    )
-    proc.start()
-    deadline = time.monotonic() + DEADLINE_S
-    while time.monotonic() < deadline:
-        if report.exists():
-            return proc, gate, report.read_text()
-        if not proc.is_alive():
-            break
-        time.sleep(0.05)
-    proc.kill()
-    proc.join()
-    raise AssertionError(f"child never reported (exit {proc.exitcode})")
-
-
-def _release(proc, gate) -> None:
-    """Let a child return from its target, so its exit hook runs."""
-    gate.touch()
+def _release(proc, done):
+    done.set()
     proc.join(timeout=DEADLINE_S)
     if proc.is_alive():
         proc.kill()
         proc.join()
-        raise AssertionError("child did not exit when released")
-    assert proc.exitcode == 0, f"child exited with {proc.exitcode}"
+        pytest.fail("child did not exit when released")
+    assert proc.exitcode == 0
 
 
-def _clear(pool: str) -> None:
-    """Take down whatever the test left behind, however it ended."""
-    owner, users, decide, progress, manifest = store._pool_paths(pool)
-    try:
-        with open(manifest) as handle:
-            names = [line.strip() for line in handle if line.strip()]
-    except OSError:
-        names = []
-    for name in names:
-        try:
-            shm = shared_memory.SharedMemory(name=name)
-        except (FileNotFoundError, OSError):
-            pass
-        else:
-            try:
-                shm.unlink()
-            finally:
-                shm.close()
-        try:
-            os.remove(store._marker_path(name))
-        except OSError:
-            pass
-    for path in (manifest, progress, owner, users, decide):
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+@pytest.fixture
+def pool(tmp_path, monkeypatch):
+    monkeypatch.setattr(store, "MARKER_DIR", str(tmp_path))
+    name = _pool_name()
+    yield name
+    # Remove test-owned segments even if a failed assertion left no manifest.
+    for key in [*_keys(name), f"{name}:unpublished"]:
+        segment, _ = store._names(key)
+        with (
+            suppress(FileNotFoundError),
+            closing(shared_memory.SharedMemory(name=segment)) as shm,
+        ):
+            shm.unlink()
+
+
+@pytest.fixture
+def start(pool, request):
+    ctx = multiprocessing.get_context("fork")
+
+    def launch(keys=(), *, accept=True):
+        reader, writer = ctx.Pipe(duplex=False)
+        done = ctx.Event()
+        proc = ctx.Process(target=_serve, args=(pool, keys, accept, writer, done))
+        proc.start()
+        writer.close()
+
+        def cleanup():
+            if proc.is_alive():
+                _release(proc, done)
+
+        request.addfinalizer(cleanup)
+        with reader:
+            assert reader.poll(DEADLINE_S), "child did not report its stores"
+            return proc, done, reader.recv()
+
+    return launch
 
 
 class _CpuDevice:
@@ -344,186 +262,85 @@ def test_registration_lives_until_the_last_tensor_view(tmp_path, monkeypatch):
     assert not os.path.exists(_segment_path(store._names(key)[0]))
 
 
-class TestSharedPinnedStoreLifetime:
-    def test_first_process_owns_and_the_second_joins(self, tmp_path):
-        pool = _pool_name()
-        keys = _keys(pool)
-        children = []
-        try:
-            children.append(_start(tmp_path, _serve, pool, keys))
-            children.append(_start(tmp_path, _serve, pool, keys))
-            assert children[0][2] == "creator:created,created,created"
-            assert children[1][2] == "follower:joined,joined,joined"
-        finally:
-            for proc, gate, _ in children:
-                if proc.is_alive():
-                    _release(proc, gate)
-            _clear(pool)
+@pytest.mark.parametrize("has_owner", [False, True], ids=["owner", "follower"])
+def test_leave_timeout_drops_pool_seat(pool, start, monkeypatch, has_owner):
+    monkeypatch.setattr(store, "DECIDE_TIMEOUT_S", 0)
+    peer = start() if has_owner else None
+    monkeypatch.setattr(store, "_note_leave", lambda pool: None)
+    try:
+        assert store.join_pool(pool) is (not has_owner)
+        _, _, decide, _, _ = store._pool_paths(pool)
+        with open(decide, "r+") as busy:
+            fcntl.flock(busy, fcntl.LOCK_EX)
+            assert not store.leave_pool(pool)
+        if peer is not None:
+            _release(*peer[:2])
+        assert store.join_pool(pool) is True
+    finally:
+        store.leave_pool(pool)
 
-    def test_a_participant_that_leaves_early_reclaims_nothing(self, tmp_path):
-        pool = _pool_name()
-        keys = _keys(pool)
-        names = [store._names(key)[0] for key in keys]
-        owner = follower = None
-        try:
-            owner = _start(tmp_path, _serve, pool, keys)
-            follower = _start(tmp_path, _serve, pool, keys)
-            assert owner[2].startswith("creator:")
-            assert follower[2].startswith("follower:")
 
-            _release(*owner[:2])
-            owner = None
-            assert _present(names), (
-                "the pool was reclaimed while a follower was still serving it"
-            )
-        finally:
-            if owner is not None:
-                _release(*owner[:2])
-            if follower is not None:
-                _release(*follower[:2])
-            _clear(pool)
+@pytest.mark.parametrize("terminate", [False, True], ids=["return", "sigterm"])
+def test_only_last_participant_reclaims_generation(pool, start, terminate):
+    keys = _keys(pool)
+    owner, owner_done, report = start(keys)
+    assert report == (True, ["created"] * len(keys))
+    follower, follower_done, report = start(keys)
+    assert report == (False, ["joined"] * len(keys))
 
-    def test_the_last_participant_releases_the_generation(self, tmp_path):
-        pool = _pool_name()
-        keys = _keys(pool)
-        names = [store._names(key)[0] for key in keys]
-        owner = follower = None
-        try:
-            owner = _start(tmp_path, _serve, pool, keys)
-            follower = _start(tmp_path, _serve, pool, keys)
-            _release(*owner[:2])
-            owner = None
-            _release(*follower[:2])
-            follower = None
+    _release(owner, owner_done)
+    names = [store._names(key)[0] for key in keys]
+    assert all(os.path.exists(_segment_path(name)) for name in names)
+    if terminate:
+        follower.terminate()
+        follower.join(timeout=DEADLINE_S)
+        assert follower.exitcode == -signal.SIGTERM
+    else:
+        _release(follower, follower_done)
 
-            for name in names:
-                assert not os.path.exists(_segment_path(name))
-                assert not os.path.exists(store._marker_path(name))
-            _, _, _, _, manifest = store._pool_paths(pool)
-            assert not os.path.exists(manifest)
-        finally:
-            if owner is not None:
-                _release(*owner[:2])
-            if follower is not None:
-                _release(*follower[:2])
-            _clear(pool)
+    for name in names:
+        assert not os.path.exists(_segment_path(name))
+        assert not os.path.exists(store._marker_path(name))
+    assert not os.path.exists(store._pool_paths(pool)[-1])
 
-    def test_a_killed_participant_leaves_the_generation_to_the_next_creator(
-        self, tmp_path
-    ):
-        pool = _pool_name()
-        keys = _keys(pool)
-        names = [store._names(key)[0] for key in keys]
-        children = []
-        try:
-            children.append(_start(tmp_path, _serve, pool, keys))
-            children.append(_start(tmp_path, _serve, pool, keys))
-            assert children[0][2].startswith("creator:")
-            assert children[1][2].startswith("follower:")
 
-            for proc, _, _ in children:
-                proc.kill()
-                proc.join(timeout=DEADLINE_S)
-            assert _present(names), "a killed participant reclaimed on its way out"
+def test_next_creator_reclaims_after_sigkill(pool, start):
+    keys = _keys(pool)
+    owner, _, report = start(keys)
+    assert report == (True, ["created"] * len(keys))
+    follower, _, report = start(keys)
+    assert report == (False, ["joined"] * len(keys))
+    for proc in (owner, follower):
+        proc.kill()
+        proc.join(timeout=DEADLINE_S)
+        assert proc.exitcode == -signal.SIGKILL
 
-            revisit = _start(tmp_path, _hold, pool)
-            try:
-                assert revisit[2] == "creator"
-                assert not any(os.path.exists(_segment_path(n)) for n in names), (
-                    "the next creator did not reclaim the killed generation"
-                )
-            finally:
-                _release(*revisit[:2])
-        finally:
-            for proc, gate, _ in children:
-                if proc.is_alive():
-                    _release(proc, gate)
-            _clear(pool)
+    segments = [Path(_segment_path(store._names(key)[0])) for key in keys]
+    assert all(path.exists() for path in segments)
+    _, _, report = start()
+    assert report == (True, [])
+    assert not any(path.exists() for path in segments)
 
-    def test_a_sigterm_releases_the_generation(self, tmp_path):
-        """The exit that actually happens in a deployment: a signal, not a return.
 
-        A unit stops with SIGTERM to every process in its cgroup, so the worker
-        never reaches `atexit` or a finalizer. The last participant still has to
-        release the generation from the handler, or the whole component stays in
-        /dev/shm until some later start.
-        """
-        pool = _pool_name()
-        keys = _keys(pool)
-        names = [store._names(key)[0] for key in keys]
-        owner = follower = None
-        try:
-            owner = _start(tmp_path, _serve, pool, keys)
-            follower = _start(tmp_path, _serve, pool, keys)
-            _release(*owner[:2])
-            owner = None
-            assert _present(names), "a clean return released the pool too early"
+def test_unpublished_key_falls_back_at_stall_timeout(pool, start, monkeypatch):
+    monkeypatch.setattr(store, "STALL_TIMEOUT_S", 2.0)
+    monkeypatch.setattr(store, "MAX_WAIT_S", 30.0)
+    keys = _keys(pool)
+    _, _, report = start(keys)
+    assert report == (True, ["created"] * len(keys))
+    started = time.monotonic()
+    _, _, report = start([f"{pool}:unpublished"])
+    assert report == (False, ["private"])
+    assert time.monotonic() - started < 10.0
 
-            follower[0].terminate()
-            follower[0].join(timeout=DEADLINE_S)
-            follower = None
-            assert not any(os.path.exists(_segment_path(n)) for n in names), (
-                "the last participant was signalled but did not release the generation"
-            )
-        finally:
-            if owner is not None:
-                _release(*owner[:2])
-            if follower is not None:
-                _release(*follower[:2])
-            _clear(pool)
 
-    def test_a_key_the_creator_never_publishes_goes_private_quickly(
-        self, tmp_path, monkeypatch
-    ):
-        """Two co-resident instances do not always have the same key set.
-
-        A store key is structural, so an instance running a different adapter
-        asks for keys the creator never made -- and nothing will ever publish
-        their markers. Waiting on those has to end at the stall timeout, not at
-        the wait limit, or the instance spends the whole load on markers that
-        are not coming.
-        """
-        monkeypatch.setattr(store, "STALL_TIMEOUT_S", 2.0)
-        monkeypatch.setattr(store, "MAX_WAIT_S", 30.0)
-        pool = _pool_name()
-        holder = None
-        try:
-            holder = _start(tmp_path, _serve, pool, _keys(pool))
-            assert holder[2] == "creator:created,created,created"
-
-            started = time.monotonic()
-            joiner = _start(tmp_path, _join_one, f"{pool}:unpublished", pool, True)
-            elapsed = time.monotonic() - started
-            try:
-                assert joiner[2] == "private"
-                assert elapsed < 10.0, (
-                    f"waited {elapsed:.1f}s on a marker the creator never published"
-                )
-            finally:
-                _release(*joiner[:2])
-        finally:
-            if holder is not None:
-                _release(*holder[:2])
-            _clear(pool)
-
-    @pytest.mark.parametrize("accept", [True, False])
-    def test_begin_trusts_a_store_only_after_the_bytes_agree(self, tmp_path, accept):
-        pool = _pool_name()
-        key = _keys(pool, count=1)[0]
-        holder = None
-        try:
-            holder = _start(tmp_path, _serve, pool, [key])
-            assert holder[2] == "creator:created"
-
-            joiner = _start(tmp_path, _join_one, key, pool, accept)
-            try:
-                assert joiner[2] == ("joined" if accept else "private")
-            finally:
-                _release(*joiner[:2])
-        finally:
-            if holder is not None:
-                _release(*holder[:2])
-            _clear(pool)
+@pytest.mark.parametrize("accept", [True, False])
+def test_join_requires_matching_weights(pool, start, accept):
+    keys = _keys(pool, count=1)
+    _, _, report = start(keys)
+    assert report == (True, ["created"])
+    _, _, report = start(keys, accept=accept)
+    assert report == (False, ["joined" if accept else "private"])
 
 
 if __name__ == "__main__":
