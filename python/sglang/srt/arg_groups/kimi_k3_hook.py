@@ -10,6 +10,7 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils.aiter import aiter_dspark_draft_reject_reason
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -56,23 +57,36 @@ def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
             "--speculative-draft-attention-backend to trtllm_mha."
         )
 
-    # Validated on the Kimi-K3 DSpark draft (8 Q / 2 KV heads, head dim 64) on gfx950;
-    # the draft worker still falls back to triton when AITER lacks causal=False.
+    # Validated on the Kimi-K3 DSpark draft (8 Q / 2 KV heads, head dim 64, no
+    # window) on gfx950 only (#47437), so other HIP archs keep the triton draft.
     if (
         cfg.speculative_algorithm == "DSPARK"
         and cfg.speculative_draft_attention_backend is None
-        and get_platform().is_hip
+        and get_platform().is_gfx950
         and attention_backends_of(resolved_view(server_args))[0] == "aiter"
     ):
-        declare_resolution(
-            server_args,
-            "apply_kimi_k3_spec_backend_defaults",
-            speculative_draft_attention_backend="aiter",
+        reject_reason = aiter_dspark_draft_reject_reason(
+            draft_is_mla=False,
+            draft_has_sliding_window=False,
+            enable_unified_memory=cfg.enable_unified_memory,
+            enable_deterministic_inference=cfg.enable_deterministic_inference,
         )
-        logger.info(
-            "Kimi hybrid DSPARK on ROCm: defaulting "
-            "--speculative-draft-attention-backend to aiter."
-        )
+        if reject_reason is None:
+            declare_resolution(
+                server_args,
+                "apply_kimi_k3_spec_backend_defaults",
+                speculative_draft_attention_backend="aiter",
+            )
+            logger.info(
+                "Kimi hybrid DSPARK on gfx950: defaulting "
+                "--speculative-draft-attention-backend to aiter."
+            )
+        else:
+            logger.info(
+                "Kimi hybrid DSPARK on gfx950: the draft keeps the triton attention "
+                "backend because aiter cannot run it: %s.",
+                reject_reason,
+            )
 
 
 def apply_kimi_k3_linear_attn_defaults(server_args: ServerArgs) -> None:

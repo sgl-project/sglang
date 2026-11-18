@@ -78,14 +78,12 @@ def draft_uses_compressed_kv_attention() -> bool:
 
 
 def _translated_draft_hf_config() -> Optional[Any]:
-    # Mirrors the MiniMax DSpark rewrite ModelConfig applies to the draft.
-    draft_hf_config = _draft_hf_config()
-    architectures = _cfg_get(draft_hf_config, "architectures") or [None]
-    if architectures[0] == "DSparkMiniMaxDraftModel":
-        from sglang.srt.configs.minimax_vl import configure_minimax_m3_dspark
+    from sglang.srt.configs.model_config import translated_dspark_draft_config
 
-        draft_hf_config = configure_minimax_m3_dspark(draft_hf_config)
-    return draft_hf_config
+    draft_hf_config = _draft_hf_config()
+    if draft_hf_config is None:
+        return None
+    return translated_dspark_draft_config(draft_hf_config)
 
 
 def draft_is_mla() -> bool:

@@ -16,7 +16,9 @@
 import functools
 import logging
 import os
+from typing import Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.device import is_hip
 
@@ -73,6 +75,41 @@ def aiter_unified_attention_supports_non_causal() -> bool:
             "CAUSAL" in kernel.arg_names
             for kernel in (kernel_unified_attention_2d, kernel_unified_attention_3d)
         )
-    except Exception as e:
+    except (ImportError, AttributeError) as e:
         logger.debug("AITER unified_attention non-causal probe failed: %s", e)
         return False
+
+
+def aiter_dspark_draft_reject_reason(
+    *,
+    draft_is_mla: bool,
+    draft_has_sliding_window: bool,
+    enable_unified_memory: bool,
+    enable_deterministic_inference: bool,
+) -> Optional[str]:
+    """Why the aiter backend cannot run a DSpark draft, or None when it can.
+
+    The aiter DSpark draft verifies its block bidirectionally on unified_attention
+    (causal=False) over a 4D NHD pool. The draft-backend resolver, the Kimi-K3 hook
+    and AiterAttnBackend all ask this one predicate.
+    """
+    if draft_is_mla:
+        return "MLA draft (the aiter MLA verify is causal-only)"
+    if draft_has_sliding_window:
+        return (
+            "sliding-window draft (unified_attention takes no window with causal=False)"
+        )
+    if not envs.SGLANG_AITER_UNIFIED_VERIFY.get():
+        return "SGLANG_AITER_UNIFIED_VERIFY=0"
+    if envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() != "nhd":
+        return "SGLANG_AITER_KV_CACHE_LAYOUT is not nhd"
+    if enable_unified_memory:
+        return "unified memory"
+    if enable_deterministic_inference:
+        return "deterministic inference (unified_attention is not batch-invariant)"
+    if not aiter_unified_attention_supports_non_causal():
+        return (
+            "the installed AITER unified_attention has no causal=False "
+            "(ROCm/aiter#7244)"
+        )
+    return None

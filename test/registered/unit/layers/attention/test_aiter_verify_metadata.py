@@ -59,6 +59,7 @@ def _unified_verify_backend():
     backend.device = torch.device("cpu")
     backend.use_mla = False
     backend._use_unified_verify = True
+    backend._graph_reads_flat_kv_indices = True
     backend.use_sliding_window_kv_pool = False
     backend.use_muse_attention_paths = False
     backend.muse_reuse_verify_lengths = False
@@ -134,32 +135,27 @@ class TestAiterUnifiedVerifyWithoutHostSeqLens(CustomTestCase):
         )
 
 
-class TestDSparkDraftUnifiedAttention(CustomTestCase):
-    def test_only_dspark_mha_draft_on_4d_pool_routes_to_unified(self):
-        """A target model, an MLA self-draft, another algorithm's draft or a SHUFFLE
-        5D pool must keep its own AITER path; only the DSpark MHA draft switches."""
-        route = aiter_backend._dspark_mha_draft_uses_unified_attention
-        dspark_draft = dict(
-            is_draft_worker=True,
-            is_dspark=True,
-            use_mla=False,
-            kv_cache_is_vectorized_5d=False,
-        )
-        self.assertTrue(route(**dspark_draft))
-        for field in dspark_draft:
-            with self.subTest(flipped=field):
-                self.assertFalse(
-                    route(**{**dspark_draft, field: not dspark_draft[field]})
-                )
+class _CountingKernel:
+    def __init__(self):
+        self.launches = 0
+
+    def __getitem__(self, _grid):
+        def launch(*_args, **_kwargs):
+            self.launches += 1
+
+        return launch
 
 
 class TestUnifiedVerifyGraphBuffers(CustomTestCase):
     def setUp(self):
-        patcher = patch.object(
-            aiter_backend, "reset_verify_attn_plan_cache", lambda: None, create=True
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        self.kv_index_kernel = _CountingKernel()
+        for target, replacement in (
+            ("reset_verify_attn_plan_cache", lambda: None),
+            ("create_flashinfer_kv_indices_triton", self.kv_index_kernel),
+        ):
+            patcher = patch.object(aiter_backend, target, replacement, create=True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def _init_graph_state(self, *, use_unified_verify, reads_flat_kv_indices):
         backend = _unified_verify_backend()
@@ -177,21 +173,37 @@ class TestUnifiedVerifyGraphBuffers(CustomTestCase):
     def test_dspark_draft_skips_the_buffers_unified_verify_never_reads(self):
         """A DSpark draft runner on unified verify allocated a max_bs x context flat
         KV-index buffer and a max_tokens x context mask its target_verify graph never
-        reads; a non-unified verify, or another runner's decode/draft-extend graph, still
-        needs them."""
+        reads, and its verify replay must not build flat indices."""
         backend = self._init_graph_state(
             use_unified_verify=True, reads_flat_kv_indices=False
         )
         self.assertIsNone(backend.cuda_graph_kv_indices)
         self.assertIsNone(backend.cuda_graph_custom_mask)
         backend.init_forward_metadata_out_graph(_verify_batch(), in_capture=False)
-        self.assertIsNone(backend.forward_metadata.kv_indptr)
+        self.assertEqual(self.kv_index_kernel.launches, 0)
 
+    def test_other_runners_keep_their_graph_buffers(self):
+        """Every other runner, unified verify (gpt-oss) or not, keeps the flat KV
+        indices and the custom mask as before, and its unified verify replay still
+        builds the flat indices."""
+        for use_unified_verify in (False, True):
+            with self.subTest(use_unified_verify=use_unified_verify):
+                backend = self._init_graph_state(
+                    use_unified_verify=use_unified_verify, reads_flat_kv_indices=True
+                )
+                self.assertIsNotNone(backend.cuda_graph_kv_indices)
+                self.assertIsNotNone(backend.cuda_graph_custom_mask)
+        backend.init_forward_metadata_out_graph(_verify_batch(), in_capture=False)
+        self.assertEqual(self.kv_index_kernel.launches, 1)
+
+    def test_a_mode_needing_flat_indices_fails_loudly_on_a_dspark_draft(self):
+        """A graph mode other than target_verify on a DSpark draft runner gets a
+        clear error instead of indexing a None buffer."""
         backend = self._init_graph_state(
-            use_unified_verify=False, reads_flat_kv_indices=True
+            use_unified_verify=True, reads_flat_kv_indices=False
         )
-        self.assertIsNotNone(backend.cuda_graph_kv_indices)
-        self.assertIsNotNone(backend.cuda_graph_custom_mask)
+        with self.assertRaisesRegex(RuntimeError, "no flat CUDA-graph KV indices"):
+            backend._flat_graph_kv_indices()
 
 
 _DCP_SIZE = 8
