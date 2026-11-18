@@ -54,7 +54,9 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             num_matched_prefix_tokens=20,
             cache_request_handle=CacheRequestHandle("waiting", 0),
         )
-        chunked_req = SimpleNamespace(seqlen=50, prefix_len=10)
+        chunked_req = SimpleNamespace(
+            seqlen=50, prefix_len=10, kv=SimpleNamespace(kv_allocated_len=10)
+        )
         return SchedulerLoadInquirer(
             disaggregation_mode=disaggregation_mode,
             server_args=None,
@@ -190,6 +192,21 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
         # 200 KV tokens in use + 100 waiting + (50 - 10) still to prefill.
         self.assertEqual(loads.num_total_tokens, 340)
         self.assertEqual(loads.num_active_tokens, 340)
+
+    def test_total_tokens_count_a_just_run_chunk_once(self):
+        """A chunk already allocated in the KV pool is not counted again as unprefilled,
+        though prefix_len only reaches it on the next scheduling pass."""
+        chunked_req = SimpleNamespace(
+            seqlen=16384, prefix_len=0, kv=SimpleNamespace(kv_allocated_len=4096)
+        )
+        inquirer = replace(
+            self.make_inquirer(),
+            get_waiting_queue=lambda: [],
+            get_chunked_req=lambda: chunked_req,
+        )
+        loads = self.get_loads_with_used_tokens(inquirer, 4096)
+
+        self.assertEqual(loads.num_total_tokens, 16384)
 
     def test_total_tokens_without_a_chunked_prefill(self):
         inquirer = replace(self.make_inquirer(), get_chunked_req=lambda: None)
