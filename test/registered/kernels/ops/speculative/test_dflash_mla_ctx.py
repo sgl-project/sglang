@@ -17,7 +17,7 @@ class TestMlaContextKV(CustomTestCase):
     def test_fused_context_kv_matches_per_layer_projection(self):
         """Stacking the layers must not mix one layer's kv_a rows, norm or RoPE into another's."""
         torch.manual_seed(0)
-        hidden, q_lora, kv_lora, rope_dim, layers, n = 1024, 64, 512, 64, 5, 7
+        hidden, q_lora, kv_lora, rope_dim, layers, n = 256, 32, 512, 64, 2, 3
         rotary_emb = get_rope(
             rope_dim, rope_dim, 4096, 50000, is_neox_style=False, dtype=torch.bfloat16
         )

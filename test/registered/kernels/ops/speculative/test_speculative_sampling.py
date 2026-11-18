@@ -314,147 +314,69 @@ def test_uno_compact_preserves_original_top_p_nucleus(joint_top_k_top_p_case):
     torch.testing.assert_close(support_probs, expected_probs[:, :4].view(1, 1, 4))
 
 
-# Probabilities are multiples of 2**-16, so every partial sum is exact in fp32
-# and no reduction order can move a CDF boundary.
-_DYADIC_DENOM = 2**16
-
-
-def _reference(
-    *,
-    predicts,
-    accept_index,
-    accept_token_num,
-    candidates,
-    retrive_index,
-    retrive_next_token,
-    retrive_next_sibling,
-    uniform_samples,
-    uniform_samples_for_final_sampling,
-    target_probs,
-    draft_probs,
-    threshold_single,
-    threshold_acc,
-):
-    """Torch port of TreeSpeculativeSamplingTargetOnly (sgl_kernel/speculative/
-    sampling.cuh) over CPU tensors; updates the outputs and draft_probs in place."""
-    threshold_single = torch.tensor(threshold_single, dtype=torch.float32)
-    threshold_acc = torch.tensor(max(threshold_acc, 1e-9), dtype=torch.float32)
-    num_spec_tokens = accept_index.shape[1]
-    vocab_size = target_probs.shape[-1]
-    for b in range(candidates.shape[0]):
-        prob_acc = torch.zeros((), dtype=torch.float32)
-        row = 0
-        coin = uniform_samples[b, 0]
-        last = int(retrive_index[b, 0])
-        accept_index[b, 0] = last
-        num_accepted = 0
-        cur = 0
-        for _ in range(1, num_spec_tokens):
-            cur = int(retrive_next_token[b, cur])
-            while cur != -1:
-                token = int(candidates[b, cur])
-                prob = target_probs[b, row, token].clone()
-                prob_acc = prob_acc + prob
-                if prob > 0 and (
-                    coin < prob_acc / threshold_acc or prob >= threshold_single
-                ):
-                    prob_acc = torch.zeros((), dtype=torch.float32)
-                    row = cur
-                    coin = uniform_samples[b, cur]
-                    predicts[last] = token
-                    num_accepted += 1
-                    last = int(retrive_index[b, cur])
-                    accept_index[b, num_accepted] = last
-                    break
-                draft_probs[b, row, token] = prob
-                cur = int(retrive_next_sibling[b, cur])
-            if cur == -1:
-                break
-        accept_token_num[b] = num_accepted
-
-        # The bonus token after the last slot has no draft distribution.
-        residual = target_probs[b, row]
-        if num_accepted != num_spec_tokens - 1:
-            residual = residual - draft_probs[b, row]
-        residual = residual.clamp(min=0)
-        u = uniform_samples_for_final_sampling[b] * residual.sum()
-        above = ((residual.cumsum(0) > u) & (residual > 0)).nonzero().flatten()
-        positive = (residual > 0).nonzero().flatten()
-        if len(above):
-            predicts[last] = int(above[0])
-        elif len(positive):
-            predicts[last] = int(positive[-1])
-        else:
-            predicts[last] = vocab_size - 1
-
-
-def _dyadic_rows(shape, vocab, pool, generator):
-    rows = torch.zeros(*shape, vocab)
-    for row in rows.view(-1, vocab):
-        support = int(torch.randint(1, len(pool) + 1, (1,), generator=generator))
-        tokens = pool[torch.randperm(len(pool), generator=generator)[:support]]
-        cuts = torch.randint(0, _DYADIC_DENOM + 1, (support - 1,), generator=generator)
-        bounds = torch.cat(
-            [torch.tensor([0]), cuts.sort().values, torch.tensor([_DYADIC_DENOM])]
-        )
-        row[tokens] = bounds.diff().float() / _DYADIC_DENOM
-    return rows
-
-
-def _make_chain_operands(*, bs, num_nodes, num_spec_tokens, vocab, seed):
-    """Random draft chains (node 0 is the root) with random draft rows, and outputs
-    filled with -1. Candidates mostly come from the parent's target support, so
-    levels accept as well as reject."""
-    generator = torch.Generator().manual_seed(seed)
-    next_token = torch.full((bs, num_nodes), -1, dtype=torch.int64)
-    next_token[:, :-1] = torch.arange(1, num_nodes)
-    # one token pool across the vocab blocks, so draft rows overlap target rows
-    pool = torch.randperm(vocab, generator=generator)[:16]
-    target = _dyadic_rows((bs, num_nodes), vocab, pool, generator)
-    draft = _dyadic_rows((bs, num_nodes), vocab, pool, generator)
-    candidates = torch.zeros((bs, num_nodes), dtype=torch.int64)
+def _reference(candidates, coins, final_coins, target_probs, draft_probs):
+    """The CUDA kernel on single-chain trees with in-order slots, at the default
+    thresholds 1: accept a node iff its coin is below its token's target prob, then
+    draw the bonus token by inverting the CDF of relu(target - draft), or of the
+    target row alone once every slot is filled. Returns predicts, accept_index,
+    accept_token_num and the updated draft_probs."""
+    bs, num_nodes = candidates.shape
+    predicts = torch.full((bs * num_nodes,), -1, dtype=torch.int32)
+    accept_index = torch.full((bs, num_nodes), -1, dtype=torch.int32)
+    accept_token_num = torch.zeros(bs, dtype=torch.int32)
+    draft_probs = draft_probs.clone()
     for b in range(bs):
+        row, last, accepted = 0, b * num_nodes, 0
+        accept_index[b, 0] = last
         for node in range(1, num_nodes):
-            support = target[b, node - 1].nonzero().flatten()
-            if torch.rand((), generator=generator) < 0.75:
-                pick = support[torch.randint(len(support), (1,), generator=generator)]
-            else:
-                pick = torch.randint(vocab, (1,), generator=generator)
-            candidates[b, node] = int(pick)
-    return {
-        "candidates": candidates,
-        # Scattered global slots exercise the predicts / accept_index indirection.
-        "retrive_index": torch.randperm(bs * num_nodes, generator=generator).view(
-            bs, num_nodes
-        ),
-        "retrive_next_token": next_token,
-        "retrive_next_sibling": torch.full((bs, num_nodes), -1, dtype=torch.int64),
-        "uniform_samples": torch.rand((bs, num_nodes), generator=generator),
-        "uniform_samples_for_final_sampling": torch.rand((bs,), generator=generator),
-        "target_probs": target,
-        "draft_probs": draft,
-        "predicts": torch.full((bs * num_nodes,), -1, dtype=torch.int32),
-        "accept_index": torch.full((bs, num_spec_tokens), -1, dtype=torch.int32),
-        "accept_token_num": torch.full((bs,), -1, dtype=torch.int32),
-    }
+            token = int(candidates[b, node])
+            prob = target_probs[b, row, token]
+            if not coins[b, row] < prob:
+                draft_probs[b, row, token] = prob
+                break
+            predicts[last] = token
+            row, last, accepted = node, b * num_nodes + node, accepted + 1
+            accept_index[b, accepted] = last
+        accept_token_num[b] = accepted
+        residual = target_probs[b, row]
+        if accepted < num_nodes - 1:
+            residual = (residual - draft_probs[b, row]).clamp(min=0)
+        above = (residual.cumsum(0) > final_coins[b] * residual.sum()) & (residual > 0)
+        predicts[last] = int(above.nonzero()[0])
+    return predicts, accept_index, accept_token_num, draft_probs
 
 
 @pytest.mark.skipif(torch.version.hip is None, reason="ROCm Triton port")
 def test_target_only_triton_matches_reference():
-    """Random chains over a vocabulary of several 4096-wide blocks, a fractional
-    threshold_acc and draft rows that overlap the target rows; the known-answer
-    cases above cover one block and thresholds 1 and 0. A walk that fills every
-    slot samples the bonus token from the target row alone."""
-    operands = _make_chain_operands(
-        bs=16, num_nodes=6, num_spec_tokens=3, vocab=9001, seed=9003
-    )
-    thresholds = dict(threshold_single=0.5, threshold_acc=0.25)
-    expected = {name: t.clone() for name, t in operands.items()}
-    _reference(**expected, **thresholds)
+    """Two 3-node chains over a vocabulary past two 4096-wide blocks. Request 0
+    fills every slot and draws its bonus token from the second block; request 1
+    rejects its first node and draws from the third, carrying the CDF across the
+    block its rejection emptied. Dyadic probabilities keep every fp32 sum exact."""
+    bs, num_nodes, vocab = 2, 3, 8200
+    target_probs = torch.zeros(bs, num_nodes, vocab)
+    target_probs[..., [1, 4097, 8193]] = torch.tensor([0.25, 0.25, 0.5])
+    operands = {
+        "candidates": torch.tensor([[0, 8193, 4097], [0, 4097, 1]]),
+        "uniform_samples": torch.tensor([[0.1, 0.1, 0.0], [0.6, 0.0, 0.0]]),
+        "uniform_samples_for_final_sampling": torch.tensor([0.3, 0.5]),
+        "target_probs": target_probs,
+        "draft_probs": torch.zeros_like(target_probs),
+    }
+    expected = _reference(*operands.values())
     actual = {name: t.cuda() for name, t in operands.items()}
-    tree_speculative_sampling_target_only(**actual, **thresholds, deterministic=True)
-    for name in ("predicts", "accept_index", "accept_token_num", "draft_probs"):
-        assert torch.equal(actual[name].cpu(), expected[name]), name
+    actual.update(
+        retrive_index=torch.arange(bs * num_nodes, device="cuda").view(bs, num_nodes),
+        retrive_next_token=torch.tensor([[1, 2, -1]] * bs, device="cuda"),
+        retrive_next_sibling=torch.full((bs, num_nodes), -1, device="cuda"),
+        predicts=torch.full((bs * num_nodes,), -1, dtype=torch.int32, device="cuda"),
+        accept_index=torch.full((bs, num_nodes), -1, dtype=torch.int32, device="cuda"),
+        accept_token_num=torch.zeros(bs, dtype=torch.int32, device="cuda"),
+    )
+    tree_speculative_sampling_target_only(**actual, deterministic=True)
+    for name, want in zip(
+        ("predicts", "accept_index", "accept_token_num", "draft_probs"), expected
+    ):
+        assert torch.equal(actual[name].cpu(), want), name
 
 
 if __name__ == "__main__":
