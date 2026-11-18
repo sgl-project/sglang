@@ -503,6 +503,12 @@ class SchedulerMetricsReporter:
                 decode_q.add(req.seqlen)
             for req in self.scheduler.disagg_decode_transfer_queue.queue:
                 decode_q.add(req.seqlen)
+            if self.scheduler.disagg_decode_prebuilt_queue is not None:
+                for req in self.scheduler.disagg_decode_prebuilt_queue:
+                    decode_q.add(req.seqlen)
+                # waiting_queue then holds the requests this server prefills.
+                for req in self.scheduler.waiting_queue:
+                    prefill_q.add(len(req.origin_input_ids))
         else:
             for req in self.scheduler.waiting_queue:
                 if len(req.output_ids) > 0:

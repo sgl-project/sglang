@@ -103,6 +103,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_other_validations",
         "validate_cuda_graph_persistence",
         "handle_model_capability_adjustments",
+        "validate_decode_local_prefill",
         "handle_monokernel",
         "handle_nvidia_megakernel",
         "validate_deepep_v2_speculative_draft",

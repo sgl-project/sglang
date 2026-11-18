@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod forward;
+mod local_prefill;
 mod openai;
 mod preparation;
 mod reorg;
@@ -378,7 +379,11 @@ impl<'a> ModelRouting<'a> {
 
     fn needs_request_tokens(&self, ctx: &AppContext) -> bool {
         match self {
-            Self::Legacy(policy) => policy.needs_request_tokens() || ctx.config.model.dp_aware,
+            Self::Legacy(policy) => {
+                policy.needs_request_tokens()
+                    || ctx.config.model.dp_aware
+                    || ctx.config.proxy.local_prefill_max_uncached_tokens.is_some()
+            }
             // The same predicate gates `--no-tokenizer` at startup,
             // so a load-only bucket skips the body parse.
             Self::Reorg(resolver) => resolver.needs_request_tokens(),
@@ -413,7 +418,7 @@ impl<'a> ModelRouting<'a> {
                 }
             }
             let workers = match self
-                .select_workers(ctx, &request, &headers, &excluded)
+                .select_workers(ctx, &request, &headers, &excluded, true)
                 .await
             {
                 Ok(workers) => workers,
@@ -438,13 +443,15 @@ impl<'a> ModelRouting<'a> {
     }
 
     /// Pick a plain worker, or a prefill worker followed by a decode peer in PD mode,
-    /// never one in `excluded`.
+    /// never one in `excluded`. With `allow_local_prefill`, a PD request whose
+    /// prefix a decode worker holds may go to that worker alone.
     async fn select_workers(
         &self,
         ctx: &AppContext,
         request: &PreparedRequest,
         headers: &HeaderMap,
         excluded: &[WorkerId],
+        allow_local_prefill: bool,
     ) -> Result<SelectedWorkers, ApiError> {
         match self {
             Self::Legacy(policy) => {
@@ -460,6 +467,7 @@ impl<'a> ModelRouting<'a> {
                     policy.as_ref(),
                     &candidates,
                     &resolver,
+                    allow_local_prefill,
                 )
                 .await
             }
@@ -486,6 +494,7 @@ async fn select_workers(
     policy: &dyn Policy,
     candidates: &[Arc<Worker>],
     resolver: &PdPoolResolver,
+    allow_local_prefill: bool,
 ) -> Result<SelectedWorkers, ApiError> {
     // Find cached prompt prefixes and capture engine load info.
     let routing_context = RoutingContext {
@@ -494,6 +503,24 @@ async fn select_workers(
         ..RoutingContext::from_headers(ctx, headers)?
     };
 
+    if allow_local_prefill {
+        if let Some(decode) = local_prefill::pick_decode_worker(
+            ctx,
+            request,
+            resolver,
+            routing_context.prefix_matches.as_ref(),
+        ) {
+            // The decode worker gains the prompt, so it takes the prefix credit.
+            record_prefill_route(ctx, routing_context.prefix_matches.as_ref(), &decode.url);
+            return Ok(SelectedWorkers {
+                prefill: decode,
+                decode: None,
+                local_prefill: true,
+                track_dispatch_timestamps: policy.needs_dispatch_timestamps(),
+            });
+        }
+    }
+
     let candidates = prefills_with_decode(ctx, request, candidates, resolver, &routing_context);
     let prefill = pick_prefill_worker(ctx, request, policy, &candidates, &routing_context)?;
     let decode = pick_decode_worker(ctx, request, &prefill, resolver, &routing_context, true)?;
@@ -501,6 +528,7 @@ async fn select_workers(
     Ok(SelectedWorkers {
         prefill,
         decode,
+        local_prefill: false,
         track_dispatch_timestamps: policy.needs_dispatch_timestamps(),
     })
 }

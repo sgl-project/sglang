@@ -619,6 +619,7 @@ impl PreparedRequest {
         ctx: &AppContext,
         bootstrap: Option<&BootstrapFields>,
         engine_rid: Option<&str>,
+        local_prefill: bool,
     ) -> Result<Bytes, ApiError> {
         if self.body.is_empty() {
             return Ok(self.body.clone());
@@ -636,6 +637,7 @@ impl PreparedRequest {
             bootstrap,
             &self.sampling_defaults,
             engine_rid,
+            local_prefill,
         )?;
         // Book only after the outgoing body exists; a request rejected here
         // (an f64-overflow literal re-parsed for PD bootstrap) was never dispatched.
@@ -1313,9 +1315,10 @@ fn build_outgoing_body(
     bootstrap: Option<&BootstrapFields>,
     sampling_defaults: &[(SamplingField, Number)],
     rid: Option<&str>,
+    local_prefill: bool,
 ) -> Result<Bytes, ApiError> {
     let needs_parse = input_ids.is_some() || bootstrap.is_some();
-    if !needs_parse && sampling_defaults.is_empty() && rid.is_none() {
+    if !needs_parse && sampling_defaults.is_empty() && rid.is_none() && !local_prefill {
         // Cloning Bytes shares the original allocation when no injection is needed.
         return Ok(body.clone());
     }
@@ -1324,7 +1327,8 @@ fn build_outgoing_body(
             .iter()
             .map(|(field, value)| (field.wire_name(), value.to_string()));
         let rid = rid.map(|rid| ("rid", Value::from(rid).to_string()));
-        let fields: Vec<_> = defaults.chain(rid).collect();
+        let local = local_prefill.then(|| ("disagg_local_prefill", "true".to_owned()));
+        let fields: Vec<_> = defaults.chain(rid).chain(local).collect();
         if let Some(spliced) = append_fields(body, &fields) {
             return Ok(spliced);
         }
@@ -1353,6 +1357,11 @@ fn build_outgoing_body(
         // A missing port must be JSON null, not omitted; the engine's validator distinguishes them.
         body_fields.insert("bootstrap_port".into(), json!(bootstrap.port));
         body_fields.insert("bootstrap_room".into(), json!(bootstrap.room));
+    }
+    if local_prefill {
+        // The decode engine prefills the prompt itself; without
+        // --disaggregation-decode-enable-local-prefill it rejects the marker.
+        body_fields.insert("disagg_local_prefill".into(), Value::Bool(true));
     }
     let bytes = serde_json::to_vec(&body_fields).map_err(|e| {
         ApiError::Internal(anyhow::Error::new(e).context("re-serialize injected request body"))
@@ -2288,10 +2297,37 @@ mod tests {
                 .extend(fields.as_object().unwrap().clone());
             for value in [None, Some(original.clone())] {
                 let out =
-                    build_outgoing_body(&body, value, ids, bootstrap.as_ref(), &[], None).unwrap();
+                    build_outgoing_body(&body, value, ids, bootstrap.as_ref(), &[], None, false)
+                        .unwrap();
                 assert_eq!(serde_json::from_slice::<Value>(&out).unwrap(), expected);
             }
         }
+    }
+
+    #[test]
+    fn outgoing_body_marks_local_prefill_on_both_paths() {
+        // The marker is what lets a decode engine accept a request without
+        // bootstrap fields; it must survive the splice path and the parse path.
+        let body =
+            Bytes::from_static(br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#);
+        let original: Value = serde_json::from_slice(&body).unwrap();
+        let mut expected = original.clone();
+        expected
+            .as_object_mut()
+            .unwrap()
+            .insert("disagg_local_prefill".into(), Value::Bool(true));
+        for (value, ids) in [(None, None), (Some(original.clone()), Some(&[1, 2][..]))] {
+            let out = build_outgoing_body(&body, value, ids, None, &[], None, true).unwrap();
+            let mut want = expected.clone();
+            if let Some(ids) = ids {
+                want.as_object_mut()
+                    .unwrap()
+                    .insert("input_ids".into(), json!(ids));
+            }
+            assert_eq!(serde_json::from_slice::<Value>(&out).unwrap(), want);
+        }
+        let out = build_outgoing_body(&body, None, None, None, &[], None, false).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&out).unwrap(), original);
     }
 
     #[test]
@@ -2299,7 +2335,7 @@ mod tests {
         for raw in [r#"{"model":"x"}"#, r#"{"model":"x","messages":[]}"#] {
             let body = Bytes::copy_from_slice(raw.as_bytes());
             for value in [None, Some(serde_json::from_slice(&body).unwrap())] {
-                let out = build_outgoing_body(&body, value, None, None, &[], None).unwrap();
+                let out = build_outgoing_body(&body, value, None, None, &[], None, false).unwrap();
                 assert_eq!(out, body);
                 assert_eq!(out.as_ptr(), body.as_ptr());
             }
@@ -2781,7 +2817,8 @@ mod tests {
             &metrics(),
         )
         .unwrap();
-        let out = build_outgoing_body(&body, None, Some(&[1, 2, 3]), None, &inject, None).unwrap();
+        let out =
+            build_outgoing_body(&body, None, Some(&[1, 2, 3]), None, &inject, None, false).unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&out).unwrap(),
             json!({
@@ -2913,7 +2950,8 @@ mod tests {
             let inject = resolve_sampling_defaults(&config, &fields_of(raw), &metrics()).unwrap();
             assert_eq!(inject.len(), 2);
             for value in [None, Some(serde_json::from_slice(&body).unwrap())] {
-                let out = build_outgoing_body(&body, value, None, None, &inject, None).unwrap();
+                let out =
+                    build_outgoing_body(&body, value, None, None, &inject, None, false).unwrap();
                 assert_eq!(std::str::from_utf8(&out).unwrap(), expected, "{raw}");
                 let parsed: Value = serde_json::from_slice(&out).unwrap();
                 assert_eq!(parsed["temperature"], json!(1.0));

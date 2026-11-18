@@ -217,6 +217,7 @@ class TestHeldDestinationPublication(CustomTestCase):
             disagg_decode_prealloc_queue=prealloc,
             disagg_decode_transfer_queue=queue,
             waiting_queue=IndexedReqList(ListKind.WAITING),
+            disagg_decode_prebuilt_queue=None,
             _preallocate_new_requests=MagicMock(),
         )
         SchedulerDisaggregationDecodeMixin.process_decode_queue(scheduler)
@@ -934,7 +935,7 @@ class TestAdmissionOverlap(CustomTestCase):
                 calls.append("leave_forward")
 
             scheduler = SimpleNamespace(
-                _get_new_prebuilt_batch=lambda _: batch,
+                _get_new_prebuilt_batch=lambda running_batch, num_joining_reqs=0: batch,
                 _nonblocking_admit_in_scope=lambda _: nonblocking,
                 _verify_kv_checksums=lambda _: calls.append("verify"),
                 ngram_embedding_manager=MagicMock(),

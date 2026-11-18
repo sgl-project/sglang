@@ -508,7 +508,7 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
             patch.object(
                 SchedulerDisaggregationDecodeMixin,
                 "_get_new_prebuilt_batch",
-                lambda s, rb: batch,
+                lambda s, running_batch, num_joining_reqs=0: batch,
             ),
             # Single rank unless a test stands in for the peers.
             patch(
