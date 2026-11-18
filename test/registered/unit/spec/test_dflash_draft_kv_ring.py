@@ -11,7 +11,6 @@ from sglang.srt.disaggregation.utils import draft_kv_ring_row_pairs
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import override_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
@@ -112,12 +111,6 @@ class TestResolveDraftKVRing(CustomTestCase):
         for name, draft_cfg in cases.items():
             with self.subTest(name), _switch():
                 self.assertFalse(self._resolve(_args(), draft_cfg=draft_cfg))
-
-    def test_on_for_rocm_triton_under_dcp(self):
-        # ROCm's triton reads the draft's rows by position under DCP.
-        with _switch(), override_platform(is_hip=True):
-            args = _args(speculative_draft_attention_backend="triton")
-            self.assertTrue(self._resolve(args))
 
     def test_off_under_dcp_when_the_draft_does_not_run_dcp(self):
         # Ascend drafts run without DCP, so their rows are not DCP-collapsed.

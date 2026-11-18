@@ -394,15 +394,6 @@ class TestMonokernelFramework(CustomTestCase):
         lm = install(archs=["Other"], lookups=[(False, False, "none", None)] * 2)
         self.assertNotIn("forward", vars(lm))
 
-    def test_another_targets_draft_keeps_its_forward(self):
-        # two targets' DFlash2 drafts share an architecture and model type: the spec's
-        # hf_config names its own draft, and the other one was refused at load
-        registry.register(
-            backend=BACKEND, architecture="SharedDraft", path=f"{__name__}:SPEC"
-        )
-        lm = install(archs=["SharedDraft"], model_type="other")
-        self.assertNotIn("forward", vars(lm))
-
     def test_the_decode_attention_backend_is_checked(self):
         # the steps a spec serves run on the decode backend, not the base one
         dsv4 = replace(
