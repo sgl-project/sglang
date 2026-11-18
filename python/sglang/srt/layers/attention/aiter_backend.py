@@ -3130,6 +3130,13 @@ class AiterAttnBackend(AttentionBackend):
         elif forward_batch.forward_mode.is_target_verify():
             if self.use_mla:
                 draft_num = spec_info.draft_token_num
+                # The opt-in was selected for one window; 2-4 tokens are wrong (ROCm/aiter#7007).
+                assert (
+                    not self.use_mla_fp8_q_asm or draft_num == self.num_draft_tokens
+                ), (
+                    f"fp8-Q asm MLA was selected for a {self.num_draft_tokens}-token "
+                    f"verify window, got {draft_num}"
+                )
                 device = forward_batch.seq_lens.device
                 use_asm_cprr_verify = self._asm_cprr_supports_verify_shape(draft_num)
                 if self.dcp_world_size > 1 and not use_asm_cprr_verify:
