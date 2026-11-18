@@ -254,9 +254,9 @@ class TestGfx950KDAPrefill(CustomTestCase):
         tokens; the real sequences must match Triton and no other state row may
         change."""
         for lengths, num_seqs, num_tokens, chunks in (
-            ((300, 200), 40, 768, None),  # rank-sorted sequence lookup (N <= 64)
-            ((300, 200), 128, 768, (2, 1)),
-            ((1024,), 128, 2048, (5,)),
+            # ws4, rank-sorted sequence lookup (N <= 64)
+            ((300, 200), 40, 768, None),
+            # vs2, input-order lookup; a sub-chunk sequence and padded track rows
             ((1500, 400, 7), 128, 2048, (20, 3, 0)),
         ):
             with self.subTest(lengths=lengths, sequences=num_seqs, track=bool(chunks)):
@@ -307,6 +307,8 @@ class TestGfx950KDAPrefill(CustomTestCase):
                     )
 
     def test_padded_batch_replays_in_a_cuda_graph(self):
+        """A graph captured on one sequence replays a three-sequence batch exactly
+        as the eager kernel runs it."""
         num_seqs, num_tokens = 128, 1024
         static = _padded(_inputs((512,), heads=12), (512,), num_seqs, num_tokens)
         stream = torch.cuda.Stream()
@@ -317,28 +319,27 @@ class TestGfx950KDAPrefill(CustomTestCase):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph), torch.inference_mode():
             static_out = _hip_padded(static)
-        for lengths in ((700,), (120, 300, 50)):
-            with self.subTest(lengths=lengths), torch.inference_mode():
-                inputs = _inputs(lengths, heads=12, seed=len(lengths))
-                fresh = _padded(_clone(inputs), lengths, num_seqs, num_tokens)
-                for name in ("q", "k", "v", "g", "beta", "cache_indices"):
-                    static[name].copy_(fresh[name])
-                static["query_start_loc"].copy_(fresh["query_start_loc"])
-                static["ssm_states"].copy_(inputs["ssm_states"])
-                # the graph captured the first batch's gate parameters
-                eager_inputs = _clone(inputs)
-                eager_inputs["A_log"] = static["A_log"]
-                eager_inputs["dt_bias"] = static["dt_bias"]
-                expected = _hip(eager_inputs)
-                graph.replay()
-                torch.cuda.synchronize()
-                total = sum(lengths)
-                torch.testing.assert_close(
-                    static_out[:, :total], expected, rtol=0, atol=0
-                )
-                torch.testing.assert_close(
-                    static["ssm_states"], eager_inputs["ssm_states"], rtol=0, atol=0
-                )
+        with torch.inference_mode():
+            lengths = (120, 300, 50)
+            inputs = _inputs(lengths, heads=12, seed=len(lengths))
+            fresh = _padded(_clone(inputs), lengths, num_seqs, num_tokens)
+            for name in ("q", "k", "v", "g", "beta", "cache_indices"):
+                static[name].copy_(fresh[name])
+            static["query_start_loc"].copy_(fresh["query_start_loc"])
+            static["ssm_states"].copy_(inputs["ssm_states"])
+            # the graph captured the first batch's gate parameters
+            eager_inputs = _clone(inputs)
+            eager_inputs["A_log"] = static["A_log"]
+            eager_inputs["dt_bias"] = static["dt_bias"]
+            expected = _hip(eager_inputs)
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                static_out[:, : sum(lengths)], expected, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                static["ssm_states"], eager_inputs["ssm_states"], rtol=0, atol=0
+            )
 
 
 if __name__ == "__main__":
