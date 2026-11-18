@@ -14,7 +14,7 @@ from sglang.srt.distributed.utils import reduce_scatter_single
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, find_available_port
 
-register_cpu_ci(est_time=43, suite="stage-a-test-cpu-intel")
+register_cpu_ci(est_time=43, suite="extra-test-cpu-intel")
 
 
 def run_distributed_test(
