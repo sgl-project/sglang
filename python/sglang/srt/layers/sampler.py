@@ -293,11 +293,11 @@ class Sampler(nn.Module):
                         batch_indices=sampling_mask_batch_indices,
                     )
                     sampling_mask_capture = _unfiltered_sampling_mask_capture(
-                        select_capture_rows(logprobs_via_logsoftmax_kernel)
+                        weights=select_capture_rows(logprobs_via_logsoftmax_kernel)
                         .float()
                         .exp(),
-                        select_capture_rows(batch_next_token_ids),
-                        sampling_mask_batch_indices,
+                        selected_tokens=select_capture_rows(batch_next_token_ids),
+                        batch_rows=sampling_mask_batch_indices,
                     )
                 if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
                     logprobs = logprobs_via_logsoftmax_kernel
@@ -416,9 +416,9 @@ class Sampler(nn.Module):
             )
             if return_sampling_mask:
                 sampling_mask_capture = _unfiltered_sampling_mask_capture(
-                    select_capture_rows(probs),
-                    select_capture_rows(batch_next_token_ids),
-                    capture_rows,
+                    weights=select_capture_rows(probs),
+                    selected_tokens=select_capture_rows(batch_next_token_ids),
+                    batch_rows=capture_rows,
                 )
         else:
             backend = get_exec().kernel.sampling_backend
