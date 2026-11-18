@@ -10,6 +10,7 @@ import torch
 
 from sglang.srt.eplb.expert_location import (
     _compute_logical_to_all_physical_map,
+    _first_match,
     append_trivial_expert_slots,
     compute_logical_to_rank_dispatch_physical_map,
 )
@@ -222,6 +223,51 @@ class TestComputeLogicalToRankDispatchPhysicalMap(CustomTestCase):
             )
 
         self.assertEqual(logical_to_physical[0, :16, 0].tolist(), list(range(64, 80)))
+
+
+def _reference_first_match(candidates, valid, owner_of_candidate, owner_of_rank):
+    """The original loop over candidate slots."""
+    count = torch.zeros(
+        (*candidates.shape[:-1], owner_of_rank.numel()), dtype=torch.int64
+    )
+    picked = torch.full_like(count, -1)
+    for k in reversed(range(candidates.shape[-1])):
+        match = valid[..., k, None] & (
+            owner_of_candidate[..., k, None] == owner_of_rank
+        )
+        count += match
+        picked = torch.where(match, candidates[..., k, None], picked)
+    return count, picked
+
+
+class TestFirstMatch(CustomTestCase):
+    def test_matches_reference_loop(self):
+        gen = torch.Generator().manual_seed(0)
+        # (layers, logical experts, width, physical experts, ep size, gpus per node)
+        shapes = [(2, 4, 1, 8, 4, 2), (3, 16, 4, 32, 8, 4), (40, 256, 6, 416, 32, 4)]
+        for layers, experts, width, physical, ep_size, per_node in shapes:
+            candidates = torch.randint(
+                0, physical, (layers, experts, width), generator=gen
+            )
+            num_valid = torch.randint(1, width + 1, (layers, experts), generator=gen)
+            valid = torch.arange(width) < num_valid[..., None]
+            candidates = torch.where(valid, candidates, 0)
+            ranks = torch.arange(ep_size)
+            per_gpu = physical // ep_size
+            owners = [
+                (candidates // per_gpu, ranks),
+                (candidates // (per_gpu * per_node), ranks // per_node),
+            ]
+            for owner_of_candidate, owner_of_rank in owners:
+                with self.subTest(shape=(layers, experts, width), ep_size=ep_size):
+                    expected = _reference_first_match(
+                        candidates, valid, owner_of_candidate, owner_of_rank
+                    )
+                    actual = _first_match(
+                        candidates, valid, owner_of_candidate, owner_of_rank
+                    )
+                    self.assertTrue(torch.equal(actual[0], expected[0]))
+                    self.assertTrue(torch.equal(actual[1], expected[1]))
 
 
 if __name__ == "__main__":
