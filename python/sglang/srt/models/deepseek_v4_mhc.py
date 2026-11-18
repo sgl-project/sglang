@@ -366,7 +366,8 @@ def mix_stats_from_state(
 ) -> HcTriplet:
     """``mix_stats``, unless the combine already stashed the triplet.
 
-    The A5 NPU combine (``npu_hc_pre_v2``, see ``_npu_combine_premix``) predicts
+    The A5 NPU combine (``mhc_pre_dpskv4`` with ``cann_recipes_infer_cann920``,
+    see ``_npu_combine_premix``) predicts
     this sublayer's ``(pre, post, comb)`` as a by-product and parks it on
     ``state.stats``.  This consumes the fused operator's coefficients exactly
     like the target model does (``precomputed=state.stats`` through
