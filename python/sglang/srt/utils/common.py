@@ -1153,6 +1153,18 @@ def is_gfx942_supported():
 
 
 @lru_cache(maxsize=1)
+def is_gfx11_supported():
+    """
+    Returns whether the current platform is AMD RDNA3 / RDNA3.5 (gfx11xx, e.g. gfx1100, gfx1151).
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx11"])
+    else:
+        return False
+
+
+@lru_cache(maxsize=1)
 def is_gfx1250_supported():
     """
     Returns whether the current platform is AMD RDNA4 (gfx1250).
