@@ -35,6 +35,8 @@ def _selector_accept(candidates, target_tokens, cutoff_verify_lens):
         _draft_probs_buf=None,
         _block_verification=False,
         _tp_sync=types.SimpleNamespace(sync=lambda site, tensor: tensor),
+        # No megakernel: acceptance is synced through _tp_sync, as on a plain server.
+        _megakernel_bcast=None,
         block_size=block,
     )
     worker._selector_sampling_accept = types.MethodType(
