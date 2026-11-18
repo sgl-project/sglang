@@ -142,12 +142,14 @@ def bootstrap_scheduler_process(spec: SchedulerProcessSpec) -> None:
     # and a child that hangs there would outlive a dead launcher.
     from sglang.multimodal_gen.runtime.utils.process import (
         defer_full_gc_for_imports,
+        hold_nvml,
         kill_itself_when_parent_died,
         use_thread_lock_for_tqdm,
     )
 
     kill_itself_when_parent_died()
     use_thread_lock_for_tqdm()
+    hold_nvml()
 
     # Every rank re-executes the same script, so one rank reporting is enough.
     if spec.rank == 0:

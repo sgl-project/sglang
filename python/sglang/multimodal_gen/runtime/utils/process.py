@@ -44,6 +44,21 @@ def use_thread_lock_for_tqdm() -> None:
     tqdm.set_lock(threading.RLock())
 
 
+def hold_nvml() -> None:
+    """Keep one NVML initialization for this process's lifetime.
+
+    NVML counts initializations: while one is held, the nvmlInit / nvmlShutdown
+    pairs of the platform, NUMA and device probes during startup only update
+    the count. Unheld, each pair initializes the driver library again, and the
+    ranks starting together serialize on it (8 ranks x 8 pairs: 2.7 s each on
+    8x B200, 0.07 s with one held).
+    """
+    try:
+        ctypes.CDLL("libnvidia-ml.so.1").nvmlInit_v2()
+    except OSError:
+        pass  # not an NVIDIA host
+
+
 _full_gc_lock = threading.Lock()
 _full_gc_deferrals = 0
 _gc_thresholds = gc.get_threshold()
