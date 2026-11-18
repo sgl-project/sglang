@@ -3509,8 +3509,9 @@ class TestInt8KvCacheCompatibility(CustomTestCase):
                 self._check(arch="Qwen3ForCausalLM")
             self._check()
 
-    def test_mlapo_is_rejected(self):
-        """Off arch35, MLAProlog writes only a BF16 cache."""
+    def test_mlapo_is_accepted(self):
+        """MLAProlog writes the INT8 record; it checks the projection weights
+        itself once they are loaded, as it does for the FP8 record."""
         with (
             override_platform(is_npu=True),
             patch(
@@ -3518,8 +3519,7 @@ class TestInt8KvCacheCompatibility(CustomTestCase):
                 return_value=True,
             ),
         ):
-            with self.assertRaisesRegex(ValueError, "SGLANG_NPU_USE_MLAPO"):
-                self._check()
+            self._check()
 
     def test_features_the_fp8_record_supports_are_accepted(self):
         """FIA NZ, prefill CP and the host KV pools handle the packed record
