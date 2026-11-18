@@ -555,7 +555,7 @@ class PrefillBootstrapQueue:
             n, tail, is_rebootstrap=req.disagg_rebootstrap
         )
         return kv_to_page_num(
-            transfer_input_len - decode_prefix_len,
+            max(0, transfer_input_len - decode_prefix_len),
             self.scheduler.token_to_kv_pool_allocator.page_size,
         )
 
@@ -701,6 +701,8 @@ class SchedulerDisaggregationPrefillMixin:
                         tail,
                         is_rebootstrap=req.disagg_rebootstrap,
                     )
+                    if lazy and req.extend_end is not None:
+                        upto_tokens = min(upto_tokens, req.extend_end)
                 elif lazy and req.extend_end is not None:
                     upto_tokens = req.extend_end
                 if upto_tokens is not None:

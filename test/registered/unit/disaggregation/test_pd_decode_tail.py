@@ -29,8 +29,17 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.disaggregation.utils import pre_alloc_fill_len, tail_transfer_input_len
 from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
-from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+)
+from sglang.srt.model_executor import forward_batch_info as forward_batch_info_module
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -281,15 +290,301 @@ class TailSchedulingTest(CustomTestCase):
             _get_new_tail_extend_batch=select_tail,
         )
         plan = decode_module.SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run(
-            scheduler, object()
+            scheduler, ScheduleBatch(reqs=[])
         )
         self.assertIs(plan.batch_to_run, tail_batch)
+
+    def _make_decode_scheduler(self, *, last_batch=None, tail_batch=None):
+        running_reqs = IndexedReqList(ListKind.DECODING)
+
+        class _Scheduler:
+            scheduler_stage_metrics = None
+            grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
+            chunked_req = None
+            enable_hisparse = False
+            dp_attn_adapter = SimpleNamespace(
+                maybe_prepare_mlp_sync_batch=lambda batch: batch
+            )
+            batch_result_processor = SimpleNamespace(
+                process_batch_result_prebuilt=lambda batch: None
+            )
+
+            def __init__(self):
+                self.last_batch = last_batch
+                self.running_reqs = running_reqs
+                self.tail_calls = []
+                self.update_calls = 0
+
+            def _get_new_tail_extend_batch(self, running_batch):
+                self.tail_calls.append(
+                    (running_batch.batch_size(), running_batch.batch_is_full)
+                )
+                return tail_batch
+
+            def get_new_prebuilt_batch(self, running_batch):
+                return None
+
+            def update_running_batch(self, batch):
+                self.update_calls += 1
+                if batch.is_empty():
+                    batch.batch_is_full = False
+                else:
+                    batch.pd_tail_extend = False
+                return batch
+
+        return _Scheduler()
+
+    def _make_tail_batch(self, reqs, *, pd_tail_extend=True, batch_is_full=False):
+        n = len(reqs)
+        batch = ScheduleBatch(
+            reqs=list(reqs),
+            model_config=SimpleNamespace(is_encoder_decoder=False),
+            device="cpu",
+            forward_mode=ForwardMode.EXTEND,
+            pd_tail_extend=pd_tail_extend,
+            batch_is_full=batch_is_full,
+            req_pool_indices=torch.arange(n, dtype=torch.int64),
+            req_pool_indices_cpu=torch.arange(n, dtype=torch.int64),
+            seq_lens=torch.full((n,), 8, dtype=torch.int64),
+            seq_lens_cpu=torch.full((n,), 8, dtype=torch.int64),
+            orig_seq_lens=torch.full((n,), 8, dtype=torch.int32),
+            input_ids=torch.arange(n, dtype=torch.int64),
+            sampling_info=SimpleNamespace(
+                filter_batch=lambda keep, keep_dev: None,
+                refresh_top_k_flags=lambda ks: None,
+                merge_batch=lambda other: None,
+            ),
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+        )
+        return batch
+
+    def test_tail_extend_flag_cleared_and_batch_is_full_reset_across_decode(self):
+        done_req = SimpleNamespace(
+            rid="done",
+            owner_list=None,
+            finished=lambda: True,
+            beam_group=None,
+            return_logprob=False,
+            grammar=None,
+            return_hidden_states_mode=CaptureHiddenMode.NULL,
+            sampling_params=SimpleNamespace(top_k=-1),
+        )
+        active_req = SimpleNamespace(
+            rid="active",
+            owner_list=None,
+            finished=lambda: False,
+            beam_group=None,
+            return_logprob=False,
+            grammar=None,
+            return_hidden_states_mode=CaptureHiddenMode.NULL,
+            sampling_params=SimpleNamespace(top_k=-1),
+        )
+
+        # Case 1: 1-token tail request finishes in last_batch -> clears flag and
+        # resets batch_is_full even when last becomes empty.
+        last_empty = self._make_tail_batch([done_req], pd_tail_extend=True)
+        running_empty = ScheduleBatch(reqs=[], batch_is_full=True)
+        sched = self._make_decode_scheduler(last_batch=last_empty)
+        with patch.object(decode_module, "set_schedule_time_batch"):
+            plan = decode_module.SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run(
+                sched, running_empty
+            )
+        self.assertFalse(last_empty.pd_tail_extend)
+        self.assertFalse(plan.running_batch.batch_is_full)
+        self.assertTrue(plan.running_batch.is_empty())
+
+        # Case 2: active tail request is adopted into running_batch, pd_tail_extend
+        # is cleared so the subsequent decode step does not re-enter the tail-merge
+        # branch on running_batch, and merge_batch also clears pd_tail_extend.
+        tail_batch = self._make_tail_batch([active_req], pd_tail_extend=True)
+        sched2 = self._make_decode_scheduler(last_batch=tail_batch)
+        with patch.object(decode_module, "set_schedule_time_batch"):
+            plan1 = decode_module.SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run(
+                sched2, ScheduleBatch(reqs=[])
+            )
+        self.assertIs(plan1.running_batch, tail_batch)
+        self.assertFalse(plan1.running_batch.pd_tail_extend)
+
+        plan1.running_batch.batch_is_full = True
+        sched2.last_batch = plan1.running_batch
+        sched2.update_calls = 0
+        with patch.object(decode_module, "set_schedule_time_batch"):
+            plan2 = decode_module.SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run(
+                sched2, plan1.running_batch
+            )
+        self.assertEqual(sched2.update_calls, 1)
+        self.assertFalse(plan2.running_batch.pd_tail_extend)
+
+        # Direct prepare_for_decode and merge_batch also clear pd_tail_extend.
+        prep_batch = self._make_tail_batch([active_req], pd_tail_extend=True)
+        prep_batch.sampling_info = SimpleNamespace(
+            penalizer_orchestrator=SimpleNamespace(is_required=False)
+        )
+        with (
+            patch(
+                "sglang.srt.managers.schedule_batch.alloc_for_decode", return_value=None
+            ),
+            patch.object(active_req, "decode_batch_idx", 0, create=True),
+            get_context().override_server_args(device="cpu"),
+        ):
+            prep_batch.prepare_for_decode()
+        self.assertFalse(prep_batch.pd_tail_extend)
+
+        dst = self._make_tail_batch([active_req], pd_tail_extend=True)
+        src = self._make_tail_batch([done_req], pd_tail_extend=True)
+        dst.merge_batch(src)
+        self.assertFalse(dst.pd_tail_extend)
+
+    def test_overlap_back_to_back_tail_pops_finished_before_admission(self):
+        # Overlap merged a 1-token tail req into running_batch before its result
+        # finished it; once pop_and_process marks it finished, the next iteration
+        # must pop it and reset batch_is_full BEFORE admitting another tail batch.
+        done_req = SimpleNamespace(
+            rid="done-1tok",
+            owner_list=None,
+            finished=lambda: True,
+            beam_group=None,
+            return_logprob=False,
+            grammar=None,
+            return_hidden_states_mode=CaptureHiddenMode.NULL,
+            sampling_params=SimpleNamespace(top_k=-1),
+        )
+        running = self._make_tail_batch(
+            [done_req], pd_tail_extend=False, batch_is_full=True
+        )
+        next_tail_batch = object()
+        sched = self._make_decode_scheduler(last_batch=None, tail_batch=next_tail_batch)
+        plan = decode_module.SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run(
+            sched, running
+        )
+        self.assertIs(plan.batch_to_run, next_tail_batch)
+        self.assertEqual(sched.tail_calls, [(0, False)])
+        self.assertTrue(running.is_empty())
+        self.assertFalse(running.batch_is_full)
+
+
+class PrefillTailClampAndGateTest(CustomTestCase):
+    def test_num_pages_to_send_clamps_negative_delta_to_zero(self):
+        queue = SimpleNamespace(
+            scheduler=SimpleNamespace(
+                token_to_kv_pool_allocator=SimpleNamespace(page_size=1)
+            )
+        )
+        req = SimpleNamespace(
+            origin_input_ids=list(range(10)),
+            disagg_rebootstrap=False,
+        )
+        with patch.object(
+            prefill_module,
+            "get_disagg",
+            return_value=SimpleNamespace(disaggregation_decode_tail_tokens=4),
+        ):
+            # transfer_input_len = 6, decode_prefix_len = 8 -> max(0, -2) == 0 pages.
+            self.assertEqual(
+                prefill_module.PrefillBootstrapQueue._num_pages_to_send(queue, req, 8),
+                0,
+            )
+            self.assertEqual(
+                prefill_module.PrefillBootstrapQueue._num_pages_to_send(queue, req, 2),
+                4,
+            )
+
+    def test_forward_batch_is_pd_tail_prefill_gates(self):
+        runner = SimpleNamespace(
+            device="cpu",
+            is_draft_worker=False,
+            model_config=SimpleNamespace(
+                requires_mm_token_modalities=False, model_is_mrope=False
+            ),
+            runner_ids=SimpleNamespace(
+                own_plan=lambda fb: SimpleNamespace(bind=lambda *a, **k: None)
+            ),
+            prefill_attention_backend_str="torch_native",
+            ngram_embedding_manager=SimpleNamespace(enabled=False),
+            lora_manager=None,
+        )
+
+        def _make_req(*, disagg_rebootstrap=False, bootstrap_host="10.0.0.5"):
+            req = Req("r1", "", array("q", range(8)), SamplingParams())
+            req.sampling_params.normalize(None)
+            req.refresh_fill_ids()
+            req.extend_end = 8
+            req.disagg_rebootstrap = disagg_rebootstrap
+            req.bootstrap_host = bootstrap_host
+            return req
+
+        def _run_init(forward_mode, reqs):
+            n = len(reqs)
+            batch = ScheduleBatch(
+                reqs=reqs,
+                device="cpu",
+                model_config=SimpleNamespace(
+                    is_encoder_decoder=False, is_matryoshka=False
+                ),
+                spec_algorithm=SpeculativeAlgorithm.NONE,
+                forward_mode=forward_mode,
+                input_ids=torch.zeros(n, dtype=torch.int64),
+                req_pool_indices=torch.arange(n, dtype=torch.int64),
+                req_pool_indices_cpu=torch.arange(n, dtype=torch.int64),
+                seq_lens=torch.full((n,), 8, dtype=torch.int64),
+                seq_lens_cpu=torch.full((n,), 8, dtype=torch.int64),
+                seq_lens_sum=8 * n,
+                orig_seq_lens=torch.full((n,), 8, dtype=torch.int32),
+                out_cache_loc=torch.arange(n, dtype=torch.int64),
+                prefix_lens=[0] * n,
+                extend_lens=[8] * n,
+                extend_num_tokens=8 * n,
+                extend_logprob_start_lens=[0] * n,
+                global_num_tokens=[8 * n],
+                global_num_tokens_for_logprob=[8 * n],
+            )
+            with (
+                get_context().override_server_args(device="cpu"),
+                patch.object(
+                    forward_batch_info_module,
+                    "get_disagg",
+                    return_value=SimpleNamespace(
+                        disaggregation_mode="prefill",
+                        disaggregation_decode_tail_tokens=4,
+                        disaggregation_transfer_backend="mooncake",
+                    ),
+                ),
+                patch.object(
+                    forward_batch_info_module,
+                    "clamp_position",
+                    lambda seq_lens: torch.clamp(seq_lens - 1, min=0).to(torch.int64),
+                ),
+            ):
+                return ForwardBatch.init_new(
+                    batch,
+                    runner,
+                    capture_hidden_mode=CaptureHiddenMode.NULL,
+                    return_hidden_states_before_norm=False,
+                )
+
+        self.assertTrue(_run_init(ForwardMode.EXTEND, [_make_req()]).is_pd_tail_prefill)
+        self.assertFalse(
+            _run_init(
+                ForwardMode.EXTEND, [_make_req(disagg_rebootstrap=True)]
+            ).is_pd_tail_prefill
+        )
+        self.assertFalse(
+            _run_init(
+                ForwardMode.EXTEND, [_make_req(bootstrap_host=FAKE_BOOTSTRAP_HOST)]
+            ).is_pd_tail_prefill
+        )
+        self.assertFalse(
+            _run_init(ForwardMode.DECODE, [_make_req()]).is_pd_tail_prefill
+        )
+        self.assertFalse(_run_init(ForwardMode.IDLE, []).is_pd_tail_prefill)
 
 
 class StagingPrefetchTailBoundaryTest(CustomTestCase):
     """Staging reservations follow the shortened transfer, including zero."""
 
-    def _prefetch(self, prompt_len, tail, *, rebootstrap=False):
+    def _prefetch(
+        self, prompt_len, tail, *, rebootstrap=False, lazy=False, extend_end=None
+    ):
         seen = []
         kv_mgr = SimpleNamespace(
             _prefetch_staging_reqs=lambda room, upto_tokens=None: seen.append(
@@ -304,7 +599,7 @@ class StagingPrefetchTailBoundaryTest(CustomTestCase):
             bootstrap_room=7,
             origin_input_ids=list(range(prompt_len)),
             disagg_rebootstrap=rebootstrap,
-            extend_end=prompt_len,
+            extend_end=prompt_len if extend_end is None else extend_end,
         )
         with (
             patch.object(
@@ -315,7 +610,7 @@ class StagingPrefetchTailBoundaryTest(CustomTestCase):
             patch.object(
                 prefill_module.envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION,
                 "get",
-                return_value=False,
+                return_value=lazy,
             ),
         ):
             prefill_module.SchedulerDisaggregationPrefillMixin.maybe_prefetch_staging_for_batch(
@@ -325,6 +620,10 @@ class StagingPrefetchTailBoundaryTest(CustomTestCase):
 
     def test_tail_reserves_only_the_transferred_prefix(self):
         self.assertEqual(self._prefetch(10, 4), [(7, 6)])
+
+    def test_tail_with_lazy_clamps_to_extend_end(self):
+        self.assertEqual(self._prefetch(20, 4, lazy=True, extend_end=8), [(7, 8)])
+        self.assertEqual(self._prefetch(20, 4, lazy=True, extend_end=20), [(7, 16)])
 
     def test_metadata_only_handoff_reserves_no_staging_slot(self):
         self.assertEqual(self._prefetch(4, 10), [(7, 0)])

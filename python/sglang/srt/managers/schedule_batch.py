@@ -2100,6 +2100,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+    # Whether this batch is a PD decode-tail extend awaiting post-forward merge
+    pd_tail_extend: bool = False
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
@@ -3240,6 +3242,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
+        self.pd_tail_extend = False
         self.mamba_track_seqlens_cpu = None
         self.mamba_prefill_track_mask_cpu = None
         # Decode embeds the last output token via embed_tokens; clear the stale
@@ -3497,6 +3500,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.return_hidden_states = self.return_hidden_states_mode.need_capture()
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
+        self.pd_tail_extend = False
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)

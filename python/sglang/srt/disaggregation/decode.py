@@ -4229,27 +4229,35 @@ class SchedulerDisaggregationDecodeMixin:
         # running decode batch (the standard prefill->decode transition).
         last = self.last_batch
         if last is not None and getattr(last, "pd_tail_extend", False):
+            last.pd_tail_extend = False
+            last_bs = last.batch_size()
             last.filter_batch()
-        if (
-            last is not None
-            and last is not running_batch
-            and getattr(last, "pd_tail_extend", False)
-            and not last.is_empty()
-        ):
-            move(
-                [req for req in last.reqs if req not in self.running_reqs],
-                self.running_reqs,
-            )
-            if running_batch.is_empty():
-                running_batch = last
-            else:
-                running_batch.merge_batch(last)
+            if last.batch_size() < last_bs:
+                running_batch.batch_is_full = False
+            if last is not running_batch and not last.is_empty():
+                move(
+                    [req for req in last.reqs if req not in self.running_reqs],
+                    self.running_reqs,
+                )
+                if running_batch.is_empty():
+                    running_batch = last
+                else:
+                    running_batch.merge_batch(last)
 
         # Poll on the shared path so sustained tail batches cannot stall
         # requests waiting to enter the decode preallocation queue.
         if self.grammar_manager.has_waiting_grammars():
             for req in self.grammar_manager.get_ready_grammar_requests():
                 self._add_request_to_queue(req)
+
+        # Overlap merges a tail extend before its result finishes its requests,
+        # and back-to-back tail batches bypass update_running_batch. Filter
+        # finished requests from running_batch before checking tail capacity.
+        if not running_batch.is_empty():
+            running_bs = running_batch.batch_size()
+            running_batch.filter_batch()
+            if running_batch.batch_size() < running_bs:
+                running_batch.batch_is_full = False
 
         # Decode-tail reqs run a real extend first: they become ordinary
         # decode reqs through the standard result processor on this batch.
