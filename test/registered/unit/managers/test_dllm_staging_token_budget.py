@@ -210,6 +210,15 @@ class TestDllmStagingTokenBudgetFallbackCap(CustomTestCase):
             available_tokens=4096,
         )
         self.assertEqual(adder._get_dllm_remain_tokens(reuses_kv=True), 0)
+        # Inclusive: a budget of exactly one block grants it.
+        at_boundary = _make_adder(
+            rem_dllm_tokens=self.BLOCK_SIZE,
+            dllm_block_size=self.BLOCK_SIZE,
+            available_tokens=4096,
+        )
+        self.assertEqual(
+            at_boundary._get_dllm_remain_tokens(reuses_kv=True), self.BLOCK_SIZE
+        )
 
 
 class _StubReq:
@@ -420,6 +429,75 @@ class TestProcessDllmStagingReqsPerRowRefusal(CustomTestCase):
             running_batch=None,
         )
         self.assertEqual(result, AddReqResult.NO_TOKEN)
+
+    def _process_dllm_batches(self, prefill_reqs, decode_reqs):
+        # _process_dllm_batches must hand the refusal on to its caller (the
+        # breaker reads it there); testing _process_batch_by_phase alone
+        # leaves that hop unpinned.
+        stub = SimpleNamespace(
+            dllm_manager=SimpleNamespace(
+                get_prefill_requests=lambda: prefill_reqs,
+                get_decode_requests=lambda: decode_reqs,
+            ),
+            dllm_config=SimpleNamespace(requires_separate_context_encoding=False),
+            _process_batch_by_phase=lambda *a, **k: AddReqResult.NO_TOKEN,
+        )
+        return SchedulerDllmMixin._process_dllm_batches(stub, None, running_batch=None)
+
+    def test_dllm_batches_pass_the_refusal_on_from_the_prefill_branch(self):
+        _, result = self._process_dllm_batches([SimpleNamespace()], [])
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+
+    def test_dllm_batches_pass_the_refusal_on_from_the_decode_branch(self):
+        _, result = self._process_dllm_batches([], [SimpleNamespace()])
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+
+
+class TestGetNewBatchDllmCallsTheStallBreaker(CustomTestCase):
+    """The breaker only helps if the round loop calls it: a zero-admission
+    round must hand its refusal signal to the breaker, and a round that
+    admitted rows must not."""
+
+    def _run(self, can_run_list):
+        calls, reached = [], []
+        adder = SimpleNamespace(can_run_list=can_run_list)
+
+        def process_dllm_batches(adder, running_batch):
+            reached.append(True)
+            return None, AddReqResult.NO_TOKEN
+
+        stub = SimpleNamespace(
+            enable_priority_preemption=False,
+            _should_skip_prefill=lambda running_batch: False,
+            _ack_waiting_health_checks=lambda: None,
+            waiting_queue=SimpleNamespace(reorder=lambda order: None),
+            policy=SimpleNamespace(calc_priority=lambda queue: None),
+            _create_dllm_prefill_adder=lambda running_bs, running_batch: adder,
+            _fetch_waiting_reqs=lambda: None,
+            _process_dllm_batches=process_dllm_batches,
+            _maybe_break_dllm_staging_stall=lambda result, running_batch: calls.append(
+                result
+            ),
+        )
+        running_batch = SimpleNamespace(reqs=[], batch_is_full=False)
+        out = None
+        try:
+            out = SchedulerDllmMixin.get_new_batch_dllm(stub, running_batch, [])
+        except AttributeError:
+            # Past the breaker call, the admitted path needs a real scheduler;
+            # only whether the breaker ran matters here.
+            pass
+        self.assertEqual(reached, [True])
+        return calls, out
+
+    def test_zero_admission_round_calls_the_breaker_with_its_signal(self):
+        calls, out = self._run([])
+        self.assertEqual(calls, [AddReqResult.NO_TOKEN])
+        self.assertIsNone(out)
+
+    def test_round_that_admitted_rows_does_not_call_the_breaker(self):
+        calls, _ = self._run([SimpleNamespace()])
+        self.assertEqual(calls, [])
 
 
 class _StubStallReq:
