@@ -589,5 +589,182 @@ class TestIpcKVScales(CustomTestCase):
         self.assertEqual((owner.k_scale._version, owner.v_scale._version), versions)
 
 
+class TestIpcParameterTies(CustomTestCase):
+    def test_attachment_preserves_parameter_identity(self):
+        from unittest.mock import patch
+
+        from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+        for topology in ("same_module", "tied", "independent"):
+            with self.subTest(topology=topology):
+
+                def build_model(*args):
+                    model = torch.nn.Module()
+                    model.embedding = torch.nn.Embedding(4, 4)
+                    if topology == "same_module":
+                        model.head = model.embedding
+                    else:
+                        model.head = torch.nn.Linear(4, 4, bias=False)
+                        if topology == "tied":
+                            model.head.weight = model.embedding.weight
+                        else:
+                            with torch.no_grad():
+                                model.head.weight.copy_(model.embedding.weight)
+                    return model
+
+                owner = build_model()
+                loader = IpcModelLoader(LoadConfig(load_format=LoadFormat.IPC_CACHE))
+                with (
+                    patch(
+                        "sglang.srt.weight_cache.ipc_loader._initialize_model",
+                        side_effect=build_model,
+                    ),
+                    patch.object(
+                        loader._transport_backend,
+                        "import_tensor",
+                        side_effect=lambda entry: entry["tensor"],
+                    ),
+                ):
+                    client = loader._load_zero_copy_mode(
+                        SimpleNamespace(dtype=torch.float32),
+                        device_config=None,
+                        entries={
+                            name: {"tensor": tensor}
+                            for name, tensor in owner.state_dict().items()
+                        },
+                        quant_config=None,
+                    )
+                self.assertEqual(
+                    client.embedding.weight is client.head.weight,
+                    owner.embedding.weight is owner.head.weight,
+                )
+                self.assertEqual(
+                    client.embedding.weight.untyped_storage()._cdata
+                    == client.head.weight.untyped_storage()._cdata,
+                    owner.embedding.weight.untyped_storage()._cdata
+                    == owner.head.weight.untyped_storage()._cdata,
+                )
+
+    def test_privatization_preserves_ties_and_rejects_views_before_copy(self):
+        from sglang.srt.weight_cache.ipc_loader import privatize_ipc_parameter
+
+        for alias in (None, "parameter", "buffer", "attribute"):
+            with self.subTest(alias=alias):
+                model = torch.nn.Module()
+                model.embedding = torch.nn.Embedding(4, 4)
+                model.head = torch.nn.Linear(4, 4, bias=False)
+                model.head.weight = model.embedding.weight
+                parameter = model.embedding.weight
+                owner = parameter.detach()
+                model._ipc_imported_tensors = [owner]
+                view = owner[1:]
+                if alias == "parameter":
+                    model.alias = torch.nn.Parameter(view)
+                elif alias == "buffer":
+                    model.register_buffer("alias", view)
+                elif alias == "attribute":
+                    model.alias = view
+                if alias:
+                    with self.assertRaisesRegex(RuntimeError, "storage alias alias"):
+                        privatize_ipc_parameter(model, parameter)
+                    self.assertEqual(parameter.data_ptr(), owner.data_ptr())
+                    self.assertEqual(model.alias.data_ptr(), view.data_ptr())
+                    continue
+
+                original = owner.clone()
+                privatize_ipc_parameter(model, parameter)
+                first_pointer = parameter.data_ptr()
+                self.assertNotEqual(first_pointer, owner.data_ptr())
+                self.assertIs(model.embedding.weight, parameter)
+                self.assertIs(model.head.weight, parameter)
+                privatize_ipc_parameter(model, parameter)
+                self.assertEqual(parameter.data_ptr(), first_pointer)
+                with torch.no_grad():
+                    parameter[1].add_(1)
+                self.assertTrue(torch.equal(owner, original))
+
+    def test_dflash_privatizes_only_after_validating_the_local_mask_write(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        cases = [
+            ("disk", True, True, None, False),
+            ("ipc", True, True, None, True),
+            ("ipc", False, True, None, False),
+            ("ipc", True, False, None, False),
+            ("ipc", True, True, ValueError, False),
+            ("ipc", True, True, NotImplementedError, False),
+        ]
+        for mode, attachment, local, error, copied in cases:
+            with self.subTest(
+                mode=mode, attachment=attachment, local=local, error=error
+            ):
+                with TemporaryDirectory() as directory:
+                    embedding = torch.nn.Embedding(4, 4)
+                    embedding.shard_indices = SimpleNamespace(
+                        org_vocab_start_index=4 if local else 0,
+                        org_vocab_end_index=8 if local else 4,
+                    )
+                    model = torch.nn.Module()
+                    model.embedding = embedding
+                    model.get_input_embeddings = lambda: embedding
+                    owner_weight = embedding.weight.detach()
+                    before = owner_weight.clone()
+                    if mode == "ipc":
+                        model._ipc_imported_tensors = [owner_weight]
+                    if attachment:
+                        torch.save(
+                            {
+                                "embedding": torch.full((4,), 8.0),
+                                "mask_token_id": 7 if error is ValueError else 5,
+                                "per_position": error is NotImplementedError,
+                            },
+                            Path(directory) / "mask_embedding.pt",
+                        )
+                    worker = SimpleNamespace(
+                        _mask_token_id=5,
+                        device=torch.device("cpu"),
+                        server_args=object(),
+                        _target_worker=SimpleNamespace(
+                            model_runner=SimpleNamespace(model=model)
+                        ),
+                    )
+                    with (
+                        patch(
+                            "sglang.srt.arg_groups.model_override_base.resolving_view",
+                            return_value=SimpleNamespace(
+                                speculative_draft_model_path=directory
+                            ),
+                        ),
+                        patch(
+                            "sglang.srt.speculative.dflash_worker_v2.get_parallel",
+                            return_value=SimpleNamespace(tp_rank=0),
+                        ),
+                    ):
+                        if error:
+                            with self.assertRaises(error):
+                                DFlashWorkerV2._maybe_merge_trained_mask_embedding(
+                                    worker
+                                )
+                        else:
+                            DFlashWorkerV2._maybe_merge_trained_mask_embedding(worker)
+                    self.assertEqual(
+                        embedding.weight.data_ptr() != owner_weight.data_ptr(), copied
+                    )
+                    expected = before.clone()
+                    if attachment and local and error is None:
+                        expected[1].fill_(8)
+                    self.assertTrue(torch.equal(embedding.weight, expected))
+                    self.assertTrue(
+                        torch.equal(
+                            owner_weight, expected if mode == "disk" else before
+                        )
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,7 @@ import signal
 import stat
 import threading
 import time
+from collections import Counter
 from typing import Optional
 
 import torch
@@ -42,6 +43,44 @@ logger = logging.getLogger(__name__)
 
 # How often the client polls the serving daemon's PID for liveness.
 _DAEMON_LIVENESS_POLL_INTERVAL = 5.0
+
+
+def privatize_ipc_parameter(model: nn.Module, parameter: nn.Parameter) -> None:
+    """Copy a shared parameter before a startup write, preserving its identity.
+
+    Call before any runtime consumer retains the storage address. Separate
+    tensor views cannot follow a storage replacement and are rejected.
+    """
+    imported = getattr(model, "_ipc_imported_tensors", ())
+    if not imported:
+        return
+    source = parameter.untyped_storage()
+    if not any(t.untyped_storage()._cdata == source._cdata for t in imported):
+        return
+
+    if not parameter.is_contiguous() or source.nbytes() != (
+        parameter.numel() * parameter.element_size()
+    ):
+        raise RuntimeError(
+            "Cannot privatize an IPC parameter that views part of a storage"
+        )
+
+    for path, module in model.named_modules():
+        for attrs in (module._parameters, module._buffers, vars(module)):
+            for name, tensor in attrs.items():
+                if (
+                    tensor is not parameter
+                    and isinstance(tensor, torch.Tensor)
+                    and tensor.layout == torch.strided
+                    and tensor.untyped_storage()._cdata == source._cdata
+                ):
+                    raise RuntimeError(
+                        f"Cannot privatize IPC parameter with storage alias "
+                        f"{path + '.' if path else ''}{name}"
+                    )
+
+    with torch.no_grad():
+        parameter.data = parameter.detach().clone(memory_format=torch.preserve_format)
 
 
 class IpcModelLoader(BaseModelLoader):
@@ -291,7 +330,11 @@ class IpcModelLoader(BaseModelLoader):
         if is_param:
             # requires_grad=False: the IPC memory is shared/read-only and SGLang
             # is inference-only, so autograd must never write into it.
-            new_param = nn.Parameter(tensor, requires_grad=False)
+            new_param = (
+                tensor
+                if isinstance(tensor, nn.Parameter)
+                else nn.Parameter(tensor, requires_grad=False)
+            )
             setattr(obj, leaf_name, new_param)
         else:
             # register_buffer raises KeyError if the name already exists as a
@@ -346,6 +389,12 @@ class IpcModelLoader(BaseModelLoader):
         }
         existing_buffers = {name: buf for name, buf in model.named_buffers()}
         existing_names = set(existing_params) | set(existing_buffers)
+        tied_ids = {
+            key
+            for key, count in Counter(map(id, existing_params.values())).items()
+            if count > 1
+        }
+        attached_ties = {}
 
         imported_refs = []
         imported_count = 0
@@ -378,7 +427,21 @@ class IpcModelLoader(BaseModelLoader):
                     continue
 
             # Replace or register the tensor in the model
-            self._set_module_tensor(model, name, imported_tensor, is_param=is_param)
+            tensor = imported_tensor
+            original_id = id(existing_params.get(name))
+            if is_param and original_id in tied_ids:
+                # The constructed model must tie the object, and the owner
+                # must export the same storage view for both names.
+                key = (
+                    original_id,
+                    tensor.untyped_storage()._cdata,
+                    tensor.storage_offset(),
+                    tensor.stride(),
+                )
+                if key not in attached_ties:
+                    attached_ties[key] = nn.Parameter(tensor, requires_grad=False)
+                tensor = attached_ties[key]
+            self._set_module_tensor(model, name, tensor, is_param=is_param)
             imported_refs.append(imported_tensor)
             imported_count += 1
 

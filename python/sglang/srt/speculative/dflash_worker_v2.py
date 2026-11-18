@@ -1474,18 +1474,18 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         token_id = self._mask_token_id
         shard_indices = getattr(embed_module, "shard_indices", None)
-        with torch.no_grad():
-            if shard_indices is not None:
-                # VocabParallelEmbedding: only update if this token is in our shard.
-                start = shard_indices.org_vocab_start_index
-                end = shard_indices.org_vocab_end_index
-                if start <= token_id < end:
-                    local_idx = token_id - start
-                    embed_module.weight[local_idx].copy_(
-                        embedding_tensor.to(embed_module.weight.dtype)
-                    )
-            else:
-                embed_module.weight[token_id].copy_(
+        local_idx = token_id
+        if shard_indices is not None:
+            start = shard_indices.org_vocab_start_index
+            end = shard_indices.org_vocab_end_index
+            local_idx = token_id - start if start <= token_id < end else None
+
+        if local_idx is not None:
+            from sglang.srt.weight_cache.ipc_loader import privatize_ipc_parameter
+
+            with torch.no_grad():
+                privatize_ipc_parameter(target_model, embed_module.weight)
+                embed_module.weight[local_idx].copy_(
                     embedding_tensor.to(embed_module.weight.dtype)
                 )
 

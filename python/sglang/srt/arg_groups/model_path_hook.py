@@ -281,12 +281,13 @@ def handle_load_format(server_args: Any):
         "EAGLE",
         "EAGLE3",
         "DSPARK",
+        "DFLASH",
         "STANDALONE",
         "NGRAM",
     ):
         raise ValueError(
             "--weight-cache-mode supports speculative decoding with EAGLE, EAGLE3, "
-            f"DSPARK, STANDALONE and NGRAM only (got {cfg.speculative_algorithm}). Set "
+            f"DSPARK, DFLASH, STANDALONE and NGRAM only (got {cfg.speculative_algorithm}). Set "
             "--weight-cache-mode off to use this speculative algorithm."
         )
 
