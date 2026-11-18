@@ -622,6 +622,8 @@ _KEEP_16 = {
     "below_multiple": (16, 992, True),
     "float": (992.0, 512, True),
 }
+# MOSS-Image and Ideogram 4 leave a non-int size to request validation.
+_KEEP_16_INT_ONLY = {**_KEEP_16, "float": (1000.0, 520, False)}
 
 
 def _size_alignment_models():
@@ -632,7 +634,15 @@ def _size_alignment_models():
     from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
         DiffusersGenericPipelineConfig,
     )
+    from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
+        Ideogram4DistilledPipelineConfig,
+        Ideogram4PipelineConfig,
+    )
     from sglang.multimodal_gen.configs.sample.anima import AnimaSamplingParams
+    from sglang.multimodal_gen.configs.sample.ideogram import (
+        Ideogram4FastSamplingParams,
+        Ideogram4SamplingParams,
+    )
 
     diffusers = DiffusersGenericPipelineConfig()
 
@@ -650,6 +660,31 @@ def _size_alignment_models():
             both(_KEEP_16),
         ),
         ("anima-diffusers", "Anima", 16, AnimaSamplingParams, diffusers, unchanged),
+        (
+            "ideogram4",
+            "Ideogram 4",
+            16,
+            Ideogram4SamplingParams,
+            Ideogram4PipelineConfig(),
+            both(_KEEP_16_INT_ONLY),
+        ),
+        # The distilled pipelines subclass the config and keep its patch grid.
+        (
+            "ideogram4-fast-distilled",
+            "Ideogram 4",
+            16,
+            Ideogram4FastSamplingParams,
+            Ideogram4DistilledPipelineConfig(),
+            both(_KEEP_16_INT_ONLY),
+        ),
+        (
+            "ideogram4-diffusers",
+            "Ideogram 4",
+            16,
+            Ideogram4SamplingParams,
+            diffusers,
+            unchanged,
+        ),
     ]
 
 
