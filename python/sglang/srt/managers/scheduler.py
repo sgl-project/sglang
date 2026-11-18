@@ -7188,7 +7188,7 @@ def configure_scheduler_process(
 
     # Set cpu affinity to this gpu process
     if envs.SGLANG_SET_CPU_AFFINITY.get():
-        set_gpu_proc_affinity(gpu_id)
+        set_gpu_proc_affinity(gpu_id, server_args)
     if envs.SGLANG_DISABLE_THP.get():
         disable_transparent_hugepages()
     if not envs.SGLANG_NUMA_BIND_V2.get():
