@@ -74,8 +74,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
-    EncodeWhileDecoding,
-    finish_streamed_encode,
+    output_rank_saved,
+    output_rank_video_path,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
@@ -1687,13 +1687,9 @@ class Cosmos3MultiviewDecodingStage(Cosmos3DecodingStage):
         )
         return payload
 
-    def _encode_while_decoding(
-        self, batch: Req, server_args: ServerArgs
-    ) -> EncodeWhileDecoding | None:
+    def _streams_frames(self, batch: Req) -> bool:
         lidar_request = batch.sampling_params.resolved_lidar() or {}
-        if lidar_request.get("decode", False):
-            return None
-        return super()._encode_while_decoding(batch, server_args)
+        return not lidar_request.get("decode", False) and super()._streams_frames(batch)
 
     def _decode_views(
         self,
@@ -1736,6 +1732,11 @@ class Cosmos3MultiviewDecodingStage(Cosmos3DecodingStage):
         batch.raw_latent_shape = tuple(latents.shape)
         # Frames reach the encoder camera by camera, the order of the clip.
         stream = self._encode_while_decoding(batch, server_args)
+        output_rank_streams = self._streams_frames(batch) and (
+            output_rank_video_path(batch, server_args, int(latents.shape[0]))
+            is not None
+        )
+        output_file_paths = None
         with self.use_declared_component(component_name="vae", module=self.vae):
             with (
                 torch.no_grad(),
@@ -1750,14 +1751,16 @@ class Cosmos3MultiviewDecodingStage(Cosmos3DecodingStage):
                         latent_frames_per_view=latent_frames_per_view,
                         on_frames=stream,
                     )
-                    output_file_paths, encode_failed = finish_streamed_encode(stream)
+                    if stream is not None:
+                        output_file_paths = stream.finish()
                 except BaseException:
                     if stream is not None:
                         stream.abort()
                     raise
-                if encode_failed:
-                    # The worker saves the clip instead. Ranks without the encoder
-                    # drop the clip they kept and repeat the decode with the output rank.
+                if output_rank_streams and not output_rank_saved(
+                    output_file_paths is not None
+                ):
+                    # The streamed encode failed, so the worker saves the clip.
                     del decoded
                     decoded = self._decode_views(
                         latents,

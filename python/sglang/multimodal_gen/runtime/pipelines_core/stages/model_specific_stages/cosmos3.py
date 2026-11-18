@@ -2587,17 +2587,21 @@ class Cosmos3DecodingStage(PipelineStage):
     def _postprocess_tensor(decoded: torch.Tensor) -> torch.Tensor:
         return decoded.mul_(0.5).add_(0.5).clamp_(0, 1).float()
 
-    def _encode_while_decoding(
-        self, batch: Req, server_args: ServerArgs
-    ) -> EncodeWhileDecoding | None:
-        """An encoder fed by the decode, if the plain video frames go straight to the MP4."""
-        if (
+    def _streams_frames(self, batch: Req) -> bool:
+        """Whether the plain video frames may go straight to the MP4, on every rank."""
+        return not (
             not self.vae.supports_decode_on_frames
             or (self._guardrails and batch.use_guardrails is not False)
             or (self.sound_tokenizer is not None and batch.audio_latents is not None)
             or batch.action_latents is not None
             or self._transfer_display_is_composed(batch)
-        ):
+        )
+
+    def _encode_while_decoding(
+        self, batch: Req, server_args: ServerArgs
+    ) -> EncodeWhileDecoding | None:
+        """An encoder fed by the decode, if the plain video frames go straight to the MP4."""
+        if not self._streams_frames(batch):
             return None
         save_file_path = streamed_video_output_path(
             batch, server_args, int(batch.latents.shape[0])

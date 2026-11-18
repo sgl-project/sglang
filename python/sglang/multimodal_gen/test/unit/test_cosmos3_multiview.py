@@ -15,7 +15,6 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
-from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -2261,54 +2260,39 @@ class TestInputLoading(unittest.TestCase):
         self.assertTrue(torch.equal(clip, expected))
         self.assertTrue(torch.equal(torch.cat(parts, dim=2), expected))
 
-    def test_every_rank_repeats_the_decode_after_the_output_rank_encode_failed(self):
-        """A rank without the encoder decodes again once the output rank's
-        encode failed: the Wan decode is shared across ranks, so the output rank
-        repeating it alone waits for the others forever."""
+    def test_ranks_without_the_encoder_decode_again_with_the_output_rank(self):
         stage = _stage(
             multiview_stage.Cosmos3MultiviewDecodingStage,
             _tiny_wan_vae(load_encoder=False),
         )
-        latents = torch.randn(1, 4, 6, 2, 3)
-        encode = (
-            "sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding"
-        )
-
-        def decodes(*, encode_failed: bool) -> int:
+        latents = torch.zeros(1, 4, 6, 2, 3)
+        for saved, decodes in ((False, 2), (True, 1)):
             batch = SimpleNamespace(
                 extra={
                     multiview_stage.EXTRA_NUM_VIEWS: 2,
                     multiview_stage.EXTRA_LATENT_FRAMES_PER_VIEW: 3,
                     multiview_stage.EXTRA_PACKED_SHAPES: (tuple(latents.shape[1:]),),
                 },
-                latents=pack_state([latents]),
-                sampling_params=SimpleNamespace(quality="exact"),
+                latents=latents.flatten(1),
+                sampling_params=SimpleNamespace(
+                    quality="lossless", resolved_lidar=lambda: None
+                ),
+                action_latents=None,
                 is_warmup=True,
-            )
-            group = SimpleNamespace(
-                world_size=2,
-                rank_in_group=1,
-                broadcast_object=lambda obj, src: encode_failed,
             )
             with (
                 mock.patch.object(stage, "_encode_while_decoding", return_value=None),
-                mock.patch.object(
-                    stage, "_decode_views", return_value="clip"
-                ) as decode,
-                mock.patch.object(
-                    stage, "use_declared_component", return_value=nullcontext()
-                ),
+                mock.patch.object(stage, "_decode_views") as decode,
                 mock.patch.object(multiview_stage.Cosmos3DecodingStage, "forward"),
-                mock.patch(
-                    f"{encode}.model_parallel_is_initialized", return_value=True
+                mock.patch.object(
+                    multiview_stage, "output_rank_video_path", return_value="out.mp4"
                 ),
-                mock.patch(f"{encode}.get_replica_group", return_value=group),
+                mock.patch.object(
+                    multiview_stage, "output_rank_saved", return_value=saved
+                ),
             ):
                 stage.forward(batch, None)
-            return decode.call_count
-
-        self.assertEqual(decodes(encode_failed=False), 1)
-        self.assertEqual(decodes(encode_failed=True), 2)
+            self.assertEqual(decode.call_count, decodes)
 
 
 class TestLidarItems(unittest.TestCase):
