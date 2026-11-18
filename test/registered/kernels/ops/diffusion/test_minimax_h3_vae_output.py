@@ -244,16 +244,21 @@ def test_minimax_h3_temporal_blend_write_kernel_is_bit_exact(monkeypatch):
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("layout", [(4, 7), (1, 3), (3, 1), (2, 2)])
+@pytest.mark.parametrize("layout", [(4, 7), (1, 3), (3, 1), (2, 2), (3, 4, 16)])
 def test_tile_assembly_kernel_matches_the_eager_chain(layout):
     """One launch places a window's tiles bitwise as the eager blend, crop and
     copy chain does."""
-    i_max, j_max = layout
+    i_max, j_max, *wide = layout
     vae = _h3_tiny_vae()
     torch.manual_seed(0)
     size = 48
     y_overlap = torch.randint(4, size // 2, (i_max - 1,)).tolist()
     x_overlap = torch.randint(4, size // 2, (j_max - 1,)).tolist()
+    if wide:
+        # latent tiles of a tiled encode: an overlap can be wider than the part
+        # of the next tile that is kept
+        size = wide[0]
+        y_overlap, x_overlap = [9, 9], [7, 9, 10]
     tiles = torch.randn(i_max * j_max, 1, 3, 5, size, size, device="cuda") * 3
     rows = [[tiles[i * j_max + j] for j in range(j_max)] for i in range(i_max)]
     reference = vae._assemble_tiles_eager(rows, y_overlap, x_overlap)

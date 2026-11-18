@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Order-preserving batches of complete H3 tiles and temporal windows."""
 
+import functools
 from collections.abc import Callable, Iterator, Sequence
 
 import torch
@@ -50,7 +51,12 @@ def forward_many(values, *, forward: Callable, capacity: int, collector=None):
 def decode_windows(
     vae, z, *, head, tail, count: int, window_limit: int
 ) -> Iterator[tuple[int, torch.Tensor]]:
-    """Only equal-shaped adjacent windows share a forward; time stays an axis."""
+    """Only equal-shaped adjacent windows share a forward; time stays an axis.
+
+    Each group's tiles are decoded, and their all-gather started, before the
+    previous group is assembled, so the gather runs beside the next group's
+    decode instead of between the two.
+    """
     if window_limit < 0:
         raise ValueError("Window batch limit cannot be negative")
     windows = []
@@ -63,19 +69,43 @@ def decode_windows(
             value = torch.cat([value, tail], dim=2)
         windows.append(value)
     limit = window_limit or max(1, len(windows))
-    for start, stop in partitions(windows, capacity=limit * int(z.shape[0])):
-        group = windows[start:stop]
-        value = group[0] if len(group) == 1 else torch.cat(group, dim=0)
-        output = vae._adaptive_decode(value)
-        batch = int(group[0].shape[0])
-        if output.shape[0] != len(group) * batch:
-            raise RuntimeError("Window decode changed the sample count")
-        decoded = (
-            [output]
-            if len(group) == 1
-            else output.unflatten(0, (len(group), batch)).unbind(0)
-        )
-        for offset, result in enumerate(decoded):
+    batch = int(z.shape[0])
+
+    def started() -> Iterator[tuple[int, Callable[[], list[torch.Tensor]]]]:
+        for start, stop in partitions(windows, capacity=limit * batch):
+            group_windows = windows[start:stop]
+            value = (
+                group_windows[0]
+                if len(group_windows) == 1
+                else torch.cat(group_windows, dim=0)
+            )
+            yield (
+                start,
+                functools.partial(
+                    _split_windows,
+                    vae._start_adaptive_decode(value),
+                    len(group_windows),
+                    batch,
+                ),
+            )
+
+    def finished(start, finish):
+        for offset, result in enumerate(finish()):
             yield start + offset, result
-        # Release the previous output batch before decoding the next group.
-        del decoded, output, result
+
+    pending = None
+    for item in started():
+        if pending is not None:
+            yield from finished(*pending)
+        pending = item
+    if pending is not None:
+        yield from finished(*pending)
+
+
+def _split_windows(finish: Callable[[], torch.Tensor], windows: int, batch: int):
+    output = finish()
+    if output.shape[0] != windows * batch:
+        raise RuntimeError("Window decode changed the sample count")
+    if windows == 1:
+        return [output]
+    return list(output.unflatten(0, (windows, batch)).unbind(0))

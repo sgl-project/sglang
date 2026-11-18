@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """H3 batched decode wiring, batching order and bit-exact output gates (CPU)."""
 
+import functools
 import logging
 from types import SimpleNamespace
 from unittest import mock
@@ -66,7 +67,11 @@ def test_windows_keep_time_axis_and_boundary_shapes(limit, use_head_tail):
         calls.append(x.clone())
         return x.repeat_interleave(2, dim=2)
 
-    vae = SimpleNamespace(tokens_chunk_size=3, token_overlap=1, _adaptive_decode=decode)
+    vae = SimpleNamespace(
+        tokens_chunk_size=3,
+        token_overlap=1,
+        _start_adaptive_decode=lambda x: functools.partial(decode, x),
+    )
     outputs = dict(
         decode_windows(vae, z, head=head, tail=tail, count=4, window_limit=limit)
     )
@@ -357,12 +362,57 @@ def test_decoded_tile_like_decodes_each_latent_shape_once():
 
 def test_light_tile_budget_spends_the_tiles_handed_off():
     # a budget of one lightens one decode (ROCm's audio-first order)
-    vae = SimpleNamespace(light_tile_rank=0, light_tile_budget=1, light_tile_keep=1)
+    vae = SimpleNamespace(
+        light_tile_rank=0, light_tile_budget=1, light_tile_keep=1, light_tile_handed=0
+    )
     assert AutoencoderKL._decode_tile_owners(vae, 56, 8).count(0) == 1
     assert AutoencoderKL._decode_tile_owners(vae, 56, 8) == klvae.tile_owners(56, 8)
     # 24 tiles: rank 0 keeps one of its three until five handed-off tiles are spent
-    vae = SimpleNamespace(light_tile_rank=0, light_tile_budget=5, light_tile_keep=1)
+    vae = SimpleNamespace(
+        light_tile_rank=0, light_tile_budget=5, light_tile_keep=1, light_tile_handed=0
+    )
     for _ in range(3):
         assert AutoencoderKL._decode_tile_owners(vae, 24, 8).count(0) == 1
     assert vae.light_tile_budget == -1
     assert AutoencoderKL._decode_tile_owners(vae, 24, 8) == klvae.tile_owners(24, 8)
+
+
+def test_handed_tiles_rotate_over_the_other_ranks():
+    stub = SimpleNamespace(
+        light_tile_rank=0, light_tile_budget=12, light_tile_keep=0, light_tile_handed=0
+    )
+    takers = []
+    while stub.light_tile_budget > 0:
+        owners = AutoencoderKL._decode_tile_owners(stub, 24, 8)
+        assert 0 not in owners
+        plain = klvae.tile_owners(24, 8)
+        takers.append([owners[i] for i, owner in enumerate(plain) if owner == 0])
+    # four windows of 24 tiles: rank 0's three a window go to the ranks after
+    # the ones before took theirs, instead of to ranks 1-3 every time
+    assert takers == [[3, 2, 1], [6, 5, 4], [2, 1, 7], [4, 3, 2]]
+    counts = [sum(t.count(rank) for t in takers) for rank in range(1, 8)]
+    assert counts == [2, 3, 2, 2, 1, 1, 1]
+    assert AutoencoderKL._decode_tile_owners(stub, 24, 8) == klvae.tile_owners(24, 8)
+
+
+def test_each_window_group_starts_before_the_last_one_is_assembled():
+    z = torch.arange(10.0).view(1, 1, 10, 1, 1)
+    calls = []
+
+    def start(value):
+        calls.append("start")
+
+        def finish():
+            calls.append("finish")
+            return value * 10
+
+        return finish
+
+    vae = SimpleNamespace(
+        tokens_chunk_size=2, token_overlap=0, _start_adaptive_decode=start
+    )
+    out = list(decode_windows(vae, z, head=None, tail=None, count=5, window_limit=1))
+    assert [i for i, _ in out] == list(range(5))
+    assert torch.equal(torch.cat([t for _, t in out], dim=2), z * 10)
+    # each group starts (tile decode + gather) before the previous one finishes
+    assert calls == ["start"] + ["start", "finish"] * 4 + ["finish"]

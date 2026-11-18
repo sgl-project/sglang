@@ -280,6 +280,7 @@ def _lighten_tile_groups(video_vae, rank: int | None, budget: int, keep: int):
     ``keep`` per tiled decode (see ``tile_owners``)."""
     video_vae.light_tile_rank = rank
     video_vae.light_tile_budget, video_vae.light_tile_keep = budget, keep
+    video_vae.light_tile_handed = 0
     try:
         yield
     finally:

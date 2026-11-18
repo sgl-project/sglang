@@ -30,8 +30,8 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_world_size,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.distributed.utils import all_gather_single
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import VaeFastPathGate
-from sglang.multimodal_gen.runtime.platforms import current_platform
 
 from .batching import decode_windows, forward_many
 from .processor import (
@@ -79,21 +79,64 @@ def get_tile_parallel_state():
 
 
 def tile_owners(
-    num_tiles: int, world: int, light_rank: int | None = None, keep: int = 1
+    num_tiles: int,
+    world: int,
+    light_rank: int | None = None,
+    keep: int = 1,
+    first_taker: int = 0,
 ) -> list[int]:
     """Decode rank of every tile: round-robin, except that ``light_rank`` hands
-    its last tiles to the other ranks, at most one each, keeping ``keep``."""
+    its last tiles to the other ranks, at most one each, keeping ``keep``; among
+    the ranks with the fewest tiles, the ones from ``first_taker`` on take first."""
     owners = [index % world for index in range(num_tiles)]
     if light_rank is None or not 0 <= light_rank < world:
         return owners
     mine = [index for index, owner in enumerate(owners) if owner == light_rank]
     takers = sorted(
         (rank for rank in range(world) if rank != light_rank),
-        key=lambda rank: (owners.count(rank), rank),
+        key=lambda rank: (owners.count(rank), (rank - first_taker) % world),
     )
     for index, rank in zip(reversed(mine[keep:]), takers):
         owners[index] = rank
     return owners
+
+
+def _tiles_by_owner(gathered, owners: list[int]) -> list[torch.Tensor]:
+    """Tiles in decode order from each rank's gathered (padded) tasks."""
+    taken = [0] * len(gathered)
+    results = []
+    for owner in owners:
+        results.append(gathered[owner][taken[owner]])
+        taken[owner] += 1
+    return results
+
+
+def _stack_tile_tasks(tasks, owners, like):
+    """This rank's decoded tiles, zero-padded to the busiest rank's count."""
+    tile_rank, tile_world_size = get_tile_parallel_state()
+
+    if not tasks and like is None:
+        raise ValueError(f"Found empty tasks on tile rank {tile_rank}")
+
+    counts = [owners.count(rank) for rank in range(tile_world_size)]
+    if len(tasks) != counts[tile_rank]:
+        raise ValueError(
+            f"Expected {counts[tile_rank]} tiled tasks on rank {tile_rank}, "
+            f"got {len(tasks)} for num_tiles={len(owners)}, "
+            f"world_size={tile_world_size}"
+        )
+
+    max_tasks = max(counts)
+    if not tasks:
+        template = like()
+        stacked = template.new_zeros((max_tasks, *template.shape))
+    elif len(tasks) == max_tasks:
+        stacked = torch.stack(tasks, dim=0)
+    else:
+        stacked = tasks[0].new_empty((max_tasks, *tasks[0].shape))
+        torch.stack(tasks, dim=0, out=stacked[: len(tasks)])
+        stacked[len(tasks) :].zero_()
+    return stacked
 
 
 class DiagonalGaussianDistribution(object):
@@ -184,6 +227,9 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
     light_tile_rank: int | None = None
     light_tile_budget: int = 0
     light_tile_keep: int = 1
+    # tiles handed so far: the next tiled decode's takers start that many ranks
+    # after the light rank, so overlapping groups do not load the same ranks
+    light_tile_handed: int = 0
 
     def setup_forward(self, **kwargs):
         self.clip_length = kwargs.get("clip_length", 17)
@@ -337,10 +383,8 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             tuple(y_overlap),
             tuple(x_overlap),
         )
-        # measured on gfx950 only
         if not (
-            current_platform.is_rocm()
-            and _output_kernel_candidate(first, _TILE_ASSEMBLE_FUSION, sig)
+            _output_kernel_candidate(first, _TILE_ASSEMBLE_FUSION, sig)
             and all(tile.shape == first.shape for row in rows for tile in row)
         ):
             return self._assemble_tiles_eager(rows, y_overlap, x_overlap)
@@ -412,44 +456,31 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
     def _all_gather_tiled_results(self, tasks, owners, like=None):
         """Every tile's decode, gathered from its owner. ``like()`` gives an
         empty decoded tile for a rank that owns none (``_decoded_tile_like``)."""
-        tile_rank, tile_world_size = get_tile_parallel_state()
-
-        if not tasks and like is None:
-            raise ValueError(f"Found empty tasks on tile rank {tile_rank}")
-
-        counts = [owners.count(rank) for rank in range(tile_world_size)]
-        if len(tasks) != counts[tile_rank]:
-            raise ValueError(
-                f"Expected {counts[tile_rank]} tiled tasks on rank {tile_rank}, "
-                f"got {len(tasks)} for num_tiles={len(owners)}, "
-                f"world_size={tile_world_size}"
-            )
-
-        max_tasks = max(counts)
-        if not tasks:
-            template = like()
-            stacked = template.new_zeros((max_tasks, *template.shape))
-        elif len(tasks) == max_tasks:
-            stacked = torch.stack(tasks, dim=0)
-        else:
-            stacked = tasks[0].new_empty((max_tasks, *tasks[0].shape))
-            torch.stack(tasks, dim=0, out=stacked[: len(tasks)])
-            stacked[len(tasks) :].zero_()
-
         # Every rank derives the same ownership, so every rank's task count is
         # known. Pad only the leading task dimension and use a single
         # equal-shape all-gather; the previous path paid for a barrier, a shape
         # all-gather, and then a padded data all-gather per temporal clip.
         gathered = get_decode_parallel_group_coordinator().all_gather(
-            stacked, separate_tensors=True
+            _stack_tile_tasks(tasks, owners, like), separate_tensors=True
+        )
+        return _tiles_by_owner(gathered, owners)
+
+    def _start_tile_gather(self, tasks, owners, like=None):
+        """``_all_gather_tiled_results`` started on the communicator's stream;
+        the returned callable makes the current stream wait for it and returns
+        the tiles, so the current stream can decode the next tiles meanwhile."""
+        stacked = _stack_tile_tasks(tasks, owners, like)
+        group = get_decode_parallel_group_coordinator()
+        gathered = stacked.new_empty((group.world_size, *stacked.shape))
+        work = all_gather_single(
+            gathered, stacked, group=group.device_group, async_op=True
         )
 
-        taken = [0] * tile_world_size
-        results = []
-        for owner in owners:
-            results.append(gathered[owner][taken[owner]])
-            taken[owner] += 1
-        return results
+        def finish():
+            work.wait()
+            return _tiles_by_owner(gathered, owners)
+
+        return finish
 
     def _local_tile_indices(self, owners, tile_rank):
         return [index for index, owner in enumerate(owners) if owner == tile_rank]
@@ -460,12 +491,17 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         if self.light_tile_budget <= 0:
             return tile_owners(num_tiles, tile_world_size)
         owners = tile_owners(
-            num_tiles, tile_world_size, self.light_tile_rank, self.light_tile_keep
+            num_tiles,
+            tile_world_size,
+            self.light_tile_rank,
+            self.light_tile_keep,
+            self.light_tile_rank + 1 + self.light_tile_handed,
         )
         handed = tile_owners(num_tiles, tile_world_size).count(
             self.light_tile_rank
         ) - owners.count(self.light_tile_rank)
         self.light_tile_budget -= max(1, handed)
+        self.light_tile_handed += handed
         return owners
 
     def _run_tile_tasks(
@@ -536,6 +572,11 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         return z
 
     def tiled_decode(self, z):
+        return self._start_tiled_decode(z)()
+
+    def _start_tiled_decode(self, z):
+        """Decode this rank's tiles of z and start their all-gather; the
+        returned callable waits for the gather and assembles the tiles."""
         if self.parallel_tiling:  # Fast online decoding for large videos
             tile_rank, tile_world_size = get_tile_parallel_state()
         else:
@@ -578,21 +619,22 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         )
 
         if tile_world_size > 1:
-            all_decoded = self._all_gather_tiled_results(
+            gather = self._start_tile_gather(
                 decoded_tasks,
                 owners,
                 functools.partial(self._decoded_tile_like, z_tiles[0]),
             )
         else:
-            all_decoded = decoded_tasks
+            gather = lambda: decoded_tasks  # noqa: E731
 
-        rows = [[None for _ in range(j_max)] for _ in range(i_max)]
-        for idx, decoded in enumerate(all_decoded):
-            i, j = idx // j_max, idx % j_max
-            rows[i][j] = decoded.to(z.device)
+        def assemble():
+            rows = [[None for _ in range(j_max)] for _ in range(i_max)]
+            for idx, decoded in enumerate(gather()):
+                i, j = idx // j_max, idx % j_max
+                rows[i][j] = decoded.to(z.device)
+            return self._assemble_tiles(rows, y_overlap, x_overlap)
 
-        dec = self._assemble_tiles(rows, y_overlap, x_overlap)
-        return dec
+        return assemble
 
     def enable_tiling(self) -> None:
         """Turn on tiled decode for subsequent decodes.
@@ -612,10 +654,15 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             return self.encode(x)
 
     def _adaptive_decode(self, z):
+        return self._start_adaptive_decode(z)()
+
+    def _start_adaptive_decode(self, z):
+        """``_adaptive_decode`` up to a tiled decode's all-gather; the returned
+        callable gives the decode."""
         if self.decoder_tiling:
-            return self.tiled_decode(z)
-        else:
-            return self.decode(z)
+            return self._start_tiled_decode(z)
+        decoded = self.decode(z)
+        return lambda: decoded
 
     def trim_code(self, z, target_codes):
         if target_codes < z.shape[2]:

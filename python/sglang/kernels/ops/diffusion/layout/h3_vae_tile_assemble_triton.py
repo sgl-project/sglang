@@ -22,7 +22,8 @@ import triton.language as tl  # type: ignore
 _BLOCK = 1024
 
 
-@triton.jit
+# lengths at run time: a new canvas or window length must not compile again
+@triton.jit(do_not_specialize=["planes", "out_h", "out_w", "j_max"])
 def _tile_assemble_kernel(
     out_ptr,
     tiles_ptr,
@@ -104,10 +105,13 @@ def _axis_tables(
         )
         ramp = torch.zeros(kept, 2, device=device, dtype=torch.float32)
         if extent:
-            # the expressions of AutoencoderKL.blend, on the tiles' device
+            # the expressions of AutoencoderKL.blend, on the tiles' device; an
+            # overlap wider than the part of this tile that is kept blends only
+            # the kept rows
             positions = torch.arange(extent, device=device, dtype=torch.float32)
-            ramp[:extent, 0] = 1 - positions / extent
-            ramp[:extent, 1] = positions / extent
+            blended = min(extent, kept)
+            ramp[:blended, 0] = (1 - positions / extent)[:blended]
+            ramp[:blended, 1] = (positions / extent)[:blended]
         weight.append(ramp)
     return torch.cat(index).contiguous(), torch.cat(weight).contiguous()
 
