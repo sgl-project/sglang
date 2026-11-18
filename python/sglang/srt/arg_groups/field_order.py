@@ -91,7 +91,6 @@ POSITIONAL_FIELD_ORDER = (
     "cp_strategy",
     "enable_dsa_cache_layer_split",
     "enable_cp_decode_attn_tp",
-    "cp_decode_attn_mode",
     "enable_kv_cache_sharding",
     "enable_dp_attention_local_control_broadcast",
     "enable_dp_lm_head",
@@ -571,5 +570,6 @@ POSITIONAL_FIELD_ORDER = (
     "enable_flashmla_prefill_token_packing",
     "decode_state_free_radix_default",
     "gc_freeze_on_idle_secs",
+    "cp_decode_attn_mode",
 )
 # fmt: on
