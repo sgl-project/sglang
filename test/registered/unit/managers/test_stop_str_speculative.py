@@ -7,7 +7,9 @@ a fake tokenizer; pure CPU. Each test guards a distinct branch of
 
 import unittest
 from array import array
+from types import SimpleNamespace
 
+from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -28,6 +30,9 @@ ID_TO_TEXT = {
     63: ".",
     70: "X",
     71: "Y",
+    80: "1",
+    81: "2",
+    82: "3",
 }
 
 # "STOP" (index 3) sits 6 tokens back: outside the old (stop_str_max_len + 1)
@@ -133,7 +138,7 @@ class TestStopStrSpeculative(unittest.TestCase):
         req = _make_req([60, 61, 62, 63], stop_regex=[r"\.$"])
         req.update_finish_state(new_accepted_len=4)
         self.assertTrue(req.finished())
-        self.assertEqual(req.finished_reason.matched, r"\.$")
+        self.assertEqual(req.finished_reason.matched, ".")
         self.assertEqual(req.finished_len, 2)
 
     def test_stop_regex_end_anchored_midchunk(self):
@@ -142,8 +147,43 @@ class TestStopStrSpeculative(unittest.TestCase):
         req = _make_req([60, 61, 62], stop_regex=[r"[.!?]\s*$"])
         req.update_finish_state(new_accepted_len=3)
         self.assertTrue(req.finished())
-        self.assertEqual(req.finished_reason.matched, r"[.!?]\s*$")
+        self.assertEqual(req.finished_reason.matched, ".")
         self.assertEqual(req.finished_len, 2)
+
+    # --- the recorded matched string is the span, not the pattern source ---
+    def test_stop_regex_non_literal_records_matched_span(self):
+        # The detokenizer trims with a literal find on `matched`; recording the
+        # pattern source ("[0-9]+") instead of the span left non-literal regex
+        # stops untrimmed and made no_stop_trim unreachable (#47461). The span
+        # must come from the emitted prefix bounded by finished_len: the tail's
+        # greedy match "123" extends past it and is never seen by the
+        # detokenizer, which only gets "kl1".
+        req = _make_req([10, 11, 80, 81, 82, 20], stop_regex=[r"[0-9]+"])
+        req.update_finish_state(new_accepted_len=6)
+        self.assertTrue(req.finished())
+        self.assertEqual(req.finished_reason.to_json()["matched"], "1")
+        self.assertEqual(req.finished_len, 3)
+        # End to end: the detokenizer trims the emitted text at the match.
+        emitted = req.tokenizer.decode(req.output_ids[: req.finished_len])
+        self.assertEqual(emitted, "kl1")
+        stub = SimpleNamespace(
+            is_tool_call_parser_gpt_oss=False, tool_close_token_ids=frozenset()
+        )
+        self.assertEqual(
+            DetokenizerManager.trim_matched_stop(
+                stub, emitted, req.finished_reason.to_json(), False
+            ),
+            "kl",
+        )
+
+    def test_stop_regex_literal_span_equals_pattern(self):
+        # A literal pattern's span is the pattern text itself: identical trim
+        # to the pre-fix behavior.
+        req = _make_req([10, 11, 70, 71, 20], stop_regex=[r"XY"])
+        req.update_finish_state(new_accepted_len=5)
+        self.assertTrue(req.finished())
+        self.assertEqual(req.finished_reason.to_json()["matched"], "XY")
+        self.assertEqual(req.finished_len, 4)
 
 
 if __name__ == "__main__":
