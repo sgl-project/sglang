@@ -100,13 +100,13 @@ class TestDeepseekScalingRotaryEmbeddingHip(CustomTestCase):
     def _run_case(self, is_neox: bool, num_tokens: int) -> None:
         device, dtype = "cuda", torch.bfloat16
         rope = DeepseekScalingRotaryEmbedding(
-            64,
-            64,
-            4096,
-            10000,
-            is_neox,
-            40.0,
-            dtype,
+            head_size=64,
+            rotary_dim=64,
+            max_position_embeddings=4096,
+            base=10000,
+            is_neox_style=is_neox,
+            scaling_factor=40.0,
+            dtype=dtype,
             beta_fast=32,
             beta_slow=1,
             mscale=1.0,
@@ -120,11 +120,13 @@ class TestDeepseekScalingRotaryEmbeddingHip(CustomTestCase):
         latent = torch.randn(num_tokens, 576, dtype=dtype, device=device)
 
         q_ref, k_ref = rope.forward_native(
-            pos_ids, q[..., 64:].clone(), latent[..., 512:].unsqueeze(1).clone()
+            positions=pos_ids,
+            query=q[..., 64:].clone(),
+            key=latent[..., 512:].unsqueeze(1).clone(),
         )
         q_hip, latent_hip = q.clone(), latent.clone()
         q_pe, k_pe = q_hip[..., 64:], latent_hip[..., 512:].unsqueeze(1)
-        q_out, k_out = rope(pos_ids, q_pe, k_pe)
+        q_out, k_out = rope(positions=pos_ids, query=q_pe, key=k_pe)
 
         self.assertEqual(q_out.data_ptr(), q_pe.data_ptr())
         self.assertEqual(k_out.data_ptr(), k_pe.data_ptr())
@@ -139,7 +141,7 @@ class TestDeepseekScalingRotaryEmbeddingHip(CustomTestCase):
         for is_neox in (False, True):
             for num_tokens in (1, 4, 37, 4096):
                 with self.subTest(is_neox=is_neox, num_tokens=num_tokens):
-                    self._run_case(is_neox, num_tokens)
+                    self._run_case(is_neox=is_neox, num_tokens=num_tokens)
 
 
 @unittest.skipIf(not _use_aiter, reason="Requires AMD GPU plus SGLANG_USE_AITER=1")
