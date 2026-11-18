@@ -47,6 +47,27 @@ class PatchEmbed(nn.Module):
 def apply_vision_rotary(q, k, position_embeddings, x_shape):
     # The reference pairs the two halves of each head, with FP32 arithmetic.
     cos, sin = position_embeddings
+    if (
+        q.is_cuda
+        and torch.version.hip is None
+        and q.ndim == k.ndim == 3
+        and q.shape == k.shape
+        and q.shape[0] > 0
+        and q.shape[1] > 0
+        and not any(t.requires_grad for t in (q, k, cos, sin))
+        and q.device == k.device == cos.device == sin.device
+        and q.shape[-1] == 64
+        and q.stride(-1) == k.stride(-1) == 1
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and q.dtype == k.dtype
+        and cos.dtype == sin.dtype == torch.float32
+        and cos.is_contiguous()
+        and sin.is_contiguous()
+        and cos.shape == sin.shape == (q.shape[0], 1, 32)
+    ):
+        from sglang.srt.models.dsv41_vision_rope import apply_fused_vision_rope
+
+        return apply_fused_vision_rope(q, k, cos, sin)
     return apply_rotary(q, cos, sin), apply_rotary(k, cos, sin)
 
 
