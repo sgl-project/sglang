@@ -4,11 +4,22 @@
 
 from __future__ import annotations
 
+import copy
 import re
 from copy import deepcopy
 from fractions import Fraction
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import numpy
 import torch
@@ -89,6 +100,39 @@ def resolve_dynamic_fused_shards(
             return list(candidate)
     shards = _DYNAMIC_FUSED_SHARDS.get(proj_name)
     return list(shards) if shards is not None else None
+
+
+# The attributes in which quantization configs keep the modules a checkpoint leaves unquantized.
+_EXCLUSION_ATTRS = (
+    "ignore",
+    "ignored_layers",
+    "exclude_modules",
+    "modules_to_not_convert",
+)
+
+
+def rename_excluded_modules(
+    quant_config: Optional[QuantizationConfig], rename: Callable[[str], str]
+) -> Optional[QuantizationConfig]:
+    """A copy of `quant_config` whose exclusion lists are renamed by `rename`.
+
+    A model whose load_weights renames checkpoint weights (e.g. `midlayer` to
+    `layers.0` in EAGLE-3 drafts) must rename the modules its checkpoint's
+    quantization config excludes the same way, or the exclusions match no layer.
+    Regex entries (`re:`) are kept as they are.
+    """
+    if quant_config is None:
+        return None
+    renamed = copy.copy(quant_config)
+    for attr in _EXCLUSION_ATTRS:
+        names = getattr(quant_config, attr, None)
+        if isinstance(names, list) and all(isinstance(n, str) for n in names):
+            setattr(
+                renamed,
+                attr,
+                [n if n.startswith("re:") else rename(n) for n in names],
+            )
+    return renamed
 
 
 def is_layer_skipped(
