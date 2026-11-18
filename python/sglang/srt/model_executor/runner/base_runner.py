@@ -25,6 +25,7 @@ import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia.binding import prepare_megakernel
 from sglang.srt.layers import deep_gemm_wrapper
@@ -46,6 +47,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    autotune_dummy_run_ctx,
     maybe_flashinfer_autotune_extend,
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
@@ -274,6 +276,14 @@ class BaseRunner(ABC):
         if prepare_model_resources is not None:
             prepare_model_resources(mr)
         prepare_megakernel(mr)
+        self._finalize_symm_workspaces()
+
+        if hybrid_gdn_config(mr.model_config) is not None:
+            from sglang.srt.layers.attention.linear.gdn_backend import (
+                prewarm_gdn_prefill_kernels,
+            )
+
+            prewarm_gdn_prefill_kernels(attn_backend=mr.attn_backend, model=mr.model)
 
         if should_run_flashinfer_autotune(self.model_runner):
             buffers, batch_size = self._autotune_buffers()
@@ -347,8 +357,8 @@ class BaseRunner(ABC):
         init_fi_a2a_workspace(get_parallel().dcp_group)
 
     def _pre_initialize_dcp_push_combine(self):
-        """Allocate the push plane of the DCP push-combine reduce; must run
-        before CG capture (IPC handle exchange across the DCP group)."""
+        """Declare and bind the DCP push-combine reduce's workspace; must run
+        before CG capture (the symmetric allocation is a DCP-group collective)."""
         parallel = get_parallel()
         if (
             not parallel.dcp_enabled
@@ -362,6 +372,15 @@ class BaseRunner(ABC):
         init_dcp_push_combine(
             parallel.dcp_group, self.model_runner.model_config.num_attention_heads
         )
+
+    def _finalize_symm_workspaces(self):
+        """Allocate the symmetric workspaces every consumer has requested by now;
+        must run before CG capture, which forbids the multicast mapping."""
+        from sglang.srt.distributed.device_communicators.symm_workspace import (
+            finalize_symm_workspaces,
+        )
+
+        finalize_symm_workspaces()
 
     def _pre_initialize_pcie_ipc_workspace(self):
         """Build the PCIe-IPC all-reduce workspace before graph capture.
@@ -414,17 +433,12 @@ class BaseRunner(ABC):
         runner exists; a freshly-allocated dummy set in the eager path).
         """
         mr = self.model_runner
-        canary_run_ctx = (
-            c.with_active_single_forward_manager(0)
-            if (c := mr.canary_manager) is not None
-            else empty_context()
-        )
 
         def forward_fn():
             self._dummy_run(
                 batch_size=batch_size,
                 buffers=buffers,
-                run_ctx=canary_run_ctx,
+                run_ctx=autotune_dummy_run_ctx(mr, buffers),
             )
 
         run_flashinfer_autotune_forward(

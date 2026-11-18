@@ -30,6 +30,7 @@ class BenchmarkConfig:
         self.num_unique_requests = 100
         self.distribution = "POISSON"  # Options: "CONSTANT", "POISSON"
         self.profile = False
+        self.admin_api_key = os.getenv("SGLANG_ADMIN_API_KEY")
 
         # Garbage Collection Control
         self.freeze_gc = True  # Enable/disable garbage collection freezing
@@ -282,7 +283,10 @@ async def make_http_call(
 
 
 async def send_profile_request(
-    profile_text: str, http_url: str, session: Optional[aiohttp.ClientSession] = None
+    profile_text: str,
+    http_url: str,
+    session: Optional[aiohttp.ClientSession] = None,
+    admin_api_key: Optional[str] = None,
 ) -> None:
     """
     Send a profile request (START_PROFILE or STOP_PROFILE) and wait for completion.
@@ -311,6 +315,8 @@ async def send_profile_request(
                 return
 
             headers = {"Content-Type": "application/json"}
+            if admin_api_key:
+                headers["Authorization"] = f"Bearer {admin_api_key}"
 
             async with session.post(endpoint_url, headers=headers) as resp:
                 resp_text = await resp.text()
@@ -328,7 +334,11 @@ async def send_profile_request(
         print(f"Error sending {profile_text} request: {e}")
 
 
-async def call_freeze_gc_http(session: aiohttp.ClientSession, http_url: str) -> None:
+async def call_freeze_gc_http(
+    session: aiohttp.ClientSession,
+    http_url: str,
+    admin_api_key: Optional[str] = None,
+) -> None:
     """
     Call the /freeze_gc HTTP endpoint.
 
@@ -345,7 +355,12 @@ async def call_freeze_gc_http(session: aiohttp.ClientSession, http_url: str) -> 
 
         print(f"Calling freeze_gc endpoint: {freeze_gc_url}")
 
-        async with session.post(freeze_gc_url) as resp:
+        async with session.post(
+            freeze_gc_url,
+            headers={"Authorization": f"Bearer {admin_api_key}"}
+            if admin_api_key
+            else {},
+        ) as resp:
             if resp.status == 200:
                 print("freeze_gc called successfully")
             else:
@@ -416,7 +431,7 @@ async def perform_global_warmup_and_freeze(
     async with aiohttp.ClientSession() as session:
         await send_warmup_requests(session, http_url, build_warmup_request_func)
         if config.freeze_gc:
-            await call_freeze_gc_http(session, http_url)
+            await call_freeze_gc_http(session, http_url, config.admin_api_key)
         print(
             f"HTTP warmup{' and GC freeze' if config.freeze_gc else ''} completed successfully."
         )
@@ -747,7 +762,12 @@ async def run_generic_benchmark(
     ) as session:
         # Send START_PROFILE if profiling is enabled
         if config.profile:
-            await send_profile_request("START_PROFILE", http_url, session=session)
+            await send_profile_request(
+                "START_PROFILE",
+                http_url,
+                session=session,
+                admin_api_key=config.admin_api_key,
+            )
 
         # Add progress bar for sending requests
         with tqdm(
@@ -794,7 +814,12 @@ async def run_generic_benchmark(
 
         # Send STOP_PROFILE if profiling is enabled
         if config.profile:
-            await send_profile_request("STOP_PROFILE", http_url, session=session)
+            await send_profile_request(
+                "STOP_PROFILE",
+                http_url,
+                session=session,
+                admin_api_key=config.admin_api_key,
+            )
 
     completion_end_time = asyncio.get_running_loop().time()
     total_duration = completion_end_time - send_start_time

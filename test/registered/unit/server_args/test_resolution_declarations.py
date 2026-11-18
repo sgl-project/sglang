@@ -87,7 +87,6 @@ _REACHED_BY_SHAPES = frozenset(
         "dp_size",
         "enable_dp_attention_local_control_broadcast",
         "enable_dp_lm_head",
-        "enable_flashinfer_allreduce_fusion",
         "encoder_transfer_backend",
         "enforce_disable_flashinfer_allreduce_fusion",
         "ep_size",
@@ -246,7 +245,8 @@ class TestResolutionDeclarations(CustomTestCase):
         `ServerArgs.resolved_dict()`.
 
         The dump is exactly the field names, carrying the resolution result
-        for each. It holds none of the resolution bookkeeping (`_raw_input`, the
+        for each, plus `enable_dp_attention`, which `/server_info` still
+        reports. It holds none of the resolution bookkeeping (`_raw_input`, the
         declaration stash, the finished flag) and no `ModelConfig` memo: none of
         that is configuration, and all of it would cross IPC with the
         readback.
@@ -255,7 +255,10 @@ class TestResolutionDeclarations(CustomTestCase):
         dump = server_args.resolved_dict()
         self.assertEqual(
             sorted(dump),
-            sorted(field.name for field in msgspec.structs.fields(server_args)),
+            sorted(
+                [field.name for field in msgspec.structs.fields(server_args)]
+                + ["enable_dp_attention"]
+            ),
             "the readback dump is no longer exactly the fields",
         )
         leaked = sorted(
