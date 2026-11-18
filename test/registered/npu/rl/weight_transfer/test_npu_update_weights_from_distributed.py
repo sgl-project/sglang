@@ -218,6 +218,31 @@ class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
         finally:
             self._destroy_group(self.lane_url, group_name, pg)
 
+    def test_05_hccl_refit_of_flattened_bucket(self):
+        """The same refit over the bucketed channel: one broadcast per round."""
+        group_name = "npu_rl_hccl_refit_packed"
+        pg = self._create_group(self.lane_url, group_name)
+        try:
+            for round_idx in range(UPDATE_ROUNDS):
+                begin_weight_update(self.lane_url)
+                try:
+                    thread, result = self._post_update_async(
+                        self.lane_url, group_name, flattened_bucket=True
+                    )
+                    self._broadcast_all(pg, flattened_bucket=True)
+                    thread.join(timeout=1800)
+                finally:
+                    end_weight_update(self.lane_url)
+
+                self.assertNotIn("error", result, f"update thread failed: {result}")
+                self.assertEqual(result.get("status"), 200, result.get("text"))
+                self._assert_reference(
+                    f"packed HCCL refit round {round_idx + 1} did not reproduce "
+                    "startup loading"
+                )
+        finally:
+            self._destroy_group(self.lane_url, group_name, pg)
+
     def test_02_init_group_defaults_to_nccl(self):
         request = InitWeightsUpdateGroupReqInput(
             master_address=MASTER_ADDR,
