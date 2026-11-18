@@ -121,6 +121,8 @@ class RolloutResponse(BaseModel):
     rollout_debug_tensors: Optional[dict[str, Any]] = None
     denoising_env: Optional[dict[str, Any]] = None
     dit_trajectory: Optional[dict[str, Any]] = None
+    # Other streams by name, keyed like the top-level fields; log-probs are per-stream means.
+    extra_streams: Optional[dict[str, dict[str, Any]]] = None
 
     inference_time_s: Optional[float] = None
     peak_memory_mb: Optional[float] = None

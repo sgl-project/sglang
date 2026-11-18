@@ -18,6 +18,7 @@ import torch
 
 from radix_transfer_plugins import StorageBackend
 from sglang.multimodal_gen.configs.post_training.rl_rollout import (
+    AUDIO_STREAM,
     PRIMARY_STREAM,
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training import rollout_api
@@ -609,6 +610,27 @@ def _store_batch(B=2, T=2, D=4, L=5, latent_steps=(0, 1, 2)):
     return batch
 
 
+def _store_batch_with_audio(D=3, latent_steps=(0, 2)):
+    batch = _store_batch()
+    streams = batch.rollout_trajectory_data.streams
+    B, T = streams[PRIMARY_STREAM].rollout_log_probs.shape
+    batch.audio = torch.randn(B, 8)
+    batch.audio_sample_rate = 24000
+    streams[AUDIO_STREAM] = RolloutStreamData(
+        rollout_log_probs=torch.randn(B, T),
+        rollout_debug_tensors=RolloutDebugTensors(
+            rollout_model_outputs=torch.randn(B, T, D),
+        ),
+        dit_trajectory=RolloutDitTrajectory(
+            latents=torch.randn(B, len(latent_steps), D),
+            timesteps=torch.linspace(1.0, 0.0, T),
+            sigmas=torch.linspace(1.0, 0.0, T + 1),
+            latent_step_indices=torch.tensor(latent_steps),
+        ),
+    )
+    return batch
+
+
 def _assert_same_tensors(test, inline, via_store, stored):
     """Every marker in ``via_store`` resolves to the tensor ``inline`` carries there."""
     if isinstance(via_store, dict) and "__store__" in via_store:
@@ -739,13 +761,39 @@ class TestBuildResponseViaStore(unittest.TestCase):
                 [0, 1, 2],
             )
 
+    def test_audio_stream_is_stored_under_its_own_prefix(self):
+        """An extra stream adds its own store fields and leaves the primary layout unchanged."""
+        primary_only = {}
+        _build_response("r", "p", 0, True, _store_batch(), stored=primary_only)
+        stored = {}
+        _build_response("r", "p", 0, True, _store_batch_with_audio(), stored=stored)
+        self.assertEqual(
+            set(stored) - set(primary_only),
+            {
+                *(
+                    f"extra_streams.audio.dit_trajectory.latents.{b}.{k}"
+                    for b in (0, 1)
+                    for k in (0, 2)
+                ),
+                *(
+                    f"extra_streams.audio.rollout_debug_tensors.rollout_model_outputs.{b}.{t}"
+                    for b in (0, 1)
+                    for t in (0, 1)
+                ),
+                "extra_streams.audio.generated_output.0",
+                "extra_streams.audio.generated_output.1",
+            },
+        )
+        self.assertTrue(set(primary_only) <= set(stored))
+
     def test_markers_resolve_to_the_inline_tensors(self):
-        batch = _store_batch()
+        batch = _store_batch_with_audio()
         fields = (
             "generated_output",
             "rollout_debug_tensors",
             "denoising_env",
             "dit_trajectory",
+            "extra_streams",
         )
         for video_dtype in (None, "uint8"):
             stored = {}
@@ -780,9 +828,40 @@ class TestBuildResponseViaStore(unittest.TestCase):
         self.assertEqual([resp.generated_output for resp in resps], [None] * len(resps))
         self.assertFalse(any(key.startswith("generated_output.") for key in stored))
 
+    def test_skipped_decode_keeps_only_the_rollout_of_an_extra_stream(self):
+        batch = _store_batch_with_audio()
+        num_outputs = batch.output.shape[0]
+        batch.output = batch.audio = batch.audio_sample_rate = None
+        for resp in _build_response("r", "p", 0, True, batch, num_outputs=num_outputs):
+            audio = resp.extra_streams["audio"]
+            self.assertIsNone(audio["generated_output"])
+            self.assertNotIn("sample_rate", audio)
+            self.assertIsNotNone(audio["rollout_log_probs"])
+        del batch.rollout_trajectory_data.streams[AUDIO_STREAM]
+        for resp in _build_response("r", "p", 0, True, batch, num_outputs=num_outputs):
+            self.assertIsNone(resp.extra_streams)
+
+    def test_one_dimensional_audio_track_is_shared_by_every_sample(self):
+        batch = _store_batch()
+        batch.audio = torch.randn(8)
+        batch.audio_sample_rate = 24000
+        for resp in _build_response("r", "p", 0, True, batch):
+            audio = _maybe_deserialize(resp.extra_streams["audio"])
+            self.assertTrue(torch.equal(audio["generated_output"], batch.audio))
+
+    def test_audio_rows_must_match_the_batch(self):
+        """Merged outputs with a missing audio part would pair samples with the wrong audio."""
+        batch = _store_batch()
+        batch.audio = torch.randn(1, 8)
+        with self.assertRaisesRegex(ValueError, "audio has 1 outputs"):
+            _build_response("r", "p", 0, True, batch)
+
     def test_eval_response_stores_nothing(self):
         batch = OutputBatch(
-            output=torch.randn(2, 1, 8, 8), rollout_trajectory_data=None
+            output=torch.randn(2, 1, 8, 8),
+            audio=torch.randn(2, 8),
+            audio_sample_rate=24000,
+            rollout_trajectory_data=None,
         )
         batch.metrics = None
         stored = {}

@@ -13,6 +13,7 @@ from sglang.multimodal_gen.configs.post_training.rl_rollout import (
     RLRolloutArgs,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.entrypoints.post_training import rollout_api
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
@@ -25,6 +26,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
 )
 from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
     truncate_rollout_sigmas,
+)
+from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    concat_rollout_trajectory_data,
+    select_output_rollout_trajectory,
 )
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     PRIMARY_STREAM,
@@ -123,6 +128,65 @@ def _prepare_stream_on_its_own_grid(batch, stream, latents):
         gather_for_sp=_identity_for_sp,
     )
     return scheduler, uncut_sigmas
+
+
+@pytest.mark.parametrize("stop_step_index", [None, 0])
+def test_any_named_stream_with_its_own_sigmas_reaches_the_response(
+    batch, stop_step_index
+):
+    """No code between the hook and the response branches on a stream's name."""
+    stream = "action"
+    batch.rollout_extra_streams = (stream,)
+    batch.rollout_stop_step_index = stop_step_index
+    batch.rollout_return_step_indices = None
+    action_latents = batch.audio_latents
+    with rollout_scope(batch):
+        _prepare_primary_stream(batch)
+        action_scheduler, uncut_sigmas = _prepare_stream_on_its_own_grid(
+            batch, stream, action_latents
+        )
+        controller = batch.rollout_controllers[stream]
+        expected_sigmas = (
+            uncut_sigmas
+            if stop_step_index is None
+            else truncate_rollout_sigmas(uncut_sigmas, stop_step_index=stop_step_index)
+        )
+        torch.testing.assert_close(controller.sigmas, expected_sigmas, rtol=0, atol=0)
+        assert not torch.equal(
+            controller.sigmas, batch.rollout_controllers[PRIMARY_STREAM].sigmas
+        )
+        # A stream on its own grid steps with its controller's timesteps.
+        for timestep, action_timestep in zip(batch.timesteps, controller.timesteps):
+            batch.latents = batch.scheduler.step(
+                torch.zeros_like(batch.latents),
+                timestep,
+                batch.latents,
+                **rollout_step_kwargs(batch, stream=PRIMARY_STREAM),
+                return_dict=False,
+            )[0]
+            action_latents = action_scheduler.step(
+                torch.zeros_like(action_latents),
+                action_timestep,
+                action_latents,
+                **rollout_step_kwargs(batch, stream=stream),
+                return_dict=False,
+            )[0]
+        _finalize_stream(batch, PRIMARY_STREAM, batch.latents)
+        _finalize_stream(batch, stream, action_latents)
+        publish_rollout_if_enabled(batch=batch, pipeline_config=_PIPELINE_CONFIG)
+    data = batch.rollout_trajectory_data
+    assert set(data.streams) == {PRIMARY_STREAM, stream}
+    assert torch.isfinite(data.streams[stream].rollout_log_probs).all()
+    merged = concat_rollout_trajectory_data(
+        [select_output_rollout_trajectory(data, i) for i in range(2)]
+    )
+    result = OutputBatch(output=torch.zeros(2, 1), rollout_trajectory_data=merged)
+    for response in rollout_api._build_response("r", "p", 10, True, result):
+        assert set(response.extra_streams) == {stream}
+        assert response.extra_streams[stream]["generated_output"] is None
+    stored = {}
+    rollout_api._build_response("r", "p", 10, True, result, stored=stored)
+    assert any(key.startswith(f"extra_streams.{stream}.") for key in stored)
 
 
 def test_stream_not_requested_for_rollout_cuts_its_own_grid_at_the_stop(batch):

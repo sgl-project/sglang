@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Response
 from fastapi.responses import StreamingResponse
 
 from sglang.multimodal_gen.configs.post_training.rl_rollout import (
+    AUDIO_STREAM,
     PRIMARY_STREAM,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
@@ -32,7 +33,10 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
     _quantize_video_uint8,
     msgpack_encode_spliced,
 )
-from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    prepare_request,
+    select_output_audio,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
     SKIP_DECODE_UNSUPPORTED_ERROR,
@@ -338,6 +342,93 @@ def _serialize_schedule(
     )
 
 
+def _serialize_sample_output(
+    value: Any, *, store_field: str, stored: dict[str, torch.Tensor] | None
+) -> Any:
+    if stored is None or value is None:
+        return _maybe_serialize(value)
+    # some pipelines return a numpy array, which the inline path serializes as a tensor too
+    stored[store_field] = torch.as_tensor(value)
+    return {"__store__": store_field}
+
+
+def _extra_stream_outputs(
+    result: OutputBatch, sample_idx: int, batch_size: int
+) -> dict[str, dict[str, Any]]:
+    audio = result.audio
+    if audio is None:
+        return {}
+    # A 1-D track is shared by every sample (see ``select_output_audio``).
+    if audio.ndim >= 2 and audio.shape[0] != batch_size:
+        raise ValueError(
+            f"audio has {audio.shape[0]} outputs for a batch of {batch_size}"
+        )
+    return {
+        AUDIO_STREAM: {
+            "generated_output": select_output_audio(audio, sample_idx),
+            "sample_rate": result.audio_sample_rate,
+        }
+    }
+
+
+_NO_ROLLOUT_FIELDS = {
+    "rollout_log_probs": None,
+    "rollout_debug_tensors": None,
+    "dit_trajectory": None,
+}
+
+
+def _serialize_extra_streams(
+    sample_idx: int,
+    batch_size: int,
+    *,
+    extra_stream_outputs: dict[str, dict[str, Any]],
+    extra_stream_rollouts: dict[str, RolloutStreamData],
+    extra_stream_schedules: dict[str, tuple[dict | None, dict | None]],
+    stored: dict[str, torch.Tensor] | None,
+) -> dict[str, dict] | None:
+    rolled_out_without_output = [
+        stream for stream in extra_stream_rollouts if stream not in extra_stream_outputs
+    ]
+    serialized = {}
+    for stream in (*extra_stream_outputs, *rolled_out_without_output):
+        stream_data = extra_stream_rollouts.get(stream)
+        if stream_data is None:
+            rollout_fields = _NO_ROLLOUT_FIELDS
+        else:
+            timesteps, sigmas = extra_stream_schedules[stream]
+            if stored is None:
+                rollout_fields = _serialize_stream(
+                    _slice_stream_for_sample(stream_data, sample_idx, batch_size),
+                    serialized_dit_timesteps=timesteps,
+                    serialized_dit_sigmas=sigmas,
+                )
+            else:
+                rollout_fields = _serialize_stream_via_store(
+                    stream_data,
+                    sample_idx,
+                    batch_size,
+                    path_prefix=f"extra_streams.{stream}.",
+                    stored=stored,
+                    serialized_dit_timesteps=timesteps,
+                    serialized_dit_sigmas=sigmas,
+                )
+        output = extra_stream_outputs.get(stream, {})
+        output_metadata = {
+            key: value for key, value in output.items() if key != "generated_output"
+        }
+        serialized[stream] = {
+            "generated_output": _serialize_sample_output(
+                output.get("generated_output"),
+                store_field=f"extra_streams.{stream}.generated_output.{sample_idx}",
+                stored=stored,
+            ),
+            **output_metadata,
+            **rollout_fields,
+        }
+    return serialized or None
+
+
 def _build_response(
     request_id: str,
     prompt: str,
@@ -362,14 +453,24 @@ def _build_response(
     peak_memory_mb = result.peak_memory_mb if result.peak_memory_mb > 0 else None
     rollout_trajectory_data = result.rollout_trajectory_data
     primary = None
+    extra_stream_rollouts = {}
     if rollout:
         assert rollout_trajectory_data is not None, (
             "rollout_trajectory_data must be present when rollout=True"
         )
         primary = rollout_trajectory_data.streams[PRIMARY_STREAM]
+        extra_stream_rollouts = {
+            stream: stream_data
+            for stream, stream_data in rollout_trajectory_data.streams.items()
+            if stream != PRIMARY_STREAM
+        }
     serialized_dit_timesteps, serialized_dit_sigmas = _serialize_schedule(
         primary.dit_trajectory if primary is not None else None
     )
+    extra_stream_schedules = {
+        stream: _serialize_schedule(stream_data.dit_trajectory)
+        for stream, stream_data in extra_stream_rollouts.items()
+    }
 
     responses: list[RolloutResponse] = []
     for sample_idx in range(batch_size):
@@ -378,6 +479,7 @@ def _build_response(
             if video_dtype == "uint8":
                 out_i = _quantize_video_uint8(out_i)
             out_i = out_i.contiguous()
+        extra_stream_outputs = _extra_stream_outputs(result, sample_idx, batch_size)
         if not rollout:
             responses.append(
                 RolloutResponse(
@@ -385,6 +487,14 @@ def _build_response(
                     prompt=prompt,
                     seed=seed,
                     generated_output=_maybe_serialize(out_i),
+                    extra_streams=_serialize_extra_streams(
+                        sample_idx,
+                        batch_size,
+                        extra_stream_outputs=extra_stream_outputs,
+                        extra_stream_rollouts={},
+                        extra_stream_schedules={},
+                        stored=None,
+                    ),
                     inference_time_s=inference_time_s,
                     peak_memory_mb=peak_memory_mb,
                 )
@@ -392,7 +502,6 @@ def _build_response(
             continue
         env = rollout_trajectory_data.denoising_env
         if stored is None:
-            serialized_generated_output = _maybe_serialize(out_i)
             primary_fields = _serialize_stream(
                 _slice_stream_for_sample(primary, sample_idx, batch_size),
                 serialized_dit_timesteps=serialized_dit_timesteps,
@@ -402,14 +511,6 @@ def _build_response(
                 _slice_denoising_env_for_sample(env, sample_idx, batch_size)
             )
         else:
-            # None when the request skipped the decode
-            serialized_generated_output = None
-            if out_i is not None:
-                # some pipelines return a numpy array, which the inline path serializes as a tensor too
-                stored[f"generated_output.{sample_idx}"] = torch.as_tensor(out_i)
-                serialized_generated_output = {
-                    "__store__": f"generated_output.{sample_idx}"
-                }
             primary_fields = _serialize_stream_via_store(
                 primary,
                 sample_idx,
@@ -427,9 +528,19 @@ def _build_response(
                 request_id=request_id,
                 prompt=prompt,
                 seed=seed,
-                generated_output=serialized_generated_output,
+                generated_output=_serialize_sample_output(
+                    out_i, store_field=f"generated_output.{sample_idx}", stored=stored
+                ),
                 **primary_fields,
                 denoising_env=serialized_denoising_env,
+                extra_streams=_serialize_extra_streams(
+                    sample_idx,
+                    batch_size,
+                    extra_stream_outputs=extra_stream_outputs,
+                    extra_stream_rollouts=extra_stream_rollouts,
+                    extra_stream_schedules=extra_stream_schedules,
+                    stored=stored,
+                ),
                 inference_time_s=inference_time_s,
                 peak_memory_mb=peak_memory_mb,
             )
