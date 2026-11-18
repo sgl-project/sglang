@@ -295,6 +295,22 @@ def tf32_hc_prenorm_gemm(
     deep_gemm.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, num_splits=num_splits)
 
 
+def tf32_hc_prenorm_gemm_dual(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    fn2: torch.Tensor,
+    out: torch.Tensor,
+    out2: torch.Tensor,
+    sqrsum: torch.Tensor,
+    num_splits: Optional[int],
+):
+    if x.shape[0] == 0:
+        return
+    deep_gemm.tf32_hc_prenorm_gemm_dual(
+        x, fn, fn2, out, out2, sqrsum, num_splits=num_splits
+    )
+
+
 def update_deep_gemm_config(gpu_id: int):
     # deep_gemm.set_pdl can initialize CUDA state, so run it only after the
     # scheduler/TP worker has been forked and assigned a GPU.

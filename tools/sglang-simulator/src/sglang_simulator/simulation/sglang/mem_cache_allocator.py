@@ -16,7 +16,7 @@ def _alloc_extend_cpu(
 ):
     """CPU implementation using SGLang's native paged-allocation helper."""
     from sglang.srt.mem_cache.allocator import alloc_extend_naive
-    from sglang.srt.utils import get_num_new_pages
+    from sglang.srt.mem_cache.utils import get_num_new_pages
 
     if num_new_pages is None:
         num_new_pages = get_num_new_pages(
@@ -54,7 +54,7 @@ def _alloc_decode_cpu(
     last_loc: torch.Tensor,
 ):
     """CPU decode allocation through the allocator's public method contract."""
-    from sglang.srt.utils import get_num_new_pages
+    from sglang.srt.mem_cache.utils import get_num_new_pages
 
     num_new_pages = get_num_new_pages(
         seq_lens=seq_lens_cpu,

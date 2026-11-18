@@ -15,11 +15,11 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     CosmosDreamsTransferHistoryProfile,
     resolve_transfer_history_profile,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams import (
     CosmosDreamsConfig,
     resolve_history_mode,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 
 @dataclass
