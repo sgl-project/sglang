@@ -68,7 +68,13 @@ def test_rms_norm_gate_matches_native(
     torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
 
 
-def _boundary(post_input_scale, hidden):
+def _boundary(
+    post_input_scale,
+    hidden,
+    *,
+    channel_wise=True,
+    use_stream_gate=True,
+):
     post_cls = (
         MuseSpark1xRMSNormWithInputScale if post_input_scale else MuseSpark1xRMSNorm
     )
@@ -80,7 +86,11 @@ def _boundary(post_input_scale, hidden):
     pre_norm = _bf16_module(
         MuseSpark1xRMSNorm(hidden, eps=1e-6, has_weight=True, zero_centered_gamma=True)
     )
-    residual = _bf16_module(MuseSpark1xNormPreservingResidualConnection(hidden))
+    residual = _bf16_module(
+        MuseSpark1xNormPreservingResidualConnection(
+            hidden, channel_wise=channel_wise, use_stream_gate=use_stream_gate
+        )
+    )
     return FusedPostNormResidualPreNorm(
         post_norm,
         residual,
@@ -110,6 +120,39 @@ def test_norm_residual_matches_native(
         assert out[2] is None and ref[2] is None
     else:
         torch.testing.assert_close(out[2], ref[2], rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+@pytest.mark.parametrize("channel_wise", [True, False])
+@pytest.mark.parametrize("use_stream_gate", [True, False])
+@pytest.mark.parametrize("precompute", [True, False])
+def test_norm_residual_stream_gate_matches_native(
+    backend, channel_wise, use_stream_gate, precompute
+):
+    """Scalar (use_stream_gate=False) and vector gates must both match native.
+
+    With use_stream_gate=False the residual alpha is a scalar while beta can
+    still be channel-wise. The fused kernels read alpha in beta's mode, so the
+    cached pair has to be shape-consistent, and precompute_coefficients() has
+    to keep the scalar on the gate's device.
+    """
+    torch.manual_seed(0)
+    hidden = 4096
+    op = _boundary(
+        False,
+        hidden,
+        channel_wise=channel_wise,
+        use_stream_gate=use_stream_gate,
+    )
+    if precompute:
+        op._residual_add.precompute_coefficients()
+    stream = torch.randn(7, hidden, device="cuda", dtype=torch.float32)
+    branch = torch.randn(7, hidden, device="cuda", dtype=torch.bfloat16)
+    ref = op.forward_native(stream, branch)
+    out = op(stream, branch, backend=backend)
+    torch.testing.assert_close(out[0], ref[0], rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(out[1], ref[1], rtol=1e-2, atol=1e-2)
+    assert op._cc_alpha.numel() == op._cc_beta.numel()
 
 
 if __name__ == "__main__":

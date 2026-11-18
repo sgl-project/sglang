@@ -153,7 +153,9 @@ class MuseSpark1xNormPreservingResidualConnection(nn.Module):
                 self.gate.view(1, -1).float() / self.temperature
             )
             self._alpha = (
-                alpha if isinstance(alpha, torch.Tensor) else torch.tensor(alpha)
+                alpha
+                if isinstance(alpha, torch.Tensor)
+                else torch.tensor(alpha, dtype=torch.float32, device=self.gate.device)
             )
             self._beta = beta
 
