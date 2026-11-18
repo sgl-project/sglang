@@ -1047,6 +1047,59 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.running_reqs = KeyedReqList(ListKind.DECODING)
         return scheduler
 
+    def test_prebuilt_admission_honors_pp_microbatch_limit(self):
+        # These requests already own preallocated rows; an empty free-row pool
+        # must not prevent their admission into a PP slot with room remaining.
+        cases = (
+            (2, 1000, 2000, 2000, 0, 1413, 1000),
+            (2, 1000, 2000, 2000, 587, 1413, 413),
+            (2, 1000, 2000, 2000, 1000, 2, 0),
+            (2, 1000, 2000, 2000, 1100, 2, 0),
+            (2, 1000, 750, 2000, 700, 100, 50),
+            (2, 1000, 2000, 750, 700, 100, 50),
+            (1, None, 4, 4, 1, 3, 3),
+        )
+        for pp, cap, pool, mrr, running, pending, expected in cases:
+            with self.subTest(pp=pp, cap=cap, pool=pool, mrr=mrr, running=running):
+                scheduler = self._new_scheduler(enable_overlap=False)
+                scheduler.req_to_token_pool = MagicMock(size=pool)
+                scheduler.req_to_token_pool.available_size.return_value = 0
+                scheduler.max_running_requests = mrr
+                scheduler.running_batch.batch_size.return_value = running
+                reqs = [
+                    FakeReq(
+                        rid=f"waiting-{i}",
+                        kv=SimpleNamespace(
+                            restore_done_event=None, kv_committed_len=None
+                        ),
+                        init_next_round_input=lambda tree_cache: None,
+                    )
+                    for i in range(pending)
+                ]
+                move(reqs, scheduler.waiting_queue)
+                with (
+                    get_context().override_server_args(
+                        pp_size=pp,
+                        pp_max_micro_batch_size=cap,
+                        disaggregation_decode_enable_radix_cache=False,
+                    ),
+                    patch(
+                        "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+                        side_effect=lambda selected, *args: SimpleNamespace(
+                            reqs=list(selected), prepare_for_prebuilt=lambda: None
+                        ),
+                    ),
+                    patch("sglang.srt.disaggregation.decode.set_time_batch"),
+                ):
+                    batch = SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch(
+                        scheduler, scheduler.running_batch
+                    )
+                selected = [] if batch is None else batch.reqs
+                self.assertEqual(len(selected), expected)
+                self.assertEqual(selected, reqs[:expected])
+                self.assertEqual(list(scheduler.waiting_queue), reqs[expected:])
+                self.assertEqual(list(scheduler.running_reqs), reqs[:expected])
+
     def test_waiting_queue_is_sorted_before_prebuilt_selection(self):
         scheduler = self._new_scheduler(enable_overlap=False)
         original_waiting_queue = [
