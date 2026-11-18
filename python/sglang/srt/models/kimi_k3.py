@@ -164,7 +164,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.common import BumpAllocator, get_bool_env_var
-from sglang.srt.utils.log_utils import rank0_log
+from sglang.srt.utils.log_utils import print_info_once, rank0_log
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import TGVMRanges
@@ -1778,11 +1778,16 @@ class KimiK3MoE(nn.Module):
 
     @cached_property
     def _sp_routes_own_rows(self) -> bool:
-        return (
+        own_rows = (
             self._route_quant_fuse_eligible
             and not self._moe_front_needs_dense_bf16
             and k3_sp_collective.prefill_sp_can_gather_routed()
         )
+        print_info_once(
+            "K3.1 prefill SP tail: MoE routing on "
+            + ("local rows" if own_rows else "gathered rows")
+        )
+        return own_rows
 
     def _sp_route_own_rows(self, normed: torch.Tensor, num_tokens: int):
         from sglang.srt.layers.quantization.mxfp4 import (
