@@ -14,6 +14,13 @@ from sglang.srt.configs.inkling import (
     InklingConvStateShape,
     InklingStateDType,
 )
+from sglang.srt.configs.mamba_utils import (
+    KimiLinearCacheParams,
+    KimiLinearStateShape,
+    Mamba2CacheParams,
+    Mamba2StateDType,
+    Mamba2StateShape,
+)
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MambaStateBufferInfo
 from sglang.srt.mem_cache.hicache_storage import (
@@ -2169,6 +2176,126 @@ class TestMambaHostShare(CustomTestCase):
                 self.assertAlmostEqual(
                     mamba_share / kv_share, mirrored_bytes / kv_bytes
                 )
+
+
+class TestMambaHostShareForModelGeometries(CustomTestCase):
+    """--hicache-size split for real hybrid geometries, before and after the Mamba
+    share was weighed by checkpoint bytes instead of all device Mamba bytes.
+
+    The sizing path has no platform branch; what differs between deployments is the
+    spec verify scratch beside the checkpoints. "mtp" is the recurrent verify with
+    per-draft-token snapshots (the CUDA MTP recipe); "replayssm" is
+    --enable-linear-replayssm-spec (the MI355X Kimi-K3.1 recipe). Pools are on the
+    meta device; the KV side is a byte count, since its weight did not change.
+    """
+
+    HICACHE_SIZE_GB = 100
+
+    @staticmethod
+    def _qwen3_next_80b(tp_size: int) -> Mamba2CacheParams:
+        # Qwen3-Next-80B-A3B: 48 layers, every 4th full attention, 32 value heads,
+        # 16 key heads, head dims 128, conv kernel 4.
+        return Mamba2CacheParams(
+            shape=Mamba2StateShape.create(
+                tp_world_size=tp_size,
+                intermediate_size=32 * 128,
+                n_groups=16,
+                num_heads=32,
+                head_dim=128,
+                state_size=128,
+                conv_kernel=4,
+                conv_shard_groups=[16 * 128, 16 * 128, 32 * 128],
+            ),
+            layers=[layer for layer in range(48) if (layer + 1) % 4],
+            dtype=Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32),
+        )
+
+    @staticmethod
+    def _kimi_k31(tp_size: int) -> KimiLinearCacheParams:
+        # Kimi-K3.1: 93 layers, 69 KDA, 96 heads of dim 128, conv kernel 4.
+        return KimiLinearCacheParams(
+            shape=KimiLinearStateShape.create(
+                tp_world_size=tp_size, num_heads=96, head_dim=128, conv_kernel_size=4
+            ),
+            layers=list(range(69)),
+            dtype=Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32),
+        )
+
+    def test_split_before_and_after(self):
+        gib = 1024**3
+        # (model, cache params, KV bytes, Mamba slots, draft tokens, bytes per slot,
+        #  {spec mode: (Mamba GiB before, Mamba GiB after)})
+        cases = (
+            (
+                # TP4; 1M tokens of 12 GQA layers, one 256-dim bf16 KV head per rank.
+                "qwen3-next-80b",
+                self._qwen3_next_80b(tp_size=4),
+                1_000_000 * 12 * 2 * 256 * 2,
+                256,
+                4,
+                36 * (2048 * 3 * 2 + 8 * 128 * 128 * 4),
+                {
+                    "none": (28.78, 28.70),
+                    "mtp": (66.89, 28.70),
+                    "replayssm": (34.01, 28.70),
+                },
+            ),
+            (
+                # TP8; 500k tokens of 24 bf16 MLA layers (512 + 64 per token).
+                "kimi-k3.1",
+                self._kimi_k31(tp_size=8),
+                500_000 * 24 * 576 * 2,
+                128,
+                8,
+                69 * (3 * 4608 * 2 + 12 * 128 * 128 * 4),
+                {
+                    "none": (34.39, 34.22),
+                    "mtp": (82.51, 34.22),
+                    "replayssm": (46.15, 34.22),
+                },
+            ),
+        )
+        for (
+            model,
+            cache_params,
+            kv_bytes,
+            slots,
+            draft_tokens,
+            slot_bytes,
+            shares,
+        ) in cases:
+            kv_pool = SimpleNamespace(
+                host_capacity_bytes=None, get_kv_size_bytes=lambda b=kv_bytes: b
+            )
+            for mode, (before_gib, after_gib) in shares.items():
+                with self.subTest(model=model, mode=mode):
+                    spec = (
+                        {}
+                        if mode == "none"
+                        else dict(
+                            speculative_num_draft_tokens=draft_tokens,
+                            enable_linear_replayssm_spec=mode == "replayssm",
+                        )
+                    )
+                    mamba_pool = MambaPool(
+                        size=slots,
+                        spec_state_size=slots,
+                        cache_params=cache_params,
+                        mamba_layer_ids=cache_params.layers,
+                        device="meta",
+                        **spec,
+                    )
+                    self.assertEqual(mamba_pool.host_capacity_bytes, slots * slot_bytes)
+                    _, mamba_share = hybrid_pool_assembler._split_hicache_size(
+                        self.HICACHE_SIZE_GB, (kv_pool, mamba_pool)
+                    )
+                    # The rule before: every device Mamba byte, scratch included.
+                    device_bytes = mamba_pool.get_kv_size_bytes()
+                    old_share = (
+                        self.HICACHE_SIZE_GB * device_bytes / (device_bytes + kv_bytes)
+                    )
+                    self.assertAlmostEqual(old_share, before_gib, places=2)
+                    self.assertAlmostEqual(mamba_share, after_gib, places=2)
 
 
 class TestHostLoadEvictsTheTargetWindowOnly(CustomTestCase):
