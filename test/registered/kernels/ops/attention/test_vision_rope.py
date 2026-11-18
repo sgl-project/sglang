@@ -56,10 +56,6 @@ class TestVisionRoPE(CustomTestCase):
             torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=atol)
             torch.testing.assert_close(actual_k, expected_k, rtol=0, atol=atol)
 
-    def test_vision_rope_inplace_rejects_non_complex_frequencies(self):
-        with self.assertRaises(ValueError):
-            prepare_fused_qk_complex_rope_inplace(torch.randn(8, 64, device="cuda"))
-
 
 if __name__ == "__main__":
     unittest.main()

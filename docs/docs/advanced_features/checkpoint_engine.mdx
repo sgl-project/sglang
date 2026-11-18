@@ -35,10 +35,13 @@ The checkpoint engine uses a parameter server architecture with support for:
 
 ## Usage Examples
 
+The checkpoint engine pushes weights through the server's `/update_weights_from_ipc` admin endpoint, so the server and the update script need the same admin key. The examples below set it through `SGLANG_ADMIN_API_KEY` (or pass `--admin-api-key`); export the same `SGLANG_ADMIN_API_KEY` where the update script runs. Both `python -m sglang.srt.checkpoint_engine.update` and `examples/checkpoint_engine/update.py` read it from the environment.
+
 ### Single Node Setup
 
 **Terminal 1 - Launch SGLang Server:**
 ```bash Command
+export SGLANG_ADMIN_API_KEY=<key>
 python -m sglang.launch_server \
     --model-path Qwen/Qwen3-8B \
     --tp 8 \
@@ -50,6 +53,7 @@ python -m sglang.launch_server \
 
 Using sglang entrypoint:
 ```bash Command
+export SGLANG_ADMIN_API_KEY=<key>
 python -m sglang.srt.checkpoint_engine.update \
     --update-method broadcast \
     --checkpoint-path /path/to/Qwen/Qwen3-8B/ \
@@ -58,6 +62,7 @@ python -m sglang.srt.checkpoint_engine.update \
 
 Using torchrun directly:
 ```bash Command
+export SGLANG_ADMIN_API_KEY=<key>
 torchrun --nproc-per-node 8 \
     examples/checkpoint_engine/update.py \
     --update-method broadcast \
@@ -71,6 +76,7 @@ torchrun --nproc-per-node 8 \
 
 Launch SGLang server:
 ```bash Command
+export SGLANG_ADMIN_API_KEY=<key>
 python -m sglang.launch_server \
     --model-path Qwen/Qwen3-8B \
     --tp 8 \
@@ -83,6 +89,7 @@ Run checkpoint engine:
 
 Using sglang entrypoint (recommended):
 ```bash Command
+export SGLANG_ADMIN_API_KEY=<key>
 python -m sglang.srt.checkpoint_engine.update \
     --update-method broadcast \
     --checkpoint-path /path/to/Qwen/Qwen3-8B/ \
@@ -91,6 +98,7 @@ python -m sglang.srt.checkpoint_engine.update \
 
 Using torchrun directly:
 ```bash Command
+export SGLANG_ADMIN_API_KEY=<key>
 torchrun --nproc-per-node 8 \
     --nnodes 2 \
     --node-rank 0 \
@@ -106,6 +114,7 @@ torchrun --nproc-per-node 8 \
 
 Launch SGLang server:
 ```bash Command
+export SGLANG_ADMIN_API_KEY=<key>
 python -m sglang.launch_server \
     --model-path Qwen/Qwen3-8B \
     --tp 8 \
@@ -118,6 +127,7 @@ Run checkpoint engine:
 
 Using sglang entrypoint (recommended):
 ```bash Command
+export SGLANG_ADMIN_API_KEY=<key>
 python -m sglang.srt.checkpoint_engine.update \
     --update-method broadcast \
     --checkpoint-path /path/to/Qwen/Qwen3-8B/ \
@@ -126,6 +136,7 @@ python -m sglang.srt.checkpoint_engine.update \
 
 Using torchrun directly:
 ```bash Command
+export SGLANG_ADMIN_API_KEY=<key>
 torchrun --nproc-per-node 8 \
     --nnodes 2 \
     --node-rank 1 \
@@ -143,6 +154,7 @@ torchrun --nproc-per-node 8 \
 
 Launch SGLang server:
 ```bash Command
+export SGLANG_ADMIN_API_KEY=<key>
 python -m sglang.launch_server \
     --model-path Qwen/Qwen3-8B \
     --tp 8 \
@@ -158,6 +170,7 @@ Run checkpoint engine:
 
 Using sglang entrypoint (recommended):
 ```bash Command
+export SGLANG_ADMIN_API_KEY=<key>
 python -m sglang.srt.checkpoint_engine.update \
     --update-method broadcast \
     --checkpoint-path /path/to/Qwen/Qwen3-8B/ \
@@ -166,6 +179,7 @@ python -m sglang.srt.checkpoint_engine.update \
 
 Using torchrun directly:
 ```bash Command
+export SGLANG_ADMIN_API_KEY=<key>
 torchrun --nproc-per-node 8 \
     --nnodes 2 \
     --node-rank 0 \
@@ -181,6 +195,7 @@ torchrun --nproc-per-node 8 \
 
 Launch SGLang server:
 ```bash Command
+export SGLANG_ADMIN_API_KEY=<key>
 python -m sglang.launch_server \
     --model-path Qwen/Qwen3-8B \
     --tp 8 \
@@ -196,6 +211,7 @@ Run checkpoint engine:
 
 Using sglang entrypoint (recommended):
 ```bash Command
+export SGLANG_ADMIN_API_KEY=<key>
 python -m sglang.srt.checkpoint_engine.update \
     --update-method broadcast \
     --checkpoint-path /path/to/Qwen/Qwen3-8B/ \
@@ -204,6 +220,7 @@ python -m sglang.srt.checkpoint_engine.update \
 
 Using torchrun directly:
 ```bash Command
+export SGLANG_ADMIN_API_KEY=<key>
 torchrun --nproc-per-node 8 \
     --nnodes 2 \
     --node-rank 1 \
@@ -230,6 +247,7 @@ torchrun --nproc-per-node 8 \
 - `--checkpoint-path`: Path to model checkpoint directory
 - `--inference-parallel-size`: Number of inference parallel processes
 - `--endpoint`: SGLang server endpoint (default: `http://localhost:19730`)
+- `--admin-api-key`: The server's admin key, required by `/update_weights_from_ipc` (default: `SGLANG_ADMIN_API_KEY`; `examples/checkpoint_engine/update.py` has no default)
 - `--checkpoint-name`: Name for the checkpoint (default: `my-checkpoint-iter-0`)
 - `--save-metas-file`: File to save checkpoint metadata
 - `--load-metas-file`: File to load checkpoint metadata from
