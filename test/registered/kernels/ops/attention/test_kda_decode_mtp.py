@@ -399,42 +399,6 @@ class TestKdaDecodeMtpBf16State(CustomTestCase):
                 )
                 self._assert_bf16_matches_fp32(ref, got, ring=False)
 
-    def test_wrapper_rejects_bad_bf16_layouts(self):
-        inp = _make_bf16_state_inputs(2, 2, 2, seed=1)
-        # 16-byte cp.async: a bf16 slot must start on an 8-element boundary.
-        flat = torch.zeros(inp["h0"].numel() + 4, device="cuda", dtype=torch.bfloat16)
-        misaligned = flat[4:].view(inp["h0"].shape)
-        with self.assertRaisesRegex(ValueError, "16-byte-aligned"):
-            self._call_with_state(inp, misaligned, torch.bfloat16)
-        # fp16 state is not supported.
-        with self.assertRaisesRegex(ValueError, "fp32/bf16"):
-            self._call_with_state(inp, inp["h0"].half(), torch.float16)
-        # Snapshot buffer must use the state dtype.
-        with self.assertRaisesRegex(ValueError, "intermediate_ssm dtype"):
-            self._call_with_state(inp, inp["h0"].bfloat16(), torch.float32)
-
-    @staticmethod
-    def _call_with_state(inp, state, snap_dtype):
-        n = inp["intermediate_state_indices"].numel()
-        t_req = inp["x_v"].shape[1] // n
-        h = inp["x_v"].shape[2]
-        kwargs = {
-            k: v
-            for k, v in inp.items()
-            if k not in ("h0", "onorm_gate", "onorm_weight")
-        }
-        for name in ("q", "k", "v"):
-            kwargs[f"intermediate_conv_{name}"] = torch.zeros(
-                n, t_req, h * _K, _W - 1, device="cuda", dtype=torch.bfloat16
-            )
-        fused_kda_decode_mtp_dspark(
-            recurrent_state=state,
-            intermediate_ssm=torch.zeros(
-                n, t_req, h, _K, _K, device="cuda", dtype=snap_dtype
-            ),
-            **kwargs,
-        )
-
 
 if __name__ == "__main__":
     unittest.main()

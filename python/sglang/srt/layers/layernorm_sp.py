@@ -40,12 +40,10 @@ from typing import Callable, Optional
 import torch
 import torch.distributed as dist
 
-from sglang.srt.runtime_context import (
-    get_flags,
-    get_forward,
-    get_parallel,
-)
+from sglang.srt.runtime_context import get_flags, get_forward, get_parallel
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.device import get_device
 
 # Architectures whose decoder layers route attention/MLP through
 # layer boundaries with the standard participant linears, and for which SP
@@ -280,6 +278,40 @@ except Exception:
     _HAS_TORCH_SYMM_MEM_FUSED = False
 
 
+# --- NPU (Ascend) MC2 fused matmul+collective fast-path -----------------------
+# CANN >= 8.0.RC2 fused ops: npu_mm_reduce_scatter_base == ReduceScatter(x1 @ x2),
+# npu_all_gather_base_mm == allgather(x1) @ x2; probed once at import.
+_HAS_NPU_MC2_FUSED = False
+_npu_mm_reduce_scatter_base = None
+_npu_all_gather_base_mm = None
+if is_npu():
+    try:
+        import torch_npu  # noqa: F401
+
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+        # arch35 (Ascend 950) MC2 fused ops accumulate at lower GEMM precision
+        # and regress model accuracy; keep the plain collective fallback there.
+        _npu_mm_reduce_scatter_base = getattr(
+            torch_npu, "npu_mm_reduce_scatter_base", None
+        )
+        _npu_all_gather_base_mm = getattr(torch_npu, "npu_all_gather_base_mm", None)
+        _HAS_NPU_MC2_FUSED = (
+            _npu_mm_reduce_scatter_base is not None
+            and _npu_all_gather_base_mm is not None
+            and not is_npu_arch35()
+        )
+    except Exception:
+        _HAS_NPU_MC2_FUSED = False
+
+
+def _npu_hccl_comm_name() -> str:
+    """HCCL handle (``hcom``) of the TP group, consumed by the MC2 fused ops."""
+    tp_group = get_parallel().tp_group
+    backend = tp_group.device_group._get_backend(torch.device(get_device()))
+    return backend.get_hccl_comm_name(tp_group.rank)
+
+
 def sp_fused_matmul_eligible(linear) -> bool:
     """Whether the selected fused matmul+collective path applies.
 
@@ -287,16 +319,20 @@ def sp_fused_matmul_eligible(linear) -> bool:
     path. Both require an unquantized, bias-free bf16/fp16 linear. The decision
     depends only on static layer properties and is identical across TP ranks.
     """
-    if (
-        not (_HAS_TORCH_SYMM_MEM_FUSED or getattr(linear, "_sp_use_cutlass", False))
-        or linear.bias is not None
-    ):
+    if linear.bias is not None:
         return False
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
     if not isinstance(linear.quant_method, UnquantizedLinearMethod):
         return False
-    return linear.weight.dtype in (torch.bfloat16, torch.float16)
+    if linear.weight.dtype not in (torch.bfloat16, torch.float16):
+        return False
+    if is_npu():
+        # CANN MC2 fused ops are 2-D-only (matmul over 2-D [m, k] x [k, n]).
+        return _HAS_NPU_MC2_FUSED and linear.weight.ndim == 2
+    if getattr(linear, "_sp_use_cutlass", False):
+        return True
+    return _HAS_TORCH_SYMM_MEM_FUSED
 
 
 def column_parallel_g_matmul(
@@ -311,7 +347,21 @@ def column_parallel_g_matmul(
     """
     num_tokens = sp_num_tokens()
     if sp_fused_matmul_eligible(linear):
-        if getattr(linear, "_sp_use_cutlass", False):
+        if is_npu():
+            # CANN MC2: allgather(input shard) @ weight.t(), then narrow.
+            try:
+                mm_out, _ = _npu_all_gather_base_mm(
+                    input_parallel.contiguous(),
+                    linear.weight.t().contiguous(),
+                    _npu_hccl_comm_name(),
+                    linear.tp_group.world_size,
+                )
+                return mm_out[:num_tokens]
+            except Exception:
+                # CANN MC2 unavailable for this shape/dtype: fall through to the
+                # plain all-gather + matmul below (symm_mem is CUDA-only).
+                pass
+        elif getattr(linear, "_sp_use_cutlass", False):
             from sglang.kernels.ops.communication.sp_collective_gemm import (
                 all_gather_matmul,
             )
@@ -325,14 +375,15 @@ def column_parallel_g_matmul(
                 get_parallel().tp_group.device_group,
                 workspace=sp_collective_gemm_workspace,
             )[:num_tokens]
-        group_name = get_parallel().tp_group.device_group.group_name
-        _, mm_outputs = torch.ops.symm_mem.fused_all_gather_matmul(
-            input_parallel.contiguous(),
-            [linear.weight.t()],
-            gather_dim=0,
-            group_name=group_name,
-        )
-        return mm_outputs[0][:num_tokens]
+        else:
+            group_name = get_parallel().tp_group.device_group.group_name
+            _, mm_outputs = torch.ops.symm_mem.fused_all_gather_matmul(
+                input_parallel.contiguous(),
+                [linear.weight.t()],
+                gather_dim=0,
+                group_name=group_name,
+            )
+            return mm_outputs[0][:num_tokens]
     gathered = sp_exit_gather(input_parallel, num_tokens=num_tokens)
     return linear.quant_method.apply(linear, gathered, bias)
 
@@ -353,7 +404,22 @@ def row_parallel_gbar_matmul(linear, input_: torch.Tensor, bias) -> torch.Tensor
     if padded != num_tokens:
         x = torch.nn.functional.pad(x, (0, 0, 0, padded - num_tokens))
     if sp_fused_matmul_eligible(linear):
-        if getattr(linear, "_sp_use_cutlass", False):
+        if is_npu():
+            # CANN MC2: ReduceScatter(x @ weight.t()). x's padded token dim is
+            # already a multiple of tp_size (required by the fused op).
+            try:
+                return _npu_mm_reduce_scatter_base(
+                    x,
+                    linear.weight.t().contiguous(),
+                    _npu_hccl_comm_name(),
+                    tp_size,
+                    reduce_op="sum",
+                )
+            except Exception:
+                # CANN MC2 unavailable for this shape/dtype: fall through to
+                # matmul + plain reduce-scatter below (symm_mem is CUDA-only).
+                pass
+        elif getattr(linear, "_sp_use_cutlass", False):
             from sglang.kernels.ops.communication.sp_collective_gemm import (
                 matmul_reduce_scatter,
             )
@@ -367,14 +433,15 @@ def row_parallel_gbar_matmul(linear, input_: torch.Tensor, bias) -> torch.Tensor
                 get_parallel().tp_group.device_group,
                 workspace=sp_collective_gemm_workspace,
             )
-        group_name = get_parallel().tp_group.device_group.group_name
-        return torch.ops.symm_mem.fused_matmul_reduce_scatter(
-            x,
-            linear.weight.t(),
-            "sum",
-            scatter_dim=0,
-            group_name=group_name,
-        )
+        else:
+            group_name = get_parallel().tp_group.device_group.group_name
+            return torch.ops.symm_mem.fused_matmul_reduce_scatter(
+                x,
+                linear.weight.t(),
+                "sum",
+                scatter_dim=0,
+                group_name=group_name,
+            )
     full = linear.quant_method.apply(linear, x, bias)
     output = full.new_empty((padded // tp_size, *full.shape[1:]))
     get_parallel().tp_group.reduce_scatter_tensor(output, full)
