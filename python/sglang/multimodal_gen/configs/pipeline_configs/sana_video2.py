@@ -59,6 +59,10 @@ class SanaVideo2PipelineConfig(SanaVideoPipelineConfig):
                 f"over the sequence-parallel ranks; --sp-degree {sp_degree} does not "
                 "divide them."
             )
+        if server_args.enable_breakable_cuda_graph:
+            server_args.require_component_resident(
+                "transformer", feature_name="SANA-Video 2.0 breakable CUDA graphs"
+            )
         super().validate_server_args(server_args)
 
     def supports_sequential_multi_output_inference(self):

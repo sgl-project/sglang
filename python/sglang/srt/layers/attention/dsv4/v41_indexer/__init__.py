@@ -10,6 +10,13 @@ from typing import TYPE_CHECKING, Tuple
 import torch
 
 from sglang.kernels.arch import current_arch
+from sglang.kernels.ops.attention.dsa.litetopk_prefill import is_fp4_indexer_supported
+from sglang.kernels.ops.attention.dsv4.candidate_table import CANDIDATE_BLOCK_SIZE
+from sglang.kernels.ops.attention.dsv4.index_logits import (
+    flat_index_logits_widen_to_fp8,
+    index_weights_dtype,
+)
+from sglang.srt.environ import envs
 
 from .full_topk import FullTopKIndexer
 from .types import (
@@ -54,8 +61,8 @@ def is_sm100() -> bool:
 def is_sm100_or_newer() -> bool:
     # The *dense* DeepGEMM fp8_fp4 mqa-logits kernels support SM100 and newer
     # (sgl-deep-gemm 0.2.6 dispatches arch 12 with the fp32 weights/logits
-    # contract, see kernels/ops/attention/dsv4/index_logits.py); Hopper and
-    # non-CUDA devices take the torch indexer.
+    # contract, see kernels/ops/attention/dsv4/index_logits.py); Hopper prefill
+    # takes _use_sm90_prefill_scores and non-CUDA devices take the torch indexer.
     return current_arch().is_sm_at_least(10)
 
 
@@ -75,16 +82,35 @@ def _use_deep_gemm_prefill() -> bool:
     return is_sm100_or_newer() and has_dense_fp4_indexer()
 
 
+@functools.cache
+def _use_sm90_prefill_scores() -> bool:
+    # The batched prefill with flat_index_logits_tiles on DeepGEMM's fp8 kernel.
+    return flat_index_logits_widen_to_fp8() and has_dense_fp4_indexer()
+
+
 def make_full_topk_indexer(
     *,
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
+    index_heads: int,
+    index_topk: int,
 ) -> FullTopKIndexer:
+    # Prefill top-k from the sampled-threshold fp4 indexer (kernels/ops/attention/dsa/litetopk_prefill) where it
+    # reproduces the DeepGEMM path: bf16 head weights, 32 or 64 index heads, a supported top-k.
+    use_prefill_lite_topk = (
+        envs.SGLANG_OPT_USE_PREFILL_LITE_TOPK.get()
+        and _use_deep_gemm_prefill()
+        and is_fp4_indexer_supported()
+        and index_weights_dtype() == torch.bfloat16
+        and index_heads in (32, 64)
+        and index_topk in (512, 1024, 2048)
+    )
     return FullTopKIndexer(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
-        use_deep_gemm_prefill=_use_deep_gemm_prefill(),
+        use_deep_gemm_prefill=_use_deep_gemm_prefill() or _use_sm90_prefill_scores(),
         use_deep_gemm_decode=is_sm100_or_newer(),
+        use_prefill_lite_topk=use_prefill_lite_topk,
     )
 
 
@@ -101,12 +127,19 @@ def make_candidate_indexer(
     from .dense_blocks import DenseBlocksBackend
 
     use_deep_gemm_prefill = _use_deep_gemm_prefill()
+    use_sm90_prefill_scores = not use_deep_gemm_prefill and _use_sm90_prefill_scores()
     dense_blocks = DenseBlocksBackend(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
         candidate_topk_blocks=candidate_topk_blocks,
         candidate_block_size=candidate_block_size,
-        use_deep_gemm_prefill=use_deep_gemm_prefill,
+        use_deep_gemm_publish=use_deep_gemm_prefill or use_sm90_prefill_scores,
+        use_deep_gemm_consume=use_deep_gemm_prefill,
+        use_sm90_deep_gemm_consume=(
+            use_sm90_prefill_scores
+            and candidate_block_size == CANDIDATE_BLOCK_SIZE
+            and envs.SGLANG_OPT_DSV41_SM90_DEEPGEMM_PREFILL.get()
+        ),
     )
     # Without candidate blocks no layer is a candidate source or consumer.
     # Stays strict SM100 on purpose: the sparse-table path needs DeepGEMM's
