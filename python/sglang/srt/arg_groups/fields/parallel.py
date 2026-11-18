@@ -200,9 +200,6 @@ class Parallel(msgspec.Struct):
         "the group's unique KV capacity. Prefill workers of PD "
         "disaggregation only.",
     ] = False
-    # Deprecated spelling of `attn_dp_size`: `--dp-size N --enable-dp-attention`
-    # resolves to `attn_dp_size = N`, `dp_size = 1`. TODO: remove after 2026-12-31.
-    enable_dp_attention: A[bool, Arg(no_cli=True, resolvable=True)] = False
     enable_dp_attention_local_control_broadcast: A[
         bool,
         "With DP-attention, send control messages to every DP group leader and broadcast within attn_tp_group instead of the full tp_group. Eliminates a costly all-ranks gloo sync on every scheduler iteration.",
