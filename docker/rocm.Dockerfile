@@ -73,7 +73,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
+ENV AITER_COMMIT_DEFAULT="fa95983c023f8678075226b9a86587f300398e0c"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -97,7 +97,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
+ENV AITER_COMMIT_DEFAULT="fa95983c023f8678075226b9a86587f300398e0c"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
 # filled in after the torch 2.11 upgrade below; it must already exist (empty is
 # valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
@@ -121,7 +121,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
+ENV AITER_COMMIT_DEFAULT="fa95983c023f8678075226b9a86587f300398e0c"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -145,7 +145,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
+ENV AITER_COMMIT_DEFAULT="fa95983c023f8678075226b9a86587f300398e0c"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
 # filled in after the torch 2.11 upgrade below; it must already exist (empty is
 # valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
@@ -322,7 +322,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
+ENV AITER_COMMIT_DEFAULT="fa95983c023f8678075226b9a86587f300398e0c"
 # Same reasoning as the rocm724 stages: keep pip from resolving the image's
 # ROCm torch away to a PyPI CUDA build. Populated after the stack is in place.
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
@@ -343,7 +343,7 @@ ENV TRITON_WHEEL_VERSION_SUFFIX=".rocm10.0.0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
+ENV AITER_COMMIT_DEFAULT="fa95983c023f8678075226b9a86587f300398e0c"
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
 
