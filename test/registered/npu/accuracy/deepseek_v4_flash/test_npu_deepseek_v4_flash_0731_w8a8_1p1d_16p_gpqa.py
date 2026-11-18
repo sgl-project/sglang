@@ -11,10 +11,10 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 )
 from sglang.test.ascend.test_ascend_utils import (
     append_ld_library_path,
+    build_hicache_storage_extra_config,
     write_memfabric_tent_conf,
 )
 from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.ascend.test_ascend_utils import build_hicache_storage_extra_config
 
 register_npu_ci(
     est_time=3800,
@@ -267,7 +267,10 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     }
     generation_config = DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH
     eval_batch_size = 128
-    min_hit_rate_pcts = {"host": 0, "storage": 0}  # percent: L2 and L3 host hit rate must exceed 0%
+    min_hit_rate_pcts = {
+        "host": 0,
+        "storage": 0,
+    }  # percent: L2 and L3 host hit rate must exceed 0%
 
     @classmethod
     def setUpClass(cls):
