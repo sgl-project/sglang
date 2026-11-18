@@ -141,17 +141,21 @@ def _validate_gluon_quant_method(layer, quant_method) -> None:
     validate_gluon_quant_method(layer, quant_method)
 
 
+def _owns_storage(tensor: torch.Tensor) -> bool:
+    """Whether ``tensor`` spans exactly the storage it points at."""
+    return (
+        tensor.is_contiguous()
+        and tensor.storage_offset() == 0
+        and tensor.untyped_storage().nbytes()
+        == tensor.numel() * tensor.element_size()
+    )
+
+
 def _copy_weight_view_before_h2d(loaded_weight: torch.Tensor) -> torch.Tensor:
     """Copy a CPU tensor view into independent contiguous storage."""
     if loaded_weight.device.type != "cpu":
         return loaded_weight
-    tensor_bytes = loaded_weight.numel() * loaded_weight.element_size()
-    needs_copy = not (
-        loaded_weight.is_contiguous()
-        and loaded_weight.storage_offset() == 0
-        and loaded_weight.untyped_storage().nbytes() == tensor_bytes
-    )
-    if not needs_copy:
+    if _owns_storage(loaded_weight):
         return loaded_weight
     return loaded_weight.clone(memory_format=torch.contiguous_format)
 
@@ -162,6 +166,30 @@ def _maybe_copy_weight_view_before_h2d(
     if not envs.SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D.get():
         return loaded_weight
     return _copy_weight_view_before_h2d(loaded_weight)
+
+
+def _materialize_weight_view(loaded_weight: torch.Tensor) -> torch.Tensor:
+    """Give the expert copy paths a source that owns its storage.
+
+    Online refits hand every payload tensor over as a view into one shared
+    transfer buffer (``FlattenedTensorBucket`` reconstruction, bucketed
+    distributed receive): the tensor covers a slice of a storage that holds the
+    whole bucket and therefore has a non-zero storage offset.  The copy below
+    writes through ``param.data[expert_id]``, which is itself a non-owning view,
+    and reads only ``loaded_weight``'s own bytes from a buffer whose remaining
+    slices are reused by the transport.  Copying the payload out of that buffer
+    first keeps the expert write independent of how the transport recycles it;
+    dense parameters already copy into a whole-tensor destination and do not
+    need this.
+
+    CPU checkpoint tensors (mmap views) keep their opt-in switch, so startup
+    loading is unaffected.
+    """
+    if loaded_weight.device.type == "cpu":
+        return _maybe_copy_weight_view_before_h2d(loaded_weight)
+    if _owns_storage(loaded_weight):
+        return loaded_weight
+    return loaded_weight.clone(memory_format=torch.contiguous_format)
 
 
 def _weight_layout_method(layer):
@@ -1236,6 +1264,7 @@ class FusedMoE(torch.nn.Module):
     ) -> None:
         # if expert_id is None, then
         # all the experts are loaded at the same time
+        loaded_weight = _materialize_weight_view(loaded_weight)
         if (
             expert_id is None
             and self.quant_config is not None
@@ -1614,6 +1643,7 @@ class FusedMoE(torch.nn.Module):
     ) -> None:
         # Mirror _weight_loader_impl: the trtllm bf16 prep reshapes expert weights
         # into block layout; hot weight updates must restore canonical shapes first.
+        loaded_weight = _materialize_weight_view(loaded_weight)
         method = _weight_layout_method(self)
         if isinstance(method, KTEPWrapperMethod):
             method = method.gpu_method

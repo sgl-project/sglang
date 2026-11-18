@@ -208,6 +208,22 @@ class _TensorSuite:
         )
         self._assert_reference("restoring the subset did not restore the output")
 
+    def test_05_packed_refit_of_whole_checkpoint(self):
+        """The whole checkpoint as one flattened bucket, i.e. what an RL trainer sends.
+
+        Every tensor arrives as a view into one shared transfer buffer; a
+        no-op refit of it has to reproduce startup loading byte for byte, for
+        routed experts included.
+        """
+        for round_idx in range(UPDATE_ROUNDS):
+            update_full_checkpoint_per_rank(
+                self.lane_url, self.checkpoint, TP_SIZE, flattened_bucket=True
+            )
+            self._assert_reference(
+                f"packed refit round {round_idx + 1} did not reproduce "
+                "startup loading"
+            )
+
 
 def _make_suite(case):
     name = "TestNpuUpdateWeightsFromTensor_" + case.id.replace("-", "_").replace(
