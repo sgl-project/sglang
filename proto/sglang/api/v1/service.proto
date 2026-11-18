@@ -12,6 +12,7 @@ import "sglang/api/v1/control.proto";
 import "sglang/api/v1/corpus.proto";
 import "sglang/api/v1/generate.proto";
 import "sglang/api/v1/hicache.proto";
+import "sglang/api/v1/ollama.proto";
 import "sglang/api/v1/parsers.proto";
 import "sglang/api/v1/weights.proto";
 import "sglang/json/v1/options.proto";
@@ -137,6 +138,14 @@ service SglangService {
   // `/scale_elastic_ep`, `/is_scaling_elastic_ep`.
   rpc ScaleElasticEp(ScaleElasticEpRequest) returns (ScaleElasticEpResponse);
   rpc GetElasticEpState(ElasticEpStateRequest) returns (ElasticEpStateResponse);
+
+  // Ollama data plane. Chat and generate are server-streaming like Generate:
+  // a unary request is a one-frame stream, and the final frame carries the
+  // counters. Chat renders the messages with the served chat template.
+  rpc OllamaChat(OllamaChatRequest) returns (stream OllamaChatResponse);
+  rpc OllamaGenerate(OllamaGenerateRequest) returns (stream OllamaGenerateResponse);
+  rpc OllamaTags(OllamaTagsRequest) returns (OllamaTagsResponse);
+  rpc OllamaShow(OllamaShowRequest) returns (OllamaShowResponse);
 }
 
 message ListModelsRequest {}

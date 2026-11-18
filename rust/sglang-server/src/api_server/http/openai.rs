@@ -33,6 +33,9 @@ use crate::api_server::handlers::CoreCall;
 use crate::message::config::ServerArgs;
 use crate::message::request::GenerateRequest;
 use crate::utils::response::error_response;
+use sglang_processor::dynamo_protocols::types::CreateChatCompletionRequest;
+
+use crate::message::request::RenderedChat;
 
 const MAX_OPENAI_CHOICES: usize = 4096;
 
@@ -43,6 +46,17 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .merge(completions::routes())
         .merge(chat::routes())
         .merge(tokenize::routes())
+}
+
+/// Render `request`'s messages with the served chat template, for the other
+/// chat-shaped frontends (Ollama) that share the OpenAI adapter's formatter.
+pub(crate) fn render_chat_prompt(
+    formatter: &ChatFormatter,
+    request: &CreateChatCompletionRequest,
+    defaults: &ChatTemplateKwargs,
+) -> Result<RenderedChat, String> {
+    let body = serde_json::to_value(request).map_err(|error| error.to_string())?;
+    template::render_chat(formatter, body, request, defaults).map_err(|error| error.to_string())
 }
 
 /// Resolve the chat formatter, or `None` to disable the OpenAI chat-completions

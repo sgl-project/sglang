@@ -23,7 +23,8 @@ struct Mock {
     id_requests: Arc<AtomicUsize>,
 }
 
-type ItemStream = Pin<Box<dyn Stream<Item = Result<api::GenerateStreamItem, Status>> + Send>>;
+type ItemStreamOf<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
+type ItemStream = ItemStreamOf<api::GenerateStreamItem>;
 
 #[tonic::async_trait]
 impl SglangService for Mock {
@@ -256,6 +257,38 @@ impl SglangService for Mock {
     ) -> Result<Response<api::ParseFunctionCallResponse>, Status> {
         Err(Status::unimplemented("parse_function_call"))
     }
+    type OllamaChatStream = ItemStreamOf<api::OllamaChatResponse>;
+
+    async fn ollama_chat(
+        &self,
+        _: Request<api::OllamaChatRequest>,
+    ) -> Result<Response<Self::OllamaChatStream>, Status> {
+        unimplemented!()
+    }
+
+    type OllamaGenerateStream = ItemStreamOf<api::OllamaGenerateResponse>;
+
+    async fn ollama_generate(
+        &self,
+        _: Request<api::OllamaGenerateRequest>,
+    ) -> Result<Response<Self::OllamaGenerateStream>, Status> {
+        unimplemented!()
+    }
+
+    async fn ollama_tags(
+        &self,
+        _: Request<api::OllamaTagsRequest>,
+    ) -> Result<Response<api::OllamaTagsResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn ollama_show(
+        &self,
+        _: Request<api::OllamaShowRequest>,
+    ) -> Result<Response<api::OllamaShowResponse>, Status> {
+        unimplemented!()
+    }
+
     async fn separate_reasoning(
         &self,
         _: Request<api::SeparateReasoningRequest>,
