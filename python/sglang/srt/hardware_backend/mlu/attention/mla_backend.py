@@ -196,19 +196,26 @@ class MLUMLABackend(AttentionBackend):
             if num_prefill_reqs >= 0
             else q.shape[0]
         )
-        prefill = self._forward_mla_prefill(
-            q[:num_prefill_tokens], k, layer, return_lse=return_lse
-        )
         if num_prefill_tokens == q.shape[0]:
-            return prefill
+            return self._forward_mla_prefill(q, k, layer, return_lse=return_lse)
+        output = q.new_empty((q.shape[0], layer.tp_q_head_num, layer.v_head_dim))
+        prefill = self._forward_mla_prefill(
+            q[:num_prefill_tokens],
+            k,
+            layer,
+            return_lse=return_lse,
+            out=output[:num_prefill_tokens],
+        )
         decode = self._forward_mla_decode(
-            q[num_prefill_tokens:], layer, num_prefill_reqs, return_lse=return_lse
+            q[num_prefill_tokens:],
+            layer,
+            num_prefill_reqs,
+            return_lse=return_lse,
+            out=output[num_prefill_tokens:].unsqueeze(1),
         )
         if return_lse:
-            return torch.cat((prefill[0], decode[0]), dim=0), torch.cat(
-                (prefill[1], decode[1]), dim=0
-            )
-        return torch.cat((prefill, decode), dim=0)
+            return output.flatten(1), torch.cat((prefill[1], decode[1]), dim=0)
+        return output.flatten(1)
 
     def _forward_mla_prefill(
         self,
@@ -216,6 +223,7 @@ class MLUMLABackend(AttentionBackend):
         k: torch.Tensor | None,
         layer: "RadixAttention",
         return_lse: bool = False,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         forward_metadata = self.forward_metadata
         if forward_metadata.is_uncached_prefill:
@@ -235,7 +243,7 @@ class MLUMLABackend(AttentionBackend):
             q=q,
             k=prefill_k,
             v=prefill_k[..., : self.kv_lora_rank],
-            out=None,
+            out=out,
             cu_seq_lens_q=forward_metadata.cu_seqlens_q,
             cu_seq_lens_kv=forward_metadata.cu_seqlens_kv,
             alibi_slope=None,
@@ -261,6 +269,7 @@ class MLUMLABackend(AttentionBackend):
         layer: "RadixAttention",
         start_req: int = 0,
         return_lse: bool = False,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         forward_metadata = self.forward_metadata
         cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
@@ -270,7 +279,7 @@ class MLUMLABackend(AttentionBackend):
             q=q.unsqueeze(1),
             k_cache=cache,
             v_cache=None,
-            out=None,
+            out=out,
             block_tables=forward_metadata.block_tables[start_req:],
             context_lens=forward_metadata.seq_lens[start_req:],
             k_cache_quant_scale=None,
