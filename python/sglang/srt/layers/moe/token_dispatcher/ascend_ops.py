@@ -142,13 +142,12 @@ class _AllToAllVState:
 @dataclass
 class _MegaMoEState:
     group: Any
-    capacity: int
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
     # Size of the single shared EP buffer. Both phases reuse it: the provider
     # registers peermem per process group, so a second buffer on the same group
     # makes the MegaMoE tiling fail with "Failed to get peermem base".
-    buffer_capacity: Optional[int] = None
+    buffer_capacity: int
 
 
 AscendOpsForwardState = _MC2State | _AllGatherState | _AllToAllVState | _MegaMoEState
@@ -312,7 +311,6 @@ class AscendOpsDispatcher(BaseDispatcher):
             exec_mode="fused_op",
             forward_state=_MegaMoEState(
                 self.ep_group,
-                capacity,
                 topk_ids,
                 topk_weights,
                 buffer_capacity=self._fused_buffer_capacity,
