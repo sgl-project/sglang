@@ -213,8 +213,12 @@ client sent. The router picks the first of these that applies:
 1. A hash of the sticky routing key or session id, so a conversation keeps
    its rank and router replicas agree.
 2. The rank with the deepest cached prefix in the local KV tree.
-3. The rank with the fewest requests this router has in flight on it, or with
-   `--dp-rank-policy round_robin`, the worker's ranks in turn.
+3. The rank with the fewest requests this router has in flight on it; with
+   `--dp-rank-policy round_robin`, the worker's ranks in turn; or with
+   `--dp-rank-policy least_tokens`, the rank holding the fewest KV tokens as
+   the engine reports them on its `--load-publish-endpoint` feed, which sees
+   every router replica's traffic. Ties, and a worker without a fresh reading
+   for every one of its ranks, fall back to the in-flight count.
 
 In PD mode, decode is ranked by step 3 only. The decode request names the
 prefill rank in `disagg_prefill_dp_rank`, and the bootstrap room satisfies

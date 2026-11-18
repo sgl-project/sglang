@@ -19,6 +19,7 @@ use sgl_router::server::app_context::AppContext;
 use sgl_router::state::kv_events::{
     compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId, RadixTreePrefixProvider,
 };
+use sgl_router::state::load_monitor::engine_reported_load::{EngineReportedLoadTable, LoadStat};
 use sgl_router::state::load_monitor::router_inflight_load::{
     RouterInflightLoadRegistry, SystemTimeClock,
 };
@@ -52,6 +53,16 @@ fn router(
     workers: &[(&MockWorker, WorkerMode, u32)],
     tree: Arc<HashTree>,
 ) -> axum::Router {
+    router_with_load(cfg, workers, tree, EngineReportedLoadTable::new())
+}
+
+/// [`router`] reading engine-reported load from `load`.
+fn router_with_load(
+    cfg: Config,
+    workers: &[(&MockWorker, WorkerMode, u32)],
+    tree: Arc<HashTree>,
+    load: Arc<EngineReportedLoadTable>,
+) -> axum::Router {
     let registry = Arc::new(WorkerRegistry::default());
     for &(worker, mode, dp_ranks) in workers {
         let spec = WorkerSpec {
@@ -82,6 +93,7 @@ fn router(
     let mut ctx =
         AppContext::with_router_inflight_load(cfg, tokenizers, proxy, registry, policies, inflight);
     ctx.dp_rank_prefix_provider = Some(RadixTreePrefixProvider::new(tree, oracle));
+    ctx.engine_reported_load = load;
     build_router(Arc::new(ctx))
 }
 
@@ -286,6 +298,46 @@ async fn round_robin_gives_decode_ranks_turns() {
         ranks.push(send(&app, &decode, &[(KEY, "conv-pd")]).await.unwrap());
     }
     assert_eq!(ranks, ["0", "1", "2", "3", "0", "1", "2", "3"]);
+}
+
+#[tokio::test]
+async fn least_tokens_sends_decode_to_the_rank_holding_the_fewest_kv_tokens() {
+    let (prefill, decode) = (
+        MockWorker::start(vec![]).await,
+        MockWorker::start(vec![]).await,
+    );
+    let workers = [
+        (&prefill, WorkerMode::Prefill, 2),
+        (&decode, WorkerMode::Decode, 4),
+    ];
+    let mut cfg = sticky_config();
+    cfg.model.dp_rank_policy = DpRankPolicy::LeastTokens;
+    let load = EngineReportedLoadTable::new();
+    let app = router_with_load(cfg, &workers, Default::default(), Arc::clone(&load));
+    let publish = |rank: u32, num_tokens: u64| {
+        let stat = LoadStat {
+            num_running_reqs: 0,
+            num_waiting_reqs: 0,
+            num_tokens,
+            max_total_num_tokens: 1_000,
+            native_cache: None,
+        };
+        load.set(&decode.url, rank, stat, Instant::now());
+    };
+    for (rank, num_tokens) in [(0, 400), (1, 100), (2, 900), (3, 250)] {
+        publish(rank, num_tokens);
+    }
+    for _ in 0..3 {
+        let rank = send(&app, &decode, &[(KEY, "conv-pd")]).await;
+        assert_eq!(rank.as_deref(), Some("1"));
+    }
+    // The pick follows the feed.
+    publish(1, 950);
+    let rank = send(&app, &decode, &[(KEY, "conv-pd")]).await;
+    assert_eq!(rank.as_deref(), Some("3"));
+    // Without a reading the policy still places the request.
+    load.forget_worker(&decode.url);
+    assert!(send(&app, &decode, &[(KEY, "conv-pd")]).await.is_some());
 }
 
 #[tokio::test]

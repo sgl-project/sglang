@@ -7,6 +7,7 @@ use super::nonempty_header;
 use super::preparation::{
     append_fields, generate_room_id, generate_room_id_for_rank, BootstrapFields, PreparedRequest,
 };
+use crate::config::DpRankPolicy;
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::policies::dp_rank::select_dp_rank;
 use crate::proxy::grpc::{Additions, EngineRpc, GrpcResponse};
@@ -297,7 +298,16 @@ async fn dispatch<T: Transport>(
                 abort.disarm();
             }
             let decode_rank = dp_aware
-                .then(|| select_dp_rank(&decode, None, &[], ctx.config.model.dp_rank_policy))
+                .then(|| {
+                    let rank_tokens = rank_tokens(ctx, &decode);
+                    select_dp_rank(
+                        &decode,
+                        None,
+                        &[],
+                        &rank_tokens,
+                        ctx.config.model.dp_rank_policy,
+                    )
+                })
                 .flatten();
             let decode_load_guards = (
                 decode_load,
@@ -750,7 +760,27 @@ fn prompt_dp_rank(
         }
         _ => Vec::new(),
     };
-    select_dp_rank(worker, key, &prefix_depths, model.dp_rank_policy)
+    let rank_tokens = rank_tokens(ctx, worker);
+    select_dp_rank(
+        worker,
+        key,
+        &prefix_depths,
+        &rank_tokens,
+        model.dp_rank_policy,
+    )
+}
+
+/// KV tokens in use per rank of `worker` from the engine's load feed, for
+/// `--dp-rank-policy least_tokens`; empty under any other policy, so the load
+/// table is not read for nothing, and empty while any rank lacks a fresh
+/// reading, which makes the selector fall back to its in-flight count.
+fn rank_tokens(ctx: &AppContext, worker: &Worker) -> Vec<(u32, u64)> {
+    if ctx.config.model.dp_rank_policy != DpRankPolicy::LeastTokens || worker.dp_ranks() <= 1 {
+        return Vec::new();
+    }
+    ctx.engine_reported_load
+        .fresh_rank_tokens(&worker.url, Instant::now())
+        .unwrap_or_default()
 }
 
 /// Under `--dp-aware` the router owns the rank: the header pins it for chat, and

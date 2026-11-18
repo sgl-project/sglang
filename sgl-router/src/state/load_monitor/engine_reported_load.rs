@@ -566,6 +566,44 @@ impl EngineReportedLoadTable {
             .collect()
     }
 
+    /// KV tokens in use on each DP rank of one worker, as `(rank, num_tokens)`
+    /// in rank order, for `--dp-rank-policy least_tokens`. `None` unless every
+    /// rank the worker advertised (or, with no advertisement, every rank
+    /// observed) is fresh, by the same rule as [`Self::capture_snapshot`]: a
+    /// silent rank must not look idle and draw traffic. Read at selection
+    /// time rather than from the request's ingress snapshot because in PD mode
+    /// the decode rank is chosen after the admission wait.
+    pub fn fresh_rank_tokens(&self, worker_url: &str, now: Instant) -> Option<Vec<(u32, u64)>> {
+        let mut observed: HashMap<u32, (u64, bool)> = HashMap::new();
+        for entry in self.by_rank.iter() {
+            if entry.key().0 != worker_url {
+                continue;
+            }
+            let fresh = now.saturating_duration_since(entry.value().at) <= self.freshness;
+            observed.insert(entry.key().1, (entry.value().load.num_tokens, fresh));
+        }
+        let mut required: Vec<u32> = self
+            .expected
+            .iter()
+            .filter(|key| key.0 == worker_url)
+            .map(|key| key.1)
+            .collect();
+        if required.is_empty() {
+            required = observed.keys().copied().collect();
+        }
+        if required.is_empty() {
+            return None;
+        }
+        required.sort_unstable();
+        required
+            .into_iter()
+            .map(|rank| match observed.get(&rank) {
+                Some(&(num_tokens, true)) => Some((rank, num_tokens)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Captures one immutable view for all routing decisions in a request.
     pub fn capture_snapshot(&self, now: Instant) -> EngineReportedLoadSnapshot {
         let mut min_rank_pending = HashMap::new();
@@ -660,6 +698,43 @@ mod tests {
                 .is_none(),
             "short frames must never be promoted to complete native monitor data"
         );
+    }
+
+    fn with_tokens(num_tokens: u64) -> LoadStat {
+        LoadStat {
+            num_tokens,
+            ..load(0, 0)
+        }
+    }
+
+    #[test]
+    fn rank_tokens_need_every_advertised_rank_fresh() {
+        let t = EngineReportedLoadTable::with_freshness(Duration::from_millis(10));
+        let now = Instant::now();
+        assert_eq!(t.fresh_rank_tokens("http://w:30000", now), None);
+        t.set("http://w:30000", 1, with_tokens(300), now);
+        t.set("http://w:30000", 0, with_tokens(700), now);
+        t.set("http://other:30000", 0, with_tokens(1), now);
+        // Nothing advertised: every observed rank counts, in rank order.
+        assert_eq!(
+            t.fresh_rank_tokens("http://w:30000", now),
+            Some(vec![(0, 700), (1, 300)])
+        );
+        // An advertised rank that never published hides the whole worker.
+        for rank in 0..3 {
+            t.mark_expected_rank("http://w:30000", rank);
+        }
+        assert_eq!(t.fresh_rank_tokens("http://w:30000", now), None);
+        t.set("http://w:30000", 2, with_tokens(0), now);
+        assert_eq!(
+            t.fresh_rank_tokens("http://w:30000", now),
+            Some(vec![(0, 700), (1, 300), (2, 0)])
+        );
+        // So does one whose reading went stale.
+        let later = now + Duration::from_secs(1);
+        t.set("http://w:30000", 0, with_tokens(700), later);
+        t.set("http://w:30000", 1, with_tokens(300), later);
+        assert_eq!(t.fresh_rank_tokens("http://w:30000", later), None);
     }
 
     #[test]
