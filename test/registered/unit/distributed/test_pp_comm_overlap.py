@@ -8,7 +8,9 @@ import torch
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.managers import scheduler_pp_mixin as pp_mod
+from sglang.srt.managers import utils as managers_utils
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.managers.utils import create_pp_comm_stream
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
 
@@ -240,6 +242,44 @@ class TestPPCommOverlap(CustomTestCase):
             proxy = schedulers[1]._pp_recv_proxy_tensors()
             torch.testing.assert_close(proxy.tensors["hidden_states"], expected_gather)
             self.assertTrue(all(not queue for queue in mailboxes.values()))
+
+
+class _StreamIdOnlyStream:
+    """Like torch.xpu.Stream: names its pool slot by ``stream_id``, has no ``cuda_stream``."""
+
+    def __init__(self, stream_id):
+        self.stream_id = stream_id
+
+
+class _RoundRobinStreamPool:
+    """Device module whose ``Stream()`` cycles through a fixed pool, as CUDA and XPU do."""
+
+    def __init__(self, size):
+        self._size = size
+        self._next = 0
+
+    def Stream(self, priority=0):
+        stream = _StreamIdOnlyStream(self._next % self._size)
+        self._next += 1
+        return stream
+
+
+class TestPPCommStream(CustomTestCase):
+    def test_xpu_comm_stream_skips_pool_slots_the_scheduler_holds(self):
+        taken = [_StreamIdOnlyStream(slot) for slot in (0, 1, 2)]
+        stream = create_pp_comm_stream(
+            device="xpu:0",
+            device_module=_RoundRobinStreamPool(size=4),
+            avoid_streams=taken,
+        )
+        self.assertEqual(stream.stream_id, 3)
+
+    def test_unsupported_device_ignores_the_flag_with_a_warning(self):
+        with self.assertLogs(managers_utils.logger, "WARNING"):
+            stream = create_pp_comm_stream(
+                device="npu:0", device_module=Mock(), avoid_streams=()
+            )
+        self.assertIsNone(stream)
 
 
 if __name__ == "__main__":

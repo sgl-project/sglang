@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_xpu_ci(est_time=720, suite="nightly-xpu-kernel-main-2-gpu", nightly=True)
+register_xpu_ci(est_time=720, suite="nightly-kernel-main-test-2-gpu-xpu", nightly=True)
 
 MODEL = DEFAULT_MODEL_NAME_FOR_TEST
 FILLER = (
@@ -32,8 +32,6 @@ FILLER = (
     "Here we go. There and back again. "
 )
 BASE_ARGS = [
-    "--device",
-    "xpu",
     "--attention-backend",
     "intel_xpu",
     "--pp-size",
@@ -93,6 +91,15 @@ class _PPServerBase(CustomTestCase):
     def server_log(self) -> str:
         return self.stdout.getvalue() + self.stderr.getvalue()
 
+    def _pp0_chunk_sizes(self) -> list[int]:
+        return [
+            int(m)
+            for m in re.findall(
+                r" PP0 [^\]]*\] Prefill batch, #new-seq: 1, #new-token: (\d+)",
+                self.server_log(),
+            )
+        ]
+
     def generate(self, input_ids: list[int], max_new_tokens: int = 12) -> dict:
         response = requests.post(
             self.base_url + "/generate",
@@ -137,9 +144,9 @@ class TestXPUPPLongContext(_PPServerBase):
 class TestXPUPPDynamicChunking(_PPServerBase):
     """Dynamic chunking from a 16K initial chunk.
 
-    Its 20K-token probes leave the allocator caching most of the free memory; the
-    PP communicator built after them must still start (it used to fail with
-    ``onecclCommInitRank failed`` or hang in the first PP send).
+    Its 20K-token probes take most of the memory the KV pool leaves free, and the PP
+    communicator is built only after them, so the server must release that memory
+    before it serves.
     """
 
     BASE = 16384
@@ -161,29 +168,20 @@ class TestXPUPPDynamicChunking(_PPServerBase):
         self.assertGreaterEqual(min(predicted), self.BASE // 4, sizes)
         self.assertEqual(sum(sizes), 65536, sizes)
 
-    def _pp0_chunk_sizes(self) -> list[int]:
-        return [
-            int(m)
-            for m in re.findall(
-                r" PP0 [^\]]*\] Prefill batch, #new-seq: 1, #new-token: (\d+)",
-                self.server_log(),
-            )
-        ]
-
 
 @unittest.skipUnless(torch.xpu.is_available(), "needs Intel XPU")
 class TestXPUPPDynamicChunkingProbeFallback(_PPServerBase):
-    """A probe that runs out of memory must disable dynamic chunking, not the server.
+    """A probe that runs out of memory disables dynamic chunking, not the server.
 
     On a 24 GB card a 0.85 static fraction leaves PP0 too little headroom for the
-    15K-token probe; the server used to die on its first request afterwards with
-    UR_RESULT_ERROR_OUT_OF_RESOURCES.
+    15K-token probe; the server must still come up and serve. A full 12K chunk does
+    not fit at this fraction either, so the request stays below one chunk.
     """
 
     mem_fraction_static = "0.85"
     other_args = ["--chunked-prefill-size", "12288", "--enable-dynamic-chunking"]
 
-    def test_server_keeps_serving_with_static_chunks(self):
+    def test_server_keeps_serving_after_the_probe_fails(self):
         if "Failed to profile prefill latency" not in self.server_log():
             self.skipTest("the probe fit in memory on this card")
         self.assertIn("Dynamic chunking will be disabled", self.server_log())

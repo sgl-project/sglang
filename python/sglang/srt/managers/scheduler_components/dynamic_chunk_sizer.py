@@ -76,17 +76,18 @@ class DynamicChunkSizer:
             try:
                 samples = self._profile_prefill_latency()
             except Exception as e:
+                hint = (
+                    " The probes reach 1.25x --chunked-prefill-size; lower it or "
+                    "--mem-fraction-static to keep dynamic chunking."
+                    if isinstance(e, torch.OutOfMemoryError)
+                    else ""
+                )
                 logger.warning(
                     f"[PP Dynamic Chunk] Failed to profile prefill latency: {e!r}. "
-                    "Dynamic chunking will be disabled. The probes reach 1.25x "
-                    "--chunked-prefill-size; lower it or --mem-fraction-static "
-                    "to keep dynamic chunking."
+                    f"Dynamic chunking will be disabled.{hint}"
                 )
-            # The probes leave the allocator caching their peak, which starves memory
-            # allocated outside PyTorch: on XPU the first PP send then hangs while
-            # oneCCL builds its communicator, or, after a failed probe, the next forward
-            # fails with UR_RESULT_ERROR_OUT_OF_RESOURCES. Release it outside the
-            # handler, where the traceback no longer pins a failed probe's activations.
+            # The probes' cached peak starves allocations outside PyTorch (oneCCL, Level
+            # Zero); release it outside the handler, whose traceback pins a failed probe.
             gc.collect()
             current_platform.empty_cache()
 

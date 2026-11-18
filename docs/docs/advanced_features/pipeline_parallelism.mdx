@@ -42,7 +42,7 @@ When `--enable-dynamic-chunking` is enabled, each chunk size of a sequence is de
 
 Due to the variation in hardware, models, and target workloads, a static configuration is seldom optimal across all scenarios. Consequently, achieving peak performance necessitates a degree of hyperparameter tuning when switching to the dynamic chunking mode.
 
-To fit the model, the first PP stage runs 128 synthetic prefills at startup, the largest of 1.25× `--chunked-prefill-size` tokens. This adds startup time (about a minute for a 12K initial chunk on an 8B model), and the largest probe needs activation memory beyond what the KV cache leaves free. If profiling fails, for example because it runs out of memory, every rank logs `Dynamic chunking will be disabled` and the server keeps serving with the fixed `--chunked-prefill-size`. To keep dynamic chunking, lower `--mem-fraction-static` or the initial chunk size. This matters most on cards with 24-48 GB.
+To fit the model, the first PP stage runs 128 synthetic prefills at startup, the largest of 1.25× `--chunked-prefill-size` tokens. This adds startup time (about a minute for a 12K initial chunk on an 8B model), and the largest probe needs activation memory beyond what the KV cache leaves free. If profiling fails, for example because it runs out of memory, the first PP stage logs `Dynamic chunking will be disabled`, every rank turns dynamic chunking off, and the server keeps serving with the fixed `--chunked-prefill-size`. To keep dynamic chunking, lower `--mem-fraction-static` or the initial chunk size. This matters most on cards with 24-48 GB.
 
 **Tuning Guidance for Dynamic Chunked Prefill**
 
@@ -157,7 +157,7 @@ python3 -m sglang.launch_server \
   --chunked-prefill-size 8192 --enable-dynamic-chunking --mem-fraction-static 0.80
 ```
 
-On 24 GB cards, the dynamic-chunking probes are what limit `--mem-fraction-static`: at 0.85, a 12K initial chunk no longer fits its 15K-token probe, and dynamic chunking turns itself off.
+On 24 GB cards, keep `--mem-fraction-static` at 0.80 for an 8K-16K initial chunk. At 0.85, PP2 has too little headroom on its first stage for a 12K chunk or its 15K-token probe: dynamic chunking turns itself off, and prompts longer than one chunk then run out of memory as well.
 
 ## Best Practice for Pipeline Parallelism with PD Disaggregation
 To be added. Stay tuned for the latest updates on Pipeline Parallelism with PD Disaggregation.

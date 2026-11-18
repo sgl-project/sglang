@@ -67,6 +67,21 @@ def allocate_distinct_stream(device_module, avoid_streams):
     raise RuntimeError("Unable to allocate a distinct stream")
 
 
+def create_pp_comm_stream(*, device: str, device_module, avoid_streams):
+    """A dedicated PP communication stream, or None where overlap is unsupported."""
+    if not str(device).startswith(("cuda", "xpu")):
+        logger.warning(
+            f"SGLANG_PP_COMM_OVERLAP is ignored on {device}: PP communication "
+            "overlap runs only on CUDA, ROCm and Intel XPU."
+        )
+        return None
+    stream = allocate_distinct_stream(device_module, avoid_streams)
+    logger.info(
+        f"PP tensor communication overlap enabled on a dedicated {device} stream"
+    )
+    return stream
+
+
 def is_war_barrier_enabled() -> bool:
     # On by default on CUDA. Unified memory frees ids and rewrites request rows on the
     # schedule stream at once, so it needs the barrier on every device.

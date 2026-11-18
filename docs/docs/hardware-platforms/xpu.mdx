@@ -368,8 +368,8 @@ has the full table and the tuning results.
   (`SGLANG_PP_COMM_OVERLAP=1`).
 - Dynamic chunking profiles prefills of up to 1.25× `--chunked-prefill-size` at
   startup. On 24 GB cards, keep `--mem-fraction-static` at 0.80 or lower for an
-  8K-12K initial chunk. Otherwise the probe runs out of memory, and dynamic chunking
-  turns itself off while the server keeps serving with fixed chunks.
+  8K-16K initial chunk. With less headroom the probe runs out of memory and dynamic
+  chunking turns itself off; at that headroom the fixed chunk may not fit either.
 - oneCCL allocates its PP transfer buffers outside PyTorch. Leave about 2 GB free on
   every card after the KV pool (the `available_gpu_mem` the server logs at startup);
   with less, the first PP transfers can stall instead of failing. Lower
