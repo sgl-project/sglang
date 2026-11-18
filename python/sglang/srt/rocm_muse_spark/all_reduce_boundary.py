@@ -42,6 +42,8 @@ _MODE = _KERNEL_MODES[os.environ.get("SGLANG_ROCM_MUSE_AR_BOUNDARY_KERNEL", "fac
 _VEC_FROM_ROWS = int(os.environ.get("SGLANG_ROCM_MUSE_AR_BOUNDARY_VEC_FROM_ROWS", "0"))
 # batches below this many rows keep the plain all-reduce (TP8 decode: no e2e gain at 8 rows, +1.9% at 16)
 _MIN_ROWS = int(os.environ.get("SGLANG_ROCM_MUSE_AR_BOUNDARY_MIN_ROWS", "0"))
+# rows an own push plane is sized for; larger batches keep the plain all-reduce
+_OWN_PUSH_MAX_ROWS = 512
 
 
 def _mode_for(num_rows: int) -> int:
@@ -78,11 +80,15 @@ def ar_boundary_modes() -> tuple[bool, bool]:
     )
 
 
-def _ensure_comm() -> None:
+def _ensure_comm(hidden: int) -> None:
     """The kernel's push plane, set once on the TP group: its carv2 custom all-reduce when it has one, else a
-    push-only carv2 instance of the kernel's own, made collectively (every TP rank builds the same layers).
+    push-only carv2 instance of the kernel's own, made collectively (every TP rank builds the same layers)
+    and sized for ``_OWN_PUSH_MAX_ROWS`` rows, without ring planes, so it takes little from the KV cache.
     The plain all-reduces keep whatever backend the group has; graph capture enters an own instance's
     context through ``GroupCoordinator.graph_capture``."""
+    from sglang.srt.distributed.device_communicators.configs.custom_all_reduce_v2 import (
+        two_shot_push_slot_bytes,
+    )
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
         CustomAllReduceV2,
     )
@@ -94,7 +100,19 @@ def _ensure_comm() -> None:
     if isinstance(ca_comm, CustomAllReduceV2) and not ca_comm.disabled:
         tp.ar_boundary_comm = ca_comm
         return
-    comm = CustomAllReduceV2(tp.cpu_group, tp.device, max_pull_size=0)
+    rows, ws = _OWN_PUSH_MAX_ROWS, tp.world_size
+    push_size = max(
+        two_shot_push_slot_bytes(rows * hidden * 2, ws),
+        -(-rows // ws) * max(_slot_row_bytes(hidden, ws, mode) for mode in (0, 2)),
+    )
+    comm = CustomAllReduceV2(
+        tp.cpu_group,
+        tp.device,
+        max_pull_size=0,
+        max_push_size=push_size,
+        ring_simple_buffer_size=0,
+        hier_ring_simple_buffer_size=0,
+    )
     tp.ar_boundary_comm = None if comm.disabled else comm
 
 
@@ -109,6 +127,13 @@ def _factored_layout(hidden: int, world_size: int) -> tuple[int, int] | None:
     segs = hidden // seg_elems
     pieces = segs * reduce_unroll // 2
     return (segs, pieces) if pieces <= 32 else None
+
+
+def _slot_row_bytes(hidden: int, world_size: int, mode: int) -> int:
+    """Push slot bytes per owned row: the partial and the reduced copy (+ the factored kernel's segment sums)."""
+    layout = _factored_layout(hidden, world_size) if mode == 2 else None
+    sums = 16 * layout[0] * layout[1] if layout else 0
+    return 2 * hidden * 2 + sums
 
 
 def _boundary_form_supported(boundary: FusedPostNormResidualPreNorm) -> bool:
@@ -142,7 +167,7 @@ class AllReduceAttnBoundary:
         )
         self._applies: dict[tuple[int, bool], bool] = {}
         if self._form_supported:
-            _ensure_comm()
+            _ensure_comm(boundary._hidden_size)
 
     def _comm(self):
         return getattr(get_parallel().tp_group, "ar_boundary_comm", None)
@@ -167,15 +192,11 @@ class AllReduceAttnBoundary:
             ).use_hier
         ):
             return False
-        # a slot holds the partial and the reduced copy of each rank's rows (+ segment sums)
         rows_per_rank = -(-num_rows // comm.world_size)
-        return rows_per_rank * self._slot_row_bytes(comm.world_size, _mode_for(num_rows)) <= comm._max_push_size
-
-    def _slot_row_bytes(self, world_size: int, mode: int) -> int:
-        hidden = self._boundary._hidden_size
-        layout = _factored_layout(hidden, world_size) if mode == 2 else None
-        sums = 16 * layout[0] * layout[1] if layout else 0
-        return 2 * hidden * 2 + sums
+        slot_row = _slot_row_bytes(
+            self._boundary._hidden_size, comm.world_size, _mode_for(num_rows)
+        )
+        return rows_per_rank * slot_row <= comm._max_push_size
 
     def applicable(self, stream: torch.Tensor, is_extend: bool) -> bool:
         if not (self._prefill if is_extend else self._decode):
