@@ -11,14 +11,11 @@ use rustix::fs::{Mode, ftruncate};
 use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
 use rustix::shm::{OFlags, open, unlink};
 
-/// Reserve the backing pages of a fresh segment (see
-/// [`platform::reserve_shm_pages`](super::platform::reserve_shm_pages)); mirrors
-/// Python's `posix_fallocate` in `ShmPointerMMData`. Injectable so tests can
-/// stand in for an exhausted tmpfs.
+/// Reserve the backing pages of a fresh segment; the real one is
+/// [`platform::reserve_shm_pages`](super::platform::reserve_shm_pages), which
+/// mirrors Python's `posix_fallocate` in `ShmPointerMMData`. Injectable so
+/// tests can stand in for an exhausted tmpfs.
 pub type Reserve = fn(BorrowedFd<'_>, u64) -> rustix::io::Result<()>;
-
-/// The real reservation.
-pub use super::platform::reserve_shm_pages as reserve_pages;
 
 /// A named POSIX shared-memory segment owning its name: dropped -> unlinked.
 ///
@@ -36,7 +33,7 @@ impl ShmSegment {
     /// Create the segment `name` holding exactly `bytes`. No leading slash --
     /// the name must suit Python's `SharedMemory(name=...)` (shm_open adds one).
     pub fn create(name: String, bytes: &[u8]) -> Result<Self, String> {
-        Self::create_with(name, bytes, reserve_pages)
+        Self::create_with(name, bytes, super::platform::reserve_shm_pages)
     }
 
     /// [`create`](Self::create) with the page reservation step supplied, so a
@@ -111,13 +108,10 @@ pub fn unique_name(tag: &str) -> String {
     format!("sgl-{tag}-{}-{n}", std::process::id())
 }
 
-/// Test helpers: look at a segment the way the platform allows.
-#[cfg(test)]
-pub use super::platform::{shm_exists, shm_read};
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::platform::{shm_exists, shm_read};
 
     fn test_name() -> String {
         unique_name("test")

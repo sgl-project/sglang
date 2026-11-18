@@ -536,7 +536,8 @@ mod tests {
     use super::*;
     use crate::message::buffers::find;
     use crate::message::config::HiddenStatesMode;
-    use crate::utils::shm::{shm_exists, shm_read, unique_name};
+    use crate::utils::platform::{shm_exists, shm_read};
+    use crate::utils::shm::unique_name;
 
     /// An external-style processor: one image item with a caller-shaped
     /// feature and spans, no M-RoPE.
@@ -788,7 +789,8 @@ mod tests {
     /// every feature value, and the segments made before the failure are gone.
     #[test]
     fn shm_exhaustion_falls_back_to_inline_with_values_intact() {
-        use crate::utils::shm::{ShmSegment, shm_exists};
+        use crate::utils::platform::shm_exists;
+        use crate::utils::shm::ShmSegment;
         use std::os::fd::BorrowedFd;
 
         // Item 0's segment is created for real; item 1's reservation fails as

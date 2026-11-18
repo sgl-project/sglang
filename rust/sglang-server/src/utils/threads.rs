@@ -13,8 +13,6 @@ use super::platform::{self, CpuSet};
 use super::runtime::Runnable;
 use crate::message::config::RuntimeConfig;
 
-pub(super) use super::platform::pin_current;
-
 /// The CPU set every frontend thread runs on, from `cores` (`None`/empty →
 /// run unpinned). The caller (Python `_partition_cores`) passes this rank's
 /// NUMA-local cores minus the scheduler's reserved launch cores, so the set
@@ -41,7 +39,7 @@ fn spawn_stage(
     let handle = std::thread::Builder::new()
         .name(name.to_string())
         .spawn(move || {
-            pin_current(cpus.as_ref());
+            platform::pin_current(cpus.as_ref());
             stage.run();
         })
         .expect("spawn stage");

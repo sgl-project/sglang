@@ -1,8 +1,9 @@
 //! The OS-specific calls the frontend makes, behind one portable surface:
 //! CPU pinning, a close-on-exec pipe, shm page reservation, and the
-//! drain-ended datagram. Every `cfg(target_os)` in the crate lives here, so
-//! the stages and the runtime read the same on every platform; the test-side
-//! counterparts sit in [`tests`] at the end of the file.
+//! drain-ended datagram. Every `cfg(target_os)` in the crate's non-test
+//! code lives here, so the stages and the runtime read the same on every
+//! platform; the test-side counterparts sit in [`test_support`] at the end
+//! of the file.
 //!
 //! The server is deployed on Linux, and the Linux arms are the real ones.
 //! The other arms exist so the crate builds and its unit tests run on a
@@ -11,19 +12,22 @@
 use std::io;
 use std::os::fd::OwnedFd;
 
+#[cfg(all(test, target_os = "linux"))]
+pub use test_support::bind_notify_socket;
 #[cfg(test)]
-pub use tests::{bind_notify_socket, shm_exists, shm_read};
+pub use test_support::{shm_exists, shm_read};
 
 // ---- CPU pinning ----
 
 /// The cores a frontend thread may run on: a kernel CPU mask on Linux. No
-/// other kernel the server builds on can pin a thread to a core.
+/// other kernel the server builds on can pin a thread to a core, so there
+/// the type has no values.
 #[cfg(target_os = "linux")]
 pub type CpuSet = rustix::thread::CpuSet;
 
 #[cfg(not(target_os = "linux"))]
 #[derive(Clone, Copy, Debug)]
-pub struct CpuSet;
+pub enum CpuSet {}
 
 /// The CPU set for `cores`; `None` when empty or when pinning is unsupported.
 #[cfg(target_os = "linux")]
@@ -71,8 +75,8 @@ pub fn pipe_cloexec() -> io::Result<(OwnedFd, OwnedFd)> {
     #[cfg(not(target_os = "linux"))]
     {
         use rustix::io::{FdFlags, fcntl_setfd};
-        // No pipe2 here: a fork+exec between pipe and fcntl would inherit
-        // the ends; the caller creates its pipe before anything forks.
+        // No pipe2 here, so a fork+exec on another thread between the two
+        // calls inherits the ends; accepted on a platform we do not deploy to.
         let (read, write) = rustix::pipe::pipe()?;
         fcntl_setfd(&read, FdFlags::CLOEXEC)?;
         fcntl_setfd(&write, FdFlags::CLOEXEC)?;
@@ -90,8 +94,8 @@ pub fn reserve_shm_pages(fd: std::os::fd::BorrowedFd<'_>, len: u64) -> rustix::i
     rustix::fs::fallocate(fd, rustix::fs::FallocateFlags::empty(), 0, len)
 }
 
-/// Darwin commits a shm object's pages in `ftruncate`, and `F_PREALLOCATE`
-/// (rustix's `fallocate` there) fails on a shm fd with `EBADF`.
+/// No tmpfs to run out of off Linux, and rustix's Apple `fallocate` is
+/// `F_PREALLOCATE`, which a shm fd rejects with `EBADF`.
 #[cfg(not(target_os = "linux"))]
 pub fn reserve_shm_pages(_fd: std::os::fd::BorrowedFd<'_>, _len: u64) -> rustix::io::Result<()> {
     Ok(())
@@ -99,55 +103,54 @@ pub fn reserve_shm_pages(_fd: std::os::fd::BorrowedFd<'_>, _len: u64) -> rustix:
 
 // ---- drain-ended datagram ----
 
-/// Send `payload`, without blocking, to the datagram socket the launching
-/// process bound under `name`; a full receive queue loses this report.
+/// Send `payload`, without blocking, to the abstract Unix datagram socket the
+/// launching process bound under `name`; a full receive queue loses this
+/// report. The abstract namespace is Linux-only, and the Python launcher binds
+/// nothing else, so elsewhere this is `Unsupported`.
 pub fn send_notify_datagram(name: &str, payload: &[u8]) -> io::Result<usize> {
-    use std::os::unix::net::UnixDatagram;
-
-    let socket = UnixDatagram::unbound()?;
-    socket.set_nonblocking(true)?;
     #[cfg(target_os = "linux")]
     {
         use std::os::linux::net::SocketAddrExt;
-        // Abstract namespace, as the Python launcher binds it ("\0" + name).
+        use std::os::unix::net::UnixDatagram;
+
+        let socket = UnixDatagram::unbound()?;
+        socket.set_nonblocking(true)?;
+        // As the Python launcher binds it ("\0" + name).
         let addr = std::os::unix::net::SocketAddr::from_abstract_name(name)?;
         socket.send_to_addr(payload, &addr)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        socket.send_to(payload, notify_path(name))
+        let _ = (name, payload);
+        Err(io::ErrorKind::Unsupported.into())
     }
-}
-
-/// No abstract namespace off Linux: the name is a file under the temp dir.
-/// The Python launcher binds only the abstract form, so this pairs with the
-/// crate's own tests, not with a launcher.
-#[cfg(not(target_os = "linux"))]
-fn notify_path(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(name)
 }
 
 /// Test-side counterparts of the platform calls: look at a shm segment, and
 /// stand in for the launching process on the drain-ended datagram.
 #[cfg(test)]
-pub mod tests {
-    use std::io;
-    use std::os::unix::net::UnixDatagram;
-
-    /// Whether the shm segment `name` exists.
+pub mod test_support {
+    /// Whether the shm segment `name` exists; any error but "no such
+    /// segment" is a test bug, not an absence.
     pub fn shm_exists(name: &str) -> bool {
         #[cfg(target_os = "linux")]
         {
-            std::path::Path::new("/dev/shm").join(name).exists()
+            std::path::Path::new("/dev/shm")
+                .join(name)
+                .try_exists()
+                .unwrap()
         }
         #[cfg(not(target_os = "linux"))]
         {
-            rustix::shm::open(
+            match rustix::shm::open(
                 format!("/{name}"),
                 rustix::shm::OFlags::RDONLY,
                 rustix::fs::Mode::empty(),
-            )
-            .is_ok()
+            ) {
+                Ok(_) => true,
+                Err(rustix::io::Errno::NOENT) => false,
+                Err(e) => panic!("shm_open(/{name}): {e}"),
+            }
         }
     }
 
@@ -155,12 +158,12 @@ pub mod tests {
     /// segment's `/dev/shm` file, which is exactly `len` long; Darwin has no such
     /// path and rounds the object's size up to a page, so the first `len` bytes
     /// are mapped.
-    pub fn shm_read(name: &str, len: usize) -> io::Result<Vec<u8>> {
+    pub fn shm_read(name: &str, len: usize) -> std::io::Result<Vec<u8>> {
         #[cfg(target_os = "linux")]
         {
             let bytes = std::fs::read(std::path::Path::new("/dev/shm").join(name))?;
             if bytes.len() != len {
-                return Err(io::Error::other(format!(
+                return Err(std::io::Error::other(format!(
                     "shm segment {name} is {} bytes, expected {len}",
                     bytes.len()
                 )));
@@ -177,7 +180,7 @@ pub mod tests {
             )?;
             let size = u64::try_from(rustix::fs::fstat(&fd)?.st_size).unwrap_or(0);
             if size < len as u64 {
-                return Err(io::Error::other(format!(
+                return Err(std::io::Error::other(format!(
                     "shm segment {name} is {size} bytes, expected at least {len}"
                 )));
             }
@@ -203,52 +206,13 @@ pub mod tests {
         }
     }
 
-    /// The receiving end of [`send_notify_datagram`](super::send_notify_datagram),
-    /// bound as the launcher binds it. An abstract name dies with its socket; a
-    /// path is unlinked on drop.
-    pub struct NotifySocket {
-        socket: UnixDatagram,
-        #[cfg(not(target_os = "linux"))]
-        path: std::path::PathBuf,
-    }
-
-    impl std::ops::Deref for NotifySocket {
-        type Target = UnixDatagram;
-        fn deref(&self) -> &Self::Target {
-            &self.socket
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    impl Drop for NotifySocket {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-
-    /// Bind the receiving end of the drain-ended datagram under `name`.
-    pub fn bind_notify_socket(name: &str) -> io::Result<NotifySocket> {
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::linux::net::SocketAddrExt;
-            let addr = std::os::unix::net::SocketAddr::from_abstract_name(name)?;
-            Ok(NotifySocket {
-                socket: UnixDatagram::bind_addr(&addr)?,
-            })
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let path = super::notify_path(name);
-            // A stale file from an earlier run would refuse the bind.
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-            Ok(NotifySocket {
-                socket: UnixDatagram::bind(&path)?,
-                path,
-            })
-        }
+    /// Bind the receiving end of [`send_notify_datagram`](super::send_notify_datagram)
+    /// under the abstract name `name`, as the launcher does; it dies with the
+    /// socket.
+    #[cfg(target_os = "linux")]
+    pub fn bind_notify_socket(name: &str) -> std::io::Result<std::os::unix::net::UnixDatagram> {
+        use std::os::linux::net::SocketAddrExt;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name)?;
+        std::os::unix::net::UnixDatagram::bind_addr(&addr)
     }
 }
