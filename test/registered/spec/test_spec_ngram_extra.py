@@ -6,7 +6,11 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.ngram_fixture import NgramServerBase
-from sglang.test.test_utils import ADMIN_API_KEY_FOR_TEST, ADMIN_HEADERS_FOR_TEST
+from sglang.test.test_utils import (
+    ADMIN_HEADERS_FOR_TEST,
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
+    admin_post,
+)
 
 # Extra: Triton + Flashinfer NGRAM backends + non-overlap (sync V2) variant.
 # Sibling per-commit file (test_spec_ngram.py) keeps the Paged variant.
@@ -41,8 +45,7 @@ class TestNgramSpeculativeDecodingFlashinfer(NgramServerBase, GSM8KMixin):
     extra_args = [
         "--speculative-ngram-external-sam-budget",
         "8",
-        "--admin-api-key",
-        ADMIN_API_KEY_FOR_TEST,
+        *ADMIN_LAUNCH_ARGS_FOR_TEST,
     ]
 
     def test_output_as_corpus_boosts_accept_length(self):
@@ -87,15 +90,12 @@ class TestNgramSpeculativeDecodingFlashinfer(NgramServerBase, GSM8KMixin):
         print(f"\n  Baseline accept length (no SAM): {baseline_accept_len:.2f}")
 
         # Flush cache so phase 2 starts clean
-        requests.post(
-            self.base_url + "/flush_cache", headers=ADMIN_HEADERS_FOR_TEST, timeout=30
-        )
+        admin_post(self.base_url + "/flush_cache", timeout=30)
 
         # Phase 2: add generated outputs as corpus via HTTP API
-        resp = requests.post(
+        resp = admin_post(
             self.base_url + "/add_external_corpus",
             json={"corpus_id": "bench", "documents": generated_outputs},
-            headers=ADMIN_HEADERS_FOR_TEST,
             timeout=120,
         )
         self.assertEqual(resp.status_code, 200, resp.text)
