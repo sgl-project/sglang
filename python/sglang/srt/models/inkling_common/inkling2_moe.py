@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.inkling2 import experts_sm90, marlin_sm90
-from sglang.kernels.ops.inkling2.comm import (
+from sglang.kernels.ops.communication.inkling2_comm import (
     ROUTED_EXCHANGE_MIN_ROWS,
     all_reduce,
     multicast_all_reduce,

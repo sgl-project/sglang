@@ -10,7 +10,7 @@ from sglang.kernels.ops.inkling2.attention import (
     gate_sink,
     pad_head_groups,
 )
-from sglang.kernels.ops.inkling2.comm import (
+from sglang.kernels.ops.communication.inkling2_comm import (
     all_reduce,
     oneshot_all_reduce,
     oneshot_all_reduce_input,

@@ -1,12 +1,15 @@
-from functools import cache
-
 import torch
 import torch.distributed._symmetric_memory as symm_mem
 import triton
 import triton.language as tl
 
-from sglang.kernels.jit.utils import load_jit
-from sglang.kernels.ops.inkling2.moe import fence_system
+from sglang.kernels.jit.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
+from sglang.kernels.ops.communication import inkling_all_reduce as ar
 
 _RANK_ORDER_MAX_BYTES = {2: 1200 * 1024, 4: 512 * 1024, 8: 288 * 1024, 16: 64 * 1024}
 
@@ -21,7 +24,26 @@ def _rank_sum(X, Y, N: tl.constexpr, WORLD: tl.constexpr, BLOCK: tl.constexpr):
     tl.store(Y + indices, total, indices < N)
 
 
-@cache
+def _device():
+    return torch.device("cuda", torch.cuda.current_device())
+
+
+def _symm(group, numel, dtype, device, flags=False):
+    """A symmetric buffer and its handle. Flags start zeroed, behind a barrier."""
+    buffer = symm_mem.empty(numel, device=device, dtype=dtype)
+    if flags:
+        buffer.zero_()
+    handle = symm_mem.rendezvous(buffer, group.device_group.group_name)
+    if flags:
+        handle.barrier()
+    return buffer, handle
+
+
+def _ptrs(handle, device):
+    return torch.tensor(handle.buffer_ptrs, device=device, dtype=torch.int64)
+
+
+@cache_once
 def _multicast_buffer(group_name, device, dtype, capacity):
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("Warm up the collective size before CUDA graph capture")
@@ -30,6 +52,12 @@ def _multicast_buffer(group_name, device, dtype, capacity):
     if not handle.multicast_ptr:
         raise RuntimeError("Inkling2 tensor parallelism requires NVLink multicast")
     return buffer
+
+
+def _multicast_view(group, device, dtype, numel):
+    capacity = 1 << (numel - 1).bit_length()
+    name = group.device_group.group_name
+    return _multicast_buffer(name, device, dtype, capacity)[:numel]
 
 
 def all_reduce(x: torch.Tensor, group, *, multicast: bool = False) -> torch.Tensor:
@@ -59,29 +87,15 @@ def all_reduce(x: torch.Tensor, group, *, multicast: bool = False) -> torch.Tens
     if comm is not None and comm.should_torch_symm_mem_allreduce(x):
         buffer = comm.buffer[: x.numel()]
     else:
-        capacity = 1 << (x.numel() - 1).bit_length()
-        buffer = _multicast_buffer(
-            group.device_group.group_name, x.device, x.dtype, capacity
-        )[: x.numel()]
+        buffer = _multicast_view(group, x.device, x.dtype, x.numel())
     buffer.copy_(x.flatten())
-    torch.ops.symm_mem.multimem_all_reduce_(
-        buffer, "sum", group.device_group.group_name
-    )
-    return buffer.view_as(x).clone()
+    return multicast_all_reduce(buffer, group).view_as(x).clone()
 
 
 def multicast_all_reduce_input(group, shape, dtype):
     """A view of the symmetric multicast buffer for a producer to write an all-reduce
     input into; multicast_all_reduce reduces it in place."""
-    numel = shape[0] * shape[1]
-    capacity = 1 << (numel - 1).bit_length()
-    buffer = _multicast_buffer(
-        group.device_group.group_name,
-        torch.device("cuda", torch.cuda.current_device()),
-        dtype,
-        capacity,
-    )
-    return buffer[:numel].view(shape)
+    return _multicast_view(group, _device(), dtype, shape[0] * shape[1]).view(shape)
 
 
 def multicast_all_reduce(x, group):
@@ -105,33 +119,25 @@ def _oneshot_blocks(tokens):
 class _OneShotAllReduce:
     """Multimem full one-shot all-reduce for decode-sized activations.
 
-    Every rank issues the same multimem.ld_reduce as torch's multimem all-reduce
-    over the whole range, so results are identical. Inputs alternate between
-    two symmetric regions: an input region is rewritten two calls later, after
-    every peer has passed the next call's entry barrier."""
+    Every rank issues the same multimem.ld_reduce over the whole range, so all
+    ranks get the same result. The sum accumulates in BF16; acc_f32 (in-place
+    sizes only) accumulates in FP32, which matches torch's multimem all-reduce.
+    Inputs alternate between two symmetric regions: an input region is rewritten
+    two calls later, after every peer has passed the next call's entry barrier."""
 
     def __init__(self, group, hidden, dtype, device, inplace_tokens):
-        from sglang.kernels.ops.communication import inkling_all_reduce as jit
-
-        self.jit = jit
         self.region = ONESHOT_MAX_TOKENS * hidden
         self.inplace_tokens = inplace_tokens
-        name = group.device_group.group_name
-        self.buffer = symm_mem.empty(3 * self.region, device=device, dtype=dtype)
-        self.handle = symm_mem.rendezvous(self.buffer, name)
-        self.inplace = symm_mem.empty(
-            inplace_tokens * hidden, device=device, dtype=dtype
-        )
-        self.inplace_handle = symm_mem.rendezvous(self.inplace, name)
-        self.flags = symm_mem.empty(
-            jit.flags_numel(group.world_size), device=device, dtype=torch.uint32
-        )
-        self.flags.zero_()
-        self.flags_handle = symm_mem.rendezvous(self.flags, name)
-        self.flags_handle.barrier()
-        self.state = torch.zeros(jit.STATE_SIZE, device=device, dtype=torch.uint32)
-        jit.compile_inkling_all_reduce(dtype, group.world_size)
         self.world = group.world_size
+        self.buffer, self.handle = _symm(group, 3 * self.region, dtype, device)
+        self.inplace, self.inplace_handle = _symm(
+            group, inplace_tokens * hidden, dtype, device
+        )
+        self.flags, self.flags_handle = _symm(
+            group, ar.flags_numel(self.world), torch.uint32, device, flags=True
+        )
+        self.state = torch.zeros(ar.STATE_SIZE, device=device, dtype=torch.uint32)
+        ar.compile_inkling_all_reduce(dtype, self.world)
         self.current = 0
 
     def input(self, rows, cols):
@@ -144,13 +150,13 @@ class _OneShotAllReduce:
         n = x.numel()
         if x.data_ptr() == self.inplace.data_ptr():
             kernel, blocks, block_size = (
-                self.jit.select_ar_config(x.shape[0], self.world)
+                ar.select_ar_config(x.shape[0], self.world)
                 if x.shape[0] > INPLACE_MAX_TOKENS
                 else ("v3b" if x.shape[0] > 256 else "v3", 32, 1024)
             )
             if kernel not in ("v3", "v3b"):
                 kernel, blocks, block_size = "v3b", 32, 1024
-            self.jit.inkling_multimem_one_shot_fused(
+            ar.inkling_multimem_one_shot_fused(
                 self.inplace[:n],
                 self.inplace_handle.multicast_ptr,
                 self.flags_handle.buffer_ptrs_dev,
@@ -166,7 +172,7 @@ class _OneShotAllReduce:
             return x
         start = self.current * self.region
         output = self.buffer[2 * self.region : 2 * self.region + n]
-        self.jit.inkling_multimem_full_oneshot(
+        ar.inkling_multimem_full_oneshot(
             self.buffer[start : start + n],
             output,
             self.handle.multicast_ptr + start * x.element_size(),
@@ -202,16 +208,11 @@ def oneshot_all_reduce_input(group, rows, cols, dtype, tag=""):
             return None
         from sglang.srt.runtime_context import cutedsl_moe_max_num_tokens
 
-        reducer = _OneShotAllReduce(
-            group,
-            cols,
-            dtype,
-            torch.device("cuda", torch.cuda.current_device()),
-            min(
-                max(INPLACE_MAX_TOKENS, cutedsl_moe_max_num_tokens()),
-                PREFILL_INPLACE_MAX_TOKENS,
-            ),
+        inplace_tokens = min(
+            max(INPLACE_MAX_TOKENS, cutedsl_moe_max_num_tokens()),
+            PREFILL_INPLACE_MAX_TOKENS,
         )
+        reducer = _OneShotAllReduce(group, cols, dtype, _device(), inplace_tokens)
         _ONESHOT[key] = reducer if reducer.handle.multicast_ptr else None
     reducer = _ONESHOT[key]
     if reducer is None or rows > reducer.inplace_tokens:
@@ -227,23 +228,20 @@ def oneshot_all_reduce(x, group, acc_f32=False, tag=""):
     return _ONESHOT[(group.device_group.group_name, x.shape[1], tag)](x, acc_f32)
 
 
-@cache
+@cache_once
 def _exchange_module(hidden, top_k, world):
+    args = make_cpp_args(hidden, top_k, world, is_arch_support_pdl())
     return load_jit(
         "inkling2_exchange",
-        str(hidden),
-        str(top_k),
-        str(world),
+        *args,
         cuda_files=["inkling2/exchange.cuh"],
-        cuda_wrappers=[
-            ("combine", f"inkling2_exchange::combine<{hidden}, {top_k}, {world}>")
-        ],
+        cuda_wrappers=[("combine", f"inkling2_exchange::combine<{args}>")],
     )
 
 
 class RoutedExchange:
     """EP combine of routed expert rows without an all-reduce. Each rank writes
-    the rows it owns into its symmetric buffer; after a per-CTA flag barrier,
+    the rows it owns into its symmetric buffer; after a grid barrier,
     every rank sums each token's rows in top-k order, reading each row from its
     owner. Equal to unweighted_post_reorder(all_reduce(routed_rows)): every row
     is nonzero on one rank only. Row buffers alternate between two slots by a
@@ -251,32 +249,23 @@ class RoutedExchange:
     later, after every peer passed the next call's barrier."""
 
     def __init__(self, group, max_rows, hidden, device):
-        name = group.device_group.group_name
         self.world, self.hidden, self.max_rows = group.world_size, hidden, max_rows
-        # Persistent grid: every CTA must be resident for the per-CTA barrier.
+        # Persistent grid: every CTA must be resident for the grid barrier.
         self.max_blocks = (
             2 * torch.cuda.get_device_properties(device).multi_processor_count
         )
-        self.buffer = symm_mem.empty(
-            2 * max_rows * hidden, device=device, dtype=torch.bfloat16
+        self.buffer, handle = _symm(
+            group, 2 * max_rows * hidden, torch.bfloat16, device
         )
-        self.handle = symm_mem.rendezvous(self.buffer, name)
-        self.flags = symm_mem.empty(
-            self.max_blocks * self.world, device=device, dtype=torch.uint32
+        self.flags, flags_handle = _symm(
+            group, ar.flags_numel(self.world), torch.uint32, device, flags=True
         )
-        self.flags.zero_()
-        self.flags_handle = symm_mem.rendezvous(self.flags, name)
-        self.flags_handle.barrier()
-        self.state = torch.zeros(self.max_blocks, device=device, dtype=torch.uint32)
-        self.buffer_ptrs = torch.tensor(
-            self.handle.buffer_ptrs, device=device, dtype=torch.int64
-        )
-        self.flag_ptrs = torch.tensor(
-            self.flags_handle.buffer_ptrs, device=device, dtype=torch.int64
-        )
+        self.state = torch.zeros(ar.STATE_SIZE, device=device, dtype=torch.uint32)
+        self.buffer_ptrs = _ptrs(handle, device)
+        self.flag_ptrs = _ptrs(flags_handle, device)
         # [call count, CTAs finished in the current call]
         self.calls = torch.zeros(2, device=device, dtype=torch.int64)
-        self.rank = self.handle.rank
+        self.rank = handle.rank
 
     def combine(self, src2dst, sorted_ids, num_local, top_k):
         tokens = src2dst.numel() // top_k
@@ -307,9 +296,7 @@ def prepare_routed_exchange(group, max_rows, hidden):
     """Allocate the routed exchange (collective; call outside graph capture)."""
     key = (group.device_group.group_name, hidden)
     if key not in _ROUTED_EXCHANGE and group.world_size > 1:
-        _ROUTED_EXCHANGE[key] = RoutedExchange(
-            group, max_rows, hidden, torch.device("cuda", torch.cuda.current_device())
-        )
+        _ROUTED_EXCHANGE[key] = RoutedExchange(group, max_rows, hidden, _device())
 
 
 @triton.jit
@@ -326,6 +313,20 @@ def _peer_barrier(FlagPtrs, State, rank, WORLD: tl.constexpr):
         seen = tl.atomic_add(own + peer, 0, sem="acquire", scope="sys")
         while seen < epoch:
             seen = tl.atomic_add(own + peer, 0, sem="acquire", scope="sys")
+
+
+@triton.jit
+def fence_system(THREADS: tl.constexpr):
+    """fence.sc.sys once per thread: its earlier stores, including NVLink stores
+    to peers, are visible system-wide before any later signal."""
+    tl.inline_asm_elementwise(
+        "fence.sc.sys; mov.b32 $0, $1;",
+        "=r,r",
+        [tl.full([THREADS], 0, tl.int32)],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
 
 
 @triton.jit
@@ -375,30 +376,21 @@ class PrefillExchange:
     buffer only after it reached the next call's first barrier, so one slot of
     each suffices."""
 
-    calls = None
-
     def __init__(self, group, max_tokens, top_k, hidden, device):
-        name = group.device_group.group_name
         self.world, self.hidden, self.top_k = group.world_size, hidden, top_k
-        self.max_tokens, self.max_rows = max_tokens, max_tokens * top_k
-        self.buffer = symm_mem.empty(
-            self.max_rows * hidden, device=device, dtype=torch.bfloat16
+        self.max_rows = max_tokens * top_k
+        self.buffer, handle = _symm(
+            group, self.max_rows * hidden, torch.bfloat16, device
         )
-        self.handle = symm_mem.rendezvous(self.buffer, name)
-        self.out = symm_mem.empty(
-            max_tokens * hidden, device=device, dtype=torch.bfloat16
+        self.out, out_handle = _symm(group, max_tokens * hidden, torch.bfloat16, device)
+        self.flags, flags_handle = _symm(
+            group, self.world, torch.uint32, device, flags=True
         )
-        self.out_handle = symm_mem.rendezvous(self.out, name)
-        self.flags = symm_mem.empty(self.world, device=device, dtype=torch.uint32)
-        self.flags.zero_()
-        self.flags_handle = symm_mem.rendezvous(self.flags, name)
-        self.flags_handle.barrier()
         self.state = torch.zeros(1, device=device, dtype=torch.uint32)
         self.row_ptrs, self.out_ptrs, self.flag_ptrs = (
-            torch.tensor(h.buffer_ptrs, device=device, dtype=torch.int64)
-            for h in (self.handle, self.out_handle, self.flags_handle)
+            _ptrs(h, device) for h in (handle, out_handle, flags_handle)
         )
-        self.rank = self.handle.rank
+        self.rank = handle.rank
 
     def barrier(self):
         _peer_barrier[(1,)](
@@ -446,11 +438,7 @@ def prepare_prefill_exchange(group, max_tokens, top_k, hidden):
     key = (group.device_group.group_name, hidden)
     if key not in _PREFILL_EXCHANGE and group.world_size > 1 and max_tokens > 0:
         _PREFILL_EXCHANGE[key] = PrefillExchange(
-            group,
-            max_tokens,
-            top_k,
-            hidden,
-            torch.device("cuda", torch.cuda.current_device()),
+            group, max_tokens, top_k, hidden, _device()
         )
 
 

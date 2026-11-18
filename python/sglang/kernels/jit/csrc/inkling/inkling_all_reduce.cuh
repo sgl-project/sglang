@@ -550,16 +550,16 @@ void inkling_multimem_one_shot_fused(
   const uint32_t num_blocks = nb_override > 0 ? min(static_cast<uint32_t>(nb_override), cap)
                                               : min(work_num_blocks<DType, kNumGPU>(n, block_size), cap);
   const auto stream = LaunchKernel::resolve_device(device);
-  LaunchKernel(num_blocks, block_size, stream)
-      .enable_pdl(true)(
-          kernel,
-          reinterpret_cast<DType*>(multicast_ptr),
-          reinterpret_cast<DType*>(local_buffer.data_ptr()),
-          reinterpret_cast<void* const*>(flag_ptrs_dev),
-          reinterpret_cast<uint32_t*>(state_ptr),
-          shared_ptr,
-          static_cast<uint32_t>(rank),
-          n);
+  auto launch = LaunchKernel(num_blocks, block_size, stream);
+  launch.enable_pdl(true)(
+      kernel,
+      reinterpret_cast<DType*>(multicast_ptr),
+      reinterpret_cast<DType*>(local_buffer.data_ptr()),
+      reinterpret_cast<void* const*>(flag_ptrs_dev),
+      reinterpret_cast<uint32_t*>(state_ptr),
+      shared_ptr,
+      static_cast<uint32_t>(rank),
+      n);
 }
 
 template <typename DType, uint32_t kNumGPU>
@@ -645,17 +645,17 @@ void inkling_multimem_full_oneshot(
   const uint32_t num_blocks = nb_override > 0 ? min(static_cast<uint32_t>(nb_override), cap)
                                               : min(full_range_num_blocks<DType>(n, block_size), cap);
   const auto stream = LaunchKernel::resolve_device(device);
-  LaunchKernel(num_blocks, block_size, stream)
-      .enable_pdl(true)(
-          kernel,
-          reinterpret_cast<DType*>(multicast_ptr),
-          reinterpret_cast<DType*>(in_buffer.data_ptr()),
-          reinterpret_cast<DType*>(out_buffer.data_ptr()),
-          reinterpret_cast<void* const*>(flag_ptrs_dev),
-          reinterpret_cast<uint32_t*>(state_ptr),
-          shared_ptr,
-          static_cast<uint32_t>(rank),
-          n);
+  auto launch = LaunchKernel(num_blocks, block_size, stream);
+  launch.enable_pdl(true)(
+      kernel,
+      reinterpret_cast<DType*>(multicast_ptr),
+      reinterpret_cast<DType*>(in_buffer.data_ptr()),
+      reinterpret_cast<DType*>(out_buffer.data_ptr()),
+      reinterpret_cast<void* const*>(flag_ptrs_dev),
+      reinterpret_cast<uint32_t*>(state_ptr),
+      shared_ptr,
+      static_cast<uint32_t>(rank),
+      n);
 }
 
 }  // namespace sglang
