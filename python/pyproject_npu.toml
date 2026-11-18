@@ -71,8 +71,10 @@ dependencies = [
   "transformers==5.19.0",
   "uvicorn",
   "uvloop",
+  "watchfiles",
   "xxhash",
   "xgrammar==0.2.7",
+  "zstandard",
 ]
 
 [project.optional-dependencies]

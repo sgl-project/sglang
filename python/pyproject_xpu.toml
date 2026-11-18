@@ -77,6 +77,8 @@ dependencies = [
   "uvicorn",
   "xxhash",
   "uvloop",
+  "watchfiles",
+  "zstandard",
   # "xgrammar==0.2.7", xgrammar depends on CUDA PyTorch and Triton only
 ]
 
