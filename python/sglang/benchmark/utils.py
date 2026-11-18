@@ -4,6 +4,7 @@ import resource
 from json import JSONDecodeError
 from typing import Dict, List, Optional, Union
 
+import pybase64
 import requests
 from tqdm.asyncio import tqdm
 from transformers import (
@@ -157,3 +158,8 @@ def set_ulimit(target_soft_limit=65535):
             resource.setrlimit(resource_type, (target_soft_limit, current_hard))
         except ValueError as e:
             print(f"Fail to set RLIMIT_NOFILE: {e}")
+
+
+def encode_image_to_base64(image_path):
+    with open(image_path, "rb") as image_file:
+        return pybase64.b64encode(image_file.read()).decode("utf-8")
