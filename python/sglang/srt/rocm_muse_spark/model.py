@@ -87,7 +87,10 @@ from sglang.srt.rocm_muse_spark import (
     mxfp4_moe,
     router_pooler,
 )
-from sglang.srt.rocm_muse_spark.all_reduce_boundary import AllReduceAttnBoundary
+from sglang.srt.rocm_muse_spark.all_reduce_boundary import (
+    AllReduceAttnBoundary,
+    ar_boundary_modes,
+)
 from sglang.srt.rocm_muse_spark.attention_kv_write import (
     FUSED_QKV_CACHE,
     QK_ROPE_CACHE,
@@ -428,8 +431,6 @@ _DENSE_TILED = envs.SGLANG_ROCM_MUSE_DENSE_TILED.get()
 _DRAFT_TRITON_A16W16_GEMMS = ((24, 7168, 8192), (24, 8192, 3584))
 # Unpooler GEMM fused with the next FFN boundary's norms at decode / verify widths.
 _FUSED_UNPOOL_BOUNDARY = envs.SGLANG_ROCM_MUSE_FUSED_UNPOOL_BOUNDARY.get()
-# The attention O projection's all-reduce inside the attention boundary kernel (gfx1250, BF16 dense weights).
-_AR_BOUNDARY = envs.SGLANG_ROCM_MUSE_AR_BOUNDARY.get() and not _DENSE_FP8
 # Device memory left for the KV pool, CUDA graphs and activations beside both MXFP4 expert layouts; below it
 # the experts keep only the a4w4 preshuffled copy. Arbitrary, not tuned.
 _A4W4_RESERVE_BYTES = 64 << 30
@@ -1566,8 +1567,12 @@ class MuseSpark1xDecoderLayer(nn.Module):
             self.post_attention_residual_gate,
             self.pre_feedforward_layernorm,
         )
+        # the attention O projection's all-reduce inside the attention boundary kernel (BF16 dense weights)
+        ar_modes = ar_boundary_modes()
         self._attn_ar_boundary = (
-            AllReduceAttnBoundary(self._fused_attn_boundary) if _AR_BOUNDARY else None
+            AllReduceAttnBoundary(self._fused_attn_boundary, ar_modes)
+            if any(ar_modes) and not _DENSE_FP8
+            else None
         )
 
     @staticmethod
@@ -1595,7 +1600,9 @@ class MuseSpark1xDecoderLayer(nn.Module):
         ar_boundary = (
             sp is None
             and self._attn_ar_boundary is not None
-            and self._attn_ar_boundary.applicable(stream)
+            and self._attn_ar_boundary.applicable(
+                stream, forward_batch.forward_mode.is_extend()
+            )
         )
         if sp is not None and not sp.verify and ulysses_prepared(self.self_attn):
             attn_output = ulysses_attention(
@@ -1622,7 +1629,7 @@ class MuseSpark1xDecoderLayer(nn.Module):
                 reduce=False,
                 x_fp8=attn_input_fp8,
             )
-            ffn_input, stream = self._attn_ar_boundary(stream, partial)
+            ffn_input, stream, _ = self._attn_ar_boundary(stream, partial)
         else:
             attn_output = self.self_attn(
                 positions, attn_input, forward_batch, x_fp8=attn_input_fp8

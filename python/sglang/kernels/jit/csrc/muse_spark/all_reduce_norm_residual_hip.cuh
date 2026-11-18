@@ -4,6 +4,7 @@
 //   normed     = bf16(rmsnorm(branch))                              (post-norm, no weight)
 //   new_stream = alpha * stream + beta * normed                     (fp32, per-channel gate)
 //   output     = bf16(rmsnorm(new_stream) * pre_weight)             (pre-norm)
+//   router_out = rmsnorm(new_stream) * pre_weight                   (fp32, optional)
 //
 // The rounding points are those of `_fused_norm_residual_triton_kernel` in
 // rocm_muse_spark/fused_norm_residual.py for this form. The branch is the bf16
@@ -55,6 +56,8 @@ struct MuseArBoundaryParams {
   const void* __restrict__ beta;
   void* __restrict__ output;
   void* __restrict__ new_stream;
+  /// fp32 copy of `output` before its bf16 rounding (the router's input), or null.
+  void* __restrict__ router_out;
   uint32_t num_rows;
   uint32_t row_vecs;
   uint32_t rows_per_rank;
@@ -163,14 +166,20 @@ struct MuseBoundaryRow {
       const auto v = threadIdx.x + k * kBlockSize;
       if (!valid(k, row_vecs)) continue;
       vec_t w, y;
+      f32_vec_t yf[2];
       w.load(params.pre_weight, v);
 #pragma unroll
       for (uint32_t j = 0; j < 4; ++j) {
         const auto& s = ops.stream[k][j / 2][j % 2];
         const auto wf = cast<fp32x2_t>(w[j]);
-        y[j] = cast<bf16x2_t>(fp32x2_t{s.x * pre_rstd * wf.x, s.y * pre_rstd * wf.y});
+        yf[j / 2][j % 2] = fp32x2_t{s.x * pre_rstd * wf.x, s.y * pre_rstd * wf.y};
+        y[j] = cast<bf16x2_t>(yf[j / 2][j % 2]);
       }
       y.store(params.output, base + v);
+      if (params.router_out != nullptr) {
+        yf[0].store(params.router_out, (base + v) * 2);
+        yf[1].store(params.router_out, (base + v) * 2 + 1);
+      }
     }
     // the smem partials are reused by the next row's reductions
     __syncthreads();
@@ -766,6 +775,7 @@ muse_all_reduce_norm_residual_2shot_push_factored_kernel(
 #pragma unroll
       for (uint32_t h = 0; h < 2; ++h) {
         auto& s = q.st[u][h];
+        f32_vec_t yf;
 #pragma unroll
         for (uint32_t k = 0; k < 2; ++k) {
           const auto& alpha = q.al[u][h][k];
@@ -774,9 +784,11 @@ muse_all_reduce_norm_residual_2shot_push_factored_kernel(
           const auto normed = cast<fp32x2_t>(cast<bf16x2_t>(fp32x2_t{b.x * post_rstd, b.y * post_rstd}));
           s[k] = fp32x2_t{alpha.x * s[k].x + beta.x * normed.x, alpha.y * s[k].y + beta.y * normed.y};
           const auto wf = cast<fp32x2_t>(q.w[u][h * 2 + k]);
-          y[h * 2 + k] = cast<bf16x2_t>(fp32x2_t{s[k].x * pre_rstd * wf.x, s[k].y * pre_rstd * wf.y});
+          yf[k] = fp32x2_t{s[k].x * pre_rstd * wf.x, s[k].y * pre_rstd * wf.y};
+          y[h * 2 + k] = cast<bf16x2_t>(yf[k]);
         }
         s.store(params.new_stream, (row_base + vu) * 2 + h);
+        if (params.router_out != nullptr) yf.store(params.router_out, (row_base + vu) * 2 + h);
       }
       y.store(params.output, row_base + vu);
     }
@@ -822,6 +834,7 @@ struct MuseAllReduceNormResidualKernel {
       const tvm::ffi::TensorView beta,
       const tvm::ffi::TensorView out,
       const tvm::ffi::TensorView new_stream,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> router_out,
       const double post_eps,
       const double pre_eps) {
     using namespace host;
@@ -840,6 +853,13 @@ struct MuseAllReduceNormResidualKernel {
     }
     for (const auto& t : {in, stream, pre_weight, alpha, beta, out, new_stream}) {
       CHECK_HOST(t.IsContiguous() && reinterpret_cast<intptr_t>(t.data_ptr()) % 16 == 0);
+    }
+    void* router_ptr = nullptr;
+    if (router_out.has_value()) {
+      const auto& t = router_out.value();
+      CHECK_HOST(t.ndim() == 2 && t.size(0) == num_rows && t.size(1) == hidden && t.IsContiguous());
+      CHECK_HOST(is_type<fp32_t>(t.dtype()) && reinterpret_cast<intptr_t>(t.data_ptr()) % 16 == 0);
+      router_ptr = t.data_ptr();
     }
     CHECK_HOST(hidden % kVecElems == 0 && hidden / kVecElems <= kBlockSize * kMaxVecs) << hidden;
     CHECK_HOST(num_rows > 0 && num_rows * hidden <= INT32_MAX) << num_rows;
@@ -863,6 +883,7 @@ struct MuseAllReduceNormResidualKernel {
         .beta = beta.data_ptr(),
         .output = out.data_ptr(),
         .new_stream = new_stream.data_ptr(),
+        .router_out = router_ptr,
         .num_rows = rows,
         .row_vecs = row_vecs,
         .rows_per_rank = rows_per_rank,

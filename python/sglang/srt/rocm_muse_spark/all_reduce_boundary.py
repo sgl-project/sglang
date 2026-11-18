@@ -1,4 +1,5 @@
-"""The attention O projection's TP all-reduce fused into the attention boundary (gfx1250, ``SGLANG_ROCM_MUSE_AR_BOUNDARY``).
+"""The attention O projection's TP all-reduce fused into the attention boundary (gfx1250,
+``--enable-aiter-allreduce-fusion`` or ``SGLANG_ROCM_MUSE_AR_BOUNDARY``).
 
 ``muse_spark/all_reduce_norm_residual_hip.cuh`` runs a row-owned 2shot_push on the carv2 push plane and the
 boundary of ``FusedPostNormResidualPreNorm`` on the reduced row: weight-free post-norm, per-channel gated
@@ -8,7 +9,6 @@ branch is bitwise that all-reduce's; the norms round where the Triton boundary k
 
 from __future__ import annotations
 
-import logging
 import os
 from typing import TYPE_CHECKING
 
@@ -33,31 +33,58 @@ if TYPE_CHECKING:
 # one 256-thread block holds a row, 4 bf16 vectors per thread
 _MAX_HIDDEN = 256 * 4 * 8
 
-logger = logging.getLogger(__name__)
-_LOG_DECISIONS = os.environ.get("SGLANG_ROCM_MUSE_AR_BOUNDARY_LOG", "0") == "1"
 # vec: per-vector exchange; unrolled: from kTwoShotPushUnrolledMinBytes the plain unrolled 2shot_push's
 # exchange; factored: segment sums travel with the reduced rows, elementwise boundary on every rank
 _KERNEL_MODES = {"vec": 0, "unrolled": 1, "factored": 2}
-_MODE = _KERNEL_MODES[os.environ.get("SGLANG_ROCM_MUSE_AR_BOUNDARY_KERNEL", "vec")]
-_logged: set = set()
-
-
-def _log_once(key, msg: str) -> None:
-    if _LOG_DECISIONS and key not in _logged:
-        _logged.add(key)
-        logger.warning("AR boundary: %s", msg)
+_MODE = _KERNEL_MODES[os.environ.get("SGLANG_ROCM_MUSE_AR_BOUNDARY_KERNEL", "factored")]
 
 
 @cache_once
 def _jit_module(world_size: int) -> Module:
     args = make_cpp_args(world_size, is_arch_support_pdl(), _MODE)
-    _log_once("jit", f"kernel mode={_MODE}")
     return load_jit(
         "muse_all_reduce_norm_residual_hip",
         *args,
         cuda_files=["muse_spark/all_reduce_norm_residual_hip.cuh"],
         cuda_wrappers=[("run", f"MuseAllReduceNormResidualKernel<{args}>::run")],
     )
+
+
+def ar_boundary_modes() -> tuple[bool, bool]:
+    """(decode, prefill): whether those batches take the kernel. ``SGLANG_ROCM_MUSE_AR_BOUNDARY`` turns on
+    both, as does ``--enable-aiter-allreduce-fusion`` less its ``--disable-aiter-allreduce-fusion-in-*``."""
+    from sglang.srt.environ import envs
+    from sglang.srt.runtime_context import get_exec
+
+    if envs.SGLANG_ROCM_MUSE_AR_BOUNDARY.get():
+        return True, True
+    comm = get_exec().comm
+    if not comm.enable_aiter_allreduce_fusion:
+        return False, False
+    return (
+        not comm.disable_aiter_allreduce_fusion_in_decode,
+        not comm.disable_aiter_allreduce_fusion_in_prefill,
+    )
+
+
+def _ensure_comm() -> None:
+    """The kernel's push plane, set once on the TP group: its carv2 custom all-reduce when it has one, else a
+    push-only carv2 instance of the kernel's own, made collectively (every TP rank builds the same layers).
+    The plain all-reduces keep whatever backend the group has; graph capture enters an own instance's
+    context through ``GroupCoordinator.graph_capture``."""
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+        CustomAllReduceV2,
+    )
+
+    tp = get_parallel().tp_group
+    if tp.world_size < 2 or hasattr(tp, "ar_boundary_comm"):
+        return
+    ca_comm = tp.ca_comm
+    if isinstance(ca_comm, CustomAllReduceV2) and not ca_comm.disabled:
+        tp.ar_boundary_comm = ca_comm
+        return
+    comm = CustomAllReduceV2(tp.cpu_group, tp.device, max_pull_size=0)
+    tp.ar_boundary_comm = None if comm.disabled else comm
 
 
 def _factored_layout(hidden: int, world_size: int) -> tuple[int, int] | None:
@@ -94,15 +121,20 @@ class AllReduceAttnBoundary:
     ``applicable`` must hold for the batch, and the caller must skip its own all-reduce.
     """
 
-    def __init__(self, boundary: FusedPostNormResidualPreNorm):
+    def __init__(
+        self, boundary: FusedPostNormResidualPreNorm, modes: tuple[bool, bool]
+    ):
         self._boundary = boundary
+        self._decode, self._prefill = modes
         self._form_supported = is_gfx1250_supported() and _boundary_form_supported(
             boundary
         )
         self._applies: dict[tuple[int, bool], bool] = {}
+        if self._form_supported:
+            _ensure_comm()
 
     def _comm(self):
-        return get_parallel().tp_group.ca_comm
+        return getattr(get_parallel().tp_group, "ar_boundary_comm", None)
 
     def _decide(self, comm, num_rows: int) -> bool:
         from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
@@ -134,12 +166,12 @@ class AllReduceAttnBoundary:
         sums = 16 * layout[0] * layout[1] if layout else 0
         return 2 * hidden * 2 + sums
 
-    def applicable(self, stream: torch.Tensor) -> bool:
+    def applicable(self, stream: torch.Tensor, is_extend: bool) -> bool:
+        if not (self._prefill if is_extend else self._decode):
+            return False
         if not self._form_supported:
-            _log_once("form", "off: boundary form or arch not supported")
             return False
         if stream.dtype != torch.float32 or not stream.is_contiguous():
-            _log_once(("stream", stream.dtype), f"off: stream {stream.dtype}")
             return False
         num_rows = stream.shape[0]
         if num_rows == 0:
@@ -150,28 +182,29 @@ class AllReduceAttnBoundary:
 
         comm = self._comm()
         if not isinstance(comm, CustomAllReduceV2) or comm.disabled:
-            _log_once("comm", f"off: tp ca_comm is {type(comm).__name__}")
             return False
         # capture and eager read different heuristics of the comm's config
         key = (num_rows, comm._can_use_graph())
         applies = self._applies.get(key)
         if applies is None:
             applies = self._applies[key] = self._decide(comm, num_rows)
-            _log_once(
-                key,
-                f"rows={num_rows} graph={key[1]} {'FUSED' if applies else 'plain'}",
-            )
         return applies
 
     def __call__(
-        self, stream: torch.Tensor, partial: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """(pre-norm output in bf16, new fp32 stream) of the boundary on ``all_reduce(partial)``."""
+        self,
+        stream: torch.Tensor,
+        partial: torch.Tensor,
+        router_dtype: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """(pre-norm output in bf16, new fp32 stream, the pre-norm output in fp32 when ``router_dtype`` is
+        fp32) of the boundary on ``all_reduce(partial)``."""
+        assert router_dtype in (None, torch.float32), router_dtype
         boundary = self._boundary
         boundary._ensure_cached_weights(torch.bfloat16)
         comm = self._comm()
         output = torch.empty_like(partial)
         new_stream = torch.empty_like(stream)
+        router_out = None if router_dtype is None else torch.empty_like(stream)
         _jit_module(comm.world_size).run(
             comm.obj,
             partial.contiguous(),
@@ -181,7 +214,8 @@ class AllReduceAttnBoundary:
             boundary._cc_beta,
             output,
             new_stream,
+            router_out,
             float(boundary._post_norm.eps),
             float(boundary._pre_norm.eps),
         )
-        return output, new_stream
+        return output, new_stream, router_out

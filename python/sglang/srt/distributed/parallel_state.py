@@ -649,6 +649,14 @@ class GroupCoordinator:
         # is already collected in init() and we can capture the quick allreduce directly.
         ca_comm = self.ca_comm
         maybe_ca_context = nullcontext() if ca_comm is None else ca_comm.capture()
+        # Muse Spark's AR-boundary kernel has a push plane of its own when the group's custom all-reduce is
+        # not carv2 (rocm_muse_spark/all_reduce_boundary.py)
+        ar_boundary_comm = getattr(self, "ar_boundary_comm", None)
+        maybe_ar_boundary_context = (
+            nullcontext()
+            if ar_boundary_comm is None or ar_boundary_comm is ca_comm
+            else ar_boundary_comm.capture()
+        )
 
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream
@@ -656,7 +664,11 @@ class GroupCoordinator:
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
-        with self.device_module.stream(stream), maybe_ca_context:
+        with (
+            self.device_module.stream(stream),
+            maybe_ca_context,
+            maybe_ar_boundary_context,
+        ):
             # In graph mode, we have to be very careful about the collective
             # operations. The current status is:
             #     allreduce \ Mode   |  Eager  |  Graph  |
@@ -2122,6 +2134,7 @@ class GroupCoordinator:
         # Also before destroy_process_group(): the symmetric workspace is released
         # collectively on cpu_group, after the custom all-reduce drops its views.
         self.ca_comm = None
+        self.ar_boundary_comm = None
         if self.cpu_group is not None:
             from sglang.srt.distributed.device_communicators.symm_workspace import (
                 close_group_symm_workspaces,
