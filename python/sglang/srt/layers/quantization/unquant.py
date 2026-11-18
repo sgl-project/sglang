@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import collections
 import logging
+import time
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, Iterable, List, Optional
 
@@ -703,6 +704,47 @@ def bf16_gemm_dispatch(
     x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
     return _bf16_gemm_dispatch_impl(x, weight, bias)
+
+
+def warmup_bf16_gemms(model: torch.nn.Module, max_m: int) -> None:
+    from sglang.srt.layers.linear import LinearBase
+
+    weights = {}
+    for module in model.modules():
+        if not isinstance(module, LinearBase) or not isinstance(
+            module.quant_method, UnquantizedLinearMethod
+        ):
+            continue
+        w = module.weight
+        if w.dim() == 2 and w.dtype == torch.bfloat16:
+            weights.setdefault((tuple(w.shape), w.stride()), w)
+    ms = set()
+    p = 1
+    while p <= max_m:
+        # cuBLASLt picks kernels per M, including by M alignment.
+        ms.update((p, p + 1, p * 3 // 2, p * 3 // 2 + 7))
+        p *= 2
+    ms = sorted(m for m in ms if m <= max_m)
+    tic = time.perf_counter()
+    with torch.inference_mode():
+        for w in weights.values():
+            n, k = w.shape
+            x = torch.zeros((max_m, k), dtype=torch.bfloat16, device=w.device)
+            for m in ms:
+                _bf16_gemm_dispatch_impl(x[:m], w, None)
+                _bf16_gemm_dispatch_impl(
+                    x[:m],
+                    w,
+                    None,
+                    addend=torch.zeros((m, n), dtype=w.dtype, device=w.device),
+                )
+            del x
+        torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    logger.info(
+        f"bf16 GEMM warmup: {len(weights)} weight shapes x {len(ms)} M values "
+        f"(max {max_m}) in {time.perf_counter() - tic:.1f}s"
+    )
 
 
 def _can_accumulate_into_addend(

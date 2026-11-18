@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
 )
 
-register_npu_ci(est_time=600, suite="nightly-4-npu-a3", nightly=True)
+register_npu_ci(est_time=600, suite="nightly-test-4-npu-a3", nightly=True)
 
 load_balance_method_options = [
     "auto",
