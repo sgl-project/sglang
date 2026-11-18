@@ -1,3 +1,4 @@
+import importlib.util
 import unittest
 from pathlib import Path
 
@@ -19,8 +20,7 @@ register_npu_ci(
     nightly=True,
 )
 
-# MOONCAKE_INSTALLED = importlib.util.find_spec("mooncake") is not None
-MOONCAKE_INSTALLED = False
+MOONCAKE_INSTALLED = importlib.util.find_spec("mooncake") is not None
 DISAGGREGATION_TRANSFER_BACKEND = "mooncake" if MOONCAKE_INSTALLED else "ascend"
 
 # Mooncake + TENT + MemFabric, only used when the Mooncake package is present.
