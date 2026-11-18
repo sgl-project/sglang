@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from sglang.benchmark.serving import (
     RequestFuncInput,
     async_request_openai_chat_completions,
+    async_request_openai_embeddings,
     set_global_args,
     wrap_multi_turn_request_func,
 )
@@ -45,6 +46,11 @@ class _ChatHandler(BaseHTTPRequestHandler):
             choice = {"index": 0, "message": message, "finish_reason": "length"}
             content_type = "application/json"
             payload = json.dumps({"choices": [choice], "usage": usage}).encode()
+        if self.path == "/v1/embeddings":
+            content_type = "application/json"
+            payload = json.dumps(
+                {"data": [{"index": 0, "embedding": [0.1]}], "usage": usage}
+            ).encode()
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.end_headers()
@@ -76,7 +82,12 @@ class TestBenchServingPromptLen(CustomTestCase):
         )
         request = RequestFuncInput(
             prompt=prompt,
-            api_url=f"http://127.0.0.1:{self.server.server_port}/v1/chat/completions",
+            api_url=f"http://127.0.0.1:{self.server.server_port}/v1/"
+            + (
+                "embeddings"
+                if request_func is async_request_openai_embeddings
+                else "chat/completions"
+            ),
             prompt_len=ROW_PROMPT_LEN,
             output_len=8,
             model="dummy-model",
@@ -89,6 +100,11 @@ class TestBenchServingPromptLen(CustomTestCase):
         for o in outputs:
             self.assertTrue(o.success, o.error)
         return [o.prompt_len for o in outputs]
+
+    def test_embeddings_record_server_prompt_token_usage(self):
+        self.assertEqual(
+            self._run(async_request_openai_embeddings, "hello", [123]), [123]
+        )
 
     def test_single_request(self):
         usage_on = {"stream_options": {"include_usage": True}}
