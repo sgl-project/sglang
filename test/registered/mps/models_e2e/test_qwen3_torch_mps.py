@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_mps_ci(est_time=240, suite="stage-b-e2e-mps")
+register_mps_ci(est_time=240, suite="extra-e2e-test-mps")
 
 MODEL_PATH = os.environ.get("SGLANG_MPS_TEST_MODEL", "Qwen/Qwen3-0.6B")
 

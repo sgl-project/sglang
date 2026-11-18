@@ -102,7 +102,9 @@ You can enable either kernel independently. To also avoid CPU sequence-length mi
 attention-parameter updates in these speculative paths, enable both kernels and set
 `SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0`. Its default is `1`; the two kernel switches
 alone do not disable CPU mirrors. Setting either kernel switch to `0` keeps the existing
-attention path for that worker.
+attention path for that worker. The DeepSeek-V4 NPU attention backend also honors this switch
+for DFlash-family speculative decoding (dFlash/DSpark verify) without the kernel switches
+above, deriving all attention metadata from the device-side `seq_lens` instead.
 
 ## Profiling
 

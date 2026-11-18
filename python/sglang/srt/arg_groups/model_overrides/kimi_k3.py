@@ -52,10 +52,6 @@ def _require_kimi_k3_aiter_gluon_dcp_support() -> None:
 @_register_for("KimiK3ForConditionalGeneration")
 def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
-    if cfg.enable_prefill_cp:
-        raise ValueError(
-            "Kimi-K3 does not support --enable-prefill-cp yet (Kimi-K3.1 does)."
-        )
     if cfg.dcp_size > 1:
         overrides = {}
         if cfg.enable_symm_mem:
@@ -190,11 +186,14 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
             raise ValueError(
                 "Kimi-K3.1 DCP supports only DSPARK and DFLASH speculative decoding."
             )
+        pd_backends = ("mooncake", "mori") if get_platform().is_gfx95 else ("mooncake",)
         if (
             cfg.disaggregation_mode != "null"
-            and cfg.disaggregation_transfer_backend != "mooncake"
+            and cfg.disaggregation_transfer_backend not in pd_backends
         ):
-            raise ValueError("Kimi-K3.1 DCP supports PD only over Mooncake.")
+            raise ValueError(
+                "Kimi-K3.1 DCP supports PD only over Mooncake (or MoRI on gfx950)."
+            )
         if cfg.speculative_algorithm == "DSPARK":
             from sglang.srt.speculative.ragged_verify import (
                 RaggedVerifyMode,
@@ -206,12 +205,17 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
                     "Kimi-K3.1 DCP + DSPARK requires SGLANG_RAGGED_VERIFY_MODE=static."
                 )
         if cfg.speculative_algorithm == "DFLASH":
-            if cfg.speculative_draft_attention_backend not in (None, "cutedsl_mla"):
+            from sglang.srt.speculative.dflash_draft_ring import (
+                dflash_dcp_mla_draft_backend,
+            )
+
+            draft_backend = dflash_dcp_mla_draft_backend()
+            if cfg.speculative_draft_attention_backend not in (None, draft_backend):
                 raise ValueError(
                     "Kimi-K3.1 DCP + DFLASH needs "
-                    "--speculative-draft-attention-backend cutedsl_mla."
+                    f"--speculative-draft-attention-backend {draft_backend}."
                 )
-            overrides["speculative_draft_attention_backend"] = "cutedsl_mla"
+            overrides["speculative_draft_attention_backend"] = draft_backend
         if cfg.speculative_algorithm is not None:
             # NOTE(yhyang201): DCP target verify runs the DSA decode path; each
             # rank attends over its KV shard and the (o, lse) partials are merged.

@@ -138,7 +138,6 @@ RUST_SERVER_HANDLED_ELSEWHERE: Dict[str, str] = {
     "context_length": "Passed as model_config.context_len (_build_server_args).",
     "language_model_only": "Passed as model_config.is_multimodal (_build_server_args).",
     "image_processor_backend": "Selects the HF image processor the Rust resize mirrors (RustMmFamily).",
-    "disable_fast_image_processor": "Selects the HF image processor the Rust resize mirrors (RustMmFamily).",
     "enable_watermark": "Refused in Rust-server mode (check_watermark_server_args).",
     "sidecar": "Run next to each node's first Rust listener (rust_server_sidecar).",
     "SGLANG_LOG_REQUEST_HEADERS": "Passed as RequestLogConfig.headers, request_logger's WHITELISTED_HEADERS (request_log_settings).",
