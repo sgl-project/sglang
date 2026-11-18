@@ -9,9 +9,12 @@ import torch
 from sglang.srt.arg_groups.choices import (
     DFLASH_MLA_ONLY_DRAFT_BACKENDS,
     DRAFT_ATTENTION_BACKEND_CHOICES,
-    DSPARK_ONLY_DRAFT_BACKENDS,
 )
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
+from sglang.srt.layers.attention.attention_registry import (
+    NONCAUSAL_DRAFT_ATTENTION_BACKENDS,
+    NonCausalDraftAttention,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
@@ -25,7 +28,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.utils.aiter import aiter_dspark_draft_reject_reason
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -49,16 +51,17 @@ def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) 
     otherwise the process's prefill backend. Both are resolution's answers, so
     they come from the bags. A backend the draft worker does not support falls
     back to the platform default, with a warning when ``algo_label`` names the
-    caller. A backend in ``DSPARK_ONLY_DRAFT_BACKENDS`` serves a DSpark draft
-    only when named for it, and a named one that cannot run the draft raises.
+    caller. A backend that declared ``NonCausalDraftAttention`` serves a DSpark
+    draft only when named for it, and a named one that cannot run the draft raises.
     """
     # FlashInfer is CUDA-only; fall back to triton on XPU and ROCm.
     platform_fallback = (
         "triton" if (get_platform().is_xpu or torch.version.hip) else "flashinfer"
     )
     draft_backend = get_spec().speculative_draft_attention_backend
-    if draft_backend in DSPARK_ONLY_DRAFT_BACKENDS and _is_dspark():
-        reject_reason = _aiter_dspark_draft_reject_reason()
+    noncausal_draft = NONCAUSAL_DRAFT_ATTENTION_BACKENDS.get(draft_backend)
+    if noncausal_draft is not None and _is_dspark():
+        reject_reason = _dspark_draft_reject_reason(noncausal_draft)
         if reject_reason is not None:
             raise ValueError(
                 f"--speculative-draft-attention-backend {draft_backend} cannot run "
@@ -95,13 +98,15 @@ def _is_dspark() -> bool:
     ).is_dspark()
 
 
-def _aiter_dspark_draft_reject_reason() -> Optional[str]:
+def _dspark_draft_reject_reason(
+    noncausal_draft: NonCausalDraftAttention,
+) -> Optional[str]:
     from sglang.srt.speculative.dspark_components.dspark_config import (
         draft_has_sliding_window,
         draft_is_mla,
     )
 
-    return aiter_dspark_draft_reject_reason(
+    return noncausal_draft.reject_reason(
         draft_is_mla=draft_is_mla(),
         draft_has_sliding_window=draft_has_sliding_window(),
         enable_unified_memory=get_memory().enable_unified_memory,

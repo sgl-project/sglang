@@ -170,10 +170,6 @@ DRAFT_ATTENTION_BACKEND_CHOICES = [
 
 DFLASH_MLA_ONLY_DRAFT_BACKENDS = ("cutedsl_mla", "trtllm_mla")
 
-# Serve a DSpark draft only when --speculative-draft-attention-backend names them
-# (aiter: an MHA draft on gfx950, see aiter_dspark_draft_reject_reason).
-DSPARK_ONLY_DRAFT_BACKENDS = ("aiter",)
-
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
     "ascend",
     "fa3",

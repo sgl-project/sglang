@@ -7,6 +7,8 @@ from unittest.mock import patch
 from sglang.srt.arg_groups.kimi_k3_hook import apply_kimi_k3_spec_backend_defaults
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention import attention_registry
+from sglang.srt.layers.attention.attention_registry import NonCausalDraftAttention
 from sglang.srt.runtime_context import override_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import draft_worker_common
@@ -93,7 +95,7 @@ class TestDraftWorkerAttentionBackend(CustomTestCase):
 
 class TestKimiK3DSparkDraftBackendDefault(CustomTestCase):
     def _declared_draft_backend(
-        self, *, is_gfx950=True, aiter_non_causal=True, **server_args
+        self, *, is_gfx950=True, aiter_non_causal=True, declared=None, **server_args
     ):
         server_args = (
             dict(
@@ -106,10 +108,19 @@ class TestKimiK3DSparkDraftBackendDefault(CustomTestCase):
         )
         args = ServerArgs(model_path="dummy", **server_args)
         with (
-            override_platform(is_gfx950=is_gfx950, is_sm100=False),
+            override_platform(is_sm100=False),
+            patch(
+                "sglang.kernels.arch.current_arch",
+                return_value=SimpleNamespace(
+                    hip=SimpleNamespace(gcn_arch="gfx950" if is_gfx950 else "gfx942")
+                ),
+            ),
             patch(
                 "sglang.srt.utils.aiter.aiter_unified_attention_supports_non_causal",
                 return_value=aiter_non_causal,
+            ),
+            patch.dict(
+                attention_registry.NONCAUSAL_DRAFT_ATTENTION_BACKENDS, declared or {}
             ),
         ):
             apply_kimi_k3_spec_backend_defaults(args)
@@ -132,37 +143,85 @@ class TestKimiK3DSparkDraftBackendDefault(CustomTestCase):
             with self.subTest(**case):
                 self.assertNotEqual(self._declared_draft_backend(**case), "aiter")
 
+    def test_hook_asks_the_declared_capability_not_the_backend_name(self):
+        """The hook defaults the draft to whichever target backend declared
+        NonCausalDraftAttention and passes its checks; one that declared nothing,
+        is not the default here, or rejects the draft keeps the draft unset."""
+        reasons = []
 
-class TestIsGfx950Supported(CustomTestCase):
-    def _probe(self, hip):
-        from sglang.srt.utils import device
+        def declared(*, default_here=True, reject_reason=None):
+            def reject(**needs):
+                reasons.append(needs)
+                return reject_reason
 
-        device.is_gfx950_supported.cache_clear()
-        self.addCleanup(device.is_gfx950_supported.cache_clear)
+            return {
+                "fake_noncausal": NonCausalDraftAttention(
+                    reject_reason=reject,
+                    default_on_this_device=lambda: default_here,
+                )
+            }
+
+        fake_target = dict(
+            prefill_attention_backend="fake_noncausal",
+            decode_attention_backend="fake_noncausal",
+        )
+        self.assertEqual(
+            self._declared_draft_backend(declared=declared(), **fake_target),
+            "fake_noncausal",
+        )
+        self.assertFalse(reasons[-1]["draft_is_mla"])
+        for case in (
+            dict(default_here=False),
+            dict(reject_reason="cannot"),
+        ):
+            with self.subTest(**case):
+                self.assertIsNone(
+                    self._declared_draft_backend(
+                        declared=declared(**case), **fake_target
+                    )
+                )
+        self.assertIsNone(
+            self._declared_draft_backend(
+                prefill_attention_backend="triton", decode_attention_backend="triton"
+            )
+        )
+
+
+class TestAiterDSparkDraftDefault(CustomTestCase):
+    def _default_here(self, hip):
+        from sglang.srt.utils.aiter import aiter_dspark_draft_default_on_this_device
+
         with patch(
             "sglang.kernels.arch.current_arch",
             return_value=SimpleNamespace(hip=hip),
         ):
-            return device.is_gfx950_supported()
+            return aiter_dspark_draft_default_on_this_device()
 
     def test_exact_gfx950_only(self):
-        """The Kimi-K3 aiter draft default is gfx950-only: another gfx95x, gfx942 or
+        """aiter's DSpark draft default is gfx950-only: another gfx95x, gfx942 or
         a non-HIP device must not pass the gate a "gfx95" substring test admits."""
-        self.assertTrue(self._probe(SimpleNamespace(gcn_arch="gfx950")))
+        self.assertTrue(self._default_here(SimpleNamespace(gcn_arch="gfx950")))
         for hip in (
             SimpleNamespace(gcn_arch="gfx951"),
             SimpleNamespace(gcn_arch="gfx942"),
             None,
         ):
             with self.subTest(hip=hip):
-                self.assertFalse(self._probe(hip))
+                self.assertFalse(self._default_here(hip))
 
-    def test_platform_probe_resolves(self):
-        """PlatformContext.is_gfx950 resolves its probe through sglang.srt.utils."""
-        from sglang.srt import utils
-        from sglang.srt.utils import device
+    def test_aiter_declares_the_noncausal_draft_capability(self):
+        """The resolver and the Kimi-K3 hook reach aiter's checks through its
+        registration, not by naming aiter."""
+        from sglang.srt.utils import aiter as aiter_utils
 
-        self.assertIs(utils.is_gfx950_supported, device.is_gfx950_supported)
+        declared = attention_registry.NONCAUSAL_DRAFT_ATTENTION_BACKENDS["aiter"]
+        self.assertIs(
+            declared.reject_reason, aiter_utils.aiter_dspark_draft_reject_reason
+        )
+        self.assertIs(
+            declared.default_on_this_device,
+            aiter_utils.aiter_dspark_draft_default_on_this_device,
+        )
 
 
 if __name__ == "__main__":
