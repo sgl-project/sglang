@@ -555,9 +555,13 @@ def fa4_mask_table(
     """
     kv_len = k_group_ids.numel()
     if key_expanded and group_allowed.shape[0] * kv_len <= MAX_KEY_EXPANDED_TABLE_BYTES:
-        table = group_allowed.to(torch.int8).index_select(1, k_group_ids.long())
-        q_table_base = q_group_ids * kv_len
-        return q_table_base.to(torch.int32).contiguous(), table.reshape(-1)
+        try:
+            table = group_allowed.to(torch.int8).index_select(1, k_group_ids.long())
+        except torch.OutOfMemoryError:
+            pass
+        else:
+            q_table_base = q_group_ids * kv_len
+            return q_table_base.to(torch.int32).contiguous(), table.reshape(-1)
     words, words_per_row = pack_allowed_bits(group_allowed)
     return (q_group_ids * words_per_row).to(torch.int32).contiguous(), words
 

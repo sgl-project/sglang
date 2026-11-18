@@ -695,17 +695,28 @@ class TestBlockSparsity(unittest.TestCase):
             expanded.q_table_base.long()[:, None] + keys[None, :]
         ]
         torch.testing.assert_close(via_bytes.bool(), dense)
-        # A table past the int32 offsets the kernel adds stays packed.
-        with mock.patch(
-            "sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation"
-            ".multiview_attention.MAX_KEY_EXPANDED_TABLE_BYTES",
-            expanded.allowed_table.numel() - 1,
+        # Past int32 offsets or out of device memory, the table stays packed.
+        index_select = torch.Tensor.index_select
+
+        def out_of_memory(table, dim, index):
+            if table.dtype == torch.int8:
+                raise torch.OutOfMemoryError("expanded table")
+            return index_select(table, dim, index)
+
+        for constraint in (
+            mock.patch(
+                "sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation"
+                ".multiview_attention.MAX_KEY_EXPANDED_TABLE_BYTES",
+                expanded.allowed_table.numel() - 1,
+            ),
+            mock.patch.object(torch.Tensor, "index_select", out_of_memory),
         ):
-            fallback = build_multiview_block_sparsity(
-                metadata, q_block_size=4, kv_block_size=4, key_expanded_table=True
-            )
-        self.assertTrue(torch.equal(fallback.allowed_table, sparsity.allowed_table))
-        self.assertTrue(torch.equal(fallback.q_table_base, sparsity.q_table_base))
+            with constraint:
+                fallback = build_multiview_block_sparsity(
+                    metadata, q_block_size=4, kv_block_size=4, key_expanded_table=True
+                )
+            self.assertTrue(torch.equal(fallback.allowed_table, sparsity.allowed_table))
+            self.assertTrue(torch.equal(fallback.q_table_base, sparsity.q_table_base))
 
     def test_block_mask_carries_block_visibility_and_exact_mask_mod(self):
         metadata = self._metadata()
