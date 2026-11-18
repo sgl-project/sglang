@@ -1216,8 +1216,8 @@ class TestPrefillAdder(CustomTestCase):
         """A unified budget has no remaining token count, so preemption asks it
         whether the request fits once victims give back their decode headroom;
         it stops at the first victim that makes room."""
-        low = self.create_mock_req("low", priority=0, max_new_tokens=1000)
-        mid = self.create_mock_req("mid", priority=1, max_new_tokens=1000)
+        low = self.create_mock_req("low", priority=0, max_new_tokens=16)
+        mid = self.create_mock_req("mid", priority=1, max_new_tokens=16)
         adder, running_batch = self._shared_preemption_adder([low, mid])
         new_req = self.create_shared_req("new")
         new_req.priority = 5
@@ -1228,7 +1228,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.preempt_aborted, [])
         running_batch.release_req.assert_called_once()
         running_batch.filter_batch.assert_called_once_with(keep_indices=[1])
-        self.assertEqual(adder.memory_budget.total_offset, 1000)
+        self.assertEqual(adder.memory_budget.total_offset, 16)
 
     def test_unified_preemption_releases_nothing_when_no_set_makes_room(self):
         """When even every preemptible victim leaves the request unadmitted,
