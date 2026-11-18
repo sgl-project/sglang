@@ -84,18 +84,29 @@ class ConfigArgumentMerger:
         config_args = self._convert_config_to_args(config_data)
 
         # Merge config args into CLI args
-        config_index = cli_args.index("--config")
+        config_index = next(
+            i
+            for i, arg in enumerate(cli_args)
+            if arg == "--config" or arg.startswith("--config=")
+        )
 
         # Split arguments around config file
         before_config = cli_args[:config_index]
-        after_config = cli_args[config_index + 2 :]  # Skip --config and file path
+        if cli_args[config_index].startswith("--config="):
+            after_config = cli_args[config_index + 1 :]
+        else:
+            after_config = cli_args[config_index + 2 :]  # Skip --config and file path
 
         # Simple merge: config args + CLI args
         return config_args + before_config + after_config
 
     def _extract_config_file_path(self, args: List[str]) -> str:
         """Extract the config file path from arguments."""
-        config_indices = [i for i, arg in enumerate(args) if arg == "--config"]
+        config_indices = [
+            i
+            for i, arg in enumerate(args)
+            if arg == "--config" or arg.startswith("--config=")
+        ]
 
         if len(config_indices) > 1:
             raise ValueError("Multiple config files specified! Only one allowed.")
@@ -104,6 +115,13 @@ class ConfigArgumentMerger:
             return None
 
         config_index = config_indices[0]
+        config_arg = args[config_index]
+        if config_arg.startswith("--config="):
+            config_path = config_arg.partition("=")[2]
+            if not config_path:
+                raise ValueError("No config file specified after --config flag!")
+            return config_path
+
         if config_index == len(args) - 1:
             raise ValueError("No config file specified after --config flag!")
 

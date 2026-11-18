@@ -590,6 +590,29 @@ class TestPrepareServerArgs(CustomTestCase):
         finally:
             os.unlink(config_file)
 
+    def test_config_equals_syntax_merges_and_allows_cli_override(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write("model-path: dummy\nport: 31000\ntp-size: 2\n")
+            config_file = f.name
+
+        try:
+            args = prepare_server_args([f"--config={config_file}", "--port", "41000"])
+            self.assertEqual(args.model_path, "dummy")
+            self.assertEqual(args.port, 41000)
+            self.assertEqual(args.tp_size, 2)
+
+            parser = server_args_module.argparse.ArgumentParser()
+            ServerArgs.add_cli_args(parser)
+            merger = ConfigArgumentMerger(parser)
+            with self.assertRaisesRegex(ValueError, "No config file specified"):
+                merger.merge_config_with_args(["--config="])
+            with self.assertRaisesRegex(ValueError, "Multiple config files specified"):
+                merger.merge_config_with_args(
+                    [f"--config={config_file}", "--config", config_file]
+                )
+        finally:
+            os.unlink(config_file)
+
 
 class TestMmEncoderDataParallelLogging(CustomTestCase):
     def test_logs_when_encoder_dp_has_no_parallelism(self):

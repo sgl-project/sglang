@@ -666,7 +666,7 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     ServerArgs.add_cli_args(parser)
 
     # Check for config file and merge arguments if present
-    if "--config" in argv:
+    if any(arg == "--config" or arg.startswith("--config=") for arg in argv):
         # Import here to avoid circular imports
         from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
 
