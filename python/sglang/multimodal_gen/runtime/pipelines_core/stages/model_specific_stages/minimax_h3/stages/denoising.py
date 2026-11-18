@@ -148,16 +148,16 @@ def _image_rollout(
     )
 
     request_generator = batch.extra[MINIMAX_H3_IMAGE_NOISE_EXTRA_KEY].generator
-    # The request's next draw: a generator seeded like the request's would
-    # repeat the initial noise as the first noisy step's noise.
+    # The request generator's next draw, not the request seed:
+    # that seed's first draw is the initial noise.
     step_noise_seed = torch.randint(
         2**63 - 1,
         (1,),
         generator=request_generator,
         device=request_generator.device,
     )
-    return MiniMaxH3ImageRollout(
-        batch=batch,
+    return MiniMaxH3ImageRollout.for_request(
+        batch,
         sigmas=[float(sigma) for sigma in batch.sigmas],
         generator=torch.Generator(device=device).manual_seed(int(step_noise_seed)),
         pos_cond_kwargs={

@@ -29,7 +29,7 @@ def _effective_sde_type(batch, loop_step_index: int) -> str:
     return sde_type
 
 
-def minimax_h3_rollout_step_is_noisy(batch, loop_step_index: int) -> bool:
+def _step_is_noisy(batch, loop_step_index: int) -> bool:
     """Whether the rollout draws transition noise on this loop step."""
     return (
         _effective_sde_type(batch, loop_step_index) != "ode"
@@ -57,7 +57,7 @@ def minimax_h3_rollout_update_video_target(
     noise_level = float(getattr(batch, "rollout_noise_level", 0.0))
     log_prob_no_const = bool(getattr(batch, "rollout_log_prob_no_const", False))
 
-    if not minimax_h3_rollout_step_is_noisy(batch, loop_step_index):
+    if not _step_is_noisy(batch, loop_step_index):
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
             _minimax_h3_update_target_rows_,
         )
@@ -81,20 +81,24 @@ def minimax_h3_rollout_update_video_target(
         log_prob_count = out.new_tensor([elem_count])
         return out, log_prob_sum, log_prob_count, noise_buffer
 
-    prev_sample, _, _, log_prob_sum, log_prob_count, noise_buffer = (
-        minimax_h3_rollout_noisy_transition(
-            video_target,
-            velocity,
-            sde_type=sde_type,
-            noise_level=noise_level,
-            sigma_curr=sigma_curr,
-            sigma_next=sigma_next,
-            sigma_max=float(getattr(batch, "_h3_rollout_sigma_max", 1.0)),
-            log_prob_no_const=log_prob_no_const,
-            generator=generator,
-            noise_buffer=noise_buffer,
-        )
+    prev_sample, _, _, variance_noise, log_prob_sum, log_prob_count = _noisy_transition(
+        video_target,
+        velocity,
+        sde_type=sde_type,
+        noise_level=noise_level,
+        sigma_curr=sigma_curr,
+        sigma_next=sigma_next,
+        sigma_max=float(getattr(batch, "_h3_rollout_sigma_max", 1.0)),
+        log_prob_no_const=log_prob_no_const,
+        generator=generator,
     )
+    if (
+        noise_buffer is None
+        or noise_buffer.shape != variance_noise.shape
+        or noise_buffer.device != variance_noise.device
+    ):
+        noise_buffer = torch.empty_like(variance_noise)
+    noise_buffer.copy_(variance_noise)
     return (
         prev_sample.to(dtype=video_target.dtype),
         log_prob_sum,
@@ -103,7 +107,7 @@ def minimax_h3_rollout_update_video_target(
     )
 
 
-def minimax_h3_rollout_noisy_transition(
+def _noisy_transition(
     target: torch.Tensor,
     velocity: torch.Tensor,
     *,
@@ -114,14 +118,14 @@ def minimax_h3_rollout_noisy_transition(
     sigma_max: float,
     log_prob_no_const: bool,
     generator: torch.Generator,
-    noise_buffer: torch.Tensor | None,
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
     """One cps or flow-sde step of target rows, in fp32.
 
-    Returns ``(next_target, mean, noise_std, log_prob_sum[B=1], log_prob_count[B=1],
-    noise_buffer)``; ``noise_buffer`` holds the unit noise the step drew.
+    Returns ``(next_target, prev_sample_mean, noise_std_dev, variance_noise,
+    log_prob_sum[B=1], log_prob_count[B=1])``, with
+    ``next_target = prev_sample_mean + variance_noise * noise_std_dev``.
     ``sigma_max`` stands in for sigma == 1 in flow-sde's std.
     """
     model_output = (-velocity).float()
@@ -129,19 +133,12 @@ def minimax_h3_rollout_noisy_transition(
     current_sigma = sample.new_tensor(float(sigma_curr))
     next_sigma = sample.new_tensor(float(sigma_next))
 
-    if (
-        noise_buffer is None
-        or noise_buffer.shape != sample.shape
-        or noise_buffer.device != sample.device
-    ):
-        noise_buffer = torch.empty_like(sample)
     variance_noise = torch.randn(
         sample.shape,
         generator=generator,
         device=sample.device,
         dtype=torch.float32,
     )
-    noise_buffer.copy_(variance_noise)
 
     if sde_type == "cps":
         std_dev_t = next_sigma * math.sin(noise_level * math.pi / 2)
@@ -198,9 +195,9 @@ def minimax_h3_rollout_noisy_transition(
         prev_sample,
         prev_mean,
         noise_std_dev,
+        variance_noise,
         log_prob_sum,
         log_prob_count,
-        noise_buffer,
     )
 
 
@@ -294,18 +291,24 @@ class MiniMaxH3ImageRollout:
     def __init__(
         self,
         *,
-        batch,
         sigmas: list[float],
+        noisy_steps: frozenset[int],
+        sde_type: str,
+        noise_level: float,
+        log_prob_no_const: bool,
+        debug_mode: bool,
+        return_step_indices: list[int] | None,
         generator: torch.Generator,
         pos_cond_kwargs: dict[str, Any],
     ) -> None:
-        self._batch = batch
         self._sigmas = sigmas
         # FlowGRPO's sigma_max, as FlowRolloutController takes it: the grid's second sigma.
         self._sigma_max = sigmas[min(1, len(sigmas) - 1)]
+        self._noisy_steps = noisy_steps
+        self._sde_type = sde_type
+        self._noise_level = noise_level
+        self._log_prob_no_const = log_prob_no_const
         self._generator = generator
-        self._noise_buffer: torch.Tensor | None = None
-        return_step_indices = batch.rollout_return_step_indices
         self._collector = MiniMaxH3RolloutCollector(
             sigmas_video=sigmas,
             return_step_indices=(
@@ -313,47 +316,70 @@ class MiniMaxH3ImageRollout:
             ),
             pos_cond_kwargs=pos_cond_kwargs,
         )
-        # Per step: unit noise, transition mean, noise std, model output (noise - clean).
-        self._debug_steps: list[tuple[torch.Tensor, ...]] | None = (
-            [] if batch.rollout_debug_mode else None
+        # Per step: variance noise, prev sample mean, noise std dev, model output.
+        # Every step is kept, whichever latents the request asks back.
+        self._debug_tensors_by_step: list[tuple[torch.Tensor, ...]] | None = (
+            [] if debug_mode else None
+        )
+
+    @classmethod
+    def for_request(
+        cls,
+        batch,
+        *,
+        sigmas: list[float],
+        generator: torch.Generator,
+        pos_cond_kwargs: dict[str, Any],
+    ) -> MiniMaxH3ImageRollout:
+        return cls(
+            sigmas=sigmas,
+            noisy_steps=frozenset(
+                step for step in range(len(sigmas) - 1) if _step_is_noisy(batch, step)
+            ),
+            sde_type=batch.rollout_sde_type,
+            noise_level=batch.rollout_noise_level,
+            log_prob_no_const=batch.rollout_log_prob_no_const,
+            debug_mode=batch.rollout_debug_mode,
+            return_step_indices=batch.rollout_return_step_indices,
+            generator=generator,
+            pos_cond_kwargs=pos_cond_kwargs,
         )
 
     def record_initial(self, target_rows: torch.Tensor) -> None:
         self._collector.record_initial(target_rows)
 
     def step_is_noisy(self, step: int) -> bool:
-        return minimax_h3_rollout_step_is_noisy(self._batch, step)
+        return step in self._noisy_steps
 
-    def noisy_step(
+    def take_noisy_step(
         self, target_rows: torch.Tensor, velocity: torch.Tensor, *, step: int
     ) -> torch.Tensor:
-        """The rows after the step's cps or flow-sde transition; records the step."""
+        """Record the step's cps or flow-sde transition and return the rows after it."""
         (
             next_rows,
-            mean,
-            noise_std,
+            prev_sample_mean,
+            noise_std_dev,
+            variance_noise,
             log_prob_sum,
             _,
-            self._noise_buffer,
-        ) = minimax_h3_rollout_noisy_transition(
+        ) = _noisy_transition(
             target_rows,
             velocity,
-            sde_type=self._batch.rollout_sde_type,
-            noise_level=self._batch.rollout_noise_level,
+            sde_type=self._sde_type,
+            noise_level=self._noise_level,
             sigma_curr=self._sigmas[step],
             sigma_next=self._sigmas[step + 1],
             sigma_max=self._sigma_max,
-            log_prob_no_const=self._batch.rollout_log_prob_no_const,
+            log_prob_no_const=self._log_prob_no_const,
             generator=self._generator,
-            noise_buffer=self._noise_buffer,
         )
         self._record_step(
             next_rows,
             velocity,
             log_prob_sum=log_prob_sum,
-            unit_noise=self._noise_buffer,
-            mean=mean,
-            noise_std=noise_std,
+            variance_noise=variance_noise,
+            prev_sample_mean=prev_sample_mean,
+            noise_std_dev=noise_std_dev,
         )
         return next_rows
 
@@ -365,9 +391,9 @@ class MiniMaxH3ImageRollout:
             next_rows,
             velocity,
             log_prob_sum=torch.zeros(1, dtype=torch.float32),
-            unit_noise=torch.zeros_like(next_rows),
-            mean=next_rows,
-            noise_std=torch.zeros((), dtype=torch.float32),
+            variance_noise=torch.zeros_like(next_rows),
+            prev_sample_mean=next_rows,
+            noise_std_dev=torch.zeros((), dtype=torch.float32),
         )
 
     def _record_step(
@@ -376,37 +402,38 @@ class MiniMaxH3ImageRollout:
         velocity: torch.Tensor,
         *,
         log_prob_sum: torch.Tensor,
-        unit_noise: torch.Tensor,
-        mean: torch.Tensor,
-        noise_std: torch.Tensor,
+        variance_noise: torch.Tensor,
+        prev_sample_mean: torch.Tensor,
+        noise_std_dev: torch.Tensor,
     ) -> None:
         self._collector.record_step(
             video_target=next_rows,
             log_prob_sum=log_prob_sum,
             log_prob_count=torch.tensor([float(next_rows.numel())]),
         )
-        if self._debug_steps is not None:
-            self._debug_steps.append(
+        if self._debug_tensors_by_step is not None:
+            self._debug_tensors_by_step.append(
                 (
-                    unit_noise.detach().cpu().clone(),
-                    mean.detach().float().cpu().clone(),
-                    noise_std.detach().float().cpu().reshape(1),
+                    variance_noise.detach().cpu().clone(),
+                    prev_sample_mean.detach().float().cpu().clone(),
+                    noise_std_dev.detach().float().cpu().reshape(1),
+                    # the trainer's convention: noise - clean
                     (-velocity).detach().float().cpu(),
                 )
             )
 
     def build_trajectory_data(self) -> RolloutTrajectoryData:
         trajectory = self._collector.build_trajectory_data()
-        if self._debug_steps is not None:
+        if self._debug_tensors_by_step is not None:
             # [B=1, T, ...], the layout FlowRolloutController returns
-            unit_noises, means, noise_stds, model_outputs = (
+            variance_noises, prev_sample_means, noise_std_devs, model_outputs = (
                 torch.stack(per_step, dim=0).unsqueeze(0)
-                for per_step in zip(*self._debug_steps)
+                for per_step in zip(*self._debug_tensors_by_step)
             )
             trajectory.rollout_debug_tensors = RolloutDebugTensors(
-                rollout_variance_noises=unit_noises,
-                rollout_prev_sample_means=means,
-                rollout_noise_std_devs=noise_stds,
+                rollout_variance_noises=variance_noises,
+                rollout_prev_sample_means=prev_sample_means,
+                rollout_noise_std_devs=noise_std_devs,
                 rollout_model_outputs=model_outputs,
             )
         return trajectory
@@ -416,7 +443,5 @@ __all__ = [
     "MiniMaxH3ImageRollout",
     "MiniMaxH3RolloutCollector",
     "MiniMaxH3RolloutCtx",
-    "minimax_h3_rollout_noisy_transition",
-    "minimax_h3_rollout_step_is_noisy",
     "minimax_h3_rollout_update_video_target",
 ]

@@ -343,18 +343,15 @@ def test_state_dependent_predictions_use_fp32_euler_deltas(dtype):
 _ROLLOUT_SIGMAS = [1.0, 0.9675236940383911, 0.75, 0.23200887441635132, 0.0]
 
 
-def _rollout(*, sde_type, noise_level, sde_step_indices, log_prob_no_const=False):
-    batch = SimpleNamespace(
-        rollout_sde_type=sde_type,
-        rollout_noise_level=noise_level,
-        rollout_sde_step_indices=sde_step_indices,
-        rollout_log_prob_no_const=log_prob_no_const,
-        rollout_return_step_indices=None,
-        rollout_debug_mode=True,
-    )
+def _rollout(*, sde_type, noise_level, noisy_steps, log_prob_no_const=False):
     return MiniMaxH3ImageRollout(
-        batch=batch,
         sigmas=_ROLLOUT_SIGMAS,
+        noisy_steps=frozenset(noisy_steps),
+        sde_type=sde_type,
+        noise_level=noise_level,
+        log_prob_no_const=log_prob_no_const,
+        debug_mode=True,
+        return_step_indices=None,
         generator=torch.Generator().manual_seed(7),
         pos_cond_kwargs={},
     )
@@ -378,7 +375,7 @@ def test_rollout_step_outside_the_noise_window_is_the_serving_step():
         sigmas=_ROLLOUT_SIGMAS,
         initial_video_rows=initial_rows,
     )
-    rollout = _rollout(sde_type="cps", noise_level=0.8, sde_step_indices=[])
+    rollout = _rollout(sde_type="cps", noise_level=0.8, noisy_steps=[])
 
     rolled = _run(
         _state_dependent_model(),
@@ -414,7 +411,7 @@ def test_rollout_noisy_step_is_the_transition_the_trainer_scores(
     rollout = _rollout(
         sde_type=sde_type,
         noise_level=noise_level,
-        sde_step_indices=[0, 2],
+        noisy_steps=[0, 2],
         log_prob_no_const=log_prob_no_const,
     )
     _run(model, _inputs(3, 0.25), sigmas=_ROLLOUT_SIGMAS, rollout=rollout)

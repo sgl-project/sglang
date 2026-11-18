@@ -21,8 +21,9 @@ Draws 1 and 2 depend only on the request geometry, so every rank of a replica
 and every dedup sibling (``n > 1``) performs them with an identical result;
 whichever image stage runs first on a rank caches them in ``batch.extra``
 (visual encoding on the encoding rank, latent preparation elsewhere). Draw 3
-happens only on the encoding rank, which is why it is last: nothing is drawn
-after it, so the other ranks' generators never desynchronise. The
+happens only on the encoding rank, so nothing may follow it: the other ranks'
+generators would desynchronise. A rollout has no references, hence no draws 2
+and 3, which is what lets draw 4 follow draw 1 on every rank. The
 process-global RNG is never touched.
 """
 
@@ -51,7 +52,7 @@ MINIMAX_H3_IMAGE_NOISE_EXTRA_KEY = "minimax_h3_image_noise"
 
 @dataclass(frozen=True)
 class MiniMaxH3ImageNoise:
-    """Draws 1 and 2 of the request, plus the generator positioned for draw 3."""
+    """Draws 1 and 2 of the request, plus the generator positioned for the next draw."""
 
     reference_grids: tuple[tuple[int, int], ...]
     target_rows: torch.Tensor

@@ -802,7 +802,9 @@ def minimax_h3_image_denoise_loop(
             target_rows = video_rows[n_cond:]
             velocity = video[n_cond:].float()
             if rollout is not None and rollout.step_is_noisy(step):
-                target_rows.copy_(rollout.noisy_step(target_rows, velocity, step=step))
+                target_rows.copy_(
+                    rollout.take_noisy_step(target_rows, velocity, step=step)
+                )
             else:
                 target_rows.copy_(target_rows + sigma_deltas[step] * velocity)
                 if rollout is not None:
