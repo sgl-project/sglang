@@ -195,15 +195,6 @@ SGL_DEVICE void wave_sum_dpp(uint32_t (&x)[N]) {
   dpp_add_stage<0x143, 0xc, 0xf>(x);  // row_bcast:31
 }
 
-/// Inclusive prefix OR/AND; lane 63 holds the wave-wide result.
-SGL_DEVICE uint32_t wave_bitor_dpp(uint32_t x) {
-  return radix4_sort::wave_scan_dpp(x, 0u, [](uint32_t a, uint32_t b) { return a | b; });
-}
-
-SGL_DEVICE uint32_t wave_bitand_dpp(uint32_t x) {
-  return radix4_sort::wave_scan_dpp(x, 0xffffffffu, [](uint32_t a, uint32_t b) { return a & b; });
-}
-
 template <int CTRL, int RM, int BM>
 SGL_DEVICE float dpp_fadd_stage(float x) {
   const int moved = __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, x), CTRL, RM, BM, false);
@@ -326,9 +317,12 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
     }
   }
 
-  or_all = radix4::wave_bitor_dpp(or_all);
-  and_all = radix4::wave_bitand_dpp(and_all);
-  if (lane == WAVE - 1) {
+#pragma unroll
+  for (int s = 32; s > 0; s >>= 1) {
+    or_all |= __shfl_xor(or_all, s, WAVE);
+    and_all &= __shfl_xor(and_all, s, WAVE);
+  }
+  if (lane == 0) {
     s_pre[0][wid] = or_all;
     s_pre[1][wid] = and_all;
   }
