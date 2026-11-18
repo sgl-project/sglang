@@ -22,6 +22,8 @@ if TYPE_CHECKING:
 
 def init_draft_backend(backend: TritonAttnBackend, model_runner: ModelRunner) -> None:
     """Configure a ROCm draft worker's Triton backend once its DCP size is final."""
+    from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+
     algorithm = model_runner.spec_algorithm
     # DFLASH / DSPARK draft KV follows --kv-cache-dtype unless
     # --speculative-draft-kv-cache-dtype says otherwise; keep q and the attention
@@ -38,7 +40,9 @@ def init_draft_backend(backend: TritonAttnBackend, model_runner: ModelRunner) ->
         and backend.topk == 1
         and is_gfx95_supported()
         and get_exec().kernel.enable_amd_monokernel
-        and model_runner.model_config.is_dflash_mla_draft
+        and parse_dflash_draft_config(
+            draft_hf_config=model_runner.model_config.hf_config
+        ).is_mla
     ):
         from sglang.kernels.ops.attention.verify_mla_draft import verify_mla_draft_fwd
 
