@@ -109,11 +109,12 @@ def _foundry_env() -> dict:
     if _foundry_pythonpath is None:
         target = tempfile.mkdtemp(prefix="foundry_core_")
         atexit.register(shutil.rmtree, target, ignore_errors=True)
-        subprocess.run(
+        install = subprocess.run(
             [sys.executable, "-m", "pip", "install", "--no-deps", "--target"]
-            + [target, _FOUNDRY_REQUIREMENT],
-            check=True,
+            + [target, _FOUNDRY_REQUIREMENT]
         )
+        if install.returncode != 0:
+            _skip_in_job_log(f"pip could not install {_FOUNDRY_REQUIREMENT}")
         _skip_unless_built_for_this_torch(target)
         _foundry_pythonpath = target
     return {
@@ -132,13 +133,16 @@ def _skip_unless_built_for_this_torch(target: str) -> None:
     runner = torch.__version__.split("+")[0]
     for req in map(Requirement, dist.requires or []):
         if req.name == "torch" and not req.specifier.contains(runner):
-            reason = (
+            _skip_in_job_log(
                 f"foundry-core {dist.version} requires {req}, this runner has "
                 f"torch {runner}"
             )
-            # Visible in the job log, not only in the skip summary.
-            print(f"[Foundry e2e] SKIPPED: {reason}", file=sys.stderr, flush=True)
-            raise unittest.SkipTest(reason)
+
+
+def _skip_in_job_log(reason: str) -> None:
+    # Visible in the job log, not only in the skip summary.
+    print(f"[Foundry e2e] SKIPPED: {reason}", file=sys.stderr, flush=True)
+    raise unittest.SkipTest(reason)
 
 
 def _write_toml(path: str, workspace: str) -> str:
@@ -202,7 +206,8 @@ class TestFoundryGraphPersistence(CustomTestCase):
     # Batched outputs are compared with native unless a subclass opts out;
     # DP attention composes batches per rank, which differs run to run natively.
     compare_batched = True
-    # Native's Prebuilt capture state counts (dispatchers, gatherers); empty = none pending.
+    # SAVE's and LOAD's Prebuilt capture state counts (dispatchers, gatherers);
+    # empty = none pending.
     prebuilt_state = []
     # LOAD upper bounds in CI, seconds, about twice what the H100 runners measure;
     # all graph sets' capture loops (restore + per-shape prep), the scheduler init.
@@ -426,14 +431,14 @@ class TestFoundryGraphPersistence(CustomTestCase):
 
     def test_capture_state_is_built_before_capture(self):
         """Catches the lazy comm state built after the first capture began,
-        or built on one of native / SAVE / LOAD only; one layout's outputs can miss both."""
-        native = _PREBUILT_STATE.findall(self.runs["native"]["log"])
-        # A prebuild moved past the capture finds nothing pending and prints no line.
-        self.assertEqual(native, self.prebuilt_state)
-        for engine in ("native", "save", "load"):
+        or built on one of SAVE / LOAD only; one layout's outputs can miss both."""
+        # Without persistence the first forward builds it, so native prints no line.
+        self.assertEqual(_PREBUILT_STATE.findall(self.runs["native"]["log"]), [])
+        for engine in ("save", "load"):
             log = self.runs[engine]["log"]
             with self.subTest(engine=engine):
-                self.assertEqual(_PREBUILT_STATE.findall(log), native)
+                # A prebuild moved past the capture finds nothing pending and prints no line.
+                self.assertEqual(_PREBUILT_STATE.findall(log), self.prebuilt_state)
                 prebuilt = _PREBUILT_STATE.search(log)
                 if prebuilt is not None:
                     capture = _CAPTURE_BEGIN.search(log)
