@@ -939,6 +939,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "DFlash2 fused selection disabled: the NVIDIA megakernel serves DFLASH."
                 )
             return None
+        if self._acceptance_estimator is not None:
+            # The confidence-scheduled verify scores each draft from the selector's lattice
+            # scores, which the fused kernels never write out.
+            if self._target_tp_rank == 0:
+                logger.warning(
+                    "DFlash2 fused selection disabled: SGLANG_RAGGED_VERIFY_MODE needs the selector scores."
+                )
+            return None
         target_model = self._target_worker.model_runner.model
         draft_config = self.draft_model.draft_config
         fused_select, blocker = build_fused_select(
