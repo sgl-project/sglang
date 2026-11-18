@@ -5,6 +5,9 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.managers.multimodal_preprocessing_admission import (
+    track_mm_preprocessing_future,
+)
 from sglang.srt.multimodal.media_io import (
     CLIENT_MEDIA_EXCEPTIONS,
     configure_media_url_security,
@@ -319,6 +322,7 @@ class MultimodalProcessorMixin:
                 discard_alpha_channel,
                 **load_kwargs,
             )
+            track_mm_preprocessing_future(future)
             futures.append((modality, idx, future))
 
         return futures

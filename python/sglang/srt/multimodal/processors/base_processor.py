@@ -23,6 +23,9 @@ import torch
 from PIL import Image
 from transformers import BaseImageProcessor
 
+from sglang.srt.managers.multimodal_preprocessing_admission import (
+    track_mm_preprocessing_future,
+)
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.multimodal.cache import (
     MultimodalPreprocessCache,
@@ -826,16 +829,16 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
                             "Mismatch between image tokens and estimated frame counts."
                         )
 
-                futures.append(
-                    self.io_executor.submit(
-                        self.__class__._load_single_item,
-                        data,
-                        modality,
-                        frame_count_limit,
-                        audio_sample_rate,
-                        discard_alpha_channel,
-                    )
+                future = self.io_executor.submit(
+                    self.__class__._load_single_item,
+                    data,
+                    modality,
+                    frame_count_limit,
+                    audio_sample_rate,
+                    discard_alpha_channel,
                 )
+                track_mm_preprocessing_future(future)
+                futures.append(future)
                 task_info.append((modality, data, frame_count_limit))
 
         for modality, iterator in data_iterators.items():
