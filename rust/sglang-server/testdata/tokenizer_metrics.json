@@ -1,0 +1,395 @@
+{
+  "labels": {
+    "model_name": "model",
+    "engine_type": "unified"
+  },
+  "families": [
+    {
+      "name": "sglang:startup_time_seconds",
+      "kind": "gauge",
+      "documentation": "Engine startup duration by phase in seconds.",
+      "labelnames": [
+        "model_name",
+        "engine_type",
+        "phase"
+      ],
+      "buckets": null
+    },
+    {
+      "name": "sglang:startup_cuda_graph_time_seconds",
+      "kind": "gauge",
+      "documentation": "CUDA graph capture duration by phase in seconds.",
+      "labelnames": [
+        "model_name",
+        "engine_type",
+        "phase"
+      ],
+      "buckets": null
+    },
+    {
+      "name": "sglang:prompt_tokens_total",
+      "kind": "counter",
+      "documentation": "Number of prefill tokens processed.",
+      "labelnames": [
+        "model_name",
+        "engine_type",
+        "is_streaming"
+      ],
+      "buckets": null
+    },
+    {
+      "name": "sglang:generation_tokens_total",
+      "kind": "counter",
+      "documentation": "Number of generation tokens processed.",
+      "labelnames": [
+        "model_name",
+        "engine_type",
+        "is_streaming"
+      ],
+      "buckets": null
+    },
+    {
+      "name": "sglang:spec_verify_calls_total",
+      "kind": "counter",
+      "documentation": "Number of speculative decoding verification calls.",
+      "labelnames": [
+        "model_name",
+        "engine_type"
+      ],
+      "buckets": null
+    },
+    {
+      "name": "sglang:prompt_tokens_histogram",
+      "kind": "histogram",
+      "documentation": "Histogram of prompt token length.",
+      "labelnames": [
+        "model_name",
+        "engine_type"
+      ],
+      "buckets": [
+        100.0,
+        300.0,
+        500.0,
+        700.0,
+        1000.0,
+        1500.0,
+        2000.0,
+        3000.0,
+        4000.0,
+        5000.0,
+        6000.0,
+        7000.0,
+        8000.0,
+        9000.0,
+        10000.0,
+        12500.0,
+        15000.0,
+        17500.0,
+        20000.0,
+        22500.0,
+        25000.0,
+        27500.0,
+        30000.0,
+        35000.0,
+        40000.0,
+        60000.0,
+        80000.0,
+        100000.0,
+        200000.0,
+        300000.0,
+        400000.0,
+        600000.0,
+        800000.0,
+        1000000.0,
+        1100000.0
+      ]
+    },
+    {
+      "name": "sglang:uncached_prompt_tokens_histogram",
+      "kind": "histogram",
+      "documentation": "Histogram of uncached (compute) prompt token length.",
+      "labelnames": [
+        "model_name",
+        "engine_type"
+      ],
+      "buckets": [
+        100.0,
+        300.0,
+        500.0,
+        700.0,
+        1000.0,
+        1500.0,
+        2000.0,
+        3000.0,
+        4000.0,
+        5000.0,
+        6000.0,
+        7000.0,
+        8000.0,
+        9000.0,
+        10000.0,
+        12500.0,
+        15000.0,
+        17500.0,
+        20000.0,
+        22500.0,
+        25000.0,
+        27500.0,
+        30000.0,
+        35000.0,
+        40000.0,
+        60000.0,
+        80000.0,
+        100000.0,
+        200000.0,
+        300000.0,
+        400000.0,
+        600000.0,
+        800000.0,
+        1000000.0,
+        1100000.0
+      ]
+    },
+    {
+      "name": "sglang:generation_tokens_histogram",
+      "kind": "histogram",
+      "documentation": "Histogram of generation token length.",
+      "labelnames": [
+        "model_name",
+        "engine_type"
+      ],
+      "buckets": [
+        100.0,
+        300.0,
+        500.0,
+        700.0,
+        1000.0,
+        1500.0,
+        2000.0,
+        3000.0,
+        4000.0,
+        5000.0,
+        6000.0,
+        7000.0,
+        8000.0,
+        9000.0,
+        10000.0,
+        12500.0,
+        15000.0,
+        17500.0,
+        20000.0,
+        22500.0,
+        25000.0,
+        27500.0,
+        30000.0,
+        35000.0,
+        40000.0,
+        60000.0,
+        80000.0,
+        100000.0,
+        200000.0,
+        300000.0,
+        400000.0,
+        600000.0,
+        800000.0,
+        1000000.0,
+        1100000.0
+      ]
+    },
+    {
+      "name": "sglang:cached_tokens_total",
+      "kind": "counter",
+      "documentation": "Number of cached prompt tokens by source (device/host/storage).",
+      "labelnames": [
+        "model_name",
+        "engine_type",
+        "cache_source"
+      ],
+      "buckets": null
+    },
+    {
+      "name": "sglang:num_requests_total",
+      "kind": "counter",
+      "documentation": "Number of requests processed.",
+      "labelnames": [
+        "model_name",
+        "engine_type",
+        "is_streaming"
+      ],
+      "buckets": null
+    },
+    {
+      "name": "sglang:get_loads_duration_seconds",
+      "kind": "histogram",
+      "documentation": "Time spent serving /v1/loads requests (seconds).",
+      "labelnames": [
+        "model_name",
+        "engine_type"
+      ],
+      "buckets": [
+        0.0001,
+        0.0005,
+        0.001,
+        0.005,
+        0.01,
+        0.05,
+        0.1,
+        0.5,
+        1.0
+      ]
+    },
+    {
+      "name": "sglang:num_so_requests_total",
+      "kind": "counter",
+      "documentation": "Number of structured output requests processed.",
+      "labelnames": [
+        "model_name",
+        "engine_type"
+      ],
+      "buckets": null
+    },
+    {
+      "name": "sglang:num_aborted_requests_total",
+      "kind": "counter",
+      "documentation": "Number of requests aborted.",
+      "labelnames": [
+        "model_name",
+        "engine_type"
+      ],
+      "buckets": null
+    },
+    {
+      "name": "sglang:time_to_first_token_seconds",
+      "kind": "histogram",
+      "documentation": "Histogram of time to first token in seconds.",
+      "labelnames": [
+        "model_name",
+        "engine_type",
+        "is_streaming"
+      ],
+      "buckets": [
+        0.1,
+        0.2,
+        0.4,
+        0.6,
+        0.8,
+        1.0,
+        2.0,
+        4.0,
+        6.0,
+        8.0,
+        10.0,
+        20.0,
+        40.0,
+        60.0,
+        80.0,
+        100.0,
+        200.0,
+        400.0
+      ]
+    },
+    {
+      "name": "sglang:inter_token_latency_seconds",
+      "kind": "histogram",
+      "documentation": "Histogram of inter-token latency in seconds.",
+      "labelnames": [
+        "model_name",
+        "engine_type"
+      ],
+      "buckets": [
+        0.002,
+        0.004,
+        0.006,
+        0.008,
+        0.01,
+        0.015,
+        0.02,
+        0.025,
+        0.03,
+        0.035,
+        0.04,
+        0.06,
+        0.08,
+        0.1,
+        0.2,
+        0.4,
+        0.6,
+        0.8,
+        1.0,
+        2.0,
+        4.0,
+        6.0,
+        8.0
+      ]
+    },
+    {
+      "name": "sglang:request_time_per_output_token_seconds",
+      "kind": "histogram",
+      "documentation": "Per-request TPOT in seconds: (finished_time - first_token_time) / (completion_tokens - 1).",
+      "labelnames": [
+        "model_name",
+        "engine_type",
+        "is_streaming"
+      ],
+      "buckets": [
+        0.002,
+        0.004,
+        0.006,
+        0.008,
+        0.01,
+        0.015,
+        0.02,
+        0.025,
+        0.03,
+        0.035,
+        0.04,
+        0.06,
+        0.08,
+        0.1,
+        0.2,
+        0.4,
+        0.6,
+        0.8,
+        1.0,
+        2.0,
+        4.0,
+        6.0,
+        8.0
+      ]
+    },
+    {
+      "name": "sglang:e2e_request_latency_seconds",
+      "kind": "histogram",
+      "documentation": "Histogram of End-to-end request latency in seconds",
+      "labelnames": [
+        "model_name",
+        "engine_type",
+        "is_streaming"
+      ],
+      "buckets": [
+        0.1,
+        0.2,
+        0.4,
+        0.6,
+        0.8,
+        1.0,
+        2.0,
+        4.0,
+        6.0,
+        8.0,
+        10.0,
+        20.0,
+        40.0,
+        60.0,
+        80.0,
+        100.0,
+        200.0,
+        400.0,
+        600.0,
+        1200.0,
+        1800.0,
+        2400.0
+      ]
+    }
+  ]
+}

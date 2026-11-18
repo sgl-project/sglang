@@ -31,6 +31,10 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.flashinfer_megamoe_autotune import (
+    MegaMoeTunedForward,
+    forward_megamoe,
+)
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -126,21 +130,7 @@ class FlashInferMegaMoeQuantInfo(MoeQuantInfo):
 
     def __post_init__(self) -> None:
         if self.mega_forward is None:
-            self.mega_forward = _select_megamoe_forward(self.mega)
-
-
-def _forward_megamoe_with_workspace_view(mega: Any, tensors: Any) -> torch.Tensor:
-    return mega.forward(tensors, return_workspace_view=True)
-
-
-def _forward_megamoe_legacy(mega: Any, tensors: Any) -> torch.Tensor:
-    return mega.forward(tensors)
-
-
-def _select_megamoe_forward(mega: Any) -> Callable[[Any, Any], torch.Tensor]:
-    if mega.supports_output_view:
-        return _forward_megamoe_with_workspace_view
-    return _forward_megamoe_legacy
+            self.mega_forward = forward_megamoe
 
 
 def _resolve_max_tokens_per_rank() -> int:
@@ -158,6 +148,20 @@ def _resolve_max_tokens_per_rank() -> int:
 
     derived = cutedsl_moe_max_num_tokens()
     return derived if derived > 0 else 1024
+
+
+def _resolve_decode_max_tokens_per_rank(max_tokens_per_rank: int) -> int:
+    """Capacity of the optional decode-only workspace; 0 means none."""
+    configured = envs.SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK.get()
+    if configured == 0:
+        return 0
+    if not 0 < configured < max_tokens_per_rank:
+        raise ValueError(
+            "SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK="
+            f"{configured} must be 0 (off) or below the main MegaMoE capacity "
+            f"of {max_tokens_per_rank} tokens per rank."
+        )
+    return configured
 
 
 def resolve_flashinfer_megamoe_combine_dtype() -> str:
@@ -255,6 +259,7 @@ def _ensure_flashinfer_megamoe_layer(
     megakernel_config: Any,
     w13_scale: torch.Tensor,
     w2_scale: torch.Tensor,
+    with_decode_workspace: bool = False,
 ) -> Any:
     mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
     if mega is not None:
@@ -316,15 +321,18 @@ def _ensure_flashinfer_megamoe_layer(
     )
     layer._flashinfer_megamoe_layer = mega
     if hasattr(megakernel_config, "knobs"):
-        from sglang.srt.layers.moe.flashinfer_megamoe_autotune import (
-            MegaMoeTunedForward,
-        )
-
         layer._flashinfer_megamoe_forward = MegaMoeTunedForward(
-            bootstrap, fleet_params, backend
+            bootstrap,
+            fleet_params,
+            backend,
+            decode_max_tokens_per_rank=(
+                _resolve_decode_max_tokens_per_rank(max_tokens_per_rank)
+                if with_decode_workspace
+                else 0
+            ),
         )
     else:
-        layer._flashinfer_megamoe_forward = _select_megamoe_forward(mega)
+        layer._flashinfer_megamoe_forward = forward_megamoe
     return mega
 
 
@@ -412,6 +420,9 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
         megakernel_config=megakernel_config,
         w13_scale=layer.w13_weight_scale,
         w2_scale=layer.w2_weight_scale,
+        # Only ModelOptNvFp4FusedMoEMethod (and its nvfp4_online subclass) gets
+        # the decode workspace; MXFP8 and FP4-expert layers never request it.
+        with_decode_workspace=True,
     )
 
 

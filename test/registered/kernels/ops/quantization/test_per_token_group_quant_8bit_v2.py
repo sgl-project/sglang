@@ -102,9 +102,6 @@ def test_v2_jit_matches_aot(dtype, num_tokens, hidden, fuse_silu_and_mul, scale_
         x_q,
         x_s,
         G,
-        1e-10,
-        float(fp8_min),
-        float(fp8_max),
         scale_ue8m0=scale_ue8m0,
         fuse_silu_and_mul=fuse_silu_and_mul,
     )
@@ -119,12 +116,9 @@ def test_v2_jit_matches_aot(dtype, num_tokens, hidden, fuse_silu_and_mul, scale_
 #      the JIT per_token_group_quant kernel and pinned bit-exact in test_per_token_group_quant
 #      (test_v3_ue8m0_row_packed_bitexact);
 #   2. fp32 [T, G] storing power-of-two VALUES (the deep_gemm.fp8_einsum
-#      format) -- v2-only. No srt caller requests it (production ties
-#      scale_ue8m0 and column_major_scales to the same DEEPGEMM_SCALE_UE8M0
-#      flag), so the srt entry `sglang_per_token_group_quant_fp8`, which now
-#      routes to the JIT kernel, rejects it loudly instead of allocating an fp32
-#      buffer the kernel cannot fill. The v2 JIT kernel itself still implements it and is
-#      covered by test_v2_jit_matches_aot above.
+#      format) -- the trait kernel handles Hopper BF16 group32; other supported
+#      configurations fall back to v2. This format is covered by the
+#      test_fp32_pow2_* cases in test_per_token_group_quant.
 
 
 # Masked (EP-MoE) path: the v2 op only has a masked scheduler for the
@@ -170,9 +164,6 @@ def test_v2_jit_masked_matches_aot(num_experts, hidden, tokens_pad):
         x_q,
         x_s,
         G,
-        1e-10,
-        float(fp8_min),
-        float(fp8_max),
         scale_ue8m0=True,
         fuse_silu_and_mul=True,
         masked_m=masked_m,

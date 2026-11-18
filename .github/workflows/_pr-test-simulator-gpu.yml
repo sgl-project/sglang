@@ -1,0 +1,68 @@
+name: PR Test SGLang Simulator (GPU)
+
+on:
+  workflow_call:
+    inputs:
+      check_changes:
+        description: 'toJson(needs.check-changes.outputs).'
+        type: string
+        required: true
+      caller_inputs:
+        description: 'toJson(inputs) from the caller workflow.'
+        type: string
+        required: true
+      rust_ext_artifact:
+        description: 'Artifact of prebuilt Rust extension modules.'
+        type: string
+        default: ''
+
+env:
+  SGLANG_IS_IN_CI: true
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ (fromJson(inputs.caller_inputs).skip_pr_test_health_check || fromJson(inputs.caller_inputs).test_parallel_dispatch || fromJson(inputs.caller_inputs).run_all_tests) && 'true' || 'false' }}
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  USE_VENV: "1"
+
+jobs:
+  run:
+    name: simulator-test-gpu
+    if: fromJson(inputs.check_changes).main_package == 'true' || fromJson(inputs.check_changes).simulator == 'true' || fromJson(inputs.check_changes).sgl_kernel == 'true'
+    runs-on: ${{ fromJson(fromJson(inputs.check_changes).runs_on_map)['1-gpu-small'] }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ fromJson(inputs.caller_inputs).git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-pr-test-health
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Download kernel wheels
+        if: fromJson(inputs.check_changes).sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: python/sglang/kernels/aot/dist/
+          merge-multiple: true
+          pattern: wheel-python3.11-cuda*
+
+      - uses: ./.github/actions/download-rust-ext
+        with:
+          artifact_name: ${{ inputs.rust_ext_artifact }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        env:
+          CUSTOM_BUILD_SGL_KERNEL: ${{ fromJson(inputs.check_changes).sgl_kernel }}
+        run: bash scripts/ci/cuda/ci_install_dependency.sh
+
+      - name: Test baseline collection
+        timeout-minutes: 10
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: |
+          uv pip install "./tools/sglang-simulator"
+          python3 -m pytest -q tools/sglang-simulator/test/test_baseline_collection_sglang.py
+
+      - name: Cleanup venv
+        if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh

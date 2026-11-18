@@ -24,6 +24,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_resources,
 )
 
@@ -300,6 +301,33 @@ class _DeepEPv2Impl:
                 f"got {topk_ids.shape[1]}"
             )
 
+    def _masked_token_capacity(self, local_tokens: int, ep_group_size: int) -> int:
+        capacity = self.num_max_dispatch_tokens_per_rank * ep_group_size
+        parallel = get_parallel()
+        # Without attention DP/CP, sources in the TP group share a batch:
+        # inputs are replicated or tensor_split shards differing by at most
+        # one row. Other topologies may have larger remote batches.
+        if (
+            parallel.attn_dp_size != 1
+            or parallel.attn_cp_size != 1
+            or parallel.tp_size != ep_group_size
+            or parallel.tp_group is None
+            or self.group is not parallel.tp_group.device_group
+        ):
+            return capacity
+
+        # A token selects an expert at most once. Even if every source routes
+        # every token to one expert, its count cannot exceed the source total.
+        # Round up for the masked GEMM layout; never enlarge the original slab.
+        # Include the possible extra row on each other tensor_split shard.
+        source_total = max(1, local_tokens * ep_group_size + ep_group_size - 1)
+        aligned_total = (
+            (source_total + _EXPERT_ALIGNMENT - 1)
+            // _EXPERT_ALIGNMENT
+            * _EXPERT_ALIGNMENT
+        )
+        return min(capacity, aligned_total)
+
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> DeepEPv2DispatchOutput:
@@ -410,8 +438,9 @@ class _DeepEPv2Impl:
                 (local_tokens * ep_group_size * self.router_topk + self.num_experts)
                 // self.num_experts,
             )
-            # Every rank can send its full dispatch capacity to one expert.
-            masked_max_m = self.num_max_dispatch_tokens_per_rank * ep_group_size
+            # Only the GEMM slab shrinks; ElasticBuffer and collective dispatch
+            # keep their configured capacity and existing handle geometry.
+            masked_max_m = self._masked_token_capacity(local_tokens, ep_group_size)
             total_expanded = recv_capacity
 
         # Publish ownership only after the returned metadata is validated.

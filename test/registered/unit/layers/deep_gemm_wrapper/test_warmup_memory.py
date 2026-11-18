@@ -17,7 +17,7 @@ from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
     _BaseWarmupExecutor,
 )
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _allocate_on_meta(factory):
@@ -98,9 +98,9 @@ class TestWarmupMemory(CustomTestCase):
                 for kernel_type in DeepGemmKernelType:
                     if (
                         kernel_type == DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32
-                        and architecture != "hopper"
+                        and architecture == "musa"
                     ):
-                        continue  # Native block32 is only dispatched on Hopper.
+                        continue  # Native block32 is only dispatched on SM90/SM100.
                     with self.subTest(
                         architecture=architecture, kernel_type=kernel_type, max_m=max_m
                     ):

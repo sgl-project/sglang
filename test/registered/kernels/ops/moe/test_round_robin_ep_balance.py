@@ -16,7 +16,7 @@ from sglang.srt.layers.moe.topk import (
 from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 NUM_EXPERTS = 256
 TOPK = 8
@@ -130,6 +130,27 @@ def test_kernel_matches_reference_on_every_shard(
         )
         assert torch.equal(ids.long(), expected), (shard, ids, expected)
         assert torch.equal(weights, torch.full_like(weights, 1.0 / topk))
+
+
+def test_kernel_masks_padded_rows_and_scales_weights():
+    tokens, real, scale = 300, 250, 1.5
+    ids = torch.zeros((tokens, TOPK), dtype=torch.int64, device="cuda")
+    weights = torch.ones((tokens, TOPK), dtype=torch.float32, device="cuda")
+    _simulate_balanced_routing(
+        ids,
+        weights,
+        NUM_EXPERTS,
+        random=False,
+        num_ranks=EP_SIZE,
+        layer_id=3,
+        num_token_non_padded=torch.tensor([real], device="cuda"),
+        weight_scale=scale,
+    )
+    expected_ids, expected_weights = _route(tokens, layer_id=3)
+    assert torch.equal(ids[:real], expected_ids[:real].long())
+    torch.testing.assert_close(weights[:real], expected_weights[:real] * scale)
+    assert torch.equal(ids[real:], torch.full_like(ids[real:], -1))
+    assert torch.equal(weights[real:], torch.zeros_like(weights[real:]))
 
 
 @pytest.mark.parametrize("num_tokens", [1, 2, 4, 300])
