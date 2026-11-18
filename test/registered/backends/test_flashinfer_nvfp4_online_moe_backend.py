@@ -104,6 +104,9 @@ class TestFlashinferCuteDSLMoeBackendNvFp4Online(
     backend = "flashinfer_cutedsl"
     model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"
     extra_args = [
+        # Nemotron-H prefill CUDA graphs are opt-in on SM100.
+        "--cuda-graph-backend-prefill",
+        "breakable",
         "--reasoning-parser",
         "nemotron_3",
         "--tool-call-parser",
@@ -134,6 +137,9 @@ class TestFlashinferCuteDSLMoeBackendNvFp4OnlineW4A16(
     backend = "flashinfer_cutedsl"
     model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"
     extra_args = [
+        # Nemotron-H prefill CUDA graphs are opt-in on SM100.
+        "--cuda-graph-backend-prefill",
+        "breakable",
         "--reasoning-parser",
         "nemotron_3",
         "--tool-call-parser",
