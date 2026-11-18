@@ -33,7 +33,7 @@ class TestSituAndMul(CustomTestCase):
     def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
-        if torch.version.hip or get_device_sm() < 100:
+        if get_device_sm() < 100:
             raise unittest.SkipTest("Kimi K3 compute kernels require SM100a+")
 
     def test_situ_and_mul(self):

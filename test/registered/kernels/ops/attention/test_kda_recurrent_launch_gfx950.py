@@ -1,4 +1,4 @@
-"""Kimi-K3 TP8 KDA recurrent launch on gfx950: narrow tiles for small batches."""
+"""Kimi-K3 TP8 KDA recurrent launch on gfx950: the narrow tile for n <= 4 requests."""
 
 import sys
 

@@ -67,14 +67,13 @@ class TestMoeSortingSmall(CustomTestCase):
     def _sort(self, fn, ids, w, bs, E=E):
         return fn(ids, w, E, self.DIM, torch.bfloat16, bs, None, None, 0, True)
 
-    def _sort_emitting_quant(self, ids, w, x, bs, E):
-        """The patched sort and the stage-1 quant it emitted (None if it did not)."""
+    def _emitted_quant(self, ids, w, x, bs, E):
         S = self.S
         tok = S._pending_quant_input.set(x)
         etok = S._emitted_quant.set(None)
         try:
-            sort = self._sort(self.fm._moe_sorting_impl, ids, w, bs, E)
-            return sort, S._emitted_quant.get()
+            self._sort(self.fm._moe_sorting_impl, ids, w, bs, E)
+            return S._emitted_quant.get()
         finally:
             S._emitted_quant.reset(etok)
             S._pending_quant_input.reset(tok)
@@ -127,7 +126,7 @@ class TestMoeSortingSmall(CustomTestCase):
                 sorted_weights=sw,
                 num_experts_upper_bound=E,
             )
-            _, emitted = self._sort_emitting_quant(ids, w, x, bs, E)
+            emitted = self._emitted_quant(ids, w, x, bs, E)
             self.assertIsNotNone(emitted, f"E={E} m={m}")
             self.assertTrue(
                 torch.equal(ref_q.view(torch.uint8), emitted[0].view(torch.uint8)),
@@ -150,8 +149,10 @@ class TestMoeSortingSmall(CustomTestCase):
         front = torch.randn(m, front_width, generator=g).to(self.dev, torch.bfloat16)
         x = front[:, routed_start:]
         self.assertTrue(self.S._small_sort_supported(ids, bs, None, None, E))
-        sort, emitted = self._sort_emitting_quant(ids, w, x, bs, E)
+        emitted = self._emitted_quant(ids, w, x, bs, E)
         self.assertIsNotNone(emitted)
+        # the quant CTAs ride the same sort CTA as this no-quant launch
+        sort = self._sort(self.fm._moe_sorting_impl, ids, w, bs, E)
         self._assert_same_sort(self._sort(self.orig_sort, ids, w, bs, E), sort, bs, "")
         sid, sw, _, nv, _ = sort
         ref_q, ref_scale = self.orig_quant(
