@@ -155,7 +155,7 @@ export const AgentX = ({ data: input }) => {
     }
     return out;
   };
-  // Submissions record the Python router's flags; render the sgl-router command that
+  // Submissions record router flags that sgl-router does not all take; render the sgl-router command that
   // python/sglang/test/agentx_common.py launches for them, and keep the two in step.
   // sgl-router reads each worker's PD role from its /server_info, so one --worker-urls list
   // replaces --prefill/--decode.
@@ -285,21 +285,19 @@ export const AgentX = ({ data: input }) => {
     return "";
   };
   const noteText = (S) => ({
-    "rename-dp-attention": <>Flags are mirrored from the submission image: <code style={S.code}>--enable-dp-attention</code> with <code style={S.code}>--dp-size</code> / <code style={S.code}>--data-parallel-size</code>. Newer SGLang deprecates them in favor of <code style={S.code}>--attn-dp-size</code> (<a style={S.a} href="https://github.com/sgl-project/sglang/pull/41818">#41818</a>).</>,
     "rename-mamba-strategy": <>Flags are mirrored from the submission image: <code style={S.code}>--mamba-scheduler-strategy</code> is the older spelling of <code style={S.code}>--mamba-radix-cache-strategy</code> (<a style={S.a} href="https://github.com/sgl-project/sglang/pull/28151">#28151</a>). Current SGLang accepts only the new name.</>,
     "hicache-size": <><code style={S.code}>--hicache-size</code> is host DRAM per rank in GB, sized to SemiAnalysis's nodes. Scale it to your host memory.</>,
     efa: <><code style={S.code}>MOONCAKE_PROTOCOL=efa</code> reflects SemiAnalysis's AWS-EFA B300 cluster. Use <code style={S.code}>rdma</code> on InfiniBand.</>,
     "nixl-libfabric": <><code style={S.code}>SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC</code> reflects SemiAnalysis's AWS-EFA B300 cluster. On InfiniBand, leave it unset to use NIXL's default UCX backend.</>,
     "ib-devices": <>Set <code style={S.code}>IB_DEVICES</code> to your node's RDMA NICs (comma-separated, e.g. <code style={S.code}>mlx5_0,mlx5_1</code>).</>,
     "mooncake-segment": <><code style={S.code}>MOONCAKE_GLOBAL_SEGMENT_SIZE</code> is the host DRAM each worker process contributes to the Mooncake store. Size it to your host memory.</>,
-    "sgl-router": <>The router flags were recorded for SGLang's earlier Python router; the router command here is their <code style={S.code}>sgl-router</code> equivalent, as the AgentX test harness launches it. Its <code style={S.code}>cache_aware</code> policy learns prefixes only from the workers' KV events, so the workers that hold the cache add <code style={S.code}>--kv-events-config</code> and <code style={S.code}>--load-publish-endpoint auto</code>.</>,
+    "sgl-router": <>The router command here is the recorded router flags translated to <code style={S.code}>sgl-router</code>, as the AgentX test harness launches it. Its <code style={S.code}>cache_aware</code> policy learns prefixes only from the workers' KV events, so the workers that hold the cache add <code style={S.code}>--kv-events-config</code> and <code style={S.code}>--load-publish-endpoint auto</code>.</>,
   });
   const notesFor = (blocks) => {
     const names = new Set(blocks.flatMap((b) => (b.args || []).map((a) => a[0])));
     const env = Object.assign({}, ...blocks.map((b) => b.env || {}));
     const text = JSON.stringify(blocks);
     return [
-      names.has("--enable-dp-attention") && "rename-dp-attention",
       names.has("--mamba-scheduler-strategy") && "rename-mamba-strategy",
       names.has("--hicache-size") && "hicache-size",
       env.MOONCAKE_PROTOCOL === "efa" && "efa",

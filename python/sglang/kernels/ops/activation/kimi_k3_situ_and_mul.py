@@ -28,7 +28,10 @@ def _jit_situ_and_mul_module(in_dtype: torch.dtype, out_dtype: torch.dtype) -> M
         _make_name("situ_and_mul"),
         *args,
         cuda_files=["kimi_k3/situ_and_mul.cuh"],
-        cuda_wrappers=[("run", f"SituAndMulKernel<{args}>::run")],
+        cuda_wrappers=[
+            ("run", f"SituAndMulKernel<{args}>::run"),
+            ("run_with_cast", f"SituAndMulKernel<{args}>::run_with_cast"),
+        ],
         extra_cuda_cflags=get_activation_cuda_cflags(),
     )
 
@@ -38,6 +41,7 @@ def situ_and_mul(
     out: Optional[torch.Tensor],
     beta: float,
     linear_beta: Optional[float],
+    cast: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Fused SiTU (SoftCap-GLU) activation.
 
@@ -52,6 +56,9 @@ def situ_and_mul(
                   the output dtype (bf16 for an fp32 input)
     beta        : gate softcap scalar (e.g. 4.0)
     linear_beta : up softcap scalar (e.g. 25.0), or None to skip
+    cast        : optional (src, dst): src [N, C] in input's dtype, rows strided like
+                  input's, written to the dense dst [N, C] in out's dtype in the
+                  same launch (the routed input of the same fused-GEMM output)
     """
     hidden_size = input.shape[-1] // 2
     if out is None:
@@ -70,11 +77,13 @@ def situ_and_mul(
 
     has_linear_beta = linear_beta is not None
     module = _jit_situ_and_mul_module(input_2d.dtype, out_2d.dtype)
-    module.run(
-        input_2d,
-        out_2d,
+    scalars = (
         float(beta),
         float(linear_beta) if has_linear_beta else 0.0,
         has_linear_beta,
     )
+    if cast is None:
+        module.run(input_2d, out_2d, *scalars)
+    else:
+        module.run_with_cast(input_2d, out_2d, cast[0], cast[1], *scalars)
     return out
