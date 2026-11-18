@@ -95,6 +95,8 @@ from sglang.srt.configs.all_configs import (
     Step3p5Config,
     Step3p7Config,
     Step3VLConfig,
+    Step5Config,
+    Step5VLConfig,
     Xing4_0Config,
     XllmConfig,
 )
@@ -182,6 +184,8 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         Step3p5Config,
         Step3p7Config,
         MiniCPMHybridConfig,
+        Step5Config,
+        Step5VLConfig,
         MiniCPMV4_6Config,
         MiniCPMV4_6VisionConfig,
         MiniCPMV4_7Config,
