@@ -206,13 +206,15 @@ class TestDeepseekScalingRopeAiterGfx1250(CustomTestCase):
         torch.testing.assert_close(q_out, q_ref, atol=3e-2, rtol=2e-2)
         torch.testing.assert_close(k_out, k_ref, atol=3e-2, rtol=2e-2)
 
-    def _small_rope(self) -> rope_variant.DeepseekScalingRotaryEmbedding:
+    def _small_rope(
+        self, is_neox: bool = False
+    ) -> rope_variant.DeepseekScalingRotaryEmbedding:
         return rope_variant.DeepseekScalingRotaryEmbedding(
             64,
             64,
             256,
             50000,
-            False,
+            is_neox,
             1.0,
             torch.bfloat16,
             mscale=1.0,
@@ -243,15 +245,39 @@ class TestDeepseekScalingRopeAiterGfx1250(CustomTestCase):
         torch.testing.assert_close(q_out, q_ref, atol=3e-2, rtol=2e-2)
         torch.testing.assert_close(k_out, k_ref, atol=3e-2, rtol=2e-2)
 
-    def test_key_passed_as_its_own_query(self) -> None:
-        # IndexerKPool's K-only path passes the rope slice of the key twice.
-        rope = self._small_rope()
-        positions = torch.arange(4, device="cuda")
-        key = torch.randn(4, 1, 128, dtype=torch.bfloat16, device="cuda")
-        k_rope = key[..., :64]
-        k_ref = rope.forward_native(positions, k_rope.clone(), k_rope.clone())[1]
-        rope(positions, k_rope, k_rope)
-        torch.testing.assert_close(key[..., :64], k_ref, atol=3e-2, rtol=2e-2)
+    def test_dsa_indexer_shapes(self) -> None:
+        # The DSA indexer passes a 3-D q_rope and a 2-D k_rope, each the rope
+        # slice of a wider row; IndexerKPool's K-only path passes k_rope twice.
+        positions = torch.tensor([0, 3, 17, 100, 255], device="cuda")
+        query = torch.randn(5, 4, 128, dtype=torch.bfloat16, device="cuda")
+        key = torch.randn(5, 128, dtype=torch.bfloat16, device="cuda")
+        for is_neox in (False, True):
+            rope = self._small_rope(is_neox)
+            # forward_native broadcasts a 2-D key against its per-token cos/sin,
+            # so the reference runs on a 3-D copy of the key.
+            q_ref, k_ref = rope.forward_native(
+                positions,
+                query[..., :64].contiguous(),
+                key[..., :64].unsqueeze(1).contiguous(),
+            )
+            q_ref, k_ref = q_ref.reshape(5, 4, 64), k_ref.reshape(5, 64)
+
+            with self.subTest(is_neox=is_neox, path="query and key"):
+                q, k = query.clone(), key.clone()
+                q_out, k_out = rope(positions, q[..., :64], k[..., :64])
+                self.assertEqual(q_out.shape, (5, 4, 64))
+                self.assertEqual(k_out.shape, (5, 64))
+                torch.testing.assert_close(q[..., :64], q_ref, atol=3e-2, rtol=2e-2)
+                torch.testing.assert_close(k[..., :64], k_ref, atol=3e-2, rtol=2e-2)
+                torch.testing.assert_close(q[..., 64:], query[..., 64:])
+                torch.testing.assert_close(k[..., 64:], key[..., 64:])
+
+            with self.subTest(is_neox=is_neox, path="key only"):
+                k = key.clone()
+                _, k_out = rope(positions, k[..., :64], k[..., :64])
+                self.assertEqual(k_out.shape, (5, 64))
+                torch.testing.assert_close(k[..., :64], k_ref, atol=3e-2, rtol=2e-2)
+                torch.testing.assert_close(k[..., 64:], key[..., 64:])
 
     def test_force_native_keeps_native(self) -> None:
         exec_ctx = SimpleNamespace(
