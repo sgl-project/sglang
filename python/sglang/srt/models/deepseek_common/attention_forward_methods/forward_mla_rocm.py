@@ -1252,7 +1252,9 @@ class DeepseekMLARocmForwardMixin:
             or not (mode.is_decode() or mode.is_target_verify())
         ):
             return None
-        kv_layer = get_kv_layers().read(self.attn_mqa.layer_id)
+        kv_layer, slot_mapping = _mla_cache_write_target(
+            layer_id=self.attn_mqa.layer_id, out_cache_loc=forward_batch.out_cache_loc
+        )
         # The writer scatters at out_cache_loc; KVLayer.store writes there only for
         # the owner sub-pool, and at the batch's swa_loc for any other.
         if not kv_layer.owner:
@@ -1262,7 +1264,7 @@ class DeepseekMLARocmForwardMixin:
             q_pe=q_pe,
             k_nope=k_nope,
             k_pe=k_pe,
-            out_cache_loc=forward_batch.out_cache_loc,
+            slot_mapping=slot_mapping,
             kv_cache=kv_layer.key(),
             k_scale_float=self.attn_mqa.k_scale_float,
             attention_backend=self.current_attention_backend,

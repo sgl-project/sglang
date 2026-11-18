@@ -6,7 +6,10 @@ import torch
 pytest.importorskip("aiter")
 from aiter import dtypes  # noqa: E402
 
-from sglang.kernels.ops.attention import mla_q_cache_aiter_hip  # noqa: E402
+from sglang.kernels.ops.attention import (  # noqa: E402
+    mla_q_cache_aiter_hip,
+    mla_q_cache_aiter_triton,
+)
 from sglang.srt.models.kimi_k3_rocm_mla import KimiK3RocmMlaQCacheWriter  # noqa: E402
 from sglang.srt.runtime_context import get_resources  # noqa: E402
 from sglang.test.ci.ci_register import register_amd_ci  # noqa: E402
@@ -29,7 +32,7 @@ def _writer_inputs(values):
         q_pe=values["q_pe"],
         k_nope=values["k_nope"],
         k_pe=values["k_pe"],
-        out_cache_loc=values["slot_mapping"],
+        slot_mapping=values["slot_mapping"],
         kv_cache=values["kv_cache"],
         k_scale_float=1.0,
         attention_backend="aiter",
@@ -37,12 +40,23 @@ def _writer_inputs(values):
     )
 
 
+def _writer(*, use_hip, use_triton):
+    return KimiK3RocmMlaQCacheWriter(
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        use_hip=use_hip,
+        use_triton=use_triton,
+    ).cuda()
+
+
 @pytest.fixture(params=["aiter", "triton"])
-def writer(request, monkeypatch):
-    if request.param == "triton":
-        # The writer falls back to the AITER Triton kernel off gfx950.
-        monkeypatch.setattr(mla_q_cache_aiter_hip, "available", lambda: False)
-    return KimiK3RocmMlaQCacheWriter(kv_lora_rank=512, qk_rope_head_dim=64).cuda()
+def writer(request):
+    if request.param == "aiter":
+        return _writer(use_hip=True, use_triton=False)
+    # Off gfx950 the writer runs the AITER Triton kernel alone.
+    if not mla_q_cache_aiter_triton.available():
+        pytest.skip("AITER build without the no-RoPE Triton kernel")
+    return _writer(use_hip=False, use_triton=True)
 
 
 @pytest.mark.parametrize("cache_dtype", [torch.bfloat16, dtypes.fp8])
@@ -91,16 +105,34 @@ def test_writer_graph_survives_a_larger_eager_batch(writer):
     assert torch.equal(small["kv_cache"][:4], expected_k)
 
 
-def test_writer_reads_a_strided_out_cache_loc(writer):
-    """A non-contiguous out_cache_loc must still land each token in its own slot;
-    a kernel reading it at stride 1 would write the wrong rows."""
+def test_writer_rejects_a_strided_slot_mapping(writer):
+    """Both kernels read slot_mapping at stride 1, so a strided one must be refused
+    rather than land tokens in the wrong slots; the caller makes it contiguous."""
     values = mla_q_cache_inputs(16)
     values["kv_cache"] = torch.zeros(32, 1, 576, device="cuda", dtype=torch.bfloat16)
     values["slot_mapping"] = torch.arange(32, device="cuda", dtype=torch.int64)[::2]
-    q, _ = writer.write(**_writer_inputs(values))
+    assert writer.write(**_writer_inputs(values)) is None
     torch.cuda.synchronize()
-    _, expected_k = mla_q_cache_reference(dict(values, out=q))
-    assert torch.equal(values["kv_cache"][values["slot_mapping"]], expected_k)
+    assert torch.count_nonzero(values["kv_cache"]).item() == 0
+
+
+@pytest.mark.parametrize("cache", ["fp8_e5m2", "paged_4d"])
+def test_writer_falls_back_on_caches_neither_kernel_takes(cache):
+    """Caches the HIP op rejects must reach the split chain, not the Triton kernel's
+    dtype/layout asserts, which would fail the decode step or graph capture."""
+    values = mla_q_cache_inputs(4)
+    if cache == "fp8_e5m2":
+        values["kv_cache"] = torch.zeros(
+            8, 1, 576, device="cuda", dtype=torch.float8_e5m2
+        )
+    else:
+        values["kv_cache"] = torch.zeros(
+            8, 1, 1, 576, device="cuda", dtype=torch.bfloat16
+        )
+    writer = _writer(use_hip=True, use_triton=mla_q_cache_aiter_triton.available())
+    assert writer.write(**_writer_inputs(values)) is None
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(values["kv_cache"].view(torch.uint8)).item() == 0
 
 
 if __name__ == "__main__":

@@ -130,10 +130,12 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
     and the cache holds the bytes the split chain would have written."""
 
     def setUp(self):
-        self.writer = KimiK3RocmMlaQCacheWriter(kv_lora_rank=512, qk_rope_head_dim=64)
+        self.writer = KimiK3RocmMlaQCacheWriter(
+            kv_lora_rank=512, qk_rope_head_dim=64, use_hip=True, use_triton=False
+        )
         self.fused_q = torch.zeros(2, 12, 576, dtype=torch.bfloat16)
         # The kernels are the boundary; the gate in front of them is under test.
-        self.writer._write_aiter = lambda **_: self.fused_q
+        self.writer._write_hip = lambda **_: self.fused_q
 
     def _write(self, *, attention_backend, is_target_verify, k_scale_float=1.0):
         return self.writer.write(
@@ -141,7 +143,7 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
             q_pe=torch.zeros(2, 12, 64, dtype=torch.bfloat16),
             k_nope=torch.zeros(2, 1, 512, dtype=torch.bfloat16),
             k_pe=torch.zeros(2, 1, 64, dtype=torch.bfloat16),
-            out_cache_loc=torch.arange(2, dtype=torch.int64),
+            slot_mapping=torch.arange(2, dtype=torch.int64),
             kv_cache=torch.zeros(4, 1, 576, dtype=torch.bfloat16),
             k_scale_float=k_scale_float,
             attention_backend=attention_backend,
@@ -180,13 +182,29 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
             )
         )
 
-    def test_missing_triton_fallback_keeps_the_split_chain(self):
-        """Off gfx950, an AITER build without the no-RoPE Triton kernel must fall
-        back to the split chain instead of failing the decode step."""
-        self.writer._write_aiter = lambda **_: None
-        with mock.patch.object(kimi_k3_rocm_mla, "_triton_q_cache_op", lambda: None):
+    def test_rejected_inputs_without_triton_keep_the_split_chain(self):
+        """Inputs the HIP op rejects, with no Triton kernel to take them,
+        must fall back to the split chain instead of failing the decode step."""
+        self.writer._write_hip = lambda **_: None
+        self.assertIsNone(
+            self._write(attention_backend="aiter", is_target_verify=False)
+        )
+
+    def test_no_writer_without_a_fused_kernel(self):
+        """Where neither kernel can run (gfx1250, an old AITER), no writer is
+        installed, so every layer keeps the split chain without per-step checks."""
+        with (
+            mock.patch.object(
+                kimi_k3_rocm_mla.mla_q_cache_aiter_hip, "available", lambda: False
+            ),
+            mock.patch.object(
+                kimi_k3_rocm_mla.mla_q_cache_aiter_triton, "available", lambda: False
+            ),
+        ):
             self.assertIsNone(
-                self._write(attention_backend="aiter", is_target_verify=False)
+                kimi_k3_rocm_mla.create_q_cache_writer(
+                    kv_lora_rank=512, qk_rope_head_dim=64
+                )
             )
 
     def test_other_backends_keep_the_split_chain(self):
@@ -201,7 +219,7 @@ class TestMlaQCacheWriterCallSite(CustomTestCase):
     """forward_absorb_rocm_core consults the writer only for non-DCP decode
     and target-verify; every other step keeps the split chain."""
 
-    def _call(self, *, mode, dcp_enabled=False, owner=True):
+    def _call(self, *, mode, dcp_enabled=False, owner=True, out_cache_loc=None):
         writer = mock.Mock()
         kv_layer = SimpleNamespace(owner=owner, key=lambda: None)
         attn = SimpleNamespace(
@@ -214,7 +232,7 @@ class TestMlaQCacheWriterCallSite(CustomTestCase):
                 is_decode=lambda: mode == "decode",
                 is_target_verify=lambda: mode == "target_verify",
             ),
-            out_cache_loc=torch.arange(2),
+            out_cache_loc=torch.arange(2) if out_cache_loc is None else out_cache_loc,
         )
         with (
             mock.patch.object(
@@ -224,8 +242,10 @@ class TestMlaQCacheWriterCallSite(CustomTestCase):
             ),
             mock.patch.object(
                 forward_mla_rocm,
-                "get_kv_layers",
-                return_value=SimpleNamespace(read=lambda _: kv_layer),
+                "get_token_to_kv_pool",
+                return_value=SimpleNamespace(
+                    layer_router=SimpleNamespace(read=lambda _: kv_layer)
+                ),
             ),
         ):
             result = forward_mla_rocm.DeepseekMLARocmForwardMixin._maybe_fused_q_cache(
@@ -255,6 +275,15 @@ class TestMlaQCacheWriterCallSite(CustomTestCase):
                 result, write = self._call(mode=mode, dcp_enabled=dcp_enabled)
                 self.assertIsNone(result)
                 write.assert_not_called()
+
+    def test_strided_out_cache_loc_reaches_the_writer_contiguous(self):
+        """AITER reads slot_mapping at stride 1; a strided out_cache_loc passed
+        through as is would land tokens in the wrong slots."""
+        loc = torch.arange(8)[::2]
+        _, write = self._call(mode="decode", out_cache_loc=loc)
+        slot_mapping = write.call_args.kwargs["slot_mapping"]
+        self.assertTrue(slot_mapping.is_contiguous())
+        self.assertTrue(torch.equal(slot_mapping, loc))
 
     def test_non_owner_sub_pool_keeps_the_split_chain(self):
         """The writer scatters at out_cache_loc, but a non-owner sub-pool's layer

@@ -103,12 +103,18 @@ def test_fused_mla_q_cache_graph_replay_uses_changed_inputs():
 
 
 def test_fused_mla_q_cache_support_is_narrow():
-    values = mla_q_cache_inputs(1)
-    assert mla_q_cache_aiter_hip.covered(**values)
-    values["positions"] = values["positions"].to(torch.float32)
-    assert not mla_q_cache_aiter_hip.covered(**values)
-    with pytest.raises(ValueError, match="unsupported inputs"):
-        mla_q_cache_aiter_hip.run(**values)
+    """run() is fail-closed: inputs outside the contract return None unlaunched."""
+    for name, broken in (
+        ("positions", lambda v: v.to(torch.float32)),
+        # SGLang's MLA pool is [slots, 1, 576]; a paged cache would be misindexed.
+        ("kv_cache", lambda v: v.view(v.shape[0], 1, 1, 576)),
+        ("kv_cache", lambda v: v.to(torch.float8_e5m2)),
+    ):
+        values = mla_q_cache_inputs(1)
+        values[name] = broken(values[name])
+        assert mla_q_cache_aiter_hip.run(**values) is None
+        torch.cuda.synchronize()
+        assert torch.count_nonzero(values["kv_cache"].view(torch.uint8)).item() == 0
 
 
 def test_fused_mla_q_cache_writes_into_padded_out():
@@ -117,7 +123,6 @@ def test_fused_mla_q_cache_writes_into_padded_out():
     padded = torch.empty((4, 16, 576), device="cuda", dtype=dtypes.fp8)
     padded.view(torch.uint8).fill_(7)
     values["out"] = padded
-    assert mla_q_cache_aiter_hip.covered(**values)
     actual = mla_q_cache_aiter_hip.run(**values)
     torch.cuda.synchronize()
     expected_q, _ = mla_q_cache_reference(values)

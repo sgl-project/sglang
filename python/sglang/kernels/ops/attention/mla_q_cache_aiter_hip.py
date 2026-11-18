@@ -1,4 +1,8 @@
-"""Fail-closed adapter for Kimi-K3's fused MLA Q materialization and cache write."""
+"""Fail-closed AITER HIP adapter for Kimi-K3's fused MLA Q materialization and cache write.
+
+Covers gfx950 only: BF16 inputs, kv_lora_rank 512, rope dim 64, one KV head, a
+[slots, 1, 576] BF16 or e4m3fn cache and int64 slots; run() rejects anything else.
+"""
 
 from __future__ import annotations
 
@@ -34,7 +38,7 @@ def available() -> bool:
     return hip is not None and hip.gcn_arch == "gfx950" and _op() is not None
 
 
-def covered(
+def _covered(
     *,
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,
@@ -77,8 +81,11 @@ def covered(
             for x in (q_nope, q_pe, k_nope, k_pe)
         )
         and all(x.device == q_nope.device for x in tensors)
-        and kv_cache.ndim in (3, 4)
-        and kv_cache.shape[-1] == _HEAD_DIM
+        # SGLang's MLA pool is [slots, 1, 576]; a paged 4D cache would be
+        # indexed as one slot per block by the non-HPT kernels.
+        and kv_cache.ndim == 3
+        and kv_cache.shape[1] == 1
+        and kv_cache.shape[2] == _HEAD_DIM
         and kv_cache.dtype in (torch.bfloat16, _FP8_DTYPE)
         and slot_mapping.shape == (tokens,)
         # AITER's gfx950 kernels take one int64 slot and position per token.
@@ -126,11 +133,13 @@ def run(
     sin_cache: torch.Tensor,
     out: torch.Tensor,
     q_scale: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Write the latent KV cache and MLA query for the supported gfx950 contract."""
-    if not available():
-        raise RuntimeError("fused MLA Q/cache requires AITER on gfx950")
-    if not covered(
+) -> torch.Tensor | None:
+    """Write the latent KV cache and MLA query for the supported gfx950 contract.
+
+    Returns None without launching when AITER's op is unavailable or the inputs are
+    outside the contract, so the caller keeps its unfused path.
+    """
+    if not _covered(
         q_nope=q_nope,
         q_pe=q_pe,
         k_nope=k_nope,
@@ -144,8 +153,8 @@ def run(
         out=out,
         q_scale=q_scale,
     ):
-        raise ValueError("unsupported inputs for fused MLA Q/cache")
-    return launch(
+        return None
+    return _launch(
         q_nope=q_nope,
         q_pe=q_pe,
         k_nope=k_nope,
@@ -161,7 +170,7 @@ def run(
     )
 
 
-def launch(
+def _launch(
     *,
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,
@@ -176,7 +185,6 @@ def launch(
     out: torch.Tensor,
     q_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """run() without its checks, for callers that already passed covered()."""
     _op()(
         q_nope,
         q_pe,

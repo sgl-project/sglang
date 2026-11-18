@@ -314,6 +314,16 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.HIP}),
     )
 )
+# The no-RoPE AITER Triton form of the same op, for ROCm targets without the gfx950
+# HIP op; the K3 writer picks one of the two at construction.
+register_kernel(
+    KernelSpec(
+        op="attention.kimi_k3_mla_q_cache",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.mla_q_cache_aiter_triton:run",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
 
 
 # Public entry points inventoried by logical operator group (RFC #29630).
