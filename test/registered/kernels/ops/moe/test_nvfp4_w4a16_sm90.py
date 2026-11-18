@@ -58,6 +58,22 @@ SHAPES = {
     ),  # I / 64 = 12 chunks, not a multiple of the 4-stage ring
     "qwen3_next_ep8": (2048, 512, 64, 512, 10),
     "eplb36": (4096, 1536, 36, 288, 8),
+    # Per-GPU expert widths that are not a multiple of 128: Qwen3.8-Flash-Next (640 wide) at TP2, TP4 and TP8, the
+    # whole 640, DeepSeek-V4.1-Flash (2304 wide) at TP8 and TP4, and a DeepSeek-R1-sized layer 64 columns past 2048.
+    "q38_tp2": (2560, 320, 64, 64, 10),
+    "q38_tp4": (2560, 160, 64, 64, 10),
+    "q38_tp8": (2560, 80, 64, 64, 10),
+    "q38_ep": (2560, 640, 64, 64, 10),
+    "q38_tp4_full": (2560, 160, 512, 512, 10),
+    # A lone half block: 64 columns (Qwen3-Next's 512 at TP8) and 48, padded to 64.
+    "w64": (2048, 64, 64, 64, 10),
+    "w48": (2048, 48, 64, 64, 10),
+    "dsv41_tp8": (5120, 288, 48, 48, 6),
+    "dsv41_tp4": (5120, 576, 48, 48, 6),
+    "r1_2112": (7168, 2112, 32, 256, 8),
+    # Clamped SwiGLU layers (swiglu_limit 10): GLM-5.3-Flash at TP4 and TP8.
+    "glm53f_tp4": (4096, 512, 36, 288, 8),
+    "glm53f_tp8": (4096, 256, 36, 288, 8),
 }
 SENTINEL = 7.0
 _LAYERS = {}
@@ -72,7 +88,9 @@ def _dequant(w, sf, gs=None):
 
 def _checkpoint(E, H, I, case, seed):
     """ModelOpt-layout experts. case: normal; subnormal (half the block scales are E4M3 subnormals); small (global
-    scale 1, all block scales subnormal); gateup (each expert's up global scale is its gate scale times 0.1 .. 10)."""
+    scale 1, all block scales subnormal); gateup (each expert's up global scale is its gate scale times 0.1 .. 10);
+    loud (gate and up 20x larger than normal, so a SwiGLU clamp of 10 binds on a large share of elements); loudgateup
+    (loud, with each expert's up global scale its gate scale times 0.5 .. 2)."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     ck = {}
     for name, (n, k) in (("w13", (2 * I, H)), ("w2", (H, I))):
@@ -91,12 +109,15 @@ def _checkpoint(E, H, I, case, seed):
         gs = torch.full((E,), 1.0 if case == "small" else gs, device="cuda")
         if case in ("normal", "gateup"):
             gs = gs * torch.exp(0.5 * torch.randn((E,), generator=g, device="cuda"))
+        if case in ("loud", "loudgateup") and name == "w13":
+            gs = gs * 20.0
         ck[name + "_weight_scale"] = sf
         ck[name + "_weight_scale_2"] = gs
     gate = ck["w13_weight_scale_2"]
+    spread = {"gateup": 3.3, "loudgateup": 1.0}.get(case)
     up = (
-        gate * torch.exp2(torch.empty_like(gate).uniform_(-3.3, 3.3, generator=g))
-        if case == "gateup"
+        gate * torch.exp2(torch.empty_like(gate).uniform_(-spread, spread, generator=g))
+        if spread
         else gate
     )
     ck["w13_weight_scale_2"] = torch.stack((gate, up), dim=1).contiguous()
@@ -138,8 +159,10 @@ def _routing(T, topk, E, Eg, kind="skew", seed=0, remote="minus_one"):
     return ids.contiguous()
 
 
-def _reference(ck, x, ids, E):
-    """FP32 per-route outputs [R, H] and the local route mask; gate and up rows each with their own global scale."""
+def _reference(ck, x, ids, E, swiglu_limit=None, clamped=None, variant=None):
+    """FP32 per-route outputs [R, H] and the local route mask; gate and up rows each with their own global scale. With
+    swiglu_limit L the expert computes SiLU(min(gate, L)) * clamp(up, -L, L), and clamped (a list) collects per expert
+    the share of gate and of up values the clamp changed."""
     flat = ids.reshape(-1).long()
     local = (flat >= 0) & (flat < E)
     out = torch.zeros((flat.numel(), x.shape[1]), dtype=torch.float32, device=x.device)
@@ -151,9 +174,29 @@ def _reference(ck, x, ids, E):
             continue
         w13 = _dequant(ck["w13_weight"][e], ck["w13_weight_scale"][e])
         h = x.float()[sel // ids.shape[1]] @ w13.T
-        inter = torch.nn.functional.silu(h[:, :I] * gs13[e, 0]) * (
-            h[:, I:] * gs13[e, 1]
-        )
+        gate, up = h[:, :I] * gs13[e, 0], h[:, I:] * gs13[e, 1]
+        if swiglu_limit is not None:
+            if clamped is not None:
+                clamped.append(
+                    (
+                        float((gate > swiglu_limit).float().mean()),
+                        float((up.abs() > swiglu_limit).float().mean()),
+                    )
+                )
+            up = up.clamp(-swiglu_limit, swiglu_limit)
+            if (
+                variant == "after_silu"
+            ):  # a wrong clamp, for tests that must tell it apart
+                act = torch.nn.functional.silu(gate).clamp(max=swiglu_limit)
+            elif (
+                variant == "both_sides"
+            ):  # a wrong clamp, for tests that must tell it apart
+                act = torch.nn.functional.silu(gate.clamp(-swiglu_limit, swiglu_limit))
+            else:
+                act = torch.nn.functional.silu(gate.clamp(max=swiglu_limit))
+            inter = act * up
+        else:
+            inter = torch.nn.functional.silu(gate) * up
         out[sel] = (
             inter
             @ _dequant(
@@ -174,7 +217,14 @@ def _assert_close(y, ref, rows):
 
 
 def _check(
-    shape, T, kind="skew", case="normal", variant="auto", ctas=0, remote="minus_one"
+    shape,
+    T,
+    kind="skew",
+    case="normal",
+    variant="auto",
+    ctas=0,
+    remote="minus_one",
+    swiglu_limit=None,
 ):
     H, I, E, Eg, topk = SHAPES[shape]
     ck, experts = _layer(shape, case)
@@ -183,10 +233,13 @@ def _check(
     ).bfloat16()
     ids = _routing(T, topk, E, Eg, kind, seed=T, remote=remote)
     y = torch.full((T * topk, H), SENTINEL, dtype=torch.bfloat16, device="cuda")
-    nvfp4_w4a16_sm90_moe(x, ids, experts, out=y, variant=variant, ctas=ctas)
-    ref, local = _reference(ck, x, ids, E)
+    kw = {} if swiglu_limit is None else {"swiglu_limit": swiglu_limit}
+    nvfp4_w4a16_sm90_moe(x, ids, experts, out=y, variant=variant, ctas=ctas, **kw)
+    clamped = []
+    ref, local = _reference(ck, x, ids, E, swiglu_limit, clamped)
     _assert_close(y, ref, local)
     assert bool((y[~local] == 0).all()), "a row of a non-local route is not zero"
+    return ck, x, ids, ref, local, clamped
 
 
 @pytest.mark.parametrize("T", [1, 7, 8, 9, 33, 255, 753, 2047, 2048, 4096, 8191, 16384])
@@ -247,6 +300,198 @@ def test_other_shapes(shape):
     expert table sized for a power of two."""
     for T in (1, 255, 4096):
         _check(shape, T)
+
+
+@pytest.mark.parametrize("T", [1, 9, 40, 100, 753, 4096])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "q38_tp2",
+        "q38_tp4",
+        "q38_tp8",
+        "q38_ep",
+        "dsv41_tp8",
+        "dsv41_tp4",
+        "r1_2112",
+        "w64",
+        "w48",
+    ],
+)
+def test_expert_widths(shape, T):
+    """Per-GPU expert widths of 48, 64, 80, 160, 288, 320, 576 and 2112 (and 640, which the old op took, as a
+    control) at every MMA width (test_expert_widths_cover_every_tile_width checks the token counts reach each one).
+    64, 160, 320, 576 and 2112 end GEMM1 on a half-height row block and give GEMM2 an odd number of K chunks, 48 and
+    64 have nothing but that half block and one K chunk, and 48, 80 and 288 also pad up to 48 zero columns. Fails on:
+    the old 128-column refusal, a half block that writes its missing 64 columns into the next row of the intermediate,
+    a dropped or doubled last K chunk, padding that is not exactly zero, a half block's weights read at a full block's
+    stride (every later expert reads the wrong bytes)."""
+    _check(shape, T)
+
+
+def _tile_widths(ids, E):
+    """The MMA widths the op's planner gives the token tiles of this routing (as plan_block and mx_w do)."""
+    counts = torch.bincount(ids[(ids >= 0) & (ids < E)].long(), minlength=E).tolist()
+    widths = set()
+    for c in counts:
+        if c == 0:
+            continue
+        pn = (c + 127) // 128
+        tsz = ((c + pn - 1) // pn + 31) // 32 * 32
+        for t in range(pn):
+            nv = min(tsz, c - t * tsz)
+            widths.add(
+                (nv + 7) // 8 * 8
+                if nv <= 16
+                else 32
+                if nv <= 32
+                else 64
+                if nv <= 64
+                else 128
+            )
+    return widths
+
+
+def test_expert_widths_cover_every_tile_width():
+    """test_expert_widths' token counts give every new width tiles on each consumer path: mma.sync (8 or 16 tokens),
+    the narrow wgmma paths (32 and 64) and the full one (128)."""
+    for shape in ("q38_tp2", "q38_tp4", "dsv41_tp8", "r1_2112", "w64", "w48"):
+        _, _, E, Eg, topk = SHAPES[shape]
+        widths = set()
+        for T in (1, 9, 40, 100, 753, 4096):
+            widths |= _tile_widths(_routing(T, topk, E, Eg, seed=T), E)
+        assert widths & {8, 16} and {32, 64, 128} <= widths, (shape, sorted(widths))
+
+
+@pytest.mark.parametrize(
+    "shape,variant,T,ctas",
+    [
+        ("q38_tp2", "single", 4096, 2),
+        ("q38_tp4", "single", 753, 3),
+        ("dsv41_tp4", "auto", 16384, 0),
+        ("r1_2112", "auto", 16384, 0),
+    ],
+)
+def test_expert_widths_queue_wrap_and_pair_fallback(shape, variant, T, ctas):
+    """The new widths with 2 or 3 CTAs, so every CTA wraps its tile queue across half blocks and one-chunk stages, and
+    at 16384 tokens, where auto picks CTA pairs for full-block shapes and must stay on one CTA per tile here. Fails on:
+    a queue or ring parity error after a one-chunk stage, the pair kernel taken on a half block."""
+    _check(shape, T, variant=variant, ctas=ctas)
+
+
+def test_expert_widths_full_qwen38_layer():
+    """Qwen3.8-Flash-Next at TP4 with its real expert count and top 10: 512 experts, 160 columns each."""
+    for T in (1, 64, 2048):
+        _check("q38_tp4_full", T)
+
+
+def test_pair_kernel_refuses_a_half_block():
+    _, experts = _layer("q38_tp2")
+    x = torch.randn((64, 2560), device="cuda").bfloat16()
+    ids = _routing(64, 10, 64, 64)
+    with pytest.raises(Exception, match="CTA pairs"):
+        nvfp4_w4a16_sm90_moe(x, ids, experts, variant="pair")
+
+
+def test_repack_size_matches_the_checkpoint_up_to_64_columns():
+    """A width that is a multiple of 64 repacks into exactly the checkpoint's bytes, and 80 and 288 add only the zero
+    columns up to the next multiple of 64. Fails on: padding to 128, which would waste a fifth of the bytes at 320."""
+    for shape in ("q38_tp2", "q38_tp4", "q38_tp8", "dsv41_tp8", "dsv41_tp4"):
+        H, I, E, _, _ = SHAPES[shape]
+        ck, experts = _layer(shape)
+        ckpt = sum(
+            ck[n].numel() * ck[n].element_size()
+            for n in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
+        )
+        packed = experts.w13.numel() + experts.w2.numel()
+        assert packed * I == ckpt * ((I + 63) // 64 * 64), (shape, packed, ckpt)
+
+
+@pytest.mark.parametrize("T", [1, 9, 100, 4096])
+@pytest.mark.parametrize("shape", ["glm53f_tp4", "glm53f_tp8", "dsv41_tp8"])
+def test_swiglu_limit(shape, T):
+    """swiglu_limit 10 on GLM-5.3-Flash and DeepSeek-V4.1-Flash shapes, with gate and up large enough that the clamp
+    binds on a large share of elements, against the clamped FP32 reference. Fails on: no clamp (the unclamped
+    reference is checked to be far from the clamped one), up clamped on one side only."""
+    ck, x, ids, ref, local, clamped = _check(shape, T, case="loud", swiglu_limit=10.0)
+    gate_share = sum(g for g, _ in clamped) / len(clamped)
+    up_share = sum(u for _, u in clamped) / len(clamped)
+    assert gate_share > 0.2 and up_share > 0.4, (gate_share, up_share)
+    unclamped, _ = _reference(ck, x, ids, SHAPES[shape][2])
+    d = (unclamped[local] - ref[local]).norm() / ref[local].norm()
+    assert float(d) > 0.5, float(d)
+
+
+@pytest.mark.parametrize("T", [9, 4096])
+@pytest.mark.parametrize("shape", ["glm53f_tp8", "q38_tp2"])
+def test_swiglu_limit_where_the_clamp_shape_matters(shape, T):
+    """A limit of 1 on normal-sized gate and up, where SiLU(gate) is far from linear: clamping the gate from below as
+    well, or clamping after SiLU instead of before, moves the output by several percent here (at a limit of 10 both
+    stay inside the error bound). q38_tp2 runs the clamp in a half-block layer. Fails on: either of those, and on the
+    clamp missing in the half block's copy-out."""
+    ck, x, ids, ref, local, clamped = _check(shape, T, swiglu_limit=1.0)
+    E = SHAPES[shape][2]
+    gate_share = sum(g for g, _ in clamped) / len(clamped)
+    up_share = sum(u for _, u in clamped) / len(clamped)
+    assert gate_share > 0.1 and up_share > 0.2, (gate_share, up_share)
+    rows = ref[local]
+    for wrong in ("both_sides", "after_silu"):
+        alt = _reference(ck, x, ids, E, 1.0, variant=wrong)[0][local]
+        assert float((alt - rows).norm() / rows.norm()) > 0.03, wrong
+
+
+@pytest.mark.parametrize("T", [9, 4096])
+def test_swiglu_limit_with_unequal_gate_and_up_scales(T):
+    """The repack folds up / gate into GEMM2's scale, so the up values GEMM1 stages carry the gate's scale, and the
+    clamp must still bind on the true up value. Fails on: the staged up value clamped at the plain limit."""
+    _check("glm53f_tp8", T, case="loudgateup", swiglu_limit=10.0)
+
+
+def test_half_block_clamped_layer_under_cuda_graph_and_reload():
+    """The half-block, clamped kernel captured in a CUDA graph, replayed with new routings and inputs, then after an
+    in-place reload of different weights. Fails on: a host-side branch on the routing in the new kernel choice, a
+    reload that misses the up / gate ratio (the clamp keeps the old weights' limit)."""
+    H, I, E, Eg, topk = SHAPES["q38_tp2"]
+    ck1 = _checkpoint(E, H, I, "normal", 21)
+    ck2 = _checkpoint(E, H, I, "loudgateup", 22)
+    experts = repack_modelopt_nvfp4_moe_for_sm90(**ck1)
+    T = 300
+    x = torch.randn((T, H), device="cuda").bfloat16()
+    ids = _routing(T, topk, E, Eg, seed=4)
+    w = torch.rand((T, topk), device="cuda")
+    out = torch.empty((T, H), dtype=torch.bfloat16, device="cuda")
+    run = lambda: nvfp4_w4a16_sm90_moe(
+        x, ids, experts, topk_weights=w, out=out, swiglu_limit=1.0
+    )
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for rep, ck in enumerate((ck1, ck2)):
+        if rep == 1:
+            assert repack_modelopt_nvfp4_moe_for_sm90(**ck, out=experts) is experts
+        x.copy_(torch.randn((T, H), device="cuda").bfloat16())
+        ids.copy_(_routing(T, topk, E, Eg, kind="hot", seed=30 + rep))
+        graph.replay()
+        eager = nvfp4_w4a16_sm90_moe(x, ids, experts, topk_weights=w, swiglu_limit=1.0)
+        torch.cuda.synchronize()
+        assert float((out.float() - eager.float()).abs().max()) <= 1e-2 * float(
+            eager.float().abs().max()
+        )
+        ref, local = _reference(ck, x, ids, E, 1.0)
+        ref_sum = (ref.view(T, topk, H) * (w * local.view(T, topk)).unsqueeze(-1)).sum(
+            1
+        )
+        _assert_close(out, ref_sum, slice(None))
+
+
+def test_swiglu_limit_far_above_every_value_is_bitwise_the_plain_op():
+    _, experts = _layer("q38_tp4")
+    for T in (9, 753):
+        x = torch.randn((T, 2560), device="cuda").bfloat16()
+        ids = _routing(T, 10, 64, 64, seed=T)
+        a = nvfp4_w4a16_sm90_moe(x, ids, experts)
+        b = nvfp4_w4a16_sm90_moe(x, ids, experts, swiglu_limit=1e30)
+        assert torch.equal(a, b)
 
 
 def test_weighted_sum():
@@ -339,8 +584,8 @@ def test_argument_checks():
         (x[:, :4096].contiguous(), ids, ex),
         (x, ids.long(), ex),
         (x, ids[:8], ex),
-        (x, ids, Nvfp4Sm90Experts(ex.w13[:16], ex.w2, ex.gs13, ex.gs2, H, I)),
-        (x, ids, Nvfp4Sm90Experts(ex.w13, ex.w2, ex.gs13, ex.gs2, H, I + 128)),
+        (x, ids, Nvfp4Sm90Experts(ex.w13[:16], ex.w2, ex.gs13, ex.gs2, ex.gsr, H, I)),
+        (x, ids, Nvfp4Sm90Experts(ex.w13, ex.w2, ex.gs13, ex.gs2, ex.gsr, H, I + 128)),
     ]
     for args in bad:
         with pytest.raises(Exception):

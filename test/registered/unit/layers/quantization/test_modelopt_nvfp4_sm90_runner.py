@@ -74,15 +74,20 @@ def _fill(layer, seed):
     return {n: p.data.clone() for n, p in layer.named_parameters()}
 
 
-def _reference(ck, x, ids, w, scale):
+def _reference(ck, x, ids, w, scale, swiglu_limit=None):
     out = torch.zeros(x.shape, dtype=torch.float32, device="cuda")
-    for e in range(E):
+    n = ck["w2_weight"].shape[2] * 2
+    for e in range(ck["w2_weight"].shape[0]):
         t, k = (ids == e).nonzero(as_tuple=True)
         if t.numel() == 0:
             continue
         h = x.float()[t] @ _dequant(ck["w13_weight"][e], ck["w13_weight_scale"][e]).T
         gs = ck["w13_weight_scale_2"][e]
-        a = torch.nn.functional.silu(h[:, :I] * gs[0]) * (h[:, I:] * gs[1])
+        gate, up = h[:, :n] * gs[0], h[:, n:] * gs[1]
+        if swiglu_limit is not None:
+            gate = gate.clamp(max=swiglu_limit)
+            up = up.clamp(-swiglu_limit, swiglu_limit)
+        a = torch.nn.functional.silu(gate) * up
         y = (
             a
             @ (
@@ -95,16 +100,15 @@ def _reference(ck, x, ids, w, scale):
 
 
 class TestRunnerConfigRefusals(CustomTestCase):
-    """The op computes plain SiLU(gate) * up with router weights applied after the down projection. Any other expert
-    math must be refused, not run without it: GLM-5.3-Flash and DeepSeek-V4.1-Flash set a SwiGLU clamp of 10, and the
-    runner used to drop it with no error."""
+    """The op computes SiLU(gate) * up, clamped by swiglu_limit when the layer sets it, with router weights applied
+    after the down projection. Any other expert math must be refused, not run without it."""
 
-    def test_plain_gated_silu_passes(self):
+    def test_plain_and_swiglu_limit_pass(self):
         _check_nvfp4_sm90_runner_config(MoeRunnerConfig())
+        _check_nvfp4_sm90_runner_config(MoeRunnerConfig(swiglu_limit=10.0))
 
     def test_refuses_each_unsupported_variant(self):
         for field, value in (
-            ("swiglu_limit", 10.0),
             ("gemm1_clamp_limit", 10.0),
             ("gemm1_alpha", 1.702),
             ("gemm1_beta", 1.0),
@@ -162,7 +166,7 @@ class TestModelOptNvfp4Sm90Runner(CustomTestCase):
         at TP2 EP2 that cost 1.25GB per GPU against Marlin. Fails when create_weights allocates the checkpoint-layout
         experts and then rebinds them to the repacked buffers. Shapes are Qwen3.8-Flash-Next at EP2 and GLM-5.3 at
         TP8, with a 30MB allocation per layer for the rest of the layer's weights."""
-        for e, h, i in ((256, 2560, 640), (256, 6144, 256)):
+        for e, h, i in ((256, 2560, 640), (256, 6144, 256), (512, 2560, 160)):
             with self.subTest(hidden=h, intermediate=i):
                 self.assertLess(self._split_bytes_after_load(e, h, i), 8 << 20)
 
@@ -202,7 +206,13 @@ class TestModelOptNvfp4Sm90Runner(CustomTestCase):
             "w2_weight_scale",
             "w2_weight_scale_2",
         )
-        for e, h, i in ((256, 2560, 640), (256, 6144, 256)):
+        # Qwen3.8-Flash-Next at EP2 and TP2, TP8 (a half block, then 48 columns of padding), GLM-5.3 at TP8.
+        for e, h, i in (
+            (256, 2560, 640),
+            (512, 2560, 320),
+            (512, 2560, 80),
+            (256, 6144, 256),
+        ):
             with self.subTest(hidden=h, intermediate=i):
                 method, layer = self._layer(e, h, i)
                 experts = layer.nvfp4_sm90_experts
@@ -228,7 +238,7 @@ class TestModelOptNvfp4Sm90Runner(CustomTestCase):
                     ref = repack_modelopt_nvfp4_moe_for_sm90(
                         *(ck[n].clone() for n in names)
                     )
-                    for f in ("w13", "w2", "gs13", "gs2"):
+                    for f in ("w13", "w2", "gs13", "gs2", "gsr"):
                         self.assertTrue(
                             torch.equal(getattr(experts, f), getattr(ref, f)), f
                         )
@@ -249,7 +259,30 @@ class TestModelOptNvfp4Sm90Runner(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "enable-eplb"):
                 self._layer()
 
-    def _layer(self, e=E, h=H, i=I):
+    def test_swiglu_limit_at_a_narrow_width(self):
+        """GLM-5.3-Flash-style layer (swiglu_limit 10) at a per-GPU width of 160, with gate and up large enough that
+        the clamp binds often: the runner must pass the limit to the op. Fails on: a runner that drops the limit
+        (about 3x the bound off), a create_weights or repack that still needs a multiple of 128."""
+        e, h, i = 16, 1024, 160
+        method, layer = self._layer(e, h, i, swiglu_limit=10.0)
+        ck = _fill(layer, seed=5)
+        ck["w13_weight_scale_2"] *= 20.0  # gate and up about 20 wide
+        layer.w13_weight_scale_2.data.copy_(ck["w13_weight_scale_2"])
+        method.process_weights_after_loading(layer)
+        g = torch.Generator(device="cuda").manual_seed(9)
+        for T in (1, 300):
+            x = torch.randn((T, h), generator=g, device="cuda").bfloat16()
+            ids = torch.argsort(torch.rand((T, e), generator=g, device="cuda"), dim=1)[
+                :, :TOPK
+            ].int()
+            w = torch.rand((T, TOPK), generator=g, device="cuda")
+            out = self._apply(method, layer, x, ids, w)
+            ref = _reference(ck, x, ids, w, 2.5, swiglu_limit=10.0)
+            free = _reference(ck, x, ids, w, 2.5)
+            self.assertLess(float((out.float() - ref).norm() / ref.norm()), 0.01)
+            self.assertGreater(float((free - ref).norm() / ref.norm()), 0.5)
+
+    def _layer(self, e=E, h=H, i=I, swiglu_limit=None):
         method = ModelOptNvFp4FusedMoEMethod(
             SimpleNamespace(
                 is_checkpoint_nvfp4_serialized=True,
@@ -266,6 +299,7 @@ class TestModelOptNvfp4Sm90Runner(CustomTestCase):
             activation="silu",
             is_gated=True,
             routed_scaling_factor=2.5,
+            swiglu_limit=swiglu_limit,
         )
         layer = torch.nn.Module()
         layer.num_experts = layer.num_local_experts = e
@@ -290,7 +324,7 @@ class TestModelOptNvfp4Sm90Runner(CustomTestCase):
         topk = StandardTopKOutput(
             topk_weights=w,
             topk_ids=ids,
-            router_logits=torch.zeros((x.shape[0], E), device="cuda"),
+            router_logits=torch.zeros((x.shape[0], layer.num_experts), device="cuda"),
         )
         return method.apply(
             layer,

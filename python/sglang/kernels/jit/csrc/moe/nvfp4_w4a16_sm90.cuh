@@ -55,8 +55,10 @@ SOFTWARE.
 //   combine_k out[t] = scale * sum over t's local routes k of w[t, k] y[t top_k + k], in increasing k
 // Weights are 16-row x 64-k units of 576B (512B of E2M1 codes in decode4's bit layout, then the 64 E4M3 block scales
 // as sc_bf16 codes), 256 rows per GEMM1 row block (for each half of its 128 intermediate columns, 64 gate rows then
-// the same 64 up rows). One FP32 global scale per expert per GEMM is applied in the epilogue. Differing gate and up
-// scales are folded exactly at pack time (up / gate into GEMM2's scale).
+// the same 64 up rows). I is a multiple of 64 (the repack pads); when it is an odd multiple, GEMM1's last row block
+// holds only one half and GEMM2 has an odd number of 64-wide K chunks. One FP32 global scale per expert per GEMM is
+// applied in the epilogue. Differing gate and up scales are folded exactly at pack time (up / gate into GEMM2's
+// scale). GEMM1's copy-out optionally clamps SwiGLU's inputs (swiglu_limit).
 // Every wgmma here takes A from registers, and ptxas through CUDA 13.2 can overwrite those registers while the wgmma
 // is in flight, so the loader refuses a build whose SASS shows that (sglang.kernels.jit.utils.wgmma_rs_hazard).
 #pragma once
@@ -74,6 +76,7 @@ SOFTWARE.
 #include <tvm/ffi/optional.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -155,13 +158,17 @@ __host__ __device__ __forceinline__ int m_cnt1(int E) {
 
 struct Shape {
   int E;         // local experts
-  int RB1, RB2;  // 256-row blocks per expert: GEMM1 (2 I / 256), GEMM2 (H / 256)
-  int C1, C2;    // 64-wide K chunks: GEMM1 (H / 64), GEMM2 (I / 64)
+  int RB1, RB2;  // 256-row blocks per expert: GEMM1 (ceil(2 I / 256), the last one half high when I % 128 == 64), GEMM2
+                 // (H / 256)
+  int HB1;       // 64-column halves of the intermediate (I / 64): RB1 full blocks, or RB1 - 1 and a half block if odd
+  int C1, C2;    // 64-wide K chunks: GEMM1 (H / 64), GEMM2 (I / 64, odd when GEMM1 ends on a half block)
   int I, H;      // row strides of the intermediate and of the output
+  float lim;     // SwiGLU clamp (gate <= lim, -lim <= up <= lim), or +inf for none
 };
 
 // Token row maps of a (gathered input, [R][H]) and inter ([R][I]): boxes of 64 k x {64, 128, 8, 16, 32} rows; the
-// weights as rows of 512B, boxes of one chunk (18 rows) and, for pair_k's narrow tiles, two chunks (36 rows).
+// weights as rows of 512B, boxes of one chunk (18 rows) and, for pair_k's narrow tiles, two chunks (36 rows). A
+// grouped_k launch with a half block (never a pair_k one) holds GEMM1's half-chunk boxes (9 rows) in w2c[0] instead.
 struct Maps {
   CUtensorMap x64[2], x128[2], xn[2][3], w[2], w2c[2];
 };
@@ -681,7 +688,9 @@ __device__ __forceinline__ int4 tl_pack(const TileInfo& o, int W) {
 // gate and up rows, writes its 128 intermediate columns and then releases the row block to GEMM2's TMA reads (cnt1);
 // GEMM2 writes each token's 256 output columns to its route's row. zs is the tile's slot buffer, double-buffered by
 // tile parity: a copier loading tile k + 1's rows has passed tile k + 1's barrier, so every copier is done with tile
-// k - 1's buffer.
+// k - 1's buffer. TAIL: the intermediate is an odd number of 64-column halves (see grouped_k). CLAMP: SwiGLU clamps its
+// inputs at S.lim. Both are template flags, so the plain shapes compile to the same code as without them.
+template <bool TAIL, bool CLAMP>
 __device__ __forceinline__ void copy_out(
     const int4 tl,
     int jt,
@@ -692,6 +701,7 @@ __device__ __forceinline__ void copy_out(
     __nv_bfloat16* out2,
     const int64_t* slot_of,
     int* cnt1,
+    const float* gsr,
     const Shape& S) {
   constexpr int NC = NW * 32;
   const int rb = tl.y & 0xFFFF, mode = (tl.y >> 16) & 15, row0 = tl.z, nv = tl.w;
@@ -703,8 +713,15 @@ __device__ __forceinline__ void copy_out(
   asm volatile("bar.sync 2, %0;" ::"n"(NC + 96) : "memory");
   if (mode == 1) {
     if (rb == S.RB1 - 1) debug_delay();
-    for (int i = ct; i < nv * 16; i += 96) {
-      const int tok = i >> 4, c8 = (i & 15) * 8;
+    // A half block (the last one when HB1 is odd) has only its first 64 columns: 8 uint4 per token, not 16.
+    const int sh = TAIL && rb == S.RB1 - 1 ? 3 : 4;
+    // The staged up rows carry the gate's global scale, and GEMM2's scale holds the up / gate ratio gsr[e], so the
+    // clamp on the true up value is a clamp at lim / |gsr[e]| here (the clamp is symmetric, so a negative ratio works
+    // too; gsr[e] is 0 only when up is all zero, and then the limit is inf).
+    float ulim = 0.f;
+    if constexpr (CLAMP) ulim = S.lim / fabsf(__ldg(gsr + tl.x));
+    for (int i = ct; i < nv << sh; i += 96) {
+      const int tok = i >> sh, c8 = (i & ((1 << sh) - 1)) * 8;
       const uint4 gq = *reinterpret_cast<const uint4*>(obuf + tok * ST + c8);
       const uint4 uq = *reinterpret_cast<const uint4*>(obuf + tok * ST + 128 + c8);
       const __nv_bfloat16* gp = reinterpret_cast<const __nv_bfloat16*>(&gq);
@@ -712,9 +729,13 @@ __device__ __forceinline__ void copy_out(
       __align__(16) __nv_bfloat16 o[8];
 #pragma unroll
       for (int x = 0; x < 8; x++) {
-        const float gv = __bfloat162float(gp[x]);
+        float gv = __bfloat162float(gp[x]), uv = __bfloat162float(up[x]);
+        if constexpr (CLAMP) {  // as SGLang's clamped SiLU: gate from above, up on both sides
+          gv = gv > S.lim ? S.lim : gv;
+          uv = uv > ulim ? ulim : (uv < -ulim ? -ulim : uv);
+        }
         const float sl = __bfloat162float(__float2bfloat16(__fdividef(gv, 1.f + __expf(-gv))));
-        o[x] = __float2bfloat16(sl * __bfloat162float(up[x]));
+        o[x] = __float2bfloat16(sl * uv);
       }
       *reinterpret_cast<uint4*>(out1 + (size_t)(row0 + tok) * S.I + rb * 128 + c8) = *reinterpret_cast<const uint4*>(o);
     }
@@ -768,12 +789,15 @@ stage_tile(const float (&acc)[2][AW / 2], float gscale, int k, int mode, int war
 // producer (TMA loads into a ring of MX_NS stages); warps NW + 1 .. NW + 3 copy finished tiles out, and the first of
 // them claims and locates the next tile (scheduler). Every tile, a CTA's first included, is claimed from a counter, so
 // only resident CTAs take tiles: a CTA that is still queued behind another kernel holds none, and the GEMM1 tiles a
-// GEMM2 tile waits for were all claimed (by running CTAs) before it.
+// GEMM2 tile waits for were all claimed (by running CTAs) before it. TAIL: GEMM1's last row block is half high (its
+// weights come through mp.w2c[0], which holds half-chunk boxes in such a launch) and GEMM2 has an odd chunk count.
+template <bool TAIL, bool CLAMP>
 __global__ void __launch_bounds__((NW + 4) * 32, 1) grouped_k(
     const __grid_constant__ Maps mp,
     int* __restrict__ meta,
     const float* __restrict__ gs1,
     const float* __restrict__ gs2,
+    const float* __restrict__ gsr,
     __nv_bfloat16* __restrict__ out1,
     __nv_bfloat16* __restrict__ out2,
     const int64_t* __restrict__ slot_of,
@@ -810,7 +834,7 @@ __global__ void __launch_bounds__((NW + 4) * 32, 1) grouped_k(
       mbar_init((uint32_t)__cvta_generic_to_shared(&gbars[s]), 1);
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
-  if (tid >= NC && tid < NC + 12) {  // tensor maps (kernel parameters, not predecessor output): before the PDL wait
+  if (tid >= NC && tid < NC + (TAIL ? 13 : 12)) {  // tensor maps (kernel parameters): before the PDL wait
     const CUtensorMap* pm = reinterpret_cast<const CUtensorMap*>(&mp) + (tid - NC);
     asm volatile("prefetch.tensormap [%0];" ::"l"(reinterpret_cast<uint64_t>(pm)) : "memory");
   }
@@ -862,27 +886,33 @@ __global__ void __launch_bounds__((NW + 4) * 32, 1) grouped_k(
         if (lane == 0) mbar_arrive(btq + 8 * (k & 7));
         if (t < 0) break;
         const int C = mode == 1 ? S.C1 : S.C2, RBm = mode == 1 ? S.RB1 : S.RB2;
-        const CUtensorMap* wm = &mp.w[mode - 1];
-        const int wr0 = ((e * RBm + rb) * C) * WROWS;
+        // GEMM1's half block (the last one when HB1 is odd) stores 8 units per chunk: half the rows and bytes. Its
+        // consumers in the second warpgroup multiply whatever the stage held before, and copy_out drops their columns.
+        const bool half = TAIL && mode == 1 && rb == S.RB1 - 1;
+        const CUtensorMap* wm = half ? &mp.w2c[0] : &mp.w[mode - 1];
+        const int wr0 = TAIL ? e * (mode == 1 ? S.HB1 : 2 * S.RB2) * C * (WROWS / 2) + rb * C * WROWS
+                             : ((e * RBm + rb) * C) * WROWS;
+        const int cr = half ? WROWS / 2 : WROWS, wbytes = half ? WB2 / 2 : WB2;
         if (mode == 2) {  // this token tile's intermediate rows: wait for its RB1 GEMM1 row blocks
           while (ld_acquire(&cnt1[jt]) < S.RB1)
             __nanosleep(128);
           asm volatile("fence.proxy.async.global;" ::: "memory");
         }
         if (W <= 64) {
-          // Narrow tile: two chunks per stage, so the ring holds twice as many of these short, load-heavy chunks.
+          // Narrow tile: two chunks per stage, so the ring holds twice as many of these short, load-heavy chunks. An
+          // odd chunk count (GEMM2 after a half block) leaves one chunk in the last stage.
           const CUtensorMap* bm = W <= 32 ? &mp.xn[mode - 1][W == 8 ? 0 : W == 16 ? 1 : 2] : &mp.x64[mode - 1];
-          const int ex = 2 * (W * 128 + WB2);
           const int cgo =
-              C >= 8 ? C - 8 : 0;  // 4 stages from the end (or the first): the scheduler may claim tile k + 1
+              (C >= 8 ? C - 8 : 0) & ~1;  // 4 stages from the end (or the first): the scheduler may claim tile k + 1
           for (int c = 0; c < C; c += 2, gch++) {
-            const int s = gch % NS;
+            const int s = gch % NS, nj = TAIL && c + 1 == C ? 1 : 2;
             if (gch >= NS) mbar_wait(bempty + 8 * s, ((gch / NS) - 1) & 1);
             if (elect_one()) {
-              mbar_expect(bfull + 8 * s, ex);
+              mbar_expect(bfull + 8 * s, nj * (W * 128 + wbytes));
 #pragma unroll
               for (int j = 0; j < 2; j++) {
-                tma_2d_h(sb + s * SB + j * MX_PAIR + 8192, wm, 0, wr0 + (c + j) * WROWS, bfull + 8 * s, pol);
+                if (j == nj) break;
+                tma_2d_h(sb + s * SB + j * MX_PAIR + 8192, wm, 0, wr0 + (c + j) * cr, bfull + 8 * s, pol);
                 tma_2d(sb + s * SB + j * MX_PAIR, bm, (c + j) * 64, row0, bfull + 8 * s);
               }
               if (c == cgo) mbar_arrive(bgo + 8 * (k & 7));
@@ -891,8 +921,8 @@ __global__ void __launch_bounds__((NW + 4) * 32, 1) grouped_k(
         } else {
           // W 128: one 128-row box of token rows and one chunk of weights per stage.
           const CUtensorMap* bmw = &mp.x128[mode - 1];
-          const int ex = 128 * 128 + WB2;
-          if ((gch % NS) == 0 && (C % NS) == 0) {  // stage slots known at compile time: unroll by NS
+          const int ex = 128 * 128 + wbytes;
+          if ((gch % NS) == 0 && (C % NS) == 0 && !half) {  // stage slots known at compile time: unroll by NS
             for (int c = 0; c < C; c += NS, gch += NS) {
               const uint32_t par = ((gch / NS) - 1) & 1;
 #pragma unroll
@@ -913,7 +943,7 @@ __global__ void __launch_bounds__((NW + 4) * 32, 1) grouped_k(
               if (gch >= NS) mbar_wait(bempty + 8 * s, ((gch / NS) - 1) & 1);
               if (elect_one()) {
                 mbar_expect(bfull + 8 * s, ex);
-                tma_2d_h(sb + s * SB + XOFF, wm, 0, wr0 + c * WROWS, bfull + 8 * s, pol);
+                tma_2d_h(sb + s * SB + XOFF, wm, 0, wr0 + c * cr, bfull + 8 * s, pol);
                 tma_2d(sb + s * SB, bmw, c * 64, row0, bfull + 8 * s);
                 if (c == cgo) mbar_arrive(bgo + 8 * (k & 7));
               }
@@ -943,7 +973,7 @@ __global__ void __launch_bounds__((NW + 4) * 32, 1) grouped_k(
           }
           __syncwarp();
         }
-        copy_out(s_tl[k & 7], s_tj[k & 7], ct, z0_slot[k & 1], obuf, out1, out2, slot_of, cnt1, S);
+        copy_out<TAIL, CLAMP>(s_tl[k & 7], s_tj[k & 7], ct, z0_slot[k & 1], obuf, out1, out2, slot_of, cnt1, gsr, S);
       }
     }
     return;
@@ -958,6 +988,7 @@ __global__ void __launch_bounds__((NW + 4) * 32, 1) grouped_k(
     const int4 tl = s_tl[k & 7];
     const int e = tl.x, mode = (tl.y >> 16) & 15, wv = tl.y >> 20, ntok = tl.w;
     const int C = mode == 1 ? S.C1 : S.C2;
+    const int Ce = TAIL ? C & ~1 : C;  // chunks in whole stages (pairs); a TAIL launch handles an odd last one after
     // One tile at MMA width W on its own accumulator array (wgmmas of different shapes writing one array are
     // serialized by ptxas, warning C7512).
     auto tile = [&](auto Wc) {
@@ -992,10 +1023,11 @@ __global__ void __launch_bounds__((NW + 4) * 32, 1) grouped_k(
         }
         gch++;
       };
-      // Narrow pair loop (W 32 / 64) at MMA width NWc: both chunks of a stage, then wait 0 and release the stage.
+      // Narrow pair loop (W 32 / 64) at MMA width NWc: both chunks of a stage, then wait 0 and release the stage. An
+      // odd chunk count ends on a stage with one chunk.
       auto pairs = [&](auto NWc) {
         constexpr int NWv = decltype(NWc)::value;
-        for (int c = 0; c < C; c += 2, gch++) {
+        for (int c = 0; c < Ce; c += 2, gch++) {
           const int s = gch % NS;
           mbar_wait(bfull + 8 * s, (gch / NS) & 1);
           chunk_mma<NWv, W>(acc, ra, sp0 + s * SB + 8192, ubase, lane, sb + s * SB);
@@ -1005,6 +1037,16 @@ __global__ void __launch_bounds__((NW + 4) * 32, 1) grouped_k(
           wg_wait<0>();
           __syncwarp();
           if (lane == 0) mbar_arrive(bempty + 8 * s);
+        }
+        if (TAIL && (C & 1)) {
+          const int s = gch % NS;
+          mbar_wait(bfull + 8 * s, (gch / NS) & 1);
+          chunk_mma<NWv, W>(acc, ra, sp0 + s * SB + 8192, ubase, lane, sb + s * SB);
+          wg_commit();
+          wg_wait<0>();
+          __syncwarp();
+          if (lane == 0) mbar_arrive(bempty + 8 * s);
+          gch++;
         }
       };
       if constexpr (W < 32) {
@@ -1017,6 +1059,7 @@ __global__ void __launch_bounds__((NW + 4) * 32, 1) grouped_k(
           mbar_wait(bfull + 8 * s, (gch / NS) & 1);
 #pragma unroll
           for (int j = 0; j < 2; j++) {
+            if (TAIL && j == 1 && c + 1 == C) break;  // an odd chunk count: the last stage holds one chunk
             const uint32_t xr = sb + s * SB + j * MX_PAIR + lrow * 128;
             uint32_t bf[NT][8];
 #pragma unroll
@@ -1074,45 +1117,53 @@ __global__ void __launch_bounds__((NW + 4) * 32, 1) grouped_k(
                        : ntok <= 120 ? 120
                                      : 128;
         if (nw == 80) {
-          for (int c = 0; c < C; c += 2) {
+          for (int c = 0; c < Ce; c += 2) {
             step(IC<80>{}, c, ra);
             step(IC<80>{}, c + 1, rb_);
           }
+          if (TAIL && (C & 1)) step(IC<80>{}, C - 1, ra);
         } else if (nw == 96) {
-          for (int c = 0; c < C; c += 2) {
+          for (int c = 0; c < Ce; c += 2) {
             step(IC<96>{}, c, ra);
             step(IC<96>{}, c + 1, rb_);
           }
+          if (TAIL && (C & 1)) step(IC<96>{}, C - 1, ra);
         } else if (nw == 112) {
-          for (int c = 0; c < C; c += 2) {
+          for (int c = 0; c < Ce; c += 2) {
             step(IC<112>{}, c, ra);
             step(IC<112>{}, c + 1, rb_);
           }
+          if (TAIL && (C & 1)) step(IC<112>{}, C - 1, ra);
         } else if (nw == 72) {
-          for (int c = 0; c < C; c += 2) {
+          for (int c = 0; c < Ce; c += 2) {
             step(IC<72>{}, c, ra);
             step(IC<72>{}, c + 1, rb_);
           }
+          if (TAIL && (C & 1)) step(IC<72>{}, C - 1, ra);
         } else if (nw == 88) {
-          for (int c = 0; c < C; c += 2) {
+          for (int c = 0; c < Ce; c += 2) {
             step(IC<88>{}, c, ra);
             step(IC<88>{}, c + 1, rb_);
           }
+          if (TAIL && (C & 1)) step(IC<88>{}, C - 1, ra);
         } else if (nw == 104) {
-          for (int c = 0; c < C; c += 2) {
+          for (int c = 0; c < Ce; c += 2) {
             step(IC<104>{}, c, ra);
             step(IC<104>{}, c + 1, rb_);
           }
+          if (TAIL && (C & 1)) step(IC<104>{}, C - 1, ra);
         } else if (nw == 120) {
-          for (int c = 0; c < C; c += 2) {
+          for (int c = 0; c < Ce; c += 2) {
             step(IC<120>{}, c, ra);
             step(IC<120>{}, c + 1, rb_);
           }
+          if (TAIL && (C & 1)) step(IC<120>{}, C - 1, ra);
         } else {
-          for (int c = 0; c < C; c += 2) {
+          for (int c = 0; c < Ce; c += 2) {
             step(IC<128>{}, c, ra);
             step(IC<128>{}, c + 1, rb_);
           }
+          if (TAIL && (C & 1)) step(IC<128>{}, C - 1, ra);
           // only the full-width step's lagged release leaves the tile's last stage to free here
           wg_wait<0>();
           __syncwarp();
@@ -1141,11 +1192,13 @@ __global__ void __launch_bounds__((NW + 4) * 32, 1) grouped_k(
 // claims pairs from the counter and forwards each claim to rank 1. The token rows are multicast: each CTA issues half
 // of a stage's token boxes (or rank 0 the single box) to both CTAs, and loads its own weights. A stage is free again
 // only when the consumers of both CTAs are done with it (empty barriers count 2 NW arrives).
+template <bool CLAMP>
 __global__ void __launch_bounds__((NW + 4) * 32, 1) pair_k(
     const __grid_constant__ Maps mp,
     int* __restrict__ meta,
     const float* __restrict__ gs1,
     const float* __restrict__ gs2,
+    const float* __restrict__ gsr,
     __nv_bfloat16* __restrict__ out1,
     __nv_bfloat16* __restrict__ out2,
     const int64_t* __restrict__ slot_of,
@@ -1271,7 +1324,7 @@ __global__ void __launch_bounds__((NW + 4) * 32, 1) pair_k(
         mbar_wait(btq + 8 * (k & 7), (k >> 3) & 1);
         const int t = s_tq[k & 7];
         if (t < 0) break;
-        copy_out(s_tl[k & 7], s_tj[k & 7], ct, z0_slot[k & 1], obuf, out1, out2, slot_of, cnt1, S);
+        copy_out<false, CLAMP>(s_tl[k & 7], s_tj[k & 7], ct, z0_slot[k & 1], obuf, out1, out2, slot_of, cnt1, gsr, S);
       }
     }
     cluster_sync();
@@ -1677,6 +1730,10 @@ __global__ void __launch_bounds__(256) combine_k(
   }
 }
 
+// A kernel as a type, so one launch helper takes any instantiation.
+template <auto K_>
+using KernelC = std::integral_constant<decltype(K_), K_>;
+
 // Route count from which the CTA-pair kernel is used (at fewer routes one CTA per tile is faster on the H200).
 inline constexpr int64_t kPairMinRoutes = 16384;
 // Route count up to which one block plans the call (the multi-block count and scatter win above it).
@@ -1714,6 +1771,7 @@ run(tvm::ffi::TensorView x,
     tvm::ffi::TensorView w2,
     tvm::ffi::TensorView gs13,
     tvm::ffi::TensorView gs2,
+    tvm::ffi::TensorView gsr,
     tvm::ffi::TensorView meta,
     tvm::ffi::TensorView order,
     tvm::ffi::TensorView a,
@@ -1722,6 +1780,7 @@ run(tvm::ffi::TensorView x,
     tvm::ffi::Optional<tvm::ffi::TensorView> topk_weights,
     tvm::ffi::Optional<tvm::ffi::TensorView> out,
     double scale,
+    double swiglu_limit,
     int64_t variant,
     int64_t ctas) {
   using namespace host;
@@ -1736,6 +1795,7 @@ run(tvm::ffi::TensorView x,
   TensorMatcher({T, K}).with_dtype<int32_t>().with_device(device).verify(topk_ids);
   TensorMatcher({E}).with_dtype<float>().with_device(device).verify(gs13);
   TensorMatcher({E}).with_dtype<float>().with_device(device).verify(gs2);
+  TensorMatcher({E}).with_dtype<float>().with_device(device).verify(gsr);
   TensorMatcher({R, H}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(a);
   TensorMatcher({R, H}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(y);
   TensorMatcher({R, I}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(inter);
@@ -1745,10 +1805,15 @@ run(tvm::ffi::TensorView x,
   RuntimeCheck(r == t * topk, "nvfp4_w4a16_sm90: workspace rows ", r, " != tokens * top_k ", t * topk);
   RuntimeCheck(topk >= 1 && r < (int64_t{1} << 30), "nvfp4_w4a16_sm90: need 1 <= top_k and tokens * top_k < 2^30");
   RuntimeCheck(h >= 256 && h % 256 == 0, "nvfp4_w4a16_sm90: hidden size must be a multiple of 256, got ", h);
-  RuntimeCheck(i >= 128 && i % 128 == 0, "nvfp4_w4a16_sm90: intermediate size must be a multiple of 128, got ", i);
+  RuntimeCheck(i >= 64 && i % 64 == 0, "nvfp4_w4a16_sm90: padded intermediate size must be a multiple of 64, got ", i);
   RuntimeCheck(e >= 1 && e <= 1024, "nvfp4_w4a16_sm90: 1 to 1024 local experts, got ", e);
-  const int RB1 = (int)(2 * i / 256), RB2 = (int)(h / 256), C1 = (int)(h / 64), C2 = (int)(i / 64);
-  TensorMatcher({e, RB1, C1, 16, 576}).with_dtype<uint8_t>().with_device(device).ensure_alignment(16).verify(w13);
+  RuntimeCheck(swiglu_limit > 0, "nvfp4_w4a16_sm90: swiglu_limit must be positive (inf for none)");
+  const int HB1 = (int)(i / 64), RB1 = (HB1 + 1) / 2, RB2 = (int)(h / 256), C1 = (int)(h / 64), C2 = (int)(i / 64);
+  TensorMatcher({e, (int64_t)HB1 * C1 * 8, 576})
+      .with_dtype<uint8_t>()
+      .with_device(device)
+      .ensure_alignment(16)
+      .verify(w13);
   TensorMatcher({e, RB2, C2, 16, 576}).with_dtype<uint8_t>().with_device(device).ensure_alignment(16).verify(w2);
   RuntimeCheck(meta.size(0) >= 8 * e + 4 + r / TOKMAX + e + 64, "nvfp4_w4a16_sm90: meta workspace too small");
   RuntimeCheck(out.has_value() == topk_weights.has_value(), "nvfp4_w4a16_sm90: out and topk_weights go together");
@@ -1761,9 +1826,10 @@ run(tvm::ffi::TensorView x,
   const DLDevice dev = device.unwrap();
   RuntimeCheck(runtime::get_sm_version(dev.device_id) == 90, "nvfp4_w4a16_sm90: needs an sm_90 (Hopper) GPU");
   const int sms = (int)runtime::get_sm_count(dev.device_id);
-  const bool pair_ok = RB1 % 2 == 0 && RB2 % 2 == 0;
+  const bool pair_ok = HB1 % 2 == 0 && RB1 % 2 == 0 && RB2 % 2 == 0;
   const bool pair = variant == 2 || (variant == 0 && pair_ok && r >= kPairMinRoutes);
-  RuntimeCheck(!pair || pair_ok, "nvfp4_w4a16_sm90: CTA pairs need an even number of 256-row blocks in both GEMMs");
+  RuntimeCheck(
+      !pair || pair_ok, "nvfp4_w4a16_sm90: CTA pairs need an even number of full 256-row blocks in both GEMMs");
   int grid = ctas > 0 ? (int)std::min<int64_t>(ctas, sms) : sms;
   if (pair) grid &= ~1;
   RuntimeCheck(grid >= (pair ? 2 : 1), "nvfp4_w4a16_sm90: too few CTAs");
@@ -1810,23 +1876,43 @@ run(tvm::ffi::TensorView x,
     for (int j = 0; j < 3; j++)
       mp.xn[k][j] = row_map(b, cols, r, 8u << j);
     const tvm::ffi::TensorView& wt = k == 0 ? w13 : w2;
-    const int64_t bytes = wt.size(0) * wt.size(1) * wt.size(2) * 16 * 576;
+    const int64_t bytes = k == 0 ? e * HB1 * C1 * 8 * 576 : e * RB2 * C2 * 16 * 576;
     mp.w[k] = weight_map(wt.data_ptr(), bytes, WROWS, CU_TENSOR_MAP_L2_PROMOTION_NONE);
     mp.w2c[k] = weight_map(wt.data_ptr(), bytes, 2 * WROWS, CU_TENSOR_MAP_L2_PROMOTION_L2_256B);
+    if (k == 0 && HB1 % 2) mp.w2c[0] = weight_map(wt.data_ptr(), bytes, WROWS / 2, CU_TENSOR_MAP_L2_PROMOTION_NONE);
   }
-  const Shape S{Ei, RB1, RB2, C1, C2, (int)i, (int)h};
+  const Shape S{Ei, RB1, RB2, HB1, C1, C2, (int)i, (int)h, (float)swiglu_limit};
+  const bool clamp = swiglu_limit < INFINITY;
   const auto* g1 = static_cast<const float*>(gs13.data_ptr());
   const auto* g2 = static_cast<const float*>(gs2.data_ptr());
+  const auto* gr = static_cast<const float*>(gsr.data_ptr());
   auto* o1 = static_cast<__nv_bfloat16*>(inter.data_ptr());
   auto* o2 = static_cast<__nv_bfloat16*>(y.data_ptr());
   if (pair) {
-    runtime::set_max_dynamic_smem_per_device<pair_k>(dev, SMEM);
-    LaunchKernel(grid, (NW + 4) * 32, dev, SMEM)
-        .enable_cluster(dim3{2, 1, 1})(pair_k, mp, m, g1, g2, o1, o2, (const int64_t*)ord, S);
+    auto launch = [&](auto kernel) {
+      runtime::set_max_dynamic_smem_per_device<decltype(kernel)::value>(dev, SMEM);
+      LaunchKernel(grid, (NW + 4) * 32, dev, SMEM)
+          .enable_cluster(dim3{2, 1, 1})(decltype(kernel)::value, mp, m, g1, g2, gr, o1, o2, (const int64_t*)ord, S);
+    };
+    if (clamp)
+      launch(KernelC<pair_k<true>>{});
+    else
+      launch(KernelC<pair_k<false>>{});
   } else {  // programmatic dependent launch: the prologue overlaps the gather's tail
-    runtime::set_max_dynamic_smem_per_device<grouped_k>(dev, SMEM);
-    LaunchKernel(grid, (NW + 4) * 32, dev, SMEM)
-        .enable_pdl(true)(grouped_k, mp, m, g1, g2, o1, o2, (const int64_t*)ord, S);
+    auto launch = [&](auto kernel) {
+      runtime::set_max_dynamic_smem_per_device<decltype(kernel)::value>(dev, SMEM);
+      LaunchKernel(grid, (NW + 4) * 32, dev, SMEM)
+          .enable_pdl(true)(decltype(kernel)::value, mp, m, g1, g2, gr, o1, o2, (const int64_t*)ord, S);
+    };
+    const bool tail = HB1 % 2;
+    if (tail && clamp)
+      launch(KernelC<grouped_k<true, true>>{});
+    else if (tail)
+      launch(KernelC<grouped_k<true, false>>{});
+    else if (clamp)
+      launch(KernelC<grouped_k<false, true>>{});
+    else
+      launch(KernelC<grouped_k<false, false>>{});
   }
   if (out.has_value()) {
     LaunchKernel((int)std::min<int64_t>(t, 4 * sms), 256, dev)

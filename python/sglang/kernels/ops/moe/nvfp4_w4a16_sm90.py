@@ -8,6 +8,7 @@ FP4 MoE GEMV (moe_gemv_fp4.cu, Copyright (c) Microsoft Corporation, MIT License)
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -49,6 +50,7 @@ def nvfp4_w4a16_sm90_moe(
     topk_weights: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     scale: float = 1.0,
+    swiglu_limit: Optional[float] = None,
     variant: str = "auto",
     ctas: int = 0,
     debug_delay_ns: int = 0,
@@ -57,10 +59,12 @@ def nvfp4_w4a16_sm90_moe(
     local routes (ids in [0, E); other ranks' routes are -1 or any id outside it), into ``out`` [T, H] when given.
     Without: the per-route outputs [T * top_k, H] (row t * top_k + k, zeros for non-local routes), into ``out`` when
     given.
-    x is BF16 [T, H] in natural column order, topk_ids int32 [T, top_k]. variant and ctas pin the kernel for tests."""
+    x is BF16 [T, H] in natural column order, topk_ids int32 [T, top_k]. With swiglu_limit L, the expert computes
+    SiLU(min(gate, L)) * clamp(up, -L, L), as SGLang's other MoE paths do for that config field. variant and ctas pin
+    the kernel for tests."""
     T, H = x.shape
     R = T * topk_ids.shape[1]
-    E, I = experts.gs13.shape[0], experts.intermediate
+    E, I = experts.gs13.shape[0], experts.padded
     dev = x.device
     meta = torch.empty(9 * E + 68 + R // 128, dtype=torch.int32, device=dev)
     order = torch.empty(R, dtype=torch.int64, device=dev)
@@ -87,6 +91,7 @@ def nvfp4_w4a16_sm90_moe(
         experts.w2,
         experts.gs13,
         experts.gs2,
+        experts.gsr,
         meta,
         order,
         gathered,
@@ -95,6 +100,8 @@ def nvfp4_w4a16_sm90_moe(
         topk_weights,
         combined,
         float(scale),
+        # As in Marlin's path, a limit of 0 or below means no clamp.
+        float(swiglu_limit) if swiglu_limit and swiglu_limit > 0 else math.inf,
         _VARIANTS[variant],
         ctas,
     )

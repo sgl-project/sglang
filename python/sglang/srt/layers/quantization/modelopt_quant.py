@@ -2418,10 +2418,10 @@ _NVFP4_SM90_CHECKPOINT_PARAMS = (
 def _check_nvfp4_sm90_runner_config(config: MoeRunnerConfig) -> None:
     """Refuse every expert variant the nvfp4_w4a16_sm90 op does not compute.
 
-    The op runs plain SiLU(gate) * up with the router weights applied after the
-    down projection. A layer that asks for a clamped or scaled SwiGLU, or for the
-    router weight on the input, would otherwise run without it and give wrong
-    output with no error.
+    The op runs SiLU(gate) * up, with the swiglu_limit clamp when the layer sets
+    one, and applies the router weights after the down projection. A layer that
+    asks for another clamp, a scaled SwiGLU or the router weight on the input
+    would otherwise run without it and give wrong output with no error.
     """
     if not config.is_gated or config.activation != "silu":
         raise ValueError(
@@ -2430,7 +2430,7 @@ def _check_nvfp4_sm90_runner_config(config: MoeRunnerConfig) -> None:
         )
     unsupported = [
         name
-        for name in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit", "swiglu_limit")
+        for name in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
         if getattr(config, name) is not None
     ]
     if config.apply_router_weight_on_input:
@@ -3253,7 +3253,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale_2.data,
             out=layer.nvfp4_sm90_experts,
         )
-        # The runner reads only the repacked copy, which has the checkpoint's size.
+        # The runner reads only the repacked copy, which has the checkpoint's size
+        # plus zero padding up to a multiple of 64 intermediate columns.
         for name in _NVFP4_SM90_CHECKPOINT_PARAMS:
             param = getattr(layer, name)
             param.data = param.data.new_empty(0)
@@ -3263,12 +3264,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     ) -> dict:
         """Allocate the repacked experts before any checkpoint-layout tensor and
         return the four checkpoint-layout parameters' data as views of them. The
-        repacked layout holds exactly the checkpoint's codes and block scales, so
-        the loader writes into the bytes the kernel later reads. Nothing is
+        repacked layout holds the checkpoint's codes and block scales (plus zero
+        padding up to a multiple of 64 intermediate columns), so the loader writes
+        into the bytes the kernel later reads. Nothing is
         allocated and freed in between, so a model's later layers cannot split
         freed segments that the KV pool would otherwise get."""
         from sglang.kernels.ops.quantization.nvfp4_sm90_repack import (
             Nvfp4Sm90Experts,
+            padded_intermediate,
+            w13_units,
         )
 
         E, H, I = layer.num_local_experts, hidden_size, intermediate_size
@@ -3286,13 +3290,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             ),
         }
         layer.nvfp4_sm90_experts = None
-        if H % 256 or I % 128 or group != 16 or not layer.moe_runner_config.is_gated:
+        if H % 256 or I % 16 or group != 16 or not layer.moe_runner_config.is_gated:
             return {}  # the repack refuses these with a clear error
         layer.nvfp4_sm90_experts = Nvfp4Sm90Experts(
-            w13=torch.empty((E, 2 * I // 256, H // 64, 16, 576), dtype=torch.uint8),
-            w2=torch.empty((E, H // 256, I // 64, 16, 576), dtype=torch.uint8),
+            w13=torch.empty((E, w13_units(H, I), 576), dtype=torch.uint8),
+            w2=torch.empty(
+                (E, H // 256, padded_intermediate(I) // 64, 16, 576), dtype=torch.uint8
+            ),
             gs13=torch.empty(E, dtype=torch.float32),
             gs2=torch.empty(E, dtype=torch.float32),
+            gsr=torch.empty(E, dtype=torch.float32),
             hidden=H,
             intermediate=I,
         )
@@ -3322,7 +3329,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 flat[key][offset[key] : offset[key] + numel].view(dtype).view(shape)
             )
             offset[key] += numel
-        assert offset == {k: v.numel() for k, v in flat.items()}
+        # The checkpoint's bytes fill the repacked copy exactly, up to its zero
+        # padding from I to the padded width.
+        I, Ip = experts.intermediate, experts.padded
+        assert all(offset[k] * Ip == v.numel() * I for k, v in flat.items())
         return views
 
     @property

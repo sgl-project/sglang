@@ -55,5 +55,6 @@ def fused_experts_none_to_nvfp4_w4a16_sm90(
         topk_weights=topk_weights.to(torch.float32).contiguous(),
         out=out,
         scale=runner_config.routed_scaling_factor or 1.0,
+        swiglu_limit=runner_config.swiglu_limit,
     )
     return StandardCombineInput(hidden_states=output)
