@@ -5,6 +5,8 @@
 //! already-tokenized prompt means non-media tokens can never drift from a
 //! retokenize (the `SGLANG_MM_AVOID_RETOKENIZE` idea, unconditional here).
 
+use crate::error::{MmError, Result};
+
 /// The tokens one media item occupies in the expanded prompt.
 pub enum TokenPattern {
     /// N copies of one placeholder id (qwen-style).
@@ -49,11 +51,7 @@ pub struct ExpandedPrompt {
 ///   truncate the prompt;
 /// * every one of the `n_items` media items is placed exactly once;
 /// * no item expands to zero tokens (which would have no representable offset).
-pub fn apply_layout(
-    src: &[i64],
-    layout: &TokenLayout,
-    n_items: usize,
-) -> Result<ExpandedPrompt, String> {
+pub fn apply_layout(src: &[i64], layout: &TokenLayout, n_items: usize) -> Result<ExpandedPrompt> {
     let mut out = Vec::new();
     let mut offsets: Vec<Option<(u32, u32)>> = vec![None; n_items];
     // Source tokens consumed so far: `Text` copies them, a `Media` segment
@@ -62,22 +60,22 @@ pub fn apply_layout(
     for segment in &layout.segments {
         match segment {
             Segment::Text(range) => {
-                let text = src
-                    .get(range.clone())
-                    .ok_or_else(|| format!("layout: text range {range:?} out of bounds"))?;
+                let text = src.get(range.clone()).ok_or_else(|| {
+                    MmError::internal(format!("layout: text range {range:?} out of bounds"))
+                })?;
                 if range.start != consumed {
-                    return Err(format!(
+                    return Err(MmError::internal(format!(
                         "layout: text range {range:?} does not resume at source index {consumed}"
-                    ));
+                    )));
                 }
                 consumed = range.end;
                 out.extend_from_slice(text);
             }
             Segment::Media { item, pattern } => {
                 if consumed >= src.len() {
-                    return Err(format!(
+                    return Err(MmError::internal(format!(
                         "layout: media item {item} has no source placeholder at index {consumed}"
-                    ));
+                    )));
                 }
                 consumed += 1;
                 let start = out.len() as u32;
@@ -92,28 +90,34 @@ pub fn apply_layout(
                     }
                 };
                 if n == 0 {
-                    return Err(format!("layout: media item {item} expands to zero tokens"));
+                    return Err(MmError::internal(format!(
+                        "layout: media item {item} expands to zero tokens"
+                    )));
                 }
-                let slot = offsets
-                    .get_mut(*item)
-                    .ok_or_else(|| format!("layout: media item {item} out of range"))?;
+                let slot = offsets.get_mut(*item).ok_or_else(|| {
+                    MmError::internal(format!("layout: media item {item} out of range"))
+                })?;
                 if slot.replace((start, start + n as u32 - 1)).is_some() {
-                    return Err(format!("layout: media item {item} placed twice"));
+                    return Err(MmError::internal(format!(
+                        "layout: media item {item} placed twice"
+                    )));
                 }
             }
         }
     }
     if consumed != src.len() {
-        return Err(format!(
+        return Err(MmError::internal(format!(
             "layout: covers {consumed} of {} source token(s)",
             src.len()
-        ));
+        )));
     }
     let offsets = offsets
         .into_iter()
         .enumerate()
-        .map(|(i, slot)| slot.ok_or_else(|| format!("layout: media item {i} not placed")))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|(i, slot)| {
+            slot.ok_or_else(|| MmError::internal(format!("layout: media item {i} not placed")))
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(ExpandedPrompt {
         input_ids: out,
         offsets,
@@ -127,13 +131,13 @@ pub fn layout_by_placeholder(
     ids: &[i64],
     placeholder_id: i64,
     counts: &[usize],
-) -> Result<TokenLayout, String> {
+) -> Result<TokenLayout> {
     let found = ids.iter().filter(|&&id| id == placeholder_id).count();
     if found != counts.len() {
-        return Err(format!(
+        return Err(MmError::invalid(format!(
             "prompt has {found} media placeholder(s) but {} media item(s)",
             counts.len()
-        ));
+        )));
     }
     let mut segments = Vec::new();
     let mut text_start = 0;
@@ -164,7 +168,7 @@ pub fn layout_by_placeholder(
 mod tests {
     use super::*;
 
-    fn expand(ids: &[i64], placeholder: i64, counts: &[usize]) -> Result<ExpandedPrompt, String> {
+    fn expand(ids: &[i64], placeholder: i64, counts: &[usize]) -> Result<ExpandedPrompt> {
         apply_layout(
             ids,
             &layout_by_placeholder(ids, placeholder, counts)?,

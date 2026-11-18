@@ -6,6 +6,8 @@ pub mod token_layout;
 #[cfg(feature = "parallel")]
 use std::sync::OnceLock;
 
+use crate::error::{MmError, Result};
+
 /// CPU pool: decode, resize, patchify, hash. Sized to cores (capped at 8)
 /// because the work is compute-bound — never run blocking I/O on it, or one
 /// request's remote fetches stall every other request's preprocessing.
@@ -43,17 +45,25 @@ pub fn content_hash_u64(data: &[u8]) -> u64 {
     u64::from_be_bytes(digest.as_bytes()[..8].try_into().unwrap())
 }
 
-pub fn decode_rgb(data: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
+pub fn content_digest(data: &[u8]) -> String {
+    format!("blake3:{}", blake3::hash(data).to_hex())
+}
+
+pub fn decode_rgb(data: &[u8]) -> Result<(Vec<u8>, usize, usize)> {
     use image::ColorType;
 
-    let img = image::load_from_memory(data).map_err(|e| format!("image decode: {e}"))?;
+    let img = image::load_from_memory(data)
+        .map_err(|e| MmError::invalid(format!("image decode: {e}")))?;
     // >8-bit samples: PIL clips to 255 where `to_rgb8` would rescale. Refuse
     // rather than silently diverge from the Python (PIL) pipeline.
     if !matches!(
         img.color(),
         ColorType::L8 | ColorType::La8 | ColorType::Rgb8 | ColorType::Rgba8
     ) {
-        return Err(format!("image decode: unsupported color {:?}", img.color()));
+        return Err(MmError::invalid(format!(
+            "image decode: unsupported color {:?}",
+            img.color()
+        )));
     }
     let rgb = img.to_rgb8();
     let (w, h) = rgb.dimensions();
@@ -64,7 +74,7 @@ pub fn decode_rescale(
     data: &[u8],
     rescale_frac: Option<f64>,
     rescale_cap: Option<i64>,
-) -> Result<(Vec<u8>, usize, usize), String> {
+) -> Result<(Vec<u8>, usize, usize)> {
     let (rgb, h, w) = decode_rgb(data)?;
     let (tw, th) = resize::scaled_dims(w, h, rescale_frac, rescale_cap);
     if (tw, th) == (w, h) {
@@ -141,9 +151,7 @@ mod python {
         py: Python<'py>,
         data: Vec<u8>,
     ) -> PyResult<(usize, usize, Bound<'py, PyArray1<u8>>)> {
-        let (rgb, h, w) = py
-            .detach(move || decode_rgb(&data))
-            .map_err(PyValueError::new_err)?;
+        let (rgb, h, w) = py.detach(move || decode_rgb(&data))?;
         Ok((h, w, rgb.into_pyarray(py)))
     }
 
@@ -155,10 +163,13 @@ mod python {
     }
 
     #[pyfunction]
+    pub fn content_digest(py: Python<'_>, data: &[u8]) -> String {
+        py.detach(|| super::content_digest(data))
+    }
+
+    #[pyfunction]
     pub fn fetch_bytes<'py>(py: Python<'py>, source: String) -> PyResult<Bound<'py, PyBytes>> {
-        let data = py
-            .detach(move || super::fetch::fetch_bytes(&source))
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let data = py.detach(move || super::fetch::fetch_bytes(&source))?;
         Ok(PyBytes::new(py, &data))
     }
 
@@ -168,6 +179,7 @@ mod python {
         m.add_function(wrap_pyfunction!(scaled_dims, &m)?)?;
         m.add_function(wrap_pyfunction!(image_decode_rgb, &m)?)?;
         m.add_function(wrap_pyfunction!(content_hash, &m)?)?;
+        m.add_function(wrap_pyfunction!(content_digest, &m)?)?;
         m.add_function(wrap_pyfunction!(fetch_bytes, &m)?)?;
         parent.add_submodule(&m)?;
         Ok(())
@@ -179,7 +191,7 @@ pub use python::register;
 
 #[cfg(test)]
 mod tests {
-    use super::decode_rgb;
+    use super::{content_digest, decode_rgb};
     use image::ImageFormat;
 
     fn encode(img: &image::DynamicImage, fmt: ImageFormat) -> Vec<u8> {
@@ -201,6 +213,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn content_digest_is_prefixed_full_blake3() {
+        assert_eq!(
+            content_digest(b""),
+            "blake3:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+        );
+    }
+
     /// Samples deeper than 8 bits stay rejected (PIL clips; we refuse).
     #[test]
     fn deep_png_rejected() {
@@ -210,7 +230,7 @@ mod tests {
             image::Rgb([65535u16, 0, 0]),
         ));
         let err = decode_rgb(&encode(&img, ImageFormat::Png)).err().unwrap();
-        assert!(err.contains("unsupported color"), "{err}");
+        assert!(err.message().contains("unsupported color"), "{err}");
     }
 }
 

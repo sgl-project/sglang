@@ -8,6 +8,7 @@
 
 pub mod common;
 pub mod dsv41;
+pub mod error;
 pub mod inkling;
 pub mod qwen_vl;
 pub mod tensor;

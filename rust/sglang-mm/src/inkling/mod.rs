@@ -148,12 +148,10 @@ mod python {
         rescale_cap: Option<i64>,
     ) -> PyResult<(usize, usize, Bound<'py, PyArray1<u16>>)> {
         check_ps(patch_size)?;
-        let (h, w, out) = py
-            .detach(move || {
-                let (rgb, h, w) = common::decode_rescale(&data, rescale_frac, rescale_cap)?;
-                Ok::<_, String>((h, w, patchify_alloc(&rgb, h, w, patch_size)))
-            })
-            .map_err(PyValueError::new_err)?;
+        let (h, w, out) = py.detach(move || {
+            let (rgb, h, w) = common::decode_rescale(&data, rescale_frac, rescale_cap)?;
+            Ok::<_, crate::error::MmError>((h, w, patchify_alloc(&rgb, h, w, patch_size)))
+        })?;
         Ok((h, w, out.into_pyarray(py)))
     }
 
@@ -167,14 +165,12 @@ mod python {
         rescale_cap: Option<i64>,
     ) -> PyResult<Vec<PyPatches<'py>>> {
         check_ps(patch_size)?;
-        let results: Vec<Patches> = py
-            .detach(move || {
-                par::try_map(&datas, |data| -> Result<Patches, String> {
-                    let (rgb, h, w) = common::decode_rescale(data, rescale_frac, rescale_cap)?;
-                    Ok((h, w, patchify_alloc(&rgb, h, w, patch_size)))
-                })
+        let results: Vec<Patches> = py.detach(move || {
+            par::try_map(&datas, |data| -> crate::error::Result<Patches> {
+                let (rgb, h, w) = common::decode_rescale(data, rescale_frac, rescale_cap)?;
+                Ok((h, w, patchify_alloc(&rgb, h, w, patch_size)))
             })
-            .map_err(PyValueError::new_err)?;
+        })?;
         results
             .into_iter()
             .map(|(h, w, v)| Ok((h, w, v.into_pyarray(py))))
@@ -191,15 +187,13 @@ mod python {
         rescale_cap: Option<i64>,
     ) -> PyResult<Vec<PyHashedPatches<'py>>> {
         check_ps(patch_size)?;
-        let results: Vec<HashedPatches> = py
-            .detach(move || {
-                par::try_map(&datas, |data| -> Result<HashedPatches, String> {
-                    let hash = common::content_hash_u64(data);
-                    let (rgb, h, w) = common::decode_rescale(data, rescale_frac, rescale_cap)?;
-                    Ok((h, w, patchify_alloc(&rgb, h, w, patch_size), hash))
-                })
+        let results: Vec<HashedPatches> = py.detach(move || {
+            par::try_map(&datas, |data| -> crate::error::Result<HashedPatches> {
+                let hash = common::content_hash_u64(data);
+                let (rgb, h, w) = common::decode_rescale(data, rescale_frac, rescale_cap)?;
+                Ok((h, w, patchify_alloc(&rgb, h, w, patch_size), hash))
             })
-            .map_err(PyValueError::new_err)?;
+        })?;
         results
             .into_iter()
             .map(|(h, w, v, hash)| Ok((h, w, v.into_pyarray(py), hash)))

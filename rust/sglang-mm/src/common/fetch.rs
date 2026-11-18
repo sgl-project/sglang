@@ -10,6 +10,8 @@ use std::sync::OnceLock;
 
 use base64::Engine;
 
+use crate::error::{MmError, Result};
+
 /// Cap on one remotely fetched payload. Inline base64 and trusted local files
 /// use their caller's whole-request budget instead.
 pub const MAX_FETCH_BYTES: u64 = 64 << 20;
@@ -37,7 +39,7 @@ impl ByteBudget {
     }
 
     /// Claim `n` bytes, or `Err` once the allowance is spent.
-    fn claim(&self, n: u64) -> Result<(), ()> {
+    fn claim(&self, n: u64) -> std::result::Result<(), ()> {
         use std::sync::atomic::Ordering::{AcqRel, Acquire};
         self.0
             .fetch_update(AcqRel, Acquire, |left| left.checked_sub(n))
@@ -52,7 +54,7 @@ impl ByteBudget {
     /// Charge bytes which were already materialized by an earlier pipeline
     /// stage. This lets the consumer apply one whole-request bound across
     /// prefetched I/O and inline payloads without reading the source twice.
-    pub fn charge_existing(&self, n: usize, what: &str) -> Result<(), String> {
+    pub fn charge_existing(&self, n: usize, what: &str) -> Result<()> {
         self.claim(n as u64).map_err(|()| over_budget(what))
     }
 
@@ -65,7 +67,7 @@ impl ByteBudget {
 /// Resolve one string-typed image source into raw encoded-image bytes.
 /// An `Err` rejects the request, matching the Python per-request
 /// exception → 400.
-pub fn fetch_bytes(src: &str) -> Result<Vec<u8>, String> {
+pub fn fetch_bytes(src: &str) -> Result<Vec<u8>> {
     fetch_bytes_budgeted(src, &ByteBudget::new(MAX_FETCH_BYTES))
 }
 
@@ -77,14 +79,17 @@ pub fn fetch_bytes(src: &str) -> Result<Vec<u8>, String> {
 /// frontend accepts. They still consume the caller's whole-request budget.
 /// Reject non-regular files and charge their size before reading so a request
 /// cannot turn devices or a huge sparse file into an unbounded allocation.
-pub fn fetch_local_file_budgeted(src: &str, budget: &ByteBudget) -> Result<Vec<u8>, String> {
+pub fn fetch_local_file_budgeted(src: &str, budget: &ByteBudget) -> Result<Vec<u8>> {
     let path = src.strip_prefix("file://").unwrap_or(src);
-    let file = std::fs::File::open(path).map_err(|e| format!("media fetch: {path}: {e}"))?;
+    let file = std::fs::File::open(path)
+        .map_err(|e| MmError::invalid(format!("media fetch: {path}: {e}")))?;
     let metadata = file
         .metadata()
-        .map_err(|e| format!("media fetch: stat {path}: {e}"))?;
+        .map_err(|e| MmError::invalid(format!("media fetch: stat {path}: {e}")))?;
     if !metadata.is_file() {
-        return Err(format!("media fetch: {path}: not a regular file"));
+        return Err(MmError::invalid(format!(
+            "media fetch: {path}: not a regular file"
+        )));
     }
     let expected = metadata.len();
     budget.claim(expected).map_err(|()| over_budget(path))?;
@@ -92,9 +97,12 @@ pub fn fetch_local_file_budgeted(src: &str, budget: &ByteBudget) -> Result<Vec<u
     let read = file
         .take(expected.saturating_add(1))
         .read_to_end(&mut buf)
-        .map_err(|e| format!("media fetch: read {path}: {e}"))? as u64;
+        .map_err(|e| MmError::invalid(format!("media fetch: read {path}: {e}")))?
+        as u64;
     if read > expected {
-        return Err(format!("media fetch: {path}: changed size while reading"));
+        return Err(MmError::invalid(format!(
+            "media fetch: {path}: changed size while reading"
+        )));
     }
     budget.release(expected - read);
     Ok(buf)
@@ -103,7 +111,7 @@ pub fn fetch_local_file_budgeted(src: &str, budget: &ByteBudget) -> Result<Vec<u
 /// [`fetch_bytes`] against a caller-owned allowance, for resolving several
 /// sources under one whole-request bound. [`MAX_FETCH_BYTES`] still caps I/O
 /// streams; already-resident base64 is bounded by `budget`.
-pub fn fetch_bytes_budgeted(src: &str, budget: &ByteBudget) -> Result<Vec<u8>, String> {
+pub fn fetch_bytes_budgeted(src: &str, budget: &ByteBudget) -> Result<Vec<u8>> {
     if src.starts_with("http://") || src.starts_with("https://") {
         return http_get(src, budget);
     }
@@ -116,7 +124,7 @@ pub fn fetch_bytes_budgeted(src: &str, budget: &ByteBudget) -> Result<Vec<u8>, S
     if let Some(rest) = src.strip_prefix("data:") {
         let encoded = rest
             .split_once(',')
-            .ok_or_else(|| "media fetch: malformed data: URL".to_string())?
+            .ok_or_else(|| MmError::invalid("media fetch: malformed data: URL"))?
             .1;
         return decode_base64_budgeted(encoded, budget);
     }
@@ -127,7 +135,7 @@ pub fn fetch_bytes_budgeted(src: &str, budget: &ByteBudget) -> Result<Vec<u8>, S
 /// Reserve the maximum decoded size before allocating. The reservation is
 /// reconciled with the exact size afterwards because trailing padding can
 /// reduce the result by up to two bytes.
-fn decode_base64_budgeted(encoded: &str, budget: &ByteBudget) -> Result<Vec<u8>, String> {
+fn decode_base64_budgeted(encoded: &str, budget: &ByteBudget) -> Result<Vec<u8>> {
     let encoded = encoded.trim();
     let padding = encoded
         .as_bytes()
@@ -144,10 +152,10 @@ fn decode_base64_budgeted(encoded: &str, budget: &ByteBudget) -> Result<Vec<u8>,
         .ok_or_else(|| over_budget("base64 payload"))?;
     let remaining = budget.remaining();
     budget.claim(estimate).map_err(|()| {
-        format!(
+        MmError::invalid(format!(
             "{} (decoded size {estimate} bytes, {remaining} bytes remaining)",
             over_budget("base64 payload")
-        )
+        ))
     })?;
     match base64::engine::general_purpose::STANDARD.decode(encoded.as_bytes()) {
         Ok(decoded) => {
@@ -156,26 +164,35 @@ fn decode_base64_budgeted(encoded: &str, budget: &ByteBudget) -> Result<Vec<u8>,
         }
         Err(error) => {
             budget.release(estimate);
-            Err(format!("media fetch: base64 decode: {error}"))
+            Err(MmError::invalid(format!(
+                "media fetch: base64 decode: {error}"
+            )))
         }
     }
 }
 
-fn over_budget(what: &str) -> String {
-    format!("media fetch: {what}: exceeds the request media byte budget")
+fn over_budget(what: &str) -> MmError {
+    MmError::invalid(format!(
+        "media fetch: {what}: exceeds the request media byte budget"
+    ))
 }
 
 /// Bounded read: never trusts metadata, so huge and non-regular files
 /// (`/dev/zero`) hit the cap instead of exhausting memory.
-fn read_file(path: &str, budget: &ByteBudget) -> Result<Vec<u8>, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("media fetch: {path}: {e}"))?;
+fn read_file(path: &str, budget: &ByteBudget) -> Result<Vec<u8>> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| MmError::invalid(format!("media fetch: {path}: {e}")))?;
     read_capped(file, path, budget)
 }
 
 /// Read to EOF, charging `budget` per chunk, so an oversized source stops
 /// mid-stream instead of going fully resident first.
-fn read_capped(mut reader: impl Read, what: &str, budget: &ByteBudget) -> Result<Vec<u8>, String> {
-    let too_big = || format!("media fetch: {what}: exceeds {MAX_FETCH_BYTES} bytes");
+fn read_capped(mut reader: impl Read, what: &str, budget: &ByteBudget) -> Result<Vec<u8>> {
+    let too_big = || {
+        MmError::invalid(format!(
+            "media fetch: {what}: exceeds {MAX_FETCH_BYTES} bytes"
+        ))
+    };
     let mut buf = Vec::new();
     loop {
         // `+ 1`: read one byte past the cap, so oversized is detected, not truncated.
@@ -188,7 +205,8 @@ fn read_capped(mut reader: impl Read, what: &str, budget: &ByteBudget) -> Result
             .by_ref()
             .take(want)
             .read_to_end(&mut buf)
-            .map_err(|e| format!("media fetch: read {what}: {e}"))? as u64;
+            .map_err(|e| MmError::invalid(format!("media fetch: read {what}: {e}")))?
+            as u64;
         budget.release(want - read);
         if buf.len() as u64 > MAX_FETCH_BYTES {
             return Err(too_big());
@@ -287,7 +305,7 @@ fn in_ipv4_network(ip: std::net::Ipv4Addr, net: std::net::Ipv4Addr, bits: u32) -
     u32::from(ip) & mask == u32::from(net) & mask
 }
 
-fn http_get(url: &str, budget: &ByteBudget) -> Result<Vec<u8>, String> {
+fn http_get(url: &str, budget: &ByteBudget) -> Result<Vec<u8>> {
     // Python: `int(os.getenv("REQUEST_TIMEOUT", "3"))` seconds per image GET.
     let timeout = std::env::var("REQUEST_TIMEOUT")
         .ok()
@@ -301,7 +319,7 @@ fn http_get(url: &str, budget: &ByteBudget) -> Result<Vec<u8>, String> {
         .get(url)
         .timeout(std::time::Duration::from_secs(timeout))
         .call()
-        .map_err(|e| format!("media fetch: GET {url}: {e}"))?;
+        .map_err(|e| MmError::invalid(format!("media fetch: GET {url}: {e}")))?;
     read_capped(resp.into_reader(), url, budget)
 }
 
@@ -335,14 +353,14 @@ mod tests {
         let err = fetch_local_file_budgeted("/dev/zero", &ByteBudget::new(1024))
             .err()
             .unwrap();
-        assert!(err.contains("not a regular file"), "{err}");
+        assert!(err.message().contains("not a regular file"), "{err}");
     }
 
     /// A non-regular file must hit the byte cap, not exhaust memory.
     #[test]
     fn unbounded_file_capped() {
         let err = fetch_bytes("/dev/zero").err().unwrap();
-        assert!(err.contains("exceeds"), "{err}");
+        assert!(err.message().contains("exceeds"), "{err}");
     }
 
     /// The convenience API keeps its 64 MiB budget, while a server request may
@@ -351,7 +369,7 @@ mod tests {
     fn inline_base64_uses_the_supplied_request_budget() {
         let encoded = "A".repeat((MAX_FETCH_BYTES / 3 * 4 + 8) as usize);
         let err = fetch_bytes(&encoded).err().unwrap();
-        assert!(err.contains("exceeds"), "{err}");
+        assert!(err.message().contains("exceeds"), "{err}");
         let decoded = fetch_bytes_budgeted(&encoded, &ByteBudget::new(MAX_FETCH_BYTES + 16))
             .expect("larger request budget admits inline media over the remote-fetch cap");
         assert!(decoded.len() as u64 > MAX_FETCH_BYTES);
@@ -367,7 +385,7 @@ mod tests {
         let err = fetch_bytes_budgeted(&encoded, &ByteBudget::new(0))
             .err()
             .unwrap();
-        assert!(err.contains("request media byte budget"), "{err}");
+        assert!(err.message().contains("request media byte budget"), "{err}");
     }
 
     /// One budget spans sources: each fits alone, the set does not.
@@ -377,7 +395,7 @@ mod tests {
         let budget = ByteBudget::new(6144);
         assert_eq!(fetch_bytes_budgeted(&payload, &budget).unwrap().len(), 4096);
         let err = fetch_bytes_budgeted(&payload, &budget).err().unwrap();
-        assert!(err.contains("request media byte budget"), "{err}");
+        assert!(err.message().contains("request media byte budget"), "{err}");
     }
 
     /// Unused claims come back, so small sources fit in a budget their
@@ -399,7 +417,11 @@ mod tests {
     fn per_source_cap_survives_a_large_budget() {
         let budget = ByteBudget::new(MAX_FETCH_BYTES * 4);
         let err = fetch_bytes_budgeted("/dev/zero", &budget).err().unwrap();
-        assert!(err.contains(&format!("exceeds {MAX_FETCH_BYTES}")), "{err}");
+        assert!(
+            err.message()
+                .contains(&format!("exceeds {MAX_FETCH_BYTES}")),
+            "{err}"
+        );
     }
 
     #[test]
@@ -506,7 +528,7 @@ mod tests {
         let err = fetch_bytes(&format!("http://{addr}/big.png"))
             .err()
             .unwrap();
-        assert!(err.contains("exceeds"), "{err}");
+        assert!(err.message().contains("exceeds"), "{err}");
         drop(handle); // server thread may die on the closed socket; don't join
     }
 }

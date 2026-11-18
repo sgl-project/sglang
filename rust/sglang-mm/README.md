@@ -51,6 +51,7 @@ common.resize_rgb(arr, out_w, out_h)
 common.scaled_dims(w, h, rescale_frac, rescale_cap)
 common.image_decode_rgb(bytes)          # -> (h, w, ndarray)
 common.content_hash(bytes)              # -> u64 (blake3, truncated)
+common.content_digest(bytes)            # -> "blake3:<64 hex>" (full blake3)
 common.fetch_bytes(source)              # -> bytes (data:/base64/file/http)
 
 # Model-specific

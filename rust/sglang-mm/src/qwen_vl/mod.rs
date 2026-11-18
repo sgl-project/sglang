@@ -8,6 +8,7 @@
 //! All parameters come from the runtime spec; nothing is hardcoded per model.
 
 use crate::common::{par, resize};
+use crate::error::{MmError, Result};
 
 const MAX_RATIO: f64 = 200.0;
 
@@ -78,9 +79,9 @@ fn normalize_lut(resample: Resampler, mean: f32, std: f32) -> [f32; 256] {
 }
 
 impl QwenVlProcessor {
-    pub fn new(spec: QwenVlSpec) -> Result<Self, String> {
+    pub fn new(spec: QwenVlSpec) -> Result<Self> {
         if spec.patch_size == 0 || spec.merge_size == 0 || spec.temporal_patch_size == 0 {
-            return Err("qwen_vl spec: sizes must be positive".into());
+            return Err(MmError::invalid("qwen_vl spec: sizes must be positive"));
         }
         let lut = core::array::from_fn(|c| {
             normalize_lut(spec.resample, spec.image_mean[c], spec.image_std[c])
@@ -88,9 +89,9 @@ impl QwenVlProcessor {
         Ok(Self { spec, lut })
     }
 
-    pub fn from_spec_json(json: &str) -> Result<Self, String> {
-        let spec: QwenVlSpec =
-            serde_json::from_str(json).map_err(|e| format!("qwen_vl spec: {e}"))?;
+    pub fn from_spec_json(json: &str) -> Result<Self> {
+        let spec: QwenVlSpec = serde_json::from_str(json)
+            .map_err(|e| MmError::invalid(format!("qwen_vl spec: {e}")))?;
         Self::new(spec)
     }
 
@@ -148,12 +149,7 @@ impl QwenVlProcessor {
             / (self.spec.merge_size * self.spec.merge_size)
     }
 
-    pub fn process_image(
-        &self,
-        rgb: &[u8],
-        h: usize,
-        w: usize,
-    ) -> Result<(Vec<f32>, [u32; 3]), String> {
+    pub fn process_image(&self, rgb: &[u8], h: usize, w: usize) -> Result<(Vec<f32>, [u32; 3])> {
         let (th, tw) = smart_resize(
             h,
             w,
@@ -174,11 +170,11 @@ impl QwenVlProcessor {
         // division below needs a non-empty grid), so fail loudly rather than
         // panic if a future spec change breaks the guarantee.
         if gh == 0 || gw == 0 || gh % self.spec.merge_size != 0 || gw % self.spec.merge_size != 0 {
-            return Err(format!(
+            return Err(MmError::invalid(format!(
                 "qwen_vl: patch grid {gh}x{gw} is empty or not a multiple of \
                  merge_size {}",
                 self.spec.merge_size
-            ));
+            )));
         }
         Ok((self.patchify(data, th, tw), [1, gh as u32, gw as u32]))
     }
@@ -201,16 +197,16 @@ pub fn smart_resize(
     factor: usize,
     min_pixels: usize,
     max_pixels: usize,
-) -> Result<(usize, usize), String> {
+) -> Result<(usize, usize)> {
     let (h, w) = (height as f64, width as f64);
     if height == 0 || width == 0 {
-        return Err("empty image".into());
+        return Err(MmError::invalid("empty image"));
     }
     let ratio = h.max(w) / h.min(w);
     if ratio > MAX_RATIO {
-        return Err(format!(
+        return Err(MmError::invalid(format!(
             "absolute aspect ratio must be smaller than {MAX_RATIO}, got {ratio}"
-        ));
+        )));
     }
     let f = factor as f64;
     let mut h_bar = ((round_half_even(h / f) * f) as usize).max(factor);
@@ -230,10 +226,10 @@ pub fn smart_resize(
     // coefficient math (overflow panic in debug, garbage in release) and the
     // `dim = len / (gh * gw)` division, so reject it as a request error.
     if h_bar == 0 || w_bar == 0 {
-        return Err(format!(
+        return Err(MmError::invalid(format!(
             "smart_resize: {height}x{width} degenerates to {h_bar}x{w_bar} at \
              max_pixels={max_pixels}; image is too thin for this pixel budget"
-        ));
+        )));
     }
     Ok((h_bar, w_bar))
 }
@@ -248,7 +244,7 @@ pub fn mrope_image_only(
     input_len: usize,
     items: &[MropeItem],
     merge_size: usize,
-) -> Result<(Vec<i64>, i64), String> {
+) -> Result<(Vec<i64>, i64)> {
     let len = input_len;
     let mut pos = vec![0i64; 3 * len];
     let fill_text = |st: usize, n: usize, base: i64, pos: &mut [i64]| {
@@ -264,9 +260,9 @@ pub fn mrope_image_only(
     for item in items {
         let (start, end) = (item.start as usize, item.end as usize);
         if start < st || end >= len {
-            return Err(format!(
+            return Err(MmError::invalid(format!(
                 "mrope: item range ({start},{end}) out of order/bounds"
-            ));
+            )));
         }
         fill_text(st, start - st, next_pos, &mut pos);
         next_pos += (start - st) as i64;
@@ -275,7 +271,7 @@ pub fn mrope_image_only(
         let gh = item.grid[1] as usize / merge_size;
         let gw = item.grid[2] as usize / merge_size;
         if t * gh * gw != end - start + 1 {
-            return Err("mrope: token span does not match grid".into());
+            return Err(MmError::invalid("mrope: token span does not match grid"));
         }
         for ti in 0..t {
             for hi in 0..gh {
@@ -302,7 +298,6 @@ pub fn mrope_image_only(
 #[cfg(feature = "python")]
 mod python {
     use numpy::{IntoPyArray, PyArray1};
-    use pyo3::exceptions::PyValueError;
     use pyo3::prelude::*;
 
     use super::*;
@@ -318,13 +313,11 @@ mod python {
         data: Vec<u8>,
         spec_json: &str,
     ) -> PyResult<PyProcessedImage<'py>> {
-        let proc = QwenVlProcessor::from_spec_json(spec_json).map_err(PyValueError::new_err)?;
-        let out = py
-            .detach(move || {
-                let (rgb, height, width) = crate::common::decode_rgb(&data)?;
-                proc.process_image(&rgb, height, width)
-            })
-            .map_err(PyValueError::new_err)?;
+        let proc = QwenVlProcessor::from_spec_json(spec_json)?;
+        let out = py.detach(move || {
+            let (rgb, height, width) = crate::common::decode_rgb(&data)?;
+            proc.process_image(&rgb, height, width)
+        })?;
         let (pixel_values, [t, h, w]) = out;
         Ok((pixel_values.into_pyarray(py), (t, h, w)))
     }
@@ -337,7 +330,7 @@ mod python {
         min_pixels: usize,
         max_pixels: usize,
     ) -> PyResult<(usize, usize)> {
-        smart_resize(height, width, factor, min_pixels, max_pixels).map_err(PyValueError::new_err)
+        Ok(smart_resize(height, width, factor, min_pixels, max_pixels)?)
     }
 
     /// `(positions flat [3*input_len], delta)` for image-only requests;
@@ -357,8 +350,7 @@ mod python {
                 grid: [t, h, w],
             })
             .collect();
-        let (pos, delta) =
-            mrope_image_only(input_len, &items, merge_size).map_err(PyValueError::new_err)?;
+        let (pos, delta) = mrope_image_only(input_len, &items, merge_size)?;
         Ok((pos.into_pyarray(py), delta))
     }
 
@@ -454,7 +446,10 @@ mod tests {
         let err = proc
             .process_image(&[0u8; 10 * 2000 * 3], 10, 2000)
             .expect_err("degenerate geometry must be an Err, never a panic");
-        assert!(err.contains("smart_resize"), "unexpected error: {err}");
+        assert!(
+            err.message().contains("smart_resize"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
