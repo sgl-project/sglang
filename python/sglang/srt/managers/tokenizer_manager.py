@@ -575,6 +575,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     # which own no server. Class-level to leave the frozen __init__ alone.
     _server_stop_hook: Optional[Callable[[], None]] = None
     _engine_state_changed_callback: Optional[Callable[[], None]] = None
+    # Set by the SIGTERM drain when it sends ShutdownReq; no scheduler serves a
+    # request registered after that.
+    _shutdown_req_sent: bool = False
 
     def set_server_stop_hook(self, hook: Callable[[], None]) -> None:
         self._server_stop_hook = hook
@@ -1050,6 +1053,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {num_dp_ranks})"
                 )
 
+        if self._shutdown_req_sent:
+            raise fastapi.HTTPException(
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                detail="The server is shutting down.",
+            )
         self._init_req_state(obj, request)
         request_states = {
             rid: self.rid_to_state[rid]
@@ -3826,6 +3834,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self._subprocess_watchdog.stop()
         # Ask schedulers to release resources in userspace and exit (see
         # ShutdownReq), then wait for them before hard-killing the rest.
+        self._shutdown_req_sent = True
         self._dispatch_to_scheduler(ShutdownReq())
         deadline = time.monotonic() + _SCHEDULER_EXIT_TIMEOUT_SECS
         while time.monotonic() < deadline and collect_scheduler_processes():
