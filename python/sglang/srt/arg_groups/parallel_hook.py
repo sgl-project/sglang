@@ -38,31 +38,6 @@ from sglang.srt.utils.common import parse_connector_type
 logger = logging.getLogger(__name__)
 
 
-def handle_deprecated_dp_attention(server_args: Any):
-    """Turn the deprecated `--dp-size N --enable-dp-attention` into
-    `--attn-dp-size N`.
-
-    Runs before any handler reads the DP layout. The old spelling counted
-    attention-DP groups with `dp_size`; that width moves to `attn_dp_size`, and
-    `dp_size` counts replicas again. Next to `--attn-dp-size` the flag adds
-    nothing: a serialized config reports it set whenever attention DP runs
-    (`ServerArgs.resolved_dict`), so reading one back resolves the same layout.
-    """
-    cfg = resolving_view(server_args)
-    if not cfg.enable_dp_attention:
-        return
-    if cfg.attn_dp_size == 1:
-        declare_resolution(
-            server_args,
-            "_handle_deprecated_dp_attention",
-            attn_dp_size=cfg.dp_size,
-            dp_size=1,
-        )
-    declare_resolution(
-        server_args, "_handle_deprecated_dp_attention", enable_dp_attention=False
-    )
-
-
 def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> dict:
     """Resolve the token-row modes the model's forward actually enters."""
     nemotron = model_type in ("nemotron_h", "nemotron_h_puzzle")
@@ -252,6 +227,77 @@ def handle_shared_experts_tp(server_args: Any):
             "--shared-experts-tp-size requires an expert-parallel all-to-all "
             "backend (deepep, megamoe, mooncake, ascend_fuseep or mori)."
         )
+
+
+_KDA_DWDP_LOAD_FORMATS_REFUSED = (
+    "sharded_state",
+    "presharded",
+    "remote",
+    "remote_instance",
+    "ipc_cache",
+)
+
+
+def handle_kda_dwdp(server_args: Any):
+    cfg = resolving_view(server_args)
+    size = cfg.kda_dwdp_size
+    if size is None:
+        return
+    if cfg.disaggregation_mode != "prefill":
+        raise ValueError(
+            "--kda-dwdp-size runs on PD prefill workers only "
+            f"(--disaggregation-mode prefill; got {cfg.disaggregation_mode!r}): a "
+            "decoding server would re-gather the sharded weights every step (about "
+            "54 GB per rank for K3 at attention TP 1 and N=8)."
+        )
+    if size < 2 or cfg.tp_size % size != 0:
+        raise ValueError(
+            f"--kda-dwdp-size ({size}) must be >= 2 and divide TP size ({cfg.tp_size})."
+        )
+    view = resolved_view(server_args)
+    attn_tp_size = derive_attn_tp_size(
+        tp_size=cfg.tp_size,
+        attn_cp_size=view.attn_cp_size,
+        attn_dp_size=cfg.attn_dp_size,
+    )
+    if cfg.attn_dp_size <= 1 or cfg.attn_dp_size % size != 0:
+        raise ValueError(
+            f"--kda-dwdp-size ({size}) needs attention DP and must divide the "
+            f"attention-DP size ({cfg.attn_dp_size}; attention TP {attn_tp_size})."
+        )
+    if view.attn_cp_size > 1:
+        raise ValueError("--kda-dwdp-size does not support --attn-cp-size > 1.")
+    if cfg.pp_size > 1:
+        raise ValueError("--kda-dwdp-size does not support pipeline parallelism.")
+    if cfg.load_format in _KDA_DWDP_LOAD_FORMATS_REFUSED:
+        raise ValueError(
+            f"--kda-dwdp-size does not support --load-format {cfg.load_format}: "
+            "the shards are filled by the model's load_weights (use a checkpoint format "
+            "such as auto or safetensors, or dummy)."
+        )
+    if cfg.weight_cache_mode != "off":
+        raise ValueError(
+            "--kda-dwdp-size does not support --weight-cache-mode "
+            f"{cfg.weight_cache_mode}: cached weights skip the shard loaders."
+        )
+    if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
+        raise ValueError("--kda-dwdp-size requires a Kimi-K3 model configuration.")
+    from sglang.srt.configs.model_config import is_kimi_k3
+
+    hf_config = model_config_of(server_args).hf_config
+    if not is_kimi_k3(hf_config):
+        raise ValueError(
+            "--kda-dwdp-size is only supported for Kimi-K3 "
+            f"(got {hf_config.architectures[0]})."
+        )
+    graph = cfg.cuda_graph_config
+    for phase in ("prefill", "decode"):
+        if graph is not None and getattr(graph, phase).backend == Backend.FULL:
+            raise ValueError(
+                "--kda-dwdp-size issues its layer-weight gathers between graph "
+                f"segments and cannot run inside a full {phase} CUDA graph; use "
+                f"--cuda-graph-backend-{phase} breakable or disabled."
+            )
 
 
 def handle_decode_context_parallelism(server_args: Any):

@@ -22,11 +22,8 @@ if TYPE_CHECKING:
 class ScheduleVerifyLensTopk:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
-        # All NPU archs route to the bit-exact torch reference: the triton
-        # kernel body (2D broadcast compare + axis-1 reduce, loop-carried
-        # rank) is not legalizable by the triton-ascend TTIR->Linalg pass
-        # (ascend has no global sort; the O(n^2)-rank scheme relies on
-        # patterns the backend cannot lower). CUDA keeps the fused kernel.
+        # Accelerator inputs take triton(), which sends NPU to its sgl_kernel_npu
+        # kernel; CPU inputs take the bit-exact torch reference.
         if inputs_on_cuda(*args, **kwargs):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
