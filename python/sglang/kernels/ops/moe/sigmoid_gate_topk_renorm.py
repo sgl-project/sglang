@@ -11,6 +11,7 @@ key (sigmoid+bias) is not the renorm value -> we re-gather the raw logits.
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.moe.gate_topk import (
@@ -113,10 +114,22 @@ def _sigmoid_gate_topk_renorm_kernel(
     active = tl.where(mask_k[None, :], routed_vals, shared)
 
     A: tl.constexpr = K + S
-    probs = tl.sigmoid(active)
+    # Normalize in the log domain. sigmoid(x) / sum(sigmoid(x)) is 0/0 -- and so
+    # NaN for the whole token -- as soon as every active logit underflows the fp32
+    # sigmoid (x < ~-104), which a logit-space router reaches easily. logsigmoid is
+    # -softplus(-x), finite for every finite logit, so the renorm stays defined;
+    # the max shift keeps the exponentials in range. Same form as the PyTorch
+    # reference (_logsigmoid_normalize) and as srt's Triton fallback.
     mask_a = offs_a < A
-    probs = tl.where(mask_a[None, :], probs, 0.0)
-    weights = probs / tl.sum(probs, axis=1, keep_dims=True)
+    log_probs = tl.minimum(active, 0.0) - libdevice.log1p(
+        libdevice.exp(-tl.abs(active))
+    )
+    # Padding lanes must not win the max shift, so park them at -inf: they then
+    # contribute exp(-inf - max) = 0 to the denominator.
+    log_probs = tl.where(mask_a[None, :], log_probs, float("-inf"))
+    max_log_probs = tl.max(log_probs, axis=1)[:, None]
+    shifted = libdevice.exp(log_probs - max_log_probs)
+    weights = shifted / tl.sum(shifted, axis=1, keep_dims=True)
     weights *= (route_scale * tl.load(global_scale_ptr)).to(weights.dtype)
 
     mask_rk = mask_m[:, None] & mask_k[None, :]

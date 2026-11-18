@@ -166,16 +166,29 @@ __device__ __forceinline__ void inkling_gate_row(
   }
 
   // Renorm, replicated on all lanes (registers only, no cross-lane traffic).
-  float active[kInklingTopK + kInklingSharedExperts];
+  // Normalize in the log domain. sigmoid(x) / sum(sigmoid(x)) is 0/0 -- and so
+  // NaN for the whole token -- as soon as every active logit underflows the fp32
+  // sigmoid (x < ~-104). logsigmoid is -softplus(-x), finite for every finite
+  // logit, so the renorm stays defined; the max shift keeps exp in range.
+  static constexpr int kInklingActive = kInklingTopK + kInklingSharedExperts;
+  float active[kInklingActive];
 #pragma unroll
   for (int k = 0; k < kInklingTopK; ++k) {
-    active[k] = device::activation::sigmoid(sel_raw[k]);
+    active[k] = sel_raw[k];
   }
-  active[kInklingTopK + 0] = device::activation::sigmoid(sh0);
-  active[kInklingTopK + 1] = device::activation::sigmoid(sh1);
+  active[kInklingTopK + 0] = sh0;
+  active[kInklingTopK + 1] = sh1;
+
+  float max_logp = -FLT_MAX;
+#pragma unroll
+  for (int i = 0; i < kInklingActive; ++i) {
+    active[i] = fminf(active[i], 0.0f) - log1pf(expf(-fabsf(active[i])));
+    max_logp = fmaxf(max_logp, active[i]);
+  }
   float sum = 0.0f;
 #pragma unroll
-  for (int i = 0; i < kInklingTopK + kInklingSharedExperts; ++i) {
+  for (int i = 0; i < kInklingActive; ++i) {
+    active[i] = expf(active[i] - max_logp);
     sum += active[i];
   }
   const float scale = st.scale / sum;
