@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import msgspec
 import torch
 
+from sglang.srt.configs.model_config import is_kimi_k31
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -52,6 +53,9 @@ if _is_gfx95:
 # Up to this many rows the column tail's slice comes from split-K partials (faster than the
 # replicated tail on MI350X); above it, from a GEMM of the RMSNorm'd latent.
 _COLUMN_TAIL_PARTIALS_MAX_TOKENS = 64
+# Kimi-K3.1's column-tail row cap: its target verify (up to 64 requests x 6 rows) takes
+# the tail. Other models stop at the partials' rows.
+_COLUMN_TAIL_MAX_TOKENS_K31 = 384
 # From this many tokens each rank computes its 1/TP routed up_proj columns into the
 # shared-expert all-reduce.
 _UP_PROJ_COLUMN_SPLIT_MIN_TOKENS = 2048
@@ -70,6 +74,8 @@ class NextAttnRead(msgspec.Struct, frozen=True):
     norm: RMSNorm
     writes_block: bool
     comm: LLComm
+    # the largest batch the column tail takes
+    max_tokens: int
 
 
 @cache
@@ -564,7 +570,7 @@ class KimiK3MoEHipMixin:
         bank = read.bank.require()
         if not (
             self._fused_latent_tail_eligible
-            and num_tokens <= envs.SGLANG_ROCM_K3_COLUMN_TAIL_MAX_TOKENS.get()
+            and num_tokens <= read.max_tokens
             and latent.shape[1] == k3_attn_res_read_hip.TAIL_LATENT
             and latent.stride(-1) == 1
             and k3_attn_res_read_hip.tail_covered(shared_output, prefix_sum)
@@ -827,6 +833,11 @@ def link_column_tails_hip(model) -> None:
     comm = k3_ll_comm_hip.get_comm()
     if comm is None:
         return
+    max_tokens = (
+        _COLUMN_TAIL_MAX_TOKENS_K31
+        if is_kimi_k31(model.config)
+        else _COLUMN_TAIL_PARTIALS_MAX_TOKENS
+    )
     for layer, next_layer in pairs:
         layer.mlp.next_attn_read = NextAttnRead(
             bank=model.attn_bank,
@@ -835,4 +846,5 @@ def link_column_tails_hip(model) -> None:
             norm=next_layer.input_layernorm,
             writes_block=next_layer.is_block_write_layer,
             comm=comm,
+            max_tokens=max_tokens,
         )

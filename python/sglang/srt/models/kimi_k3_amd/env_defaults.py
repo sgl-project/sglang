@@ -55,7 +55,5 @@ def apply_kimi_k31_rocm_env_defaults() -> None:
     os.environ.setdefault("AITER_OPUS_STAGE2_FP8", "0")
     # the same experts as AITER's biased top-k, in under half its time
     os.environ.setdefault("SGLANG_K3_RADIX4_TOPK", "1")
-    # target verify (up to 64 requests x 6 rows) takes the column-split tail
-    os.environ.setdefault("SGLANG_ROCM_K3_COLUMN_TAIL_MAX_TOKENS", "384")
     if "AITER_CONFIG_GEMM_BF16" not in os.environ:
         os.environ["AITER_CONFIG_GEMM_BF16"] = write_k31_bf16_gemm_table()
