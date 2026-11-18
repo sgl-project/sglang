@@ -609,14 +609,6 @@ def _load_image(
 
         image_tensor = decode_jpeg_with_dvpp(image_bytes)
         if image_tensor is not None:
-            # Warning range from A3 measurements, not a routing threshold. The
-            # crossover varies with CPU threading and image content.
-            if image_tensor.shape[-2] * image_tensor.shape[-1] <= 104 * 104:
-                logger.warning_once(
-                    "NPU JPEG decoding may be slower than CPU/PIL for images "
-                    "with up to 10,816 pixels (104x104). "
-                    "Actual performance depends on CPU configuration and workload."
-                )
             return image_tensor
         # Unsupported devices/images return None; execution errors propagate.
     try:

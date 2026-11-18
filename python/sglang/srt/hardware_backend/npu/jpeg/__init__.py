@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import logging
 import os
 import threading
 import weakref
@@ -14,6 +15,8 @@ if TYPE_CHECKING:
 
 from sglang.srt.hardware_backend.npu.dvpp import ACLFailure, check, supports_device
 from sglang.srt.hardware_backend.npu.jpeg_header import prepare_jpeg
+
+logger = logging.getLogger(__name__)
 
 _local = threading.local()
 _live = {}
@@ -134,7 +137,7 @@ def decode_jpeg(
     prepared = prepare_jpeg(data)
     if prepared is None:
         return None
-    data, _ = prepared
+    data, info = prepared
     import torch_npu  # noqa: F401 - registers the NPU device backend
 
     target = torch.device(device)
@@ -145,5 +148,12 @@ def decode_jpeg(
         device_index = torch.npu.current_device()
     if not supports_device(device_index):
         return None
+    # A3 measurements: small JPEGs may be faster on CPU, depending on its workload.
+    if info.width * info.height <= 104 * 104:
+        logger.warning_once(
+            "NPU JPEG decoding may be slower than CPU/PIL for images "
+            "with up to 10,816 pixels (104x104). "
+            "Actual performance depends on CPU configuration and workload."
+        )
     with torch.npu.device(device_index):
         return _get_dvpp(device_index).process_jpeg_dec(data)

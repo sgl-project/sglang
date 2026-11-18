@@ -2,7 +2,6 @@
 
 import base64
 import io
-import logging
 import tempfile
 import unittest
 from pathlib import Path
@@ -40,8 +39,6 @@ def encoded_image(fmt="JPEG", size=(64, 48)):
 
 class TestNPUImageDecodeModes(unittest.TestCase):
     def setUp(self):
-        # Use the real warning_once method with a fresh logger/cache key per test.
-        self.enterContext(patch.object(media_io, "logger", logging.Logger(__name__)))
         self.enterContext(patch.object(media_io, "is_cuda", return_value=False))
         self.enterContext(patch.object(media_io, "is_npu", return_value=True))
         self.decode = self.enterContext(
@@ -84,45 +81,6 @@ class TestNPUImageDecodeModes(unittest.TestCase):
         self.assertIs(image, expected)
         self.decode.assert_called_once_with(data)
         self.assertIs(self.decode.call_args.args[0], data)
-
-    def test_small_npu_jpeg_warning_uses_pixel_area(self):
-        self.decode.side_effect = None
-        for width, height, should_warn in (
-            (103, 105, True),
-            (104, 104, True),
-            (105, 105, False),
-            (64, 169, True),
-            (169, 64, True),
-            (64, 170, False),
-        ):
-            with self.subTest(size=(width, height)):
-                expected = torch.zeros((3, height, width), dtype=torch.uint8)
-                self.decode.return_value = expected
-                with patch.object(media_io.logger, "warning_once") as warning:
-                    image, _ = media_io.load_image(
-                        encoded_image(size=(width, height)), True
-                    )
-                    self.assertIs(image, expected)
-                    self.assertEqual(warning.call_count, int(should_warn))
-
-    def test_small_npu_jpeg_warns_once_without_changing_dispatch(self):
-        self.decode.side_effect = None
-        with patch.object(media_io.logger, "warning") as warning:
-            self.decode.return_value = torch.zeros((3, 105, 105), dtype=torch.uint8)
-            media_io.load_image(encoded_image(size=(105, 105)), True)
-            self.decode.return_value = None
-            self.assert_pil_pixels(
-                media_io.load_image(encoded_image(), True)[0], encoded_image()
-            )
-            warning.assert_not_called()
-            small = torch.zeros((3, 48, 64), dtype=torch.uint8)
-            data = encoded_image()
-            self.decode.return_value = small
-            for _ in range(1000):
-                self.assertIs(media_io.load_image(data, True)[0], small)
-            warning.assert_called_once()
-            self.assertIn("may be slower", warning.call_args.args[0])
-            self.assertIn("10,816", warning.call_args.args[0])
 
     def test_false_uses_pil_without_dvpp(self):
         data = encoded_image()

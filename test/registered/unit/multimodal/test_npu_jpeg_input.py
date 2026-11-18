@@ -5,6 +5,7 @@ import ctypes
 import gc
 import importlib.util
 import io
+import logging
 import os
 import sys
 import threading
@@ -342,6 +343,46 @@ class TestNpuJpegInput(unittest.TestCase):
         self.assertFalse(acl.synchronized)
         self.assertEqual(len(acl.freed), 2)
 
+    def test_warning_uses_encoded_pixel_area(self):
+        for size, should_warn in (
+            ((103, 105), True),
+            ((104, 104), True),
+            ((105, 105), False),
+            ((64, 169), True),
+            ((169, 64), True),
+            ((64, 170), False),
+        ):
+            with (
+                self.subTest(size=size),
+                self._npu(),
+                patch.object(self.jpeg, "_get_dvpp") as factory,
+                patch.object(self.jpeg.logger, "warning_once") as warning,
+            ):
+                data = _jpeg(size)
+                self.jpeg.decode_jpeg(data)
+                self.assertEqual(warning.call_count, int(should_warn))
+                factory.return_value.process_jpeg_dec.assert_called_once_with(data)
+
+    def test_warns_once_before_attempt_even_if_decode_fails(self):
+        data = _jpeg()
+        logger = logging.Logger(__name__)
+        with (
+            self._npu(),
+            patch.object(self.jpeg, "logger", logger),
+            patch.object(logger, "warning") as warning,
+            patch.object(self.jpeg, "_get_dvpp") as factory,
+        ):
+
+            def fail_decode(_):
+                warning.assert_called_once()
+                raise RuntimeError("decoder failure")
+
+            factory.return_value.process_jpeg_dec.side_effect = fail_decode
+            for _ in range(2):
+                with self.assertRaisesRegex(RuntimeError, "decoder failure"):
+                    self.jpeg.decode_jpeg(data)
+            self.assertIn("10,816", warning.call_args.args[0])
+
     def test_public_noncontiguous_input_and_device_restore(self):
         encoded = _encoded_tensor(_jpeg())
         storage = torch.empty(encoded.numel() * 2, dtype=torch.uint8)
@@ -417,12 +458,18 @@ class TestNpuJpegInput(unittest.TestCase):
             _jpeg(icc_profile=b"profile"),
             _jpeg((16, 16)),
         )
-        with patch.object(
-            self.jpeg, "_get_dvpp", side_effect=AssertionError("decoder constructed")
+        with (
+            patch.object(self.jpeg.logger, "warning_once") as warning,
+            patch.object(
+                self.jpeg,
+                "_get_dvpp",
+                side_effect=AssertionError("decoder constructed"),
+            ),
         ):
             for encoded in cases:
                 with self.subTest(length=len(encoded)):
                     self.assertIsNone(self.jpeg.decode_jpeg(_encoded_tensor(encoded)))
+            warning.assert_not_called()
 
     def test_public_rejects_invalid_tensor_contract(self):
         cases = (
@@ -448,12 +495,14 @@ class TestNpuJpegInput(unittest.TestCase):
             with (
                 self.subTest(arch=arch),
                 self._npu(arch=arch) as (state, backend),
+                patch.object(self.jpeg.logger, "warning_once") as warning,
                 patch.object(self.jpeg, "_get_dvpp") as factory,
             ):
                 self.assertIsNone(self.jpeg.decode_jpeg(data, device="npu:1"))
                 backend.architecture_query.assert_called_once_with(1, 601)
                 self.assertEqual(state.current, 3)
                 factory.assert_not_called()
+                warning.assert_not_called()
                 with self.assertRaises((TypeError, ValueError)):
                     self.jpeg.decode_jpeg(data, device="cpu")
 
