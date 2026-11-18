@@ -880,9 +880,9 @@ class DeepseekMLARocmForwardMixin:
             elif forward_batch.forward_mode.is_extend():
                 # Assemble the full sequence into dcp_kv_buffer, which the
                 # backend attends over instead of the sharded local cache
-                # (K3.1's DSA backend gathers its own cache).
+                # (on gfx950, K3.1's DSA backend gathers its own cache).
                 if (
-                    not self.use_dsa
+                    not (_is_gfx95_supported and self.use_dsa)
                     and forward_batch.attn_dcp_metadata is not None
                     and forward_batch.attn_dcp_metadata.dcp_kv_buffer is not None
                 ):
