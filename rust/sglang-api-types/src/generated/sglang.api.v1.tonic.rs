@@ -978,6 +978,43 @@ pub mod sglang_service_client {
             ));
             self.inner.unary(req, path, codec).await
         }
+        /// `/open_session`, `/close_session`: multi-turn sessions on the schedulers.
+        pub async fn open_session(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OpenSessionRequest>,
+        ) -> std::result::Result<tonic::Response<super::OpenSessionResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/OpenSession");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "OpenSession",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn close_session(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CloseSessionRequest>,
+        ) -> std::result::Result<tonic::Response<super::CloseSessionResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/CloseSession");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "CloseSession",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1231,6 +1268,15 @@ pub mod sglang_service_server {
             &self,
             request: tonic::Request<super::UpdateWeightVersionRequest>,
         ) -> std::result::Result<tonic::Response<super::UpdateWeightVersionResponse>, tonic::Status>;
+        /// `/open_session`, `/close_session`: multi-turn sessions on the schedulers.
+        async fn open_session(
+            &self,
+            request: tonic::Request<super::OpenSessionRequest>,
+        ) -> std::result::Result<tonic::Response<super::OpenSessionResponse>, tonic::Status>;
+        async fn close_session(
+            &self,
+            request: tonic::Request<super::CloseSessionRequest>,
+        ) -> std::result::Result<tonic::Response<super::CloseSessionResponse>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct SglangServiceServer<T> {
@@ -3235,6 +3281,88 @@ pub mod sglang_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = UpdateWeightVersionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/OpenSession" => {
+                    #[allow(non_camel_case_types)]
+                    struct OpenSessionSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::OpenSessionRequest>
+                        for OpenSessionSvc<T>
+                    {
+                        type Response = super::OpenSessionResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OpenSessionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::open_session(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OpenSessionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/CloseSession" => {
+                    #[allow(non_camel_case_types)]
+                    struct CloseSessionSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::CloseSessionRequest>
+                        for CloseSessionSvc<T>
+                    {
+                        type Response = super::CloseSessionResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::CloseSessionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::close_session(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CloseSessionSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

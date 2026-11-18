@@ -141,3 +141,24 @@ message UpdateWeightVersionResponse {
   string message = 2;
   optional string new_version = 3;
 }
+
+// `/open_session`: open a multi-turn session on every DP rank's scheduler.
+// Python's `OpenSessionReqInput`; the frontend mints `session_id` when unset.
+message OpenSessionRequest {
+  int64 capacity_of_str_len = 1;
+  optional string session_id = 2;
+  // A streaming session needs `--enable-streaming-session`.
+  optional bool streaming = 3;
+  optional double timeout = 4;
+}
+
+// The session's id; HTTP answers it as a bare JSON string, as Python does.
+message OpenSessionResponse {
+  string session_id = 1;
+}
+
+// `/close_session`.
+message CloseSessionRequest {
+  string session_id = 1;
+}
+message CloseSessionResponse {}
