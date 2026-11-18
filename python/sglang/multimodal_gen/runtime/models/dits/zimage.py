@@ -13,6 +13,11 @@ from sglang.multimodal_gen.runtime.distributed import (
 from sglang.multimodal_gen.runtime.distributed.device_communicators.tp_peer_partial import (
     staged_partials,
 )
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+    build_shard_plan,
+    gather_seq,
+    shard_like,
+)
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import (
     USPAttention,
@@ -843,8 +848,12 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         config: ZImageDitConfig,
         hf_config: dict[str, Any],
         quant_config: Optional[QuantizationConfig] = None,
+        *,
+        shard_joint_sequence: bool = False,
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
+        # Opt-in layout for replicated full latents and long, uniform conditions.
+        self.shard_joint_sequence = shard_joint_sequence
 
         arch_config = self.config
 
@@ -1537,6 +1546,60 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         pad_value = pad_token.to(device=tensor.device, dtype=tensor.dtype)
         return torch.where(valid_mask.unsqueeze(-1), tensor, pad_value.view(1, 1, -1))
 
+    def _run_sequence_blocks(
+        self,
+        layers: nn.ModuleList,
+        hidden_states: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        adaln_input: torch.Tensor,
+        rope_cache: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        rope_freqs_complex: torch.Tensor | None,
+        mask: torch.Tensor | None,
+        mask_meta: dict[str, torch.Tensor | int] | None,
+        replicated_suffix: int = 0,
+    ) -> torch.Tensor:
+        shard = None
+        if self.shard_joint_sequence and get_sp_world_size() > 1:
+            shard = build_shard_plan(hidden_states.shape[1])
+            if shard.num_pad or mask is not None or mask_meta is not None:
+                raise ValueError(
+                    "Joint sequence SP requires uniform, evenly divisible padded sequences"
+                )
+            freqs_cis = tuple(shard_like(freq, shard, dim=-2) for freq in freqs_cis)
+            if positions is not None:
+                positions = shard_like(
+                    positions.view(hidden_states.shape[:2]), shard
+                ).reshape(-1)
+            elif rope_cache is not None:
+                rope_cache = shard_like(rope_cache, shard, dim=0)
+            if rope_freqs_complex is not None:
+                rope_freqs_complex = shard_like(rope_freqs_complex, shard, dim=0)
+            hidden_states = shard_like(hidden_states, shard).contiguous()
+            # Canonicalize singleton batch strides for the fused normalization path.
+            hidden_states = hidden_states.view(-1, hidden_states.shape[-1]).view(
+                hidden_states.shape
+            )
+            replicated_suffix = 0
+
+        for layer in layers:
+            hidden_states = layer(
+                hidden_states,
+                freqs_cis,
+                adaln_input,
+                rope_cos_sin_cache=rope_cache,
+                rope_positions=positions,
+                rope_freqs_complex=rope_freqs_complex,
+                attn_mask=mask,
+                attn_mask_meta=mask_meta,
+                num_replicated_suffix=replicated_suffix,
+            )
+        return (
+            gather_seq(hidden_states, shard.orig_len)
+            if shard is not None
+            else hidden_states
+        )
+
     def forward(
         self,
         hidden_states: List[torch.Tensor],
@@ -1609,17 +1672,17 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             "_cached_x_attn_mask_meta", x_attn_lens, x.shape[1], device
         )
 
-        for layer_id, layer in enumerate(self.noise_refiner):
-            x = layer(
-                x,
-                x_freqs_cis,
-                adaln_input,
-                rope_cos_sin_cache=x_rope_cos_sin_cache,
-                rope_positions=x_rope_positions,
-                attn_mask=x_attn_mask,
-                attn_mask_meta=x_attn_mask_meta,
-                rope_freqs_complex=x_rope_freqs_complex,
-            )
+        x = self._run_sequence_blocks(
+            self.noise_refiner,
+            x,
+            x_freqs_cis,
+            adaln_input,
+            x_rope_cos_sin_cache,
+            x_rope_positions,
+            x_rope_freqs_complex,
+            x_attn_mask,
+            x_attn_mask_meta,
+        )
 
         cap_feats, _ = self.cap_embedder(cap_feats)
         if cap_valid_mask is not None:
@@ -1665,20 +1728,18 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             unified_rope_positions,
             unified_rope_freqs_complex,
         ) = self._get_rope_cache("unified", unified_freqs_cis)
-        num_replicated_suffix = cap_seq_len
-
-        for layer in self.layers:
-            unified = layer(
-                unified,
-                unified_freqs_cis,
-                adaln_input,
-                rope_cos_sin_cache=unified_rope_cos_sin_cache,
-                rope_positions=unified_rope_positions,
-                attn_mask=unified_attn_mask,
-                attn_mask_meta=unified_attn_mask_meta,
-                num_replicated_suffix=num_replicated_suffix,
-                rope_freqs_complex=unified_rope_freqs_complex,
-            )
+        unified = self._run_sequence_blocks(
+            self.layers,
+            unified,
+            unified_freqs_cis,
+            adaln_input,
+            unified_rope_cos_sin_cache,
+            unified_rope_positions,
+            unified_rope_freqs_complex,
+            unified_attn_mask,
+            unified_attn_mask_meta,
+            cap_seq_len,
+        )
 
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](
             unified, adaln_input
