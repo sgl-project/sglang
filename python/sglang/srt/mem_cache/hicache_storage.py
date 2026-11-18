@@ -411,6 +411,11 @@ class HiCacheStorage(ABC):
         """
         return False
 
+    # A backend that keys objects by its own rank (not by the shared object)
+    # must back up on every rank, even where is_storage_writer elects one
+    # writer for rank-replicated KV such as MLA.
+    requires_rank_local_backup = False
+
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host
@@ -693,6 +698,10 @@ class HiCacheStorageFailureInjector(HiCacheStorage):
 
     def consumes_kv_hints(self) -> bool:
         return self._backend.consumes_kv_hints()
+
+    @property
+    def requires_rank_local_backup(self) -> bool:
+        return self._backend.requires_rank_local_backup
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self._backend.register_mem_pool_host(mem_pool_host)

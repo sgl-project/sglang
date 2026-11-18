@@ -324,7 +324,7 @@ def resolve_storage_layout_compatibility(server_args: Any):
         # and runtime attachment on the same requested host layout.
         return
     if (
-        cfg.hicache_storage_backend not in ("mooncake", "npu_memcache")
+        cfg.hicache_storage_backend not in ("mooncake", "npu_memcache", "kvcr")
         or cfg.hicache_mem_layout != "layer_first"
     ):
         return
@@ -343,7 +343,7 @@ def resolve_storage_layout_compatibility(server_args: Any):
         hicache_mem_layout=new_layout,
     )
     logger.warning(
-        f"Mooncake/Ascend MemCache storage backend does not support layer_first layout, "
+        f"{cfg.hicache_storage_backend} storage backend does not support layer_first layout, "
         f"switching to {new_layout} layout for {cfg.hicache_io_backend} io backend"
     )
 

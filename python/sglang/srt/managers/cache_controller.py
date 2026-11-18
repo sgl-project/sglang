@@ -794,6 +794,7 @@ class HiCacheController:
                 in [
                     "hf3fs",
                     "mooncake",
+                    "kvcr",
                     "npu_memcache",
                     "eic",
                     "nixl",
@@ -887,6 +888,10 @@ class HiCacheController:
 
     @property
     def backup_skip(self) -> bool:
+        # A rank-local store keeps every rank's copy, even of replicated KV.
+        backend = getattr(self, "storage_backend", None)
+        if getattr(backend, "requires_rank_local_backup", False) is True:
+            return False
         return not self.storage_config.is_storage_writer
 
     def _generate_storage_config(
