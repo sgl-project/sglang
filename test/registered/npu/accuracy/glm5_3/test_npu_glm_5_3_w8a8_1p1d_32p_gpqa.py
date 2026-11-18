@@ -107,7 +107,7 @@ def build_prefill_args(variant):
         args += [
             "--ep-size",
             8,
-            "--dp-size",
+            "--attn-dp-size",
             8,
         ]
     else:
@@ -119,7 +119,6 @@ def build_prefill_args(variant):
             "interleave",
         ]
     args += [
-        "--enable-dp-attention",
         "--mem-fraction-static",
         0.88,
         "--attention-backend",
@@ -150,7 +149,8 @@ def build_prefill_args(variant):
         "--moe-ascend-ops-config",
         '{"prefill": "alltoallv", "decode": "low_latency"}',
         "--disable-shared-experts-fusion",
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph",
+        "--disable-prefill-cuda-graph",
         "--dtype",
         "bfloat16",
         "--enable-dp-lm-head",
@@ -196,9 +196,8 @@ def build_decode_args(variant):
         2,
         "--tp-size",
         32,
-        "--dp-size",
+        "--attn-dp-size",
         8,
-        "--enable-dp-attention",
     ]
     if variant == "dcp":
         args += [
