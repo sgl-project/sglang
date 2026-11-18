@@ -15,7 +15,7 @@ PAYLOAD = b'{"text":"hello world","n":7}'
 COMPRESSED = zstandard.ZstdCompressor().compress(PAYLOAD)
 
 
-def _drive(scope, body_chunks):
+def _drive(scope, body_chunks, max_decompressed_body_size=None):
     """Drive the middleware once. Returns (seen, sent): `seen` is what the inner
     app received ({scope, body}) or None if the app was never called; `sent` is
     the list of ASGI messages the middleware emitted directly."""
@@ -44,7 +44,10 @@ def _drive(scope, body_chunks):
         seen["scope"] = inner_scope
         seen["body"] = body
 
-    asyncio.run(RequestDecompressionMiddleware(app)(scope, receive, send))
+    kwargs = {}
+    if max_decompressed_body_size is not None:
+        kwargs["max_decompressed_body_size"] = max_decompressed_body_size
+    asyncio.run(RequestDecompressionMiddleware(app, **kwargs)(scope, receive, send))
     return (seen or None), sent
 
 
@@ -105,6 +108,23 @@ class TestRequestDecompressionMiddleware(CustomTestCase):
         self.assertIsNone(seen)
         self.assertEqual(sent[0]["type"], "http.response.start")
         self.assertEqual(sent[0]["status"], 400)
+
+    def test_decompressed_body_at_limit_is_accepted(self):
+        scope = {"type": "http", "headers": [(b"x-body-compressed", b"zstd")]}
+        seen, sent = _drive(
+            scope, [(COMPRESSED, False)], max_decompressed_body_size=len(PAYLOAD)
+        )
+        self.assertEqual(seen["body"], PAYLOAD)
+        self.assertEqual(sent, [])
+
+    def test_decompressed_body_over_limit_returns_413(self):
+        scope = {"type": "http", "headers": [(b"x-body-compressed", b"zstd")]}
+        seen, sent = _drive(
+            scope, [(COMPRESSED, False)], max_decompressed_body_size=len(PAYLOAD) - 1
+        )
+        self.assertIsNone(seen)
+        self.assertEqual(sent[0]["type"], "http.response.start")
+        self.assertEqual(sent[0]["status"], 413)
 
     def test_non_http_scope_passthrough(self):
         scope = {"type": "lifespan", "headers": []}
