@@ -44,6 +44,7 @@ def source_method(path, cls, method, namespace):
 def backend():
     obj = mod.AscendAttnBackend.__new__(mod.AscendAttnBackend)
     obj.prepare_in_graph = False
+    obj.shared_read_enabled = False
     obj.use_quant_flash_attn = False
     obj.use_paged_mtp = True
     obj.paged_mtp_attention_decode = Mock()

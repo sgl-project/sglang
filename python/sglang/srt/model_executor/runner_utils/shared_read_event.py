@@ -4,7 +4,6 @@ import logging
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import is_cuda
@@ -29,19 +28,12 @@ def make_external_event(device_module):
 
 
 def maybe_publish_prefill_shared_read_done(
-    model_runner,
-    shared_read_ends: SharedReadEnds,
-    device_module,
-    *,
-    allow_speculative_draft: bool = False,
+    model_runner, shared_read_ends: SharedReadEnds, device_module
 ) -> None:
     """Publish prefill read-done at the resolved pre-replay boundary."""
     if shared_read_ends is not SharedReadEnds.PRE_REPLAY:
         return
-    if (
-        not model_runner.spec_algorithm.supports_prefill_shared_read_done()
-        and not allow_speculative_draft
-    ):
+    if not model_runner.spec_algorithm.supports_prefill_shared_read_done():
         return
     # Host and storage offload copy a stashed chunk's KV ordered only behind the
     # schedule stream, so they need the whole-forward barrier unless every such
@@ -56,21 +48,6 @@ def maybe_publish_prefill_shared_read_done(
         "Prefill shared-read-done fastpath active (%s)",
         type(model_runner.attn_backend).__name__,
     )
-    read_done = device_module.Event()
-    read_done.record()
-    model_runner.shared_read_done_event = read_done
-
-
-def maybe_publish_eager_shared_read_done(model_runner, forward_batch, device_module):
-    """Publish after the final eager preparation, replacing any earlier phase's event."""
-    model_runner.shared_read_done_event = None
-    if envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
-        return
-    if (
-        model_runner.attn_backend.resolve_eager_shared_read_ends(forward_batch)
-        is not SharedReadEnds.PRE_REPLAY
-    ):
-        return
     read_done = device_module.Event()
     read_done.record()
     model_runner.shared_read_done_event = read_done

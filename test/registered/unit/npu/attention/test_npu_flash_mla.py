@@ -39,6 +39,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 def backend():
     obj = mod.AscendAttnBackend.__new__(mod.AscendAttnBackend)
     obj.prepare_in_graph = False
+    obj.shared_read_enabled = False
     obj.use_quant_flash_attn = False
     obj.use_flash_mla = obj.use_mla = True
     obj.use_paged_mtp = False
