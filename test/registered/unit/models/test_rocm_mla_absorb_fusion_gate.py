@@ -132,9 +132,7 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
     and the cache holds the bytes the split chain would have written."""
 
     def setUp(self):
-        self.writer = KimiK3RocmMlaQCacheWriter(
-            kv_lora_rank=512, qk_rope_head_dim=64, use_hip=True, use_triton=False
-        )
+        self.writer = KimiK3RocmMlaQCacheWriter(kv_lora_rank=512, qk_rope_head_dim=64)
         self.fused_q = torch.zeros(2, 12, 576, dtype=torch.bfloat16)
         # The kernels are the boundary; the gate in front of them is under test.
         self.writer._write_hip = lambda **_: self.fused_q
@@ -184,30 +182,70 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
             )
         )
 
-    def test_rejected_inputs_without_triton_keep_the_split_chain(self):
-        """Inputs the HIP op rejects, with no Triton kernel to take them,
-        must fall back to the split chain instead of failing the decode step."""
+    def test_unsized_capture_keeps_the_split_chain(self):
+        """A capture the eager warmup did not size gets no fused launch;
+        the writer must hand that step back to the split chain."""
         self.writer._write_hip = lambda **_: None
         self.assertIsNone(
             self._write(attention_backend="aiter", is_target_verify=False)
         )
 
-    def test_no_writer_without_a_fused_kernel(self):
-        """Where neither kernel can run (gfx1250, an old AITER), no writer is
+    def test_cache_the_op_cannot_write_keeps_the_split_chain(self):
+        """A paged 4D or e5m2 cache is not the op's [slots, 1, 576] BF16/e4m3fn
+        pool; it must reach the split chain, not run() and its ValueError."""
+        for kv_cache in (
+            torch.zeros(4, 1, 1, 576, dtype=torch.bfloat16),
+            torch.zeros(4, 1, 576, dtype=torch.float8_e5m2),
+        ):
+            with self.subTest(shape=tuple(kv_cache.shape), dtype=kv_cache.dtype):
+                self.assertIsNone(
+                    self.writer.write(
+                        q_nope=torch.zeros(2, 12, 512, dtype=torch.bfloat16),
+                        q_pe=torch.zeros(2, 12, 64, dtype=torch.bfloat16),
+                        k_nope=torch.zeros(2, 1, 512, dtype=torch.bfloat16),
+                        k_pe=torch.zeros(2, 1, 64, dtype=torch.bfloat16),
+                        slot_mapping=torch.arange(2, dtype=torch.int64),
+                        kv_cache=kv_cache,
+                        k_scale_float=1.0,
+                        attention_backend="aiter",
+                        is_target_verify=False,
+                    )
+                )
+
+    def test_no_writer_without_the_fused_kernel(self):
+        """Where the op cannot run (not gfx950, an old AITER), no writer is
         installed, so every layer keeps the split chain without per-step checks."""
-        with (
-            mock.patch.object(
-                kimi_k3_rocm_mla.mla_q_cache_aiter_hip, "available", lambda: False
-            ),
-            mock.patch.object(
-                kimi_k3_rocm_mla.mla_q_cache_aiter_triton, "available", lambda: False
-            ),
+        with mock.patch.object(
+            kimi_k3_rocm_mla.mla_q_cache_aiter_hip, "available", lambda: False
         ):
             self.assertIsNone(
                 kimi_k3_rocm_mla.create_q_cache_writer(
                     kv_lora_rank=512, qk_rope_head_dim=64
                 )
             )
+
+    def test_op_is_available_on_gfx950_only(self):
+        """The op is built for gfx950; every other HIP target, including gfx942
+        and gfx1250, must keep the split chain."""
+        hip_op = kimi_k3_rocm_mla.mla_q_cache_aiter_hip
+        for gcn_arch, expected in (
+            ("gfx950", True),
+            ("gfx942", False),
+            ("gfx90a", False),
+            ("gfx1250", False),
+        ):
+            with (
+                self.subTest(gcn_arch=gcn_arch),
+                mock.patch.object(hip_op.torch.version, "hip", "7.0"),
+                mock.patch.object(hip_op.torch.cuda, "is_available", lambda: True),
+                mock.patch.object(
+                    hip_op,
+                    "current_arch",
+                    lambda: SimpleNamespace(hip=SimpleNamespace(gcn_arch=gcn_arch)),
+                ),
+                mock.patch.object(hip_op, "_op", lambda: object()),
+            ):
+                self.assertIs(hip_op.available.__wrapped__(), expected)
 
     def test_other_backends_keep_the_split_chain(self):
         for verify in (False, True):
@@ -290,9 +328,12 @@ class TestMlaQCacheWriterCallSite(CustomTestCase):
     def test_non_owner_sub_pool_keeps_the_split_chain(self):
         """The writer scatters at out_cache_loc, but a non-owner sub-pool's layer
         is written at the batch's swa_loc; fusing it would write the wrong rows."""
-        result, write = self._call(mode="decode", owner=False)
+        with mock.patch.object(forward_mla_rocm, "_mla_cache_slot_mapping") as slots:
+            result, write = self._call(mode="decode", owner=False)
         self.assertIsNone(result)
         write.assert_not_called()
+        # Declining must not pay the HiSparse translation or contiguous copy.
+        slots.assert_not_called()
 
 
 _ROPE_HEAD_DIM = 64
@@ -342,7 +383,6 @@ class _RocmAttn(forward_mla_rocm.DeepseekMLARocmForwardMixin):
         self.rotary_emb = _rope()
         self.attn_mqa = _Mqa()
         self._fuse_rope_for_trtllm_mla = lambda forward_batch: False
-        self.rocm_mla_q_cache_writer = None
         vars(self).update(overrides)
 
 

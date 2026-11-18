@@ -13,7 +13,7 @@ from sglang.test.kernels.mla_q_cache import (  # noqa: E402
     mla_q_cache_reference,
 )
 
-register_amd_ci(est_time=25, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=25, stage="base-b", runner_config="1-gpu-small-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(
     not mla_q_cache_aiter_hip.available(),
@@ -49,7 +49,7 @@ def test_fused_mla_q_cache_identity_rope(tokens, cache_dtype, output_dtype):
 
 def test_fused_mla_q_cache_skips_negative_slots():
     """A slot < 0 token skips only its KV cache write; its Q row must still be
-    written, as the split chain and the Triton kernel write it."""
+    written, as the split chain writes it."""
     values = mla_q_cache_inputs(4)
     values["slot_mapping"][-2:] = -1
     values["out"].fill_(float("nan"))
@@ -102,17 +102,21 @@ def test_fused_mla_q_cache_graph_replay_uses_changed_inputs():
     torch.testing.assert_close(values["kv_cache"][:64], expected_k)
 
 
-def test_fused_mla_q_cache_support_is_narrow():
-    """run() is fail-closed: inputs outside the contract return None unlaunched."""
+def test_fused_mla_q_cache_rejects_inputs_outside_the_contract():
+    """run() raises before launching on inputs outside the contract, rather than
+    returning a value the caller could mistake for a fused write."""
     for name, broken in (
         ("positions", lambda v: v.to(torch.float32)),
         # SGLang's MLA pool is [slots, 1, 576]; a paged cache would be misindexed.
         ("kv_cache", lambda v: v.view(v.shape[0], 1, 1, 576)),
         ("kv_cache", lambda v: v.to(torch.float8_e5m2)),
+        # The op reads slot_mapping at stride 1; a strided one lands in wrong slots.
+        ("slot_mapping", lambda v: torch.arange(2 * v.numel(), device="cuda")[::2]),
     ):
         values = mla_q_cache_inputs(1)
         values[name] = broken(values[name])
-        assert mla_q_cache_aiter_hip.run(**values) is None
+        with pytest.raises(ValueError):
+            mla_q_cache_aiter_hip.run(**values)
         torch.cuda.synchronize()
         assert torch.count_nonzero(values["kv_cache"].view(torch.uint8)).item() == 0
 

@@ -127,6 +127,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
+from sglang.srt.models.kimi_k3_rocm_mla import create_q_cache_writer
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3MultiModalProjector,
     KimiK3VisionTower,
@@ -2664,9 +2665,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 )
                 self.register_parameter(f"{role}_b_qweight_type", qweight_type)
             self._kimi_split_gguf_kv_b = True
-        if _is_hip and envs.SGLANG_OPT_HIP_K3_MLA_Q_CACHE_FUSION.get():
-            from sglang.srt.models.kimi_k3_rocm_mla import create_q_cache_writer
-
+        if _is_hip:
             self.rocm_mla_q_cache_writer = create_q_cache_writer(
                 kv_lora_rank=self.kv_lora_rank,
                 qk_rope_head_dim=self.qk_rope_head_dim,

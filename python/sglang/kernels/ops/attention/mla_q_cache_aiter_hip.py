@@ -1,7 +1,8 @@
-"""Fail-closed AITER HIP adapter for Kimi-K3's fused MLA Q materialization and cache write.
+"""AITER HIP adapter for Kimi-K3's fused MLA Q materialization and cache write.
 
-Covers gfx950 only: BF16 inputs, kv_lora_rank 512, rope dim 64, one KV head, a
-[slots, 1, 576] BF16 or e4m3fn cache and int64 slots; run() rejects anything else.
+Covers gfx950 only (available()): BF16 inputs, kv_lora_rank 512, rope dim 64, one
+KV head, a [slots, 1, 576] BF16 or e4m3fn cache (supports_cache()) and int64
+slots. run() raises ValueError on inputs outside that contract.
 """
 
 from __future__ import annotations
@@ -32,13 +33,25 @@ def _op():
 
 @functools.cache
 def available() -> bool:
+    """Whether run() can launch here: gfx950 and an AITER with the HIP op."""
     if torch.version.hip is None or not torch.cuda.is_available():
         return False
     hip = current_arch().hip
     return hip is not None and hip.gcn_arch == "gfx950" and _op() is not None
 
 
-def _covered(
+def supports_cache(kv_cache: torch.Tensor) -> bool:
+    """Whether the op can write this KV cache: SGLang's [slots, 1, 576] MLA pool in
+    BF16 or e4m3fn. A paged 4D cache would be indexed as one slot per block."""
+    return (
+        kv_cache.ndim == 3
+        and kv_cache.shape[1] == 1
+        and kv_cache.shape[2] == _HEAD_DIM
+        and kv_cache.dtype in (torch.bfloat16, _FP8_DTYPE)
+    )
+
+
+def _in_contract(
     *,
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,
@@ -53,7 +66,7 @@ def _covered(
     out: torch.Tensor,
     q_scale: torch.Tensor | None = None,
 ) -> bool:
-    if not available() or q_nope.device.type != "cuda" or q_nope.ndim != 3:
+    if q_nope.device.type != "cuda" or q_nope.ndim != 3:
         return False
     tokens, heads, _ = q_nope.shape
     q_scale = k_scale if q_scale is None else q_scale
@@ -81,12 +94,7 @@ def _covered(
             for x in (q_nope, q_pe, k_nope, k_pe)
         )
         and all(x.device == q_nope.device for x in tensors)
-        # SGLang's MLA pool is [slots, 1, 576]; a paged 4D cache would be
-        # indexed as one slot per block by the non-HPT kernels.
-        and kv_cache.ndim == 3
-        and kv_cache.shape[1] == 1
-        and kv_cache.shape[2] == _HEAD_DIM
-        and kv_cache.dtype in (torch.bfloat16, _FP8_DTYPE)
+        and supports_cache(kv_cache)
         and slot_mapping.shape == (tokens,)
         # AITER's gfx950 kernels take one int64 slot and position per token.
         and slot_mapping.dtype == torch.int64
@@ -133,13 +141,18 @@ def run(
     sin_cache: torch.Tensor,
     out: torch.Tensor,
     q_scale: torch.Tensor | None = None,
-) -> torch.Tensor | None:
-    """Write the latent KV cache and MLA query for the supported gfx950 contract.
+) -> torch.Tensor:
+    """Write the latent KV cache and MLA query for the gfx950 contract.
 
-    Returns None without launching when AITER's op is unavailable or the inputs are
-    outside the contract, so the caller keeps its unfused path.
+    Callers check available() and supports_cache() first; anything else outside
+    the contract (shapes, dtypes, strides, devices) raises ValueError.
     """
-    if not _covered(
+    if not available():
+        raise RuntimeError(
+            "AITER fused_qk_rope_concat_and_cache_mla needs gfx950 and an AITER "
+            "build that has it"
+        )
+    if not _in_contract(
         q_nope=q_nope,
         q_pe=q_pe,
         k_nope=k_nope,
@@ -153,7 +166,13 @@ def run(
         out=out,
         q_scale=q_scale,
     ):
-        return None
+        raise ValueError(
+            "Kimi-K3 MLA Q/cache inputs are outside the AITER HIP op's contract: "
+            f"q_nope {tuple(q_nope.shape)} {q_nope.dtype}, "
+            f"kv_cache {tuple(kv_cache.shape)} {kv_cache.dtype}, "
+            f"slot_mapping {tuple(slot_mapping.shape)} {slot_mapping.dtype} "
+            f"stride {slot_mapping.stride()}, out {tuple(out.shape)} {out.dtype}"
+        )
     return _launch(
         q_nope=q_nope,
         q_pe=q_pe,
@@ -200,7 +219,7 @@ def _launch(
         sin_cache,
         True,  # is_neox
         True,  # is_nope_first
-        # Write Q for slot < 0 tokens too, as the split chain and the Triton kernel do;
+        # Write Q for slot < 0 tokens too, as the split chain does;
         # only their KV cache write is skipped.
         compute_all_q_rope=True,
     )

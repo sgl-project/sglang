@@ -6,10 +6,7 @@ import torch
 pytest.importorskip("aiter")
 from aiter import dtypes  # noqa: E402
 
-from sglang.kernels.ops.attention import (  # noqa: E402
-    mla_q_cache_aiter_hip,
-    mla_q_cache_aiter_triton,
-)
+from sglang.kernels.ops.attention import mla_q_cache_aiter_hip  # noqa: E402
 from sglang.srt.models.kimi_k3_rocm_mla import KimiK3RocmMlaQCacheWriter  # noqa: E402
 from sglang.srt.runtime_context import get_resources  # noqa: E402
 from sglang.test.ci.ci_register import register_amd_ci  # noqa: E402
@@ -18,7 +15,7 @@ from sglang.test.kernels.mla_q_cache import (  # noqa: E402
     mla_q_cache_reference,
 )
 
-register_amd_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=10, stage="base-b", runner_config="1-gpu-small-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(
     not mla_q_cache_aiter_hip.available(),
@@ -40,23 +37,9 @@ def _writer_inputs(values):
     )
 
 
-def _writer(*, use_hip, use_triton):
-    return KimiK3RocmMlaQCacheWriter(
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-        use_hip=use_hip,
-        use_triton=use_triton,
-    ).cuda()
-
-
-@pytest.fixture(params=["aiter", "triton"])
-def writer(request):
-    if request.param == "aiter":
-        return _writer(use_hip=True, use_triton=False)
-    # Off gfx950 the writer runs the AITER Triton kernel alone.
-    if not mla_q_cache_aiter_triton.available():
-        pytest.skip("AITER build without the no-RoPE Triton kernel")
-    return _writer(use_hip=False, use_triton=True)
+@pytest.fixture
+def writer():
+    return KimiK3RocmMlaQCacheWriter(kv_lora_rank=512, qk_rope_head_dim=64)
 
 
 @pytest.mark.parametrize("cache_dtype", [torch.bfloat16, dtypes.fp8])
@@ -82,7 +65,7 @@ def test_writer_graph_survives_a_larger_eager_batch(writer):
     """A captured step keeps reading the zero positions it saw,
     even after a larger eager batch replaces the shared buffer."""
     # Start from no shared buffer so the larger batch below has to replace it.
-    get_resources().buffers.pop("kimi_k3_mla_zero_positions", None)
+    get_resources().buffers.pop("kimi_k3_mla_identity_rope", None)
     small = mla_q_cache_inputs(4)
     writer.write(**_writer_inputs(small))
     graph = torch.cuda.CUDAGraph()
@@ -105,34 +88,35 @@ def test_writer_graph_survives_a_larger_eager_batch(writer):
     assert torch.equal(small["kv_cache"][:4], expected_k)
 
 
-def test_capture_never_allocates_the_zero_positions():
-    """A capture the eager warmup did not size must not allocate the shared buffer
-    inside the graph; the HIP path declines and that step keeps the split chain."""
-    get_resources().buffers.pop("kimi_k3_mla_zero_positions", None)
-    writer = _writer(use_hip=True, use_triton=False)
+def test_capture_never_allocates_the_zero_positions(writer):
+    """A capture the eager warmup did not size must not allocate the shared buffers
+    inside the graph; the writer declines and that step keeps the split chain."""
+    get_resources().buffers.pop("kimi_k3_mla_identity_rope", None)
     values = mla_q_cache_inputs(4)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         result = writer.write(**_writer_inputs(values))
     assert result is None
-    assert get_resources().buffers["kimi_k3_mla_zero_positions"].buf is None
+    rope = get_resources().buffers["kimi_k3_mla_identity_rope"]
+    assert rope.positions is None and rope.tables is None
 
 
-def test_writer_rejects_a_strided_slot_mapping(writer):
-    """Both kernels read slot_mapping at stride 1, so a strided one must be refused
+def test_writer_raises_on_a_strided_slot_mapping(writer):
+    """The kernel reads slot_mapping at stride 1, so a strided one must fail loudly
     rather than land tokens in the wrong slots; the caller makes it contiguous."""
     values = mla_q_cache_inputs(16)
     values["kv_cache"] = torch.zeros(32, 1, 576, device="cuda", dtype=torch.bfloat16)
     values["slot_mapping"] = torch.arange(32, device="cuda", dtype=torch.int64)[::2]
-    assert writer.write(**_writer_inputs(values)) is None
+    with pytest.raises(ValueError):
+        writer.write(**_writer_inputs(values))
     torch.cuda.synchronize()
     assert torch.count_nonzero(values["kv_cache"]).item() == 0
 
 
 @pytest.mark.parametrize("cache", ["fp8_e5m2", "paged_4d"])
-def test_writer_falls_back_on_caches_neither_kernel_takes(cache):
-    """Caches the HIP op rejects must reach the split chain, not the Triton kernel's
-    dtype/layout asserts, which would fail the decode step or graph capture."""
+def test_writer_falls_back_on_caches_the_kernel_does_not_take(writer, cache):
+    """Caches the HIP op cannot write must reach the split chain unlaunched,
+    not fail the decode step or graph capture."""
     values = mla_q_cache_inputs(4)
     if cache == "fp8_e5m2":
         values["kv_cache"] = torch.zeros(
@@ -142,7 +126,6 @@ def test_writer_falls_back_on_caches_neither_kernel_takes(cache):
         values["kv_cache"] = torch.zeros(
             8, 1, 1, 576, device="cuda", dtype=torch.bfloat16
         )
-    writer = _writer(use_hip=True, use_triton=mla_q_cache_aiter_triton.available())
     assert writer.write(**_writer_inputs(values)) is None
     torch.cuda.synchronize()
     assert torch.count_nonzero(values["kv_cache"].view(torch.uint8)).item() == 0
