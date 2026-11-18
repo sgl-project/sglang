@@ -294,6 +294,6 @@ def activate_foundry(server_args: Any) -> FoundryAdapter:
         _active._guarded(_active._api.activate, mode=mode, config_path=config_path)
         return _active
     _active = _FoundryAdapterReal(
-        _import_foundry_api(), mode=mode, config_path=config_path
+        api=_import_foundry_api(), mode=mode, config_path=config_path
     )
     return _active

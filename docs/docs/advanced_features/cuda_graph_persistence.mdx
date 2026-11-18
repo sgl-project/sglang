@@ -43,7 +43,7 @@ workspace_root = "/data/foundry_archive/qwen3-1.7b"
 region_size = "256GB"
 ```
 
-`region_size` is the address range every device allocation of a scheduler lands in after Foundry's setup: weights, KV pool, graph memory and symmetric-memory reservations under 2 GiB. Only address space is reserved up front; memory is mapped per allocation. Sizing it is on the user: it must cover what one GPU allocates, which at the default `--mem-fraction-static` is about the GPU's memory. The default is 512GB.
+`region_size` is the address range every device allocation of a scheduler lands in after Foundry's setup: weights, KV pool, graph memory and symmetric-memory reservations under 2 GiB. Only address space is reserved up front; memory is mapped per allocation. You size it: it must cover what one GPU allocates, which at the default `--mem-fraction-static` is about the GPU's memory. The default is 512GB.
 
 `save` and `load` must use the same model, flags, parallel layout and GPU type; remove the archive before a `save` of another configuration.
 

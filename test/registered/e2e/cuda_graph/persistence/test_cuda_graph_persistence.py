@@ -101,8 +101,8 @@ _foundry_pythonpath: Optional[str] = None
 
 
 def _foundry_env() -> dict:
-    """Server env importing Foundry; in CI a scratch --target dir on PYTHONPATH,
-    since CI runners share site-packages between jobs."""
+    # Server env importing Foundry; in CI a scratch --target dir on PYTHONPATH,
+    # since CI runners share site-packages between jobs.
     global _foundry_pythonpath
     if not is_in_ci():
         return {}
@@ -153,8 +153,8 @@ def _write_toml(path: str, workspace: str) -> str:
 
 
 def _startup_seconds(log: str):
-    """(scheduler init, time in the runners' capture loops over every graph set),
-    from the engine's startup-timings line; None without one."""
+    # (scheduler init, time in the runners' capture loops over every graph set),
+    # from the engine's startup-timings line; None without one.
     match = _STARTUP_FIELDS.search(log)
     if match is None:
         return None
@@ -221,7 +221,9 @@ class TestFoundryGraphPersistence(CustomTestCase):
         cls.foundry_env = _foundry_env()
         cls.tmp = tempfile.mkdtemp(prefix="foundry_e2e_")
         cls.workspace = os.path.join(cls.tmp, "archive")
-        cls.toml = _write_toml(os.path.join(cls.tmp, "foundry.toml"), cls.workspace)
+        cls.toml = _write_toml(
+            path=os.path.join(cls.tmp, "foundry.toml"), workspace=cls.workspace
+        )
         if cls.prefill_bs:
             prefill_args = [
                 "full",
@@ -253,7 +255,7 @@ class TestFoundryGraphPersistence(CustomTestCase):
         # Native first: it also fills the JIT caches,
         # which SAVE must not compile inside its capture window.
         try:
-            cls.runs = {"native": cls._run_engine("native", mode=None)}
+            cls.runs = {"native": cls._run_engine(name="native", mode=None)}
         except Exception as e:
             if not cls.native_failure_skips:
                 raise
@@ -268,8 +270,8 @@ class TestFoundryGraphPersistence(CustomTestCase):
                 f"{cls.__name__}: the native engine of this layout does not start "
                 f"here ({e}); log tail:\n{tail}"
             ) from e
-        cls.runs["save"] = cls._run_engine("save", mode="save")
-        cls.runs["load"] = cls._run_engine("load", mode="load")
+        cls.runs["save"] = cls._run_engine(name="save", mode="save")
+        cls.runs["load"] = cls._run_engine(name="load", mode="load")
 
     @classmethod
     def tearDownClass(cls):
@@ -309,13 +311,14 @@ class TestFoundryGraphPersistence(CustomTestCase):
                         timeout=60,
                     ).raise_for_status()
                     result["sequential"].append(
-                        _generate(cls.base_url, prompt)["output_ids"]
+                        _generate(base_url=cls.base_url, text=prompt)["output_ids"]
                     )
                 result["prefill_passes"] = (
                     _prefill_graph_passes(cls.base_url) - passes_before
                 )
                 result["batched"] = [
-                    r["output_ids"] for r in _generate(cls.base_url, _PROMPTS)
+                    r["output_ids"]
+                    for r in _generate(base_url=cls.base_url, text=_PROMPTS)
                 ]
             finally:
                 terminate_and_kill_process_tree(cls.process)

@@ -41,7 +41,7 @@ def _fake_api(
     version=(FOUNDRY_INTEGRATION_API_MAJOR, FOUNDRY_INTEGRATION_API_MIN_MINOR),
     unsupported_at=None,
 ):
-    """``unsupported_at``: the api function that raises ``Unsupported``."""
+    # ``unsupported_at``: the api function that raises ``Unsupported``.
     api = types.ModuleType(_API_MODULE)
     api.INTEGRATION_API_VERSION = version
     api.Unsupported = _Unsupported
@@ -96,7 +96,7 @@ def _sa(mode=None, config=None):
 
 
 def _graph_sa(**fields):
-    """The graph fields Foundry pins, at SGLang's defaults unless given."""
+    # The graph fields Foundry pins, at SGLang's defaults unless given.
     defaults = dict(
         cuda_graph_backend_decode=None,
         cuda_graph_backend_prefill=None,
@@ -107,7 +107,7 @@ def _graph_sa(**fields):
 
 
 def _pin_lines(api, server_args):
-    """The ``[Foundry] pin:`` lines the adapter prints while pinning ``server_args``."""
+    # The ``[Foundry] pin:`` lines the adapter prints while pinning ``server_args``.
     with _installed(api), redirect_stderr(io.StringIO()) as err:
         activate_foundry(_sa("save")).pin_server_args(server_args)
     return [
@@ -119,7 +119,7 @@ def _pin_lines(api, server_args):
 
 @contextmanager
 def _installed(api):
-    """Makes ``api`` importable as foundry.integration.sglang.api; fresh adapter."""
+    # Makes ``api`` importable as foundry.integration.sglang.api; fresh adapter.
     parents = {
         "foundry": types.ModuleType("foundry"),
         "foundry.integration": types.ModuleType("foundry.integration"),
@@ -134,8 +134,8 @@ def _installed(api):
 
 
 def _drive(adapter, body=lambda: None):
-    """Every adapter method in process order, ``body`` inside the capture scope;
-    returns what the pool-config replay and capture_one gave."""
+    # Every adapter method in process order, ``body`` inside the capture scope;
+    # returns what the pool-config replay and capture_one gave.
     sa = _graph_sa()
     adapter.pin_server_args(sa)
     adapter.validate_resolved_server_args(sa)
@@ -232,7 +232,9 @@ class TestFoundryAdapter(CustomTestCase):
                 loops = []
                 with _installed(api):
                     adapter = activate_foundry(_sa("save"))
-                    replayed, captured = _drive(adapter, lambda: loops.append(1))
+                    replayed, captured = _drive(
+                        adapter=adapter, body=lambda: loops.append(1)
+                    )
                     self.assertFalse(adapter.enabled)
                     self.assertIs(activate_foundry(_sa("save")), adapter)
                 self.assertEqual(loops, [1])
@@ -261,7 +263,7 @@ class TestFoundryAdapter(CustomTestCase):
             disable_flashinfer_autotune=True,
         )
         self.assertEqual(
-            _pin_lines(api, _graph_sa()),
+            _pin_lines(api=api, server_args=_graph_sa()),
             [
                 "[Foundry] pin: cuda_graph_backend_decode='full' (was None)",
                 "[Foundry] pin: disable_flashinfer_autotune=True (was False)",
@@ -281,7 +283,7 @@ class TestFoundryAdapter(CustomTestCase):
             ("unsupported", _fake_api(unsupported_at="pin_server_args"), _graph_sa()),
         ):
             with self.subTest(case=name):
-                self.assertEqual(_pin_lines(api, server_args), [])
+                self.assertEqual(_pin_lines(api=api, server_args=server_args), [])
 
     def test_other_foundry_errors_propagate(self):
         """Only ``Unsupported`` falls back; a Foundry bug must stay an error."""
@@ -355,14 +357,14 @@ class TestFoundryCallSites(CustomTestCase):
         that work: parallel init, memory profile, capture loop, first publish."""
         for path, qualname, first, then in _ORDER:
             with self.subTest(site=qualname, first=first, then=then):
-                source = _source(path, qualname)
+                source = _source(relpath=path, qualname=qualname)
                 at = source.find(first)
                 self.assertGreaterEqual(at, 0, f"{qualname} lost {first}")
                 self.assertGreater(source.find(then, at + 1), at)
 
     def test_every_scheduler_spawn_is_wrapped(self):
         """The DP controller's schedulers inherit the hook preload from its spawn."""
-        source = _source(*_ENGINE)
+        source = _source(relpath=_ENGINE[0], qualname=_ENGINE[1])
         self.assertEqual(
             source.count("foundry_adapter.configure_subprocess("),
             source.count("proc.start()"),

@@ -166,8 +166,8 @@ class StandardDispatcher(BaseDispatcher):
             self.local_expert_mapping = self._build_local_expert_mapping()
 
     def _build_local_expert_mapping(self) -> torch.Tensor:
-        """Global expert id -> local slot, -1 for experts held elsewhere;
-        fused shared experts take the last ids, behind the routed slots."""
+        # Global expert id -> local slot, -1 for experts held elsewhere;
+        # fused shared experts take the last ids, behind the routed slots.
         device = get_device()
         routed = self.num_local_routed_experts
         mapping = torch.full((self.num_experts,), -1, dtype=torch.int32, device=device)

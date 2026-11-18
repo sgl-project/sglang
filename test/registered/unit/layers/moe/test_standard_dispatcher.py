@@ -49,7 +49,7 @@ def _ep_dispatcher(*, moe_ep_rank: int, num_shared: int = 0):
 
 
 class _LazyDispatcher(BaseDispatcher):
-    """No ``prebuild`` override: builds its state at the first dispatch."""
+    # No ``prebuild`` override: builds its state at the first dispatch.
 
     prebuild_pending = True
 
