@@ -1600,6 +1600,9 @@ class Qwen4ExpPLELayer(nn.Module):
             short_conv = get_token_to_kv_pool().layer_router.read(
                 self.layer_id, SHORT_CONV_PART
             )
+            intermediate_cache = short_conv.view.layer_intermediate_cache(
+                short_conv.view_layer_id
+            )
             conv_args = (
                 gated_value_normed,
                 gated_value,
@@ -1609,10 +1612,22 @@ class Qwen4ExpPLELayer(nn.Module):
                 batch.valid_tokens,
                 batch.row_width,
                 self.short_conv_dilation,
-                short_conv.view.layer_intermediate_cache(short_conv.view_layer_id),
+                intermediate_cache,
             )
             if can_fuse_qwen4_verify_conv(*conv_args):
-                output = fused_qwen4_verify_conv(*conv_args)
+                intermediate_indices = None
+                if intermediate_cache is not None:
+                    # Verify padding uses state slot 0 and can share a live
+                    # request-pool index. Send its writes to the discard row.
+                    intermediate_indices = select_verify_intermediate_state_indices(
+                        None,
+                        forward_batch.req_pool_indices,
+                        lambda: batch.state_indices.ne(0),
+                        get_req_to_token_pool().size,
+                    )
+                output = fused_qwen4_verify_conv(
+                    *conv_args, intermediate_state_indices=intermediate_indices
+                )
                 return _pad_token_rows(output, batch.physical_tokens)
         if sp_active:
             full_conv_input = layernorm_sp.all_gather_token_rows(
