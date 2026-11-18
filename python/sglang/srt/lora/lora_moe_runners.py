@@ -315,6 +315,7 @@ def _add_lora_gate_up_delta(
     num_tokens_post_padded_lora: torch.Tensor | None,
     lora_ids: torch.Tensor | None,
     routing_cache: dict | None = None,
+    apply_router_weight_on_input: bool = False,
 ) -> None:
     """Add LoRA gate_up delta to intermediate_cache in-place."""
     from sglang.kernels.ops.lora.moe.fused_moe_lora_kernel import fused_moe_lora
@@ -358,7 +359,7 @@ def _add_lora_gate_up_delta(
             topk_ids=topk_ids,
             topk_weights=topk_weights,
             token_lora_mapping=token_lora_mapping,
-            mul_routed_weight=False,
+            mul_routed_weight=apply_router_weight_on_input,
             experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
             experts_shared_outer_loras_b=False,
             routing_cache=routing_cache,
@@ -394,6 +395,7 @@ def _add_lora_gate_up_delta(
             expand_num_warps=4,
             expand_num_stages=2,
             expand_split_k=1,
+            mul_routed_weight=apply_router_weight_on_input,
         )
 
 
@@ -409,6 +411,7 @@ def _add_lora_down_delta(
     num_tokens_post_padded_lora: torch.Tensor | None,
     lora_ids: torch.Tensor | None,
     routing_cache: dict | None = None,
+    apply_router_weight_on_input: bool = False,
 ) -> None:
     """Add LoRA down delta to intermediate_cache in-place."""
     from sglang.kernels.ops.lora.moe.fused_moe_lora_kernel import fused_moe_lora
@@ -435,7 +438,7 @@ def _add_lora_down_delta(
             topk_ids=topk_ids,
             topk_weights=topk_weights,
             token_lora_mapping=token_lora_mapping,
-            mul_routed_weight=True,
+            mul_routed_weight=not apply_router_weight_on_input,
             experts_shared_outer_loras_a=False,
             experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
             routing_cache=routing_cache,
@@ -470,7 +473,7 @@ def _add_lora_down_delta(
             expand_num_warps=4,
             expand_num_stages=2,
             expand_split_k=1,
-            mul_routed_weight=True,
+            mul_routed_weight=not apply_router_weight_on_input,
         )
 
 
@@ -478,6 +481,7 @@ def build_lora_hooks(
     hidden_states: torch.Tensor,
     lora_info: LoRAInfo,
     topk_ids: torch.Tensor,
+    apply_router_weight_on_input: bool = False,
 ) -> LoRAHooks:
     """Build LoRA hook closures for injection into any MoE runner.
 
@@ -530,6 +534,7 @@ def build_lora_hooks(
             num_tokens_post_padded_lora,
             lora_ids,
             routing_cache=routing_cache,
+            apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
     def after_down(
@@ -550,6 +555,7 @@ def build_lora_hooks(
             num_tokens_post_padded_lora,
             lora_ids,
             routing_cache=routing_cache,
+            apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
     return LoRAHooks(after_gate_up=after_gate_up, after_down=after_down)
