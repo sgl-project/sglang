@@ -14,6 +14,7 @@ from sglang.test.ascend.test_ascend_utils import (
     write_memfabric_tent_conf,
 )
 from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.ascend.test_ascend_utils import build_hicache_storage_extra_config
 
 register_npu_ci(
     est_time=3800,
@@ -109,7 +110,11 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_SPECULATIVE_ARGS = [
     "--speculative-num-draft-tokens",
     6,
 ]
-
+HICACHE_STORAGE_EXTRA_CONFIG = build_hicache_storage_extra_config(
+    world_size=16,
+    protocol="device_sdma",
+    dram_size="4GB",
+)
 # Prefill node launch arguments.
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--page-size",
@@ -169,6 +174,10 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--enable-cache-report",
     "--max-total-tokens",
     140000,
+    "--hicache-storage-backend",
+    "npu_memcache",
+    "--hicache-storage-backend-extra-config",
+    HICACHE_STORAGE_EXTRA_CONFIG,
     *DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_SPECULATIVE_ARGS,
 ]
 
@@ -258,7 +267,7 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     }
     generation_config = DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH
     eval_batch_size = 128
-    min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 0%
+    min_hit_rate_pcts = {"host": 0, "storage": 0}  # percent: L2 and L3 host hit rate must exceed 0%
 
     @classmethod
     def setUpClass(cls):

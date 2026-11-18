@@ -8,9 +8,6 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     assert_metrics,
     run_bench_serving,
 )
-from sglang.test.ascend.test_ascend_utils import write_memfabric_tent_conf
-from sglang.test.ascend.test_ascend_utils import build_hicache_storage_extra_config
-
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
@@ -71,11 +68,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS = {
     "SGLANG_NPU_SPLIT_SHARED_EXPERT_OVERLAP": "1",
     "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX": "1",
 }
-HICACHE_STORAGE_EXTRA_CONFIG = build_hicache_storage_extra_config(
-    world_size=16,
-    protocol="device_sdma",
-    dram_size="4GB",
-)
+
 # Prefill node launch arguments.
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--page-size",
@@ -135,10 +128,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--enable-cache-report",
     "--max-total-tokens",
     140000,
-    "--hicache-storage-backend",
-    "npu_memcache",
-    "--hicache-storage-backend-extra-config",
-    HICACHE_STORAGE_EXTRA_CONFIG,
 ]
 
 # Decode node launch arguments.
@@ -224,11 +213,11 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     }
     generation_config = DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH
     eval_batch_size = 128
-    min_hit_rate_pcts = {"host": 0, "storage": 0}  # percent: L2 host hit rate must exceed 0%
+    min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 0%
 
-    # def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
-    #     """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""
-    #     self.run_accuracy()
+    def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
+        """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""
+        self.run_accuracy()
 
     def test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_l2_host_hit_rate(self):
         """Run the 32k GSP bench; assert_metrics checks the host hit rate"""
