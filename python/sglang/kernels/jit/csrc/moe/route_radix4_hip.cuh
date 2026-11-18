@@ -162,6 +162,27 @@ SGL_DEVICE void wave_sum_dpp(uint32_t (&x)[N]) {
   dpp_add_stage<0x143, 0xc, 0xf>(x);  // row_bcast:31
 }
 
+/// One DPP move: a lane reads the lane CTRL selects, or `identity` when the
+/// row/bank masks switch it off or its source falls outside the row.
+template <int CTRL, int RM, int BM>
+SGL_DEVICE uint32_t dpp_move(uint32_t x, uint32_t identity) {
+  return static_cast<uint32_t>(
+      __builtin_amdgcn_update_dpp(static_cast<int>(identity), static_cast<int>(x), CTRL, RM, BM, false));
+}
+
+/// Wave-wide inclusive scan under `op`, whose identity is `identity`: lane 63
+/// ends with the whole-wave result. Same ladder and masks as wave_sum_dpp.
+template <typename Op>
+SGL_DEVICE uint32_t wave_scan_dpp(uint32_t x, uint32_t identity, Op op) {
+  x = op(x, dpp_move<0x111, 0xf, 0xf>(x, identity));  // row_shr:1
+  x = op(x, dpp_move<0x112, 0xf, 0xf>(x, identity));  // row_shr:2
+  x = op(x, dpp_move<0x114, 0xf, 0xe>(x, identity));  // row_shr:4
+  x = op(x, dpp_move<0x118, 0xf, 0xc>(x, identity));  // row_shr:8
+  x = op(x, dpp_move<0x142, 0xa, 0xf>(x, identity));  // row_bcast:15
+  x = op(x, dpp_move<0x143, 0xc, 0xf>(x, identity));  // row_bcast:31
+  return x;
+}
+
 template <int CTRL, int RM, int BM>
 SGL_DEVICE float dpp_fadd_stage(float x) {
   const int moved = __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, x), CTRL, RM, BM, false);
@@ -246,12 +267,11 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
   __shared__ uint32_t s_key[TOPK];
   __shared__ int s_cnt;
 
-#pragma unroll
-  for (int s = 32; s > 0; s >>= 1) {
-    or_all |= __shfl_xor(or_all, s, WAVE);
-    and_all &= __shfl_xor(and_all, s, WAVE);
-  }
-  if (lane == 0) {
+  // DPP, not __shfl_xor (six ds_bpermute LDS round trips). Only lane 63 ends
+  // with the wave's OR/AND; the other lanes are made whole by the loop below.
+  or_all = radix4::wave_scan_dpp(or_all, 0u, [](uint32_t a, uint32_t b) { return a | b; });
+  and_all = radix4::wave_scan_dpp(and_all, ~0u, [](uint32_t a, uint32_t b) { return a & b; });
+  if (lane == WAVE - 1) {
     s_pre[0][wid] = or_all;
     s_pre[1][wid] = and_all;
   }
