@@ -6,8 +6,8 @@
 //! First match wins: a sticky/session key hashes to a fixed rank, so router
 //! replicas agree without shared state; else the rank with the deepest cached
 //! prefix; else [`DpRankPolicy`] picks: the fewest router in-flight requests,
-//! the fewest engine-reported KV tokens (in use or queued), or the worker's ranks
-//! in turn.
+//! the lighter of two random ranks by engine-reported KV tokens (in use or
+//! queued), or the worker's ranks in turn.
 
 use crate::config::DpRankPolicy;
 use crate::state::load_monitor::engine_reported_load::RankLoad;
@@ -41,7 +41,10 @@ pub fn projected_rank_tokens(worker: &Worker, loads: &[RankLoad]) -> Vec<(u32, u
 /// `None` for a single-rank worker. `prefix_depths` is `(rank, cached blocks)`;
 /// `rank_tokens` is `(rank, committed KV tokens)` from the engine's load feed, read
 /// only under `least_tokens`, and ignored unless it covers every candidate so a
-/// rank with no reading never looks idle.
+/// rank with no reading never looks idle. Under `least_tokens` the pick is the
+/// lighter of two candidates drawn at random (power of two choices): router
+/// replicas act on the same engine reading, and all taking its minimum would
+/// herd onto one rank until the next one arrives.
 pub fn select_dp_rank(
     worker: &Worker,
     affinity_key: Option<&str>,
@@ -81,20 +84,31 @@ pub fn select_dp_rank(
     };
     let by_tokens = policy == DpRankPolicy::LeastTokens
         && candidates.iter().all(|&rank| tokens_of(rank).is_some());
+    let key = |rank: u32| {
+        let tokens = if by_tokens {
+            tokens_of(rank).unwrap_or(0)
+        } else {
+            0
+        };
+        (tokens, worker.dp_rank_inflight(rank))
+    };
+    if by_tokens && candidates.len() > 2 {
+        let first = rand::random::<usize>() % candidates.len();
+        let mut second = rand::random::<usize>() % (candidates.len() - 1);
+        if second >= first {
+            second += 1;
+        }
+        return [candidates[first], candidates[second]]
+            .into_iter()
+            .min_by_key(|&rank| key(rank));
+    }
     // Random start so equally loaded ranks share traffic.
     let start = rand::random::<usize>() % candidates.len();
     candidates[start..]
         .iter()
         .chain(&candidates[..start])
         .copied()
-        .min_by_key(|&rank| {
-            let tokens = if by_tokens {
-                tokens_of(rank).unwrap_or(0)
-            } else {
-                0
-            };
-            (tokens, worker.dp_rank_inflight(rank))
-        })
+        .min_by_key(|&rank| key(rank))
 }
 
 #[cfg(test)]
@@ -145,20 +159,37 @@ mod tests {
     }
 
     #[test]
-    fn least_tokens_reads_engine_load_and_falls_back_to_in_flight() {
+    fn least_tokens_keeps_the_lighter_of_two_random_ranks() {
         let w = worker(4);
         let tokens = [(0, 50), (1, 10), (2, 10), (3, 90)];
         let _busy_1 = w.dp_rank_guard(1);
-        // Fewest tokens; the router's in-flight count breaks the tie.
-        assert_eq!(select_dp_rank(&w, None, &[], &tokens, TOKENS), Some(2));
+        let draws = |rank_tokens: &[(u32, u64)]| -> Vec<u32> {
+            (0..200)
+                .map(|_| select_dp_rank(&w, None, &[], rank_tokens, TOKENS).unwrap())
+                .collect()
+        };
+        // Of two random ranks the lighter wins: rank 3 never beats a rival,
+        // rank 2 beats every one (fewest tokens; in-flight beats rank 1).
+        let picks = draws(&tokens);
+        assert!(!picks.contains(&3), "{picks:?}");
+        let count = |rank| picks.iter().filter(|&&r| r == rank).count();
+        assert!(count(2) > count(0), "{picks:?}");
         // A cached prefix still outranks load.
         assert_eq!(
             select_dp_rank(&w, None, &[(3, 4)], &tokens, TOKENS),
             Some(3)
         );
-        // Tokens outrank in-flight: rank 0 is idle but holds more KV.
+        // Two candidates compare directly, tokens before in-flight.
+        assert_eq!(
+            select_dp_rank(&w, None, &[(0, 2), (1, 2)], &tokens, TOKENS),
+            Some(1)
+        );
+        // Tokens outrank in-flight: rank 0 is idle but holds more KV, so it
+        // only ever beats rank 3; rank 1 now beats everyone.
         let _busy_2 = [2, 2].map(|rank| w.dp_rank_guard(rank));
-        assert_eq!(select_dp_rank(&w, None, &[], &tokens, TOKENS), Some(1));
+        let picks = draws(&tokens);
+        assert!(!picks.contains(&3), "{picks:?}");
+        assert!(picks.contains(&1), "{picks:?}");
         // No reading, or one that misses a candidate: least in flight (0 or 3).
         for partial in [&[][..], &[(1, 0)][..]] {
             let picked = select_dp_rank(&w, None, &[], partial, TOKENS).unwrap();

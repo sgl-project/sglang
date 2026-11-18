@@ -355,8 +355,8 @@ unset fields inherit the CLI flags. See
   [circuit breaker](REFERENCE.md#circuit-breaker).
 - **DP-rank routing**: `--dp-aware` also picks the DP rank inside multi-rank
   engines; for ranks that no routing key or cached prefix decides,
-  `--dp-rank-policy round_robin` cycles them and `least_tokens` picks the one
-  committed to the fewest engine-reported KV tokens; in PD mode,
+  `--dp-rank-policy round_robin` cycles them and `least_tokens` keeps the
+  lighter of two random ranks by engine-reported KV tokens; in PD mode,
   `--decode-dispatch-limit N` picks the decode rank shortly before the KV
   arrives; see
   [DP-rank routing](REFERENCE.md#dp-rank-routing).

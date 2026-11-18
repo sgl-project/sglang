@@ -301,7 +301,7 @@ async fn round_robin_gives_decode_ranks_turns() {
 }
 
 #[tokio::test]
-async fn least_tokens_sends_decode_to_the_rank_holding_the_fewest_kv_tokens() {
+async fn least_tokens_keeps_the_lighter_of_two_decode_ranks() {
     let (prefill, decode) = (
         MockWorker::start(vec![]).await,
         MockWorker::start(vec![]).await,
@@ -327,14 +327,22 @@ async fn least_tokens_sends_decode_to_the_rank_holding_the_fewest_kv_tokens() {
     for (rank, num_tokens) in [(0, 400), (1, 100), (2, 900), (3, 250)] {
         publish(rank, num_tokens);
     }
-    for _ in 0..3 {
-        let rank = send(&app, &decode, &[(KEY, "conv-pd")]).await;
-        assert_eq!(rank.as_deref(), Some("1"));
+    // Of two random ranks the lighter wins: the heaviest never beats a
+    // rival, the lightest beats every one.
+    let mut ranks = Vec::new();
+    for _ in 0..32 {
+        ranks.push(send(&app, &decode, &[(KEY, "conv-pd")]).await.unwrap());
     }
-    // The pick follows the feed.
+    assert!(!ranks.contains(&"2".to_string()), "{ranks:?}");
+    assert!(ranks.contains(&"1".to_string()), "{ranks:?}");
+    // The pick follows the feed: rank 1 is now the heaviest.
     publish(1, 950);
-    let rank = send(&app, &decode, &[(KEY, "conv-pd")]).await;
-    assert_eq!(rank.as_deref(), Some("3"));
+    let mut ranks = Vec::new();
+    for _ in 0..32 {
+        ranks.push(send(&app, &decode, &[(KEY, "conv-pd")]).await.unwrap());
+    }
+    assert!(!ranks.contains(&"1".to_string()), "{ranks:?}");
+    assert!(ranks.contains(&"3".to_string()), "{ranks:?}");
     // Without a reading the policy still places the request.
     load.forget_worker(&decode.url);
     assert!(send(&app, &decode, &[(KEY, "conv-pd")]).await.is_some());
@@ -342,7 +350,8 @@ async fn least_tokens_sends_decode_to_the_rank_holding_the_fewest_kv_tokens() {
 
 /// Between two engine reports, requests still in flight on a rank count as
 /// its mean KV per request, so a burst spreads instead of herding the rank
-/// that was lightest at the last report.
+/// that was lightest at the last report. Two decode ranks, so the two
+/// candidates compare directly and the projection alone decides.
 #[tokio::test]
 async fn least_tokens_charges_in_flight_requests_to_their_rank() {
     let (prefill, decode) = (
@@ -351,14 +360,14 @@ async fn least_tokens_charges_in_flight_requests_to_their_rank() {
     );
     let workers = [
         (&prefill, WorkerMode::Prefill, 1),
-        (&decode, WorkerMode::Decode, 4),
+        (&decode, WorkerMode::Decode, 2),
     ];
     let mut cfg = sticky_config();
     cfg.model.dp_rank_policy = DpRankPolicy::LeastTokens;
     let load = EngineReportedLoadTable::new();
     let app = router_with_load(cfg, &workers, Default::default(), Arc::clone(&load));
-    // Mean KV per request over the worker: 1650 / 16, about 103.
-    for (rank, num_tokens, num_reqs) in [(0, 400, 4), (1, 100, 1), (2, 900, 9), (3, 250, 2)] {
+    // Mean KV per request over the worker: 500 / 5 = 100.
+    for (rank, num_tokens, num_reqs) in [(0, 400, 4), (1, 100, 1)] {
         let stat = LoadStat {
             num_running_reqs: num_reqs,
             num_waiting_reqs: 0,
@@ -370,7 +379,7 @@ async fn least_tokens_charges_in_flight_requests_to_their_rank() {
     }
     let mut ranks = Vec::new();
     let mut in_flight = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..4 {
         decode.captured.lock().unwrap().headers.clear();
         let app = app.clone();
         in_flight.push(tokio::spawn(async move {
@@ -394,8 +403,9 @@ async fn least_tokens_charges_in_flight_requests_to_their_rank() {
         };
         ranks.push(rank);
     }
-    // Rank 1 at 100, then 203 with one request charged, then 306 > rank 3's 250.
-    assert_eq!(ranks, ["1", "1", "3"]);
+    // Rank 1 at 100, then 200, 300 and 400 as each request is charged; at
+    // 400 it ties rank 0, whose router in-flight count is lower.
+    assert_eq!(ranks, ["1", "1", "1", "0"]);
     for task in in_flight {
         task.abort();
     }
