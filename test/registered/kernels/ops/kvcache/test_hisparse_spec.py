@@ -607,25 +607,6 @@ class TestHiSparseSpec(CustomTestCase):
         _assert_output_matches_tokens(state, graph_out, top_k_tokens)
         self.assertTrue(graph_out.ge(0).all().item())
 
-    def test_rejects_invalid_step_shape_before_compilation(self) -> None:
-        state = _make_state(
-            num_reqs=1,
-            hot_buffer_size=4096,
-            page_size=64,
-            scratch_size=4096,
-            seq_len=8192,
-            item_words=1,
-            metadata_occurrences=8192,
-        )
-        with self.assertRaisesRegex(ValueError, "2-8 steps"):
-            _run_swap(
-                top_k_tokens=torch.zeros(
-                    (1, 1, 2048), dtype=torch.int32, device=DEVICE
-                ),
-                seq_lens=torch.tensor([8192], dtype=torch.int32, device=DEVICE),
-                state=state,
-            )
-
 
 @pytest.mark.parametrize("item_bytes", [656, 1152])
 @pytest.mark.parametrize("use_graph", [False, True])

@@ -1,12 +1,10 @@
 import logging
 from typing import Optional
 
+from sglang.srt.configs.model_config import get_dsa_index_kpool, is_deepseek_dsa
 from sglang.srt.layers.attention.qsa.config import QSAProfile
 from sglang.srt.runtime_context import attention_backends, get_spec
 from sglang.srt.utils.device import (
-    cpu_has_amx_support,
-    is_blackwell,
-    is_cpu,
     is_hip,
     is_musa,
     is_npu,
@@ -104,13 +102,11 @@ class DraftBackendFactory:
             "intel_xpu": self._create_intel_xpu_decode_backend,
             "aiter": self._create_aiter_decode_backend,
             "fa3": self._create_fa3_decode_backend,
-            "hybrid_linear_attn": self._create_hybrid_linear_attn_decode_backend,
             "flashmla": self._create_flashmla_decode_backend,
             "trtllm_mha": self._create_trtllm_mha_decode_backend,
             "trtllm_mla": self._create_trtllm_mla_decode_backend,
             "cutedsl_mla": self._create_cutedsl_mla_decode_backend,
             "dsa": self._create_dsa_decode_backend,
-            "nsa": self._create_dsa_decode_backend,  # Deprecated alias for "dsa"
             "ascend": self._create_ascend_decode_backend,
             "fa4": self._create_fa4_decode_backend,
             "dsv4": self._create_dsv4_decode_backend,
@@ -135,14 +131,12 @@ class DraftBackendFactory:
             "intel_xpu": self._create_intel_xpu_prefill_backend,
             "aiter": self._create_aiter_prefill_backend,
             "fa3": self._create_fa3_prefill_backend,
-            "hybrid_linear_attn": self._create_hybrid_linear_attn_prefill_backend,
             "flashmla": self._create_flashmla_prefill_backend,
             "trtllm_mha": self._create_trtllm_mha_prefill_backend,
             "trtllm_mla": self._create_trtllm_mla_prefill_backend,
             # cute-dsl MLA only supports decode; draft-extend falls back to trtllm-gen.
             "cutedsl_mla": self._create_trtllm_mla_prefill_backend,
             "dsa": self._create_dsa_prefill_backend,
-            "nsa": self._create_dsa_prefill_backend,  # Deprecated alias for "dsa"
             "ascend": self._create_ascend_prefill_backend,
             "fa4": self._create_fa4_prefill_backend,
             "dsv4": self._create_dsv4_prefill_backend,
@@ -289,20 +283,6 @@ class DraftBackendFactory:
             ),
         )
 
-    def _create_hybrid_linear_attn_decode_backend(self):
-        if is_cpu() and cpu_has_amx_support():
-            return self._create_intel_amx_decode_backend()
-        if is_blackwell():
-            return self._create_triton_decode_backend()
-        return self._create_fa3_decode_backend()
-
-    def _create_hybrid_linear_attn_prefill_backend(self):
-        if is_cpu() and cpu_has_amx_support():
-            return self._create_intel_amx_prefill_backend()
-        if is_blackwell():
-            return self._create_triton_prefill_backend()
-        return self._create_fa3_prefill_backend()
-
     def _create_intel_xpu_decode_backend(self):
         from sglang.srt.layers.attention.xpu_backend import XPUMultiStepDraftBackend
 
@@ -420,15 +400,19 @@ class DraftBackendFactory:
         )
 
     def _create_ascend_decode_backend(self):
-        from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
-            AscendAttnMultiStepDraftBackend,
-        )
+        config = self.draft_model_runner.model_config.hf_config
+        if is_deepseek_dsa(config) and get_dsa_index_kpool(config) > 1:
+            from sglang.srt.hardware_backend.npu.attention.ascend_dsa_backend import (
+                AscendDSAAttnMultiStepDraftBackend as backend_cls,
+            )
+        else:
+            from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+                AscendAttnMultiStepDraftBackend as backend_cls,
+            )
 
         return (
             "ascend",
-            AscendAttnMultiStepDraftBackend(
-                self.draft_model_runner, self.topk, self.speculative_num_steps
-            ),
+            backend_cls(self.draft_model_runner, self.topk, self.speculative_num_steps),
         )
 
     def _create_dsv4_decode_backend(self):
@@ -570,11 +554,12 @@ class DraftBackendFactory:
         )
 
     def _create_ascend_prefill_backend(self):
-        from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
-            AscendAttnBackend,
+        from sglang.srt.layers.attention.attention_registry import (
+            ATTENTION_BACKENDS,
         )
 
-        return ("ascend", AscendAttnBackend(self.draft_model_runner))
+        # Reuse the registered factory to select KPool metadata for draft extend.
+        return ("ascend", ATTENTION_BACKENDS["ascend"](self.draft_model_runner))
 
     def _create_flashmla_prefill_backend(self):
         if is_sail():

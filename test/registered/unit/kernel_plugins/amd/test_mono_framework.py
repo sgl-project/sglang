@@ -85,6 +85,19 @@ SPEC = MonoSpec(
     load_tensor=_load_tensor,
 )
 OLD_SPEC = replace(SPEC, api_version=registry.MONOKERNEL_API_VERSION - 1)
+
+
+def _refuse_unchecked(model, hf, copies):
+    raise AssertionError("the model checks ran on another model")
+
+
+# a spec whose model checks fail on any model they should never see
+UNCHECKED = replace(
+    SPEC,
+    model_disable_reasons=lambda model, hf, copies: (
+        _refuse_unchecked(model, hf, copies) if hf.model_type != "fake" else []
+    ),
+)
 # a DSpark draft at 2 draft tokens with anchor sampling: 1-token blocks
 ONE_TOKEN_DRAFT = replace(SPEC, tokens_per_request=lambda model: 1)
 
@@ -117,7 +130,7 @@ def batch(mode, bs, rows):
     )
 
 
-def install(*, archs, lookups=None, is_load_observed=False):
+def install(*, archs, lookups=None, is_load_observed=False, model_type="fake"):
     """install_monokernel_forward on an Lm, as rank 0 of two whose gathered lookups
     are lookups, or as the only rank."""
     lm = Lm()
@@ -135,7 +148,7 @@ def install(*, archs, lookups=None, is_load_observed=False):
     ):
         binding.install_monokernel_forward(
             model=lm,
-            hf_config=SimpleNamespace(architectures=archs),
+            hf_config=SimpleNamespace(architectures=archs, model_type=model_type),
             capture_tail_hooks=[],
         )
     return lm
@@ -165,6 +178,9 @@ class TestMonokernelFramework(CustomTestCase):
         registry_patch.start()
         self.addCleanup(registry_patch.stop)
         registry.register(backend=BACKEND, architecture=ARCH, path=f"{__name__}:SPEC")
+        registry.register(
+            backend=BACKEND, architecture="Unchecked", path=f"{__name__}:UNCHECKED"
+        )
 
     def test_find_spec_refuses_with_a_reason(self):
         register = partial(registry.register, backend=BACKEND)
@@ -358,6 +374,12 @@ class TestMonokernelFramework(CustomTestCase):
         self.addCleanup(reset_context)
         lm = install(archs=["Draft"], is_load_observed=True)
         self.assertEqual(lm(torch.zeros(1), None, batch("target_verify", 2, 2)), "mono")
+
+    def test_another_models_draft_keeps_its_forward(self):
+        # another target's draft shares the architecture but not the spec's
+        # hf_config: it keeps its forward instead of reaching the model checks
+        lm = install(archs=["Unchecked"], is_load_observed=True, model_type="other")
+        self.assertNotIn("forward", vars(lm))
 
     def test_every_rank_takes_the_same_lookup_branch(self):
         # every rank refuses together: one returning alone would hang its peers
