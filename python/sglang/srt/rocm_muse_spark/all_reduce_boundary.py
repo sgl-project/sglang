@@ -37,11 +37,22 @@ _MAX_HIDDEN = 256 * 4 * 8
 # exchange; factored: segment sums travel with the reduced rows, elementwise boundary on every rank
 _KERNEL_MODES = {"vec": 0, "unrolled": 1, "factored": 2}
 _MODE = _KERNEL_MODES[os.environ.get("SGLANG_ROCM_MUSE_AR_BOUNDARY_KERNEL", "factored")]
+# factored only: batches of at least this many rows run the vec kernel instead (0: never). With FlyDSL in the
+# process the factored kernel stalls ~100 ms on rare calls at 64 rows; vec does not.
+_VEC_FROM_ROWS = int(os.environ.get("SGLANG_ROCM_MUSE_AR_BOUNDARY_VEC_FROM_ROWS", "0"))
+# batches below this many rows keep the plain all-reduce (TP8 decode: no e2e gain at 8 rows, +1.9% at 16)
+_MIN_ROWS = int(os.environ.get("SGLANG_ROCM_MUSE_AR_BOUNDARY_MIN_ROWS", "0"))
+
+
+def _mode_for(num_rows: int) -> int:
+    if _MODE == 2 and 0 < _VEC_FROM_ROWS <= num_rows:
+        return 0
+    return _MODE
 
 
 @cache_once
-def _jit_module(world_size: int) -> Module:
-    args = make_cpp_args(world_size, is_arch_support_pdl(), _MODE)
+def _jit_module(world_size: int, mode: int) -> Module:
+    args = make_cpp_args(world_size, is_arch_support_pdl(), mode)
     return load_jit(
         "muse_all_reduce_norm_residual_hip",
         *args,
@@ -141,7 +152,7 @@ class AllReduceAttnBoundary:
             choose_algo,
         )
 
-        if not 2 <= comm.world_size <= 8:
+        if not 2 <= comm.world_size <= 8 or num_rows < _MIN_ROWS:
             return False
         row_bytes = self._boundary._hidden_size * 2
         nbytes = num_rows * row_bytes
@@ -158,11 +169,11 @@ class AllReduceAttnBoundary:
             return False
         # a slot holds the partial and the reduced copy of each rank's rows (+ segment sums)
         rows_per_rank = -(-num_rows // comm.world_size)
-        return rows_per_rank * self._slot_row_bytes(comm.world_size) <= comm._max_push_size
+        return rows_per_rank * self._slot_row_bytes(comm.world_size, _mode_for(num_rows)) <= comm._max_push_size
 
-    def _slot_row_bytes(self, world_size: int) -> int:
+    def _slot_row_bytes(self, world_size: int, mode: int) -> int:
         hidden = self._boundary._hidden_size
-        layout = _factored_layout(hidden, world_size) if _MODE == 2 else None
+        layout = _factored_layout(hidden, world_size) if mode == 2 else None
         sums = 16 * layout[0] * layout[1] if layout else 0
         return 2 * hidden * 2 + sums
 
@@ -205,7 +216,7 @@ class AllReduceAttnBoundary:
         output = torch.empty_like(partial)
         new_stream = torch.empty_like(stream)
         router_out = None if router_dtype is None else torch.empty_like(stream)
-        _jit_module(comm.world_size).run(
+        _jit_module(comm.world_size, _mode_for(partial.shape[0])).run(
             comm.obj,
             partial.contiguous(),
             stream,
