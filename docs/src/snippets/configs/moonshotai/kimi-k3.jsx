@@ -353,6 +353,14 @@ export const config = {
               ? ["--enable-linear-replayssm-spec"]
               : []),
           ],
+          hints: (s) => config.isNpuHw(s)
+            ? [
+                "Optional Ascend DSPARK attention kernels: set SGLANG_NPU_USE_FLASH_MLA=1 for target-model MLA verification, and ASCEND_USE_PAGED_MTP=1 for draft-model MHA attention.",
+                "Both switches default to false and preserve the operators used for ordinary non-speculative decode. They apply to eager execution and graph replay.",
+                "These paths require sgl-kernel-npu with the attention.flash_mla and attention.paged_mtp_attention modules for your NPU.",
+                "To avoid CPU sequence-length mirror and host attention-parameter updates, enable both kernels and set SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0. Its default is 1; selecting the kernels alone keeps the CPU mirrors enabled.",
+              ]
+            : [],
         },
         {
           id: "dflash",
@@ -791,18 +799,14 @@ export const config = {
         port: 8000,
         // Ports come from the engine's PD_PORTS, the same source the role
         // commands rewrite `--port` from, so the router always targets the
-        // ports the two roles actually bind. The positional after --prefill is
-        // the bootstrap port; it must match the prefill server's
-        // --disaggregation-bootstrap-port (default 8998) or only the decode
-        // worker registers.
+        // ports the two roles actually bind.
         command:
-`python3 -m sglang_router.launch_router \\
-  --pd-disaggregation \\
-  --prefill http://<prefill-host>:{{PREFILL_PORT}} 8998 \\
-  --decode http://<decode-host>:{{DECODE_PORT}} \\
+`sgl-router \\
+  --model-id {{MODEL_NAME}} \\
+  --no-tokenizer \\
+  --worker-urls http://<prefill-host>:{{PREFILL_PORT}} http://<decode-host>:{{DECODE_PORT}} \\
   --host 0.0.0.0 --port {{ROUTER_PORT}} \\
-  --disable-circuit-breaker \\
-  --health-check-interval-secs 999999`,
+  --disable-circuit-breaker`,
       },
     },
 
@@ -1349,8 +1353,6 @@ export const config = {
         "NCCL_CUMEM_ENABLE=1",
         "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
-        "SGLANG_K3_ATTN_RES_MODE=jit",
-        "SGLANG_MOE_FUSED_GATE_RADIX=1",
         "SGLANG_HOST_IP={{LOCAL_IP}}",
         "NCCL_SOCKET_IFNAME={{NETWORK_IFACE}}",
         "GLOO_SOCKET_IFNAME={{NETWORK_IFACE}}",
@@ -1381,8 +1383,6 @@ export const config = {
         "NCCL_CUMEM_ENABLE=1",
         "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
-        "SGLANG_K3_ATTN_RES_MODE=jit",
-        "SGLANG_MOE_FUSED_GATE_RADIX=1",
         "SGLANG_HOST_IP={{LOCAL_IP}}",
         "NCCL_SOCKET_IFNAME={{NETWORK_IFACE}}",
         "GLOO_SOCKET_IFNAME={{NETWORK_IFACE}}",
@@ -1413,8 +1413,6 @@ export const config = {
         "NCCL_CUMEM_ENABLE=1",
         "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
-        "SGLANG_K3_ATTN_RES_MODE=jit",
-        "SGLANG_MOE_FUSED_GATE_RADIX=1",
         "SGLANG_HOST_IP={{LOCAL_IP}}",
         "NCCL_SOCKET_IFNAME={{NETWORK_IFACE}}",
         "GLOO_SOCKET_IFNAME={{NETWORK_IFACE}}",
@@ -1499,8 +1497,6 @@ export const config = {
         "NCCL_CUMEM_ENABLE=1",
         "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
-        "SGLANG_K3_ATTN_RES_MODE=jit",
-        "SGLANG_MOE_FUSED_GATE_RADIX=1",
         "SGLANG_HOST_IP={{LOCAL_IP}}",
         "NCCL_SOCKET_IFNAME={{NETWORK_IFACE}}",
         "GLOO_SOCKET_IFNAME={{NETWORK_IFACE}}",
@@ -2126,8 +2122,6 @@ export const config = {
         "NCCL_CUMEM_ENABLE=1",
         "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
-        "SGLANG_K3_ATTN_RES_MODE=jit",
-        "SGLANG_MOE_FUSED_GATE_RADIX=1",
         "SGLANG_HOST_IP={{LOCAL_IP}}",
         "NCCL_SOCKET_IFNAME={{NETWORK_IFACE}}",
         "GLOO_SOCKET_IFNAME={{NETWORK_IFACE}}",
@@ -2158,8 +2152,6 @@ export const config = {
         "NCCL_CUMEM_ENABLE=1",
         "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
-        "SGLANG_K3_ATTN_RES_MODE=jit",
-        "SGLANG_MOE_FUSED_GATE_RADIX=1",
         "SGLANG_HOST_IP={{LOCAL_IP}}",
         "NCCL_SOCKET_IFNAME={{NETWORK_IFACE}}",
         "GLOO_SOCKET_IFNAME={{NETWORK_IFACE}}",
@@ -2190,8 +2182,6 @@ export const config = {
         "NCCL_CUMEM_ENABLE=1",
         "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
-        "SGLANG_K3_ATTN_RES_MODE=jit",
-        "SGLANG_MOE_FUSED_GATE_RADIX=1",
         "SGLANG_HOST_IP={{LOCAL_IP}}",
         "NCCL_SOCKET_IFNAME={{NETWORK_IFACE}}",
         "GLOO_SOCKET_IFNAME={{NETWORK_IFACE}}",

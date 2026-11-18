@@ -20,12 +20,12 @@ from sglang.srt.models.dots3_common.dots_omni_towers import (
     get_audio_token_string,
     load_omni_component_config,
 )
+from sglang.srt.multimodal.media_io import VideoData, get_video_bytes
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils import VideoData, get_video_bytes
 
 logger = logging.getLogger(__name__)
 

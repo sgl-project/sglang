@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from array import array
-from typing import TYPE_CHECKING, Callable, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Callable, List, Optional, Set
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
@@ -12,6 +12,7 @@ from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
@@ -34,11 +35,11 @@ class SchedulerDllmMixin:
         )
         self.dllm_manager = DllmManager(
             dllm_config=self.dllm_config,
-            release_aborted=self._release_aborted_dllm_req,
+            abort=self._abort_dllm_req,
         )
 
-    def _release_aborted_dllm_req(self: Scheduler, req: Req) -> None:
-        self.request_retirer.abort_queued(req)
+    def _abort_dllm_req(self: Scheduler, req: Req) -> None:
+        self.request_retirer.abort(req)
         logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
     def validate_dllm_request(self: Scheduler, req: Req) -> Optional[str]:
@@ -47,7 +48,7 @@ class SchedulerDllmMixin:
         return self.dllm_config.validate_request(req)
 
     def get_new_batch_dllm(
-        self: Scheduler, running_batch: ScheduleBatch
+        self: Scheduler, running_batch: ScheduleBatch, staged: List[Req]
     ) -> Optional[ScheduleBatch]:
         """Generate a new batch for DLLM (Diffusion LLM) scheduling."""
         if self.enable_priority_preemption:
@@ -58,13 +59,15 @@ class SchedulerDllmMixin:
             return None
 
         running_bs = len(running_batch.reqs)
-        self.waiting_queue.replace(self.policy.calc_priority(self.waiting_queue))
+        self._ack_waiting_health_checks()
+        self.waiting_queue.reorder(self.policy.calc_priority(self.waiting_queue))
 
         # Create prefill adder with resource constraints
         adder = self._create_dllm_prefill_adder(running_bs, running_batch=running_batch)
 
-        # Initialize DLLM manager and transfer requests
-        self.dllm_manager.init_next_round()
+        # The last round's requests start their next block.
+        for req in staged:
+            req.init_next_round_input()
         self._fetch_waiting_reqs()
 
         # Process batches
@@ -189,7 +192,7 @@ class SchedulerDllmMixin:
             req.finish_outside_step(FINISH_LENGTH(length=len(req.output_ids)))
 
         if req.finished():
-            self.request_retirer.release_finished(
+            self.request_retirer.release(
                 req,
                 checkpoint=not self.dllm_config.requires_separate_context_encoding,
             )
@@ -238,9 +241,7 @@ class SchedulerDllmMixin:
         num_requests_to_add = min(max_dllm_capacity, len(self.waiting_queue))
 
         if num_requests_to_add > 0:
-            requests_to_add = self.waiting_queue[:num_requests_to_add]
-            self.dllm_manager.add_waiting_reqs(requests_to_add)
-            self.waiting_queue.replace(self.waiting_queue[num_requests_to_add:])
+            self.dllm_manager.add_waiting_reqs(self.waiting_queue[:num_requests_to_add])
 
     def _should_skip_prefill(self: Scheduler, running_batch: ScheduleBatch) -> bool:
         """Check if DLLM prefill should be skipped."""
@@ -276,6 +277,7 @@ class SchedulerDllmMixin:
             self.priority_scheduling_preemption_threshold,
             prefill_max_requests=get_schedule().prefill_max_requests,
             dllm_config=self.dllm_config,
+            request_retirer=self.request_retirer,
         )
 
     def _process_dllm_batches(
@@ -338,9 +340,6 @@ class SchedulerDllmMixin:
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
-
-        if can_run_list:
-            self.dllm_manager.add_staging_reqs(can_run_list)
 
     def _create_dllm_batch(
         self: Scheduler,
@@ -427,27 +426,20 @@ class SchedulerDllmMixin:
 
 
 class DllmManager:
-    """
-    Manager for Diffusion LLM request scheduling.
-
-    Maintains two queues:
-    - waiting_queue: The requests waiting to be scheduled with max running requests limit
-    - staging_queue: Requests allocated resources by PrefillAdder
-    """
+    """Manager for Diffusion LLM request scheduling: `waiting_queue` holds every
+    dLLM request until it finishes, the ones a round runs included."""
 
     def __init__(
         self,
         dllm_config: Optional[DllmConfig],
-        release_aborted: Callable[[Req], None],
+        abort: Callable[[Req], None],
     ):
         self.dllm_config = dllm_config
         self.max_running_reqs = (
             dllm_config.max_running_requests if dllm_config is not None else 1
         )
         self.waiting_queue = IndexedReqList(ListKind.DLLM, abort=self._abort)
-        # A subset of the waiting queue.
-        self.staging_queue: List[Req] = []
-        self._release_aborted = release_aborted
+        self._abort_one = abort
 
     def get_prefill_requests(self) -> List[Req]:
         """Get all prefill requests from waiting queue."""
@@ -457,52 +449,32 @@ class DllmManager:
         """Get all decode requests from waiting queue."""
         return [req for req in self.waiting_queue if not req.is_dllm_prefill()]
 
-    def add_waiting_reqs(self, reqs: Union[Req, List[Req]]) -> None:
-        """Add requests to waiting queue with redundancy check."""
+    def add_waiting_reqs(self, reqs: List[Req]) -> None:
+        """Move requests into the waiting queue, with a redundancy check."""
         assert self.dllm_config is not None, "Diffusion LLM config is not set."
 
-        reqs_to_add = reqs if isinstance(reqs, list) else [reqs]
-
         # Check for duplicate request IDs
-        if self._has_duplicate_reqs(reqs_to_add):
+        if self._has_duplicate_reqs(reqs):
             raise RuntimeError("Redundant requests detected in dLLM requests.")
 
-        self.waiting_queue.join(reqs_to_add)
-
-    def add_staging_reqs(self, reqs: Union[Req, List[Req]]) -> None:
-        """Add requests to staging queue (allocated by PrefillAdder)."""
-        reqs_to_add = reqs if isinstance(reqs, list) else [reqs]
-        self.staging_queue.extend(reqs_to_add)
+        move(reqs, self.waiting_queue)
 
     def _has_duplicate_reqs(self, reqs: List[Req]) -> bool:
         """Check if any request ID already exists in waiting queue."""
         existing_rids: Set[str] = {r.rid for r in self.waiting_queue}
         return any(req.rid in existing_rids for req in reqs)
 
-    def any_staging_reqs(self) -> bool:
-        """Check if there are requests in staging queue."""
-        return self.dllm_config is not None and len(self.staging_queue) > 0
+    def staged_reqs(self, last_batch: Optional[ScheduleBatch]) -> List[Req]:
+        """The requests the last round ran that are still waiting, in its order."""
+        if last_batch is None:
+            return []
+        return [req for req in last_batch.reqs if req in self.waiting_queue]
 
     def is_empty(self) -> bool:
-        """Check if both queues are empty or DLLM is not configured."""
         if self.dllm_config is None:
             return True
         return len(self.waiting_queue) == 0
 
-    def filter_finished_reqs(self) -> None:
-        """Remove finished requests from both queues."""
-        self.waiting_queue.take(lambda req: req.finished())
-        self.staging_queue = [req for req in self.staging_queue if not req.finished()]
-
     def _abort(self, recv_req: AbortReq) -> None:
-        aborted_reqs = self.waiting_queue.take(lambda req: recv_req.matches(req.rid))
-        aborted = set(aborted_reqs)
-        self.staging_queue = [req for req in self.staging_queue if req not in aborted]
-        for req in aborted_reqs:
-            self._release_aborted(req)
-
-    def init_next_round(self) -> None:
-        """Initialize staging requests for next round and clear staging queue."""
-        for req in self.staging_queue:
-            req.init_next_round_input()
-        self.staging_queue = []
+        for req in [r for r in self.waiting_queue if recv_req.matches(r.rid)]:
+            self._abort_one(req)

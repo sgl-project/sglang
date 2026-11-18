@@ -77,5 +77,37 @@ def test_sigmoid_gate_mul_contiguous_output():
     assert out.is_contiguous()
 
 
+def test_sigmoid_gate_mul_strided_gate_round_sigmoid_is_bit_exact():
+    num_tokens = 300
+    # The gate is the tail columns of a merged [q_up | gate] GEMM output.
+    from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+
+    torch.manual_seed(0)
+    x = torch.randn(num_tokens, 8192, dtype=torch.bfloat16, device=DEVICE)
+    merged = torch.randn(num_tokens, 4096 + 8192, dtype=torch.bfloat16, device=DEVICE)
+    gate = merged[:, 4096:]
+    ref = x * torch.sigmoid(gate)
+    assert torch.equal(fused_sigmoid_mul(x, gate, round_sigmoid=True), ref)
+    assert torch.equal(fused_sigmoid_mul(x, gate.contiguous(), round_sigmoid=True), ref)
+
+
+def test_sigmoid_gate_mul_head_strided_gate_round_sigmoid_is_bit_exact():
+    # Qwen3-Next layout: per head [q | gate] from the QKV GEMM, chunked into a 3D view.
+    from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+
+    num_tokens, num_heads, head_dim = 300, 16, 256
+    torch.manual_seed(0)
+    q_gate = torch.randn(
+        num_tokens, num_heads, 2 * head_dim, dtype=torch.bfloat16, device=DEVICE
+    )
+    _, gate = torch.chunk(q_gate, 2, dim=-1)
+    x = torch.randn(
+        num_tokens, num_heads * head_dim, dtype=torch.bfloat16, device=DEVICE
+    )
+    ref = x * torch.sigmoid(gate.reshape(num_tokens, -1))
+    out = fused_sigmoid_mul(x.clone(), gate, inplace=True, round_sigmoid=True)
+    assert torch.equal(out, ref)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
