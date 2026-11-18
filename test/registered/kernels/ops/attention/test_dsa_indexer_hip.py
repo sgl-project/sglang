@@ -1,14 +1,4 @@
-"""Kimi-K3.1's ROCm DSA indexer hooks (dsa_indexer_hip) against their plain counterparts.
-
-- Store under DCP: a rank's index-K equals a DCP1 store of only the tokens it owns
-  (slot % N == rank) at row slot // N, as with the CUDA fused store.
-- Target verify: the shared-index-K logits equal the per-row aiter call on every
-  row's keys, layer after layer and forward after forward.
-- NoPE prologue: quantized queries, head weights and stored keys match the generic path.
-- FP4 index-K: AITER's row-group logits read the keys and queries our kernels write.
-- TP-split prefill top-k: the in-place all-gather of equal slots rebuilds the rows in
-  order, without the shorter slices' padding.
-"""
+"""Kimi-K3.1 ROCm DSA indexer hooks (dsa_indexer_hip) against their plain paths."""
 
 import contextlib
 import sys
@@ -82,6 +72,8 @@ def _store(pool, loc, key) -> torch.Tensor:
 )
 class TestDSAIndexerHip(CustomTestCase):
     def test_dcp_store_keeps_this_ranks_tokens(self):
+        """A rank's index-K equals a DCP1 store of only the tokens it owns
+        (slot % N == rank) at row slot // N."""
         dcp_size = 8
         gen = torch.Generator(device="cuda").manual_seed(0)
         loc = torch.randperm(ROWS * dcp_size, device="cuda", generator=gen)[:700]
@@ -100,6 +92,8 @@ class TestDSAIndexerHip(CustomTestCase):
         self.assertTrue(torch.equal(got, ref))
 
     def test_verify_logits_match_per_row_call(self):
+        """The shared-index-K logits equal the per-row aiter call, layer after layer
+        and forward after forward."""
         num_reqs, next_n, req_pages = 3, 4, 8
         q_offset = num_reqs * next_n
         max_seq_len = req_pages * PAGE
@@ -432,6 +426,8 @@ class _TpGroup:
 
 class TestTpSplitGatherHip(CustomTestCase):
     def test_unequal_slices_gather_back_in_row_order(self):
+        """The in-place all-gather of equal slots rebuilds the rows in order,
+        without the shorter slices' padding."""
         sizes, topk = [3, 1, 2], 4
         rows = torch.arange(sum(sizes) * topk, dtype=torch.int32).view(-1, topk)
         bufs = [None] * len(sizes)
