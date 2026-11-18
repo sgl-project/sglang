@@ -27,7 +27,7 @@ from sglang.test.kernels.kv_canary.bench_cases import (
 
 register_cuda_ci(est_time=40, stage="weekly", runner_config="1-gpu-large")
 # AMD mirrors the CUDA nightly registration (nightly-only, no per-PR suite).
-register_amd_ci(est_time=900, suite="nightly-amd-kernel-1-gpu", nightly=True)
+register_amd_ci(est_time=900, suite="nightly-kernel-test-1-gpu-amd", nightly=True)
 
 
 _TOTAL_TOKENS_AXIS: list[int] = [256, 4096, 65536, 262144]
