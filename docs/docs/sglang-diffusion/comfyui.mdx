@@ -7,7 +7,7 @@ The [ComfyUI SGLDiffusion plugin](https://github.com/sgl-project/sglang/tree/mai
 
 **Server mode** talks to a standalone `sglang serve` process over HTTP. ComfyUI sends prompts and receives images or video. This is the same path as the [OpenAI-compatible API](/docs/sglang-diffusion/api/openai_api).
 
-**Integrated mode** keeps ComfyUI's CLIP, VAE, and sampler loop. SGLang loads only the DiT and runs one forward per sampler step. The worker starts the native Flux / Qwen-Image / Z-Image / MiniMax-H3 pipeline under `--comfyui-mode`. A single-file ComfyUI `.safetensors` (or a GGUF overlay) is loaded through a checkpoint spec. Each `apply_model` call is translated by a per-model adapter.
+**Integrated mode** keeps ComfyUI's CLIP, VAE, and sampler loop. SGLang loads only the DiT and runs one forward per sampler step. The worker starts the native Flux / Qwen-Image / Qwen-Image-2.1 / Z-Image / LTX-2 / MiniMax-H3 pipeline with `comfyui_mode` enabled (a `ServerArgs` field the plugin sets; there is no CLI flag). A single-file ComfyUI `.safetensors` (or a GGUF overlay) is loaded through a checkpoint spec. Each `apply_model` call is translated by a per-model adapter.
 
 Integrated mode does not ship a separate `comfyui_*` pipeline class per model.
 
@@ -25,7 +25,7 @@ Example workflows live next to the plugin under `workflows/`.
 2. Set `num_gpus`, `tp_size`, `model_type`, or compile flags with `SGLDiffusion Options`.
 3. Connect the loaded model to a standard ComfyUI sampler.
 
-Supported integrated-mode families: Flux, Qwen-Image, Z-Image, MiniMax-H3. Qwen-Image edit is experimental.
+Supported integrated-mode families: Flux, Qwen-Image, Qwen-Image-2.1, Z-Image, LTX-2.5 / LTX-2.3, MiniMax-H3 (plus FastH3 and VDN-H3 through `SGLDiffusion Native Model Loader`). Qwen-Image edit is experimental.
 
 ## How a sampler step reaches the worker
 
@@ -33,7 +33,7 @@ The plugin README has the [architecture diagram](https://github.com/sgl-project/
 
 1. A model adapter packs ComfyUI tensors into an SGLang `Req`.
 2. Local ZMQ replaces CUDA tensors with IPC handles so latents stay on GPU.
-3. Rank 0 materializes the handles. Multi-rank `--comfyui-mode` then detaches CUDA tensors and broadcasts them over NCCL. The general SP / CFG / TP path is still the original `broadcast_pyobj`.
+3. Rank 0 materializes the handles. Multi-rank `comfyui_mode` then detaches CUDA tensors and broadcasts them over NCCL. The general SP / CFG / TP path is still the original `broadcast_pyobj`.
 4. The worker pipeline keeps `transformer` plus a pass-through scheduler. After the first step, conditioning stays in a worker session; later steps send latents and the timestep.
 
 Integrated mode currently supports:
@@ -44,7 +44,10 @@ Integrated mode currently supports:
 | Z-Image | `lumina2` | `ZImagePipeline` | `Z-Image-Turbo` |
 | Qwen-Image | `qwen_image` | `QwenImagePipeline` | `Qwen-Image`, `Qwen-Image-2512` |
 | Qwen-Image edit | `qwen_image_edit` | `QwenImageEditPlusPipeline` | `Qwen-Image-Edit-2511` (experimental) |
+| Qwen-Image-2.1 | `qwen_image21` | `QwenImage21Pipeline` | `qwen_image_2.1_bf16.safetensors`, `qwen_image_2.1_int8_convrot.safetensors` |
+| LTX-2.5 / LTX-2.3 | `ltxav` | `LTX2Pipeline` | LTX-2.5 single-file DiT (INT8 ConvRot or BF16), LTX-2.3 all-in-one FP8 |
 | MiniMax-H3 | `minimax_h3` | `MiniMaxH3Pipeline` | `minimax_h3_fl2va_*.safetensors`, `minimax_h3_ref2va_*.safetensors` |
+| FastH3 / VDN-H3 (native directories, `SGLDiffusion Native Model Loader`) | none; read from `model_index.json` (internally `fast_h3` / `vdn_h3`) | `FastH3Pipeline` / `VDNH3Pipeline` | FastH3 8-Step V2, VDN-H3 |
 
 MiniMax-H3 example graphs: `minimax_h3_t2v_sgld.json` (T2V / I2VA / FL2VA on the FL2VA DiT), `minimax_h3_r2v_sgld.json` (reference-to-video; use a `ref2va` file), `minimax_h3_t2v_sgld_upscaler.json` (two-pass 3D ×2). Set `SGLDOptions.model_type` to `minimax_h3`. On 24 GB, keep the 32B CLIP on CPU and prefer pruned BF16, GGUF, or `convrot_int8` with DiT layerwise offload. See the [MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#comfyui-integrated-mode).
 

@@ -37,7 +37,12 @@ _CASES = {
     "aiter-aiter_env": ("aiter", True, "none", True),
     "auto-aiter_env": ("auto", True, "none", True),
     "auto": ("auto", False, "none", False),
-    "auto-aiter_env-unsupported_a2a": ("auto", True, "flashinfer", False),
+    "auto-aiter_env-unsupported_a2a": (
+        "auto",
+        True,
+        "flashinfer_nvlink_one_sided",
+        False,
+    ),
 }
 
 
@@ -49,7 +54,6 @@ class TestMxfp4AiterRunnerSelection(CustomTestCase):
             ("_aiter_k3_opt", False),
             ("_is_cpu", False),
             ("_is_xpu", False),
-            ("has_triton_kernels", False),
         ):
             stack.enter_context(patch.object(mxfp4_module, name, value))
         stack.enter_context(
