@@ -108,4 +108,3 @@ def make_processor(case, config, image_processor_cls=None):
     return QwenVLImageProcessor(
         hf_config, server_args, processor, None, skip_mm_pool=True
     )
-
