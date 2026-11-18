@@ -1987,7 +1987,11 @@ class LTX2DenoisingStage(DenoisingStage):
                     return_dict=False,
                 )[0]
                 ctx.audio_latents = ctx.audio_scheduler.step(
-                    model_audio, step.t_device, ctx.audio_latents, return_dict=False
+                    model_audio,
+                    step.t_device,
+                    ctx.audio_latents,
+                    **rollout_step_kwargs(batch, stream=AUDIO_STREAM),
+                    return_dict=False,
                 )[0]
                 if ctx.denoise_mask is not None and ctx.clean_latent is not None:
                     ctx.latents = (
