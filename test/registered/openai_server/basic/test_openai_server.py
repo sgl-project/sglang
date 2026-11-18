@@ -29,7 +29,6 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_rust_server_built,
     popen_launch_server,
-    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=294, stage="base-b", runner_config="1-gpu-small")
@@ -37,8 +36,6 @@ register_amd_ci(est_time=224, suite="base-b-test-1-gpu-small-amd")
 
 
 class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):
-    process = None
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -56,8 +53,7 @@ class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):
 
     @classmethod
     def tearDownClass(cls):
-        if cls.process is not None:
-            terminate_and_kill_process_tree(cls.process)
+        kill_process_tree(cls.process.pid)
 
     def test_ignore_eos(self):
         """ignore_eos=True must keep generating past EOS up to max_tokens."""
