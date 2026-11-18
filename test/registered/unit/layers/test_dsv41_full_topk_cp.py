@@ -6,8 +6,10 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsv4.v41_indexer.full_topk import FullTopKIndexer
 from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import prefill_k_slots
+from sglang.srt.layers.attention.dsv4.v41_indexer.selector import TopKSelector
 from sglang.srt.layers.attention.dsv4.v41_indexer.types import PrefillInputs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -30,6 +32,7 @@ class TestDSV41FullTopKCP(CustomTestCase):
                 req_to_token=self.req_to_token,
                 use_deep_gemm_prefill=False,
                 use_deep_gemm_decode=False,
+                selector=TopKSelector(DSATopKBackend.SGL_KERNEL),
             )
 
     def _inputs(self, req, pos, counts, ratio, *, explicit=False, device_counts=True):
