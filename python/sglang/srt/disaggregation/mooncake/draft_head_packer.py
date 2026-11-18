@@ -39,7 +39,7 @@ class DraftHeadPacker:
         *,
         tensors: List[torch.Tensor],
         page_size: int,
-        register: Callable[[List[int], List[int]], int],
+        register: Callable[[List[int], List[int]], None],
     ):
         self._tensors = tensors
         self._page_size = page_size
@@ -53,11 +53,10 @@ class DraftHeadPacker:
             _StagingBuffer(nbytes=self._batch_bytes, device=self._device)
             for _ in range(_NUM_BUFFERS)
         ]
-        ret = register(
+        # The engine raises when it rejects a region; there is no status to check.
+        register(
             [b.data.data_ptr() for b in buffers], [self._batch_bytes] * len(buffers)
         )
-        if ret != 0:
-            raise RuntimeError(f"registering draft head staging failed: {ret}")
         for b in buffers:
             self._free.put(b)
 

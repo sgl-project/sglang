@@ -475,8 +475,10 @@ class PrefillBootstrapQueue:
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
         from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
 
-        kv_args.main_kv_page_row = isinstance(
-            self.token_to_kv_pool, MiniMaxM3Nvfp4KVPool
+        # Only the Mooncake sender slices page rows by head.
+        kv_args.main_kv_page_row = (
+            isinstance(self.token_to_kv_pool, MiniMaxM3Nvfp4KVPool)
+            and self.transfer_backend == TransferBackend.MOONCAKE
         )
         if kv_args.main_kv_page_row:
             kv_args.main_kv_head_dim = self.token_to_kv_pool.head_dim

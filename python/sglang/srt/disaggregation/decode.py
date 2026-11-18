@@ -906,8 +906,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
         from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
 
-        kv_args.main_kv_page_row = isinstance(
-            self.token_to_kv_pool, MiniMaxM3Nvfp4KVPool
+        # Admits a prefill with another attention TP size only where a sender
+        # can slice page rows by head; the other backends still send whole rows.
+        kv_args.main_kv_page_row = (
+            isinstance(self.token_to_kv_pool, MiniMaxM3Nvfp4KVPool)
+            and self.transfer_backend == TransferBackend.MOONCAKE
         )
         if kv_args.main_kv_page_row:
             kv_args.main_kv_head_dim = self.token_to_kv_pool.head_dim

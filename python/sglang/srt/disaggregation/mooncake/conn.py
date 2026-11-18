@@ -2146,6 +2146,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     dst_layer_ids=dst_layer_ids,
                 )
             )
+            # Built lazily: its staging allocation and registration can fail,
+            # and a raise from this thread would stop the transfer worker.
+            draft_head_packer = self._get_draft_head_packer() if draft_jobs else None
         except (ValueError, RuntimeError) as e:
             logger.error(f"[{mooncake_session_id}] head-sliced KV send: {e}")
             return -1
@@ -2179,10 +2182,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 for job in draft_segment_jobs
             ]
-            if draft_jobs:
+            if draft_head_packer is not None:
                 futures.append(
                     executor.submit(
-                        self._get_draft_head_packer().send,
+                        draft_head_packer.send,
                         src_page_indices=draft_src_pages,
                         dst_page_indices=draft_dst_pages,
                         jobs=draft_jobs,
