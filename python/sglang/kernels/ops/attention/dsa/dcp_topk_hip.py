@@ -14,7 +14,6 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
-from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -101,7 +100,7 @@ def dcp_local_candidates_hip(
 # 1 selects the single-block kernel; the merge holds at most one block's registers of candidates.
 def _local_max_chunks(width: int) -> int:
     chunks = triton.cdiv(width, _LOCAL_PER_THREAD * 1024)
-    if not envs.SGLANG_DSA_DCP_TOPK_CHUNKED.get() or chunks < _LOCAL_MIN_CHUNKS:
+    if chunks < _LOCAL_MIN_CHUNKS:
         return 1
     return min(chunks, _LOCAL_PER_THREAD * 1024 // TOPK)
 

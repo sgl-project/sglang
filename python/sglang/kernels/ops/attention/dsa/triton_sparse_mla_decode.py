@@ -87,7 +87,7 @@ def triton_sparse_mla_decode_splitk(
     kv_splits: int | None = None,
     workspace: _SplitKWorkspace | None = None,
     return_lse: bool = False,
-    topk_length: torch.Tensor | None = None,
+    lengths: torch.Tensor | None = None,
     expected_topk: int | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Split-K Triton sparse MLA decode (DSv4 pattern).
@@ -97,11 +97,11 @@ def triton_sparse_mla_decode_splitk(
     kv:      [num_pages, 1, DIM] fp8/bf16
     indices: [bs, 1, topk] int32
     workspace: backend-owned grow-only split-K buffers for graph-safe reuse
-    topk_length: optional [>= bs] int32 in [0, topk]; only the first topk_length[i]
+    lengths: optional [>= bs] int32 in [0, topk]; only the first lengths[i]
              indices of row i are scanned, and the rest of the row must be -1.
              Under DCP these are the owned counts and the -1 tail written by
              transform_index_page_table_dcp (transform_index.py) or dcp_local_topk.
-    expected_topk: typical topk_length, which sizes the split count instead of topk
+    expected_topk: typical lengths value, which sizes the split count instead of topk
     returns: [1, bs, H, d_v] bf16, plus a [bs, H] fp32 natural-log LSE (-inf for
              rows with no key) if return_lse
     """
@@ -113,10 +113,10 @@ def triton_sparse_mla_decode_splitk(
     d_tail = q_rope.shape[-1]
     kv_dim = kv.shape[-1]
     topk = indices.shape[-1]
-    if topk_length is not None:
-        assert topk_length.numel() >= bs and topk_length.dtype == torch.int32, (
-            f"topk_length must be [>= bs={bs}] int32, got "
-            f"{tuple(topk_length.shape)} {topk_length.dtype}"
+    if lengths is not None:
+        assert lengths.numel() >= bs and lengths.dtype == torch.int32, (
+            f"lengths must be [>= bs={bs}] int32, got {tuple(lengths.shape)} "
+            f"{lengths.dtype}"
         )
         assert indices.dtype == torch.int32
     idx_flat = indices.squeeze(1).contiguous()
@@ -138,7 +138,7 @@ def triton_sparse_mla_decode_splitk(
 
     # Keep the number of split partials independent of a smaller LDS-safe
     # BLOCK_K. This retains the existing reduction cost on 64 KiB devices.
-    split_topk = topk if topk_length is None else min(expected_topk or topk, topk)
+    split_topk = topk if lengths is None else min(expected_topk or topk, topk)
     max_kv_splits = max(1, split_topk // _PREFERRED_BLOCK_K)
     num_cu = _cu_count(q_nope.device)
     base_ctas = max(1, bs * n_head_blocks)
@@ -185,7 +185,7 @@ def triton_sparse_mla_decode_splitk(
         if return_lse
         else None
     )
-    topk_length_ptr = topk_length if topk_length is not None else idx_flat
+    topk_length = lengths if lengths is not None else idx_flat
 
     if kv_splits == 1:
         fused_num_warps = 4
@@ -198,7 +198,7 @@ def triton_sparse_mla_decode_splitk(
                 q_rope,
                 kv,
                 idx_flat,
-                topk_length_ptr,
+                topk_length,
                 out,
                 qk_scale,
                 _FP8_MAX,
@@ -213,8 +213,8 @@ def triton_sparse_mla_decode_splitk(
                 STRIDE_QR_T=stride_qr_t,
                 STRIDE_QR_H=stride_qr_h,
                 USE_FP8_DOT=use_fp8_dot,
-                USE_TOPK_LENGTH=topk_length is not None,
-                TOPK_TAIL_INVALID=topk_length is not None,
+                USE_TOPK_LENGTH=lengths is not None,
+                TOPK_TAIL_INVALID=lengths is not None,
                 KV_SCALED=kv_scaled,
                 BLOCK_H=BLOCK_H,
                 BLOCK_K=BLOCK_K,
@@ -231,7 +231,7 @@ def triton_sparse_mla_decode_splitk(
             )
         return (out.unsqueeze(0), lse) if return_lse else out.unsqueeze(0)
 
-    if topk_length is None:
+    if lengths is None:
         tiles_per_split = (topk + kv_splits * BLOCK_K - 1) // (kv_splits * BLOCK_K)
         active_splits = (topk + tiles_per_split * BLOCK_K - 1) // (
             tiles_per_split * BLOCK_K
@@ -276,8 +276,8 @@ def triton_sparse_mla_decode_splitk(
             KV_SPLITS=kv_splits,
             BLOCK_H=BLOCK_H,
             BLOCK_K=BLOCK_K,
-            topk_length_ptr=topk_length_ptr,
-            USE_TOPK_LENGTH=topk_length is not None,
+            topk_length_ptr=topk_length,
+            USE_TOPK_LENGTH=lengths is not None,
             KV_SCALED=kv_scaled,
             num_warps=split_num_warps,
             num_stages=2,

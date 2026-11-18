@@ -4288,7 +4288,7 @@ class DeepseekSparseAttnBackend(
             d_v=v_head_dim,
             workspace=workspace,
             return_lse=True,
-            topk_length=owned_counts,
+            lengths=owned_counts,
         )
         return out.view(rows, heads, v_head_dim), lse_base2_for_dcp_merge(lse)
 

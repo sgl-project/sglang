@@ -20,7 +20,6 @@ from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.metadata import q8kv8_topk_length_from_indices
 from sglang.kernels.ops.quantization.dsa_quant_k_cache import fp8_ds_mla_row_width
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.environ import envs
 from sglang.srt.utils import get_device_core_count, is_gfx95_supported, print_info_once
 
 _ASYNC_COPY_OFF_ARCHES = frozenset({"gfx950"})
@@ -1380,11 +1379,7 @@ def triton_sparse_mla_fwd(
                 return_lse=return_lse,
                 bf16_dot=bf16_dot,
             )
-    if (
-        _HIP_SPLIT_MIN_ROWS <= seq <= _HIP_SPLIT_MAX_ROWS
-        and envs.SGLANG_ROCM_SPARSE_MLA_DECODE_HIP.get()
-        and is_gfx95_supported()
-    ):
+    if _HIP_SPLIT_MIN_ROWS <= seq <= _HIP_SPLIT_MAX_ROWS and is_gfx95_supported():
         from sglang.kernels.ops.attention.dsa.sparse_mla_prefill_gfx950 import (
             sparse_mla_decode_splits,
             sparse_mla_split_gfx950,

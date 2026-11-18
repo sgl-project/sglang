@@ -229,7 +229,7 @@ def test_dcp_owned_count_decode_merges_to_full_kv(fp8, heads, kv_splits):
             d_v,
             kv_splits=kv_splits,
             return_lse=True,
-            topk_length=owned_counts,
+            lengths=owned_counts,
         )
         lse = lse_base2_for_dcp_merge(lse)
         assert torch.isfinite(lse).all()

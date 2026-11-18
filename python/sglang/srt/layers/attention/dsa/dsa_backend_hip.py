@@ -75,7 +75,7 @@ def forward_triton_dcp_partial(
         d_v=layer.v_head_dim,
         workspace=workspace,
         return_lse=True,
-        topk_length=topk_length,
+        lengths=topk_length,
         expected_topk=expected_topk,
     )
     return o.squeeze(0), lse

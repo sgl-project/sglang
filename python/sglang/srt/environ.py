@@ -1103,8 +1103,6 @@ class Envs:
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
-    # ROCm: 16..512-row triton_sparse_mla_fwd calls (target verify) run the HIP split-K kernel
-    SGLANG_ROCM_SPARSE_MLA_DECODE_HIP = EnvBool(True)
     # Kimi-K3 gfx950 prefill: the MoE front on row shards, full shared experts (+264 MB a layer)
     SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_FRONT = EnvBool(False)
     # The same front, shared experts TP-sharded (no extra memory); FRONT takes precedence
@@ -2357,9 +2355,6 @@ class Envs:
     # ROCm prefill indexer logits: aiter FlyDSL fp8_mqa_logits instead of Triton;
     # same fp8 inputs and fp32 accumulation, only the summation order differs.
     SGLANG_USE_FLYDSL_DSA_PREFILL_LOGITS = EnvBool(True)
-    # DCP local top-2048 on HIP: split rows longer than one block's registers over several
-    # blocks, then merge (exact). Set 0 for the single-block-per-row kernel.
-    SGLANG_DSA_DCP_TOPK_CHUNKED = EnvBool(True)
     # aiter paged indexer logits on ROCm: balance the grid over each row's real length
     # (persistent schedule) instead of a fixed split per row. Set 0 for the fixed split.
     SGLANG_DSA_MQA_PERSISTENT_SCHEDULE = EnvBool(True)
