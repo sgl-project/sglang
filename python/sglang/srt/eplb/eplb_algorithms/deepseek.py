@@ -1,6 +1,7 @@
 # This file is copied from https://github.com/deepseek-ai/EPLB/blob/main/eplb.py since that one is not a pypi package
 from typing import Tuple
 
+import numpy as np
 import torch
 
 
@@ -30,25 +31,45 @@ def balanced_packing(
         rank_in_pack = torch.zeros_like(weight, dtype=torch.int64)
         return pack_index, rank_in_pack
 
-    indices_list = weight.float().sort(-1, descending=True).indices.tolist()
-    weight_list = weight.tolist()
-    pack_index_list = [[-1] * num_groups for _ in range(num_layers)]
-    rank_in_pack_list = [[-1] * num_groups for _ in range(num_layers)]
-    for i in range(num_layers):
-        pack_weights = [0] * num_packs
-        pack_items = [0] * num_packs
-        for group in indices_list[i]:
-            pack = min(
-                (j for j in range(num_packs) if pack_items[j] < groups_per_pack),
-                key=pack_weights.__getitem__,
-            )
-            assert pack_items[pack] < groups_per_pack
-            pack_index_list[i][group] = pack
-            rank_in_pack_list[i][group] = pack_items[pack]
-            pack_weights[pack] += weight_list[i][group]
-            pack_items[pack] += 1
-    pack_index = torch.tensor(pack_index_list, dtype=torch.int64, device="cpu")
-    rank_in_pack = torch.tensor(rank_in_pack_list, dtype=torch.int64, device="cpu")
+    order = weight.float().sort(-1, descending=True).indices.cpu().numpy()
+    pack_index, rank_in_pack = _greedy_packing(
+        order, weight.detach().cpu().double().numpy(), num_packs, groups_per_pack
+    )
+    return torch.from_numpy(pack_index), torch.from_numpy(rank_in_pack)
+
+
+def _greedy_packing(
+    order: np.ndarray, weight: np.ndarray, num_packs: int, groups_per_pack: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Greedy packing for all layers at once.
+
+    Per layer, items are taken in ``order`` (heaviest first) and each goes to
+    the lightest pack that still has room, lowest pack index on ties. Pack
+    weights accumulate in float64 in the same order as the per-layer Python
+    loop this replaces, so the result is identical; stepping all layers
+    together keeps the Python loop at ``num_groups`` iterations instead of
+    ``num_layers * num_groups * num_packs``.
+
+    Parameters:
+        order: [X, n], item ids of each layer sorted by descending weight
+        weight: [X, n], float64 weight of each item
+    """
+    num_layers, num_groups = order.shape
+    layers = np.arange(num_layers)
+    pack_weights = np.zeros((num_layers, num_packs), dtype=np.float64)
+    pack_items = np.zeros((num_layers, num_packs), dtype=np.int64)
+    pack_index = np.full((num_layers, num_groups), -1, dtype=np.int64)
+    rank_in_pack = np.full((num_layers, num_groups), -1, dtype=np.int64)
+    for k in range(num_groups):
+        group = order[:, k]
+        has_room = pack_items < groups_per_pack
+        # argmin returns the first minimum, matching min() over ascending ids.
+        pack = np.where(has_room, pack_weights, np.inf).argmin(axis=1)
+        assert has_room[layers, pack].all()
+        pack_index[layers, group] = pack
+        rank_in_pack[layers, group] = pack_items[layers, pack]
+        pack_weights[layers, pack] += weight[layers, group]
+        pack_items[layers, pack] += 1
     return pack_index, rank_in_pack
 
 
