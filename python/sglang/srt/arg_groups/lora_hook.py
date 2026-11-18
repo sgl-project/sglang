@@ -212,10 +212,18 @@ def _lora_targets_kv_b_proj(server_args: Any) -> bool:
 
 
 def check_kv_b_lora_prefix_cache(server_args: Any):
-    """Keep cached prefixes off the MHA paths when an adapter targets kv_b_proj."""
+    """Keep cached prefixes off the MHA paths when an adapter targets kv_b_proj
+    and the LoRA backend cannot route those rows."""
     if not _lora_targets_kv_b_proj(server_args):
         return
+    # imports the backend classes, so only once kv_b_proj is targeted
+    from sglang.srt.lora.backend.lora_registry import routes_kv_b_lora_cached_rows
+
     cfg = resolving_view(server_args)
+    if routes_kv_b_lora_cached_rows(
+        cfg.lora_backend, cfg.cuda_graph_config.prefill.backend
+    ):
+        return
     prefill_backend, _ = attention_backends_of(cfg)
     error = kv_b_lora_prefix_cache_error(
         prefill_backend,

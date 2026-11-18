@@ -2,6 +2,8 @@ import logging
 from typing import Type
 
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +58,17 @@ def create_uno_cublas_backend():
     from sglang.srt.lora.backend.uno_cublas_backend import UnoCublasLoRABackend
 
     return UnoCublasLoRABackend
+
+
+def routes_kv_b_lora_cached_rows(lora_backend: str, prefill_graph_backend: str) -> bool:
+    """Whether MLA cached-prefix rows reach their own ``kv_b_proj`` adapters."""
+    # Full prefill graphs capture the cached-prefix paths with static routing;
+    # the ROCm paths (forward_mha_rocm, aiter) are not routed
+    return (
+        get_backend_from_name(lora_backend).supports_rows_routing
+        and prefill_graph_backend != Backend.FULL
+        and not is_hip()
+    )
 
 
 def get_backend_from_name(name: str) -> Type[BaseLoRABackend]:

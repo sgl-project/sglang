@@ -209,6 +209,7 @@ class TritonLoRABackend(BaseLoRABackend):
     supports_dp_attention = True
     supports_prefill_cuda_graph = True
     supports_grouped_lora = True
+    supports_rows_routing = True
 
     def __init__(
         self,
@@ -565,6 +566,7 @@ class TritonLoRABackend(BaseLoRABackend):
         use_cuda_graph: bool,
         use_prefill_cuda_graph: bool = False,
     ):
+        self.request_weight_indices = weight_indices
         # Use pinned memory to avoid synchronizations during host-to-device transfer
         weight_indices_tensor = torch.tensor(
             weight_indices, dtype=torch.int32, pin_memory=True, device="cpu"
@@ -781,6 +783,17 @@ class TritonLoRABackend(BaseLoRABackend):
 
         # These segments already describe physical token-row order.
         self.sgemm_batch_info = None
+
+    def build_rows_batch_info(self, row_lens: list[int]) -> LoRABatchInfo:
+        num_rows = sum(row_lens)
+        return dataclasses.replace(
+            self._build_lm_head_batch_info(
+                self._merge_request_rows(row_lens, chunk_size=num_rows),
+                self.batch_info,
+                num_rows,
+            ),
+            permutation=None,
+        )
 
     def _prepare_lm_head_batch_info(
         self,
