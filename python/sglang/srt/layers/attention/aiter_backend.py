@@ -78,6 +78,10 @@ try:
     _unified_attention_has_equal_seqlen_q = (
         "equal_seqlen_q" in inspect.signature(unified_attention).parameters
     )
+    # aiter before ROCm/aiter#6107 has no fast_mode at launch; its launch plan ignores it.
+    _mla_decode_fwd_has_fast_mode = (
+        "fast_mode" in inspect.signature(mla_decode_fwd).parameters
+    )
     from sglang.kernels.ops.attention.unified_attention_3d_mtp import (
         asm_verify_attn_enabled,
         reset_verify_attn_plan_cache,
@@ -87,6 +91,7 @@ try:
     )
 except ImportError:
     _unified_attention_has_equal_seqlen_q = False
+    _mla_decode_fwd_has_fast_mode = False
     print(
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
@@ -2251,6 +2256,24 @@ class AiterAttnBackend(AttentionBackend):
             return None
         return self.forward_metadata.num_kv_splits
 
+    def _mla_decode_launch_schedule(
+        self, *, default_num_kv_splits: Optional[int]
+    ) -> dict:
+        # Off the fp8-Q opt-in, keep the module intra_batch_mode and the caller's split count.
+        if not self.use_mla_fp8_q_asm:
+            return dict(
+                intra_batch_mode=intra_batch_mode, num_kv_splits=default_num_kv_splits
+            )
+        # The opt-in launches with the schedule its metadata was planned with.
+        planned_fast_mode, planned_intra_batch_mode = self._mla_decode_metadata_modes()
+        schedule = dict(
+            intra_batch_mode=planned_intra_batch_mode,
+            num_kv_splits=self._kernel_num_kv_splits(),
+        )
+        if _mla_decode_fwd_has_fast_mode:
+            schedule["fast_mode"] = planned_fast_mode
+        return schedule
+
     def _forward_mla_decode(
         self,
         q: torch.Tensor,
@@ -2323,9 +2346,9 @@ class AiterAttnBackend(AttentionBackend):
         reduce_indptr = self.forward_metadata.reduce_indptr
         reduce_final_map = self.forward_metadata.reduce_final_map
         reduce_partial_map = self.forward_metadata.reduce_partial_map
-        num_kv_splits = self._kernel_num_kv_splits()
-        # The kernel takes the intra_batch_mode its metadata was planned with.
-        _, planned_intra_batch_mode = self._mla_decode_metadata_modes()
+        launch_schedule = self._mla_decode_launch_schedule(
+            default_num_kv_splits=self._kernel_num_kv_splits()
+        )
 
         return self._mla_decode_fwd_with_head_pad(
             q,
@@ -2346,8 +2369,7 @@ class AiterAttnBackend(AttentionBackend):
             reduce_partial_map=reduce_partial_map,
             q_scale=k_descale,
             kv_scale=k_descale,
-            intra_batch_mode=planned_intra_batch_mode,
-            num_kv_splits=num_kv_splits,
+            **launch_schedule,
         )
 
     def _dcp_max_local_kv_len(self, max_global_kv_len: int) -> int:
@@ -4903,9 +4925,10 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_final_map = self.forward_metadata.reduce_final_map
                 reduce_partial_map = self.forward_metadata.reduce_partial_map
 
-                num_kv_splits = self._kernel_num_kv_splits()
                 # DCP verify returned above, so the decode modes planned this metadata.
-                _, planned_intra_batch_mode = self._mla_decode_metadata_modes()
+                launch_schedule = self._mla_decode_launch_schedule(
+                    default_num_kv_splits=self.forward_metadata.num_kv_splits
+                )
 
                 o = self._mla_decode_fwd_with_head_pad(
                     q,
@@ -4926,8 +4949,7 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_partial_map=reduce_partial_map,
                     q_scale=k_descale,
                     kv_scale=k_descale,
-                    intra_batch_mode=planned_intra_batch_mode,
-                    num_kv_splits=num_kv_splits,
+                    **launch_schedule,
                 )
                 return o
             elif forward_batch.forward_mode.is_draft_extend_v2():

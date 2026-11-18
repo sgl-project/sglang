@@ -642,9 +642,12 @@ class TestFp8QAsmPersistScope(CustomTestCase):
 
 
 class TestFp8QAsmLaunchMatchesPlan(CustomTestCase):
-    """Decode and verify launch with the schedule their metadata was planned with."""
+    """The opt-in launches with the schedule its metadata was planned with;
+    the default route launches exactly as before the opt-in existed."""
 
-    def _launch_kwargs(self, *, verify, auto_kv_splits):
+    def _launch_kwargs(
+        self, *, verify, auto_kv_splits, fp8_q_asm=True, launch_has_fast_mode=True
+    ):
         from sglang.srt.layers.attention import aiter_backend
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 
@@ -657,7 +660,7 @@ class TestFp8QAsmLaunchMatchesPlan(CustomTestCase):
         be.mla_kernel_num_head_padded = 16
         be.dcp_world_size = 1
         be.use_mla_dcp_asm = False
-        be.use_mla_fp8_q_asm = True
+        be.use_mla_fp8_q_asm = fp8_q_asm
         be.use_mla_auto_kv_splits = auto_kv_splits
         be.mla_decode_backend = "asm"
         be.mla_verify_backend = "asm"
@@ -675,10 +678,24 @@ class TestFp8QAsmLaunchMatchesPlan(CustomTestCase):
             return_value=torch.zeros(qlen, 12, 512)
         )
         q = torch.zeros(qlen, 12, 576, dtype=torch.bfloat16)
+        # The opt-in runs under PERSIST=0 (module modes off); the default route
+        # needs PERSIST=1, whose modes the auto KV split block sets.
+        module_fast_mode, module_intra_batch_mode = (
+            (False, False)
+            if fp8_q_asm
+            else ((True, False) if auto_kv_splits else (False, True))
+        )
         with (
-            mock.patch.object(aiter_backend, "_use_mla_ps_kernel", False),
-            mock.patch.object(aiter_backend, "fast_mode", False),
-            mock.patch.object(aiter_backend, "intra_batch_mode", False),
+            mock.patch.object(aiter_backend, "_use_mla_ps_kernel", not fp8_q_asm),
+            mock.patch.object(aiter_backend, "fast_mode", module_fast_mode),
+            mock.patch.object(
+                aiter_backend, "intra_batch_mode", module_intra_batch_mode
+            ),
+            mock.patch.object(
+                aiter_backend,
+                "_mla_decode_fwd_has_fast_mode",
+                launch_has_fast_mode,
+            ),
             mock.patch.object(
                 aiter_backend, "prefer_mla_gluon_decode", return_value=True
             ),
@@ -700,21 +717,54 @@ class TestFp8QAsmLaunchMatchesPlan(CustomTestCase):
                 be._forward_mla_decode(q, _layer(), mock.Mock(), k_descale=1.0)
         return be._mla_decode_fwd_with_head_pad.call_args.kwargs
 
-    def test_launch_takes_the_planned_intra_batch_mode(self):
-        """Under PERSIST=0 the module intra_batch_mode is off, but the opt-in plans
-        with the PERSIST=1 schedule (intra_batch_mode on); the launch must match."""
+    def test_opt_in_launches_with_the_planned_schedule(self):
+        """Under PERSIST=0 the module modes are off, but the opt-in plans with the
+        PERSIST=1 schedule; the launch must take the same fast and intra-batch modes."""
         for verify in (False, True):
-            with self.subTest(verify=verify):
-                kwargs = self._launch_kwargs(verify=verify, auto_kv_splits=False)
-                self.assertTrue(kwargs["intra_batch_mode"])
+            for auto_kv_splits, planned in (
+                (False, (False, True)),
+                (True, (True, False)),
+            ):
+                with self.subTest(verify=verify, auto_kv_splits=auto_kv_splits):
+                    kwargs = self._launch_kwargs(
+                        verify=verify, auto_kv_splits=auto_kv_splits
+                    )
+                    self.assertEqual(
+                        (kwargs["fast_mode"], kwargs["intra_batch_mode"]), planned
+                    )
 
-    def test_auto_kv_splits_reach_the_kernel_as_none(self):
+    def test_opt_in_skips_fast_mode_on_an_older_aiter(self):
+        """An aiter whose mla_decode_fwd has no fast_mode must not get one."""
+        kwargs = self._launch_kwargs(
+            verify=True, auto_kv_splits=False, launch_has_fast_mode=False
+        )
+        self.assertNotIn("fast_mode", kwargs)
+        self.assertTrue(kwargs["intra_batch_mode"])
+
+    def test_opt_in_auto_kv_splits_reach_the_kernel_as_none(self):
         """mla_decode_fwd reads -1 as a real split count; None lets aiter pick."""
         for verify in (False, True):
             with self.subTest(verify=verify):
                 kwargs = self._launch_kwargs(verify=verify, auto_kv_splits=True)
                 self.assertIsNone(kwargs["num_kv_splits"])
-                self.assertFalse(kwargs["intra_batch_mode"])
+
+    def test_default_route_launch_is_unchanged(self):
+        """With the opt-in off, PERSIST=1 decode and verify launch with the module
+        intra_batch_mode, no fast_mode, and verify keeps the planned split cap."""
+        for auto_kv_splits in (False, True):
+            for verify, num_kv_splits in (
+                (False, None if auto_kv_splits else 32),
+                (True, -1 if auto_kv_splits else 32),
+            ):
+                with self.subTest(verify=verify, auto_kv_splits=auto_kv_splits):
+                    kwargs = self._launch_kwargs(
+                        verify=verify,
+                        auto_kv_splits=auto_kv_splits,
+                        fp8_q_asm=False,
+                    )
+                    self.assertNotIn("fast_mode", kwargs)
+                    self.assertEqual(kwargs["intra_batch_mode"], not auto_kv_splits)
+                    self.assertEqual(kwargs["num_kv_splits"], num_kv_splits)
 
 
 class TestFp8QAsmQueryCast(CustomTestCase):
