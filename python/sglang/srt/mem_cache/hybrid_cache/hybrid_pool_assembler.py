@@ -2262,6 +2262,13 @@ class _SwaStrategy(StackStrategy):
             IdSpaceKind.SLIDING_WINDOW
         ) is not None and components == {ComponentType.FULL, ComponentType.SWA}
 
+    def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            _build_swa_device_pool_group,
+        )
+
+        return _build_swa_device_pool_group(kvcache, params, page_size)
+
     def build(
         self,
         *,

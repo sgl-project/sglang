@@ -1287,21 +1287,71 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             self.assertIn(row_ptr(pool.mamba_cache.temporal[0], 3), mamba_ptrs)
             self.assertIn(row_ptr(pool.mamba_cache.conv[0][0], 3), mamba_ptrs)
 
-    def test_unsupported_strategy_fails_with_context(self):
+    def test_mha_swa_packs_draft_kv_on_full_or_window_pages(self):
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
+        def mha_pool(layer_num, row_bytes):
+            pool = MHATokenToKVPool.__new__(MHATokenToKVPool)
+            pool.page_size, pool.layer_num = 2, layer_num
+            pool.kv_cache_layout = "nhd"
+            pool.k_scale_buffer = pool.native_k_scale_buffer = None
+            shape, layers = (8, row_bytes), range(layer_num)
+            pool.k_buffer = [torch.zeros(shape, dtype=torch.uint8) for _ in layers]
+            pool.v_buffer = [torch.zeros(shape, dtype=torch.uint8) for _ in layers]
+            return pool
+
         kvcache = SWAKVPool.__new__(SWAKVPool)
-        kvcache.full_kv_pool, kvcache.swa_kv_pool = object(), object()
-        kvcache.layers_mapping = {}
-        with self.assertRaisesRegex(
-            ValueError,
-            "does not support the direct external linker: _SwaStrategy",
-        ):
-            resolve_hybrid_device_pool_group(
+        kvcache.start_layer = 4
+        kvcache.full_kv_pool, kvcache.swa_kv_pool = mha_pool(1, 3), mha_pool(2, 5)
+        kvcache.layers_mapping = {4: (0, True), 5: (0, False), 6: (1, True)}
+        draft = mha_pool(1, 7)
+        params = SimpleNamespace(
+            mtp_draft_device_pools=(), sidecar_draft_device_pools=(draft,)
+        )
+
+        def layer_mappings():
+            group = resolve_hybrid_device_pool_group(
                 kvcache=kvcache,
                 page_size=2,
-                params=SimpleNamespace(),
+                params=params,
                 components={ComponentType.FULL, ComponentType.SWA},
+            )
+            self.assertEqual(group.num_layers, 3)
+            self.assertEqual(set(group.entry_map), {PoolName.KV, PoolName.SWA})
+            return [
+                group.entry_map[name].layer_mapping
+                for name in (PoolName.KV, PoolName.SWA)
+            ]
+
+        # The draft buffers follow the target's, on the entry's last layer.
+        self.assertEqual(layer_mappings(), [{1: (0, 1, 2, 3)}, {0: (0, 2), 2: (1, 3)}])
+        draft.follows_target_swa_ids = True
+        self.assertEqual(layer_mappings(), [{1: (0, 1)}, {0: (0, 2), 2: (1, 3, 4, 5)}])
+
+        params.sidecar_draft_device_pools = (object(),)
+        with self.assertRaisesRegex(ValueError, "this model's draft KV"):
+            layer_mappings()
+
+    def test_unsupported_strategy_fails_with_context(self):
+        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
+
+        class _HostOnlyStrategy(hybrid_pool_assembler.StackStrategy):
+            def matches(self, kvcache, components):
+                return True
+
+        with (
+            patch.object(hybrid_pool_assembler, "_STRATEGIES", [_HostOnlyStrategy()]),
+            self.assertRaisesRegex(
+                ValueError,
+                "does not support the direct external linker: _HostOnlyStrategy",
+            ),
+        ):
+            resolve_hybrid_device_pool_group(
+                kvcache=object(),
+                page_size=2,
+                params=SimpleNamespace(),
+                components={ComponentType.FULL},
             )
 
 
