@@ -177,6 +177,7 @@ class _DecodeNode:
             uocr_runtime=None,
             decode_offload_manager=None,
             hisparse_coordinator=None,
+            disagg_decode_prebuilt_queue=None,
             kv_checksum_computer=None,
             forward_ct=0,
             last_batch=None,

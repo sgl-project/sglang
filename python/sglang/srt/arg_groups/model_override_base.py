@@ -198,6 +198,15 @@ def is_attention_backend_not_set(cfg: Any):
     )
 
 
+def runs_prefill_of(cfg: Any) -> bool:
+    """Whether this server runs prefill forwards; a PD decode server only does
+    with --disaggregation-decode-enable-local-prefill."""
+    return (
+        cfg.disaggregation_mode != "decode"
+        or cfg.disaggregation_decode_enable_local_prefill
+    )
+
+
 def use_mla_backend(server_args: Any):
     from sglang.srt.configs.model_config import AttentionArch
 

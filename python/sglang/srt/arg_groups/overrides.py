@@ -48,6 +48,7 @@ from sglang.srt.arg_groups.model_override_base import (
     register_model_override_predicate,
     resolved_view,
     resolving_view,
+    runs_prefill_of,
     use_mla_backend,
 )
 from sglang.srt.arg_groups.prefill_buffer_ceiling import prefill_buffer_ceiling_of
@@ -198,6 +199,8 @@ def pre_capture_activation_reserve_mb_of(cfg: Any, gpu_mem: Optional[float]) -> 
         activation_tokens = max(
             running_requests * (cfg.speculative_num_draft_tokens or 1), 2048
         )
+        if cfg.disaggregation_decode_enable_local_prefill:
+            activation_tokens = max(activation_tokens, cfg.chunked_prefill_size or 0)
     elif cfg.chunked_prefill_size > 0:
         activation_tokens = max(cfg.chunked_prefill_size, 2048)
     else:
@@ -2150,7 +2153,7 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     ):
         return False
 
-    if cfg.disaggregation_mode != "decode":
+    if runs_prefill_of(cfg):
         prefill_cfg = cfg.cuda_graph_config.prefill
         # We can only skip eager activation headroom when the largest
         # prefill forward batch size is already graph-captured. Otherwise,

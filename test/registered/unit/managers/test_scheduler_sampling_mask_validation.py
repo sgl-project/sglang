@@ -52,8 +52,10 @@ def _handle_pd_request(mode, req):
         input_embeds=None,
         bootstrap_port=1,
         bootstrap_room=9,
+        disagg_local_prefill=False,
     )
     req.exit_via = req.send_via = req.kv.retraction_backup = None
+    req.disagg_local_prefill = False
     req.kv.holds_kv = req.kv.holds_mamba = False
     with (
         patch(

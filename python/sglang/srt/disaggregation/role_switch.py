@@ -270,6 +270,7 @@ def teardown_disaggregation(scheduler: Scheduler) -> None:
                 km.teardown()
             scheduler.disagg_decode_prealloc_queue = None
         scheduler.disagg_decode_transfer_queue = None
+        scheduler.disagg_decode_prebuilt_queue = None
         # clear socket ctx in CommonKVReceiver
         CommonKVReceiver.close_all_sockets()
     scheduler.disagg_metadata_buffers = None

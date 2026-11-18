@@ -32,6 +32,7 @@
 //! | `sgl_router_stale_requests_total` | Counter | `outcome` |
 //! | `sgl_router_retries_total` | Counter | `model_id` |
 //! | `sgl_router_decode_affinity_total` | Counter | `outcome` |
+//! | `sgl_router_pd_local_prefill_total` | Counter | `outcome` |
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
 //! | `sgl_router_policy_decisions_total` | Counter | `policy`, `reason` |
 //! | `sgl_router_policy_selection_failures_total` | Counter | `policy`, `reason` |
@@ -351,6 +352,27 @@ pub enum DecodeAffinityOutcome {
     FallbackLoadImbalance,
 }
 
+/// Why a PD request went to a decode worker alone, or did not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PdLocalPrefillOutcome {
+    /// Sent to the decode worker holding the prefix, marked `disagg_local_prefill`.
+    Routed,
+    /// No healthy decode worker holds a prefix of the prompt.
+    NoPrefix,
+    /// Every decode worker holding a prefix leaves more uncached tokens than the limit.
+    UncachedOverLimit,
+}
+
+impl PdLocalPrefillOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Routed => "routed",
+            Self::NoPrefix => "no_prefix",
+            Self::UncachedOverLimit => "uncached_over_limit",
+        }
+    }
+}
+
 impl DecodeAffinityOutcome {
     fn as_str(self) -> &'static str {
         match self {
@@ -501,6 +523,7 @@ pub struct MetricsRegistry {
     router_inflight_load: Mutex<HashMap<RouterInflightLoadKey, Arc<AtomicI64>>>,
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    pd_local_prefill_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     policy_decisions_total: Mutex<HashMap<PolicyDecisionKey, Arc<AtomicU64>>>,
     policy_selection_failures_total: Mutex<HashMap<PolicyDecisionKey, Arc<AtomicU64>>>,
@@ -790,6 +813,17 @@ impl MetricsRegistry {
     /// Bump `sgl_router_decode_affinity_total{outcome}`.
     pub fn record_decode_affinity(&self, outcome: DecodeAffinityOutcome) {
         let mut guard = self.decode_affinity_total.lock();
+        let counter = guard
+            .entry(outcome.as_str())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_pd_local_prefill_total{outcome}`.
+    pub fn record_pd_local_prefill(&self, outcome: PdLocalPrefillOutcome) {
+        let mut guard = self.pd_local_prefill_total.lock();
         let counter = guard
             .entry(outcome.as_str())
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
@@ -1247,6 +1281,25 @@ impl MetricsRegistry {
         for (outcome, value) in entries {
             out.push_str(&format!(
                 "sgl_router_decode_affinity_total{{outcome=\"{}\"}} {}\n",
+                outcome, value,
+            ));
+        }
+        drop(guard);
+
+        // pd_local_prefill_total
+        out.push_str(
+            "# HELP sgl_router_pd_local_prefill_total PD requests considered for prefill on the decode worker, by outcome.\n",
+        );
+        out.push_str("# TYPE sgl_router_pd_local_prefill_total counter\n");
+        let guard = self.pd_local_prefill_total.lock();
+        let mut entries: Vec<(&&str, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|e| *e.0);
+        for (outcome, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_pd_local_prefill_total{{outcome=\"{}\"}} {}\n",
                 outcome, value,
             ));
         }

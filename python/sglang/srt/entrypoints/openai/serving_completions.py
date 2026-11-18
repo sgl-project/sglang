@@ -127,6 +127,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             bootstrap_room=request.bootstrap_room,
             routed_dp_rank=effective_routed_dp_rank,
             disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
+            disagg_local_prefill=request.disagg_local_prefill,
             return_hidden_states=request.return_hidden_states,
             return_routed_experts=request.return_routed_experts,
             routed_experts_start_len=request.routed_experts_start_len,

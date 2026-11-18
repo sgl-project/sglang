@@ -355,6 +355,9 @@ class GenerateReqInput:
     routed_dp_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
+    # For PD disagg: the decode worker prefills this request itself, so it
+    # needs no bootstrap fields.
+    disagg_local_prefill: bool = False
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
     # Conversation id used for tracking requests
@@ -1165,6 +1168,7 @@ class GenerateReqInput:
             ),
             routed_dp_rank=self.routed_dp_rank,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
+            disagg_local_prefill=self.disagg_local_prefill,
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,
             require_reasoning=self.require_reasoning,
@@ -1315,6 +1319,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # scheduler (encoder disaggregation). A defaulted tail field, so older
     # IPC senders decode as None.
     mm_routing_labels: Optional[Dict[str, List[str]]] = None
+    # See GenerateReqInput.disagg_local_prefill. A defaulted tail field, so
+    # older IPC senders decode as False.
+    disagg_local_prefill: bool = False
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)

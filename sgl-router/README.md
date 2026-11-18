@@ -369,6 +369,10 @@ unset fields inherit the CLI flags. See
   `--decode-dispatch-limit N` picks the decode rank shortly before the KV
   arrives; see
   [DP-rank routing](REFERENCE.md#dp-rank-routing).
+- **Local prefill on decode**: in PD mode, `--pd-local-prefill-max-uncached-tokens N`
+  sends a request whose prefix a decode worker already holds to that worker
+  alone, which prefills the short remainder itself; see
+  [local prefill on decode](REFERENCE.md#local-prefill-on-decode).
 - **PD version groups**: `--pd-version-group-label <key>` pairs prefill and
   decode only within the same engine version; see
   [PD version groups](REFERENCE.md#pd-version-groups).
