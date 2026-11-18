@@ -13,6 +13,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.observability.log_redaction import redact_text
 from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_INVOKE_TOOL_JSON,
     CONTENT_INVOKE_TOOL_TEXT,
@@ -300,7 +301,9 @@ class InklingDetector(BaseFormatDetector):
         name = payload.get("name")
         args = payload.get("args")
         if not isinstance(name, str) or not isinstance(args, Mapping):
-            logger.warning("Invalid Inkling tool call payload: %s", payload)
+            logger.warning(
+                "Invalid Inkling tool call payload: %s", redact_text(payload)
+            )
             return None
 
         if not hasattr(self, "_tool_indices"):

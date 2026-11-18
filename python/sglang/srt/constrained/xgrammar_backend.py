@@ -58,6 +58,7 @@ from sglang.kernels.ops.grammar.token_filter_ops import set_token_filter_triton
 from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
     set_token_filter_torch,
 )
+from sglang.srt.observability.log_redaction import redact_content, redact_exception
 
 logger = logging.getLogger(__name__)
 MAX_ROLLBACK_TOKENS = 200
@@ -183,7 +184,11 @@ class XGrammarGrammar(BaseGrammarObject):
         )
 
     def __repr__(self):
-        return f"XGrammarGrammar({self.key_string=}, {self.accepted_tokens=}, {self.current_token=})"
+        return (
+            f"XGrammarGrammar(key_string={redact_content(self.key_string)}, "
+            f"accepted_tokens={redact_content(self.accepted_tokens)}, "
+            f"current_token={redact_content(self.current_token)})"
+        )
 
 
 class TokenizerNotSupportedError(Exception):
@@ -386,7 +391,10 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             json.decoder.JSONDecodeError,
             UnicodeDecodeError,
         ) as e:
-            logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
+            logger.error(
+                f"Hit invalid json_schema: key_string={redact_content(key_string)}, "
+                f"e={redact_exception(e)}"
+            )
             return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="json"))
 
@@ -394,7 +402,10 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         try:
             ctx = self.grammar_compiler.compile_grammar(key_string)
         except RuntimeError as e:
-            logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
+            logger.error(
+                f"Hit invalid ebnf: key_string={redact_content(key_string)}, "
+                f"e={redact_exception(e)}"
+            )
             return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="ebnf"))
 
@@ -402,7 +413,10 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         try:
             ctx = self.grammar_compiler.compile_regex(key_string)
         except RuntimeError as e:
-            logger.error(f"Hit invalid regex: {key_string=}, {e=}")
+            logger.error(
+                f"Hit invalid regex: key_string={redact_content(key_string)}, "
+                f"e={redact_exception(e)}"
+            )
             return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="regex"))
 
@@ -433,7 +447,10 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     key_string = json.dumps(structural_tag)
                 ctx = self.grammar_compiler.compile_structural_tag(key_string)
         except (RuntimeError, json.decoder.JSONDecodeError) as e:
-            logger.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
+            logger.error(
+                f"Hit invalid structural_tag: key_string={redact_content(key_string)}, "
+                f"e={redact_exception(e)}"
+            )
             return InvalidGrammarObject(str(e))
         return self._from_context(
             ctx, key_string, GrammarStats(dispatch_type="structural_tag")

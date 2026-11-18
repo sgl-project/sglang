@@ -32,6 +32,7 @@ from sglang.srt.function_call.utils import (
     infer_type_from_json_schema,
     safe_literal_eval,
 )
+from sglang.srt.observability.log_redaction import redact_text
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +148,7 @@ class GraniteToolCallDetector(BaseFormatDetector):
                 return int(raw)
             except Exception:
                 logger.warning(
-                    f"Parsed value '{raw}' of parameter '{name}' is not an integer in tool "
+                    f"Parsed value '{redact_text(raw)}' of parameter '{name}' is not an integer in tool "
                     f"'{func_name}', degenerating to string."
                 )
                 return raw
@@ -161,7 +162,7 @@ class GraniteToolCallDetector(BaseFormatDetector):
                 return number
             except Exception:
                 logger.warning(
-                    f"Parsed value '{raw}' of parameter '{name}' is not a float in tool "
+                    f"Parsed value '{redact_text(raw)}' of parameter '{name}' is not a float in tool "
                     f"'{func_name}', degenerating to string."
                 )
                 return raw
@@ -170,7 +171,7 @@ class GraniteToolCallDetector(BaseFormatDetector):
             lowered = raw.lower()
             if lowered not in ("true", "false"):
                 logger.warning(
-                    f"Parsed value '{lowered}' of parameter '{name}' is not a boolean (`true` or `false`) in tool '{func_name}', degenerating to false."
+                    f"Parsed value '{redact_text(lowered)}' of parameter '{name}' is not a boolean (`true` or `false`) in tool '{func_name}', degenerating to false."
                 )
             return lowered == "true"
 
@@ -179,14 +180,14 @@ class GraniteToolCallDetector(BaseFormatDetector):
                 return json.loads(raw)
             except Exception:
                 logger.warning(
-                    f"Parsed value '{raw}' of parameter '{name}' cannot be parsed with json.loads in tool "
+                    f"Parsed value '{redact_text(raw)}' of parameter '{name}' cannot be parsed with json.loads in tool "
                     f"'{func_name}', will try other methods to parse it."
                 )
         try:
             return safe_literal_eval(raw)
         except Exception:
             logger.warning(
-                f"Parsed value '{raw}' of parameter '{name}' cannot be converted via Python `ast.literal_eval()` in tool '{func_name}', degenerating to string."
+                f"Parsed value '{redact_text(raw)}' of parameter '{name}' cannot be converted via Python `ast.literal_eval()` in tool '{func_name}', degenerating to string."
             )
             return raw
 

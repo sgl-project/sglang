@@ -53,6 +53,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.observability.log_redaction import redact_content
 from sglang.srt.observability.req_time_stats import monotonic_time
 
 if TYPE_CHECKING:
@@ -1239,8 +1240,8 @@ class AnthropicServing:
                         if content_block_type != "tool_use":
                             logger.warning(
                                 "Dropping tool_call argument delta with no "
-                                "open tool_use block: %r",
-                                (tc_func.arguments or "")[:100],
+                                "open tool_use block: %s",
+                                redact_content(tc_func.arguments[:100]),
                             )
                             continue
                         yield _emit(

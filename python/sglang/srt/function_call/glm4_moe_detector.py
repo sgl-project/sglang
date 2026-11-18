@@ -20,6 +20,7 @@ from sglang.srt.function_call.utils import (
     infer_type_from_json_schema,
     safe_literal_eval,
 )
+from sglang.srt.observability.log_redaction import redact_text
 
 logger = logging.getLogger(__name__)
 
@@ -492,7 +493,7 @@ class Glm4MoeDetector(BaseFormatDetector):
             except (ValueError, AttributeError):
                 # Fallback to string if not a valid number
                 logger.warning(
-                    f"Failed to parse '{value}' as number, treating as string"
+                    f"Failed to parse '{redact_text(value)}' as number, treating as string"
                 )
                 return json.dumps(str(value), ensure_ascii=False)
         else:

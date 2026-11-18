@@ -40,6 +40,7 @@ from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
     set_token_filter_torch,
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
+from sglang.srt.observability.log_redaction import redact_content, redact_exception
 from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
@@ -251,7 +252,10 @@ class GuidanceBackend(BaseGrammarBackend):
                 serialized_grammar=serialized_grammar,
             )
         except Exception as e:
-            logger.error(f"Hit invalid grammar: {serialized_grammar=}, {e=}")
+            logger.error(
+                f"Hit invalid grammar: serialized_grammar={redact_content(serialized_grammar)}, "
+                f"e={redact_exception(e)}"
+            )
             return InvalidGrammarObject(str(e))
 
     def dispatch_json(self, key_string: str) -> BaseGrammarObject:
@@ -264,7 +268,10 @@ class GuidanceBackend(BaseGrammarBackend):
                 },
             )
         except Exception as e:
-            logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
+            logger.error(
+                f"Hit invalid json_schema: key_string={redact_content(key_string)}, "
+                f"e={redact_exception(e)}"
+            )
             return InvalidGrammarObject(str(e))
         return self._from_serialized(serialized_grammar)
 
@@ -277,7 +284,10 @@ class GuidanceBackend(BaseGrammarBackend):
             serialized_grammar = grammar_from("ebnf", key_string)
             return self._from_serialized(serialized_grammar)
         except ValueError as e:
-            logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
+            logger.error(
+                f"Hit invalid ebnf: key_string={redact_content(key_string)}, "
+                f"e={redact_exception(e)}"
+            )
             return InvalidGrammarObject(str(e))
 
     def dispatch_structural_tag(self, key_string: str) -> BaseGrammarObject:
@@ -306,5 +316,8 @@ class GuidanceBackend(BaseGrammarBackend):
             g = StructTag.to_grammar(tags)
             return self._from_serialized(g)
         except Exception as e:
-            logger.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
+            logger.error(
+                f"Hit invalid structural_tag: key_string={redact_content(key_string)}, "
+                f"e={redact_exception(e)}"
+            )
             return InvalidGrammarObject(str(e))

@@ -169,6 +169,7 @@ if TYPE_CHECKING:
     from sglang.srt.sampling.custom_logit_processor import PageGuardState
     from sglang.srt.session.session_controller import Session
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
+from sglang.srt.observability.log_redaction import log_request_content_on_error
 
 logger = logging.getLogger(__name__)
 
@@ -1657,9 +1658,12 @@ class Req(ReqDllmMixin):
         error_msg: str,
         status_code: int = HTTPStatus.BAD_REQUEST,
         err_type: str = "BadRequestError",
+        *,
+        log_msg: Optional[str] = None,
     ):
+        # log_msg replaces error_msg in the server log; the client gets error_msg.
         if get_parallel().tp_rank == 0:
-            logger.error(f"{error_msg}, {self.rid=}")
+            logger.error(f"{error_msg if log_msg is None else log_msg}, {self.rid=}")
         # Session requests share historical multimodal inputs with their prior
         # request. The session owns and releases those features when it closes.
         self.release_mm_inputs_on_abort()
@@ -1718,6 +1722,13 @@ class Req(ReqDllmMixin):
         self.update_reasoning_tokens(token_id[consumed:], think_end_ids)
 
     def __repr__(self):
+        if not log_request_content_on_error():
+            return (
+                f"Req(rid={self.rid}, "
+                f"input_len={len(self.origin_input_ids)}, "
+                f"output_len={len(self.output_ids)}, "
+                f"grammar={None if self.grammar is None else type(self.grammar).__name__})"
+            )
         return (
             f"Req(rid={self.rid}, "
             f"input_ids={self.origin_input_ids}, output_ids={self.output_ids}, "

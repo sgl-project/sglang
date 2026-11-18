@@ -84,6 +84,7 @@ if TYPE_CHECKING:
         UocrSchedulerRuntime,
     )
     from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
+from sglang.srt.observability.log_redaction import redact_exception, redact_text
 
 logger = logging.getLogger(__name__)
 
@@ -906,7 +907,8 @@ class SchedulerBatchResultProcessor:
                 # grammar. This can happen if the grammar is not set correctly or the
                 # token is invalid.
                 logger.error(
-                    f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                    f"Grammar accept_token failed for req {req.rid} with token "
+                    f"{redact_text(next_token_id)}: {redact_exception(e)}"
                 )
                 req.request_finish(
                     FINISH_ABORT(
@@ -1055,7 +1057,7 @@ class SchedulerBatchResultProcessor:
             # (misconfigured grammar or invalid token); abort the request.
             logger.error(
                 f"Grammar accept_token failed for req {req.rid} with token "
-                f"{tokens}: {e}"
+                f"{redact_text(tokens)}: {redact_exception(e)}"
             )
             req.request_finish(
                 FINISH_ABORT(

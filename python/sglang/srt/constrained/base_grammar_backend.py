@@ -22,6 +22,7 @@ from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
+from sglang.srt.observability.log_redaction import redact_content
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.runtime_context import (
     get_context,
@@ -198,7 +199,9 @@ class BaseGrammarBackend:
         return None
 
     def _not_supported(self, key_type: str, key_string: str) -> BaseGrammarObject:
-        logger.warning(f"Skip unsupported {key_type=}, {key_string=}")
+        logger.warning(
+            f"Skip unsupported {key_type=}, key_string={redact_content(key_string)}"
+        )
         return InvalidGrammarObject()
 
     @property
