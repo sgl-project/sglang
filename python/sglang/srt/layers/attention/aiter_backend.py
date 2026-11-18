@@ -164,6 +164,11 @@ logger = logging.getLogger(__name__)
 # Use aiter mla persist design for fp8-kv cache
 _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
 
+# Measured on gfx950 (bf16 KV, 16 heads): 2, 4 and 8 splits keep every row bitwise
+# equal at any batch size. 8, the largest, keeps long-KV decode parallel at small
+# batches.
+_DETERMINISTIC_MLA_KV_SPLITS = 8
+
 # Use fp8 prefill only on gfx95
 _use_fp8_prefill_attn = (
     get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and is_gfx95_supported()
@@ -849,6 +854,13 @@ class AiterAttnBackend(AttentionBackend):
         # sizes the launch, and 1 selects a non-causal mask), so every call gets the
         # same value, one that covers any extend: at most one chunk.
         self.deterministic_prefill_max_q = None
+        # Deterministic mode: MLA decode gets a fixed KV split count, since aiter's own
+        # pick follows the batch size and total KV length.
+        self.deterministic_mla_kv_splits = (
+            _DETERMINISTIC_MLA_KV_SPLITS
+            if get_exec().deterministic.enable_deterministic_inference
+            else None
+        )
         if get_exec().deterministic.enable_deterministic_inference:
             self._reject_deterministic_fp8_kv_prefill(
                 getattr(model_runner, "prefill_attention_backend_str", None),
@@ -1082,6 +1094,23 @@ class AiterAttnBackend(AttentionBackend):
                 (self.mla_kernel_num_head_padded == 16 and self.head_pad_mode != "zero")
                 or self.mla_kernel_num_head_padded == 128
             ) and self.kv_cache_dtype is not fp8_dtype:
+                _use_mla_ps_kernel = False
+                fast_mode = False
+                intra_batch_mode = False
+            # The persistent kernel's work split follows the batch (and aiter swaps it
+            # for the split-KV kernel above a batch size), so deterministic mode runs
+            # the split-KV kernel with a fixed split count.
+            if self.deterministic_mla_kv_splits is not None:
+                # Measured on gfx950: with fixed splits the split-KV kernel is
+                # batch-invariant at 16 heads; at 32 and 128 heads rows still change
+                # with the batch.
+                if may_run_mla_decode and self.mla_kernel_num_head_padded != 16:
+                    raise ValueError(
+                        "Deterministic inference runs aiter MLA decode only with 16 "
+                        "attention heads per GPU (after padding), but this model has "
+                        f"{self.num_head}. Use --decode-attention-backend triton "
+                        "or a TP size that gives 16 or fewer heads per GPU."
+                    )
                 _use_mla_ps_kernel = False
                 fast_mode = False
                 intra_batch_mode = False
@@ -2153,6 +2182,8 @@ class AiterAttnBackend(AttentionBackend):
         kernel takes None instead. mla.py re-decides persistent mode only on
         None. It would read -1 as a real count.
         """
+        if self.deterministic_mla_kv_splits is not None:
+            return self.deterministic_mla_kv_splits
         if self.use_mla_auto_kv_splits:
             return None
         return self.forward_metadata.num_kv_splits
