@@ -266,7 +266,18 @@ class RealtimeConnection:
                 )
                 continue
 
-            self._current_client_event_id = raw.get("event_id")
+            client_event_id = raw.get("event_id")
+            if client_event_id is not None and not isinstance(client_event_id, str):
+                await self._send_error(
+                    "invalid_value", "event_id must be a string", param="event_id"
+                )
+                continue
+            self._current_client_event_id = client_event_id
+            if not isinstance(raw.get("type"), str):
+                await self._send_error(
+                    "invalid_value", "Event type must be a string", param="type"
+                )
+                continue
             try:
                 event = _parse_client_event(raw)
             except ValidationError as e:
