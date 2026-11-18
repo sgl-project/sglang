@@ -9,7 +9,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.triton_qk_rmsno
 )
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=20, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 # Kimi-K2 / DeepSeek MLA: q_lora_rank, kv_lora_rank, qk_rope_head_dim.
 Q_LORA, KV_LORA, ROPE = 1536, 512, 64
