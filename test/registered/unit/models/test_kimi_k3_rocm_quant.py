@@ -47,9 +47,9 @@ def _per_channel_fp8(out_features: int, in_features: int):
 
 
 class TestChannelFp8ToBf16(CustomTestCase):
-    """The BF16 kv_b of the MLA absorb (off gfx950 + AITER, or with
-    SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8=0) and the merged in-proj's f_b: each channel
-    dequantized with its own scale, ~0.12% error on real K3 weights."""
+    """The BF16 kv_b of the MLA absorb (by default, or off gfx950 + AITER) and
+    the merged in-proj's f_b: each channel dequantized with its own scale, ~0.12%
+    error on real K3 weights."""
 
     def test_dequantizes_every_channel_with_its_own_scale(self):
         weight, scale, dense = _per_channel_fp8(out_features=8, in_features=16)
@@ -113,12 +113,22 @@ class TestMergeDtypeGuard(CustomTestCase):
         self.assertFalse(_is_unquantized_mergeable(weights))
 
 
-@mock.patch("sglang.srt.models.deepseek_common.utils._use_aiter_gfx95", True)
-class TestKvBForAbsorb(CustomTestCase):
-    """The MLA absorb BMMs take one scalar w_scale, so on gfx950 + AITER kv_b is
-    requantized to per-tensor FP8; the kill switch keeps the BF16 dequant."""
+_FORWARD_MLA_ROCM = (
+    "sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla_rocm"
+)
 
-    def test_default_requantizes_to_one_tensor_scale(self):
+
+@mock.patch(f"{_FORWARD_MLA_ROCM}._use_aiter_gfx95", True)
+class TestKvBForAbsorb(CustomTestCase):
+    """The MLA absorb BMMs take one scalar w_scale, so with the opt-in on gfx950 +
+    AITER kv_b is requantized to per-tensor FP8; by default it is dequantized to BF16."""
+
+    def setUp(self):
+        stack = contextlib.ExitStack()
+        stack.enter_context(envs.SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8.override(True))
+        self.addCleanup(stack.close)
+
+    def test_opt_in_requantizes_to_one_tensor_scale(self):
         module = _quark_fp8_linear(8)
         weight, scale = module.weight, module.weight_scale.view(-1, 1)
 
@@ -133,7 +143,7 @@ class TestKvBForAbsorb(CustomTestCase):
         err = (q.float() * tensor_scale - exact).abs().max()
         self.assertLess(err.item(), 0.07 * exact.abs().max().item())
 
-    def test_kill_switch_keeps_the_bf16_dequant(self):
+    def test_off_keeps_the_bf16_dequant(self):
         module = _quark_fp8_linear(8)
 
         with envs.SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8.override(False):
@@ -147,9 +157,7 @@ class TestKvBForAbsorb(CustomTestCase):
         so a requant would add its error for no speedup."""
         module = _quark_fp8_linear(8)
 
-        with mock.patch(
-            "sglang.srt.models.deepseek_common.utils._use_aiter_gfx95", False
-        ):
+        with mock.patch(f"{_FORWARD_MLA_ROCM}._use_aiter_gfx95", False):
             out, tensor_scale = k3_kv_b_for_absorb(module=module)
 
         self.assertIsNone(tensor_scale)

@@ -1212,9 +1212,10 @@ class Envs:
     SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvIntWithAlias(
         256, deprecated_name="SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS"
     )
-    # gfx950 + AITER: requantize Quark per-channel FP8 kv_b to per-tensor FP8 so
-    # the MLA absorb BMMs run AITER's a8w8 kernel (~2.3% weight error vs BF16).
-    SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8 = EnvBool(True)
+    # Opt-in, lossy: on gfx950 + AITER, requantize Quark per-channel FP8 kv_b to
+    # per-tensor FP8 so the MLA absorb BMMs run AITER's a8w8 kernel (~2.3% weight
+    # error vs BF16). Off keeps the BF16 dequant.
+    SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8 = EnvBool(False)
     # On gfx95x with SGLANG_USE_AITER=1, quantize the BF16 Qwen3.5/3.8 GDN
     # in_proj_qkvz and out_proj to MXFP4 after loading. 0 keeps them BF16.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvBool(True)

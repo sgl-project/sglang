@@ -3961,6 +3961,7 @@ class KimiK3LinearForCausalLM(nn.Module):
         # ShardedStateLoader, remote-instance flows -- none of which call
         # load_weights), so e.g. dummy-weight benchmarks get the fused buffers.
         # Post-load: absorb kv_b_proj into w_kc and w_vc for MLA layers
+        num_fp8_absorb_layers = 0
         for layer_id in self.config.full_attention_layer_ids:
             if layer_id >= len(self.model.layers):
                 continue  # truncated config (e.g. num_hidden_layers override)
@@ -3994,6 +3995,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                         module=self_attn.kv_b_proj
                     )
                     scale_folded_into_weight = kv_b_tensor_scale is None
+                    num_fp8_absorb_layers += kv_b_tensor_scale is not None
             w_kc, w_vc = kv_b_weight.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
@@ -4025,6 +4027,11 @@ class KimiK3LinearForCausalLM(nn.Module):
                 pass
             elif hasattr(self_attn.kv_b_proj, "weight_scale"):
                 self_attn.w_scale = self_attn.kv_b_proj.weight_scale
+        if num_fp8_absorb_layers:
+            rank0_log(
+                f"Kimi-K3 MLA absorb: {num_fp8_absorb_layers} layers run AITER's "
+                "a8w8 BMM on a per-tensor FP8 requant of kv_b_proj."
+            )
 
         # Post-load: precompute the attn-res combined score weights BEFORE
         # cuda graph capture (a lazy first call inside get_cw would bake the

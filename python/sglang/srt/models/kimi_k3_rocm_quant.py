@@ -81,18 +81,21 @@ def k3_kv_b_for_absorb(
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """kv_b for the MLA absorb BMMs, [out, in], from a per-channel FP8 kv_b_proj.
 
-    On gfx950 with AITER, requantize to per-tensor FP8 and return its scalar
-    scale, so the absorb runs AITER's a8w8 BMM. Otherwise (or with
-    SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8 off) return dense BF16 and no scale. Must
-    run before the kv_b head split.
+    With SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8 set and an absorb that runs FP8
+    weights on AITER's a8w8 BMM (gfx950), requantize to per-tensor FP8 and
+    return its scalar scale. Otherwise return dense BF16 and no scale. Must run
+    before the kv_b head split.
     """
-    from sglang.srt.models.deepseek_common import utils as deepseek_utils
+    from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla_rocm import (
+        rocm_absorb_bmm_runs_fp8,
+    )
 
     weight = _k3_channel_fp8_checkpoint_weight(module)
-    # rocm_absorb_{q,v}_bmm only take the a8w8 BMM on gfx950 + AITER; elsewhere
-    # an FP8 w_kc/w_vc would be dequantized back to BF16 after a lossy requant.
+    # Where the absorb would dequantize an FP8 w_kc/w_vc back to BF16, the lossy
+    # requant would buy nothing.
     if not (
-        deepseek_utils._use_aiter_gfx95 and envs.SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8.get()
+        envs.SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8.get()
+        and rocm_absorb_bmm_runs_fp8(weight.dtype)
     ):
         return _k3_channel_fp8_to_bf16(module=module, weight=weight), None
 
