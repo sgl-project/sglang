@@ -714,7 +714,6 @@ def test_deep_select_spec_matches_wrapper_architectures():
 # get_jit_cache() cache instead, and converting a file removes it from here.
 _IN_PROCESS_CUTE_COMPILES = {
     "kernels/kda_kernels/qwen3x_nvfp4_gemm_sm120.py": 1,
-    "kernels/ops/attention/cutedsl_gdn.py": 1,
     "kernels/ops/attention/cutedsl_gdn_mtp_ring.py": 2,
     "kernels/ops/attention/cutedsl_kda.py": 1,
     "kernels/ops/attention/dsa/cutedsl_paged_mqa_logits.py": 1,
@@ -750,6 +749,7 @@ _IN_PROCESS_CUTE_COMPILES = {
 
 # Each compile here is stored into a get_jit_cache() cache, which persists it.
 _PERSISTED_CUTE_COMPILES = {
+    "kernels/ops/attention/cutedsl_gdn.py": 1,
     "kernels/ops/attention/flash_attention_v4.py": 1,
     "kernels/ops/attention/flash_attn/cute/interface.py": 5,
     "kernels/ops/attention/kda_decode_mtp.py": 1,
