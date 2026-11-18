@@ -155,6 +155,80 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
         self.assertEqual(req.last_node, "prealloc")
         tree_cache.lock.assert_not_called()
 
+    def test_deferred_load_back_preserves_l3_span_until_queued(self):
+        """Deferred restores must retain L3 attribution when a retry succeeds."""
+        rematch = SimpleNamespace(
+            device_prefix_len=2,
+            last_device_node="rematched",
+            best_match_node="anchor",
+            host_hit_length=2,
+        )
+        storage_spans = {CacheRequestHandle("req-0", 0): (2, 2)}
+        tree_cache = SimpleNamespace(
+            tree_core=SimpleNamespace(is_eagle=False),
+            match_prefix=Mock(return_value=rematch),
+            init_load_back=Mock(side_effect=[None, None, (2, "restored")]),
+            check_prefetch_progress=Mock(return_value=True),
+            pop_prefetch_loaded_span=Mock(
+                side_effect=lambda handle: storage_spans.pop(handle, (0, None))
+            ),
+            path_device_indices=Mock(return_value=torch.tensor([10, 11, 12, 13])),
+            lock=Mock(return_value="restore-lock"),
+        )
+        harness = SimpleNamespace(tree_cache=tree_cache)
+        req = SimpleNamespace(
+            rid="req-0",
+            cache_request_handle=CacheRequestHandle("req-0", 0),
+            origin_input_ids=[0, 1, 2, 3, 4, 5],
+            last_node="prealloc",
+            storage_hit_length=0,
+            storage_hit_start=None,
+        )
+        prefix_match = DecodePrefixMatch(
+            prefix_indices=torch.tensor([10, 11]),
+            l2_host_hit_length=0,
+            l3_storage_hit_length=2,
+            last_device_node="prealloc",
+        )
+        decode_req = SimpleNamespace(
+            req=req,
+            prefix_match=prefix_match,
+            hicache_restore_status=HiCacheRestoreResult.PENDING,
+            hicache_restore_lock=None,
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.decode_hicache_mixin._req_radix_key",
+            return_value="key",
+        ):
+            for _ in range(2):
+                self.assertFalse(
+                    DecodeHiCacheTransferMixin._try_hicache_queue_load_back(
+                        harness, decode_req
+                    )
+                )
+                self.assertEqual(
+                    decode_req.hicache_restore_status, HiCacheRestoreResult.PENDING
+                )
+                self.assertIsNone(decode_req.hicache_restore_lock)
+                self.assertEqual(req.last_node, "prealloc")
+                tree_cache.lock.assert_not_called()
+
+            self.assertTrue(
+                DecodeHiCacheTransferMixin._try_hicache_queue_load_back(
+                    harness, decode_req
+                )
+            )
+
+        self.assertEqual((req.storage_hit_length, req.storage_hit_start), (2, 2))
+        self.assertEqual(prefix_match.decode_prefix_len, 4)
+        self.assertEqual(decode_req.hicache_restored_kv_indices.tolist(), [12, 13])
+        self.assertEqual(decode_req.hicache_restore_lock, "restore-lock")
+        self.assertEqual(req.last_node, "prealloc")
+        tree_cache.pop_prefetch_loaded_span.assert_called_once_with(
+            req.cache_request_handle
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
