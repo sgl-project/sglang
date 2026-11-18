@@ -89,6 +89,7 @@ def triton_sparse_mla_decode_splitk(
     return_lse: bool = False,
     lengths: torch.Tensor | None = None,
     expected_topk: int | None = None,
+    natural_lse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Split-K Triton sparse MLA decode (DSv4 pattern).
 
@@ -102,8 +103,8 @@ def triton_sparse_mla_decode_splitk(
              Under DCP these are the owned counts and the -1 tail written by
              transform_index_page_table_dcp (transform_index.py) or dcp_local_topk.
     expected_topk: typical lengths value, which sizes the split count instead of topk
-    returns: [1, bs, H, d_v] bf16, plus a [bs, H] fp32 natural-log LSE (-inf for
-             rows with no key) if return_lse
+    natural_lse: return the LSE in natural log, -inf for a row with no key
+    returns: [1, bs, H, d_v] bf16, plus a [bs, H] fp32 base-2 LSE if return_lse
     """
     kv, kv_scaled = _as_scaled_fp8_kv(kv, d_v, q_rope.shape[-1])
     is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
@@ -226,6 +227,7 @@ def triton_sparse_mla_decode_splitk(
                 ),
                 lse_out_ptr=lse,
                 STORE_LSE=return_lse,
+                NATURAL_LSE=natural_lse,
                 num_warps=fused_num_warps,
                 num_stages=2,
             )
@@ -298,16 +300,10 @@ def triton_sparse_mla_decode_splitk(
         BLOCK_K=BLOCK_K,
         lse_out_ptr=lse,
         STORE_LSE=return_lse,
+        NATURAL_LSE=natural_lse,
         num_warps=4,
     )
     return (out.unsqueeze(0), lse) if return_lse else out.unsqueeze(0)
-
-
-def lse_base2_for_dcp_merge(lse: torch.Tensor) -> torch.Tensor:
-    """The natural-log LSE returned above, as the replicated-index-K DCP merge reads it:
-    base 2, and a finite floor for a row with no key (the merge weights a rank by
-    exp2(lse - max), which is NaN when every rank of a row is -inf)."""
-    return torch.where(torch.isfinite(lse), lse * _LOG2E, -1073741824.0)
 
 
 # ---------------------------------------------------------------------------

@@ -699,6 +699,7 @@ def _sparse_mla_fused_kernel(
     PIPE_STAGES: tl.constexpr = 3,
     lse_out_ptr=None,
     STORE_LSE: tl.constexpr = False,
+    NATURAL_LSE: tl.constexpr = False,
     # Set only when 0 <= topk_length <= topk and every index past it is -1,
     # as transform_index_page_table_dcp writes the DCP-localized table: the
     # tile count skips the clamp and the index load masks on the constexpr
@@ -837,8 +838,13 @@ def _sparse_mla_fused_kernel(
         acc3 = tl.where(l_i[:, None] > 0.0, acc3 * inv_denom[:, None], 0.0)
 
     if STORE_LSE:
-        # A row whose keys are all masked keeps m_i at the -3.4e38 sentinel.
-        lse = tl.where(m_i > -1.0e38, (m_i + tl.log2(denom)) * _LN2, float("-inf"))
+        if NATURAL_LSE:
+            # A row whose keys are all masked keeps m_i at the -3.4e38 sentinel.
+            lse = tl.where(m_i > -1.0e38, (m_i + tl.log2(denom)) * _LN2, float("-inf"))
+        else:
+            # Finite floor: the DCP merge weights an empty rank by exp2(lse - max),
+            # so an all-masked row must not come back as -inf.
+            lse = tl.where(l_i > 0.0, tl.log2(denom) + m_i, -1073741824.0)
         tl.store(lse_out_ptr + t * H + h_offs, lse, mask=h_mask)
 
     o_base = out_ptr + t * H * D_V
@@ -1081,6 +1087,7 @@ def _sparse_mla_reduce_kernel(
     BLOCK_K: tl.constexpr,
     lse_out_ptr=None,
     STORE_LSE: tl.constexpr = False,
+    NATURAL_LSE: tl.constexpr = False,
 ):
     """Reduce split-K partials via log-space combine. grid=(seq, H, d_v_chunks)."""
     t = tl.program_id(0).to(tl.int64)
@@ -1128,12 +1135,10 @@ def _sparse_mla_reduce_kernel(
     )
     if STORE_LSE:
         if dc == 0:
-            # Every split empty leaves lse_max at the -3.4e38 sentinel.
-            lse = tl.where(
-                lse_max > -1.0e38,
-                (lse_max + tl.log2(tl.maximum(w_sum, 1.0e-30))) * _LN2,
-                float("-inf"),
-            )
+            lse = lse_max + tl.log2(tl.maximum(w_sum, 1.0e-30))
+            if NATURAL_LSE:
+                # Every split empty leaves lse_max at the -3.4e38 sentinel.
+                lse = tl.where(lse_max > -1.0e38, lse * _LN2, float("-inf"))
             tl.store(lse_out_ptr + t * H + h, lse)
 
 
@@ -1237,6 +1242,7 @@ def _triton_sparse_mla_fwd_splitk(
             KV_SCALED=kv_scaled,
             lse_out_ptr=lse,
             STORE_LSE=return_lse,
+            NATURAL_LSE=True,
             num_warps=fused_num_warps,
             num_stages=2,
         )
@@ -1301,6 +1307,7 @@ def _triton_sparse_mla_fwd_splitk(
             BLOCK_K=BLOCK_K,
             lse_out_ptr=lse,
             STORE_LSE=return_lse,
+            NATURAL_LSE=True,
             num_warps=4,
         )
     return (out.unsqueeze(0), lse) if return_lse else out.unsqueeze(0)
