@@ -1,4 +1,4 @@
-"""AITER and SGLang env defaults Kimi-K3.1 is served with on ROCm."""
+"""AITER and SGLang env defaults Kimi-K3.1 is served with on gfx950."""
 
 import hashlib
 import os
@@ -49,7 +49,7 @@ def write_k31_bf16_gemm_table() -> str:
 
 
 def apply_kimi_k31_rocm_env_defaults() -> None:
-    """AITER and SGLang env defaults Kimi-K3.1 is served with on ROCm, unless the user set them."""
+    """AITER and SGLang env defaults Kimi-K3.1 is served with on gfx950, unless the user set them."""
     # AITER's opus MoE stage 2 otherwise stores per-slot down outputs in fp8 before the
     # top-k sum: 11x the error of the bf16 partials the reference keeps.
     os.environ.setdefault("AITER_OPUS_STAGE2_FP8", "0")
