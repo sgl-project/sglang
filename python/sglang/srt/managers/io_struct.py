@@ -2509,6 +2509,10 @@ class AbortReq(BaseReq, kw_only=True):
     abort_message: Optional[str] = None
     weight_versions: Optional[WeightVersionSpans] = None
     prefill_weight_versions: Optional[WeightVersionSpans] = None
+    # Set by a tokenizer worker that does not hold this rid; the multi-tokenizer
+    # router replays such an abort behind the rid's generate if it passes later.
+    # The scheduler does not read it.
+    forward: bool = False
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code

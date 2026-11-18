@@ -42,16 +42,19 @@ import zmq.asyncio
 from sglang.srt.environ import envs
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     BaseBatchReq,
     BaseReq,
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
+    BatchTokenizedGenerateReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     FreezeGCReq,
     PauseContinueBroadcastReq,
     PauseGenerationReqInput,
+    TokenizedGenerateReqInput,
     TokenizerWorkerRegistrationReq,
     async_sock_recv,
     async_sock_send,
@@ -66,6 +69,7 @@ from sglang.srt.managers.load_snapshot import (
     create_load_snapshot_reader,
     zmq_reader_owner,
 )
+from sglang.srt.managers.pending_abort_table import PendingAbortTable
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.trace import process_tracing_init
 from sglang.srt.runtime_context import get_observability
@@ -451,6 +455,9 @@ class MultiTokenizerRouter:
 
         # Worker IPC names for pause/continue broadcasting
         self.all_worker_ipcs: set[str] = set()
+        # Aborts from workers that did not hold the rid, replayed behind the
+        # rid's generate if it passes later.
+        self.pending_aborts = PendingAbortTable()
         # Shared socket mapping (both coroutines run on self._loop, so safe)
         self.socket_mapping = SocketMapping()
 
@@ -478,34 +485,59 @@ class MultiTokenizerRouter:
         """Forward path: workers → scheduler, with pause/continue broadcast."""
         while True:
             recv_obj = await async_sock_recv(self.receive_from_worker)
+            await self._route_worker_obj(recv_obj)
 
-            if isinstance(recv_obj, TokenizerWorkerRegistrationReq):
-                if recv_obj.worker_ipc_name not in self.all_worker_ipcs:
-                    self.all_worker_ipcs.add(recv_obj.worker_ipc_name)
-                    logger.info(
-                        f"Router registered worker IPC: {recv_obj.worker_ipc_name} "
-                        f"(total: {len(self.all_worker_ipcs)})"
-                    )
-                continue
+    async def _route_worker_obj(self, recv_obj):
+        if isinstance(recv_obj, TokenizerWorkerRegistrationReq):
+            if recv_obj.worker_ipc_name not in self.all_worker_ipcs:
+                self.all_worker_ipcs.add(recv_obj.worker_ipc_name)
+                logger.info(
+                    f"Router registered worker IPC: {recv_obj.worker_ipc_name} "
+                    f"(total: {len(self.all_worker_ipcs)})"
+                )
+            return
 
-            if isinstance(
-                recv_obj, (PauseGenerationReqInput, ContinueGenerationReqInput)
+        if isinstance(recv_obj, (PauseGenerationReqInput, ContinueGenerationReqInput)):
+            # Broadcast to ALL workers so every worker's is_pause is set
+            is_pause = isinstance(recv_obj, PauseGenerationReqInput)
+            broadcast = PauseContinueBroadcastReq(is_pause=is_pause)
+            for ipc_name in self.all_worker_ipcs:
+                self.socket_mapping.send_output(ipc_name, broadcast)
+            # Forward to scheduler rank 0 (it broadcasts to all TP/PP/DP
+            # ranks internally). Skip for abort mode which drains via polling.
+            if not (
+                isinstance(recv_obj, PauseGenerationReqInput)
+                and recv_obj.mode == "abort"
             ):
-                # Broadcast to ALL workers so every worker's is_pause is set
-                is_pause = isinstance(recv_obj, PauseGenerationReqInput)
-                broadcast = PauseContinueBroadcastReq(is_pause=is_pause)
-                for ipc_name in self.all_worker_ipcs:
-                    self.socket_mapping.send_output(ipc_name, broadcast)
-                # Forward to scheduler rank 0 (it broadcasts to all TP/PP/DP
-                # ranks internally). Skip for abort mode which drains via polling.
-                if not (
-                    isinstance(recv_obj, PauseGenerationReqInput)
-                    and recv_obj.mode == "abort"
-                ):
-                    await async_sock_send(self.send_to_scheduler, recv_obj)
-                continue
+                await async_sock_send(self.send_to_scheduler, recv_obj)
+            return
 
+        if isinstance(recv_obj, AbortReq):
+            if recv_obj.forward:
+                # The sender does not hold this rid, and the scheduler drops an
+                # abort for a rid it has not received yet; keep it for the generate.
+                self.pending_aborts.record(recv_obj.rid)
             await async_sock_send(self.send_to_scheduler, recv_obj)
+            return
+
+        replay_rids = self._take_pending_aborts(recv_obj)
+        await async_sock_send(self.send_to_scheduler, recv_obj)
+        for rid in replay_rids:
+            # Same socket as the generate, so the scheduler sees the abort after
+            # it and removes the request from its queues.
+            logger.debug(f"Replaying an abort that preceded its generate. {rid=}")
+            await async_sock_send(self.send_to_scheduler, AbortReq(rid=rid))
+
+    def _take_pending_aborts(self, recv_obj) -> List[str]:
+        if not self.pending_aborts:
+            return []
+        if isinstance(recv_obj, TokenizedGenerateReqInput):
+            rids = [recv_obj.rid]
+        elif isinstance(recv_obj, BatchTokenizedGenerateReqInput):
+            rids = [tokenized.rid for tokenized in recv_obj.batch]
+        else:
+            return []
+        return [rid for rid in rids if self.pending_aborts.consume(rid)]
 
     async def handle_loop(self):
         """Backward path: detokenizer → route results to correct worker."""
@@ -515,8 +547,13 @@ class MultiTokenizerRouter:
 
     async def _distribute_result_to_workers(self, recv_obj):
         if isinstance(recv_obj, BaseReq):
+            # Any output proves the scheduler holds the rid, so its forwarded
+            # abort already took effect and must not be replayed.
+            self.pending_aborts.discard(recv_obj.rid)
             ipc_names = [recv_obj.http_worker_ipc]
         elif isinstance(recv_obj, BaseBatchReq):
+            for rid in recv_obj.rids or []:
+                self.pending_aborts.discard(rid)
             ipc_names = recv_obj.http_worker_ipcs
         else:
             raise ValueError(f"Unknown recv_obj type: {type(recv_obj)}")

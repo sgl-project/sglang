@@ -135,6 +135,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.pending_abort_table import PendingAbortTable
 from sglang.srt.managers.positional_embeds_transport import PositionalEmbedsTransport
 from sglang.srt.managers.req_types import (
     get_request_return_hidden_states_mode,
@@ -764,6 +765,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
+        # Single-tokenizer aborts for rids not registered yet, consumed when the
+        # rid registers. With several workers the router keeps this table instead.
+        self.pending_aborts = PendingAbortTable()
         self.encoder_dispatch_ready: Dict[str, threading.Event] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
@@ -997,6 +1001,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             rid: self.rid_to_state[rid]
             for rid in ([obj.rid] if obj.is_single else obj.rid)
         }
+        for rid, state in request_states.items():
+            if self.pending_aborts.consume(rid):
+                # Aborted before it registered: never dispatched (the
+                # skip-dispatch path), and the waiter finishes it as aborted.
+                state.abort_sent = True
         for state in request_states.values():
             state.waiting_at_pause_gate = True
         try:
@@ -2490,8 +2499,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     return
                 state.abort_sent = True
             elif get_serving().tokenizer_worker_num == 1:
+                # The rid is not registered yet (the request can still be in
+                # the HTTP handler backlog). Remember the abort so registration
+                # consumes it; dropping it would let the request run unaborted.
+                self.pending_aborts.record(rid)
                 return
-        req = AbortReq(rid=rid, abort_all=abort_all)
+        req = AbortReq(
+            rid=rid,
+            abort_all=abort_all,
+            # A rid this worker does not hold: the router also replays the abort
+            # behind the rid's generate in case that has not passed yet.
+            forward=not abort_all and state is None,
+        )
         try:
             self._dispatch_to_scheduler(req)
         except BaseException:
