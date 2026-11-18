@@ -789,6 +789,44 @@ class IndexerKPool(MultiPlatformOp):
             topk_v2_plan=topk_v2_plan,
         )
 
+    @staticmethod
+    def _kpool_verify_next_n_layout(
+        forward_batch: ForwardBatch,
+        metadata: BaseIndexerMetadata,
+        pool_seqlens: torch.Tensor,
+        pool_block_tables: torch.Tensor,
+        n_real: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """AITER paged-MQA inputs that score each request's draft rows as one
+        ``next_n`` query, so every split of a request runs on one XCD.
+
+        A request's draft rows share one page table, so row ``b * next_n`` read
+        ``next_n`` rows wide is that request's table; blocks past its width
+        fall in the request's own duplicate rows and only feed columns the
+        kernel's ``max_model_len`` store mask drops.
+        """
+        plan = metadata.attn_metadata.kpool_write_plan
+        if (
+            not forward_batch.forward_mode.is_target_verify()
+            or plan is None
+            or plan.pool_context_lens_per_req is None
+        ):
+            return pool_seqlens, pool_block_tables, 1
+        next_n = plan.num_draft_tokens
+        if (
+            next_n <= 1
+            or n_real % next_n != 0
+            or pool_block_tables.shape[0] < n_real
+            or not pool_block_tables.is_contiguous()
+        ):
+            return pool_seqlens, pool_block_tables, 1
+        bs = n_real // next_n
+        return (
+            plan.pool_context_lens_per_req[:bs],
+            pool_block_tables[:n_real].view(bs, -1),
+            next_n,
+        )
+
     def _get_kpool_decode_metadata(
         self,
         metadata: BaseIndexerMetadata,
@@ -1036,15 +1074,21 @@ class IndexerKPool(MultiPlatformOp):
                 )
             from sglang.kernels.ops.attention.dsa import aiter_paged_mqa_logits
 
+            mqa_seqlens, mqa_block_tables, mqa_next_n = (
+                self._kpool_verify_next_n_layout(
+                    forward_batch, metadata, pool_seqlens, pool_block_tables, n_real
+                )
+            )
             logits = aiter_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
                 weights,
-                pool_seqlens,
-                pool_block_tables,
+                mqa_seqlens,
+                mqa_block_tables,
                 pool_max_seq_len,
                 preshuffle=True,
                 kv_block_size=block_kv,
+                next_n=mqa_next_n,
             )
         elif use_tilelang_paged_mqa:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
