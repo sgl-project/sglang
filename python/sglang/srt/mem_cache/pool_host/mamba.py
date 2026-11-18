@@ -217,7 +217,9 @@ class MambaPoolHost(HostKVCache):
         ]
 
         if self._buffer_device.type == "npu":
-            reserve_mamba_host_memory(total_bytes=self.size * self.size_per_token)
+            reserve_mamba_host_memory(
+                num_slots=self.size, bytes_per_slot=self.size_per_token
+            )
         self.kv_buffer = self.init_kv_buffer()
         self._init_npu_state_transfer()
         self._init_write_back_staging_buffers()

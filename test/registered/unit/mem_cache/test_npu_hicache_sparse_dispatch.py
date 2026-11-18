@@ -187,12 +187,12 @@ class TestRegisteredNPUHostAllocation(unittest.TestCase):
 
     def test_mha_reserves_both_kv_components_before_allocation(self):
         path = ROOT / "python/sglang/srt/mem_cache/pool_host/npu_host_memory.py"
-        function = next(
+        functions = [
             node
             for node in ast.parse(path.read_text()).body
             if isinstance(node, ast.FunctionDef)
-            and node.name == "reserve_mha_host_memory"
-        )
+            and node.name in ("_mha_host_buffer_bytes", "reserve_mha_host_memory")
+        ]
         reserve = Mock()
         backend = SimpleNamespace(ensure_capacity=reserve)
         namespace = dict(
@@ -202,7 +202,7 @@ class TestRegisteredNPUHostAllocation(unittest.TestCase):
             ),
         )
         exec(
-            compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"),
+            compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"),
             namespace,
         )
         reserve_mha = namespace["reserve_mha_host_memory"]

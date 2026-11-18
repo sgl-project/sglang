@@ -192,9 +192,9 @@ def set_default_server_args(args: "ServerArgs"):
             "set_default_server_args",
             hicache_io_backend="kernel_ascend",
         )
-        from sglang.srt.configs.model_config import AttentionArch, is_deepseek_v4
+        from sglang.srt.configs.model_config import is_deepseek_v4
 
-        # DSV4, MLA, and MHA use page-aware transfer operators.
+        # DSV4 and MLA require their own host layouts; other models use direct pages.
         if is_deepseek_v4(model_config_of(args).hf_config):
             declare_resolution(
                 args,
@@ -214,12 +214,6 @@ def set_default_server_args(args: "ServerArgs"):
                     if cfg.hicache_mem_layout in ("layer_first", "layer_first_kv_split")
                     else "page_first_kv_split"
                 ),
-            )
-        elif model_config_of(args).attention_arch == AttentionArch.MHA:
-            declare_resolution(
-                args,
-                "set_default_server_args",
-                hicache_mem_layout="page_first_direct",
             )
         else:
             declare_resolution(

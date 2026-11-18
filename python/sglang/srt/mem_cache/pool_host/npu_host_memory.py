@@ -333,6 +333,19 @@ def reserve_mla_split_host_memory(
     backend.ensure_capacity(total_bytes, torch.npu.current_device())
 
 
+def _mha_host_buffer_bytes(
+    *,
+    num_tokens: int,
+    num_layers: int,
+    head_num: int,
+    k_width: int,
+    v_width: int,
+    dtype: torch.dtype,
+) -> int:
+    """Size the K and V host buffers for a token capacity."""
+    return num_tokens * num_layers * head_num * (k_width + v_width) * dtype.itemsize
+
+
 def reserve_mha_host_memory(
     *,
     num_pages: int,
@@ -347,15 +360,21 @@ def reserve_mha_host_memory(
     if backend is None:
         return
 
-    total_bytes = (
-        2 * num_pages * page_size * num_layers * head_num * head_dim * dtype.itemsize
+    total_bytes = _mha_host_buffer_bytes(
+        num_tokens=num_pages * page_size,
+        num_layers=num_layers,
+        head_num=head_num,
+        k_width=head_dim,
+        v_width=head_dim,
+        dtype=dtype,
     )
     backend.ensure_capacity(total_bytes, torch.npu.current_device())
 
 
-def reserve_mamba_host_memory(*, total_bytes: int) -> None:
+def reserve_mamba_host_memory(*, num_slots: int, bytes_per_slot: int) -> None:
     """Declare Mamba's combined state bytes before allocating any buffers."""
     backend = get_host_memory_backend()
+    total_bytes = num_slots * bytes_per_slot
     if backend is not None and total_bytes:
         backend.ensure_capacity(total_bytes, torch.npu.current_device())
 
@@ -416,11 +435,13 @@ def mha_host_allocation_bytes(
             "MemFabric hybrid reservation does not support MHA KV scales"
         )
     layers = len(buffer_info.buffers.k) + draft_count
-    bytes_per_token = (
-        (buffer_info.head_dim + buffer_info.v_head_dim)
-        * layers
-        * buffer_info.head_num
-        * buffer_info.dtype.itemsize
+    bytes_per_token = _mha_host_buffer_bytes(
+        num_tokens=1,
+        num_layers=layers,
+        head_num=buffer_info.head_num,
+        k_width=buffer_info.head_dim,
+        v_width=buffer_info.v_head_dim,
+        dtype=buffer_info.dtype,
     )
     if host_size > 0:
         slots = sync_fixed_hicache_size(
