@@ -780,11 +780,22 @@ def test_mamba_chunk_scan_track_states_at_request_boundary(chunk_size, seqlens):
         )
 
 
-def test_mamba_chunk_scan_isolates_nonfinite_request():
+@pytest.mark.parametrize("len_a", [5, 16], ids=["same_chunk", "chunk_boundary"])
+@pytest.mark.parametrize("target", ["x", "B"])
+@pytest.mark.parametrize("nonfinite_value", [torch.inf, torch.nan], ids=["inf", "nan"])
+def test_mamba_chunk_scan_isolates_nonfinite_request(len_a, target, nonfinite_value):
     """Regression test for https://github.com/sgl-project/sglang/issues/51108.
 
-    One request's non-finite input must not corrupt another request's output or
-    final state in the same packed prefill, even though both share a chunk.
+    One request's non-finite input (x or B, inf or nan) must not corrupt another
+    request's output or final state in the same packed prefill.
+
+    `len_a=5` ("same_chunk") puts both requests in chunk 0, exercising the
+    chunk-local masking in `_chunk_state_fwd_kernel` / `_chunk_scan_fwd_kernel`.
+    `len_a=16` ("chunk_boundary") makes request A exactly fill chunk 0 (chunk_size
+    is 16), so request B starts in chunk 1 and the only remaining contamination
+    path is the cross-chunk state carry in `_state_passing_fwd_kernel`, which
+    masks the same way (`scale = where(mask, exp(dA_cs), 0.0); states = scale *
+    states + new_states`) and is just as vulnerable to `0 * inf = nan`.
     """
     device = get_device()
     if device not in ["cuda", "xpu"]:
@@ -792,14 +803,17 @@ def test_mamba_chunk_scan_isolates_nonfinite_request():
 
     torch.manual_seed(0)
     n_heads, d_head, d_state = 2, 4, 8
-    len_a, len_b = 5, 30
+    len_b = 30
     seqlen = len_a + len_b
 
     x = torch.ones(1, seqlen, n_heads, d_head, device=device)
-    x[0, 2, 0, 1] = torch.inf  # only request A (the first len_a tokens) is affected
+    B = torch.ones(1, seqlen, 1, d_state, device=device)
+    if target == "x":
+        x[0, 2, 0, 1] = nonfinite_value  # only request A (the first len_a tokens)
+    else:
+        B[0, 2, 0, 1] = nonfinite_value
     dt = torch.ones(1, seqlen, n_heads, device=device)
     A = torch.zeros(n_heads, device=device)
-    B = torch.ones(1, seqlen, 1, d_state, device=device)
     C = torch.ones(1, seqlen, 1, d_state, device=device)
     seq_idx = torch.repeat_interleave(
         torch.arange(2, dtype=torch.int32, device=device),
@@ -814,7 +828,7 @@ def test_mamba_chunk_scan_isolates_nonfinite_request():
         A,
         B,
         C,
-        16,  # chunk_size: both requests share chunk 0 (16 < seqlen)
+        16,  # chunk_size
         seq_idx=seq_idx,
         cu_seqlens=cu_seqlens,
         out=out,
@@ -830,6 +844,43 @@ def test_mamba_chunk_scan_isolates_nonfinite_request():
     assert victim_out.isfinite().all(), "request B's output must stay finite"
     torch.testing.assert_close(victim_out, expected)
     torch.testing.assert_close(states[1], torch.full_like(states[1], float(len_b)))
+
+
+@pytest.mark.parametrize("target", ["x", "B"])
+def test_mamba_chunk_scan_lone_request_nonfinite_input_stays_nonfinite(target):
+    """A single, unbatched request's own non-finite input must still surface as
+    non-finite output, not be silently sanitized into a finite-but-wrong value.
+
+    The sanitization added for #51108 only guards the masked-select paths that
+    exist when `seq_idx` is given (HAS_SEQ_IDX); without it there is one
+    sequence per batch row and no `0 * inf` path to guard against, so the fix
+    must not apply there.
+    """
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    torch.manual_seed(0)
+    n_heads, d_head, d_state = 2, 4, 8
+    seqlen = 30
+
+    x = torch.ones(1, seqlen, n_heads, d_head, device=device)
+    B = torch.ones(1, seqlen, 1, d_state, device=device)
+    if target == "x":
+        x[0, 2, 0, 1] = torch.inf
+    else:
+        B[0, 2, 0, 1] = torch.inf
+    dt = torch.ones(1, seqlen, n_heads, device=device)
+    A = torch.zeros(n_heads, device=device)
+    C = torch.ones(1, seqlen, 1, d_state, device=device)
+
+    out = torch.empty_like(x)
+    mamba_chunk_scan_combined(x, dt, A, B, C, 16, out=out)
+
+    assert not out.isfinite().all(), (
+        "a lone request's own non-finite input must not be silently sanitized "
+        "into finite-but-wrong output"
+    )
 
 
 if __name__ == "__main__":

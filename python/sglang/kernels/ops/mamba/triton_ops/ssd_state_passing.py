@@ -174,8 +174,16 @@ def _state_passing_fwd_kernel(
                 scale_mask = seq_idx_chunk_end == prev_seq_idx_chunk_end
             prev_seq_idx_chunk_end = seq_idx_chunk_end
 
-        scale = tl.where(scale_mask, tl.exp(dA_cs), 0.0)
-        states = scale * states + new_states
+        # Select the carried term itself (not just the scale) at a sequence
+        # boundary: `states` here can be non-finite (e.g. a chunk entirely owned
+        # by a sequence with its own non-finite input legitimately produces a
+        # non-finite state), and multiplying that by a scale that merely
+        # evaluates to 0 here (`scale * states`) is still `0 * nan = nan`, which
+        # would leak into the next sequence's otherwise-finite `new_states`.
+        # `tl.where` discards the unselected branch's value instead of combining
+        # it arithmetically, so the reset case is an exact, clean `new_states`.
+        carried = tl.where(scale_mask, tl.exp(dA_cs) * states, 0.0)
+        states = carried + new_states
         if c < nchunks - 1:
             tl.store(out_ptrs, states, mask=offs_m < dim)
         else:

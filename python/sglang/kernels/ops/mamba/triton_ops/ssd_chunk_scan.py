@@ -426,6 +426,12 @@ def _chunk_scan_fwd_kernel(
                 mask=(offs_k_dstate[:, None] < dstate) & (offs_n[None, :] < hdim),
                 other=0.0,
             )
+            if HAS_SEQ_IDX:
+                # prev_states can carry another sequence's non-finite state across
+                # a chunk boundary (its own chunk legitimately went non-finite);
+                # scale_m is 0 for those rows, but 0 * nan is still nan, and that
+                # would leak through tl.dot into acc below regardless of scale_m.
+                prev_states = tl.where((prev_states - prev_states) == 0.0, prev_states, 0.0)
             prev_states = prev_states.to(C_ptr.dtype.element_ty)
             acc = tl.dot(C, prev_states) * scale_m[:, None]
         else:
@@ -443,11 +449,26 @@ def _chunk_scan_fwd_kernel(
                     & (offs_n[None, :] < hdim),
                     other=0.0,
                 )
+                if HAS_SEQ_IDX:
+                    # See the comment on the other `prev_states` sanitize above.
+                    prev_states = tl.where(
+                        (prev_states - prev_states) == 0.0, prev_states, 0.0
+                    )
                 prev_states = prev_states.to(C_ptr.dtype.element_ty)
                 acc += tl.dot(C, prev_states)
                 C_ptrs += BLOCK_SIZE_K
                 prev_states_ptrs += BLOCK_SIZE_K
             acc *= scale_m[:, None]
+
+    if HAS_SEQ_IDX:
+        # seq_idx is non-decreasing within [c_off, chunk_size_limit) (this pseudo-
+        # chunk's own range; c_off is 0 unless HAS_INITSTATES splits a physical
+        # chunk), so that whole range belongs to one sequence iff its first and
+        # last positions agree. Most chunks are like this; only one straddling a
+        # sequence boundary needs the x sanitize below, so skip it otherwise.
+        chunk_has_boundary = tl.load(
+            seq_idx_ptr + c_off * stride_seq_idx_seqlen
+        ) != tl.load(seq_idx_ptr + (chunk_size_limit - 1) * stride_seq_idx_seqlen)
 
     offs_k = tl.arange(0, BLOCK_SIZE_K) + c_off
     cb_ptrs = cb_ptr + (
@@ -486,7 +507,7 @@ def _chunk_scan_fwd_kernel(
             mask=(offs_k[:, None] < chunk_size_limit - k) & (offs_n[None, :] < hdim),
             other=0.0,
         )
-        if HAS_SEQ_IDX:
+        if HAS_SEQ_IDX and chunk_has_boundary:
             # cb[m, k] is already exactly 0 for seq_idx[m] != seq_idx[k] (comment
             # above), but x does not carry an m axis, so a non-finite x here would
             # still turn into nan at 0 * inf (or 0 * nan) for every m row that reads
