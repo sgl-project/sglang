@@ -395,6 +395,7 @@ class _SelectorDraftSampler:
         self.block_size = int(block_size)
         self.sampling_enabled = sampling_enabled
         max_bs, gamma, top_k = int(max_bs), self.block_size - 1, self.selector.top_k
+        self.max_bs = max_bs
         self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
         # Written by the host before replay, or read after it; the addresses are
         # baked into the captured graph.
@@ -469,6 +470,8 @@ class _MegakernelSelectorDraftSampler:
     def __init__(self, *, head, out, candidate_out, q_out, sampling_enabled):
         self.out, self.candidate_out, self.q_out = out, candidate_out, q_out
         self.sampling_enabled = sampling_enabled
+        # Staging goes to the megakernel head's own buffers, not ones sized here.
+        self.max_bs = None
         self._head = head
         self._staged_greedy = False
 
@@ -1389,6 +1392,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             result.sampling_headroom_bytes,
         )
         return result
+
+    def _stage_draft_sampler(self, *, bs: int, sampling_info) -> None:
+        # A batch past the sampler's static buffers has no captured bucket,
+        # so its draft runs eager and the eager head reads none of them.
+        sampler = self._draft_sampler
+        if sampler is None:
+            return
+        if sampler.max_bs is None or bs <= sampler.max_bs:
+            sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
 
     def _maybe_attach_megakernel_head(self, lm_head):
         head = megakernel_draft_selector_head(self.draft_model)
@@ -4101,11 +4113,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self.selector is not None or self.lilicorr is not None:
             self._selector_sample = None
             self._draft_feature = self._draft_confidence = None
-            if self._draft_sampler is not None:
-                # Consumed by the in-graph sample; must be staged before the replay.
-                self._draft_sampler.stage_sampling_params(
-                    bs=bs, sampling_info=batch.sampling_info
-                )
+            # Consumed by the in-graph sample; must be staged before the replay.
+            self._stage_draft_sampler(bs=bs, sampling_info=batch.sampling_info)
 
         self._join_aux()
         with (
