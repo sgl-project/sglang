@@ -357,6 +357,7 @@ from sglang.srt.mem_cache.kv.alloc.forward_steps import (
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
 from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.models.unlimited_ocr_v2_support.admission import UocrPrefillAdder
@@ -2319,6 +2320,18 @@ class Scheduler(
                 last_batch_is_extend = last_batch.forward_mode.is_extend()
             if last_batch_is_extend:
                 return True
+
+        # Idle state is rank-local under MLP synchronization: it must not
+        # choose a collective scheduling boundary there. Intermediate chunks
+        # have no first token to return, so keep their overlap as well.
+        if (
+            envs.SGLANG_DISABLE_OVERLAP_AFTER_IDLE_PREFILL.get()
+            and not self.require_mlp_sync
+            and last_batch.after_idle_gap
+            and last_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            and last_batch.contains_last_prefill_chunk
+        ):
+            return True
 
         # The next batch's grammar bitmask needs this result's FSM advance.
         return last_batch.grammar_needs_sync()

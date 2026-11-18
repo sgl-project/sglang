@@ -759,6 +759,8 @@ class Envs:
     # ===================================================================
     # Process a prefill step's result before scheduling the next step, for TTFT.
     SGLANG_DISABLE_OVERLAP_AFTER_PREFILL = EnvBool(False)
+    # Return the first prefill after idle before launching another forward.
+    SGLANG_DISABLE_OVERLAP_AFTER_IDLE_PREFILL = EnvBool(False)
     # Force delay_sample_func for all overlap decode (not just grammar mode),
     # allowing CPU result processing to overlap with subsequent forward computation
     # and reducing the impact of sampling overhead on the critical path.
