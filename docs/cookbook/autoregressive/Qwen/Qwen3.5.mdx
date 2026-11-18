@@ -324,7 +324,7 @@ A few notes on the command:
 
 - `--speculative-algorithm EAGLE` is the same algorithm the command generator in section 3.1 emits as `NEXTN`; SGLang resolves `NEXTN` to `EAGLE`.
 - `SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1` makes the AITER backend use `--mem-fraction-static 0.8` as-is. Without it, AITER multiplies an explicit value by 0.85 when the context length is above 8192, so 0.8 runs as 0.68. With it set, the KV pool grows from 7.83M to 11.32M tokens per GPU (+45%). The reserve it skips holds non-static attention workspace, so lowering `--mem-fraction-static` is the first thing to try if you run out of memory on a different workload or GPU.
-- AITER allreduce fusion stays on, and `ROCM_QUICK_REDUCE_QUANTIZATION` is not set. The two are mutually exclusive, and quick all-reduce belongs to the MXFP4 recipe.
+- AITER allreduce fusion stays on, and `ROCM_QUICK_REDUCE_QUANTIZATION` is not set. The two are mutually exclusive, and quick all-reduce belongs to the MXFP4 recipe. On images older than `v0.5.23`, `ROCM_QUICK_REDUCE_QUANTIZATION` defaults to INT8, so set `ROCM_QUICK_REDUCE_QUANTIZATION=NONE` explicitly there.
 - Weights load with multiple threads by default, so `--model-loader-extra-config '{"enable_multithread_load": true}'` is not needed.
 - `--kv-cache-dtype fp8_e4m3` carries the same accuracy caveat as the FP8 KV cache warning in section 3.2.
 
