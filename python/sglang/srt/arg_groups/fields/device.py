@@ -94,3 +94,16 @@ class Device(msgspec.Struct):
         "timer. At most every 10 minutes, an idle freeze also unfreezes first, so frozen "
         "garbage is freed and logged. Set to 0 to disable.",
     ] = 0.0
+    gc_dp_lockstep_steps: A[
+        int,
+        "With DP attention, run the scheduler's full garbage collections at the same step on "
+        "every attention-DP rank. Left to itself, each rank starts a full collection whenever "
+        "its own allocation counts say so, and every other rank waits for it at the next batch "
+        "gather. At the first gather this freezes the heap and turns off automatic full "
+        "collections (the third GC threshold; the younger generations stay automatic). Then "
+        "every rank runs one full collection every this many batch gathers (one or two per "
+        "scheduler step). Each one also frees the cyclic garbage that reached the oldest "
+        "generation since the last, so its pause grows with this value: tune it so a pass "
+        "stays within your step-time budget (--gc-warning-threshold-secs reports long ones). "
+        "Set to 0 to disable.",
+    ] = 0

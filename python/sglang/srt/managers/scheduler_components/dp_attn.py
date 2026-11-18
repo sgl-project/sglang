@@ -814,6 +814,9 @@ class SchedulerDPAttnAdapter:
     # iteration (see DPDrainColumn).
     get_drain_state: Callable[[], int] = lambda: 0
     on_drain_rows: Optional[Callable[[list[int]], None]] = None
+    # Runs before every gather. Every rank runs the same number of gathers, so
+    # a count of these calls names the same step on every rank (GCFreezer).
+    before_gather: Optional[Callable[[], None]] = None
     # Set once a gather carried this rank's own shutdown vote.
     shutdown_vote_sent: DPShutdownVoteSent = field(
         default_factory=DPShutdownVoteSent, init=False
@@ -839,6 +842,8 @@ class SchedulerDPAttnAdapter:
         self.sync_wait_carry.seconds = 0.0
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
+        if self.before_gather is not None:
+            self.before_gather()
         draft_require_mlp_tp_gather = None
         if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
             draft_moe_a2a_backend = get_spec().speculative_moe_a2a_backend

@@ -18,6 +18,9 @@ maybe_stub_sgl_kernel()
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX  # noqa: E402
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.scheduler_components import dp_attn  # noqa: E402
+from sglang.srt.managers.scheduler_components.gc_freezer import (  # noqa: E402
+    GCFreezer,
+)
 from sglang.srt.model_executor.cuda_graph_config import Backend  # noqa: E402
 from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 from sglang.srt.observability.metrics_collector import DPBalanceStats  # noqa: E402
@@ -718,6 +721,7 @@ class TestDPShutdownVote(CustomTestCase):
         scheduler.require_mlp_sync = True
         scheduler.gracefully_exit = False
         scheduler.rust_server = None
+        scheduler.gc_freezer = GCFreezer(freeze_on_idle_secs=0.0)
         Scheduler.init_dp_attn_adapter(scheduler)
         adapter = scheduler.dp_attn_adapter
         adapter.on_peer_shutdown()
@@ -847,6 +851,111 @@ class TestDPDrainColumn(CustomTestCase):
         info.drain_state = 5
         info.finalize_local()
         self.assertEqual(info.tp0_info_cpu[:, 12].tolist(), [5])
+
+
+class TestBeforeGatherHook(CustomTestCase):
+    """The adapter runs its before_gather hook (the scheduler's GC lockstep)
+    once before every MLP-sync gather."""
+
+    def test_hook_runs_once_before_each_gather(self):
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=lambda: 1,
+            spec_info=None,
+            reqs=[SimpleNamespace(rid="req-0", seqlen=1)],
+            seq_lens_cpu=None,
+            dp_balance_stats=None,
+        )
+        tbo_preparer = Mock()
+        tbo_preparer.prepare_all_gather.return_value = (True, ForwardMode.DECODE.value)
+        tbo_preparer.compute_output.return_value = (None, ForwardMode.DECODE)
+        before_gather = Mock()
+        calls_at_exchange = []
+
+        def fake_exchange(output, local, group, **_):
+            calls_at_exchange.append(before_gather.call_count)
+            output.copy_(torch.stack([local, local.clone()]).flatten())
+
+        adapter = dp_attn.SchedulerDPAttnAdapter(
+            model_runner=SimpleNamespace(
+                prefill_cuda_graph_runner=None,
+                spec_algorithm=SpeculativeAlgorithm.NONE,
+                model_config=object(),
+            ),
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+            tree_cache=None,
+            offload_tags=set(),
+            model_config=None,
+            enable_overlap=False,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            get_require_mlp_sync=lambda: True,
+            before_gather=before_gather,
+        )
+        with (
+            envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False),
+            patch.object(dp_attn, "TboDPAttentionPreparer", return_value=tbo_preparer),
+            patch.object(dp_attn, "world_dp_gather_enabled", return_value=False),
+            patch.object(
+                dp_attn,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    num_dp_ranks=2,
+                    attn_tp_size=1,
+                    attn_cp_size=1,
+                    dwdp_size=1,
+                    tp_group=SimpleNamespace(
+                        device_group=object(),
+                        device="cpu",
+                        cpu_group=object(),
+                        active_ranks_cpu=torch.ones(2, dtype=torch.int64),
+                    ),
+                ),
+            ),
+            patch.object(dp_attn, "check_cuda_graph_backend", return_value=False),
+            patch.object(dp_attn, "cuda_graph_fully_disabled", return_value=True),
+            patch.object(dp_attn, "require_mlp_tp_gather", return_value=True),
+            patch.object(
+                dp_attn,
+                "get_schedule",
+                return_value=SimpleNamespace(disable_overlap_schedule=True),
+            ),
+            patch.object(dp_attn, "exchange_sync_rows", side_effect=fake_exchange),
+        ):
+            adapter.prepare_mlp_sync_batch(batch)
+            adapter.maybe_prepare_mlp_sync_batch(batch)
+            adapter.maybe_prepare_mlp_sync_batch(batch, need_sync=False)
+        self.assertEqual(calls_at_exchange, [1, 2])
+        self.assertEqual(before_gather.call_count, 2)
+
+    def test_scheduler_wires_the_gc_lockstep_hook(self):
+        from sglang.srt.managers.scheduler import Scheduler
+
+        for steps in (0, 30000):
+            scheduler = Scheduler.__new__(Scheduler)
+            scheduler.tp_worker = SimpleNamespace(model_runner=Mock())
+            scheduler.req_to_token_pool = Mock()
+            scheduler.token_to_kv_pool_allocator = Mock()
+            scheduler.tree_cache = Mock()
+            scheduler.weight_updater = SimpleNamespace(offload_tags=set())
+            scheduler.model_config = Mock()
+            scheduler.enable_overlap = False
+            scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
+            scheduler.require_mlp_sync = True
+            scheduler.gracefully_exit = False
+            scheduler.rust_server = None
+            scheduler.gc_freezer = GCFreezer(
+                freeze_on_idle_secs=0.0, dp_lockstep_steps=steps
+            )
+            Scheduler.init_dp_attn_adapter(scheduler)
+            with self.subTest(steps=steps):
+                self.assertEqual(
+                    scheduler.dp_attn_adapter.before_gather,
+                    scheduler.gc_freezer.before_dp_gather,
+                )
+                self.assertIs(
+                    scheduler.dp_attn_adapter.before_gather is None, steps == 0
+                )
 
 
 _EXCHANGE_WORLDS = (2, 3, 4, 5, 6, 8)
