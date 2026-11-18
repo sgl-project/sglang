@@ -162,7 +162,7 @@ register_kernel(
         op="sampling.softcap_row_argmax",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.sampling.softcap_row_argmax:softcap_row_argmax",
-        capabilities=CUDA_ONLY,
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
     )
 )
 register_kernel(
