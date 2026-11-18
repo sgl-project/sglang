@@ -40,31 +40,6 @@ from sglang.srt.utils.common import parse_connector_type
 logger = logging.getLogger(__name__)
 
 
-def handle_deprecated_dp_attention(server_args: Any):
-    """Turn the deprecated `--dp-size N --enable-dp-attention` into
-    `--attn-dp-size N`.
-
-    Runs before any handler reads the DP layout. The old spelling counted
-    attention-DP groups with `dp_size`; that width moves to `attn_dp_size`, and
-    `dp_size` counts replicas again. Next to `--attn-dp-size` the flag adds
-    nothing: a serialized config reports it set whenever attention DP runs
-    (`ServerArgs.resolved_dict`), so reading one back resolves the same layout.
-    """
-    cfg = resolving_view(server_args)
-    if not cfg.enable_dp_attention:
-        return
-    if cfg.attn_dp_size == 1:
-        declare_resolution(
-            server_args,
-            "_handle_deprecated_dp_attention",
-            attn_dp_size=cfg.dp_size,
-            dp_size=1,
-        )
-    declare_resolution(
-        server_args, "_handle_deprecated_dp_attention", enable_dp_attention=False
-    )
-
-
 def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> dict:
     """Resolve the token-row modes the model's forward actually enters."""
     nemotron = model_type in ("nemotron_h", "nemotron_h_puzzle")
