@@ -11,7 +11,8 @@ from __future__ import annotations
 import torch
 
 from sglang.kernels.jit.utils import cache_once
-from sglang.srt.utils.common import ceil_div, get_device_core_count
+from sglang.srt.utils.common import ceil_div
+from sglang.srt.utils.device import get_device_core_count
 
 # quack 0.6.4's SM120 cooperative tile widths, widest first so ties keep it; 0.6.5
 # also accepts other multiples of 32, which were not measured here.

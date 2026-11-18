@@ -2403,7 +2403,7 @@ def _wait_for_model_info(
             assert res.status_code == 200, f"{res=}, {res.text=}"
             return res.json()
         except (AssertionError, requests.exceptions.RequestException):
-            last_traceback = get_exception_traceback()
+            last_traceback = traceback.format_exc()
     raise TimeoutError(last_traceback)
 
 

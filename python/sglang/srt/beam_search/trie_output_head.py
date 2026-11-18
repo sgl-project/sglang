@@ -27,7 +27,7 @@ from sglang.srt.beam_search.trie_config import (
     get_beam_trie_config,
 )
 from sglang.srt.utils import is_cpu, is_npu
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.device import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig

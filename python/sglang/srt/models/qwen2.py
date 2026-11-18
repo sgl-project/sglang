@@ -74,7 +74,6 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel, get_platform
-from sglang.srt.utils import add_prefix, make_pp_layers
 
 Qwen2Config = None
 

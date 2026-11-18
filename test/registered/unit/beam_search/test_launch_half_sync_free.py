@@ -11,7 +11,7 @@ from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
 from sglang.srt.beam_search.trie_constraint import BeamTrieConstraint
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ReqKvInfo
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
@@ -54,6 +54,14 @@ class _Storage:
         self.take_rows = pool.alloc_rows
 
 
+class _DenseModelConfig:
+    hf_config = SimpleNamespace()
+    model_path = ""
+    vocab_size = 0
+    revision = None
+    is_draft_model = False
+
+
 class _FutureMap:
     def __init__(self):
         self.tokens = torch.zeros(64, dtype=torch.int64, device="cuda")
@@ -81,7 +89,7 @@ def _setup():
     )
     pool = _ReqToTokenPool()
     coordinator = BeamCoordinator(
-        model_config=SimpleNamespace(beam_trie_config=None),
+        model_config=_DenseModelConfig,
         spec_algorithm=None,
         dllm_enabled=False,
         max_req_len=0,
