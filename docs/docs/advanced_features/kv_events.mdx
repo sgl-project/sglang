@@ -1,0 +1,261 @@
+---
+title: "KV Cache Events"
+metatags:
+    description: "Subscribe to SGLang's KV cache event stream: enabling the publisher, the msgpack wire format, replay and the cache_salt and session_id fields on stored blocks."
+---
+
+SGLang can publish a live stream of KV cache events. The events provide data like which blocks a replica stored, which it evicted and
+when it cleared its cache. KV aware routers such as the [SGLang model gateway](./sgl_model_gateway),
+[llm-d](./llm-d) and NVIDIA Dynamo subscribe to it and keep an index of where each prefix lives, so they
+can send a request to the replica that already holds its prefix.
+
+## Enable the stream
+
+```bash Command
+python3 -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --kv-events-config '{"publisher": "zmq", "endpoint": "tcp://*:5557", "replay_endpoint": "tcp://*:5600", "topic": "kv-events"}'
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `publisher` | `"null"` | `"zmq"` publishes. `"null"` disables. |
+| `endpoint` | `"tcp://*:5557"` | PUB socket address. A wildcard host (`*`, `0.0.0.0`, `::`) or an `ipc://` / `inproc://` address binds. A concrete host connects. |
+| `replay_endpoint` | none | ROUTER socket address for replaying missed batches. Always binds. |
+| `buffer_steps` | `10000` | Number of past batches kept for replay. |
+| `hwm` | `100000` | ZeroMQ high-water mark on the PUB socket. Past it, batches are dropped for a subscriber that isn't keeping up. |
+| `max_queue_size` | `100000` | Batches held in memory waiting to be sent. |
+| `topic` | `""` | Topic frame on every message. Subscribers filter on it as a prefix. |
+
+### One publisher per KV cache
+
+Each independent KV cache gets its own publisher. Rank `r` adds `r` to both the `endpoint` port and the
+`replay_endpoint` port. Under DP attention the rank is the attention DP rank and with plain data
+parallelism it's the DP rank. Every batch carries its publisher's rank in `attn_dp_rank`.
+
+### Discover endpoints from `/server_info`
+
+Rather than hard coding ports, read the `kv_events` block from `/server_info`:
+
+```json
+"kv_events": {
+  "publisher": "zmq",
+  "endpoint_host": "*",
+  "endpoint_port_base": 5557,
+  "topic": "kv-events",
+  "block_size": 16,
+  "dp_size": 2
+}
+```
+
+- Open one SUB socket per rank at `tcp://<host>:<endpoint_port_base + rank>`, for ranks `0` to `dp_size - 1`.
+- When `endpoint_host` is a wildcard, use the worker's own host instead.
+- `block_size` is the width events are emitted at: `page_size × dcp_size`.
+- The replay endpoint isn't advertised.
+- There's no descriptor when publishing is off or the endpoint isn't a routable TCP address.
+
+`load_endpoint_port_base` and `load_topic` also show up when `--load-publish-endpoint` is set. They
+describe a separate runtime load stream, not KV events.
+
+## Message format
+
+Each message is three ZeroMQ frames:
+
+1. The topic.
+2. A sequence number as 8 big-endian bytes. It starts at 0 and goes up by one per batch. It's per
+   publisher and starts over when the server restarts.
+3. A [msgspec](https://github.com/msgspec/msgspec) msgpack payload holding one `KVEventBatch`.
+
+The batch is a msgpack array `[ts, events, attn_dp_rank]`. Each event is a msgpack map: `type` names the
+event and every other key is a field name. Optional fields that aren't set are left out of the map.
+Decoded, a batch looks like this:
+
+```python
+[
+    1757912345.12,
+    [
+        {
+            "type": "BlockStored",
+            "block_hashes": [1, 2],
+            "parent_block_hash": None,
+            "token_ids": [1, 2, 3, 4],
+            "block_size": 2,
+            "lora_id": None,
+            "medium": "GPU",
+            "cache_salt": "tenant-a",
+            "session_id": "agent-42",
+        },
+        {"type": "BlockRemoved", "block_hashes": [1, 2], "medium": "GPU"},
+        {"type": "AllBlocksCleared"},
+    ],
+    0,
+]
+```
+
+### Events
+
+| Event | Fields | Meaning |
+| --- | --- | --- |
+| `BlockStored` | `block_hashes`, `parent_block_hash`, `token_ids`, `block_size`, `lora_id`, `medium`, `cache_salt`, `session_id` | One or more blocks became resident on `medium`. |
+| `BlockRemoved` | `block_hashes`, `medium` | Blocks were evicted from `medium`. |
+| `AllBlocksCleared` | — | The cache was reset. Drop everything you hold for this publisher. |
+
+More on `BlockStored`:
+
+- **One event can hold several blocks.** Stores that chain parent to child and share `medium`, `lora_id`,
+  `block_size`, `cache_salt` and `session_id` are merged. `block_hashes` lists the blocks in order and
+  `token_ids` is their tokens joined, so `len(token_ids) == len(block_hashes) * block_size`.
+- **`parent_block_hash`** is the block the first one extends or `null` at the root. Each later block in
+  the event extends the one before it.
+- **`medium`** is `GPU`, `CPU_PINNED`, `DISK` or `EXTERNAL`. The same block can be resident on more than
+  one tier, so key your index on hash and medium.
+- **`lora_id`** is always `null` today.
+- **`token_ids`** holds one integer per token. The exception is EAGLE speculative decoding where the radix
+  tree keys on token bigrams and each entry is a `[t_i, t_i+1]` pair.
+
+<Warning>
+The exported `KVEventBatch` declares `token_ids` as `list[int]`, so decoding an EAGLE server's stream with
+it raises `msgspec.ValidationError`. EAGLE consumers need their own struct with a looser `token_ids` type.
+</Warning>
+
+## Decode the stream
+
+```python
+import msgspec
+import zmq
+
+from sglang.srt.disaggregation.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+    KVEventBatch,
+)
+
+decoder = msgspec.msgpack.Decoder(KVEventBatch)
+
+socket = zmq.Context.instance().socket(zmq.SUB)
+socket.connect("tcp://127.0.0.1:5557")
+socket.setsockopt_string(zmq.SUBSCRIBE, "kv-events")
+
+# (block hash, medium) -> cache_salt of the request that stored it
+blocks = {}
+next_seq = None
+
+while True:
+    _topic, seq_bytes, payload = socket.recv_multipart()
+    seq = int.from_bytes(seq_bytes, "big")
+    if next_seq is not None and seq > next_seq:
+        print(f"missed batches {next_seq}..{seq - 1}")  # see "Replay missed batches"
+    next_seq = seq + 1
+
+    batch = decoder.decode(payload)
+    for event in batch.events:
+        if isinstance(event, BlockStored):
+            for block_hash in event.block_hashes:
+                blocks[(block_hash, event.medium)] = event.cache_salt
+        elif isinstance(event, BlockRemoved):
+            for block_hash in event.block_hashes:
+                blocks.pop((block_hash, event.medium), None)
+        elif isinstance(event, AllBlocksCleared):
+            blocks.clear()
+```
+
+`KVEventBatch` is the same type the server publishes with, so one decoder reads every event.
+`cache_salt` and `session_id` come back as `None` when they aren't set. msgspec ignores map keys it
+doesn't know, so optional fields added later won't break it. Don't decode with
+`forbid_unknown_fields=True`.
+
+Consumers in other languages can decode the map format above directly. Ignore keys you don't use. The Rust
+decoder in `experimental/sgl-router/src/policies/kv_events/wire.rs` is a working reference.
+
+## Replay missed batches
+
+When `replay_endpoint` is set, the publisher keeps its last `buffer_steps` batches. To fetch them:
+
+1. Connect a DEALER socket. A REQ socket won't work because it only accepts one reply.
+2. Send an empty frame and then the first sequence number you want as 8 big-endian bytes.
+
+The publisher replies with one `["", seq, payload]` message for each buffered batch from that number on.
+It finishes with `["", -1, ""]` where `-1` is encoded as a signed 8-byte integer.
+
+```python
+replay = zmq.Context.instance().socket(zmq.DEALER)
+replay.connect("tcp://127.0.0.1:5600")
+replay.send_multipart([b"", next_seq.to_bytes(8, "big")])
+
+while True:
+    _empty, seq_bytes, payload = replay.recv_multipart()
+    seq = int.from_bytes(seq_bytes, "big", signed=True)
+    if seq == -1:
+        break
+    batch = decoder.decode(payload)  # apply it the same way as a live batch
+```
+
+Batches older than the buffer are gone. If the first replayed `seq` is later than the one you asked for,
+you can't fully recover that rank's index. The safe option is to clear it and rebuild it from new events.
+
+## `cache_salt` and `session_id`
+
+A request can set both on `/generate`, `/v1/completions`, `/v1/chat/completions` and `/v1/responses`:
+
+```python
+import requests
+
+requests.post(
+    "http://127.0.0.1:30000/v1/chat/completions",
+    json={
+        "model": "meta-llama/Llama-3.1-8B-Instruct",
+        "messages": [{"role": "user", "content": "Summarize the attached contract."}],
+        "cache_salt": "tenant-a",
+        "session_id": "agent-42",
+    },
+)
+```
+
+### `cache_salt`
+
+`cache_salt` puts a request's prefixes in their own namespace, so two tenants sending the same prompt don't
+share cache entries.
+
+- **Only `BlockStored` carries it.** Every store event for a salted request includes the salt.
+  `BlockRemoved` doesn't need it (see the next point).
+- **Hashes are namespaced by the salt.** The salt seeds the block hash chain. A salted prefix gets
+  completely different `block_hashes` from the same prefix unsalted or under another salt. Hashes are
+  unique across tenants on their own which is why `BlockRemoved` is unambiguous without the salt.
+- **Index the hashes you receive. Don't compute them.** The hash function isn't a public contract and
+  it differs from other engines'. Treat `cache_salt` as a label on an emitted hash, not an input to it.
+
+### `session_id`
+
+`session_id` tells you which session caused a store. It's attribution only.
+
+- **It doesn't change the hash or claim ownership.** Other sessions may share the same blocks.
+- **It's set when a request stores blocks.** That covers new blocks and blocks that come back onto the
+  GPU during the request's insert.
+- **Reused blocks produce no event.** A request that only hits blocks already on the GPU emits nothing, so
+  a shared prefix appears once under the session that stored it. Where two sessions diverge, each new
+  tail carries its own `session_id`.
+- **Background tier moves carry no `session_id`.** Examples are HiCache write through to host memory and
+  loading back from host. There's no request behind them.
+- **Only the default unified radix cache sets it.** Pure SWA, LMCache and FlexKV caches don't.
+- **Stores from different sessions are never merged** into one event.
+- **You don't need `--enable-session-radix-cache`** for `session_id` to appear in events.
+
+### Handling these values
+
+Both fields come from the client and are published as-is on the PUB socket. They identify tenants and
+sessions. Keep the event sockets on a trusted network and treat the values like any other tenant
+identifier when you log or forward them.
+
+## Compatibility
+
+Older SGLang releases published each event as a positional msgpack array (`["BlockStored", block_hashes,
+...]`) and a salted store added a trailing metadata map. Current releases publish maps. The two formats
+don't work together in either direction and are not compatabile as follows:
+
+- A decoder built for the array format rejects map events, unsalted ones included.
+- The current `KVEventBatch`, the in-tree router and the KV indexer reject array events from older workers.
+
+<Note>
+Upgrade publishers and consumers together. The outer batch is still an array.
+</Note>
