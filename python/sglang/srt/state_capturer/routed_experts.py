@@ -5,7 +5,7 @@ import pybase64
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.model_config import MOE_TOPK_ATTRS, ModelConfig, get_moe_topk
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     dp_slot_in,
@@ -95,7 +95,12 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         self.stage_start_layer = stage_start_layer
         self.stage_end_layer = stage_end_layer
         self.is_pipelined = get_parallel().pp_size > 1
-        topk_size = model_config.hf_text_config.num_experts_per_tok
+        topk_size = get_moe_topk(model_config.hf_text_config)
+        if topk_size is None:
+            raise ValueError(
+                "Could not determine MoE top-k expert count from hf_text_config "
+                f"(checked {MOE_TOPK_ATTRS})."
+            )
         num_layers = model_config.hf_text_config.num_hidden_layers
 
         # Scale by num_dp_ranks so the buffer covers the full DP-concatenated batch.

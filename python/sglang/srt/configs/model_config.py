@@ -104,6 +104,24 @@ SWA_SINK_ARCHS = frozenset(
 )
 
 
+MOE_TOPK_ATTRS = (
+    "num_experts_per_tok",
+    "num_experts_per_token",
+    "top_k_experts",
+    "moe_top_k",
+    "moe_topk",
+)
+
+
+def get_moe_topk(hf_text_config: Any) -> Optional[int]:
+    """Return the per-token routed expert count across MoE config spellings."""
+    for attr in MOE_TOPK_ATTRS:
+        val = getattr(hf_text_config, attr, None)
+        if val is not None:
+            return val
+    return None
+
+
 def _quant_config_to_dict(quant_config):
     if quant_config is not None and not isinstance(quant_config, dict):
         return quant_config.to_dict()

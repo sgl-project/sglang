@@ -86,6 +86,7 @@ from sglang.srt.beam_search.coordinator import BeamCoordinator
 from sglang.srt.configs.model_config import (
     ModelConfig,
     ModelImpl,
+    get_moe_topk,
     is_deepseek_v4,
     is_minimax_sparse,
     is_unlimited_ocr_v2,
@@ -1070,14 +1071,7 @@ class Scheduler(
         # Different MoE architectures expose the per-token expert count under
         # different attribute names (e.g. Gemma4 uses ``top_k_experts``,
         # LongCat-2.0 uses ``moe_topk``).
-        moe_topk_attrs = (
-            "num_experts_per_tok",
-            "num_experts_per_token",
-            "top_k_experts",
-            "moe_top_k",
-            "moe_topk",
-        )
-        if any(hasattr(config_to_check, attr) for attr in moe_topk_attrs):
+        if get_moe_topk(config_to_check) is not None:
             initialize_moe_config()
 
         # Initialize GEMM-related configuration for FP8 and FP4 backends.
