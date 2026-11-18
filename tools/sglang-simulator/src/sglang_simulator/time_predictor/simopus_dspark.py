@@ -115,8 +115,8 @@ class SimOpusDSparkTimePredictor(InferTimePredictor):
             SimOpusNativeCostAdapter,
         )
         from sglang_simulator.time_predictor.simopus_sdk import load_sdk
-        from simopus.sdk.models.model_config import load_model_config
-        from simopus.sdk.models.umd import build_model_description
+        from simopus.sdk import load_model_config
+        from simopus.sdk import build_model_description
 
         package, sdk = load_sdk()
         _require(

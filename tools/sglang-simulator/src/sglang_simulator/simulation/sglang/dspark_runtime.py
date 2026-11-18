@@ -164,7 +164,7 @@ def capture_simulator_source_facts(native_batch):
 def sampling_snapshot(params):
     # The SDK owns the source-pinned field inventory; do not maintain a second
     # simulator sampling schema or discard normalized defaults.
-    from simopus.sdk.native_sampling import SAMPLING_FIELDS
+    from simopus.sdk import SAMPLING_FIELDS
 
     def builtins(value):
         if isinstance(value, dict):
