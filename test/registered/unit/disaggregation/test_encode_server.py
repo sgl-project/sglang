@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import pickle
 import threading
 import unittest
@@ -115,6 +116,31 @@ class TestEncoderDPErrorHandling(CustomTestCase):
             self.assertEqual(future.result(), valid)
 
         asyncio.run(run())
+
+
+class TestVideoDecoderCleanup(CustomTestCase):
+    def test_a_failed_qwen_decode_still_closes_the_reader(self):
+        preprocessor = EncoderPreprocessor.__new__(EncoderPreprocessor)
+        preprocessor.model_type = "qwen3_vl"
+        preprocessor.vision_config = {}
+        reader = SimpleNamespace(close=Mock())
+        loaded = concurrent.futures.Future()
+        loaded.set_result(reader)
+        preprocessor._submit_data_loading_tasks = lambda items, modalities: (
+            [loaded],
+            None,
+        )
+
+        async def failing_preprocess(video, video_config):
+            raise RuntimeError("decode failed")
+
+        with patch(
+            "sglang.srt.disaggregation.encoder.preprocessor.preprocess_video",
+            failing_preprocess,
+        ):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(preprocessor._flatten_and_load_videos([reader]))
+        reader.close.assert_called_once_with()
 
 
 class TestEncoderCacheIdentity(CustomTestCase):

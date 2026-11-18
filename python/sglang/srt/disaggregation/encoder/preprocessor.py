@@ -537,99 +537,100 @@ class EncoderPreprocessor:
         )
         async_futures = [asyncio.wrap_future(f) for f in futures]
         video_items = await asyncio.gather(*async_futures)
-
-        video_processor_kwargs = {}
-        if "qwen" in self.model_type:
-            video_processed = [
-                await preprocess_video(
-                    video, video_config=self.vision_config.get("video", {})
-                )
-                for video in video_items
-            ]
-            videos, video_metadata = map(list, zip(*video_processed))
-            video_processor_kwargs["do_sample_frames"] = False
-            if video_metadata:
-                video_processor_kwargs["video_metadata"] = video_metadata
-            return videos, video_processor_kwargs
-
-        if "glm" in self.model_type:
-            budget_kwargs = glm_budget_kwargs(
-                self.video_processor,
-                user_max_image_tokens=glm_max_image_tokens_from_configs(video_configs),
-                count=len(video_items),
-                split=True,
-            )
-            if budget_kwargs is not None:
-                video_processor_kwargs.update(budget_kwargs)
-                video_configs = [
-                    _glm_effective_presize_budget(
-                        config, budget_kwargs.get("max_image_tokens")
+        try:
+            video_processor_kwargs = {}
+            if "qwen" in self.model_type:
+                video_processed = [
+                    await preprocess_video(
+                        video, video_config=self.vision_config.get("video", {})
                     )
-                    for config in video_configs
+                    for video in video_items
                 ]
+                videos, video_metadata = map(list, zip(*video_processed))
+                video_processor_kwargs["do_sample_frames"] = False
+                if video_metadata:
+                    video_processor_kwargs["video_metadata"] = video_metadata
+                return videos, video_processor_kwargs
 
-            framed = any(isinstance(video, list) for video in video_items)
-            if framed:
-                processed = await asyncio.gather(
-                    *[
-                        asyncio.get_running_loop().run_in_executor(
-                            self.io_executor, preprocess_video_frames_sync, video
-                        )
-                        for video in video_items
-                    ]
+            if "glm" in self.model_type:
+                budget_kwargs = glm_budget_kwargs(
+                    self.video_processor,
+                    user_max_image_tokens=glm_max_image_tokens_from_configs(
+                        video_configs
+                    ),
+                    count=len(video_items),
+                    split=True,
                 )
-            else:
-                parallel = get_parallel()
-                tp_size = parallel.attn_tp_size
-                sampled = None
-                if len(video_items) == 1:
-                    vr = video_items[0]
-                    config = video_configs[0]
-                    sampled = glm_sample_frame_indices(
-                        len(vr),
-                        vr.avg_fps,
-                        len(vr) / vr.avg_fps if vr.avg_fps else 0,
-                        target_fps=config.get("fps"),
-                        max_frame_count=config.get("max_frames"),
-                    )
-                if (
-                    self.server_args.mm_enable_dp_encoder
-                    and tp_size > 1
-                    and sampled is not None
-                    and len(sampled) >= max(32, tp_size * 2)
-                ):
-                    result = await self._dp_sharded_decode_single_video(
-                        video_items[0],
-                        video_configs[0],
-                        video_processor_kwargs=video_processor_kwargs,
-                        precomputed_indices=sampled,
-                    )
-                    self._close_video_decoders(video_items)
-                    return result
+                if budget_kwargs is not None:
+                    video_processor_kwargs.update(budget_kwargs)
+                    video_configs = [
+                        _glm_effective_presize_budget(
+                            config, budget_kwargs.get("max_image_tokens")
+                        )
+                        for config in video_configs
+                    ]
 
-                processed = await asyncio.gather(
-                    *[
-                        asyncio.get_running_loop().run_in_executor(
-                            self.io_executor,
-                            glm_sample_and_decode_sync,
-                            video,
-                            video_configs[index],
+                framed = any(isinstance(video, list) for video in video_items)
+                if framed:
+                    processed = await asyncio.gather(
+                        *[
+                            asyncio.get_running_loop().run_in_executor(
+                                self.io_executor, preprocess_video_frames_sync, video
+                            )
+                            for video in video_items
+                        ]
+                    )
+                else:
+                    parallel = get_parallel()
+                    tp_size = parallel.attn_tp_size
+                    sampled = None
+                    if len(video_items) == 1:
+                        vr = video_items[0]
+                        config = video_configs[0]
+                        sampled = glm_sample_frame_indices(
+                            len(vr),
+                            vr.avg_fps,
+                            len(vr) / vr.avg_fps if vr.avg_fps else 0,
+                            target_fps=config.get("fps"),
+                            max_frame_count=config.get("max_frames"),
                         )
-                        for index, video in enumerate(video_items)
-                    ]
-                )
-            videos, video_metadata = map(list, zip(*processed))
-            video_processor_kwargs["do_sample_frames"] = False
-            video_processor_kwargs["return_metadata"] = True
-            if video_metadata:
-                video_processor_kwargs["video_metadata"] = video_metadata
+                    if (
+                        self.server_args.mm_enable_dp_encoder
+                        and tp_size > 1
+                        and sampled is not None
+                        and len(sampled) >= max(32, tp_size * 2)
+                    ):
+                        result = await self._dp_sharded_decode_single_video(
+                            video_items[0],
+                            video_configs[0],
+                            video_processor_kwargs=video_processor_kwargs,
+                            precomputed_indices=sampled,
+                        )
+                        return result
+
+                    processed = await asyncio.gather(
+                        *[
+                            asyncio.get_running_loop().run_in_executor(
+                                self.io_executor,
+                                glm_sample_and_decode_sync,
+                                video,
+                                video_configs[index],
+                            )
+                            for index, video in enumerate(video_items)
+                        ]
+                    )
+                videos, video_metadata = map(list, zip(*processed))
+                video_processor_kwargs["do_sample_frames"] = False
+                video_processor_kwargs["return_metadata"] = True
+                if video_metadata:
+                    video_processor_kwargs["video_metadata"] = video_metadata
+                return videos, video_processor_kwargs
+
+            raise NotImplementedError(
+                f"Video processing is not supported for {self.model_type} model."
+            )
+        finally:
             self._close_video_decoders(video_items)
-            return videos, video_processor_kwargs
-
-        self._close_video_decoders(video_items)
-        raise NotImplementedError(
-            f"Video processing is not supported for {self.model_type} model."
-        )
 
     async def _flatten_and_load_audios(self, mm_items):
         return await self._flatten_and_load_data_by_modality(mm_items, Modality.AUDIO)
