@@ -1050,7 +1050,7 @@ export const config = {
       verificationStatus: (s) => (s.spec === "dflash" ? "verified" : "in-progress"),
       env: [
         "SGLANG_USE_AITER=1",
-        "SGLANG_AITER_K3_OPT=1",
+        "SGLANG_OPT_HIP_K3_AITER=1",
         "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
         "SGLANG_AMD_MONO_K31_WIDE=1",
@@ -1093,7 +1093,7 @@ export const config = {
       verificationStatus: (s) => (s.spec === "dflash" && s.hicache === "amd-l2" ? "verified" : "in-progress"),
       env: [
         "SGLANG_USE_AITER=1",
-        "SGLANG_AITER_K3_OPT=1",
+        "SGLANG_OPT_HIP_K3_AITER=1",
         "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
         "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.95",
@@ -1135,7 +1135,7 @@ export const config = {
       verificationStatus: (s) => (s.spec === "dflash" && s.hicache === "amd-l2" ? "verified" : "in-progress"),
       env: [
         "SGLANG_USE_AITER=1",
-        "SGLANG_AITER_K3_OPT=1",
+        "SGLANG_OPT_HIP_K3_AITER=1",
         "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
         "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.95",
@@ -1191,7 +1191,7 @@ export const config = {
       verificationStatus: (s) => (s.spec === "dflash" ? "verified" : "in-progress"),
       env: [
         "SGLANG_USE_AITER=1",
-        "SGLANG_AITER_K3_OPT=1",
+        "SGLANG_OPT_HIP_K3_AITER=1",
         "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
         "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.99",
@@ -1238,7 +1238,7 @@ export const config = {
       verificationStatus: (s) => (s.spec === "dflash" ? "verified" : "in-progress"),
       env: [
         "SGLANG_USE_AITER=1",
-        "SGLANG_AITER_K3_OPT=1",
+        "SGLANG_OPT_HIP_K3_AITER=1",
         "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
         "SGLANG_AMD_MONO_K31_WIDE=1",
@@ -1281,7 +1281,7 @@ export const config = {
       verificationStatus: (s) => (s.spec === "dflash" && s.hicache === "amd-l2" ? "verified" : "in-progress"),
       env: [
         "SGLANG_USE_AITER=1",
-        "SGLANG_AITER_K3_OPT=1",
+        "SGLANG_OPT_HIP_K3_AITER=1",
         "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
         "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.95",
@@ -1323,7 +1323,7 @@ export const config = {
       verificationStatus: (s) => (s.spec === "dflash" && s.hicache === "amd-l2" ? "verified" : "in-progress"),
       env: [
         "SGLANG_USE_AITER=1",
-        "SGLANG_AITER_K3_OPT=1",
+        "SGLANG_OPT_HIP_K3_AITER=1",
         "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
         "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.95",
@@ -1379,7 +1379,7 @@ export const config = {
       verificationStatus: (s) => (s.spec === "dflash" ? "verified" : "in-progress"),
       env: [
         "SGLANG_USE_AITER=1",
-        "SGLANG_AITER_K3_OPT=1",
+        "SGLANG_OPT_HIP_K3_AITER=1",
         "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
         "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.99",
