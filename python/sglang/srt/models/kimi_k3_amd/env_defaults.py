@@ -55,5 +55,8 @@ def apply_kimi_k31_rocm_env_defaults() -> None:
     os.environ.setdefault("AITER_OPUS_STAGE2_FP8", "0")
     # the same experts as AITER's biased top-k, in under half its time
     os.environ.setdefault("SGLANG_K3_RADIX4_TOPK", "1")
+    # every rank loads the TreeCore the gfx950 image bundles instead of building its own,
+    # so no two ranks run different implementations and diverge on HiCache reclaim
+    os.environ.setdefault("SGLANG_RUST_BUILD_MODE", "never")
     if "AITER_CONFIG_GEMM_BF16" not in os.environ:
         os.environ["AITER_CONFIG_GEMM_BF16"] = write_k31_bf16_gemm_table()
