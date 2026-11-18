@@ -192,7 +192,7 @@ jobs:
       # The MMLU case is registered with nightly=True, so run_suite.py only
       # selects it when --nightly is passed. Keep the PR install path (above)
       # while still collecting nightly tests.
-      collect_nightly_tests: 'true'
+      collect_nightly_tests: true
       skip_pr_test_health_check: 'true'
     secrets: inherit
 
