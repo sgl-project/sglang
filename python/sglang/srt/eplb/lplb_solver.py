@@ -11,6 +11,11 @@ Design for DP-attention:
     broadcast is needed.  Empty-token ranks contribute zeros in the
     all-reduce so the collective never deadlocks.
 
+    On Ascend NPU, DeepEP exclusively owns the moe_ep group's HCCL
+    communication domain.  Running the count all-reduce on that group
+    contends with DeepEP and can hang, so callers pass ``allreduce_group``
+    (a dedicated process group spanning the same EP ranks) instead.
+
 Usage:
     solver = LPLBSolver(phy2log, log2phy, num_gpus, ep_group)
     log2phy_prob = solver.solve(topk_ids)  # per batch
@@ -90,6 +95,7 @@ class LPLBSolver:
         num_gpus: int,
         ep_group=None,
         logical_to_all_physical_map_num_valid=None,
+        allreduce_group=None,
     ):
         """
         Args:
@@ -98,10 +104,16 @@ class LPLBSolver:
             num_gpus: Number of GPUs in the EP group.
             ep_group: GroupCoordinator for EP communication (all-reduce).
             logical_to_all_physical_map_num_valid: (num_logical_experts,) number of valid physical copies.
+            allreduce_group: Optional raw ``torch.distributed.ProcessGroup``
+                spanning the EP ranks. When set, the per-batch count
+                all-reduce uses this group instead of ``ep_group``. Ascend NPU
+                passes a dedicated group here because DeepEP owns the moe_ep
+                group's HCCL communication domain.
         """
         device = phy2log.device
         self.num_gpus = num_gpus
         self.ep_group = ep_group
+        self.allreduce_group = allreduce_group
         self._has_redundancy = False
         if logical_to_all_physical_map_num_valid is not None:
             self._has_redundancy = bool(
@@ -213,6 +225,8 @@ class LPLBSolver:
         including empty-token ranks (which pass an empty topk_ids tensor).
         This ensures the all-reduce collective does not deadlock under
         DP-attention where different ranks may have different token counts.
+        The count all-reduce runs on ``allreduce_group`` when one was supplied,
+        otherwise on ``ep_group``.
 
         Args:
             topk_ids: (num_tokens, topk) int32 tensor of logical expert IDs.
@@ -242,12 +256,18 @@ class LPLBSolver:
         # All EP ranks must participate — empty-token ranks contribute zeros.
         # After all-reduce, every rank has identical global_counts and solves
         # the same LP independently, so no broadcast is needed.
+        # On Ascend NPU the dedicated ``allreduce_group`` is preferred: DeepEP
+        # owns the moe_ep group's HCCL communication domain and an all-reduce
+        # there would contend with it (and hang the DeepEP path).
         # GroupCoordinator.all_reduce may be in-place (pynccl) or out-of-place
         # (ca_comm / pymscclpp / ...) depending on tensor size; small tensors
         # like ours (~num_logical * 4 B) typically take the out-of-place path,
         # so we must capture the return value.
         global_counts = local_counts.float()
-        if self.ep_group is not None:
+        if self.allreduce_group is not None:
+            # Dedicated raw process group; the collective is in-place.
+            torch.distributed.all_reduce(global_counts, group=self.allreduce_group)
+        elif self.ep_group is not None:
             global_counts = self.ep_group.all_reduce(global_counts)
 
         # Step 3: Run LP solver

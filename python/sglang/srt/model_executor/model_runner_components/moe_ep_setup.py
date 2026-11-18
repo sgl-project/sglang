@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
+
+import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
@@ -18,7 +20,7 @@ from sglang.srt.layers.moe.topk import (
     is_routed_scaling_factor_fused_in_topk,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils import get_bool_env_var, is_hip, log_info_on_rank0
+from sglang.srt.utils import get_bool_env_var, is_hip, is_npu, log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -101,6 +103,48 @@ def prebuild_deepep_v2_buffer(*, model) -> None:
             return
 
 
+# Ascend NPU keeps a dedicated process group for LPLB's per-batch count
+# all-reduce: DeepEP owns the moe_ep group's HCCL communication domain, so a
+# collective on that group from another caller can hang the DeepEP path.
+# Cached because init_lplb_solvers() also runs after every EPLB rebalance.
+_lplb_allreduce_group: Optional[torch.distributed.ProcessGroup] = None
+_lplb_allreduce_group_source: Optional[torch.distributed.ProcessGroup] = None
+
+
+def _get_lplb_allreduce_group(ep_group) -> Optional[torch.distributed.ProcessGroup]:
+    """Return LPLB's dedicated all-reduce group, or None off Ascend NPU.
+
+    The group spans exactly the moe_ep ranks, so it yields the same global
+    token counts as an all-reduce on ``ep_group`` while leaving DeepEP's
+    communication domain untouched.
+    """
+    if not is_npu() or ep_group is None:
+        return None
+
+    # The source group's identity also invalidates the cache if model-parallel
+    # state is rebuilt in this process with the same ranks but a new group.
+    global _lplb_allreduce_group, _lplb_allreduce_group_source
+    source = ep_group.device_group
+    if _lplb_allreduce_group is None or _lplb_allreduce_group_source is not source:
+        ranks = tuple(torch.distributed.get_process_group_ranks(source))
+        if len(ranks) <= 1:
+            return None
+        from sglang.srt.distributed.parallel_state import create_custom_parallel_group
+
+        _lplb_allreduce_group = create_custom_parallel_group(
+            group_ranks=list(ranks),
+            backend=torch.distributed.get_backend(source),
+        )
+        _lplb_allreduce_group_source = source
+        assert _lplb_allreduce_group is not None
+        log_info_on_rank0(
+            logger,
+            "Initialized dedicated LPLB count all-reduce group over ranks "
+            f"{ranks}.",
+        )
+    return _lplb_allreduce_group
+
+
 def init_lplb_solvers(*, model_config: ModelConfig) -> None:
     """Initialize per-layer LPLB solvers from current expert location metadata."""
     from sglang.srt.runtime_context import get_parallel
@@ -117,6 +161,7 @@ def init_lplb_solvers(*, model_config: ModelConfig) -> None:
         return
     clear_global_lplb_solvers()
     ep_group = get_parallel().moe_ep_group
+    allreduce_group = _get_lplb_allreduce_group(ep_group)
     for lid in range(metadata.num_layers):
         solver = LPLBSolver(
             phy2log=metadata.physical_to_logical_map[lid],
@@ -126,6 +171,7 @@ def init_lplb_solvers(*, model_config: ModelConfig) -> None:
             logical_to_all_physical_map_num_valid=(
                 metadata.logical_to_all_physical_map_num_valid[lid]
             ),
+            allreduce_group=allreduce_group,
         )
         set_global_lplb_solver(lid, solver)
     logger.info(f"Initialized LPLB solvers for {metadata.num_layers} layers")
