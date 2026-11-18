@@ -16,7 +16,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import DEFAULT_MLA_MODEL_NAME_FOR_TEST
 
-register_amd_ci(est_time=600, suite="stage-b-test-large-8-gpu-mi35x-disaggregation-amd")
+register_amd_ci(est_time=600, suite="base-b-disaggregation-test-large-8-gpu-amd-mi35x")
 
 PAGE_SIZE = 64
 COMMON_ARGS = ["--attention-backend", "aiter", "--page-size", str(PAGE_SIZE)]
