@@ -49,6 +49,12 @@ class EPLBManager:
             get_exec().moe.eplb_rebalance_layers_per_chunk
         )
         self._rebalance_num_iterations = get_exec().moe.eplb_rebalance_num_iterations
+        self._first_rebalance_num_iterations = (
+            get_exec().moe.eplb_first_rebalance_num_iterations
+        )
+        # The first-rebalance delay covers only the first window after startup;
+        # a generator reset (e.g. elastic EP) uses the regular interval.
+        self._first_window_done = False
         self._rebalance_disabled_reason = None
         self._rebalance_disabled_logged = False
 
@@ -63,9 +69,10 @@ class EPLBManager:
         if not get_global_expert_distribution_recorder().recording:
             get_global_expert_distribution_recorder().start_record()
 
-        logger.info(
-            f"[EPLBManager] system started, will rebalance per {self._rebalance_num_iterations} iterations."
-        )
+        msg = f"[EPLBManager] system started, will rebalance per {self._rebalance_num_iterations} iterations"
+        if self._first_rebalance_num_iterations is not None:
+            msg += f", first after {self._first_rebalance_num_iterations} iterations"
+        logger.info(msg + ".")
 
         self._main_generator = self._entrypoint()
 
@@ -88,10 +95,16 @@ class EPLBManager:
     # can be more complex if needed
     def _entrypoint(self):
         while True:
-            for _ in range(self._rebalance_num_iterations):
+            for _ in range(self._next_rebalance_num_iterations()):
                 yield
+            self._first_window_done = True
 
             yield from self.rebalance()
+
+    def _next_rebalance_num_iterations(self) -> int:
+        if self._first_rebalance_num_iterations is None or self._first_window_done:
+            return self._rebalance_num_iterations
+        return self._first_rebalance_num_iterations
 
     def rebalance(self):
         if self._rebalance_disabled_reason is not None:
