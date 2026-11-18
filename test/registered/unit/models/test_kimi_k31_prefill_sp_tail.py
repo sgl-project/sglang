@@ -44,10 +44,11 @@ def _batch(mode=ForwardMode.EXTEND):
     return SimpleNamespace(forward_mode=mode)
 
 
-class _ExpertsSkippingTheQuant:
+class _Experts:
     quant_method = SimpleNamespace(hidden_size=64)
 
-    def __call__(self, x, topk_output):
+    def __call__(self, x, topk_output, pre_quant_input=None):
+        self.call = (x, topk_output, pre_quant_input)
         return torch.full((x.shape[0], 8), 2.0)
 
 
@@ -131,16 +132,25 @@ class TestK31PrefillSPTail(CustomTestCase):
             self.assertEqual(full.shape, (16, 6))
             torch.testing.assert_close(full[10:12], local)
 
-    def test_runner_that_skips_the_gathered_quant_fails(self):
-        with self.assertRaises(RuntimeError):
-            kimi_k3.KimiK3MoE._forward_routed_gathered(
-                SimpleNamespace(experts=_ExpertsSkippingTheQuant()),
-                torch.ones(3, 2),
-                torch.zeros(3, 2, dtype=torch.int32),
-                torch.empty(3, 64, dtype=torch.float8_e4m3fn),
-                torch.zeros(3, 2, dtype=torch.uint8),
-                torch.zeros(3, 8),
-            )
+    def test_gathered_quant_reaches_the_runner_as_its_pre_quant(self):
+        experts = _Experts()
+        weights = torch.ones(3, 2)
+        ids = torch.zeros(3, 2, dtype=torch.int32)
+        x_q = torch.empty(3, 64, dtype=torch.float8_e4m3fn)
+        x_s = torch.empty(3, 2, dtype=torch.float8_e4m3fn)
+        latent = torch.zeros(3, 8)
+
+        kimi_k3.KimiK3MoE._forward_routed_gathered(
+            SimpleNamespace(experts=experts), weights, ids, x_q, x_s, latent
+        )
+
+        x, topk_output, pre_quant = experts.call
+        self.assertEqual(tuple(x.shape), (3, 64))
+        self.assertIs(topk_output.topk_weights, weights)
+        self.assertIs(topk_output.topk_ids, ids)
+        self.assertIs(pre_quant.x_q, x_q)
+        self.assertIs(pre_quant.x_sf, x_s)
+        torch.testing.assert_close(latent, torch.full((3, 8), 2.0))
 
 
 if __name__ == "__main__":

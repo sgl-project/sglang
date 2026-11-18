@@ -100,6 +100,9 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+    Mxfp8RoutedInputPreQuant,
+)
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
@@ -1800,23 +1803,19 @@ class KimiK3MoE(nn.Module):
             weights[:num_tokens],
             ids[:num_tokens],
             x_q[:num_tokens].view(torch.float8_e4m3fn),
-            x_s[:num_tokens],
+            x_s[:num_tokens].view(torch.float8_e4m3fn),
         )
 
     def _forward_routed_gathered(self, weights, ids, x_q, x_s, latent):
-        # The runner reads only this tensor's shape: route_quant_handoff hands it
-        # the gathered quant.
-        x = latent.new_empty((1, 1)).expand(
+        shape_only = latent.new_empty((1, 1)).expand(
             x_q.shape[0], self.experts.quant_method.hidden_size
         )
-        route_quant_handoff.publish_quant(x, x_q, x_s)
-        try:
-            with zero_copy_context.set_moe_output(latent):
-                expert_output = self.experts(x, StandardTopKOutput(weights, ids, None))
-            if route_quant_handoff.take(x) is not None:
-                raise RuntimeError("The MoE runner did not take the gathered SP quant.")
-        finally:
-            route_quant_handoff.clear()
+        with zero_copy_context.set_moe_output(latent):
+            expert_output = self.experts(
+                shape_only,
+                StandardTopKOutput(weights, ids, None),
+                pre_quant_input=Mxfp8RoutedInputPreQuant(x_q, x_s, None),
+            )
         if expert_output.data_ptr() != latent.data_ptr():
             latent.copy_(expert_output)
 
@@ -1826,6 +1825,10 @@ class KimiK3MoE(nn.Module):
         prefix_sum: torch.Tensor,
         sp: _PrefillSP,
     ) -> torch.Tensor:
+        from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+            is_in_tc_piecewise_cuda_graph,
+        )
+
         if TYPE_CHECKING:
             assert (
                 self.routed_expert_up_proj is not None and self.alt_stream is not None
@@ -1833,7 +1836,8 @@ class KimiK3MoE(nn.Module):
         hidden_size = normed.shape[1]
         latent_size = self.moe_hidden_size
         num_tokens, padded = sp.num_tokens, sp.padded
-        own_rows = self._sp_routes_own_rows
+        # The MoE op of the piecewise TC graph drops pre_quant_input.
+        own_rows = self._sp_routes_own_rows and not is_in_tc_piecewise_cuda_graph()
         if own_rows:
             routed = self._sp_route_own_rows(normed, num_tokens)
         else:

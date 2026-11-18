@@ -77,8 +77,15 @@ def _is_sm107_supported() -> bool:
 
 
 def _prepare_flashinfer_mxfp8_activations(
-    x: torch.Tensor, hidden_size: int
+    x: torch.Tensor, hidden_size: int, pre_quant: Optional[tuple] = None
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+    if pre_quant is not None:
+        x_quant, x_scale, ready = pre_quant
+        assert x_quant.shape[0] == x.shape[0]
+        if ready is not None:
+            torch.cuda.current_stream().wait_event(ready)
+        return x, None, x_quant, x_scale
+
     prepared = None
     if x.shape[-1] == hidden_size:
         if x.dim() > 2:

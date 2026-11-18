@@ -1586,7 +1586,9 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
         )
 
         x, prepared_packed_topk, x_quant, x_scale = (
-            _prepare_flashinfer_mxfp8_activations(x, quant_info.hidden_size)
+            _prepare_flashinfer_mxfp8_activations(
+                x, quant_info.hidden_size, dispatch_output.hidden_states_pre_quant
+            )
         )
     else:
         raise NotImplementedError(
