@@ -9,7 +9,7 @@ import test_npu_ngram as ngram_checks
 from sglang.test.ascend.test_ascend_utils import DEEPSEEK_V2_LITE_W8A8_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=800, suite="nightly-1-npu-a3", nightly=True)
+register_npu_ci(est_time=800, suite="nightly-test-1-npu-a3", nightly=True)
 
 
 class TestNpuMlaNgram(ngram_checks.TestNpuNgram):

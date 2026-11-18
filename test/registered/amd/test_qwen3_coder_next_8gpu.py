@@ -5,7 +5,7 @@ on MI35x. Covers GSM8K accuracy and BS=1 decode speed.
 
 Server args match run_qwen3-coder-next_spec.sh.
 
-Registry: stage-c-test-large-8-gpu-amd-mi35x-qwen3-coder-next suite
+Registry: nightly-test-8-gpu-amd-mi35x suite (disabled)
 """
 
 import unittest
@@ -27,7 +27,7 @@ from sglang.test.test_utils import (
 
 register_amd_ci(
     est_time=450,
-    suite="nightly-amd-8-gpu-mi35x",
+    suite="nightly-test-8-gpu-amd-mi35x",
     nightly=True,
     disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
