@@ -289,6 +289,29 @@ impl SglangService for Mock {
         unimplemented!()
     }
 
+    async fn anthropic_messages(
+        &self,
+        _: Request<api::AnthropicMessagesRequest>,
+    ) -> Result<Response<api::AnthropicMessagesResponse>, Status> {
+        unimplemented!()
+    }
+
+    type AnthropicStreamMessagesStream = ItemStreamOf<api::AnthropicStreamEvent>;
+
+    async fn anthropic_stream_messages(
+        &self,
+        _: Request<api::AnthropicMessagesRequest>,
+    ) -> Result<Response<Self::AnthropicStreamMessagesStream>, Status> {
+        unimplemented!()
+    }
+
+    async fn anthropic_count_tokens(
+        &self,
+        _: Request<api::AnthropicCountTokensRequest>,
+    ) -> Result<Response<api::AnthropicCountTokensResponse>, Status> {
+        unimplemented!()
+    }
+
     async fn separate_reasoning(
         &self,
         _: Request<api::SeparateReasoningRequest>,

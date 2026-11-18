@@ -8,6 +8,7 @@ syntax = "proto3";
 
 package sglang.api.v1;
 
+import "sglang/api/v1/anthropic.proto";
 import "sglang/api/v1/control.proto";
 import "sglang/api/v1/corpus.proto";
 import "sglang/api/v1/generate.proto";
@@ -146,6 +147,13 @@ service SglangService {
   rpc OllamaGenerate(OllamaGenerateRequest) returns (stream OllamaGenerateResponse);
   rpc OllamaTags(OllamaTagsRequest) returns (OllamaTagsResponse);
   rpc OllamaShow(OllamaShowRequest) returns (OllamaShowResponse);
+
+  // Anthropic Messages data plane. The unary and streamed replies have
+  // different wire shapes, so they are two RPCs; `stream` in the request is
+  // ignored here (the RPC decides).
+  rpc AnthropicMessages(AnthropicMessagesRequest) returns (AnthropicMessagesResponse);
+  rpc AnthropicStreamMessages(AnthropicMessagesRequest) returns (stream AnthropicStreamEvent);
+  rpc AnthropicCountTokens(AnthropicCountTokensRequest) returns (AnthropicCountTokensResponse);
 }
 
 message ListModelsRequest {}
