@@ -1600,7 +1600,14 @@ def _build_sidecar_host_pool(
         config.buffer_info,
         layer_mapping=config.device_to_host_layer,
         target_device_layer_num=root.layer_num,
-        num_host_pages=root_host_pool.page_num,
+        # A replicated index-K spans every rank's slots, so the host mirror
+        # pages the widened transfer indices untranslated. A sharded one does
+        # not, and keeps the per-rank page count.
+        num_host_pages=(
+            root_host_pool.page_num
+            if dsa_shards_index_k()
+            else root_host_pool.page_num * root_host_pool.dcp_size
+        ),
         transfer_page_size=root_host_pool.page_size,
         layout=root_host_pool.layout,
         buffer_device=root.device,
@@ -1608,6 +1615,9 @@ def _build_sidecar_host_pool(
         layer_sharded=root.layer_shard_enabled,
         dcp_size=root_host_pool.dcp_size if dsa_shards_index_k() else 1,
         dcp_rank=root_host_pool.dcp_rank if dsa_shards_index_k() else 0,
+        # One L3 key covers the anchor's widened page either way: a sharded
+        # mirror spends one page per rank, a replicated one spends dcp_size.
+        storage_pages_per_key=(1 if dsa_shards_index_k() else root_host_pool.dcp_size),
         allocator_type=_get_allocator_type(),
     )
     host.start_layer, host.end_layer = root.start_layer, root.end_layer
