@@ -59,6 +59,13 @@ class CancellationRetirementRegistry:
     def create(self, cancellation_id: str, rid: str, instance_id: str) -> _Receipt:
         self._expire()
         if len(self._receipts) >= self.capacity:
+            for key in [
+                k for k, existing in self._receipts.items() if existing.result.done()
+            ]:
+                if len(self._receipts) < self.capacity:
+                    break
+                del self._receipts[key]
+        if len(self._receipts) >= self.capacity:
             raise ValueError("Cancellation receipt capacity reached; retry later")
         receipt = _Receipt(
             rid,

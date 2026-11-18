@@ -287,6 +287,32 @@ class TestCancelRetirementFrontend(unittest.IsolatedAsyncioTestCase):
         self._receipt(request)
         self.assertEqual((await self._cancel()).status_code, 200)
 
+    async def test_completed_receipts_evict_before_capacity_rejection(self):
+        registry = CancellationRetirementRegistry(capacity=256, ttl_seconds=300.0)
+        for i in range(256):
+            cid = f"done-{i}"
+            registry.create(cid, f"req-{i}", f"inst-{i}")
+            registry.resolve(
+                CancellationRetirementOutput(
+                    rid=f"req-{i}",
+                    cancellation_id=cid,
+                    request_instance_id=f"inst-{i}",
+                    status="retired",
+                )
+            )
+        # 257th sequential receipt succeeds by evicting the oldest completed entry.
+        receipt = registry.create("done-256", "req-256", "inst-256")
+        self.assertFalse(receipt.result.done())
+        self.assertIsNone(registry.lookup("done-0", "req-0"))
+        self.assertIsNotNone(registry.lookup("done-255", "req-255"))
+
+    async def test_unresolved_receipts_at_capacity_still_reject(self):
+        registry = CancellationRetirementRegistry(capacity=256, ttl_seconds=300.0)
+        for i in range(256):
+            registry.create(f"pending-{i}", f"req-{i}", f"inst-{i}")
+        with self.assertRaisesRegex(ValueError, "capacity"):
+            registry.create("pending-256", "req-256", "inst-256")
+
     async def test_expiry_returns_unknown_to_a_waiting_http_caller(self):
         self.tm._cancel_retirement_registry = CancellationRetirementRegistry(
             capacity=1, ttl_seconds=0
