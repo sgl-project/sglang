@@ -2,6 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_gfx95_supported
+
 
 def fp8_ds_mla_row_width(d_nope: int, d_rope: int) -> int:
     """Bytes per fp8_ds_mla KV row: FP8 NoPE, FP32 scale per 128 NoPE, BF16 RoPE."""
@@ -189,11 +191,11 @@ def _quantize_k_cache_fast_separate(
 
     assert num_tokens == num_tokens_, f"k_nope and k_rope must have same num_tokens"
 
-    # The kernel addresses rows by stride: column slices of the kv_a output
-    # (k_rope) need no copy, only a packed inner dim.
-    if k_nope.stride(-1) != 1:
+    # gfx950: the kernel addresses rows by stride, so column slices of the kv_a
+    # output (k_rope) need no copy, only a packed inner dim.
+    if not is_gfx95_supported() or k_nope.stride(-1) != 1:
         k_nope = k_nope.contiguous()
-    if k_rope.stride(-1) != 1:
+    if not is_gfx95_supported() or k_rope.stride(-1) != 1:
         k_rope = k_rope.contiguous()
 
     num_tiles = dim_nope // group_size

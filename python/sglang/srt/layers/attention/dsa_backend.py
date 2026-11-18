@@ -4258,7 +4258,6 @@ class DeepseekSparseAttnBackend(
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Attend the owned slots of the global top-k; one query row per token."""
         from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
-            lse_base2_for_dcp_merge,
             triton_sparse_mla_decode_splitk,
         )
 
@@ -4290,7 +4289,7 @@ class DeepseekSparseAttnBackend(
             return_lse=True,
             lengths=owned_counts,
         )
-        return out.view(rows, heads, v_head_dim), lse_base2_for_dcp_merge(lse)
+        return out.view(rows, heads, v_head_dim), lse
 
     def _forward_intel_xpu_sparse_decode(
         self,

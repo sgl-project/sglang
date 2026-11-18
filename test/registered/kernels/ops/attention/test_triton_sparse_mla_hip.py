@@ -24,7 +24,6 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
 from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
     _get_splitk_bufs,
     _splitk_bufs,
-    lse_base2_for_dcp_merge,
     triton_sparse_mla_decode_splitk,
 )
 from sglang.kernels.ops.quantization.dsa_quant_k_cache import quantize_k_cache
@@ -231,7 +230,6 @@ def test_dcp_owned_count_decode_merges_to_full_kv(fp8, heads, kv_splits):
             return_lse=True,
             lengths=owned_counts,
         )
-        lse = lse_base2_for_dcp_merge(lse)
         assert torch.isfinite(lse).all()
         outs.append(out[0].float())
         lses.append(lse)

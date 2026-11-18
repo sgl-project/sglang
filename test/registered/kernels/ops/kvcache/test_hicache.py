@@ -20,7 +20,7 @@ from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
@@ -395,8 +395,8 @@ def _run_page_first_staged_write_back_mha(
         element_size=element_dim * host_pool.dtype.itemsize,
     )
     assert host_pool.can_use_write_back_jit
-    # ROCm's direct copy tiles every 16-byte multiple (hicache._default_unroll)
-    if element_dim * host_pool.dtype.itemsize % 128 != 0 and not is_hip():
+    # gfx950's direct copy tiles every 16-byte multiple (hicache._default_unroll)
+    if element_dim * host_pool.dtype.itemsize % 128 != 0 and not is_gfx95_supported():
         assert not host_pool.can_use_jit
     assert host_pool.staging_page_capacity > 0
     if page_count > 64:
@@ -507,8 +507,8 @@ def _run_page_first_staged_write_back_mla(
         element_size=element_dim * host_pool.dtype.itemsize,
     )
     assert host_pool.can_use_write_back_jit
-    # ROCm's direct copy tiles every 16-byte multiple (hicache._default_unroll)
-    if element_dim * host_pool.dtype.itemsize % 128 != 0 and not is_hip():
+    # gfx950's direct copy tiles every 16-byte multiple (hicache._default_unroll)
+    if element_dim * host_pool.dtype.itemsize % 128 != 0 and not is_gfx95_supported():
         assert not host_pool.can_use_jit
     assert host_pool.staging_page_capacity > 0
     if page_count > 64:
