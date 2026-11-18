@@ -339,19 +339,14 @@ _TIMELESS_ROLES = (ROLE_CONTROL, ROLE_TARGET_CONDITION)
 def reusable_token_mask(plans: Sequence[ReplayPlan]) -> torch.Tensor:
     """Current-chunk tokens whose K/V and hidden states are the same in every forward of the chunk.
 
-    ``plans`` are the chunk's passes (noisy and clean) over one ring and one
-    caption set. A token qualifies when no pass embeds a timestep into it,
-    every pass admits it the same keys, and none of those keys is a
-    current-chunk token that does not qualify itself. The ring and the
-    captions do not change within a chunk, so every layer's output for such a
-    token is fixed by the chunk's first forward.
+    The ring and the captions do not change within a chunk, so every layer's
+    output for such a token is fixed by the chunk's first forward.
     """
     first = plans[0]
     num_runs = first.query_runs.num_runs
     for plan in plans:
         if plan.num_query_tokens != plan.num_current_tokens:
             raise ValueError("reusable_token_mask needs plans over the whole chunk.")
-        # The current-chunk key runs are the query runs, in the same order.
         if not torch.equal(plan.key_runs.start[:num_runs], plan.query_runs.start):
             raise RuntimeError("The current-chunk key runs are not the query runs.")
         if not (
@@ -462,8 +457,7 @@ def _project_blocks(streams: _PaddedStreams, block_size: tuple[int, int]) -> _Bl
     num_q_runs, num_k_runs = streams.allowed.shape
     q_presence = _presence(streams.q_ids, q_block, num_q_runs).to(torch.float32)
     # The padding query run admits every key but its rows are discarded, so it
-    # must not make a block visible: real rows would score such a block all
-    # -inf, which the online softmax accumulates as an exact no-op.
+    # must not add blocks that the real rows would only score -inf.
     q_presence[:, num_q_runs - 1] = 0.0
     k_presence = _presence(streams.k_ids, kv_block, num_k_runs).to(torch.float32)
     allowed = streams.allowed.to(torch.float32)
@@ -578,9 +572,8 @@ def build_replay_mask(
 def drop_unused_query_blocks(mask: ReplayMask, rows: torch.Tensor) -> ReplayMask:
     """``mask`` with empty key lists for the query blocks that hold none of ``rows``.
 
-    For a forward that reads only ``rows`` of the attention output. The other
-    blocks keep their key lists, so ``rows`` accumulate the same keys in the
-    same order as under ``mask``; the remaining rows come back unspecified.
+    ``rows`` accumulate the same keys in the same order as under ``mask``, and
+    the other rows come back unspecified.
     """
     if isinstance(mask, ReplayFa4Mask):
         sparsity = mask.sparsity
@@ -623,7 +616,6 @@ def drop_unused_query_blocks(mask: ReplayMask, rows: torch.Tensor) -> ReplayMask
 def _used_query_blocks(
     rows: torch.Tensor, *, q_block: int, padded_q_len: int, device: torch.device
 ) -> torch.Tensor:
-    """``[query blocks]`` bool: the blocks holding at least one of ``rows``."""
     used = torch.zeros(padded_q_len // q_block, dtype=torch.bool, device=rows.device)
     used[torch.div(rows, q_block, rounding_mode="floor")] = True
     return used.to(device)

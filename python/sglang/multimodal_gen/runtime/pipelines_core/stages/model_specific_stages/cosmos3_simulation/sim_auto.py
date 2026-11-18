@@ -340,9 +340,8 @@ class _Session(msgspec.Struct, eq=False, kw_only=True):
     und_kv: list[KVPair]
     ring: ReplayRing
     masks: dict[tuple[Any, ...], ReplayMask]
-    # Whether a chunk's later forwards may reuse its first one (ChunkReuse), and
-    # per plan key the tokens they still recompute; None when nothing is reusable.
     reuse_enabled: bool
+    # Per plan key, the rows later forwards recompute, None to run each in full.
     recomputed_rows: dict[tuple[Any, ...], torch.Tensor | None]
     device: torch.device
 
@@ -877,7 +876,6 @@ class Cosmos3SimAutoRolloutStage(PipelineStage):
         pass_kind: str,
         reuse: ChunkReuse | None = None,
     ) -> ReplayMask:
-        """The pass's mask for its next forward: once ``reuse`` is filled, only its rows are read."""
         key = (pass_kind, *self._plan_key(session, chunk, items))
         mask = session.masks.get(key)
         if mask is None:
@@ -898,7 +896,6 @@ class Cosmos3SimAutoRolloutStage(PipelineStage):
     def _chunk_reuse(
         self, session: _Session, chunk: Chunk, items: Sequence[StreamItem]
     ) -> ChunkReuse | None:
-        """Reuse state for the chunk's forwards, or ``None`` when each must run in full."""
         if not session.reuse_enabled:
             return None
         key = self._plan_key(session, chunk, items)
@@ -953,7 +950,6 @@ class Cosmos3SimAutoRolloutStage(PipelineStage):
         lidar_target = items[3] if len(items) == 4 else None
         noisy_rgb = rgb_target.generated_frames
         noisy_sweeps = lidar_target.generated_frames if lidar_target is not None else ()
-        # Shared by the chunk's denoising steps and its commit; dropped with the chunk.
         reuse = None
         if noisy_rgb or noisy_sweeps:
             reuse = self._chunk_reuse(session, chunk, items)

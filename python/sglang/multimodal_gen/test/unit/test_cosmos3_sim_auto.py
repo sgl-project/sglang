@@ -789,9 +789,7 @@ class TestBlockMask(unittest.TestCase):
         self._check(_wide_plan())
 
     def test_fa4_tiles_and_both_table_forms_resolve_the_predicate(self):
-        """Hopper (128x128) and Blackwell (256x128) maps classify tiles like the
-        predicate, and the key-expanded bytes and the packed words a table past
-        int32 offsets falls back to both answer every pair like it."""
+        """Hopper (128x128) and Blackwell (256x128) maps classify tiles like the predicate."""
         plans = (
             _plan(2, PASS_NOISY, joint=True, lengths=(9, 13), sink=4)[0],
             _wide_plan(grid=SensorGrid(9, 11, 1, 1), lengths=(130, 70, 90)),
@@ -883,7 +881,6 @@ class TestBlockMask(unittest.TestCase):
 
 
 def _listed_blocks(counts, indices):
-    """``[query blocks, key blocks]`` bool: the key blocks each query block's list holds."""
     listed = torch.zeros(indices.shape, dtype=torch.bool)
     for q_block, count in enumerate(counts.tolist()):
         listed[q_block, indices[q_block, :count].long()] = True
@@ -892,11 +889,8 @@ def _listed_blocks(counts, indices):
 
 class TestPaddingRows(unittest.TestCase):
     def test_padding_rows_make_no_key_block_visible(self):
-        """A query block lists exactly the key blocks a real row of it may read.
-
-        The padding rows that fill the last block admit every key; counting them
-        made that block visit the whole key stream, empty ring slots included.
-        """
+        """A query block lists exactly the key blocks a real row of it may read,
+        also when the last block is filled with padding rows that admit every key."""
         plan = _wide_plan()
         cpu = torch.device("cpu")
         fa4 = build_replay_fa4_mask(plan, device=cpu, block_size=(128, 128)).sparsity
@@ -972,16 +966,13 @@ def _replay_layer(hidden, heads, kv_heads, head_dim):
 
 
 def _positional_shift(q, k, norm_q, norm_k, head_dim, cos_sin_cache, positions):
-    """Stand-in for the fused qk-norm and RoPE: a per-position offset on Q and K."""
+    """Position-sensitive stand-in for ``_apply_qwen3_qk_norm_rope``."""
     shift = cos_sin_cache[positions].view(1, -1, 1, head_dim)
     return q + shift, k + shift
 
 
 class TestChunkReuse(unittest.TestCase):
-    """Which tokens a chunk's later forwards take from its first, and that taking them changes no row."""
-
     def test_reusable_tokens_are_the_ones_the_timestep_never_reaches(self):
-        """The replay predicate and the embedder must agree on which tokens stay fixed."""
         for step, joint in ((1, False), (2, True)):
             with self.subTest(step=step, joint=joint):
                 plans, items = [], None
@@ -999,7 +990,6 @@ class TestChunkReuse(unittest.TestCase):
                 reusable = reusable_token_mask(plans)
                 self.assertTrue(torch.equal(reusable, ~embedded))
                 self.assertTrue(bool(reusable.any()) and not bool(reusable.all()))
-                # In both passes a reused token reads the same keys, none recomputed.
                 recomputed = torch.zeros(plans[0].num_key_tokens, dtype=torch.bool)
                 recomputed[: plans[0].num_current_tokens] = ~reusable
                 noisy, clean = (_dense_token_mask(plan) for plan in plans)
@@ -1026,7 +1016,6 @@ class TestChunkReuse(unittest.TestCase):
         reusable_runs[noisy.query_run_ids[reusable_token_mask(changed)].unique()] = True
         self.assertTrue(torch.equal(reusable_runs, controls & (runs.view_id != 0)))
 
-        # The passes disagree on what one control run reads (an extra ring run).
         changed = plans()
         unread = torch.nonzero(~changed[0].allowed[victim, runs.num_runs :])
         ring_run = runs.num_runs + int(unread[0])
@@ -1072,9 +1061,6 @@ class TestChunkReuse(unittest.TestCase):
         )
 
     def test_later_forwards_match_full_forwards(self):
-        """A forward that recomputes only the tokens the timestep reaches returns
-        the predictions and chunk K/V of a full forward, and a K/V-only forward
-        returns the K/V alone."""
         torch.manual_seed(5)
         hidden_size, heads, kv_heads, head_dim = 16, 4, 2, 4
         noisy_plan, items, frame_unit, _ = _plan(1, PASS_NOISY)
@@ -1150,7 +1136,6 @@ class TestChunkReuse(unittest.TestCase):
             actual = forward(hidden, mask, reuse=reuse)
             torch.testing.assert_close(actual.targets, expected.targets, **close)
             assert_same_kv(actual.current_kv, expected.current_kv, **close)
-        # later forwards update the first forward's K/V in place
         self.assertIs(actual.current_kv[0][0], reuse.layer_kv[0][0])
 
         hidden = base.clone()
