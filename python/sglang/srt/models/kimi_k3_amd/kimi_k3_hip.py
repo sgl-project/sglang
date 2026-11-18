@@ -7,6 +7,11 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream
+from sglang.srt.layers.layer_boundary.residual.attn_bank import _bank_rows
+from sglang.srt.layers.layer_boundary.residual.attn_bank_hip import gather_row_shards
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.unquant_hip import (
     a16w16_into,
     a16w16_tgemm,
@@ -42,3 +47,27 @@ def mono_output_gate_hip(pre: dict, alt: Optional[torch.cuda.Stream]) -> torch.T
     if alt is not None:
         torch.cuda.current_stream().wait_stream(alt)
     return pre["gate"]
+
+
+def aggregate_stream_hip(
+    bank: AttnResidual,
+    hidden_states: torch.Tensor,
+    nvb: int,
+    score_proj: ReplicatedLinear,
+    score_norm: RMSNorm,
+) -> torch.Tensor:
+    """aggregate_stream of ``bank``'s stream on every row. Off a stream the row-sharded
+    MoE tail left on this rank's rows, it aggregates those bank rows and gathers the
+    mixture, keeping the bank sharded."""
+    rows = _bank_rows(bank, hidden_states)
+    mixed = aggregate_stream(
+        hidden_states,
+        bank.block_residual if rows is None else bank.block_residual[rows],
+        nvb,
+        score_proj,
+        score_norm,
+    )
+    if rows is None:
+        return mixed
+    # the draft reads every row
+    return gather_row_shards(mixed, bank.block_residual.shape[0])
