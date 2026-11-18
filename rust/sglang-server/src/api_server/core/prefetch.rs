@@ -76,13 +76,22 @@ pub async fn prefetch_all(
             else {
                 continue;
             };
-            let count = items.len();
+            let extra = mm.decoded.as_ref().map_or(0, |input| match name {
+                "image" => input.descriptor.images.len(),
+                "video" => input.descriptor.videos.len(),
+                "audio" => input.descriptor.audios.len(),
+                _ => 0,
+            });
+            let count = items.len().saturating_add(extra);
             if count > *limit {
                 let display = name[..1].to_uppercase() + &name[1..];
                 return Err(MediaError::Client(format!(
                     "{display} count {count} exceeds limit {limit} per request."
                 )));
             }
+        }
+        if mm.decoded.is_some() && processor.is_none() {
+            return Err(MediaError::Client("decoded_media is disabled".into()));
         }
         if let Some(processor) = processor {
             processor.check_media(mm).map_err(MediaError::Client)?;
@@ -100,6 +109,32 @@ pub async fn prefetch_all(
         .iter()
         .map(|r| plan(&r.mm))
         .collect::<Result<Vec<_>, MediaError>>()?;
+    for request in requests.iter_mut() {
+        let Some(mm) = request.mm.as_mut() else {
+            continue;
+        };
+        if let Some(mut input) = mm.decoded.take() {
+            let processor = processor
+                .cloned()
+                .ok_or_else(|| MediaError::Client("decoded_media is disabled".into()))?;
+            // No scheduler I/O and no unbounded thread creation. On RPC/Abort
+            // cancellation the blocking reader retains its own byte lease.
+            let permit = PERMITS
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| MediaError::Server("media prefetch stopped".into()))?;
+            mm.decoded = Some(
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    processor.prepare_decoded(&mut input)?;
+                    Ok::<_, MediaError>(input)
+                })
+                .await
+                .map_err(|_| MediaError::Server("decoded media reader failed".into()))??,
+            );
+        }
+    }
     let fetches = plans.into_iter().map(|sources| async {
         let started = Instant::now();
         let fetched =

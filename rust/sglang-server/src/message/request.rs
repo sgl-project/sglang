@@ -113,6 +113,7 @@ pub fn into_requests(
         routed_dp_rank,
         disagg_prefill_dp_rank,
         image_data,
+        decoded_media,
         mm_hashes,
         video_data,
         audio_data,
@@ -400,6 +401,17 @@ pub fn into_requests(
     let videos = multimodal::fan_out(video_data, n, is_batch, "video_data")?;
     let audios = multimodal::fan_out(audio_data, n, is_batch, "audio_data")?;
 
+    if decoded_media.is_some()
+        && (is_batch
+            || !mm_hashes.is_empty()
+            || images.iter().any(|v| !v.is_empty())
+            || videos.iter().any(|v| !v.is_empty())
+            || audios.iter().any(|v| !v.is_empty()))
+    {
+        return Err(Error::Validation(
+            "decoded_media requires one prompt and cannot mix with encoded media".into(),
+        ));
+    }
     // Every column above is exactly `n` long, so zip them by value: each
     // request takes ownership of its cell, with no indexing or bounds checks.
     if let Some(value) = &routing_key {
@@ -512,6 +524,11 @@ pub fn into_requests(
     // dropped here and warned about in `mm::apply_caller_hashes`, never a 400.
     if let Some(mm) = requests.first_mut().and_then(|req| req.mm.as_deref_mut()) {
         mm.mm_hashes = mm_hashes;
+    }
+    if let Some(media) = decoded_media {
+        requests[0].mm.get_or_insert_with(Default::default).decoded = Some(Box::new(
+            crate::multi_modality::decoded::DecodedInput::new(media)?,
+        ));
     }
     Ok((requests, is_batch))
 }
@@ -808,6 +825,7 @@ impl TryFrom<api_v1::KvHintsEnvelope> for KvHintsEnvelope {
 /// `prefetched` field, everything else gets it packed inside a `GenerateRequest`.
 #[derive(Debug, Default)]
 pub struct MmData {
+    pub decoded: Option<Box<crate::multi_modality::decoded::DecodedInput>>,
     pub image_data: Vec<MmItem>,
     pub video_data: Vec<MmItem>,
     pub audio_data: Vec<MmItem>,
@@ -855,7 +873,10 @@ impl GenerateRequest {
     /// Python `GenerateReqInput.contains_mm_input()`.
     pub fn has_multimodal(&self) -> bool {
         self.mm.as_ref().is_some_and(|mm| {
-            !mm.image_data.is_empty() || !mm.video_data.is_empty() || !mm.audio_data.is_empty()
+            !mm.image_data.is_empty()
+                || !mm.video_data.is_empty()
+                || !mm.audio_data.is_empty()
+                || mm.decoded.is_some()
         })
     }
 

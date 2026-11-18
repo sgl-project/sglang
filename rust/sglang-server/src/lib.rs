@@ -250,6 +250,18 @@ impl Server {
             .collect()
     }
 
+    /// Enable a same-host decoded RGB source on the existing native MM pool.
+    pub fn start_decoded_mm_workers(
+        &self,
+        spec: MmSpec,
+        root: &str,
+        workers: usize,
+    ) -> PyResult<()> {
+        self.rt
+            .start_decoded_mm_workers(spec, root, workers)
+            .map_err(|e| value_error("decoded media", e))
+    }
+
     /// Park up to `timeout_ms` for an incoming request so the idle scheduler loop
     /// sleeps instead of spinning at 100% CPU.
     #[pyo3(signature = (timeout_ms = 1000))]

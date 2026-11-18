@@ -78,6 +78,9 @@ pub struct MmRequestInfo<'a> {
 /// any other exception a 500.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum MediaError {
+    /// Temporary bounded admission pressure (429 / RESOURCE_EXHAUSTED).
+    #[error("{0}")]
+    Capacity(String),
     /// Bad input from the client (400).
     #[error("{0}")]
     Client(String),
@@ -103,8 +106,18 @@ pub trait MmProcessor: Send + Sync {
     /// Reject a request's media before any of it is fetched, e.g. a modality
     /// the served model cannot encode. `Err` is a client error (400). Runs on
     /// an async worker, so it must not block.
-    fn check_media(&self, _mm: &MmData) -> Result<(), String> {
+    fn check_media(&self, mm: &MmData) -> Result<(), String> {
+        if mm.decoded.is_some() {
+            return Err("decoded_media is disabled for this processor".into());
+        }
         Ok(())
+    }
+
+    /// Optional same-host source import, on the bounded blocking admission pool.
+    fn prepare_decoded(&self, _input: &mut super::decoded::DecodedInput) -> Result<(), MediaError> {
+        Err(MediaError::Client(
+            "decoded_media is disabled for this processor".into(),
+        ))
     }
 
     /// One I/O-backed source the processor already holds (e.g. in a cache),
@@ -177,14 +190,59 @@ pub trait MmProcessor: Send + Sync {
 /// request's resolved media bytes.
 struct ImageMmProcessor {
     pipeline: sglang_processor::MmProcessor,
+    decoded: Option<super::decoded::DecodedStore>,
 }
 
 impl MmProcessor for ImageMmProcessor {
-    fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, MediaError> {
+    fn check_media(&self, mm: &MmData) -> Result<(), String> {
+        if let Some(input) = &mm.decoded {
+            self.decoded
+                .as_ref()
+                .ok_or("decoded_media is disabled")?
+                .check(input)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_decoded(&self, input: &mut super::decoded::DecodedInput) -> Result<(), MediaError> {
+        self.decoded
+            .as_ref()
+            .ok_or_else(|| MediaError::Client("decoded_media is disabled".into()))?
+            .snapshot(input)
+    }
+
+    fn process(&self, input_ids: TokenIds, mut mm: MmData) -> Result<MmProcessOutput, MediaError> {
         if !mm.video_data.is_empty() || !mm.audio_data.is_empty() {
             return Err(MediaError::Client(
                 "unsupported modality: video/audio input".into(),
             ));
+        }
+        if let Some(mut input) = mm.decoded.take() {
+            self.decoded
+                .as_ref()
+                .ok_or_else(|| MediaError::Client("decoded_media is disabled".into()))?
+                .check(&input)
+                .map_err(MediaError::Client)?;
+            let ids = input_ids
+                .iter()
+                .map(|&id| {
+                    i32::try_from(id)
+                        .map_err(|_| MediaError::Client("token id out of range".into()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let images = input.take_images()?;
+            let output = self
+                .pipeline
+                .process_decoded_images(&ids, images)
+                .map_err(|error| match error {
+                    sglang_processor::ProcessorError::Internal(message) => {
+                        MediaError::Server(message)
+                    }
+                    error => MediaError::Client(error.to_string()),
+                })?;
+            // The snapshot byte allowance spans preprocessing, not just I/O.
+            drop(input);
+            return encode_output(output).map_err(MediaError::Server);
         }
         let media = super::payload::resolve_media_work(input_ids, mm)?;
         let input_ids = (media.input_ids.iter())
@@ -296,10 +354,17 @@ pub struct MmContext {
 
 impl MmContext {
     pub fn new(spec: MmSpec) -> Result<Self, String> {
+        Self::new_with_decoded(spec, None)
+    }
+
+    pub(crate) fn new_with_decoded(
+        spec: MmSpec,
+        decoded: Option<super::decoded::DecodedStore>,
+    ) -> Result<Self, String> {
         let pipeline =
             sglang_processor::MmProcessor::from_spec(spec.pipeline).map_err(|e| e.to_string())?;
         Ok(Self {
-            processor: Arc::new(ImageMmProcessor { pipeline }),
+            processor: Arc::new(ImageMmProcessor { pipeline, decoded }),
             feature_shm: spec.feature_shm,
             limits: None,
         })
@@ -406,6 +471,7 @@ fn process(
     input_ids: TokenIds,
     mut mm: MmData,
 ) -> Result<(TokenIds, Vec<Buffer>), Error> {
+    let is_decoded = mm.decoded.is_some();
     let caller_hashes = std::mem::take(&mut mm.mm_hashes);
     let mut output = ctx
         .processor
@@ -433,10 +499,16 @@ fn process(
     // Intake fits the ids to the context (`check_total_tokens`) before the
     // scheduler sees them; fit them first, so `processed` sees the same ids. A
     // prompt intake will reject is not observed.
+    let original_len = output.input_ids.len();
     let fits = ctx
         .limits
         .as_ref()
         .is_none_or(|limits| fit_input(&mut output.input_ids, limits).is_ok());
+    if is_decoded && output.input_ids.len() != original_len {
+        return Err(Error::Validation(
+            "cannot auto-truncate decoded-media token layout".into(),
+        ));
+    }
     if fits {
         ctx.processor
             .try_processed(request, &output)
@@ -867,6 +939,244 @@ mod tests {
         runtime_rid: "r",
         bootstrap_room: None,
     };
+
+    /// A real source snapshot reaches the normal native feature/ring format,
+    /// with the same preprocessing and cache identity as its encoded control.
+    #[test]
+    fn decoded_rgb_snapshot_preserves_native_ring_output_after_producer_unlink() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use sglang_api_types::api::v1 as api;
+        use sglang_processor::dynamo_multimodal::image::decode::{DecodeLimits, decode_rgb};
+        use sglang_processor::dynamo_multimodal::{MediaDtype, content_hash_canonical_image};
+
+        use crate::message::multimodal::MmItem;
+        use crate::multi_modality::decoded::{DecodedInput, DecodedStore};
+
+        struct Root(std::path::PathBuf);
+        impl Drop for Root {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root =
+            Root(std::env::temp_dir().join(format!("sglang-native-rgb-{}", uuid::Uuid::new_v4())));
+        std::fs::create_dir(&root.0).unwrap();
+        std::fs::set_permissions(&root.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../sglang-processor/tests/fixtures/mm_parity");
+        let fixture: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(fixtures.join("qwen2.5-vl-3b-instruct.json")).unwrap(),
+        )
+        .unwrap();
+        let case = &fixture["cases"][0];
+        let input_ids: TokenIds = case["input_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_i64().unwrap())
+            .collect();
+        let encoded_path = fixtures
+            .join("images")
+            .join(case["images"][0].as_str().unwrap());
+        let encoded = std::fs::read(&encoded_path).unwrap();
+        let (rgb, height, width) = decode_rgb(&encoded, &DecodeLimits::default()).unwrap();
+        let source_hash = content_hash_canonical_image(&[height, width, 3], MediaDtype::U8, &rgb);
+
+        // Nonzero offset, row padding and unrelated trailing object bytes must
+        // not reach preprocessing or affect the image's source/cache identity.
+        let offset = 19;
+        let padding = 7;
+        let row = width * 3;
+        let mut stored = vec![91; offset];
+        for pixels in rgb.chunks_exact(row) {
+            stored.extend_from_slice(pixels);
+            stored.extend_from_slice(&[37; 7]);
+        }
+        let length = stored.len() - offset;
+        stored.extend_from_slice(&[63; 13]);
+        let object = format!("rgb-object-{}", uuid::Uuid::new_v4());
+        let object_path = root.0.join(&object);
+        std::fs::write(&object_path, &stored).unwrap();
+
+        let processor = Arc::new(ImageMmProcessor {
+            pipeline: sglang_processor::MmProcessor::from_spec(
+                serde_json::from_value(case["spec"].clone()).unwrap(),
+            )
+            .unwrap(),
+            decoded: Some(DecodedStore::new(root.0.to_str().unwrap(), "boot".into()).unwrap()),
+        });
+        let mut mm = MmData {
+            decoded: Some(Box::new(
+                DecodedInput::new(api::DecodedMediaInput {
+                    images: vec![api::DecodedImage {
+                        width: width as u32,
+                        height: height as u32,
+                        row_stride_bytes: (row + padding) as u64,
+                        pixel_format: "rgb8".into(),
+                        payload: Some(api::MediaPayloadReference {
+                            mounted_shm: Some(api::MountedSharedMemoryRegion {
+                                object_id: object,
+                                offset_bytes: offset as u64,
+                                length_bytes: length as u64,
+                                engine_instance_id: "boot".into(),
+                            }),
+                        }),
+                    }],
+                    ..Default::default()
+                })
+                .unwrap(),
+            )),
+            ..Default::default()
+        };
+        let consumed = mm.decoded.as_ref().unwrap().consumed.clone();
+        assert!(!consumed.load(std::sync::atomic::Ordering::Acquire));
+        processor.check_media(&mm).unwrap();
+        processor
+            .prepare_decoded(mm.decoded.as_mut().unwrap())
+            .unwrap();
+        assert!(consumed.load(std::sync::atomic::Ordering::Acquire));
+        std::fs::remove_file(&object_path).unwrap();
+
+        let ctx = MmContext::with_processor(processor, false);
+        let (actual_ids, actual_buffers) = process(
+            &ctx,
+            MmRequestInfo {
+                rid: "prefill-rid",
+                runtime_rid: "prefill-runtime-rid",
+                bootstrap_room: Some(42),
+            },
+            input_ids.clone(),
+            mm,
+        )
+        .unwrap();
+        let (expected_ids, expected_buffers) = process(
+            &ctx,
+            NO_REQUEST,
+            input_ids.clone(),
+            MmData {
+                image_data: vec![MmItem::Source(encoded_path.to_str().unwrap().into())],
+                prefetched: vec![encoded.into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(actual_ids, expected_ids);
+        assert_eq!(
+            actual_buffers.iter().map(|b| &b.name).collect::<Vec<_>>(),
+            expected_buffers.iter().map(|b| &b.name).collect::<Vec<_>>()
+        );
+        for name in ["mm.feature.0", "mm.mrope"] {
+            let actual = find(&actual_buffers, name).unwrap();
+            let expected = find(&expected_buffers, name).unwrap();
+            assert_eq!(actual.shape, expected.shape);
+            let (BufferStore::Inline(actual), BufferStore::Inline(expected)) =
+                (&actual.store, &expected.store)
+            else {
+                panic!("expected native inline buffers")
+            };
+            assert_eq!(actual.dtype(), expected.dtype());
+            assert_eq!(actual.as_bytes(), expected.as_bytes(), "{name}");
+        }
+        let mut actual_meta: serde_json::Value =
+            rmpv::ext::from_value(decoded_meta(&actual_buffers)).unwrap();
+        let mut expected_meta: serde_json::Value =
+            rmpv::ext::from_value(decoded_meta(&expected_buffers)).unwrap();
+        assert_eq!(actual_meta["items"][0]["hash"].as_u64(), Some(source_hash));
+        assert_eq!(
+            actual_meta["items"][0]["identity"]
+                .as_array()
+                .unwrap()
+                .len(),
+            32
+        );
+        // Legacy source hashes differ between encoded bytes and canonical RGB;
+        // all real feature identities and scheduler-facing semantics must agree.
+        actual_meta["items"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("hash");
+        expected_meta["items"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("hash");
+        assert_eq!(actual_meta, expected_meta);
+
+        // Decode receives the same pixels through its own root, object name,
+        // runtime epoch and request identity. None may change expanded ids,
+        // feature identity/hash, item offsets, M-RoPE positions or delta.
+        let decode_root =
+            Root(std::env::temp_dir().join(format!("sglang-native-rgb-{}", uuid::Uuid::new_v4())));
+        std::fs::create_dir(&decode_root.0).unwrap();
+        std::fs::set_permissions(&decode_root.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let decode_object = format!("decode-object-{}", uuid::Uuid::new_v4());
+        let decode_path = decode_root.0.join(&decode_object);
+        std::fs::write(&decode_path, stored).unwrap();
+        let decode_processor = Arc::new(ImageMmProcessor {
+            pipeline: sglang_processor::MmProcessor::from_spec(
+                serde_json::from_value(case["spec"].clone()).unwrap(),
+            )
+            .unwrap(),
+            decoded: Some(
+                DecodedStore::new(decode_root.0.to_str().unwrap(), "decode-boot".into()).unwrap(),
+            ),
+        });
+        let mut decode_mm = MmData {
+            decoded: Some(Box::new(
+                DecodedInput::new(api::DecodedMediaInput {
+                    images: vec![api::DecodedImage {
+                        width: width as u32,
+                        height: height as u32,
+                        row_stride_bytes: (row + padding) as u64,
+                        pixel_format: "rgb8".into(),
+                        payload: Some(api::MediaPayloadReference {
+                            mounted_shm: Some(api::MountedSharedMemoryRegion {
+                                object_id: decode_object,
+                                offset_bytes: offset as u64,
+                                length_bytes: length as u64,
+                                engine_instance_id: "decode-boot".into(),
+                            }),
+                        }),
+                    }],
+                    ..Default::default()
+                })
+                .unwrap(),
+            )),
+            ..Default::default()
+        };
+        let decode_consumed = decode_mm.decoded.as_ref().unwrap().consumed.clone();
+        assert!(!decode_consumed.load(std::sync::atomic::Ordering::Acquire));
+        decode_processor
+            .prepare_decoded(decode_mm.decoded.as_mut().unwrap())
+            .unwrap();
+        assert!(decode_consumed.load(std::sync::atomic::Ordering::Acquire));
+        std::fs::remove_file(&decode_path).unwrap();
+        let (decode_ids, decode_buffers) = process(
+            &MmContext::with_processor(decode_processor, false),
+            MmRequestInfo {
+                rid: "decode-rid",
+                runtime_rid: "decode-runtime-rid",
+                bootstrap_room: Some(42),
+            },
+            input_ids,
+            decode_mm,
+        )
+        .unwrap();
+        assert_eq!(actual_ids, decode_ids);
+        assert_eq!(actual_buffers.len(), decode_buffers.len());
+        for (prefill, decode) in actual_buffers.iter().zip(&decode_buffers) {
+            assert_eq!(prefill.name, decode.name);
+            assert_eq!(prefill.shape, decode.shape);
+            let (BufferStore::Inline(prefill), BufferStore::Inline(decode)) =
+                (&prefill.store, &decode.store)
+            else {
+                panic!("expected single-rank inline buffers")
+            };
+            assert_eq!(prefill.dtype(), decode.dtype());
+            assert_eq!(prefill.as_bytes(), decode.as_bytes());
+        }
+    }
 
     /// An external processor's result rides the same buffers: its tensor's
     /// dtype and shape are kept, the caller hash override applies, and the

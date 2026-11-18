@@ -296,6 +296,19 @@ class RustServer:
         model package whose ``_start_multimodal`` starts its own pipeline
         overrides this to return ``None``; its server admits no generation
         request until that pipeline starts."""
+        if envs.SGLANG_DECODED_MEDIA_SHM_ROOT.get():
+            parallel = get_parallel()
+            if (
+                any(
+                    getattr(parallel, name) != 1
+                    for name in ("nnodes", "tp_size", "dp_size", "pp_size")
+                )
+                or parallel.attn_dp_enabled
+            ):
+                raise ValueError(
+                    "decoded RGB SHM currently requires single-node "
+                    "single-rank serving per engine"
+                )
         mm_spec = RustMmProcessor(
             server_args=scheduler.server_args,
             model_config=scheduler.model_config,
@@ -316,6 +329,13 @@ class RustServer:
     def _start_multimodal(self, scheduler: Scheduler) -> None:
         """Start the Rust workers for the pipeline ``launch`` resolved."""
         assert self.mm_spec is not None
+        if root := envs.SGLANG_DECODED_MEDIA_SHM_ROOT.get():
+            self.server.start_decoded_mm_workers(
+                self._build_mm_spec(self.mm_spec),
+                root,
+                get_mm().mm_processor_worker_num or RustMmProcessor.AUTO_MM_WORKERS,
+            )
+            return
         self.server.start_mm_workers(
             self._build_mm_spec(self.mm_spec),
             get_mm().mm_processor_worker_num or RustMmProcessor.AUTO_MM_WORKERS,

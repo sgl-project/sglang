@@ -592,6 +592,528 @@ impl<'de> ::serde::Deserialize<'de> for ErrorBody {
     }
 }
 
+impl ::serde::Serialize for DecodedMediaInput {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if !self.images.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "images", &self.images)?;
+        }
+        if !self.videos.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "videos", &self.videos)?;
+        }
+        if !self.audios.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "audios", &self.audios)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for DecodedMediaInput {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = DecodedMediaInput;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct DecodedMediaInput")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_images = None;
+                let mut f_videos = None;
+                let mut f_audios = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "images" => {
+                            if f_images.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("images"));
+                            }
+                            f_images = Some(
+                                map.next_value::<Option<Vec<DecodedImage>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        "videos" => {
+                            if f_videos.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("videos"));
+                            }
+                            f_videos = Some(
+                                map.next_value::<Option<Vec<DecodedVideo>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        "audios" => {
+                            if f_audios.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("audios"));
+                            }
+                            f_audios = Some(
+                                map.next_value::<Option<Vec<DecodedAudio>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(DecodedMediaInput {
+                    images: f_images.unwrap_or_default(),
+                    videos: f_videos.unwrap_or_default(),
+                    audios: f_audios.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for DecodedImage {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "width", &self.width)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "height", &self.height)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "row_stride_bytes",
+            &self.row_stride_bytes,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "pixel_format", &self.pixel_format)?;
+        if let Some(v) = &self.payload {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "payload", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for DecodedImage {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = DecodedImage;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct DecodedImage")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_width = None;
+                let mut f_height = None;
+                let mut f_row_stride_bytes = None;
+                let mut f_pixel_format = None;
+                let mut f_payload = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "width" => {
+                            if f_width.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("width"));
+                            }
+                            f_width = Some(map.next_value::<u32>()?);
+                        }
+                        "height" => {
+                            if f_height.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("height"));
+                            }
+                            f_height = Some(map.next_value::<u32>()?);
+                        }
+                        "row_stride_bytes" => {
+                            if f_row_stride_bytes.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "row_stride_bytes",
+                                ));
+                            }
+                            f_row_stride_bytes = Some(map.next_value::<u64>()?);
+                        }
+                        "pixel_format" => {
+                            if f_pixel_format.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("pixel_format"));
+                            }
+                            f_pixel_format =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "payload" => {
+                            if f_payload.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("payload"));
+                            }
+                            f_payload = Some(map.next_value::<Option<MediaPayloadReference>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(DecodedImage {
+                    width: f_width.unwrap_or_default(),
+                    height: f_height.unwrap_or_default(),
+                    row_stride_bytes: f_row_stride_bytes.unwrap_or_default(),
+                    pixel_format: f_pixel_format.unwrap_or_default(),
+                    payload: f_payload.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for MediaPayloadReference {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.mounted_shm {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "mounted_shm", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for MediaPayloadReference {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = MediaPayloadReference;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct MediaPayloadReference")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_mounted_shm = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "mounted_shm" => {
+                            if f_mounted_shm.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("mounted_shm"));
+                            }
+                            f_mounted_shm =
+                                Some(map.next_value::<Option<MountedSharedMemoryRegion>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(MediaPayloadReference {
+                    mounted_shm: f_mounted_shm.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for MountedSharedMemoryRegion {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "object_id", &self.object_id)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "offset_bytes", &self.offset_bytes)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "length_bytes", &self.length_bytes)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "engine_instance_id",
+            &self.engine_instance_id,
+        )?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for MountedSharedMemoryRegion {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = MountedSharedMemoryRegion;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct MountedSharedMemoryRegion")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_object_id = None;
+                let mut f_offset_bytes = None;
+                let mut f_length_bytes = None;
+                let mut f_engine_instance_id = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "object_id" => {
+                            if f_object_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("object_id"));
+                            }
+                            f_object_id = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "offset_bytes" => {
+                            if f_offset_bytes.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("offset_bytes"));
+                            }
+                            f_offset_bytes = Some(map.next_value::<u64>()?);
+                        }
+                        "length_bytes" => {
+                            if f_length_bytes.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("length_bytes"));
+                            }
+                            f_length_bytes = Some(map.next_value::<u64>()?);
+                        }
+                        "engine_instance_id" => {
+                            if f_engine_instance_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "engine_instance_id",
+                                ));
+                            }
+                            f_engine_instance_id =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(MountedSharedMemoryRegion {
+                    object_id: f_object_id.unwrap_or_default(),
+                    offset_bytes: f_offset_bytes.unwrap_or_default(),
+                    length_bytes: f_length_bytes.unwrap_or_default(),
+                    engine_instance_id: f_engine_instance_id.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for DecodedVideo {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if !self.frames.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "frames", &self.frames)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "source_fps", &self.source_fps)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "source_frame_count",
+            &self.source_frame_count,
+        )?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for DecodedVideo {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = DecodedVideo;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct DecodedVideo")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_frames = None;
+                let mut f_source_fps = None;
+                let mut f_source_frame_count = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "frames" => {
+                            if f_frames.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("frames"));
+                            }
+                            f_frames = Some(
+                                map.next_value::<Option<Vec<DecodedVideoFrame>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        "source_fps" => {
+                            if f_source_fps.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("source_fps"));
+                            }
+                            f_source_fps = Some(map.next_value::<f64>()?);
+                        }
+                        "source_frame_count" => {
+                            if f_source_frame_count.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "source_frame_count",
+                                ));
+                            }
+                            f_source_frame_count = Some(map.next_value::<u64>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(DecodedVideo {
+                    frames: f_frames.unwrap_or_default(),
+                    source_fps: f_source_fps.unwrap_or_default(),
+                    source_frame_count: f_source_frame_count.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for DecodedVideoFrame {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.image {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "image", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "timestamp_us", &self.timestamp_us)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "source_frame_index",
+            &self.source_frame_index,
+        )?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for DecodedVideoFrame {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = DecodedVideoFrame;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct DecodedVideoFrame")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_image = None;
+                let mut f_timestamp_us = None;
+                let mut f_source_frame_index = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "image" => {
+                            if f_image.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("image"));
+                            }
+                            f_image = Some(map.next_value::<Option<DecodedImage>>()?);
+                        }
+                        "timestamp_us" => {
+                            if f_timestamp_us.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("timestamp_us"));
+                            }
+                            f_timestamp_us = Some(map.next_value::<u64>()?);
+                        }
+                        "source_frame_index" => {
+                            if f_source_frame_index.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "source_frame_index",
+                                ));
+                            }
+                            f_source_frame_index = Some(map.next_value::<u64>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(DecodedVideoFrame {
+                    image: f_image.flatten(),
+                    timestamp_us: f_timestamp_us.unwrap_or_default(),
+                    source_frame_index: f_source_frame_index.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for DecodedAudio {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "sample_format",
+            &self.sample_format,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "sample_rate_hz",
+            &self.sample_rate_hz,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "channels", &self.channels)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "sample_frames",
+            &self.sample_frames,
+        )?;
+        if let Some(v) = &self.payload {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "payload", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for DecodedAudio {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = DecodedAudio;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct DecodedAudio")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_sample_format = None;
+                let mut f_sample_rate_hz = None;
+                let mut f_channels = None;
+                let mut f_sample_frames = None;
+                let mut f_payload = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "sample_format" => {
+                            if f_sample_format.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("sample_format"));
+                            }
+                            f_sample_format =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "sample_rate_hz" => {
+                            if f_sample_rate_hz.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("sample_rate_hz"));
+                            }
+                            f_sample_rate_hz = Some(map.next_value::<u32>()?);
+                        }
+                        "channels" => {
+                            if f_channels.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("channels"));
+                            }
+                            f_channels = Some(map.next_value::<u32>()?);
+                        }
+                        "sample_frames" => {
+                            if f_sample_frames.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("sample_frames"));
+                            }
+                            f_sample_frames = Some(map.next_value::<u64>()?);
+                        }
+                        "payload" => {
+                            if f_payload.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("payload"));
+                            }
+                            f_payload = Some(map.next_value::<Option<MediaPayloadReference>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(DecodedAudio {
+                    sample_format: f_sample_format.unwrap_or_default(),
+                    sample_rate_hz: f_sample_rate_hz.unwrap_or_default(),
+                    channels: f_channels.unwrap_or_default(),
+                    sample_frames: f_sample_frames.unwrap_or_default(),
+                    payload: f_payload.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
 impl ::serde::Serialize for Matched {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match &self.value {
@@ -1698,6 +2220,9 @@ impl ::serde::Serialize for GenerateRequest {
         if let Some(v) = &self.modalities {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "modalities", v)?;
         }
+        if let Some(v) = &self.decoded_media {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "decoded_media", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -1753,6 +2278,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                 let mut f_routed_experts_start_len = None;
                 let mut f_return_sampling_mask = None;
                 let mut f_modalities = None;
+                let mut f_decoded_media = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "rid" => {
@@ -2037,6 +2563,12 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                             }
                             f_modalities = Some(map.next_value::<Option<OptionalStringList>>()?);
                         }
+                        "decoded_media" => {
+                            if f_decoded_media.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("decoded_media"));
+                            }
+                            f_decoded_media = Some(map.next_value::<Option<DecodedMediaInput>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -2082,6 +2614,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                     routed_experts_start_len: f_routed_experts_start_len.unwrap_or_default(),
                     return_sampling_mask: f_return_sampling_mask.flatten(),
                     modalities: f_modalities.flatten(),
+                    decoded_media: f_decoded_media.flatten(),
                 })
             }
         }

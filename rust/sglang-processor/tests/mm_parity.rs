@@ -7,9 +7,10 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
+use sglang_processor::dynamo_multimodal::image::decode::{DecodeLimits, decode_rgb};
 use sglang_processor::dynamo_multimodal::processor::{PositionOutput, TensorData};
 use sglang_processor::dynamo_multimodal::registry::ProcessorSpec;
-use sglang_processor::{MmOutput, MmProcessor};
+use sglang_processor::{DecodedRgbImage, MmOutput, MmProcessor, RgbImageLayout};
 use sha2::{Digest, Sha256};
 
 fn fixtures() -> PathBuf {
@@ -27,6 +28,107 @@ fn fixtures_match_sglang() {
         }
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+#[test]
+fn decoded_images_preserve_encoded_features_layout_and_positions() {
+    for entry in std::fs::read_dir(fixtures()).unwrap() {
+        let path = entry.unwrap().path();
+        if !path.extension().is_some_and(|ext| ext == "json") {
+            continue;
+        }
+        let fixture: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        // Exercise each recorded family configuration, both single-image and
+        // multi-image prompts, using existing local fixtures without downloads.
+        for (index, case) in fixture["cases"].as_array().unwrap().iter().enumerate() {
+            let names = case["images"].as_array().unwrap();
+            if index != 0 && names.len() < 2 {
+                continue;
+            }
+            let spec = serde_json::from_value(case["spec"].clone()).unwrap();
+            let processor = MmProcessor::from_spec(spec).unwrap();
+            let input_ids = case["input_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| id.as_i64().unwrap() as i32)
+                .collect::<Vec<_>>();
+            let encoded = names
+                .iter()
+                .map(|name| {
+                    std::fs::read(fixtures().join("images").join(name.as_str().unwrap())).unwrap()
+                })
+                .collect::<Vec<_>>();
+            let decoded = encoded
+                .iter()
+                .map(|bytes| {
+                    let (rgb, height, width) = decode_rgb(bytes, &DecodeLimits::default()).unwrap();
+                    // Also exercise the source layout bridge: padding must never
+                    // reach model preprocessing or become part of item identity.
+                    let row = width * 3;
+                    let mut padded = Vec::new();
+                    for row in rgb.chunks_exact(row) {
+                        padded.extend_from_slice(row);
+                        padded.extend_from_slice(&[17; 5]);
+                    }
+                    RgbImageLayout {
+                        width: width as u32,
+                        height: height as u32,
+                        row_stride_bytes: row as u64 + 5,
+                    }
+                    .pack_owned(padded)
+                    .unwrap()
+                })
+                .collect();
+            let expected = processor
+                .process(
+                    &input_ids,
+                    &encoded.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+                )
+                .unwrap();
+            let actual = processor
+                .process_decoded_images(&input_ids, decoded)
+                .unwrap();
+            assert_eq!(
+                summary(&actual),
+                summary(&expected),
+                "{} {}",
+                fixture["model"],
+                case["name"]
+            );
+        }
+    }
+}
+
+#[test]
+fn decoded_requests_reject_bad_images_and_placeholder_counts() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "fixtures/mm_parity/qwen2.5-vl-3b-instruct.json"
+    ))
+    .unwrap();
+    let case = &fixture["cases"][0];
+    let processor =
+        MmProcessor::from_spec(serde_json::from_value(case["spec"].clone()).unwrap()).unwrap();
+    assert!(processor.process_decoded_images(&[], vec![]).is_err());
+    // Public field construction cannot bypass layout validation.
+    assert!(
+        processor
+            .process_decoded_images(
+                &[],
+                vec![DecodedRgbImage {
+                    rgb: vec![0; 2],
+                    width: 1,
+                    height: 1,
+                }]
+            )
+            .is_err()
+    );
+    let image = DecodedRgbImage::new(vec![0; 3], 1, 1).unwrap();
+    assert!(
+        processor
+            .process_decoded_images(&[7, 8], vec![image])
+            .is_err()
+    );
 }
 
 fn check(fixture: &Value) -> Vec<String> {

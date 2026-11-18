@@ -114,6 +114,10 @@ impl DrainEndGate {
 const SHUTDOWN_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Runtime {
+    pub(crate) fn instance_id(&self) -> &str {
+        self.core.instance_id()
+    }
+
     /// The crash dump's requests (`None` without `--crash-dump-folder`).
     pub fn crash_dump_snapshot(&self) -> Option<Vec<u8>> {
         self.core.crash_dump_snapshot()
@@ -135,6 +139,24 @@ impl Runtime {
     ) -> Result<(), String> {
         let ctx = Arc::new(
             crate::multi_modality::worker::MmContext::new(spec)?
+                .with_limits(self.mm_wiring.limits.clone()),
+        );
+        self.spawn_mm_pool(workers, ctx);
+        Ok(())
+    }
+
+    /// The same native family pipeline and output/ring path, with an explicit
+    /// same-host decoded RGB source enabled before the pool starts.
+    pub fn start_decoded_mm_workers(
+        &self,
+        spec: crate::message::config::MmSpec,
+        root: &str,
+        workers: usize,
+    ) -> Result<(), String> {
+        let store =
+            crate::multi_modality::decoded::DecodedStore::new(root, self.instance_id().to_owned())?;
+        let ctx = Arc::new(
+            crate::multi_modality::worker::MmContext::new_with_decoded(spec, Some(store))?
                 .with_limits(self.mm_wiring.limits.clone()),
         );
         self.spawn_mm_pool(workers, ctx);

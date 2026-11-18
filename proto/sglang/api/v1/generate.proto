@@ -8,6 +8,7 @@ syntax = "proto3";
 package sglang.api.v1;
 
 import "sglang/api/v1/common.proto";
+import "sglang/api/v1/decoded_media.proto";
 import "sglang/api/v1/finish.proto";
 import "sglang/api/v1/sampling.proto";
 import "sglang/json/v1/options.proto";
@@ -83,6 +84,9 @@ message GenerateRequest {
   OptionalStringOrList custom_logit_processor = 34;
   map<string, string> custom_labels = 35;
   ImagesConfig images_config = 36;
+  // Single prompt only; cannot mix with image_data/video_data/audio_data.
+  // Optional decoded-media shared-memory path, disabled unless configured.
+  DecodedMediaInput decoded_media = 42;
   bool return_prompt_token_ids = 37;
   int64 routed_experts_start_len = 38;
   BoolOrList return_sampling_mask = 39;
