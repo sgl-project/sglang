@@ -19,7 +19,7 @@ The examples use W8A8 weights on A3 series and W8A8_MXFP8 weights on 950PR/DT se
 | --- | --- |
 | Tensor Parallelism | `--tp-size 16` |
 | Pipeline Parallelism | `--pp-size 4` |
-| Data Parallelism | `--dp-size 16` and `--enable-dp-attention` |
+| Data Parallelism | `--attn-dp-size 16` |
 | DeepEP | `--moe-a2a-backend deepep` and `--deepep-mode auto` |
 | PD Disaggregation | `--disaggregation-mode prefill` and `--disaggregation-transfer-backend ascend` |
 | Quantization | `--quantization modelslim` |
@@ -367,8 +367,7 @@ if [[ "$LOCAL_IPS" == *" $PREFILL_IP "* ]]; then
         --disaggregation-bootstrap-port 8998 \
         --disaggregation-transfer-backend ascend \
         --dist-init-addr "${PREFILL_IP}:5000" \
-        --tp-size 4 --pp-size 4 --dp-size 4 --nnodes 1 \
-        --enable-dp-attention \
+        --tp-size 4 --pp-size 4 --attn-dp-size 4 --nnodes 1 \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
         --moe-a2a-backend deepep --deepep-mode normal \
@@ -402,8 +401,7 @@ elif [[ "$LOCAL_IPS" == *" $DECODE_IP "* ]]; then
         --disaggregation-mode decode \
         --disaggregation-transfer-backend ascend \
         --dist-init-addr "${DECODE_IP}:5000" \
-        --tp-size 16 --pp-size 1 --dp-size 16 --nnodes 1 \
-        --enable-dp-attention \
+        --tp-size 16 --pp-size 1 --attn-dp-size 16 --nnodes 1 \
         --moe-a2a-backend deepep --deepep-mode low_latency \
         --load-balance-method round_robin \
         --mem-fraction-static 0.75 \
@@ -464,7 +462,7 @@ if [[ "$LOCAL_IPS" == *" $PREFILL_IP "* ]]; then
         --disaggregation-mode prefill \
         --disaggregation-bootstrap-port 8998 \
         --disaggregation-transfer-backend ascend \
-        --tp-size 8 --pp-size 1 --dp-size 2 --enable-dp-attention --nnodes 1 \
+        --tp-size 8 --pp-size 1 --attn-dp-size 2 --nnodes 1 \
         --chunked-prefill-size 16384 --max-prefill-tokens 16384 \
         --mem-fraction-static 0.83 --page-size 64 --max-running-requests 16 \
         --speculative-draft-model-path "$MODEL_PATH" \
@@ -483,7 +481,7 @@ elif [[ "$LOCAL_IPS" == *" $DECODE_IP "* ]]; then
         --disaggregation-mode decode \
         --disaggregation-bootstrap-port 8998 \
         --disaggregation-transfer-backend ascend \
-        --tp-size 8 --pp-size 1 --dp-size 2 --enable-dp-attention --nnodes 1 \
+        --tp-size 8 --pp-size 1 --attn-dp-size 2 --nnodes 1 \
         --chunked-prefill-size 16384 --max-prefill-tokens 16384 \
         --mem-fraction-static 0.83 --page-size 64 --max-running-requests 16 \
         --speculative-draft-model-path "$MODEL_PATH" \

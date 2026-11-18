@@ -7,6 +7,7 @@ import torch
 from sglang.kernels.ops.speculative.dflash_ring_locs import dflash_ring_block_locs
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
+    draft_kv_ring_paged_rows_per_req,
     draft_kv_ring_rows_per_req,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -41,6 +42,30 @@ def test_block_locs_match_ring_locs(dcp):
         dcp_size=dcp,
     )
     assert torch.equal(got, expected)
+
+
+def test_paged_block_locs_match_ring_locs():
+    page = 64
+    ring = DFlashDraftKVRing(
+        rows_per_req=draft_kv_ring_paged_rows_per_req(
+            window_left=2047, block_size=BLOCK, page_size=page
+        ),
+        dcp_size=1,
+        req_to_token_rows=9,
+        device="cuda",
+        window_left=2047,
+        dcp_rank=0,
+        pool=SimpleNamespace(maybe_get_custom_mem_pool=lambda: None),
+        page_size=page,
+    )
+    req_pool_indices = torch.tensor([3, 7, 1, 8], dtype=torch.int64, device="cuda")
+    ring.min_pos[req_pool_indices] = torch.tensor(
+        [4000, 0, 3, 13], dtype=torch.int32, device="cuda"
+    )
+    prefix = torch.tensor([5000, 700, 3, 9000], dtype=torch.int64, device="cuda")
+    positions = (prefix.unsqueeze(1) + torch.arange(BLOCK, device="cuda")).reshape(-1)
+    expected = ring.locs(req_pool_indices.repeat_interleave(BLOCK), positions)
+    assert torch.equal(ring.block_locs(req_pool_indices, positions, BLOCK), expected)
 
 
 if __name__ == "__main__":

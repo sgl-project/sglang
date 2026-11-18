@@ -3,7 +3,7 @@
 End-to-end accuracy test for DeepSeek-V4-Pro (1.6T) FP4 with the non-EP DP
 two-batch-overlap path on MI35x ROCm 7.2.
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-pro-mtp suite
+Registry: nightly-test-8-gpu-amd-mi35x-deepseek-v4-pro-mtp suite
 """
 
 import os
@@ -22,7 +22,9 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=14400, suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro-mtp", nightly=True
+    est_time=14400,
+    suite="nightly-test-8-gpu-amd-mi35x-deepseek-v4-pro-mtp",
+    nightly=True,
 )
 
 DEEPSEEK_V4_PRO_FP4_MODEL_PATH = os.environ.get(

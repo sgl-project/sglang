@@ -249,7 +249,7 @@ def start_follower_grpc_server(server_args, scheduler_info: Dict[str, Any]):
     sidecar or enable inference/control RPCs.
     """
     serving = get_serving()
-    if serving.grpc_port is None or serving.smg_grpc_mode or serving.grpc_mode:
+    if serving.grpc_port is None:
         return None
     if envs.SGLANG_RUST_SERVER.get():
         return None

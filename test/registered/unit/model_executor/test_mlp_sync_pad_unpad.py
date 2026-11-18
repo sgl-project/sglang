@@ -17,6 +17,8 @@ import torch
 
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.managers.scheduler_components.dp_attn import MLPSyncBatchInfo
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
@@ -467,6 +469,75 @@ class TestDraftScopeMlpSync(CustomTestCase):
         self.assertEqual(fb.global_num_tokens_cpu, [9, 9, 9, 9])
         self._assert_token_rows(fb, rows=9)
         torch.testing.assert_close(fb.mm_input_embeds[6:], torch.zeros(3, self.HIDDEN))
+
+
+class TestPrefillGraphIdleRankPadding(CustomTestCase):
+    """An idle DP rank either gets the capture-bucket dummy row or eager."""
+
+    SLOT = 2
+    HIDDEN = 8
+
+    def setUp(self):
+        override = get_context().override_server_args(
+            tp_size=4,
+            attn_dp_size=4,
+            cuda_graph_config=CudaGraphConfig(prefill=PhaseConfig(bs=[4, 16])),
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+    def _sync_with_idle_rank(self, global_num_tokens):
+        num_tokens = global_num_tokens[self.SLOT]
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=1,
+            input_ids=torch.arange(num_tokens),
+            req_pool_indices=torch.tensor([0]),
+            seq_lens=torch.tensor([num_tokens]),
+            out_cache_loc=torch.arange(num_tokens),
+            seq_lens_sum=num_tokens,
+            positions=torch.arange(num_tokens),
+            seq_lens_cpu=torch.tensor([num_tokens]),
+            mm_input_embeds=torch.ones(num_tokens, self.HIDDEN),
+            is_extend_in_batch=True,
+            can_run_dp_prefill_cuda_graph=True,
+            global_num_tokens_cpu=list(global_num_tokens),
+            global_num_tokens_for_logprob_cpu=list(global_num_tokens),
+            global_num_tokens_gpu=torch.zeros(
+                len(global_num_tokens), dtype=torch.int32
+            ),
+        )
+        runner = _mock_model_runner()
+        runner.attn_backend.get_cpu_graph_seq_len_fill_value.return_value = 1
+        runner.is_draft_worker = True
+        runner.attn_tp_sequence_sharded.return_value = False
+        group = GroupCoordinator.__new__(GroupCoordinator)
+        group.world_size = 1
+        group.rank_in_group = 0
+        with (
+            get_flags().dp.override(enabled=True),
+            get_parallel().override(
+                tp_rank=self.SLOT, attn_tp_rank=0, attn_dp_rank=self.SLOT
+            ),
+            patch.object(parallel_state, "_TP", group),
+            patch("sglang.srt.model_executor.forward_batch_info._is_cpu", True),
+            parallel_state.patch_tensor_parallel_group(group, owns_attention=True),
+        ):
+            fb.prepare_mlp_sync_batch(runner)
+        return fb
+
+    def test_default_keeps_max_len_bucket_padding(self):
+        """Off by default: GPU prefill keeps the MAX_LEN fabricated-row path."""
+        fb = self._sync_with_idle_rank([9, 0, 6, 4])
+        self.assertEqual(fb.dp_padding_mode, DpPaddingMode.MAX_LEN)
+        self.assertEqual(fb.global_num_tokens_cpu, [16, 16, 16, 16])
+
+    def test_idle_rank_eager_opt_in(self):
+        """The opt-in keeps SUM_LEN so the runner rejects replay and runs eager."""
+        with envs.SGLANG_ENABLE_PREFILL_GRAPH_IDLE_RANK_EAGER.override(True):
+            fb = self._sync_with_idle_rank([9, 0, 6, 4])
+        self.assertEqual(fb.dp_padding_mode, DpPaddingMode.SUM_LEN)
+        self.assertEqual(fb.global_num_tokens_cpu, [9, 0, 6, 4])
 
 
 if __name__ == "__main__":

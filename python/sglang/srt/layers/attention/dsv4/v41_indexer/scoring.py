@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention.dsv4.candidate_blocks import amax8_varlen
 from sglang.kernels.ops.attention.dsv4.candidate_scores import (
     can_use_candidate_scores,
     candidate_scores,
@@ -27,6 +28,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.device import async_h2d
 
@@ -309,7 +311,7 @@ def score_tiles(
         starts=data.request_starts,
         lengths=data.compress_lens,
         context_lengths=data.lens_per_request,
-        budget_bytes=_DEEP_GEMM_SCORE_BUDGET_BYTES,
+        budget_bytes=_prefill_score_budget_bytes(_DEEP_GEMM_SCORE_BUDGET_BYTES),
     )
 
 
@@ -337,6 +339,23 @@ def topk_ragged(
     from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
 
     topk_transform_ragged_v2(logits, lens, out_offsets=offsets, out_indices=out)
+
+
+def select_prefill_block_ids(
+    logits: torch.Tensor,
+    lens: torch.Tensor,
+    nblocks: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    offsets: torch.Tensor,
+) -> None:
+    """Select size-8 blocks by their maximum score, keeping the newest block."""
+    width = (logits.shape[1] + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+    keys = logits.new_empty(
+        (logits.shape[0], (width + 3) // 4 * 4), dtype=torch.float32
+    )
+    amax8_varlen(logits, lens, out=keys)
+    topk_ragged(keys, nblocks, out=out, offsets=offsets)
 
 
 def dense_prefill_topk(
@@ -376,6 +395,12 @@ def sharded_dense_prefill_topk(
 
 # Arbitrary cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
 _TORCH_SCORE_BUDGET_BYTES = 1 << 30
+
+
+def _prefill_score_budget_bytes(default: int) -> int:
+    if envs.SGLANG_OPT_DSV41_LARGE_PREFILL_SCORE_BUDGET.get():
+        return 2 << 30
+    return default
 
 
 class RequestScores(msgspec.Struct, frozen=True):
@@ -494,7 +519,11 @@ def _score_chunks(
     candidate_only = can_use_candidate_scores(q, index_k, weights, candidate_width, lc)
     score_width = candidate_width if candidate_only else index_k.shape[0]
     # Chunk rows so the [rows, heads, score_width] BF16 scores stay under budget.
-    rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * score_width * 2))
+    rows_per_chunk = max(
+        1,
+        _prefill_score_budget_bytes(_TORCH_SCORE_BUDGET_BYTES)
+        // (q.shape[1] * score_width * 2),
+    )
     for start in range(0, request.tok.numel(), rows_per_chunk):
         rows = slice(start, start + rows_per_chunk)
         tok_c, lens_c = request.tok[rows], request.lens[rows]

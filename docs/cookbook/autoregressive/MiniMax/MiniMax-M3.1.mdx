@@ -48,9 +48,9 @@ Then run the **Python** output of the command panel below in that environment.
 <Tab title="Docker">
 
 ```bash Command
-docker pull lmsysorg/sglang:dev-minimax-m31-flash
+docker pull lmsysorg/sglang:latest
 # AMD MI350X / MI355X (ROCm 7.2):
-docker pull lmsysorg/sglang:dev-minimax-m31-flash-mi35x
+docker pull lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261113
 ```
 
 For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
@@ -84,7 +84,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 Agentic workloads, such as coding agents and other multi-turn, tool-using assistants, send long prompts whose prefixes grow and repeat from turn to turn. Serving them well depends on reusing the KV cache across turns, offloading it beyond GPU memory, and keeping each session on the workers that already hold its prefix. This section gives complete launch commands for such deployments, each benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) and linked to the run that measured it. Pick a hardware platform, checkpoint, deployment shape, concurrency, KV cache offloading mechanism and router to get every process of the deployment as a raw command, one tab per process in launch order.
 
-- **Router.** Each configuration was submitted behind one front door: Dynamo (`dynamo.frontend` with `dynamo.sglang` workers) or SGLang (`sglang.launch_server`, behind `sglang_router` when there are several workers or DP-attention ranks).
+- **Router.** Each configuration was submitted behind one front door: Dynamo (`dynamo.frontend` with `dynamo.sglang` workers) or SGLang (`sglang.launch_server`, behind a router when there are several workers or DP-attention ranks).
 - **KV offload.** Choose among these KV cache offloading mechanisms: none (GPU KV only), HiCache (host DRAM), or a Mooncake store attached through the external linker. The Mooncake option needs an image whose SGLang build includes `--enable-unified-cache-external-linker`.
 - **Container image.** Run the commands inside the image listed for each configuration; flag names follow that image.
 
@@ -118,10 +118,10 @@ import { agentx } from "/src/snippets/agentx/MiniMaxAI/minimax-m3.1.jsx";
 
 ### MonoKernel (Low-Latency)
 
-The B300 **Low-Latency** recipe serves batch-size-1 decode through the MSA-V1 MonoKernel plugin with `--monokernel-backend msa`. The plugin supports Blackwell sm_100 and sm_103 (B200 / GB200 and B300 / GB300) at `--tp 4` only; it has been measured on B300. B200 and GB200 run the same command; their final verification is in progress. Each MoE layer of the DSpark verify step runs as two persistent kernels, MegaAttention then the token-parallel MoE, each fused with its TP4 all-reduce. The DSpark draft step runs as one cooperative kernel per rank. On 4x B300 with the acceptance length fixed at 5, decode reaches 1028 tokens/s at 1K context, 919 at 256K and 723 at 1M, against 479, 465 and 408 on the standard path.
+The B300 **Low-Latency** recipe serves batch-size-1 decode through the MSA-V1 MonoKernel plugin with `--enable-nvidia-megakernel`. The plugin supports Blackwell sm_100 and sm_103 (B200 / GB200 and B300 / GB300) at `--tp 4` only; it has been measured on B300. B200 and GB200 run the same command; their final verification is in progress. Each MoE layer of the DSpark verify step runs as two persistent kernels, MegaAttention then the token-parallel MoE, each fused with its TP4 all-reduce. The DSpark draft step runs as one cooperative kernel per rank. On 4x B300 with the acceptance length fixed at 5, decode reaches 1028 tokens/s at 1K context, 919 at 256K and 723 at 1M, against 479, 465 and 408 on the standard path.
 
 - **Batch size 1 only.** Prefill, plain decode and batches of more than one request run on the standard path, so throughput under concurrency is lower than the Balanced recipe. The recipe caps `--max-running-requests` at 8.
-- **Required flags.** The plugin needs `--page-size 128`, a DSpark chain of 8 draft tokens (`--speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 8 --speculative-dspark-block-size 7`), and `--disable-attn-tp-gather`; without the last one SGLang pads the 7-row draft block and the server refuses to start. At startup the server lists every unsupported setting it finds, and the log confirms the plugin with `--monokernel-backend msa: minimax_m3_msa_v1 on sm_103, widths [8]`.
+- **Required flags.** The plugin needs `--page-size 128`, a DSpark chain of 8 draft tokens (`--speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 8 --speculative-dspark-block-size 7`), and `--disable-attn-tp-gather`; without the last one SGLang pads the 7-row draft block and the server refuses to start. At startup the server lists every unsupported setting it finds, and the log confirms the plugin with `NVIDIA megakernel: active (minimax_m3_msa_v1: ...; widths [8]; ...)`.
 - **`ALLOW_JIT=1`** lets the MonoKernel kernels compile on first launch; set `CACHE_DIR` to keep the compiled kernels across restarts.
 - **`SGLANG_FORCE_COARSE_WAR_BARRIER=1`** runs MegaAttention in canonical cluster placement, about 3–4% faster end to end. Canonical placement faults if another kernel holds SMs when MegaAttention launches, so the server must have the GPUs to itself. Without the variable, the server keeps cluster placement on, which is safe and slightly slower. The log prints `cluster placement off (canonical)` or `cluster placement on`.
 - **Memory.** The plugin keeps its own copy of the routed experts (54.1 GiB per rank), so at `--mem-fraction-static 0.8` the KV pool holds about 6.5M tokens instead of 10.4M.
@@ -141,7 +141,7 @@ The B300 **Low-Latency** recipe serves batch-size-1 decode through the MSA-V1 Mo
 - Requires ROCm 7.2 (Triton 3.7); earlier ROCm images are not supported.
 - **NVFP4 on MI355X:** the same `MiniMaxAI/MiniMax-M3.1-Flash` checkpoint as on NVIDIA; the routed experts are requantized to MXFP4 while loading.
 - **MXFP4 on MI350X / MI355X:** `amd/MiniMax-M3.1-Flash-Quark-MXFP4` (Quark-quantized), same command as NVFP4 Low-Latency on both; select **MI350X / MXFP4** or **MI355X / MXFP4** in the panel. Only the Low-Latency recipe has been run with this checkpoint.
-- **One server per four GPUs.** M3.1 NVFP4 on ROCm runs at `--tp 4` or less, and the server refuses a larger TP. On an 8-GPU node, start two servers with `HIP_VISIBLE_DEVICES=0,1,2,3` and `HIP_VISIBLE_DEVICES=4,5,6,7` on different ports, and put the router in front with `--policy cache_aware`.
+- **One server per four GPUs.** M3.1 NVFP4 on ROCm runs at `--tp 4` or less, and the server refuses a larger TP. On an 8-GPU node, start two servers with `HIP_VISIBLE_DEVICES=0,1,2,3` and `HIP_VISIBLE_DEVICES=4,5,6,7` on different ports, and put the router in front with `--policy cache_aware`. Start each server with `--kv-events-config` on its own port (for example `tcp://*:5557` and `tcp://*:5567`), because the router learns cached prefixes only from those events.
 - **Pick the recipe by concurrency.** Low-Latency is for up to about 32 concurrent requests. High-Throughput is for 48 or more concurrent long multi-turn sessions, such as coding agents, and adds two things to Low-Latency:
   - **Hierarchical KV cache** (`--enable-hierarchical-cache`). At the default ratio of 2, the host pools (main KV, index K and draft KV) take about 350 GB per rank, so one TP4 server needs about 1.4 TB of host memory. On a host with less free memory, the server lowers the ratio until the pools fit in 80% of it. When two servers share a host, lower `--hicache-host-memory-fraction` on each.
   - **FP8 DSpark draft KV cache** (`--speculative-draft-kv-cache-dtype fp8_e4m3`). The same memory holds 9% more tokens. The draft cache only affects which draft tokens get accepted; the target model still verifies every token.
@@ -454,19 +454,16 @@ sglang serve \
 ```
 
 ```bash Router
-python3 -m sglang_router.launch_router \
-  --pd-disaggregation \
-  --prefill http://<node-A>:30000 8998 \
-  --decode http://<node-B>:30100 \
+sgl-router \
+  --model-id MiniMaxAI/MiniMax-M3.1-Flash \
+  --no-tokenizer \
+  --worker-urls http://<node-A>:30000 http://<node-B>:30100 \
   --policy round_robin \
   --host 0.0.0.0 --port 8000
 ```
 
-The `8998` after the prefill URL is the prefill bootstrap port. It must match the prefill server's `--disaggregation-bootstrap-port`.
-
 - **HiCache host memory.** `--hicache-size` is per rank, so at DP8 the prefill node reserves 8 × 192 GB of host memory for the host pools. Lower it on nodes with less memory.
 - **MegaMoE token budget.** `SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK` must cover each rank's share of a prefill chunk (65536 / 8 here) and its largest decode or verify batch.
-- **Media options through the router.** The PD router forwards only the standard OpenAI request fields. Per-request media options such as `max_long_side_pixel` and video `fps` do not reach the servers; this was observed with sglang-router 0.3.2.
 
 <Note>
 Correctness was validated on 1P1D with TP4 on each role (8×B300, Mooncake, DSpark on both roles, HiCache on prefill). GSM8K matched colocated serving, and `--disaggregation-enable-kv-checksum` reported no mismatch. The DP8 / TP1 / EP8 layout has not been benchmarked yet.

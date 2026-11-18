@@ -3,7 +3,7 @@
 DeepSeek-R1 has 128 attention heads, so TP=4 gives 32 heads per rank. This
 covers the AITER persistent MLA decode metadata path for the nhead=32 case.
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4-tp4 suite
+Registry: nightly-test-8-gpu-amd-mi35x-deepseek-r1-mxfp4-tp4 suite
 """
 
 import ast
@@ -27,7 +27,7 @@ from sglang.utils import download_and_cache_file, read_jsonl
 
 register_amd_ci(
     est_time=1800,
-    suite="nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4-tp4",
+    suite="nightly-test-8-gpu-amd-mi35x-deepseek-r1-mxfp4-tp4",
     nightly=True,
 )
 

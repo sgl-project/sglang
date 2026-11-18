@@ -701,6 +701,7 @@ _RESOLVED_KEYS = (
     "cuda_graph_backend_prefill",
     "cuda_graph_backend_decode",
     "disable_cuda_graph",
+    "disable_decode_cuda_graph",
     "enable_lora",
     "lora_backend",
     "moe_runner_backend",
@@ -1127,8 +1128,11 @@ def required_coverage(
         )
         return required, notes
     disabled_all = str(resolved_args.get("disable_cuda_graph")).lower() in _TRUE
+    disabled_decode = (
+        str(resolved_args.get("disable_decode_cuda_graph")).lower() in _TRUE
+    )
     decode_on = (
-        not disabled_all
+        not (disabled_all or disabled_decode)
         and resolved_args.get("cuda_graph_backend_decode") != "disabled"
     )
     if decode_on:
@@ -1920,10 +1924,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     )
                 )
 
-    # Explicit per-phase selectors win over --disable-cuda-graph, so the
-    # reference repeats them as disabled (last occurrence wins in argparse).
     eager = [
-        "--disable-cuda-graph",
         "--cuda-graph-backend-prefill",
         "disabled",
         "--cuda-graph-backend-decode",

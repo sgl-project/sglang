@@ -259,7 +259,8 @@ struct FusedParallelQKNormAcrossHead {
     params.eps = eps / kNumGPU;  // scale down eps by number of GPUs
     params.rank = push.rank;
     params.num_tokens = num_tokens;
-    params.epoch_bytes = static_cast<uint32_t>(push.slot_bytes);
+    // a phase owns kNumGPU slots, as in PushEpoch; the other push kernels share the counter
+    params.epoch_bytes = static_cast<uint32_t>(push.slot_bytes * kNumGPU);
 
     const auto needed_buffer_bytes = static_cast<int64_t>(num_tokens) * 2 * sizeof(float);
     RuntimeCheck(push.world_size == kNumGPU, "Number of GPUs mismatch");

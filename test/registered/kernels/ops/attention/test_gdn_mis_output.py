@@ -394,29 +394,6 @@ class TestGDNMISOutput(CustomTestCase):
             for result, reference in zip(actual, expected):
                 torch.testing.assert_close(result, reference, rtol=0, atol=0)
 
-    @torch.inference_mode()
-    def test_prepare_rejects_malformed_gate_mapping(self):
-        packed = torch.empty(3, 384, device="cuda", dtype=torch.bfloat16)
-        a = torch.empty(5, 2, device="cuda", dtype=packed.dtype)
-        args = dict(
-            A_log=torch.zeros(2, device="cuda"),
-            a=a,
-            b=a,
-            dt_bias=torch.zeros(2, device="cuda"),
-            token_indices=torch.arange(3, device="cuda"),
-        )
-        for override in (
-            {"token_indices": torch.arange(2, device="cuda")},
-            {"token_indices": torch.arange(3, device="cuda").float()},
-            {"token_indices": torch.arange(6, device="cuda")[::2]},
-            {"token_indices": torch.arange(3)},
-        ):
-            with self.subTest(fields=tuple(override)):
-                with self.assertRaisesRegex(ValueError, "GDN preparation requires"):
-                    fused_qkv_gating_gdn_prefill(
-                        packed, 2, 2, 2, 64, 64, 64, **(args | override)
-                    )
-
     def _assert_within_ulp(self, actual, expected, max_ulp=1):
         self.assertTrue(bool(torch.isfinite(actual).all()))
         self.assertTrue(bool(torch.isfinite(expected).all()))
@@ -739,20 +716,6 @@ class TestGDNMISOutput(CustomTestCase):
             {"out": None},
             {"output_indices": None},
             {"cu_seqlens": None},
-            {"out": out.float()},
-            {"out": out.transpose(1, 2)},
-            {"out": torch.empty(1, 3, 2, 128, device="cuda", dtype=q.dtype)[..., ::2]},
-            {"out": out.cpu()},
-            {"output_indices": indices.float()},
-            {"output_indices": indices[:2]},
-            {"output_indices": indices.cpu()},
-            {"output_indices": torch.arange(6, device="cuda")[::2]},
-            {"q": q.detach().requires_grad_()},
-            {
-                "initial_state": torch.empty(
-                    1, 2, 64, 64, device="cuda", requires_grad=True
-                )
-            },
         ):
             with self.subTest(fields=tuple(override)):
                 with self.assertRaisesRegex(

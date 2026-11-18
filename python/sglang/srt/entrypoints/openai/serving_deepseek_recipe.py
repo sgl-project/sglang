@@ -134,6 +134,8 @@ class DeepSeekRecipeChatEncodingAdapter:
             "thinking": thinking,
             "continue_final_message": continue_final,
             "response_format": wire.get("response_format"),
+            # Also without request tools: it decides which message-declared tools show.
+            "tool_choice": wire.get("tool_choice"),
         }
         if tools is not None:
             # `model_dump` adds None for unset fields, which recipe renders as values.
@@ -146,7 +148,6 @@ class DeepSeekRecipeChatEncodingAdapter:
                 }
                 for tool in tools
             ]
-            body["tool_choice"] = wire.get("tool_choice")
         body = {key: value for key, value in body.items() if value is not None}
         image_urls = []
         prompt_ids = self._encode(

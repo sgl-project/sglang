@@ -90,6 +90,7 @@ def _server_args(ext, port: int):
         limit_mm_data_per_request=[],
         allow_auto_truncate=False,
         enable_return_hidden_states=False,
+        return_hidden_states_mode=None,
         num_reserved_tokens=0,
         tokenizer_model_max_length=-1,
         version="test",
@@ -140,7 +141,7 @@ class TestRustServerCrashDumpBoundary(CustomTestCase):
                     http.post,
                     f"http://127.0.0.1:{port}/generate",
                     json=payload,
-                    headers={"x-smg-routing-key": "k"},
+                    headers={"x-sgl-routing-key": "k"},
                     timeout=20,
                 )
                 self.assertTrue(server.wait_request(timeout_ms=15000))

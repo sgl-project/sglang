@@ -147,6 +147,39 @@ def apply_accuracy_dataset_override(test_cls):
     )
 
 
+def extract_report_accuracy(report_data):
+    """Return the primary accuracy ratio from an evalscope report.
+
+    Older reports carry a top-level ``score``. Schema v2 reports (evalscope
+    1.11+) moved it into ``metrics[]``: each entry has ``identity.name`` plus a
+    ``score`` already normalised to 0..1, next to ``num``/``num_correct``.
+    """
+    score = report_data.get("score")
+    if isinstance(score, (int, float)):
+        return float(score)
+
+    primary_identity = report_data.get("primary_metric_identity")
+    primary = (
+        primary_identity.get("name") if isinstance(primary_identity, dict) else None
+    )
+    metrics = report_data.get("metrics")
+    if not isinstance(metrics, list):
+        metrics = []
+    for name in (primary, "accuracy"):
+        if not name:
+            continue
+        for metric in metrics:
+            if not isinstance(metric, dict):
+                continue
+            identity = metric.get("identity")
+            if not isinstance(identity, dict) or identity.get("name") != name:
+                continue
+            value = metric.get("score")
+            if isinstance(value, (int, float)):
+                return float(value)
+    return None
+
+
 def run_evalscope(
     host,
     port,
@@ -259,15 +292,18 @@ def run_evalscope(
             try:
                 with open(report_path, "r") as rf:
                     report_data = json.load(rf)
-                score = report_data.get("score")
+                score = extract_report_accuracy(report_data)
                 if score is not None:
-                    metrics["accuracy"] = float(score)
+                    metrics["accuracy"] = score
                     logger.info(f"The Final Accuracy from report: {score}")
             except Exception as e:
                 logger.warning(f"Failed to read report file {report_path}: {e}")
 
         if "accuracy" not in metrics:
             accuracy_patterns = [
+                # evalscope 1.11+ adds a Correct column between Num and Score:
+                # │ ... │ Accuracy ↑ │ default │ 20 │ 18 │ 90% │
+                r"Accuracy\s*[↑↓]?\s*│\s*[^│]*│\s*\d+\s*│\s*\d+\s*│\s*([\d.]+)%?\s*│",
                 # Add adaptation for evalscope 1.11+ table format
                 r"Accuracy\s*[↑↓]?\s*│\s*[^│]*│\s*\d+\s*│\s*([\d.]+)%?\s*│",
                 r"mean_acc\s*.*?│\s*\d+\s*│\s*([\d.]+)\s*│",
@@ -284,7 +320,8 @@ def run_evalscope(
                     final_accuracy = float(matches[-1].group(1))
                     # evalscope 1.11+ reports accuracy as a percentage (e.g. 66.67%);
                     # normalize it to a 0-1 fraction to compare against the baseline.
-                    if "%" in matches[-1].group(0):
+                    # Accuracy can never exceed 1, so a bare "90" is a percentage too.
+                    if "%" in matches[-1].group(0) or final_accuracy > 1.0:
                         final_accuracy /= 100.0
                     metrics["accuracy"] = final_accuracy
                     logger.info(f"The Final Accuracy from output: {final_accuracy}")

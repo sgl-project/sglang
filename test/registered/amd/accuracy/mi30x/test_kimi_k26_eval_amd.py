@@ -6,7 +6,7 @@ Kimi-K2.6 shares the same architecture as Kimi-K2.5 (per the model card the
 deployment method is directly reused), so the AMD server arguments match the
 existing Kimi-K2.5 MI30x test.
 
-Registry: nightly-amd-accuracy-8-gpu-kimi-k26 suite
+Registry: nightly-accuracy-test-8-gpu-amd-kimi-k26 suite
 """
 
 import os
@@ -28,7 +28,7 @@ from sglang.test.test_utils import (
 
 # Register for AMD CI - Kimi K2.6 accuracy test (~60 min)
 register_amd_ci(
-    est_time=3600, suite="nightly-amd-accuracy-8-gpu-kimi-k26", nightly=True
+    est_time=3600, suite="nightly-accuracy-test-8-gpu-amd-kimi-k26", nightly=True
 )
 
 KIMI_K26_MODEL_PATH = "moonshotai/Kimi-K2.6"

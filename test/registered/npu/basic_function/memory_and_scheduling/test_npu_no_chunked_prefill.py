@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     run_bench_serving,
 )
 
-register_npu_ci(est_time=400, suite="full-1-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="full-test-1-npu-a3", nightly=True)
 
 
 class TestNoChunkedPrefill(CustomTestCase):
@@ -30,7 +30,8 @@ class TestNoChunkedPrefill(CustomTestCase):
         other_args = [
             "--attention-backend",
             "ascend",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
             "--chunked-prefill-size",
             "-1",
             "--disable-radix-cache",

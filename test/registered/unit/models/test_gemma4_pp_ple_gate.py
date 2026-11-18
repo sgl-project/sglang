@@ -73,8 +73,7 @@ class TestGemma4PipelinePleGate(CustomTestCase):
             gemma4_causal.Gemma4TextModel(_ple_config())
 
     def test_graphs_disabled_on_both_phases_admit_pp(self):
-        """Graphs disabled through the per-phase backend flags admit PP, not
-        only the deprecated --disable-cuda-graph spelling."""
+        """Graphs disabled through either per-phase spelling admit PP."""
         for argv in (
             [
                 "--cuda-graph-backend-decode",
@@ -82,7 +81,7 @@ class TestGemma4PipelinePleGate(CustomTestCase):
                 "--cuda-graph-backend-prefill",
                 "disabled",
             ],
-            ["--disable-cuda-graph"],
+            ["--disable-decode-cuda-graph", "--disable-prefill-cuda-graph"],
         ):
             with self.subTest(argv=argv), self.assertRaises(_GatePassed):
                 self._build_second_stage_model(argv)

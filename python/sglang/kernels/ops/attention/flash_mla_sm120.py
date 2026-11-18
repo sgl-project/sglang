@@ -1,10 +1,12 @@
 """SM120 FlashMLA sparse decode implementation.
 
 On SM120 (Blackwell Desktop / RTX PRO 6000) the flash_mla CUDA kernel
-is not available, so this module provides alternative implementations:
+is not available, so this module provides alternative implementations,
+selected by ``SGLANG_SM120_FLASHMLA_BACKEND``:
 
-- A fused Triton kernel (default, ``SGLANG_SM120_TRITON_FLASHMLA=1``)
-- A pure-PyTorch fallback (``SGLANG_SM120_TRITON_FLASHMLA=0``)
+- FlashInfer's SM120 sparse MLA decode (``flashinfer``, the default)
+- A fused Triton kernel (``triton``)
+- A pure-PyTorch fallback (``torch``)
 
 The FP8 KV cache uses a page-internal layout where NOPE+ROPE data has
 stride (nope_dim + rope_dim*2) per token, and scales are stored in a

@@ -8,7 +8,7 @@ existing Kimi-K2.5 MI30x accuracy test (mixed aiter prefill + triton decode).
 
 The model path can be configured via KIMI_K26_MODEL_PATH environment variable.
 
-Registry: nightly-perf-8-gpu-kimi-k26 suite
+Registry: nightly-perf-test-8-gpu-amd-kimi-k26 suite
 
 Example usage:
     KIMI_K26_MODEL_PATH=moonshotai/Kimi-K2.6 python -m pytest test_kimi_k26_perf_amd.py -v
@@ -26,7 +26,7 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 # Register for AMD CI - Kimi K2.6 perf benchmark (~90 min)
 register_amd_ci(
     est_time=5400,
-    suite="nightly-perf-8-gpu-kimi-k26",
+    suite="nightly-perf-test-8-gpu-amd-kimi-k26",
     nightly=True,
     disabled="Older model generation; AMD nightly keeps the latest two per family",
 )

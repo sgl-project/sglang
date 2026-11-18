@@ -672,12 +672,6 @@ def launch_context(server_cls, cores=(None, None)):
                 host="::", port=30000, warmups=None, api_key=None
             ),
         ),
-        # No GC warning, no `--warmups`.
-        patch.object(
-            server_module,
-            "get_observability",
-            return_value=SimpleNamespace(gc_warning_threshold_secs=0.0),
-        ),
         patch.object(
             server_module,
             "get_disagg",

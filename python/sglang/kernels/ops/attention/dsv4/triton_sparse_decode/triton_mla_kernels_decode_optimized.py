@@ -29,8 +29,6 @@ def _should_use_fused_splitk(total_tokens: int, h_q: int, total_topk: int) -> bo
 
     The fused split-K kernel is preferred for small batch sizes because
     split-K provides better GPU utilization when the grid is small.
-
-    This matches the original _should_use_fused_dual_scope() thresholds.
     """
     if total_tokens <= 4:
         return True
@@ -156,7 +154,6 @@ def _triton_sparse_attn_decode_dsv4(
             topk_length_extra=extra_kv_scope.topk_length,
             attn_sink=attn_sink,
             s_q=s_q,
-            force_no_splitk=True,
         )
 
     return output.view(b, s_q, h_q, d_v), lse.view(b, s_q, h_q).transpose(1, 2)
