@@ -127,9 +127,8 @@ class LoadConfig:
     weight_cache_transport: str = "auto"  # "auto", "torch_ipc", "vmm_fd"
     fallback_load_format: Union[str, "LoadFormat"] = LoadFormat.AUTO
 
-    # Runtime-only load group, currently used by InstantTensor; None disables
-    # collective loading. Other distributed loaders, such as fastsafetensors
-    # and runai_model_streamer, could also benefit from honoring this group.
+    # Runtime-only load group for InstantTensor and RunAI; None disables
+    # collective loading. RunAI streams independently for stage-local groups.
     load_group: LoadGroup = field(default=_DEFAULT_LOAD_GROUP, repr=False)
 
     def __post_init__(self):

@@ -450,7 +450,7 @@ def prepare_for_draft_extend(
         # (the `_batch_size == batch_size` assertion, see #27091); the
         # marked pre-pad metadata is used as-is, matching the proven
         # skip_attn_backend_init=True behavior.
-        # On NPU with --disable-cuda-graph, block_table shape won't match
+        # On NPU with --disable-decode-cuda-graph --disable-prefill-cuda-graph, block_table shape won't match
         # after prepare_mlp_sync_batch padding; defer re-init to
         # forward_extend (post-pad) instead.
         if not is_npu() or can_run_decode_cuda_graph:
@@ -864,7 +864,7 @@ def run_eagle_verify(
         # skipped here unconditionally, although eagle_prepare_for_verify
         # only plans when cuda-graph load_batch ran. Single-layer eagle
         # re-inits the non-graph path instead (post-pad); multi-layer has
-        # not adopted that fix. On NPU with --disable-cuda-graph, non-graph
+        # not adopted that fix. On NPU with --disable-decode-cuda-graph --disable-prefill-cuda-graph, non-graph
         # verify needs metadata init in forward_extend (post-pad); only
         # mark ready for the cuda-graph path.
         if not _is_npu or can_run_cuda_graph:
