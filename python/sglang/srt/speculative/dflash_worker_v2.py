@@ -182,8 +182,8 @@ _is_npu = is_npu()
 
 
 if TYPE_CHECKING:
-    from sglang.kernels.ops.speculative.dflash_mla_ctx import MlaContextKV
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.dflash_mla_ctx import MlaContextKV
 
 logger = logging.getLogger(__name__)
 
@@ -2475,7 +2475,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     def _mla_context_kv(self) -> Optional["MlaContextKV"]:
         """The ROCm monokernel's stacked context-KV writer, or None."""
         if "_mla_ctx" not in self.__dict__:
-            from sglang.kernels.ops.speculative.dflash_mla_ctx import MlaContextKV
+            from sglang.srt.speculative.dflash_mla_ctx import MlaContextKV
 
             self._mla_ctx = MlaContextKV.for_worker(self)
         return self._mla_ctx
