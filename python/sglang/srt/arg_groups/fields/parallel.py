@@ -258,6 +258,17 @@ class Parallel(msgspec.Struct):
         bool,
         "Shard dense MLP weights across the attention TP group under DP attention.",
     ] = False
+    kda_dwdp_size: A[
+        Optional[int],
+        "DWDP for Kimi-K3 KDA projection and shared-expert weights on PD prefill "
+        "workers (--disaggregation-mode prefill) under attention DP: each group of "
+        "this many attention-DP ranks holding the same attention-TP slice keeps 1/N "
+        "of every KDA layer's [q,k,v,g] in-projection and o_proj (and of the shared "
+        "experts when they would be replicated), and gathers a layer's full weights "
+        "over NVLink just before it runs. Must divide the attention-DP size. Saves "
+        "~(1 - 1/N) of those weights per rank (about 53 GB for K3 at attention TP 1, "
+        "N=8) for one layer-weight gather per sharded layer per forward.",
+    ] = None
     enable_layernorm_sp: A[
         bool,
         "Enable Megatron-style sequence parallelism (arXiv:2205.05198) for the "
