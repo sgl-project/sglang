@@ -3821,6 +3821,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 break
 
+        self.stop_schedulers_gracefully()
+        kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
+        if self._server_stop_hook is not None:
+            # sys.exit() here raises SystemExit into the loop and kills it,
+            # so the ASGI server never runs its lifespan shutdown.
+            # The loop outlives this coroutine now, so drop our own tasks first;
+            # a pending handle_loop would be reported as destroyed-while-pending.
+            current = asyncio.current_task()
+            for task in self.asyncio_tasks:
+                if task is not current:
+                    task.cancel()
+            self._server_stop_hook()
+            return
+        sys.exit(0)
+
+    def stop_schedulers_gracefully(self) -> None:
+        """Ask the schedulers to release their resources and exit, and wait.
+
+        Call before ``kill_process_tree``: a SIGKILLed scheduler leaves its pinned
+        host buffers to the kernel (see ``HostKVCache.destroy``), whose reclaim
+        also blocks GPU calls of other processes on the node.
+        """
         # Stop the watchdog: child exits are expected during shutdown, not crashes.
         if self._subprocess_watchdog is not None:
             self._subprocess_watchdog.stop()
@@ -3838,19 +3860,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 f"Schedulers still alive {_SCHEDULER_EXIT_TIMEOUT_SECS}s after "
                 f"ShutdownReq, killing them before they released: {stragglers}"
             )
-        kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
-        if self._server_stop_hook is not None:
-            # sys.exit() here raises SystemExit into the loop and kills it,
-            # so the ASGI server never runs its lifespan shutdown.
-            # The loop outlives this coroutine now, so drop our own tasks first;
-            # a pending handle_loop would be reported as destroyed-while-pending.
-            current = asyncio.current_task()
-            for task in self.asyncio_tasks:
-                if task is not current:
-                    task.cancel()
-            self._server_stop_hook()
-            return
-        sys.exit(0)
 
     def force_exit_handler(self):
         """Put some custom force exit logic here."""

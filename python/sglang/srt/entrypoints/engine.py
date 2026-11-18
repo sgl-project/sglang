@@ -163,6 +163,7 @@ from sglang.srt.utils import (
     numa_utils,
     set_ulimit,
 )
+from sglang.srt.utils.cudacore_pyspy_dump_utils import collect_scheduler_processes
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -1547,7 +1548,17 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_init_result = getattr(self, "_scheduler_init_result", None)
             if scheduler_init_result is not None:
                 scheduler_init_result.stop_grpc_server()
-            if (
+            if isinstance(self.tokenizer_manager, TokenizerManager) and (
+                collect_scheduler_processes()
+            ):
+                # Let the schedulers release their pinned host buffers before
+                # the kill_process_tree below, as sigterm_watchdog does. Skipped
+                # once they are gone: shutdown() runs again from atexit.
+                try:
+                    self.tokenizer_manager.stop_schedulers_gracefully()
+                except Exception:
+                    logger.exception("Graceful scheduler shutdown failed")
+            elif (
                 self.tokenizer_manager is not None
                 and self.tokenizer_manager._subprocess_watchdog is not None
             ):
