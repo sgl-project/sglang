@@ -604,12 +604,15 @@ def _hc_head_reference(x, fn, scale, base, norm_eps, hc_eps, eps_outside_sqrt):
     return torch.sum((pre + hc_eps).unsqueeze(-1) * x.float(), dim=1).to(x.dtype)
 
 
+@pytest.mark.parametrize("hc", [4, 3, 5])
 @pytest.mark.parametrize("eps_outside_sqrt", [False, True])
-def test_fused_hc_head(eps_outside_sqrt):
+def test_fused_hc_head(eps_outside_sqrt, hc):
+    """hc=3 and hc=5 are not powers of two (the kernel pads the tile to 4 and 8):
+    it must mask the padded streams, else it mixes in the next token's streams."""
     from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
 
     torch.manual_seed(0)
-    num_tokens, hc, hidden = 33, 4, 4096
+    num_tokens, hidden = 33, 4096
     x = torch.randn(num_tokens, hc, hidden, device="cuda").bfloat16()
     fn = torch.randn(hc, hc * hidden, device="cuda") * 0.1
     scale = torch.ones(1, device="cuda")
