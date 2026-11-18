@@ -10,7 +10,9 @@ geometry (4 index heads, head_dim 128, compress ratio 4), chunked as the indexer
 it. Today's arm selects on scores divided by sqrt(head_dim), the new arm on unscaled ones
 (topk_v2 reads only their order); the "new_divided" arm takes the gfx95 branch with the
 scores still divided, which splits the difference between the top-k and the division
-pass. Timing is one call of the whole function (all row chunks: one layer).
+pass. These arms keep the fused top-k off; the "fused" arm takes it at every row count
+(by default it serves selections of at least ``_FUSED_TOPK_MIN_ROWS`` rows). Timing is
+one call of the whole function (all row chunks: one layer).
 
 Decode: each input is the draft rows of a target-verify step, 4 rows a request, over
 random request contexts, padded with length-0 requests to the batch size a CUDA graph
@@ -56,15 +58,18 @@ CASES = {
     "served": (16384, 83968),
     "no_prefix": (16384, 0),
     "chunk4096_on_96256": (4096, 96256),
+    "chunk8192_on_92160": (8192, 92160),
     "odd_width": (16384, 83973),  # 25,089 compressed keys: not a multiple of 4
 }
 # arm -> kernel fragments one call must launch / must not launch; the division by
 # sqrt(head_dim) runs as an elementwise MulFunctor (a multiply by the reciprocal)
+FUSED = "qsa_prefill_fused_topk"
 EXPECTED_KERNELS = {
-    "today": (("fast_topk_kernel", "MulFunctor"), ("topk_ragged_kernel",)),
-    "new": (("topk_ragged_kernel",), ("fast_topk", "MulFunctor")),
-    "new_repeat": (("topk_ragged_kernel",), ("fast_topk", "MulFunctor")),
-    "new_divided": (("topk_ragged_kernel", "MulFunctor"), ("fast_topk",)),
+    "today": (("fast_topk_kernel", "MulFunctor"), ("topk_ragged_kernel", FUSED)),
+    "new": (("topk_ragged_kernel",), ("fast_topk", "MulFunctor", FUSED)),
+    "new_repeat": (("topk_ragged_kernel",), ("fast_topk", "MulFunctor", FUSED)),
+    "new_divided": (("topk_ragged_kernel", "MulFunctor"), ("fast_topk", FUSED)),
+    "fused": ((FUSED,), ("topk_ragged_kernel", "fast_topk", "MulFunctor")),
 }
 ARMS = list(EXPECTED_KERNELS)
 
@@ -98,6 +103,7 @@ DECODE_ARMS = list(EXPECTED_DECODE_KERNELS)
 
 _original_gate = qsa_indexer.is_gfx95_supported
 _original_scoring = qsa_indexer.qsa_mqa_prefill_relative
+_original_fused_min_rows = qsa_indexer._FUSED_TOPK_MIN_ROWS
 _original_decode_scoring = qsa_indexer.qsa_mqa_decode
 _original_decode_topk = qsa_indexer._exact_decode_block_topk
 _flush_buffer = None
@@ -162,6 +168,7 @@ def use_arm(arm):
     qsa_indexer.qsa_mqa_prefill_relative = (
         divided_scoring if arm == "new_divided" else _original_scoring
     )
+    qsa_indexer._FUSED_TOPK_MIN_ROWS = 0 if arm == "fused" else 1 << 62
 
 
 def time_arms(arms, reps, prepare, call, warmup=3):
@@ -241,14 +248,15 @@ def paired_ratio(numerator, denominator):
     return summarize([a / b for a, b in zip(numerator, denominator, strict=True)])
 
 
-def differing_rows(case):
-    """Rows whose selected token sets differ between today's arm and the new one: a
-    tie at the k-th score, or two scores the division by sqrt(head_dim) merged there."""
-    use_arm("today")
-    today = select(case).sort(dim=1).values
-    use_arm("new")
-    new = select(case).sort(dim=1).values
-    return int((today != new).any(dim=1).sum())
+def differing_rows(case, arm_a, arm_b):
+    """Rows whose selected token sets differ between two arms. Today's and the new one
+    differ at a tie at the k-th score, or where the division by sqrt(head_dim) merged
+    two scores there; the new and the fused one only at a tie."""
+    use_arm(arm_a)
+    a = select(case).sort(dim=1).values
+    use_arm(arm_b)
+    b = select(case).sort(dim=1).values
+    return int((a != b).any(dim=1).sum())
 
 
 def run_case(name, reps):
@@ -278,7 +286,9 @@ def run_case(name, reps):
         "new_divided_over_today": paired_ratio(us["new_divided"], us["today"]),
         "new_over_new_divided": paired_ratio(us["new"], us["new_divided"]),
         "aa_new_over_repeat": paired_ratio(us["new"], us["new_repeat"]),
-        "rows_with_different_token_sets": differing_rows(case),
+        "fused_over_new": paired_ratio(us["fused"], us["new"]),
+        "rows_with_different_token_sets": differing_rows(case, "today", "new"),
+        "rows_with_different_token_sets_fused": differing_rows(case, "new", "fused"),
         "kernels": kernels,
         "gates": gates,
     }
@@ -298,13 +308,16 @@ def print_case(name, result):
         ("new_divided / today", "new_divided_over_today"),
         ("new / new_divided", "new_over_new_divided"),
         ("new / new (A/A)", "aa_new_over_repeat"),
+        ("fused / new", "fused_over_new"),
     ):
         r = result[key]
         print(
             f"  {label:19s} {r['median']:.4f}  (p10-p90 {r['p10']:.4f}-{r['p90']:.4f})"
         )
     print(
-        f"  rows with different token sets: {result['rows_with_different_token_sets']}"
+        "  rows with different token sets: "
+        f"{result['rows_with_different_token_sets']} (today, new), "
+        f"{result['rows_with_different_token_sets_fused']} (new, fused)"
     )
     for arm, gate in result["gates"].items():
         print(f"  kernels {arm}: {'ok' if gate['ok'] else gate}")
@@ -543,6 +556,7 @@ def main():
                 print_case(name, results[name])
     finally:
         use_arm("new")
+        qsa_indexer._FUSED_TOPK_MIN_ROWS = _original_fused_min_rows
         restore_decode_patches()
     if args.out:
         with open(args.out, "w") as f:

@@ -94,6 +94,88 @@ def _exact_decode_block_topk(
     return block_indices
 
 
+# The fused prefill top-k runs one CTA per 32 rows over their whole key range, so below
+# about this many rows (256 CTAs) it leaves CUs idle: on MI355X it is about as fast as
+# scoring + topk_v2 at 6,144 rows and slower at 4,096.
+_FUSED_TOPK_MIN_ROWS = 8192
+# It stores a row's columns in 16 bits.
+_FUSED_TOPK_MAX_ROW_KEYS = 1 << 16
+
+
+def _use_fused_prefill_topk(
+    q: torch.Tensor,
+    compressed_keys: torch.Tensor,
+    max_row_keys: int,
+    block_topk: int,
+    compress_ratio: int,
+) -> bool:
+    """Whether a gfx95 relative prefill selection takes qsa_prefill_fused_topk: 4 heads
+    of 128 dims (bf16 on ROCm), top-512 blocks of 4 tokens, outside batch-invariant
+    mode."""
+    return (
+        q.shape[0] >= _FUSED_TOPK_MIN_ROWS
+        and max_row_keys <= _FUSED_TOPK_MAX_ROW_KEYS
+        and block_topk == 512
+        and compress_ratio == 4
+        and tuple(q.shape[1:]) == (4, 128)
+        and tuple(compressed_keys.shape[1:]) == (1, 128)
+        and not is_batch_invariant_mode_enabled()
+    )
+
+
+def _select_prefill_tokens_fused(
+    q: torch.Tensor,
+    compressed_keys: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths_for_rows: torch.Tensor,
+    output: torch.Tensor,
+    block_topk: int,
+    compress_ratio: int,
+    token_topk: int,
+) -> torch.Tensor:
+    """select_prefill_tokens' gfx95 relative path without the fp32 logits: the token
+    sets of scoring + topk_v2 + expansion (ties at the k-th score go to the smallest
+    block indices), blocks in ascending order."""
+    from sglang.kernels.ops.attention.qsa_prefill_fused_topk_hip import (
+        qsa_prefill_fused_topk,
+        qsa_prefill_fused_topk_row_bytes,
+    )
+
+    q = q.contiguous()
+    keys = compressed_keys[:, 0].contiguous()
+    starts = row_starts.to(torch.int32).contiguous()
+    ends = row_ends.to(torch.int32).contiguous()
+    positions = query_positions.to(torch.int64)
+    sequence_lengths = sequence_lengths_for_rows.to(torch.int32)
+    # The candidate workspace stays within the logits budget, in row chunks of equal
+    # size, so that none is left with too few rows to fill the GPU.
+    rows = q.shape[0]
+    max_chunk_rows = max(
+        1,
+        _QSA_PREFILL_LOGITS_BUDGET_BYTES
+        // qsa_prefill_fused_topk_row_bytes(block_topk),
+    )
+    num_chunks = -(-rows // max_chunk_rows)
+    row_chunk_size = -(-rows // num_chunks)
+    for row_start in range(0, rows, row_chunk_size):
+        chunk_slice = slice(row_start, row_start + row_chunk_size)
+        qsa_prefill_fused_topk(
+            q[chunk_slice],
+            keys,
+            starts[chunk_slice],
+            ends[chunk_slice],
+            positions[chunk_slice],
+            sequence_lengths[chunk_slice],
+            output[chunk_slice],
+            topk=block_topk,
+            compress_ratio=compress_ratio,
+            token_topk=token_topk,
+        )
+    return output
+
+
 class QSAIndexer(MultiPlatformOp):
     """Config-driven fused-QK, weight-free sparse-attention indexer."""
 
@@ -512,8 +594,25 @@ class QSAIndexer(MultiPlatformOp):
         # exact where fast_topk drops members of an overfull threshold bin (as in
         # sgl-project/sglang#36807). It only reads the order of the scores, so they stay
         # unscaled, and it needs the logits row stride to be a multiple of
-        # _TOPK_V2_ROW_ALIGNMENT.
+        # _TOPK_V2_ROW_ALIGNMENT. Selections _use_fused_prefill_topk accepts take the
+        # fused kernel instead, which selects topk_v2's mode-2 set (ties to the smallest
+        # blocks) whatever SGLANG_TOPK_V2_MODE is.
         use_topk_v2 = relative and is_gfx95_supported()
+        if use_topk_v2 and _use_fused_prefill_topk(
+            q, compressed_keys, max_row_keys, self.block_topk, self.compress_ratio
+        ):
+            return _select_prefill_tokens_fused(
+                q,
+                compressed_keys,
+                row_starts,
+                row_ends,
+                query_positions,
+                sequence_lengths_for_rows,
+                output,
+                self.block_topk,
+                self.compress_ratio,
+                self.token_topk,
+            )
         score_scale = 1.0 if use_topk_v2 else None
         logits_width = max_row_keys
         if use_topk_v2:

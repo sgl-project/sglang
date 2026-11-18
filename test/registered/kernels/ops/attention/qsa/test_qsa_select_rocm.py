@@ -3,7 +3,8 @@
 
 On gfx95 the blocks come from topk_v2, which selects exactly where ``fast_topk``
 keeps at most 4096 candidates of a row's threshold bin and drops the rest. Prefill
-in batch-invariant mode gives ties to the smallest block indices.
+in batch-invariant mode gives ties to the smallest block indices; so does the fused
+prefill top-k that selections of at least 8,192 rows take.
 """
 
 import sys
@@ -14,6 +15,7 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4 import topk as topk_v2_module
 from sglang.srt.layers.attention.qsa import qsa_indexer
+from sglang.srt.layers.attention.qsa.kernel import expand_qsa_block_indices
 from sglang.srt.layers.attention.qsa.mqa import (
     HAS_TILELANG,
     qsa_mqa_decode,
@@ -124,6 +126,171 @@ def test_select_prefill_tokens_ties_go_to_the_smallest_blocks_when_batch_invaria
         assert torch.all(scores[row, :length] == scores[row, 0]), row
         blocks = _blocks(selected[row], length)
         assert torch.equal(blocks.cpu(), torch.arange(BLOCK_TOPK)), row
+
+
+# Prefill selections of at least this many rows take the fused top-k.
+FUSED_MIN_ROWS = 8192
+
+
+def _packed_operands(requests, seed=11):
+    """Operands of packed prefill requests, each (new rows, cached tokens): rms-normed
+    Gaussian Q and keys, a row seeing the blocks completed before it."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    q, k, starts, ends, positions, seq_lens, base = [], [], [], [], [], [], 0
+    for rows, prefix in requests:
+        seq_len = prefix + rows
+        keys = seq_len // RATIO
+        row_positions = torch.arange(prefix, seq_len, device="cuda")
+        q.append(torch.randn(rows, NUM_Q_HEADS, HEAD_DIM, generator=gen, device="cuda"))
+        k.append(torch.randn(keys, 1, HEAD_DIM, generator=gen, device="cuda"))
+        starts.append(torch.full((rows,), base, device="cuda"))
+        ends.append(base + torch.clamp((row_positions + 1) // RATIO, max=keys))
+        positions.append(row_positions)
+        seq_lens.append(torch.full((rows,), seq_len, device="cuda"))
+        base += keys
+    q, k = torch.cat(q), torch.cat(k)
+    return SimpleNamespace(
+        q=(q * torch.rsqrt(q.pow(2).mean(-1, keepdim=True))).bfloat16(),
+        k=(k * torch.rsqrt(k.pow(2).mean(-1, keepdim=True))).bfloat16(),
+        starts=torch.cat(starts).int(),
+        ends=torch.cat(ends).int(),
+        positions=torch.cat(positions),
+        seq_lens=torch.cat(seq_lens).int(),
+        width=max(prefix + rows for rows, prefix in requests) // RATIO,
+    )
+
+
+def _head_score_operands(head_scores, rows=FUSED_MIN_ROWS):
+    """Rows over the same keys whose head h is the unit vector e_h, so that head h
+    scores key j as head_scores[j, h]."""
+    keys = head_scores.shape[0]
+    q = torch.zeros(rows, NUM_Q_HEADS, HEAD_DIM)
+    q[:, range(NUM_Q_HEADS), range(NUM_Q_HEADS)] = 1.0
+    k = torch.zeros(keys, 1, HEAD_DIM)
+    k[:, 0, :NUM_Q_HEADS] = head_scores
+    seq_len = RATIO * keys + rows
+    return SimpleNamespace(
+        q=q.bfloat16().cuda(),
+        k=k.bfloat16().cuda(),
+        starts=torch.zeros(rows, dtype=torch.int32, device="cuda"),
+        ends=torch.full((rows,), keys, dtype=torch.int32, device="cuda"),
+        positions=torch.arange(RATIO * keys, seq_len, device="cuda"),
+        seq_lens=torch.full((rows,), seq_len, dtype=torch.int32, device="cuda"),
+        width=keys,
+    )
+
+
+def _ties_cut_in_first_compaction():
+    """Scanned first (keys 3,072..4,095): 300 keys at 2 and 724 at 1. The first
+    compaction keeps 212 of the 1s, and no later key (0.5) reaches them."""
+    scores = torch.zeros(4096, NUM_Q_HEADS)
+    scores[:, 0] = 0.5
+    top = 3072 + torch.randperm(1024, generator=torch.Generator().manual_seed(34))
+    scores[top[:300], 0] = 2.0
+    scores[top[300:], 0] = 1.0
+    return _head_score_operands(scores)
+
+
+def _head_sum_order():
+    """Keys 0..510 score 2^27; key 700 has heads (2^24, 2, 0, 0) and key 600 (2^24, 1,
+    1, 0). Added from head 0, as the scoring kernel adds them, key 700 scores 2^24 + 2
+    and key 600 2^24: key 700 is the 512th block. Added from head 3 they tie, and key
+    600 would take the slot."""
+    scores = torch.zeros(1100, NUM_Q_HEADS)
+    scores[:, 0] = 0.5
+    scores[:511] = 2.0**25
+    scores[600] = torch.tensor([2.0**24, 1.0, 1.0, 0.0])
+    scores[700] = torch.tensor([2.0**24, 2.0, 0.0, 0.0])
+    return _head_score_operands(scores)
+
+
+def _all_keys_equal():
+    operands = _packed_operands([(FUSED_MIN_ROWS, 30000)])
+    operands.k = operands.k[:1].expand_as(operands.k).contiguous()
+    return operands
+
+
+FUSED_CASES = {
+    # A request without a prefix, rows of 512 and 513 blocks, and longer ones; with a
+    # 16 MiB workspace budget (below), in four row chunks.
+    "ragged": lambda: _packed_operands(
+        [(5000, 70000), (2000, 0), (1, 2048), (1191, 2000)]
+    ),
+    "all_keys_equal": _all_keys_equal,
+    "ties_cut_in_first_compaction": _ties_cut_in_first_compaction,
+    "head_sum_order": _head_sum_order,
+}
+
+
+@pytest.mark.parametrize("case", list(FUSED_CASES))
+def test_select_prefill_tokens_fused_equals_scoring_then_topk_v2(monkeypatch, case):
+    """From FUSED_MIN_ROWS rows the selection is fused: each row's output is the
+    expansion of the blocks that the relative scores and topk_v2 with ties to the
+    smallest blocks select (topk_v2's batch-invariant mode, which also keeps the fused
+    path off), in ascending order."""
+    operands = FUSED_CASES[case]()
+    if case == "ragged":
+        monkeypatch.setattr(qsa_indexer, "_QSA_PREFILL_LOGITS_BUDGET_BYTES", 16 << 20)
+
+    def select():
+        indexer = SimpleNamespace(
+            token_topk=TOKEN_TOPK, compress_ratio=RATIO, block_topk=BLOCK_TOPK
+        )
+        return QSAIndexer.select_prefill_tokens(
+            indexer,
+            operands.q,
+            operands.k,
+            operands.starts,
+            operands.ends,
+            operands.positions,
+            operands.seq_lens,
+            max_row_keys=operands.width,
+        )
+
+    fused = select()
+    monkeypatch.setattr(qsa_indexer, "is_batch_invariant_mode_enabled", lambda: True)
+    expected = select()
+
+    # The expected row's blocks: the first token of each of its first min(length, 512)
+    # groups, sorted, padded with -1, expanded again.
+    lengths = (operands.ends - operands.starts).clamp(max=BLOCK_TOPK)
+    valid = torch.arange(BLOCK_TOPK, device="cuda") < lengths[:, None]
+    pad = torch.iinfo(torch.int32).max
+    blocks = torch.where(valid, expected[:, :TOKEN_TOPK:RATIO] // RATIO, pad)
+    blocks = blocks.sort(dim=1).values
+    blocks = torch.where(blocks == pad, -1, blocks)
+    expanded = expand_qsa_block_indices(
+        blocks, operands.positions, operands.seq_lens, RATIO, TOKEN_TOPK
+    )
+    assert torch.equal(fused, expanded)
+
+
+@pytest.mark.parametrize(
+    "limit",
+    ["rows", "row_keys", "block_topk", "compress_ratio", "heads", "batch_invariant"],
+)
+def test_fused_prefill_topk_limits(monkeypatch, limit):
+    """The fused top-k needs FUSED_MIN_ROWS rows, rows of at most 65,536 blocks, the
+    top-512 blocks of 4 tokens, 4 heads of 128 dims and batch-invariant mode off."""
+    q = torch.zeros(FUSED_MIN_ROWS, NUM_Q_HEADS, HEAD_DIM, dtype=torch.bfloat16)
+    k = torch.zeros(16, 1, HEAD_DIM, dtype=torch.bfloat16)
+    args = [q, k, 1 << 16, BLOCK_TOPK, RATIO]
+    assert qsa_indexer._use_fused_prefill_topk(*args)
+    if limit == "rows":
+        args[0] = q[1:]
+    elif limit == "row_keys":
+        args[2] += 1
+    elif limit == "block_topk":
+        args[3] = 2048
+    elif limit == "compress_ratio":
+        args[4] = 8
+    elif limit == "heads":
+        args[0] = q.view(FUSED_MIN_ROWS, 2 * NUM_Q_HEADS, HEAD_DIM // 2)
+    else:
+        monkeypatch.setattr(
+            qsa_indexer, "is_batch_invariant_mode_enabled", lambda: True
+        )
+    assert not qsa_indexer._use_fused_prefill_topk(*args)
 
 
 PAGE_SIZE = 16
