@@ -127,13 +127,13 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
+from sglang.srt.models.kimi_k3_amd.latent_mxfp4 import build_latent_mxfp4_projections
 from sglang.srt.models.kimi_k3_amd.moe import (
     KimiK3MoEHipMixin,
     link_hip_paths,
     prepare_hip_paths,
     row_shard_bank_hooks_hip,
 )
-from sglang.srt.models.kimi_k3_rocm_mxfp4 import build_latent_mxfp4_projections
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3MultiModalProjector,
     KimiK3VisionTower,
@@ -1869,9 +1869,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         if cp_shard_rows:
             return self._forward_cp_shard_rows(hidden_states)
         if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
-            # its row-sharded tail may return this rank's rows; the MXFP4 latent
-            # projections run in _forward_fused
-            if _is_gfx95 and not self._use_latent_mxfp4(num_tokens=num_tokens):
+            if _is_gfx95:  # its row-sharded tail may return this rank's rows
                 return self._forward_fused_hip(hidden_states, prefix_sum=prefix_sum)
             out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
         else:

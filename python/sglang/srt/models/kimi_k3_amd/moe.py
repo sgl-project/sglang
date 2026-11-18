@@ -170,7 +170,11 @@ class KimiK3MoEHipMixin:
         self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor]
     ) -> torch.Tensor:
         """KimiK3MoE._forward_fused on ROCm: the merged front, both TP-partial sums
-        in one flat [latent | shared] buffer, then the tail the batch takes."""
+        in one flat [latent | shared] buffer, then the tail the batch takes. A batch
+        that takes the MXFP4 latent projections runs the shared _forward_fused
+        instead, on every row: this path runs them in BF16."""
+        if self._use_latent_mxfp4(num_tokens=hidden_states.shape[0]):
+            return self._forward_fused(hidden_states, prefix_sum=prefix_sum)
         from sglang.srt.models.kimi_k3 import _add3
 
         num_tokens, hidden_size = hidden_states.shape

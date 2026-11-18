@@ -11,9 +11,10 @@ from torch.nn import functional as F
 
 from sglang.kernels.ops.gemm import latent_mxfp4_aiter_hip
 from sglang.srt.environ import envs
-from sglang.srt.models import kimi_k3, kimi_k3_rocm_mxfp4
+from sglang.srt.models import kimi_k3
+from sglang.srt.models.kimi_k3_amd import latent_mxfp4
 from sglang.srt.models.kimi_k3_amd import moe as kimi_k3_moe_hip
-from sglang.srt.models.kimi_k3_rocm_mxfp4 import (
+from sglang.srt.models.kimi_k3_amd.latent_mxfp4 import (
     LatentMXFP4Projections,
     build_latent_mxfp4_projections,
 )
@@ -111,7 +112,7 @@ def _toy_runtime() -> ExitStack:
         (kimi_k3, "tensor_model_parallel_all_reduce", lambda x: x),
     ):
         stack.enter_context(mock.patch.object(target, name, side_effect=value))
-    stack.enter_context(mock.patch.object(kimi_k3_rocm_mxfp4, "_MIN_TOKENS", 2))
+    stack.enter_context(mock.patch.object(latent_mxfp4, "_MIN_TOKENS", 2))
     return stack
 
 
@@ -123,6 +124,10 @@ def _expected(moe, x, *, use_mxfp4: bool) -> torch.Tensor:
         up = moe._latent_mxfp4.up_weight
     routed = F.linear(x, down) * moe.gate(x).sigmoid()
     return F.linear(routed, up) + moe.shared_experts(x)
+
+
+class _Gfx950Tail(Exception):
+    """Raised where a batch enters the BF16 gfx950 fused path."""
 
 
 class TestLatentMXFP4Runtime(CustomTestCase):
@@ -157,24 +162,25 @@ class TestLatentMXFP4Runtime(CustomTestCase):
             mock.patch.object(
                 kimi_k3, "k3_bf16_gemm_hip", return_value=None, create=True
             ),
-            mock.patch.object(
-                kimi_k3.KimiK3MoE,
-                "_forward_fused_hip",
-                side_effect=lambda *args, **kwargs: "gfx950 tail",
-            ),
         ):
             moe = _moe(prepared=True)
             moe._eligible_for_fused_front = True
-            for tokens in (1, 2, 3):
-                with self.subTest(tokens=tokens):
-                    x = torch.randn(tokens, 4)
-                    actual = moe.forward(x)
-                    if tokens < 2:
-                        self.assertEqual(actual, "gfx950 tail")
-                    else:
-                        torch.testing.assert_close(
-                            actual, _expected(moe, x, use_mxfp4=True)
-                        )
+            # The BF16 gfx950 body starts by choosing its tail; stop it there.
+            with mock.patch.object(
+                kimi_k3_moe_hip.KimiK3MoEHipMixin,
+                "_row_sharded_tail_eligible",
+                side_effect=_Gfx950Tail,
+            ):
+                for tokens in (1, 2, 3):
+                    with self.subTest(tokens=tokens):
+                        x = torch.randn(tokens, 4)
+                        if tokens < 2:
+                            with self.assertRaises(_Gfx950Tail):
+                                moe.forward(x)
+                        else:
+                            torch.testing.assert_close(
+                                moe.forward(x), _expected(moe, x, use_mxfp4=True)
+                            )
             # nor may the decoder shard the residual by rows for that tail
             moe.tp_size = 8
             with (
@@ -272,7 +278,7 @@ class TestLatentMXFP4Runtime(CustomTestCase):
         )
         with (
             mock.patch.object(latent_mxfp4_aiter_hip, "available", return_value=True),
-            mock.patch.object(kimi_k3_rocm_mxfp4, "is_hip", return_value=True),
+            mock.patch.object(latent_mxfp4, "is_hip", return_value=True),
         ):
             for broken in (None, *ok):
                 case = dict(ok)
