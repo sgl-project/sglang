@@ -15,7 +15,7 @@ from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_xpu_ci(est_time=15, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=15, suite="extra-test-1-gpu-xpu")
 
 
 def _sdpa_ref(
