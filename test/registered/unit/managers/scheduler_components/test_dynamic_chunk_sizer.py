@@ -1,6 +1,7 @@
 """Synthetic chunk profiling must stay within request bounds and release on failure."""
 
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -121,6 +122,67 @@ class TestDynamicChunkSizerProfiling(CustomTestCase):
         self._profile(
             context=8192, mapping=8196, prefill=16384, base=512, fail_forward=True
         )
+
+
+class TestDynamicChunkSizerCacheRelease(CustomTestCase):
+    """PP0 hands the probes' cached memory back before serving, whether or not they fit.
+
+    Left cached, it starves allocations made outside the framework allocator (oneCCL,
+    Level Zero) and the first request hangs or fails; after a failed probe the release
+    frees nothing while the handler's traceback still holds the probe's activations.
+    """
+
+    def _profile_and_fit(self, *, probe_fails):
+        probe_refs = []
+        probe_freed_at_release = []
+
+        def probe():
+            activations = torch.empty(8)
+            probe_refs.append(weakref.ref(activations))
+            if probe_fails:
+                raise torch.OutOfMemoryError("probe ran out of memory")
+            lengths = list(range(4096, 1024, -256))
+            return lengths, [1e-6 * n * n + 1e-2 * n + 5 for n in lengths]
+
+        def empty_cache():
+            probe_freed_at_release.append(probe_refs[0]() is None)
+
+        parallel = SimpleNamespace(
+            pp_rank=0,
+            pp_group=SimpleNamespace(is_first_rank=True),
+            world_group=SimpleNamespace(rank=0, cpu_group=None),
+        )
+        with (
+            patch.object(module, "get_parallel", return_value=parallel),
+            patch.object(
+                module, "broadcast_pyobj", side_effect=lambda data, *_a, **_k: data
+            ),
+            patch.object(
+                module.current_platform, "empty_cache", side_effect=empty_cache
+            ),
+        ):
+            sizer = module.DynamicChunkSizer(
+                model_runner=Mock(),
+                model_config=Mock(),
+                tree_cache=Mock(),
+                req_to_token_pool=Mock(),
+                token_to_kv_pool_allocator=Mock(),
+                spec_algorithm=Mock(),
+                chunked_prefill_size=2048,
+                max_prefill_tokens=16384,
+                page_size=1,
+                device="cpu",
+            )
+            with patch.object(sizer, "_profile_prefill_latency", side_effect=probe):
+                ready = sizer.profile_and_fit()
+        return ready, probe_freed_at_release
+
+    def test_probe_memory_is_released_after_profiling(self):
+        for probe_fails in (False, True):
+            with self.subTest(probe_fails=probe_fails):
+                ready, freed = self._profile_and_fit(probe_fails=probe_fails)
+                self.assertEqual(ready, not probe_fails)
+                self.assertEqual(freed, [True])
 
 
 class TestChunkSizePredictorSmoothing(CustomTestCase):
