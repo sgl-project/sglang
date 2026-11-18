@@ -1234,8 +1234,45 @@ class InputItemNormalizationTestCase(CustomTestCase):
     def test_unknown_input_item_type_raises(self):
         with self.assertRaises(ValueError):
             OpenAIServingResponses._normalize_response_message_for_chat(
-                {"type": "web_search_call", "id": "ws_1"}
+                {"type": "definitely_not_a_type", "id": "x_1"}
             )
+
+    def test_web_search_call_becomes_user_context_note(self):
+        # The user's replay shape: a completed hosted web_search_call item whose
+        # queries act as the question already answered.
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "web_search_call",
+                "id": "ws-call-1",
+                "status": "completed",
+                "action": {
+                    "type": "search",
+                    "queries": ["Qwen API reference"],
+                    "sources": [
+                        {
+                            "type": "url",
+                            "url": "https://help.aliyun.com/zh/model-studio/qwen-api-reference",
+                        }
+                    ],
+                },
+            }
+        )
+        self.assertEqual(normalized["role"], "user")
+        self.assertIn("Qwen API reference", normalized["content"])
+        self.assertIn("Do not call web_search", normalized["content"])
+
+    def test_web_search_call_single_query_shape(self):
+        # Older OpenAI shape: action.query as a single string instead of queries[].
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "web_search_call",
+                "id": "ws_2",
+                "status": "completed",
+                "action": {"type": "search", "query": "Qwen API reference"},
+            }
+        )
+        self.assertEqual(normalized["role"], "user")
+        self.assertIn("Qwen API reference", normalized["content"])
 
 
 class FullResponseUsageTestCase(CustomTestCase):

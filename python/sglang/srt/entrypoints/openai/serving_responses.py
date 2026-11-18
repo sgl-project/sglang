@@ -1589,6 +1589,25 @@ class OpenAIServingResponses(OpenAIServingChat):
             ],
         }
 
+    @staticmethod
+    def _web_search_call_to_context_note(message: dict) -> dict:
+        """Render a replayed hosted web_search_call item as the context note the
+        provider injects: the queries act as the question already answered."""
+        action = message.get("action") or {}
+        queries = action.get("queries")
+        if not queries and action.get("query"):
+            queries = [action["query"]]
+        queries_text = ", ".join(q for q in queries or [] if isinstance(q, str))
+        note = (
+            "Previous web_search_call in this conversation searched for: "
+            f"{queries_text}. Status: completed. Treat those results as already "
+            "available evidence. Do not call web_search again for the same "
+            "question, substantive evidence. Do not call web_search. Before "
+            "calling web_search, first answer from those results and prior "
+            "context, or state uncertainty."
+        )
+        return {"role": "user", "content": note}
+
     @classmethod
     def _normalize_response_message_for_chat(
         cls, message: Any, *, tool_call_parser: Optional[str] = None
@@ -1683,6 +1702,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "role": "assistant",
                 "reasoning_content": "\n".join(text_parts),
             }
+        if msg_type == "web_search_call":
+            return cls._web_search_call_to_context_note(message)
         if msg_type not in (None, "message"):
             raise ValueError(f"Unsupported Responses API input item type: {msg_type!r}")
 
