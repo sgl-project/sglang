@@ -551,7 +551,21 @@ class MiniMaxM3MoE(nn.Module):
                 "M3.1 NVFP4 MegaMoE weights are not ready on this device"
             )
         num_tokens = hidden_states.shape[0]
-        shared = self._forward_shared_experts(hidden_states) if num_tokens else None
+        # Under CUDA-graph capture the shared expert runs on the alt stream beside
+        # the router and MegaMoE, which keeps SMs free for other streams (as
+        # DeepSeek's forward_mega_moe forks it); eager steps run it inline.
+        fork_shared = (
+            self.alt_stream is not None
+            and self.shared_experts is not None
+            and num_tokens > 0
+            and get_is_capture_mode()
+        )
+        if fork_shared:
+            self.alt_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.alt_stream):
+                shared = self._forward_shared_experts(hidden_states)
+        else:
+            shared = self._forward_shared_experts(hidden_states) if num_tokens else None
         topk_ids = topk_weights = None
         if num_tokens:
             output = self.topk(
@@ -569,7 +583,7 @@ class MiniMaxM3MoE(nn.Module):
             if not num_tokens:
                 return hidden_states
             output = self._forward_trtllm_decode(hidden_states, topk_ids, topk_weights)
-            return output + shared if shared is not None else output
+            return self._add_shared(output, shared, fork_shared)
         output = run_mega_routed_experts(
             self.experts,
             hidden_states,
@@ -582,6 +596,16 @@ class MiniMaxM3MoE(nn.Module):
             activation=self.experts._minimax_activation,
             activation_clamp=self.config.swiglu_limit,
         )
+        return self._add_shared(output, shared, fork_shared)
+
+    def _add_shared(
+        self,
+        output: torch.Tensor,
+        shared: Optional[torch.Tensor],
+        forked: bool,
+    ) -> torch.Tensor:
+        if forked:
+            torch.cuda.current_stream().wait_stream(self.alt_stream)
         return output + shared if shared is not None else output
 
     def _forward_trtllm_decode(
