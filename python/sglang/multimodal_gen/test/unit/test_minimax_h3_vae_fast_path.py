@@ -288,6 +288,9 @@ def test_light_tile_rank_hands_one_tile_to_each_other_rank():
     assert [owners.count(rank) for rank in range(8)] == [1, 4, 4, 4, 4, 4, 4, 3]
     assert klvae.tile_owners(56, 2, light_rank=1).count(1) == 27
     assert klvae.tile_owners(4, 1, light_rank=0) == [0, 0, 0, 0]
+    # keeping none: 24 tiles on 8 ranks leave the light rank idle
+    owners = klvae.tile_owners(24, 8, light_rank=0, keep=0)
+    assert [owners.count(rank) for rank in range(8)] == [0, 4, 4, 4, 3, 3, 3, 3]
 
 
 def test_tile_gather_places_results_by_owner(monkeypatch):
@@ -308,8 +311,58 @@ def test_tile_gather_places_results_by_owner(monkeypatch):
     assert [int(t[0]) for t in results] == list(range(11))
 
 
-def test_light_tile_rank_applies_to_one_decode():
-    vae = SimpleNamespace(light_tile_rank=0)
-    first = AutoencoderKL._decode_tile_owners(vae, 56, 8)
-    assert first.count(0) == 1 and vae.light_tile_rank is None
+def test_a_rank_without_tiles_joins_the_gather_with_their_shape(monkeypatch):
+    owners = klvae.tile_owners(6, 4, light_rank=0, keep=0)
+    assert 0 not in owners
+    tiles = [torch.full((2, 3), float(index)) for index in range(6)]
+    sent = []
+
+    def all_gather(stacked, separate_tensors):
+        sent.append(stacked)
+        gathered = [stacked]
+        for rank in range(1, 4):
+            mine = [tiles[i] for i, owner in enumerate(owners) if owner == rank]
+            mine += [torch.zeros(2, 3)] * (len(sent[0]) - len(mine))
+            gathered.append(torch.stack(mine))
+        return gathered
+
+    coordinator = SimpleNamespace(all_gather=all_gather)
+    monkeypatch.setattr(klvae, "get_tile_parallel_state", lambda: (0, 4))
+    monkeypatch.setattr(
+        klvae, "get_decode_parallel_group_coordinator", lambda: coordinator
+    )
+    results = AutoencoderKL._all_gather_tiled_results(
+        None, [], owners, lambda: torch.empty(2, 3)
+    )
+    assert sent[0].shape == (2, 2, 3)
+    assert [int(t[0, 0]) for t in results] == list(range(6))
+    with pytest.raises(ValueError):
+        AutoencoderKL._all_gather_tiled_results(None, [], owners)
+
+
+def test_decoded_tile_like_decodes_each_latent_shape_once():
+    calls = []
+
+    def decode(tile):
+        calls.append(tuple(tile.shape))
+        return torch.zeros(tile.shape[0], 3, 4 * tile.shape[2], 16, 16)
+
+    vae = SimpleNamespace(decode=decode, _decoded_tile_specs={})
+    tile = torch.zeros(1, 24, 7, 1, 1)
+    for _ in range(3):
+        like = AutoencoderKL._decoded_tile_like(vae, tile)
+        assert like.shape == (1, 3, 28, 16, 16) and like.dtype == torch.float32
+    assert calls == [(1, 24, 7, 1, 1)]
+
+
+def test_light_tile_budget_spends_the_tiles_handed_off():
+    # a budget of one lightens one decode (ROCm's audio-first order)
+    vae = SimpleNamespace(light_tile_rank=0, light_tile_budget=1, light_tile_keep=1)
+    assert AutoencoderKL._decode_tile_owners(vae, 56, 8).count(0) == 1
     assert AutoencoderKL._decode_tile_owners(vae, 56, 8) == klvae.tile_owners(56, 8)
+    # 24 tiles: rank 0 keeps one of its three until five handed-off tiles are spent
+    vae = SimpleNamespace(light_tile_rank=0, light_tile_budget=5, light_tile_keep=1)
+    for _ in range(3):
+        assert AutoencoderKL._decode_tile_owners(vae, 24, 8).count(0) == 1
+    assert vae.light_tile_budget == -1
+    assert AutoencoderKL._decode_tile_owners(vae, 24, 8) == klvae.tile_owners(24, 8)
