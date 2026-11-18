@@ -398,6 +398,7 @@ def _qwen4_verify_conv_prepare_kernel(
     x_ptr,
     state_ptr,
     indices_ptr,
+    intermediate_indices_ptr,
     valid_ptr,
     conv_ptr,
     intermediate_ptr,
@@ -405,6 +406,7 @@ def _qwen4_verify_conv_prepare_kernel(
     state_stride1,
     state_stride2,
     index_stride,
+    intermediate_index_stride,
     cache_stride0,
     cache_stride1,
     cache_stride2,
@@ -413,6 +415,7 @@ def _qwen4_verify_conv_prepare_kernel(
     WIDTH: tl.constexpr,
     STATE_LEN: tl.constexpr,
     HAS_INTERMEDIATE: tl.constexpr,
+    HAS_INTERMEDIATE_INDICES: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     req = tl.program_id(0)
@@ -440,6 +443,11 @@ def _qwen4_verify_conv_prepare_kernel(
         mask,
     )
     if HAS_INTERMEDIATE and STATE_LEN > 0:
+        cache_row = req
+        if HAS_INTERMEDIATE_INDICES:
+            cache_row = tl.load(
+                intermediate_indices_ptr + req * intermediate_index_stride
+            ).to(tl.int64)
         step = offsets // (CHANNELS * STATE_LEN)
         channel = (offsets // STATE_LEN) % CHANNELS
         state_col = offsets % STATE_LEN
@@ -462,7 +470,7 @@ def _qwen4_verify_conv_prepare_kernel(
         value = tl.where(valid, tl.where(col < STATE_LEN, state, x), 0)
         tl.store(
             intermediate_ptr
-            + req * cache_stride0
+            + cache_row * cache_stride0
             + step * cache_stride1
             + channel * cache_stride2
             + state_col * cache_stride3,
@@ -544,12 +552,29 @@ def can_fuse_qwen4_verify_conv(
 
 
 def fused_qwen4_verify_conv(
-    x, residual, weight, state, state_indices, valid, width, dilation, intermediate
+    x,
+    residual,
+    weight,
+    state,
+    state_indices,
+    valid,
+    width,
+    dilation,
+    intermediate,
+    *,
+    intermediate_state_indices: torch.Tensor | None = None,
 ):
+    """Verify a draft block and save step windows in request or batch rows."""
     if not can_fuse_qwen4_verify_conv(
         x, residual, weight, state, state_indices, valid, width, dilation, intermediate
     ):
         raise ValueError("unsupported input for Qwen4 PLE verify convolution")
+    if intermediate_state_indices is not None and (
+        intermediate_state_indices.shape != state_indices.shape
+        or intermediate_state_indices.dtype not in (torch.int32, torch.int64)
+        or intermediate_state_indices.device != x.device
+    ):
+        raise ValueError("invalid intermediate state indices for Qwen4 PLE verify")
     output = torch.empty_like(x)
     if x.shape[0] == 0:
         return output
@@ -565,16 +590,21 @@ def fused_qwen4_verify_conv(
         x,
         state,
         state_indices,
+        intermediate_state_indices,
         valid,
         conv_input,
         intermediate if intermediate is not None else x,
         *state.stride(),
         state_indices.stride(0),
+        intermediate_state_indices.stride(0)
+        if intermediate_state_indices is not None
+        else 0,
         *(intermediate.stride() if intermediate is not None else (0, 0, 0, 0)),
         CHANNELS=channels,
         WIDTH=width,
         STATE_LEN=state_len,
         HAS_INTERMEDIATE=intermediate is not None,
+        HAS_INTERMEDIATE_INDICES=intermediate_state_indices is not None,
         BLOCK=256,
     )
     conv = torch.nn.functional.conv1d(
