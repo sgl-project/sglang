@@ -5340,6 +5340,11 @@ class DeepseekV4ForCausalLM(
         for i, layer in enumerate(layers):
             if isinstance(layer, DeepseekV4PlatformDecoderLayer):
                 layer.bind_next(layers[i + 1] if i + 1 < len(layers) else None)
+        # Target only (NextN returned above; DSpark drafts have their own class),
+        # and here rather than in load_weights so every loader and weight
+        # reload builds or refreshes the --lm-head-dtype copy.
+        if self.pp_group.is_last_rank:
+            self.logits_processor.prepare_lm_head_dtype(self.lm_head)
 
     def precompile_kernels_after_loading(self) -> None:
         from sglang.srt.layers.moe.mega_moe import (

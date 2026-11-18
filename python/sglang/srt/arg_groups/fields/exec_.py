@@ -58,6 +58,20 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "If set, the LM head outputs (logits) are in FP32.",
     ] = False
+    lm_head_dtype: A[
+        Optional[str],
+        Arg(
+            help="Quantized dtype for the target model's logits GEMM. 'mxfp8' "
+            "keeps an MXFP8 copy of the BF16 lm_head weight (E4M3 values, one "
+            "E8M0 scale per 32 along the hidden size; about one extra byte per "
+            "lm_head parameter, built at load) and runs cuBLASLt's block-scaled "
+            "GEMM with BF16 logits. Lowers logit precision. Requires Blackwell; "
+            "supported for DeepSeek-V4. Draft model heads keep their own dtype "
+            "(see --speculative-dspark-lm-head-dtype). Default keeps the "
+            "lm_head's own dtype.",
+            choices=["mxfp8"],
+        ),
+    ] = None
     enable_tf32_matmul: A[
         Optional[bool],
         Arg(
