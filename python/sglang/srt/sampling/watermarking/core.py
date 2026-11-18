@@ -820,6 +820,19 @@ class WatermarkState:
         context_hashes: torch.Tensor,
         selected: torch.Tensor,
     ) -> None:
+        if self.token_ids.is_cuda:
+            from sglang.kernels.ops.sampling.textseal_selector import (
+                record_watermark_contexts_triton,
+            )
+
+            record_watermark_contexts_triton(
+                self.watermarked_context_hashes,
+                self.num_watermarked_contexts,
+                req_pool_indices,
+                context_hashes,
+                selected,
+            )
+            return
         rows = selected.nonzero(as_tuple=True)[0]
         if rows.numel() == 0:
             return
