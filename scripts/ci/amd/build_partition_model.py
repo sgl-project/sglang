@@ -32,11 +32,11 @@ def parse_test_timings(log):
         if (
             not isinstance(record, dict)
             or not {"file", "passed", "elapsed"}.issubset(record)
-            or record.get("passed") is not True
+            or record["passed"] is not True
         ):
             continue
-        filename = record.get("file")
-        elapsed = record.get("elapsed")
+        filename = record["file"]
+        elapsed = record["elapsed"]
         if not isinstance(filename, str):
             continue
         filename = filename.removeprefix("/sglang-checkout/")
@@ -55,7 +55,7 @@ def parse_test_timings(log):
     return timings
 
 
-def build_model(traces, source_runs, runner_arch, rocm_version):
+def build_model(*, traces, source_runs, runner_arch, rocm_version):
     if len(traces) != len(source_runs) or not traces:
         raise ValueError("Supply one non-empty timing trace per source run")
     if len(source_runs) != len(set(source_runs)):
@@ -94,7 +94,7 @@ def github_api(endpoint, *, raw=False):
     return response if raw else json.loads(response)
 
 
-def collect_run_timings(run_id, runner_arch, rocm_version, *, expected_shards):
+def collect_run_timings(*, run_id, runner_arch, rocm_version, expected_shards):
     runner = runner_name(runner_arch)
     pattern = re.compile(
         rf"{re.escape(SUITE)} \({re.escape(rocm_version)}, {re.escape(runner)}, (\d+)\)"
@@ -146,14 +146,19 @@ def main():
         parser.error("run IDs and expected shard count must be positive")
     traces = [
         collect_run_timings(
-            run_id,
-            args.runner_arch,
-            args.rocm_version,
+            run_id=run_id,
+            runner_arch=args.runner_arch,
+            rocm_version=args.rocm_version,
             expected_shards=args.expected_shards,
         )
         for run_id in args.run_id
     ]
-    model = build_model(traces, args.run_id, args.runner_arch, args.rocm_version)
+    model = build_model(
+        traces=traces,
+        source_runs=args.run_id,
+        runner_arch=args.runner_arch,
+        rocm_version=args.rocm_version,
+    )
     output = MODEL_DIR / f"partition-model-{args.runner_arch}-{args.rocm_version}.json"
     output.write_text(json.dumps(model, indent=2) + "\n")
     print(f"Wrote {output}")
