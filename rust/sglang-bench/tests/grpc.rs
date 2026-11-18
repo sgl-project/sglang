@@ -155,6 +155,25 @@ impl SglangService for Mock {
     ) -> Result<Response<api::HiCacheStorageResponse>, Status> {
         Err(Status::unimplemented("clear_hi_cache_storage"))
     }
+
+    async fn freeze_gc(
+        &self,
+        _: Request<api::FreezeGcRequest>,
+    ) -> Result<Response<api::FreezeGcResponse>, Status> {
+        Err(Status::unimplemented("freeze_gc"))
+    }
+    async fn pause_generation(
+        &self,
+        _: Request<api::PauseGenerationRequest>,
+    ) -> Result<Response<api::GenerationPauseResponse>, Status> {
+        Err(Status::unimplemented("pause_generation"))
+    }
+    async fn continue_generation(
+        &self,
+        _: Request<api::ContinueGenerationRequest>,
+    ) -> Result<Response<api::GenerationPauseResponse>, Status> {
+        Err(Status::unimplemented("continue_generation"))
+    }
 }
 
 /// Bind on a free port and serve the mock on its own runtime thread, so the

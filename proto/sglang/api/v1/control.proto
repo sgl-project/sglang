@@ -1,0 +1,38 @@
+// Scheduler control APIs shared by HTTP JSON and gRPC: one request per
+// operation, fanned out to every DP rank by the Rust frontend, with the
+// per-rank replies merged the way the Python TokenizerManager merges them.
+syntax = "proto3";
+
+package sglang.api.v1;
+
+import "sglang/api/v1/common.proto";
+import "sglang/json/v1/options.proto";
+
+// `/freeze_gc`: freeze the Python garbage collector on every DP rank's
+// scheduler, with the launch's `--gc-threshold`.
+message FreezeGcRequest {}
+message FreezeGcResponse {}
+
+// `/pause_generation`. `in_place` holds the scheduler loop with its batches
+// intact; `retract` returns running requests to the waiting queue; `abort`
+// cancels them and is handled by the frontend alone.
+message PauseGenerationRequest {
+  optional string mode = 1 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "abort"
+  ];
+}
+
+// `/continue_generation`.
+message ContinueGenerationRequest {
+  optional bool torch_empty_cache = 1 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_bool = true
+  ];
+}
+
+// Python's `{"message": ..., "status": "ok"}` body for pause and continue.
+message GenerationPauseResponse {
+  string message = 1;
+  string status = 2;
+}

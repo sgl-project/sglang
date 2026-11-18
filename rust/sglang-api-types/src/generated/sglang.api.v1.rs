@@ -140,6 +140,17 @@ pub struct OptionalStringList {
     #[prost(message, repeated, tag = "1")]
     pub items: ::prost::alloc::vec::Vec<OptionalString>,
 }
+/// A nullable double list element (e.g. a completion token logprob).
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct OptionalDouble {
+    #[prost(double, optional, tag = "1")]
+    pub value: ::core::option::Option<f64>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DoubleList {
+    #[prost(double, repeated, tag = "1")]
+    pub items: ::prost::alloc::vec::Vec<f64>,
+}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OptionalInt64 {
     #[prost(int64, optional, tag = "1")]
@@ -180,6 +191,34 @@ pub struct ErrorBody {
     pub r#type: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(bool, optional, tag = "4")]
     pub retryable: ::core::option::Option<bool>,
+}
+/// `/freeze_gc`: freeze the Python garbage collector on every DP rank's
+/// scheduler, with the launch's `--gc-threshold`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FreezeGcRequest {}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FreezeGcResponse {}
+/// `/pause_generation`. `in_place` holds the scheduler loop with its batches
+/// intact; `retract` returns running requests to the waiting queue; `abort`
+/// cancels them and is handled by the frontend alone.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PauseGenerationRequest {
+    #[prost(string, optional, tag = "1")]
+    pub mode: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `/continue_generation`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ContinueGenerationRequest {
+    #[prost(bool, optional, tag = "1")]
+    pub torch_empty_cache: ::core::option::Option<bool>,
+}
+/// Python's `{"message": ..., "status": "ok"}` body for pause and continue.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GenerationPauseResponse {
+    #[prost(string, tag = "1")]
+    pub message: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub status: ::prost::alloc::string::String,
 }
 /// Python's `matched` key, `Union\[str, int, List[int]\]`: the three wire shapes
 /// are disjoint, so shape alone picks the arm (untagged).

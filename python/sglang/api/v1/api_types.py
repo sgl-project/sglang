@@ -129,6 +129,78 @@ class ErrorBody(msgspec.Struct, kw_only=True, frozen=True):
         return encode_ErrorBody(self)
 
 
+class FreezeGcRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.FreezeGcRequest: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "FreezeGcRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_FreezeGcRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_FreezeGcRequest(self)
+
+
+class FreezeGcResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.FreezeGcResponse: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "FreezeGcResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_FreezeGcResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_FreezeGcResponse(self)
+
+
+class PauseGenerationRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.PauseGenerationRequest: JSON object (unknown keys ignored)."""
+
+    mode: Optional[str] = "abort"
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "PauseGenerationRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_PauseGenerationRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_PauseGenerationRequest(self)
+
+
+class ContinueGenerationRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ContinueGenerationRequest: JSON object (unknown keys ignored)."""
+
+    torch_empty_cache: Optional[bool] = True
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ContinueGenerationRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ContinueGenerationRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ContinueGenerationRequest(self)
+
+
+class GenerationPauseResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.GenerationPauseResponse: JSON object (unknown keys ignored)."""
+
+    message: str = ""
+    status: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "GenerationPauseResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_GenerationPauseResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_GenerationPauseResponse(self)
+
+
 class FinishStop(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.FinishStop: JSON object (unknown keys ignored)."""
 
@@ -894,6 +966,12 @@ OptionalString = Optional[str]
 # sglang.api.v1.OptionalStringList: JSON bare array.
 OptionalStringList = List[OptionalString]
 
+# sglang.api.v1.OptionalDouble: JSON: the wrapped value itself, null when unset.
+OptionalDouble = Optional[float]
+
+# sglang.api.v1.DoubleList: JSON bare array.
+DoubleList = List[float]
+
 # sglang.api.v1.OptionalInt64: JSON: the wrapped value itself, null when unset.
 OptionalInt64 = Optional[int]
 
@@ -1124,6 +1202,22 @@ def encode_OptionalStringList(v: OptionalStringList) -> List[Any]:
     return [encode_OptionalString(e) for e in v]
 
 
+def decode_OptionalDouble(value: Any) -> OptionalDouble:
+    return None if value is None else _expect_float(value, expected="f64")
+
+
+def encode_OptionalDouble(v: OptionalDouble) -> Any:
+    return None if v is None else float(v)
+
+
+def decode_DoubleList(value: Any) -> DoubleList:
+    return [_expect_float(e, expected="f64") for e in _expect_seq(value, expected="a sequence")]
+
+
+def encode_DoubleList(v: DoubleList) -> List[Any]:
+    return [float(e) for e in v]
+
+
 def decode_OptionalInt64(value: Any) -> OptionalInt64:
     return None if value is None else _expect_int(value, expected="i64")
 
@@ -1178,6 +1272,76 @@ def encode_ErrorBody(v: ErrorBody) -> Dict[str, Any]:
     return d
 
 
+def decode_FreezeGcRequest(value: Any) -> FreezeGcRequest:
+    m = _expect_map(value, expected="struct FreezeGcRequest")
+    return FreezeGcRequest()
+
+
+def encode_FreezeGcRequest(v: FreezeGcRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_FreezeGcResponse(value: Any) -> FreezeGcResponse:
+    m = _expect_map(value, expected="struct FreezeGcResponse")
+    return FreezeGcResponse()
+
+
+def encode_FreezeGcResponse(v: FreezeGcResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_PauseGenerationRequest(value: Any) -> PauseGenerationRequest:
+    m = _expect_map(value, expected="struct PauseGenerationRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "mode":
+            kw["mode"] = "abort" if x is None else _expect_str(x, expected="a string")
+    return PauseGenerationRequest(**kw)
+
+
+def encode_PauseGenerationRequest(v: PauseGenerationRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.mode is not None:
+        d["mode"] = v.mode
+    return d
+
+
+def decode_ContinueGenerationRequest(value: Any) -> ContinueGenerationRequest:
+    m = _expect_map(value, expected="struct ContinueGenerationRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "torch_empty_cache":
+            kw["torch_empty_cache"] = True if x is None else _expect_bool(x, expected="a boolean")
+    return ContinueGenerationRequest(**kw)
+
+
+def encode_ContinueGenerationRequest(v: ContinueGenerationRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.torch_empty_cache is not None:
+        d["torch_empty_cache"] = v.torch_empty_cache
+    return d
+
+
+def decode_GenerationPauseResponse(value: Any) -> GenerationPauseResponse:
+    m = _expect_map(value, expected="struct GenerationPauseResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+        elif key == "status":
+            kw["status"] = _expect_str(x, expected="a string")
+    return GenerationPauseResponse(**kw)
+
+
+def encode_GenerationPauseResponse(v: GenerationPauseResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["message"] = v.message
+    d["status"] = v.status
+    return d
+
+
 def decode_Matched(value: Any) -> Matched:
     if isinstance(value, str):
         return value
@@ -1217,8 +1381,7 @@ def decode_FinishStop(value: Any) -> FinishStop:
 
 def encode_FinishStop(v: FinishStop) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
-    if v.matched is not None:
-        d["matched"] = encode_Matched(v.matched)
+    d["matched"] = None if v.matched is None else encode_Matched(v.matched)
     return d
 
 
@@ -1233,8 +1396,7 @@ def decode_FinishLength(value: Any) -> FinishLength:
 
 def encode_FinishLength(v: FinishLength) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
-    if v.length is not None:
-        d["length"] = v.length
+    d["length"] = v.length
     return d
 
 
@@ -1265,23 +1427,23 @@ def decode_FinishReason(value: Any) -> FinishReason:
     if tag == "stop":
         try:
             return FinishStop(
-                matched=None if raw.get("matched") is None else decode_Matched(raw["matched"]),
+                matched=None if raw.get("matched") is None else decode_Matched(raw.get("matched")),
             )
         except JsonContractError:
             return dict(raw)
     elif tag == "length":
         try:
             return FinishLength(
-                length=None if raw.get("length") is None else _expect_uint(raw["length"], expected="u64"),
+                length=None if raw.get("length") is None else _expect_uint(raw.get("length"), expected="u64"),
             )
         except JsonContractError:
             return dict(raw)
     elif tag == "abort":
         try:
             return FinishAbort(
-                message=None if raw.get("message") is None else _expect_str(raw["message"], expected="a string"),
-                status_code=None if raw.get("status_code") is None else _expect_uint(raw["status_code"], expected="u32"),
-                err_type=None if raw.get("err_type") is None else _expect_str(raw["err_type"], expected="a string"),
+                message=None if raw.get("message") is None else _expect_str(raw.get("message"), expected="a string"),
+                status_code=None if raw.get("status_code") is None else _expect_uint(raw.get("status_code"), expected="u32"),
+                err_type=None if raw.get("err_type") is None else _expect_str(raw.get("err_type"), expected="a string"),
             )
         except JsonContractError:
             return dict(raw)
@@ -2124,18 +2286,22 @@ def decode_MediaInput(value: Any) -> MediaInput:
     if isinstance(value, dict):
         return decode_MediaItem(value)
     if isinstance(value, list):
-        if value and isinstance(value[0], list):
+        if not value:
+            return decode_MediaItems(value)
+        if isinstance(value[0], str) or isinstance(value[0], dict) or value[0] is None or isinstance(value[0], (MediaRef,)):
+            return decode_MediaItems(value)
+        if isinstance(value[0], list) or value[0] is None:
             return decode_MediaItemsList(value)
-        return decode_MediaItems(value)
+        raise _invalid_type(value, expected="one of the MediaInput list shapes")
     raise _invalid_type(value, expected="one of the MediaInput shapes")
 
 
 def encode_MediaInput(v: MediaInput) -> Any:
     if isinstance(v, (str, MediaRef,)):
         return encode_MediaItem(v)
-    if isinstance(v, list) and not (v and isinstance(v[0], list)):
+    if isinstance(v, list) and (not v or isinstance(v[0], str) or isinstance(v[0], dict) or v[0] is None or isinstance(v[0], (MediaRef,))):
         return encode_MediaItems(v)
-    if isinstance(v, list) and (v and isinstance(v[0], list)):
+    if isinstance(v, list) and bool(v) and (isinstance(v[0], list) or v[0] is None):
         return encode_MediaItemsList(v)
     return v
 

@@ -118,11 +118,13 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
                 "GetInternalStateReq",
                 "FlushCacheReqInput",
                 "CheckWeightsReqInput",
+                "FreezeGCReq",
+                "ProfileReq",
+                "PauseGenerationReqInput",
+                "ContinueGenerationReqInput",
                 "ClearHiCacheReqInput",
                 "DetachHiCacheStorageReqInput",
                 "AttachHiCacheStorageReqInput",
-                "ProfileReq",
-                "FreezeGCReq",
             },
         )
         for name, body in messages:
