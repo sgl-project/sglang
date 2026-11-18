@@ -544,11 +544,11 @@ class SchedulerWeightUpdaterManager:
         # resume of a tag that was never released, is a no-op rather than a
         # KeyError that would fail the control request.
         pending = list(dict.fromkeys(tag for tag in tags if tag in self.offload_tags))
-        for tag in pending:
-            self.offload_tags.remove(tag)
-
         if not pending:
             return ResumeMemoryOccupationReqOutput()
+
+        for tag in pending:
+            self.offload_tags.remove(tag)
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in pending:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
