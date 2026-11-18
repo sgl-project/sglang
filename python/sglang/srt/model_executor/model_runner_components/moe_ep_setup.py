@@ -139,8 +139,7 @@ def _get_lplb_allreduce_group(ep_group) -> Optional[torch.distributed.ProcessGro
         assert _lplb_allreduce_group is not None
         log_info_on_rank0(
             logger,
-            "Initialized dedicated LPLB count all-reduce group over ranks "
-            f"{ranks}.",
+            f"Initialized dedicated LPLB count all-reduce group over ranks {ranks}.",
         )
     return _lplb_allreduce_group
 
