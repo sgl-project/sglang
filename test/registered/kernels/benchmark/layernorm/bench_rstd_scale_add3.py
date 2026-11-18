@@ -14,7 +14,7 @@ from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import create_random
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=30, stage="jit-kernel-benchmark", runner_config="amd")
+register_amd_ci(est_time=30, stage="base-a-jit-kernel-benchmark", runner_config="amd")
 
 LATENT, HIDDEN, EPS = 3584, 7168, 1e-5
 
