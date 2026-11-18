@@ -1520,7 +1520,6 @@ class CosmosDreamsRolloutStage(PipelineStage):
         return latents
 
     def _hand_over_decode(self, batch: Req, decode_queue: "CausalDecodeQueue") -> None:
-        """Tell the decoding stage what the rollout already produced."""
         self.log_info("Decoded %d chunks during the rollout", decode_queue.submitted)
         output_file_paths, encode_failed = finish_streamed_encode(decode_queue.encoder)
         if encode_failed:

@@ -879,8 +879,7 @@ class Cosmos3MultiviewInputStage(PipelineStage):
         """Start loading the rig's control and RGB clips; returns before they finish.
 
         The latent stage encodes the cameras in the order they are queued here,
-        controls first, so its GPU work overlaps the clips still decoding; one
-        gate paces both rigs' loads to that consumer.
+        controls first, and one gate paces both rigs' loads to that consumer.
         """
         pool = ThreadPoolExecutor(
             max_workers=COSMOS3_MULTIVIEW_MEDIA_THREADS,

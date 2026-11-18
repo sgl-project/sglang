@@ -545,13 +545,12 @@ def fa4_mask_table(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``(q_table_base, allowed_table)``: the run-pair truth table as an FA4 mask_mod reads it.
 
-    Key-expanded, the table is int8 and byte ``q_run * kv_len + n`` answers
-    query run ``q_run`` and key position ``n``, so the kernel resolves a pair
-    with one load and no bit arithmetic. It holds ``q_runs * kv_len`` bytes:
-    26 MB for seven cameras of 16 latent frames, growing with the square of the
-    clip length. Past int32 offsets, or with ``key_expanded=False``, the table
-    is the int32 words of :func:`pack_allowed_bits`, which the kernel reaches
-    through the key's run id: a second, dependent load per pair.
+    Key-expanded, the int8 table holds one byte per query run and key position,
+    at ``q_table_base`` plus the key position. Past int32 offsets, with
+    ``key_expanded=False``, or when the expansion runs out of device memory, it
+    is the int32 words of :func:`pack_allowed_bits`, indexed through the key's
+    run id. Folding the row stride into ``q_table_base`` lets one compiled
+    mask_mod serve every layout.
     """
     kv_len = k_group_ids.numel()
     if key_expanded and group_allowed.shape[0] * kv_len <= MAX_KEY_EXPANDED_TABLE_BYTES:
@@ -683,8 +682,6 @@ def build_multiview_block_sparsity(
     partial_counts, partial_indices = _block_indices(partial_blocks)
     full_counts, full_indices = _block_indices(full_blocks)
 
-    # The table row stride is folded into the query-side id so the kernel needs
-    # no compile-time shape constant and one compiled mask_mod serves every layout.
     q_table_base, allowed_table = fa4_mask_table(
         group_allowed, q_group_ids, k_group_ids, key_expanded=key_expanded_table
     )

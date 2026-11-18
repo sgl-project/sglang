@@ -1767,10 +1767,10 @@ class AutoencoderKLWan(ParallelTiledVAE):
     ) -> DiagonalGaussianDistribution:
         """:meth:`encode` of a clip handed over in its causal groups.
 
-        ``groups`` yields ``[B, C, t, H, W]`` pixels: frame 0, then four frames at
-        a time, the slices :meth:`encode` cuts from a whole clip. One group is
-        pulled per encoder call, so a producer may block until its next frames
-        exist. Not cached: a clip that is still arriving has no digest to look up.
+        ``groups`` yields ``[B, C, t, H, W]`` pixels, frame 0 and then four frames
+        at a time. One group is pulled per encoder call, so a producer may block
+        until its next frames exist. Not cached: a clip that is still arriving has
+        no digest to look up.
         """
         if not self.use_feature_cache:
             raise ValueError(
@@ -1792,7 +1792,6 @@ class AutoencoderKLWan(ParallelTiledVAE):
     def _encode_causal_groups(
         self, groups: Iterable[torch.Tensor]
     ) -> torch.Tensor | None:
-        """Encoder features of patchified causal groups, concatenated in time."""
         out = None
         with forward_context(
             feat_cache_arg=self._enc_feat_map, feat_idx_arg=self._enc_conv_idx
