@@ -221,6 +221,42 @@ class TestDeprecatedEnvRegistry(unittest.TestCase):
         self.assertEqual(os.environ[new_name], "ABC")
 
 
+# Renamed env vars still read through the old name: new name -> deprecated alias.
+RENAMED_ENVS = {
+    "SGLANG_OPT_KDA_TRITON_CHAIN_VERIFY": "SGLANG_OPT_FUSED_KDA_VERIFY",
+}
+
+
+class TestRenamedEnvAliases(unittest.TestCase):
+    def test_old_name_forwards_with_future_warning(self):
+        for new_name, old_name in RENAMED_ENVS.items():
+            field = vars(type(envs))[new_name]
+            with self.subTest(new_name=new_name), patch.dict(os.environ):
+                self.assertEqual(field.deprecated_name, old_name)
+                os.environ.pop(new_name, None)
+                os.environ[old_name] = "1"
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    self.assertIs(field.get(), True)
+                messages = [
+                    str(w.message) for w in caught if w.category is FutureWarning
+                ]
+                self.assertEqual(len(messages), 1)
+                self.assertIn(old_name, messages[0])
+                self.assertIn(new_name, messages[0])
+
+    def test_new_name_wins_over_old_name(self):
+        for new_name, old_name in RENAMED_ENVS.items():
+            field = vars(type(envs))[new_name]
+            with self.subTest(new_name=new_name), patch.dict(os.environ):
+                os.environ[new_name] = "0"
+                os.environ[old_name] = "1"
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    self.assertIs(field.get(), False)
+                self.assertFalse([w for w in caught if w.category is FutureWarning])
+
+
 class TestDocumentedBooleanKnobs(unittest.TestCase):
     """Documented booleans must accept `true`/`false`: compared to "1" or "0" at the
     read site, `true` was ignored and even turned the MLA RoPE fusion off."""
