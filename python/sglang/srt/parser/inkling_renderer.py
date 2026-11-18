@@ -34,10 +34,6 @@ _TEXT_PART_TYPES = frozenset({None, "text", "input_text"})
 _IMAGE_LOCATION_PREFIX = "sglang-inkling-image://"
 _AUDIO_LOCATION_PREFIX = "sglang-inkling-audio://"
 
-_NATIVE_TOKENIZERS = {
-    "inkling": "O200kBaseChatTokenizer",
-    "inkling2": "H200kBaseChatTokenizer",
-}
 # Inkling2 checkpoints keep these native audio IDs as unused reserved tokens.
 _UNUSED_SPECIALS = {
     "inkling": (),
@@ -51,7 +47,11 @@ def load_tml_renderers(spec: str = "inkling") -> SimpleNamespace:
         from tml_renderers import chat, tokenizers, v0
     except ImportError as exc:
         raise ImportError(TML_RENDERERS_INSTALL_HINT) from exc
-    tokenizer = getattr(tokenizers, _NATIVE_TOKENIZERS[spec])()
+    native_tokenizers = {
+        "inkling": tokenizers.O200kBaseChatTokenizer,
+        "inkling2": tokenizers.H200kBaseChatTokenizer,
+    }
+    tokenizer = native_tokenizers[spec]()
     return SimpleNamespace(
         chat=chat,
         v0=v0,
@@ -66,7 +66,7 @@ def load_tml_renderers(spec: str = "inkling") -> SimpleNamespace:
 _TOKENIZER_PROBE = "Hello, 世界! def f(x): return x**2\n\t  naïve 👩‍🚀 12345678901"
 
 
-def check_served_tokenizer(tokenizer: Any, spec: str) -> None:
+def check_served_tokenizer(tokenizer: Any, *, spec: str) -> None:
     # Prompts and outputs use tml-renderers' tokenizer, while the scheduler matches
     # stop strings and detokenizes with the served one; they must agree.
     tml = load_tml_renderers(spec)
@@ -99,13 +99,12 @@ def render_inkling_messages(
     reasoning_effort: float | None = None,
     spec: str = "inkling",
 ) -> list[int]:
-    """Media parts emit one placeholder each for later MM expansion.
-    Inkling samples its own assistant header. The tool-choice instruction
-    joins the first system message: the effort directive if none was sent."""
+    """Media parts emit one placeholder each; Inkling samples its own assistant header.
+    The tool-choice instruction joins the first system message."""
     tml = load_tml_renderers(spec)
     media_marker = f"sglang-inkling-media-{uuid.uuid4().hex}:"
     chat_messages, media_kinds = _to_chat_messages(messages, media_marker)
-    tools = _tools_for_choice(tools, tool_choice)
+    tools = _tools_for_choice(tools=tools, tool_choice=tool_choice)
     effort = (
         INKLING_DEFAULT_REASONING_EFFORT
         if reasoning_effort is None
@@ -116,9 +115,13 @@ def render_inkling_messages(
         _thinking_effort_message(tml=tml, effort=effort),
     )
     if tools:
-        instruction = _tool_choice_instruction(tool_choice, parallel_tool_calls)
+        instruction = _tool_choice_instruction(
+            tool_choice=tool_choice, parallel_tool_calls=parallel_tool_calls
+        )
         if instruction is not None:
-            chat_messages[0] = _with_appended_text(chat_messages[0], instruction)
+            chat_messages[0] = _with_appended_text(
+                message=chat_messages[0], text=instruction
+            )
     native = [
         _resolve_media(message, tml.chat, media_marker, media_kinds)
         for chat_message in tml.chat.OpenAIMessage.from_openai_chat_dicts(
@@ -130,7 +133,7 @@ def render_inkling_messages(
     return _spans_to_input_ids(spans, tml)
 
 
-def render_inkling_assistant_prefix(prefix: str, spec: str = "inkling") -> list[int]:
+def render_inkling_assistant_prefix(prefix: str, *, spec: str = "inkling") -> list[int]:
     """TMLv0 has no prefill; continuation opens a model text block without a terminator."""
     tokenizer = load_tml_renderers(spec).tokenizer
     return [
@@ -221,6 +224,7 @@ def _thinking_effort_message(*, tml: SimpleNamespace, effort: float) -> dict[str
 
 
 def _tools_for_choice(
+    *,
     tools: Sequence[Mapping[str, Any]] | None,
     tool_choice: str | Mapping[str, Any] | None,
 ) -> Sequence[Mapping[str, Any]] | None:
@@ -238,7 +242,7 @@ def _tools_for_choice(
 
 
 def _tool_choice_instruction(
-    tool_choice: str | Mapping[str, Any] | None, parallel_tool_calls: bool
+    *, tool_choice: str | Mapping[str, Any] | None, parallel_tool_calls: bool
 ) -> str | None:
     name = _chosen_function_name(tool_choice)
     if name is not None:
@@ -265,7 +269,7 @@ def _chosen_function_name(tool_choice: str | Mapping[str, Any] | None) -> str | 
     return name
 
 
-def _with_appended_text(message: Mapping[str, Any], text: str) -> dict[str, Any]:
+def _with_appended_text(*, message: Mapping[str, Any], text: str) -> dict[str, Any]:
     content = message.get("content")
     if isinstance(content, str) and content:
         content = f"{content}\n\n{text}"
@@ -283,7 +287,12 @@ def _spans_to_input_ids(spans: Sequence[Any], tml: SimpleNamespace) -> list[int]
         if isinstance(span, tml.chat.EncodedTextTokenSpan):
             input_ids.extend(span.tokens)
         elif isinstance(span, tml.chat.ImageAssetPointerTokenSpan):
-            _append_media_placeholder(input_ids, span.location, tml)
+            _append_media_placeholder(
+                input_ids,
+                location=span.location,
+                tokenizer=tml.tokenizer,
+                unused_special_ids=tml.unused_special_ids,
+            )
         else:
             raise ValueError(
                 f"unexpected TMLv0 span in Inkling prompt: {type(span).__name__}"
@@ -292,17 +301,20 @@ def _spans_to_input_ids(spans: Sequence[Any], tml: SimpleNamespace) -> list[int]
 
 
 def _append_media_placeholder(
-    input_ids: list[int], location: str, tml: SimpleNamespace
+    input_ids: list[int],
+    *,
+    location: str,
+    tokenizer: Any,
+    unused_special_ids: frozenset[int],
 ) -> None:
     if location.startswith(_IMAGE_LOCATION_PREFIX):
         input_ids.append(IMAGE_TOKEN_ID)
         return
-    tokenizer = tml.tokenizer
     audio_input, audio_end = (
         tokenizer.encode_special(_special_name(token))
         for token in (CONTENT_AUDIO_INPUT, AUDIO_END)
     )
-    if {audio_input, audio_end} & tml.unused_special_ids:
+    if {audio_input, audio_end} & unused_special_ids:
         raise ValueError("This Inkling checkpoint does not accept audio input")
     # tml-renderers DMel-encodes audio at render time, so audio rides in an image
     # slot and gets the MM processor's audio framing here.
