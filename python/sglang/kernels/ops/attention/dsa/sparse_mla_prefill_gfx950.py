@@ -1,9 +1,5 @@
-"""DSA sparse MLA prefill for fp8_ds_mla KV on gfx950 (HIP).
-
-csrc/attention/sparse_mla_prefill_gfx950.cuh: one CTA per query token, 4 waves, one wave
-per fp8 scale group, BF16 MFMA with the group scales applied after the dots. Same contract
-as ``triton_sparse_mla_fwd`` for H <= 16 heads and 656-byte KV rows.
-"""
+"""DSA sparse MLA prefill for fp8_ds_mla KV on gfx950: same contract as
+`triton_sparse_mla_fwd` for H <= 16 heads and 656-byte KV rows."""
 
 from __future__ import annotations
 
@@ -11,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.jit.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -20,15 +16,13 @@ _ROW_BYTES = 656
 
 
 @cache_once
-def _jit_module(stages: int) -> Module:
-    args = make_cpp_args(stages)
+def _jit_module() -> Module:
     return load_jit(
         "sparse_mla_prefill_gfx950",
-        *args,
         cuda_files=["attention/sparse_mla_prefill_gfx950.cuh"],
         cuda_wrappers=[
-            ("run", f"SparseMlaPrefillGfx950Kernel<{args}>::run"),
-            ("run_split", f"SparseMlaPrefillGfx950Kernel<{args}>::run_split"),
+            ("run", "SparseMlaPrefillGfx950Kernel::run"),
+            ("run_split", "SparseMlaPrefillGfx950Kernel::run_split"),
         ],
     )
 
@@ -61,7 +55,6 @@ def sparse_mla_prefill_gfx950(
     sm_scale: float,
     d_v: int = 512,
     return_lse: bool = False,
-    stages: int = 2,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """q_nope [T, H, 512] / q_rope [T, H, 64] bf16, kv [N, 1, 656] fp8_ds_mla rows,
     indices [T, 1, topk] or [T, topk] int32 (-1 = no key).
@@ -74,7 +67,7 @@ def sparse_mla_prefill_gfx950(
     kv_rows = kv.view(torch.uint8).reshape(kv.shape[0], _ROW_BYTES)
     out = torch.empty(seq, H, d_v, device=q_nope.device, dtype=torch.bfloat16)
     lse = torch.empty(seq, H, device=q_nope.device, dtype=torch.float32)
-    _jit_module(stages).run(
+    _jit_module().run(
         q_nope, q_rope, kv_rows, idx, out, lse, float(sm_scale), int(return_lse)
     )
     return (out.unsqueeze(0), lse) if return_lse else out.unsqueeze(0)
@@ -101,7 +94,6 @@ def sparse_mla_split_gfx950(
     splits: int,
     d_v: int = 512,
     return_lse: bool = False,
-    stages: int = 2,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """sparse_mla_prefill_gfx950 with each row's top-k split over ``splits`` CTAs and an
     fp32 log-sum-exp combine: for decode / verify batches too small to fill the GPU at
@@ -119,7 +111,7 @@ def sparse_mla_split_gfx950(
         seq, splits, H, d_v, device=q_nope.device, dtype=torch.float32
     )
     part_ml = torch.empty(2, seq, splits, H, device=q_nope.device, dtype=torch.float32)
-    _jit_module(stages).run_split(
+    _jit_module().run_split(
         q_nope,
         q_rope,
         kv_rows,

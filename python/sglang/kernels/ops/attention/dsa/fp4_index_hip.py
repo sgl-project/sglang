@@ -405,10 +405,8 @@ def _fp4_request_runs(
     rows = ks.shape[0]
     total_pages = keys.payload.shape[0]
     device = keys.payload.device
-    # AITER plans a row over keys [0, ke) of its table, so a request whose window starts
-    # deep in the batch's gathered keys pays for every key before it (and the attn-TP
-    # rank holding the batch's last requests stalls the others). Score each request
-    # (a run of rows with one ks) on a table starting at its first page.
+    # AITER scans keys [0, ke) of a row's table, so each request (a run of rows with one
+    # ks) gets a table starting at its first page instead of paying for the keys before it
     ks_cpu = ks.cpu()
     cuts = (torch.nonzero(ks_cpu[1:] != ks_cpu[:-1]).flatten() + 1).tolist()
     runs = []
@@ -416,10 +414,8 @@ def _fp4_request_runs(
         base = int(ks_cpu[r0]) // PAGE_KEYS * PAGE_KEYS
         first_page = base // PAGE_KEYS
         pages = total_pages - first_page
-        # AITER compiles the scorer per table width and its schedule per search depth
-        # and bound alignment: a power-of-two table (one sequence over the staged pages,
-        # plus the block the scorer prefetches past the last) and fresh bounds keep it
-        # to one variant per doubling of the context
+        # AITER compiles per table width: a power of two (the pages plus the block the
+        # scorer prefetches past the last) keeps one variant per doubling of the context
         width = max(1024, 1 << (pages + 4 - 1).bit_length())
         table = torch.zeros((1, width), dtype=torch.int32, device=device)
         table[0, :pages] = torch.arange(

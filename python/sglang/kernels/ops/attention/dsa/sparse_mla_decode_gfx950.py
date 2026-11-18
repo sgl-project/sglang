@@ -1,10 +1,7 @@
 """Sparse MLA decode on gfx950 over fp8_ds_mla KV, one query per row (a DCP rank's partial).
 
-csrc/attention/sparse_mla_decode_gfx950.cuh, ported from aiter's opus MXFP8 MLA decode. Q's
-NoPE is quantized to MXFP8 (one E8M0 scale per 32 channels) for the scaled-MFMA QK dot; KV is
-read in place. Each block takes one (row, split) and reads the row's first topk_length keys, so
-the launch is graph-safe and splits follow each row's actual top-k share. Same contract as
-triton_sparse_mla_decode_splitk with return_lse=True and topk_length.
+Same contract as `triton_sparse_mla_decode_splitk` with `return_lse=True` and `topk_length`;
+Q's NoPE is quantized to MXFP8 for the kernel's scaled-MFMA QK dot.
 """
 
 from __future__ import annotations

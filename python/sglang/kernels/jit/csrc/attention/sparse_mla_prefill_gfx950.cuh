@@ -42,6 +42,7 @@ constexpr int kThreads = 64 * kWaves;
 constexpr int kTileBytes = kKeys * kRow;
 constexpr int kRowChunks = kRow / 16;  // 41 16-B chunks per row
 constexpr int kRowsPerWave = kKeys / kWaves;
+constexpr int kStages = 2;  // KV tiles in flight
 
 struct Params {
   const __bf16* q_nope;
@@ -105,9 +106,8 @@ SGL_DEVICE float xsum16(float x) {
 
 // kStages tiles of KV rows live in LDS; wave w fetches rows [8w, 8w + 8) of each tile with
 // LDS DMA (lanes 0..40 move one 16-B chunk each), addressed from wave-uniform indices.
-template <int kStages, bool kSplit>
+template <bool kSplit>
 __global__ __launch_bounds__(kThreads) void sparse_mla_prefill_kernel(const Params p) {
-  static_assert(kStages >= 2 && kStages <= 4, "vmcnt waits are written for 2..4 stages");
   __shared__ __attribute__((aligned(16))) uint8_t s_kv[kStages][kTileBytes];
   __shared__ __attribute__((aligned(16))) float s_mask[kStages][kKeys];  // 0 or -inf per key
   __shared__ floatx4 s_red[kWaves][2][64];
@@ -209,18 +209,8 @@ __global__ __launch_bounds__(kThreads) void sparse_mla_prefill_kernel(const Para
 
   for (int j = 0; j < ntiles; ++j) {
     const int stage = j % kStages;
-    // Tile j's DMAs must have landed. Issued after them: one index load in their iteration
-    // and 9 VMEM in each of the S-2 later ones, unless the tail skipped DMAs.
-    if (j + kStages - 2 < ntiles) {
-      if constexpr (kStages == 2)
-        asm volatile("s_waitcnt vmcnt(1)" ::: "memory");
-      else if constexpr (kStages == 3)
-        asm volatile("s_waitcnt vmcnt(10)" ::: "memory");
-      else
-        asm volatile("s_waitcnt vmcnt(19)" ::: "memory");
-    } else {
-      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-    }
+    // Tile j's DMAs must have landed; only one index load was issued after them.
+    asm volatile("s_waitcnt vmcnt(1)" ::: "memory");
     lds_barrier();  // tile j visible to all waves; everyone is done with tile j-1
     if (j + kStages - 1 < ntiles) issue_kv((j + kStages - 1) % kStages, vq[0]);
 #pragma unroll
@@ -375,7 +365,6 @@ __global__ __launch_bounds__(128) void sparse_mla_split_combine_kernel(const Par
 
 }  // namespace sparse_mla_prefill_gfx950
 
-template <int kStages>
 struct SparseMlaPrefillGfx950Kernel {
   static void
   run(const tvm::ffi::TensorView q_nope,   // [T, H, 512] bf16, unit inner stride
@@ -420,8 +409,7 @@ struct SparseMlaPrefillGfx950Kernel {
     p.topk = static_cast<int>(indices.size(1));
     p.qk_scale = static_cast<float>(sm_scale * 1.4426950408889634);
     p.store_lse = static_cast<int>(store_lse);
-    LaunchKernel(static_cast<uint32_t>(T), k::kThreads, q_nope.device())(
-        k::sparse_mla_prefill_kernel<kStages, false>, p);
+    LaunchKernel(static_cast<uint32_t>(T), k::kThreads, q_nope.device())(k::sparse_mla_prefill_kernel<false>, p);
   }
 
   // The same attention with each row's key tiles split over `splits` CTAs, then combined
@@ -480,7 +468,7 @@ struct SparseMlaPrefillGfx950Kernel {
     p.part_l = p.part_m + T * splits * H;
     const DLDevice dev = q_nope.device();
     LaunchKernel(dim3(static_cast<uint32_t>(T), static_cast<uint32_t>(splits)), k::kThreads, dev)(
-        k::sparse_mla_prefill_kernel<kStages, true>, p);
+        k::sparse_mla_prefill_kernel<true>, p);
     LaunchKernel(static_cast<uint32_t>(T * H), 128, dev)(
         k::sparse_mla_split_combine_kernel, p, static_cast<int>(splits));
   }

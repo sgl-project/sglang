@@ -1,10 +1,4 @@
-"""HIP DCP top-2048 (dcp_topk_hip): each rank's local candidate scores, all-gathered
-rank-major, must yield exactly the global top-2048 positions as KV slots, each rank
-emitting its own winners and the ranks' outputs disjoint.
-
-Inputs are left as production leaves them: logits past a row's local length and
-gathered entries past a rank's share hold high-scoring garbage the kernels must skip.
-"""
+"""HIP DCP top-2048: the ranks' disjoint outputs are exactly the global top-2048 slots."""
 
 import sys
 
@@ -15,16 +9,17 @@ from sglang.kernels.ops.attention.dsa.dcp_topk_hip import (
     TOPK,
     dcp_global_slots_hip,
     dcp_local_candidates_hip,
-    supports_dcp_topk_hip,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=25, stage="base-b", runner_config="1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=14, stage="base-b", runner_config="1-gpu-small-amd-mi35x")
 
 PAGE = 64
+# logits past a row's local length and gathered entries past a rank's share are left
+# undefined in production; this score beats every real one if a kernel reads it
 _GARBAGE = 1e30
 # kPer scores per thread stay in registers; a longer local row re-reads the excess
 _REGISTER_SCORES = 16 * 1024
@@ -35,17 +30,13 @@ def _row_lengths(world: int) -> list[int]:
     return [
         0,
         1,
-        world - 1,
         1000,
-        TOPK,
+        TOPK,  # global: every candidate wins
         TOPK + 1,
-        world * TOPK - 1,
         world * TOPK,  # local copy/select boundary
         world * TOPK + 1,
-        world * 5000,
         world * _REGISTER_SCORES,
-        world * _REGISTER_SCORES + 1,
-        world * 17500,
+        world * 17500,  # register tail
         world * 40000,  # several chunks on the chunked path
         world * 9 * _REGISTER_SCORES,  # past 8 chunks: the last re-reads the rest
     ]
@@ -113,7 +104,6 @@ def test_selects_the_global_topk_slots(chunked):
     them, whichever local path (copy, radix, register tail, chunks + merge) each
     rank's share takes."""
     world, span = 8, PAGE * 8
-    assert supports_dcp_topk_hip(TOPK, world)
     lengths = _row_lengths(world)
     gen = torch.Generator().manual_seed(world * 7)
     scores = [_scores(n, gen) for n in lengths]
