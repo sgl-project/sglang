@@ -75,8 +75,8 @@ def _backend(rank, req_to_token, kv_shard, ring):
             dcp_size=DCP,
             dcp_rank=rank,
         ),
-        SimpleNamespace(draft_kv_ring=ring),
     )
+    backend.set_draft_kv_ring(ring)
     return backend
 
 
