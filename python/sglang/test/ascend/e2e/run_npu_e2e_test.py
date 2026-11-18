@@ -338,33 +338,6 @@ def prepare_cm_data(namespace, pod_string, run_id=None):
     return data
 
 
-def dump_pod_logs(namespace, pod_name):
-    """Print the full log of ``pod_name`` under a banner.
-
-    Used once monitoring ends without success: streaming the pod live would
-    interleave with the test output and make the CI log unreadable, so the log
-    is fetched only when it is actually needed for debugging.
-    """
-    logger.error(f"===== begin logs of {pod_name} =====")
-    try:
-        result = subprocess.run(
-            # Keep the tail bounded: a long-serving prefill pod logs a lot and
-            # the most recent lines carry the failure that matters.
-            ["kubectl", "logs", "--tail=1000", "-n", namespace, pod_name],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        output = (result.stdout or "").strip()
-        if output:
-            print(output)
-        if result.returncode != 0:
-            logger.error(f"kubectl logs {pod_name} failed: {result.stderr.strip()}")
-    except Exception as e:
-        logger.error(f"Failed to dump logs of {pod_name}: {e}")
-    logger.error(f"===== end logs of {pod_name} =====")
-
-
 def monitor_pod_logs(
     kube_job_type,
     kube_job_prefix_name,
@@ -386,13 +359,6 @@ def monitor_pod_logs(
         KUBE_JOB_MULTI_PD_SEPARATION: f"{kube_job_prefix_name}-sgl-router-0",
     }
     pod_name = monitor_pod_name.get(kube_job_type)
-
-    # In PD separation the test verdict is printed by the router pod, but the
-    # model servers (and most startup errors) live on the prefill/decode pods.
-    # Their logs are dumped only when the run fails, to keep the live log clean.
-    extra_pod_names = []
-    if kube_job_type == KUBE_JOB_MULTI_PD_SEPARATION:
-        extra_pod_names.append(f"{kube_job_prefix_name}-sglang-prefill-0")
 
     # Build kubectl command
     cmd = ["kubectl", "logs", "-f", "-n", namespace, pod_name]
@@ -417,8 +383,6 @@ def monitor_pod_logs(
     metric_pattern = re.compile(r"^\[METRIC\] (\S+)=(\S+)(?: labels=(.*))?$")
 
     process = None
-    log_thread = None
-    test_succeeded = False
     try:
         # Start kubectl logs process
         process = subprocess.Popen(
@@ -564,7 +528,6 @@ def monitor_pod_logs(
         elif not is_success:
             raise Exception("The test result was FAILED!")
         else:
-            test_succeeded = True
             logger.info("The test result was OK!")
     finally:
         if process and process.poll() is None:
@@ -573,13 +536,6 @@ def monitor_pod_logs(
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
-        if log_thread is not None:
-            log_thread.join(timeout=5)
-        # Dump the auxiliary pods' logs only when the run failed; they are
-        # noisy (model server startup) and would bury the test output.
-        if not test_succeeded:
-            for extra_pod_name in extra_pod_names:
-                dump_pod_logs(namespace, extra_pod_name)
 
     return streamed_metrics, streamed_labels
 
