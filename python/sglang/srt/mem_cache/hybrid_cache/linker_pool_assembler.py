@@ -179,6 +179,7 @@ class DevicePoolGroup:
         page_size: int,
         *,
         rank_replicated: bool = False,
+        restores_sidecar_drafts: bool = False,
     ):
         self.entries = list(entries)
         self.entry_map = {entry.name: entry for entry in entries}
@@ -188,6 +189,7 @@ class DevicePoolGroup:
         self.num_layers = num_layers
         self.page_size = page_size
         self.rank_replicated = rank_replicated
+        self.restores_sidecar_drafts = restores_sidecar_drafts
         self.kv_buffer = None
 
     def resolve_transfers(
@@ -526,6 +528,36 @@ def _mha_device_pool_entry(
     )
 
 
+def _split_sidecar_draft_pools(
+    draft_pools: Sequence[Any],
+) -> tuple[list[Any], list[Any]] | None:
+    """Split hybrid-SWA sidecar drafts into the sub-pools that follow target KV
+    indices and those that follow target SWA indices; None if any is unsupported."""
+    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+    kv_drafts, swa_drafts = [], []
+    for draft in draft_pools:
+        if type(draft) is MHATokenToKVPool:
+            kv_drafts.append(draft)
+            continue
+        if not isinstance(draft, BaseSWAKVPool) or not all(
+            type(sub) is MHATokenToKVPool
+            for sub in (draft.full_kv_pool, draft.swa_kv_pool)
+        ):
+            return None
+        if draft.full_kv_pool.layer_num:
+            kv_drafts.append(draft.full_kv_pool)
+        if draft.swa_kv_pool.layer_num:
+            # A draft SWA pool addressed by full-token ids rides the KV pages;
+            # a linker page may mix head geometries.
+            if draft.swa_uses_full_indices:
+                kv_drafts.append(draft.swa_kv_pool)
+            else:
+                swa_drafts.append(draft.swa_kv_pool)
+    return kv_drafts, swa_drafts
+
+
 def _mamba_device_pool_entry(
     state: Any,
     start_layer: int,
@@ -607,6 +639,11 @@ def _build_mamba_swa_device_pool_group(
         for draft in drafts
         if draft.swa_kv_pool.layer_num and not draft.swa_uses_full_indices
     ]
+    # Non-packed sidecar drafts ride the same entries as packed MTP drafts.
+    split = _split_sidecar_draft_pools(params.sidecar_draft_device_pools)
+    if split is not None:
+        kv_drafts += split[0]
+        swa_drafts += split[1]
     entries = [
         _mha_device_pool_entry(
             PoolName.KV,
@@ -629,7 +666,9 @@ def _build_mamba_swa_device_pool_group(
         ),
     ]
     num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
-    return DevicePoolGroup(entries, num_layers + 1, page_size)
+    return DevicePoolGroup(
+        entries, num_layers + 1, page_size, restores_sidecar_drafts=split is not None
+    )
 
 
 def _build_mamba_device_pool_group(
@@ -724,7 +763,9 @@ def _build_mamba_device_pool_group(
     )
     num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
     # Not rank_replicated: the Mamba state is TP-sharded.
-    return DevicePoolGroup(entries, num_layers + 1, page_size)
+    return DevicePoolGroup(
+        entries, num_layers + 1, page_size, restores_sidecar_drafts=True
+    )
 
 
 def _sidecar_draft_entries(
@@ -822,7 +863,9 @@ def _build_minimax_m3_nvfp4_device_pool_group(
         *_sidecar_draft_entries(params, page_size),
     ]
     # Not rank_replicated: the KV heads are TP-sharded.
-    return DevicePoolGroup(entries, main_pool.layer_num, page_size)
+    return DevicePoolGroup(
+        entries, main_pool.layer_num, page_size, restores_sidecar_drafts=True
+    )
 
 
 def resolve_hybrid_device_pool_group(
@@ -842,8 +885,10 @@ def resolve_hybrid_device_pool_group(
         params=params,
         page_size=page_size,
     )
-    if getattr(params, "sidecar_draft_device_pools", ()) and (
-        PoolName.DRAFT not in group.entry_map
+    if (
+        getattr(params, "sidecar_draft_device_pools", ())
+        and PoolName.DRAFT not in group.entry_map
+        and not group.restores_sidecar_drafts
     ):
         raise ValueError(
             "The direct external linker does not support this model's draft KV."
