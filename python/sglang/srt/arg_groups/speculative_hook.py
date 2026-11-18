@@ -1133,7 +1133,10 @@ def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
         ),
         enable_unified_memory=cfg.enable_unified_memory,
         dcp_size=cfg.dcp_size,
+        attn_cp_size=cfg.attn_cp_size,
+        enable_dp_attention=attn_dp_enabled_of(cfg),
         draft_window_size=cfg.speculative_draft_window_size,
+        is_cuda=current_platform.is_cuda(),
     )
     if reason is not None:
         if switch.is_set():

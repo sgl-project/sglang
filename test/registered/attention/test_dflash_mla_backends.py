@@ -29,7 +29,7 @@ from sglang.test.parallel_groups import publish
 
 register_cuda_ci(est_time=40, stage="base-b", runner_config="4-gpu-b200")
 # backend-specific: ROCm serves DFLASH MLA drafts on the triton draft backend
-register_amd_ci(est_time=70, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(est_time=70, stage="base-b", runner_config="1-gpu-small-amd")
 
 HIDDEN, HEADS, RANK, NOPE, ROPE, VALUE, BLOCK = 128, 32, 512, 128, 64, 128, 8
 CAPACITY = 256
