@@ -177,7 +177,7 @@ first layer whose output differs while its inputs are bit-identical.
 export SGLANG_ADMIN_API_KEY=<key>
 DUMPER_ENABLE=0 DUMPER_SERVER_PORT=reuse DUMPER_NON_INTRUSIVE_MODE=all \
 DUMPER_DIR=/path/to/dumps python3 -m sglang.launch_server ... \
-  --disable-cuda-graph --disable-prefill-cuda-graph
+  --disable-decode-cuda-graph --disable-prefill-cuda-graph
 curl -X POST localhost:PORT/dumper/configure -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" -d '{"enable": true, "exp_name": "dec"}'
 ```
 
@@ -193,7 +193,7 @@ Five settings that are each required, and each fails silently if wrong:
   error to tell you.
 - `DUMPER_SERVER_PORT=reuse` is a literal sentinel, not a port number; the
   `/dumper/{method}` route only registers for that exact value.
-- `--disable-prefill-cuda-graph` on top of `--disable-cuda-graph`. Some models
+- `--disable-prefill-cuda-graph` together with `--disable-decode-cuda-graph`. Some models
   default prefill onto a CUDA graph, and Python forward hooks do not run inside a
   replay -- the prefill pass then dumps the embedding and nothing else.
 - Prefer `dumper.py` over `--debug-tensor-dump-*`: the latter asserts on a top-level

@@ -92,13 +92,14 @@ jobs:
   wait-for-base-a:
     needs: [check-changes, call-gate]
     if: |
-      always() &&
+      (always() &&
       !cancelled() &&
       needs.check-changes.result == 'success' &&
       github.event_name == 'pull_request' &&
       inputs.test_parallel_dispatch != true &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
-      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped'))
+      && needs.call-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-latest
     outputs:
       base_a_result: ${{ steps.wait.outputs.result }}
@@ -121,14 +122,15 @@ jobs:
   wait-for-base-b:
     needs: [check-changes, call-gate, wait-for-base-a]
     if: |
-      always() &&
+      (always() &&
       !cancelled() &&
       needs.check-changes.result == 'success' &&
       github.event_name == 'pull_request' &&
       inputs.test_parallel_dispatch != true &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
       (needs.wait-for-base-a.result == 'success' || needs.wait-for-base-a.result == 'skipped') &&
-      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped'))
+      && needs.call-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-latest
     outputs:
       base_b_result: ${{ steps.wait.outputs.result }}
@@ -178,11 +180,12 @@ jobs:
     needs: [check-changes, call-gate]
     # Skip for scheduled runs (they run stages independently).
     if: |
-      github.event_name != 'schedule' &&
+      (github.event_name != 'schedule' &&
       inputs.test_parallel_dispatch != true &&
       needs.check-changes.result == 'success' &&
       needs.check-changes.outputs.sgl_kernel == 'true' &&
-      needs.call-gate.result == 'success'
+      needs.call-gate.result == 'success')
+      && needs.call-gate.outputs.opted-in != 'false'
     uses: ./.github/workflows/_pr-test-sgl-kernel-build.yml
     with:
       runs_on: x64-kernel-build-node
@@ -195,11 +198,12 @@ jobs:
     needs: [check-changes, call-gate]
     # Skip for scheduled runs (they run stages independently).
     if: |
-      github.event_name != 'schedule' &&
+      (github.event_name != 'schedule' &&
       inputs.test_parallel_dispatch != true &&
       needs.check-changes.result == 'success' &&
       needs.check-changes.outputs.sgl_kernel == 'true' &&
-      needs.call-gate.result == 'success'
+      needs.call-gate.result == 'success')
+      && needs.call-gate.outputs.opted-in != 'false'
     uses: ./.github/workflows/_pr-test-sgl-kernel-build.yml
     with:
       runs_on: arm-kernel-build-node
@@ -230,6 +234,7 @@ jobs:
        needs.check-changes.outputs.jit_kernel == 'true' ||
        needs.check-changes.outputs.sgl_kernel == 'true') &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+      && needs.call-gate.outputs.opted-in != 'false'
     uses: ./.github/workflows/_pr-test-rust-ext-build.yml
     with:
       runs_on: ubuntu-22.04
@@ -272,9 +277,10 @@ jobs:
   call-sgl-kernel-tests:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
     if: |
-      github.event_name != 'schedule' &&
+      (github.event_name != 'schedule' &&
       inputs.test_parallel_dispatch != true &&
-      needs.check-changes.outputs.sgl_kernel == 'true'
+      needs.check-changes.outputs.sgl_kernel == 'true')
+      && needs.call-gate.outputs.opted-in != 'false'
     uses: ./.github/workflows/pr-test-sgl-kernel.yml
     with:
       runner_config: 4-gpu-b200
@@ -293,9 +299,10 @@ jobs:
     # jit_kernel suite is exercised on main 3x daily, not only on PRs that touch kernels/**.
     # check-changes already forces jit_kernel='true' on scheduled runs (run_all_tests).
     if: |
-      always() &&
+      (always() &&
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-      needs.check-changes.outputs.jit_kernel == 'true'
+      needs.check-changes.outputs.jit_kernel == 'true')
+      && needs.call-gate.outputs.opted-in != 'false'
     uses: ./.github/workflows/pr-test-jit-kernel.yml
     with:
       runs_on_map: ${{ needs.check-changes.outputs.runs_on_map }}
@@ -318,7 +325,7 @@ jobs:
   base-a-test:
     name: base-a-test-${{ matrix.runner_config }}
     needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ (!failure() && !cancelled()) && needs.call-gate.outputs.opted-in != 'false' }}
     strategy:
       fail-fast: false
       matrix:
@@ -340,9 +347,10 @@ jobs:
   base-a-test-cpu:
     needs: [check-changes, call-gate, rust-ext-build]
     if: |
-      always() &&
+      (always() &&
       needs.check-changes.result == 'success' &&
-      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled()))
+      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())))
+      && needs.call-gate.outputs.opted-in != 'false'
     uses: ./.github/workflows/_pr-test-stage-cpu.yml
     with:
       self_name: base-a-test-cpu
@@ -358,7 +366,7 @@ jobs:
     name: base-b-test-${{ matrix.runner_config }}
     needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, rust-ext-build, sgl-router-build]
     # A cancelled need is neither failure() nor cancelled(), so check it explicitly.
-    if: ${{ !failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' }}
+    if: ${{ (!failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled') && needs.call-gate.outputs.opted-in != 'false' }}
     strategy:
       fail-fast: false
       matrix:
@@ -384,10 +392,11 @@ jobs:
   call-multimodal-gen-tests:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: |
-      always() &&
+      (always() &&
       !cancelled() &&
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-      needs.check-changes.outputs.multimodal_gen == 'true'
+      needs.check-changes.outputs.multimodal_gen == 'true')
+      && needs.call-gate.outputs.opted-in != 'false'
     uses: ./.github/workflows/pr-test-multimodal-gen.yml
     with:
       runs_on_map: ${{ needs.check-changes.outputs.runs_on_map }}
@@ -407,7 +416,7 @@ jobs:
     # wait-for-base-a is listed only to read its result: when it is cancelled,
     # wait-for-base-b ends `skipped`, which alone would let this stage through.
     needs: [check-changes, call-gate, wait-for-base-a, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build, sgl-router-build]
-    if: ${{ !failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' && needs.wait-for-base-b.result != 'cancelled' }}
+    if: ${{ (!failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' && needs.wait-for-base-b.result != 'cancelled') && needs.call-gate.outputs.opted-in != 'false' }}
     strategy:
       fail-fast: false
       matrix:
@@ -433,7 +442,7 @@ jobs:
   base-c-test-aarch64:
     name: base-c-test-${{ matrix.runner_config }}
     needs: [check-changes, call-gate, wait-for-base-a, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build-aarch64, sgl-router-build-aarch64]
-    if: ${{ !failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' && needs.wait-for-base-b.result != 'cancelled' }}
+    if: ${{ (!failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' && needs.wait-for-base-b.result != 'cancelled') && needs.call-gate.outputs.opted-in != 'false' }}
     strategy:
       fail-fast: false
       matrix:
@@ -487,29 +496,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
         run: |
-          # Convert the 'needs' context to a JSON string
-          json_needs='${{ toJson(needs) }}'
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$NEEDS_JSON"
+          if jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' <<< "$NEEDS_JSON" >/dev/null; then
+            echo "::error::A dependent job failed or was cancelled."
+            exit 1
+          fi
 
-          # Get a list of all job names from the JSON keys
-          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
-
-          for job in $job_names; do
-            # For each job, extract its result
-            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
-
-            # Print the job name and its result
-            echo "$job: $result"
-
-            # Check for failure or cancellation and exit if found
-            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
-              echo "The above jobs failed."
-              exit 1
-            fi
-          done
-          # If the loop completes, all jobs were successful
-          echo "All jobs completed successfully"
-          exit 0
+      # The required check: a draft or a PR without run-ci skipped every test
+      # above, so fail here rather than pass with nothing run.
+      - name: Require that tests ran
+        if: needs.call-gate.outputs.opted-in == 'false'
+        run: |
+          echo "::error::Tests were skipped: the PR is a draft or lacks the 'run-ci' label. Add the label and mark the PR ready, then use /rerun-failed-ci, 'Re-run all jobs', or push."
+          exit 1
 
   # =============================================== notify pr-states ====================================================
   # Dispatches pr-states.yml after every attempt (initial + every rerun).

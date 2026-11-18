@@ -65,6 +65,7 @@ class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool)
         skip_topk_layers: Optional[list[bool]] = None,
         host_to_device_ratio: int = 2,
         kv_scale_ue8m0: bool = False,
+        fp8_cast_on_write: bool = False,
         use_fp4_indexer: bool = False,
     ):
         super().__init__(
@@ -87,6 +88,7 @@ class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool)
             max_running_requests=max_running_requests,
             skip_topk_layers=skip_topk_layers,
             kv_scale_ue8m0=kv_scale_ue8m0,
+            fp8_cast_on_write=fp8_cast_on_write,
             use_fp4_indexer=use_fp4_indexer,
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize

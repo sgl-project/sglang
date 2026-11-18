@@ -37,7 +37,7 @@ class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
         self.preprocess_backend = "cpu"
         self.cpu_patchify = patchify_image
         backend = get_mm().image_processor_backend
-        if backend == "pil" or get_mm().disable_fast_image_processor:
+        if backend == "pil":
             self.preprocess_backend = "cpu"
         elif envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get():
             self.preprocess_backend = "gpu"

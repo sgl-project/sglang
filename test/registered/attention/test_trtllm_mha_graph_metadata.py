@@ -755,6 +755,95 @@ def test_unified_decode_replay_reads_only_this_replays_pages(monkeypatch):
     )
 
 
+def _ring_backend(monkeypatch):
+    from sglang.srt.speculative.dflash_draft_ring import (
+        DFlashDraftKVRing,
+        draft_kv_ring_paged_rows_per_req,
+    )
+
+    def recorded_kernel(**kwargs):
+        assert kwargs["page_table"] is None and kwargs["skip_page_table"]
+        bs = kwargs["bs"]
+        kwargs["cache_seqlens"][:bs].copy_(
+            kwargs["seq_lens"][:bs] + kwargs["seqlen_offset"]
+        )
+
+    monkeypatch.setattr(
+        trtllm_mha_backend, "update_trtllm_mha_graph_metadata", recorded_kernel
+    )
+    backend = _make_backend_for_hook_test(speculative_num_draft_tokens=8)
+    backend.expand_encoder_only_verify = True
+    backend.init_cuda_graph_state(max_bs=4, max_num_tokens=32)
+    ring = DFlashDraftKVRing(
+        rows_per_req=draft_kv_ring_paged_rows_per_req(
+            window_left=255, block_size=8, page_size=PAGE_SIZE
+        ),
+        dcp_size=1,
+        req_to_token_rows=4,
+        device="cpu",
+        window_left=255,
+        dcp_rank=0,
+        pool=SimpleNamespace(maybe_get_custom_mem_pool=lambda: None),
+        page_size=PAGE_SIZE,
+    )
+    ring.min_pos.copy_(torch.tensor([0, 300, 5, 0], dtype=torch.int32))
+    backend.set_draft_kv_ring(ring)
+    return backend, ring
+
+
+def _assert_reads_the_ring(backend, ring, req_pool_indices, seq_lens, block):
+    metadata = backend.forward_metadata
+    bs = len(seq_lens)
+    floors = ring.min_pos[req_pool_indices].tolist()
+    expected_lens = [n - f + block for n, f in zip(seq_lens, floors)]
+    assert metadata.cache_seqlens_int32[:bs].tolist() == expected_lens
+    cols = torch.arange(backend.max_num_pages) % ring.pages_per_req
+    for row, req in enumerate(req_pool_indices.tolist()):
+        expected = (1 + req * ring.pages_per_req + cols).to(torch.int32)
+        assert torch.equal(metadata.page_table[row], expected)
+    rows = bs * block
+    assert torch.equal(
+        metadata.encoder_page_table[:rows],
+        metadata.page_table[:bs].repeat_interleave(block, dim=0),
+    )
+    assert metadata.encoder_cache_seqlens[:rows].tolist() == [
+        n for n in expected_lens for _ in range(block)
+    ]
+
+
+def test_draft_kv_ring_graph_verify_reads_the_ring(monkeypatch):
+    backend, ring = _ring_backend(monkeypatch)
+    capture = _graph_batch([1, 1], ForwardMode.TARGET_VERIFY, None, 8)
+    backend.init_forward_metadata_out_graph(capture, in_capture=True)
+    backend.init_forward_metadata_in_graph(capture)
+    for seq_lens, reqs in (([700, 310], [3, 1]), ([9, 900], [2, 0])):
+        replay = _graph_batch(seq_lens, ForwardMode.TARGET_VERIFY, None, 8)
+        replay.req_pool_indices = torch.tensor(reqs, dtype=torch.int64)
+        backend.init_forward_metadata_out_graph(replay)
+        backend.init_forward_metadata_in_graph(replay)
+        _assert_reads_the_ring(backend, ring, replay.req_pool_indices, seq_lens, 8)
+
+
+def test_draft_kv_ring_eager_verify_reads_the_ring(monkeypatch):
+    backend, ring = _ring_backend(monkeypatch)
+    seq_lens = [310, 700]
+    forward_batch = _eager_batch(seq_lens, ForwardMode.TARGET_VERIFY, tokens_per_req=8)
+    forward_batch.req_pool_indices = torch.tensor([1, 3], dtype=torch.int64)
+    backend.runner_ids.bind_own_plan(forward_batch)
+    backend.init_forward_metadata(forward_batch)
+    _assert_reads_the_ring(backend, ring, forward_batch.req_pool_indices, seq_lens, 8)
+
+
+def test_draft_kv_ring_other_modes_stay_inside_the_ring(monkeypatch):
+    backend, ring = _ring_backend(monkeypatch)
+    forward_batch = _eager_batch([1000, 20], ForwardMode.DECODE)
+    backend.runner_ids.bind_own_plan(forward_batch)
+    backend.init_forward_metadata(forward_batch)
+    table = backend.forward_metadata.page_table
+    assert backend.forward_metadata.cache_seqlens_int32.tolist() == [1000, 20]
+    assert int(table.max()) < 1 + 4 * ring.pages_per_req and int(table.min()) >= 1
+
+
 def _eager_batch(seq_lens, forward_mode, spec_info=None, tokens_per_req=1):
     seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
     bs = seq_lens.numel()

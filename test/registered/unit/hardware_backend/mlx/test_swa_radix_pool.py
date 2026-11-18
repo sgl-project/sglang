@@ -16,7 +16,7 @@ import unittest
 from sglang.test.ci.ci_register import register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_mlx_ci(est_time=10, suite="stage-a-unit-test-mlx")
+register_mlx_ci(est_time=10, suite="extra-unit-test-mlx")
 
 _HAS_MLX = (
     importlib.util.find_spec("mlx") is not None

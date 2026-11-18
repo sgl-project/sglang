@@ -158,7 +158,7 @@ export const MiniMaxM25Deployment = () => {
         '    --context-length 4096 --max-running-requests 1',
         '    --chunked-prefill-size 128 --max-prefill-tokens 4096',
         '    --mem-fraction-static 0.96 --max-total-tokens 4096',
-        '    --disable-cuda-graph --disable-radix-cache'
+        '    --disable-decode-cuda-graph --disable-prefill-cuda-graph --disable-radix-cache'
       ];
       return environment.join('\n') + '\n' + launch.join(' \\\n');
     }
@@ -205,8 +205,7 @@ export const MiniMaxM25Deployment = () => {
         '    --model-path "$MODEL_PATH"',
         '    --host 127.0.0.1 --port 6688',
         '    --tp-size 16',
-        '    --enable-dp-attention',
-        '    --dp-size 16',
+        '    --attn-dp-size 16',
         '    --mem-fraction-static 0.75',
         '    --max-running-requests 320',
         '    --disable-radix-cache',
@@ -290,7 +289,7 @@ export const MiniMaxM25Deployment = () => {
     }
 
     if (useAllreduceFusion) {
-      cmd += ` \\\n  --enable-flashinfer-allreduce-fusion`;
+      cmd += ` \\\n  --flashinfer-allreduce-fusion-backend auto`;
     }
 
     if (isAMD) {

@@ -5,13 +5,14 @@
 from __future__ import annotations
 
 import logging
-from functools import partial
+from functools import cache, partial
 from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.kernels.ops.communication import sp_collective
 from sglang.kernels.ops.sampling.topk import radix_topk
 from sglang.kernels.ops.speculative.dflash import (
     dflash_grouped_conv,
@@ -24,6 +25,7 @@ from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.environ import envs
 from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.communication import k3_ar_fusion
 from sglang.srt.layers.layer_boundary import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
@@ -153,6 +155,70 @@ def _project_candidate_logits(
     return logits
 
 
+def _candidate_ag_ready(group) -> bool:
+    # The kernel barriers on k3_ar_fusion's communicator, so only the TP group works.
+    return (
+        envs.SGLANG_OPT_DFLASH_FUSED_CANDIDATE_AG.get()
+        and k3_ar_fusion.enabled()
+        and group is get_parallel().tp_group
+        and _candidate_ag_registered()
+    )
+
+
+@cache
+def _candidate_ag_registered() -> bool:
+    if not k3_ar_fusion.register_sp_collective_comm():
+        logger.warning(
+            "DFLASH fused candidate all-gather: another communicator owns "
+            "TP%d; using NCCL.",
+            get_parallel().tp_size,
+        )
+        return False
+    logger.info(
+        "DFLASH fused candidate all-gather enabled (TP%d, one direct multicast "
+        "all-gather of the top-k values and ids)",
+        get_parallel().tp_size,
+    )
+    return True
+
+
+def _fused_candidate_all_gather(
+    group, vals: torch.Tensor, global_ids: torch.Tensor
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """[N, K] vals/ids -> [N, tp*K] fp32 vals, int32 ids, rank-major; None for NCCL."""
+    if not _candidate_ag_ready(group):
+        return None
+
+    rows, k = vals.shape
+    tp = group.world_size
+    # Each rank's [N, 2K] int32 shard must be whole 16 B vectors.
+    if (rows * k) % 2:
+        return None
+    # The kernel copies raw 16 B vectors; bf16 is only its host-side dtype check.
+    # One buffer per k: a symm_buffer name fixes its width.
+    out = k3_ar_fusion.try_symm_buffer(
+        f"dflash_candidate_ag_k{k}", rows, tp * 4 * k, torch.bfloat16
+    )
+    if out is None:
+        return None
+    payload = torch.empty((rows, 2 * k), dtype=torch.int32, device=vals.device)
+    payload[:, :k].view(torch.float32).copy_(vals)
+    payload[:, k:].copy_(global_ids)
+    sp_collective.all_gather_direct(
+        tp,
+        payload.view(torch.bfloat16),
+        out,
+        output_mc_ptr=k3_ar_fusion.get_mc_ptr(out),
+        # One CTA covers the few hundred bytes each rank sends.
+        tuning=sp_collective.Tuning(num_blocks=1, block_size=128),
+    )
+    # [tp, N, 2K] rank-major -> [N, tp, 2K]; reshape copies each half contiguous.
+    gathered = out.view(torch.int32).view(tp, rows, 2 * k).transpose(0, 1)
+    gathered_vals = gathered[..., :k].view(torch.float32).reshape(rows, tp * k)
+    gathered_ids = gathered[..., k:].reshape(rows, tp * k)
+    return gathered_vals, gathered_ids
+
+
 def candidate_topk(
     hidden: torch.Tensor,
     lm_head: nn.Module,
@@ -212,8 +278,12 @@ def candidate_topk(
     if tp:
         return ids.long(), vals, lse
     global_ids = ids.long() + int(lm_head.shard_indices.org_vocab_start_index)
-    gathered_vals = lm_head.tp_group.all_gather(vals.float(), dim=-1)
-    gathered_ids = lm_head.tp_group.all_gather(global_ids, dim=-1)
+    gathered = _fused_candidate_all_gather(lm_head.tp_group, vals, global_ids)
+    if gathered is not None:
+        gathered_vals, gathered_ids = gathered
+    else:
+        gathered_vals = lm_head.tp_group.all_gather(vals.float(), dim=-1)
+        gathered_ids = lm_head.tp_group.all_gather(global_ids, dim=-1)
     top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
     if lse is not None:
         lse = torch.logsumexp(
@@ -1039,6 +1109,8 @@ class DFlashDraftModel(nn.Module):
     # Layer prefixes and a quant_config-aware `fc`, for quantized checkpoints.
     supports_quantization = False
     own_quant_config = staticmethod(keeps_no_quant_config)
+    # `project_target_hidden` gathers a TP-split `fc` (SGLANG_OPT_DFLASH_TP_AUX_FC).
+    supports_fc_tp_split = True
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
@@ -1130,6 +1202,8 @@ class DFlashDraftModel(nn.Module):
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
+        # [start, end) fc output columns this rank computes; None = replicated fc.
+        self.fc_tp_columns = self._resolve_fc_tp_columns()
         if self.quantizable:
             fc_prefix = f"{prefix}.fc" if prefix else "fc"
             self.fc = ReplicatedLinear(
@@ -1138,6 +1212,18 @@ class DFlashDraftModel(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=fc_prefix,
+            )
+        elif self.fc_tp_columns is not None:
+            start, end = self.fc_tp_columns
+            self.fc = nn.Linear(
+                self.num_context_features * hidden_size, end - start, bias=False
+            )
+            logger.info(
+                "DFLASH aux fc split across TP: columns [%d, %d) of %d "
+                "(SGLANG_OPT_DFLASH_TP_AUX_FC)",
+                start,
+                end,
+                hidden_size,
             )
         else:
             self.fc = nn.Linear(
@@ -1217,7 +1303,34 @@ class DFlashDraftModel(nn.Module):
         projected = self.fc(target_hidden)
         if self.quantizable:
             projected = projected[0]
+        elif self.fc_tp_columns is not None:
+            projected = self._gather_fc_columns(projected)
         return self.hidden_norm(projected)
+
+    def _resolve_fc_tp_columns(self) -> Optional[Tuple[int, int]]:
+        hidden_size = int(self.config.hidden_size)
+        parallel = get_parallel()
+        if (
+            not envs.SGLANG_OPT_DFLASH_TP_AUX_FC.get()
+            or not self.supports_fc_tp_split
+            or self.quantizable
+            or parallel.tp_size == 1
+            or hidden_size % parallel.tp_size != 0
+            # An attention-owning draft runs under a narrowed TP group (draft_tp_context).
+            or parallel.attn_dp_enabled
+            or parallel.attn_cp_size > 1
+        ):
+            return None
+        width = hidden_size // parallel.tp_size
+        return parallel.tp_rank * width, (parallel.tp_rank + 1) * width
+
+    def _gather_fc_columns(self, local: torch.Tensor) -> torch.Tensor:
+        # Each element is one rank's value plus zeros, so the all-reduce gathers
+        # exactly (a -0.0 comes back as +0.0).
+        start, end = self.fc_tp_columns
+        full = local.new_zeros(local.shape[0], int(self.config.hidden_size))
+        full[:, start:end] = local
+        return get_parallel().tp_group.all_reduce(full)
 
     @torch.no_grad()
     def forward(
@@ -1356,6 +1469,16 @@ class DFlashDraftModel(nn.Module):
                             getattr(param, "pack_factor", None) is None
                             and tuple(loaded_weight.shape) == tuple(param.shape)
                         )
+                    elif self.fc_tp_columns is not None:
+                        expected_shape = (
+                            int(self.config.hidden_size),
+                            int(self.num_context_features * self.config.hidden_size),
+                        )
+                        loaded_shape = tuple(loaded_weight.shape)
+                        shape_matches = loaded_shape == expected_shape
+                        if shape_matches:
+                            start, end = self.fc_tp_columns
+                            loaded_weight = loaded_weight[start:end]
                     else:
                         expected_shape = tuple(param.shape)
                         loaded_shape = tuple(loaded_weight.shape)
@@ -1462,6 +1585,8 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
 
     decoder_layer_cls = DFlashLagunaDecoderLayer
     supports_fused_context_kv = False
+    # Its own `project_target_hidden` reads the whole `fc` output.
+    supports_fc_tp_split = False
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)

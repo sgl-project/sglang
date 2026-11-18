@@ -110,6 +110,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
     get_schedule,
+    get_spec,
 )
 from sglang.srt.utils import is_npu, rank_consensus_checker
 from sglang.srt.utils.device import async_d2h
@@ -460,6 +461,7 @@ class PrefillBootstrapQueue:
             self.scheduler.model_config.num_hidden_layers,
             window_tails=storage.retained_window_lengths(),
             draft_kv_ring=self.draft_kv_ring,
+            empty_draft_kv_ring=get_spec().speculative_dflash_draft_kv_ring,
         )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
@@ -1733,11 +1735,16 @@ class SchedulerDisaggregationPrefillMixin:
 
         sender = req.disagg_kv_sender
         # The schedule stream may wait on the in-flight forward. A sender that takes
-        # host-tensor indices waits on their copy's event itself, so the scheduler
-        # never blocks on these device reads.
-        host_indices = getattr(sender, "supports_host_tensor_indices", False) and not (
-            sender.kv_mgr.enable_all_cp_ranks_for_transfer
-            and not get_parallel().enable_dsa_cache_layer_split
+        # host-tensor indices waits on their copy's event itself. CP and shard
+        # filtering read the indices on the scheduler before that wait, so those
+        # paths need a completed host copy even with CP-TP group sharing.
+        host_indices = (
+            getattr(sender, "supports_host_tensor_indices", False)
+            and sender.kv_mgr.kv_shard_size <= 1
+            and not (
+                sender.kv_mgr.enable_all_cp_ranks_for_transfer
+                and not get_parallel().enable_dsa_cache_layer_split
+            )
         )
 
         def page_indices_of(kv_indices: torch.Tensor):
@@ -1867,6 +1874,8 @@ class SchedulerDisaggregationPrefillMixin:
 
             def _draft_ring_payload():
                 ring = self.disagg_prefill_bootstrap_queue.draft_kv_ring
+                if ring is None:
+                    return None
                 return ring.transfer_rows(int(req.kv.req_pool_idx), seq_len)
 
             def _request_row_payload():

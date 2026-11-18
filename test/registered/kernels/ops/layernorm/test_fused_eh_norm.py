@@ -95,27 +95,5 @@ def test_fused_eh_norm_row_strided_inputs():
     torch.testing.assert_close(actual.float(), expected.float(), rtol=1e-2, atol=1e-2)
 
 
-def test_fused_eh_norm_rejects_unsupported_dtype():
-    hidden_size = 7168
-    inputs_embeds = torch.randn(1, hidden_size, device="cuda", dtype=torch.float32)
-    previous_hidden = torch.randn_like(inputs_embeds)
-    enorm_weight = torch.randn(hidden_size, device="cuda", dtype=torch.float32)
-    hnorm_weight = torch.randn(hidden_size, device="cuda", dtype=torch.float32)
-
-    with pytest.raises(RuntimeError, match="unsupported dtype"):
-        fused_eh_norm(inputs_embeds, previous_hidden, enorm_weight, hnorm_weight, 1e-6)
-
-
-def test_fused_eh_norm_rejects_unsupported_hidden_size():
-    hidden_size = 5000
-    inputs_embeds = torch.randn(1, hidden_size, device="cuda", dtype=torch.bfloat16)
-    previous_hidden = torch.randn_like(inputs_embeds)
-    enorm_weight = torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16)
-    hnorm_weight = torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16)
-
-    with pytest.raises(RuntimeError, match="unsupported hidden_size"):
-        fused_eh_norm(inputs_embeds, previous_hidden, enorm_weight, hnorm_weight, 1e-6)
-
-
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

@@ -155,8 +155,6 @@ def maybe_dump_performance(
 
 def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None):
     """The entry point for the generate command."""
-    args.request_id = "mocked_fake_id_for_offline_generate"
-
     server_args = ServerArgs.from_cli_args(args, unknown_args)
     sampling_params_cls = _resolve_cli_sampling_params_cls(server_args)
 

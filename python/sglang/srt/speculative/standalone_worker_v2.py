@@ -21,6 +21,7 @@ from sglang.srt.speculative.base_spec_worker import (
 )
 from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
+from sglang.srt.speculative.eagle_worker_common import check_draft_branch_tail_copy
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
@@ -115,6 +116,9 @@ class StandaloneDraftWorker(EagleDraftWorker):
             memory_pool_config=memory_pool_config,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        )
+        check_draft_branch_tail_copy(
+            self.draft_runner.token_to_kv_pool, self.topk, get_schedule().page_size
         )
         self.init_token_map()
         self.init_lm_head()

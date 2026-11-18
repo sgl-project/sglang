@@ -265,9 +265,6 @@ export const config = {
     numPromptsByConc: { 1: 16, 16: 80, 64: 320, 256: 1280 },
   },
 
-  // The K3.1 image is built from docker/k31.Dockerfile; it verifies the Rust radix TreeCore,
-  // flashmla_ops and the 1024-expert FlashInfer DynBlock at build time (a Python-only install
-  // falls back to slower paths silently).
   dockerImages: {
     m890: "egslingjun-registry.cn-wulanchabu.cr.aliyuncs.com/egslingjun-tmp/inference-xpu-pytorch:kimi-k3.1-pro-sglang0.5.22-cuda13.0-pytorch2.13.0-20261103",
     "810e": "egslingjun-registry.cn-wulanchabu.cr.aliyuncs.com/egslingjun-tmp/inference-xpu-pytorch:kimi-k3.1-pro-sglang0.5.22-cuda13.0-pytorch2.13.0-20261103",
@@ -1510,8 +1507,7 @@ export const config = {
         "--dist-timeout 3600",
         "--tp-size 32",
         "--ep-size 32",
-        "--dp-size 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--enable-dp-lm-head",
         "--linear-attn-prefill-backend flashkda",
         "--moe-runner-backend deep_gemm",

@@ -219,7 +219,6 @@ class TestVisionParallelGroups(CustomTestCase):
                     device="cpu",
                     tp_size=4,
                     attn_dp_size=dp_size,
-                    enable_dp_attention=dp_size > 1,
                     mm_attention_backend="sdpa",
                 ),
                 role="test",
@@ -251,8 +250,6 @@ class TestVisionParallelGroups(CustomTestCase):
                             in (
                                 "siglip",
                                 "qwen_merger",
-                                "glm4v_mlp",
-                                "glm4v_merger",
                                 "internvl_mlp",
                             )
                             else "attn_tp"

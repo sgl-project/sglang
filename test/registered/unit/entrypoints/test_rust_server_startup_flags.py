@@ -605,17 +605,5 @@ def test_warmup_rust_cannot_run_is_refused(listener, registered_warmup, name):
     extension.return_value.Server.assert_not_called()
 
 
-@pytest.mark.parametrize("threshold", [0.25, 0.0, -1.0])
-def test_gc_warning_watches_the_listener_scheduler(listener, threshold):
-    """Installed with the configured threshold when positive; Python disables
-    it otherwise."""
-    with patch.object(rust_server, "configure_gc_warning") as configure:
-        _launch(listener.port, gc_warning_threshold_secs=threshold)
-    if threshold > 0:
-        configure.assert_called_once_with(threshold)
-    else:
-        configure.assert_not_called()
-
-
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

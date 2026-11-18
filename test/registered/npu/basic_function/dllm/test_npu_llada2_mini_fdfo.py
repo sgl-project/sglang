@@ -7,8 +7,8 @@ from sglang.test.ascend.test_ascend_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-# Moved from nightly-2-npu-a3 to full-2-npu-a3: the model requires maintenance.
-register_npu_ci(est_time=400, suite="full-2-npu-a3", nightly=True)
+# Moved from nightly-test-2-npu-a3 to full-test-2-npu-a3: the model requires maintenance.
+register_npu_ci(est_time=400, suite="full-test-2-npu-a3", nightly=True)
 
 
 class TestLLaDA2MiniFDFO(CustomTestCase):
@@ -51,7 +51,12 @@ class TestLLaDA2MiniFDFO(CustomTestCase):
         ]
         for common_arg in common_args:
             other_args = common_arg + (
-                ["--attention-backend", "ascend", "--disable-cuda-graph"]
+                [
+                    "--attention-backend",
+                    "ascend",
+                    "--disable-decode-cuda-graph",
+                    "--disable-prefill-cuda-graph",
+                ]
             )
             res = run_bench_serving(
                 model=model,

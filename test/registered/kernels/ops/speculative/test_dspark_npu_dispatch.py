@@ -22,7 +22,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import DSparkSchedu
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=90, suite="base-b-test-1-npu-a3")
+register_npu_ci(est_time=90, suite="extra-b-test-1-npu-a3")
 
 
 class TestDSparkNpuDispatch(CustomTestCase):
@@ -76,8 +76,6 @@ class TestDSparkNpuDispatch(CustomTestCase):
         npu = cpu.npu()
         self.assertFalse(inputs_on_cuda(None, cpu, npu))
         self.assertTrue(inputs_on_cuda(None, npu, cpu))
-        with self.assertRaises(AssertionError):
-            inputs_on_cuda(1, flag=True)
 
     def test_markov_greedy_matches_native_rounding(self):
         for dtype in (torch.float32, torch.float16, torch.bfloat16):

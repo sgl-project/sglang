@@ -1750,18 +1750,18 @@ async def parse_function_call_request(
             chat_encoding_spec=chat.chat_encoding_spec,
             adapter=chat.encoding_adapter,
         )
+        if text_parser is None:
+            # 1) Initialize the parser based on the request body
+            parser = FunctionCallParser(
+                tools=obj.tools,
+                tool_call_parser=obj.tool_call_parser,
+                tokenizer=get_global_state().tokenizer_manager.tokenizer,
+            )
     except ValueError as error:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(error))
     if text_parser is not None:
         normal_text, calls = text_parser.parse_function_call_text(obj.text, obj.tools)
     else:
-        # 1) Initialize the parser based on the request body
-        parser = FunctionCallParser(
-            tools=obj.tools,
-            tool_call_parser=obj.tool_call_parser,
-            tokenizer=get_global_state().tokenizer_manager.tokenizer,
-        )
-
         # 2) Call the non-stream parsing method (non-stream)
         normal_text, calls = parser.parse_non_stream(obj.text)
 

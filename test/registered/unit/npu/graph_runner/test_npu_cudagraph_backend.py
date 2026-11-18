@@ -15,7 +15,7 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=10, suite="base-a-test-npu")
+register_npu_ci(est_time=10, suite="extra-a-test-npu")
 
 
 def _device_module_stub():

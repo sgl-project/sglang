@@ -17,7 +17,7 @@ import torch
 from sglang.srt.utils import is_xpu
 from sglang.test.ci.ci_register import register_xpu_ci
 
-register_xpu_ci(est_time=20, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=20, suite="extra-test-1-gpu-xpu")
 
 if is_xpu():
     from compressed_tensors.quantization import QuantizationArgs

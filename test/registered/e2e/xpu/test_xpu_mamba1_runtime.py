@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_xpu_ci(est_time=600, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=600, suite="extra-test-1-gpu-xpu")
 
 # Small Mamba-1 (state-spaces) checkpoint; exercises MambaMixer1 on XPU.
 MODEL = "state-spaces/mamba-130m-hf"

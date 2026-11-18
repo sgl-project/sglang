@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cpu_ci(est_time=685, suite="stage-a-tp-test-cpu-intel")
+register_cpu_ci(est_time=685, suite="extra-tp-test-cpu-intel")
 
 
 class TestIntelAMXAttnBackend(CustomTestCase):

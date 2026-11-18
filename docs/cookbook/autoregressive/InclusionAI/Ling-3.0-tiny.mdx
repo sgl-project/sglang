@@ -57,7 +57,7 @@ It is a thinking model with chain-of-thought enabled by default, and it supports
 - Use the dedicated `lmsysorg/sglang:dev-Ling-3.0-tiny` runtime image; it includes the compressed-tensors Hopper and Blackwell backends that INT4 needs.
 - The FP8 checkpoint uses blockwise (128×128) E4M3 weights with dynamic activations, quantized from the BF16 model with attention projections, the dense MoE gate, and the lm_head left in higher precision. SGLang detects the format from the checkpoint's `quantization_config`, so no explicit quantization flag is needed, and the same single-GPU recipe serves it.
 - The INT4 checkpoint uses symmetric group-32 W4A16 routed experts. SGLang selects Marlin on Hopper and Triton WNA16 on Blackwell automatically; no explicit quantization or MoE backend flag is needed.
-- Unlike Ling-3.0-flash (which pairs `--reasoning-parser ling3` / `--tool-call-parser ling3`), Ling-3.0-tiny uses `--reasoning-parser deepseek-r1` and `--tool-call-parser glm45` (its auto-detected template pairing) — the template wraps tool calls in `<tool_call>` blocks and emits an inline `...</think>` chain-of-thought. Toggle them in the **Parsers** card of the [Playground](#playground).
+- Unlike Ling-3.0-flash (which pairs `--reasoning-parser ling3` / `--tool-call-parser ling3`), Ling-3.0-tiny uses `--reasoning-parser deepseek-r1` and `--tool-call-parser glm` (its auto-detected template pairing) — the template wraps tool calls in `<tool_call>` blocks and emits an inline `...</think>` chain-of-thought. Toggle them in the **Parsers** card of the [Playground](#playground).
 - Only `--model-path`, `--host`, and `--port` are needed. SGLang auto-resolves the context length (native 128K from `max_position_embeddings`), the attention backend, and `--mem-fraction-static` from the GPU and the CUDA-graph runtime, so the recipes leave them unset.
 - The chat template defaults to thinking on. Turn it off per request with `"chat_template_kwargs": {"enable_thinking": false}` for direct answers without the `...</think>` block.
 - Ling-3.0-tiny ships no built-in MTP draft layer (`num_nextn_predict_layers: 0`), so `--speculative-algorithm NEXTN` is not applicable.
@@ -107,7 +107,7 @@ Thinking is controlled by the chat template's `enable_thinking` kwarg and is on 
 
 ### 3.2 Tool Calling
 
-With `--tool-call-parser glm45` (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)), structured calls are parsed into `message.tool_calls` and `finish_reason` is `tool_calls`:
+With `--tool-call-parser glm` (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)), structured calls are parsed into `message.tool_calls` and `finish_reason` is `tool_calls`:
 
 <Accordion title="Tool-calling request">
 

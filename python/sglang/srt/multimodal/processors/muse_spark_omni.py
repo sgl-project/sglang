@@ -19,7 +19,6 @@ import torch
 from PIL import Image
 from transformers.utils.hub import cached_file
 
-from sglang.srt.hf_transformers import resolve_image_processor_backend
 from sglang.srt.hf_transformers.common import resolve_runai_obj_uri
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.muse_spark_omni import MuseSparkForConditionalGeneration
@@ -447,7 +446,7 @@ def _load_video_processor_config(
 
 def make_preprocess_config(vision) -> PreprocessConfig:
     return PreprocessConfig(
-        use_rust_resize=resolve_image_processor_backend(get_mm()) != "pil",
+        use_rust_resize=get_mm().image_processor_backend != "pil",
         patch_size=vision.patch_size,
         patch_temporal=vision.patch_temporal,
         downsample_factor=vision.merge_size,

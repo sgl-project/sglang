@@ -7,7 +7,7 @@ Runs the point AGENTX_POINT (``tp2-c1``, ``tp2-c16``, ...) of InferenceX's
 HiCache. InferenceX runs this row on rocm720 and the nightly on rocm10, so its
 published points are a reference, not a like-for-like comparison.
 
-Registry: nightly-perf-8-gpu-mi35x-qwen35-mxfp4-agentx suite
+Registry: nightly-perf-test-8-gpu-amd-mi35x-qwen35-mxfp4-agentx suite
 """
 
 import unittest
@@ -18,7 +18,9 @@ from sglang.test.ci.ci_register import register_amd_ci
 # Register for AMD CI - one AgentX point: model load, then InferenceX's one-hour
 # measurement window (this row has no warmup grace).
 register_amd_ci(
-    est_time=10800, suite="nightly-perf-8-gpu-mi35x-qwen35-mxfp4-agentx", nightly=True
+    est_time=10800,
+    suite="nightly-perf-test-8-gpu-amd-mi35x-qwen35-mxfp4-agentx",
+    nightly=True,
 )
 
 

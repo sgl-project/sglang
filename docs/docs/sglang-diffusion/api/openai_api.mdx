@@ -1,9 +1,9 @@
 ---
 title: OpenAI API
 sidebarTitle: OpenAI API
-description: Image and video generation endpoints with LoRA adapter management.
+description: OpenAI-compatible image and video APIs, SGLang action generation APIs, and LoRA adapter management.
 ---
-The SGLang diffusion HTTP server implements an OpenAI-compatible API for image and video generation, as well as LoRA adapter management.
+The SGLang Diffusion server supports image, video, audio, and action generation. It provides OpenAI-compatible image and video APIs, plus SGLang extensions for [action generation](#action-generation-sglang-extension), mesh generation, and LoRA adapter management. Audio output depends on the selected model's audio/video pipeline; action endpoints are not part of the OpenAI API standard.
 
 ## Prerequisites
 
@@ -491,6 +491,23 @@ curl -sS -L "http://localhost:30010/v1/videos/<VIDEO_ID>/content" \
 ```
 
 ---
+
+### Action generation (SGLang extension)
+
+Action policies use `/v1/actions` rather than the image or video endpoints.
+Launch a supported policy with `sglang serve` and use its cookbook recipe for
+the observation schema, action layout, and sampling defaults.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /v1/actions/generations` | Generate an action chunk synchronously using JSON or msgpack. |
+| `GET /v1/actions/metadata` | Discover the served policy's observation schema, action shape, defaults, and capabilities. |
+| `WS /v1/actions/realtime` | Send successive action requests using the msgpack WebSocket protocol. |
+
+See the [VLA cookbook](/cookbook/vla/intro) for Pi0.5, FLUX 3 Action, and
+Praxis-1 recipes, or [Cosmos3 policy and inverse dynamics](/cookbook/diffusion/Cosmos/Cosmos3#action-generation)
+for world-model action generation. Supported inputs, session behavior, and
+transports depend on the policy; consult its metadata and recipe before use.
 
 ### LoRA Management
 

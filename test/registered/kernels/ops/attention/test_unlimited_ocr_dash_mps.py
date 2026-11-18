@@ -47,7 +47,7 @@ from sglang.test.kernels.unlimited_ocr_dash import (
     win_bounds_reference,
 )
 
-register_mps_ci(est_time=60, suite="stage-a-unit-test-mps")
+register_mps_ci(est_time=60, suite="extra-unit-test-mps")
 
 pytestmark = pytest.mark.skipif(
     not torch.backends.mps.is_available(), reason="requires Apple MPS"

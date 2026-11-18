@@ -10,14 +10,14 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-Kimi K3.1 Pro is served from the `kimi-k3.1-day-0` branch of [SGLang](https://github.com/sgl-project/sglang), based on `main`. To build and install from source, follow `docker/k31.Dockerfile` so that every dependency is in place.
+Install [SGLang](https://github.com/sgl-project/sglang) from source on `main`. The Kimi K3.1 Pro image recipe, with every dependency in place, is [`docker/k31.Dockerfile`](https://github.com/sgl-project/sglang/blob/37794659f6732c59288acc83d21cad481a6c2cd2/docker/k31.Dockerfile); it packages the SGLang source of commit `37794659f6` on the Kimi K3.1 branch, not `main`. Build it from a checkout of that commit with `docker buildx build -f docker/k31.Dockerfile .`.
 
 <Tabs>
 
 <Tab title="Python (from source)">
 
 ```bash Command
-git clone -b kimi-k3.1-day-0 https://github.com/sgl-project/sglang.git && cd sglang
+git clone https://github.com/sgl-project/sglang.git && cd sglang
 pip install -e "python"
 ```
 

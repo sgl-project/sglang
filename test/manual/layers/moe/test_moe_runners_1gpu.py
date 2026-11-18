@@ -130,7 +130,8 @@ class TestMoERunner(CustomTestCase):
                 "triton",
                 "--sampling-backend",
                 "pytorch",
-                "--disable-cuda-graph",
+                "--disable-decode-cuda-graph",
+                "--disable-prefill-cuda-graph",
             ],
         },
         "moe_runner_speculative": {

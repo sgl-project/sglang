@@ -114,10 +114,7 @@ class AttnForwardMethod(IntEnum):
     MHA_PREFILL = auto()
 
 
-SEPARATE_ROPE_BACKENDS = frozenset(
-    ["fa3", "flashinfer", "dsa", "nsa", "trtllm_mla"]
-    # "nsa" is a deprecated alias for "dsa"
-)
+SEPARATE_ROPE_BACKENDS = frozenset(["fa3", "flashinfer", "dsa", "trtllm_mla"])
 CONCAT_ROPE_BACKENDS = frozenset(["flashmla", "triton"])
 
 

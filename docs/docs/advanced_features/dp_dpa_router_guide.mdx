@@ -120,14 +120,12 @@ python -m sglang.launch_server \
 
 **Important**: `--attn-dp-size` must be greater than 1 for DPA to work. When `attn_dp_size == 1` (default), DPA is disabled. The constraint `tp_size % attn_dp_size == 0` must also be satisfied. `--dp-size` only sets the number of data-parallel replicas of the model; combining replicas (`--dp-size` > 1) with DPA is not supported.
 
-> **Deprecated**: `--enable-dp-attention` still works: `--dp-size N --enable-dp-attention` resolves to `--attn-dp-size N --dp-size 1` and prints a deprecation warning. Use `--attn-dp-size N` instead. The flag will be removed after 2026-12-31.
->
-> Under DeepSeek context parallelism (DSA, MLA, and DeepSeek-V4 prefill CP), `--dp-size N` alone still runs N attention-DP groups, and logs a deprecation warning; it will be rejected after 2026-12-31. Use `--attn-dp-size N` there too.
+> Under DeepSeek context parallelism (DSA, MLA, and DeepSeek-V4 prefill CP), `--dp-size` above 1 is rejected; use `--attn-dp-size N` for attention DP there.
 
 **Elastic EP scale joiners.** A rank that joins an existing DPA deployment through elastic EP scale-up runs DPA even when it is launched with `--attn-dp-size 1`: its own attention DP group is one rank wide.
 
 **DP rank count.** The number of DP ranks (one scheduler each) is `dp_size × attn_dp_size`; one of the two is always 1.
-- `/server_info` reports `dp_size` (replicas) and `attn_dp_size` separately, so under DPA its `dp_size` is 1. Until the flag is removed, its deprecated `enable_dp_attention` field still reports whether DPA runs; new clients should read `attn_dp_size`.
+- `/server_info` reports `dp_size` (replicas) and `attn_dp_size` separately, so under DPA its `dp_size` is 1. Its `enable_dp_attention` field reports whether DPA runs, for older clients; new clients should read `attn_dp_size`.
 - Wire formats that predate `--attn-dp-size` keep the key `dp_size` for the DP rank count: KV-event descriptors, the PD prefill server info, and load snapshots.
 
 ### TP LMHead with all-to-all
@@ -296,7 +294,22 @@ Note that for RL rollout systems, **there are four crucial reasons that sgl-rout
 
 **Installation**
 
-`sgl-router` is pre-installed on the `PATH` of the SGLang Docker images. If you installed SGLang from source, build it from the `sgl-router` directory of the SGLang repository (this needs a Rust toolchain, e.g., from [rustup](https://rustup.rs)) and put it on your `PATH`:
+`sgl-router` is pre-installed on the `PATH` of the SGLang Docker images. Otherwise, install it in one of three ways.
+
+From PyPI (Linux x86_64 and aarch64), which puts `sgl-router` on your `PATH`:
+
+```bash
+pip install sgl-router
+```
+
+As a container image, `lmsysorg/sgl-router`: `latest` (the newest release), `v<version>`, or `nightly` (built from main every night):
+
+```bash
+docker pull lmsysorg/sgl-router:latest
+docker run --rm --network host lmsysorg/sgl-router:latest --help    # router flags go after the image name
+```
+
+From source, in the `sgl-router` directory of the SGLang repository (this needs a Rust toolchain, e.g., from [rustup](https://rustup.rs)):
 
 ```bash
 cd sgl-router

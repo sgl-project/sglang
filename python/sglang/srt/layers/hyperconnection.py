@@ -12,6 +12,9 @@ from sglang.srt.layers.hc_mix_flydsl import (
     flydsl_hc_mix_weights_supported,
     weight_cache_key,
 )
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 
 @lru_cache(None)
@@ -54,6 +57,12 @@ class GroupedGemmaRMSNorm(nn.Module):
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _is_npu:
+            from sgl_kernel_npu.operators.norm import grouped_gemma_rmsnorm
+
+            return grouped_gemma_rmsnorm(
+                x, self.weight, self.group_size, self.variance_epsilon
+            )
         if (
             self._jit_group_size is not None
             and x.is_cuda
@@ -160,7 +169,8 @@ class GatedResidual(HyperConnectionBase):
             )
             lowrank = self.config.hc_lowrank
             self._jit_mix_ok = (
-                torch.cuda.is_available()
+                not _is_npu
+                and torch.cuda.is_available()
                 # The CuTe split-K pair is tcgen05 (sm_100 family) only.
                 and torch.cuda.get_device_capability()[0] == 10
                 and (self.hc_count * self.hidden_size) % 2048 == 0
@@ -239,8 +249,14 @@ class GatedResidual(HyperConnectionBase):
             )
             return (R + injection).flatten(-2)
 
-        self._mix_compute = torch.compile(_mix_compute)
-        self._combine_compute = torch.compile(_combine_compute)
+        # With PyTorch 2.10.0+cpu and torch_npu 2.10.0, multi-rank cached
+        # restarts can fail in Inductor's timeout-extension helper with
+        # "No backend type associated with device type npu".
+        # Disable torch.compile on NPU; NPU graph capture remains unchanged.
+        # TODO: Re-enable after both fresh-cache and cached-restart tests pass
+        # on NPU with compatible dependencies.
+        self._mix_compute = torch.compile(_mix_compute, disable=_is_npu)
+        self._combine_compute = torch.compile(_combine_compute, disable=_is_npu)
 
     def _flydsl_mix_ok(self) -> bool:
         if self._mix_flydsl_ok is None:
@@ -273,7 +289,17 @@ class GatedResidual(HyperConnectionBase):
             hyper_input_normed = self.hc_norm(
                 hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
             ).flatten(-2)
-        if (
+        if _is_npu:
+            from sgl_kernel_npu.operators.hyper_conn import hc_mix
+
+            mixed_input = hc_mix(
+                hyper_input_normed,
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+                self.hc_count,
+                self.hidden_size,
+            ).to(self.params_dtype)
+        elif (
             self._jit_mix_ok
             and hyper_input_normed.is_cuda
             and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
@@ -400,6 +426,18 @@ class GatedResidual(HyperConnectionBase):
         if block_output.shape[0] == 0:
             return hyper_input.to(self.params_dtype)
 
+        if _is_npu:
+            from sgl_kernel_npu.operators.hyper_conn import hc_combine
+
+            return hc_combine(
+                block_output,
+                hyper_input,
+                hyper_input_normed,
+                self.block_inject_weight.weight,
+                self.hc_count,
+                self.hidden_size,
+            ).to(self.params_dtype)
+
         if (
             self._jit_combine_ok
             and block_output.is_cuda
@@ -409,9 +447,7 @@ class GatedResidual(HyperConnectionBase):
             and self.block_inject_weight.weight.dtype == block_output.dtype
         ):
             if self._split_combine_ok and block_output.shape[0] <= 32:
-                from sglang.kernels.ops.elementwise.hc_combine import (
-                    hc_combine_split,
-                )
+                from sglang.kernels.ops.elementwise.hc_combine import hc_combine_split
 
                 return hc_combine_split(
                     block_output,
