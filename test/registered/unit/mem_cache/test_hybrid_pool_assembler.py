@@ -15,6 +15,7 @@ from sglang.srt.configs.inkling import (
     InklingConvStateShape,
     InklingStateDType,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MambaStateBufferInfo
 from sglang.srt.mem_cache.hicache_storage import (
@@ -2205,6 +2206,42 @@ class TestHostLoadEvictsTheTargetWindowOnly(CustomTestCase):
         # The cache measures the shortfall on the target's own room.
         self.assertEqual(len(evicted), 1)
         self.assertEqual(evicted[0].window_tokens, {"window_4096": 16})
+
+
+class TestMambaHostRatioScale(CustomTestCase):
+    def test_hicache_size_budget_is_kept_while_the_mamba_share_scales(self):
+        rebalance = hybrid_pool_assembler._rebalance_mamba_host_size
+        self.assertEqual(rebalance(80.0, 20.0), (80.0, 20.0))
+        # Below 1 the Mamba share shrinks and the KV host pool gets the bytes (a
+        # path cap that also counts host copies needs fewer host states).
+        with envs.SGLANG_HICACHE_MAMBA_HOST_RATIO_SCALE.override(0.65):
+            kv, mamba = rebalance(80.0, 20.0)
+        self.assertAlmostEqual(mamba, 13.0)
+        self.assertAlmostEqual(kv + mamba, 100.0)
+        with envs.SGLANG_HICACHE_MAMBA_HOST_RATIO_SCALE.override(1.25):
+            kv, mamba = rebalance(80.0, 20.0)
+        self.assertAlmostEqual(mamba, 25.0)
+        self.assertAlmostEqual(kv + mamba, 100.0)
+        # The Mamba share never takes more than the KV share holds.
+        with envs.SGLANG_HICACHE_MAMBA_HOST_RATIO_SCALE.override(10.0):
+            self.assertEqual(rebalance(80.0, 20.0), (0.0, 100.0))
+        with envs.SGLANG_HICACHE_MAMBA_HOST_RATIO_SCALE.override(0.0):
+            with self.assertRaises(ValueError):
+                rebalance(80.0, 20.0)
+
+    def test_hicache_ratio_path_scales_only_the_mamba_host_pool(self):
+        memory = MagicMock(hicache_ratio=2.0)
+        with (
+            envs.SGLANG_HICACHE_MAMBA_HOST_RATIO_SCALE.override(1.25),
+            patch.object(hybrid_pool_assembler, "get_memory", return_value=memory),
+            patch.object(hybrid_pool_assembler, "MambaPoolHost") as host,
+            patch.object(hybrid_pool_assembler, "_device_capacity_tokens"),
+            patch.object(hybrid_pool_assembler, "_get_allocator_type"),
+        ):
+            hybrid_pool_assembler.build_mamba_host_pool(
+                MagicMock(), MagicMock(), host_size=0, layout="layer_first"
+            )
+        self.assertEqual(host.call_args.args[1], 2.5)
 
 
 if __name__ == "__main__":
