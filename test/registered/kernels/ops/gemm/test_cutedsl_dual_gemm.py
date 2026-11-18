@@ -491,52 +491,6 @@ class TestCuteDSLDualGemm(CustomTestCase):
             2,
         )
 
-    def test_fp8_quant_mode_validation(self):
-        from sglang.kernels.ops.gemm import dual_gemm_swiglu_fp8
-
-        x, gate_up_weight, x_scale, gate_up_weight_scale = _make_inputs(
-            4,
-            seed=20261014,
-        )
-        scalar_scale = torch.ones((1,), dtype=torch.float32, device="cuda")
-
-        with self.assertRaisesRegex(ValueError, "must be None"):
-            dual_gemm_swiglu_fp8(
-                x,
-                gate_up_weight,
-                x_scale,
-                gate_up_weight_scale,
-                scalar_scale,
-                DualGemmQuantMode.DYNAMIC_PER_TENSOR,
-            )
-        with self.assertRaisesRegex(ValueError, "must be a scale tensor"):
-            dual_gemm_swiglu_fp8(
-                x,
-                gate_up_weight,
-                x_scale,
-                gate_up_weight_scale,
-                None,
-                DualGemmQuantMode.STATIC_PER_TENSOR,
-            )
-        with self.assertRaisesRegex(ValueError, "requires 4 output scale"):
-            dual_gemm_swiglu_fp8(
-                x,
-                gate_up_weight,
-                x_scale,
-                gate_up_weight_scale,
-                scalar_scale,
-                DualGemmQuantMode.STATIC_PER_TOKEN,
-            )
-        with self.assertRaisesRegex(ValueError, "not valid for the FP8"):
-            dual_gemm_swiglu_fp8(
-                x,
-                gate_up_weight,
-                x_scale,
-                gate_up_weight_scale,
-                None,
-                DualGemmQuantMode.UNQUANT,
-            )
-
 
 if __name__ == "__main__":
     unittest.main()

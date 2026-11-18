@@ -1,6 +1,7 @@
 import unittest
 from collections import OrderedDict
 from contextlib import ExitStack, nullcontext
+from itertools import product
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -15,7 +16,10 @@ from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
     BaseBreakableCudaGraphRunner,
 )
 from sglang.multimodal_gen.runtime.layers.attention import layer
-from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPABackend
+from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
+    CudnnSDPABackend,
+    SDPABackend,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits.ltx_2 import (
     LTX2AudioVideoRotaryPosEmbed,
@@ -259,7 +263,7 @@ class TestLTX2GuidanceBCG(CustomTestCase):
             kwargs["audio_hidden_states"] * 0.5 + prompt,
         )
 
-    def _run_step(self, *, mode, warmup, runner, value, sigmas=None):
+    def _run_step(self, *, mode, warmup, runner, value, sigmas=None, num_outputs=1):
         stage = object.__new__(LTX2DenoisingStage)
         stage.sampler_name = "euler"
         stage._attention_backend_active_override = None
@@ -278,6 +282,8 @@ class TestLTX2GuidanceBCG(CustomTestCase):
         stage.server_args = args
         video = torch.arange(8, dtype=torch.float32).view(1, 2, 4) + value
         audio = torch.arange(4, dtype=torch.float32).view(1, 1, 4) + value
+        video = video.repeat(num_outputs, 1, 1)
+        audio = audio.repeat(num_outputs, 1, 1)
         if sigmas is None:
             sigmas = torch.tensor([1.0, 0.5])
         scheduler = SimpleNamespace(
@@ -368,6 +374,21 @@ class TestLTX2GuidanceBCG(CustomTestCase):
                         kwargs["perturbation_configs"][3]["skip_a2v_cross_attn"]
                     )
 
+    def test_multiple_outputs_per_prompt_match_single_output(self):
+        # n=2 holds two latent samples against one prompt row.
+        for mode in ("batched", "legacy", "official"):
+            with self.subTest(mode=mode):
+                single = self._run_step(mode=mode, warmup=False, runner=None, value=1.0)
+                double = self._run_step(
+                    mode=mode, warmup=False, runner=None, value=1.0, num_outputs=2
+                )
+                for result, reference in zip(double, single):
+                    self.assertEqual(result.shape[0], 2)
+                    for sample in result:
+                        torch.testing.assert_close(
+                            sample[None], reference, rtol=0, atol=0
+                        )
+
     def test_steps_never_read_device_sigmas_on_host(self):
         modes = ("official", "batched", "ti2v", "hq", "legacy", "legacy_batched")
         for mode in modes:
@@ -431,7 +452,6 @@ class TestLTX2DenseAttentionBCG(CustomTestCase):
     def test_capture_and_eager_break_replay_changed_masks(self):
         with ExitStack() as stack:
             for name, value in (
-                ("get_attn_backend", SDPABackend),
                 ("get_compute_dtype", torch.bfloat16),
                 ("get_sequence_parallel_world_size", 1),
                 ("get_ring_parallel_world_size", 1),
@@ -440,9 +460,19 @@ class TestLTX2DenseAttentionBCG(CustomTestCase):
             ):
                 stack.enter_context(patch.object(layer, name, return_value=value))
             stack.enter_context(set_forward_context(0, None))
-            for cls in (layer.LocalAttention, layer.USPAttention):
+            for backend, cls in product(
+                (SDPABackend, CudnnSDPABackend),
+                (layer.LocalAttention, layer.USPAttention),
+            ):
                 for capture_dense in (False, True):
-                    with self.subTest(layer=cls.__name__, capture_dense=capture_dense):
+                    with (
+                        self.subTest(
+                            backend=backend.__name__,
+                            layer=cls.__name__,
+                            capture_dense=capture_dense,
+                        ),
+                        patch.object(layer, "get_attn_backend", return_value=backend),
+                    ):
                         attention = cls(
                             num_heads=4,
                             head_size=64,

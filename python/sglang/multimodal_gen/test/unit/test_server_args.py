@@ -1240,6 +1240,27 @@ class TestDiffusionModelDetection(unittest.TestCase):
 
 
 class TestMiniMaxH3Routing(unittest.TestCase):
+    def test_quantized_fa_preserves_text_encoder_backend(self):
+        for components, roles in (
+            ({}, {}),
+            ({"text_encoder": "fa"}, {}),
+            ({}, {"text_encoder": {"self": "fa"}}),
+        ):
+            with (
+                self.subTest(components=components, roles=roles),
+                patch.object(current_platform, "is_npu", return_value=True),
+            ):
+                args = ServerArgs.__new__(ServerArgs)
+                args.pipeline_config = MiniMaxH3PipelineConfig()
+                args.ring_degree = 1
+                args.attention_backend = "fa"
+                args.attention_backend_config = {"precision": "fp8"}
+                args.component_attention_backends = dict(components)
+                args.component_attention_backend_roles = dict(roles)
+                args._adjust_attention_backend()
+                self.assertEqual(args.component_attention_backends, components)
+                self.assertEqual(args.component_attention_backend_roles, roles)
+
     def test_semantic_variants_map_to_checkpoint_partitions(self):
         self.assertEqual(
             MiniMaxH3Pipeline.model_subfolder_for_variant("fl2va"), "FL2VA"
@@ -1275,6 +1296,7 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         dit_parameter_count=None,
         checkpoint_sizes=None,
         is_cuda=True,
+        device_name="Test CUDA",
         kwargs=None,
     ):
         def get_available_gpu_memory(device_id=0, **_kwargs):
@@ -1314,7 +1336,7 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
                 "sglang.multimodal_gen.runtime.platforms.current_platform.enable_dit_layerwise_offload_by_default",
                 return_value=True,
             ),
-            patch.object(current_platform, "get_device_name", return_value="Test CUDA"),
+            patch.object(current_platform, "get_device_name", return_value=device_name),
             patch(
                 "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
                 return_value=memory_gb * 1024**3,
@@ -2894,17 +2916,25 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         self.assertIsNone(args.layerwise_offload_components)
 
     def test_auto_ltx2_two_stage_device_mode_follows_device_memory(self):
-        for memory_gb, mode in ((140, "resident"), (80, "original")):
-            args = self._from_dict_with_pipeline_config(
-                LTX2PipelineConfig(),
-                memory_gb=memory_gb,
-                kwargs={
-                    "model_path": "Lightricks/LTX-2",
-                    "num_gpus": 2,
-                    "pipeline_class_name": "LTX2TwoStagePipeline",
-                },
-            )
-            self.assertEqual(args.ltx2_two_stage_device_mode, mode)
+        """The default follows total memory only. A 96 GiB GH200 has "H200" in
+        its device name and used to get both stage DiTs resident."""
+        for device_name, memory_gb, mode in (
+            ("NVIDIA H200", 140, "resident"),
+            ("Test CUDA", 80, "original"),
+            ("NVIDIA GH200 480GB", 96, "original"),
+        ):
+            with self.subTest(device_name=device_name, memory_gb=memory_gb):
+                args = self._from_dict_with_pipeline_config(
+                    LTX2PipelineConfig(),
+                    memory_gb=memory_gb,
+                    device_name=device_name,
+                    kwargs={
+                        "model_path": "Lightricks/LTX-2",
+                        "num_gpus": 2,
+                        "pipeline_class_name": "LTX2TwoStagePipeline",
+                    },
+                )
+                self.assertEqual(args.ltx2_two_stage_device_mode, mode)
 
     def test_auto_high_memory_ltx23_original_keeps_default_layerwise_components(self):
         args = self._from_dict_with_pipeline_config(
@@ -3522,6 +3552,33 @@ class TestKVGatherDegree(unittest.TestCase):
         self.assertEqual(args.kv_gather_degree, 1)
         self.assertFalse(args.sp_split_auto)
         self.assertEqual(args.ulysses_degree, 4)
+
+    def test_higher_sp_keeps_heads_whole_when_ulysses_cannot_split_them(self):
+        # Z-Image's 30 heads do not split over 4 or 8 Ulysses ranks
+        for num_gpus in (4, 8):
+            with self.subTest(num_gpus=num_gpus):
+                args = _from_dict_without_model_resolution(
+                    {
+                        "model_path": "/fake",
+                        "num_gpus": num_gpus,
+                        "performance_mode": "manual",
+                    },
+                    ZImagePipelineConfig(),
+                )
+
+                self.assertEqual(args.sp_degree, num_gpus)
+                self.assertEqual(args.kv_gather_degree, num_gpus)
+                self.assertTrue(args.sp_split_auto)
+                self.assertEqual(args.ring_degree, 1)
+
+    def test_higher_sp_keeps_ulysses_when_heads_divide(self):
+        args = _from_dict_without_model_resolution(
+            {"model_path": "/fake", "num_gpus": 3, "performance_mode": "manual"},
+            ZImagePipelineConfig(),
+        )
+
+        self.assertEqual(args.kv_gather_degree, 1)
+        self.assertEqual(args.ulysses_degree, 3)
 
     def test_explicit_ulysses_is_not_overridden(self):
         args = _from_dict_without_model_resolution(

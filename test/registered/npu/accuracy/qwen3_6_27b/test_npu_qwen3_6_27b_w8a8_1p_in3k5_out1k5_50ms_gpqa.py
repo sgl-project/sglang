@@ -12,7 +12,7 @@ from sglang.test.send_one import BenchArgs, send_one_prompt
 
 register_npu_ci(
     est_time=8400,
-    suite="nightly-acc-2-npu-a3",
+    suite="nightly-acc-test-2-npu-a3",
     nightly=True,
 )
 

@@ -30,7 +30,7 @@ from sglang.test.test_utils import CustomTestCase, is_in_amd_ci
 
 # Triton attention kernel unit tests (decode, extend, prefill)
 register_cuda_ci(est_time=19, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=30, suite="base-b-test-1-gpu-small-amd")
 
 
 def extend_attention_fwd_torch(
@@ -842,6 +842,14 @@ class TestTritonAttention(CustomTestCase):
         for B, H_Q, H_KV, D in configs:
             self._test_decode_attention_once(B, H_Q, H_KV, D)
 
+    def test_decode_attention_gqa_group_above_tile(self):
+        """Every query head reads its own KV head when a GQA group is wider than
+        the grouped kernel's 16-head tile, also when it is not a multiple of 16."""
+        # groups of 24 (GLM-4-32B at TP 1) and 20, then 8, 16 and 32
+        for H_Q, H_KV in ((48, 2), (40, 2), (16, 2), (32, 2), (64, 2)):
+            with self.subTest(H_Q=H_Q, H_KV=H_KV):
+                self._test_decode_attention_once(2, H_Q, H_KV, 128)
+
     def _test_grouped_decode_attention_once(self, B, S, H_Q, H_KV, D, D_V):
         dtype = torch.bfloat16
         device = get_device()
@@ -978,12 +986,7 @@ class TestTritonAttention(CustomTestCase):
             backend.cuda_graph_uneven_batch = torch.zeros(
                 1, dtype=torch.int32, device=device
             )
-            backend._update_decode_kv_buffers = lambda plan, n, lens, req: (
-                None,
-                None,
-                None,
-                lens,
-            )
+            backend._update_decode_kv_buffers = lambda plan, n, lens, req: (None, lens)
 
             seq_lens = torch.zeros(bs, dtype=torch.int32, device=device)
             kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=device)

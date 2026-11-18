@@ -72,21 +72,16 @@ class Serving(msgspec.Struct):
         bool,
         "Give each Uvicorn HTTP worker its own SO_REUSEPORT listener.",
     ] = False
-    smg_grpc_mode: A[
-        bool,
-        "Use the legacy SMG gRPC server (smg-grpc-servicer) instead of the HTTP "
-        "server. Replaces the deprecated --grpc-mode.",
-    ] = False
     grpc_mode: A[
-        bool, "(Deprecated, use --smg-grpc-mode) Legacy SMG gRPC server selector."
+        bool,
+        "Serve the encoder over gRPC on --port instead of HTTP. Requires "
+        "--encoder-only.",
     ] = False
     grpc_port: A[
         Optional[int],
         "Port for the native gRPC server, started alongside HTTP. Setting this "
         "(or SGLANG_GRPC_PORT) enables the native gRPC server; it is off by "
-        "default. Follower nodes expose GetServerInfo only. "
-        "In legacy --smg-grpc-mode this is the SMG server port and "
-        "defaults to --port + 10000.",
+        "default. Follower nodes expose GetServerInfo only.",
     ] = None
     grpc_response_timeout_secs: A[
         int,
@@ -120,7 +115,7 @@ class Serving(msgspec.Struct):
     ] = None
     enable_http2: A[
         bool,
-        "Use Granian instead of Uvicorn as the ASGI server, enabling HTTP/1.1 and HTTP/2 auto-negotiation. Clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. Requires 'pip install sglang[http2]'.",
+        "Serve HTTP/2 alongside HTTP/1.1 on the same port: clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. The Python frontend switches from Uvicorn to Granian and requires 'pip install sglang[http2]'; the Rust frontend (SGLANG_RUST_SERVER=1) serves it natively.",
     ] = False
     http2_max_concurrent_streams: A[
         int,
@@ -163,7 +158,7 @@ class Serving(msgspec.Struct):
     ] = None
     admin_api_key: A[
         Optional[str],
-        "Set admin API key for sensitive management endpoints (e.g. /hicache/storage-backend/clear). When set, admin endpoints require this key and do NOT accept --api-key.",
+        "Set admin API key for management endpoints. Sensitive ones (e.g. weight updates, LoRA loading, profiling, /hicache/storage-backend) are refused unless it is set. When set, admin endpoints require this key and do NOT accept --api-key. Defaults to SGLANG_ADMIN_API_KEY, which the bundled clients also read.",
     ] = None
     served_model_name: A[
         Optional[str],

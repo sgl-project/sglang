@@ -166,8 +166,6 @@ def round_up_to_multiple(x: int, m: int) -> int:
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
-        FlashinferCombineInput,
-        FlashinferDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -899,14 +897,13 @@ def trtllm_nvfp4_hidden_alignment(
 ) -> int:
     """Hidden-dim alignment required by the TRT-LLM NVFP4 MoE cubins.
 
-    The per-token (dynamic activation scale) non-gated variant ships far fewer
-    tile configs than the static one. At Nemotron's hidden size 2688 it runs
-    but produces garbage (GSM8K ~0.02 on FlashInfer 0.7.0.post1), while a
-    512-aligned hidden size is correct. Every other variant runs unpadded.
+    The kernels require a hidden size that is a multiple of 256, and of 512
+    for the per-token (dynamic activation scale) non-gated variant. A
+    misaligned hidden size runs without error but returns wrong outputs.
     """
     if use_per_token_activation and not is_gated:
         return 512
-    return 1
+    return 256
 
 
 def align_fp4_moe_weights_for_flashinfer_trtllm(
@@ -2392,8 +2389,8 @@ def fused_experts_none_to_flashinfer_trtllm_routed(
     )
 
 
-@register_fused_func("flashinfer", "flashinfer_trtllm")
-@register_fused_func("flashinfer", "flashinfer_trtllm_routed")
+@register_fused_func("flashinfer_nvlink_one_sided", "flashinfer_trtllm")
+@register_fused_func("flashinfer_nvlink_one_sided", "flashinfer_trtllm_routed")
 def fused_experts_flashinfer_to_flashinfer_trtllm(
     dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
     quant_info: MoeQuantInfo,

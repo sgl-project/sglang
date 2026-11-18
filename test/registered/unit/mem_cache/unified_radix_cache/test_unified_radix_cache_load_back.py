@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -60,7 +61,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang.test.tree_slots import window_evictable
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=11, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=11, suite="base-b-test-1-gpu-small-amd")
 
 
 class TestUnifiedTreeCoreLoadBackPending(
@@ -254,6 +255,30 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
             self.assertEqual(len(loaded_conv), len(expected_conv))
             for actual_conv, expected_conv_buf in zip(loaded_conv, expected_conv):
                 self.assertTrue(torch.equal(actual_conv, expected_conv_buf))
+        cache.sanity_check()
+
+    @requires_hicache
+    def test_load_back_commits_once_through_commit_load_back(self):
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        base = self._make_seq(1, 2)
+        self._insert(cache, allocator, req_to_token_pool, base)
+        node = match_prefix(cache, base).last_device_node
+        self._backup_node(cache, node)
+        cache.evict(EvictParams(num_tokens=len(base)))
+
+        with mock.patch.object(
+            cache, "_commit_load_back", wraps=cache._commit_load_back
+        ) as commit:
+            # An aborted load-back never reaches the commit.
+            self.assertFalse(cache.load_back(node, mem_quota=-(10**9)))
+            commit.assert_not_called()
+            self._load_back_node(cache, node)
+
+        commit.assert_called_once()
+        committed_node, committed_indices = commit.call_args.args[:2]
+        self.assertEqual(committed_node, node)
+        # The load refilled the whole evicted path, so the commit gets all its pages.
+        self.assertTrue(torch.equal(committed_indices, cache.path_device_indices(node)))
         cache.sanity_check()
 
     @requires(
@@ -1003,7 +1028,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
             ) as evict_for_alloc,
         ):
             prep = comp.prepare_load_back(leaf, req=req)
-        evict_for_alloc.assert_called_once_with(EvictParams(num_tokens=0, mamba_num=1))
+        evict_for_alloc.assert_called_once_with(KVDemand(state_slots=1))
         self.assertIs(prep.allocated_mamba_slot, retry_slot)
         self.assertEqual(int(req.kv.mamba_pool_idx), int(retry_slot[0]))
 
@@ -1183,6 +1208,8 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
             ComponentType.FULL, leaf, CacheTransferPhase.LOAD_BACK
         )[0]
         self.assertEqual(int(kv_xfer.host_indices.numel()), kv_tokens)
+        # Admission sizes a load-back by the rows this transfer copies.
+        self.assertEqual(cache.full_load_back_tokens(leaf), kv_tokens)
 
         swa_xfer = cache.tree_core.build_hicache_transfers(
             ComponentType.SWA, leaf, CacheTransferPhase.LOAD_BACK
@@ -1226,7 +1253,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         full_pre_evict_calls = [
             call
             for call in evict_for_alloc_mock.call_args_list
-            if call.args and call.args[0].num_tokens > 0
+            if call.args and call.args[0].full_tokens > 0
         ]
         self.assertEqual(full_pre_evict_calls, [])
 
@@ -1234,8 +1261,8 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         self.assertTrue(
             any(
                 call.args
-                and call.args[0].num_tokens == 0
-                and sum(call.args[0].window_num_tokens.values()) > 0
+                and call.args[0].full_tokens == 0
+                and sum(call.args[0].window_tokens.values()) > 0
                 for call in evict_for_alloc_mock.call_args_list
             )
         )

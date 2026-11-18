@@ -103,14 +103,13 @@ jobs:
     if: needs.check-changes.outputs.ppu == 'true'
     uses: ./.github/workflows/pr-gate.yml
     with:
-      require-run-ci: true
-      require-label: run-ci-ppu
+      require-label: run-ci-ppu-extra
     secrets: inherit
 
   ppu-build:
     name: ppu-build
     needs: [check-changes, pr-gate]
-    if: needs.check-changes.outputs.ppu == 'true'
+    if: needs.check-changes.outputs.ppu == 'true' && needs.pr-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
@@ -168,7 +167,7 @@ jobs:
   ppu-sanity:
     name: ppu-sanity (${{ matrix.runner }})
     needs: [check-changes, pr-gate, ppu-build]
-    if: needs.check-changes.outputs.ppu == 'true'
+    if: needs.check-changes.outputs.ppu == 'true' && needs.pr-gate.outputs.opted-in != 'false'
     # Both PPU generations reuse the same wheels; each host supplies its own
     # runtime image and device, while checkpoints come from the shared NAS.
     strategy:
@@ -240,7 +239,7 @@ jobs:
   pr-test-ppu-finish:
     name: pr-test-ppu-finish
     needs: [pr-gate, check-changes, ppu-build, ppu-sanity]
-    if: always() && needs.check-changes.result != 'skipped'
+    if: always() && needs.check-changes.result != 'skipped' && needs.pr-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-latest
     permissions: {}
     steps:

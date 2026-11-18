@@ -29,7 +29,7 @@ from sglang.test.test_utils import (
     publish_build_topology,
 )
 
-register_cpu_ci(est_time=193, suite="stage-a-test-cpu-intel")
+register_cpu_ci(est_time=193, suite="extra-test-cpu-intel")
 
 
 def run_distributed_test(

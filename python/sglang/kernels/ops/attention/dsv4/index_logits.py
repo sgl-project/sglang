@@ -10,11 +10,13 @@ from typing import Iterator, Optional, Tuple
 import torch
 
 from sglang.kernels.arch import current_arch
+from sglang.kernels.ops.quantization.fp4_to_fp8 import widen_fp4_to_fp8
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_row_bytes,
     mqa_logits_rows_per_chunk,
 )
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import ceil_align
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
@@ -87,6 +89,38 @@ def flat_index_logits_rows_per_tile(
     return rows_per_tile
 
 
+def flat_index_logits_widen_to_fp8() -> bool:
+    """Whether the flat logits run DeepGEMM's fp8 kernel on the operands widened
+    to e4m3: Hopper, which has no fp4 MMA for ``fp8_fp4_mqa_logits``."""
+    return get_platform().is_sm90
+
+
+def _flat_index_logits_tiles_fp8(
+    q, kv, weights, starts, lengths, width, rows_per_tile
+) -> Iterator[tuple[slice, torch.Tensor]]:
+    """fp32 logits tiles of the widened operands, with the query scale folded
+    into the head weights. K is widened once for all the tiles."""
+    from deep_gemm import fp8_mqa_logits
+
+    k = widen_fp4_to_fp8(*kv)
+    for offset in range(0, q[0].shape[0], rows_per_tile):
+        tile = slice(offset, offset + rows_per_tile)
+        q_fp8, q_scale = widen_fp4_to_fp8(q[0][tile], q[1][tile])
+        tile_starts = starts[tile]
+        yield (
+            slice(offset, offset + q_fp8.shape[0]),
+            fp8_mqa_logits(
+                q_fp8,
+                k,
+                weights[tile] * q_scale,
+                tile_starts,
+                tile_starts + lengths[tile],
+                clean_logits=False,
+                max_seqlen_k=width,
+            ),
+        )
+
+
 def flat_index_logits_tiles(
     *,
     q: tuple[torch.Tensor, torch.Tensor],
@@ -101,8 +135,6 @@ def flat_index_logits_tiles(
     ``logits[i, j]`` scores query row ``rows.start + i`` against ``kv[starts + j]``,
     garbage past the row's ``lengths``; the width is ``max(context_lengths)``
     aligned to ``FLAT_LOGITS_WIDTH_ALIGN``."""
-    from deep_gemm import fp8_fp4_mqa_logits
-
     rows = q[0].shape[0]
     width = ceil_align(max(context_lengths, default=0), FLAT_LOGITS_WIDTH_ALIGN)
     if rows == 0 or width == 0:
@@ -110,6 +142,13 @@ def flat_index_logits_tiles(
     rows_per_chunk = flat_index_logits_rows_per_tile(
         rows, width, heads=q[0].shape[1], budget_bytes=budget_bytes
     )
+    if flat_index_logits_widen_to_fp8():
+        yield from _flat_index_logits_tiles_fp8(
+            q, kv, weights, starts, lengths, width, rows_per_chunk
+        )
+        return
+    from deep_gemm import fp8_fp4_mqa_logits
+
     weights = weights.to(index_weights_dtype())
     if weights.dtype == torch.bfloat16:
         logits_args, logits_kwargs = (width,), {}

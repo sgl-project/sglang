@@ -132,7 +132,10 @@ impl SglangService for GrpcService {
         request.apply_absent_defaults();
         let stream = request.stream.unwrap_or(false);
         let (mut payloads, is_batch) = into_requests(request, &self.config.generation_policy)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            .map_err(|error| {
+                tracing::warn!(%error, "rejected request");
+                Status::invalid_argument(error.to_string())
+            })?;
         client_max_new_tokens.mark(&mut payloads);
         // Python starts its request clock after normalization and before
         // tokenization / multimodal preprocessing; `e2e_latency` measures from
@@ -199,7 +202,13 @@ impl SglangService for GrpcService {
         &self,
         _request: Request<api::GetHiCacheStorageRequest>,
     ) -> Result<Response<api::HiCacheStatus>, Status> {
-        Ok(Response::new(self.hicache_manager.status().await))
+        // Unlike the admin-only HTTP route, this RPC takes no key, so the
+        // backend config (it can carry S3 keys) is not returned.
+        let mut status = self.hicache_manager.status().await;
+        if status.hicache_storage_backend_extra_config.is_some() {
+            status.hicache_storage_backend_extra_config = Some("<redacted>".into());
+        }
+        Ok(Response::new(status))
     }
 
     async fn attach_hi_cache_storage(
@@ -334,7 +343,14 @@ mod tests {
 
     impl Harness {
         fn new(response_capacity: usize, incremental: bool, response_timeout: Duration) -> Self {
-            Self::build(response_capacity, incremental, response_timeout, true, None)
+            Self::build(
+                response_capacity,
+                incremental,
+                response_timeout,
+                true,
+                None,
+                test_server_args(),
+            )
         }
 
         fn build(
@@ -343,6 +359,7 @@ mod tests {
             response_timeout: Duration,
             startup_ready: bool,
             preferred: Option<PreferredSamplingParams>,
+            server_args: ServerArgs,
         ) -> Self {
             let (intake_tx, intake_rx) = flume::unbounded();
             let (abort_tx, abort_rx) = flume::unbounded();
@@ -357,17 +374,11 @@ mod tests {
                     mm_limits: Default::default(),
                     multimodal: false,
                     peer_endpoints: Vec::new(),
-                    metadata: CoreMetadata::from(&ServerArgs {
-                        served_model_name: "test-model".into(),
-                        model_config: ModelConfig {
-                            context_len: 4096,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }),
+                    metadata: CoreMetadata::from(&server_args),
                     metrics: None,
                     request_log: None,
                     generate_validator: None,
+                    abort_hook: None,
                 },
             );
             Self {
@@ -401,6 +412,17 @@ mod tests {
                 sink,
                 admission,
             }
+        }
+    }
+
+    fn test_server_args() -> ServerArgs {
+        ServerArgs {
+            served_model_name: "test-model".into(),
+            model_config: ModelConfig {
+                context_len: 4096,
+                ..Default::default()
+            },
+            ..Default::default()
         }
     }
 
@@ -654,33 +676,47 @@ mod tests {
     }
 
     /// A runtime failure after admission is this request's in-stream error item
-    /// (the SSE error frame's twin), not an RPC status; the call is disarmed.
+    /// (the SSE error frame's twin, `type` and `retryable` included), not an
+    /// RPC status; the call is disarmed.
     #[tokio::test]
     async fn runtime_failure_rides_the_stream_as_an_error_item() {
-        let harness = Harness::new(1, false, Duration::from_secs(1));
-        let mut stream = harness
-            .service
-            .generate(Request::new(ids_request(&[1], None)))
-            .await
-            .unwrap()
-            .into_inner();
-        let intake = harness.next_generation().await;
-        assert!(intake.admission.try_accept());
-        intake
-            .sink
-            .try_send(ResponseItem::Error(crate::utils::error::Error::Validation(
-                "bad sampling".into(),
-            )))
-            .unwrap();
+        use crate::utils::error::Error;
+        for (failure, code, kind, retryable) in [
+            (
+                Error::Validation("bad sampling".into()),
+                400,
+                "invalid_request_error",
+                false,
+            ),
+            (
+                Error::Internal("bad state".into()),
+                500,
+                "internal_error",
+                true,
+            ),
+        ] {
+            let harness = Harness::new(1, false, Duration::from_secs(1));
+            let mut stream = harness
+                .service
+                .generate(Request::new(ids_request(&[1], None)))
+                .await
+                .unwrap()
+                .into_inner();
+            let intake = harness.next_generation().await;
+            assert!(intake.admission.try_accept());
+            intake.sink.try_send(ResponseItem::Error(failure)).unwrap();
 
-        let error = stream_error(stream.next().await.unwrap().unwrap());
-        assert_eq!(error.index, None);
-        let body = error.error.unwrap();
-        assert_eq!(body.code, 400);
-        assert!(body.message.contains("bad sampling"));
-        assert!(stream.next().await.is_none());
-        drop(stream);
-        assert!(harness.abort_rx.try_recv().is_err());
+            let error = stream_error(stream.next().await.unwrap().unwrap());
+            assert_eq!(error.index, None);
+            let body = error.error.unwrap();
+            assert_eq!(body.code, code);
+            assert!(body.message.contains("bad "), "{}", body.message);
+            assert_eq!(body.r#type.as_deref(), Some(kind));
+            assert_eq!(body.retryable, Some(retryable));
+            assert!(stream.next().await.is_none());
+            drop(stream);
+            assert!(harness.abort_rx.try_recv().is_err());
+        }
     }
 
     #[tokio::test]
@@ -749,6 +785,7 @@ mod tests {
                 metrics: None,
                 request_log: None,
                 generate_validator: None,
+                abort_hook: None,
             },
         );
         let service = GrpcService::for_test(core, None, false, Duration::from_secs(1));
@@ -764,12 +801,13 @@ mod tests {
     }
 
     /// Normalization failures end the RPC before anything is submitted, with the
-    /// status that mirrors the HTTP 400.
+    /// status that mirrors the HTTP 400, and are logged once with the reason.
     #[tokio::test]
     async fn malformed_request_is_rejected_before_submission() {
         let harness = Harness::new(1, false, Duration::from_secs(1));
         let mut both = text_request("prompt", "both");
         both.input_ids = Some(one_token_ids(&[1]));
+        let logs = crate::utils::logging::capture_logs();
         let error = harness
             .service
             .generate(Request::new(both))
@@ -778,6 +816,11 @@ mod tests {
             .expect("text and input_ids together must be rejected");
         assert_eq!(error.code(), Code::InvalidArgument);
         assert!(error.message().contains("text"));
+        let rejections = logs.rejections();
+        assert!(
+            matches!(rejections.as_slice(), [line] if line.contains("WARN") && line.contains(error.message())),
+            "{rejections:?}"
+        );
 
         let error = harness
             .service
@@ -790,7 +833,8 @@ mod tests {
     }
 
     /// The launch's generate validator refuses a batch whole, as on HTTP: no
-    /// item reaches the scheduler, the valid one included.
+    /// item reaches the scheduler, the valid one included. The refusal is
+    /// logged once.
     #[tokio::test]
     async fn generate_validator_refuses_the_whole_batch_before_submission() {
         let (intake_tx, intake_rx) = flume::unbounded();
@@ -809,6 +853,7 @@ mod tests {
                 metrics: None,
                 request_log: None,
                 generate_validator: Some(Arc::new(crate::api_server::core::TopLogprobsCap)),
+                abort_hook: None,
             },
         );
         let service = GrpcService::for_test(core, None, false, Duration::from_secs(1));
@@ -821,6 +866,7 @@ mod tests {
             }),
             ..Default::default()
         };
+        let logs = crate::utils::logging::capture_logs();
         let error = service
             .generate(Request::new(request))
             .await
@@ -828,6 +874,11 @@ mod tests {
             .expect("the validator must refuse the batch");
         assert_eq!(error.code(), Code::InvalidArgument);
         assert_eq!(error.message(), "top_logprobs_num 2");
+        let rejections = logs.rejections();
+        assert!(
+            matches!(rejections.as_slice(), [line] if line.contains("WARN") && line.contains("top_logprobs_num 2")),
+            "{rejections:?}"
+        );
         assert!(intake_rx.is_empty());
     }
 
@@ -892,7 +943,14 @@ mod tests {
             "temperature": 0.25,
             "max_new_tokens": 32,
         }));
-        let harness = Harness::build(1, false, Duration::from_secs(1), true, Some(preferred));
+        let harness = Harness::build(
+            1,
+            false,
+            Duration::from_secs(1),
+            true,
+            Some(preferred),
+            test_server_args(),
+        );
         for (max_new_tokens, expected) in [(None, (Some(32), true)), (Some(8), (Some(8), false))] {
             let mut request = ids_request(&[1], None);
             request.sampling_params = Some(api::SamplingParamsOrList {
@@ -957,7 +1015,14 @@ mod tests {
     /// UNAVAILABLE, and the stalled probe is a real generation submission.
     #[tokio::test]
     async fn health_check_reports_not_ready_and_stalled_as_unavailable() {
-        let not_ready = Harness::build(1, false, Duration::from_secs(1), false, None);
+        let not_ready = Harness::build(
+            1,
+            false,
+            Duration::from_secs(1),
+            false,
+            None,
+            test_server_args(),
+        );
         let error = not_ready
             .service
             .health_check(Request::new(api::HealthCheckRequest {}))
@@ -1030,6 +1095,7 @@ mod tests {
                 success,
                 service.attach_hi_cache_storage(Request::new(api::AttachHiCacheStorageRequest {
                     hicache_storage_backend: Some("file".into()),
+                    hicache_storage_backend_extra_config_json: Some(r#"{"secret_key":"s"}"#.into()),
                     hicache_write_policy: Some("write_through".into()),
                     ..Default::default()
                 })),
@@ -1038,6 +1104,15 @@ mod tests {
             assert_eq!(response.success, success);
             assert_eq!(response.message, "backend detail");
         }
+        let status = service
+            .get_hi_cache_storage(Request::new(api::GetHiCacheStorageRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            status.hicache_storage_backend_extra_config.as_deref(),
+            Some("<redacted>")
+        );
         for success in [false, true] {
             let response = hicache_reply(
                 &h,
@@ -1111,6 +1186,96 @@ mod tests {
         })
         .await
         .expect("HiCache RPC did not finish")
+    }
+
+    /// Out-of-process orchestrators read these launch facts to reproduce the
+    /// server's token admission.
+    #[tokio::test]
+    async fn server_info_reports_launch_facts_for_orchestrators() {
+        let Harness {
+            service,
+            intake_rx,
+            abort_rx: _,
+        } = Harness::build(
+            1,
+            false,
+            Duration::from_secs(1),
+            true,
+            None,
+            ServerArgs {
+                allow_auto_truncate: true,
+                skip_tokenizer_init: true,
+                num_reserved_tokens: 4,
+                ..test_server_args()
+            },
+        );
+        let request = tokio::spawn(async move {
+            service
+                .get_server_info(Request::new(api::GetServerInfoRequest {}))
+                .await
+        });
+        let TmEvent::Intake {
+            request: control,
+            admission,
+        } = intake_rx.recv_async().await.unwrap()
+        else {
+            panic!("server info must submit one control request");
+        };
+        assert!(admission.try_accept());
+        let envelope = rmpv::Value::Map(vec![(
+            rmpv::Value::from("internal_state"),
+            rmpv::Value::Map(Vec::new()),
+        )]);
+        let mut payload = Vec::new();
+        rmpv::encode::write_value(&mut payload, &envelope).unwrap();
+        control
+            .sink
+            .try_send(ResponseItem::Control(bytes::Bytes::from(payload)))
+            .unwrap();
+        let info = request.await.unwrap().unwrap().into_inner();
+        assert!(info.allow_auto_truncate);
+        assert!(info.skip_tokenizer_init);
+        assert_eq!(info.num_reserved_tokens, 4);
+    }
+
+    /// gRPC `GetServerInfo` advertises the same nonempty owning-runtime id on
+    /// repeated calls against the same core-backed adapter.
+    #[tokio::test]
+    async fn server_info_instance_id_is_stable_across_grpc_reads() {
+        let Harness {
+            service,
+            intake_rx,
+            abort_rx: _,
+        } = Harness::new(1, false, Duration::from_secs(1));
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let call = service.get_server_info(Request::new(api::GetServerInfoRequest {}));
+            let scheduler = async {
+                let TmEvent::Intake {
+                    request: control,
+                    admission,
+                } = intake_rx.recv_async().await.unwrap()
+                else {
+                    panic!("server info must submit one control request");
+                };
+                assert!(admission.try_accept());
+                let envelope = rmpv::Value::Map(vec![(
+                    rmpv::Value::from("internal_state"),
+                    rmpv::Value::Map(Vec::new()),
+                )]);
+                let mut payload = Vec::new();
+                rmpv::encode::write_value(&mut payload, &envelope).unwrap();
+                control
+                    .sink
+                    .try_send(ResponseItem::Control(bytes::Bytes::from(payload)))
+                    .unwrap();
+            };
+            let (response, ()) = tokio::join!(call, scheduler);
+            ids.push(response.unwrap().into_inner().instance_id);
+        }
+        let uuid = uuid::Uuid::parse_str(&ids[0]).unwrap();
+        assert_eq!(uuid.get_version(), Some(uuid::Version::Random));
+        assert_eq!(ids[0], ids[1]);
     }
 
     #[tokio::test]

@@ -82,6 +82,7 @@ class TestLaunchServerShutdown(unittest.TestCase):
                 patch.object(ls, "configure_logger"),
                 patch.object(ls, "_find_available_port", side_effect=lambda port: port),
                 patch.object(ls, "_start_scheduler_processes", side_effect=starts),
+                patch.object(ls, "resolve_sampling_params_cls"),
                 patch.object(ls, "DiffusionServer", return_value=router),
             ):
                 with self.assertRaises(RuntimeError):

@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.memory.views import MHAKVView, MLAKVView
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -156,9 +157,13 @@ def prepare_hicache_staging(
     prepare(runner.token_to_kv_pool, runner.mtp_draft_device_pools)
     if draft_plan is not None and draft_plan.mode == HiCacheDraftMode.SIDECAR:
         for pool in draft_plan.device_pools:
-            # SWA sidecars follow only the draft's SWA component.
-            if pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
-                pool = pool.layer_router.view(IdSpaceKind.SLIDING_WINDOW)
+            # A hybrid draft gets one sidecar per component: SWA, plus FULL
+            # when the draft has full-attention layers.
+            router = pool.layer_router
+            if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
+                if router.routes_to(IdSpaceKind.FULL):
+                    prepare(router.view(IdSpaceKind.FULL), sidecar=True)
+                pool = router.view(IdSpaceKind.SLIDING_WINDOW)
             elif isinstance(pool, DeepSeekV4TokenToKVPool):
                 pool = pool.swa_kv_pool
             prepare(pool, sidecar=True)
@@ -225,6 +230,15 @@ def uses_ssm_state(model_config) -> bool:
         or glm5_next_config(model_config) is not None
         or hybrid_lightning_config(model_config) is not None
     )
+
+
+def agree_on_stage_request_capacity(*, tp_worker: BaseTpWorker) -> None:
+    """Once the pool is final, and before its request limits are read and the HiCache
+    host pools are sized: pipeline stages serve the same requests, so every stage
+    keeps the smallest share."""
+    allocator = tp_worker.model_runner.token_to_kv_pool_allocator
+    if get_parallel().pp_size > 1 and isinstance(allocator, ChainAllocator):
+        allocator.agree_on_stage_shares(get_parallel().pp_group.cpu_group)
 
 
 def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
@@ -465,6 +479,7 @@ def build_kv_cache(
         decoder_swa_bounded_replay=get_exec().features.enable_decoder_swa_bounded_replay,
         pp_rank=parallel.pp_rank,
         pp_size=parallel.pp_size,
+        pp_async_batch_depth=parallel.pp_async_batch_depth,
         attn_cp_rank=parallel.attn_cp_rank,
         attn_cp_size=parallel.attn_cp_size,
         chunked_prefill_size=effective_chunked_prefill_size,

@@ -62,6 +62,7 @@ class TestDcpCachedPrefixSend(CustomTestCase):
             gpu_id=0,
             state_types=[StateType.MAMBA],
             dsa_index_k_token_bytes=None,
+            state_sub_pools=[None],
         )
         mgr._dcp_pack_buffers = None
         mgr._dcp_pack_max_tokens = None
@@ -122,6 +123,7 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                         page_size=page_size,
                         translate_kv_indices_for_transfer=lambda x: x,
                         state_ids=lambda sub_pool: IdSpace(key=(sub_pool, None)),
+                        storage=None,
                     ),
                     req_to_token_pool=SimpleNamespace(
                         req_to_token=torch.arange(total).reshape(1, -1),
@@ -130,7 +132,6 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                     ),
                     disagg_metadata_buffers=Mock(),
                     disagg_prefill_bootstrap_queue=SimpleNamespace(kv_manager=mgr),
-                    disagg_prefill_pending_chunk_rids=set(),
                 )
                 SchedulerDisaggregationPrefillMixin._send_kv_chunk(
                     scheduler, req, last_chunk=True
@@ -179,7 +180,9 @@ class TestHostTensorIndicesEvent(CustomTestCase):
 
         sender = SimpleNamespace(
             supports_host_tensor_indices=True,
-            kv_mgr=SimpleNamespace(enable_all_cp_ranks_for_transfer=False),
+            kv_mgr=SimpleNamespace(
+                enable_all_cp_ranks_for_transfer=False, kv_shard_size=1
+            ),
             get_max_transfer_tokens=lambda: None,
             should_send_kv_chunk=lambda num_pages, is_last: True,
             send=Mock(),
@@ -201,11 +204,11 @@ class TestHostTensorIndicesEvent(CustomTestCase):
             token_to_kv_pool_allocator=SimpleNamespace(
                 page_size=page_size,
                 translate_kv_indices_for_transfer=lambda x: x,
+                storage=None,
             ),
             req_to_token_pool=SimpleNamespace(
                 req_to_token=torch.arange(total).reshape(1, -1)
             ),
-            disagg_prefill_pending_chunk_rids=set(),
         )
         real_empty = torch.empty
 
@@ -222,6 +225,57 @@ class TestHostTensorIndicesEvent(CustomTestCase):
         self.assertIsInstance(event, _Event)
         self.assertIs(event.recorded_on, stream)
         np.testing.assert_array_equal(sender.send.call_args.args[0], [0, 1])
+
+    def test_sharded_sender_gets_completed_indices_before_filtering(self):
+        # CP-TP sharing does not set enable_all_cp_ranks_for_transfer. Shard
+        # filtering still runs in send(), before a worker could wait for D2H.
+        page_size, total = 64, 5
+        manager = SimpleNamespace(
+            enable_all_cp_ranks_for_transfer=False,
+            kv_shard_size=4,
+            kv_args=SimpleNamespace(state_types=[], state_sub_pools=[]),
+        )
+        sender = SimpleNamespace(
+            supports_host_tensor_indices=True,
+            kv_mgr=manager,
+            get_max_transfer_tokens=lambda: None,
+            should_send_kv_chunk=lambda num_pages, is_last: True,
+            send=Mock(),
+        )
+        req = SimpleNamespace(
+            rid="sharded-host-indices",
+            kv=SimpleNamespace(req_pool_idx=0),
+            origin_input_ids=[0] * total,
+            extend_end=total,
+            start_send_idx=0,
+            disagg_kv_sender=sender,
+        )
+        scheduler = SimpleNamespace(
+            enable_staging=False,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                page_size=page_size,
+                translate_kv_indices_for_transfer=lambda x: x,
+                storage=None,
+            ),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.arange(5 * page_size, 5 * page_size + total).reshape(
+                    1, -1
+                )
+            ),
+            disagg_metadata_buffers=Mock(),
+            disagg_prefill_bootstrap_queue=SimpleNamespace(kv_manager=manager),
+            disagg_prefill_pending_chunk_rids=set(),
+        )
+        with patch(
+            "sglang.srt.disaggregation.prefill.async_d2h",
+            side_effect=AssertionError("shard filtering cannot read an async copy"),
+        ):
+            SchedulerDisaggregationPrefillMixin._send_kv_chunk(
+                scheduler, req, last_chunk=True
+            )
+        self.assertIsInstance(sender.send.call_args.args[0], np.ndarray)
+        np.testing.assert_array_equal(sender.send.call_args.args[0], [5])
+        self.assertNotIn("indices_event", sender.send.call_args.kwargs)
 
 
 class TestDcpPackBufferBytes(CustomTestCase):

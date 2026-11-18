@@ -1,6 +1,4 @@
-import glob
 import json
-import os
 import re
 import struct
 from pathlib import Path
@@ -113,6 +111,24 @@ def _merge_comfy_quant_marker(
     previous.update(marker)
 
 
+# Model prefixes ComfyUI strips before matching _quantization_metadata layer names.
+_COMFY_MODEL_PREFIXES = ("model.diffusion_model.", "diffusion_model.", "model.")
+
+
+def _checkpoint_prefix(layer: str, names: set[str]) -> str:
+    """The checkpoint name of a _quantization_metadata layer.
+
+    Some converters write layer names relative to the diffusion model
+    (``blocks.0.attn.qkv_proj``) while the tensors keep the full prefix.
+    """
+    if f"{layer}.weight" in names:
+        return layer
+    for model_prefix in _COMFY_MODEL_PREFIXES:
+        if f"{model_prefix}{layer}.weight" in names:
+            return model_prefix + layer
+    return layer
+
+
 def inspect_comfy_quant_markers(
     safetensors_list: list[str],
     param_name_mapper: Callable[[str], str] | None = None,
@@ -122,6 +138,7 @@ def inspect_comfy_quant_markers(
     raw_markers: dict[str, dict[str, Any]] = {}
     marked_dtype_weight_prefixes: set[str] = set()
     global_quant_formats: set[str] = set()
+    metadata_markers: list[tuple[str, str, dict[str, Any]]] = []
 
     for path in safetensors_list:
         with safe_open(path, framework="pt", device="cpu") as checkpoint:
@@ -150,8 +167,15 @@ def inspect_comfy_quant_markers(
                         raise ValueError(
                             f"Comfy quantization metadata for {prefix!r} must be an object"
                         )
-                    _merge_comfy_quant_marker(raw_markers, prefix, marker)
-            for key in checkpoint.keys():
+                    metadata_markers.append((path, prefix, marker))
+            keys = list(checkpoint.keys())
+            names = set(keys)
+            for path_, prefix, marker in metadata_markers:
+                if path_ == path:
+                    _merge_comfy_quant_marker(
+                        raw_markers, _checkpoint_prefix(prefix, names), marker
+                    )
+            for key in keys:
                 tensor_slice = checkpoint.get_slice(key)
                 checkpoint_meta[key] = (
                     tensor_slice.get_dtype(),
@@ -566,13 +590,6 @@ def find_quant_modelslim_config(model_config, component_model_path):
     return quant_cfg
 
 
-def replace_prefix(key: str, prefix_mapping: dict[str, str]) -> str:
-    for prefix, new_prefix in prefix_mapping.items():
-        if key.startswith(prefix):
-            key = key.replace(prefix, new_prefix, 1)
-    return key
-
-
 def get_quant_config(
     model_config,
     component_model_path: str,
@@ -597,54 +614,17 @@ def get_quant_config(
     if hf_quant_config["quant_method"] == "gguf":
         return quant_cls.from_config({})
 
-    if hf_quant_config is not None:
-        hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
-        is_modelopt_fp8 = (
-            hf_quant_config.get("quant_method") == "modelopt"
-            and "FP8" in str(hf_quant_config.get("quant_algo", "")).upper()
-        )
-        extra_kwargs = (
-            {"ignore_remap": quant_ignore_remap}
-            if quant_ignore_remap and is_modelopt_fp8
-            else {}
-        )
-        return quant_cls.from_config(hf_quant_config, **extra_kwargs)
-
-    model_name_or_path = model_config["model_path"]
-    hf_folder = model_name_or_path
-
-    possible_config_filenames = quant_cls.get_config_filenames()
-
-    # If the quantization config is not found, use the default config.
-    if not possible_config_filenames:
-        return quant_cls()
-
-    config_files = glob.glob(os.path.join(hf_folder, "*.json"))
-
-    quant_config_files = [
-        f for f in config_files if any(f.endswith(x) for x in possible_config_filenames)
-    ]
-    if len(quant_config_files) == 0:
-        raise ValueError(
-            f"Cannot find the config file for {model_config['quantization_config']['quant_method']}"
-        )
-    if len(quant_config_files) > 1:
-        raise ValueError(
-            f"Found multiple config files for {model_config['quantization_config']['quant_method']}: "
-            f"{quant_config_files}"
-        )
-
-    quant_config_file = quant_config_files[0]
-    with open(quant_config_file) as f:
-        config = json.load(f)
-        if remap_prefix is not None and "quantization" in config:
-            exclude_modules = [
-                replace_prefix(key, remap_prefix)
-                for key in config["quantization"]["exclude_modules"]
-            ]
-            config["quantization"]["exclude_modules"] = exclude_modules
-        config["packed_modules_mapping"] = packed_modules_mapping
-        return quant_cls.from_config(config)
+    hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
+    is_modelopt_fp8 = (
+        hf_quant_config.get("quant_method") == "modelopt"
+        and "FP8" in str(hf_quant_config.get("quant_algo", "")).upper()
+    )
+    extra_kwargs = (
+        {"ignore_remap": quant_ignore_remap}
+        if quant_ignore_remap and is_modelopt_fp8
+        else {}
+    )
+    return quant_cls.from_config(hf_quant_config, **extra_kwargs)
 
 
 def handle_fp8_metadata_format(quant_config_dict):

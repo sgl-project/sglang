@@ -5,7 +5,7 @@ on 8 GPUs with TP=8, FP8 KV cache.
 
 Model path can be configured via GLM51_MODEL_PATH environment variable.
 
-Registry: nightly-perf-8-gpu-glm51 suite
+Registry: nightly-perf-test-8-gpu-amd-glm51 suite
 """
 
 import os
@@ -17,7 +17,12 @@ from sglang.test.nightly_bench_utils import BenchmarkResult
 from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
-register_amd_ci(est_time=5400, suite="nightly-perf-8-gpu-glm51", nightly=True)
+register_amd_ci(
+    est_time=5400,
+    suite="nightly-perf-test-8-gpu-amd-glm51",
+    nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
+)
 
 
 def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:

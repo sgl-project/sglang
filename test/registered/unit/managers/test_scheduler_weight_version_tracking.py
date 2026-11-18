@@ -1,6 +1,7 @@
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import DEFAULT, MagicMock, Mock, patch
 
 import torch
 
@@ -10,6 +11,7 @@ from sglang.srt.managers.io_struct import (
     EndWeightUpdateReqInput,
     PluginWeightUpdateReqInput,
     PluginWeightUpdateReqOutput,
+    ReleaseMemoryOccupationReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -106,6 +108,7 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         scheduler.deferred_responses = DeferredResponses(
             disaggregation_mode=DisaggregationMode.NULL,
             output_streamer=None,
+            request_retirer=None,
             send_abort=None,
         )
         scheduler.token_to_kv_pool_allocator = None
@@ -114,7 +117,10 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         scheduler.scheduler_stage_metrics = None
         scheduler.load_publisher = MagicMock()
         scheduler.load_inquirer = MagicMock()
-        scheduler.tree_cache = SimpleNamespace(flush_pending_backups=MagicMock())
+        scheduler.tree_cache = SimpleNamespace(
+            flush_pending_backups=MagicMock(),
+            lease_checkpoint_state_slots=lambda reqs: nullcontext(),
+        )
         scheduler.running_reqs = KeyedReqList(ListKind.DECODING)
         scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         scheduler.invariant_checker = MagicMock()
@@ -143,6 +149,7 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
             request_retirer=release_only_retirer(tree_cache=scheduler.tree_cache),
             abort_request=lambda *args, **kwargs: None,
             still_in_batch=lambda req: True,
+            prefill_launched_reqs=scheduler.prefill_launched_reqs,
         )
         for name, value in (
             ("get_observability", SimpleNamespace(enable_metrics=False)),
@@ -323,7 +330,8 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
             scheduler=SimpleNamespace(
                 record_weight_version_change=lambda new_version: self.recorded.append(
                     new_version
-                )
+                ),
+                wait_for_launched_forward=lambda: None,
             ),
         )
 
@@ -708,6 +716,119 @@ class TestPluginWeightUpdate(_WeightUpdaterManagerTestBase):
         self.assertFalse(unknown.success)
         self.assertIn("nccl", unknown.message)
         self.assertEqual(called, [])
+
+
+class TestReleaseMemoryRefusal(_WeightUpdaterManagerTestBase):
+    def test_an_idle_rank_refuses_when_a_tp_peer_is_busy(self):
+        """A rank that released alone would wait forever in the group barrier."""
+        manager = self._manager(Mock(), session=False)
+        manager.scheduler = None
+        manager.memory_saver_adapter = Mock()
+
+        def a_peer_is_busy(busy, **kwargs):
+            busy.fill_(1)
+
+        with patch("torch.distributed.all_reduce", side_effect=a_peer_is_busy):
+            output = manager.release_memory_occupation(
+                ReleaseMemoryOccupationReqInput(tags=["cuda_graph"])
+            )
+
+        self.assertFalse(output.success)
+        manager.memory_saver_adapter.pause.assert_not_called()
+
+
+class _RecordingStream:
+    """Stands in for a device stream; records the cross-stream waits enqueued on it."""
+
+    def __init__(self, name: str, log: list):
+        self.name = name
+        self.log = log
+
+    def wait_stream(self, stream: "_RecordingStream") -> None:
+        self.log.append(f"{self.name} waits for {stream.name}")
+
+
+class TestWeightWritesWaitForLaunchedForward(_WeightUpdaterManagerTestBase):
+    def setUp(self):
+        super().setUp()
+        gather = patch(
+            "torch.distributed.all_gather_object",
+            side_effect=lambda outputs, obj, group: outputs.__setitem__(0, obj),
+        )
+        gather.start()
+        self.addCleanup(gather.stop)
+        override = get_parallel().override(tp_rank=0, tp_size=1)
+        override.__enter__()
+        self.addCleanup(override.__exit__, None, None, None)
+
+        def transport(*, context, payload):
+            self.log.append("write transport")
+            return [("w", object())]
+
+        platform = patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.current_platform",
+            SimpleNamespace(get_weight_update_handlers=lambda: {"ici": transport}),
+        )
+        platform.start()
+        self.addCleanup(platform.stop)
+        self.log = []
+
+    def _overlap_manager(self, *, session):
+        def record_write(name):
+            return lambda *args, **kwargs: self.log.append(f"write {name}") or DEFAULT
+
+        target = _runner()
+        for name in (
+            "begin_weight_update",
+            "end_weight_update",
+            "update_weights_from_disk",
+            "update_weights_from_tensor",
+            "update_weights_from_ipc",
+            "load_weights_from_distributed",
+        ):
+            getattr(target.weight_updater, name).side_effect = record_write(name)
+        manager = self._manager(target, session=session)
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_overlap = True
+        scheduler.schedule_stream = _RecordingStream("schedule", self.log)
+        scheduler.forward_stream = _RecordingStream("forward", self.log)
+        scheduler.record_weight_version_change = lambda new_version: None
+        manager.scheduler = scheduler
+        return manager
+
+    def test_weight_writes_wait_for_the_forward_launched_before_the_update(self):
+        """An in_place pause can leave the last launched forward reading the weights;
+        every update path must order its weight writes after that whole forward."""
+        calls = {
+            "begin": (
+                False,
+                lambda m: m.begin_weight_update(BeginWeightUpdateReqInput()),
+            ),
+            "end": (True, lambda m: m.end_weight_update(EndWeightUpdateReqInput())),
+            "disk": (False, lambda m: m.update_weights_from_disk(_request())),
+            "ipc": (False, lambda m: m.update_weights_from_ipc(_request())),
+            "tensor": (True, lambda m: m.update_weights_from_tensor(_request())),
+            "distributed": (
+                True,
+                lambda m: m.update_weights_from_distributed(_request()),
+            ),
+            "plugin": (
+                True,
+                lambda m: m.plugin_weight_update(
+                    PluginWeightUpdateReqInput(handler="ici")
+                ),
+            ),
+        }
+        for path, (session, call) in calls.items():
+            with self.subTest(path=path):
+                self.log.clear()
+
+                output = call(self._overlap_manager(session=session))
+
+                self.assertTrue(output.success)
+                writes = [i for i, e in enumerate(self.log) if e.startswith("write")]
+                self.assertTrue(writes, f"{path} wrote no weights")
+                self.assertIn("schedule waits for forward", self.log[: writes[0]])
 
 
 class TestPluginWeightUpdateReply(CustomTestCase):
