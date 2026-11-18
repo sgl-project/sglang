@@ -68,7 +68,10 @@ def _worker_impl(sp_mode: str) -> int:
         LingBotVideoBlock,
         LingBotVideoRMSNorm,
     )
-    from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+    from sglang.multimodal_gen.runtime.platforms import (
+        AttentionBackendEnum,
+        current_platform,
+    )
     from sglang.multimodal_gen.runtime.server_args import set_global_server_args
     from sglang.multimodal_gen.runtime.utils.precision import (
         set_mixed_precision_policy,
@@ -88,10 +91,16 @@ def _worker_impl(sp_mode: str) -> int:
         ring_degree=ring_degree,
     )
     set_mixed_precision_policy(torch.bfloat16, torch.float32)
-    global_force_attn_backend(AttentionBackendEnum.FA)
+    # FA falls back to SDPA on ROCm, which has no ring support, and AITer does
+    backend = (
+        AttentionBackendEnum.AITER
+        if sp_mode == "ring" and current_platform.is_rocm()
+        else AttentionBackendEnum.FA
+    )
+    global_force_attn_backend(backend)
     set_global_server_args(
         SimpleNamespace(
-            attention_backend="fa",
+            attention_backend=backend.name.lower(),
             attention_backend_config=None,
             kv_gather_degree=kv_gather_degree,
             sp_split_auto=False,

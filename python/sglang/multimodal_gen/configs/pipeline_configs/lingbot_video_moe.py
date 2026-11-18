@@ -68,12 +68,6 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
         )
 
     def validate_server_args(self, server_args) -> None:
-        num_experts = self.dit_config.arch_config.num_experts
-        if server_args.ep_size > 1 and num_experts % server_args.ep_size != 0:
-            raise ValueError(
-                f"num_experts ({num_experts}) must be divisible by "
-                f"ep_size ({server_args.ep_size})"
-            )
         if server_args.sp_degree > 1 and server_args.batching_max_size > 1:
             raise ValueError(
                 "LingBot-Video MoE sequence parallelism does not support "

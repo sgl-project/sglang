@@ -30,6 +30,10 @@ class MoeExpertParallelInfo(msgspec.Struct, frozen=True):
 def resolve_moe_expert_parallel(
     num_experts: int, *, ep_size: int
 ) -> MoeExpertParallelInfo:
+    if num_experts % ep_size != 0:
+        raise ValueError(
+            f"num_experts ({num_experts}) must be divisible by ep_size ({ep_size})"
+        )
     num_local_experts = num_experts // ep_size
     ep_rank = get_sp_parallel_rank() if ep_size > 1 else 0
     return MoeExpertParallelInfo(

@@ -30,8 +30,13 @@ class LingBotVideoMoESamplingParams(SamplingParams):
     def _adjust_visual_fields(self, server_args, pipeline_config):
         super()._adjust_visual_fields(server_args, pipeline_config)
         sp_degree = server_args.sp_degree or 1
-        if not self.enable_sequence_shard or sp_degree <= 1:
+        if sp_degree <= 1:
             return
+        if not self.enable_sequence_shard:
+            raise ValueError(
+                "LingBot-Video MoE requires sequence sharding when sp_degree is "
+                "greater than 1, so leave enable_sequence_shard unset or true"
+            )
         vae_config = pipeline_config.vae_config
         temporal = vae_config.arch_config.scale_factor_temporal
         spatial = vae_config.arch_config.scale_factor_spatial

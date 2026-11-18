@@ -958,7 +958,8 @@ class ServerArgsAutoTuner:
         )
         if not total or not routed:
             return share
-        return share * (total - routed * (1 - 1 / args.ep_size)) / total
+        # TP keeps each routed expert whole, so only EP divides routed weights
+        return (share * (total - routed) + routed / args.ep_size) / total
 
     def _has_explicit_parallel_policy(self) -> bool:
         args = self.server_args

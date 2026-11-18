@@ -519,7 +519,7 @@ def test_lingbot_uses_model_level_sequence_sharding():
     assert sharded is latents
 
 
-def test_lingbot_sp_rejects_token_counts_the_sp_degree_does_not_divide():
+def test_lingbot_sp_admission_rejects_unshardable_requests():
     config = LingBotVideoMoEPipelineConfig()
     server_args = SimpleNamespace(
         pipeline_config=config, num_gpus=2, sp_degree=2, comfyui_mode=True
@@ -529,6 +529,15 @@ def test_lingbot_sp_rejects_token_counts_the_sp_degree_does_not_divide():
         LingBotVideoMoESamplingParams(width=496, height=496)._adjust_visual_fields(
             server_args, config
         )
+    with pytest.raises(ValueError, match="requires sequence sharding"):
+        LingBotVideoMoESamplingParams(
+            enable_sequence_shard=False
+        )._adjust_visual_fields(server_args, config)
+
+
+def test_expert_parallel_requires_experts_divisible_by_ep_size():
+    with pytest.raises(ValueError, match=r"num_experts \(20\) must be divisible"):
+        resolve_moe_expert_parallel(20, ep_size=8)
 
 
 def test_lingbot_sp_rejects_dynamic_batching():

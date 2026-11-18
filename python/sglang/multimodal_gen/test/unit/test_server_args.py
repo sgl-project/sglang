@@ -2587,12 +2587,13 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
             "text_encoder": (4_437_000_000, 8_874_000_000),
             "vae": (127_000_000, 508_000_000),
         }
-        for available_gb, checkpoint_sizes, streams in (
-            (30, None, True),
-            (50, None, False),
-            (79, sizes, False),
+        for available_gb, tp_size, checkpoint_sizes, streams in (
+            (30, 1, None, True),
+            (50, 1, None, False),
+            (79, 1, sizes, False),
+            (24, 2, None, True),
         ):
-            with self.subTest(available_gb=available_gb):
+            with self.subTest(available_gb=available_gb, tp_size=tp_size):
                 args = self._from_dict_with_pipeline_config(
                     LingBotVideoMoEPipelineConfig(),
                     available_memory_gb=available_gb,
@@ -2601,7 +2602,8 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
                     kwargs={
                         "model_path": "robbyant/lingbot-video-moe-30b-a3b",
                         "performance_mode": "auto",
-                        "num_gpus": 2,
+                        "num_gpus": 2 * tp_size,
+                        "tp_size": tp_size,
                         "ulysses_degree": 2,
                         "ep_size": 2,
                     },
@@ -4017,11 +4019,6 @@ class TestExpertParallelMesh(CustomTestCase):
 
         cases = (
             ("non-positive ep_size", dict(num_gpus=4, ep_size=0), "ep_size"),
-            (
-                "indivisible experts",
-                dict(num_gpus=3, ep_size=3, ulysses_degree=1, ring_degree=3),
-                r"num_experts \(128\) must be divisible by ep_size \(3\)",
-            ),
             (
                 "ep_size != sp_degree",
                 dict(num_gpus=4, ep_size=2, ulysses_degree=4),

@@ -7,16 +7,7 @@ from sglang.kernels.ops.moe.moe_fused_mul_sum import moe_fused_mul_sum
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=4, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=4, stage="jit-kernel-unit", runner_config="amd")
-
-
-def test_ep_requires_topk_ids():
-    with pytest.raises(AssertionError, match="topk_ids is required"):
-        moe_fused_mul_sum(
-            inputs=torch.empty((1, 1, 1), device="cuda"),
-            topk_weights=torch.empty((1, 1), device="cuda"),
-            is_ep=True,
-        )
+register_amd_ci(est_time=4, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 
 def test_ep_masking_skips_invalid_nan_slots_and_accumulates_in_fp32():

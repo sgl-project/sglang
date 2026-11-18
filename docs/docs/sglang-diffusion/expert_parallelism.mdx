@@ -9,7 +9,11 @@ and shared expert remain replicated.
 
 ## Enable EP
 
-Set `ep_size` to the number of GPUs in the sequence-parallel group. For example:
+Set `ep_size` to the number of GPUs in the sequence-parallel group. The
+checkpoint expects a structured JSON caption as its prompt, so save one on a
+single line, serialized as in the
+[LingBot-Video MoE cookbook](/cookbook/diffusion/LingBot-Video/LingBot-Video-MoE),
+to `caption.txt`. For example:
 
 ```bash
 sglang generate \
@@ -17,7 +21,7 @@ sglang generate \
   --num-gpus 2 \
   --ep-size 2 \
   --ulysses-degree 2 \
-  --prompt "A robotic arm moves a red cube on a white table" \
+  --prompt-path caption.txt \
   --save-output
 ```
 
