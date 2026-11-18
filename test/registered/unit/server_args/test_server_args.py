@@ -96,6 +96,7 @@ from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.arg_groups.validation_hook import (
     check_pipeline_parallel_compat,
     check_two_batch_overlap,
+    validate_device_lora_backend,
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.entrypoints.sidecar import (
@@ -112,6 +113,7 @@ from sglang.srt.layers.moe.utils import (
     FlashinferA2ADispatchType,
     get_flashinfer_a2a_dispatch_type,
 )
+from sglang.srt.lora.backend.lora_registry import LORA_SUPPORTED_BACKENDS
 from sglang.srt.mem_cache import platform_kv_cache_dtype
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -135,7 +137,7 @@ from sglang.test.test_utils import (
 )
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
-register_cpu_ci(est_time=11, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=11, suite="extra-test-cpu-intel")
 
 # Mock get_device() so all tests run on CPU-only CI runners
 _mock_device = patch(
@@ -152,21 +154,21 @@ class TestServerArgsPositionalOrder(CustomTestCase):
             (95, "disable_attn_tp_gather"),
             (96, "enable_p2p_check"),
             (97, "device"),
-            (532, "grpc_response_timeout_secs"),
-            (533, "enable_paged_experts"),
-            (534, "paged_experts_num_resident"),
-            (535, "enable_nvidia_megakernel"),
-            (536, "enable_megamoe_for_layernorm_sp"),
+            (530, "grpc_response_timeout_secs"),
+            (531, "enable_paged_experts"),
+            (532, "paged_experts_num_resident"),
+            (533, "enable_nvidia_megakernel"),
+            (534, "enable_megamoe_for_layernorm_sp"),
         ):
             with self.subTest(index=index):
                 self.assertEqual(fields[index].name, name)
         defaults = ServerArgs(model_path="dummy")
         # deprecated constructor fields keep their historical slots
-        positional = [getattr(defaults, field.name) for field in fields[:533]]
+        positional = [getattr(defaults, field.name) for field in fields[:531]]
         positional[95] = True
         positional[96] = False
         positional[97] = "cpu"
-        positional[532] = 123.0
+        positional[530] = 123.0
 
         args = ServerArgs(*positional)
 
@@ -4542,8 +4544,8 @@ class TestHandleCrashDumpEnv(CustomTestCase):
 
 class TestGrpcServerArgs(CustomTestCase):
     """Native gRPC is enabled by --grpc-port (or SGLANG_GRPC_PORT) and runs
-    alongside HTTP; --smg-grpc-mode (and the deprecated --grpc-mode) select the
-    legacy SMG server. Worker-threads / max-prefill-tokens are env-only knobs.
+    alongside HTTP; --grpc-mode serves the encoder over gRPC. Worker-threads /
+    max-prefill-tokens are env-only knobs.
 
     The gRPC setup lives in `serving_hook.handle_deprecated_args`, which
     __post_init__ skips for dummy models, so these tests build a dummy
@@ -4657,11 +4659,6 @@ class TestGrpcServerArgs(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "requires --grpc-port"):
             handle_deprecated_args(sa)
 
-    def test_sidecar_rejects_legacy_grpc(self):
-        sa = self._args(sidecar="example.sidecar", smg_grpc_mode=True)
-        with self.assertRaisesRegex(ValueError, "native gRPC server"):
-            handle_deprecated_args(sa)
-
     def test_sidecar_rejects_empty_value(self):
         sa = self._args(sidecar="", grpc_port=50051)
         with self.assertRaisesRegex(ValueError, "must not be empty"):
@@ -4771,24 +4768,6 @@ class TestGrpcServerArgs(CustomTestCase):
         proc.terminate.assert_called_once_with()
         proc.join.assert_called_once_with(timeout=42.0)
         kill_tree.assert_called_once_with(1234, wait_timeout=42.0)
-
-    def test_legacy_smg_derives_grpc_port_from_http_port(self):
-        sa = self._args(port=30000, smg_grpc_mode=True)
-        handle_deprecated_args(sa)
-        self.assertEqual(resolution_result(sa, "grpc_port"), 40000)
-
-    def test_grpc_mode_is_deprecated_alias_for_smg_grpc_mode(self):
-        sa = self._args(grpc_mode=True)
-        with self.assertLogs(serving_hook.logger, level="WARNING") as cm:
-            handle_deprecated_args(sa)
-        self.assertTrue(resolution_result(sa, "smg_grpc_mode"))
-        self.assertTrue(any("--grpc-mode is deprecated" in line for line in cm.output))
-
-    def test_legacy_smg_takes_precedence_over_grpc_port(self):
-        sa = self._args(grpc_port=50051, smg_grpc_mode=True)
-        handle_deprecated_args(sa)
-        self.assertTrue(resolution_result(sa, "smg_grpc_mode"))
-        self.assertEqual(resolution_result(sa, "grpc_port"), 50051)
 
     def test_native_grpc_rejects_multi_tokenizer(self):
         sa = self._args(grpc_port=40000, tokenizer_worker_num=2)
@@ -4930,6 +4909,24 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         # require dp-attention there.
         args = self._args(moe_a2a_backend="deepep")
         check_two_batch_overlap(args)
+
+
+class TestIntelXpuLoRABackend(CustomTestCase):
+    def test_registered_backend_is_selectable_from_cli(self):
+        self.assertIn("intel_xpu", LORA_SUPPORTED_BACKENDS)
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args = parser.parse_args(
+            ["--model-path", "dummy-model", "--lora-backend", "intel_xpu"]
+        )
+        self.assertEqual(args.lora_backend, "intel_xpu")
+
+    def test_rejected_off_xpu(self):
+        with self.assertRaisesRegex(ValueError, "requires --device xpu"):
+            validate_device_lora_backend(lora_backend="intel_xpu", device="cuda")
+
+    def test_accepted_on_xpu(self):
+        validate_device_lora_backend(lora_backend="intel_xpu", device="xpu")
 
 
 class TestKvCacheShardingCompatibility(CustomTestCase):
@@ -5412,10 +5409,10 @@ class TestLaunchCommand(CustomTestCase):
 
 
 class TestAccessKeyRedaction(CustomTestCase):
-    """The access keys and the TLS key password reach nothing that reports the
-    configuration: not the launch command, `/server_info`, the startup log or
-    the record's repr. Anyone holding the API key can read those, and the
-    admin key must stay out of their reach."""
+    """The access keys, the TLS key password and the HiCache storage config
+    reach nothing that reports the configuration: not the launch command,
+    `/server_info`, the startup log or the record's repr. Anyone holding the
+    API key can read those, and the admin key must stay out of their reach."""
 
     # Spellings argparse accepts: an abbreviation with `=`, a value with a
     # space, a value that spells another key flag, and a repeated flag.
@@ -5430,6 +5427,8 @@ class TestAccessKeyRedaction(CustomTestCase):
         "second-admin",
         "--ssl-keyfile-password",
         "tls-secret",
+        "--hicache-storage-backend-extra-config",
+        '{"secret_key": "s3-secret"}',
     ]
     SECRETS = (
         "alpha beta",
@@ -5437,6 +5436,7 @@ class TestAccessKeyRedaction(CustomTestCase):
         "--admin-api-key=x",
         "second-admin",
         "tls-secret",
+        "s3-secret",
     )
 
     def _assert_no_secret(self, text: str):
@@ -5449,7 +5449,8 @@ class TestAccessKeyRedaction(CustomTestCase):
             server_args.launch_command,
             "--model-path /tmp/x --api-key <redacted> --admin-api-ke=<redacted> "
             "--api-key=<redacted> --admin-api-key <redacted> "
-            "--ssl-keyfile-password <redacted>",
+            "--ssl-keyfile-password <redacted> "
+            "--hicache-storage-backend-extra-config <redacted>",
         )
         # Redaction is for display only: the server still authenticates with
         # the values the operator gave, the last of each repeated flag.
@@ -5463,6 +5464,7 @@ class TestAccessKeyRedaction(CustomTestCase):
         self.assertEqual(info["api_key"], "<redacted>")
         self.assertEqual(info["admin_api_key"], "<redacted>")
         self.assertEqual(info["ssl_keyfile_password"], "<redacted>")
+        self.assertEqual(info["hicache_storage_backend_extra_config"], "<redacted>")
         self._assert_no_secret(json.dumps(info, default=str))
         unset = build_server_info(prepare_server_args(["--model-path", "/tmp/x"]), {})
         self.assertIsNone(unset["api_key"])

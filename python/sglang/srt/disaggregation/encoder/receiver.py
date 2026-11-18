@@ -381,14 +381,15 @@ def _normalize_embedding_ports(embedding_port):
 
 async def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count):
     import grpc
-    from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
+
+    from sglang.encoder.v1 import encoder_pb2, encoder_pb2_grpc
 
     timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
     channel = grpc.aio.insecure_channel(target)
-    stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
+    stub = encoder_pb2_grpc.SglangEncoderStub(channel)
     try:
         await stub.SchedulerReceiveUrl(
-            sglang_encoder_pb2.SchedulerReceiveUrlRequest(
+            encoder_pb2.SchedulerReceiveUrlRequest(
                 req_id=req_id,
                 receive_url=receive_url,
                 receive_count=receive_count,
@@ -401,14 +402,15 @@ async def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count
 
 def _grpc_encode_request(target, encode_request):
     import grpc
-    from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
+
+    from sglang.encoder.v1 import encoder_pb2, encoder_pb2_grpc
 
     timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
     channel = grpc.insecure_channel(target)
-    stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
+    stub = encoder_pb2_grpc.SglangEncoderStub(channel)
     try:
         response = stub.Encode(
-            sglang_encoder_pb2.EncodeRequest(
+            encoder_pb2.EncodeRequest(
                 mm_items=encode_request["mm_items"],
                 req_id=encode_request["req_id"],
                 num_parts=encode_request["num_parts"],
@@ -1318,7 +1320,9 @@ class WaitingZmqRequestGrpc(WaitingZmqRequest):
                 if assigned_num == 0:
                     continue
                 encoder_url = self.encoder_urls[idx]
-                receive_url = f"{host_name}:{embedding_port}"
+                receive_url = NetworkAddress(
+                    host_name, embedding_port
+                ).to_host_port_str()
                 target_url = f"{encoder_url}/SchedulerReceiveUrl"
                 logger.info(f"Preparing to send to {target_url}")
                 tasks.append(
@@ -2429,7 +2433,10 @@ class MMReceiverBase(ABC):
             # Per-request sockets receive here; shared-socket requests use this
             # tick to retry pool staging after _drain_scheduler_embeddings().
             waiting_req._try_recv_mm_data()
-            if current_time - waiting_req.start_time > self.wait_timeout:
+            if (
+                waiting_req.status == WaitingMMRequestStatus.PENDING
+                and current_time - waiting_req.start_time > self.wait_timeout
+            ):
                 waiting_req.status = WaitingMMRequestStatus.TIMEOUT
                 waiting_req.release_resources()
                 waiting_req.close_recv_socket()

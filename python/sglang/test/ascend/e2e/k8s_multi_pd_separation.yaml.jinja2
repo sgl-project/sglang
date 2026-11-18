@@ -67,6 +67,12 @@ spec:
             value: "{{ trouble_shotting }}"
           - name: TRANSFORMERS_VERSION_FOR_SGLANG
             value: "{{ transformers_version }}"
+          - name: SGLANG_NPU_CONTAINER_PATCHES
+            value: "{{ container_patches }}"
+          - name: SGLANG_USE_IMAGE
+            value: "{{ use_image_sglang }}"
+          - name: NPU_TEST_METHOD
+            value: "{{ test_method }}"
           command: ["/bin/bash", "-c"]
           args:
             - |
@@ -190,6 +196,12 @@ spec:
             value: "{{ trouble_shotting }}"
           - name: TRANSFORMERS_VERSION_FOR_SGLANG
             value: "{{ transformers_version }}"
+          - name: SGLANG_NPU_CONTAINER_PATCHES
+            value: "{{ container_patches }}"
+          - name: SGLANG_USE_IMAGE
+            value: "{{ use_image_sglang }}"
+          - name: NPU_TEST_METHOD
+            value: "{{ test_method }}"
           command: ["/bin/bash", "-c"]
           args:
             - |
@@ -268,7 +280,7 @@ spec:
           accelerator-type: module-a3-16
           {% endif %}
         restartPolicy: OnFailure
-  - name: "sglang-router"
+  - name: "sgl-router"
     replicas: {{ router_size }}
     template:
       metadata:
@@ -313,6 +325,12 @@ spec:
             value: "{{ trouble_shotting }}"
           - name: TRANSFORMERS_VERSION_FOR_SGLANG
             value: "{{ transformers_version }}"
+          - name: SGLANG_NPU_CONTAINER_PATCHES
+            value: "{{ container_patches }}"
+          - name: SGLANG_USE_IMAGE
+            value: "{{ use_image_sglang }}"
+          - name: NPU_TEST_METHOD
+            value: "{{ test_method }}"
           command: ["/bin/bash", "-c"]
           args:
             - |

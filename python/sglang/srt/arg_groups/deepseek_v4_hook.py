@@ -111,7 +111,13 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
             logger.warning(
                 "%s deprecated; use --engram-config '%s' instead.",
                 ", ".join(legacy),
-                json.dumps(dataclasses.asdict(config)),
+                json.dumps(
+                    {
+                        k: v
+                        for k, v in dataclasses.asdict(config).items()
+                        if k in ("placement", "replication", "lookup")
+                    }
+                ),
             )
     else:
         if legacy:
@@ -138,6 +144,17 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
         raise ValueError(
             "--engram-config: replication 'per_node' needs the TP group on one node."
         )
+    if config.replication == EngramReplication.GROUP_SHARDS:
+        if config.group_size < cfg.tp_size:
+            raise ValueError(
+                "--engram-config: replication 'group_shards' needs 'group_size' of "
+                "at least --tp-size."
+            )
+        if cfg.pp_size > 1:
+            raise ValueError(
+                "--engram-config: replication 'group_shards' does not support "
+                "pipeline parallelism."
+            )
     declare_resolution(server_args, "_resolve_engram_config", engram_config=config)
     logger.info("DeepSeek-V4.1 Engram tables: %s", config)
 
