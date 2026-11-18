@@ -32,10 +32,10 @@ class RingSimpleAllReduce:
 
     Each block runs one ring (channel) over a contiguous share of the tensor:
     every chunk goes to the next rank only, through a FIFO of chunk-sized slices
-    in that rank's memory, behind 64-bit counters. The ring keeps each SoC's
-    partitions next to each other: they share the SoC's fabric bandwidth, so
-    with DPX partners apart every hop crosses the fabric and the ring runs
-    1.5-1.8x slower from 64 MB.
+    in that rank's memory, behind 64-bit counters. The ring keeps the
+    partitions of each accelerator next to each other: they share its links
+    to the other accelerators, so with them apart every hop leaves an
+    accelerator and the ring runs 1.5-1.8x slower from 64 MB.
     """
 
     @staticmethod
@@ -74,9 +74,9 @@ class RingSimpleAllReduce:
         slot_bytes: int,
     ) -> None:
         """The plane lives on a symmetric buffer of its own, which starts zeroed."""
-        from .gfx1250_fabric import probe_soc_ring_order
+        from .gfx1250_fabric import probe_accelerator_ring_order
 
-        order = probe_soc_ring_order(group, device)
+        order = probe_accelerator_ring_order(group, device)
         self._buffer = SymmetricBuffer(
             group,
             device,
@@ -117,11 +117,11 @@ class RingSimpleAllReduce:
 
 
 class HierRingSimpleAllReduce:
-    """hier_ring_simple on ROCm gfx1250 DPX: ring_simple over DPX pairs.
+    """hier_ring_simple on ROCm gfx1250: ring_simple over partition pairs.
 
-    Each SoC's two partitions split every chunk in halves, and half h runs a
-    ring over partition h of every SoC, so only 2 * (m - 1) / m of the tensor
-    leaves each SoC (m SoCs). The pair trades the inputs it reduces and the
+    The two partitions of each accelerator split every chunk in halves, and
+    half h runs a ring over partition h of every accelerator, so only
+    2 * (m - 1) / m of the tensor leaves each accelerator (m accelerators). The pair trades the inputs it reduces and the
     results in the same kernel, through two more FIFOs per channel.
     """
 
@@ -133,10 +133,10 @@ class HierRingSimpleAllReduce:
         config: AllReduceConfig,
         buffer_size: int,
     ) -> Tuple[AllReduceConfig, Optional[List[List[int]]], int]:
-        """``(config, DPX pairs, slot bytes)``; a slot size of 0 disables it.
+        """``(config, partition pairs, slot bytes)``; a slot size of 0 disables it.
 
-        Runs before the push slots are sized. With DPX pairs of at least two
-        SoCs, it takes the sizes from its range up: 2shot_push keeps only the
+        Runs before the push slots are sized. With both partitions of each of
+        at least two accelerators in the group, it takes the sizes from its range up: 2shot_push keeps only the
         sizes below it, and ring_simple none it covers, so neither plane grows
         for them. Otherwise its ranges are cleared and the table is unchanged.
         """
@@ -207,17 +207,17 @@ class HierRingSimpleAllReduce:
         fifo_bytes = num_channels * _HIER_FIFOS * _SLOTS * slot_bytes
         pair = next(ranks for ranks in pairs if rank in ranks)
         half = pair.index(rank)
-        soc = pairs.index(pair)
-        num_socs = len(pairs)
+        accel = pairs.index(pair)
+        num_accels = len(pairs)
         self._plane: Optional[HierRingPlane] = HierRingPlane(
             rank,
             world_size,
             peer=pair[1 - half],
-            x_prev=pairs[(soc - 1) % num_socs][half],
-            x_next=pairs[(soc + 1) % num_socs][half],
+            x_prev=pairs[(accel - 1) % num_accels][half],
+            x_next=pairs[(accel + 1) % num_accels][half],
             half=half,
-            soc=soc,
-            num_socs=num_socs,
+            accel=accel,
+            num_accels=num_accels,
             workspaces=[
                 s[sem_bytes : sem_bytes + fifo_bytes].view(fifo_shape) for s in slabs
             ],

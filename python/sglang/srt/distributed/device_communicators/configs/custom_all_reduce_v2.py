@@ -37,7 +37,7 @@ class Heuristic(NamedTuple):
       2. ``hier_2shot_push``: nbytes in ``hier_2shot_push.min_bytes..max_bytes``
                             (only when the group is made of DPX pairs)
       3. ``hier_ring_simple``: nbytes in ``hier_ring_simple.min_bytes..max_bytes``
-                            (only when the group is made of DPX pairs)
+                            (only when the group is made of partition pairs)
       4. ``2shot_push``:    nbytes <= ``two_shot_push_threshold``
       5. ``1shot_pull``:    nbytes <= ``one_shot_pull_threshold``
       6. ``2shot_pull`` mc: nbytes in ``mc.min_bytes..mc.max_bytes``
@@ -355,14 +355,13 @@ def _rocm_configs(num_sm: int) -> dict[int, AllReduceConfig]:
     return {world_size: default for world_size in range(2, 9)}
 
 
-# ROCm (MI450 / gfx1250, 96 CUs). Every size up to 4 GB stays on carv2:
-# 1shot_push, then 2shot_push, then ring_simple. The 2shot_push and ring_simple
-# cutoffs are the last size each won on h13-13 (DPX, graph, bf16, median of 3,
-# back to back, TP2-8). 1shot_push wins back to back up to 256 KB-8 MB, but
-# stops at 64 KB: with a late rank and a GEMM before the all-reduce, as in
-# serving, 2shot_push wins from 128 KB, and at TP8 a 256 KB cutoff cost
-# DeepSeek-V4-Flash 18% of its C16 decode throughput. Pull stays off: it lost
-# at every measured size.
+# ROCm gfx1250. Every size up to 4 GB stays on carv2: 1shot_push, then
+# 2shot_push, then ring_simple. The 2shot_push and ring_simple cutoffs are the
+# last size each won (graph, bf16, median of 3, back to back, TP2-8).
+# 1shot_push wins back to back up to 256 KB-8 MB, but stops at 64 KB: with a
+# late rank and a GEMM before the all-reduce, as in serving, 2shot_push wins
+# from 128 KB, and at TP8 a 256 KB cutoff cost DeepSeek-V4-Flash 18% of its C16
+# decode throughput. Pull stays off: it lost at every measured size.
 @cache
 def _rocm_gfx1250_configs(
     num_sm: int, dev_kernarg: bool = False
@@ -406,59 +405,62 @@ def _rocm_gfx1250_configs(
         7: (64 * KB, 16 * MB),
         8: (64 * KB, 8 * MB),
     }
-    # That stall needs kernel arguments in host memory (the cookbook's
-    # HIP_FORCE_DEV_KERNARG=0). With HIP_FORCE_DEV_KERNARG=1 the kernels after
-    # a 2shot_push run at full speed, so TP2/4/8 take 2shot_push to the last
-    # size it wins back to back. 1shot_push also serves decode further, to the
-    # last size it wins in CUDA graphs with a late rank or a GEMM before it
-    # (768 KB at TP8, every decode size at TP2/4): DeepSeek-V4-Flash decode
-    # gains about 2-4% at TP4/TP8.
+    # That stall needs kernel arguments in host memory (HIP_FORCE_DEV_KERNARG
+    # unset or 0). With HIP_FORCE_DEV_KERNARG=1 the kernels after a 2shot_push
+    # run at full speed, so TP2/4/8 take 2shot_push to the last size it wins
+    # back to back. 1shot_push also serves decode further, to the last size it
+    # wins in CUDA graphs with a late rank (768 KB at TP8, also with a GEMM
+    # before it; 1 MB at TP2/4: at 2 MB 2shot_push wins back to back and with a
+    # late rank).
     if dev_kernarg:
         cutoffs.update(
-            {2: (2 * MB, 16 * MB), 4: (2 * MB, 32 * MB), 8: (768 * KB, 32 * MB)}
+            {2: (1 * MB, 16 * MB), 4: (1 * MB, 16 * MB), 8: (768 * KB, 32 * MB)}
         )
-    # Where the group is made of DPX pairs, hier_ring_simple takes over from
-    # 2shot_push and ring_simple from these sizes (the table keeps them as the
-    # fallback for other groups). Each SoC then sends 2 * (m - 1) / m of the
-    # tensor across the fabric (m SoCs) instead of 2 * (2m - 1) / 2m: its two
-    # partitions share the SoC's fabric bandwidth, while the pair link is a
-    # separate one. On h13-15 (graph, bf16, median of 3) it beats ring_simple
-    # by 10-17% from 64 MB to 256 MB at TP4 and TP8, and 2shot_push from
-    # 12 MB at TP4 and 20 MB at TP8; only the `=1` rows take it so far.
+    # Where the group is made of partition pairs (both partitions of every
+    # accelerator), hier_ring_simple takes over from 2shot_push and ring_simple
+    # from these sizes; the table keeps them as the fallback for other groups.
+    # An accelerator's partitions share its links to the others, while the
+    # link between them is separate, so splitting every chunk across the pair
+    # cuts what each accelerator sends to the others from 2 * (2m - 1) / 2m of
+    # the tensor (m accelerators) to 2 * (m - 1) / m. Back to back (graph,
+    # bf16, median of 3) it beats ring_simple by 10-17% from 64 MB to 256 MB at
+    # TP4 and TP8, and 2shot_push from 12 MB at TP4 and 20 MB at TP8; only the
+    # `=1` rows take it so far.
     hier_ring_from = {4: 8 * MB + 16, 8: 16 * MB + 16} if dev_kernarg else {}
     configs = {
         ws: config(*cutoff, hier_ring_from.get(ws, 0)) for ws, cutoff in cutoffs.items()
     }
-    # 16 ranks span two DPX hosts in one UALink fabric clique. Tuned there with
-    # and without a late rank: across hosts 2shot_push pays two fabric hops, so
+    if dev_kernarg:
+        # TP8 on partition pairs: hier_2shot_push, tried before hier_ring_simple,
+        # beats 2shot_push by 21% and hier_ring_simple by 14% (10% / 11% with a
+        # late rank) at 16 MB; hier_ring_simple wins from 24 MB
+        tp8 = configs[8].graph._replace(hier_2shot_push=Range(8 * MB + 16, 16 * MB))
+        configs[8] = configs[8]._replace(graph=tp8, eager=tp8)
+    # 16 ranks span two hosts in one fabric clique. Tuned there with and
+    # without a late rank: across hosts 2shot_push pays two fabric hops, so
     # 1shot_push wins to 256 KB, and a block per CU keeps 2shot_push ahead of
-    # RCCL to 64 MB. When every SoC's two DPX partitions are in the group,
+    # RCCL to 64 MB. When both partitions of every accelerator are in the group,
     # hier_2shot_push reduces each pair first, so only half the tensor crosses
-    # the fabric: above 256 KB it beats 2shot_push by 17-31% back to back and
-    # 9-14% with a late rank, so it takes over to 64 MB. ring_simple takes
-    # the sizes above that.
-    # proxy-moe TP16 (h13-14 / h13-15): two-node bench 2026-11-11, ring_simple 1258 us vs RCCL 995 us at 256 MB
-    # (the 8k prefill chunk), tie at 128 MB -> ring_simple starts above SGLANG_OPT_CARV2_TP16_RING_MIN_MB (default
-    # 256; 64 = the upstream row). hier_ring_simple is not measured at TP16 upstream: off unless
-    # SGLANG_OPT_CARV2_TP16_HIER_RING_MIN_MB > 0, then it takes the sizes above that (and above hier_2shot_push).
-    tp16_ring_from = int(os.environ.get("SGLANG_OPT_CARV2_TP16_RING_MIN_MB", "256")) * MB + 16
-    tp16_hier_ring_mb = int(os.environ.get("SGLANG_OPT_CARV2_TP16_HIER_RING_MIN_MB", "0"))
+    # the fabric: above 2 MB it beats 2shot_push by 13-33% back to back, so it
+    # takes over to 64 MB. Up to 2 MB 2shot_push stays: it is 13% faster than
+    # hier with a late rank, as in serving after the MoE, and 7-11% slower
+    # back to back at 512 KB-1 MB. ring_simple takes the sizes above 64 MB.
     tp16 = Heuristic(
         256 * KB,
         0,
         0,
         two_shot_push_threshold=64 * MB,
-        hier_2shot_push=Range(256 * KB, 64 * MB),
-        ring_simple=Range(tp16_ring_from, 4 * 1024 * MB),
-        hier_ring_simple=(
-            Range(max(tp16_hier_ring_mb, 64) * MB + 16, 4 * 1024 * MB)
-            if tp16_hier_ring_mb > 0
-            else Range(0, 0)
-        ),
+        hier_2shot_push=Range(2 * MB + 16, 64 * MB),
+        ring_simple=Range(64 * MB + 16, 4 * 1024 * MB),
     )
-    configs[16] = configs[8]._replace(
-        graph=tp16, eager=tp16, num_push_blocks=min(num_sm, 96)
-    )
+    if dev_kernarg:
+        # Partition pairs at TP16: hier_ring_simple beats ring_simple by 17% at
+        # 128 MB and 7% at 512 MB, also with a late rank, and 2shot_push from
+        # 32 MB (21% at 64 MB). hier_2shot_push is tried first and keeps the
+        # sizes it covers, so this takes 32-64 MB only where the default
+        # max_size caps hier at 32 MB.
+        tp16 = tp16._replace(hier_ring_simple=Range(32 * MB + 16, 4 * 1024 * MB))
+    configs[16] = configs[8]._replace(graph=tp16, eager=tp16, num_push_blocks=num_sm)
     return configs
 
 

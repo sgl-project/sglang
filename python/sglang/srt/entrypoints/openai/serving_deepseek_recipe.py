@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 from sglang.srt.entrypoints.openai.chat_encoding_adapters import (
     ADAPTER_OUTPUT_PARSERS,
+    OPENAI_CHAT_WIRE,
     select_new_output_ids,
     token_output_sse_chunks,
 )
@@ -51,7 +52,11 @@ JSON_RESPONSE_FORMATS = ("json_object", "json_schema")
 class DeepSeekRecipeChatEncodingAdapter:
     # recipe sorts tool results by call order, so images come from its render.
     collects_openai_media = False
-    strict_tool_call_arguments = False  # recipe serializes object arguments itself.
+    # recipe serializes object arguments itself.
+    history_tool_call_arguments = "lenient"
+    renders_response_format = False
+    uncounted_prompt_tokens = 0
+    wire = OPENAI_CHAT_WIRE
 
     def __init__(
         self,
@@ -97,6 +102,9 @@ class DeepSeekRecipeChatEncodingAdapter:
     def output(self) -> Optional[DeepSeekRecipeChatEncodingAdapter]:
         return self if self._token_output else None
 
+    def validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
+        return None
+
     def encode_messages(
         self,
         *,
@@ -126,6 +134,8 @@ class DeepSeekRecipeChatEncodingAdapter:
             "thinking": thinking,
             "continue_final_message": continue_final,
             "response_format": wire.get("response_format"),
+            # Also without request tools: it decides which message-declared tools show.
+            "tool_choice": wire.get("tool_choice"),
         }
         if tools is not None:
             # `model_dump` adds None for unset fields, which recipe renders as values.
@@ -138,7 +148,6 @@ class DeepSeekRecipeChatEncodingAdapter:
                 }
                 for tool in tools
             ]
-            body["tool_choice"] = wire.get("tool_choice")
         body = {key: value for key, value in body.items() if value is not None}
         image_urls = []
         prompt_ids = self._encode(

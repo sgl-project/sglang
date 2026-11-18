@@ -3,6 +3,7 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.cutedsl_kda import (
     cutedsl_fused_sigmoid_gating_kda_update,
 )
@@ -12,17 +13,6 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 from sglang.srt.layers.attention.linear.kernels.state_pool_io import state_pool_indices
 
 logger = logging.getLogger(__name__)
-
-
-def _is_sm10x() -> bool:
-    """True iff on SM10x, the only arch with the tcgen05/TMEM the chunk prefill uses.
-
-    SM120 (desktop Blackwell) lacks tcgen05 despite its larger capability number.
-    """
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major == 10
 
 
 class CuteDSLKDAKernel(LinearAttnKernelBase):
@@ -37,7 +27,8 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
     supports_safe_gate: bool = False
 
     def __init__(self):
-        self.supports_prefill = _is_sm10x()
+        # Only SM10x has the tcgen05/TMEM the chunk prefill uses; SM120 lacks them.
+        self.supports_prefill = current_arch().is_sm(10)
         self._extend_fn: Optional[callable] = None
         self._l2norm_fn: Optional[callable] = None
 

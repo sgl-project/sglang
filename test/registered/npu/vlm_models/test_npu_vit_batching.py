@@ -14,7 +14,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, terminate_and_kill_process_tree
 
-register_npu_ci(est_time=400, suite="full-1-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="full-test-1-npu-a3", nightly=True)
 
 
 class TestNpuViTBatching(DefaultServerBase):
@@ -23,7 +23,7 @@ class TestNpuViTBatching(DefaultServerBase):
     other_args = (
         "--attention-backend ascend --dtype bfloat16 --context-length 8192 "
         "--chunked-prefill-size 512 --max-running-requests 8 "
-        "--mem-fraction-static 0.7 --disable-cuda-graph"
+        "--mem-fraction-static 0.7 --disable-decode-cuda-graph --disable-prefill-cuda-graph"
     ).split()
     server_env = {"ASCEND_USE_FIA": "1", "SGLANG_VIT_ENABLE_CUDA_GRAPH": "1"}
 

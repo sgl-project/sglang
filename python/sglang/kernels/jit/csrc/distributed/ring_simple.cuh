@@ -1,4 +1,4 @@
-// ring_simple, CustomAllReduceV2's ring all-reduce for ROCm gfx1250 (MI450): each
+// ring_simple, CustomAllReduceV2's ring all-reduce for ROCm gfx1250: each
 // chunk goes to the next rank only, through a fixed-size FIFO behind 64-bit
 // counters, in 2 * (world_size - 1) hops per loop. It runs over a ring plane of
 // its own (`RingPlaneObj` below), not over the shared communicator.
@@ -288,7 +288,7 @@ inline constexpr uint32_t kHierCrossWarps = 5;
 static_assert(0 < kHierCrossWarps && kHierCrossWarps < kRingSimpleThreads / device::kWarpThreads);
 
 /// One hier ring's state on one rank, padded to a cache line. Each counter has
-/// one writer: the cross-ring neighbour named, the DPX peer, or this rank.
+/// one writer: the cross-ring neighbour named, the pair peer, or this rank.
 struct alignas(128) HierRingSemaphore {
   uint64_t x_drained;    // cross packets the cross successor drained from this rank
   uint64_t x_ready;      // cross packets the cross predecessor published here
@@ -306,12 +306,12 @@ static_assert(sizeof(HierRingSemaphore) == 128, "must match _SEMAPHORE_BYTES in 
 enum HierFifo : uint32_t { kCrossFifo = 0, kPairInFifo = 1, kPairOutFifo = 2, kNumHierFifos = 3 };
 
 /// Kernel-facing view of a hier ring plane from one rank: its own FIFOs and
-/// semaphores, the cross successor's and the DPX peer's FIFOs, and the
+/// semaphores, the cross successor's and the pair peer's FIFOs, and the
 /// semaphores of the cross neighbours and the peer.
 struct HierRingWorkSpace {
   uint8_t* own;     // [num_rings][kNumHierFifos][num_slots][slot_bytes]
   uint8_t* x_next;  // the cross successor's rows
-  uint8_t* peer;    // the DPX peer's rows
+  uint8_t* peer;    // the pair peer's rows
   HierRingSemaphore* credits;
   HierRingSemaphore* x_prev_credits;
   HierRingSemaphore* x_next_credits;
@@ -324,8 +324,8 @@ struct HierParams {
   const void* __restrict__ input;
   void* __restrict__ output;
   uint32_t num_vecs;
-  uint32_t half;  // this rank's index in its DPX pair: the half its cross ring reduces
-  uint32_t soc;   // this rank's SoC's position in the cross ring
+  uint32_t half;   // this rank's index in its partition pair: the half its cross ring reduces
+  uint32_t accel;  // this rank's accelerator's position in the cross ring
   HierRingWorkSpace ws;
 };
 
@@ -337,20 +337,18 @@ struct HierHop {
   static constexpr bool kStoreOut = kStoreOut_, kSendX = kSendX_, kSendP = kSendP_;
 };
 
-/// ring_simple over DPX pairs: each SoC's two partitions split every chunk in
-/// halves, and half h runs a ring over partition h of every SoC, so each SoC
-/// sends 2 * (m - 1) / m of the tensor across the fabric (m SoCs) instead of
-/// 2 * (2m - 1) / 2m. The pair exchange rides in the same steps: while the ring
-/// reduces, each rank pushes the peer the input chunk the peer reduces next
-/// (pair-in FIFO), and every reduced chunk also goes to the peer (pair-out
-/// FIFO). One loop is 2m - 1 steps; at step s the rank, its peer and every
-/// rank of both rings work on the same chunk index, so each step waits only
-/// on steps before it and on the peer's same step.
+/// ring_simple over partition pairs: the two partitions of each accelerator
+/// split every chunk in halves, and half h runs a ring over partition h of
+/// every accelerator, so each accelerator sends 2 * (m - 1) / m of the tensor
+/// to the others (m accelerators) instead of 2 * (2m - 1) / 2m. The pair exchange rides in the same steps: while the
+/// ring reduces, each rank pushes the peer the input chunk the peer reduces next (pair-in FIFO), and every reduced
+/// chunk also goes to the peer (pair-out FIFO). One loop is 2m - 1 steps; at step s the rank, its peer and every rank
+/// of both rings work on the same chunk index, so each step waits only on steps before it and on the peer's same step.
 template <typename T, uint32_t kCrossSize, bool kUsePDL>
 __global__ __launch_bounds__(kRingSimpleThreads, 1) __attribute__((
     amdgpu_waves_per_eu(1, 2))) void all_reduce_hier_ring_kernel(const __grid_constant__ HierParams params) {
   using namespace device;
-  static_assert(kCrossSize >= 2, "a hier ring needs at least two SoCs");
+  static_assert(kCrossSize >= 2, "a hier ring needs at least two accelerators");
   constexpr uint32_t kVecSize = 16 / (sizeof(T) * 2);
   constexpr uint32_t kNumCross = 2 * (kCrossSize - 1);  // cross packets per loop
   constexpr uint32_t kNumSteps = kNumCross + 1;
@@ -358,7 +356,7 @@ __global__ __launch_bounds__(kRingSimpleThreads, 1) __attribute__((
   using vec_t = AlignedVector<packed_t<T>, kVecSize>;
   const auto& ws = params.ws;
   const auto h = params.half;
-  const auto k = params.soc;
+  const auto k = params.accel;
   const auto num_vecs = params.num_vecs;
   const auto ch = blockIdx.x;
   const auto num_channels = gridDim.x;
@@ -499,7 +497,7 @@ __global__ __launch_bounds__(kRingSimpleThreads, 1) __attribute__((
       return min(chunk_vecs, len - min(len, chunk_off(half, c)));
     };
 
-    // step 0 sends this SoC's own chunk; step 1 + q receives chunk k - 1 - q,
+    // step 0 sends this accelerator's own chunk; step 1 + q receives chunk k - 1 - q,
     // a partial up to the last reducing step kCrossSize - 1, then a reduced one
     const auto chunk_at = [&](uint32_t s) { return s == 0 ? k : (k + 2 * kCrossSize - s) % kCrossSize; };
     // the input chunk the peer reduces at step s, to pair-in packet p
@@ -719,11 +717,11 @@ SGLANG_REGISTER_FFI_REFERENCE_CLASS(RingPlaneRef, RingPlaneObj);
 
 /**
  * \brief Hier ring plane: per rank and ring, a cross, a pair-in and a pair-out
- * FIFO plus one semaphore, over a group made of DPX pairs.
+ * FIFO plus one semaphore, over a group made of partition pairs.
  *
  * Each rank holds `[num_rings][3][num_slots][slot_bytes]`. Ranks are group
- * ranks; the caller resolves the DPX peer and the cross-ring neighbours (the
- * same partition of the previous and next SoC). The counters persist across
+ * ranks; the caller resolves the pair peer and the cross-ring neighbours (the
+ * same partition of the previous and next accelerator). The counters persist across
  * launches, so the semaphores MUST be zero-filled before first use.
  *
  * Holds no storage: the caller (Python) owns the tensors and their lifetime.
@@ -738,8 +736,8 @@ struct HierRingPlaneObj : public tvm::ffi::Object {
       uint32_t x_prev,
       uint32_t x_next,
       uint32_t half,
-      uint32_t soc,
-      uint32_t num_socs,
+      uint32_t accel,
+      uint32_t num_accels,
       std::vector<tvm::ffi::TensorView> workspaces,  // world_size * [num_rings][3][num_slots][slot_bytes]
       std::vector<tvm::ffi::TensorView> semaphores)  // world_size * [num_rings][sizeof(HierRingSemaphore)]
       : rank(rank),
@@ -748,8 +746,8 @@ struct HierRingPlaneObj : public tvm::ffi::Object {
         x_prev(x_prev),
         x_next(x_next),
         half(half),
-        soc(soc),
-        num_socs(num_socs),
+        accel(accel),
+        num_accels(num_accels),
         num_rings(),
         num_slots(),
         slot_bytes(),
@@ -759,7 +757,8 @@ struct HierRingPlaneObj : public tvm::ffi::Object {
         << "Invalid world size for a hier ring: " << world_size;
     CHECK_HOST(rank < world_size && peer < world_size && x_prev < world_size && x_next < world_size)
         << "Invalid hier ring ranks";
-    CHECK_HOST(peer != rank && half < 2 && num_socs * 2 == world_size && soc < num_socs) << "Invalid hier ring layout";
+    CHECK_HOST(peer != rank && half < 2 && num_accels * 2 == world_size && accel < num_accels)
+        << "Invalid hier ring layout";
     CHECK_HOST(workspaces.size() == world_size) << "Bad hier ring workspace count";
     CHECK_HOST(semaphores.size() == world_size) << "Bad hier ring semaphore count";
     auto R = SymbolicSize{"num_rings"};
@@ -795,12 +794,12 @@ struct HierRingPlaneObj : public tvm::ffi::Object {
 
   uint32_t rank;
   uint32_t world_size;
-  uint32_t peer;      // the other DPX partition of this rank's SoC
-  uint32_t x_prev;    // the same partition of the previous SoC
-  uint32_t x_next;    // the same partition of the next SoC
-  uint32_t half;      // this rank's index in its pair
-  uint32_t soc;       // this rank's SoC's position in the cross ring
-  uint32_t num_socs;  // cross ring size
+  uint32_t peer;        // the other partition of this rank's accelerator
+  uint32_t x_prev;      // the same partition of the previous accelerator
+  uint32_t x_next;      // the same partition of the next accelerator
+  uint32_t half;        // this rank's index in its pair
+  uint32_t accel;       // this rank's accelerator's position in the cross ring
+  uint32_t num_accels;  // cross ring size
   uint32_t num_rings;
   uint32_t num_slots;
   int64_t slot_bytes;
@@ -845,7 +844,7 @@ inline void register_ring_plane() {
           "__init__")
       .def_ro("rank", &dist::HierRingPlaneObj::rank)
       .def_ro("world_size", &dist::HierRingPlaneObj::world_size)
-      .def_ro("num_socs", &dist::HierRingPlaneObj::num_socs)
+      .def_ro("num_accels", &dist::HierRingPlaneObj::num_accels)
       .def_ro("num_rings", &dist::HierRingPlaneObj::num_rings)
       .def_ro("num_slots", &dist::HierRingPlaneObj::num_slots)
       .def_ro("slot_bytes", &dist::HierRingPlaneObj::slot_bytes);
@@ -890,7 +889,7 @@ struct HierRingSimpleKernel {
   static Tensor run(const host::distributed::HierRingPlaneRef ring_ref, const Tensor in) {
     using namespace host;
     const auto& ring = *ring_ref.get();
-    CHECK_HOST(ring.num_socs == kCrossSize) << ring.num_socs;
+    CHECK_HOST(ring.num_accels == kCrossSize) << ring.num_accels;
     CHECK_HOST(in.IsContiguous() && is_type<T>(in.dtype()) && in.device().device_type == kDLGPU);
     const auto num_elems = in.numel();
     const auto nbytes = static_cast<int64_t>(num_elems * sizeof(T));
@@ -904,7 +903,7 @@ struct HierRingSimpleKernel {
         .output = out.data_ptr(),
         .num_vecs = num_vecs,
         .half = ring.half,
-        .soc = ring.soc,
+        .accel = ring.accel,
         .ws = ring.get_workspace(),
     };
     const auto stream = LaunchKernel::resolve_device(in.device());

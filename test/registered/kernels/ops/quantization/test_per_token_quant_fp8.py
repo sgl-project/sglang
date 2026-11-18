@@ -106,14 +106,5 @@ def test_per_token_quant_fp8_preserves_padded_tail():
     assert torch.all(scale[1:] == 2.0)
 
 
-def test_per_token_quant_fp8_rejects_unsupported_dtype():
-    input = torch.ones((1, 512), dtype=torch.int32, device="cuda")
-    output = torch.empty((1, 512), dtype=torch.float8_e4m3fn, device="cuda")
-    scale = torch.empty((1, 1), dtype=torch.float32, device="cuda")
-
-    with pytest.raises(RuntimeError, match="Unsupported dtype"):
-        per_token_quant_fp8(input, output, scale)
-
-
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

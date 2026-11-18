@@ -39,6 +39,11 @@ def handle_hicache(server_args: Any):
     ):
         raise ValueError("--enable-linker-mla-dedup requires the Mooncake linker.")
     if cfg.enable_unified_cache_external_linker:
+        if cfg.pp_size > 1:
+            raise ValueError(
+                "--enable-unified-cache-external-linker does not support "
+                "pipeline parallelism; use --pp-size 1."
+            )
         if cfg.disable_radix_cache or cfg.radix_cache_backend is not None:
             raise ValueError(
                 "--enable-unified-cache-external-linker requires the default "
@@ -53,6 +58,16 @@ def handle_hicache(server_args: Any):
             raise ValueError(
                 "--enable-unified-cache-external-linker does not use "
                 "--hicache-storage-backend."
+            )
+        if (
+            config is None
+            and cfg.hicache_storage_backend_extra_config
+            and cfg.unified_cache_external_linker_backend in ("mooncake", "mori")
+        ):
+            raise ValueError(
+                "--hicache-storage-backend-extra-config as the external linker "
+                "config was removed in SGLang 1.0; pass the same options as a "
+                "JSON object to --unified-cache-external-linker-config."
             )
         return
 
@@ -138,11 +153,12 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
         raise NotImplementedError(
             "HiCache L3 with DCP does not support buffer_only host memory."
         )
-    if cfg.speculative_algorithm not in (None, "DSPARK"):
+    draft_supported = cfg.speculative_algorithm in (None, "DSPARK", "DFLASH")
+    if not draft_supported and not _dsa_mtp_packs_into_dcp_host(server_args):
         raise NotImplementedError(
-            "HiCache with --dcp-size > 1 only supports DSPARK speculative "
-            "decoding; other draft-model host pools have no DCP index "
-            "translation."
+            "HiCache with --dcp-size > 1 only supports DSPARK and DFLASH "
+            "speculative decoding, or DSA MTP on ROCm; other draft-model host "
+            "pools have no DCP index translation."
         )
     if cfg.enable_lmcache:
         raise NotImplementedError(
@@ -166,6 +182,24 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
         "the transfer boundary (dcp_size=%d).",
         cfg.dcp_size,
     )
+
+
+def _dsa_mtp_packs_into_dcp_host(server_args: Any) -> bool:
+    """A ROCm DSA MTP draft shards its KV like the DCP target, so it packs into
+    the target's host rows and shares their DCP translation.
+
+    Only an argument-level screen: `_build_hicache_draft_plan` picks packed or
+    sidecar from the draft runners and checks the draft pool's real layout."""
+    from sglang.srt.arg_groups.model_override_base import model_config_of
+    from sglang.srt.configs.model_config import dsa_draft_shards_under_dcp
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    cfg = resolving_view(server_args)
+    algo = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
+    if not algo.is_eagle() or algo.is_eagle3():
+        return False
+    hf_config = model_config_of(server_args).hf_config
+    return dsa_draft_shards_under_dcp(hf_config, cfg.dcp_size)
 
 
 def resolve_hicache_key_scheme(server_args: Any):

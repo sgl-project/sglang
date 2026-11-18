@@ -118,7 +118,7 @@ class AllReduceChoice(NamedTuple):
     use_hier: bool = False
     # ring_simple (ROCm gfx1250): RingSimpleAllReduce, not a kernel algo of the
     # shared communicator; ``algo`` is None. With ``use_hier`` too, it is
-    # hier_ring_simple (DPX): HierRingSimpleAllReduce
+    # hier_ring_simple (partition pairs): HierRingSimpleAllReduce
     use_ring: bool = False
 
 
@@ -181,10 +181,10 @@ class CustomAllReduceV2:
                                  config enables it: ROCm gfx1250): two
                                  chunk-sized slices.
         :param hier_ring_simple_buffer_size: bytes per FIFO (cross, pair-in,
-                                 pair-out) of each channel of the DPX ring
+                                 pair-out) of each channel of the ring
                                  all-reduce (``hier_ring_simple``, where the
                                  tuned config enables it and the group is
-                                 made of DPX pairs): two chunk-sized slices.
+                                 made of partition pairs): two chunk-sized slices.
 
         ``SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB`` /
         ``SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB`` take the highest

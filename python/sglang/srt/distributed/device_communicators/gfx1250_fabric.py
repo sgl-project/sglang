@@ -214,19 +214,19 @@ def dpx_pairs(accel_ids: List[Optional[int]]) -> Optional[List[List[int]]]:
     return sorted(socs.values())
 
 
-def soc_ring_order(accel_ids: List[Optional[int]]) -> List[int]:
-    """Ranks in ring order: each SoC's partitions next to each other.
+def accelerator_ring_order(accel_ids: List[Optional[int]]) -> List[int]:
+    """Ranks in ring order: the partitions of each accelerator next to each other.
 
-    ``accel_ids[r]`` is rank r's accelerator ID. SoCs keep the order of their
-    lowest rank, and ranks within a SoC their own order. A missing ID leaves
-    the group order.
+    ``accel_ids[r]`` is rank r's accelerator ID. Accelerators keep the order of
+    their lowest rank, and ranks within one their own order. A missing ID
+    leaves the group order.
     """
     if any(a is None for a in accel_ids):
         return list(range(len(accel_ids)))
-    socs: dict[int, List[int]] = {}
+    accels: dict[int, List[int]] = {}
     for rank, accel_id in enumerate(accel_ids):
-        socs.setdefault(accel_id, []).append(rank)
-    return [rank for ranks in sorted(socs.values()) for rank in ranks]
+        accels.setdefault(accel_id, []).append(rank)
+    return [rank for ranks in sorted(accels.values()) for rank in ranks]
 
 
 def _probe_accel_ids(group: ProcessGroup, device: torch.device) -> List[Optional[int]]:
@@ -250,6 +250,8 @@ def probe_dpx_pairs(
     return dpx_pairs(_probe_accel_ids(group, device))
 
 
-def probe_soc_ring_order(group: ProcessGroup, device: torch.device) -> List[int]:
-    """``soc_ring_order`` of ``group``; collective, every rank gets the same answer."""
-    return soc_ring_order(_probe_accel_ids(group, device))
+def probe_accelerator_ring_order(
+    group: ProcessGroup, device: torch.device
+) -> List[int]:
+    """``accelerator_ring_order`` of ``group``; collective, every rank gets the same answer."""
+    return accelerator_ring_order(_probe_accel_ids(group, device))

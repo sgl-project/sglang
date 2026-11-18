@@ -73,10 +73,10 @@ class RingPlane(tvm_ffi.Object):
 
 @lazy_register_class("sgl.distributed.HierRingPlane", _init_ring_plane)
 class HierRingPlane(tvm_ffi.Object):
-    """Hier ring FIFOs over DPX pairs: a symmetric workspace + per-ring semaphores.
+    """Hier ring FIFOs over partition pairs: a symmetric workspace + per-ring semaphores.
 
-    Each SoC's two partitions split every chunk; half h runs a ring over
-    partition h of every SoC, and the pair trades inputs and results through
+    The two partitions of each accelerator split every chunk; half h runs a
+    ring over partition h of every accelerator, and the pair trades inputs and results through
     two more FIFOs. All buffers are owned by the caller; this object only
     validates and records them.
     """
@@ -85,7 +85,7 @@ class HierRingPlane(tvm_ffi.Object):
     if TYPE_CHECKING:
         rank: int
         world_size: int
-        num_socs: int
+        num_accels: int
         num_rings: int
         num_slots: int
         slot_bytes: int
@@ -99,16 +99,17 @@ class HierRingPlane(tvm_ffi.Object):
         x_prev: int,
         x_next: int,
         half: int,
-        soc: int,
-        num_socs: int,
+        accel: int,
+        num_accels: int,
         workspaces: List[torch.Tensor],
         semaphores: List[torch.Tensor],
     ) -> None:
         """
-        :param peer: the other DPX partition of this rank's SoC (group rank).
-        :param x_prev, x_next: the same partition of the previous / next SoC.
+        :param peer: the other partition of this rank's accelerator (group rank).
+        :param x_prev, x_next: the same partition of the previous / next accelerator.
         :param half: this rank's index in its pair; its ring reduces that half.
-        :param soc: this rank's SoC's position in the cross ring of ``num_socs``.
+        :param accel: this rank's accelerator's position in the cross ring of
+                      ``num_accels``.
         :param workspaces: per group rank ``[num_rings, 3, num_slots, slot_bytes]``
                            uint8 views of symmetric memory (cross, pair-in and
                            pair-out FIFOs). ``num_slots`` must be a power of two.
@@ -122,8 +123,8 @@ class HierRingPlane(tvm_ffi.Object):
             x_prev,
             x_next,
             half,
-            soc,
-            num_socs,
+            accel,
+            num_accels,
             workspaces,
             semaphores,
         )
@@ -141,8 +142,8 @@ def get_ring_simple_module(dtype: torch.dtype, world_size: int) -> Module:
 
 
 @cache_once
-def get_hier_ring_simple_module(dtype: torch.dtype, num_socs: int) -> Module:
-    args = make_cpp_args(dtype, num_socs, is_arch_support_pdl())
+def get_hier_ring_simple_module(dtype: torch.dtype, num_accels: int) -> Module:
+    args = make_cpp_args(dtype, num_accels, is_arch_support_pdl())
     return load_jit(
         "hier_ring_simple",
         *args,
@@ -163,7 +164,7 @@ def custom_ring_simple(ring: RingPlane, input: torch.Tensor) -> torch.Tensor:
 @debug_kernel_api
 def custom_hier_ring_simple(ring: HierRingPlane, input: torch.Tensor) -> torch.Tensor:
     """All-reduce ``input`` over the hier ``ring``; returns a new tensor."""
-    result = get_hier_ring_simple_module(input.dtype, ring.num_socs).run(ring, input)
+    result = get_hier_ring_simple_module(input.dtype, ring.num_accels).run(ring, input)
     if isinstance(result, torch.Tensor):
         return result
     return torch.from_dlpack(result)
