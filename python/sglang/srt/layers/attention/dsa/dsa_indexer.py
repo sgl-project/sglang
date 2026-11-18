@@ -216,7 +216,9 @@ def indexer_tp_split_min_rows(cuda_rows: int) -> int:
 # once per process: a missing FlyDSL warns once, not once per layer
 @functools.cache
 def _resolve_hip_prefill_mqa_logits():
-    if envs.SGLANG_USE_FLYDSL_DSA_PREFILL_LOGITS.get():
+    # gfx950: AITER's FlyDSL fp8_mqa_logits instead of Triton; same fp8 inputs and
+    # fp32 accumulation, only the summation order differs
+    if _is_gfx95_supported:
         try:
             from aiter.ops.flydsl import flydsl_fp8_mqa_logits
 

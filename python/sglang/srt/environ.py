@@ -2352,9 +2352,6 @@ class Envs:
     # and top-k across the attention-TP ranks and all-gather the top-k.
     # Unset picks the platform default (1024 on CUDA, 64 on ROCm).
     SGLANG_OPT_DSA_INDEXER_TP_SPLIT_MIN_ROWS = EnvInt(None)
-    # ROCm prefill indexer logits: aiter FlyDSL fp8_mqa_logits instead of Triton;
-    # same fp8 inputs and fp32 accumulation, only the summation order differs.
-    SGLANG_USE_FLYDSL_DSA_PREFILL_LOGITS = EnvBool(True)
     # aiter paged indexer logits on ROCm: balance the grid over each row's real length
     # (persistent schedule) instead of a fixed split per row. Set 0 for the fixed split.
     SGLANG_DSA_MQA_PERSISTENT_SCHEDULE = EnvBool(True)
