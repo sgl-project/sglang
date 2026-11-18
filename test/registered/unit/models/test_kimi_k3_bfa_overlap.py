@@ -390,7 +390,10 @@ class TestKimiK3BfaOverlap(CustomTestCase):
         owner = SimpleNamespace(
             config=SimpleNamespace(full_attention_layer_ids=[]),
             model=SimpleNamespace(
-                layers=[], output_attn_res_proj=proj, output_attn_res_norm=norm
+                layers=[],
+                output_attn_res_proj=proj,
+                output_attn_res_norm=norm,
+                kda_dwdp=None,
             ),
         )
 
@@ -428,7 +431,8 @@ class TestKimiK3BfaOverlap(CustomTestCase):
             model=SimpleNamespace(
                 layers=[
                     SimpleNamespace(self_attn=attn, use_attn_residuals=False, mlp=None)
-                ]
+                ],
+                kda_dwdp=None,
             ),
         )
         post_load = KimiK3LinearForCausalLM.post_load_weights
