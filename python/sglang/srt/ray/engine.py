@@ -33,6 +33,7 @@ from sglang.srt.entrypoints.engine import (
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import merge_scheduler_info_layouts
 from sglang.srt.ray.scheduler_actor import SchedulerActor
+from sglang.srt.ray.scheduler_monitor import SchedulerActorMonitor
 from sglang.srt.runtime_context import (
     get_parallel,
 )
@@ -46,6 +47,8 @@ class RaySchedulerInitResult(SchedulerInitResult):
     """SchedulerInitResult that also holds Ray actor handles for cleanup."""
 
     scheduler_actors: list = dataclasses.field(default_factory=list)
+    # One ref per scheduler actor's run_event_loop, watched by SchedulerActorMonitor.
+    event_loop_refs: list = dataclasses.field(default_factory=list)
 
 
 def _find_engine_bundle(
@@ -233,6 +236,8 @@ class RayEngine(Engine):
         # Set before super().__init__(): it launches the subprocesses, which need
         # the group to schedule the scheduler actors onto.
         self._placement_group = kwargs.pop("placement_group", None)
+        self._scheduler_monitor: Optional[SchedulerActorMonitor] = None
+        self._scheduler_exit_error: Optional[RuntimeError] = None
         if "log_level" not in kwargs:
             kwargs["log_level"] = "error"
         # Schedulers are separate Ray actors; default to the Ray-backed
@@ -242,9 +247,37 @@ class RayEngine(Engine):
 
             kwargs["stat_loggers"] = build_ray_stat_loggers()
         super().__init__(server_args=ServerArgs(**kwargs))
+        self._scheduler_monitor = SchedulerActorMonitor(
+            event_loop_refs=self._scheduler_init_result.event_loop_refs,
+            on_exit=self._handle_scheduler_exit,
+        )
+        self._scheduler_monitor.start()
+
+    def check_health(self) -> None:
+        """Raise if a scheduler actor died or its event loop exited.
+
+        Non-blocking; callers such as a serving framework's health probe use it
+        to replace the engine.
+        """
+        if self._scheduler_exit_error is not None:
+            raise self._scheduler_exit_error
+
+    def _handle_scheduler_exit(self, error: RuntimeError) -> None:
+        logger.error(f"{error}; failing pending and new requests")
+        self._scheduler_exit_error = error
+        tokenizer_manager = self.tokenizer_manager
+        loop = tokenizer_manager.event_loop
+        if loop is None:
+            # No request has started the handle loop, so none is pending.
+            tokenizer_manager.handle_scheduler_exit(str(error))
+            return
+        # Request events belong to the handle loop and are not thread-safe.
+        loop.call_soon_threadsafe(tokenizer_manager.handle_scheduler_exit, str(error))
 
     def shutdown(self):
         """Shutdown the engine — kill Ray scheduler actors then local processes."""
+        if self._scheduler_monitor is not None:
+            self._scheduler_monitor.stop()
         for actor in self._scheduler_init_result.scheduler_actors:
             try:
                 ray.kill(actor)
@@ -416,6 +449,7 @@ class RayEngine(Engine):
                     scheduler_infos=scheduler_infos,
                     block_until_scheduler_exits=block_until_scheduler_exits,
                     scheduler_actors=scheduler_actors,
+                    event_loop_refs=event_loop_refs,
                 ),
                 None,
             )
@@ -499,4 +533,5 @@ class RayEngine(Engine):
             scheduler_infos=scheduler_infos,
             block_until_scheduler_exits=block_until_scheduler_exits,
             scheduler_actors=controller.scheduler_actors,
+            event_loop_refs=event_loop_refs,
         )

@@ -40,6 +40,7 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
+    ServerStatus,
     TokenizerManager,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import (  # noqa: E402
@@ -423,6 +424,48 @@ class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
                 await anext(stream)
         request.is_disconnected.assert_awaited_once()
         self.tm.abort_request.assert_called_once_with(self.state.obj.rid)
+
+
+class TestSchedulerExit(unittest.IsolatedAsyncioTestCase):
+    """A scheduler the subprocess watchdog cannot see (a Ray actor) has exited.
+
+    Before handle_scheduler_exit, pending and new requests waited forever for
+    outputs the dead scheduler would never send.
+    """
+
+    async def asyncSetUp(self):
+        self.tm = _make_tokenizer_manager(self)
+        self.tm.event_loop = asyncio.get_running_loop()
+        self.tm.request_logger = Mock()
+        self.tm.request_metrics_exporter_manager = Mock()
+        self.tm.request_metrics_exporter_manager.exporter_enabled.return_value = False
+        self.tm.gracefully_exit = False
+        self.tm.server_status = ServerStatus.Up
+
+    async def test_pending_request_fails_with_503(self):
+        state = _make_req_state("pending")
+        state.obj.stream = False
+        self.tm.rid_to_state[state.obj.rid] = state
+        stream = self.tm._wait_one_response(state.obj)
+        pending = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+
+        self.tm.handle_scheduler_exit("SGLang scheduler actor died")
+
+        with self.assertRaises(HTTPException) as ctx:
+            await pending
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertNotIn(state.obj.rid, self.tm.rid_to_state)
+        self.assertFalse(self.tm.is_healthy())
+
+    async def test_new_request_is_rejected_with_503(self):
+        self.tm.handle_scheduler_exit("SGLang scheduler actor died")
+
+        obj = GenerateReqInput(rid="new", input_ids=[1, 2])
+        with self.assertRaises(HTTPException) as ctx:
+            await anext(self.tm.generate_request(obj))
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(self.tm.rid_to_state, {})
 
 
 class TestRidToStateCleanupOnAbort(CustomTestCase):

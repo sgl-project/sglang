@@ -575,6 +575,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     # which own no server. Class-level to leave the frozen __init__ alone.
     _server_stop_hook: Optional[Callable[[], None]] = None
     _engine_state_changed_callback: Optional[Callable[[], None]] = None
+    # Set by handle_scheduler_exit; requests are then rejected with 503.
+    scheduler_exit_error: Optional[str] = None
 
     def set_server_stop_hook(self, hook: Callable[[], None]) -> None:
         self._server_stop_hook = hook
@@ -1025,6 +1027,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
+        if self.scheduler_exit_error is not None:
+            raise fastapi.HTTPException(
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                detail=self.scheduler_exit_error,
+            )
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
@@ -3855,6 +3862,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def force_exit_handler(self):
         """Put some custom force exit logic here."""
         pass
+
+    def handle_scheduler_exit(self, message: str) -> None:
+        """Fail every pending request with 503 and reject new ones.
+
+        For engines whose schedulers are not child processes of this one, so the
+        subprocess watchdog cannot see them exit. Must run on the handle loop.
+        """
+        self.scheduler_exit_error = message
+        self.server_status = ServerStatus.UnHealthy
+        finished_reason = {
+            "type": "abort",
+            "message": message,
+            "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+        }
+        for rid in list(self.rid_to_state):
+            self._handle_abort_req(AbortReq(rid=rid, finished_reason=finished_reason))
 
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
