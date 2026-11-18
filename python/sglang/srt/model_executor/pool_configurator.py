@@ -190,6 +190,8 @@ def dflash_draft_kv_follows_target_swa(kvc: KVCacheConfigurator) -> bool:
         reasons.append("--enable-unified-memory is set")
     if get_parallel().attn_dcp_size > 1:
         reasons.append("DCP widens the draft id space")
+    if get_disagg().disaggregation_mode != "null":
+        reasons.append("PD transfer addresses the draft KV by full-attention page")
     if reasons:
         logger.warning(
             "SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV ignored: %s", "; ".join(reasons)
