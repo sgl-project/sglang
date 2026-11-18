@@ -13,6 +13,7 @@ def make_paged_case(
     klens=(31, 513, 2063),
     window=-1,
     causal=True,
+    softmax_scale=0.19,
 ):
     torch.manual_seed(42)
     kv_heads = 2
@@ -48,7 +49,7 @@ def make_paged_case(
         seqused_k=lengths,
         max_seqlen_q=max(qlens),
         max_seqlen_k=max(klens),
-        softmax_scale=0.19,
+        softmax_scale=softmax_scale,
         causal=causal,
         window_size=(window, 0 if causal else -1),
         block_table=table,
