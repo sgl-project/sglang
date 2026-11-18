@@ -21,7 +21,7 @@ from sglang.srt.speculative.dflash_draft_ring import (
 )
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=20, stage="base-a-jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=14, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 PAGE = 64
 Q_LEN = 8  # the draft block
