@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Start the Intel XPU CI container (ci_sglang_xpu) using the intel/sglang-dev:latest
+# Start the Intel XPU CI container (default name ci_sglang_xpu) using the intel/sglang-dev:latest
 # image published by .github/workflows/release-docker-intel-xpu-nightly.yml.
 #
 # Pulls the :latest tag and starts a long-running container that subsequent
@@ -89,13 +89,14 @@ fi
 VIDEO_GID=$(getent group video | cut -d: -f3)
 RENDER_GID=$(getent group render | cut -d: -f3)
 
-# Forward ZE_AFFINITY_MASK so each runner pins to its own GPU (else all pile onto L0 dev 0).
-# ONEAPI_DEVICE_SELECTOR keeps SYCL consistent with the L0-filtered device.
+# Forward ZE_AFFINITY_MASK so each runner pins to its own GPU(s) (else all pile onto L0 dev 0).
+# ONEAPI_DEVICE_SELECTOR keeps SYCL consistent with the L0-filtered devices; the
+# mask renumbers them from 0, so level_zero:* exposes exactly the masked cards.
 GPU_AFFINITY_ARGS=()
 if [[ -n "${ZE_AFFINITY_MASK:-}" ]]; then
-  echo "Pinning container to GPU via ZE_AFFINITY_MASK=${ZE_AFFINITY_MASK}"
+  echo "Pinning container to GPU(s) via ZE_AFFINITY_MASK=${ZE_AFFINITY_MASK}"
   GPU_AFFINITY_ARGS+=(-e "ZE_AFFINITY_MASK=${ZE_AFFINITY_MASK}")
-  GPU_AFFINITY_ARGS+=(-e "ONEAPI_DEVICE_SELECTOR=level_zero:0")
+  GPU_AFFINITY_ARGS+=(-e "ONEAPI_DEVICE_SELECTOR=level_zero:*")
 else
   echo "Warning: ZE_AFFINITY_MASK is not set; container will default to GPU 0." >&2
   echo "         Set ZE_AFFINITY_MASK per runner to spread jobs across GPUs." >&2
