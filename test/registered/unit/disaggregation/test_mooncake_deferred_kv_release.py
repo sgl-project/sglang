@@ -18,7 +18,11 @@ from test_deferred_decode_kv_release import (
 )
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import AckTarget, CommonKVManager
+from sglang.srt.disaggregation.common.conn import (
+    AckTarget,
+    CommonKVManager,
+    CommonKVSender,
+)
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, TransferInfo
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -181,6 +185,37 @@ class TestMooncakeAbortNotification(
         self._run_worker(manager, _chunk())
         manager.send_kvcache.assert_called_once()
         manager.conclude_failure.assert_called_once()
+
+    def test_partial_chunk_then_cancel_does_not_strand_shutdown(self):
+        manager = _manager()
+        self._prepare_worker(manager)
+        completed = []
+
+        def after_write(room, record):
+            # Zero remains visible until the worker has finished bookkeeping.
+            self.assertEqual(manager._staging_outstanding[room], 0)
+            self.assertFalse(manager.is_shutdown_quiescent())
+            completed.append(room)
+
+        manager.note_send_finished = after_write
+        queue = MagicMock(get=MagicMock(side_effect=[_chunk(), None]))
+        manager.transfer_worker(queue, MagicMock())
+        self.assertEqual(completed, [ROOM])
+        manager.send_kvcache.assert_called_once()
+        # A non-final chunk must keep its destinations for subsequent chunks.
+        self.assertIn(ROOM, manager.transfer_infos)
+        self.assertNotIn(ROOM, manager._staging_outstanding)
+
+        sender = CommonKVSender.__new__(CommonKVSender)
+        sender.kv_mgr = manager
+        sender.bootstrap_room = ROOM
+        sender.conclude_state = None
+        sender.trace_ctx = MagicMock()
+        sender.abort()
+        sender.clear()
+        self.assertNotIn(ROOM, manager.request_status)
+        self.assertNotIn(ROOM, manager.transfer_infos)
+        self.assertTrue(manager.is_shutdown_quiescent())
 
     def test_failed_send_never_acks_drained(self):
         # batch_transfer_sync can return -1 with the batch still writing, so a

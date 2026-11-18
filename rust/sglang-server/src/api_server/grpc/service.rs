@@ -45,7 +45,7 @@ pub(crate) struct GrpcService {
     core: CoreHandle,
     config: AdapterConfig,
     hicache_manager: Arc<HiCacheManager>,
-    shutdown_admin_key: Option<String>,
+    admin_key: Option<String>,
     shutdown_enabled: bool,
     shutdown_topology_supported: bool,
 }
@@ -57,7 +57,7 @@ impl GrpcService {
         hicache_manager: Arc<HiCacheManager>,
     ) -> Self {
         Self {
-            shutdown_admin_key: server_args.api_keys.admin_api_key.clone(),
+            admin_key: server_args.api_keys.admin_api_key.clone(),
             shutdown_enabled: environ::env_bool("SGLANG_ENABLE_NATIVE_SHUTDOWN_RPC", false),
             // P/D adds a local scheduler quiescence proof, not consensus
             // across PP stages. Unknown PP metadata also fails closed.
@@ -98,7 +98,7 @@ impl GrpcService {
             ..Default::default()
         };
         Self {
-            shutdown_admin_key: Some("sk-admin".into()),
+            admin_key: Some("sk-admin".into()),
             shutdown_enabled: false,
             shutdown_topology_supported: true,
             hicache_manager: Arc::new(HiCacheManager::new(core.clone(), &args)),
@@ -128,6 +128,37 @@ fn response_timeout(secs: u64) -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Authentication must precede any management fan-out. The Shutdown opt-in
+/// permits a configured admin key with native gRPC, so existing management
+/// RPCs must enforce that key too.
+fn require_admin_bearer<T>(request: &Request<T>, key: &str) -> Result<(), Status> {
+    let authorized = request
+        .metadata()
+        .get_all("authorization")
+        .iter()
+        .collect::<Vec<_>>();
+    let token = (authorized.len() == 1)
+        .then(|| authorized[0].to_str().ok())
+        .flatten()
+        .and_then(|value| value.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token);
+    if !key.is_empty()
+        && token.is_some_and(|token| {
+            token.len() == key.len()
+                && token
+                    .bytes()
+                    .zip(key.bytes())
+                    .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+                    == 0
+        })
+    {
+        Ok(())
+    } else {
+        Err(Status::unauthenticated("requires the admin bearer token"))
+    }
+}
+
 #[tonic::async_trait]
 impl SglangService for GrpcService {
     type GenerateStream = ResponseStream<api::GenerateStreamItem>;
@@ -140,33 +171,11 @@ impl SglangService for GrpcService {
             return Err(Status::unimplemented("native Shutdown RPC is disabled"));
         }
         let key = self
-            .shutdown_admin_key
+            .admin_key
             .as_deref()
             .filter(|key| !key.is_empty())
             .ok_or_else(|| Status::failed_precondition("Shutdown requires --admin-api-key"))?;
-        let authorized = request
-            .metadata()
-            .get_all("authorization")
-            .iter()
-            .collect::<Vec<_>>();
-        let token = (authorized.len() == 1)
-            .then(|| authorized[0].to_str().ok())
-            .flatten()
-            .and_then(|value| value.split_once(' '))
-            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
-            .map(|(_, token)| token);
-        if !token.is_some_and(|token| {
-            token.len() == key.len()
-                && token
-                    .bytes()
-                    .zip(key.bytes())
-                    .fold(0u8, |diff, (a, b)| diff | (a ^ b))
-                    == 0
-        }) {
-            return Err(Status::unauthenticated(
-                "Shutdown requires the admin bearer token",
-            ));
-        }
+        require_admin_bearer(&request, key)?;
         if !self.shutdown_topology_supported {
             return Err(Status::unimplemented(
                 "Shutdown requires static-role single-node single-DP serving; P/D also requires TP=PP=1 and a supported transfer-quiescence configuration",
@@ -297,6 +306,9 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::AttachHiCacheStorageRequest>,
     ) -> Result<Response<api::HiCacheStorageResponse>, Status> {
+        if let Some(key) = self.admin_key.as_deref() {
+            require_admin_bearer(&request, key)?;
+        }
         let output = self
             .hicache_manager
             .attach(request.into_inner())
@@ -307,8 +319,11 @@ impl SglangService for GrpcService {
 
     async fn detach_hi_cache_storage(
         &self,
-        _request: Request<api::DetachHiCacheStorageRequest>,
+        request: Request<api::DetachHiCacheStorageRequest>,
     ) -> Result<Response<api::HiCacheStorageResponse>, Status> {
+        if let Some(key) = self.admin_key.as_deref() {
+            require_admin_bearer(&request, key)?;
+        }
         let output = self
             .hicache_manager
             .detach()
@@ -319,8 +334,11 @@ impl SglangService for GrpcService {
 
     async fn clear_hi_cache_storage(
         &self,
-        _request: Request<api::ClearHiCacheStorageRequest>,
+        request: Request<api::ClearHiCacheStorageRequest>,
     ) -> Result<Response<api::HiCacheStorageResponse>, Status> {
+        if let Some(key) = self.admin_key.as_deref() {
+            require_admin_bearer(&request, key)?;
+        }
         let output = self
             .hicache_manager
             .clear()
@@ -362,6 +380,9 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::AbortRequest>,
     ) -> Result<Response<api::AbortResponse>, Status> {
+        if let Some(key) = self.admin_key.as_deref() {
+            require_admin_bearer(&request, key)?;
+        }
         let request = request.into_inner();
         if request.abort_all != request.rid.is_empty() {
             return Err(Status::invalid_argument(
@@ -377,9 +398,8 @@ impl SglangService for GrpcService {
     }
 }
 
-/// `--grpc-port` refuses `--admin-api-key` at startup, so a gRPC server never
-/// has the admin key attach and detach require; HTTP's Python message, which
-/// says to restart with one, would point gRPC callers at a refused flag.
+/// Without the Shutdown opt-in, `--grpc-port` still refuses an admin key.
+/// Attach and detach remain unavailable when no admin key is configured.
 const HICACHE_GRPC_UNAVAILABLE: &str =
     "HiCache attach/detach is not available over gRPC; use the HTTP endpoint with --admin-api-key.";
 
@@ -1335,6 +1355,71 @@ mod tests {
         assert_eq!(probe.request.input_ids.as_deref(), Some(&[0][..]));
     }
 
+    fn bearer_request<T>(body: T, bearers: &[&str]) -> Request<T> {
+        let mut request = Request::new(body);
+        for bearer in bearers {
+            request
+                .metadata_mut()
+                .append("authorization", bearer.parse().unwrap());
+        }
+        request
+    }
+
+    fn admin_request<T>(body: T) -> Request<T> {
+        bearer_request(body, &["Bearer sk-admin"])
+    }
+
+    #[tokio::test]
+    async fn management_requires_admin_credentials_before_any_control_intake() {
+        let h = Harness::new(1, false, Duration::from_secs(1));
+        for bearers in [
+            &[][..],
+            &["Bearer wrong"][..],
+            &["Basic sk-admin"][..],
+            &["Bearer sk-admin", "Bearer sk-admin"][..],
+        ] {
+            let attach = h
+                .service
+                .attach_hi_cache_storage(bearer_request(
+                    api::AttachHiCacheStorageRequest::default(),
+                    bearers,
+                ))
+                .await
+                .unwrap_err();
+            let detach = h
+                .service
+                .detach_hi_cache_storage(bearer_request(
+                    api::DetachHiCacheStorageRequest {},
+                    bearers,
+                ))
+                .await
+                .unwrap_err();
+            let clear = h
+                .service
+                .clear_hi_cache_storage(bearer_request(api::ClearHiCacheStorageRequest {}, bearers))
+                .await
+                .unwrap_err();
+            let abort = h
+                .service
+                .abort(bearer_request(
+                    api::AbortRequest {
+                        rid: String::new(),
+                        abort_all: true,
+                    },
+                    bearers,
+                ))
+                .await
+                .unwrap_err();
+            for error in [attach, detach, clear, abort] {
+                assert_eq!(error.code(), Code::Unauthenticated);
+            }
+            // No request reaches the shared core, hence no local or peer
+            // control target can observe an unauthenticated mutation.
+            assert!(h.intake_rx.is_empty());
+            assert!(h.abort_rx.is_empty());
+        }
+    }
+
     /// Check gRPC validation, scheduler results, and the configuration returned by GET.
     #[tokio::test]
     async fn hicache_controls_preserve_results_and_configuration() {
@@ -1352,7 +1437,7 @@ mod tests {
         let refusing = GrpcService {
             core: service.core.clone(),
             config: service.config.clone(),
-            shutdown_admin_key: None,
+            admin_key: None,
             shutdown_enabled: false,
             shutdown_topology_supported: true,
             hicache_manager: Arc::new(HiCacheManager::new(
@@ -1376,9 +1461,28 @@ mod tests {
             assert_eq!(error.message(), super::HICACHE_GRPC_UNAVAILABLE);
         }
         assert!(h.intake_rx.is_empty());
+        let response = hicache_reply(
+            &h,
+            "ClearHiCacheReqInput",
+            true,
+            refusing.clear_hi_cache_storage(Request::new(api::ClearHiCacheStorageRequest {})),
+        )
+        .await;
+        assert!(response.success);
+        assert!(
+            !refusing
+                .abort(Request::new(api::AbortRequest {
+                    rid: "not-active".into(),
+                    abort_all: false,
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .success
+        );
 
         let error = service
-            .attach_hi_cache_storage(Request::new(api::AttachHiCacheStorageRequest::default()))
+            .attach_hi_cache_storage(admin_request(api::AttachHiCacheStorageRequest::default()))
             .await
             .unwrap_err();
         assert_eq!(error.code(), Code::InvalidArgument);
@@ -1389,7 +1493,7 @@ mod tests {
                 &h,
                 "AttachHiCacheStorageReqInput",
                 success,
-                service.attach_hi_cache_storage(Request::new(api::AttachHiCacheStorageRequest {
+                service.attach_hi_cache_storage(admin_request(api::AttachHiCacheStorageRequest {
                     hicache_storage_backend: Some("file".into()),
                     hicache_storage_backend_extra_config_json: Some(r#"{"secret_key":"s"}"#.into()),
                     hicache_write_policy: Some("write_through".into()),
@@ -1414,7 +1518,7 @@ mod tests {
                 &h,
                 "ClearHiCacheReqInput",
                 success,
-                service.clear_hi_cache_storage(Request::new(api::ClearHiCacheStorageRequest {})),
+                service.clear_hi_cache_storage(admin_request(api::ClearHiCacheStorageRequest {})),
             )
             .await;
             assert_eq!(response.success, success);
@@ -1425,7 +1529,7 @@ mod tests {
                 &h,
                 "DetachHiCacheStorageReqInput",
                 success,
-                service.detach_hi_cache_storage(Request::new(api::DetachHiCacheStorageRequest {})),
+                service.detach_hi_cache_storage(admin_request(api::DetachHiCacheStorageRequest {})),
             )
             .await;
             assert_eq!(response.success, success);
@@ -1682,7 +1786,7 @@ mod tests {
         assert!(intake.admission.try_accept());
         let reply = harness
             .service
-            .abort(Request::new(api::AbortRequest {
+            .abort(admin_request(api::AbortRequest {
                 rid: "abort-me".into(),
                 abort_all: false,
             }))
@@ -1697,7 +1801,7 @@ mod tests {
         assert!(
             !harness
                 .service
-                .abort(Request::new(api::AbortRequest {
+                .abort(admin_request(api::AbortRequest {
                     rid: "abort-me".into(),
                     abort_all: false,
                 }))
@@ -1716,7 +1820,7 @@ mod tests {
         for (rid, abort_all) in [("", false), ("ambiguous", true)] {
             let error = harness
                 .service
-                .abort(Request::new(api::AbortRequest {
+                .abort(admin_request(api::AbortRequest {
                     rid: rid.into(),
                     abort_all,
                 }))
@@ -1735,7 +1839,7 @@ mod tests {
         assert!(
             harness
                 .service
-                .abort(Request::new(api::AbortRequest {
+                .abort(admin_request(api::AbortRequest {
                     rid: String::new(),
                     abort_all: true,
                 }))

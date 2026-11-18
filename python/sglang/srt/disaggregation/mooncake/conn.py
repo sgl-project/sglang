@@ -3194,9 +3194,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             if key[0] == kv_chunk.room:
                                 self._staging_ctx.prefetch_requested.discard(key)
                         self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
-                    # Publish worker cleanup last: deferred allocation must not
-                    # acknowledge Success while this worker can still erase
-                    # bookkeeping for a subsequent transfer using the same room.
+                # Publish completion after all worker cleanup, including for a
+                # non-final chunk. Its transfer metadata stays live for the next
+                # chunk, but an idle worker must not leave a zero count that a
+                # later cancellation can strand forever during Shutdown.
+                if self._staging_outstanding.get(kv_chunk.room, 0) <= 0:
                     self._staging_outstanding.pop(kv_chunk.room, None)
 
             except Exception as e:

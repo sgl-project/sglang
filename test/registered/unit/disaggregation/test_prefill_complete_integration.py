@@ -788,6 +788,7 @@ class TestAllocationIntegration(CustomTestCase):
             # The worker has finished writes and decremented its counter, but
             # is still deleting room-indexed state. Force a scheduler poll here.
             self.assertEqual(mgr._staging_outstanding[room], 0)
+            self.assertFalse(mgr.is_shutdown_quiescent())
             self.assertEqual(sender.poll(), KVPoll.Transferring)
             self.flush()
             self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
