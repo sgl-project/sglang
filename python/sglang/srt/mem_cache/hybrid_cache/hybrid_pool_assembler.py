@@ -221,7 +221,7 @@ def build_kv_host_pool(
 
 
 def _split_hicache_size(
-    hicache_size: float, kv_pools: tuple[Any, ...]
+    hicache_size: int, kv_pools: tuple[Any, ...]
 ) -> tuple[float, ...]:
     device_pool_sizes = []
     for kv_pool in kv_pools:
@@ -239,45 +239,36 @@ def _split_hicache_size(
 
 
 def _split_hicache_size_with_mamba(
-    *,
-    hicache_size: float,
-    hicache_mamba_size_gb: Optional[float],
-    kv_pools: tuple[Any, ...],
-    mamba_pool: Any,
+    kv_pools: tuple[Any, ...], mamba_pools: tuple[Any, ...]
 ) -> tuple[float, ...]:
-    if hicache_mamba_size_gb is None:
-        return _split_hicache_size(
-            hicache_size=hicache_size, kv_pools=(*kv_pools, mamba_pool)
+    """--hicache-size shares for each KV pool, then one for the Mamba host pool,
+    which packs every pool in mamba_pools. --hicache-mamba-size pins the Mamba
+    share; otherwise every pool's share follows its device bytes."""
+    hicache_size = get_memory().hicache_size
+    mamba_size = get_memory().hicache_mamba_size
+    if mamba_size == 0:
+        sizes = _split_hicache_size(
+            hicache_size=hicache_size, kv_pools=(*kv_pools, *mamba_pools)
         )
-    kv_host_sizes = _split_hicache_size(
-        hicache_size=hicache_size - hicache_mamba_size_gb, kv_pools=kv_pools
+        return (*sizes[: len(kv_pools)], sum(sizes[len(kv_pools) :]))
+    kv_sizes = _split_hicache_size(
+        hicache_size=hicache_size - mamba_size, kv_pools=kv_pools
     )
-    return (*kv_host_sizes, hicache_mamba_size_gb)
+    return (*kv_sizes, mamba_size)
 
 
 def _require_pinned_mamba_slot(host_pool: MambaPoolHost, *, host_size: float) -> None:
     # Ratio sizing (host_size 0) never carries a pin. Sizing pads every host
     # pool by one slot, so a pin below one slot would still build a 1-slot pool.
-    if host_size <= 0 or get_memory().hicache_mamba_size_gb is None:
+    if host_size <= 0 or get_memory().hicache_mamba_size == 0:
         return
     if host_size * 1e9 >= host_pool.size_per_token:
         return
     raise ValueError(
-        f"--hicache-mamba-size-gb {host_size:g} cannot hold one Mamba state slot, "
+        f"--hicache-mamba-size {host_size:g} cannot hold one Mamba state slot, "
         f"which takes {host_pool.size_per_token / 1e9:.3f} GB across the target "
         "and MTP draft Mamba layers."
     )
-
-
-def _warn_unused_mamba_host_size(host_pool_group: HostPoolGroup) -> None:
-    if (
-        get_memory().hicache_mamba_size_gb is not None
-        and PoolName.MAMBA not in host_pool_group.entry_map
-    ):
-        logger.warning(
-            "--hicache-mamba-size-gb has no effect: this model has no HiCache "
-            "Mamba host pool."
-        )
 
 
 def build_pool_entry(
@@ -1264,10 +1255,7 @@ def build_hybrid_mamba_stack(
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
         kv_host_size, mamba_host_size = _split_hicache_size_with_mamba(
-            hicache_size=get_memory().hicache_size,
-            hicache_mamba_size_gb=get_memory().hicache_mamba_size_gb,
-            kv_pools=(kv_pool,),
-            mamba_pool=mamba_pool,
+            kv_pools=(kv_pool,), mamba_pools=(mamba_pool,)
         )
     index_bytes = _kv_budget_index_bytes(config)
     if index_bytes and kv_host_size is not None:
@@ -1340,10 +1328,7 @@ def build_hybrid_mamba_swa_stack(
     kv_host_size, swa_host_size, mamba_host_size = None, None, 0
     if get_memory().hicache_size > 0:
         kv_host_size, swa_host_size, mamba_host_size = _split_hicache_size_with_mamba(
-            hicache_size=get_memory().hicache_size,
-            hicache_mamba_size_gb=get_memory().hicache_mamba_size_gb,
-            kv_pools=(full_kv_pool, swa_kv_pool),
-            mamba_pool=mamba_pool,
+            kv_pools=(full_kv_pool, swa_kv_pool), mamba_pools=(mamba_pool,)
         )
     host_pool_group = build_hybrid_swa_group(
         page_size=params.page_size,
@@ -2685,7 +2670,6 @@ def attach_hybrid_pool_to_unified_cache(
             _check_device_pools_present(
                 kvcache=kvcache, result=result, strategy=strategy
             )
-        _warn_unused_mamba_host_size(result.host_pool_group)
         _apply_stack_result(cache, kvcache, params, result)
     except Exception:
         logger.exception("attach_hybrid_pool_to_unified_cache failed")

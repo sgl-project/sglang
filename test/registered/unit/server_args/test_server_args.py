@@ -2832,19 +2832,19 @@ class TestHiCacheArgs(CustomTestCase):
 
     def test_hicache_mamba_size_must_leave_a_kv_share(self):
         """A Mamba share must be positive and leave --hicache-size a KV share."""
-        for mamba_size in (192, 250, -1, 0):
+        for mamba_size in (192, 250, -1):
             with self.subTest(mamba_size=mamba_size):
                 with self.assertRaises(ValueError) as context:
                     self._resolve_mamba_size(
                         enable_hierarchical_cache=True,
                         hicache_size=192,
-                        hicache_mamba_size_gb=mamba_size,
+                        hicache_mamba_size=mamba_size,
                     )
                 self.assertIn("must be in (0, --hicache-size)", str(context.exception))
         self._resolve_mamba_size(
             enable_hierarchical_cache=True,
             hicache_size=192,
-            hicache_mamba_size_gb=70.5,
+            hicache_mamba_size=70,
         )
 
     def test_hicache_mamba_size_needs_explicit_hicache_size(self):
@@ -2852,7 +2852,7 @@ class TestHiCacheArgs(CustomTestCase):
         the error must name the missing flag instead of an empty range."""
         with self.assertRaises(ValueError) as context:
             self._resolve_mamba_size(
-                enable_hierarchical_cache=True, hicache_mamba_size_gb=70
+                enable_hierarchical_cache=True, hicache_mamba_size=70
             )
         self.assertIn("explicit --hicache-size", str(context.exception))
 
@@ -2860,7 +2860,7 @@ class TestHiCacheArgs(CustomTestCase):
         """Without HiCache there is no host pool to size, so the flag must not
         be accepted and silently ignored."""
         with self.assertRaises(ValueError) as context:
-            self._resolve_mamba_size(hicache_size=192, hicache_mamba_size_gb=70)
+            self._resolve_mamba_size(hicache_size=192, hicache_mamba_size=70)
         self.assertIn("--enable-hierarchical-cache", str(context.exception))
 
     def test_hicache_mamba_size_rejects_unified_memory(self):
@@ -2870,7 +2870,7 @@ class TestHiCacheArgs(CustomTestCase):
             self._resolve_mamba_size(
                 enable_hierarchical_cache=True,
                 hicache_size=192,
-                hicache_mamba_size_gb=70,
+                hicache_mamba_size=70,
                 enable_unified_memory=True,
             )
         self.assertIn("--enable-unified-memory", str(context.exception))
