@@ -3355,10 +3355,6 @@ class KimiK3LinearModel(nn.Module):
         self.kda_dwdp = None
         dwdp_size = get_parallel().kda_dwdp_size
         if dwdp_size is not None:
-            if self.pp_group.world_size > 1:
-                raise ValueError(
-                    "--kda-dwdp-size does not support pipeline parallelism"
-                )
             num_layers = config.num_hidden_layers
             shard_shared = (
                 _replicates_shared_experts() and (config.num_shared_experts or 0) > 0
