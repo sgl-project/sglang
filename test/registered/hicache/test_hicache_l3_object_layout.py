@@ -72,9 +72,7 @@ def _sidecar(pool_name: PoolName, hit_policy: PoolHitPolicy) -> SidecarPoolSpec:
 class TestHiCacheL3ObjectLayout(CustomTestCase):
     def setUp(self):
         super().setUp()
-        override = get_context().override_server_args(
-            tp_size=1, pp_size=1, dp_size=2, enable_dp_attention=False
-        )
+        override = get_context().override_server_args(tp_size=1, pp_size=1, dp_size=2)
         override.install()
         self.addCleanup(override.restore)
 

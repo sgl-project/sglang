@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=800, suite="full-2-npu-a3", nightly=True)
+register_npu_ci(est_time=800, suite="full-test-2-npu-a3", nightly=True)
 
 TEST_MODEL_MATRIX = {
     DEEPSEEK_CODER_V2_LITE_WEIGHTS_PATH,
@@ -28,7 +28,8 @@ class TestAscendOffloadModes(CustomTestCase):
         cls.url = urlparse(DEFAULT_URL_FOR_TEST)
         cls.common_args = [
             "--trust-remote-code",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
             "--mem-fraction-static",
             0.9,
             "--attention-backend",
