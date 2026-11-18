@@ -8,7 +8,7 @@ from sglang.test.kits.mmmu_vlm_kit import MMMUMultiModelTestBase
 from sglang.test.test_utils import is_in_ci
 
 register_cuda_ci(est_time=510, stage="weekly", runner_config="4-gpu-h100")
-register_amd_ci(est_time=500, suite="nightly-amd-4-gpu", nightly=True)
+register_amd_ci(est_time=500, suite="nightly-test-4-gpu-amd", nightly=True)
 
 MODELS = [
     SimpleNamespace(model="Qwen/Qwen2.5-VL-72B-Instruct", mmmu_accuracy=0.55),
