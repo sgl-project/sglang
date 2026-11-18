@@ -33,15 +33,6 @@ on:
           - gsm8k
           - gpqa_diamond
         default: 'auto'
-      accuracy_variant:
-        description: 'Force the DCP/PCP variant of multi-node accuracy cases. "auto" rotates by the Beijing date recorded at run start.'
-        required: false
-        type: choice
-        options:
-          - auto
-          - dcp
-          - pcp
-        default: 'auto'
   workflow_call:
     inputs:
       ref:
