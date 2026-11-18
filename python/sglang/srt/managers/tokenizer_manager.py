@@ -75,7 +75,6 @@ from sglang.srt.hf_transformers import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
-    resolve_image_processor_backend,
 )
 from sglang.srt.kv_canary.canary_info.tokenizer_manager_hook import (
     CanaryInfoTokenizerManagerHook,
@@ -203,6 +202,7 @@ from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     supports_sampling_mask,
 )
+from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import (
     resolve_watermark_request,
@@ -371,6 +371,9 @@ class ReqState:
     output_token_sampling_logprobs: List[Union[float, List[float]]] = dataclasses.field(
         default_factory=list
     )
+    output_token_sampling_mask_chunks: List[SamplingMaskChunk] = dataclasses.field(
+        default_factory=list
+    )
 
     # Cached flat-format prompt top logprob fields; rebuilt only when more
     # prefill chunks arrive, so streaming decode chunks reuse the payload.
@@ -479,6 +482,61 @@ def _build_flat_top_logprobs_fields_from_arrays(
     fields[f"{side}_top_logprobs_shape"] = [val_arr.shape[0], val_arr.shape[1]]
     fields[f"{side}_top_logprobs_null_prefix"] = null_prefix
     return fields
+
+
+def _build_flat_sampling_mask_fields(
+    chunks: List[SamplingMaskChunk], return_b64: bool
+) -> Dict[str, Any]:
+    """A finished request's sampling masks as flat arrays; base64 if ``return_b64``."""
+    fields: Dict[str, Any] = {
+        "output_token_sampling_mask_length": sum(len(c.lengths) for c in chunks)
+    }
+    for name, attr, dtype in (
+        ("output_token_sampling_mask_flat", "token_ids", np.int32),
+        ("output_token_sampling_mask_row_lengths", "lengths", np.int32),
+        ("output_token_sampling_logprobs_flat", "logprobs", np.float32),
+    ):
+        values = np.concatenate(
+            [np.empty(0, dtype)] + [getattr(c, attr) for c in chunks]
+        )
+        if return_b64:
+            fields[f"{name}_b64"] = pybase64.b64encode(values.tobytes()).decode("utf-8")
+            fields[f"{name}_b64_dtype"] = values.dtype.name
+        else:
+            fields[name] = values.tolist()
+    return fields
+
+
+def _add_sampling_mask_to_meta_info(
+    meta_info: dict,
+    state: ReqState,
+    chunk: Optional[SamplingMaskChunk],
+    finished: bool,
+):
+    if chunk is not None:
+        if state.obj.return_flat_raw_sampling_mask:
+            state.output_token_sampling_mask_chunks.append(chunk)
+        else:
+            masks, logprobs = chunk.to_lists(
+                support_logprobs=state.obj.sampling_logprobs_mode == "support"
+            )
+            state.output_token_sampling_mask.extend(masks)
+            state.output_token_sampling_logprobs.extend(logprobs)
+            meta_info["output_token_sampling_mask"] = state.output_token_sampling_mask
+            meta_info["output_token_sampling_logprobs"] = (
+                state.output_token_sampling_logprobs
+            )
+            meta_info["output_token_sampling_mask_length"] = len(
+                state.output_token_sampling_mask
+            )
+    # Built once on the finished response; streaming is rejected.
+    if state.obj.return_flat_raw_sampling_mask and finished:
+        meta_info.update(
+            _build_flat_sampling_mask_fields(
+                state.output_token_sampling_mask_chunks,
+                return_b64=state.obj.return_flat_raw_sampling_mask_b64,
+            )
+        )
 
 
 class InputFormat(Enum):
@@ -1512,6 +1570,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if obj.sampling_logprobs_mode is not None and not obj.return_sampling_mask:
                 raise ValueError(
                     "sampling_logprobs_mode can only be set when "
+                    "return_sampling_mask=true."
+                )
+            if obj.return_flat_raw_sampling_mask and not obj.return_sampling_mask:
+                raise ValueError(
+                    "return_flat_raw_sampling_mask can only be set when "
                     "return_sampling_mask=true."
                 )
 
@@ -2840,21 +2903,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and state.obj.return_sampling_mask
             ):
                 output_sampling_mask = recv_obj.output_token_sampling_mask
-                if output_sampling_mask is not None:
-                    masks, logprobs = output_sampling_mask[i].to_lists(
-                        support_logprobs=state.obj.sampling_logprobs_mode == "support"
-                    )
-                    state.output_token_sampling_mask.extend(masks)
-                    state.output_token_sampling_logprobs.extend(logprobs)
-                    meta_info["output_token_sampling_mask"] = (
-                        state.output_token_sampling_mask
-                    )
-                    meta_info["output_token_sampling_logprobs"] = (
-                        state.output_token_sampling_logprobs
-                    )
-                    meta_info["output_token_sampling_mask_length"] = len(
-                        state.output_token_sampling_mask
-                    )
+                _add_sampling_mask_to_meta_info(
+                    meta_info,
+                    state,
+                    None if output_sampling_mask is None else output_sampling_mask[i],
+                    finished=recv_obj.finished_reasons[i] is not None,
+                )
 
             if not isinstance(recv_obj, BatchEmbeddingOutput):
                 meta_info.update(
@@ -3834,17 +3888,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "weight_version": self.config_value("weight_version"),
             "e2e_latency": state.time_stats.get_e2e_latency(),
         }
+        is_generate = isinstance(state.obj, GenerateReqInput)
+        is_stream = is_generate and state.obj.stream
+        # The scheduler echoes an abort only for a request that holds no KV
+        # (queued, retracted or mid-chunk), so the routed experts of the tokens
+        # it produced are gone. A non-streaming reply then carries no output
+        # tokens rather than tokens without routed-experts rows.
+        drop_output = is_generate and not is_stream and state.obj.return_routed_experts
         if recv_obj.weight_versions is not None:
             add_weight_versions_to_meta_info(
                 meta_info,
                 recv_obj.weight_versions,
-                num_output_tokens=len(state.output_ids),
+                num_output_tokens=(0 if drop_output else len(state.output_ids)),
             )
         if prefill_spans := recv_obj.prefill_weight_versions:
             meta_info["prefill_weight_versions"] = weight_version_spans_to_json(
                 prefill_spans
             )
-        is_stream = getattr(state.obj, "stream", False)
         if getattr(state.obj, "return_logprob", False):
             self.add_logprob_to_meta_info(
                 meta_info,
@@ -3857,11 +3917,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
         output_ids = state.output_ids
+        text = state.get_text()
+        if drop_output:
+            output_ids, text = [], ""
+            meta_info["routed_experts"] = ""
+            for key in _INCREMENTAL_STREAMING_META_INFO_KEYS:
+                if key in meta_info:
+                    meta_info[key] = []
+            if "output_token_logprobs_length" in meta_info:
+                meta_info["output_token_logprobs_length"] = 0
+            if "output_top_logprobs_shape" in meta_info:
+                meta_info.update(
+                    _build_flat_top_logprobs_fields(
+                        "output",
+                        [],
+                        [],
+                        state.obj.top_logprobs_num,
+                        return_b64=state.obj.return_flat_raw_top_logprobs_b64,
+                    )
+                )
         meta_info["completion_tokens"] = len(output_ids)
         if is_stream and self.incremental_streaming_output:
             output_ids = [output_ids[-1]] if len(output_ids) > 0 else []
         out = {
-            "text": state.get_text(),
+            "text": text,
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
@@ -4285,7 +4364,7 @@ def get_processor_wrapper():
         tokenizer_mode=get_serving().tokenizer_mode,
         trust_remote_code=get_model().trust_remote_code,
         revision=get_model().revision,
-        image_processor_backend=resolve_image_processor_backend(get_mm()),
+        image_processor_backend=get_mm().image_processor_backend,
         tokenizer_backend=get_serving().tokenizer_backend,
         model_name=get_model().model_path,
     )
