@@ -672,6 +672,33 @@ class TestPPUCIDevSailDependencies(CustomTestCase):
                         ["--additions", str(self.wheels / "additions.json")],
                     )
 
+    def test_runtime_summary_accepts_only_nonempty_fully_passing_suites(self):
+        bash = shutil.which("bash")
+        if bash is None and sys.platform == "win32":
+            bash = str(Path(os.environ["ProgramFiles"]) / "Git/bin/bash.exe")
+        if bash is None:
+            self.skipTest("bash is required for the runtime summary test")
+        source = SCRIPT.with_name("build_and_test.sh").read_text()
+        command = source.split("# Require a non-empty suite", 1)[1].splitlines()[1]
+        log = self.wheels / "sanity.log"
+        for summary, accepted in (
+            ("Test Summary: 5/5 passed", True),
+            ("Test Summary: 13/13 passed", True),
+            ("Test Summary: 12/13 passed", False),
+            ("Test Summary: 0/0 passed", False),
+            ("Test Summary: 13/130 passed", False),
+            ("", False),
+        ):
+            with self.subTest(summary=summary):
+                log.write_text(summary + "\n")
+                result = subprocess.run(
+                    [bash, "-c", command],
+                    env={**os.environ, "artifacts": str(self.wheels)},
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 0 if accepted else 1)
+
     def test_wheel_metadata_and_extra_selection_fail_closed(self):
         root = self.write_root()
         self.write_wheel(

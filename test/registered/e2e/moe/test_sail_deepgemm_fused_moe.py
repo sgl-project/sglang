@@ -15,7 +15,7 @@ from sglang.srt.utils.network import get_free_port
 from sglang.test.ci.ci_register import register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_ppu_ci(est_time=560, suite="stage-a-test-1-gpu-ppu")
+register_ppu_ci(est_time=560, suite="extra-test-1-gpu-ppu")
 
 
 class TestSailDeepGemmFusedMoE(CustomTestCase):
