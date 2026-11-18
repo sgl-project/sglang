@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+from dataclasses import dataclass
 from itertools import chain
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
@@ -31,6 +32,10 @@ from sglang.srt.models.minicpmv import MiniCPMV4_6ForConditionalGeneration
 from sglang.srt.multimodal.cache import (
     CONTENT_HASH_PREFIX,
     resolve_multimodal_item_hash,
+)
+from sglang.srt.multimodal.media_artifacts.base import (
+    MediaArtifactCacheMixin,
+    MediaArtifactInput,
 )
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
@@ -304,7 +309,36 @@ class MiniCPMV4_6ImageProcessor:
         }
 
 
-class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
+@dataclass(frozen=True)
+class MiniCPMVImagePreprocessArtifact:
+    """Processor output for one image: NaViT-packed tiles, source patch first."""
+
+    content_digest: str
+    artifact_key: str
+    feature_hash: int
+    pixel_values: Tuple[torch.Tensor, ...]
+    tgt_sizes: Tuple[Tuple[int, int], ...]
+    grid: Tuple[int, int]
+
+    @property
+    def has_feature(self) -> bool:
+        return True
+
+    def cache_value(self) -> "MiniCPMVImagePreprocessArtifact":
+        return self
+
+    def cache_size_items(self):
+        return (
+            self.content_digest,
+            self.artifact_key,
+            self.feature_hash,
+            self.pixel_values,
+            self.tgt_sizes,
+            self.grid,
+        )
+
+
+class MiniCPMV4_6MultimodalProcessor(MediaArtifactCacheMixin, BaseMultimodalProcessor):
     """4.6-only mm processor.
 
     The legacy ``MiniCPMMultimodalProcessor`` stays for 2.6/4.0/4.5 because its
@@ -316,6 +350,8 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
     support_dynamic_frame_expansion = False
     gpu_image_decode = False
     video_image_id = True
+    artifact_modality = Modality.IMAGE
+    auto_mm_preprocess_cache_size_mb = 256
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
@@ -370,6 +406,53 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
             video_token=self.video_token,
             video_token_id=self.video_token_id,
         ).build(_processor)
+
+    def preprocess_fingerprint_payload(self):
+        payload = super().preprocess_fingerprint_payload()
+        # Called from the base constructor, before ``image_processor`` exists.
+        vision_cfg = getattr(self.hf_config, "vision_config", None)
+        patch_size = (
+            getattr(vision_cfg, "patch_size", 14) if vision_cfg is not None else 14
+        )
+        payload["minicpmv"] = {
+            "max_slice_nums": 9,
+            "scale_resolution": 448,
+            "patch_size": patch_size,
+            "slice_mode": True,
+            "downsample_mode": getattr(self.hf_config, "downsample_mode", "16x"),
+            "image_mean": list(IMAGENET_STANDARD_MEAN),
+            "image_std": list(IMAGENET_STANDARD_STD),
+            "rescale_factor": 1.0 / 255.0,
+        }
+        return payload
+
+    def prepare_artifact_batch(
+        self,
+        entries: Sequence[MediaArtifactInput],
+        *,
+        processor=None,
+    ) -> List[MiniCPMVImagePreprocessArtifact]:
+        """Preprocess the cache misses; one artifact per image."""
+        if not entries:
+            return []
+        out = self.image_processor.preprocess([entry.media for entry in entries])
+        artifacts: List[MiniCPMVImagePreprocessArtifact] = []
+        for entry, pixel_values, tgt_sizes, grid in zip(
+            entries, out["pixel_values"], out["tgt_sizes"], out["grids"]
+        ):
+            artifacts.append(
+                MiniCPMVImagePreprocessArtifact(
+                    content_digest=entry.content_digest,
+                    artifact_key=entry.artifact_key,
+                    feature_hash=resolve_multimodal_item_hash(
+                        feature=list(pixel_values), namespace=entry.artifact_key
+                    ),
+                    pixel_values=tuple(pixel_values),
+                    tgt_sizes=tuple(tuple(size) for size in tgt_sizes),
+                    grid=tuple(grid),
+                )
+            )
+        return artifacts
 
     def _token_id(self, token: str):
         try:
@@ -452,9 +535,28 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
 
         # Image: one "frame" per image. Video: per-frame nesting kept so each
         # frame becomes its own ``<image>...</image>`` block in the expansion.
-        img_per_pv, img_per_ts, img_grids = self._preprocess_images(
-            images, image_processor
-        )
+        # Artifacts key on the raw sources, so a hit hashes the submitted bytes
+        # instead of the decoded pixels. Sources that expand to several images
+        # keep the plain path.
+        if (
+            images
+            and len(images) == len(image_data or ())
+            and self.mm_preprocess_cache.enabled
+            and not any(self._is_preprocessed_input(item) for item in image_data or ())
+        ):
+            artifacts = await self.prepare_media_artifacts(
+                image_data,
+                content_hashes=getattr(request_obj, "mm_content_hashes", None),
+            )
+            img_per_pv = [list(artifact.pixel_values) for artifact in artifacts]
+            img_per_ts = [
+                [list(size) for size in artifact.tgt_sizes] for artifact in artifacts
+            ]
+            img_grids = [list(artifact.grid) for artifact in artifacts]
+        else:
+            img_per_pv, img_per_ts, img_grids = self._preprocess_images(
+                images, image_processor
+            )
         vid_per_pv, vid_per_ts, vid_grids = self._preprocess_videos(
             videos, image_processor
         )
