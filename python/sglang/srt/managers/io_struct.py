@@ -423,8 +423,9 @@ class GenerateReqInput:
 
     # Versioned KV-hint envelope, set by a trusted orchestrator after worker
     # selection and never by an application client. Passed through untouched to
-    # the HiCache storage backends, each of which reads only the action types it
-    # implements. Accepts a plain dict from HTTP/gRPC; normalization converts it
+    # HiCache storage backends that opt in via HiCacheStorage.consumes_kv_hints(),
+    # each of which reads only the action types it implements. Other backends
+    # never see it. Accepts a plain dict from HTTP/gRPC; normalization converts it
     # to KvHintsEnvelope. A hint describes one request's prefix, so a batch
     # carries one envelope per request.
     kv_hints: Optional[
