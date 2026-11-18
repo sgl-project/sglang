@@ -112,6 +112,7 @@ from sglang.srt.arg_groups.choices import (  # noqa: F401
     GRAMMAR_BACKEND_CHOICES,
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
     LOAD_FORMAT_CHOICES,
+    LORA_BACKEND_CHOICES,
     MOE_RUNNER_BACKEND_CHOICES,
     MXFP8_MOE_RUNNER_BACKEND_CHOICES,
     QUANTIZATION_CHOICES,
@@ -346,6 +347,7 @@ class ServerArgs:
         "MuseGlimmerForConditionalGeneration",
         "Cosmos3ForConditionalGeneration",
         "Cosmos3EdgeForConditionalGeneration",
+        "Gemma4ForConditionalGeneration",
     )
 
     # The attention-backend allow-list is enforced via
@@ -699,10 +701,17 @@ def _declared_default(name: str):
     )
 
 
-# Credentials -- the access keys and the TLS key's password: no display, log or
-# dump of the configuration carries them.
+# Credentials -- the access keys, the TLS key's password and the HiCache and
+# external-linker storage configs (they can carry storage credentials): no
+# display, log or dump of the configuration carries them.
 SERVER_ARGS_SECRET_FIELD_NAMES = frozenset(
-    {"api_key", "admin_api_key", "ssl_keyfile_password"}
+    {
+        "api_key",
+        "admin_api_key",
+        "ssl_keyfile_password",
+        "hicache_storage_backend_extra_config",
+        "unified_cache_external_linker_config",
+    }
 )
 _REDACTED = "<redacted>"
 

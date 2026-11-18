@@ -3,7 +3,7 @@
 Tests unquantized (bf16) Qwen3 MoE (Qwen/Qwen3-30B-A3B) using a few-shot GSM8K
 completion benchmark on MI35x with aiter enabled (SGLANG_USE_AITER=1).
 
-Registry: nightly-amd-8-gpu-mi35x suite
+Registry: nightly-test-8-gpu-amd-mi35x suite
 """
 
 import ast
@@ -30,7 +30,7 @@ from sglang.utils import download_and_cache_file, read_jsonl
 # Register for AMD CI - MI35x Qwen3 MoE accuracy test (~15 min)
 register_amd_ci(
     est_time=1200,
-    suite="nightly-amd-8-gpu-mi35x",
+    suite="nightly-test-8-gpu-amd-mi35x",
     nightly=True,
     disabled="Older model generation; AMD nightly keeps the latest two per family",
 )

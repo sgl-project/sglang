@@ -502,8 +502,8 @@ fi
 </Tabs>
 
 Launch the router after the prefill and decode services are ready. Use the same node IP addresses as in the worker
-scripts. Client requests go to the router on port 8000; the worker ports are 8810 and 8811, and the prefill bootstrap
-port is 8998.
+scripts. Client requests go to the router on port 8000; the worker ports are 8810 and 8811. The router reads each
+worker's role and the prefill bootstrap port (8998) from the workers themselves.
 
 ```shell
 # ============================================================
@@ -519,15 +519,14 @@ ROUTER_HOST_IP="<your router ip>"
 export no_proxy="127.0.0.1,localhost,${PREFILL_IP},${DECODE_IP},${ROUTER_HOST_IP},${no_proxy:-}"
 export NO_PROXY="$no_proxy"
 
-python3 -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill "http://${PREFILL_IP}:8810" 8998 \
-    --decode "http://${DECODE_IP}:8811" \
+sgl-router \
+    --model-id GLM-5.3-Flash \
+    --no-tokenizer \
+    --worker-urls "http://${PREFILL_IP}:8810" "http://${DECODE_IP}:8811" \
     --host "$ROUTER_HOST_IP" --port 8000 \
     --policy round_robin \
-    --worker-startup-timeout-secs 3600 \
     --request-timeout-secs 7200 \
-    --disable-retries
+    --stale-request-timeout-secs 7200
 ```
 
 ## Functional verification
