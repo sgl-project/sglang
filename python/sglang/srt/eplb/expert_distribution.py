@@ -273,6 +273,8 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             self._disable_all = previous_disable_all
 
     def _on_forward_pass_start(self, forward_batch: ForwardBatch):
+        if self._disable_all:
+            return
         if not self._recording:
             self._record_current_pass = False
             return
@@ -284,6 +286,8 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             gatherer.on_forward_pass_start(forward_batch)
 
     def _on_forward_pass_end(self, forward_pass_id: int, outputs: Dict[str, Any]):
+        if self._disable_all:
+            return
         if not self._recording or not self._record_current_pass:
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
