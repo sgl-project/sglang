@@ -2050,10 +2050,13 @@ class ModelRunner:
         if pool.holds_state_slots and not self.is_draft_worker:
             from sglang.srt.layers.communication import kda_tp
 
-            staging = kda_tp.pd_staging(pool)
-            if staging is not None:
+            if kda_tp.enabled():
+                from sglang.srt.layers.communication.kda_tp.staging import (
+                    mirror_deferred_state_ops,
+                )
+
                 # Head-sharded KDA state: every rank applies every DP rank's ops.
-                staging.mirror_deferred_state_ops(self, forward_batch)
+                mirror_deferred_state_ops(self, forward_batch)
                 return
         if (
             not pool.holds_state_slots

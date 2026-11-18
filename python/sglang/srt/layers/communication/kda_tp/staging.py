@@ -357,53 +357,6 @@ class KdaTpStaging:
             rows_loop=envs.SGLANG_MAMBA_SSM_COMMIT_ROW_LOOP.get(),
         )
 
-    def mirror_deferred_state_ops(self, model_runner, forward_batch) -> None:
-        # Runs on every rank at every target forward start; no-op unless a DP rank extends.
-        modes = getattr(forward_batch, "dp_forward_modes", None)
-        if modes is not None:
-            from sglang.srt.model_executor.forward_mode import ForwardMode
-
-            if not any(
-                ForwardMode(m).is_extend() and not ForwardMode(m).is_target_verify()
-                for m in modes
-            ):
-                return
-        state = model_runner.token_to_kv_pool_allocator.state
-        if state.ckpt_pool is not None:
-            raise NotImplementedError(
-                "KDA TP: int8 mamba checkpoints are not supported"
-            )
-
-        def ids(t):
-            return [] if t is None else [int(x) for x in t.tolist()]
-
-        local = (
-            ids(forward_batch.mamba_clear_indices),
-            ids(forward_batch.mamba_cow_src_indices),
-            ids(forward_batch.mamba_cow_dst_indices),
-        )
-        forward_batch.mamba_clear_indices = None
-        forward_batch.mamba_cow_src_indices = None
-        forward_batch.mamba_cow_dst_indices = None
-        out: List[Optional[tuple]] = [None] * width()
-        torch.distributed.all_gather_object(out, local, group=group().cpu_group)
-        clear = [i for o in out for i in o[0]]
-        src = [i for o in out for i in o[1]]
-        dst = [i for o in out for i in o[2]]
-        dev = state.pool.device
-        # Global slot ids index physical storage directly (no compaction under KDA TP).
-        if clear:
-            state.pool.clear_slots(torch.tensor(clear, dtype=torch.int64, device=dev))
-        if src:
-            from sglang.srt.mem_cache.kv.decl import STATE_PART
-
-            # The copy reads every state layer of the source slot.
-            model_runner.token_to_kv_pool.layer_router.wait_for_part(STATE_PART)
-            state.copy(
-                torch.tensor(src, dtype=torch.int64, device=dev),
-                torch.tensor(dst, dtype=torch.int64, device=dev),
-            )
-
     def admit(self, req_to_token_pool, req) -> bool:
         """Whether a transferred request can join the batch now (its state slot is bound)."""
         if not getattr(req, "kda_tp_lazy_mamba", False) or req.kv.holds_mamba:
@@ -462,3 +415,49 @@ class KdaTpStaging:
             if getattr(req, "kda_tp_staged_slot", None) is not None:
                 self.queue_import(req.kda_tp_staged_slot)
                 req.kda_tp_staged_slot = None
+
+
+def mirror_deferred_state_ops(model_runner, forward_batch) -> None:
+    # Runs on every rank at every target forward start; no-op unless a DP rank extends.
+    modes = getattr(forward_batch, "dp_forward_modes", None)
+    if modes is not None:
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+
+        if not any(
+            ForwardMode(m).is_extend() and not ForwardMode(m).is_target_verify()
+            for m in modes
+        ):
+            return
+    state = model_runner.token_to_kv_pool_allocator.state
+    if state.ckpt_pool is not None:
+        raise NotImplementedError("KDA TP: int8 mamba checkpoints are not supported")
+
+    def ids(t):
+        return [] if t is None else [int(x) for x in t.tolist()]
+
+    local = (
+        ids(forward_batch.mamba_clear_indices),
+        ids(forward_batch.mamba_cow_src_indices),
+        ids(forward_batch.mamba_cow_dst_indices),
+    )
+    forward_batch.mamba_clear_indices = None
+    forward_batch.mamba_cow_src_indices = None
+    forward_batch.mamba_cow_dst_indices = None
+    out: List[Optional[tuple]] = [None] * width()
+    torch.distributed.all_gather_object(out, local, group=group().cpu_group)
+    clear = [i for o in out for i in o[0]]
+    src = [i for o in out for i in o[1]]
+    dst = [i for o in out for i in o[2]]
+    dev = state.pool.device
+    # Global slot ids index physical storage directly (no compaction under KDA TP).
+    if clear:
+        state.pool.clear_slots(torch.tensor(clear, dtype=torch.int64, device=dev))
+    if src:
+        from sglang.srt.mem_cache.kv.decl import STATE_PART
+
+        # The copy reads every state layer of the source slot.
+        model_runner.token_to_kv_pool.layer_router.wait_for_part(STATE_PART)
+        state.copy(
+            torch.tensor(src, dtype=torch.int64, device=dev),
+            torch.tensor(dst, dtype=torch.int64, device=dev),
+        )
