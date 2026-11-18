@@ -163,7 +163,6 @@ class TestWanNormSiLUPost(CustomTestCase):
             for layout in (torch.contiguous_format, torch.channels_last_3d):
                 x = domain.to(memory_format=layout)
                 gamma = torch.ones((64, 1, 1, 1), device="cuda", dtype=torch.bfloat16)
-                # an FP32 denominator selects the FP32 chain, a BF16 one the BF16 chain
                 for denominator_dtype in {torch.float32, x.dtype}:
                     denominator = torch.ones(
                         (1, 1, *x.shape[2:]), device="cuda", dtype=denominator_dtype

@@ -612,9 +612,8 @@ class CudaVideoEncoder:
             ):
                 assert buffer.tensor is not None
                 copy_stream = torch.cuda.Stream()
-                # A stream synchronize spins a core until the producer's stream
-                # reaches `ready`, which is most of a request for a caller that
-                # keeps generating; a blocking event sleeps through the same wait.
+                # A blocking event lets this thread sleep until the producer
+                # reaches the recorded point.
                 copied = torch.cuda.Event(blocking=True)
                 while (item := self._queue.get()) is not None:
                     chunk, ready = item

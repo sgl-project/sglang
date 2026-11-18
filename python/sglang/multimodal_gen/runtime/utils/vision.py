@@ -279,9 +279,8 @@ def iter_video_frames(
 ) -> Iterator[np.ndarray | PIL.Image.Image]:
     """Yield the frames :func:`load_video` returns, one at a time as they decode.
 
-    A local non-GIF clip yields the decoder's own ``uint8 [H, W, C]`` arrays,
-    the pixels :func:`load_video` wraps in PIL images. URLs and GIFs yield
-    :func:`load_video`'s PIL images.
+    A local non-GIF clip yields the decoder's ``uint8 [H, W, C]`` arrays, and URLs
+    and GIFs yield :func:`load_video`'s PIL images.
     """
     if max_frames is not None and max_frames <= 0:
         raise ValueError(f"max_frames must be positive, got {max_frames}.")
@@ -293,7 +292,6 @@ def iter_video_frames(
 
 
 def rgb_hwc_uint8(frame: np.ndarray | PIL.Image.Image) -> np.ndarray:
-    """A decoded frame as ``uint8 [H, W, 3]`` RGB; the decoder's own array when it already is one."""
     if isinstance(frame, np.ndarray):
         if frame.dtype == np.uint8 and frame.ndim == 3 and frame.shape[2] == 3:
             return frame

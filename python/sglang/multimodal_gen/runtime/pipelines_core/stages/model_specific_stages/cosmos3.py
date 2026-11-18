@@ -2616,7 +2616,6 @@ class Cosmos3DecodingStage(PipelineStage):
 
     @staticmethod
     def _transfer_display_is_composed(batch: Req) -> bool:
-        """Whether ``_compose_transfer_display`` may change the decoded frames."""
         return batch.extra.get("transfer_plan") is not None
 
     @staticmethod

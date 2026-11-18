@@ -1721,17 +1721,14 @@ class AutoencoderKLWan(ParallelTiledVAE):
 
     @staticmethod
     def causal_prefix_frames(latent_frames: int) -> int:
-        """Input frames the cached encode reads for its first ``latent_frames`` latents."""
         return 1 + 4 * (latent_frames - 1)
 
     @cached_vae_encode
     def encode(self, x: torch.Tensor, latent_frames: int | None = None) -> torch.Tensor:
         """``latent_frames`` zero-pads the latent to that length, for a clip cut to a causal prefix.
 
-        The cached encode feeds latent ``i`` only frames up to
-        ``causal_prefix_frames(i + 1)``, so the prefix latents are those of the
-        full clip; padding before ``quant_conv`` keeps its input shape, and
-        with it the conv algorithm, the same as for the full clip.
+        Padding before ``quant_conv`` keeps its input shape, and with it the conv
+        algorithm, the same as for the full clip.
         """
         if self.use_feature_cache:
             self.clear_cache()
