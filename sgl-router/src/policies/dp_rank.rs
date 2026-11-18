@@ -6,7 +6,8 @@
 //! First match wins: a sticky/session key hashes to a fixed rank, so router
 //! replicas agree without shared state; else the rank with the deepest cached
 //! prefix; else [`DpRankPolicy`] picks: the fewest router in-flight requests,
-//! the fewest engine-reported KV tokens, or the worker's ranks in turn.
+//! the fewest engine-reported KV tokens (in use or queued), or the worker's ranks
+//! in turn.
 
 use crate::config::DpRankPolicy;
 use crate::state::load_monitor::engine_reported_load::RankLoad;
@@ -38,7 +39,7 @@ pub fn projected_rank_tokens(worker: &Worker, loads: &[RankLoad]) -> Vec<(u32, u
 }
 
 /// `None` for a single-rank worker. `prefix_depths` is `(rank, cached blocks)`;
-/// `rank_tokens` is `(rank, KV tokens in use)` from the engine's load feed, read
+/// `rank_tokens` is `(rank, committed KV tokens)` from the engine's load feed, read
 /// only under `least_tokens`, and ignored unless it covers every candidate so a
 /// rank with no reading never looks idle.
 pub fn select_dp_rank(

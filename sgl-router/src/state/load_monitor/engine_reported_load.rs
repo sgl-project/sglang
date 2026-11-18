@@ -75,7 +75,9 @@ pub struct EngineReportedWorkerLoad {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RankLoad {
     pub rank: u32,
-    /// KV tokens in use.
+    /// KV tokens the rank has committed: in use, plus the prompt tokens of
+    /// requests it holds but has not allocated for yet (the V4 feed's
+    /// `num_total_tokens`); KV tokens in use alone from an older publisher.
     pub num_tokens: u64,
     /// Requests running or waiting on the rank.
     pub num_reqs: u64,
@@ -595,7 +597,12 @@ impl EngineReportedLoadTable {
             let fresh = now.saturating_duration_since(*at) <= self.freshness;
             let reading = RankLoad {
                 rank: entry.key().1,
-                num_tokens: load.num_tokens,
+                // Queued requests hold no KV yet, so in-use tokens alone make
+                // a rank with a deep queue look lightest.
+                num_tokens: load
+                    .native_cache
+                    .as_ref()
+                    .map_or(load.num_tokens, |native| native.num_total_tokens),
                 num_reqs: load.num_running_reqs.saturating_add(load.num_waiting_reqs),
                 at: *at,
             };
@@ -760,6 +767,20 @@ mod tests {
         t.set("http://w:30000", 2, load(3, 2), later);
         let rank_2 = t.fresh_rank_loads("http://w:30000", later).unwrap()[2];
         assert_eq!((rank_2.num_reqs, rank_2.at), (5, later));
+        // A V4 publisher's total (in use plus queued prompts) replaces in use.
+        let native = NativeCacheRankLoad {
+            num_waiting_uncached_tokens: 0,
+            num_total_tokens: 900,
+            max_running_requests: 8,
+            total_prefill_uncached_tokens: 0,
+            total_prefill_busy_us: 0,
+        };
+        let total = LoadStat {
+            native_cache: Some(native),
+            ..with_tokens(700)
+        };
+        t.set("http://w:30000", 0, total, later);
+        assert_eq!(tokens(later).unwrap()[0], (0, 900));
     }
 
     #[test]
