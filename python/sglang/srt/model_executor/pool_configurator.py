@@ -322,6 +322,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     budget_options = dict(
                         model_config=kvc.model_config,
                         request_rows=max_running_requests_per_worker + extra_rows + 1,
+                        resident_rows=(
+                            max_running_requests_per_worker + 1
+                            if disagg.disaggregation_mode == "decode"
+                            and not disagg.enable_pd_role_switch
+                            and extra_rows > 0
+                            else max_running_requests_per_worker + extra_rows + 1
+                        ),
                         context_len=kvc.model_config.context_len
                         + get_req_to_token_extra_context_len(),
                         top_k=get_sparsity_driven_kv_offload_sparse_context_len(

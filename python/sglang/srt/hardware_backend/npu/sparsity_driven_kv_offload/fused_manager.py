@@ -81,13 +81,14 @@ class FusedSparseKVCacheManager:
         self._copy_sfa_operator = load_copy_sfa_operator()
 
         # Allocate exactly the persistent shapes reserved by the plan.
+        self.request_to_resident: Optional[torch.Tensor] = None
         try:
             for name, spec in self.budget.manager_buffers.items():
-                fill_value = (
-                    -1
-                    if name in ("device_slot_map", "resident_begin", "resident_end")
-                    else None
-                )
+                fill_value = None
+                if name in ("device_slot_map", "resident_begin", "resident_end"):
+                    fill_value = -1
+                elif name == "request_to_resident":
+                    fill_value = 0
                 value = (
                     [spec.allocate(self.device, fill_value) for _ in range(spec.count)]
                     if name
@@ -129,9 +130,11 @@ class FusedSparseKVCacheManager:
         )
         # Log allocation metadata once, before any graph capture or forward.
         logger.info(
-            "Sparse split C allocation: capacity=%d layers=%d bytes=%d "
-            "ckv_spec=%s rope_spec=%s",
+            "Sparse split C allocation: capacity=%d resident_rows=%d request_rows=%d "
+            "layers=%d bytes=%d ckv_spec=%s rope_spec=%s",
             self.device_cache_size,
+            self.budget.resident_rows,
+            self.size,
             self.layer_num,
             self.budget.device_kv_bytes,
             self.budget.manager_buffers["device_kv_buffer"],
@@ -177,7 +180,13 @@ class FusedSparseKVCacheManager:
 
         self.lim_adapter = LIMDecodeAdapter(self)
 
-        self._install_req_alloc_hook(req_to_token_pool)
+        if self.request_to_resident is None:
+            self._install_req_alloc_hook(req_to_token_pool)
+        else:
+            self._clear_resident_rows()
+            req_to_token_pool.admit_sparse_resident_rows = self._admit_resident_rows
+            req_to_token_pool.release_sparse_resident_row = self._release_resident_row
+            req_to_token_pool.clear_sparse_resident_rows = self._clear_resident_rows
 
     def _raise_buffer_allocation_error(
         self,
@@ -201,18 +210,57 @@ class FusedSparseKVCacheManager:
         columns = positions.long().clamp(0, self.logical_max_context_len - 1)
         return self.req_to_token_pool.req_to_token[rows, columns].long()
 
-    def reset_requests(self, req_ids: List[int]) -> None:
+    def reset_requests(
+        self, req_ids: List[int], resident_ids: Optional[List[int]] = None
+    ) -> None:
         if not req_ids:
             return
 
-        req_ids_tensor = torch.tensor(
-            req_ids, dtype=torch.long, device=self.device
-        ).contiguous()
-        for layer_idx in range(self.layer_num):
-            self.resident_begin[layer_idx].index_fill_(0, req_ids_tensor, -1)
-            self.resident_end[layer_idx].index_fill_(0, req_ids_tensor, -1)
-            self.device_slot_map[layer_idx].index_fill_(0, req_ids_tensor, -1)
-        self.lim_adapter.reset_requests(req_ids_tensor)
+        req_indices = torch.tensor(req_ids, dtype=torch.long).to(
+            self.device, non_blocking=True
+        )
+        resident_indices = (
+            req_indices
+            if resident_ids is None
+            else torch.tensor(resident_ids, dtype=torch.long).to(
+                self.device, non_blocking=True
+            )
+        )
+        self.resident_begin.index_fill_(1, req_indices, -1)
+        self.resident_end.index_fill_(1, req_indices, -1)
+        for slot_map in self.device_slot_map:
+            slot_map.index_fill_(0, resident_indices, -1)
+        self.lim_adapter.reset_requests(resident_indices)
+
+    def _clear_resident_rows(self) -> None:
+        self._resident_rows_by_request = [0] * self.size
+        self._free_resident_rows = list(range(self.budget.resident_rows - 1, 0, -1))
+
+    def _release_resident_row(self, req_id: int) -> None:
+        resident_id = self._resident_rows_by_request[req_id]
+        if resident_id:
+            self._resident_rows_by_request[req_id] = 0
+            self._free_resident_rows.append(resident_id)
+
+    def _admit_resident_rows(self, req_ids: List[int]) -> None:
+        new_req_ids = [
+            req_id for req_id in req_ids if not self._resident_rows_by_request[req_id]
+        ]
+        if not new_req_ids:
+            return
+        if len(new_req_ids) > len(self._free_resident_rows):
+            raise RuntimeError(
+                "PD decode admitted more requests than resident KV rows."
+            )
+
+        resident_ids = [self._free_resident_rows.pop() for _ in new_req_ids]
+        self.reset_requests(new_req_ids, resident_ids)
+        for req_id, resident_id in zip(new_req_ids, resident_ids):
+            self._resident_rows_by_request[req_id] = resident_id
+        # Admission runs on the consumer stream. Publish released and new rows
+        # together after resetting the reused cache state and before graph replay.
+        mapping = torch.tensor(self._resident_rows_by_request, dtype=torch.int32)
+        self.request_to_resident.copy_(mapping, non_blocking=True)
 
     def copy_sfa_attention(
         self,
@@ -235,7 +283,7 @@ class FusedSparseKVCacheManager:
             source_ids=plan.source_ids,
             valid_rows=plan.valid_rows,
             sparse_rows=plan.sparse_rows,
-            request_slots=plan.request_safe_slots,
+            request_slots=plan.resident_safe_slots,
             actual_seq_lengths_kv=actual_seq_lengths_kv,
             hbm_block_table=self.planner_hbm_block_table[:batch],
             capacity=adapter.capacity,
@@ -287,8 +335,8 @@ class FusedSparseKVCacheManager:
             valid=valid,
             request_slots=plan.request_safe_slots,
             req_to_token=self.req_to_token_pool.req_to_token,
-            resident_begin=self.resident_begin[layer_idx],
-            resident_end=self.resident_end[layer_idx],
+            resident_begin=self.resident_begin[layer_idx, : self.actual_request_rows],
+            resident_end=self.resident_end[layer_idx, : self.actual_request_rows],
             host_token_capacity=self.host_token_capacity,
             dram_rope_dev_ptr=self.rope_dev_ptr_list[layer_idx],
         )

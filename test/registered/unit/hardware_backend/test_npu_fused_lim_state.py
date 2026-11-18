@@ -90,6 +90,26 @@ class TestLIMState(CustomTestCase):
             budget = resolve_sparse_kv_budget(**self.options(max_query_width=width))
             self.assertEqual(budget.cache_tokens, width * 2048)
 
+    def test_compact_resident_budget_preserves_raw_request_geometry(self):
+        options = self.options(resident_rows=3)
+        options.update(request_rows=103, graph_batch_capacity=4)
+        plan = resolve_sparse_kv_budget(**options)
+        self.assertEqual((plan.request_rows, plan.resident_rows), (103, 3))
+        self.assertEqual(plan.batch_capacity, 4)
+        self.assertEqual(plan.manager_buffers["device_kv_buffer"].shape[0], 3)
+        self.assertEqual(plan.manager_buffers["device_rope_buffer"].shape[0], 3)
+        self.assertEqual(plan.manager_buffers["device_slot_map"].shape[0], 4)
+        self.assertEqual(plan.manager_buffers["resident_begin"].shape, (2, 103))
+        self.assertEqual(plan.manager_buffers["resident_end"].shape, (2, 103))
+        self.assertEqual(plan.manager_buffers["request_to_resident"].shape, (103,))
+        self.assertEqual(plan.adapter_buffers["last_prefix"].shape, (2, 4))
+        self.assertEqual(plan.adapter_buffers["resident_safe_slots"].shape, (4,))
+        options["request_rows"] = 3
+        identity = resolve_sparse_kv_budget(**options)
+        self.assertNotIn("request_to_resident", identity.manager_buffers)
+        self.assertEqual(plan.device_kv_bytes, identity.device_kv_bytes)
+        self.assertEqual(plan.batch_capacity, identity.batch_capacity)
+
     def test_optional_prefill_workspace_budget_and_fallback(self):
         base = resolve_sparse_kv_budget(**self.options())
         plan = resolve_sparse_kv_budget(**self.options(prefill_workspace_tokens=129))
@@ -293,6 +313,12 @@ class TestLIMState(CustomTestCase):
             resolve_sparse_kv_budget(**self.options(kv_dtype=torch.float32))
 
     def test_manager_and_adapter_use_same_bound_plan(self):
+        self._check_manager_and_adapter_plan(compact_pd=False)
+
+    def test_pd_resident_rows_reuse_without_changing_request_ids(self):
+        self._check_manager_and_adapter_plan(compact_pd=True)
+
+    def _check_manager_and_adapter_plan(self, *, compact_pd):
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
 
         native_package = ModuleType("sgl_kernel_npu")
@@ -316,7 +342,8 @@ class TestLIMState(CustomTestCase):
             model_config=self.options()["model_config"],
             page_size=128,
             copy_sfa_query_heads=128,
-            request_rows=4,
+            request_rows=6 if compact_pd else 4,
+            resident_rows=3 if compact_pd else None,
             context_len=4097,
             num_layers=2,
             top_k=2048,
@@ -339,8 +366,13 @@ class TestLIMState(CustomTestCase):
         pool.indexer_layer_ids = (1,)
         pool.get_index_k_buffer = Mock(return_value=pool.get_index_k_buffer(0))
         plan.bind_native_pool(pool)
-        req_pool = ReqToTokenPool(2, 4097, "cpu", False)
-        req_pool.req_to_token[2, 4096] = 73
+        if compact_pd:
+            from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
+
+            req_pool = DecodeReqToTokenPool(2, 4097, "cpu", False, pre_alloc_size=3)
+        else:
+            req_pool = ReqToTokenPool(2, 4097, "cpu", False)
+        req_pool.req_to_token[-1, 4096] = 73
         pre, post = ModuleType("pre"), ModuleType("post")
         pre.fused_prepare_lim_metadata = Mock()
         post.prepare_copy_sfa_metadata = Mock()
@@ -393,6 +425,12 @@ class TestLIMState(CustomTestCase):
             manager = fused_manager.FusedSparseKVCacheManager(
                 req_pool, 2048, paged_kv_cache=pool
             )
+        request_ids = [5, 4] if compact_pd else [1, 2]
+        if compact_pd:
+            self.assertEqual(manager.request_to_resident.tolist(), [0] * 6)
+            req_pool.admit_sparse_resident_rows(request_ids)
+            self.assertEqual(manager.request_to_resident.tolist(), [0, 0, 0, 0, 2, 1])
+
         self.assertIs(manager.budget, plan)
         self.assert_buffers_match(manager, plan.manager_buffers)
         self.assert_buffers_match(manager.lim_adapter, plan.adapter_buffers)
@@ -428,7 +466,8 @@ class TestLIMState(CustomTestCase):
 
         self.assertEqual(
             manager.host_source_indices(
-                torch.tensor([3, 99]), torch.tensor([4096, 9999])
+                torch.tensor([req_pool.req_to_token.shape[0] - 1, 99]),
+                torch.tensor([4096, 9999]),
             ).tolist(),
             [73, 73],
         )
@@ -440,6 +479,9 @@ class TestLIMState(CustomTestCase):
 
         def native_lim(*tensors, full_visible=False):
             self.assertEqual(tensors[5].data_ptr(), tensors[6].data_ptr())
+            torch.testing.assert_close(
+                tensors[9], torch.tensor([1, 2], dtype=torch.int32)
+            )
             self.assertEqual(tensors[11].shape, source_values.shape)
             self.assertEqual(tensors[12].shape, slot_values.shape)
             tensors[11].copy_(source_values)
@@ -447,7 +489,8 @@ class TestLIMState(CustomTestCase):
 
         adapter = manager.lim_adapter
         adapter.operator = native_lim
-        adapter.request_safe_slots[:2].copy_(torch.tensor([1, 2]))
+        adapter.request_safe_slots[:2].copy_(torch.tensor(request_ids))
+        adapter.resident_safe_slots[:2].copy_(torch.tensor([1, 2]))
         adapter._pre_next_prefix[:2].zero_()
         adapter._pre_valid[:2].fill_(True)
         adapter._pre_cache_sizes[:2].copy_(torch.tensor([8192, 0]))
@@ -464,7 +507,7 @@ class TestLIMState(CustomTestCase):
                 spec_info=SimpleNamespace(num_tokens_per_req=manager.max_query_width),
                 seq_lens=torch.zeros(2, dtype=torch.int32),
                 positions=torch.arange(rows, dtype=torch.int32),
-                req_pool_indices=torch.tensor([1, 2]),
+                req_pool_indices=torch.tensor(request_ids),
             ),
             layer_id=0,
         )
@@ -500,6 +543,12 @@ class TestLIMState(CustomTestCase):
             torch.testing.assert_close(
                 tensors[14], torch.arange(66, dtype=torch.int32).view(2, 33)
             )
+            torch.testing.assert_close(
+                kwargs["request_slots"], torch.tensor(request_ids, dtype=torch.int32)
+            )
+            self.assertEqual(
+                kwargs["resident_begin"].numel(), req_pool.req_to_token.shape[0]
+            )
             self.assertEqual(tensors[7].ndim, 2)
             self.assertEqual(tensors[8].ndim, 2)
             torch.testing.assert_close(tensors[7], source_values)
@@ -509,6 +558,9 @@ class TestLIMState(CustomTestCase):
         manager._copy_sfa_operator = native_copy_sfa
 
         def prepare_metadata(**kwargs):
+            torch.testing.assert_close(
+                kwargs["request_slots"], torch.tensor([1, 2], dtype=torch.int32)
+            )
             self.assertEqual(
                 kwargs["actual_seq_lengths_kv"].data_ptr(),
                 adapter._pre_lengths.data_ptr(),
@@ -542,6 +594,21 @@ class TestLIMState(CustomTestCase):
         torch.testing.assert_close(
             result, torch.full((rows, 8 * 512), 3, dtype=result.dtype)
         )
+        if compact_pd:
+            manager.device_slot_map[0][1].fill_(7)
+            adapter.last_prefix[:, 1].fill_(12)
+            manager.resident_begin[:, 3].fill_(10)
+            manager.resident_end[:, 3].fill_(11)
+            req_pool.release_sparse_resident_row(
+                1
+            )  # Transfer aborted before admission.
+            req_pool.release_sparse_resident_row(5)
+            req_pool.admit_sparse_resident_rows([3])
+            self.assertEqual(manager.request_to_resident.tolist(), [0, 0, 0, 1, 2, 0])
+            self.assertTrue(manager.device_slot_map[0][1].eq(-1).all())
+            self.assertTrue(adapter.last_prefix[:, 1].eq(-1).all())
+            self.assertTrue(manager.resident_begin[:, 3].eq(-1).all())
+            self.assertTrue(manager.resident_end[:, 3].eq(-1).all())
         # Use the allocated index pages, including their dummy page, rather
         # than reconstructing the physical capacity from a logical size.
         pool.size = 3968

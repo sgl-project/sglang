@@ -223,6 +223,9 @@ class DecodeReqToTokenPool:
 
     # Mirrors ReqToTokenPool.register_on_alloc_rows.
     _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
+    admit_sparse_resident_rows: Optional[Callable[[List[int]], None]] = None
+    release_sparse_resident_row: Optional[Callable[[int], None]] = None
+    clear_sparse_resident_rows: Optional[Callable[[], None]] = None
     # No recurrent state (`ReqToTokenPool.mamba_pool`, `ReqToTokenPool.state`).
     holds_state_slots = False
     state = None
@@ -307,10 +310,14 @@ class DecodeReqToTokenPool:
 
     def free(self, req: Req):
         assert req.kv.holds_kv, "request must have req_pool_idx"
+        if self.release_sparse_resident_row is not None:
+            self.release_sparse_resident_row(req.kv.req_pool_idx)
         self.free_slots.append(req.kv.req_pool_idx)
         req.kv.req_pool_idx = None
 
     def clear(self):
+        if self.clear_sparse_resident_rows is not None:
+            self.clear_sparse_resident_rows()
         self.free_slots = list(range(1, self._alloc_size))
         # req_generation must stay monotonic; see ReqToTokenPool.clear().
 
@@ -3028,6 +3035,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             ListKind.PD_RELEASING, req_of=lambda x: x[0].req
         )
 
+    def num_recv_inflight(self) -> int:
+        # Receiver conclusion is cached by the existing polling path.
+        return sum(
+            not dr.awaiting_publish
+            and dr.pending_metadata is None
+            and dr.kv_receiver is not None
+            and dr.kv_receiver.conclude_state is None
+            for dr in self.queue.items()
+        )
+
     def request_lists(self) -> Dict[ListKind, ReqList]:
         return {
             ListKind.PD_RECEIVING: self.queue,
@@ -3818,6 +3835,7 @@ class SchedulerDisaggregationDecodeMixin:
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
         # Process pending prebuilt batch: output processing + filter + merge
+        new_req_ids = None
         new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
         if new_prebuilt_batch:
             assert self.chunked_req is None
@@ -3826,6 +3844,17 @@ class SchedulerDisaggregationDecodeMixin:
             )
             new_prebuilt_batch.filter_batch()
             if not new_prebuilt_batch.is_empty():
+                admit_rows = getattr(
+                    self.req_to_token_pool, "admit_sparse_resident_rows", None
+                )
+                if admit_rows is not None:
+                    row_ids = [req.kv.req_pool_idx for req in new_prebuilt_batch.reqs]
+                    if self.enable_overlap:
+                        with self.forward_stream_ctx:
+                            admit_rows(row_ids)
+                    else:
+                        admit_rows(row_ids)
+                new_req_ids = {id(req) for req in new_prebuilt_batch.reqs}
                 self.running_reqs.join(new_prebuilt_batch.reqs)
                 if running_batch.is_empty():
                     running_batch = new_prebuilt_batch
@@ -3840,6 +3869,12 @@ class SchedulerDisaggregationDecodeMixin:
         else:
             running_batch = self.update_running_batch(running_batch)
             ret = running_batch if not running_batch.is_empty() else None
+            if ret is not None:
+                ret.num_new_decode_reqs = (
+                    sum(id(req) in new_req_ids for req in ret.reqs)
+                    if new_req_ids
+                    else 0
+                )
 
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
         if ret:

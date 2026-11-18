@@ -1962,6 +1962,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     dp_balance_stats: Optional[DPBalanceStats] = None
     prefill_stats: Optional[PrefillStats] = None
     forward_iter: Optional[int] = None
+    num_new_decode_reqs: int = 0
     launch_ts: Optional[float] = None
     after_idle_gap: bool = False
 
@@ -3506,6 +3507,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dp_balance_stats=self.dp_balance_stats,
             prefill_stats=self.prefill_stats,
             forward_iter=self.forward_iter,
+            num_new_decode_reqs=self.num_new_decode_reqs,
             launch_ts=self.launch_ts,
             after_idle_gap=self.after_idle_gap,
             extend_num_tokens=self.extend_num_tokens,

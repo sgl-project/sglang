@@ -10,6 +10,7 @@ import torch
 
 pytest.importorskip("torch_npu")
 
+from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_attention import (
     forward_fused_sparse_kv_offload,
 )
@@ -71,6 +72,15 @@ class _IndexPool(MLATokenToKVPool):
     ],
 )
 def test_real_manager_mtp_owner_share_lifecycle(graph, heads, query_width, capacity):
+    _run_manager_lifecycle(graph, heads, query_width, capacity)
+
+
+@pytest.mark.parametrize("graph", [False, True])
+def test_real_manager_mtp_compact_pd_lifecycle(graph):
+    _run_manager_lifecycle(graph, 4, 2, 4096, compact_pd=True)
+
+
+def _run_manager_lifecycle(graph, heads, query_width, capacity, compact_pd=False):
     if not torch.npu.is_available():
         pytest.skip("NPU is required")
     device_id = torch.npu.current_device()
@@ -97,9 +107,18 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, heads, query_width, capac
     query = torch.zeros(token_rows, 32, 128, dtype=torch.bfloat16, device=device)
     query[:, :, 0] = 1
     weights = torch.full((token_rows, 32), 1 / 32, dtype=query.dtype, device=device)
-    pool = ReqToTokenPool(2, CONTEXT, "npu", False)
-    pool.req_to_token[1, :CONTEXT] = torch.arange(CONTEXT, device=device)
-    pool.req_to_token[2, :CONTEXT] = torch.arange(CONTEXT, 2 * CONTEXT, device=device)
+    if compact_pd:
+        pool = DecodeReqToTokenPool(2, CONTEXT, "npu", False, pre_alloc_size=4)
+        request_ids = [5, 4, 0]
+    else:
+        pool = ReqToTokenPool(2, CONTEXT, "npu", False)
+        request_ids = [1, 2, 0]
+    pool.req_to_token[request_ids[0], :CONTEXT] = torch.arange(CONTEXT, device=device)
+    pool.req_to_token[request_ids[1], :CONTEXT] = torch.arange(
+        CONTEXT, 2 * CONTEXT, device=device
+    )
+    if compact_pd:
+        pool.req_to_token[6, :CONTEXT] = pool.req_to_token[5, :CONTEXT]
     index_pool = _IndexPool(keys)
     budget = resolve_sparse_kv_budget(
         model_config=SimpleNamespace(
@@ -114,7 +133,8 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, heads, query_width, capac
             ),
         ),
         page_size=128,
-        request_rows=3,
+        request_rows=7 if compact_pd else 3,
+        resident_rows=3,
         graph_batch_capacity=3,
         context_len=CONTEXT,
         cache_tokens=C,
@@ -129,7 +149,7 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, heads, query_width, capac
     inputs = SimpleNamespace(
         batch_size=batch,
         forward_mode=ForwardMode.TARGET_VERIFY,
-        req_pool_indices=torch.tensor([1, 2, 0], dtype=torch.int32, device=device),
+        req_pool_indices=torch.tensor(request_ids, dtype=torch.int32, device=device),
         seq_lens=torch.tensor([L - Q, L - Q, 0], dtype=torch.int32, device=device),
         seq_lens_cpu=torch.tensor([L - Q, L - Q, 0], dtype=torch.int32),
         positions=torch.tensor(
@@ -180,6 +200,17 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, heads, query_width, capac
                 K,
                 paged_kv_cache=index_pool,
             )
+            if compact_pd:
+                pool.admit_sparse_resident_rows([4, 5])
+                assert manager.request_to_resident.cpu().tolist() == [
+                    0,
+                    0,
+                    0,
+                    0,
+                    1,
+                    2,
+                    0,
+                ]
             for i in range(2):
                 for component in (manager.host_k_buffer[i], manager.host_v_buffer[i]):
                     component.copy_(
@@ -227,6 +258,8 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, heads, query_width, capac
             plan, outputs = run()
             torch.npu.synchronize()
             assert plan.miss_counts.cpu().tolist() == [C, C, 0]
+            if compact_pd:
+                assert plan.resident_safe_slots.cpu().tolist() == [2, 1, 3]
             if graph:
                 captured = torch.npu.NPUGraph()
                 with torch.npu.graph(captured):
@@ -242,7 +275,21 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, heads, query_width, capac
             torch.npu.synchronize()
             assert plan.miss_counts.cpu().tolist() == [Q, Q, 0]
             # Reusing one request row must cold-fill only that row.
-            manager.reset_requests([1])
+            if compact_pd:
+                pool.release_sparse_resident_row(5)
+                pool.admit_sparse_resident_rows([6])
+                inputs.req_pool_indices[0] = 6
+                assert manager.request_to_resident.cpu().tolist() == [
+                    0,
+                    0,
+                    0,
+                    0,
+                    1,
+                    0,
+                    2,
+                ]
+            else:
+                manager.reset_requests([1])
             for value in fresh:
                 value.add_(1)
             if graph:

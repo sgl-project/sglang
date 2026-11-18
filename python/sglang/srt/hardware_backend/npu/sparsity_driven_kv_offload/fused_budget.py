@@ -61,8 +61,13 @@ class BudgetPlan:
         qk_rope_head_dim: int,
         index_head_dim: int,
         prefill_workspace_tokens: int = 0,
+        resident_rows: int | None = None,
     ) -> None:
+        resident_rows = request_rows if resident_rows is None else resident_rows
+        if not 1 <= resident_rows <= request_rows:
+            raise ValueError("Resident rows must be between 1 and request rows.")
         self.request_rows = request_rows
+        self.resident_rows = resident_rows
         self.context_len = context_len
         self.num_layers = num_layers
         self.top_k = top_k
@@ -78,17 +83,17 @@ class BudgetPlan:
         metadata_dtype = torch.int32
         self.manager_buffers = {
             "device_kv_buffer": BufferSpec(
-                (request_rows, cache_tokens, 1, kv_lora_rank),
+                (resident_rows, cache_tokens, 1, kv_lora_rank),
                 kv_dtype,
                 num_layers,
             ),
             "device_rope_buffer": BufferSpec(
-                (request_rows, cache_tokens, 1, qk_rope_head_dim),
+                (resident_rows, cache_tokens, 1, qk_rope_head_dim),
                 kv_dtype,
                 num_layers,
             ),
             "device_slot_map": BufferSpec(
-                (request_rows + 1, context_len), metadata_dtype, num_layers
+                (resident_rows + 1, context_len), metadata_dtype, num_layers
             ),
             "resident_begin": BufferSpec((num_layers, request_rows), metadata_dtype),
             "resident_end": BufferSpec((num_layers, request_rows), metadata_dtype),
@@ -96,6 +101,10 @@ class BudgetPlan:
                 (batch_capacity, cache_tokens // page_size), metadata_dtype
             ),
         }
+        if resident_rows < request_rows:
+            self.manager_buffers["request_to_resident"] = BufferSpec(
+                (request_rows,), metadata_dtype
+            )
         if prefill_workspace_tokens:
             self.manager_buffers.update(
                 prefill_nope=BufferSpec(
@@ -122,11 +131,12 @@ class BudgetPlan:
             "block_table": BufferSpec(
                 (batch_capacity, context_len // page_size), metadata_dtype
             ),
-            "last_prefix": BufferSpec((num_layers, request_rows + 1), metadata_dtype),
+            "last_prefix": BufferSpec((num_layers, resident_rows + 1), metadata_dtype),
         }
-        # Per batch row: five int32 metadata arrays and two boolean masks (22 bytes).
+        # Per batch row: six int32 metadata arrays and two boolean masks.
         for name in (
             "request_safe_slots",
+            "resident_safe_slots",
             "_pre_lengths",
             "_pre_states",
             "_pre_next_prefix",
@@ -230,6 +240,7 @@ def resolve_sparse_kv_budget(
     max_query_width: int = 1,
     graph_batch_capacity: int = 0,
     prefill_workspace_tokens: int = 0,
+    resident_rows: int | None = None,
 ) -> BudgetPlan:
     """Resolve and validate native persistent allocations before pool sizing."""
     kv_lora_rank = model_config.kv_lora_rank
@@ -255,15 +266,17 @@ def resolve_sparse_kv_budget(
         raise ValueError(
             "Native LIM cache capacity must cover query width * TopK, be <= 32640 and aligned to 128."
         )
+    resident_rows = request_rows if resident_rows is None else resident_rows
     plan_options = dict(
         request_rows=request_rows,
+        resident_rows=resident_rows,
         context_len=ceil_div(context_len, page_size) * page_size,
         num_layers=num_layers,
         top_k=top_k,
         kv_dtype=kv_dtype,
         copy_sfa_query_heads=copy_sfa_query_heads,
         max_query_width=max_query_width,
-        batch_capacity=max(request_rows, graph_batch_capacity),
+        batch_capacity=max(resident_rows, graph_batch_capacity),
         cache_tokens=capacity,
         page_size=page_size,
         kv_lora_rank=kv_lora_rank,

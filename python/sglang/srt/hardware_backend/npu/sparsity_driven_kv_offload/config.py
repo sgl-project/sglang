@@ -183,8 +183,10 @@ def get_sparse_kv_budget(
     top_k: int,
     kv_bytes_per_token: int,
     graph_batch_capacity: Optional[int] = None,
+    resident_rows: Optional[int] = None,
     kv_dtype: torch.dtype = torch.bfloat16,
 ) -> BudgetPlan:
+    resident_rows = request_rows if resident_rows is None else resident_rows
     query_heads = model_config.num_attention_heads // get_parallel().attn_tp_size
     # Native SFA accepts 1..64 or 128 query heads per KV head.
     copy_sfa_query_heads = 128 if 64 < query_heads < 128 else query_heads
@@ -204,13 +206,14 @@ def get_sparse_kv_budget(
         decode = config.decode if config is not None else None
         graph_batch_capacity = 0
         if not graph.disable_cuda_graph:
-            graph_batch_capacity = get_cuda_graph_max_batch_size(request_rows)
+            graph_batch_capacity = get_cuda_graph_max_batch_size(resident_rows)
             if decode is not None and decode.bs:
                 graph_batch_capacity = min(max(decode.bs), graph_batch_capacity)
     return resolve_sparse_kv_budget(
         model_config=model_config,
         page_size=page_size,
         request_rows=request_rows,
+        resident_rows=resident_rows,
         context_len=context_len,
         num_layers=num_layers,
         top_k=top_k,
@@ -222,9 +225,9 @@ def get_sparse_kv_budget(
         max_query_width=get_sparse_kv_max_query_width(),
         copy_sfa_query_heads=copy_sfa_query_heads,
         graph_batch_capacity=max(
-            request_rows,
+            resident_rows,
             graph_batch_capacity,
-            get_eager_max_batch_size(request_rows - 1),
+            get_eager_max_batch_size(resident_rows - 1),
         ),
     )
 

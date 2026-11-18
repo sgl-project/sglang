@@ -15,6 +15,8 @@ def _prepare_kernel(
     src_table_ptr,
     out_table_ptr,
     safe_slot_ptr,
+    resident_slot_ptr,
+    mapping_ptr,
     length_ptr,
     sparse_ptr,
     valid_ptr,
@@ -22,6 +24,8 @@ def _prepare_kernel(
     next_prefix_ptr,
     cache_size_ptr,
     ROWS: tl.constexpr,
+    RESIDENT_ROWS: tl.constexpr,
+    HAS_MAPPING: tl.constexpr,
     CAPACITY: tl.constexpr,
     QUERY_WIDTH: tl.constexpr,
     HAS_POSITIONS: tl.constexpr,
@@ -60,18 +64,31 @@ def _prepare_kernel(
                 )
                 + 1
             )
+        valid_request = (raw_slot > 0) & (raw_slot < ROWS)
+        if HAS_MAPPING:
+            resident_slot = tl.load(
+                mapping_ptr + raw_slot, mask=valid_request, other=0
+            ).to(tl.int64)
+        else:
+            resident_slot = raw_slot
         valid = (
-            (raw_slot > 0) & (raw_slot < ROWS) & (active_length > 0) & (raw_length > 0)
+            valid_request
+            & (resident_slot > 0)
+            & (resident_slot < RESIDENT_ROWS)
+            & (active_length > 0)
+            & (raw_length > 0)
         )
         safe_slot = tl.where(valid, raw_slot, ROWS).to(tl.int32)
+        safe_resident = tl.where(valid, resident_slot, RESIDENT_ROWS).to(tl.int32)
         length = tl.where(valid, raw_length, 0).to(tl.int32)
         sparse = valid & (length >= CAPACITY)
-        previous = tl.load(last_ptr + safe_slot).to(tl.int32)
+        previous = tl.load(last_ptr + safe_resident).to(tl.int32)
         warm = (previous >= 0) & (length >= previous)
         state = tl.where(sparse, tl.where(warm, -1, -2), -3).to(tl.int32)
         next_prefix = tl.where(sparse, length, -1).to(tl.int32)
         cache_size = tl.where(sparse, CAPACITY, 0).to(tl.int32)
         tl.store(safe_slot_ptr + row, safe_slot)
+        tl.store(resident_slot_ptr + row, safe_resident)
         tl.store(length_ptr + row, length)
         tl.store(sparse_ptr + row, sparse)
         tl.store(valid_ptr + row, valid)
@@ -98,6 +115,9 @@ def fused_prepare_lim_metadata(
     request_rows: int,
     query_width: int = 1,
     positions=None,
+    resident_safe_slots=None,
+    request_to_resident=None,
+    resident_rows=None,
 ) -> None:
     """Fill request inputs and source pages; positions supply the actual visible length."""
     batch = seq_lens.numel()
@@ -111,6 +131,8 @@ def fused_prepare_lim_metadata(
         block_table,
         out_block_table,
         safe_slots,
+        resident_safe_slots if resident_safe_slots is not None else safe_slots,
+        request_to_resident if request_to_resident is not None else request_slots,
         lengths,
         sparse_rows,
         valid_rows,
@@ -118,6 +140,8 @@ def fused_prepare_lim_metadata(
         next_prefixes,
         cache_sizes,
         request_rows,
+        resident_rows if resident_rows is not None else request_rows,
+        request_to_resident is not None,
         capacity,
         query_width,
         positions is not None,

@@ -30,6 +30,7 @@ class LIMSelection:
     sparse_rows: torch.Tensor
     valid_rows: torch.Tensor
     request_safe_slots: torch.Tensor
+    resident_safe_slots: torch.Tensor
     query_width: int = 1
 
 
@@ -89,6 +90,9 @@ class LIMDecodeAdapter:
             capacity=self.capacity,
             request_rows=self.rows,
             query_width=width,
+            resident_safe_slots=self.resident_safe_slots[:batch],
+            request_to_resident=manager.request_to_resident,
+            resident_rows=manager.budget.resident_rows,
         )
         sources = self.source_ids[:rows]
         fused_lightning_indexer_manage(
@@ -101,7 +105,7 @@ class LIMDecodeAdapter:
             prefix_lens=self._pre_lengths[:batch],
             cache_sizes=self._pre_cache_sizes[:batch],
             request_state=self._pre_states[:batch],
-            request_slots=self.request_safe_slots[:batch],
+            request_slots=self.resident_safe_slots[:batch],
             slot_pool=manager.device_slot_map[layer_index],
             source_ids=sources,
             device_slots=self.device_slots[:rows],
@@ -113,7 +117,7 @@ class LIMDecodeAdapter:
             full_visible=True,
         )
         self.last_prefix[layer_index].index_copy_(
-            0, self.request_safe_slots[:batch].long(), self._pre_next_prefix[:batch]
+            0, self.resident_safe_slots[:batch].long(), self._pre_next_prefix[:batch]
         )
         return LIMSelection(
             sources,
@@ -125,5 +129,6 @@ class LIMDecodeAdapter:
             self._pre_sparse[:batch],
             self._pre_valid[:batch],
             self.request_safe_slots[:batch],
+            self.resident_safe_slots[:batch],
             width,
         )
