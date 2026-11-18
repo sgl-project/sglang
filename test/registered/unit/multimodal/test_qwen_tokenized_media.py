@@ -123,7 +123,13 @@ TOKEN_TEXT = {
 }
 # Cache identity: legacy keys it by artifact or by feature bytes, token space by
 # feature bytes scoped by the item's grids, so the routes never compare it.
-_CACHE_IDENTITY_ITEM_FIELDS = ("hash", "pad_value", "pad_values", "identity")
+_CACHE_IDENTITY_ITEM_FIELDS = (
+    "hash",
+    "pad_value",
+    "pad_values",
+    "identity",
+    "processor_fingerprint",
+)
 
 
 QwenTokenSpaceCore = TokenSpaceProcessor.for_strategy(QwenTokenSpaceProcessStrategy)
@@ -560,7 +566,7 @@ class TestQwenTokenizedMedia(CustomTestCase):
             mm_process_config={},
             mm_feature_transport="cpu",
             mm_preprocess_cache_size_mb=0,
-            disable_fast_image_processor=True,
+            image_processor_backend="pil",
             mm_processor_worker_num=1,
             enable_token_space_processor=True,
         )

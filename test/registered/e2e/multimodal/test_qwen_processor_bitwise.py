@@ -89,7 +89,13 @@ def _snapshot(value):
 
 # Cache identity: legacy keys it by artifact or by feature bytes, token space by
 # feature bytes scoped by the item's grids, so the routes never compare it.
-_CACHE_IDENTITY_ITEM_FIELDS = ("hash", "pad_value", "pad_values", "identity")
+_CACHE_IDENTITY_ITEM_FIELDS = (
+    "hash",
+    "pad_value",
+    "pad_values",
+    "identity",
+    "processor_fingerprint",
+)
 
 
 def _drop_cache_identity(reference_cases, candidate_cases):
@@ -195,11 +201,11 @@ async def _capture(checkout, manifest_path, route):
     from transformers import Qwen3VLVideoProcessor
 
     import sglang
+    from sglang.srt.hf_transformers import get_config, get_processor
     from sglang.srt.managers.io_struct import GenerateReqInput
     from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
     from sglang.srt.runtime_context import publish, reset_context
     from sglang.srt.server_args import ServerArgs
-    from sglang.srt.utils.hf_transformers import get_config, get_processor
 
     assert Path(sglang.__file__).resolve().is_relative_to(checkout / "python")
     source = _checkout_identity(checkout)
@@ -219,7 +225,6 @@ async def _capture(checkout, manifest_path, route):
         model_impl="sglang",
         trust_remote_code=manifest.get("trust_remote_code", False),
         image_processor_backend=backend,
-        disable_fast_image_processor=backend == "pil",
         mm_feature_transport="cpu",
         mm_preprocess_cache_size_mb=0,
         mm_io_worker_num=1,
@@ -248,7 +253,7 @@ async def _capture(checkout, manifest_path, route):
             register_token_space_models,
             serving_spec_for,
         )
-        from sglang.srt.multimodal.token_space_mm_process.sglang import (
+        from sglang.srt.multimodal.token_space_mm_process.serving_processor import (
             TokenSpaceSGLangProcessor,
         )
 
@@ -469,7 +474,7 @@ def _benchmark_media(directory):
 def _default_benchmark_manifest(directory, case):
     from huggingface_hub import snapshot_download
 
-    from sglang.srt.utils.hf_transformers import get_processor
+    from sglang.srt.hf_transformers import get_processor
 
     checkpoint_id, checkpoint_revision, backend, modalities = DEFAULT_CASES[case]
     checkpoint = snapshot_download(
