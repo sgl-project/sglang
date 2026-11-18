@@ -840,7 +840,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.index_k_scale_dtype = torch.float16
         elif self.indexer_kv_store_mxfp8:
             self.index_k_store_dtype = torch.float8_e4m3fn
-            self.index_k_scale_dtype = torch.uint8
+            self.index_k_scale_dtype = torch.uint8  # e8m0 scale
         else:
             self.index_k_store_dtype = self.store_dtype
             self.index_k_scale_dtype = (
