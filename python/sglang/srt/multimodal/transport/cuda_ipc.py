@@ -266,41 +266,26 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
         target_device = torch.device(f"{_DEVICE_TYPE}:{rebuild_device_idx}")
         cache_key = _normalize_pool_cache_key(pool_handle, rebuild_device_idx)
 
-        if _is_npu:
-            if use_cache:
-                pool_storage = _pool_handle_cache_get_or_open(
-                    cache_key, redirected_handle
-                )
-            else:
-                pool_storage = _open_pooled_storage_uncached(redirected_handle)
-            # set_ initializes the NPUStorageDesc that later NPU ops read;
-            # the storage's DataPtr owns the IPC mapping.
-            pool_tensor = torch.empty(
-                0,
-                dtype=torch.uint8,
-                device=target_device,
-            ).set_(pool_storage)
-            slice_tensor = pool_tensor.as_strided(
-                size=shape,
-                stride=stride,
-                storage_offset=ipc_extra["pool_byte_offset"],
-            )
-            return slice_tensor, pool_storage
-
-        with torch.cuda.device(target_device):
+        with get_device_module().device(target_device):
             if use_cache:
                 storage = _pool_handle_cache_get_or_open(cache_key, redirected_handle)
             else:
                 storage = _open_pooled_storage_uncached(redirected_handle)
-            slice_storage = storage[
-                ipc_extra["pool_byte_offset"] : ipc_extra["pool_byte_offset"]
-                + ipc_extra["nbytes"]
-            ]
-            slice_tensor = torch.empty(0, dtype=dtype, device=target_device).set_(
-                slice_storage,
-                storage_offset=ipc_extra["storage_offset"],
+            # Build a tensor over the complete mapping so NPU storage metadata
+            # is initialized without creating a sliced storage.
+            pool_bytes = torch.empty(0, dtype=torch.uint8, device=target_device).set_(
+                storage
+            )
+            slice_bytes = pool_bytes.narrow(
+                0, ipc_extra["pool_byte_offset"], ipc_extra["nbytes"]
+            )
+            slice_data = slice_bytes.view(dtype)
+            # as_strided takes an absolute offset into the backing storage.
+            slice_tensor = slice_data.as_strided(
                 size=shape,
                 stride=stride,
+                storage_offset=slice_data.storage_offset()
+                + ipc_extra["storage_offset"],
             )
 
         return slice_tensor, storage
