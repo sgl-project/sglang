@@ -86,10 +86,19 @@ def sample_random_requests(
 
         # Download sharegpt if necessary
         if not is_file_valid_json(dataset_path):
-            dataset_path = download_and_cache_hf_file(
-                repo_id=SHAREGPT_REPO_ID,
-                filename=SHAREGPT_FILENAME,
-            )
+            try:
+                dataset_path = download_and_cache_hf_file(
+                    repo_id=SHAREGPT_REPO_ID,
+                    filename=SHAREGPT_FILENAME,
+                )
+            except Exception as exc:
+                exc.add_note(
+                    "The 'random' dataset samples tokens from ShareGPT. "
+                    "Provide a local ShareGPT JSON file with --dataset-path, "
+                    "or use --dataset-name random-ids to generate token IDs "
+                    "without downloading a dataset."
+                )
+                raise
 
         # Load the dataset.
         with open(dataset_path) as f:
