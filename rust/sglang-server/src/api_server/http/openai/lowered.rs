@@ -25,9 +25,10 @@ use super::chat::ChatBody;
 use super::template::RenderedChat;
 use super::{AppState, ChatFormatter};
 use crate::api_server::core::{CoreError, OpenAiRequest, ReceivedAs};
+use crate::api_server::handlers::CoreCall;
 use crate::api_server::http::native_api::{
     GenerateItem, RequestState, RequestTiming, drain_unary_frame, generate_requests,
-    generation_event_stream_with,
+    generation_event_stream_mapped,
 };
 use crate::message::config::ServerArgs;
 use crate::message::request::check_prompt_copies;
@@ -245,7 +246,7 @@ pub(super) async fn chat(
     }
 
     let incremental = state.server_args.incremental_streaming_output;
-    let frames = generation_event_stream_with(calls, incremental, is_batch, python_error_frame);
+    let frames = generation_chat_stream(calls, incremental, is_batch);
     let mut frames = Box::pin(frames);
     // An error before the first frame answers the whole request, as on Python.
     let mut first = Vec::new();
@@ -253,7 +254,7 @@ pub(super) async fn chat(
         let Some(data) = frames.next().await else {
             break;
         };
-        match stream_data(&mut responder, &data) {
+        match data.respond(&mut responder) {
             Ok(events) => first = events,
             Err(reply) => return Some(reply_response(reply)),
         }
@@ -266,7 +267,7 @@ pub(super) async fn chat(
             let Some(data) = frames.next().await else {
                 break;
             };
-            for event in stream_data(&mut responder, &data).unwrap_or_default() {
+            for event in data.respond(&mut responder).unwrap_or_default() {
                 yield Ok(event);
             }
         }
@@ -278,6 +279,41 @@ pub(super) async fn chat(
         )
             .into_response(),
     )
+}
+
+/// Ordinary internal frames stay typed; extensions and stream controls retain
+/// the native JSON path and its schema normalization.
+enum ChatStreamFrame {
+    Response(Box<GenerateResponse>),
+    Json(String),
+}
+
+impl From<String> for ChatStreamFrame {
+    fn from(data: String) -> Self {
+        Self::Json(data)
+    }
+}
+
+impl ChatStreamFrame {
+    fn respond(self, responder: &mut ChatResponder) -> Result<Vec<String>, Reply> {
+        match self {
+            Self::Response(response) => responder.stream_data(Ok(*response)),
+            Self::Json(data) => stream_data(responder, &data),
+        }
+    }
+}
+
+fn generation_chat_stream(
+    calls: Vec<(CoreCall, RequestState)>,
+    incremental: bool,
+    is_batch: bool,
+) -> impl futures::Stream<Item = ChatStreamFrame> {
+    generation_event_stream_mapped(calls, incremental, is_batch, python_error_frame, |frame| {
+        match frame.into_schema_or_json() {
+            Ok(response) => ChatStreamFrame::Response(response),
+            Err(data) => ChatStreamFrame::Json(data),
+        }
+    })
 }
 
 /// A `/generate` item as the processor reads it: a frame, or its error body.
@@ -826,6 +862,277 @@ mod tests {
                 .unwrap();
             let text = String::from_utf8(bytes.to_vec()).unwrap();
             assert!(text.contains(r#""logprob":-0.5"#), "{text}");
+        }
+    }
+
+    async fn stream_values(response: Response) -> Vec<Value> {
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+        text.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect()
+    }
+
+    /// Removing an internal JSON hop must retain its visible float handling.
+    #[tokio::test]
+    async fn streamed_logprobs_preserve_non_finite_values_and_negative_zero() {
+        for incremental in [false, true] {
+            let app = lowered_state_with(
+                ServerArgs {
+                    tokenizer_path: tokenizer_path().into(),
+                    incremental_streaming_output: incremental,
+                    ..Default::default()
+                },
+                |rid| {
+                    let mut item = chunk(rid, "!", true);
+                    let ResponseItem::Done(output) = &mut item else {
+                        unreachable!()
+                    };
+                    output.extras = Some(Box::new(ChunkExtras {
+                        out_lp_val: vec![-0.0],
+                        out_lp_idx: vec![1],
+                        out_lp_txt: vec!["!".into()],
+                        out_top_val: vec![
+                            f32::NEG_INFINITY,
+                            f32::INFINITY,
+                            f32::NAN,
+                            -0.0,
+                            -0.1234567,
+                            -8.9037,
+                        ],
+                        out_top_idx: vec![1; 6],
+                        out_top_lens: vec![6],
+                        out_top_txt: vec!["!".into(); 6],
+                        ..Default::default()
+                    }));
+                    item
+                },
+            );
+            let events = stream_values(
+                post_json(
+                    app,
+                    "/v1/chat/completions",
+                    json!({
+                        "model": "model", "messages": [{"role": "user", "content": "hi"}],
+                        "stream": true, "logprobs": true, "top_logprobs": 6
+                    }),
+                )
+                .await,
+            )
+            .await;
+            let token = events
+                .iter()
+                .find_map(|event| event.pointer("/choices/0/logprobs/content/0"))
+                .expect("one token's logprobs");
+            assert_eq!(token["token"], "!");
+            assert!(token["logprob"].as_f64().unwrap().is_sign_negative());
+            let alternatives = token["top_logprobs"].as_array().unwrap();
+            assert_eq!(alternatives.len(), 6);
+            for alternative in &alternatives[..3] {
+                assert!(alternative["logprob"].is_null());
+            }
+            assert!(
+                alternatives[3]["logprob"]
+                    .as_f64()
+                    .unwrap()
+                    .is_sign_negative()
+            );
+            assert_eq!(
+                alternatives[4]["logprob"].as_f64(),
+                Some(f64::from(-0.1234567_f32))
+            );
+            assert_eq!(
+                alternatives[5]["logprob"].as_f64(),
+                Some(f64::from(-8.9037_f32))
+            );
+        }
+    }
+
+    #[derive(Debug)]
+    struct OverrideFrame;
+
+    impl crate::GenerateHook for OverrideFrame {
+        fn start(
+            &self,
+            _: &crate::message::request::GenerateRequest,
+            _: &HeaderMap,
+            _: Option<&Map<String, Value>>,
+        ) -> Box<dyn crate::GenerateFrameHook> {
+            Box::new(Self)
+        }
+    }
+
+    impl crate::GenerateFrameHook for OverrideFrame {
+        fn annotate(
+            &mut self,
+            _: &crate::GenerateFrameInfo<'_>,
+            keys: &mut crate::GenerateFrameKeys,
+        ) {
+            // Keep the existing last-key-wins behavior, even for a hook that
+            // repeats schema fields against the hook contract's advice.
+            keys.frame.insert("text".into(), json!("hook text"));
+            keys.meta_info.insert("completion_tokens".into(), json!(7));
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_hook_and_stats_keep_last_key_wins() {
+        use crate::message::response::{CustomizedInfo, RequestStats};
+
+        for incremental in [false, true] {
+            let args = Arc::new(ServerArgs {
+                served_model_name: "model".into(),
+                tokenizer_path: tokenizer_path().into(),
+                incremental_streaming_output: incremental,
+                ..Default::default()
+            });
+            let tokenizer_json = std::fs::read_to_string(tokenizer_path()).unwrap();
+            let formatter = ChatFormatter::deepseek_v4(true, Some(&tokenizer_json)).unwrap();
+            let mut state =
+                answering_app_state_with_item(args, formatter, Some(tokenizer()), |rid| {
+                    let mut item = chunk(rid, "original", true);
+                    let ResponseItem::Done(output) = &mut item else {
+                        unreachable!()
+                    };
+                    output.extras = Some(Box::new(ChunkExtras {
+                        request_stats: Some(RequestStats(Map::from_iter([
+                            ("prompt_tokens".into(), json!(11)),
+                            ("completion_tokens".into(), json!(5)),
+                        ]))),
+                        customized_info: CustomizedInfo(vec![(
+                            "trace".into(),
+                            vec![json!("kept")],
+                        )]),
+                        ..Default::default()
+                    }));
+                    item
+                });
+            Arc::get_mut(&mut state).unwrap().generate_hook = Some(Arc::new(OverrideFrame));
+            let app = super::super::routes().with_state(state);
+            let events = stream_values(
+                post_json(
+                    app,
+                    "/v1/chat/completions",
+                    json!({
+                        "model":"model", "messages":[{"role":"user","content":"hi"}],
+                        "stream":true, "stream_options":{"include_usage":true}, "n":2
+                    }),
+                )
+                .await,
+            )
+            .await;
+            for index in [0, 1] {
+                assert!(
+                    events.iter().any(|event| {
+                        event.pointer("/choices/0/index") == Some(&json!(index))
+                            && event.pointer("/choices/0/delta/content")
+                                == Some(&json!("hook text"))
+                    }),
+                    "{events:?}"
+                );
+            }
+            let usage = events
+                .iter()
+                .find_map(|event| event.get("usage").filter(|v| !v.is_null()))
+                .unwrap();
+            assert_eq!(usage["prompt_tokens"], 11);
+            assert_eq!(usage["completion_tokens"], 14);
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_terminal_stats_follow_plain_frames() {
+        use super::super::test_utils::{app_state, frontend_closed};
+        use crate::message::response::RequestStats;
+
+        for incremental in [false, true] {
+            let state = app_state(frontend_closed());
+            let (requests, _) =
+                generate_requests(&state, json!({"input_ids":[1], "stream":true})).unwrap();
+            let request = RequestState::new(
+                &state,
+                &requests[0],
+                &HeaderMap::new(),
+                None,
+                RequestTiming::new(),
+            );
+            let (tx, rx) = tokio::sync::mpsc::channel(2);
+            let (abort_tx, abort_rx) = flume::unbounded();
+            let call = CoreCall::from_test_generation_parts("mixed".into(), rx, abort_tx);
+            let mut frames = Box::pin(generation_chat_stream(
+                vec![(call, request)],
+                incremental,
+                false,
+            ));
+            let mut responder = lower_chat(
+                br#"{"model":"model","messages":[{"role":"user","content":"hi"}],"stream":true,"stream_options":{"include_usage":true}}"#,
+                &OpenAiHeaders::default(),
+                &OpenAiSettings { incremental_streaming_output: incremental, ..Default::default() },
+                &ChatModel { context_length: Some(2048), ..Default::default() },
+                |_| Some(vec![1]), None,
+            ).unwrap().1;
+
+            tx.try_send(chunk("mixed", "a", false)).unwrap();
+            let first = frames.next().await.unwrap();
+            assert!(matches!(&first, ChatStreamFrame::Response(_)));
+            let mut events = first.respond(&mut responder).unwrap();
+            let mut terminal = chunk("mixed", "b", true);
+            let ResponseItem::Done(output) = &mut terminal else {
+                unreachable!()
+            };
+            output.extras = Some(Box::new(ChunkExtras {
+                request_stats: Some(RequestStats(Map::from_iter([(
+                    "completion_tokens".into(),
+                    json!(9),
+                )]))),
+                ..Default::default()
+            }));
+            tx.try_send(terminal).unwrap();
+            let last = frames.next().await.unwrap();
+            assert!(matches!(&last, ChatStreamFrame::Json(_)));
+            events.extend(last.respond(&mut responder).unwrap());
+            events.extend(
+                frames
+                    .next()
+                    .await
+                    .unwrap()
+                    .respond(&mut responder)
+                    .unwrap(),
+            );
+            assert!(frames.next().await.is_none());
+            assert!(events.last().unwrap().contains("[DONE]"));
+            let values: Vec<Value> = events
+                .iter()
+                .filter_map(|event| {
+                    let data = event.trim().strip_prefix("data: ")?;
+                    (data != "[DONE]").then(|| serde_json::from_str(data).unwrap())
+                })
+                .collect();
+            let text: String = values
+                .iter()
+                .filter_map(|value| {
+                    value
+                        .pointer("/choices/0/delta/content")
+                        .and_then(Value::as_str)
+                })
+                .collect();
+            assert_eq!(text, "ab");
+            let usage = values
+                .iter()
+                .find_map(|value| value.get("usage").filter(|value| !value.is_null()))
+                .unwrap();
+            assert_eq!(usage["completion_tokens"], 9);
+            drop(frames);
+            assert!(
+                abort_rx.try_recv().is_err(),
+                "a completed call must not be aborted"
+            );
         }
     }
 
