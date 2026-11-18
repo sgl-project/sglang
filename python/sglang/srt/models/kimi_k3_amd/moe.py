@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 
 _is_gfx95 = is_gfx95_supported()
 _use_aiter = is_hip() and get_bool_env_var("SGLANG_USE_AITER")
+_is_hip = is_hip()
 if _is_gfx95:
     from sglang.kernels.ops.attention import k3_attn_res_read_hip
     from sglang.kernels.ops.gemm import kimi_k3_latent_tail_hip
@@ -725,6 +726,20 @@ def row_shard_bank_hooks_hip(layer) -> dict:
     return dict(
         ffn_row_shard=RowShardRead(row_shards, shard_front=layer.mlp.shard_front)
     )
+
+
+def routed_mxfp4_intermediate_align_hip() -> Optional[int]:
+    """The intermediate alignment KimiK3MoE's routed experts declare: 128 under
+    SGLANG_OPT_HIP_K3_AITER on ROCm, where AITER runs them on the K3 FlyDSL MoE (TP8
+    keeps the native 384 instead of the generic kernels' 512); None elsewhere."""
+    return 128 if _is_hip and envs.SGLANG_OPT_HIP_K3_AITER.get() else None
+
+
+def router_logits_contiguous_hip() -> bool:
+    """Whether KimiK3MoE copies the router logits it splits off the fused front
+    contiguous before routing a multi-token batch: on ROCm, unless
+    SGLANG_OPT_HIP_K3_AITER is on."""
+    return _is_hip and not envs.SGLANG_OPT_HIP_K3_AITER.get()
 
 
 def prepare_hip_paths(layer) -> None:

@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
@@ -55,6 +56,7 @@ class TestMxfp4AiterRunnerSelection(CustomTestCase):
             ("_is_xpu", False),
         ):
             stack.enter_context(patch.object(mxfp4_module, name, value))
+        stack.enter_context(envs.SGLANG_USE_AITER.override(use_aiter))
         stack.enter_context(
             patch.object(
                 mxfp4_module,
@@ -76,7 +78,7 @@ class TestMxfp4AiterRunnerSelection(CustomTestCase):
         layer.hidden_size = _HIDDEN
         layer.intermediate_size_per_partition = _INTERMEDIATE
         layer.num_local_experts = _EXPERTS
-        layer.aiter_mxfp4_intermediate_align_128 = align_128
+        layer.mxfp4_intermediate_align = 128 if align_128 else None
         method.create_weights(
             layer,
             num_experts=_EXPERTS,
@@ -102,17 +104,20 @@ class TestMxfp4AiterRunnerSelection(CustomTestCase):
                 self.assertEqual(shapes, expected)
 
     def test_declared_128_alignment_narrows_only_the_aiter_intermediate(self):
-        """A layer declaring aiter_mxfp4_intermediate_align_128 (Kimi-K3) pads the
-        AITER intermediate to 128, not 256; layers that declare nothing keep 256,
-        and the Triton runner never pads."""
-        for case in ("aiter-aiter_env", "triton-aiter_env"):
+        """A layer declaring mxfp4_intermediate_align=128 (Kimi-K3) has the AITER
+        runner pad its intermediate to 128, not 256; layers that declare nothing
+        keep 256, an explicit AITER runner without SGLANG_USE_AITER keeps 256, and
+        the Triton runner never pads."""
+        for case in ("aiter-aiter_env", "aiter", "triton-aiter_env"):
             for align_128 in (False, True):
                 with self.subTest(case=case, align_128=align_128), ExitStack() as stack:
                     _, layer, expect_aiter = self._build(stack, case, align_128)
                     if not expect_aiter:
                         inter = _INTERMEDIATE
+                    elif case == "aiter-aiter_env" and align_128:
+                        inter = 128
                     else:
-                        inter = 128 if align_128 else _AITER_ALIGN
+                        inter = _AITER_ALIGN
                     self.assertEqual(layer.w2_weight.shape[-1], inter // 2)
 
     def test_apply_dispatch_matches_runner(self):

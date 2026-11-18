@@ -131,6 +131,8 @@ from sglang.srt.models.kimi_k3_amd.moe import (
     KimiK3MoEHipMixin,
     link_hip_paths,
     prepare_hip_paths,
+    routed_mxfp4_intermediate_align_hip,
+    router_logits_contiguous_hip,
     row_shard_bank_hooks_hip,
 )
 from sglang.srt.models.kimi_k3_vl import (
@@ -598,8 +600,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
 
             moe_quant_config = Mxfp4Config(is_checkpoint_mxfp4_serialized=True)
 
-        aiter_k3_opt = envs.SGLANG_OPT_HIP_K3_AITER.get()
-        self._router_logits_contiguous = _is_hip and not aiter_k3_opt
+        self._router_logits_contiguous = router_logits_contiguous_hip()
 
         # Routed experts (operate in moe_hidden_size space)
         # gate_up_interleaved=False: K3 loads per-expert w1/w3 into non-interleaved layout
@@ -615,8 +616,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             gemm1_alpha=config.activation_situ_beta,
             gemm1_clamp_limit=config.activation_situ_linear_beta,
             gate_up_interleaved=False,
-            # The K3 FlyDSL MoE runs the 128-aligned intermediate (384 at TP8).
-            aiter_mxfp4_intermediate_align_128=aiter_k3_opt,
+            mxfp4_intermediate_align=routed_mxfp4_intermediate_align_hip(),
             # trtllm fused-routing MoE backends (e.g. nvfp4 w4a4) route inside
             # the kernel and require the routing method; K3 uses DSv3-style
             # grouped topk with e_score_correction_bias.

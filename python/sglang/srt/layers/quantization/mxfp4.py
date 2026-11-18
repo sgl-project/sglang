@@ -509,13 +509,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # naive-copy fast path is correct.
             intermediate_size_per_partition_after_pad = intermediate_size_per_partition
         elif self.use_aiter_moe:
+            from sglang.srt.layers.moe.moe_runner.aiter import (
+                aiter_mxfp4_intermediate_align,
+            )
+
             # Expert intermediate is padded to 128 or 256. On K3 (TP8) the 256
             # default costs +33% mem (3072/8=384 -> 512). K3 FlyDSL MoE works with
             # 128 padding, so relaxing to 128 saves that memory and lets the TP8
             # decode CUDA graph range grow from 20 to 120.
-            _inter_align = (
-                128 if _use_aiter and layer.aiter_mxfp4_intermediate_align_128 else 256
-            )
+            _inter_align = aiter_mxfp4_intermediate_align(layer)
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, _inter_align
             )

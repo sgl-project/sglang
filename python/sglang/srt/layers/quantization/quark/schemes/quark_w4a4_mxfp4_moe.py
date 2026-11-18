@@ -278,9 +278,11 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         # TP8 that changes the native 384 intermediate width (192 packed) into
         # 512 (256 packed), adding 33% zero work and preventing the native-shape
         # MXMoE tuning table from binding. The K3 FlyDSL path supports 128-wide
-        # alignment in the unpacked dimension, so retain the checkpoint shape.
+        # alignment in the unpacked dimension, so a layer that declares its
+        # kernels' alignment (FusedMoE.mxfp4_intermediate_align) keeps the
+        # checkpoint shape.
         pad_for_aiter = _use_aiter and not (
-            layer.aiter_mxfp4_intermediate_align_128 or _use_triton_w4a16
+            layer.mxfp4_intermediate_align is not None or _use_triton_w4a16
         )
         w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
