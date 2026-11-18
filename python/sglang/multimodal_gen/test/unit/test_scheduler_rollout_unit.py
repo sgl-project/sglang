@@ -1,7 +1,7 @@
 """Unit tests for FlowRolloutController, whose ``transition`` the rollout passes
 to ``scheduler.step()``.
 
-    scheduler.step(model_output, t, x_t, **rollout_step_kwargs(batch))
+    scheduler.step(model_output, t, x_t, **rollout_step_kwargs(batch, stream=...))
         |  upcast x_t to fp32, look up sigma_t / sigma_next, dt = sigma_next - sigma_t
         v
     current_rollout_controller.transition(...)
@@ -38,6 +38,7 @@ import weakref
 
 import torch
 
+from sglang.multimodal_gen.configs.post_training.rl_rollout import PRIMARY_STREAM
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
@@ -61,13 +62,28 @@ from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import 
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     finalize_rollout_if_enabled,
     init_rollout_env_if_enabled,
+    pipeline_config_sp_fns,
     prepare_rollout_if_enabled,
+    publish_rollout_if_enabled,
     rollout_step_kwargs,
-    set_rollout_early_stop_if_enabled,
 )
 
 _SIGMAS = torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2, 0.0], dtype=torch.float32)
 _TIMESTEPS = _SIGMAS[:-1] * 1000.0
+
+
+def _prepare_primary_stream(batch, pipeline_config) -> None:
+    """The denoising stage's prepare of the stream its loop iterates."""
+    shard_for_sp, gather_for_sp = pipeline_config_sp_fns(pipeline_config)
+    prepare_rollout_if_enabled(
+        batch=batch,
+        stream=PRIMARY_STREAM,
+        scheduler=batch.scheduler,
+        timesteps=batch.timesteps,
+        latents=batch.latents,
+        shard_for_sp=shard_for_sp,
+        gather_for_sp=gather_for_sp,
+    )
 
 
 def _make_rollout_controller(
@@ -112,7 +128,7 @@ class TestRolloutControllerOwnership(unittest.TestCase):
         batch.scheduler.set_timesteps(5)
         batch.timesteps = batch.scheduler.timesteps
         batch.latents = torch.zeros(1, 4, 8, 8)
-        prepare_rollout_if_enabled(batch=batch, pipeline_config=types.SimpleNamespace())
+        _prepare_primary_stream(batch, types.SimpleNamespace())
         self.assertTrue(batch.rollout_controllers)
 
         batch_ref = weakref.ref(batch)
@@ -843,7 +859,7 @@ class TestRolloutStopStepUnit(unittest.TestCase):
         with self.assertRaises(ValueError):
             _make_rollout_controller(self._batch("cps")).stop_at(5)
 
-    def test_default_builder_iterates_the_pipelines_published_timesteps(self):
+    def test_stop_cuts_the_timesteps_the_pipeline_published(self):
         """A pipeline may publish batch.timesteps on the DiT's own scale while
         stepping the same scheduler (Krea-2 feeds raw sigmas between 0 and 1; the
         scheduler reports sigma * 1000). The stop must cut those values, not
@@ -858,8 +874,7 @@ class TestRolloutStopStepUnit(unittest.TestCase):
         batch.scheduler.set_timesteps(4)
         batch.timesteps = batch.scheduler.sigmas[:4]
         batch.latents = torch.zeros(1, 4, 8, 8)
-        prepare_rollout_if_enabled(batch=batch, pipeline_config=types.SimpleNamespace())
-        set_rollout_early_stop_if_enabled(batch=batch)
+        _prepare_primary_stream(batch, types.SimpleNamespace())
         self.assertTrue(torch.equal(batch.timesteps, batch.scheduler.sigmas[:2]))
 
     def test_loop_on_its_own_grid_is_rejected(self):
@@ -881,7 +896,7 @@ class TestRolloutStopStepUnit(unittest.TestCase):
         batch.timesteps = batch.scheduler.timesteps
         batch.latents = torch.zeros(1, 4, 8, 8)
         pipeline_config = types.SimpleNamespace()
-        prepare_rollout_if_enabled(batch=batch, pipeline_config=pipeline_config)
+        _prepare_primary_stream(batch, pipeline_config)
         init_rollout_env_if_enabled(
             batch=batch,
             image_kwargs={},
@@ -889,7 +904,6 @@ class TestRolloutStopStepUnit(unittest.TestCase):
             neg_cond_kwargs={},
             guidance=None,
         )
-        set_rollout_early_stop_if_enabled(batch=batch)
         timesteps = batch.timesteps
         self.assertEqual(len(timesteps), 3)
         self.assertEqual(len(batch.scheduler.timesteps), 4)
@@ -897,29 +911,34 @@ class TestRolloutStopStepUnit(unittest.TestCase):
         latents = batch.latents
         for t in timesteps:
             latents = batch.scheduler.step(
-                torch.tanh(latents), t, latents, **rollout_step_kwargs(batch)
+                torch.tanh(latents),
+                t,
+                latents,
+                **rollout_step_kwargs(batch, stream=PRIMARY_STREAM),
             ).prev_sample
         with self.assertRaises(ValueError):
             batch.scheduler.step(
                 torch.tanh(latents),
                 batch.scheduler.timesteps[3],
                 latents,
-                **rollout_step_kwargs(batch),
+                **rollout_step_kwargs(batch, stream=PRIMARY_STREAM),
             )
 
         def finalize(num_inference_steps: int) -> None:
             finalize_rollout_if_enabled(
                 batch=batch,
+                stream=PRIMARY_STREAM,
                 latents=latents,
                 num_inference_steps=num_inference_steps,
                 final_timestep=timesteps.new_zeros(()),
-                pipeline_config=pipeline_config,
             )
 
         with self.assertRaises(ValueError):
             finalize(len(batch.scheduler.timesteps))
         finalize(len(timesteps))
-        self.assertEqual(batch.rollout_trajectory_data.rollout_log_probs.shape, (1, 3))
+        publish_rollout_if_enabled(batch=batch, pipeline_config=pipeline_config)
+        primary = batch.rollout_trajectory_data.streams[PRIMARY_STREAM]
+        self.assertEqual(primary.rollout_log_probs.shape, (1, 3))
 
     def _run_minimax_h3(
         self, stop_step_index: int | None

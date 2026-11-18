@@ -16,6 +16,8 @@ _VALID_ROLLOUT_SDE_TYPES = ("sde", "cps", "ode")
 
 # Name of the stream the denoise loop iterates.
 PRIMARY_STREAM = "primary"
+# Stream name of ``OutputBatch.audio``; a pipeline that rolls out audio uses it too.
+AUDIO_STREAM = "audio"
 # Extra stream names become output-store path segments, which are dot-separated.
 _STREAM_NAME_PATTERN = re.compile(r"[a-z][a-z0-9_]*")
 

@@ -10,6 +10,8 @@ import torch
 
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutDebugTensors,
+    RolloutDitTrajectory,
+    RolloutStreamData,
 )
 
 _LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
@@ -79,6 +81,7 @@ class FlowRolloutController:
         # terminal included; stop_at cuts both.
         self.sigmas = sigmas
         self.timesteps = timesteps
+        self.uncut_num_steps = len(timesteps)
         self.latents_shape = latents_shape
         # The model's own deterministic update, called as
         # ode_transition(model_output=, sample=, step_index=) on ODE steps;
@@ -98,10 +101,11 @@ class FlowRolloutController:
         self.step_latent_indices: list[int] = []
         self.step_timesteps: list[torch.Tensor] = []
 
+        # Set by collect_rollout_stream_data at the loop end, read at publish.
+        self.stream_data: RolloutStreamData | None = None
+
     def stop_at(self, stop_step_index: int) -> None:
-        """Keep steps 0..stop_step_index; the last one steps to the terminal sigma.
-        Called by ``set_rollout_early_stop_if_enabled`` before the loop's first
-        step; loops do not call it themselves."""
+        """Keep steps 0..stop_step_index; the last one steps to the terminal sigma."""
         self.sigmas = truncate_rollout_sigmas(
             self.sigmas, stop_step_index=stop_step_index
         )
@@ -177,10 +181,10 @@ class FlowRolloutController:
         with ``batch`` bound by ``rollout_step_kwargs``;
         ``sample`` arrives already upcast to fp32 by ``step()``.
 
-        Steps on the controller's own grid: the scheduler's ``next_sigma`` and
+        Steps on the controller's own schedule: the scheduler's ``next_sigma`` and
         ``dt`` are not used, so a requested stop sends the last step to the
-        terminal sigma while the scheduler's grid stays untouched. Draws variance
-        noise from the request generator captured at creation, so the caller's
+        terminal sigma without reading the scheduler's grid. Draws variance
+        noise from the generators it was created with, so the caller's
         ``generator`` argument is not used either. Records ``sample`` as the
         step's x_t before advancing it.
         """
@@ -228,8 +232,8 @@ class FlowRolloutController:
         batch: Any,
         model_output: torch.FloatTensor,
     ) -> torch.FloatTensor:
-        """Generate variance noise for rollout from the request generator; a list
-        of generators gives one per batch item."""
+        """Generate variance noise from this controller's generators; a list gives
+        one per batch item."""
         assert self.generator is not None, "Generator must be provided"
 
         device = model_output.device
@@ -461,3 +465,44 @@ class FlowRolloutController:
 
         self.step_latents.append(latents.detach())
         self.step_latent_indices.append(step_index)
+
+    def collect_rollout_stream_data(
+        self,
+        *,
+        batch: Any,
+        final_latents: torch.Tensor,
+        num_inference_steps: int,
+        final_timestep: torch.Tensor,
+    ) -> None:
+        """Pack what the loop recorded for this stream into ``stream_data``."""
+        num_schedule_steps = len(self.timesteps)
+        if num_inference_steps != num_schedule_steps:
+            raise ValueError(
+                f"the denoising loop ran {num_inference_steps} steps but the rollout "
+                f"schedule has {num_schedule_steps}; a rollout loop must iterate the "
+                "controller's timesteps"
+            )
+        stream_data = RolloutStreamData(
+            rollout_log_probs=self.collect_rollout_log_probs()
+        )
+        if self.debug_mode:
+            stream_data.rollout_debug_tensors = self.collect_rollout_debug_tensors(
+                batch
+            )
+        self.record_trajectory_step(
+            latents=final_latents,
+            timestep_value=final_timestep,
+            step_index=num_inference_steps,
+        )
+        if self.step_latents:
+            stream_data.dit_trajectory = RolloutDitTrajectory(
+                latents=self.gather_for_sp(
+                    batch, torch.stack(self.step_latents, dim=1)
+                ).cpu(),
+                timesteps=torch.stack(self.step_timesteps).cpu(),
+                sigmas=self.sigmas.detach().cpu().clone(),
+                latent_step_indices=torch.tensor(
+                    self.step_latent_indices, dtype=torch.long
+                ),
+            )
+        self.stream_data = stream_data
