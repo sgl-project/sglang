@@ -431,7 +431,9 @@ def _chunk_scan_fwd_kernel(
                 # a chunk boundary (its own chunk legitimately went non-finite);
                 # scale_m is 0 for those rows, but 0 * nan is still nan, and that
                 # would leak through tl.dot into acc below regardless of scale_m.
-                prev_states = tl.where((prev_states - prev_states) == 0.0, prev_states, 0.0)
+                prev_states = tl.where(
+                    (prev_states - prev_states) == 0.0, prev_states, 0.0
+                )
             prev_states = prev_states.to(C_ptr.dtype.element_ty)
             acc = tl.dot(C, prev_states) * scale_m[:, None]
         else:
