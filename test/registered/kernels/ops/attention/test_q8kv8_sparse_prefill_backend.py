@@ -466,14 +466,16 @@ def _patched_sparse_kernels(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("compress_ratio", [0, 4, 128])
+@pytest.mark.parametrize("local_heads", [16, 32])
 def test_q8kv8_sparse_prefill_helper_builds_fp8_workspace_matching_bf16_path(
     compress_ratio: int,
+    local_heads: int,
 ):
     from sglang.kernels.ops.attention.dsv4.dequant_k_cache import fp8_dtype
 
     device = torch.device("cuda")
     backend, forward_batch, token_to_kv_pool, q, attn_sink, core_attn_metadata = (
-        _make_sparse_prefill_case(device, local_heads=16)
+        _make_sparse_prefill_case(device, local_heads=local_heads)
     )
     _populate_compress_metadata(
         core_attn_metadata,
@@ -513,7 +515,7 @@ def test_q8kv8_sparse_prefill_helper_builds_fp8_workspace_matching_bf16_path(
         == q8_out.shape
         == (
             forward_batch.extend_num_tokens,
-            16,
+            local_heads,
             512,
         )
     )
@@ -528,8 +530,8 @@ def test_q8kv8_sparse_prefill_helper_builds_fp8_workspace_matching_bf16_path(
     assert bf16_kv.dtype == torch.bfloat16
     assert q8_kv.dtype == fp8_dtype
     assert q8_call["q"].dtype == fp8_dtype
-    assert q8_call["q"].shape[1] == 16
-    assert q8_call["attn_sink"].shape == (16,)
+    assert q8_call["q"].shape[1] == local_heads
+    assert q8_call["attn_sink"].shape == (local_heads,)
     assert q8_kv.shape[0] == bf16_kv.shape[0] + 1
     torch.testing.assert_close(
         q8_kv[:-1].to(torch.bfloat16).float(),

@@ -13,14 +13,25 @@ __global__ void sparse_mla_q8kv8_etap_kernel(__grid_constant__ const SparseMlaQ8
 
 // Transpose both GEMMs so heads occupy WGMMA's narrow N dimension:
 // K Q^T -> [64, H], V^T P^T -> [512, H]. Softmax still reduces over keys.
-template <int D_QK, int H, bool HAVE_TOPK_LENGTH, bool HAVE_ATTN_SINK>
+template <int D_QK, int H, bool HAVE_TOPK_LENGTH, bool HAVE_ATTN_SINK, int LOGICAL_H = H>
 struct SparseMlaQ8Kv8EtapKernel {
   static_assert(H == 8 || H == 16 || H == 32);
+  static_assert(LOGICAL_H >= H && LOGICAL_H % H == 0);
+  static constexpr int HEAD_SPLITS = LOGICAL_H / H;
   static constexpr int NUM_THREADS = 256;
+  static constexpr int MIN_CTAS = 1;
+  static constexpr int NUM_STAGES = 2;
+  static constexpr bool COALESCED_O = true;
   static constexpr int D_V = 512;
   static constexpr int B_TOPK = 64;
   static constexpr int NUM_COLS = H / 4;
   using fp8_t = cutlass::float_e4m3_t;
+  static __device__ __forceinline__ cutlass::Array<fp8_t, 2> pack_probabilities(float p0, float p1) {
+    cutlass::Array<float, 2> values;
+    values[0] = p0;
+    values[1] = p1;
+    return cutlass::NumericArrayConverter<fp8_t, float, 2>::convert(values);
+  }
 
   template <int M, int K>
   using SmemLayout = decltype(coalesce(
@@ -43,12 +54,12 @@ struct SparseMlaQ8Kv8EtapKernel {
       array_aligned<fp8_t, cosize_v<SmemLayoutQ>> q;
       array_aligned<bf16, cosize_v<SmemLayoutO>> o;
     } q_o;
-    array_aligned<fp8_t, cosize_v<SmemLayoutK>> k[2];
-    array_aligned<fp8_t, cosize_v<SmemLayoutVt>> vt[2];
+    array_aligned<fp8_t, cosize_v<SmemLayoutK>> k[NUM_STAGES];
+    array_aligned<fp8_t, cosize_v<SmemLayoutVt>> vt[NUM_STAGES];
     array_aligned<fp8_t, cosize_v<SmemLayoutP>> p;
-    bool valid[2][B_TOPK];
+    bool valid[NUM_STAGES][B_TOPK];
     float col_max[4][H], col_sum[4][H];
-    transac_bar_t q_ready, k_ready[2], vt_ready[2], free[2];
+    transac_bar_t q_ready, k_ready[NUM_STAGES], vt_ready[NUM_STAGES], free[NUM_STAGES];
   };
 
   static __device__ __forceinline__ int get_col(int slot, int tid) {
@@ -70,13 +81,14 @@ struct SparseMlaQ8Kv8EtapKernel {
     const int wg = threadIdx.x / 128;
     const int warp = tid / 32;
     const int lane = tid % 32;
-    const int query = blockIdx.x;
+    const int query = blockIdx.x / HEAD_SPLITS;
+    const int head_offset = (blockIdx.x % HEAD_SPLITS) * H;
     extern __shared__ char workspace[];
     auto& plan = *reinterpret_cast<SharedMemoryPlan*>(workspace);
     if (threadIdx.x == 0) {
       plan.q_ready.init(128);
       CUTE_UNROLL
-      for (int b = 0; b < 2; ++b) {
+      for (int b = 0; b < NUM_STAGES; ++b) {
         plan.k_ready[b].init(128);
         if constexpr (H == 32) plan.vt_ready[b].init(128);
         plan.free[b].init(128);
@@ -109,8 +121,8 @@ struct SparseMlaQ8Kv8EtapKernel {
 
       CUTE_NO_UNROLL
       for (int block = 0; block < num_blocks; ++block) {
-        const int buf = block & 1;
-        const int phase = (block / 2) & 1;
+        const int buf = block % NUM_STAGES;
+        const int phase = (block / NUM_STAGES) & 1;
         plan.k_ready[buf].wait(phase);
         Tensor sK = make_tensor(make_smem_ptr(plan.k[buf].data()), SmemLayoutK{});
         Tensor sVt = make_tensor(make_smem_ptr(plan.vt[buf].data()), SmemLayoutVt{});
@@ -149,8 +161,9 @@ struct SparseMlaQ8Kv8EtapKernel {
           const float p0 = exp2f(rS(i) - m);
           const float p1 = exp2f(rS(i + 2) - m);
           rL[s] = rL[s] * rescale[s] + p0 + p1;
-          sP(head, get_p_key_idx(row0)) = fp8_t(p0);
-          sP(head, get_p_key_idx(row1)) = fp8_t(p1);
+          const auto packed = pack_probabilities(p0, p1);
+          sP(head, get_p_key_idx(row0)) = packed[0];
+          sP(head, get_p_key_idx(row1)) = packed[1];
         }
         CUTE_UNROLL
         for (int i = 0; i < size(rO); ++i)
@@ -185,14 +198,16 @@ struct SparseMlaQ8Kv8EtapKernel {
         for (int w = 0; w < 4; ++w)
           l += plan.col_sum[w][head];
         if (warp == 0 && lane < 4) {
-          params.max_logits[(int64_t)query * H + head] = l > 0 ? rM[s] * CUDART_LN2_F : -INFINITY;
-          params.lse[(int64_t)query * H + head] = l > 0 ? (rM[s] + log2f(l)) * CUDART_LN2_F : -INFINITY;
+          params.max_logits[(int64_t)query * LOGICAL_H + head_offset + head] = l > 0 ? rM[s] * CUDART_LN2_F : -INFINITY;
+          params.lse[(int64_t)query * LOGICAL_H + head_offset + head] =
+              l > 0 ? (rM[s] + log2f(l)) * CUDART_LN2_F : -INFINITY;
         }
         float denom = l;
-        if constexpr (HAVE_ATTN_SINK) denom += exp2f(__ldg(params.attn_sink + head) * CUDART_L2E_F - rM[s]);
+        if constexpr (HAVE_ATTN_SINK)
+          denom += exp2f(__ldg(params.attn_sink + head_offset + head) * CUDART_L2E_F - rM[s]);
         output_scale[s] = l > 0 ? kv_scale / denom : 0.0f;
       }
-      if constexpr (H == 32) {
+      if constexpr (H == 32 || COALESCED_O) {
         Tensor sO = make_tensor(make_smem_ptr(plan.q_o.o.data()), SmemLayoutO{});
         CUTE_UNROLL
         for (int i = 0; i < size(rO); ++i) {
@@ -204,20 +219,22 @@ struct SparseMlaQ8Kv8EtapKernel {
         CUTE_UNROLL
         for (int i = tid; i < H * (D_V / 8); i += 128) {
           const int head = i / (D_V / 8), dim = (i % (D_V / 8)) * 8;
-          *reinterpret_cast<uint128_t*>(params.out + (int64_t)query * H * D_V + head * D_V + dim) =
+          *reinterpret_cast<uint128_t*>(
+              params.out + (int64_t)query * LOGICAL_H * D_V + (head_offset + head) * D_V + dim) =
               *reinterpret_cast<const uint128_t*>(&sO(head, dim));
         }
       } else {
         CUTE_UNROLL
         for (int i = 0; i < size(rO); ++i) {
           const auto coord = cO(i);
-          params.out[((int64_t)query * H + get<1>(coord)) * D_V + get<0>(coord)] =
+          params.out[((int64_t)query * LOGICAL_H + head_offset + get<1>(coord)) * D_V + get<0>(coord)] =
               bf16(rO(i) * output_scale[get_col_slot(i)]);
         }
       }
     } else {
-      cutlass::arch::warpgroup_reg_dealloc<40>();
-      const fp8_t* q = reinterpret_cast<const fp8_t*>(params.q) + (int64_t)query * params.stride_q_s_q;
+      cutlass::arch::warpgroup_reg_dealloc<56>();
+      const fp8_t* q = reinterpret_cast<const fp8_t*>(params.q) + (int64_t)query * params.stride_q_s_q +
+                       (int64_t)head_offset * params.stride_q_h_q;
       Tensor sQ = make_tensor(make_smem_ptr(plan.q_o.q.data()), SmemLayoutQ{});
       const int64_t cache_policy = ::sm90::createpolicy_evict_last();
       CUTE_UNROLL
@@ -235,8 +252,8 @@ struct SparseMlaQ8Kv8EtapKernel {
       TransposeV transpose;
       CUTE_NO_UNROLL
       for (int block = 0; block < num_blocks; ++block) {
-        const int buf = block & 1;
-        plan.free[buf].wait(((block / 2) & 1) ^ 1);
+        const int buf = block % NUM_STAGES;
+        plan.free[buf].wait(((block / NUM_STAGES) & 1) ^ 1);
         Tensor sK = make_tensor(make_smem_ptr(plan.k[buf].data()), SmemLayoutK{});
         // Four lanes load one 64-byte key tile; every key is owned by one group.
         CUTE_UNROLL
@@ -280,20 +297,25 @@ struct SparseMlaQ8Kv8EtapKernel {
   }
 
   static void run(const SparseMlaQ8Kv8PrefillParams& params) {
-    KU_ASSERT(params.h_kv == 1 && params.h_q == H);
+    KU_ASSERT(params.h_kv == 1 && params.h_q == LOGICAL_H);
     KU_ASSERT(params.topk > 0 && params.topk % 128 == 0);
     auto kernel = sparse_mla_q8kv8_etap_kernel<SparseMlaQ8Kv8EtapKernel>;
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    kernel<<<params.s_q, NUM_THREADS, smem_size, params.stream>>>(params);
+    if constexpr (MIN_CTAS == 2)
+      KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    kernel<<<params.s_q * HEAD_SPLITS, NUM_THREADS, smem_size, params.stream>>>(params);
     KU_CHECK_KERNEL_LAUNCH();
   }
 };
 
 template <typename Kernel>
-__global__ void __launch_bounds__(Kernel::NUM_THREADS, 1)
+__global__ void __launch_bounds__(Kernel::NUM_THREADS, Kernel::MIN_CTAS)
     sparse_mla_q8kv8_etap_kernel(__grid_constant__ const SparseMlaQ8Kv8PrefillParams params) {
   Kernel::devfunc(params);
 }
 
 }  // namespace sglang
+
+#include "headsplit.cuh"
+#include "row_qk.cuh"

@@ -49,8 +49,10 @@ template <typename Kernel, typename TMAParamsT>
 __global__ void sparse_mla_q8kv8_prefill_kernel(
     __grid_constant__ const SparseMlaQ8Kv8PrefillParams params, __grid_constant__ const TMAParamsT tma_params);
 
-template <int D_QK, bool HAVE_TOPK_LENGTH, bool HAVE_ATTN_SINK>
+template <int D_QK, bool HAVE_TOPK_LENGTH, bool HAVE_ATTN_SINK, int COMPACT_HEADS = 0>
 struct SparseMlaQ8Kv8PrefillKernel {
+  static_assert(COMPACT_HEADS == 0 || COMPACT_HEADS == 8 || COMPACT_HEADS == 16 || COMPACT_HEADS == 32);
+  static constexpr bool IS_COMPACT = COMPACT_HEADS != 0;
   static constexpr int D_Q = D_QK;
   static constexpr int D_K = D_QK;
   static constexpr int D_V = 512;
@@ -186,8 +188,8 @@ struct SparseMlaQ8Kv8PrefillKernel {
   static __device__ __forceinline__ void
   devfunc(const SparseMlaQ8Kv8PrefillParams& params, const TMAParamType& tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
-    const int q_h_idx = blockIdx.x % (params.h_q / B_H);
-    const int s_q_idx = blockIdx.x / (params.h_q / B_H);
+    const int q_h_idx = blockIdx.x % (IS_COMPACT ? 1 : params.h_q / B_H);
+    const int s_q_idx = blockIdx.x / (IS_COMPACT ? 1 : params.h_q / B_H);
     const int warpgroup_idx = cutlass::canonical_warp_group_idx();
     const int warp_idx = cutlass::canonical_warp_idx_sync();
     const int idx_in_warpgroup = threadIdx.x % 128;
@@ -258,9 +260,12 @@ struct SparseMlaQ8Kv8PrefillKernel {
           CUTE_UNROLL
           for (int ti = 0; ti < NUM_Q_TILES; ++ti) {
             // Guard against OOB: last tile may be partial when D_Q%64!=0
+            const int q_row = q_gg + lr * Q_NUM_GROUPS;
             bool q_pred = (ti * 64 + q_ig * 16 + 16) <= D_Q;
+            if constexpr (IS_COMPACT) q_pred &= q_row < COMPACT_HEADS;
+            const int load_row = IS_COMPACT && !q_pred ? 0 : q_row;
             cp_async_cacheglobal_l2_prefetch_256B(
-                gQ + (q_gg + lr * Q_NUM_GROUPS) * (int64_t)params.stride_q_h_q + ti * 64 + q_ig * 16,
+                gQ + load_row * (int64_t)params.stride_q_h_q + ti * 64 + q_ig * 16,
                 sQ_base + ti * (B_H * 64) + lr * Q_NUM_GROUPS * 64,
                 q_pred,
                 q_cache_policy);
@@ -270,7 +275,7 @@ struct SparseMlaQ8Kv8PrefillKernel {
         asm volatile("cp.async.wait_group 0;\n" ::);
       }
       fence_view_async_shared();
-      NamedBarrier::arrive_and_wait(256, q_load_done);
+      NamedBarrier(256, q_load_done).arrive_and_wait_unaligned();
 
       // --------------------------------------------------------
       // Register fragments
@@ -399,7 +404,7 @@ struct SparseMlaQ8Kv8PrefillKernel {
         rL[1] += __shfl_xor_sync(0xffffffff, rL[1], 1);
         rL[1] += __shfl_xor_sync(0xffffffff, rL[1], 2);
         if (idx_in_warpgroup % 4 == 0) plan.sL[threadIdx.x / 4] = *(float2*)(rL);
-        NamedBarrier::arrive_and_wait(256, NamedBarriers::sL_ready);
+        NamedBarrier(256, NamedBarriers::sL_ready).arrive_and_wait_unaligned();
         float2 peer_L = plan.sL[(threadIdx.x / 4) ^ 32];
         rL[0] += peer_L.x;
         rL[1] += peer_L.y;
@@ -411,7 +416,9 @@ struct SparseMlaQ8Kv8PrefillKernel {
         for (int i = 0; i < 2; ++i) {
           if constexpr (HAVE_ATTN_SINK) {
             int attn_sink_idx = q_h_idx * B_H + get_AorC_row_idx(i, idx_in_warpgroup);
-            float attn_sink = __ldg(params.attn_sink + attn_sink_idx) * CUDART_L2E_F;
+            float attn_sink = 0.0f;
+            if (!IS_COMPACT || attn_sink_idx < COMPACT_HEADS)
+              attn_sink = __ldg(params.attn_sink + attn_sink_idx) * CUDART_L2E_F;
             scale_factors[i] = kv_scale / (rL[i] + exp2f(attn_sink - rM[i]));
           } else {
             scale_factors[i] = kv_scale / rL[i];
@@ -451,8 +458,8 @@ struct SparseMlaQ8Kv8PrefillKernel {
           }
           // Make the STSM writes visible to the subsequent TMA store proxy.
           cute::tma_store_fence();
-          NamedBarrier::arrive_and_wait(
-              128, warpgroup_idx ? NamedBarriers::warpgroup1_sync : NamedBarriers::warpgroup0_sync);
+          NamedBarrier(128, warpgroup_idx ? NamedBarriers::warpgroup1_sync : NamedBarriers::warpgroup0_sync)
+              .arrive_and_wait_unaligned();
           if (s2g_pred) {
             int g_tile_idx = warpgroup_idx * 4 + tile_idx;
             SM90_TMA_STORE_3D::copy(
@@ -558,18 +565,18 @@ struct SparseMlaQ8Kv8PrefillKernel {
           // rendezvous kills the aliasing; WG1's path here (mask_rP -> its
           // bar_is_kv_valid wait) does not depend on anything WG0 does after
           // this point, so no deadlock surface is added.
-          NamedBarrier::arrive_and_wait(256, NamedBarriers::wg0_bunch_0_ready);
+          NamedBarrier(256, NamedBarriers::wg0_bunch_0_ready).arrive_and_wait_unaligned();
 
           // Wait for Vt[0] left half only (producer + WG0 arrivals).
           // V[0]-RIGHT may still be transposing; WG0 doesn't need it.
-          NamedBarrier::arrive_and_wait(256, vt0_left_ready);
+          NamedBarrier(256, vt0_left_ready).arrive_and_wait_unaligned();
 
           // Local PV: rP_fp8 x Vt0 left half -> RS fp8 GMMA
           gemm_rs(false, TiledMMA_PV_LocalP{}, rP_fp8_local, sVt0l, rO, idx_in_warpgroup);
           warpgroup_commit_batch();
 
           // Overlap PV-local GMMA drain with barrier waits, sM read, and peer P load.
-          NamedBarrier::arrive_and_wait(256, NamedBarriers::wg1_bunch_0_ready);
+          NamedBarrier(256, NamedBarriers::wg1_bunch_0_ready).arrive_and_wait_unaligned();
           float new_rM[2], scale_factors_arr[2];
           *(float2*)new_rM = plan.sM[(block_idx >> 1) & 1][idx_in_warpgroup / 4];
           CUTE_UNROLL
@@ -584,10 +591,10 @@ struct SparseMlaQ8Kv8PrefillKernel {
           plan.bar_vt_free[0].arrive();
 
           load_sS_to_rP(plan.s[1].data());
-          NamedBarrier::arrive_and_wait(256, s_consumed_ready);
+          NamedBarrier(256, s_consumed_ready).arrive_and_wait_unaligned();
 
           // Wait for Vt[1] transpose (prod+WG0 barrier)
-          NamedBarrier::arrive_and_wait(256, vt1_for_wg0);
+          NamedBarrier(256, vt1_for_wg0).arrive_and_wait_unaligned();
 
           // Rescale rO: must be after wait<0> since rO is PV-local accumulator
           rescale_rO(scale_factors_arr);
@@ -660,7 +667,7 @@ struct SparseMlaQ8Kv8PrefillKernel {
 
           mask_rP(Warpgroup1{}, block_idx);  // pass block_idx for kv_buf parity
 
-          NamedBarrier::arrive_and_wait(256, NamedBarriers::wg0_bunch_0_ready);
+          NamedBarrier(256, NamedBarriers::wg0_bunch_0_ready).arrive_and_wait_unaligned();
           online_softmax_and_rescale_o(Warpgroup1{}, (block_idx >> 1) & 1);
 
           save_rP_fp8_to_sS(plan.s[1].data());
@@ -671,10 +678,10 @@ struct SparseMlaQ8Kv8PrefillKernel {
           // rescale factors on one CTA's 64-head half.  No deadlock surface:
           // WG0 reaches its wait via wg0_bunch (which WG1 arrives earlier) plus
           // producer vt0_left; neither depends on WG1's progress past here.
-          NamedBarrier::arrive_and_wait(256, NamedBarriers::wg1_bunch_0_ready);
+          NamedBarrier(256, NamedBarriers::wg1_bunch_0_ready).arrive_and_wait_unaligned();
 
           // Wait for Vt[1] transpose (prod+WG1 barrier)
-          NamedBarrier::arrive_and_wait(256, vt1_for_wg1);
+          NamedBarrier(256, vt1_for_wg1).arrive_and_wait_unaligned();
 
           // Local PV: rP_fp8 x Vt1 right half -> RS
           gemm_rs(false, TiledMMA_PV_LocalP{}, rP_fp8_local, sVt1r, rO, idx_in_warpgroup);
@@ -697,11 +704,11 @@ struct SparseMlaQ8Kv8PrefillKernel {
             }
           }
           load_sS_to_rP(plan.s[0].data());
-          NamedBarrier::arrive_and_wait(256, s_consumed_ready);
+          NamedBarrier(256, s_consumed_ready).arrive_and_wait_unaligned();
 
           // Wait for Vt[0] right half only (producer + WG1 arrivals).
           // V[0]-LEFT was signaled earlier; WG1 doesn't need it.
-          NamedBarrier::arrive_and_wait(256, vt0_right_ready);
+          NamedBarrier(256, vt0_right_ready).arrive_and_wait_unaligned();
 
           Tensor sVt0r = make_tensor(make_smem_ptr(plan.vt_rem[1].data()), SmemLayoutHalfVt{});
           gemm_rs(false, TiledMMA_PV_LocalP{}, rP_fp8_local, sVt0r, rO, idx_in_warpgroup);
@@ -752,17 +759,20 @@ struct SparseMlaQ8Kv8PrefillKernel {
             int real_row = get_AorC_row_idx(row, idx_in_warpgroup);
             bool is_no_valid_tokens = rL[row] == 0.0f;
             plan.final_max_logits[real_row] = is_no_valid_tokens ? -INFINITY : rM[row] * CUDART_LN2_F;
-            plan.final_lse[real_row] = is_no_valid_tokens ? +INFINITY : logf(rL[row]) + rM[row] * CUDART_LN2_F;
+            plan.final_lse[real_row] =
+                is_no_valid_tokens ? (IS_COMPACT ? -INFINITY : INFINITY) : logf(rL[row]) + rM[row] * CUDART_LN2_F;
           }
           // Regular stores are not async-proxy operations; the barrier provides ordering.
           asm volatile("" ::: "memory");
         }
 
-        NamedBarrier::arrive_and_wait(128, NamedBarriers::warpgroup1_sync);
+        NamedBarrier(128, NamedBarriers::warpgroup1_sync).arrive_and_wait_unaligned();
         if (idx_in_warpgroup == 0) {
           int g_offset = s_q_idx * params.h_q + q_h_idx * B_H;
-          SM90_BULK_COPY_S2G::copy(plan.final_max_logits, params.max_logits + g_offset, B_H * sizeof(float));
-          SM90_BULK_COPY_S2G::copy(plan.final_lse, params.lse + g_offset, B_H * sizeof(float));
+          SM90_BULK_COPY_S2G::copy(
+              plan.final_max_logits, params.max_logits + g_offset, (IS_COMPACT ? COMPACT_HEADS : B_H) * sizeof(float));
+          SM90_BULK_COPY_S2G::copy(
+              plan.final_lse, params.lse + g_offset, (IS_COMPACT ? COMPACT_HEADS : B_H) * sizeof(float));
           cute::tma_store_arrive();
         }
       }
@@ -777,7 +787,11 @@ struct SparseMlaQ8Kv8PrefillKernel {
       constexpr int NUM_ROWS_PER_GROUP = B_TOPK / NUM_GROUPS;
       int idx_in_group = idx_in_warpgroup % GROUP_SIZE;
       int group_idx = idx_in_warpgroup / GROUP_SIZE;
-      int* gIndices = params.indices + s_q_idx * params.stride_indices_s_q;
+      int* gIndices;
+      if constexpr (IS_COMPACT)
+        gIndices = params.indices + (int64_t)s_q_idx * params.stride_indices_s_q;
+      else
+        gIndices = params.indices + s_q_idx * params.stride_indices_s_q;
 
       int tile_shift = idx_in_group / 4;
       int col_in_tile = (idx_in_group % 4) * 16;
@@ -974,7 +988,7 @@ struct SparseMlaQ8Kv8PrefillKernel {
         // generic proxy for LDSM reads in V transpose
         fence_view_async_shared();
         asm volatile("bar.sync 7, 128;\n" ::: "memory");
-        NamedBarrier::arrive(256, vt0_left_ready);  // covered by the fence above
+        NamedBarrier(256, vt0_left_ready).arrive_unaligned();  // covered by the fence above
 
         // V[1]-LEFT: tiles 0-3 from K[1] -- WG0 needs this for PV-remote
         if (block_idx > 0) {
@@ -984,7 +998,7 @@ struct SparseMlaQ8Kv8PrefillKernel {
         // The fence is cheap here: cp.async queue already drained by
         // wait_group 0 above; orders V[1]L STSM writes before the arrive.
         fence_view_async_shared();
-        NamedBarrier::arrive(256, vt1_for_wg0);
+        NamedBarrier(256, vt1_for_wg0).arrive_unaligned();
 
         // V[0]-RIGHT: tiles 4-7 from K[0]
         transpose_v_to_half(0, plan.vt_rem[1].data(), 4, 8);  // block0-right -> WG1 remote
@@ -992,8 +1006,8 @@ struct SparseMlaQ8Kv8PrefillKernel {
         transpose_v_to_half(1, plan.vt_loc[1].data(), 4, 8);  // block1-right -> WG1 local
         // One fence covers both right-half transposes, then arrive both.
         fence_view_async_shared();
-        NamedBarrier::arrive(256, vt0_right_ready);
-        NamedBarrier::arrive(256, vt1_for_wg1);
+        NamedBarrier(256, vt0_right_ready).arrive_unaligned();
+        NamedBarrier(256, vt1_for_wg1).arrive_unaligned();
 
         asm volatile("bar.sync 7, 128;\n" ::: "memory");
 
@@ -1016,7 +1030,10 @@ struct SparseMlaQ8Kv8PrefillKernel {
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.topk % (2 * B_TOPK) == 0);
     KU_ASSERT(params.topk > 0);
-    KU_ASSERT(params.h_q % B_H == 0);
+    if constexpr (IS_COMPACT)
+      KU_ASSERT(params.h_q == COMPACT_HEADS);
+    else
+      KU_ASSERT(params.h_q % B_H == 0);
 
     CUtensorMap tensor_map_O;
     {
@@ -1043,14 +1060,18 @@ struct SparseMlaQ8Kv8PrefillKernel {
     TmaParams_t tma_p = {tensor_map_O};
 
     auto kernel = &sparse_mla_q8kv8_prefill_kernel<
-        SparseMlaQ8Kv8PrefillKernel<D_QK, HAVE_TOPK_LENGTH, HAVE_ATTN_SINK>,
+        SparseMlaQ8Kv8PrefillKernel<D_QK, HAVE_TOPK_LENGTH, HAVE_ATTN_SINK, COMPACT_HEADS>,
         TmaParams_t>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
     cutlass::ClusterLaunchParams launch_params = {
-        dim3((params.h_q / B_H) * params.s_q, 1, 1), dim3(NUM_THREADS, 1, 1), dim3(1, 1, 1), smem_size, params.stream};
+        dim3((IS_COMPACT ? 1 : params.h_q / B_H) * params.s_q, 1, 1),
+        dim3(NUM_THREADS, 1, 1),
+        dim3(1, 1, 1),
+        smem_size,
+        params.stream};
     cutlass::launch_kernel_on_cluster(launch_params, (void*)kernel, params, tma_p);
     KU_CHECK_KERNEL_LAUNCH();
   }
@@ -1068,9 +1089,9 @@ __global__ void __launch_bounds__(Kernel::NUM_THREADS, 1, 1) sparse_mla_q8kv8_pr
 // ============================================================================
 // External dispatch function
 // ============================================================================
-template <int D_QK, bool HAVE_TOPK_LENGTH, bool HAVE_ATTN_SINK>
+template <int D_QK, bool HAVE_TOPK_LENGTH, bool HAVE_ATTN_SINK, int COMPACT_HEADS = 0>
 void run_sparse_mla_q8kv8_prefill_kernel(const SparseMlaQ8Kv8PrefillParams& params) {
-  SparseMlaQ8Kv8PrefillKernel<D_QK, HAVE_TOPK_LENGTH, HAVE_ATTN_SINK>::run(params);
+  SparseMlaQ8Kv8PrefillKernel<D_QK, HAVE_TOPK_LENGTH, HAVE_ATTN_SINK, COMPACT_HEADS>::run(params);
 }
 
 }  // namespace fwd

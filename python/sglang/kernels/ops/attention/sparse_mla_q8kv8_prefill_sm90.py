@@ -553,7 +553,7 @@ def cast_q_fp8_for_q8kv8_prefill(
     The incoming Q is the model-produced BF16/FP16 tensor already shaped as
     ``(num_tokens, num_heads, 512)`` after removing the singleton MQA axis.
 
-    Local head counts of 8, 16 and 32 use the transposed SM90 kernel directly.
+    Local head counts of 8, 16 and 32 keep their native query width.
     Other head counts are copied into a zero-padded 64/128-head FP8 tensor.
     """
     assert q.ndim == 3

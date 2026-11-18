@@ -20,6 +20,7 @@ limitations under the License.
 #include <tvm/ffi/container/tensor.h>
 
 #include "etap.cuh"
+#include "kvsplit.cuh"
 #include <cmath>
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -34,9 +35,54 @@ _set_device_and_stream(SparseMlaQ8Kv8PrefillParams& params, tvm::ffi::TensorView
 }
 
 template <int D_QK, int H, bool HAVE_TOPK_LENGTH, bool HAVE_ATTN_SINK>
+static bool try_sparse_mla_q8kv8_compact(const SparseMlaQ8Kv8PrefillParams& params) {
+  static thread_local int cached_device = -1, cached_sms = 0;
+  int device;
+  KU_CUDA_CHECK(cudaGetDevice(&device));
+  if (cached_device != device) {
+    KU_CUDA_CHECK(cudaDeviceGetAttribute(&cached_sms, cudaDevAttrMultiProcessorCount, device));
+    cached_device = device;
+  }
+  if (cached_sms < 128 || (reinterpret_cast<uintptr_t>(params.out) & 15)) return false;
+  if constexpr (H == 32) {
+    const bool short_kv = params.topk <= 1024 && params.s_q > cached_sms / 4;
+    if (params.s_q <= cached_sms / 2 && !short_kv) return false;
+  } else if (params.s_q <= 64) {
+    return false;
+  }
+  sm90::fwd::run_sparse_mla_q8kv8_prefill_kernel<D_QK, HAVE_TOPK_LENGTH, HAVE_ATTN_SINK, H>(params);
+  return true;
+}
+
+template <int D_QK, int H, bool HAVE_TOPK_LENGTH, bool HAVE_ATTN_SINK>
 static inline void _run_q8kv8_kernel(SparseMlaQ8Kv8PrefillParams& params) {
   if constexpr (H < 64) {
-    SparseMlaQ8Kv8EtapKernel<D_QK, H, HAVE_TOPK_LENGTH, HAVE_ATTN_SINK>::run(params);
+    if (try_sparse_mla_q8kv8_compact<D_QK, H, HAVE_TOPK_LENGTH, HAVE_ATTN_SINK>(params)) return;
+    if (try_sparse_mla_q8kv8_kvsplit<D_QK, H, HAVE_TOPK_LENGTH, HAVE_ATTN_SINK, 16>(params)) return;
+    if constexpr (H == 32) {
+      static thread_local int cached_device = -1, cached_sms = 0;
+      int device;
+      KU_CUDA_CHECK(cudaGetDevice(&device));
+      if (device != cached_device) {
+        KU_CUDA_CHECK(cudaDeviceGetAttribute(&cached_sms, cudaDevAttrMultiProcessorCount, device));
+        cached_device = device;
+      }
+      if (cached_sms >= 128) {
+        if (params.s_q <= 32) {
+          SparseMlaQ8Kv8HeadSplitKernel<D_QK, 8, HAVE_TOPK_LENGTH, HAVE_ATTN_SINK>::run(params);
+          return;
+        }
+        if (params.s_q <= cached_sms / 2) {
+          SparseMlaQ8Kv8HeadSplitKernel<D_QK, 16, HAVE_TOPK_LENGTH, HAVE_ATTN_SINK>::run(params);
+          return;
+        }
+      }
+    }
+    using Kernel = std::conditional_t<
+        H == 32,
+        SparseMlaQ8Kv8RowQKKernel<D_QK, H, HAVE_TOPK_LENGTH, HAVE_ATTN_SINK>,
+        SparseMlaQ8Kv8EtapKernel<D_QK, H, HAVE_TOPK_LENGTH, HAVE_ATTN_SINK>>;
+    Kernel::run(params);
   } else {
     sm90::fwd::run_sparse_mla_q8kv8_prefill_kernel<D_QK, HAVE_TOPK_LENGTH, HAVE_ATTN_SINK>(params);
   }

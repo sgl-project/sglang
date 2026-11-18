@@ -500,7 +500,8 @@ separately). bf16 KV is correct at every batch size.
 
 The SM90 Q8KV8 kernel also serves DeepSeek-V4/V4.1 sparse prefill when you select
 `--dsv4-prefill-backend flashmla_sparse_q8`. Local query-head counts of 8, 16 and
-32 use native FP8 transposed GEMMs without head padding. Decode and CP fallback
+32 retain native-width Q and output buffers. The kernel selects transposed or
+wide FP8 tiles according to the GPU and query count. Decode and CP fallback
 retain their existing query widths and backends.
 
 For deployment examples, see the [DeepSeek V3.2 deployment guide](/cookbook/autoregressive/DeepSeek/DeepSeek-V3_2).

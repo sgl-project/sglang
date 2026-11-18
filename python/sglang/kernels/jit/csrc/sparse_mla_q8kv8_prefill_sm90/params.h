@@ -44,4 +44,8 @@ struct SparseMlaQ8Kv8PrefillParams {
   float* __restrict__ lse;
 
   cudaStream_t stream;
+  float* kvsplit_out;
+  float* kvsplit_m;
+  float* kvsplit_l;
+  int kvsplit_count;
 };
