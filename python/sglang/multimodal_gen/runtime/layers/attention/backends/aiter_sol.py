@@ -25,6 +25,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.aiter_sol_dispatch 
     sol_attn_bshd,
     sol_attn_routing_mode,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.aiter_sol_schedule import (
+    BetaSchedule,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
@@ -48,47 +51,10 @@ _DEFAULT_RECIPE = "fp8"
 _DEFAULT_BETA = 0.5
 
 
-class _BetaSchedule(msgspec.Struct, frozen=True):
-    """The routing threshold per denoising step.
-
-    Either two endpoints to ramp between or one value per step. A larger beta
-    raises the threshold, so it keeps fewer blocks exact and leans harder on
-    the pooled correction.
-    """
-
-    endpoints: tuple[float, float] | None = None
-    values: tuple[float, ...] = ()
-
-    @classmethod
-    def from_spec(cls, spec: str) -> _BetaSchedule:
-        text = spec.strip()
-        if ":" in text:
-            first, last = text.split(":", 1)
-            return cls(endpoints=(float(first), float(last)))
-        values = tuple(float(part) for part in text.split(",") if part.strip())
-        if not values:
-            raise ValueError(
-                "beta_schedule must be 'first:last' for a linear ramp or one "
-                f"comma-separated value per step, got {spec!r}."
-            )
-        if len(values) == 1:
-            return cls(endpoints=(values[0], values[0]))
-        return cls(values=values)
-
-    def beta_at(self, step: int, total_steps: int) -> float:
-        if self.values:
-            return self.values[min(step, len(self.values) - 1)]
-        first, last = self.endpoints
-        if total_steps <= 1:
-            return first
-        position = min(step, total_steps - 1) / (total_steps - 1)
-        return first + (last - first) * position
-
-
 class _SolConfig(msgspec.Struct, frozen=True):
     recipe: str
     beta: float
-    beta_schedule: _BetaSchedule | None
+    beta_schedule: BetaSchedule | None
     block_tile: tuple[int, int] | None
 
 
@@ -120,7 +86,7 @@ def _resolve_config() -> _SolConfig:
         recipe=recipe,
         beta=float(cfg.get("beta", _DEFAULT_BETA)),
         beta_schedule=(
-            None if schedule is None else _BetaSchedule.from_spec(str(schedule))
+            None if schedule is None else BetaSchedule.from_spec(str(schedule))
         ),
         block_tile=_parse_block_tile(cfg.get("block_size")),
     )
@@ -201,18 +167,19 @@ class AITERSolImpl(AttentionImpl):
             return None
         return int(sampling_params.num_inference_steps)
 
-    def _current_beta(self) -> float:
-        """This forward's routing threshold.
-
-        A scheduled beta is a different Python float on every step, so it is
-        baked as a new constant into each traced graph; keep the schedule for
-        eager runs until the step index is published as a device tensor.
-        """
+    def _current_beta(self) -> float | torch.Tensor:
+        """Read the threshold prepared before the compiled model forward."""
         if self.beta_schedule is None:
             return self.beta
         context = get_forward_context_or_none()
         if context is None:
             return self.beta
+        if context.sol_beta is not None:
+            return context.sol_beta
+        if torch.compiler.is_compiling():
+            raise SolAttnUnsupported(
+                "Compiled beta_schedule requires a denoising context with sol_beta."
+            )
         step = context.current_timestep
         if not isinstance(step, Integral):
             return self.beta
@@ -263,26 +230,28 @@ class AITERSolImpl(AttentionImpl):
         cu_seqlens_k: torch.Tensor | None = None,
         max_seqlen_k: int | None = None,
     ) -> torch.Tensor:
-        """Serve a packed call that is one sequence followed by a trailing pad.
-
-        Sol-Attn takes no key-padding mask, and its pooled blocks would straddle
-        any boundary other than the end, so a pack of several sequences is
-        refused rather than attended over its own padding.
-        """
+        """Serve one sequence with optional trailing padding."""
         del max_seqlen_k
-        used = (
-            None
-            if cu_seqlens_host is None
-            else trailing_padding_used_len(
-                total_tokens=query.shape[0],
-                max_seqlen=max_seqlen,
-                bounds=cu_seqlens_host,
+        total_tokens = query.shape[0]
+        if max_seqlen == total_tokens and cu_seqlens_host in (
+            (0, total_tokens),
+            (0, total_tokens, total_tokens),
+        ):
+            used = total_tokens
+        else:
+            used = (
+                None
+                if cu_seqlens_host is None
+                else trailing_padding_used_len(
+                    total_tokens=total_tokens,
+                    max_seqlen=max_seqlen,
+                    bounds=cu_seqlens_host,
+                )
             )
-        )
         if used is None or cu_seqlens_k is not None:
             raise SolAttnUnsupported(
                 "AITER Sol-Attn backend serves a packed call only as a single "
-                "sequence with a trailing pad; it has no key-padding mask."
+                "sequence with an optional trailing pad; it has no key-padding mask."
             )
 
         live_output, _ = sol_attn_bshd(

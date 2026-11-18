@@ -941,7 +941,10 @@ def test_guidance_formula_window_branch_count_and_request_isolation(
     }
     policy = CFGPolicy().build(batch, {}, pos, neg)
     initial_kwargs = [dict(branch.kwargs) for branch in policy.branches]
+    from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPABackend
+
     stage = object.__new__(MOSSImageDenoisingStage)
+    stage.attn_backend = SDPABackend
     calls = []
 
     def predict(**kwargs):

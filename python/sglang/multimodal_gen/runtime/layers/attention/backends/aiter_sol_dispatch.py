@@ -656,7 +656,7 @@ def sol_attn_routing_fused(
 
     mask, lut_count, block_bitmap, kv_block_indices = route_and_pack(
         proxy,
-        float(beta),
+        beta,
         num_kv_blocks,
         bitmap_ds,
         seqlen_k % block_n != 0,

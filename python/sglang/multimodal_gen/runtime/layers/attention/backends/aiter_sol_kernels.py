@@ -39,6 +39,7 @@ def _sol_route_pack_kernel(
     num_q_tiles,
     num_heads,
     bitmap_ds,
+    BETA_IS_TENSOR: tl.constexpr,
     PARTIAL_TAIL: tl.constexpr,
     NUM_WORDS: tl.constexpr,
 ):
@@ -78,7 +79,11 @@ def _sol_route_pack_kernel(
     mean = tl.sum(tl.where(in_row, proxy, 0.0)) / count_f
     centered = tl.where(in_row, proxy - mean, 0.0)
     variance = tl.sum(centered * centered) / count_f
-    tau = mean + beta * tl.sqrt(variance)
+    if BETA_IS_TENSOR:
+        beta_value = tl.load(beta).to(tl.float32)
+    else:
+        beta_value = beta
+    tau = mean + beta_value * tl.sqrt(variance)
 
     selected = (proxy > tau) & in_row
     if PARTIAL_TAIL:
@@ -133,7 +138,7 @@ def row_lut_start(
 
 def route_and_pack(
     proxy: torch.Tensor,
-    beta: float,
+    beta: float | torch.Tensor,
     num_kv_blocks: int,
     bitmap_ds: int,
     partial_tail: bool,
@@ -143,6 +148,9 @@ def route_and_pack(
     proxy is (batch, nheads_q, num_q_tiles, num_kv_blocks) float32. The index
     list holds num_kv_blocks entries per row, which row_lut_start addresses.
     """
+    if isinstance(beta, torch.Tensor):
+        if beta.numel() != 1 or beta.device != proxy.device:
+            raise ValueError("beta must be a scalar tensor on the proxy device.")
     batch, num_heads, num_q_tiles, blocks = proxy.shape
     if blocks != num_kv_blocks:
         raise ValueError(
@@ -185,6 +193,7 @@ def route_and_pack(
         num_q_tiles,
         num_heads,
         bitmap_ds,
+        BETA_IS_TENSOR=isinstance(beta, torch.Tensor),
         PARTIAL_TAIL=partial_tail,
         NUM_WORDS=num_words,
         num_warps=num_warps,

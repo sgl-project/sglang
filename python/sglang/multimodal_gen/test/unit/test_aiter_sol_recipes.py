@@ -22,7 +22,13 @@ from sglang.multimodal_gen.runtime.layers.attention.backends import (
     aiter_sol,
     aiter_sol_dispatch,
 )
-from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.layers.attention.backends.aiter_sol_schedule import (
+    BetaSchedule,
+    prepare_sol_beta,
+)
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    set_forward_context,
+)
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 from sglang.test.test_utils import CustomTestCase
 
@@ -348,7 +354,7 @@ class TestSolKeyPadding(_SolTestCase):
 
 class TestSolBetaSchedule(_SolTestCase):
     def test_a_ramp_hits_both_endpoints(self):
-        schedule = aiter_sol._BetaSchedule.from_spec("1.0:0.0")
+        schedule = BetaSchedule.from_spec("1.0:0.0")
         self.assertAlmostEqual(schedule.beta_at(0, 40), 1.0)
         self.assertAlmostEqual(schedule.beta_at(39, 40), 0.0)
         self.assertAlmostEqual(schedule.beta_at(20, 41), 0.5)
@@ -356,26 +362,26 @@ class TestSolBetaSchedule(_SolTestCase):
     def test_a_ramp_clamps_past_the_last_step(self):
         # A pipeline that runs one extra forward must not extrapolate the ramp
         # past its endpoint and route against a threshold nobody asked for.
-        schedule = aiter_sol._BetaSchedule.from_spec("1.0:0.0")
+        schedule = BetaSchedule.from_spec("1.0:0.0")
         self.assertAlmostEqual(schedule.beta_at(99, 40), 0.0)
 
     def test_a_single_step_takes_the_first_endpoint(self):
-        schedule = aiter_sol._BetaSchedule.from_spec("1.0:0.0")
+        schedule = BetaSchedule.from_spec("1.0:0.0")
         self.assertAlmostEqual(schedule.beta_at(0, 1), 1.0)
 
     def test_a_per_step_list_indexes_and_clamps(self):
-        schedule = aiter_sol._BetaSchedule.from_spec("0.9,0.5,0.1")
+        schedule = BetaSchedule.from_spec("0.9,0.5,0.1")
         self.assertAlmostEqual(schedule.beta_at(1, 3), 0.5)
         self.assertAlmostEqual(schedule.beta_at(7, 3), 0.1)
 
     def test_one_value_is_a_flat_schedule(self):
-        schedule = aiter_sol._BetaSchedule.from_spec("0.25")
+        schedule = BetaSchedule.from_spec("0.25")
         self.assertAlmostEqual(schedule.beta_at(0, 40), 0.25)
         self.assertAlmostEqual(schedule.beta_at(39, 40), 0.25)
 
     def test_an_empty_schedule_is_rejected(self):
         with self.assertRaises(ValueError):
-            aiter_sol._BetaSchedule.from_spec(" , ")
+            BetaSchedule.from_spec(" , ")
 
     def test_the_scheduled_beta_reaches_the_kernel(self):
         impl = self._build({"recipe": "fp8", "beta_schedule": "1.0:0.0"})
@@ -385,6 +391,63 @@ class TestSolBetaSchedule(_SolTestCase):
         ):
             impl.forward(*self._operands(), None)
         self.assertAlmostEqual(self._beta_seen(), 0.0)
+
+    def test_schedule_changes_without_recompiling(self):
+        """Each CFG branch reads the step's beta without specializing its value."""
+        config = {"recipe": "fp8", "beta_schedule": "1.0:0.0"}
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+            DenoisingStage,
+        )
+
+        impl = self._build(config)
+        stage = DenoisingStage.__new__(DenoisingStage)
+        stage.attn_backend = aiter_sol.AITERSolBackend
+        stage._sol_beta_states = {}
+        batch = SimpleNamespace(
+            num_inference_steps=5,
+            is_warmup=False,
+            sampling_params=SimpleNamespace(num_inference_steps=5),
+        )
+        server_args = SimpleNamespace(attention_backend_config=config)
+        graphs = []
+
+        def backend(graph, example_inputs):
+            graphs.append(graph)
+            return graph.forward
+
+        def forward(x):
+            return x * impl._current_beta()
+
+        compiled = torch.compile(forward, backend=backend, fullgraph=True)
+        x = torch.ones(2)
+        for step, expected in enumerate((1.0, 0.75, 0.5, 0.25, 0.0)):
+            beta = stage._prepare_sol_beta(batch, step, x.device, server_args)
+            for _ in range(2):
+                with set_forward_context(step, None, batch, sol_beta=beta):
+                    # Models can install a nested attention context.
+                    with set_forward_context(step, None, batch):
+                        torch.testing.assert_close(compiled(x), x * expected)
+        self.assertEqual(len(graphs), 1)
+        address = beta.data_ptr()
+        batch.num_inference_steps = 3
+        batch.sampling_params.num_inference_steps = 3
+        beta = stage._prepare_sol_beta(batch, 0, x.device, server_args)
+        self.assertEqual(beta.data_ptr(), address)
+        with set_forward_context(0, None, sol_beta=beta):
+            torch.testing.assert_close(compiled(x), x)
+        self.assertEqual(len(graphs), 1)
+
+    def test_schedule_list_must_match_the_request(self):
+        """A short list must not silently reuse its last beta for later steps."""
+        with self.assertRaisesRegex(ValueError, "3 values for 5"):
+            prepare_sol_beta(
+                states={},
+                total_steps=5,
+                is_warmup=False,
+                step=0,
+                device=torch.device("cpu"),
+                config={"beta_schedule": "0.9,0.5,0.1"},
+            )
 
     def test_the_constant_beta_stands_outside_a_denoising_loop(self):
         # Stages set a forward context without a request, and direct callers
@@ -447,17 +510,21 @@ class TestSolRejectedCalls(_SolTestCase):
         query, key, value = (
             tensor.squeeze(0) for tensor in self._operands(seqlen=SEQUENCE)
         )
-        with self.assertRaisesRegex(
-            aiter_sol_dispatch.SolAttnUnsupported, "trailing pad"
-        ):
-            impl.forward_varlen(
-                query,
-                key,
-                value,
-                cu_seqlens=None,
-                max_seqlen=SEQUENCE // 2,
-                cu_seqlens_host=(0, SEQUENCE // 2, SEQUENCE - 128, SEQUENCE),
-            )
+        for max_seqlen in (SEQUENCE // 2, SEQUENCE):
+            with (
+                self.subTest(max_seqlen=max_seqlen),
+                self.assertRaisesRegex(
+                    aiter_sol_dispatch.SolAttnUnsupported, "trailing pad"
+                ),
+            ):
+                impl.forward_varlen(
+                    query,
+                    key,
+                    value,
+                    cu_seqlens=None,
+                    max_seqlen=max_seqlen,
+                    cu_seqlens_host=(0, SEQUENCE // 2, SEQUENCE - 128, SEQUENCE),
+                )
 
     def test_rejects_a_pack_whose_keys_have_their_own_bounds(self):
         # Asymmetric key ranges are a second sequence on the key side, which
@@ -466,45 +533,123 @@ class TestSolRejectedCalls(_SolTestCase):
         query, key, value = (
             tensor.squeeze(0) for tensor in self._operands(seqlen=SEQUENCE)
         )
-        with self.assertRaisesRegex(
-            aiter_sol_dispatch.SolAttnUnsupported, "trailing pad"
+        for used, bounds in (
+            (SEQUENCE // 2, (0, SEQUENCE // 2, SEQUENCE)),
+            (SEQUENCE, (0, SEQUENCE)),
+            (SEQUENCE, (0, SEQUENCE, SEQUENCE)),
         ):
-            impl.forward_varlen(
-                query,
-                key,
-                value,
-                cu_seqlens=None,
-                max_seqlen=SEQUENCE // 2,
-                cu_seqlens_host=(0, SEQUENCE // 2, SEQUENCE),
-                cu_seqlens_k=torch.tensor([0, SEQUENCE // 2]),
-            )
+            with (
+                self.subTest(bounds=bounds),
+                self.assertRaisesRegex(
+                    aiter_sol_dispatch.SolAttnUnsupported, "trailing pad"
+                ),
+            ):
+                impl.forward_varlen(
+                    query,
+                    key,
+                    value,
+                    cu_seqlens=None,
+                    max_seqlen=used,
+                    cu_seqlens_host=bounds,
+                    cu_seqlens_k=torch.tensor([0, SEQUENCE // 2]),
+                )
 
 
 class TestSolTrailingPad(_SolTestCase):
-    def test_a_trailing_pad_is_served_and_the_pad_rows_are_zeroed(self):
-        # The live prefix is attended on its own and the pad rows are written
-        # as zeros, so a caller that reads the whole buffer never sees the
-        # junk an unmasked kernel would leave there.
+    def test_single_sequence_output_with_optional_trailing_padding(self):
+        """Single-sequence bounds must return live output even without padding;
+        any trailing pad rows must remain zero.
+        """
+        self._patch("_aiter_mha_v4_packed", lambda q, k, v, *args, **kwargs: v + 7)
         impl = self._build()
         query, key, value = (
             tensor.squeeze(0) for tensor in self._operands(seqlen=SEQUENCE)
         )
-        used = SEQUENCE // 2
-        output = impl.forward_varlen(
-            query,
-            key,
-            value,
-            cu_seqlens=None,
-            max_seqlen=used,
-            cu_seqlens_host=(0, used, SEQUENCE),
-        )
-        self.assertEqual(self._key_seen().shape[1], used)
-        self.assertEqual(output.shape, (SEQUENCE, HEADS, HEAD_DIM))
-        self.assertTrue(torch.all(output[used:] == 0))
+        value.copy_((torch.arange(SEQUENCE) % 17).to(value.dtype).view(SEQUENCE, 1, 1))
+        for used, bounds in (
+            (SEQUENCE // 2, (0, SEQUENCE // 2, SEQUENCE)),
+            (SEQUENCE, (0, SEQUENCE)),
+            (SEQUENCE, (0, SEQUENCE, SEQUENCE)),
+        ):
+            with self.subTest(bounds=bounds):
+                output = impl.forward_varlen(
+                    query,
+                    key,
+                    value,
+                    cu_seqlens=None,
+                    max_seqlen=used,
+                    cu_seqlens_host=bounds,
+                )
+                expected = torch.zeros_like(value)
+                expected[:used] = value[:used] + 7
+                torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
 class TestSolAgainstRealAiter(CustomTestCase):
-    """The two facts only aiter can confirm."""
+    """Routing and recipe contracts against the installed AITER build."""
+
+    @unittest.skipUnless(
+        aiter_sol_dispatch.AITER_SOL_AVAILABLE and torch.cuda.is_available(),
+        "requires a GPU and an aiter that ships mha_v4_sol",
+    )
+    def test_tensor_beta_updates_in_a_captured_routing_graph(self):
+        """Graph replay must read the current beta, not its capture-time value."""
+        from sglang.multimodal_gen.runtime.layers.attention.backends.aiter_sol_kernels import (
+            route_and_pack,
+        )
+
+        proxy = torch.arange(32, device="cuda", dtype=torch.float32).reshape(
+            1, 1, 1, 32
+        )
+        states = {}
+        beta = prepare_sol_beta(
+            states=states,
+            step=0,
+            total_steps=1,
+            is_warmup=True,
+            device=proxy.device,
+            config={"beta_schedule": "0.0,1.0,-1.0"},
+        )
+
+        def route():
+            return route_and_pack(proxy, beta, 32, 4, False)
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                route()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = route()
+        for step, threshold in enumerate((0.0, 1.0, -1.0)):
+            prepare_sol_beta(
+                states=states,
+                step=step,
+                total_steps=3,
+                is_warmup=False,
+                device=proxy.device,
+                config={"beta_schedule": "0.0,1.0,-1.0"},
+            )
+            graph.replay()
+            reference = route_and_pack(proxy, threshold, 32, 4, False)
+            for actual, expected in zip(captured[:3], reference[:3]):
+                torch.testing.assert_close(actual, expected)
+            count = reference[1].item()
+            torch.testing.assert_close(captured[3][:count], reference[3][:count])
+            expected_mask = proxy > proxy.mean() + threshold * proxy.std(correction=0)
+            torch.testing.assert_close(captured[0], expected_mask)
+        prepare_sol_beta(
+            states=states,
+            step=1,
+            total_steps=2,
+            is_warmup=False,
+            device=proxy.device,
+            config={"beta_schedule": "1.0:0.0"},
+        )
+        graph.replay()
+        torch.testing.assert_close(captured[0], proxy > proxy.mean())
 
     @unittest.skipUnless(
         aiter_sol_dispatch.AITER_SOL_AVAILABLE,
@@ -547,14 +692,27 @@ class TestSolAgainstRealAiter(CustomTestCase):
         operands = aiter_sol_dispatch._quantize(
             recipe, query, key, value, SOFTMAX_SCALE
         )
-        reference = aiter_sol_dispatch.sol_attn_routing_for(*operands, beta, recipe)
-        fused = aiter_sol_dispatch.sol_attn_routing_fused(*operands, beta, recipe)
+        beta_tensor = torch.tensor(beta, device=query.device)
+        graphs = []
 
-        self.assertTrue(
-            torch.equal(reference["block_attn_mask"], fused["block_attn_mask"])
-        )
-        self.assertTrue(torch.equal(reference["lut_count"], fused["lut_count"]))
-        self.assertTrue(torch.equal(reference["block_bitmap"], fused["block_bitmap"]))
+        def backend(graph, example_inputs):
+            graphs.append(graph)
+            return torch._inductor.compile(graph, example_inputs)
+
+        def route(beta):
+            return aiter_sol_dispatch.sol_attn_routing_fused(*operands, beta, recipe)
+
+        route(beta_tensor)
+        compiled = torch.compile(route, backend=backend, fullgraph=True)
+        for threshold in (0.5, 0.0, 1.0):
+            beta_tensor.fill_(threshold)
+            reference = aiter_sol_dispatch.sol_attn_routing_for(
+                *operands, beta_tensor, recipe
+            )
+            fused = compiled(beta_tensor)
+            for key in ("block_attn_mask", "lut_count", "block_bitmap"):
+                self.assertTrue(torch.equal(reference[key], fused[key]), key)
+        self.assertEqual(len(graphs), 1)
         # A routing that selects everything, or nothing, would pass the
         # comparisons above without exercising the threshold.
         density = fused["block_attn_mask"].float().mean().item()

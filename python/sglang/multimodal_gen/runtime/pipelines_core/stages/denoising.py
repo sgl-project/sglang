@@ -334,6 +334,7 @@ class DenoisingStage(PipelineStage):
         # Breakable CUDA graph runners, lazily created per (module, quality
         # level); see _maybe_get_bcg_runner for why the level is in the key.
         self._bcg_runners: dict[tuple[int, str], Any] = {}
+        self._sol_beta_states = {}
 
         hidden_size = self.server_args.pipeline_config.dit_config.hidden_size
         num_attention_heads = (
@@ -2192,6 +2193,24 @@ class DenoisingStage(PipelineStage):
             return kwargs
         return {k: v for k, v in kwargs.items() if k in param_names}
 
+    def _prepare_sol_beta(
+        self, batch: Req, step: int, device: torch.device, server_args: ServerArgs
+    ) -> torch.Tensor | None:
+        if self.attn_backend.get_enum() != AttentionBackendEnum.AITER_SOL:
+            return None
+        from sglang.multimodal_gen.runtime.layers.attention.backends.aiter_sol_schedule import (
+            prepare_sol_beta,
+        )
+
+        return prepare_sol_beta(
+            states=self._sol_beta_states,
+            step=step,
+            total_steps=batch.num_inference_steps,
+            is_warmup=batch.is_warmup,
+            device=device,
+            config=server_args.attention_backend_config or {},
+        )
+
     def _predict_noise_with_cfg(
         self,
         current_model: nn.Module,
@@ -2213,6 +2232,10 @@ class DenoisingStage(PipelineStage):
             batch, current_guidance_scale
         )
 
+        sol_beta = self._prepare_sol_beta(
+            batch, timestep_index, latent_model_input.device, server_args
+        )
+
         def predict_fn(branch):
             branch.configure_batch(batch)
             with set_forward_context(
@@ -2220,6 +2243,7 @@ class DenoisingStage(PipelineStage):
                 attn_metadata=attn_metadata,
                 forward_batch=batch,
                 quality=batch.sampling_params.quality,
+                sol_beta=sol_beta,
             ):
                 raw = self._predict_noise(
                     current_model=current_model,

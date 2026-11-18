@@ -226,7 +226,12 @@ class TestLayeredCFGOrder(CustomTestCase):
         self.assertFalse(torch.equal(serial, neg + 7.0 * (pos - neg)))
 
     def test_dispatch_gathers_for_layered_and_preserves_legacy_fast_path(self):
+        from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
+            SDPABackend,
+        )
+
         stage = DenoisingStage.__new__(DenoisingStage)
+        stage.attn_backend = SDPABackend
         batch = SimpleNamespace(
             do_classifier_free_guidance=True,
             cfg_normalization=0,
