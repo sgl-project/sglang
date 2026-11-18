@@ -91,6 +91,8 @@ def test_padded_prompt_encodes_bitwise_like_the_native_rope(encoder, monkeypatch
         calls.append(kwargs["query"].shape)
         return fused_rope(**kwargs)
 
+    # a CUDA graph replay would skip both the counting and the native RoPE
+    monkeypatch.setattr(encoder, "_cuda_graphs", None)
     monkeypatch.setattr(
         qwen3, "flashinfer_apply_rope_inplace", counting_rope, raising=False
     )
