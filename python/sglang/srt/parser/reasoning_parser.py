@@ -444,6 +444,90 @@ class IQuestQ1ReasoningDetector(BaseReasoningFormatDetector):
         )
 
 
+class Step5Detector(DeepSeekR1Detector):
+    """Reasoning detector for Step5 models.
+
+    Step models follow DeepSeek-R1's always-on reasoning behavior, but may
+    begin ``<tool_call>`` without first emitting ``</think>``. Treat the tool
+    marker as an implicit reasoning boundary so the downstream tool parser
+    receives the complete tool-call payload.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = True,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        super().__init__(
+            stream_reasoning=stream_reasoning,
+            force_reasoning=force_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
+        )
+        self.tool_start_token = "<tool_call>"
+
+    def _detect_and_parse_impl(self, text: str) -> StreamingParseResult:
+        if self._in_reasoning or self.think_start_token in text:
+            processed = text
+            opening = self.think_start_token + self.think_start_self_label
+            while processed.startswith(opening):
+                processed = processed[len(opening) :]
+            tool = processed.find(self.tool_start_token)
+            end = processed.find(self.think_end_token)
+            if tool >= 0 and (end < 0 or tool < end):
+                return StreamingParseResult(
+                    reasoning_text=processed[:tool], normal_text=processed[tool:]
+                )
+        return super()._detect_and_parse_impl(text)
+
+    def _parse_streaming_increment_impl(self, new_text: str) -> StreamingParseResult:
+        self._buffer += new_text
+        text = self._buffer
+        opening = self.think_start_token + self.think_start_self_label
+        if any(
+            token.startswith(text) and token != text
+            for token in (opening, self.think_end_token, self.tool_start_token)
+        ):
+            return StreamingParseResult()
+        # Opening markers inside tool arguments are literal content.
+        if not self.stripped_think_start and text.startswith(opening):
+            text = text[len(opening) :]
+            self._buffer = text
+            self.stripped_think_start = True
+            self._in_reasoning = True
+        if self._in_reasoning:
+            tool = text.find(self.tool_start_token)
+            end = text.find(self.think_end_token)
+            if tool >= 0 and (end < 0 or tool < end):
+                boundary, skip = tool, 0
+            elif end >= 0:
+                boundary, skip = end, len(self.think_end_token)
+            else:
+                if not self.stream_reasoning:
+                    return StreamingParseResult()
+                tokens = [self.think_end_token, self.tool_start_token]
+                if not self.stripped_think_start:
+                    tokens.append(opening)
+                holdback = max(self._ends_with_partial_token(text, t) for t in tokens)
+                self._buffer = text[len(text) - holdback :]
+                reasoning = text[: len(text) - holdback]
+                if reasoning:
+                    self._streamed_reasoning_tail = reasoning[-1]
+                return StreamingParseResult(reasoning_text=reasoning)
+            self._buffer = ""
+            self._in_reasoning = False
+            self.stripped_think_start = True
+            return StreamingParseResult(
+                reasoning_text=text[:boundary], normal_text=text[boundary + skip :]
+            )
+        self._buffer = ""
+        return StreamingParseResult(normal_text=text)
+
+
 class Qwen3Detector(BaseReasoningFormatDetector):
     """
     Detector for Qwen3 models (e.g., Qwen/Qwen3-235B-A22B).
@@ -2384,6 +2468,7 @@ class ReasoningParser:
         "nanbeige": Qwen3Detector,
         "step3": DeepSeekR1Detector,
         "step3p5": DeepSeekR1Detector,
+        "step5": Step5Detector,
         "mistral": MistralDetector,
         "nemotron_3": Nemotron3Detector,
         "granite_thinking_parser": GraniteThinkingDetector,
