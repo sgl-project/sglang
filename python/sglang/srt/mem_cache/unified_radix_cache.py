@@ -1336,6 +1336,17 @@ class UnifiedRadixCache(BasePrefixCache):
         for comp in self._components_tuple:
             effective_cache_len = comp.floor_cache_len(effective_cache_len)
 
+        if is_finished and effective_cache_len <= 0 < req.bidir_prefix_len <= len(
+            token_ids
+        ):
+            # No component checkpoint to donate (the Mamba state ran past the
+            # key after decoding); keep the state block on its own.
+            effective_cache_len = req.bidir_prefix_len
+            insert_params.mamba_value = None
+            insert_params.mamba_host_value = None
+            insert_params.mamba_host_src = None
+            insert_params.allow_missing_mamba = True
+
         radix_key = RadixKey(
             token_ids[:effective_cache_len],
             req.extra_key,
@@ -1511,9 +1522,7 @@ class UnifiedRadixCache(BasePrefixCache):
             from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
             if not isinstance(req.finished_reason, FINISH_ABORT):
-                self.session_refs.register_session_ref(
-                    req, leaf=result.last_device_node
-                )
+                self.session_refs.register_session_ref(req, leaf=last_node)
 
     @rank_consensus(same_params=["req.rid"])
     def advance_unpublished_req(self, req: Req) -> None:

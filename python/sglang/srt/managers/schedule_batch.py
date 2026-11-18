@@ -54,6 +54,7 @@ ScheduleBatch -> ForwardBatch
 
 import copy
 import dataclasses
+import hashlib
 import logging
 import re
 import sys
@@ -861,10 +862,14 @@ class Req(ReqDllmMixin):
             ) + lora_id  # lora_id is concatenated to the extra key
 
         if bidir_prefix_len >= 0:
-            # Boundary and caller namespace as length-delimited components, so
-            # ("|bidir4", P=1) and ("", P=4) cannot share a cache subtree.
+            # State-token KV depends on the whole state block, so two states
+            # must never share radix nodes: key the namespace on the state's
+            # tokens, with the caller key as a length-delimited component.
+            state_hash = hashlib.sha256(
+                array("q", origin_input_ids[:bidir_prefix_len]).tobytes()
+            ).hexdigest()
             caller_key = extra_key or ""
-            extra_key = f"bidir{bidir_prefix_len}|{len(caller_key)}|{caller_key}"
+            extra_key = f"bidir{state_hash}|{len(caller_key)}|{caller_key}"
 
         self.extra_key = extra_key
         self.cache_salt = cache_salt or None

@@ -767,6 +767,29 @@ class MambaComponent(TreeComponent):
             return None
         return previous_cache_len, pool.get_mamba_ping_pong_other_idx(keep_idx)
 
+    def _track_state_only_end(self, req: Req, token_ids_len: int) -> None:
+        """A state-only block-bidirectional prefill ends where its key ends:
+        keep its exact state so questions on it need no recompute."""
+        tracked = req.kv.mamba_last_track_seqlen
+        if (
+            req.bidir_prefix_len != token_ids_len
+            or not req.is_prefill_only
+            or token_ids_len % self.tree_core.page_size != 0
+            or tracked is None
+            or not 0 < tracked < token_ids_len
+            or req.kv.mamba_ping_pong_track_buffer is None
+        ):
+            return
+        keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
+        storage, sub_pool = self._state()
+        storage.copy_state(
+            sub_pool,
+            req.kv.mamba_pool_idx.unsqueeze(0),
+            req.kv.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(0),
+        )
+        req.kv.mamba_prev_track_seqlen = tracked
+        req.kv.mamba_last_track_seqlen = token_ids_len
+
     def prepare_for_caching_req(
         self,
         req: Req,
@@ -791,6 +814,7 @@ class MambaComponent(TreeComponent):
             if cache_len is None:
                 cache_len = 0
             if self.cache.enable_mamba_extra_buffer:
+                self._track_state_only_end(req, token_ids_len)
                 checkpoint = self._select_finished_checkpoint(req, token_ids_len)
                 if checkpoint is None:
                     return 0

@@ -1847,7 +1847,7 @@ class TestBidirStateBlockCheckpoint(
     )
     STATE_LEN, PROMPT_LEN, CHECKPOINT = 12, 16, 8
 
-    def _finish(self, bidir_prefix_len):
+    def _finish(self, bidir_prefix_len, checkpoint=CHECKPOINT):
         cache, allocator, pool = build_fixture(self.cfg, mamba_cache_chunk_size=4)
         req, _ = self._build_req(allocator, pool, None)
         tokens = list(range(self.PROMPT_LEN))
@@ -1857,7 +1857,7 @@ class TestBidirStateBlockCheckpoint(
             (req.kv.req_pool_idx, slice(self.STATE_LEN, len(tokens))),
             allocator.alloc(len(tokens) - self.STATE_LEN),
         )
-        req.kv.mamba_last_track_seqlen = self.CHECKPOINT
+        req.kv.mamba_last_track_seqlen = checkpoint
         req.bidir_prefix_len = bidir_prefix_len
         req.last_node = cache.root_node_handle()
         avail_before = allocator.available_size()
@@ -1871,6 +1871,17 @@ class TestBidirStateBlockCheckpoint(
         self.assertEqual(state.full_kv_hit_length, self.STATE_LEN)
         self.assertEqual(state.device_prefix_len, self.CHECKPOINT)
         self.assertEqual(match_prefix(cache, tokens).full_kv_hit_length, self.STATE_LEN)
+        self.assertEqual(freed, self.PROMPT_LEN - self.STATE_LEN)
+
+    def test_state_block_is_kept_without_a_mamba_checkpoint(self):
+        # After decoding the tracked state can run past the key, so Mamba
+        # donates nothing; the state block is still kept.
+        cache, tokens, freed = self._finish(
+            self.STATE_LEN, checkpoint=self.PROMPT_LEN + 2
+        )
+        state = match_prefix(cache, tokens[: self.STATE_LEN])
+        self.assertEqual(state.full_kv_hit_length, self.STATE_LEN)
+        self.assertEqual(state.device_prefix_len, 0)
         self.assertEqual(freed, self.PROMPT_LEN - self.STATE_LEN)
 
     def test_causal_request_is_unchanged(self):
