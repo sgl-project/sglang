@@ -387,23 +387,28 @@ impl CoreHandle {
     }
 
     async fn prepare_generations(&self, requests: &mut [GenerateRequest]) -> Result<(), CoreError> {
-        // A multimodal model's requests wait here until the MM pool starts, so
-        // none is admitted without the processor's media hooks. The wait has
-        // no deadline: the pool starts during launch, and runtime shutdown
-        // cancels a waiting handler with the api runtime.
-        let processor = if self.inner.multimodal {
-            Some(self.inner.mm_processor.wait().await)
+        let prepared = if self.inner.metadata.epd_dispatch {
+            // The encoders fetch the media themselves.
+            (requests.iter().filter_map(|r| r.mm.as_deref()))
+                .try_for_each(|mm| prefetch::check_limits(mm, &self.inner.mm_limits).map(drop))
         } else {
-            self.inner.mm_processor.get()
+            // A multimodal model's requests wait here until the MM pool starts, so
+            // none is admitted without the processor's media hooks. The wait has
+            // no deadline: the pool starts during launch, and runtime shutdown
+            // cancels a waiting handler with the api runtime.
+            let processor = if self.inner.multimodal {
+                Some(self.inner.mm_processor.wait().await)
+            } else {
+                self.inner.mm_processor.get()
+            };
+            prefetch::prefetch_all(requests, &self.inner.mm_limits, processor).await
         };
-        prefetch::prefetch_all(requests, &self.inner.mm_limits, processor)
-            .await
-            .map_err(|error| {
-                if let (MediaError::Client(message), Some(request)) = (&error, requests.first()) {
-                    tracing::warn!(rid = %request.rid, error = %message, "rejected request");
-                }
-                CoreError::from(error)
-            })
+        prepared.map_err(|error| {
+            if let (MediaError::Client(message), Some(request)) = (&error, requests.first()) {
+                tracing::warn!(rid = %request.rid, error = %message, "rejected request");
+            }
+            CoreError::from(error)
+        })
     }
 }
 

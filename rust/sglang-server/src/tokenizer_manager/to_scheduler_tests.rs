@@ -90,7 +90,12 @@ fn make_intake_inner(
 
 /// An [`MmDispatch`] over `tx`.
 fn test_mm(tx: flume::Sender<Request>, enabled: bool) -> MmDispatch {
-    MmDispatch { enabled, tx }
+    MmDispatch {
+        enabled,
+        epd_dispatch: false,
+        epd_image_token_id: None,
+        tx,
+    }
 }
 
 /// Token count of a pushed request's `input_ids` buffer.
@@ -1666,4 +1671,139 @@ fn mm_text_prompt_under_skip_tokenizer_init_is_a_400() {
     intake.drive(req);
     assert!(rx.try_recv().is_err(), "no error frame");
     assert!(mm_rx.try_recv().is_ok(), "submitted to the mm pool");
+}
+
+/// The `epd.media` buffer of a pushed request, decoded.
+fn epd_media(req: &SchedulerRequest) -> serde_json::Value {
+    let buffer = find(&req.buffers, "epd.media").expect("epd.media buffer");
+    let crate::message::buffers::BufferStore::Inline(BufferData::U8(bytes)) = &buffer.store else {
+        panic!("epd.media is inline msgpack bytes");
+    };
+    rmp_serde::from_slice(bytes).unwrap()
+}
+
+/// Under EPD dispatch a multimodal text prompt takes the plain text route:
+/// the tokenizer pool, never the mm pool, and its media rides to the
+/// scheduler as `epd.media` beside the unexpanded ids.
+#[test]
+fn epd_text_prompt_skips_the_mm_pool_and_carries_its_media() {
+    let (mut intake, tok_rx, mm_rx, consumer, _detok_rx) = make_intake_with_tokenizer(true);
+    intake.mm.epd_dispatch = true;
+    intake.mm.epd_image_token_id = Some(1);
+    intake.drive(mm_generate_req("epd-t"));
+
+    let mut req = tok_rx.try_recv().expect("tokenizer pool");
+    assert!(
+        matches!(
+            req.state,
+            RequestState::Tokenizing {
+                then: AfterTokenize::PreSend
+            }
+        ),
+        "{:?}",
+        req.state
+    );
+    assert!(mm_rx.try_recv().is_err(), "never reaches the mm pool");
+    if let RequestKind::Generate(g) = &mut req.kind {
+        g.input_ids = Some(vec![7, 1, 8]);
+    }
+    req.state.apply(Event::TokenizeDone).unwrap();
+    intake.drive(req);
+
+    let batch = consumer.drain(16);
+    assert_eq!(batch.len(), 1);
+    let names: Vec<&str> = batch[0].buffers.iter().map(|b| b.name.as_str()).collect();
+    assert_eq!(names, ["input_ids", "epd.media"]);
+    assert_eq!(ids_len(&batch[0]), 3, "the ids stay unexpanded");
+    assert_eq!(
+        epd_media(&batch[0]),
+        serde_json::json!(["data:image/jpeg;base64,xxxx"])
+    );
+}
+
+/// Client ids go straight to the channel; each image keeps its form: a bare
+/// source, or `{"url", "detail"}` when the client set a detail.
+#[test]
+fn epd_pretokenized_request_carries_each_image_as_sent() {
+    let (mut intake, _tok_rx, mm_rx, consumer, _detok_rx) = make_intake_with_tokenizer(true);
+    intake.mm.epd_dispatch = true;
+    let mut req = mm_pretokenized_req("epd-ids");
+    if let RequestKind::Generate(g) = &mut req.kind {
+        g.mm.as_mut().unwrap().image_data.extend([
+            crate::message::multimodal::MmItem::Ref {
+                url: "http://a/x.png".into(),
+                hints: crate::message::multimodal::MediaHints {
+                    detail: Some("high".into()),
+                    ..Default::default()
+                },
+            },
+            crate::message::multimodal::MmItem::Ref {
+                url: "http://a/y.png".into(),
+                hints: Default::default(),
+            },
+        ]);
+    }
+    intake.drive(req);
+
+    assert!(mm_rx.try_recv().is_err(), "never reaches the mm pool");
+    let batch = consumer.drain(16);
+    assert_eq!(batch.len(), 1);
+    assert_eq!(ids_len(&batch[0]), 3);
+    assert_eq!(
+        epd_media(&batch[0]),
+        serde_json::json!([
+            "data:image/jpeg;base64,xxxx",
+            {"url": "http://a/x.png", "detail": "high"},
+            "http://a/y.png",
+        ])
+    );
+}
+
+/// The EPD refusal of a pretokenized request, read from its error frame;
+/// nothing reaches a pool or the channel.
+fn epd_refusal(epd_image_token_id: Option<i32>, edit: impl FnOnce(&mut GenerateRequest)) -> Error {
+    let (mut intake, _tok_rx, mm_rx, consumer, _detok_rx) = make_intake_with_tokenizer(true);
+    intake.mm.epd_dispatch = true;
+    intake.mm.epd_image_token_id = epd_image_token_id;
+    let (tx, mut rx) = mpsc::channel(8);
+    let mut req = mm_pretokenized_req("epd-refused");
+    req.sink = ResponseSink::Local(tx);
+    if let RequestKind::Generate(g) = &mut req.kind {
+        edit(g);
+    }
+    intake.drive(req);
+
+    assert!(mm_rx.try_recv().is_err(), "never reaches the mm pool");
+    assert!(consumer.drain(16).is_empty(), "never reaches the channel");
+    let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
+        panic!("expected a terminal error frame");
+    };
+    err
+}
+
+/// EPD dispatch serves images only: a video is a 400.
+#[test]
+fn epd_video_is_a_400() {
+    let err = epd_refusal(None, |g| {
+        let mm = g.mm.as_mut().unwrap();
+        mm.video_data = std::mem::take(&mut mm.image_data);
+    });
+    assert_eq!(
+        err.client_fault_reason(),
+        Some(
+            "SGLANG_RUST_SERVER=1 with --language-only serves image inputs only; \
+             video and audio are not supported"
+        )
+    );
+}
+
+/// Ids whose placeholders do not match the images are the same 400 as the
+/// Rust MM pipeline's, before the scheduler sees them.
+#[test]
+fn epd_placeholder_count_mismatch_is_a_400() {
+    let err = epd_refusal(Some(1), |g| g.input_ids = Some(vec![7, 1, 1, 1, 8]));
+    assert_eq!(
+        err.client_fault_reason(),
+        Some("prompt has 3 media placeholder(s) but 1 media item(s)")
+    );
 }

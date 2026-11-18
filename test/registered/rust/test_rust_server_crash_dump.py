@@ -89,6 +89,8 @@ def _server_args(ext, port: int):
         enable_strict_thinking=False,
         limit_mm_data_per_request=[],
         allow_auto_truncate=False,
+        epd_dispatch=False,
+        epd_image_token_id=None,
         enable_return_hidden_states=False,
         return_hidden_states_mode=None,
         num_reserved_tokens=0,

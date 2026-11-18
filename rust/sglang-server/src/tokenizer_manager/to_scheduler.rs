@@ -241,7 +241,11 @@ impl Intake {
                             // worker expands placeholders in ids only, so the
                             // route is Tokenizing -> Encoding; a prompt that
                             // already has ids skips the pool hop, not the state.
-                            Ok(()) if self.mm.enabled && g.has_multimodal() => {
+                            Ok(())
+                                if self.mm.enabled
+                                    && !self.mm.epd_dispatch
+                                    && g.has_multimodal() =>
+                            {
                                 Ok(ValidationOutcome::HasMultimodal)
                             }
                             // Client ids skip the pool; text goes to the tokenizer.
@@ -320,8 +324,13 @@ impl Intake {
                 // a text request has no ids yet.
                 RequestState::PreSendValidating => {
                     if let RequestKind::Generate(g) = &mut req.kind
-                        && let Err(e) = validate_input_ids(g, self.limits.vocab_size)
-                            .and_then(|()| check_total_tokens(g, &self.limits))
+                        && let Err(e) = (if self.mm.epd_dispatch {
+                            g.take_epd_media(self.mm.epd_image_token_id)
+                        } else {
+                            Ok(())
+                        })
+                        .and_then(|()| validate_input_ids(g, self.limits.vocab_size))
+                        .and_then(|()| check_total_tokens(g, &self.limits))
                     {
                         let _ = req.state.apply(Event::Error(e)); // → Failed
                         continue;

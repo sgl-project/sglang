@@ -501,6 +501,8 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         let limits = tokenizer_manager::to_scheduler::Limits::from(&*cfg.server_args);
         let mm = tokenizer_manager::to_scheduler::MmDispatch {
             enabled: cfg.server_args.model_is_multimodal(),
+            epd_dispatch: cfg.server_args.epd_dispatch,
+            epd_image_token_id: cfg.server_args.epd_image_token_id,
             tx: mm_worker_tx,
         };
         let mut parts = Some((tok_manager_rx, to_scheduler_tx)); // moved into the single worker
@@ -530,7 +532,8 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             startup_ready: cfg.server_args.skip_server_warmup,
             is_disaggregation: cfg.server_args.is_disaggregation(),
             mm_limits: cfg.server_args.limit_mm_data_per_request.clone(),
-            multimodal: cfg.server_args.model_is_multimodal(),
+            // A language-only server runs no MM pool, so admission waits for none.
+            multimodal: cfg.server_args.model_is_multimodal() && !cfg.server_args.epd_dispatch,
             peer_endpoints: crate::api_server::core::peer_endpoints(
                 &cfg.server_args.deployment_info,
                 cfg.server_args.deployment_info.dp_rank.unwrap_or(0),

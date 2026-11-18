@@ -25,6 +25,7 @@ use sglang_mm::common::fetch::{ByteBudget, fetch_bytes_budgeted, fetch_local_fil
 use sglang_mm::driver::MAX_REQUEST_BYTES;
 use tokio::sync::Semaphore;
 
+use crate::message::multimodal::MmItem;
 use crate::message::request::{GenerateRequest, MmData, ProcessorFetch};
 use crate::multi_modality::encoded::MmModality;
 use crate::multi_modality::payload::io_sources;
@@ -63,27 +64,7 @@ pub async fn prefetch_all(
         let Some(mm) = mm.as_deref() else {
             return Ok(Vec::new());
         };
-        let modalities = [
-            (MmModality::Image, &mm.image_data),
-            (MmModality::Video, &mm.video_data),
-            (MmModality::Audio, &mm.audio_data),
-        ];
-        for (limit_name, limit) in modality_limits {
-            let Some((name, items)) = modalities
-                .iter()
-                .map(|&(modality, items)| (modality_name(modality), items))
-                .find(|(name, _)| name == limit_name)
-            else {
-                continue;
-            };
-            let count = items.len();
-            if count > *limit {
-                let display = name[..1].to_uppercase() + &name[1..];
-                return Err(MediaError::Client(format!(
-                    "{display} count {count} exceeds limit {limit} per request."
-                )));
-            }
-        }
+        let modalities = check_limits(mm, modality_limits)?;
         if let Some(processor) = processor {
             processor.check_media(mm).map_err(MediaError::Client)?;
         }
@@ -119,6 +100,35 @@ pub async fn prefetch_all(
         mm.prefetched = fetched.into_iter().map(|source| source.bytes).collect();
     }
     Ok(())
+}
+
+/// Check one request's media counts against `--limit-mm-data-per-request`.
+pub fn check_limits<'a>(
+    mm: &'a MmData,
+    modality_limits: &[(String, usize)],
+) -> Result<[(MmModality, &'a Vec<MmItem>); 3], MediaError> {
+    let modalities = [
+        (MmModality::Image, &mm.image_data),
+        (MmModality::Video, &mm.video_data),
+        (MmModality::Audio, &mm.audio_data),
+    ];
+    for (limit_name, limit) in modality_limits {
+        let Some((name, items)) = modalities
+            .iter()
+            .map(|&(modality, items)| (modality_name(modality), items))
+            .find(|(name, _)| name == limit_name)
+        else {
+            continue;
+        };
+        let count = items.len();
+        if count > *limit {
+            let display = name[..1].to_uppercase() + &name[1..];
+            return Err(MediaError::Client(format!(
+                "{display} count {count} exceeds limit {limit} per request."
+            )));
+        }
+    }
+    Ok(modalities)
 }
 
 /// One resolved source, and its timing when the processor fetched it.
