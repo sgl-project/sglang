@@ -33,6 +33,7 @@ from sglang.srt.runtime_context import (
     attn_dp_enabled_of,
     derive_attn_tp_size,
     get_platform,
+    shared_experts_tp_spans_dp,
 )
 from sglang.srt.utils.common import parse_connector_type
 
@@ -223,7 +224,11 @@ def handle_shared_experts_tp(server_args: Any):
         attn_cp_size=view.attn_cp_size,
         attn_dp_size=cfg.attn_dp_size,
     )
-    across_dp = cfg.attn_dp_size > 1 and attn_tp_size == 1 and view.attn_cp_size == 1
+    across_dp = shared_experts_tp_spans_dp(
+        attn_tp_size=attn_tp_size,
+        attn_cp_size=view.attn_cp_size,
+        attn_dp_size=cfg.attn_dp_size,
+    )
     replica_size = attn_tp_size * view.attn_cp_size
     width = cfg.tp_size if across_dp else replica_size
     if size < 1 or width % size != 0:

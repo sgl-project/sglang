@@ -158,6 +158,7 @@ from sglang.srt.runtime_context import (
     linear_attn_parallel_group,
     linear_attn_tp_rank,
     linear_attn_tp_size,
+    shared_experts_tp_spans_dp,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_hip, is_npu
@@ -711,8 +712,11 @@ class KimiK3MoE(nn.Module):
         self._shared_experts_tp_across_dp = (
             self._shared_experts_tp_comm
             and requested_shared_tp is not None
-            and parallel.attn_tp_size == 1
-            and parallel.attn_dp_size > 1
+            and shared_experts_tp_spans_dp(
+                attn_tp_size=parallel.attn_tp_size,
+                attn_cp_size=parallel.attn_cp_size,
+                attn_dp_size=parallel.attn_dp_size,
+            )
         )
         shared_experts_parallel_group = None
         if self._shared_experts_tp1:
