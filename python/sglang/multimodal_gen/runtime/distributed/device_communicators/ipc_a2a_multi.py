@@ -19,6 +19,7 @@ of slots (see ``_PipelinePool``).
 import dataclasses
 import functools
 import logging
+import math
 import socket
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -52,6 +53,10 @@ _MIN_GROUP_WAVES = 3
 # below, 30 us per peer loses to NCCL's one kernel. Pairs have ipc_a2a; larger
 # groups are not measured
 _AUTO_PLAIN_MIN_BYTES = {3: 48 << 20, 4: 128 << 20}
+# A pool that grows takes this much more than the call needs: every regrowth
+# re-shares the buffers over IPC (0.38 s of cudaIpcOpenMemHandle on 8 x B300),
+# and requests differ by a few percent.
+_POOL_HEADROOM = 1.25
 
 
 @functools.lru_cache(maxsize=None)
@@ -626,6 +631,12 @@ class IpcA2AMultiState:
             sizes = tuple(map(max, sizes, pool.sizes))
         reference = None
         grow = pool is None or pool.sizes != sizes
+        if grow:
+            sizes = (
+                math.ceil(sizes[0] * _POOL_HEADROOM),
+                math.ceil(sizes[1] * _POOL_HEADROOM),
+                sizes[2],
+            )
         if grow or check is not None:
             if torch.cuda.is_current_stream_capturing() or key in self.declined:
                 return None
