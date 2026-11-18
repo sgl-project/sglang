@@ -35,11 +35,11 @@ from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
+from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 
 if TYPE_CHECKING:
