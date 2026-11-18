@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.aiter_sol_dispatch 
     SolAttnUnsupported,
     check_sol_attn_build,
     check_sol_attn_values,
+    check_sol_tilt,
     sol_attn_bshd,
     sol_attn_routing_mode,
 )
@@ -66,6 +67,7 @@ class _SolConfig(msgspec.Struct, frozen=True):
     beta: float
     beta_schedule: BetaSchedule | None
     block_tile: tuple[int, int] | None
+    tilt_rank: int
 
 
 def _parse_block_tile(value: str | None) -> tuple[int, int] | None:
@@ -99,6 +101,7 @@ def _resolve_config() -> _SolConfig:
             None if schedule is None else BetaSchedule.from_spec(str(schedule))
         ),
         block_tile=_parse_block_tile(cfg.get("block_size")),
+        tilt_rank=int(cfg.get("tilt_rank", 0)),
     )
 
 
@@ -134,8 +137,9 @@ class AITERSolImpl(AttentionImpl):
     `recipe` key of --attention-backend-config (default fp8).
 
     Other keys: `beta` (routing threshold, default 0.5), `beta_schedule`
-    (`first:last` or one value per denoising step) and `block_size`
-    (`<q_tile>x<kv_tile>`, default the recipe's own geometry).
+    (`first:last` or one value per denoising step), `block_size`
+    (`<q_tile>x<kv_tile>`, default the recipe's own geometry) and `tilt_rank`
+    (pooled value tilt rank, default 0, which keeps the block means).
     """
 
     def __init__(
@@ -151,19 +155,22 @@ class AITERSolImpl(AttentionImpl):
         check_sol_attn_values(head_dim=head_size, is_causal=causal)
         config = _resolve_config()
         check_sol_attn_build(config.recipe, block_tile=config.block_tile)
+        check_sol_tilt(config.recipe, config.tilt_rank)
         self.recipe = config.recipe
         self.block_tile = config.block_tile
         self.beta = config.beta
         self.beta_schedule = config.beta_schedule
+        self.tilt_rank = config.tilt_rank
         self.softmax_scale = softmax_scale
 
         logger.info_once(
             "aiter_sol attention backend using recipe=%s beta=%s block_size=%s "
-            "routing=%s.",
+            "tilt_rank=%d routing=%s.",
             self.recipe,
             self.beta if self.beta_schedule is None else "scheduled",
             "default" if self.block_tile is None else self.block_tile,
-            sol_attn_routing_mode(self.recipe),
+            self.tilt_rank,
+            sol_attn_routing_mode(self.recipe, self.tilt_rank),
         )
 
     def _total_steps(self) -> int | None:
@@ -225,6 +232,7 @@ class AITERSolImpl(AttentionImpl):
             softmax_scale=self.softmax_scale,
             recipe=self.recipe,
             block_tile=self.block_tile,
+            tilt_rank=self.tilt_rank,
         )
         return output
 
@@ -277,6 +285,7 @@ class AITERSolImpl(AttentionImpl):
             softmax_scale=self.softmax_scale,
             recipe=self.recipe,
             block_tile=self.block_tile,
+            tilt_rank=self.tilt_rank,
             exact_kv_tokens=None if exact_kv_tokens is None else exact_kv_tokens[:used],
         )
         live_output = live_output.squeeze(0)

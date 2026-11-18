@@ -427,6 +427,77 @@ class TestSolExactKvTokens(_SolTestCase):
             self._forward_varlen(self._build({"recipe": "mxfp8"}), flags)
 
 
+class TestSolTilt(_SolTestCase):
+    """The pooled value tilt needs block K variance, which only aiter's routing
+    computes, and the packed entry point, which only it takes."""
+
+    def setUp(self):
+        super().setUp()
+        self._patch("SOL_TILT_AVAILABLE", True)
+        self.second_order_calls = []
+
+        def second_order(recipe, q, k, v, routing, softmax_scale, block_tile, rank):
+            self.second_order_calls.append({"recipe": recipe.name, "rank": rank})
+            return dict(
+                mean_k=routing["mean_k"],
+                mean_v=routing["mean_v"],
+                mean_k_scale=routing["mean_k_scale"],
+                mean_v_scale=routing["mean_v_scale"],
+                sol_tilt=(rank, 0, None),
+            )
+
+        self._patch("_second_order", second_order)
+
+    def test_a_tilted_call_leaves_the_fused_kernel_for_aiter_routing(self):
+        self._build({"recipe": "fp8", "tilt_rank": 2}).forward(*self._operands(), None)
+        self.assertEqual(self.fused_calls, [])
+        self.assertEqual(self.sol_calls, [])
+        (prepare,) = self.prepare_calls
+        self.assertTrue(prepare["k_variance"])
+        self.assertEqual(self.second_order_calls, [{"recipe": "fp8", "rank": 2}])
+        (packed,) = self.packed_calls
+        self.assertEqual(packed["sol_tilt"][0], 2)
+
+    def test_a_tilted_raw_capable_recipe_takes_the_packed_entry_point(self):
+        self._build({"recipe": "mxfp4", "tilt_rank": 1}).forward(
+            *self._operands(), None
+        )
+        self.assertEqual(self.sol_calls, [])
+        self.assertEqual(len(self.packed_calls), 1)
+
+    def test_an_untilted_call_keeps_the_fused_kernel(self):
+        self._build({"recipe": "fp8"}).forward(*self._operands(), None)
+        self.assertEqual(len(self.fused_calls), 1)
+        self.assertEqual(self.second_order_calls, [])
+        self.assertNotIn("sol_tilt", self.packed_calls[0])
+
+    def test_a_tilted_mxfp8_call_skips_the_lookahead_copy(self):
+        """The tilt's planes already come in aiter's padded storage."""
+        storage_calls = []
+        self._patch(
+            "_aiter_block_scale_storage",
+            lambda scale, *args, **kwargs: storage_calls.append(scale) or scale,
+        )
+        self._build({"recipe": "mxfp8", "tilt_rank": 2}).forward(
+            *self._operands(), None
+        )
+        self.assertEqual(storage_calls, [])
+        self._build({"recipe": "mxfp8"}).forward(*self._operands(), None)
+        self.assertEqual(len(storage_calls), 1)
+
+    def test_a_recipe_without_the_tilt_is_refused_at_construction(self):
+        with self.assertRaisesRegex(aiter_sol_dispatch.SolAttnUnsupported, "mxfp6"):
+            self._build({"recipe": "mxfp6", "tilt_rank": 2})
+        with self.assertRaisesRegex(aiter_sol_dispatch.SolAttnUnsupported, ">= 0"):
+            self._build({"recipe": "fp8", "tilt_rank": -1})
+
+    def test_an_aiter_without_the_tilt_builders_refuses_a_rank(self):
+        self._patch("SOL_TILT_AVAILABLE", False)
+        with self.assertRaisesRegex(aiter_sol_dispatch.SolAttnUnsupported, "sol_tilt"):
+            self._build({"recipe": "fp8", "tilt_rank": 2})
+        self._build({"recipe": "fp8"})
+
+
 class TestSolBetaSchedule(_SolTestCase):
     def test_a_ramp_hits_both_endpoints(self):
         schedule = BetaSchedule.from_spec("1.0:0.0")
@@ -895,6 +966,56 @@ class TestSolAgainstRealAiter(CustomTestCase):
                     # tail + forced + at most the kept maximum per row
                     bound = len(expected) + 2
                     self.assertLessEqual(mask.sum(dim=-1).max().item(), bound)
+
+    @unittest.skipUnless(
+        aiter_sol_dispatch.AITER_SOL_AVAILABLE
+        and aiter_sol_dispatch.SOL_TILT_AVAILABLE
+        and torch.cuda.is_available(),
+        "requires a GPU and an aiter that ships the Sol-Attn tilt builders",
+    )
+    def test_the_tilt_brings_pooled_blocks_closer_to_dense_attention(self):
+        """A pooled block's mean value is the unweighted block average; the tilt
+        adds the softmax-weighted correction. A plane that never reaches the
+        kernel would leave the output unchanged."""
+        torch.manual_seed(0)
+        seqlen, heads = 8192, 4
+        centers = 0.3 * torch.randn(16, HEAD_DIM, device="cuda")
+
+        def block_coherent():
+            # Runs of 64 tokens share a center, as neighbouring video tokens do.
+            pick = torch.randint(0, 16, (1, seqlen // 64, 1, heads), device="cuda")
+            pick = pick.expand(-1, -1, 64, -1).reshape(1, seqlen, heads)
+            noise = torch.randn(1, seqlen, heads, HEAD_DIM, device="cuda")
+            return (centers[pick] + 0.15 * noise).to(torch.bfloat16)
+
+        query, key, value = block_coherent(), block_coherent(), block_coherent()
+        reference = torch.nn.functional.scaled_dot_product_attention(
+            *(t.float().transpose(1, 2) for t in (query, key, value)),
+            scale=SOFTMAX_SCALE,
+        ).transpose(1, 2)
+
+        def error(recipe, tilt_rank):
+            output, _ = aiter_sol_dispatch.sol_attn_bshd(
+                query,
+                key,
+                value,
+                beta=0.5,
+                softmax_scale=SOFTMAX_SCALE,
+                recipe=recipe,
+                tilt_rank=tilt_rank,
+            )
+            self.assertTrue(output.isfinite().all().item())
+            return ((output.float() - reference).norm() / reference.norm()).item()
+
+        served = aiter_sol_dispatch.sol_attn_recipes_served()
+        for row in aiter_sol_dispatch._RECIPE_ROWS:
+            if row.tilt is None or row.name not in served:
+                continue
+            with self.subTest(recipe=row.name):
+                plain, tilted = error(row.name, 0), error(row.name, 2)
+                self.assertNotEqual(plain, tilted)
+                if row.name == "fp8":
+                    self.assertLess(tilted, 0.6 * plain)
 
     @unittest.skipUnless(
         aiter_sol_dispatch.AITER_SOL_AVAILABLE,
