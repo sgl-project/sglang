@@ -259,7 +259,6 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
 
         processor_config = MultimodalProcessorConfig(
             image_processor_backend=get_mm().image_processor_backend,
-            disable_fast_image_processor=get_mm().disable_fast_image_processor,
             mm_process_config=get_mm().mm_process_config,
             # A processor built without the feature pool runs its calls synchronously.
             mm_processor_worker_num=(

@@ -3,7 +3,7 @@
 Tests GLM-5 with DSA attention backend using few-shot completion
 benchmark on MI325/MI300X.
 
-Registry: nightly-amd-accuracy-8-gpu-glm5 suite
+Registry: nightly-accuracy-test-8-gpu-amd-glm5 suite
 """
 
 import ast
@@ -30,7 +30,7 @@ from sglang.utils import download_and_cache_file, read_jsonl
 # Register for AMD CI - GLM-5 accuracy test (~60 min)
 register_amd_ci(
     est_time=3600,
-    suite="nightly-amd-accuracy-8-gpu-glm5",
+    suite="nightly-accuracy-test-8-gpu-amd-glm5",
     nightly=True,
     disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
