@@ -41,6 +41,17 @@ class GraphTests(CustomTestCase):
         for n, expected in ((1, 1), (2, 4), (4, 4), (5, 16), (16, 16), (17, 0)):
             self.assertEqual(graph_rows_for_batch(batch([128] * n)), expected)
 
+    def test_cached_prefix_uses_suffix_rows_and_keeps_metadata(self):
+        b = batch([3, 5])
+        b.extend_prefix_lens_cpu = [1024, 256]
+        self.assertEqual(graph_rows_for_batch(b), 4)
+        buf = torch.full((4,), -1, dtype=torch.int64)
+        stage_graph_indices(buf, b.extend_seq_lens, 4)
+        self.assertEqual(buf.tolist(), [2, 7, 0, 0])
+        self.assertEqual(b.extend_prefix_lens_cpu, [1024, 256])
+        b.extend_is_final_cpu = [False, True]
+        self.assertEqual(graph_rows_for_batch(b), 0)
+
     def test_unsupported_uses_original_graph(self):
         for key, value in [
             ("return_logprob", True),
@@ -48,7 +59,7 @@ class GraphTests(CustomTestCase):
             ("tbo_parent_token_range", (0, 128)),
             ("tbo_children", []),
             ("extend_is_final_cpu", [False]),
-            ("extend_prefix_lens_cpu", [64]),
+            ("extend_prefix_lens_cpu", [-1]),
             ("capture_hidden_mode", CaptureHiddenMode.FULL),
             ("input_embeds", torch.ones(1)),
             ("return_pooled_hidden_states", True),

@@ -55,7 +55,7 @@ class LastLayerFFNTests(CustomTestCase):
             "lora_ids": ["adapter", None],
             "mm_inputs": [object()],
             "extend_is_final_cpu": [True, False],
-            "extend_prefix_lens_cpu": [1, 0],
+            "extend_prefix_lens_cpu": [-1, 0],
             "extend_seq_lens_cpu": [0, 8],
             "batch_size": 3,
             "input_ids": torch.arange(9),
@@ -65,6 +65,17 @@ class LastLayerFFNTests(CustomTestCase):
             with self.subTest(name=name):
                 b = batch()
                 setattr(b, name, value)
+                self.assertFalse(eligible_batch(b))
+
+    def test_cached_prefix_and_final_chunk_use_suffix_local_indices(self):
+        for prefixes in ([128, 0], [128, 256]):
+            with self.subTest(prefixes=prefixes):
+                b = batch()
+                b.extend_prefix_lens_cpu = prefixes
+                self.assertTrue(eligible_batch(b))
+                indices = torch.cumsum(b.extend_seq_lens, dim=0) - 1
+                self.assertEqual(indices.tolist(), [2, 7])
+                b.extend_is_final_cpu = [True, False]
                 self.assertFalse(eligible_batch(b))
 
     def test_empty_and_single_token_requests_keep_original_path(self):

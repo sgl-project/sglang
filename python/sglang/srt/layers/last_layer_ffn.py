@@ -7,7 +7,7 @@ from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMod
 
 
 def eligible_batch(batch):
-    """Fail closed unless every request is a complete ordinary cold prefill.
+    """Fail closed unless every request finishes an ordinary prefill.
 
     CPU metadata is used for decisions; never synchronize a CUDA tensor here.
     Static model/parallel/graph restrictions are checked by the model caller.
@@ -44,7 +44,9 @@ def eligible_batch(batch):
         return False
     if not (len(lens) == len(prefixes) == len(final) == batch.batch_size):
         return False
-    if not lens or min(lens) <= 0 or any(prefixes) or not all(final):
+    # Cached tokens already have KV. Selection is local to the newly extended
+    # rows, whether the prefix came from a cache hit or an earlier chunk.
+    if not lens or min(lens) <= 0 or min(prefixes) < 0 or not all(final):
         return False
     if sum(lens) != batch.input_ids.shape[0] or sum(lens) <= len(lens):
         return False

@@ -2454,9 +2454,11 @@ This preserves every attention operation and KV-cache write. It removes unused
 terminal computations without changing model weights or approximating the model.
 Reduced-precision GEMM rounding can differ when the number of rows changes.
 
-Supported models are dense, unquantized Qwen2 (including Qwen2.5) and Qwen3 on a
+Supported models are dense, unquantized Qwen2 (including Qwen2.5), Qwen3, and Llama on a
 single NVIDIA GPU, with tensor, pipeline, and context parallel sizes of one.
-The optimization applies to complete prefills with no cached prefix. Requests
+The optimization applies when every request in the batch finishes its prefill,
+including requests with cached prefixes and the final chunk of chunked prefill.
+Only newly extended token rows are selected; cached KV remains unchanged. Requests
 for prompt logprobs, hidden states, embeddings, speculative decoding, multimodal
 inputs, or LoRA use the original path, as do intermediate prefill chunks.
 Two-batch overlap also retains the original path, including ordinary prefill graphs.
