@@ -240,6 +240,14 @@ def _disable_normalize_embedding() -> bool:
     return get_model().disable_normalize_embedding
 
 
+def _normalize_embeddings(embeddings: torch.Tensor) -> torch.Tensor:
+    dtype = embeddings.dtype
+    # The norm can overflow fp16, and the normalization epsilon rounds to zero.
+    if dtype == torch.float16:
+        embeddings = embeddings.float()
+    return nn.functional.normalize(embeddings, p=2, dim=-1).to(dtype)
+
+
 class Pooler(nn.Module):
     """A layer that pools specific information from hidden states.
     This layer does the following:
@@ -275,12 +283,9 @@ class Pooler(nn.Module):
 
         if self.normalize:
             if isinstance(pooled_data, list):
-                pooled_data = [
-                    nn.functional.normalize(tensor, p=2, dim=-1)
-                    for tensor in pooled_data
-                ]
+                pooled_data = [_normalize_embeddings(tensor) for tensor in pooled_data]
             else:
-                pooled_data = nn.functional.normalize(pooled_data, p=2, dim=-1)
+                pooled_data = _normalize_embeddings(pooled_data)
 
         return EmbeddingPoolerOutput(embeddings=pooled_data)
 
