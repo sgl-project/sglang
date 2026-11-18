@@ -15,7 +15,7 @@ from types import SimpleNamespace as NS
 from sglang_simulator.simulation.sglang.hook_bootstrap import install_simulator_hooks
 install_simulator_hooks()
 from simopus.sdk import load_model_config
-from simopus.sdk.perf_database.native.proposal import MODEL_REVISION
+MODEL_REVISION = "5254448103b6254fc646dacbca1cbbf20e9216c1"
 from sglang.srt.configs.deepseek_v41 import DeepseekV41Config
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang_simulator.time_predictor.native_checkpoint import _bind_local_model_config
