@@ -178,7 +178,12 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
-from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
+from sglang.srt.utils import (
+    get_available_gpu_memory,
+    is_cuda,
+    is_gfx95_supported,
+    is_npu,
+)
 from sglang.srt.utils.aiter import maybe_pre_warm_aiter_chip_info
 
 if TYPE_CHECKING:
@@ -753,7 +758,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._dcp_extend_active = get_parallel().attn_dcp_size > 1 and hasattr(
             model_runner.model, "prepare_context_parallel_metadata_for_dcp"
         )
-        if is_hip() and is_kimi_k31(model_runner.model_config.hf_config):
+        if is_gfx95_supported() and is_kimi_k31(model_runner.model_config.hf_config):
             self._kimi_k31_rocm_bcg = True
             # Kimi-K3.1's DSA layers never read that gather buffer.
             self._dcp_extend_active = False
