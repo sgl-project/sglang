@@ -70,7 +70,6 @@ def _backend(rank, req_to_token, kv_shard, ring):
         SimpleNamespace(
             req_to_token=req_to_token,
             token_to_kv_pool=SimpleNamespace(get_key_buffer=lambda _: kv_shard),
-            kv_index_translator=SimpleNamespace(full_v2p_table=None),
             page_size=PAGE,
             dcp_size=DCP,
             dcp_rank=rank,
