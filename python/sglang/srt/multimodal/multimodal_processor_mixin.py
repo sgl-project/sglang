@@ -33,6 +33,7 @@ class MultimodalProcessorMixin:
     """Share media loading and preprocessing resources across training and serving."""
 
     gpu_image_decode = True  # Enable GPU decoding by default
+    gpu_video_decode = True
     smart_rgb_conversion = False
     auto_mm_io_worker_num = 4
     # Processors opt out only when their preprocessing is not thread-safe. The
@@ -44,6 +45,10 @@ class MultimodalProcessorMixin:
     video_preprocessing_device = None
     precompute_hash_before_cpu_transfer = False
     keep_mm_features_on_device = False
+
+    def _worker_thread_initializer(self):
+        """Runs first on every IO and processor worker thread; None runs nothing."""
+        return None
 
     def _initialize_processor(self, hf_config, _processor, *, processor_config):
         self.hf_config = hf_config
@@ -57,11 +62,10 @@ class MultimodalProcessorMixin:
         )
 
         self.image_processor_backend = processor_config.image_processor_backend
-        if processor_config.disable_fast_image_processor:
-            self.image_processor_backend = "pil"
         self.disable_fast_image_processor = self.image_processor_backend == "pil"
 
         mm_process_config = processor_config.mm_process_config
+        self.mm_process_config = mm_process_config
         self.image_config = mm_process_config.get("image", {})
         self.video_config = mm_process_config.get("video", {})
         self.audio_config = mm_process_config.get("audio", {})
@@ -93,6 +97,7 @@ class MultimodalProcessorMixin:
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=self.mm_io_worker_num,
             thread_name_prefix="sglang-mm-io",
+            initializer=self._worker_thread_initializer(),
         )
         if self.mm_io_worker_num > 4:
             logger.info(
@@ -122,7 +127,9 @@ class MultimodalProcessorMixin:
                 # `_processor` after this returns, and the workers must clone it
                 # as the subclass left it.
                 self.mm_processor_executor = MultimodalProcessorExecutor(
-                    lambda: self._processor, self.mm_processor_worker_num
+                    lambda: self._processor,
+                    self.mm_processor_worker_num,
+                    initializer=self._worker_thread_initializer(),
                 )
             except Exception:
                 logger.warning(
@@ -148,6 +155,12 @@ class MultimodalProcessorMixin:
     def _resolve_auto_mm_processor_worker_num(self) -> int:
         """Worker count when none is requested; serving overrides this."""
         return 1
+
+    async def _run_mm_processor(self, function, **kwargs):
+        # The function always gets a processor: a worker's clone, or the original inline.
+        if self.mm_processor_executor is None:
+            return function(processor=self._processor, **kwargs)
+        return await self.mm_processor_executor.run(function, **kwargs)
 
     @contextmanager
     def _temporary_fast_processor_cuda_pool(self, device: Optional[str]):
@@ -189,6 +202,7 @@ class MultimodalProcessorMixin:
         frame_count_limit=None,
         audio_sample_rate: Optional[int] = None,
         discard_alpha_channel=True,
+        video_decode_device: Optional[str] = None,
     ):
         """
         Load a single multimodal data.
@@ -214,7 +228,11 @@ class MultimodalProcessorMixin:
                 img.load()
                 return img
             elif modality == Modality.VIDEO:
-                return load_video(data, use_gpu=cls.video_preprocessing_device != "cpu")
+                if video_decode_device is None:
+                    video_decode_device = cls.video_preprocessing_device
+                return load_video(
+                    data, use_gpu=cls.gpu_video_decode and video_decode_device != "cpu"
+                )
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
@@ -262,6 +280,7 @@ class MultimodalProcessorMixin:
         modality: Modality,
         audio_sample_rate: Optional[int],
         discard_alpha_channel: bool,
+        video_decode_device: Optional[str] = None,
     ) -> List[Tuple[Modality, int, concurrent.futures.Future]]:
         """
         Simple version: For one modal data submit IO load task.
@@ -277,6 +296,12 @@ class MultimodalProcessorMixin:
             )
             return futures
 
+        # Legacy loader overrides predate the argument, so only a chosen device is sent.
+        load_kwargs = (
+            {}
+            if video_decode_device is None
+            else {"video_decode_device": video_decode_device}
+        )
         for idx, data in enumerate(data_list):
             logger.debug(
                 "[_submit_mm_data_loading_tasks_simple] submit load task: "
@@ -292,6 +317,7 @@ class MultimodalProcessorMixin:
                 None,  # frame_count_limit: no consider for fast path
                 audio_sample_rate,
                 discard_alpha_channel,
+                **load_kwargs,
             )
             futures.append((modality, idx, future))
 
@@ -349,6 +375,7 @@ class MultimodalProcessorMixin:
         *,
         audio_sample_rate: Optional[int],
         discard_alpha_channel: bool,
+        video_decode_device: Optional[str] = None,
     ) -> Tuple[List[Any], List[Any], List[Any]]:
         futures: List[Tuple[Modality, int, concurrent.futures.Future]] = []
 
@@ -361,7 +388,11 @@ class MultimodalProcessorMixin:
         for data_list, modality in modalities_data:
             futures.extend(
                 self._submit_mm_data_loading_tasks_simple(
-                    data_list, modality, audio_sample_rate, discard_alpha_channel
+                    data_list,
+                    modality,
+                    audio_sample_rate,
+                    discard_alpha_channel,
+                    video_decode_device=video_decode_device,
                 )
             )
 
