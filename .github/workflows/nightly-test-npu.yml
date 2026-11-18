@@ -2,6 +2,10 @@ name: Nightly Test (NPU)
 on:
   schedule:
     - cron: '0 16 * * *'  # Execute at 0:00 a.m. Beijing Time every day
+  # TEMPORARY(verify-mmlu-503): allow PR pushes to trigger this workflow since
+  # workflow_dispatch is unavailable here. All other nightly jobs are gated off,
+  # so only nightly-mmlu-npu-a3 executes.
+  pull_request:
   workflow_dispatch:
     inputs:
       ref:
@@ -153,7 +157,8 @@ jobs:
 
   nightly-test-1-npu-a3:
     name: nightly-test-1-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-1-npu-a3,')) }}
+    # TEMPORARY(verify-mmlu-503): disabled so only nightly-mmlu-npu-a3 runs.
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -184,12 +189,17 @@ jobs:
       # exercises the non-nightly dependency path where the MMLU prefetch now
       # lives. Revert to true once the verification run is green.
       is_nightly_pipeline_job: false
+      # The MMLU case is registered with nightly=True, so run_suite.py only
+      # selects it when --nightly is passed. Keep the PR install path (above)
+      # while still collecting nightly tests.
+      collect_nightly_tests: 'true'
       skip_pr_test_health_check: 'true'
     secrets: inherit
 
   nightly-test-2-npu-a3:
     name: nightly-test-2-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-2-npu-a3,')) }}
+    # TEMPORARY(verify-mmlu-503): disabled so only nightly-mmlu-npu-a3 runs.
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -205,7 +215,8 @@ jobs:
   # The nightly-test-4-npu-a3 suite is split across 2 parallel partition jobs, mirroring extra-b-test-4-npu-a3 in the PR pipeline.
   nightly-test-4-npu-a3:
     name: nightly-test-4-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-4-npu-a3,')) }}
+    # TEMPORARY(verify-mmlu-503): disabled so only nightly-mmlu-npu-a3 runs.
+    if: false
     needs: [set-image-config, sgl-router-build-aarch64]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -223,7 +234,8 @@ jobs:
 
   nightly-test-8-npu-a3:
     name: nightly-test-8-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-8-npu-a3,')) }}
+    # TEMPORARY(verify-mmlu-503): disabled so only nightly-mmlu-npu-a3 runs.
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -238,7 +250,8 @@ jobs:
 
   nightly-test-16-npu-a3:
     name: nightly-test-16-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-16-npu-a3,')) }}
+    # TEMPORARY(verify-mmlu-503): disabled so only nightly-mmlu-npu-a3 runs.
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -253,7 +266,8 @@ jobs:
 
   nightly-perf-test-2-npu-a3:
     name: nightly-perf-test-2-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-perf-test-2-npu-a3,')) }}
+    # TEMPORARY(verify-mmlu-503): disabled so only nightly-mmlu-npu-a3 runs.
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -269,7 +283,8 @@ jobs:
 
   nightly-perf-test-4-npu-a3:
     name: nightly-perf-test-4-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-perf-test-4-npu-a3,')) }}
+    # TEMPORARY(verify-mmlu-503): disabled so only nightly-mmlu-npu-a3 runs.
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -285,7 +300,8 @@ jobs:
 
   nightly-perf-test-16-npu-a3:
     name: nightly-perf-test-16-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-perf-test-16-npu-a3,')) }}
+    # TEMPORARY(verify-mmlu-503): disabled so only nightly-mmlu-npu-a3 runs.
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -303,7 +319,8 @@ jobs:
   # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
   nightly-acc-test-2-npu-a3:
     name: nightly-acc-test-2-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-test-2-npu-a3,')) }}
+    # TEMPORARY(verify-mmlu-503): disabled so only nightly-mmlu-npu-a3 runs.
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -320,7 +337,8 @@ jobs:
 
   nightly-acc-test-16-npu-a3:
     name: nightly-acc-test-16-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-test-16-npu-a3,')) }}
+    # TEMPORARY(verify-mmlu-503): disabled so only nightly-mmlu-npu-a3 runs.
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -336,7 +354,8 @@ jobs:
 
   nightly-acc-test-4-npu-a5:
      name: nightly-acc-test-4-npu-a5
-     if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-test-4-npu-a5,')) }}
+     # TEMPORARY(verify-mmlu-503): disabled so only nightly-mmlu-npu-a3 runs.
+     if: false
      needs: [set-image-config]
      uses: ./.github/workflows/_npu-single-node-test-stage.yml
      with:
@@ -353,7 +372,8 @@ jobs:
   # The router the PD tests in nightly-test-4-npu-a3, nightly-poc-multi-node-tests
   # and the nightly-poc-multi-node-accuracy-* jobs launch.
   sgl-router-build-aarch64:
-    if: ${{ needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-4-npu-a3,') || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-tests,') || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-accuracy-odd-day,') || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-accuracy-even-day,') }}
+    # TEMPORARY(verify-mmlu-503): disabled so only nightly-mmlu-npu-a3 runs.
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_pr-test-sgl-router-build.yml
     with:
@@ -363,7 +383,8 @@ jobs:
 
   nightly-poc-multi-node-tests:
     name: multi-node-poc
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-tests,')) }}
+    # TEMPORARY(verify-mmlu-503): disabled so only nightly-mmlu-npu-a3 runs.
+    if: false
     needs: [set-image-config, nightly-perf-test-2-npu-a3, nightly-perf-test-4-npu-a3, nightly-perf-test-16-npu-a3, nightly-acc-test-2-npu-a3, nightly-acc-test-16-npu-a3, sgl-router-build-aarch64]
     strategy:
       fail-fast: false
@@ -468,7 +489,8 @@ jobs:
   # deployment occupies the pool at a time.
   nightly-poc-multi-node-accuracy-odd-day:
     name: multi-node-poc-accuracy-odd-day
-    if: ${{ !cancelled() && needs.set-image-config.outputs.accuracy_date_parity == 'odd' && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-accuracy-odd-day,')) }}
+    # TEMPORARY(verify-mmlu-503): disabled so only nightly-mmlu-npu-a3 runs.
+    if: false
     needs: [set-image-config, nightly-poc-multi-node-tests, sgl-router-build-aarch64]
     strategy:
       fail-fast: false
@@ -500,7 +522,8 @@ jobs:
 
   nightly-poc-multi-node-accuracy-even-day:
     name: multi-node-poc-accuracy-even-day
-    if: ${{ !cancelled() && needs.set-image-config.outputs.accuracy_date_parity == 'even' && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-accuracy-even-day,')) }}
+    # TEMPORARY(verify-mmlu-503): disabled so only nightly-mmlu-npu-a3 runs.
+    if: false
     needs: [set-image-config, nightly-poc-multi-node-tests, sgl-router-build-aarch64]
     strategy:
       fail-fast: false
@@ -532,7 +555,8 @@ jobs:
 
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-mix-tests,')) }}
+    # TEMPORARY(verify-mmlu-503): disabled so only nightly-mmlu-npu-a3 runs.
+    if: false
     needs: [set-image-config, nightly-perf-test-2-npu-a3, nightly-perf-test-4-npu-a3, nightly-perf-test-16-npu-a3, nightly-acc-test-2-npu-a3, nightly-acc-test-16-npu-a3, nightly-poc-multi-node-tests, nightly-poc-multi-node-accuracy-odd-day, nightly-poc-multi-node-accuracy-even-day]
     strategy:
       fail-fast: false
