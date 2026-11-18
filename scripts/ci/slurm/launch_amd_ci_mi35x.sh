@@ -197,7 +197,9 @@ for attempt in $(seq 1 "$SUBMIT_ATTEMPTS"); do
     else
         wait_for_exit_file || true
     fi
-    stream_log || true   # also picks up the last lines of the log
+    # The last chance to print the end of the log (often the traceback): retry
+    # once, then warn rather than drop it silently.
+    stream_log || { sleep 2; stream_log; } || echo "WARN: could not read the end of $LOG" >&2
 
     if [[ -s "$CI_EXIT_FILE" ]]; then
         # The job copies its artifacts out before it writes the exit code.
