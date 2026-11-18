@@ -270,7 +270,7 @@ impl Runtime {
         if let Some(notify) = notify {
             let _ = self.drain_notify.set(notify);
         }
-        let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+        let (read, write) = super::platform::pipe_cloexec()?;
         // Python requires a non-blocking wakeup fd.
         rustix::fs::fcntl_setfl(&write, rustix::fs::OFlags::NONBLOCK)?;
         let core = self.core.clone();
@@ -317,19 +317,10 @@ impl Drop for Runtime {
     }
 }
 
-/// Send the drain-ended datagram to the abstract Unix socket `name`; best
-/// effort, since the launching process falls back to scheduler exits.
+/// Send the drain-ended datagram to the Unix socket `name`; best effort,
+/// since the launching process falls back to scheduler exits.
 fn notify_drained(name: &str) {
-    use std::os::linux::net::SocketAddrExt;
-    use std::os::unix::net::{SocketAddr, UnixDatagram};
-
-    // Non-blocking: a full receive queue (EAGAIN) loses only this report.
-    let sent = SocketAddr::from_abstract_name(name).and_then(|addr| {
-        let socket = UnixDatagram::unbound()?;
-        socket.set_nonblocking(true)?;
-        socket.send_to_addr(b"drained", &addr)
-    });
-    if let Err(error) = sent {
+    if let Err(error) = super::platform::send_notify_datagram(name, b"drained") {
         tracing::warn!(%error, name, "could not report the drain's end");
     }
 }
@@ -977,12 +968,9 @@ mod tests {
     #[test]
     fn drain_signal_fd_begins_the_drain_and_reports_its_end() {
         use std::io::Write;
-        use std::os::linux::net::SocketAddrExt;
-        use std::os::unix::net::{SocketAddr, UnixDatagram};
 
         let name = format!("sglang-drain-test-{}", std::process::id());
-        let launcher =
-            UnixDatagram::bind_addr(&SocketAddr::from_abstract_name(&name).unwrap()).unwrap();
+        let launcher = crate::utils::platform::bind_notify_socket(&name).unwrap();
         launcher
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
@@ -1026,12 +1014,8 @@ mod tests {
     /// hold cannot be taken once a drain began.
     #[test]
     fn held_drain_end_waits_for_the_release() {
-        use std::os::linux::net::SocketAddrExt;
-        use std::os::unix::net::{SocketAddr, UnixDatagram};
-
         let name = format!("sglang-drain-hold-test-{}", std::process::id());
-        let launcher =
-            UnixDatagram::bind_addr(&SocketAddr::from_abstract_name(&name).unwrap()).unwrap();
+        let launcher = crate::utils::platform::bind_notify_socket(&name).unwrap();
         launcher.set_nonblocking(true).unwrap();
         let (addr, _) = free_loopback_addrs();
         let rt = start(test_config(addr, None), None).expect("start runtime");

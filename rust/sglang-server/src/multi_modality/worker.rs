@@ -536,7 +536,7 @@ mod tests {
     use super::*;
     use crate::message::buffers::find;
     use crate::message::config::HiddenStatesMode;
-    use crate::utils::shm::{shm_path, unique_name};
+    use crate::utils::shm::{shm_exists, shm_read, unique_name};
 
     /// An external-style processor: one image item with a caller-shaped
     /// feature and spans, no M-RoPE.
@@ -750,11 +750,11 @@ mod tests {
         for (i, name) in names.iter().enumerate() {
             assert!(matches!(buffers[i].store, BufferStore::Shm { .. }));
             assert_eq!(buffers[i].shape, [[2, 2], [1, 2]][i]);
-            let bytes = std::fs::read(shm_path(name)).unwrap();
-            assert_eq!(bytes, bytemuck::cast_slice::<f32, u8>(&expected[i]));
+            let want = bytemuck::cast_slice::<f32, u8>(&expected[i]);
+            assert_eq!(shm_read(name, want.len()).unwrap(), want);
         }
         drop(buffers);
-        assert!(names.iter().all(|n| !shm_path(n).exists()), "drop unlinks");
+        assert!(names.iter().all(|n| !shm_exists(n)), "drop unlinks");
     }
 
     /// An empty tensor has no segment to make: it stays inline while its
@@ -778,15 +778,9 @@ mod tests {
             matches!(&buffers[0].store, BufferStore::Inline(BufferData::F32(v)) if v.is_empty())
         );
         assert_eq!(buffers[0].shape, [0, 2]);
-        assert!(
-            !shm_path(&names[0]).exists(),
-            "no segment for the empty item"
-        );
+        assert!(!shm_exists(&names[0]), "no segment for the empty item");
         assert!(matches!(buffers[1].store, BufferStore::Shm { .. }));
-        assert!(
-            shm_path(&names[1]).exists(),
-            "the sibling still goes to shm"
-        );
+        assert!(shm_exists(&names[1]), "the sibling still goes to shm");
     }
 
     /// A full `/dev/shm` (page reservation refused with `ENOSPC`) reaches the
@@ -794,7 +788,7 @@ mod tests {
     /// every feature value, and the segments made before the failure are gone.
     #[test]
     fn shm_exhaustion_falls_back_to_inline_with_values_intact() {
-        use crate::utils::shm::{ShmSegment, shm_path};
+        use crate::utils::shm::{ShmSegment, shm_exists};
         use std::os::fd::BorrowedFd;
 
         // Item 0's segment is created for real; item 1's reservation fails as
@@ -834,7 +828,7 @@ mod tests {
         let err = parked.unwrap_err();
         assert!(err.contains("fallocate("), "{err}");
         assert!(err.contains("No space left"), "{err}");
-        assert!(!shm_path(&first).exists(), "item 0's segment released");
+        assert!(!shm_exists(&first), "item 0's segment released");
 
         // And through `place_features` itself, with a namer whose second
         // segment cannot be reserved: values survive, inline.

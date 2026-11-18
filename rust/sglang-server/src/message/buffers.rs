@@ -231,7 +231,7 @@ pub fn find<'a>(buffers: &'a [Buffer], name: &str) -> Option<&'a Buffer> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::shm::{shm_path, unique_name};
+    use crate::utils::shm::{shm_exists, shm_read, unique_name};
 
     /// An inline buffer keeps its typed vector; a shm buffer holds the same
     /// bytes in a segment that lives exactly as long as the buffer.
@@ -245,9 +245,12 @@ mod tests {
         let segment = unique_name("test");
         let shm = Buffer::shm("x", segment.clone(), vec![2, 2], &data).unwrap();
         assert_eq!((shm.dtype(), &shm.shape), (DType::F32, &vec![2, 2]));
-        assert_eq!(std::fs::read(shm_path(&segment)).unwrap(), data.as_bytes());
+        assert_eq!(
+            shm_read(&segment, data.as_bytes().len()).unwrap(),
+            data.as_bytes()
+        );
         drop(shm);
-        assert!(!shm_path(&segment).exists(), "dropping the buffer unlinks");
+        assert!(!shm_exists(&segment), "dropping the buffer unlinks");
     }
 
     /// A shape that does not hold the data is rejected before anything is
@@ -258,7 +261,7 @@ mod tests {
         assert!(Buffer::inline_shaped("x", vec![usize::MAX, 2], vec![1i64, 2]).is_err());
         let segment = unique_name("test");
         assert!(Buffer::shm("x", segment.clone(), vec![3], &BufferData::I64(vec![1, 2])).is_err());
-        assert!(!shm_path(&segment).exists());
+        assert!(!shm_exists(&segment));
     }
 
     /// Empty data never becomes a segment (nothing could map it): `shm`
@@ -269,7 +272,7 @@ mod tests {
         let err =
             Buffer::shm("x", segment.clone(), vec![0, 4], &BufferData::F32(vec![])).unwrap_err();
         assert!(err.contains("empty payload"), "{err}");
-        assert!(!shm_path(&segment).exists(), "no segment for empty data");
+        assert!(!shm_exists(&segment), "no segment for empty data");
     }
 
     #[test]

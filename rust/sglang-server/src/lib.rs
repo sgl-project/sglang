@@ -528,7 +528,7 @@ fn _server(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod shm_buffer_tests {
     use super::ShmBuffer;
-    use crate::utils::shm::{ShmSegment, shm_path, unique_name};
+    use crate::utils::shm::{ShmSegment, shm_exists, unique_name};
 
     fn buffer() -> (ShmBuffer, String) {
         let name = unique_name("test");
@@ -544,7 +544,7 @@ mod shm_buffer_tests {
         assert_eq!(buffer.name, name);
         assert!(buffer.owns_segment());
         drop(buffer);
-        assert!(!shm_path(&name).exists());
+        assert!(!shm_exists(&name));
     }
 
     /// `release` moves the unlink duty to Python: the segment must outlive the
@@ -556,7 +556,7 @@ mod shm_buffer_tests {
         assert!(!buffer.owns_segment());
         buffer.discard(); // no-op after release
         drop(buffer);
-        assert!(shm_path(&name).exists(), "released: Python unlinks later");
+        assert!(shm_exists(&name), "released: Python unlinks later");
         let _ = rustix::shm::unlink(format!("/{name}"));
     }
 
@@ -565,7 +565,7 @@ mod shm_buffer_tests {
     fn discard_unlinks_immediately() {
         let (mut buffer, name) = buffer();
         buffer.discard();
-        assert!(!shm_path(&name).exists());
+        assert!(!shm_exists(&name));
         buffer.discard();
         drop(buffer);
     }
