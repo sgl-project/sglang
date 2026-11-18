@@ -310,6 +310,7 @@ class TestKimiK3BfaOverlap(CustomTestCase):
 
         owner = SimpleNamespace(
             _may_fuse_kda_inproj=lambda: True,
+            _kda_dwdp=None,
             _qkvgbfa_layer=None,
             fused_qkvg_proj=module(8),
             f_a_proj=module(4),
