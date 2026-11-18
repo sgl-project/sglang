@@ -48,6 +48,7 @@ class TestMoEGateCorrectionBiasDtype(CustomTestCase):
             n_routed_experts=NUM_EXPERTS,
             hidden_size=16,
             topk_method="noaux_tc",
+            model_type="deepseek_v3" if arch == NON_GLM_ARCH else "glm_moe_dsa",
             architectures=[arch],
         )
         quant_config = SimpleNamespace(get_name=lambda: "fp8")
@@ -113,7 +114,7 @@ class TestGlm5NextTextCorrectionBiasDtype(CustomTestCase):
         self.assertTrue(
             routes_with_fp32_correction_bias(SimpleNamespace(model_type=GLM5_NEXT_TEXT))
         )
-        # GLM-5.2 and DeepSeek keep today's runtime cast to the gating dtype.
+        # GLM-5.2 keeps fp32 through is_glm_moe_dsa; DeepSeek keeps the aiter bf16 downcast.
         for model_type in ("glm_moe_dsa", "deepseek_v3", None):
             with self.subTest(model_type=model_type):
                 self.assertFalse(
@@ -131,9 +132,7 @@ class TestAiterRoutingBiasDtype(CustomTestCase):
     """The bias dtype select_experts hands the aiter grouped router, with bf16 logits as
     the HIP gate emits them."""
 
-    def _bias_dtype_at_router(
-        self, fp32_correction_bias: bool, bias_dtype: torch.dtype = torch.float32
-    ) -> torch.dtype:
+    def _bias_dtype_at_router(self, bias_dtype: torch.dtype) -> torch.dtype:
         bias = (BIAS_BASE + torch.linspace(0, 0.5, NUM_EXPERTS)).to(bias_dtype)
         config = TopKConfig(
             top_k=8,
@@ -142,7 +141,6 @@ class TestAiterRoutingBiasDtype(CustomTestCase):
             topk_group=1,
             scoring_func="sigmoid",
             correction_bias=bias,
-            fp32_correction_bias=fp32_correction_bias,
         )
 
         def router(*, correction_bias, **kwargs):
@@ -157,16 +155,11 @@ class TestAiterRoutingBiasDtype(CustomTestCase):
             select_experts(torch.empty(4, 16), logits, config)
         return reached.exception.args[0]
 
-    def test_fp32_correction_bias_reaches_the_router_fp32(self):
-        self.assertEqual(self._bias_dtype_at_router(True), torch.float32)
-
-    def test_fp32_bias_reaches_the_router_fp32_without_the_flag(self):
-        self.assertEqual(self._bias_dtype_at_router(False), torch.float32)
+    def test_fp32_bias_reaches_the_router_fp32(self):
+        self.assertEqual(self._bias_dtype_at_router(torch.float32), torch.float32)
 
     def test_bf16_bias_reaches_the_router_bf16(self):
-        self.assertEqual(
-            self._bias_dtype_at_router(False, torch.bfloat16), torch.bfloat16
-        )
+        self.assertEqual(self._bias_dtype_at_router(torch.bfloat16), torch.bfloat16)
 
 
 class TestIsGlmMoeDsaHelper(CustomTestCase):

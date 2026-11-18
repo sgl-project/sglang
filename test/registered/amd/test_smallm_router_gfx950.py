@@ -205,7 +205,6 @@ class TestSmallMRouterGfx950(CustomTestCase):
             renormalize=True,
             shared_experts=SharedExpertsConfig(num_fused_shared_experts=1),
             correction_bias=bias,
-            fp32_correction_bias=True,
             scoring_func="sigmoid",
             routed_scaling_factor=rsf,
             fused_shared_experts_scaling_factor=shared_w,
