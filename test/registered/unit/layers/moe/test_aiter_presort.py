@@ -1,6 +1,7 @@
 """The radix-4 router registers its fused MoE sort only on the batch sizes where
-AITER's fused_moe will consume it: those whose resolved config is the BM=16
-aux-sort pipeline."""
+AITER's fused_moe will consume it, at the block_m AITER names for the resolved
+config (presorted_moe_block_m), or, with an older AITER, where that config is
+the BM=16 aux-sort pipeline."""
 
 import sys
 import unittest
@@ -41,7 +42,7 @@ def _metadata(block_m, output_aux=True):
     return SimpleNamespace(block_m=block_m, output_aux=output_aux, full_impl=None)
 
 
-def _fake_cfg_api(get_2stage_cfgs):
+def _fake_cfg_api(get_2stage_cfgs, presorted_moe_block_m=None):
     return SimpleNamespace(
         ActivationType=_ActivationType,
         QuantType=_QuantType,
@@ -61,6 +62,7 @@ def _fake_cfg_api(get_2stage_cfgs):
         quant_remap={},
         resolve_activation_dtype=lambda *args, **kwargs: torch.bfloat16,
         presort_block_m=16,
+        presorted_moe_block_m=presorted_moe_block_m,
     )
 
 
@@ -97,8 +99,12 @@ def _bm16_up_to_64(**kwargs):
     return _metadata(16 if kwargs["token"] <= 64 else 32)
 
 
-def _patch_cfg_api(lookup):
-    return patch.object(aiter_presort, "_cfg_api", return_value=_fake_cfg_api(lookup))
+def _patch_cfg_api(lookup, presorted_moe_block_m=None):
+    return patch.object(
+        aiter_presort,
+        "_cfg_api",
+        return_value=_fake_cfg_api(lookup, presorted_moe_block_m),
+    )
 
 
 def _route(gate, m, registrations):
@@ -127,7 +133,8 @@ def _route(gate, m, registrations):
             )
         finally:
             route_quant_handoff.clear()
-    return hit, route_with_sort.call_count
+    block_ms = [c.kwargs["block_m"] for c in route_with_sort.call_args_list]
+    return hit, block_ms
 
 
 class TestPresortGate(CustomTestCase):
@@ -142,12 +149,12 @@ class TestPresortGate(CustomTestCase):
         gate = aiter_presort.PresortGate()
         gate.observe(_fused_moe_call(1))
         registrations = []
-        hit, launches = _route(gate, 16, registrations)
+        hit, block_ms = _route(gate, 16, registrations)
         self.assertIsNotNone(hit)
-        self.assertEqual(launches, 1)
-        hit, launches = _route(gate, 128, registrations)
+        self.assertEqual(block_ms, [16])
+        hit, block_ms = _route(gate, 128, registrations)
         self.assertIsNone(hit)
-        self.assertEqual(launches, 0)
+        self.assertEqual(block_ms, [])
         self.assertEqual([r["M"] for r in registrations], [16])
 
     def test_declines_before_it_has_seen_the_layers_fused_moe_call(self):
@@ -163,8 +170,8 @@ class TestPresortGate(CustomTestCase):
         gate.observe(_fused_moe_call(4))
         gate.observe(_fused_moe_call(8, a1_scale=torch.ones(1)))  # first call wins
         self.assertEqual(
-            [gate.takes_presort(m) for m in (16, 16, 128, 128, 16)],
-            [True, True, False, False, True],
+            [gate.sort_block_m(m) for m in (16, 16, 128, 128, 16)],
+            [16, 16, None, None, 16],
         )
         self.assertEqual(
             [c.kwargs["token"] for c in self.lookup.call_args_list], [16, 128]
@@ -180,14 +187,29 @@ class TestPresortGate(CustomTestCase):
             with self.subTest(overrides=sorted(overrides)):
                 gate = aiter_presort.PresortGate()
                 gate.observe(_fused_moe_call(1, **overrides))
-                self.assertFalse(gate.takes_presort(1))
+                self.assertIsNone(gate.sort_block_m(1))
         self.lookup.assert_not_called()
 
 
 class TestPresortGateAiterAnswers(CustomTestCase):
+    def test_sorts_at_the_block_m_aiter_names(self):
+        """With presorted_moe_block_m (ROCm/aiter#8197) AITER names the block_m:
+        the router sorts at it, BM=32 included, and skips a batch it answers None
+        for or one at a block size the kernel is not built for."""
+        answers = {16: 16, 128: 32, 256: None, 512: 64}
+        lookup = MagicMock(side_effect=lambda **kw: _metadata(kw["token"]))
+        with _patch_cfg_api(lookup, lambda metadata: answers[metadata.block_m]):
+            gate = aiter_presort.PresortGate()
+            gate.observe(_fused_moe_call(1))
+            registrations = []
+            launched = {m: _route(gate, m, registrations)[1] for m in answers}
+        self.assertEqual(launched, {16: [16], 128: [32], 256: [], 512: []})
+        self.assertEqual([r["M"] for r in registrations], [16, 128])
+
     def test_bm16_config_without_the_aux_sort_pipeline_declines(self):
-        """Only the aux-sort pipeline reads a presort: AITER's A16W4 SiTUv2 rows
-        are BM=16 without it, and a full_impl config returns before any sort."""
+        """An AITER without presorted_moe_block_m reads a presort only on the
+        aux-sort pipeline at BM=16: its A16W4 SiTUv2 rows are BM=16 without it,
+        and a full_impl config returns before any sort."""
         for metadata in (
             _metadata(16, output_aux=False),
             SimpleNamespace(block_m=16, output_aux=True, full_impl=object()),
@@ -198,15 +220,15 @@ class TestPresortGateAiterAnswers(CustomTestCase):
             ):
                 gate = aiter_presort.PresortGate()
                 gate.observe(_fused_moe_call(1))
-                self.assertFalse(gate.takes_presort(1))
+                self.assertIsNone(gate.sort_block_m(1))
 
     def test_a_config_aiter_rejects_turns_the_layer_off(self):
         lookup = MagicMock(side_effect=NotImplementedError("no backend"))
         with _patch_cfg_api(lookup):
             gate = aiter_presort.PresortGate()
             gate.observe(_fused_moe_call(1))
-            self.assertFalse(gate.takes_presort(1))
-            self.assertFalse(gate.takes_presort(2))
+            self.assertIsNone(gate.sort_block_m(1))
+            self.assertIsNone(gate.sort_block_m(2))
         self.assertEqual(lookup.call_count, 1)
 
     def test_wrong_lookup_arguments_are_not_swallowed(self):
@@ -215,7 +237,7 @@ class TestPresortGateAiterAnswers(CustomTestCase):
             gate = aiter_presort.PresortGate()
             gate.observe(_fused_moe_call(1))
             with self.assertRaises(TypeError):
-                gate.takes_presort(1)
+                gate.sort_block_m(1)
 
     def test_aiter_without_the_config_lookup_is_unsupported(self):
         """An AITER with register_presorted_moe but no get_2stage_cfgs cannot say

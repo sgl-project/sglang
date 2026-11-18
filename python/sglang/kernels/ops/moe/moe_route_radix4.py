@@ -4,10 +4,10 @@ The ROCm counterpart to moe_route_radix, dispatched from
 biased_grouped_topk_gpu's aiter branch for covered inputs; anything else falls
 back to aiter. Kernel notes live in jit/csrc/moe/route_radix4_hip.cuh.
 
-route_radix4_with_sort also writes AITER's BM=16 MoE sort from the same launch,
-for a caller that hands it to AITER's fused_moe in place of moe_sorting. Up to 64
-tokens the last CTA to finish routing sorts; past that the last ceil(M / 16)
-CTAs share the sort, one 16-token chunk each.
+route_radix4_with_sort also writes AITER's MoE sort, at block size 16 or 32,
+from the same launch, for a caller that hands it to AITER's fused_moe in place
+of moe_sorting. Up to 64 tokens the last CTA to finish routing sorts; past that
+the last ceil(M / 16) CTAs share the sort, one 16-token chunk each.
 """
 
 from __future__ import annotations
@@ -25,7 +25,8 @@ if TYPE_CHECKING:
 
 _NUM_EXPERTS = 896
 _TOPK = 16
-_SORT_BLOCK_M = 16
+# The block sizes the fused sort is built for (kRadix4SortBlockMs).
+SORT_BLOCK_MS = (16, 32)
 # One block per token, so the grid outgrows the machine somewhere past a
 # thousand tokens and the kernel turns throughput-bound, where spreading a token
 # over four waves is a cost rather than a win. Measured break-even is ~1.5k
@@ -153,15 +154,13 @@ def new_sort_workspace(device: torch.device) -> torch.Tensor:
     return torch.zeros(4, dtype=torch.int32, device=device)
 
 
-def _sorted_capacity(n_tokens: int) -> int:
-    """AITER's moe_sorting capacity: every route, plus up to BM - 1 padding
+def _sorted_capacity(n_tokens: int, block_m: int) -> int:
+    """AITER's worst-case sort capacity: every route, plus up to BM - 1 padding
     rows for each expert that can be active."""
     routes = n_tokens * _TOPK
     active = min(_NUM_EXPERTS, routes)
-    blocks = (routes + active * (_SORT_BLOCK_M - 1) + _SORT_BLOCK_M - 1) // (
-        _SORT_BLOCK_M
-    )
-    return blocks * _SORT_BLOCK_M
+    blocks = (routes + active * (block_m - 1) + block_m - 1) // block_m
+    return blocks * block_m
 
 
 def route_radix4_with_sort(
@@ -172,10 +171,16 @@ def route_radix4_with_sort(
     routed_scaling_factor: float,
     *,
     sort_ws: torch.Tensor,
+    block_m: int,
     moe_buf: Optional[torch.Tensor] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
-    """route_radix4 plus AITER's BM=16 sort of its routes, in one launch.
+    """route_radix4 plus AITER's BM-block sort of its routes, in one launch.
+
+    block_m is one of SORT_BLOCK_MS. The sort is what AITER's
+    moe_sorting(block_size=block_m) writes for the same routes, bit for bit,
+    except on padding rows (below): moe_sorting keeps one row of a token that
+    picks expert 0 in every slot, this sort a weight-0 row per route.
 
     sort_ws comes from new_sort_workspace and belongs to the launching stream.
     Returns (weights, ids, aux), where aux is the dict AITER's
@@ -187,12 +192,14 @@ def route_radix4_with_sort(
     """
     M = scores.shape[0]
     device = scores.device
-    capacity = _sorted_capacity(M)
+    if block_m not in SORT_BLOCK_MS:
+        raise ValueError(f"block_m must be one of {SORT_BLOCK_MS}, got {block_m}")
+    capacity = _sorted_capacity(M, block_m)
     out_w = torch.empty((M, topk), dtype=torch.float32, device=device)
     out_i = torch.empty((M, topk), dtype=torch.int32, device=device)
     sorted_token_ids = torch.empty(capacity, dtype=torch.int32, device=device)
     sorted_expert_ids = torch.empty(
-        capacity // _SORT_BLOCK_M, dtype=torch.int32, device=device
+        capacity // block_m, dtype=torch.int32, device=device
     )
     sorted_weights = torch.empty(capacity, dtype=torch.float32, device=device)
     num_valid_ids = torch.empty(2, dtype=torch.int32, device=device)
@@ -216,6 +223,7 @@ def route_radix4_with_sort(
             if num_token_non_padded is not None
             else empty_sentinel(device, torch.int32)
         ),
+        block_m,
         topk,
         float(routed_scaling_factor),
         bool(renormalize),
@@ -224,7 +232,7 @@ def route_radix4_with_sort(
         "topk_ids_ptr": out_i.data_ptr(),
         "topk_weights_ptr": out_w.data_ptr(),
         "M": M,
-        "block_m": _SORT_BLOCK_M,
+        "block_m": block_m,
         "num_experts": _NUM_EXPERTS,
         "topk": _TOPK,
         "sorted_token_ids": sorted_token_ids,

@@ -1,12 +1,12 @@
-/// BM=16 MoE sort used by the fused radix4+sort kernel.
+/// BM-block MoE sort (BM 16 or 32) used by the fused radix4+sort kernel.
 ///
-/// Mirrors aiter's `moe_sort_quant.cuh` sort-only path (count, padded
-/// prefix, place, pad), so GEMM1/GEMM2 get the layout of AITER's BM=16 aux
-/// sort, pad rows carrying token id M. It is not byte-equal to every AITER
-/// sort: moe_sorting(output_aux=False) pads with (topk << 24) | M, and the order
-/// of one expert's routes can differ (the leader sort places them in LDS-atomic
-/// order), which only changes GEMM2's atomic accumulation order. Kept in this
-/// TU so the SGLang JIT does not include AITER headers.
+/// Follows aiter's `moe_sort_quant.cuh` sort-only path (count, padded prefix,
+/// place, pad) and writes what AITER's moe_sorting(block_size=BM) writes, bit
+/// for bit: each expert's routes in token order as (slot << 24) | token, pad
+/// rows (topk << 24) | M with weight 0 (m_indices pads with M). CUDA-graph
+/// padding rows, which route every slot to expert 0, are the exception:
+/// moe_sorting keeps one row per token, this sort a weight-0 row per route.
+/// Kept in this TU so the SGLang JIT does not include AITER headers.
 ///
 /// The phases are split by what they depend on rather than by aiter's order.
 /// Padding a slot does not depend on the routing result: the pad token, the pad
@@ -19,7 +19,9 @@
 /// Two tails share that layout. Up to a few routes per thread, the last CTA to
 /// arrive sorts everything (sort_subkernel). Past that one CTA's placement
 /// grows with M, so sort_tail_stable spreads it over the last ceil(M / 16)
-/// arrivals instead, each placing one token chunk.
+/// arrivals instead, each placing one token chunk. Both rank a route within
+/// its expert by the earlier tokens that picked the expert, so the order does
+/// not depend on which thread got there first.
 
 #pragma once
 
@@ -74,7 +76,8 @@ SGL_DEVICE void pad_sorted_slice(
     int32_t* __restrict__ m_indices,
     float* __restrict__ sorted_weights,
     int capacity,
-    int pad_val,
+    int token_pad,
+    int index_pad,
     int part,
     int nparts) {
   if constexpr (kWriteThrough) {
@@ -82,14 +85,16 @@ SGL_DEVICE void pad_sorted_slice(
     const int per_part = (nvec + nparts - 1) / nparts;
     const int begin = part * per_part;
     const int end = (begin + per_part < nvec) ? (begin + per_part) : nvec;
-    const auto pad = static_cast<uint32_t>(pad_val);
-    const uint64_t pad2 = (static_cast<uint64_t>(pad) << 32) | pad;
+    const auto tpad = static_cast<uint32_t>(token_pad);
+    const auto ipad = static_cast<uint32_t>(index_pad);
+    const uint64_t tpad2 = (static_cast<uint64_t>(tpad) << 32) | tpad;
+    const uint64_t ipad2 = (static_cast<uint64_t>(ipad) << 32) | ipad;
     auto* tok2 = reinterpret_cast<uint64_t*>(sorted_token_ids);
     auto* idx2 = reinterpret_cast<uint64_t*>(m_indices);
     auto* w2 = reinterpret_cast<uint64_t*>(sorted_weights);
     for (int i = begin + static_cast<int>(threadIdx.x); i < end; i += THREADS_PER_CTA) {
-      __hip_atomic_store(&tok2[i], pad2, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      __hip_atomic_store(&idx2[i], pad2, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      __hip_atomic_store(&tok2[i], tpad2, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      __hip_atomic_store(&idx2[i], ipad2, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       __hip_atomic_store(&w2[i], uint64_t{0}, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
   } else {
@@ -97,21 +102,22 @@ SGL_DEVICE void pad_sorted_slice(
     const int per_part = (nvec + nparts - 1) / nparts;
     const int begin = part * per_part;
     const int end = (begin + per_part < nvec) ? (begin + per_part) : nvec;
-    const int4 pad4 = make_int4(pad_val, pad_val, pad_val, pad_val);
+    const int4 tpad4 = make_int4(token_pad, token_pad, token_pad, token_pad);
+    const int4 ipad4 = make_int4(index_pad, index_pad, index_pad, index_pad);
     const int4 zero4 = make_int4(0, 0, 0, 0);
     auto* tok4 = reinterpret_cast<int4*>(sorted_token_ids);
     auto* idx4 = reinterpret_cast<int4*>(m_indices);
     auto* w4 = reinterpret_cast<int4*>(sorted_weights);
     for (int i = begin + static_cast<int>(threadIdx.x); i < end; i += THREADS_PER_CTA) {
-      tok4[i] = pad4;
-      idx4[i] = pad4;
+      tok4[i] = tpad4;
+      idx4[i] = ipad4;
       w4[i] = zero4;
     }
   }
 }
 
-/// Every CTA clears its histogram before the arrival barrier, so the leader
-/// does not pay for it in the serial tail.
+/// Every CTA clears its histogram before the arrival barrier, so the tail
+/// CTAs do not pay for it after they arrive.
 template <int NUM_EXPERTS, int THREADS_PER_CTA>
 SGL_DEVICE void reset_counts(int* __restrict__ count) {
   // Contiguous per thread rather than strided, so the four zeros are one LDS
@@ -192,47 +198,23 @@ SGL_DEVICE void parallel_cumsum(
   __syncthreads();
 }
 
-/// parallel_cumsum over per-expert counts held in LDS.
-template <int NUM_EXPERTS, int THREADS_PER_CTA, int SORT_MPB>
-SGL_DEVICE void
-parallel_cumsum_lds(const int* __restrict__ count, int* __restrict__ cumsum, int32_t* __restrict__ sorted_expert_ids) {
-  constexpr int ITEMS_PER_THREAD = kExpertsPerThread<NUM_EXPERTS, THREADS_PER_CTA>;
-  int v[ITEMS_PER_THREAD];
-#pragma unroll
-  for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
-    const int e = static_cast<int>(threadIdx.x) * ITEMS_PER_THREAD + i;
-    v[i] = (e < NUM_EXPERTS) ? count[e] : 0;
-  }
-  parallel_cumsum<NUM_EXPERTS, THREADS_PER_CTA, SORT_MPB>(v, cumsum, sorted_expert_ids);
-}
-
-/// Write one winner into its expert's next free slot. `cursor` is the padded
-/// prefix, already published, bumped in place; unreached slots keep their pad.
-template <int TOPK, int SLOT_BITS>
-SGL_DEVICE void place_pair(
-    int* __restrict__ cursor,
-    int32_t* __restrict__ sorted_token_ids,
-    float* __restrict__ sorted_weights,
-    int32_t* __restrict__ reverse_sorted,
-    int32_t* __restrict__ m_indices,
-    int eid,
-    float weight,
-    int pair) {
-  const int sp = atomicAdd(&cursor[eid], 1);
-  const int token_id = (pair >> SLOT_BITS) & 0x00FFFFFF;
-  const int topk_id = pair & (TOPK - 1);
-  sorted_token_ids[sp] = token_id | (topk_id << 24);
-  m_indices[sp] = token_id;
-  sorted_weights[sp] = weight;
-  reverse_sorted[pair] = sp;
-}
+/// Most tokens sort_subkernel ranks: one bit each in an expert's 64-bit mask.
+inline constexpr int kLeaderMaxTokens = 64;
 
 /// The whole sort with the pairs held in registers, so counting and placement
 /// share one (post-invalidate) L2 read. Only for batches one round covers.
-template <int NUM_EXPERTS, int TOPK, int M_PER_BLOCK, int THREADS_PER_CTA, int PAIRS_PER_ROUND, int SLOT_BITS>
+///
+/// A routed token picks an expert at most once, so each token sets one bit in
+/// the mask of every expert it picked, and a route's rank within its expert is
+/// the popcount of the bits of earlier tokens: token order, the order AITER's
+/// moe_sorting writes, and the same on every run. CUDA-graph padding rows
+/// (tokens >= n_real) send all TOPK routes to expert 0; they are left out of
+/// the masks and placed after expert 0's routed tokens in (token, slot) order,
+/// as sort_tail_stable does. s_mask arrives zeroed.
+template <int NUM_EXPERTS, int TOPK, int M_PER_BLOCK, int THREADS_PER_CTA, int PAIRS_PER_ROUND>
 SGL_DEVICE void sort_resident(
-    int* __restrict__ count,
     int* __restrict__ cumsum,
+    unsigned long long* __restrict__ s_mask,
     const int32_t* __restrict__ topk_ids,
     const float* __restrict__ topk_weight,
     int32_t* __restrict__ sorted_token_ids,
@@ -241,9 +223,12 @@ SGL_DEVICE void sort_resident(
     int32_t* __restrict__ cumsum_tensor,
     int32_t* __restrict__ reverse_sorted,
     int32_t* __restrict__ m_indices,
+    const int32_t* __restrict__ num_non_padded,
     int total_pairs,
     int M) {
   const int tid = threadIdx.x;
+  int n_real = M;
+  if (num_non_padded != nullptr) n_real = (*num_non_padded < M) ? *num_non_padded : M;
   int eid[PAIRS_PER_ROUND];
   float w[PAIRS_PER_ROUND];
 #pragma unroll
@@ -255,12 +240,20 @@ SGL_DEVICE void sort_resident(
   }
 #pragma unroll
   for (int j = 0; j < PAIRS_PER_ROUND; ++j) {
-    if ((unsigned)eid[j] < NUM_EXPERTS) atomicAdd(&count[eid[j]], 1);
+    const int t = (tid + j * THREADS_PER_CTA) / TOPK;
+    if ((unsigned)eid[j] < NUM_EXPERTS && t < n_real) atomicOr(&s_mask[eid[j]], 1ull << t);
   }
   __syncthreads();
-
-  parallel_cumsum_lds<NUM_EXPERTS, THREADS_PER_CTA, M_PER_BLOCK>(count, cumsum, sorted_expert_ids);
-  // Published before placement consumes the prefix as its cursor.
+  // Counts straight from the masks into the scan's registers.
+  constexpr int ITEMS = kExpertsPerThread<NUM_EXPERTS, THREADS_PER_CTA>;
+  int counts[ITEMS];
+#pragma unroll
+  for (int k = 0; k < ITEMS; ++k) {
+    const int e = tid * ITEMS + k;
+    counts[k] = (e < NUM_EXPERTS) ? __popcll(s_mask[e]) : 0;
+  }
+  if (tid == 0) counts[0] += (M - n_real) * TOPK;
+  parallel_cumsum<NUM_EXPERTS, THREADS_PER_CTA, M_PER_BLOCK>(counts, cumsum, sorted_expert_ids);
   if (tid == 0) {
     cumsum_tensor[0] = cumsum[NUM_EXPERTS];
     cumsum_tensor[1] = M;
@@ -268,16 +261,25 @@ SGL_DEVICE void sort_resident(
 
 #pragma unroll
   for (int j = 0; j < PAIRS_PER_ROUND; ++j) {
-    if ((unsigned)eid[j] < NUM_EXPERTS)
-      place_pair<TOPK, SLOT_BITS>(
-          cumsum, sorted_token_ids, sorted_weights, reverse_sorted, m_indices, eid[j], w[j], tid + j * THREADS_PER_CTA);
+    const int e = eid[j];
+    if ((unsigned)e < NUM_EXPERTS) {
+      const int i = tid + j * THREADS_PER_CTA;
+      const int t = i / TOPK;
+      const int rank =
+          (t < n_real) ? __popcll(s_mask[e] & ((1ull << t) - 1ull)) : __popcll(s_mask[0]) + (i - n_real * TOPK);
+      const int sp = cumsum[e] + rank;
+      sorted_token_ids[sp] = t | ((i & (TOPK - 1)) << 24);
+      m_indices[sp] = t;
+      sorted_weights[sp] = w[j];
+      reverse_sorted[i] = sp;
+    }
   }
 }
 
 template <int NUM_EXPERTS, int TOPK, int M_PER_BLOCK, int THREADS_PER_CTA>
 SGL_DEVICE void sort_subkernel(
-    int* count,
     int* cumsum,
+    unsigned long long* s_mask,
     const int32_t* topk_ids,
     const float* topk_weight,
     int32_t* sorted_token_ids,
@@ -286,33 +288,29 @@ SGL_DEVICE void sort_subkernel(
     int32_t* cumsum_tensor,
     int32_t* reverse_sorted,
     int32_t* m_indices,
+    const int32_t* num_non_padded,
     int M) {
-  static_assert((TOPK & (TOPK - 1)) == 0, "a power-of-two topk splits the pair index by shift and mask");
-  constexpr int kSlotBits = (TOPK == 1)    ? 0
-                            : (TOPK == 2)  ? 1
-                            : (TOPK == 4)  ? 2
-                            : (TOPK == 8)  ? 3
-                            : (TOPK == 16) ? 4
-                                           : 5;
-  static_assert(1 << kSlotBits == TOPK, "kSlotBits must be log2(TOPK)");
+  static_assert((TOPK & (TOPK - 1)) == 0, "a power-of-two topk splits the pair index by mask");
   constexpr int kMaxResident = 4;
+  static_assert(kLeaderMaxTokens * TOPK <= kMaxResident * THREADS_PER_CTA, "one round holds every leader route");
 
   const int total_pairs = M * TOPK;
   const int per_thread = (total_pairs + THREADS_PER_CTA - 1) / THREADS_PER_CTA;
 
-#define SGL_RADIX4_SORT_RESIDENT(PPR)                                             \
-  sort_resident<NUM_EXPERTS, TOPK, M_PER_BLOCK, THREADS_PER_CTA, PPR, kSlotBits>( \
-      count,                                                                      \
-      cumsum,                                                                     \
-      topk_ids,                                                                   \
-      topk_weight,                                                                \
-      sorted_token_ids,                                                           \
-      sorted_expert_ids,                                                          \
-      sorted_weights,                                                             \
-      cumsum_tensor,                                                              \
-      reverse_sorted,                                                             \
-      m_indices,                                                                  \
-      total_pairs,                                                                \
+#define SGL_RADIX4_SORT_RESIDENT(PPR)                                  \
+  sort_resident<NUM_EXPERTS, TOPK, M_PER_BLOCK, THREADS_PER_CTA, PPR>( \
+      cumsum,                                                          \
+      s_mask,                                                          \
+      topk_ids,                                                        \
+      topk_weight,                                                     \
+      sorted_token_ids,                                                \
+      sorted_expert_ids,                                               \
+      sorted_weights,                                                  \
+      cumsum_tensor,                                                   \
+      reverse_sorted,                                                  \
+      m_indices,                                                       \
+      num_non_padded,                                                  \
+      total_pairs,                                                     \
       M)
   // The host sends wider batches to sort_tail_stable (kRadix4LeaderSortMaxTokens).
   if (per_thread <= 1) {

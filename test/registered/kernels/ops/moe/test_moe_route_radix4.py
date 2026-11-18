@@ -308,7 +308,7 @@ def test_select_experts_sorts_only_for_a_staged_layer(staged):
         patch.object(aiter_presort, "_registrar", return_value=registrations.append),
     ):
         if staged:
-            aiter_presort.stage(SimpleNamespace(takes_presort=lambda m: True))
+            aiter_presort.stage(SimpleNamespace(sort_block_m=lambda m: 16))
         try:
             _, ids, _ = select_experts(
                 torch.zeros((m, 8), device="cuda"), scores, config
@@ -408,9 +408,10 @@ def test_route_radix4_coverage():
     )
 
 
-# ===== Fused BM=16 sort (route_radix4_with_sort) =====
+# ===== Fused BM-block sort (route_radix4_with_sort) =====
 
 BM = 16
+BLOCK_MS = moe_route_radix4.SORT_BLOCK_MS
 MODEL_DIM = 3584
 
 
@@ -432,14 +433,14 @@ def _payload_from_route(ids, weights):
 
 
 def _payload_from_sorted(
-    sorted_token_ids, sorted_weights, sorted_expert_ids, n_blocks, m
+    sorted_token_ids, sorted_weights, sorted_expert_ids, n_blocks, m, bm=BM
 ):
     bag = defaultdict(list)
     for block in range(n_blocks):
         expert = int(sorted_expert_ids[block])
-        start = block * BM
+        start = block * bm
         live = []
-        for row in range(BM):
+        for row in range(bm):
             packed = int(sorted_token_ids[start + row])
             token = packed & 0x00FFFFFF
             slot = (packed >> 24) & 0xFF
@@ -459,8 +460,9 @@ def _payload_from_sorted(
 # Past 64 the last ceil(M / 16) CTAs share the sort: 65 is the smallest such
 # tail (5 CTAs, a short last chunk), 300 has a short last chunk too, and 1024 is
 # the router's largest batch (64 tail CTAs).
+@pytest.mark.parametrize("block_m", BLOCK_MS)
 @pytest.mark.parametrize("m", [1, 2, 4, 8, 16, 32, 64, 65, 80, 128, 300, 512, 1024])
-def test_fused_sort_matches_route_and_layout(m):
+def test_fused_sort_matches_route_and_layout(m, block_m):
     generator = torch.Generator(device="cuda").manual_seed(7 + m)
     scores = torch.randn(
         (m, NUM_EXPERTS), dtype=torch.bfloat16, device="cuda", generator=generator
@@ -472,21 +474,30 @@ def test_fused_sort_matches_route_and_layout(m):
 
     ref_w, ref_ids = moe_route_radix4.route_radix4(scores, bias, TOPK, True, 2.5)
     w, ids, aux = moe_route_radix4.route_radix4_with_sort(
-        scores, bias, TOPK, True, 2.5, sort_ws=_sort_ws(), moe_buf=moe_buf
+        scores,
+        bias,
+        TOPK,
+        True,
+        2.5,
+        sort_ws=_sort_ws(),
+        block_m=block_m,
+        moe_buf=moe_buf,
     )
 
     assert torch.equal(ids, ref_ids)
     torch.testing.assert_close(w, ref_w, rtol=0, atol=0)
     assert torch.count_nonzero(moe_buf).item() == 0
     assert int(aux["num_valid_ids"][1]) == m
+    assert aux["block_m"] == block_m
 
     expected = _payload_from_route(ref_ids.cpu(), ref_w.cpu())
     got = _payload_from_sorted(
         aux["sorted_token_ids"].cpu(),
         aux["sorted_weights"].cpu(),
         aux["sorted_expert_ids"].cpu(),
-        int(aux["num_valid_ids"][0]) // BM,
+        int(aux["num_valid_ids"][0]) // block_m,
         m,
+        block_m,
     )
     assert got.keys() == expected.keys()
     for expert in expected:
@@ -533,6 +544,7 @@ def test_fused_sort_routes_padded_rows_like_the_mask(m, n_real):
         True,
         2.5,
         sort_ws=_sort_ws(),
+        block_m=BM,
         num_token_non_padded=non_padded,
     )
 
@@ -551,10 +563,11 @@ def test_fused_sort_routes_padded_rows_like_the_mask(m, n_real):
     assert len(set(reverse.tolist())) == m * TOPK
 
 
-@pytest.mark.parametrize("m", [65, 300])
-def test_fused_sort_tail_is_stable(m):
-    """Past 64 tokens each expert's routes come out in token order, as AITER's
-    default moe_sorting writes them, and the same on every launch."""
+@pytest.mark.parametrize("m", [12, 64, 65, 300])
+def test_fused_sort_is_stable(m):
+    """Each expert's routes come out in token order, as AITER's moe_sorting
+    writes them, and the same on every launch: in the last CTA's sort (12, 64)
+    and in the shared tail (65, 300)."""
     generator = torch.Generator(device="cuda").manual_seed(m)
     scores = torch.randn(
         (m, NUM_EXPERTS), dtype=torch.bfloat16, device="cuda", generator=generator
@@ -564,10 +577,10 @@ def test_fused_sort_tail_is_stable(m):
     )
     sort_ws = _sort_ws()
     _, _, first = moe_route_radix4.route_radix4_with_sort(
-        scores, bias, TOPK, True, 2.5, sort_ws=sort_ws
+        scores, bias, TOPK, True, 2.5, sort_ws=sort_ws, block_m=BM
     )
     _, _, again = moe_route_radix4.route_radix4_with_sort(
-        scores, bias, TOPK, True, 2.5, sort_ws=sort_ws
+        scores, bias, TOPK, True, 2.5, sort_ws=sort_ws, block_m=BM
     )
     used = int(first["num_valid_ids"][0])
     for key in ("sorted_token_ids", "sorted_weights", "m_indices"):
@@ -582,6 +595,50 @@ def test_fused_sort_tail_is_stable(m):
         assert torch.all(tokens[1:] > tokens[:-1]), expert
 
 
+def _aiter_moe_sorting():
+    try:
+        from aiter.fused_moe import moe_sorting
+    except ImportError:
+        pytest.skip("AITER without moe_sorting")
+    return moe_sorting
+
+
+# 1 skips the arrival handshake, up to 64 the last CTA sorts, past 64 the tail
+# CTAs share it. No CUDA-graph padding rows: they route all 16 slots to expert
+# 0, which moe_sorting collapses to one row per token while the fused sort keeps
+# a weight-0 row per route (test_fused_sort_routes_padded_rows_like_the_mask).
+@pytest.mark.parametrize("block_m", BLOCK_MS)
+@pytest.mark.parametrize("m", [1, 2, 12, 64, 65, 128, 300, 512, 1024])
+def test_fused_sort_is_aiters_moe_sorting(m, block_m):
+    """The fused sort is what AITER's moe_sorting(block_size=block_m) writes for
+    the routes the launch emits, bit for bit: sorted_token_ids and
+    sorted_weights up to num_valid_ids[0], sorted_expert_ids for those blocks,
+    and num_valid_ids. So a fused_moe that takes it computes what it would on
+    its own sort."""
+    moe_sorting = _aiter_moe_sorting()
+    generator = torch.Generator(device="cuda").manual_seed(m * 37 + block_m)
+    scores = torch.randn(
+        (m, NUM_EXPERTS), dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    bias = torch.randn(
+        NUM_EXPERTS, dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    w, ids, aux = moe_route_radix4.route_radix4_with_sort(
+        scores, bias, TOPK, True, 2.5, sort_ws=_sort_ws(), block_m=block_m
+    )
+    ref_ids, ref_w, ref_experts, ref_valid, _ = moe_sorting(
+        ids, w, NUM_EXPERTS, MODEL_DIM, torch.bfloat16, block_m
+    )
+    assert torch.equal(aux["num_valid_ids"], ref_valid[:2])
+    n = int(ref_valid[0])
+    assert n <= aux["sorted_token_ids"].numel()
+    assert torch.equal(aux["sorted_token_ids"][:n], ref_ids[:n])
+    assert torch.equal(aux["sorted_weights"][:n], ref_w[:n])
+    assert torch.equal(
+        aux["sorted_expert_ids"][: n // block_m], ref_experts[: n // block_m]
+    )
+
+
 def test_fused_sort_graph_replay():
     """Each launch has to leave the stream's arrival counters ready for the next
     one: the last CTA's sort resets its counter, and the tail sort's counters
@@ -589,6 +646,7 @@ def test_fused_sort_graph_replay():
     elect no sorter, or every CTA, in the launches after it. Mixes the two sorts
     and an odd number of tail launches per replay, so replays alternate too."""
     sizes = [80, 300, 12, 80]
+    block_ms = [16, 32, 32, 16]
     inputs = [
         (
             torch.randn((m, NUM_EXPERTS), dtype=torch.bfloat16, device="cuda"),
@@ -605,9 +663,16 @@ def test_fused_sort_graph_replay():
     with torch.cuda.graph(graph, stream=stream):
         outs = [
             moe_route_radix4.route_radix4_with_sort(
-                scores, bias, TOPK, True, 2.5, sort_ws=sort_ws, moe_buf=moe_buf
+                scores,
+                bias,
+                TOPK,
+                True,
+                2.5,
+                sort_ws=sort_ws,
+                block_m=block_m,
+                moe_buf=moe_buf,
             )
-            for scores, bias, moe_buf in inputs
+            for (scores, bias, moe_buf), block_m in zip(inputs, block_ms)
         ]
     expected = []
     for scores, bias, _ in inputs:
@@ -619,8 +684,8 @@ def test_fused_sort_graph_replay():
             moe_buf.fill_(1.0)
         graph.replay()
         torch.cuda.synchronize()
-        for m, (_, _, moe_buf), (_, ids, aux), (ref_ids, payload) in zip(
-            sizes, inputs, outs, expected
+        for m, block_m, (_, _, moe_buf), (_, ids, aux), (ref_ids, payload) in zip(
+            sizes, block_ms, inputs, outs, expected
         ):
             assert torch.equal(ids, ref_ids)
             assert torch.count_nonzero(moe_buf).item() == 0
@@ -628,8 +693,9 @@ def test_fused_sort_graph_replay():
                 aux["sorted_token_ids"].cpu(),
                 aux["sorted_weights"].cpu(),
                 aux["sorted_expert_ids"].cpu(),
-                int(aux["num_valid_ids"][0]) // BM,
+                int(aux["num_valid_ids"][0]) // block_m,
                 m,
+                block_m,
             )
             assert got == payload, m
 
@@ -643,7 +709,14 @@ def test_fused_sort_rejects_a_moe_buf_it_cannot_zero():
     moe_buf = torch.ones((m + 1, MODEL_DIM), dtype=torch.bfloat16, device="cuda")
     with pytest.raises(Exception):
         moe_route_radix4.route_radix4_with_sort(
-            scores, bias, TOPK, True, 2.5, sort_ws=_sort_ws(), moe_buf=moe_buf
+            scores,
+            bias,
+            TOPK,
+            True,
+            2.5,
+            sort_ws=_sort_ws(),
+            block_m=BM,
+            moe_buf=moe_buf,
         )
 
 
@@ -656,7 +729,14 @@ def test_fused_sort_aux_pins_the_addresses_it_matches_on():
     bias = torch.randn(NUM_EXPERTS, dtype=torch.bfloat16, device="cuda")
     moe_buf = torch.ones((m, MODEL_DIM), dtype=torch.bfloat16, device="cuda")
     w, ids, aux = moe_route_radix4.route_radix4_with_sort(
-        scores, bias, TOPK, True, 2.5, sort_ws=_sort_ws(), moe_buf=moe_buf
+        scores,
+        bias,
+        TOPK,
+        True,
+        2.5,
+        sort_ws=_sort_ws(),
+        block_m=BM,
+        moe_buf=moe_buf,
     )
     del w, ids, moe_buf
     later = [
@@ -668,22 +748,39 @@ def test_fused_sort_aux_pins_the_addresses_it_matches_on():
     assert pinned.isdisjoint(t.data_ptr() for t in later)
 
 
+@pytest.mark.parametrize("block_m", BLOCK_MS)
 @pytest.mark.parametrize("m", [1, 12, 64, 80, 512])
-def test_aiter_accepts_fused_sort(m):
+def test_aiter_accepts_fused_sort(m, block_m):
     """AITER drops a registered sort whose aux lacks a key it matches on, such as
     topk_weights_ptr, logs it once and sorts again, so a missing key only shows
-    up as a lost speedup."""
+    up as a lost speedup. BM=32 is taken by its standard-sort pipelines only."""
     try:
-        from aiter.presorted_moe import match_presorted_moe
+        from aiter import presorted_moe
     except ImportError:
         pytest.skip("AITER without register_presorted_moe (ROCm/aiter#6484)")
+    try:
+        from aiter.presorted_moe import PRESORTED_MOE_BLOCK_MS
+    except ImportError:  # before ROCm/aiter#8197
+        PRESORTED_MOE_BLOCK_MS = (presorted_moe.PRESORTED_MOE_BLOCK_M,)
+    if block_m not in PRESORTED_MOE_BLOCK_MS:
+        pytest.skip(f"AITER without BM={block_m} presorts (ROCm/aiter#8197)")
+    aux_sort = block_m == presorted_moe.PRESORTED_MOE_BLOCK_M
     scores = torch.randn((m, NUM_EXPERTS), dtype=torch.bfloat16, device="cuda")
     bias = torch.randn(NUM_EXPERTS, dtype=torch.bfloat16, device="cuda")
     w, ids, aux = moe_route_radix4.route_radix4_with_sort(
-        scores, bias, TOPK, True, 2.5, sort_ws=_sort_ws()
+        scores, bias, TOPK, True, 2.5, sort_ws=_sort_ws(), block_m=block_m
     )
+    kwargs = {} if aux_sort else {"aux_sort": False}
     assert (
-        match_presorted_moe(aux, ids, w, block_m=BM, num_experts=NUM_EXPERTS, topk=TOPK)
+        presorted_moe.match_presorted_moe(
+            aux,
+            ids,
+            w,
+            block_m=block_m,
+            num_experts=NUM_EXPERTS,
+            topk=TOPK,
+            **kwargs,
+        )
         is aux
     )
 
@@ -700,7 +797,7 @@ def test_aiter_ignores_fused_sort_for_another_moe_call():
     scores = torch.randn((m, NUM_EXPERTS), dtype=torch.bfloat16, device="cuda")
     bias = torch.randn(NUM_EXPERTS, dtype=torch.bfloat16, device="cuda")
     w, ids, aux = moe_route_radix4.route_radix4_with_sort(
-        scores, bias, TOPK, True, 2.5, sort_ws=_sort_ws()
+        scores, bias, TOPK, True, 2.5, sort_ws=_sort_ws(), block_m=BM
     )
     other_w, other_ids = w.clone(), ids.clone()
     assert (
@@ -807,11 +904,21 @@ def test_presort_gate_asks_aiter_what_fused_moe_asks(mode, m, monkeypatch):
 @pytest.mark.parametrize("mode", list(_SITU_MODES))
 def test_select_experts_sorts_only_where_aiter_takes_it(mode, monkeypatch):
     """On AITER's own tables for the K3 MoE shapes (TP8, non-EP), the router
-    registers its sort exactly on the batch sizes whose config is the BM=16
-    aux-sort pipeline; elsewhere (e.g. stock A4W4's BM=32 rows at 65-256
-    tokens) AITER would sort again, so the router skips it."""
+    registers its sort exactly on the batch sizes whose config takes one, at the
+    block_m AITER names (presorted_moe_block_m, ROCm/aiter#8197: e.g. stock
+    A4W4's BM=32 rows at 65-256 tokens and A16W4's standard-sort rows). An older
+    AITER takes only its BM=16 aux-sort pipeline; elsewhere it would sort again,
+    so the router skips it."""
     aiter_presort = _requires_presort_aiter()
     from aiter.fused_moe import get_2stage_cfgs
+
+    try:
+        from aiter.fused_moe import presorted_moe_block_m as aiter_block_m
+    except ImportError:  # before ROCm/aiter#8197: the BM=16 aux-sort pipeline only
+
+        def aiter_block_m(metadata):
+            takes = bool(metadata.output_aux) and int(metadata.block_m) == BM
+            return BM if takes and metadata.full_impl is None else None
 
     from sglang.srt.environ import envs
     from sglang.srt.layers.moe import topk as topk_module
@@ -840,8 +947,7 @@ def test_select_experts_sorts_only_where_aiter_takes_it(mode, monkeypatch):
     sizes = [1, 16, 64, 65, 128, 256, 512]
     expected = {}
     for m in sizes:
-        metadata = get_2stage_cfgs(**gate.cfg_args(m))
-        expected[m] = bool(metadata.output_aux) and int(metadata.block_m) == BM
+        expected[m] = aiter_block_m(get_2stage_cfgs(**gate.cfg_args(m)))
     registered = {}
     for m in sizes:
         registrations = []
@@ -859,7 +965,7 @@ def test_select_experts_sorts_only_where_aiter_takes_it(mode, monkeypatch):
                 select_experts(torch.zeros((m, 8), device="cuda"), scores, config)
             finally:
                 aiter_presort.clear()
-        registered[m] = len(registrations) == 2
+        registered[m] = registrations[0]["block_m"] if len(registrations) == 2 else None
     assert registered == expected
 
 

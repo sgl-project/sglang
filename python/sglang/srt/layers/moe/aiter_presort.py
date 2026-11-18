@@ -1,4 +1,4 @@
-"""Hand AITER's fused_moe the BM=16 sort the radix-4 router writes on ROCm.
+"""Hand AITER's fused_moe the MoE sort the radix-4 router writes on ROCm.
 
 At decode and verify batch sizes AITER's fused_moe spends one or two launches on
 moe_sorting, which also zeroes its output. route_radix4_with_sort emits both from
@@ -6,9 +6,10 @@ the routing launch; register_presorted_moe (ROCm/aiter#6484) hands that sort to
 the next fused_moe call, which uses it when the call's topk tensors, M and
 block_m match and ignores it otherwise.
 
-AITER takes the sort only where the kernel config it resolves for the batch is
-its BM=16 aux-sort pipeline, and sorts again elsewhere, so each layer's
-PresortGate asks AITER's own config lookup (get_2stage_cfgs) per batch size.
+AITER takes the sort only where the kernel config it resolves for the batch
+reads it, at that config's block_m, and sorts again elsewhere, so each layer's
+PresortGate asks AITER's own config lookup (get_2stage_cfgs) per batch size
+which block_m to sort at, if any.
 
 Only a Kimi-K3 MoE layer whose experts take the sort asks for it, through the
 consume-once stash in route_quant_handoff, so the shared routing functions keep
@@ -68,6 +69,11 @@ def _cfg_api() -> Optional[SimpleNamespace]:
             f"radix-4 fused MoE sort off: AITER lacks its config lookup ({e})"
         )
         return None
+    try:
+        # ROCm/aiter#8197: the block_m a config takes a presort at, or None.
+        from aiter.fused_moe import presorted_moe_block_m
+    except ImportError:
+        presorted_moe_block_m = None
     return SimpleNamespace(
         ActivationType=ActivationType,
         QuantType=QuantType,
@@ -79,6 +85,7 @@ def _cfg_api() -> Optional[SimpleNamespace]:
         quant_remap=quant_remap,
         resolve_activation_dtype=resolve_activation_dtype,
         presort_block_m=PRESORTED_MOE_BLOCK_M,
+        presorted_moe_block_m=presorted_moe_block_m,
     )
 
 
@@ -233,15 +240,18 @@ def _cfg_args(lookup: dict, m: int) -> dict:
 
 
 class PresortGate:
-    """Whether a layer's fused_moe takes the router's sort at a batch size.
+    """Which block_m a layer's fused_moe takes the router's sort at, per batch size.
 
     AITER uses a registered sort only where the config it resolves for the batch
-    runs its aux-sort pipeline at block_m == PRESORTED_MOE_BLOCK_M (16); a BM=32
-    row, say, sorts again and the fused sort is wasted work. The gate asks
-    get_2stage_cfgs with the arguments _fused_moe_impl derives from the layer's
-    fused_moe call, which it learns from the first call (observe()); until then
-    it declines. A config fused_moe re-resolves at call time (an unsupported
-    tuned row) is not seen here; AITER then ignores the sort and logs it.
+    reads one, and only at that config's block_m; elsewhere it sorts again and
+    the fused sort is wasted work. The gate asks get_2stage_cfgs with the
+    arguments _fused_moe_impl derives from the layer's fused_moe call, which it
+    learns from the first call (observe()); until then it declines. AITER's
+    presorted_moe_block_m (ROCm/aiter#8197) then names the block_m: 16 or 32 on
+    its FlyDSL standard-sort pipelines, 16 on its aux-sort ones. An older AITER
+    takes only the aux-sort pipeline at PRESORTED_MOE_BLOCK_M (16). A config
+    fused_moe re-resolves at call time (an unsupported tuned row) is not seen
+    here; AITER then ignores the sort and logs it.
 
     Answers are cached per M and are host-only, so a CUDA graph captures a fixed
     one for its batch size.
@@ -250,7 +260,7 @@ class PresortGate:
     def __init__(self) -> None:
         self._lookup: Optional[dict] = None
         self._unsupported = False
-        self._by_m: dict[int, bool] = {}
+        self._by_m: dict[int, Optional[int]] = {}
 
     def observe(self, call: dict) -> None:
         """Learn the layer's fused_moe arguments from its call (keyword form)."""
@@ -262,31 +272,37 @@ class PresortGate:
         else:
             self._lookup = lookup
 
-    def takes_presort(self, m: int) -> bool:
+    def sort_block_m(self, m: int) -> Optional[int]:
+        """The block_m to sort an M-token batch at, or None to skip the sort."""
         if self._lookup is None or m == 0:
-            return False
-        hit = self._by_m.get(m)
-        if hit is None:
-            hit = self._by_m[m] = self._resolve(m)
-        return hit
+            return None
+        if m not in self._by_m:
+            self._by_m[m] = self._resolve(m)
+        return self._by_m[m]
 
     def cfg_args(self, m: int) -> dict:
         """The get_2stage_cfgs arguments of the layer's fused_moe at M tokens."""
         return _cfg_args(self._lookup, m)
 
-    def _resolve(self, m: int) -> bool:
+    def _resolve(self, m: int) -> Optional[int]:
         api = _cfg_api()
         try:
             metadata = api.get_2stage_cfgs(**self.cfg_args(m))
         except (NotImplementedError, ValueError) as e:
             # fused_moe itself would raise here; nothing to hand it.
             self._decline(f"get_2stage_cfgs rejects M={m}: {e}")
-            return False
-        return (
+            return None
+        if api.presorted_moe_block_m is not None:
+            block_m = api.presorted_moe_block_m(metadata)
+        elif (
             metadata.full_impl is None
             and bool(metadata.output_aux)
             and int(metadata.block_m) == api.presort_block_m
-        )
+        ):
+            block_m = api.presort_block_m
+        else:
+            block_m = None
+        return block_m if block_m in moe_route_radix4.SORT_BLOCK_MS else None
 
     def _decline(self, reason: str) -> None:
         self._lookup = None
@@ -367,7 +383,8 @@ def try_route_and_register(
     Caller must have checked moe_route_radix4.covered().
     """
     gate, num_token_non_padded = route_quant_handoff.take_aiter_presort()
-    if gate is None or not gate.takes_presort(scores.shape[0]):
+    block_m = None if gate is None else gate.sort_block_m(scores.shape[0])
+    if block_m is None:
         return None
     sort_ws = get_buffer("aiter_presort_sort_ws", _SortWorkspaces).get(scores.device)
     if sort_ws is None:
@@ -379,6 +396,7 @@ def try_route_and_register(
         renormalize=renormalize,
         routed_scaling_factor=routed_scaling_factor,
         sort_ws=sort_ws,
+        block_m=block_m,
         moe_buf=_published_moe_output(scores.shape[0]),
         num_token_non_padded=num_token_non_padded,
     )

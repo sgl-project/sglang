@@ -44,7 +44,7 @@
 
 #include <tvm/ffi/container/tensor.h>
 
-#include "route_radix4_sort.cuh"  // BM=16 sort scratch; hashed via this TU
+#include "route_radix4_sort.cuh"  // BM-block sort scratch; hashed via this TU
 #include <algorithm>
 #include <cstdint>
 
@@ -54,12 +54,14 @@ inline constexpr uint32_t kRadix4NumExperts = 896;
 inline constexpr uint32_t kRadix4TopK = 16;
 inline constexpr uint32_t kRadix4Block = 256;
 inline constexpr uint32_t kRadix4Wave = 64;
-inline constexpr uint32_t kRadix4SortBlockM = 16;
+// The sort block sizes AITER takes a presort at (PRESORTED_MOE_BLOCK_MS).
+inline constexpr uint32_t kRadix4SortBlockMs[] = {16, 32};
 // Up to this many tokens the last CTA to arrive sorts every route (four per
 // thread at most); past it the last ceil(M / kRadix4TailChunk) CTAs share the
 // sort, a token chunk each. They wait for each other, so their number stays far
 // below what any GPU partition holds at once: past 512 tokens the chunks grow.
 inline constexpr uint32_t kRadix4LeaderSortMaxTokens = 64;
+static_assert(kRadix4LeaderSortMaxTokens <= radix4_sort::kLeaderMaxTokens, "the leader ranks a token by one mask bit");
 inline constexpr uint32_t kRadix4TailChunk = 16;
 inline constexpr uint32_t kRadix4MaxTailCtas = 32;
 inline constexpr int kRadix4SortNone = 0;
@@ -79,7 +81,7 @@ struct RouteRadix4Params {
   uint32_t stride_out;
   fp32_t routed_scaling_factor;
   bool renormalize;
-  // Fused BM=16 sort (null when the kernel is route-only). sort_ws is
+  // Fused BM-block sort (null when the kernel is route-only). sort_ws is
   // [leader arrival, tail parity, tail arrival 0, tail arrival 1], zeroed once.
   int32_t* __restrict__ sort_ws = nullptr;
   // The tail sort (kRadix4SortTail) is shared by the last tail_ctas CTAs.
@@ -217,10 +219,11 @@ SGL_DEVICE void stage_wave_sum(float v, int lane, int wid, float* out) {
 
 }  // namespace radix4
 
-template <typename T, int EXPERTS, int TOPK, int BLOCK, int kSort = kRadix4SortNone>
+template <typename T, int EXPERTS, int TOPK, int BLOCK, int kSort = kRadix4SortNone, int SORT_BM = 16>
 __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ const RouteRadix4Params params) {
   constexpr bool kFuseSort = kSort != kRadix4SortNone;
   constexpr bool kTailSort = kSort == kRadix4SortTail;
+  constexpr bool kLeaderSort = kSort == kRadix4SortLeader;
   constexpr int WAVE = static_cast<int>(kRadix4Wave);
   constexpr int NWAVE = BLOCK / WAVE;
   constexpr int VPT = (EXPERTS + BLOCK - 1) / BLOCK;
@@ -280,14 +283,15 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
   __shared__ int s_id[TOPK];
   __shared__ uint32_t s_key[TOPK];
   __shared__ int s_cnt;
-  // The padded prefix doubles as the placement cursor, so the sort needs a
-  // histogram and a prefix and no third array.
-  __shared__ int sort_count[kFuseSort ? EXPERTS : 1];
+  // The tail tallies routes per expert (sort_count, sort_before) and marks its
+  // chunk's tokens (sort_mask); the leader marks every token (sort_mask64).
+  __shared__ int sort_count[kTailSort ? EXPERTS : 1];
   __shared__ int sort_cumsum[kFuseSort ? (EXPERTS + 1) : 1];
   __shared__ int s_leader;
   __shared__ int s_ticket;
   __shared__ int sort_before[kTailSort ? EXPERTS : 1];
   __shared__ uint32_t sort_mask[kTailSort ? EXPERTS : 1];
+  __shared__ unsigned long long sort_mask64[kLeaderSort ? EXPERTS : 1];
 
   // No CTA of a launch knows when every tail CTA has seen the final arrival
   // count, so none can reset it. Two counters alternate instead: each launch
@@ -296,17 +300,18 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
   if constexpr (kFuseSort) {
     // Routing-independent, so issued first to drain during the radix search;
     // pads stay in wave 0, the only wave that releases at the arrival barrier.
-    radix4_sort::reset_counts<EXPERTS, BLOCK>(sort_count);
     if (wid == 0)
       radix4_sort::pad_sorted_slice<static_cast<int>(kRadix4Wave), kTailSort>(
           params.sorted_token_ids,
           params.m_indices,
           params.sorted_weights,
           static_cast<int>(params.sorted_capacity),
+          (TOPK << 24) | static_cast<int>(gridDim.x),
           static_cast<int>(gridDim.x),
           token,
           static_cast<int>(gridDim.x));
     if constexpr (kTailSort) {
+      radix4_sort::reset_counts<EXPERTS, BLOCK>(sort_count);
       tail_parity = __hip_atomic_load(&params.sort_ws[1], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) & 1;
       if (token == 0 && tid == 0)
         __hip_atomic_store(&params.sort_ws[2 + (tail_parity ^ 1)], 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -314,6 +319,10 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
         sort_before[e] = 0;
         sort_mask[e] = 0u;
       }
+    }
+    if constexpr (kLeaderSort) {
+      for (int e = tid; e < EXPERTS; e += BLOCK)
+        sort_mask64[e] = 0ull;
     }
   }
 
@@ -568,7 +577,7 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
     __syncthreads();
     const int ticket = s_ticket;
     if (ticket >= first_helper) {
-      radix4_sort::sort_tail_stable<EXPERTS, TOPK, static_cast<int>(kRadix4SortBlockM), BLOCK>(
+      radix4_sort::sort_tail_stable<EXPERTS, TOPK, SORT_BM, BLOCK>(
           sort_count,
           sort_before,
           sort_mask,
@@ -614,9 +623,9 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
     if (s_leader) {
       // moe_buf is zeroed after the sort: nothing here reads it, and zeroing
       // first would stall sort_subkernel's first __syncthreads.
-      radix4_sort::sort_subkernel<EXPERTS, TOPK, static_cast<int>(kRadix4SortBlockM), BLOCK>(
-          sort_count,
+      radix4_sort::sort_subkernel<EXPERTS, TOPK, SORT_BM, BLOCK>(
           sort_cumsum,
+          sort_mask64,
           params.out_i,
           params.out_w,
           params.sorted_token_ids,
@@ -625,6 +634,7 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
           params.cumsum_tensor,
           params.reverse_sorted,
           params.m_indices,
+          params.num_non_padded,
           static_cast<int>(gridDim.x));
       if (tid == 0) params.sort_ws[0] = 0;
     }
@@ -705,6 +715,7 @@ struct RouteRadix4SortKernel {
       const tvm::ffi::TensorView m_indices,
       const tvm::ffi::TensorView moe_buf,
       const tvm::ffi::TensorView num_non_padded,
+      int64_t block_m,
       int64_t topk,
       double routed_scaling_factor,
       bool renormalize) {
@@ -759,17 +770,20 @@ struct RouteRadix4SortKernel {
         << "fused sort needs packed [M, K] rows";
     CHECK_HOST(M_.unwrap() <= static_cast<int64_t>(kRadix4MaxTailCtas) * radix4_sort::kTailMaxChunkTokens)
         << "the fused sort covers at most 1024 tokens";
-    CHECK_HOST(S_.unwrap() % kRadix4SortBlockM == 0 && S_.unwrap() / kRadix4SortBlockM <= sorted_expert_ids.size(0))
-        << "sorted rows must hold whole BM=16 blocks, one expert id each";
+    CHECK_HOST(
+        std::find(std::begin(kRadix4SortBlockMs), std::end(kRadix4SortBlockMs), block_m) !=
+        std::end(kRadix4SortBlockMs))
+        << "the fused sort's block_m is 16 or 32, got " << block_m;
+    CHECK_HOST(S_.unwrap() % block_m == 0 && S_.unwrap() / block_m <= sorted_expert_ids.size(0))
+        << "sorted rows must hold whole BM blocks, one expert id each";
 
     const auto M = static_cast<uint32_t>(M_.unwrap());
     if (M == 0) return;
     // The kernel writes these without bounds checks; sizes mirror _sorted_capacity.
     const int64_t routes = static_cast<int64_t>(M) * kRadix4TopK;
     const int64_t active = routes < kRadix4NumExperts ? routes : kRadix4NumExperts;
-    const int64_t capacity =
-        (routes + active * (kRadix4SortBlockM - 1) + kRadix4SortBlockM - 1) / kRadix4SortBlockM * kRadix4SortBlockM;
-    CHECK_HOST(S_.unwrap() >= capacity) << "sorted rows are shorter than the BM=16 sort capacity for M";
+    const int64_t capacity = (routes + active * (block_m - 1) + block_m - 1) / block_m * block_m;
+    CHECK_HOST(S_.unwrap() >= capacity) << "sorted rows are shorter than the BM sort capacity for M";
     CHECK_HOST(reverse_sorted.size(0) >= routes) << "reverse_sorted must hold M * topk entries";
 
     void* moe_ptr = nullptr;
@@ -816,20 +830,32 @@ struct RouteRadix4SortKernel {
         .num_non_padded = non_padded_ptr,
     };
 
+    const auto device = device_.unwrap();
+    const bool tail = M > kRadix4LeaderSortMaxTokens;
+    const bool bf16 = score_dtype.is_type<bf16_t>();
+    if (block_m == 16) {
+      launch<16>(M, device, bf16, tail, params);
+    } else {
+      launch<32>(M, device, bf16, tail, params);
+    }
+  }
+
+ private:
+  template <int kSortBM>
+  static void launch(uint32_t M, DLDevice device, bool bf16, bool tail, const RouteRadix4Params& params) {
+    using namespace host;
     constexpr auto kExperts = static_cast<int>(kRadix4NumExperts);
     constexpr auto kTopK = static_cast<int>(kRadix4TopK);
     constexpr auto kBlock = static_cast<int>(kRadix4Block);
-    const auto device = device_.unwrap();
-    const bool tail = M > kRadix4LeaderSortMaxTokens;
-    if (score_dtype.is_type<bf16_t>()) {
+    if (bf16) {
       LaunchKernel(M, kBlock, device)(
-          tail ? route_radix4_kernel<bf16_t, kExperts, kTopK, kBlock, kRadix4SortTail>
-               : route_radix4_kernel<bf16_t, kExperts, kTopK, kBlock, kRadix4SortLeader>,
+          tail ? route_radix4_kernel<bf16_t, kExperts, kTopK, kBlock, kRadix4SortTail, kSortBM>
+               : route_radix4_kernel<bf16_t, kExperts, kTopK, kBlock, kRadix4SortLeader, kSortBM>,
           params);
     } else {
       LaunchKernel(M, kBlock, device)(
-          tail ? route_radix4_kernel<fp32_t, kExperts, kTopK, kBlock, kRadix4SortTail>
-               : route_radix4_kernel<fp32_t, kExperts, kTopK, kBlock, kRadix4SortLeader>,
+          tail ? route_radix4_kernel<fp32_t, kExperts, kTopK, kBlock, kRadix4SortTail, kSortBM>
+               : route_radix4_kernel<fp32_t, kExperts, kTopK, kBlock, kRadix4SortLeader, kSortBM>,
           params);
     }
   }
