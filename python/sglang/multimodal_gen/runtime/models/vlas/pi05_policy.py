@@ -488,6 +488,8 @@ class Pi05PolicyModel(nn.Module):
                 quantization_config = json.load(f).get("quantization_config")
         device = torch.device(current_platform.device_type)
         dtype = dtype or cls._dtype_from_config(config.materialize_dtype)
+        if dtype not in (torch.bfloat16, torch.float32):
+            raise ValueError(f"Pi05 supports bf16 or fp32 weights, got {dtype}")
         manifest = cls._inspect_checkpoint(local_path, config)
         logger.info(
             "Loaded Pi05 checkpoint manifest from %s (%d safetensors, %d skipped lm_head tensors)",

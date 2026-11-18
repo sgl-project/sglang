@@ -7,8 +7,10 @@ import pytest
 import torch
 from torch import nn
 
+import sglang.multimodal_gen.runtime.models.vlas.pi05_core as pi05_core_module
 import sglang.multimodal_gen.runtime.models.vlas.pi05_policy as pi05_policy_module
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
+from sglang.multimodal_gen.runtime.loader.utils import set_default_torch_dtype
 from sglang.multimodal_gen.runtime.models.vlas.pi05_core import (
     Pi05CoreModel,
     Pi05SiglipVisionModel,
@@ -317,6 +319,26 @@ def test_pi05_graph_config_validation():
     for overrides, match in invalid_configs:
         with pytest.raises(ValueError, match=match):
             Pi05PipelineConfig(**overrides)
+
+
+def test_pi05_core_precision_follows_policy_dtype(tmp_path, monkeypatch):
+    monkeypatch.setattr(Pi05PolicyModel, "__init__", lambda self, *a, **k: None)
+    with pytest.raises(ValueError, match="bf16 or fp32"):
+        Pi05PolicyModel.from_pretrained(
+            str(tmp_path), Pi05PipelineConfig(materialize_dtype="fp16")
+        )
+
+    precisions = []
+    monkeypatch.setattr(
+        pi05_core_module,
+        "PaliGemmaWithExpertModel",
+        lambda *args, precision, **kwargs: precisions.append(precision),
+    )
+    with set_default_torch_dtype(torch.bfloat16):
+        Pi05CoreModel(
+            Pi05PipelineConfig(materialize_dtype="BF16"), runtime_role="prefix"
+        )
+    assert precisions == ["bfloat16"]
 
 
 def test_prefix_cache_key_distinguishes_bucket_layouts_and_mask_holes():
