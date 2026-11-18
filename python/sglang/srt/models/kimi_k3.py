@@ -1778,7 +1778,11 @@ class KimiK3MoE(nn.Module):
 
     @cached_property
     def _sp_routes_own_rows(self) -> bool:
-        return self._route_quant_fuse_eligible and not self._moe_front_needs_dense_bf16
+        return (
+            self._route_quant_fuse_eligible
+            and not self._moe_front_needs_dense_bf16
+            and k3_sp_collective.prefill_sp_can_gather_routed()
+        )
 
     def _sp_route_own_rows(self, normed: torch.Tensor, num_tokens: int):
         from sglang.srt.layers.quantization.mxfp4 import (
@@ -1797,7 +1801,7 @@ class KimiK3MoE(nn.Module):
         _, _, x_q, x_s = _prepare_flashinfer_mxfp8_activations(
             routed_input, self.experts.quant_method.hidden_size
         )
-        weights, ids, x_q, x_s = get_parallel().tp_group.all_gatherv(
+        weights, ids, x_q, x_s = k3_sp_collective.prefill_sp_gather_routed(
             [
                 topk_output.topk_weights,
                 topk_output.topk_ids,

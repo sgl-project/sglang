@@ -556,3 +556,11 @@ def prefill_sp_all_gather(
     out = x.new_empty((rows, *x.shape[1:]))
     group.all_gather_into_tensor(out, x.contiguous())
     return out
+
+
+def prefill_sp_can_gather_routed() -> bool:
+    return get_parallel().tp_group.get_available_pynccl_comm() is not None
+
+
+def prefill_sp_gather_routed(segments: list[torch.Tensor]) -> list[torch.Tensor]:
+    return get_parallel().tp_group.all_gatherv(segments)
