@@ -1472,11 +1472,9 @@ class DeepseekSparseAttnBackend(
         # DCP prefill: the batch's KV rows from all ranks, request after request
         # in position order, padded to whole pages (the ragged top-k layout)
         if _IS_GFX95:
-            from sglang.srt.layers.attention.dsa.dsa_backend_hip import (
-                dcp_gather_kv_cache,
+            return dsa_backend_hip.dcp_gather_kv_cache(
+                self, kv_cache, forward_batch, metadata
             )
-
-            return dcp_gather_kv_cache(self, kv_cache, forward_batch, metadata)
         rows = kv_cache.view(torch.uint8).view(-1, self.kv_cache_dim)
         gathered = dcp_gather_request_rows(
             rows[metadata.dcp_local_kv_rows], forward_batch.seq_lens_cpu
@@ -2906,11 +2904,7 @@ class DeepseekSparseAttnBackend(
                 and self.dsa_shards_index_k
                 and forward_batch.forward_mode.is_target_verify()
             ):
-                from sglang.srt.layers.attention.dsa.dsa_backend_hip import (
-                    forward_triton_dcp_partial,
-                )
-
-                return forward_triton_dcp_partial(
+                return dsa_backend_hip.forward_triton_dcp_partial(
                     self, q_nope, q_rope, kv_cache, page_table_1, layer
                 )
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
@@ -3287,11 +3281,7 @@ class DeepseekSparseAttnBackend(
                     topk_indices=shared_topk_indices,
                 )
             if _IS_GFX95 and self.dsa_shards_index_k:
-                from sglang.srt.layers.attention.dsa.dsa_backend_hip import (
-                    forward_triton_dcp_partial,
-                )
-
-                return forward_triton_dcp_partial(
+                return dsa_backend_hip.forward_triton_dcp_partial(
                     self, q_nope, q_rope, kv_cache, page_table_1, layer
                 )
             return self._forward_triton_decode(

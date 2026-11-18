@@ -448,9 +448,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             k_norm_cls = LayerNorm
             if _is_gfx95_supported and getattr(config, "index_k_norm_fp32", False):
                 # Kimi-K3.1's fp32 index k_norm runs in one launch on gfx950
-                from sglang.srt.layers.attention.dsa.dsa_indexer_hip import (
-                    Fp32LayerNormHip as k_norm_cls,
-                )
+                k_norm_cls = dsa_indexer_hip.Fp32LayerNormHip
             self.k_norm = k_norm_cls(
                 self.head_dim,
                 dtype=(
