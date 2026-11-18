@@ -1671,6 +1671,14 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE = EnvBool(False)
+    # Run the W4A4 MXFP4 (mxf4xmxf4) MegaMoE layers on FlashInfer's SM107 CuTe
+    # DSL MegaMoE instead of DeepGEMM; same E2M1 + per-32 E8M0 numerics on both
+    # operands. SM107 only. Capacity is
+    # SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.
+    SGLANG_OPT_MEGA_MOE_MXFP4_FLASHINFER = EnvBool(False)
+    # FlashInfer kernel knobs for that path: "cache" uses the winner in
+    # FLASHINFER_MOE_EP_KNOB_CACHE when present, else FlashInfer's heuristic.
+    SGLANG_OPT_MEGA_MOE_MXFP4_FLASHINFER_KNOBS = EnvStr("cache")
 
     # ===================================================================
     # Top-k kernels

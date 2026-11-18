@@ -198,6 +198,235 @@ def _destroy_mega_moe_localizer() -> None:
         )
 
 
+# FlashInfer SM107 MegaMoE for the W4A4 MXFP4 (mxf4xmxf4) layers
+# (SGLANG_OPT_MEGA_MOE_MXFP4_FLASHINFER). The layer owns FlashInfer's
+# transformed weights; the routed-expert parameters become per-expert byte views
+# of them, so EPLB moves the kernel's own weights. No DeepGEMM buffer is used.
+
+
+def _use_flashinfer_mxfp4_mega_moe(mma_type: str) -> bool:
+    return mma_type == "mxf4xmxf4" and envs.SGLANG_OPT_MEGA_MOE_MXFP4_FLASHINFER.get()
+
+
+def _flashinfer_mega_layer(experts):
+    return getattr(experts, "_flashinfer_mega_layer", None)
+
+
+def _as_e8m0(sf: torch.Tensor) -> torch.Tensor:
+    """Per-32 block scales as float8_e8m0fnu. FP32 / BF16 scales must be
+    non-negative powers of two (E8M0 holds only the exponent)."""
+    if sf.dtype == torch.float8_e8m0fnu:
+        return sf
+    if sf.dtype in (torch.uint8, torch.int8):
+        return sf.view(torch.uint8).view(torch.float8_e8m0fnu)
+    bits = sf.float().contiguous().view(torch.int32)
+    if bool((bits & 0x7FFFFF).any()) or bool((bits < 0).any()):
+        raise ValueError("MXFP4 block scales are not powers of two")
+    return ((bits >> 23) & 0xFF).to(torch.uint8).view(torch.float8_e8m0fnu)
+
+
+def _expert_byte_slabs(t: torch.Tensor, num_local: int, name: str) -> torch.Tensor:
+    """A one-byte (E, ...) tensor whose expert slices are each one gapless block
+    (any inner stride order), viewed as a contiguous (E, bytes) uint8 tensor over
+    the same memory."""
+    if t.element_size() != 1 or t.shape[0] != num_local:
+        raise ValueError(f"{name}: unexpected {t.dtype} {tuple(t.shape)}")
+    u = t.view(torch.uint8)
+    slab = u[0]
+    expected = 1
+    for stride, size in sorted(zip(slab.stride(), slab.shape)):
+        if size == 1:
+            continue
+        if stride != expected:
+            raise ValueError(
+                f"{name}: expert slice {tuple(slab.shape)} {slab.stride()} is not dense"
+            )
+        expected *= size
+    if num_local > 1 and u.stride(0) < slab.numel():
+        raise ValueError(f"{name}: expert slices overlap")
+    return torch.as_strided(
+        u, (num_local, slab.numel()), (u.stride(0), 1), u.storage_offset()
+    )
+
+
+def _build_flashinfer_mxfp4_mega_moe(experts) -> None:
+    if _device_sm != 107:
+        raise RuntimeError(
+            "SGLANG_OPT_MEGA_MOE_MXFP4_FLASHINFER needs an SM107 GPU "
+            f"(FlashInfer's Rubin MegaMoE), got SM{_device_sm}"
+        )
+    if _is_mega_moe_localization_enabled():
+        raise ValueError(
+            "SGLANG_OPT_MEGA_MOE_MXFP4_FLASHINFER does not support "
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE"
+        )
+    try:
+        from flashinfer.moe_ep import (
+            BootstrapConfig,
+            FleetParams,
+            MegaConfig,
+            MoEEpMegaLayer,
+            PrequantizedMoEWeights,
+            Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+        )
+        from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp4_mxfp4_bf16_cutedsl.weights import (
+            preprocess_mega_weights,
+        )
+    except ImportError as e:
+        raise ImportError(
+            "SGLANG_OPT_MEGA_MOE_MXFP4_FLASHINFER needs a FlashInfer with "
+            "Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig"
+        ) from e
+
+    from sglang.srt.runtime_context import get_parallel
+
+    w13 = experts.w13_weight.data.view(torch.uint8)
+    w2 = experts.w2_weight.data.view(torch.uint8)
+    num_local, n1, packed_k1 = w13.shape
+    _, n2, packed_k2 = w2.shape
+    hidden, intermediate = packed_k1 * 2, n1 // 2
+    if n2 != hidden or packed_k2 * 2 != intermediate:
+        raise ValueError(f"MXFP4 expert shapes {tuple(w13.shape)} / {tuple(w2.shape)}")
+    w13_sf = _as_e8m0(experts.w13_weight_scale_inv.data)
+    w2_sf = _as_e8m0(experts.w2_weight_scale_inv.data)
+    transformed = preprocess_mega_weights(
+        PrequantizedMoEWeights(w13, w2, w13_sf, w2_sf),
+        intermediate_size=intermediate,
+        hidden_size=hidden,
+    )
+    del w13, w2, w13_sf, w2_sf
+    # FlashInfer reads these tensors on every forward. Expose each expert's slice
+    # through the routed-expert parameters, so EPLB rebalancing rewrites them in
+    # place, and free SGLang's original copies.
+    (l1_w, l1_sf), (l2_w, l2_sf) = transformed
+    for name, t in (
+        ("w13_weight", l1_w),
+        ("w13_weight_scale_inv", l1_sf),
+        ("w2_weight", l2_w),
+        ("w2_weight_scale_inv", l2_sf),
+    ):
+        getattr(experts, name).data = _expert_byte_slabs(t, num_local, name)
+    torch.cuda.empty_cache()
+
+    group = get_parallel().moe_ep_group.device_group
+    config = Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=intermediate,
+        top_k=experts.top_k,
+        gate_up_clamp=experts.moe_runner_config.swiglu_limit,
+        knobs=envs.SGLANG_OPT_MEGA_MOE_MXFP4_FLASHINFER_KNOBS.get(),
+    )
+    max_tokens = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+    experts._flashinfer_mega_layer = MoEEpMegaLayer(
+        bootstrap=BootstrapConfig(
+            world_size=group.size(),
+            rank=group.rank(),
+            device=torch.cuda.current_device(),
+            process_group=group,
+        ),
+        fleet_params=FleetParams(
+            num_experts=experts.num_experts,
+            max_tokens_per_rank=max_tokens,
+            token_hidden_size=hidden,
+        ),
+        weights=None,
+        backend=MegaConfig(
+            megakernel=config,
+            preprocess_weights=False,
+            transformed_weights=transformed,
+        ),
+    )
+    experts._flashinfer_mega_hidden = hidden
+    experts._mega_moe_weights_built = True
+
+
+def _run_flashinfer_mxfp4_mega_moe(
+    experts,
+    hidden_states: torch.Tensor,
+    topk_ids: Optional[torch.Tensor],
+    topk_weights: Optional[torch.Tensor],
+    *,
+    num_tokens: int,
+    top_k: int,
+    routed_scaling_factor: float,
+) -> torch.Tensor:
+    from flashinfer.moe_ep import MoEEpTensors
+
+    hidden = experts._flashinfer_mega_hidden
+    if num_tokens > 0:
+        x = hidden_states[:num_tokens]
+        ids = topk_ids[:num_tokens].to(torch.int32)
+        weights = topk_weights[:num_tokens].to(torch.float32)
+        if routed_scaling_factor != 1.0:
+            weights = weights * routed_scaling_factor
+    else:
+        # The layer still joins this step's EP exchange with zero rows.
+        x = hidden_states.new_empty((0, hidden))
+        ids = hidden_states.new_empty((0, top_k), dtype=torch.int32)
+        weights = hidden_states.new_empty((0, top_k), dtype=torch.float32)
+    # A contiguous BF16 output lets FlashInfer's top-k reduce write it directly.
+    out = torch.empty(
+        (num_tokens, hidden), device=hidden_states.device, dtype=torch.bfloat16
+    )
+    y = _flashinfer_mega_layer(experts).forward(
+        MoEEpTensors(
+            hidden_states=x.to(torch.bfloat16),
+            topk_ids=ids,
+            topk_weights=weights,
+            output=out,
+        )
+    )
+    return y[:num_tokens]
+
+
+def _warmup_flashinfer_mxfp4_mega_moe(experts) -> None:
+    """Run one capacity-size forward, on every EP rank together, so FlashInfer's
+    pooled workspace and the kernel compile happen before the KV cache is sized."""
+    num_tokens = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+    top_k = experts.top_k
+    device = torch.device("cuda", torch.cuda.current_device())
+    free_before = torch.cuda.mem_get_info()[0]
+    generator = torch.Generator(device=device).manual_seed(1234)
+    x = (
+        torch.randn(
+            (num_tokens, experts._flashinfer_mega_hidden),
+            device=device,
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        * 0.1
+    )
+    ids = torch.randint(
+        0,
+        experts.num_experts,
+        (num_tokens, top_k),
+        device=device,
+        generator=generator,
+        dtype=torch.int32,
+    )
+    ids = torch.sort(ids, dim=1).values
+    duplicate = torch.zeros_like(ids, dtype=torch.bool)
+    duplicate[:, 1:] = ids[:, 1:] == ids[:, :-1]
+    ids = ids.masked_fill(duplicate, -1)
+    weights = torch.full(ids.shape, 1.0 / top_k, device=device, dtype=torch.float32)
+    _run_flashinfer_mxfp4_mega_moe(
+        experts,
+        x,
+        ids,
+        weights,
+        num_tokens=num_tokens,
+        top_k=top_k,
+        routed_scaling_factor=1.0,
+    )
+    torch.cuda.synchronize()
+    del x, ids, weights, duplicate
+    torch.cuda.empty_cache()
+    logger.info(
+        "FlashInfer MXFP4 MegaMoE resident before KV cache sizing: "
+        f"{(free_before - torch.cuda.mem_get_info()[0]) / (1 << 30):.2f} GB "
+        f"after a {num_tokens}-token warmup"
+    )
+
+
 def is_mega_moe_experts_ready(experts) -> bool:
     if not experts._mega_moe_weights_built:
         return False
@@ -230,6 +459,12 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     if max_tokens_per_rank <= cap:
         return True
+    assert _flashinfer_mega_layer(moe.experts) is None, (
+        f"mega MoE: {max_tokens_per_rank} tokens per rank exceed "
+        f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK={cap}; FlashInfer "
+        f"MXFP4 MegaMoE weights have no non-mega fallback — raise the env var to "
+        f"cover the per-rank rows"
+    )
     assert not getattr(moe.experts, "_mega_moe_weights_localized", False), (
         f"mega MoE: {max_tokens_per_rank} tokens per rank exceed "
         f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK={cap}; localized "
@@ -339,10 +574,17 @@ def allocate_mega_moe_buffers(model: torch.nn.Module) -> None:
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
     buffers = {}
+    flashinfer_warmed = False
     for module in model.modules():
-        if isinstance(module, DeepseekV2MoE) and is_mega_moe_experts_ready(
-            module.experts
-        ):
+        if not isinstance(module, DeepseekV2MoE):
+            continue
+        if _flashinfer_mega_layer(module.experts) is not None:
+            # Layers share FlashInfer's pooled workspace: warm it once.
+            if not flashinfer_warmed:
+                _warmup_flashinfer_mxfp4_mega_moe(module.experts)
+                flashinfer_warmed = True
+            continue
+        if is_mega_moe_experts_ready(module.experts):
             buf = _mega_moe_buffer(module)
             buffers[id(buf)] = buf
     if buffers:
@@ -429,7 +671,11 @@ def _run_mega_routed(
     eplb_load_row: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     hidden_size = moe.config.hidden_size
-    buf = _mega_moe_buffer(moe)
+    buf = (
+        None
+        if _flashinfer_mega_layer(moe.experts) is not None
+        else _mega_moe_buffer(moe)
+    )
 
     routing = None
     if should_use_mega_gate(moe, hidden_states, forward_batch):
@@ -544,6 +790,17 @@ def run_mega_routed_experts(
     eplb_load_row: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # Rows are this rank's tokens; the returned rows are fully combined.
+    if _flashinfer_mega_layer(experts) is not None:
+        assert num_shared_experts == 0 and not routing_in_buffer
+        return _run_flashinfer_mxfp4_mega_moe(
+            experts,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            num_tokens=num_tokens,
+            top_k=top_k,
+            routed_scaling_factor=routed_scaling_factor,
+        )
     import deep_gemm
 
     from sglang.srt.runtime_context import get_parallel
@@ -775,6 +1032,9 @@ def build_mega_moe_experts_weights(experts) -> None:
         return
 
     mma_type = _mega_moe_mma_type(experts)
+    if _use_flashinfer_mxfp4_mega_moe(mma_type):
+        _build_flashinfer_mxfp4_mega_moe(experts)
+        return
     w13 = experts.w13_weight.data
     w13_sf_fp32 = _mega_moe_sf_as_fp32(experts.w13_weight_scale_inv.data)
     w2 = experts.w2_weight.data
