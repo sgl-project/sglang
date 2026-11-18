@@ -19,6 +19,7 @@ use sgl_router::server::app_context::AppContext;
 use sgl_router::state::kv_events::{
     compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId, RadixTreePrefixProvider,
 };
+use sgl_router::state::load_monitor::engine_reported_load::{EngineReportedLoadTable, LoadStat};
 use sgl_router::state::load_monitor::router_inflight_load::{
     RouterInflightLoadRegistry, SystemTimeClock,
 };
@@ -52,6 +53,16 @@ fn router(
     workers: &[(&MockWorker, WorkerMode, u32)],
     tree: Arc<HashTree>,
 ) -> axum::Router {
+    router_with_load(cfg, workers, tree, EngineReportedLoadTable::new())
+}
+
+/// [`router`] reading engine-reported load from `load`.
+fn router_with_load(
+    cfg: Config,
+    workers: &[(&MockWorker, WorkerMode, u32)],
+    tree: Arc<HashTree>,
+    load: Arc<EngineReportedLoadTable>,
+) -> axum::Router {
     let registry = Arc::new(WorkerRegistry::default());
     for &(worker, mode, dp_ranks) in workers {
         let spec = WorkerSpec {
@@ -82,6 +93,7 @@ fn router(
     let mut ctx =
         AppContext::with_router_inflight_load(cfg, tokenizers, proxy, registry, policies, inflight);
     ctx.dp_rank_prefix_provider = Some(RadixTreePrefixProvider::new(tree, oracle));
+    ctx.engine_reported_load = load;
     build_router(Arc::new(ctx))
 }
 
@@ -286,6 +298,117 @@ async fn round_robin_gives_decode_ranks_turns() {
         ranks.push(send(&app, &decode, &[(KEY, "conv-pd")]).await.unwrap());
     }
     assert_eq!(ranks, ["0", "1", "2", "3", "0", "1", "2", "3"]);
+}
+
+#[tokio::test]
+async fn least_tokens_keeps_the_lighter_of_two_decode_ranks() {
+    let (prefill, decode) = (
+        MockWorker::start(vec![]).await,
+        MockWorker::start(vec![]).await,
+    );
+    let workers = [
+        (&prefill, WorkerMode::Prefill, 2),
+        (&decode, WorkerMode::Decode, 4),
+    ];
+    let mut cfg = sticky_config();
+    cfg.model.dp_rank_policy = DpRankPolicy::LeastTokens;
+    let load = EngineReportedLoadTable::new();
+    let app = router_with_load(cfg, &workers, Default::default(), Arc::clone(&load));
+    let publish = |rank: u32, num_tokens: u64| {
+        let stat = LoadStat {
+            num_running_reqs: 0,
+            num_waiting_reqs: 0,
+            num_tokens,
+            max_total_num_tokens: 1_000,
+            native_cache: None,
+        };
+        load.set(&decode.url, rank, stat, Instant::now());
+    };
+    for (rank, num_tokens) in [(0, 400), (1, 100), (2, 900), (3, 250)] {
+        publish(rank, num_tokens);
+    }
+    // Of two random ranks the lighter wins: the heaviest never beats a
+    // rival, the lightest beats every one.
+    let mut ranks = Vec::new();
+    for _ in 0..32 {
+        ranks.push(send(&app, &decode, &[(KEY, "conv-pd")]).await.unwrap());
+    }
+    assert!(!ranks.contains(&"2".to_string()), "{ranks:?}");
+    assert!(ranks.contains(&"1".to_string()), "{ranks:?}");
+    // The pick follows the feed: rank 1 is now the heaviest.
+    publish(1, 950);
+    let mut ranks = Vec::new();
+    for _ in 0..32 {
+        ranks.push(send(&app, &decode, &[(KEY, "conv-pd")]).await.unwrap());
+    }
+    assert!(!ranks.contains(&"1".to_string()), "{ranks:?}");
+    assert!(ranks.contains(&"3".to_string()), "{ranks:?}");
+    // Without a reading the policy still places the request.
+    load.forget_worker(&decode.url);
+    assert!(send(&app, &decode, &[(KEY, "conv-pd")]).await.is_some());
+}
+
+/// Between two engine reports, requests still in flight on a rank count as
+/// its mean KV per request, so a burst spreads instead of herding the rank
+/// that was lightest at the last report. Two decode ranks, so the two
+/// candidates compare directly and the projection alone decides.
+#[tokio::test]
+async fn least_tokens_charges_in_flight_requests_to_their_rank() {
+    let (prefill, decode) = (
+        MockWorker::start(vec![]).await,
+        MockWorker::start_hanging(Duration::from_secs(30)).await,
+    );
+    let workers = [
+        (&prefill, WorkerMode::Prefill, 1),
+        (&decode, WorkerMode::Decode, 2),
+    ];
+    let mut cfg = sticky_config();
+    cfg.model.dp_rank_policy = DpRankPolicy::LeastTokens;
+    let load = EngineReportedLoadTable::new();
+    let app = router_with_load(cfg, &workers, Default::default(), Arc::clone(&load));
+    // Mean KV per request over the worker: 500 / 5 = 100.
+    for (rank, num_tokens, num_reqs) in [(0, 400, 4), (1, 100, 1)] {
+        let stat = LoadStat {
+            num_running_reqs: num_reqs,
+            num_waiting_reqs: 0,
+            num_tokens,
+            max_total_num_tokens: 1_000,
+            native_cache: None,
+        };
+        load.set(&decode.url, rank, stat, Instant::now());
+    }
+    let mut ranks = Vec::new();
+    let mut in_flight = Vec::new();
+    for _ in 0..4 {
+        decode.captured.lock().unwrap().headers.clear();
+        let app = app.clone();
+        in_flight.push(tokio::spawn(async move {
+            let request = Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(KEY, "conv-pd")
+                .body(Body::from(body().to_string()))
+                .unwrap();
+            let _ = app.oneshot(request).await;
+        }));
+        let started = Instant::now();
+        let rank = loop {
+            if let Some(rank) = decode.captured.lock().unwrap().headers.get(RANK).cloned() {
+                break rank;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "decode never called"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        ranks.push(rank);
+    }
+    // Rank 1 at 100, then 200, 300 and 400 as each request is charged; at
+    // 400 it ties rank 0, whose router in-flight count is lower.
+    assert_eq!(ranks, ["1", "1", "1", "0"]);
+    for task in in_flight {
+        task.abort();
+    }
 }
 
 #[tokio::test]
