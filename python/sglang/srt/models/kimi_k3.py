@@ -4049,7 +4049,8 @@ class KimiK3LinearForCausalLM(nn.Module):
                 and layer.self_attn.indexer is not None
             ):
                 layer.self_attn.indexer.prepare_merged_k_gate()
-                layer.self_attn.indexer.tp_split_min_rows = 1024
+                # MI355X, 140k keys: ~0.6 ms/layer unsplit at 512 rows vs ~0.16 ms at 64
+                layer.self_attn.indexer.tp_split_min_rows = 64 if _is_gfx95 else 1024
 
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer) or not isinstance(
