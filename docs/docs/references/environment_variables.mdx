@@ -272,6 +272,16 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use the sgl-fa3 wheel implementation for FlashAttention v3 instead of the kernels-hub build</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DISABLE_FUSED_EP_REMAP</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Disable fusing <code>StandardDispatcher</code> expert-parallel global-to-local expert-ID remapping and padded-row masking into <code>moe_fused_gate</code> (and fall back to eager PyTorch ops in <code>_map_topk_ids_to_local_experts</code>)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_EP_INTERLEAVED_EXPERTS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Experimental: shard routed experts across EP ranks by strided modulo (<code>expert_id % ep_size == ep_rank</code>) instead of contiguous rank slices under <code>StandardDispatcher</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
 </tbody>
 </table>
 

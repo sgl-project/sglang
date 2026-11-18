@@ -65,6 +65,11 @@ def _router_triton_kernel(
     stride_ik,
     stride_pm,
     stride_pk,
+    HAS_EP_REMAP: tl.constexpr = False,
+    EP_START: tl.constexpr = 0,
+    EP_END: tl.constexpr = 0,
+    EP_INTERLEAVED_SIZE: tl.constexpr = 0,
+    EP_RANK: tl.constexpr = 0,
 ) -> None:
     # Row-tiled: each program handles BLOCK_M rows; all reductions run along the
     # expert (N) axis. Tiling rows keeps CTAs large enough to stay occupancy-bound
@@ -219,11 +224,31 @@ def _router_triton_kernel(
         selected_vals = selected_vals / norm
     if APPLY_SCALE:
         selected_vals = selected_vals * routed_scaling_factor
+    if HAS_EP_REMAP:
+        if EP_INTERLEAVED_SIZE > 1:
+            in_local = (
+                (selected_idx >= 0)
+                & (selected_idx < N)
+                & ((selected_idx % EP_INTERLEAVED_SIZE) == EP_RANK)
+            )
+            selected_idx = tl.where(in_local, selected_idx // EP_INTERLEAVED_SIZE, -1)
+        else:
+            in_local = (selected_idx >= EP_START) & (selected_idx < EP_END)
+            selected_idx = tl.where(in_local, selected_idx - EP_START, -1)
     if K_ROUTED < K:
         # The shared expert's contribution is independent of routed normalization.
         is_shared = (offs_k[None, :] >= K_ROUTED) & mask_k_total[None, :]
         shared_weight = 1.0 if APPLY_SCALE else 1.0 / routed_scaling_factor
-        shared_idx = (N + (offs_k - K_ROUTED)).to(tl.int32)[None, :]
+        shared_base = (
+            (
+                N // EP_INTERLEAVED_SIZE
+                if EP_INTERLEAVED_SIZE > 1
+                else (EP_END - EP_START)
+            )
+            if HAS_EP_REMAP
+            else N
+        )
+        shared_idx = (shared_base + (offs_k - K_ROUTED)).to(tl.int32)[None, :]
         selected_vals = tl.where(is_shared, shared_weight, selected_vals)
         selected_idx = tl.where(is_shared, shared_idx, selected_idx)
     if HAS_PADDING:
@@ -281,6 +306,10 @@ def moe_fused_gate(
     renormalize_epsilon: float = 0.0,
     packed_out: Optional[torch.Tensor] = None,
     sqrtsoftplus_log1p: bool = False,
+    ep_start: Optional[int] = None,
+    ep_end: Optional[int] = None,
+    ep_interleaved_size: int = 0,
+    ep_rank: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Triton fused router: scoring + bias + topk + (optional) renorm/scale.
 
@@ -294,6 +323,9 @@ def moe_fused_gate(
     (DeepSeek-V4.1); off, the DeepSeek-V4 formula and NaN order are kept.
     ``packed_out`` ([M, topk] int32, optional) receives the FlashInfer routed-MoE form
     ``(id << 16) | bf16_bits(weight)``, bitwise identical to ``fused_pack_topk``.
+    ``ep_start`` / ``ep_end`` (contiguous) or ``ep_interleaved_size`` / ``ep_rank``
+    (strided ``expert_id % ep_interleaved_size == ep_rank``) fuse EP local expert-ID
+    remapping (mapping non-local routed experts to ``-1``) into the router output.
     """
     scoring_func = scoring_func.lower()
     scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func)
@@ -322,6 +354,24 @@ def moe_fused_gate(
             "scores and bias must have same num_experts"
         )
     assert topk > num_fused_shared_experts, "topk must be > num_fused_shared_experts"
+    if ep_start is not None or ep_end is not None:
+        assert ep_start is not None and ep_end is not None, (
+            "ep_start and ep_end must both be specified"
+        )
+        assert 0 <= ep_start <= ep_end <= scores.size(1), (
+            f"invalid EP slice [{ep_start}, {ep_end}) for {scores.size(1)} experts"
+        )
+        assert ep_interleaved_size <= 1, (
+            "ep_start/ep_end and ep_interleaved_size are mutually exclusive"
+        )
+    if ep_interleaved_size > 1:
+        assert scores.size(1) % ep_interleaved_size == 0, (
+            f"num_experts ({scores.size(1)}) must be divisible by ep_interleaved_size ({ep_interleaved_size})"
+        )
+        assert 0 <= ep_rank < ep_interleaved_size, (
+            f"ep_rank ({ep_rank}) out of range for ep_interleaved_size ({ep_interleaved_size})"
+        )
+    has_ep_remap = ep_start is not None or ep_interleaved_size > 1
     if input_ids is not None:
         assert bias_alt is not None and bias_alt_token_id is not None
         assert bias is not None and bias_alt.shape == bias.shape
@@ -345,7 +395,8 @@ def moe_fused_gate(
     # kernels are order-insensitive). It is 3.1-3.5x faster than the Triton
     # kernel at [1..8192, 896] top-16 on B200.
     if (
-        scoring_func == "sigmoid"
+        not has_ep_remap
+        and scoring_func == "sigmoid"
         and num_fused_shared_experts == 0
         and num_expert_group <= 1
         and moe_softcapping == 0.0
@@ -369,7 +420,8 @@ def moe_fused_gate(
     # One-warp-per-token CUDA router: same selection, order and padding contract
     # as the Triton kernel below.
     if (
-        moe_softcapping == 0.0
+        not has_ep_remap
+        and moe_softcapping == 0.0
         and moe_route_warp.covered(
             scores.dtype,
             scores.shape[1],
@@ -481,6 +533,11 @@ def moe_fused_gate(
         stride_ik=indices.stride(1),
         stride_pm=packed_out.stride(0) if packed_out is not None else 0,
         stride_pk=packed_out.stride(1) if packed_out is not None else 0,
+        HAS_EP_REMAP=has_ep_remap,
+        EP_START=0 if ep_start is None else int(ep_start),
+        EP_END=0 if ep_end is None else int(ep_end),
+        EP_INTERLEAVED_SIZE=int(ep_interleaved_size),
+        EP_RANK=int(ep_rank),
         num_warps=num_warps,
         **extra,
     )

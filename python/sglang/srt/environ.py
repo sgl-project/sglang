@@ -1663,6 +1663,14 @@ class Envs:
     # standard dispatcher, and the triton MoE runner; falls back silently
     # otherwise.
     SGLANG_OPT_MOE_QUANT_ONCE = EnvBool(False)
+    # Disable fusing StandardDispatcher's EP global->local expert-ID remap and
+    # padded-row masking into the Triton router (and fall back to eager torch
+    # ops in _map_topk_ids_to_local_experts). Escape hatch / A/B control switch.
+    SGLANG_DISABLE_FUSED_EP_REMAP = EnvBool(False)
+    # Experimental: shard routed experts across EP ranks by strided modulo
+    # (expert_id % ep_size == ep_rank) instead of contiguous rank blocks to
+    # study cross-rank routing load skew under StandardDispatcher.
+    SGLANG_EP_INTERLEAVED_EXPERTS = EnvBool(False)
 
     # ===================================================================
     # DeepGEMM Mega MoE
