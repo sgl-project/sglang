@@ -1080,6 +1080,8 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
 
         def build(drafts):
             params = SimpleNamespace(
+                mtp_draft_device_pools=(),
+                mtp_draft_mamba_pools=(),
                 sidecar_draft_device_pools=drafts,
                 token_to_kv_pool_allocator=SimpleNamespace(state=state),
             )
@@ -1231,6 +1233,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         params = SimpleNamespace(
             mtp_draft_device_pools=drafts,
             mtp_draft_mamba_pools=draft_mamba,
+            sidecar_draft_device_pools=(),
             token_to_kv_pool_allocator=SimpleNamespace(
                 state=SimpleNamespace(
                     pool=mamba(2),
