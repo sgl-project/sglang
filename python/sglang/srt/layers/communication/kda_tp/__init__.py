@@ -46,6 +46,11 @@ def all_gather_padded(t: torch.Tensor, n: int, pad_value: int) -> torch.Tensor:
     return out
 
 
+def pd_staging(req_to_token_pool):
+    """The PD decode worker's KDA TP state staging, or None without --enable-kda-tp."""
+    return req_to_token_pool.mamba_pool.pd_staging if enabled() else None
+
+
 def lazy_mamba_slot(enable_mamba_extra_buffer: bool) -> bool:
     # Not with ping-pong tracking slots, which are allocated with the main slot.
     return (

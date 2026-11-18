@@ -2049,13 +2049,11 @@ class ModelRunner:
         pool = self.req_to_token_pool
         if pool.holds_state_slots and not self.is_draft_worker:
             from sglang.srt.layers.communication import kda_tp
-            from sglang.srt.layers.communication.kda_tp.staging import (
-                mirror_deferred_state_ops,
-            )
 
-            if kda_tp.enabled():
+            staging = kda_tp.pd_staging(pool)
+            if staging is not None:
                 # Head-sharded KDA state: every rank applies every DP rank's ops.
-                mirror_deferred_state_ops(self, forward_batch)
+                staging.mirror_deferred_state_ops(self, forward_batch)
                 return
         if (
             not pool.holds_state_slots
@@ -2170,12 +2168,9 @@ class ModelRunner:
                     forward_batch.dp_kda_tp_state_imports is not None
                     and not self.is_draft_worker
                 ):
-                    from sglang.srt.layers.communication.kda_tp.staging import (
-                        run_pd_imports,
-                    )
-
+                    mamba_pool = self.req_to_token_pool.mamba_pool
                     # KDA TP PD decode: import received states before anything reads them.
-                    run_pd_imports(self.req_to_token_pool, forward_batch)
+                    mamba_pool.pd_staging.run_imports(mamba_pool, forward_batch)
 
             # Replay cuda graph if applicable
             if can_run_graph:

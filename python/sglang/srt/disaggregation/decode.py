@@ -94,6 +94,7 @@ from sglang.srt.disaggregation.utils import (
     state_indices_per_entry,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.communication import kda_tp
 from sglang.srt.layers.dcp.layout import dsa_index_k_page_tokens
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import NextBatchPlan, ScheduleBatch
@@ -377,7 +378,6 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         # Each request needs 1 main mamba slot + ping-pong slots when extra_buffer is enabled.
         # Cap the pool at max concurrent requests * slots_per_req to avoid allocating failed.
         slots_per_req = 1 + self.mamba_initial_tracking_slots
-        from sglang.srt.layers.communication import kda_tp
         from sglang.srt.layers.communication.kda_tp.staging import KdaTpStaging
 
         # KDA TP: a head-sharded pool holds every DP rank's slots and verify rows.
@@ -435,49 +435,6 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
         self.state.slots.clear()
-
-
-def _kda_tp_pd_staging(req_to_token_pool):
-    from sglang.srt.layers.communication import kda_tp
-
-    if not kda_tp.enabled():
-        return None
-    return req_to_token_pool.mamba_pool.pd_staging
-
-
-def _bind_late_stage(req_to_token_pool, req: Req) -> bool:
-    key = getattr(req, "kda_tp_staged_slot", None)
-    if key is None:
-        return True
-    from sglang.srt.layers.communication import kda_tp
-
-    if not kda_tp.late_stage():
-        return True
-    return req_to_token_pool.mamba_pool.pd_staging.bind(key) is not None
-
-
-def _admit_lazy_mamba_slot(req_to_token_pool, req: Req) -> bool:
-    if not getattr(req, "kda_tp_lazy_mamba", False) or req.kv.holds_mamba:
-        return True
-    from sglang.srt.layers.communication import kda_tp
-
-    mid = req_to_token_pool.mamba_allocator.alloc(1)
-    if mid is None:
-        return False
-    req.kv.mamba_pool_idx = mid[0]
-    req.kv.mamba_needs_clear = True
-    req_to_token_pool.req_index_to_mamba_index_mapping[req.kv.req_pool_idx] = mid[0].to(
-        torch.int32
-    )
-    # The one host read of the new slot; release keys the stage by it.
-    slot = int(mid[0])
-    req.kda_tp_state_slot = slot
-    key = kda_tp.lazy_stage_key(req.kv.req_pool_idx)
-    if getattr(req, "kda_tp_staged_slot", None) == key:
-        req_to_token_pool.mamba_pool.pd_staging.rekey(key, slot)
-        req.kda_tp_staged_slot = slot
-    req.kda_tp_lazy_mamba = False
-    return True
 
 
 @dataclass
@@ -1854,17 +1811,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
-            from sglang.srt.layers.communication import kda_tp
-
-            kda_tp_staging = _kda_tp_pd_staging(self.req_to_token_pool)
-            if (
-                kda_tp_staging is not None
-                and not decode_req.req.kv.holds_mamba
-                and kda_tp.lazy_mamba_slot(
-                    self.req_to_token_pool.enable_mamba_extra_buffer
-                )
-            ):
-                decode_req.req.kda_tp_lazy_mamba = True
+            kda_tp_staging = kda_tp.pd_staging(self.req_to_token_pool)
+            if kda_tp_staging is not None:
+                kda_tp_staging.mark_lazy(self.req_to_token_pool, decode_req.req)
 
             # Reserve enough Mamba capacity for radix COW and tracking buffers
             # before prefix matching can bind state or lock cached entries.
@@ -1876,13 +1825,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ):
                 break
 
-            # Late staging binds the stage when the prefill sends the state instead.
-            if (
-                kda_tp_staging is not None
-                and not kda_tp.late_stage()
-                and not kda_tp_staging.has_room(
-                    self.req_to_token_pool.mamba_allocator, self.req_to_token_pool
-                )
+            if kda_tp_staging is not None and not kda_tp_staging.has_prealloc_room(
+                self.req_to_token_pool
             ):
                 break
 
@@ -2034,10 +1978,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_len,
                 total_prefix_len,
             )
-            if kda_tp_staging is not None and not kda_tp.late_stage():
-                # Deferred publish assigns the stage later; hold it so has_room counts it.
-                kda_tp_staging.reserve()
-                decode_req.req.kda_tp_stage_reserved = True
+            if kda_tp_staging is not None:
+                kda_tp_staging.reserve_for(decode_req.req)
             if self.draft_kv_ring is not None and _is_fake_transfer(decode_req.req):
                 # No prefill sends this request's floor.
                 self.draft_kv_ring.reset_floor(
@@ -2123,9 +2065,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return preallocated_reqs, failed_reqs
 
     def _drop_kda_tp_stage_reservation(self, req) -> None:
-        if getattr(req, "kda_tp_stage_reserved", False):
-            _kda_tp_pd_staging(self.req_to_token_pool).unreserve()
-            req.kda_tp_stage_reserved = False
+        staging = kda_tp.pd_staging(self.req_to_token_pool)
+        if staging is not None:
+            staging.drop_reservation(req)
 
     def publish_pending_destinations(self) -> None:
         """Send the destinations allocated by an earlier `move_preallocated`,
@@ -2238,28 +2180,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     decode_req.req.kv.req_pool_idx
                 ]
             )
-            from sglang.srt.layers.communication import kda_tp
-
-            staging = _kda_tp_pd_staging(self.req_to_token_pool)
+            staging = kda_tp.pd_staging(self.req_to_token_pool)
             if staging is not None:
-                slots = indices.cpu().numpy()
-                slot = int(slots.reshape(-1)[0])
-                if getattr(decode_req.req, "kda_tp_lazy_mamba", False):
-                    slot = kda_tp.lazy_stage_key(decode_req.req.kv.req_pool_idx)
-                else:
-                    decode_req.req.kda_tp_state_slot = slot
-                decode_req.req.kda_tp_staged_slot = slot
-                if kda_tp.late_stage():
-                    stage = kda_tp.LATE_STAGE_UNBOUND
-                else:
-                    stage = staging.assign(
-                        slot,
-                        reserved=getattr(
-                            decode_req.req, "kda_tp_stage_reserved", False
-                        ),
-                    )
-                    decode_req.req.kda_tp_stage_reserved = False
-                return [np.full(slots.shape, stage, dtype=slots.dtype)]
+                return [
+                    staging.state_destination(decode_req.req, indices.cpu().numpy())
+                ]
             return [indices if non_blocking_metadata else indices.cpu().numpy()]
 
         def _swa_payload(sub_pool=None):
@@ -3433,8 +3358,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             req_of=lambda x: x.req,
         )
         self.gloo_group = get_parallel().attn_tp_group.cpu_group
-        from sglang.srt.layers.communication import kda_tp
-
         self._kda_late_stage = kda_tp.late_stage()
         # room -> (first KDA_STAGE_REQ time, prefill sessions asking)
         self._kda_stage_waiting: Dict[int, Tuple[float, set]] = {}
@@ -4422,7 +4345,7 @@ class SchedulerDisaggregationDecodeMixin:
             running_batch = self.update_running_batch(running_batch)
             ret = running_batch if not running_batch.is_empty() else None
 
-        kda_tp_staging = _kda_tp_pd_staging(self.req_to_token_pool)
+        kda_tp_staging = kda_tp.pd_staging(self.req_to_token_pool)
         if ret is not None and kda_tp_staging is not None:
             # The MLP sync advertises these; this batch's forward imports them.
             ret.kda_tp_state_imports = kda_tp_staging.take_pending()
@@ -4597,6 +4520,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         curr_batch_size = running_batch.batch_size()
 
+        kda_tp_staging = kda_tp.pd_staging(self.req_to_token_pool)
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 
         num_not_used_batch = batch_size - curr_batch_size
@@ -4612,9 +4536,9 @@ class SchedulerDisaggregationDecodeMixin:
                 or req.kv.restore_done_event is None
                 or id(req) in restores_ready
             ):
-                if not _bind_late_stage(
+                if kda_tp_staging is not None and not kda_tp_staging.admit(
                     self.req_to_token_pool, req
-                ) or not _admit_lazy_mamba_slot(self.req_to_token_pool, req):
+                ):
                     # No free state slot yet: it stays in the waiting queue.
                     continue
                 can_run_list.append(req)
@@ -4643,12 +4567,8 @@ class SchedulerDisaggregationDecodeMixin:
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
-        kda_tp_staging = _kda_tp_pd_staging(self.req_to_token_pool)
         if kda_tp_staging is not None:
-            for req in can_run_list:
-                if getattr(req, "kda_tp_staged_slot", None) is not None:
-                    kda_tp_staging.queue_import(req.kda_tp_staged_slot)
-                    req.kda_tp_staged_slot = None
+            kda_tp_staging.queue_imports(can_run_list)
 
         # construct a schedule batch with those requests and mark as decode
         new_batch = ScheduleBatch.init_new(
