@@ -34,6 +34,7 @@ def _selector_accept(candidates, target_tokens, cutoff_verify_lens):
         _selector_sample=(candidate_ids, q_rows),
         _draft_probs_buf=None,
         _block_verification=False,
+        _megakernel_bcast=None,
         _tp_sync=types.SimpleNamespace(sync=lambda site, tensor: tensor),
         block_size=block,
     )
