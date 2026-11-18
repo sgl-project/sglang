@@ -4,6 +4,7 @@
 //! built from: errors, events, the fan-out, peers, and media prefetch.
 
 mod control;
+mod corpus;
 mod frontend_state;
 mod generate;
 mod handle;
@@ -17,6 +18,7 @@ mod tokenize;
 mod weights;
 
 pub(crate) use control::ProfileOutcome;
+pub(crate) use corpus::CorpusSource;
 pub use generate::{AbortEnding, Aborted};
 pub(crate) use generate::{CoreCall, PendingGeneration, recv_indexed};
 pub(crate) use handle::{CoreConfig, CoreHandle, CoreMetadata, GRACEFUL_CLOSE_TIMEOUT};

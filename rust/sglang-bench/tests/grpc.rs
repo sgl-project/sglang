@@ -262,6 +262,24 @@ impl SglangService for Mock {
     ) -> Result<Response<api::SeparateReasoningResponse>, Status> {
         Err(Status::unimplemented("separate_reasoning"))
     }
+    async fn add_external_corpus(
+        &self,
+        _: Request<api::AddExternalCorpusRequest>,
+    ) -> Result<Response<api::AddExternalCorpusResponse>, Status> {
+        Err(Status::unimplemented("add_external_corpus"))
+    }
+    async fn remove_external_corpus(
+        &self,
+        _: Request<api::RemoveExternalCorpusRequest>,
+    ) -> Result<Response<api::RemoveExternalCorpusResponse>, Status> {
+        Err(Status::unimplemented("remove_external_corpus"))
+    }
+    async fn list_external_corpora(
+        &self,
+        _: Request<api::ListExternalCorporaRequest>,
+    ) -> Result<Response<api::ListExternalCorporaResponse>, Status> {
+        Err(Status::unimplemented("list_external_corpora"))
+    }
     async fn update_weights_from_disk(
         &self,
         _: Request<api::UpdateWeightsFromDiskRequest>,
