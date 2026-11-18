@@ -5,7 +5,7 @@ import unittest
 import torch
 
 from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
-from sglang.kernels.ops.attention.verify_mla import verify_mla_draft_fwd
+from sglang.kernels.ops.attention.verify_mla_draft import verify_mla_draft_fwd
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
