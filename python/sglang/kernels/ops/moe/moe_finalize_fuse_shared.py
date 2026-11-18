@@ -50,11 +50,11 @@ def moe_finalize_fuse_shared(
     (without it the output keeps the padded width);
     out: optional [num_tokens, hidden] bf16 destination with unit column stride
     (e.g. a symmetric-memory buffer), allocated when None;
-    routing_ready: with enable_pdl, the routing tensors and shared_output are
-    read before the PDL wait. Valid when they were complete at this kernel's
-    launch, i.e. the kernel producing gemm2_out triggers its dependents only
-    after its own griddepcontrol.wait, as the trtllm-gen gemm2 does (its routing
-    runs in an earlier kernel). Pass False for a producer that triggers before
+    routing_ready: with enable_pdl, the routing tensors are read before the
+    PDL wait (shared_output always after it). Valid when they were complete at
+    this kernel's launch, i.e. the kernel producing gemm2_out triggers its
+    dependents only after its own griddepcontrol.wait, as the trtllm-gen gemm2
+    does (its routing runs in an earlier kernel). Pass False for a producer that triggers before
     it has waited for the routing.
     """
     num_tokens = expert_weights.shape[0]

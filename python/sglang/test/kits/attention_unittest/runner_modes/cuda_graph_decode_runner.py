@@ -4,6 +4,9 @@ from typing import Any, Callable
 import torch
 
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
+    _make_forward_batch as _make_dsa_forward_batch,
+)
 
 from ..attention_methods.dense_attention import DEFAULT_DEVICE as DENSE_DEFAULT_DEVICE
 from ..attention_methods.dense_attention import DEFAULT_DTYPE as DENSE_DEFAULT_DTYPE
@@ -39,11 +42,6 @@ from ..attention_methods.dsa_attention import (
     DSA_SPARSE_RTOL,
     DSAAttentionCase,
     _clone_dsa_sparse_cache,
-)
-from ..attention_methods.dsa_attention import (
-    _make_forward_batch as _make_dsa_forward_batch,
-)
-from ..attention_methods.dsa_attention import (
     _restore_dsa_sparse_cache,
     build_dsa_sparse_attention_fixture,
     dsa_sparse_fixture_inputs,

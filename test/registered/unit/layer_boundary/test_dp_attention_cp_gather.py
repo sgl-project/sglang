@@ -27,7 +27,7 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NORM_READOUT,
     PLAIN_RESIDUAL_OPS,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.boundary_fixtures import (
     make_test_stages,

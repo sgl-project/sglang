@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -26,6 +27,7 @@ from sglang.srt.utils import register_xpu_device_properties_for_dynamo
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+logger = logging.getLogger(__name__)
 
 _fake_ops_registered = False
 
@@ -112,16 +114,20 @@ class XPUGraphRunner(DecodeCudaGraphRunner):
         torch._dynamo.config.suppress_errors = True
 
     def __init__(self, model_runner: ModelRunner):
-        assert not get_exec().features.enable_memory_saver, (
-            "XPUGraphRunner does not support Torch Memory Saver yet."
-        )
+        if get_exec().features.enable_memory_saver:
+            logger.info(
+                "XPUGraphRunner initialized with Torch Memory Saver enabled: "
+                "weights and KV cache memory saving is supported, but XPU graph "
+                "allocations themselves cannot be paused on Intel XPU."
+            )
         register_fake_ops()
         self._apply_xpu_compile_config()
         register_xpu_device_properties_for_dynamo()
         super().__init__(model_runner)
 
         assert not self.enable_two_batch_overlap, (
-            "XPUGraphRunner does not support two batch overlap yet."
+            "XPUGraphRunner does not support two batch overlap (TBO) yet "
+            "because TBO requires concurrent multi-stream graph capture."
         )
         assert not self.require_mlp_tp_gather, (
             "XPUGraphRunner does not support MLP TP gather yet."

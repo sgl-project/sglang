@@ -4,7 +4,7 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -22,6 +22,7 @@ class TestDSV4CutedslH16Dispatch(CustomTestCase):
         )
         backend = SimpleNamespace(
             trtllm_attn=False,
+            is_dsv41=False,
             dsv4_prefill_backend="cutedsl_h16",
             forward_metadata=SimpleNamespace(late_layer_tail=None),
         )

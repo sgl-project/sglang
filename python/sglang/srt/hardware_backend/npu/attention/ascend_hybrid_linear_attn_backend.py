@@ -2,6 +2,7 @@ import logging
 from typing import Optional, Union
 
 import torch
+import triton
 from sgl_kernel_npu.mamba.mamba_state_update_triton import (
     conv_state_rollback,
     move_intermediate_cache,
@@ -15,12 +16,40 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 
 logger = logging.getLogger(__name__)
+
+# Ascend Unified Buffer budget for the mamba gather-scatter kernel. The kernel
+# tile is H_BLOCK_SIZE * next_pow2(V) * next_pow2(K) elements, and the Bisheng
+# multi-buffer pass doubles that allocation, so a tile larger than half the UB
+# fails to compile ("ub overflow"). 192KB UB is the smallest across supported
+# SoCs; keep the tile under half of it and let H_BLOCK_SIZE absorb the rest.
+_ASCEND_UB_BYTES = 192 * 1024
+
+
+def _mamba_scatter_h_block_size(intermediate_state_cache: torch.Tensor) -> int:
+    """Largest H_BLOCK_SIZE whose (double-buffered) kernel tile fits in UB."""
+    _, _, _, _, dim_v, dim_k = intermediate_state_cache.shape
+    tile_elems = triton.next_power_of_2(dim_v) * triton.next_power_of_2(dim_k)
+    tile_bytes = tile_elems * intermediate_state_cache.element_size()
+    # Halve the budget to leave room for the multi-buffer duplicate.
+    h_block_size = (_ASCEND_UB_BYTES // 2) // max(tile_bytes, 1)
+    if h_block_size < 1:
+        # A single (V, K) plane already overflows UB; the kernel would need to
+        # tile V/K too. Warn instead of letting Bisheng fail with a raw
+        # "ub overflow" during the first verify step.
+        logger.warning_once(
+            f"Mamba state shape (V={dim_v}, K={dim_k}, "
+            f"dtype={intermediate_state_cache.dtype}) needs {tile_bytes} bytes per "
+            f"plane, which exceeds the {_ASCEND_UB_BYTES // 2} byte Ascend UB tile "
+            "budget; the gather-scatter kernel may fail to compile. Consider "
+            "--mamba-ssm-dtype bfloat16."
+        )
+    return max(h_block_size, 1)
 
 
 class AscendMambaAttnBackendBase(MambaAttnBackendBase):
@@ -238,6 +267,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         mamba_steps_to_track: Optional[torch.Tensor],
         model,
         req_pool_indices: Optional[torch.Tensor] = None,
+        state_slots=None,
     ):
         """
         Update mamba states after MTP verify using fully fused Triton kernel.
@@ -248,14 +278,16 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         - index_select kernel launches
         - nonzero kernel launches
         """
-        del req_pool_indices  # accepted for hook parity; slots come from metadata
+        del req_pool_indices  # accepted for hook parity
         request_number = last_correct_step_indices.shape[0]
 
-        state_indices_tensor = (
-            self.linear_attn_backend.forward_metadata.mamba_cache_indices[
-                :request_number
-            ]
-        )
+        if state_slots is None:
+            state_slots = self.forward_state_slots(request_number, mamba_track_indices)
+        state_indices_tensor = state_slots.working[:request_number]
+        # Checkpoints go to the slots the same forward resolved.
+        if mamba_track_indices is not None:
+            assert state_slots.track is not None
+            mamba_track_indices = state_slots.track[:request_number]
 
         mamba_caches = self.linear_attn_backend.state_pool.get_speculative_mamba2_params_all_layers()
 
@@ -270,12 +302,15 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         )
         last_steps = last_correct_step_indices.to(torch.int64)  # [N]
 
+        h_block_size = _mamba_scatter_h_block_size(intermediate_state_cache)
+
         move_intermediate_cache(
             ssm_states,
             intermediate_state_cache,
             dst_indices_tensor,
             src_indices_tensor,
             last_steps,
+            h_block_size=h_block_size,
         )
 
         draft_token_num = intermediate_state_cache.shape[2]
@@ -290,6 +325,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
                 mamba_track_indices,
                 src_indices_tensor,
                 mamba_steps_to_track,
+                h_block_size=h_block_size,
             )
 
             track_mask = mamba_steps_to_track >= 0

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import atexit
 import os
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -20,6 +22,7 @@ from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
+from sglang.srt.layers.communication.k3_ar_fusion import _SHARDED_UP_MAX_TOKENS
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
@@ -28,7 +31,14 @@ register_cuda_ci(est_time=21, stage="base-c", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=480, stage="nightly", runner_config="8-gpu-b200")
 
 _HIDDEN_SIZE = 7168
-_GEMM_AG_WORLD_SIZE = 8
+# The GEMV table's two ends, the first batch past it (slice GEMM + gather_add3 only),
+# and the model's gather cap, where the consumer reaches its widest block and strides.
+_GEMM_AG_NUM_TOKENS = (
+    1,
+    gemm_ag.GEMV_MAX_TOKENS,
+    gemm_ag.GEMV_MAX_TOKENS + 1,
+    _SHARDED_UP_MAX_TOKENS,
+)
 _MB = 1024 * 1024
 _SP_TUNING = sp_collective.Tuning(num_blocks=1, block_size=256)
 
@@ -72,9 +82,9 @@ def _init_comm():
     )
     if comm.disabled or not comm.has_multicast:
         raise RuntimeError("Kimi K3 collectives require multicast symmetric memory")
-    all_reduce.register_comm(comm.obj)
-    sp_collective.register_comm(comm.obj)
-    attn_res_collective.register_comm(comm.obj)
+    all_reduce.register_comm(lambda: comm.obj, world_size=comm.world_size)
+    sp_collective.register_comm(lambda: comm.obj, world_size=comm.world_size)
+    attn_res_collective.register_comm(lambda: comm.obj, world_size=comm.world_size)
     register_comm_cleanup(comm)
     return comm
 
@@ -200,80 +210,90 @@ def test_sequence_parallel_collectives():
     torch.testing.assert_close(gather_output, expected_gather, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 12])
-@pytest.mark.parametrize("with_prefix", [False, True])
+@cache_once
+def _gemm_ag_operands():
+    generator = torch.Generator().manual_seed(30)
+    max_tokens = max(_GEMM_AG_NUM_TOKENS)
+    x = (torch.randn(max_tokens, gemm_ag.K, generator=generator) * 0.05).to(
+        torch.bfloat16
+    )
+    weight = (torch.randn(gemm_ag.N, gemm_ag.K, generator=generator) * 0.05).to(
+        torch.bfloat16
+    )
+    b = torch.randn(max_tokens, gemm_ag.N, generator=generator).to(torch.bfloat16)
+    c = torch.randn(max_tokens, gemm_ag.N, generator=generator).to(torch.bfloat16)
+    return tuple(t.to(_device()) for t in (x, weight, b, c))
+
+
+@pytest.mark.parametrize("with_c", [False, True])
+@pytest.mark.parametrize("num_tokens", _GEMM_AG_NUM_TOKENS)
 @torch.inference_mode()
-def test_gemm_all_gather(num_tokens, with_prefix):
+def test_gemm_all_gather(num_tokens, with_c):
     _require_sm100()
-    if int(os.environ["WORLD_SIZE"]) != _GEMM_AG_WORLD_SIZE:
-        pytest.skip("Kimi K3 gemm_ag is compiled for TP8")
-    comm = _init_comm()
-    generator = torch.Generator(device=_device()).manual_seed(30)
-    x = (
-        torch.randn(
-            num_tokens,
-            gemm_ag.K,
-            generator=generator,
-            device=_device(),
-            dtype=torch.bfloat16,
-        )
-        * 0.05
-    )
-    weight = (
-        torch.randn(
-            gemm_ag.N,
-            gemm_ag.K,
-            generator=generator,
-            device=_device(),
-            dtype=torch.bfloat16,
-        )
-        * 0.05
-    )
-    bias = torch.randn(
-        num_tokens,
-        gemm_ag.N,
-        generator=generator,
-        device=_device(),
-        dtype=torch.bfloat16,
-    )
-    prefix = torch.randn_like(bias) if with_prefix else None
-    local_weight = weight.chunk(comm.world_size)[dist.get_rank()].clone()
-    output = torch.empty_like(bias)
-    local_output = torch.empty_like(bias)
+    world_size = int(os.environ["WORLD_SIZE"])
+    if world_size not in gemm_ag.WORLD_SIZES:
+        pytest.skip(f"Kimi K3 gemm_ag is built for TP{gemm_ag.WORLD_SIZES}")
+    _init_comm()
+    _, nccl_group = _init_world()
+    x, weight, b, c = _gemm_ag_operands()
+    x, b = x[:num_tokens], b[:num_tokens]
+    c = c[:num_tokens] if with_c else None
+    output = torch.empty(num_tokens, gemm_ag.N, device=_device(), dtype=torch.bfloat16)
 
-    def run():
-        gemm_ag.gemm_ag_up_proj(comm.world_size, x, weight, bias, prefix, output)
-        gemm_ag.gemm_ag_up_proj(
-            comm.world_size, x, local_weight, bias, prefix, local_output
-        )
-
-    def check():
-        expected = (x.float() @ weight.float().t()).to(torch.bfloat16) + bias
-        if prefix is not None:
-            expected = expected + prefix
-        torch.testing.assert_close(output, expected, rtol=3e-2, atol=3e-2)
-        torch.testing.assert_close(local_output, output, rtol=0, atol=0)
-
-    for _ in range(3):
-        run()
-    torch.cuda.synchronize()
-    check()
-    graph = torch.cuda.CUDAGraph()
-    dist.barrier()
-    with torch.cuda.graph(graph):
-        run()
-    for _ in range(5):
-        x.normal_(std=0.05, generator=generator)
-        bias.normal_(generator=generator)
-        graph.replay()
+    if num_tokens <= gemm_ag.GEMV_MAX_TOKENS:
+        expected = x.float() @ weight.float().t() + b.float()
+        if c is not None:
+            expected += c.float()
+        gemm_ag.gemm_ag_up_proj(world_size, x, weight, b, c, output)
         torch.cuda.synchronize()
-        check()
+        torch.testing.assert_close(
+            output, expected.to(torch.bfloat16), rtol=3e-2, atol=3e-2
+        )
+
+        # The physically sharded entry must preserve the replicated GEMV.
+        shard = weight.chunk(world_size)[dist.get_rank()].clone()
+        sharded_output = torch.empty_like(output)
+        gemm_ag.gemm_ag_up_proj(world_size, x, shard, b, c, sharded_output)
+        torch.testing.assert_close(sharded_output, output, rtol=0, atol=0)
+
+    # Slice GEMM + gather: exact against the slices gathered by NCCL, with the
+    # replicated tail's bf16(bf16(up_proj + b) + c) rounding.
+    rows = gemm_ag.N // world_size
+    rank = dist.get_rank()
+    local = torch.nn.functional.linear(x, weight[rank * rows : (rank + 1) * rows])
+    slices = torch.empty(
+        world_size, num_tokens, rows, device=_device(), dtype=torch.bfloat16
+    )
+    dist.all_gather_into_tensor(slices, local, group=nccl_group)
+    expected = slices.permute(1, 0, 2).reshape(num_tokens, gemm_ag.N) + b
+    if c is not None:
+        expected = expected + c
+    for _ in range(3):  # each round flips the push-plane phase
+        output.fill_(float("nan"))
+        gemm_ag.gather_add3(world_size, local, b, c, output)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+    if num_tokens > gemm_ag.GEMV_MAX_TOKENS:
+        from sglang.srt.layers.communication import k3_ar_fusion
+
+        # The communication workspace is real; only select the already
+        # initialized rank/world state without constructing a full model.
+        with patch.object(
+            k3_ar_fusion,
+            "_get_state",
+            return_value=SimpleNamespace(world_size=world_size, rank=rank),
+        ):
+            full = k3_ar_fusion.gemm_ag_up_proj(x, weight, b, c)
+            shard = weight[rank * rows : (rank + 1) * rows].clone()
+            sliced = k3_ar_fusion.gemm_ag_up_proj(x, shard, b, c)
+        torch.testing.assert_close(sliced, full, rtol=0, atol=0)
 
 
 @torch.inference_mode()
 def test_kimi_latent_up_projection():
     _require_sm100()
-    if int(os.environ["WORLD_SIZE"]) != _GEMM_AG_WORLD_SIZE:
+    if int(os.environ["WORLD_SIZE"]) != 8:
         pytest.skip("Kimi K3 latent-up sharding is enabled for TP8")
     _init_world()
     from sglang.srt.models.kimi_k3 import KimiK3LatentUpProjection
@@ -406,8 +426,8 @@ def _precompile(num_gpus):
     for world_size in num_gpus:
         all_reduce._jit_module(world_size)
         sp_collective._jit_module(world_size)
-    if _GEMM_AG_WORLD_SIZE in num_gpus:
-        gemm_ag._jit_module()
+        if world_size in gemm_ag.WORLD_SIZES:
+            gemm_ag._jit_module(world_size)
     attn_res._jit_fused_tma_module(4, 1, 200)
 
 

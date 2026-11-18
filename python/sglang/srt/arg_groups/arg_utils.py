@@ -39,8 +39,10 @@ annotation is equivalent to ``Arg(help=that_string)``.
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import functools
+import json
 import types
 from collections.abc import Callable
 from typing import (
@@ -55,6 +57,7 @@ from typing import (
 
 import msgspec
 import msgspec.structs
+import orjson
 
 A = Annotated
 
@@ -415,3 +418,18 @@ def add_cli_args_from_dataclass(parser, cls, *, fields: list[str] | None = None)
         ) and any(name.startswith("-") for name in names):
             kwargs["required"] = True
         parser.add_argument(*names, **kwargs)
+
+
+def nullable_str(val: str):
+    if not val or val == "None":
+        return None
+    return val
+
+
+def json_list_type(value):
+    try:
+        return orjson.loads(value)
+    except json.JSONDecodeError:
+        raise argparse.ArgumentTypeError(
+            f"Invalid JSON list: {value}. Please provide a valid JSON list."
+        )
