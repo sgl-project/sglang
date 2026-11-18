@@ -18,7 +18,7 @@ from test_deferred_decode_kv_release import (
     WorkerFailureAbortScenarios,
 )
 
-from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferDestination
 from sglang.srt.disaggregation.common.conn import AckTarget
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.nixl import conn as nixl_conn
@@ -197,6 +197,7 @@ class TestNixlAbortNotification(
                 is_dummy=False,
                 agent_name=agent_name,
                 dst_kv_indices=np.array([1], dtype=np.int32),
+                destination=KVTransferDestination.DEVICE,
             )
         manager.conclude_failure = MagicMock(
             side_effect=lambda **kw: manager.update_status(

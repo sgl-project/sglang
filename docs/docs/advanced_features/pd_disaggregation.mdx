@@ -74,6 +74,75 @@ destination registration. Older decode workers do not enforce this check. Keep
 `early` on both sides until every worker has been upgraded, then enable the new
 policy on both sides.
 
+## Decode host receive
+
+Decode normally reserves a request's destination KV in HBM at bootstrap, so a
+long or slow prefill holds device capacity that running requests need. Host
+receive moves that destination into decode's pinned host pool: incoming KV lands
+there, and decode restores it to HBM once the request is admitted.
+
+Set the device usage fraction at which incoming KV goes to the host pool, on the
+decode worker:
+
+```bash
+--disaggregation-decode-host-receive-threshold 0.9
+```
+
+The threshold is the fraction of device tokens in use, excluding evictable cache
+pages. `1` disables host receive and is the default; `0` always uses it.
+
+The host pool is the HiCache host pool, and host receive allocates it by itself,
+so it does not need `--enable-hierarchical-cache`. A decode worker runs with
+`--disable-radix-cache` by default, and the two flags are mutually exclusive.
+Unless you set `--hicache-size` (GB per rank) or `--hicache-ratio`, a decode
+worker without `--enable-hierarchical-cache` sizes the pool to the larger of 0.2
+times the device KV pool and two maximum-length requests, so one request can
+receive while another is retracted. The pool is pinned, so it counts against
+host memory on every decode rank. It must hold one retraction plus one receive
+page, and startup fails when it cannot. The layer-first host layout is resolved
+automatically, which makes host receive incompatible with a HiCache storage
+backend that resolves a different layout.
+
+Receiving into the host pool and restoring it costs more than writing the device
+pool directly. On 2 x H20 with Qwen3-8B, prefill TP2 / decode TP2 and a TCP
+transport, a decode that sent every request through the host pool (threshold
+`0`) took 2.0-2.4 times as long as the device path, and its mean TTFT was
+2.1-2.4 times higher, over 8K-token prompts at concurrency 8 up to 32K-token
+prompts at concurrency 32. That range includes runs where the device pool could
+not hold the in-flight requests at all. A larger `--hicache-size` and the
+`direct` IO backend each left the numbers unchanged. The added time follows KV
+volume rather than request count: about 0.5 s per 8K-token request per rank,
+which is roughly 1.2 GB/s for receiving and restoring together. Treat host
+receive as capacity headroom for long prompts, not as a throughput win, keep the
+threshold high enough that only the overflow takes the host path, and measure
+your own model and transport before lowering it.
+
+A transfer backend has to write the host pool directly, which NIXL does on peers
+whose attention TP size matches the decode's. Other geometries keep device
+destinations for that connection rather than failing: a heterogeneous-TP slice,
+TP-heterogeneous KV packing, a DCP relayout and a staging buffer all rebuild the
+destination without a host counterpart. Mooncake and Mori do not support host
+destinations yet, and the decode worker rejects the flag on a backend that
+reports no support at all.
+
+Both sides need a build that supports host destinations. A prefill worker
+without it ignores the destination field and writes the decode's device pool at
+host-pool row numbers, so upgrade prefill workers before you lower the threshold
+on a decode worker.
+
+The option covers full KV pools without extra state components. A pool carrying
+window, Mamba or DSA state keeps device receive, because a state component has
+no host counterpart yet. HiSparse, unified memory and runtime PD role switching
+are rejected, and the `cpu_tensor` retraction backup is rejected because host KV
+buffering needs `host_pool` retraction.
+
+Host rows are released only once every prefill rank holding their addresses
+acknowledges that its writes drained; an elapsed timeout does not prove a remote
+write stopped. An unreachable peer therefore holds its host rows until the pool
+is torn down. Restoring to HBM costs one host-to-device copy of the prefix, so
+measure both the added concurrency and that cost for your workload before
+lowering the threshold; long-context traffic benefits most.
+
 ## Profiling in PD Disaggregation Mode
 
 When you need to profile prefill or decode workers in PD disaggregation mode, please refer to the [Profile In PD Disaggregation Mode](../developer_guide/benchmark_and_profiling#profile-in-pd-disaggregation-mode) section in the Benchmark and Profiling guide. Due to torch profiler limitations, prefill and decode workers must be profiled separately using dedicated command-line options.
