@@ -1099,22 +1099,93 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
 
 class InputItemNormalizationTestCase(CustomTestCase):
     def test_function_call_rejects_invalid_or_non_object_arguments(self):
-        for arguments in ('{"unfinished":', "", "[]", "null", "1", None):
+        for arguments in ('{"unfinished":', "   ", "[]", "null", "1", None):
             with self.subTest(arguments=arguments), self.assertRaises(ValueError):
                 OpenAIServingResponses._normalize_response_message_for_chat(
                     {"type": "function_call", "name": "lookup", "arguments": arguments}
                 )
 
     def test_function_call_preserves_valid_empty_and_dict_arguments(self):
-        for arguments in ("{}", {}, {"key": "value"}):
+        for arguments in ("", "{}", {}, {"key": "value"}):
             normalized = OpenAIServingResponses._normalize_response_message_for_chat(
                 {"type": "function_call", "name": "lookup", "arguments": arguments}
             )
             parsed = orjson.loads(normalized["tool_calls"][0]["function"]["arguments"])
-            self.assertEqual(
-                parsed,
-                orjson.loads(arguments) if isinstance(arguments, str) else arguments,
+            expected = (
+                {}
+                if arguments == ""
+                else (
+                    orjson.loads(arguments) if isinstance(arguments, str) else arguments
+                )
             )
+            self.assertEqual(parsed, expected)
+
+    def test_function_call_non_strict_coerces_invalid_history_arguments(self):
+        for arguments in ('{"unfinished":', "[]", "null", "1", None):
+            with self.subTest(arguments=arguments):
+                normalized = (
+                    OpenAIServingResponses._normalize_response_message_for_chat(
+                        {
+                            "type": "function_call",
+                            "name": "lookup",
+                            "arguments": arguments,
+                        },
+                        strict_tool_arguments=False,
+                    )
+                )
+                self.assertEqual(
+                    normalized["tool_calls"][0]["function"]["arguments"], "{}"
+                )
+
+    def test_previous_response_id_tolerates_malformed_history_but_rejects_fresh_input(
+        self,
+    ):
+        publish(
+            ServerArgs(model_path="dummy", enable_response_store=True), role="tokenizer"
+        )
+        serving = make_serving()
+        prev_response = ResponsesResponse(
+            id="resp_prev", model="x", created_at=0, status="incomplete"
+        )
+        serving.response_store["resp_prev"] = prev_response
+        serving.msg_store["resp_prev"] = [
+            {"role": "user", "content": "old input"},
+            {
+                "type": "function_call",
+                "call_id": "call_prev",
+                "name": "lookup",
+                "arguments": '{"unfinished":',
+            },
+        ]
+
+        valid_followup = ResponsesRequest(
+            model="x",
+            previous_response_id="resp_prev",
+            input="continue",
+            store=False,
+        )
+        messages = serving._construct_input_messages(valid_followup, prev_response)
+        self.assertEqual(messages[1]["tool_calls"][0]["function"]["arguments"], "{}")
+
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                bad_followup = ResponsesRequest(
+                    model="x",
+                    previous_response_id="resp_prev",
+                    input=[
+                        {
+                            "type": "function_call",
+                            "call_id": "call_new",
+                            "name": "lookup",
+                            "arguments": '{"unfinished":',
+                        }
+                    ],
+                    stream=stream,
+                    store=False,
+                )
+                result = asyncio.run(serving.create_responses(bad_followup))
+                self.assertIsInstance(result, ORJSONResponse)
+                self.assertEqual(result.status_code, 400)
 
     def test_function_call_becomes_assistant_tool_call(self):
         normalized = OpenAIServingResponses._normalize_response_message_for_chat(

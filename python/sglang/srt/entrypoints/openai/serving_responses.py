@@ -1554,7 +1554,11 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @classmethod
     def _normalize_response_message_for_chat(
-        cls, message: Any, *, tool_call_parser: Optional[str] = None
+        cls,
+        message: Any,
+        *,
+        tool_call_parser: Optional[str] = None,
+        strict_tool_arguments: bool = True,
     ) -> Any:
         """Convert one Responses-API input item to a chat-completions message."""
         if hasattr(message, "model_dump"):
@@ -1575,19 +1579,32 @@ class OpenAIServingResponses(OpenAIServingChat):
         msg_type = message.get("type")
         if msg_type == "function_call":
             raw = message.get("arguments")
-            if isinstance(raw, str):
+            if raw == "":
+                # Zero-argument function calls can arrive as an empty string;
+                # normalize to "{}" so chat templates and JSON parsers succeed.
+                raw = "{}"
+            elif isinstance(raw, str):
                 try:
                     parsed = orjson.loads(raw)
                 except orjson.JSONDecodeError as exc:
-                    raise ValueError(
-                        "function_call arguments must be valid JSON"
-                    ) from exc
-                if not isinstance(parsed, dict):
-                    raise ValueError("function_call arguments must be a JSON object")
+                    if strict_tool_arguments:
+                        raise ValueError(
+                            "function_call arguments must be valid JSON"
+                        ) from exc
+                    raw = "{}"
+                else:
+                    if not isinstance(parsed, dict):
+                        if strict_tool_arguments:
+                            raise ValueError(
+                                "function_call arguments must be a JSON object"
+                            )
+                        raw = "{}"
             elif isinstance(raw, dict):
                 raw = orjson.dumps(raw).decode("utf-8")
             else:
-                raise ValueError("function_call arguments must be a JSON object")
+                if strict_tool_arguments:
+                    raise ValueError("function_call arguments must be a JSON object")
+                raw = "{}"
             name = message.get("name")
             if tool_call_parser == "muse" and message.get("namespace"):
                 name = f"{message['namespace']}.{name}"
@@ -1721,17 +1738,23 @@ class OpenAIServingResponses(OpenAIServingChat):
             merged.append(msg)
         return merged
 
-    def _response_input_history(self, request: ResponsesRequest) -> list:
+    def _split_response_input_history(
+        self, request: ResponsesRequest
+    ) -> tuple[list, list]:
         history = (
             list(self.msg_store[request.previous_response_id])
             if request.previous_response_id is not None
             else []
         )
         if isinstance(request.input, str):
-            history.append({"role": "user", "content": request.input})
+            current = [{"role": "user", "content": request.input}]
         else:
-            history.extend(request.input)
-        return history
+            current = list(request.input)
+        return history, current
+
+    def _response_input_history(self, request: ResponsesRequest) -> list:
+        history, current = self._split_response_input_history(request)
+        return history + current
 
     def _construct_input_messages(
         self,
@@ -1749,14 +1772,24 @@ class OpenAIServingResponses(OpenAIServingChat):
                 }
             )
 
-        for input_item in self._response_input_history(request):
-            if tool_adapter is not None:
-                input_item = tool_adapter.input_item(input_item)
-            normalized = self._normalize_response_message_for_chat(
-                input_item, tool_call_parser=self.tool_call_parser
-            )
-            if normalized is not None:
-                messages.append(normalized)
+        history_items, current_items = self._split_response_input_history(request)
+        # Historical items came from our own stored responses (possibly truncated
+        # mid-JSON), so coerce malformed arguments instead of breaking multi-turn
+        # previous_response_id continuations; validate fresh caller items strictly.
+        for strict_tool_arguments, items in (
+            (False, history_items),
+            (True, current_items),
+        ):
+            for input_item in items:
+                if tool_adapter is not None:
+                    input_item = tool_adapter.input_item(input_item)
+                normalized = self._normalize_response_message_for_chat(
+                    input_item,
+                    tool_call_parser=self.tool_call_parser,
+                    strict_tool_arguments=strict_tool_arguments,
+                )
+                if normalized is not None:
+                    messages.append(normalized)
 
         # One Responses-API assistant turn maps to multiple input items
         # (message + function_call(s)); collapse them into one chat message
