@@ -216,6 +216,10 @@ class TestDiffusionProfiler(unittest.TestCase):
         self.apply_patches.assert_called_once()
         self.torch_npu._apply_all_patches.assert_not_called()
         self.npu_api.profile.assert_called_once()
+        self.assertEqual(
+            self.npu_api.profile.call_args.kwargs["activities"],
+            [torch.profiler.ProfilerActivity.CPU, self.npu_api.ProfilerActivity.NPU],
+        )
         self.npu_api.schedule.assert_called_once_with(
             skip_first=0, wait=0, warmup=1, active=5, repeat=1
         )

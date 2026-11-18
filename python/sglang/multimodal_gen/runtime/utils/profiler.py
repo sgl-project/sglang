@@ -14,14 +14,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 from sglang.srt.environ import envs as srt_envs
-from sglang.srt.observability.profile_analysis_npu import (
-    NPUTraceHandler,
-    get_torch_npu,
-)
+from sglang.srt.hardware_backend.npu import get_torch_npu
+from sglang.srt.observability.profile_analysis_npu import NPUTraceHandler
 
 if current_platform.is_npu():
-    torch_npu = get_torch_npu()
-
     NPUTraceHandler.apply_patches("diffusion")
 
 logger = init_logger(__name__)
@@ -104,7 +100,7 @@ class SGLDiffusionProfiler:
             if current_platform.is_cuda_alike():
                 activities.append(torch.profiler.ProfilerActivity.CUDA)
             if current_platform.is_npu():
-                activities.append(torch_npu.profiler.ProfilerActivity.NPU)
+                activities.append(get_torch_npu().profiler.ProfilerActivity.NPU)
 
             if hasattr(torch, "xpu") and torch.xpu.is_available():
                 activities.append(torch.profiler.ProfilerActivity.XPU)

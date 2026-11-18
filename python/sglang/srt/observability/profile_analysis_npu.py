@@ -25,17 +25,6 @@ from typing import Any, Literal
 logger = logging.getLogger(__name__)
 
 
-def get_torch_npu():
-    # Keep the standalone parser entrypoint free of SGLang runtime imports.
-    from sglang.srt.utils import is_npu
-
-    if not is_npu():
-        raise RuntimeError("NPU profiling requires an available NPU")
-    import torch_npu
-
-    return torch_npu
-
-
 class NPUTraceHandler:
     """Own NPU profiler patches, callbacks, and capture-stop/analysis policy.
 
@@ -49,6 +38,7 @@ class NPUTraceHandler:
         """Install the existing replacements for one profiler entry point."""
         if mode not in ("diffusion", "srt"):
             raise ValueError(f"Unknown NPU profiler patch mode: {mode!r}")
+        from sglang.srt.hardware_backend.npu import get_torch_npu
         from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
         torch_npu = get_torch_npu()
@@ -73,6 +63,8 @@ class NPUTraceHandler:
     @staticmethod
     def get_on_trace_ready(log_dir: str) -> Callable[[Any], None]:
         """Choose native analysis from the process mode, not the workload name."""
+        from sglang.srt.hardware_backend.npu import get_torch_npu
+
         # TODO(https://gitcode.com/Ascend/msprof/issues/265): Remove this
         # daemon-specific background analysis workaround once supported
         # torch_npu versions can automatically parse traces from multiprocessing
