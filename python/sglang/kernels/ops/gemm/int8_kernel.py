@@ -60,7 +60,8 @@ def _w8a8_block_int8_matmul(
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    # int64: row offset * row stride wraps int32 once M * K or M * N >= 2^31
+    offs_am = ((pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M).to(tl.int64)
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
@@ -91,7 +92,7 @@ def _w8a8_block_int8_matmul(
     else:
         c = accumulator.to(tl.float32)
 
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)).to(tl.int64)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
