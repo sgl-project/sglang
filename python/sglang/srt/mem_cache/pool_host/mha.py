@@ -44,7 +44,7 @@ from sglang.srt.mem_cache.pool_host._kvcacheio import require_kvcacheio_ops
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
-    host_memory_budget_bytes,
+    host_memory_preflight,
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
@@ -167,9 +167,9 @@ class MHATokenToKVPoolHost(HostKVCache):
             )
         infos = (buffer_info, *draft_buffer_infos)
         for info in infos:
-            if (
-                info.scales is not None
-                and info.scales.layout != KVScaleLayout.MXFP8_INTERLEAVED
+            if info.scales is not None and info.scales.layout not in (
+                KVScaleLayout.MXFP8_INTERLEAVED,
+                KVScaleLayout.MXFP8_MODELSLIM_K_DYNAMIC_V_PER_CHANNEL,
             ):
                 raise ValueError(
                     f"{pool_label}: MHA host transfers do not support "
@@ -1004,17 +1004,18 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self.page_num = anchor_host.page_num
         self.size_per_token = self.get_size_per_token()
 
-        requested_bytes = self.size * self.size_per_token
-        available_bytes = host_memory_budget_bytes(requested_bytes)
-        if requested_bytes > available_bytes:
+        allocation_bytes, available_bytes = host_memory_preflight(
+            self.get_mapping_lengths(), self.allocator, self._transfer_device
+        )
+        if allocation_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for MiniMax index-K hierarchical cache. "
-                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
+                f"Requesting {allocation_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free."
             )
         logger.info(
             "Allocating %.2f GB host memory for MiniMax sparse index-K (layout=%s).",
-            requested_bytes / 1e9,
+            allocation_bytes / 1e9,
             layout,
         )
 
@@ -1416,6 +1417,11 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
     def get_ksize_per_token(self):
         return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize
 
+    def get_mapping_lengths(self) -> list[int]:
+        kv_bytes = self.size * self.size_per_token
+        k_bytes = self.size * self.get_ksize_per_token()
+        return [k_bytes, kv_bytes - k_bytes]
+
     def init_kv_buffer(self):
         if self.layout == "page_first":
             k_dims = (self.size, self.layer_num, self.head_num, self.head_dim)
@@ -1743,17 +1749,22 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
 
 
 def get_mha_host_pool_cls(buffer_info: MHABufferInfo) -> type:
-    is_mxfp8 = (
-        buffer_info.scales is not None
-        and buffer_info.scales.layout == KVScaleLayout.MXFP8_INTERLEAVED
-    )
-    if is_mxfp8:
+    scale_layout = buffer_info.scales.layout if buffer_info.scales is not None else None
+    if scale_layout in (
+        KVScaleLayout.MXFP8_INTERLEAVED,
+        KVScaleLayout.MXFP8_MODELSLIM_K_DYNAMIC_V_PER_CHANNEL,
+    ):
         if buffer_info.head_dim != buffer_info.v_head_dim:
             raise NotImplementedError(
                 "MXFP8 HiCache does not support asymmetric K/V head dimensions yet."
             )
-        from sglang.srt.mem_cache.pool_host.mha_mxfp8 import MHATokenToKVPoolMXFP8Host
+        from sglang.srt.mem_cache.pool_host.mha_mxfp8 import (
+            MHATokenToKVPoolMXFP8Host,
+            NPUModelSlimMXFP8KDynamicVPerChannelHost,
+        )
 
+        if scale_layout == KVScaleLayout.MXFP8_MODELSLIM_K_DYNAMIC_V_PER_CHANNEL:
+            return NPUModelSlimMXFP8KDynamicVPerChannelHost
         return MHATokenToKVPoolMXFP8Host
     if buffer_info.head_dim != buffer_info.v_head_dim:
         return AsymmetricMHATokenToKVPoolHost

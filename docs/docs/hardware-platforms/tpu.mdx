@@ -23,7 +23,7 @@ Development and testing focus on TPU7x (Ironwood). A single host has four chips 
 
 ## Model coverage
 
-Model integrations include Muse Spark Open, GLM-5.3-Flash, Kimi-K3, DeepSeek-V4-Flash, Qwen3.8-27B, GPT-OSS, and Gemma 4. Coverage ranges from serving recipes to registered accuracy tests; Kimi-K3 currently has a small-model compile test with dummy weights.
+Model integrations include Muse Spark Open, GLM-5.3-Flash, Kimi-K3, Kimi-K3.1-Pro, DeepSeek-V4-Flash, Qwen3.8-27B, GPT-OSS, and Gemma 4. Coverage ranges from serving recipes to registered accuracy tests; Kimi-K3 currently has a small-model compile test with dummy weights.
 
 
 The backend includes prefix caching, host-memory KV offload, EAGLE3 and DFlash speculative decoding, and prefill/decode disaggregation. Available combinations depend on the model and topology. Check the repository's [support guide](https://github.com/sgl-project/sglang-torchtpu/blob/main/SUPPORT.md) for feature restrictions and experimental capabilities.

@@ -13,8 +13,8 @@ from sglang.srt.managers.scheduler_components.load_inquirer import (
     SchedulerLoadInquirer,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     ListKind,
-    _RequestList,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.observability.metrics_collector import SchedulerStats
@@ -28,6 +28,7 @@ class TestSchedulePolicyWaitingQueueMatching(unittest.TestCase):
     def make_policy(self, policy, supports_fast_match_prefix):
         schedule_policy = object.__new__(SchedulePolicy)
         schedule_policy.policy = policy
+        schedule_policy._bounded_active = False
         schedule_policy.tree_cache = SimpleNamespace(
             supports_fast_match_prefix=lambda: supports_fast_match_prefix
         )
@@ -40,6 +41,9 @@ class TestSchedulePolicyWaitingQueueMatching(unittest.TestCase):
 
         policy.tree_cache = SimpleNamespace(supports_fast_match_prefix=lambda: True)
         self.assertTrue(policy.waiting_queue_prefix_matched([None] * 129))
+
+        policy._bounded_active = True
+        self.assertFalse(policy.waiting_queue_prefix_matched([None] * 129))
 
 
 class TestSchedulerLoadInquirer(unittest.TestCase):
@@ -139,7 +143,7 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
                 ListKind.WAITING: [],
                 ListKind.PD_PREALLOC: prealloc,
                 ListKind.PD_RECEIVING: decode_queue(ListKind.PD_RECEIVING),
-                ListKind.PD_RETRACTED: _RequestList(ListKind.PD_RETRACTED),
+                ListKind.PD_RETRACTED: IndexedReqList(ListKind.PD_RETRACTED),
             },
             get_total_prefill_uncached_tokens=lambda: 0,
             get_total_prefill_busy_us=lambda: 0,

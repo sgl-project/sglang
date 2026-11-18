@@ -2,6 +2,7 @@ import inspect
 import logging
 from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union
 
+from sglang.srt.arg_groups.choices import removed_choice_message
 from sglang.srt.entrypoints.openai.protocol import (
     LegacyStructuralTagResponseFormat,
     StructuralTagResponseFormat,
@@ -22,6 +23,7 @@ from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.deepseekv41_detector import DeepSeekV41Detector
 from sglang.srt.function_call.dots_detector import DotsToolDetector
+from sglang.srt.function_call.ernie55_detector import Ernie5_5Detector
 from sglang.srt.function_call.gemma4_detector import Gemma4Detector
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
 from sglang.srt.function_call.gigachat35_detector import GigaChat35Detector
@@ -32,6 +34,7 @@ from sglang.srt.function_call.glm4_moe_detector import (
 )
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
+from sglang.srt.function_call.granite_toolcall_detector import GraniteToolCallDetector
 from sglang.srt.function_call.hermes_detector import HermesDetector
 from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
 from sglang.srt.function_call.inkling_detector import InklingDetector
@@ -60,6 +63,7 @@ from sglang.srt.function_call.utils import (
     _get_tool_schema_defs,
     get_json_schema_constraint,
 )
+from sglang.srt.function_call.xing4_0_detector import Xing4_0Detector
 from sglang.srt.parser.response_template import ResponseTemplateToolDetector
 
 logger = logging.getLogger(__name__)
@@ -84,11 +88,12 @@ class FunctionCallParser:
         "deepseekv4": DeepSeekV4Detector,
         "deepseekv41": DeepSeekV41Detector,
         "dots": DotsToolDetector,
+        "ernie55": Ernie5_5Detector,
         "glm": Glm4MoeDetector,
-        "glm45": Glm4MoeDetector,
         "glm47": Glm47MoeDetector,
         "flint": Glm47MoeDetector,
         "gpt-oss": GptOssDetector,
+        "granite_toolcall_parser": GraniteToolCallDetector,
         "k2_horizon": K2V3Detector,
         "kimi_k2": KimiK2Detector,
         "kimi_k3": KimiK3Detector,
@@ -102,11 +107,11 @@ class FunctionCallParser:
         "poolside_v1": PoolsideV1Detector,
         "pythonic": PythonicDetector,
         "qwen": Qwen25Detector,
-        "qwen25": Qwen25Detector,
         "qwen3_coder": Qwen3CoderDetector,
         "spark25": Spark25Detector,
         "step3": Step3Detector,
         "step3p5": Qwen3CoderDetector,
+        "xing4_0": Xing4_0Detector,
         "minimax-m2": MinimaxM2Detector,
         "minimax-m3": MinimaxM3Detector,
         "nanbeige": Qwen3CoderDetector,
@@ -148,7 +153,10 @@ class FunctionCallParser:
                 kwargs["tools"] = self.structural_tag_tools()
             detector = detector_class(**kwargs)
         else:
-            raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
+            message = removed_choice_message("tool_call_parser", tool_call_parser)
+            raise ValueError(
+                message or f"Unsupported tool_call_parser: {tool_call_parser}"
+            )
 
         if isinstance(detector, Glm47MoeDetector):
             detector.use_full_assistant_constraint = not any(

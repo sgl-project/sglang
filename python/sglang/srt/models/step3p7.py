@@ -8,6 +8,7 @@ from transformers.activations import ACT2FN
 from sglang.srt.configs.step3p7 import Step3p7Config
 from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
@@ -19,7 +20,6 @@ from sglang.srt.models.step3_vl_10b import PerceptionEncoder
 from sglang.srt.models.step3p5 import Step3p5ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.utils import add_prefix
 
 
 class Step3p7ForConditionalGeneration(nn.Module):

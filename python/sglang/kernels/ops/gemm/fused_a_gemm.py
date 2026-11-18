@@ -15,7 +15,7 @@ from enum import Enum
 
 import torch
 
-from sglang.srt.utils.common import get_device_sm, is_cuda, is_sm120_supported
+from sglang.srt.utils.device import get_device_sm, is_cuda, is_sm120_supported
 
 
 class FusedAGemmBackend(str, Enum):
@@ -31,7 +31,7 @@ _AUTO_BACKEND = (
 # Mirrors the K asserts in each backend's _dsv3_fused_a_gemm_run.
 _K_ALIGNMENT = {
     FusedAGemmBackend.JIT: 256,
-    FusedAGemmBackend.CUTEDSL: 1024,
+    FusedAGemmBackend.CUTEDSL: 256,
 }
 
 _IS_CUDA = is_cuda()
@@ -48,10 +48,16 @@ def fused_a_gemm_weight_eligible(
     *,
     backend: FusedAGemmBackend | str = FusedAGemmBackend.AUTO,
 ) -> bool:
+    # Any module may be passed (callers and tests use plain linears), and a
+    # packed-quantized one (e.g. compressed-tensors W4A16) has no dense weight.
+    weight = getattr(layer, "weight", None)
     return (
-        layer.weight.dtype == torch.bfloat16
-        and layer.weight.shape[0] % 16 == 0
-        and layer.weight.shape[1] % _K_ALIGNMENT[_resolve_backend(backend)] == 0
+        weight is not None
+        and weight.dtype == torch.bfloat16
+        # The kernels compute x @ weight.T only, so a biased layer keeps its own path.
+        and layer.bias is None
+        and weight.shape[0] % 16 == 0
+        and weight.shape[1] % _K_ALIGNMENT[_resolve_backend(backend)] == 0
         and _IS_CUDA
         and _DEVICE_SM >= 90
     )
