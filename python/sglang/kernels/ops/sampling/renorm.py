@@ -19,11 +19,14 @@ elif is_hip():
         top_p_renorm_probs_triton as top_p_renorm_prob,
     )
 elif is_npu():
-    try:
-        from sgl_kernel_npu.sample import top_k_renorm_prob, top_p_renorm_prob
-    except ImportError:
-        top_k_renorm_prob = None
-        top_p_renorm_prob = None
+    # sgl_kernel_npu renormalizes by scattering the kept sorted probabilities
+    # back to token positions; that full-vocabulary random write dominates the
+    # op on Ascend (~85% of its cost, ~3.1 ms for a 4 x 154880 block). The
+    # threshold form is numerically equivalent and only uses aten ops.
+    from sglang.kernels.ops.sampling.renorm_threshold import (
+        top_k_renorm_prob,
+        top_p_renorm_prob,
+    )
 elif is_musa() or is_xpu():
     try:
         from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
