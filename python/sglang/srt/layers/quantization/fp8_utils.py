@@ -45,6 +45,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,
     get_device_capability,
+    get_device_core_count,
     get_device_sm,
     get_hip_version,
     is_cuda,
@@ -731,9 +732,31 @@ if get_platform().is_blackwell and is_flashinfer_available():
         )
 
 
+_HAS_FLASHINFER_SM90_SWAPAB = False
 if get_platform().is_sm90 and is_flashinfer_available():
     # FlashInfer SM90 DeepGEMM with automatic swapAB optimization for small M
-    from flashinfer.gemm import fp8_blockscale_gemm_sm90
+    try:
+        from flashinfer.gemm import fp8_blockscale_gemm_sm90
+
+        _HAS_FLASHINFER_SM90_SWAPAB = True
+    except ImportError:
+        pass
+
+
+# H20 is Hopper silicon cut down to 78 SMs; the next smallest Hopper SKU is the
+# 114-SM H100 PCIe and SXM H100/H200 are 132. Per byte of weights streamed that
+# leaves H20 with roughly a third of their compute, which is the whole reason a
+# narrow-M block-FP8 GEMM is compute-bound there and bandwidth-bound elsewhere.
+_H20_LIKE_MAX_SMS = 96
+
+
+def _is_h20() -> bool:
+    """Whether this is an H20-class Hopper part: few SMs, compute-starved."""
+    # Keyed on the SM count, not on the product name: "H20" is a substring of
+    # "H200", so the `"H20" in get_device_name()` test used for the QSA tuning
+    # table (layers/attention/qsa/sparse_attn.py) would select H200 as well.
+    # Every part this does not match keeps the DeepGEMM default it has today.
+    return get_platform().is_sm90 and get_device_core_count() <= _H20_LIKE_MAX_SMS
 
 
 def dispatch_w8a8_block_fp8_linear(
@@ -1330,7 +1353,8 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
 def _dispatch_auto_backend(act_scale_ue8m0: bool = False) -> Callable:
     """Auto-select the best backend based on hardware capabilities."""
     # Priority order for auto selection:
-    # 1. DeepGEMM (if enabled and available)
+    # 1. DeepGEMM (if enabled and available); on H20 the FlashInfer hybrid, which
+    #    routes 1 <= M < 32 to the swapAB kernel
     # 2. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
     # 3. CUTLASS (if SM120 GPU and CUDA 12.8+)
     # 4. AITER (if AMD GPU with AITER enabled)
@@ -1339,6 +1363,18 @@ def _dispatch_auto_backend(act_scale_ue8m0: bool = False) -> Callable:
     # 7. Triton (fallback)
 
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        # On H20 the FlashInfer entry point is a strict superset of plain
+        # DeepGEMM: 1 <= M < 32 takes the swapAB kernel and every other M is
+        # handed to DeepGEMM. Decode sits in that band, and on H20 it is
+        # compute-bound, so narrow-M is where the queue lives (17.51 -> 10.53 ms
+        # TPOT at M=1). H100/H200 make the same call bandwidth-bound, measure
+        # within noise, and keep the DeepGEMM default.
+        # ue8m0 activation scales stay on DeepGEMM: that path binds
+        # act_scale_ue8m0 through this exact callable below, and the FlashInfer
+        # entry point quantizes the activation itself with fp32 scales.
+        # --fp8-gemm-backend=deep_gemm still selects plain DeepGEMM everywhere.
+        if _HAS_FLASHINFER_SM90_SWAPAB and _is_h20() and not act_scale_ue8m0:
+            return flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback
         return deepgemm_w8a8_block_fp8_linear_with_fallback
     elif get_platform().is_blackwell and is_flashinfer_available():
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
@@ -1484,7 +1520,12 @@ def flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback(
 
     For SM90 (Hopper), this uses the DeepGEMM JIT with automatic swapAB selection.
     """
-    assert input_scale is None
+    if input_scale is not None:
+        # fp8_blockscale_gemm_sm90 quantizes the activation itself and takes no
+        # static per-tensor input scale; DeepGEMM covers those checkpoints.
+        return deepgemm_w8a8_block_fp8_linear_with_fallback(
+            input, weight, block_size, weight_scale, input_scale, bias
+        )
 
     output_dtype = input.dtype
     dtype_supported = output_dtype == torch.bfloat16
