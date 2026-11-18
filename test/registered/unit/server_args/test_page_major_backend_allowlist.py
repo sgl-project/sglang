@@ -56,6 +56,8 @@ def _accepts(
     linear_prefill: str | None = None,
     has_asymmetric_kv: bool = False,
     draft_backend: str | None = None,
+    hf_config=None,
+    **overrides,
 ) -> bool:
     """Run just `handle_page_major_kv_layout` against a minimal stand-in, since
     ServerArgs' real constructor pulls in a model config."""
@@ -73,6 +75,7 @@ def _accepts(
         "linear_attn_prefill_backend": linear_prefill,
         "mamba_backend": "triton",
         "speculative_draft_attention_backend": draft_backend,
+        **overrides,
     }.items():
         msgspec.Struct.__setattr__(sa, name, value)
     setattr(
@@ -85,6 +88,8 @@ def _accepts(
             v_head_dim=128,
             swa_head_dim=128,
             swa_v_head_dim=128,
+            hf_config=hf_config
+            or SimpleNamespace(architectures=["DeepseekV2ForCausalLM"]),
         ),
     )
     try:
@@ -215,6 +220,34 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                 f"{backend} must stay allowed for an MLA model with asymmetric "
                 "K/V head dims",
             )
+
+    def test_sparse_attention_serves_flashmla_kv_only(self):
+        """A DSA model (Kimi-K3.1) reads its unified pages with the dsa backend
+        and the flashmla_kv kernels; the trtllm kernels read flat rows, and
+        modes the unified pool does not serve for it yet are refused."""
+        k31 = SimpleNamespace(
+            architectures=["KimiK31ForConditionalGeneration"], index_topk=2048
+        )
+        dsa = dict(
+            use_mla=True,
+            hf_config=k31,
+            dsa_prefill_backend="flashmla_kv",
+            dsa_decode_backend="flashmla_kv",
+        )
+        self.assertTrue(_accepts("dsa", **dsa))
+        self.assertFalse(_accepts("dsa", use_mla=True))
+        for overrides in (
+            dict(dsa_decode_backend="trtllm"),
+            dict(dsa_prefill_backend="trtllm"),
+            dict(speculative_algorithm="DFLASH"),
+            dict(dcp_size=8),
+            dict(disaggregation_mode="decode"),
+            dict(enable_hierarchical_cache=True),
+            dict(enable_return_indexer_topk=True),
+        ):
+            with self.subTest(**overrides):
+                with self.assertRaisesRegex(ValueError, "--enable-unified-memory"):
+                    _accepts("dsa", **{**dsa, **overrides})
 
     def test_page_major_rejected_without_unified_memory(self):
         """There is no static page-major arm today, so the flag alone is

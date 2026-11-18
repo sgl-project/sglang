@@ -8,7 +8,7 @@ pack + all-to-all + combine sequence. See ``csrc/dsa/dcp_push_combine.cuh``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import torch
 
@@ -18,6 +18,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.ops.communication.comm_registry import CommRegistry
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -42,22 +43,18 @@ def _jit_module(world_size: int) -> Module:
     )
 
 
-_COMM_MAP: dict[int, Communicator] = {}
+_COMMS = CommRegistry("dcp_push_combine")
 
 
-def register_comm(comm: Communicator) -> None:
-    """Register the communicator whose push plane carries the exchange (one per
-    world size: the op keys on it)."""
-    prev = _COMM_MAP.get(comm.world_size)
-    assert prev is None or prev is comm, (
-        f"a different communicator is already registered for world_size="
-        f"{comm.world_size}"
-    )
-    _COMM_MAP[comm.world_size] = comm
+def register_comm(provider: Callable[[], Communicator], *, world_size: int) -> None:
+    """Register the provider of the communicator these ops launch over; it runs on
+    first launch (see ``CommRegistry``).
+    """
+    _COMMS.register(provider, world_size=world_size)
 
 
 def is_registered(world_size: int) -> bool:
-    return world_size in _COMM_MAP
+    return world_size in _COMMS
 
 
 @register_custom_op(mutates_args=["out"])
@@ -68,7 +65,7 @@ def _push_combine_op(
     out: torch.Tensor,
     lse_base_e: bool,
 ) -> None:
-    _jit_module(world_size).run(_COMM_MAP[world_size], v, lse, out, lse_base_e)
+    _jit_module(world_size).run(_COMMS.get(world_size), v, lse, out, lse_base_e)
 
 
 def dcp_push_combine(

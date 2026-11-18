@@ -243,7 +243,7 @@ class Qwen2_5_VisionBlock(nn.Module):
         self.attn = VisionAttention(
             embed_dim=dim,
             num_heads=num_heads,
-            head_size=head_size,
+            head_dim=head_size,
             projection_size=num_heads * head_size,
             use_qkv_parallel=True,
             proj_bias=True,
