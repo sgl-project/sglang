@@ -233,7 +233,9 @@ def _invoke_moe_lora_shrink_splitk(
     N = weight.shape[1]
     K = weight.shape[2]
     BLOCK_SIZE_M = config["BLOCK_SIZE_M"]
-    BLOCK_SIZE_N = min(config.get("BLOCK_SIZE_N", 64), max(16, N))
+    BLOCK_SIZE_N = min(
+        config.get("BLOCK_SIZE_N", 64), max(16, triton.next_power_of_2(N))
+    )
     BLOCK_SIZE_K = config.get("BLOCK_SIZE_K", 64)
     GROUP_SIZE_M = config.get("GROUP_SIZE_M", 1)
 
@@ -572,11 +574,11 @@ def _merged_experts_fused_moe_lora_add_impl(
             elif K_dim >= 64:
                 default_block_k = 64
             else:
-                default_block_k = max(16, K_dim)
+                default_block_k = max(16, triton.next_power_of_2(K_dim))
             cfg = {
                 "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": min(64, max(16, N_dim)),
-                "BLOCK_SIZE_K": min(default_block_k, max(16, K_dim)),
+                "BLOCK_SIZE_N": min(64, max(16, triton.next_power_of_2(N_dim))),
+                "BLOCK_SIZE_K": default_block_k,
                 "GROUP_SIZE_M": 1,
                 "num_warps": 4,
                 "num_stages": 4,
