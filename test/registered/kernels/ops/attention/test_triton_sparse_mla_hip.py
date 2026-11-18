@@ -1,4 +1,4 @@
-"""ROCm sparse MLA over packed FP8 KV: numerical references and launch tuning."""
+"""ROCm tests for Triton sparse MLA launch tuning."""
 
 import math
 
@@ -38,11 +38,6 @@ pytestmark = pytest.mark.skipif(not is_hip(), reason="ROCm only")
 _IS_GFX950 = is_hip() and _is_gfx950_sparse_mla_fp8(
     torch.float8_e4m3fn, 16, 512, 64, 576
 )
-
-
-_DEVICE = "cuda"
-_DV, _DR, _TOPK, _N = 512, 64, 2048, 16384
-_PREFILL_POOL = 8192
 
 
 def test_cu_count_uses_tensor_device(monkeypatch):
@@ -108,19 +103,6 @@ def test_splitk_workspaces_are_graph_and_stream_safe():
             pointers.append(lse.data_ptr())
     assert pointers[0] != pointers[1]
     _splitk_bufs.clear()
-
-
-def _keys_reference(q, keys, idx, sm_scale):
-    """fp32 (out, natural-log lse) over each row's keys; -1 selects nothing, and a
-    row with no key gives 0 and -inf."""
-    gathered = keys[idx.clamp(min=0).long()]
-    scores = torch.einsum("thd,tkd->thk", q, gathered) * sm_scale
-    scores = scores.masked_fill((idx < 0)[:, None, :], float("-inf"))
-    lse = torch.logsumexp(scores, -1)
-    out = torch.einsum(
-        "thk,tkd->thd", torch.softmax(scores, -1).nan_to_num(0.0), gathered[..., :512]
-    )
-    return out, lse
 
 
 @pytest.mark.skipif(not _IS_GFX950, reason="topk_length path is gfx950-only")
@@ -219,8 +201,6 @@ def _sparse_mla_reference(q, kv, indices, sm_scale, d_v):
 @pytest.mark.parametrize("heads", [16, 64])
 @pytest.mark.parametrize("fp8", [False, True])
 def test_dcp_owned_count_decode_merges_to_full_kv(fp8, heads, kv_splits):
-    """Replicated-index-K DCP decode: each rank's partial over its owned slots
-    merges base 2 into full-KV attention, empty ranks included."""
     torch.manual_seed(heads + kv_splits)
     dcp_size, topk, num_slots, d_v, d_tail = 4, 512, 4096, 512, 64
     sm_scale = (d_v + d_tail) ** -0.5
@@ -335,6 +315,24 @@ def test_scaled_kv_decode_matches_reference(bs, kv_splits):
 
     ref = _scaled_kv_reference(q_nope, q_rope, keys, idx, sm_scale)
     assert _rel_err(out[0], ref) < 4e-3
+
+
+_DEVICE = "cuda"
+_DV, _DR, _TOPK, _N = 512, 64, 2048, 16384
+_PREFILL_POOL = 8192
+
+
+def _keys_reference(q, keys, idx, sm_scale):
+    """fp32 (out, natural-log lse) over each row's keys; -1 selects nothing, and a
+    row with no key gives 0 and -inf."""
+    gathered = keys[idx.clamp(min=0).long()]
+    scores = torch.einsum("thd,tkd->thk", q, gathered) * sm_scale
+    scores = scores.masked_fill((idx < 0)[:, None, :], float("-inf"))
+    lse = torch.logsumexp(scores, -1)
+    out = torch.einsum(
+        "thk,tkd->thd", torch.softmax(scores, -1).nan_to_num(0.0), gathered[..., :512]
+    )
+    return out, lse
 
 
 def _decode_reference(qn, qr, idx, kd, sm, mxfp8_q=True):
