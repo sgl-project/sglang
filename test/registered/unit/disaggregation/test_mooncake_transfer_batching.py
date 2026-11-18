@@ -620,6 +620,7 @@ class TestMooncakeEarlySend(CustomTestCase):
             validate_aux_buffers=MagicMock(),
             bootstrap_port=8998,
             note_send_finished=MagicMock(),
+            settle_provisional_success=MagicMock(),
         )
         manager.check_status = lambda room: manager.request_status[room]
         return manager, queue
