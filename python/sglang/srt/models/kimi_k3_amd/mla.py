@@ -18,6 +18,9 @@ one DeepSeek MLA uses on ROCm (rocm_linear_utils), against one-row identity cos/
 tables with all-zero positions, which leaves Q and the cache bytes equal to the
 split concat/cache chain's. Where the attention backend reads an FP8 query padded
 to its kernel head count (mla_fp8_q_out), the same launch casts Q into that buffer.
+
+kimi_k3 calls create_q_cache_writer on every platform; this module alone decides
+where the fused write runs (fused_q_cache_available) and returns None elsewhere.
 """
 
 from typing import Callable, Optional, Tuple

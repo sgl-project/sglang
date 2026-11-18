@@ -90,7 +90,7 @@ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-    from sglang.srt.models.kimi_k3_rocm_mla import KimiK3RocmMlaQCacheWriter
+    from sglang.srt.models.kimi_k3_amd.mla import KimiK3RocmMlaQCacheWriter
 
 if _use_aiter:
     # On gfx1250 the aiter `module_fused_qk_norm_rope_cache_quant_shuffle` kernel
@@ -600,7 +600,7 @@ class DeepseekMLARocmForwardMixin:
 
     # Model-installed writer for the absorbed decode Q and latent KV cache;
     # None keeps the split rope/concat/cache chain.
-    rocm_mla_q_cache_writer: Optional[KimiK3RocmMlaQCacheWriter] = None
+    mla_q_cache_writer: Optional[KimiK3RocmMlaQCacheWriter] = None
 
     def forward_absorb_rocm_prepare(
         self: DeepseekV2AttentionMLA,
@@ -1292,7 +1292,7 @@ class DeepseekMLARocmForwardMixin:
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         mode = forward_batch.forward_mode
         if (
-            self.rocm_mla_q_cache_writer is None
+            self.mla_q_cache_writer is None
             or get_parallel().dcp_enabled
             or not (mode.is_decode() or mode.is_target_verify())
         ):
@@ -1311,7 +1311,7 @@ class DeepseekMLARocmForwardMixin:
             num_tokens=q_nope_out.shape[0],
             head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
         )
-        return self.rocm_mla_q_cache_writer.write(
+        return self.mla_q_cache_writer.write(
             q_nope=q_nope_out,
             q_pe=q_pe,
             k_nope=k_nope,
