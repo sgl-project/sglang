@@ -1107,8 +1107,6 @@ class Envs:
     SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_FRONT = EnvBool(False)
     # The same front, shared experts TP-sharded (no extra memory); FRONT takes precedence
     SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT = EnvBool(False)
-    # Kimi-K3 gfx950 prefill: o_proj on row shards, full weight (+176 MB a layer), eager only
-    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_O_PROJ = EnvBool(False)
     # Kimi-K3 gfx950 prefill: leave the stream on each rank's rows after the row-sharded tail
     SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM = EnvBool(False)
     # GiB of gfx950 memory kept out of torch's allocator for HSA queue scratch (0: none)

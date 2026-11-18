@@ -6,7 +6,7 @@ which imports this mixin. ROCm keeps the multicast all-reduce fusion disabled.
 
 from __future__ import annotations
 
-from functools import cache, cached_property, partial
+from functools import cache, cached_property
 from typing import TYPE_CHECKING, Callable, Optional
 
 import msgspec
@@ -27,15 +27,10 @@ from sglang.srt.layers.layer_boundary.residual.attn_bank_hip import (
     row_shard,
 )
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.linear import ReplicatedLinear, RowParallelLinear
 from sglang.srt.layers.moe.topk import TopKOutputChecker
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
-)
-from sglang.srt.models.kimi_k3_amd.row_shard_o_proj import (
-    gather_full_o_proj,
-    pad_o_proj_rows,
-    take_o_proj_row_shard,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_gfx95_supported, is_hip, print_info_once
@@ -723,67 +718,62 @@ def ffn_row_shards_hip(layer) -> Optional[Callable[[int], bool]]:
 
 
 def _row_sharded_switch_on() -> bool:
-    """Any of the opt-in gfx950 row-sharded front / o_proj / stream switches."""
+    """Any of the opt-in gfx950 row-sharded front / stream switches."""
     return (
         envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_FRONT.get()
         or envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT.get()
-        or envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_O_PROJ.get()
         or envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get()
     )
 
 
-def _is_row_shard_o_proj(o_proj) -> bool:
-    """Whether row_shard_o_proj wrapped o_proj (its forward then keeps the input)."""
-    return "row_shard_input" in o_proj.__dict__
+def pad_o_proj_rows(
+    o_proj: RowParallelLinear, *, tp_size: int, row_shards: Callable[[int], bool]
+) -> None:
+    """For a batch whose attention output is reduce-scattered onto row shards,
+    o_proj writes into rows padded to a multiple of TP, which the
+    reduce-scatter then reads in place instead of copying into a padded buffer."""
+    inner_forward = o_proj.forward
 
+    def _row_padded_o_proj_forward(x, *args, **kwargs):
+        rows = x.shape[0]
+        pad = -rows % tp_size
+        if pad == 0 or kwargs.get("output_tensor") is not None or not row_shards(rows):
+            return inner_forward(x, *args, **kwargs)
+        output = x.new_empty(rows + pad, o_proj.weight.shape[0])
+        return inner_forward(x, *args, output_tensor=output[:rows], **kwargs)
 
-def _o_proj_row_shard(layer, num_tokens: int) -> Optional[torch.Tensor]:
-    if not layer._o_proj_row_sharded:
-        return None
-    return take_o_proj_row_shard(layer.self_attn.o_proj, num_tokens)
+    o_proj.forward = _row_padded_o_proj_forward
 
 
 def row_shard_bank_hooks_hip(layer) -> dict:
     """gfx950: a KimiK3DecoderLayer's row-sharded FFN read (ffn_row_shards_hip)
     as AttnBankState keywords, {} without one. Sets layer._row_shards, and runs
-    after the attention built o_proj's wrappers: o_proj keeps its input for the
-    row-sharded FFN read (row_shard_o_proj), else writes into rows padded for
-    its reduce-scatter."""
+    after the attention built o_proj's wrappers: under a row-sharded switch,
+    o_proj writes into rows padded for its reduce-scatter."""
     from sglang.srt.models.kimi_k3 import _o_proj_takes_output
 
     layer._row_shards = row_shards = ffn_row_shards_hip(layer)
     if row_shards is None:
         return {}
     o_proj = layer.self_attn.o_proj
-    if _is_row_shard_o_proj(o_proj):
-        o_proj.row_shards = row_shards
-        layer._o_proj_row_sharded = True
-    elif _row_sharded_switch_on() and _o_proj_takes_output(o_proj):
+    if _row_sharded_switch_on() and _o_proj_takes_output(o_proj):
         pad_o_proj_rows(
             o_proj, tp_size=get_parallel().attn_tp_size, row_shards=row_shards
         )
     return dict(
-        ffn_row_shard=RowShardRead(
-            row_shards,
-            shard_front=layer.mlp.shard_front,
-            attn_rows=partial(_o_proj_row_shard, layer),
-        )
+        ffn_row_shard=RowShardRead(row_shards, shard_front=layer.mlp.shard_front)
     )
 
 
 def prepare_hip_paths(layer) -> None:
     """Post-load, after _merge_front_weights: a MoE KimiK3DecoderLayer's ROCm
-    paths, the fp32 next-layer norm weight its column tail reads, and the full
-    o_proj weight its row-sharded o_proj applies (only a MoE layer has row
-    shards, see ffn_row_shards_hip)."""
+    paths and the fp32 next-layer norm weight its column tail reads."""
     layer.mlp._prepare_hip_paths()
     if (read := layer.mlp.next_attn_read) is not None:
         from sglang.srt.layers.attn_residual_hip import get_fp32_norm_weight
 
         # a reload rewrites that norm in place; the tail reads only this copy
         get_fp32_norm_weight(read.norm, refresh=True)
-    if layer._o_proj_row_sharded:
-        gather_full_o_proj(layer.self_attn.o_proj)
 
 
 def link_row_sharded_stream_hip(model) -> None:

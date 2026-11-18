@@ -133,7 +133,6 @@ from sglang.srt.models.kimi_k3_amd.moe import (
     prepare_hip_paths,
     row_shard_bank_hooks_hip,
 )
-from sglang.srt.models.kimi_k3_amd.row_shard_o_proj import row_shard_o_proj
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3MultiModalProjector,
     KimiK3VisionTower,
@@ -2115,8 +2114,6 @@ class KimiK3DeltaAttention(nn.Module):
             # buffer, which needs the GEMM to write into caller-owned storage
             self.all_reduce_fusion = False
             self.o_proj.use_dp_attention_reduce = True
-        if _is_hip and envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_O_PROJ.get():
-            row_shard_o_proj(self.o_proj)
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
         bias = self.qkv_conv1d.bias
 
@@ -2721,9 +2718,6 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             # Allocate o_proj's output in the attention-TP group's symmetric
             # memory, where the stage boundary sums it.
             self.o_proj.use_dp_attention_reduce = True
-        if _is_hip and envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_O_PROJ.get():
-            # inside the output gate, which multiplies x before o_proj takes it
-            row_shard_o_proj(self.o_proj)
         if self.use_output_gate:
             projection_size = config.num_attention_heads * config.v_head_dim
             # Shard by attn-TP to match the attention output (DSV2 MLA shards
@@ -3027,7 +3021,6 @@ class KimiK3DecoderLayer(nn.Module):
 
     # gfx950 row-sharded FFN read (row_shard_bank_hooks_hip)
     _row_shards = None
-    _o_proj_row_sharded = False
 
     def __init__(
         self,

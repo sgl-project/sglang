@@ -34,10 +34,6 @@ class RowShardRead:
     # needs, in place of gathering the normed input. Takes the padded rows and
     # the token count; False leaves the gather to the read.
     shard_front: Optional[Callable[[torch.Tensor, int], bool]] = None
-    # The attention output's complete sum on this rank's padded rows when the
-    # attention produced it there, else None (the read reduce-scatters its
-    # TP-partial output).
-    attn_rows: Optional[Callable[[int], Optional[torch.Tensor]]] = None
 
 
 def row_shard(num_tokens: int, world: int, rank: int) -> Tuple[int, int]:
@@ -127,12 +123,10 @@ def reduce_scatter_rows_and_read_ffn_input(
     world, rank = group.world_size, group.rank_in_group
     padded = -(-num_tokens // world) * world
     rows = padded // world
-    reduced = None if read.attn_rows is None else read.attn_rows(num_tokens)
-    if reduced is None:
-        if padded != num_tokens:
-            hidden_states = _padded_rows(hidden_states, padded)
-        reduced = hidden_states.new_empty(rows, hidden_size)
-        group.reduce_scatter_tensor(reduced, hidden_states.contiguous())
+    if padded != num_tokens:
+        hidden_states = _padded_rows(hidden_states, padded)
+    reduced = hidden_states.new_empty(rows, hidden_size)
+    group.reduce_scatter_tensor(reduced, hidden_states.contiguous())
     start, valid = row_shard(num_tokens, world, rank)
     if valid == 0:
         # this rank's padded rows all lie past the last token

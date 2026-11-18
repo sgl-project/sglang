@@ -194,7 +194,7 @@ class TestColumnTailNormWeight(CustomTestCase):
         mlp = SimpleNamespace(
             _prepare_hip_paths=lambda: None, next_attn_read=SimpleNamespace(norm=norm)
         )
-        layer = SimpleNamespace(mlp=mlp, _o_proj_row_sharded=False)
+        layer = SimpleNamespace(mlp=mlp)
         cached = get_fp32_norm_weight(norm)  # filled by an earlier forward
         norm.weight.data.copy_(torch.arange(HIDDEN, dtype=torch.bfloat16))
         prepare_hip_paths(layer)  # post_load_weights after the reload
