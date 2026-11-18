@@ -41,7 +41,7 @@ try:
 except ImportError:
     aiter_biased_grouped_topk = None
 
-register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=30, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 NUM_EXPERTS = 896
 TOPK = 16
