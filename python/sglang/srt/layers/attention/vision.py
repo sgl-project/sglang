@@ -110,13 +110,28 @@ BATCH_BUCKETS = [8, 16, 32, 64]
 
 # Bucketized max seqlens to reduce cuDNN recompilation frequency while
 # preserving a tighter upper bound than a single fixed max seqlen.
+# Vision sequences are short: a 2x2 window merger packs only 4 tokens per
+# segment and the longest segment is a single tile (1024 tokens for a 448px
+# tile at patch_size 14). An LLM-scale floor (4096) therefore over-pads the
+# cuDNN plan by up to 1024x. Measured on A100 (7 segments / 6784 tokens):
+# window merger 2.0 ms at max_seqlen 4-8 vs 55.9 ms at 4096; encoder prefill
+# 0.74 ms vs 2.05 ms.
 FLASHINFER_MAX_SEQLEN_BUCKETS = [
-    4 * 1024,
-    8 * 1024,
-    16 * 1024,
-    32 * 1024,
-    64 * 1024,
-    128 * 1024,
+    8,
+    16,
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16384,
+    32768,
+    65536,
+    131072,
 ]
 
 
