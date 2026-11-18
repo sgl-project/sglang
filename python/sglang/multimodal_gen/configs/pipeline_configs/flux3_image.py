@@ -16,17 +16,17 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    MissingSidePolicy,
+    SamplingParams,
+)
 from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 from sglang.multimodal_gen.runtime.utils.argparse import StoreBoolean
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines.flux3_image_package import (
         Flux3ImagePackage,
     )
-
-logger = init_logger(__name__)
 
 _IMAGE_MODES = frozenset({"t2i", "i2i"})
 
@@ -83,6 +83,8 @@ class Flux3ImageSamplingParams(SamplingParams):
     data_type: DataType = DataType.IMAGE
     _default_height = 1024
     _default_width = 1024
+    _request_size_model_name = "FLUX.3"
+    _request_size_missing_side = MissingSidePolicy.PER_SIDE
 
     # The reference CFG pairs the prompt with an empty negative prompt.
     negative_prompt: str = ""
@@ -113,31 +115,12 @@ class Flux3ImageSamplingParams(SamplingParams):
             # is synthesized under breakable CUDA graphs) it warms the t2i path.
             req.image_path = None
             self.flux3_mode = "t2i"
-        # Warmup overwrites the dimensions after _adjust has run.
-        self._align_resolution(server_args.pipeline_config)
+        super().prepare_synthetic_warmup_request_for_queue(req, server_args)
 
-    def _adjust_visual_fields(self, server_args: Any, pipeline_config: Any) -> None:
-        super()._adjust_visual_fields(server_args, pipeline_config)
-        self._align_resolution(pipeline_config)
-
-    def _align_resolution(self, pipeline_config: Any) -> None:
+    def _request_size_multiple(self, pipeline_config: Any) -> int | None:
         if not isinstance(pipeline_config, Flux3ImagePipelineConfig):
-            return
-        m = _FLUX3_SIZE_MULTIPLE
-        requested_size = (self.width, self.height)
-        if self.width is not None and self.width > 0:
-            self.width = max(m, self.width // m * m)
-        if self.height is not None and self.height > 0:
-            self.height = max(m, self.height // m * m)
-        if (self.width, self.height) != requested_size:
-            logger.warning(
-                "FLUX.3 requires dimensions divisible by %s; adjusted requested "
-                "resolution from %sx%s to %sx%s",
-                m,
-                *requested_size,
-                self.width,
-                self.height,
-            )
+            return None
+        return _FLUX3_SIZE_MULTIPLE
 
     def _adjust(self, server_args: Any) -> None:
         package = server_args.pipeline_config.flux3_package
