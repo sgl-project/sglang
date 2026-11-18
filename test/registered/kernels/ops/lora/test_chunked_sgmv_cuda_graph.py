@@ -417,9 +417,10 @@ def _skip_without_free_gpu_memory():
         pytest.skip("needs about 10 GB of free GPU memory")
 
 
-def test_shrink_row_offset_past_int32():
-    """The shrink kernels index x with the int32 permutation; a row past 2^31
-    elements must still be read at its real offset."""
+@pytest.mark.parametrize("split_k", [None, 2])
+def test_shrink_row_offset_past_int32(split_k):
+    """The shrink kernels (plain and split-K) index x with the int32 permutation;
+    a row past 2^31 elements must still be read at its real offset."""
     _skip_without_free_gpu_memory()
     x = torch.zeros(LARGE_ROWS, LARGE_WIDTH, dtype=torch.float16, device="cuda")
     x[-1] = 1
@@ -427,7 +428,7 @@ def test_shrink_row_offset_past_int32():
         (1, LARGE_RANK, LARGE_WIDTH), 1 / 1024, dtype=torch.float16, device="cuda"
     )
     out = chunked_sgmv_lora_shrink_forward(
-        x, weights, _large_single_token_batch_info(), 1
+        x, weights, _large_single_token_batch_info(), 1, split_k=split_k
     )
     torch.cuda.synchronize()
     assert (out[-1] == 32).all()
