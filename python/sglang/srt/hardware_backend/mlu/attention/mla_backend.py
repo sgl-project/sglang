@@ -92,7 +92,8 @@ class MLUMLABackend(AttentionBackend):
         self.device = model_runner.device
         self.page_size = model_runner.page_size
         self.max_context_len = model_runner.model_config.context_len
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.req_to_token = self.req_to_token_pool.req_to_token
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.forward_metadata = None
