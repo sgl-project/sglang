@@ -14,8 +14,8 @@ Shapes and scale magnitudes follow real NVFP4 MoE checkpoints rather than toy
 sizes, so a failure looks like one a real checkpoint would hit.
 
 The TRT-LLM weight padding is pinned here too: Nemotron 3 (hidden 2688,
-intermediate 1856, ReLU2 experts) needs a 128-aligned intermediate and, for
-per-token activations, a 512-aligned hidden; padding must be zero-filled.
+intermediate 1856, ReLU2 experts) needs a 128-aligned intermediate and a
+256-aligned hidden (512 for per-token non-gated); padding must be zero-filled.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -81,8 +81,11 @@ def _global_scales(num_experts: int, num_cols: int, seed: int) -> torch.Tensor:
     return scales if num_cols > 1 else scales.squeeze(1)
 
 
-def _nvfp4_loader_layer(*, is_gated=True, tp_rank=0):
-    """Small CPU buffers with the real quant method and checkpoint loader."""
+def _nvfp4_loader_layer(*, is_gated=True, tp_rank=0, hidden_size=4096):
+    """Small CPU buffers with the real quant method and checkpoint loader.
+
+    `hidden_size` is the model dim the layer reports; the buffers stay small.
+    """
     config = MoeRunnerConfig(is_gated=is_gated)
     with mock.patch.object(
         modelopt_quant, "get_platform", return_value=SimpleNamespace(is_blackwell=True)
@@ -102,6 +105,7 @@ def _nvfp4_loader_layer(*, is_gated=True, tp_rank=0):
     layer.use_presharded_weights = False
     layer.moe_tp_size = 2
     layer.moe_tp_rank = tp_rank
+    layer.hidden_size = hidden_size
     layer.dispatcher = SimpleNamespace(set_quant_config=lambda config: None)
     num_shards = 2 if is_gated else 1
     for name, data in {
@@ -284,6 +288,33 @@ class TestNvfp4MoeScaleLoading(CustomTestCase):
                 else:
                     self.assertFalse(hasattr(layer, "gemm1_clamp_limit"))
                     torch.testing.assert_close(layer.gemm1_beta, torch.tensor([25.0]))
+
+    def test_padded_trtllm_hidden_keeps_bf16_dispatch(self):
+        """The padded TRT-LLM path needs BF16 activations, so a hidden size it
+        pads must not get an FP4 dispatch scale; an aligned one keeps it."""
+        for hidden_size, expects_fp4 in [(2688, False), (4096, True)]:
+            with (
+                self.subTest(hidden_size=hidden_size),
+                get_flags().moe.override(
+                    runner_backend=MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED,
+                    a2a_backend=MoeA2ABackend.NONE,
+                ),
+                mock.patch.object(
+                    modelopt_quant, "_use_nvfp4_dispatch", return_value=True
+                ),
+                mock.patch.object(modelopt_quant, "reorder_rows_for_gated_act_gemm"),
+                mock.patch.object(modelopt_quant, "shuffle_matrix_sf_a"),
+            ):
+                layer = _nvfp4_loader_layer(hidden_size=hidden_size)
+                configs = []
+                layer.dispatcher = SimpleNamespace(set_quant_config=configs.append)
+                with mock.patch.object(
+                    layer.quant_method, "_align_fp4_moe_weights_for_flashinfer_trtllm"
+                ):
+                    layer.quant_method.process_weights_after_loading(layer)
+                self.assertEqual(
+                    configs[0]["input_global_scale"] is not None, expects_fp4
+                )
 
 
 class TestGemm1Alphas(CustomTestCase):
@@ -570,12 +601,12 @@ def _byte_sum(t: torch.Tensor) -> int:
 
 
 class TestTrtllmNvfp4HiddenAlignment(CustomTestCase):
-    def test_only_per_token_non_gated_is_padded(self):
+    def test_per_token_non_gated_needs_512_and_the_rest_256(self):
         for per_token, is_gated, expected in [
             (True, False, 512),
-            (True, True, 1),
-            (False, False, 1),
-            (False, True, 1),
+            (True, True, 256),
+            (False, False, 256),
+            (False, True, 256),
         ]:
             self.assertEqual(
                 trtllm_nvfp4_hidden_alignment(
