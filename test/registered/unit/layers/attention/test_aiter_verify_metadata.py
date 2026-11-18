@@ -167,6 +167,11 @@ class _ShapeSupport:
         )
 
 
+def _rejecting_query(**_kwargs):
+    # An aiter whose get_mla_decode_shape_support does not take a keyword sglang passes.
+    raise TypeError("unexpected keyword argument 'intra_batch_mode'")
+
+
 def _failing_query(**_kwargs):
     raise RuntimeError("module_mla_metadata failed to build")
 
@@ -182,10 +187,7 @@ def _dcp_backend(*, use_mla=True, dcp_world_size=8, num_draft_tokens=8, verify="
     backend.kv_cache_dtype = aiter_backend.fp8_dtype
     backend.cprr_fast_mode = True
     backend.cprr_intra_batch_mode = False
-    model_config = SimpleNamespace(v_head_dim=128)
-    if use_mla:
-        model_config.kv_lora_rank = 512
-    backend._init_cprr_verify(model_config=model_config)
+    backend._init_cprr_verify(kv_lora_rank=512 if use_mla else 0)
     return backend
 
 
@@ -246,11 +248,32 @@ class TestAiterCprrKernelHeads(CustomTestCase):
         self.assertEqual(_dcp_backend(verify="gluon").cprr_kernel_heads, 128)
         self.assertEqual(support.calls, [])
 
-    def test_failed_query_falls_back_to_the_table(self):
-        self._query(_failing_query)
+    def test_rejected_query_falls_back_to_the_table(self):
+        self._query(_rejecting_query)
         with self.assertLogs(aiter_backend.logger, "WARNING"):
             self.assertEqual(_dcp_backend(num_draft_tokens=6).cprr_kernel_heads, 96)
         self.assertEqual(_dcp_backend(num_draft_tokens=8).cprr_kernel_heads, 128)
+
+    def test_broken_aiter_raises(self):
+        # Only the documented argument errors fall back; a broken aiter build stops startup.
+        self._query(_failing_query)
+        with self.assertRaises(RuntimeError):
+            _dcp_backend(num_draft_tokens=8)
+
+    def test_ask_aiter_does_not_follow_the_persist_flag(self):
+        # __init__'s persist block runs after _init_cprr_verify and may turn
+        # _use_mla_ps_kernel off from these answers; the ask decision must not
+        # depend on the order, and the cached answers must not go stale.
+        support = self._query(_ShapeSupport({(96, 8), (128, 8)}))
+        with patch.object(aiter_backend, "_use_mla_ps_kernel", False):
+            backend = _dcp_backend(num_draft_tokens=8)
+            self.assertFalse(backend._asm_cprr_verify_enabled())
+            self.assertFalse(backend._asm_cprr_supports_verify_shape(8))
+        self.assertTrue(backend._cprr_ask_aiter)
+        self.assertEqual(backend.cprr_kernel_heads, 96)
+        self.assertEqual(len(support.calls), 1)
+        # Persist on (the module default): the same backend now runs the asm verify.
+        self.assertTrue(backend._asm_cprr_supports_verify_shape(8))
 
     def test_table_decides_where_aiter_cannot(self):
         # aiter cannot confirm a kernel on gfx950 (supported=None), or has no query.

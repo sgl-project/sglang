@@ -166,7 +166,7 @@ from sglang.kernels.ops.kvcache.shuffle_5d_cache import (
     launch_gather_shuffle_5d_to_linear,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, scaled_fp8_quant
-from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.aiter_mla_gluon import (
     log_mla_gluon_capability,
@@ -218,8 +218,10 @@ _MLA_ASM_PS_MAX_QLEN = 4
 # count as native, on gfx950 with an fp8 query and KV. None means any length.
 # The keys are also the head counts a gathered query may be padded to.
 # Copied from natively_supported in aiter/ops/attention.py. It decides where aiter
-# is not asked (off the asm verify route, before ROCm/aiter#6107, a failed query),
-# and on gfx950 where aiter cannot confirm a kernel; never against aiter's fold. See
+# is not asked (off the asm verify route, before ROCm/aiter#6107), and on gfx950
+# where aiter cannot confirm a kernel; never against aiter's fold. Once sglang
+# requires an aiter with get_mla_decode_shape_support, keep only the candidate
+# head counts and drop the query lengths. See
 # https://github.com/ROCm/aiter/blob/bf37db00749722ae29ac27c101f534da43c586f5/aiter/ops/attention.py#L1669-L1706
 _MLA_ASM_CPRR_NATIVE_QLENS = {
     16: None,
@@ -257,7 +259,9 @@ def _asm_cprr_shape_verdict(
             fast_mode=fast_mode,
             intra_batch_mode=intra_batch_mode,
         )
-    except Exception as e:  # an aiter that rejects the query must not stop startup
+    except (TypeError, ValueError) as e:
+        # What get_mla_decode_shape_support raises for arguments it cannot
+        # describe (e.g. a dtype or keyword this aiter does not know).
         logger.warning(
             "aiter cannot describe the DCP verify at %d heads and q_len %d; "
             "the copied table decides: %r",
@@ -900,7 +904,9 @@ class AiterAttnBackend(AttentionBackend):
             self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
                 -1
             ]
-        self._init_cprr_verify(model_config=model_runner.model_config)
+        self._init_cprr_verify(
+            kv_lora_rank=model_runner.model_config.kv_lora_rank if self.use_mla else 0
+        )
 
         # The asm fp8 prefill reduces through mla_reduce_v1, which only has
         # instantiations for the head shapes in _MLA_REDUCE_V1_HEADS; anything
@@ -2328,14 +2334,21 @@ class AiterAttnBackend(AttentionBackend):
             and is_gfx95_supported()
         )
 
-    def _asm_cprr_verify_enabled(self) -> bool:
-        """Whether this topology may run DCP target verify on the asm cp kernel."""
+    def _asm_cprr_verify_requested(self) -> bool:
+        """Whether this topology asks for DCP target verify on the asm cp kernel.
+
+        Fixed for the backend's lifetime, unlike _use_mla_ps_kernel, which the
+        persist block of __init__ may still turn off from the answer to this.
+        """
         return (
-            _use_mla_ps_kernel
-            and self.mla_verify_backend == "asm"
+            self.mla_verify_backend == "asm"
             and self.dcp_world_size > 1
             and self.kv_cache_dtype == fp8_dtype
         )
+
+    def _asm_cprr_verify_enabled(self) -> bool:
+        """Whether this topology may run DCP target verify on the asm cp kernel."""
+        return _use_mla_ps_kernel and self._asm_cprr_verify_requested()
 
     def _asm_cprr_supports_verify_shape(self, q_len: Optional[int]) -> bool:
         """Whether this topology has an asm cp kernel for DCP target verify."""
@@ -2345,19 +2358,21 @@ class AiterAttnBackend(AttentionBackend):
             and self._asm_cprr_supports(self.cprr_kernel_heads, q_len)
         )
 
-    def _init_cprr_verify(self, *, model_config: ModelConfig) -> None:
+    def _init_cprr_verify(self, *, kv_lora_rank: int) -> None:
         """Pick the head count the MLA DCP target verify pads its gathered query to."""
         self._cprr_supports_cache: dict[tuple[int, int], tuple[bool, str]] = {}
         self.cprr_v_head_dim = 0
         self.cprr_kernel_heads = 0
         # Only the asm cp verify launches aiter's kernel, so only it asks aiter;
-        # elsewhere the copied table decides.
+        # elsewhere the copied table decides. Decided from the request, not from
+        # _use_mla_ps_kernel: the persist block runs after this and may turn
+        # persist off from these answers.
         self._cprr_ask_aiter = False
         if not (self.use_mla and self.dcp_world_size > 1):
             return
         # The absorbed verify writes the kv_lora_rank-wide latent, not v_head_dim.
-        self.cprr_v_head_dim = model_config.kv_lora_rank
-        self._cprr_ask_aiter = self._asm_cprr_verify_enabled()
+        self.cprr_v_head_dim = kv_lora_rank
+        self._cprr_ask_aiter = self._asm_cprr_verify_requested()
         self.cprr_kernel_heads = _asm_cprr_kernel_heads(
             self.num_head * self.dcp_world_size,
             lambda heads: self._asm_cprr_supports(heads, self.num_draft_tokens or 1),
