@@ -10,6 +10,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
     DecodePrefixMatch,
+    HiCacheRestoreResult,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -103,6 +104,56 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
         tree_cache.path_device_indices.assert_called_once_with("restored")
         self.assertEqual(decode_req.hicache_restored_kv_indices.tolist(), [12, 13])
         tree_cache.lock.assert_called_once_with("restored")
+
+    def test_deferred_load_back_keeps_the_restore_pending(self):
+        rematch = SimpleNamespace(
+            device_prefix_len=2,
+            last_device_node="rematched",
+            best_match_node="anchor",
+            host_hit_length=0,
+        )
+        tree_cache = SimpleNamespace(
+            tree_core=SimpleNamespace(is_eagle=False),
+            match_prefix=Mock(return_value=rematch),
+            init_load_back=Mock(return_value=None),
+            path_device_indices=Mock(),
+            lock=Mock(),
+        )
+        harness = SimpleNamespace(tree_cache=tree_cache)
+        req = SimpleNamespace(
+            rid="req-0",
+            cache_request_handle=CacheRequestHandle("req-0", 0),
+            origin_input_ids=[0, 1, 2, 3, 4, 5],
+            last_node="prealloc",
+        )
+        prefix_match = DecodePrefixMatch(
+            prefix_indices=torch.tensor([10, 11]),
+            l2_host_hit_length=2,
+            l3_storage_hit_length=0,
+            last_device_node="prealloc",
+        )
+        decode_req = SimpleNamespace(
+            req=req,
+            prefix_match=prefix_match,
+            hicache_restore_status=HiCacheRestoreResult.PENDING,
+            hicache_restore_lock=None,
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.decode_hicache_mixin._req_radix_key",
+            return_value="key",
+        ):
+            queued = DecodeHiCacheTransferMixin._try_hicache_queue_load_back(
+                harness, decode_req
+            )
+
+        self.assertFalse(queued)
+        self.assertEqual(
+            decode_req.hicache_restore_status, HiCacheRestoreResult.PENDING
+        )
+        self.assertIsNone(decode_req.hicache_restore_lock)
+        self.assertEqual(req.last_node, "prealloc")
+        tree_cache.lock.assert_not_called()
 
 
 if __name__ == "__main__":
