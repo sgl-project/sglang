@@ -326,6 +326,48 @@ impl SglangService for Mock {
         unimplemented!()
     }
 
+    async fn open_ai_embeddings(
+        &self,
+        _: Request<api::OpenAiEmbeddingRequest>,
+    ) -> Result<Response<api::OpenAiEmbeddingResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_classify(
+        &self,
+        _: Request<api::OpenAiClassifyRequest>,
+    ) -> Result<Response<api::OpenAiClassifyResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_score(
+        &self,
+        _: Request<api::OpenAiScoreRequest>,
+    ) -> Result<Response<api::OpenAiScoreResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_rerank(
+        &self,
+        _: Request<api::OpenAiRerankRequest>,
+    ) -> Result<Response<api::OpenAiRerankResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_tokenize(
+        &self,
+        _: Request<api::OpenAiTokenizeRequest>,
+    ) -> Result<Response<api::OpenAiTokenizeResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_detokenize(
+        &self,
+        _: Request<api::OpenAiDetokenizeRequest>,
+    ) -> Result<Response<api::OpenAiDetokenizeResponse>, Status> {
+        unimplemented!()
+    }
+
     type OpenAiStreamCompletionsStream = ItemStreamOf<api::OpenAiCompletionStreamResponse>;
 
     async fn open_ai_stream_completions(

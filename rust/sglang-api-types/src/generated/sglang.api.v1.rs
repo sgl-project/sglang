@@ -2822,6 +2822,355 @@ pub struct OpenAiChatCompletionStreamResponse {
     #[prost(message, optional, tag = "7")]
     pub sglext: ::core::option::Option<OpenAiSglExt>,
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiMultimodalEmbeddingInput {
+    #[prost(string, optional, tag = "1")]
+    pub text: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub image: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "3")]
+    pub video: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiMultimodalEmbeddingInputList {
+    #[prost(message, repeated, tag = "1")]
+    pub items: ::prost::alloc::vec::Vec<OpenAiMultimodalEmbeddingInput>,
+}
+/// `input`: text, texts, token ids, token-id lists, or multimodal items.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiEmbeddingInput {
+    #[prost(oneof = "open_ai_embedding_input::Value", tags = "1, 2, 3, 4, 5")]
+    pub value: ::core::option::Option<open_ai_embedding_input::Value>,
+}
+/// Nested message and enum types in `OpenAiEmbeddingInput`.
+pub mod open_ai_embedding_input {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(string, tag = "1")]
+        Text(::prost::alloc::string::String),
+        #[prost(message, tag = "2")]
+        Texts(super::StringList),
+        #[prost(message, tag = "3")]
+        Ids(super::TokenIds),
+        #[prost(message, tag = "4")]
+        IdsList(super::TokenIdsList),
+        #[prost(message, tag = "5")]
+        Multimodal(super::OpenAiMultimodalEmbeddingInputList),
+    }
+}
+/// `POST /v1/embeddings`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiEmbeddingRequest {
+    #[prost(message, optional, tag = "1")]
+    pub input: ::core::option::Option<OpenAiEmbeddingInput>,
+    #[prost(string, optional, tag = "2")]
+    pub model: ::core::option::Option<::prost::alloc::string::String>,
+    /// "float" | "base64".
+    #[prost(string, optional, tag = "3")]
+    pub encoding_format: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "4")]
+    pub dimensions: ::core::option::Option<i64>,
+    #[prost(string, optional, tag = "5")]
+    pub user: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "6")]
+    pub rid: ::core::option::Option<StringOrList>,
+    #[prost(int64, optional, tag = "7")]
+    pub priority: ::core::option::Option<i64>,
+    #[prost(message, optional, tag = "8")]
+    pub lora_path: ::core::option::Option<OptionalStringOrList>,
+    #[prost(int64, optional, tag = "9")]
+    pub embed_override_token_id: ::core::option::Option<i64>,
+    /// One `[num_replacements][hidden]` matrix per input, or null to skip it.
+    #[prost(string, repeated, tag = "10")]
+    pub embed_overrides: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// `embedding`: floats, or base64 with `encoding_format` "base64".
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiEmbeddingVector {
+    #[prost(oneof = "open_ai_embedding_vector::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<open_ai_embedding_vector::Value>,
+}
+/// Nested message and enum types in `OpenAiEmbeddingVector`.
+pub mod open_ai_embedding_vector {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(message, tag = "1")]
+        Floats(super::DoubleList),
+        #[prost(string, tag = "2")]
+        Base64(::prost::alloc::string::String),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiEmbeddingObject {
+    #[prost(message, optional, tag = "1")]
+    pub embedding: ::core::option::Option<OpenAiEmbeddingVector>,
+    #[prost(int64, tag = "2")]
+    pub index: i64,
+    #[prost(string, tag = "3")]
+    pub object: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiEmbeddingResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub data: ::prost::alloc::vec::Vec<OpenAiEmbeddingObject>,
+    #[prost(string, tag = "2")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub object: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "4")]
+    pub usage: ::core::option::Option<OpenAiUsage>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiClassifyInput {
+    #[prost(oneof = "open_ai_classify_input::Value", tags = "1, 2, 3")]
+    pub value: ::core::option::Option<open_ai_classify_input::Value>,
+}
+/// Nested message and enum types in `OpenAiClassifyInput`.
+pub mod open_ai_classify_input {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(string, tag = "1")]
+        Text(::prost::alloc::string::String),
+        #[prost(message, tag = "2")]
+        Texts(super::StringList),
+        #[prost(message, tag = "3")]
+        Ids(super::TokenIds),
+    }
+}
+/// `POST /v1/classify`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiClassifyRequest {
+    #[prost(string, optional, tag = "1")]
+    pub model: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "2")]
+    pub input: ::core::option::Option<OpenAiClassifyInput>,
+    #[prost(string, optional, tag = "3")]
+    pub user: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "4")]
+    pub rid: ::core::option::Option<StringOrList>,
+    #[prost(int64, optional, tag = "5")]
+    pub priority: ::core::option::Option<i64>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiClassifyData {
+    #[prost(int64, tag = "1")]
+    pub index: i64,
+    #[prost(string, tag = "2")]
+    pub label: ::prost::alloc::string::String,
+    #[prost(double, repeated, tag = "3")]
+    pub probs: ::prost::alloc::vec::Vec<f64>,
+    #[prost(int64, tag = "4")]
+    pub num_classes: i64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiClassifyResponse {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub object: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub created: i64,
+    #[prost(string, tag = "4")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "5")]
+    pub data: ::prost::alloc::vec::Vec<OpenAiClassifyData>,
+    #[prost(message, optional, tag = "6")]
+    pub usage: ::core::option::Option<OpenAiUsage>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiScoreQuery {
+    #[prost(oneof = "open_ai_score_query::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<open_ai_score_query::Value>,
+}
+/// Nested message and enum types in `OpenAiScoreQuery`.
+pub mod open_ai_score_query {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(string, tag = "1")]
+        Text(::prost::alloc::string::String),
+        #[prost(message, tag = "2")]
+        Ids(super::TokenIds),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiScoreItems {
+    #[prost(oneof = "open_ai_score_items::Value", tags = "1, 2, 3")]
+    pub value: ::core::option::Option<open_ai_score_items::Value>,
+}
+/// Nested message and enum types in `OpenAiScoreItems`.
+pub mod open_ai_score_items {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(string, tag = "1")]
+        Text(::prost::alloc::string::String),
+        #[prost(message, tag = "2")]
+        Texts(super::StringList),
+        #[prost(message, tag = "3")]
+        IdsList(super::TokenIdsList),
+    }
+}
+/// `POST /v1/score`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiScoreRequest {
+    #[prost(message, optional, tag = "1")]
+    pub query: ::core::option::Option<OpenAiScoreQuery>,
+    #[prost(message, optional, tag = "2")]
+    pub items: ::core::option::Option<OpenAiScoreItems>,
+    #[prost(int64, optional, tag = "3")]
+    pub embed_override_token_id: ::core::option::Option<i64>,
+    /// `[num_query_embed_overrides][hidden]`.
+    #[prost(message, repeated, tag = "4")]
+    pub query_embed_overrides: ::prost::alloc::vec::Vec<DoubleList>,
+    /// One `[num_item_embed_overrides][hidden]` matrix per item, or null.
+    #[prost(string, repeated, tag = "5")]
+    pub item_embed_overrides: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Shared candidates, or one candidate list per item.
+    #[prost(message, optional, tag = "6")]
+    pub label_token_ids: ::core::option::Option<TokenIdsOrList>,
+    #[prost(bool, tag = "7")]
+    pub apply_softmax: bool,
+    #[prost(double, optional, tag = "8")]
+    pub temperature: ::core::option::Option<f64>,
+    #[prost(bool, tag = "9")]
+    pub return_token_logprobs: bool,
+    #[prost(bool, tag = "10")]
+    pub item_first: bool,
+    #[prost(bool, tag = "11")]
+    pub return_pooled_hidden_states: bool,
+    /// Setwise readout: score at every occurrence of this token instead of the
+    /// last position; `scores` is then nested per item.
+    #[prost(string, optional, tag = "12")]
+    pub score_extraction_token: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "13")]
+    pub model: ::core::option::Option<::prost::alloc::string::String>,
+    /// The base rid; each item's request is `<rid>_<i>`, as Python expands it.
+    #[prost(string, optional, tag = "14")]
+    pub rid: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `[num_rows][num_labels]`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiScoreMatrix {
+    #[prost(message, repeated, tag = "1")]
+    pub rows: ::prost::alloc::vec::Vec<DoubleList>,
+}
+/// One matrix per item (setwise).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiScoreMatrixList {
+    #[prost(message, repeated, tag = "1")]
+    pub items: ::prost::alloc::vec::Vec<OpenAiScoreMatrix>,
+}
+/// `scores`: pointwise `[rows][labels]` or setwise `[items][rows][labels]`;
+/// the nesting depth tells them apart.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiScores {
+    #[prost(oneof = "open_ai_scores::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<open_ai_scores::Value>,
+}
+/// Nested message and enum types in `OpenAiScores`.
+pub mod open_ai_scores {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(message, tag = "1")]
+        Pointwise(super::OpenAiScoreMatrix),
+        #[prost(message, tag = "2")]
+        Setwise(super::OpenAiScoreMatrixList),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiScoreResponse {
+    #[prost(message, optional, tag = "1")]
+    pub scores: ::core::option::Option<OpenAiScores>,
+    /// Parallel to `scores`, rows nullable: `[rows][hidden]` or
+    /// `[items][rows][hidden]`.
+    #[prost(string, optional, tag = "2")]
+    pub pooled_hidden_states: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "3")]
+    pub token_logprobs: ::prost::alloc::vec::Vec<DoubleList>,
+    #[prost(string, tag = "4")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "5")]
+    pub usage: ::core::option::Option<OpenAiUsage>,
+    #[prost(string, tag = "6")]
+    pub object: ::prost::alloc::string::String,
+}
+/// `POST /v1/rerank` (`V1RerankReqInput`): text or multimodal parts.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiRerankRequest {
+    #[prost(message, optional, tag = "1")]
+    pub query: ::core::option::Option<OpenAiChatContent>,
+    #[prost(message, repeated, tag = "2")]
+    pub documents: ::prost::alloc::vec::Vec<OpenAiChatContent>,
+    #[prost(string, optional, tag = "3")]
+    pub instruct: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "4")]
+    pub top_n: ::core::option::Option<i64>,
+    #[prost(bool, optional, tag = "5")]
+    pub return_documents: ::core::option::Option<bool>,
+}
+/// One ranked document; the route answers a list of these.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiRerankResult {
+    #[prost(double, tag = "1")]
+    pub score: f64,
+    #[prost(string, optional, tag = "2")]
+    pub document: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, tag = "3")]
+    pub index: i64,
+    #[prost(string, optional, tag = "4")]
+    pub meta_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiRerankResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub items: ::prost::alloc::vec::Vec<OpenAiRerankResult>,
+}
+/// `POST /v1/tokenize`: exactly one of `prompt` or `messages`; the chat form
+/// renders the template with the tool and reasoning settings.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiTokenizeRequest {
+    #[prost(string, optional, tag = "1")]
+    pub model: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "2")]
+    pub prompt: ::core::option::Option<StringOrList>,
+    #[prost(message, repeated, tag = "3")]
+    pub messages: ::prost::alloc::vec::Vec<OpenAiChatMessage>,
+    #[prost(message, repeated, tag = "4")]
+    pub tools: ::prost::alloc::vec::Vec<OpenAiTool>,
+    #[prost(message, optional, tag = "5")]
+    pub tool_choice: ::core::option::Option<OpenAiToolChoice>,
+    #[prost(message, optional, tag = "6")]
+    pub reasoning_effort: ::core::option::Option<OpenAiReasoningEffort>,
+    #[prost(bool, tag = "7")]
+    pub continue_final_message: bool,
+    #[prost(string, optional, tag = "8")]
+    pub chat_template_kwargs: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "9")]
+    pub add_special_tokens: ::core::option::Option<bool>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiTokenizeResponse {
+    #[prost(message, optional, tag = "1")]
+    pub tokens: ::core::option::Option<TokenIdsOrList>,
+    #[prost(message, optional, tag = "2")]
+    pub count: ::core::option::Option<Int64OrList>,
+    #[prost(int64, tag = "3")]
+    pub max_model_len: i64,
+}
+/// `POST /v1/detokenize`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiDetokenizeRequest {
+    #[prost(string, optional, tag = "1")]
+    pub model: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "2")]
+    pub tokens: ::core::option::Option<TokenIdsOrList>,
+    #[prost(bool, optional, tag = "3")]
+    pub skip_special_tokens: ::core::option::Option<bool>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiDetokenizeResponse {
+    #[prost(message, optional, tag = "1")]
+    pub text: ::core::option::Option<StringOrList>,
+}
 /// `/parse_function_call`.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ParseFunctionCallRequest {

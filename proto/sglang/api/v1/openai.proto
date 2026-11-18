@@ -685,3 +685,271 @@ message OpenAiChatCompletionStreamResponse {
   optional OpenAiUsage usage = 6 [(sglang.json.v1.field_json).emit_null_when_absent = true];
   optional OpenAiSglExt sglext = 7;
 }
+
+// ---- Embeddings ----------------------------------------------------------------
+
+message OpenAiMultimodalEmbeddingInput {
+  optional string text = 1;
+  optional string image = 2;
+  optional string video = 3;
+}
+
+message OpenAiMultimodalEmbeddingInputList {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated OpenAiMultimodalEmbeddingInput items = 1;
+}
+
+// `input`: text, texts, token ids, token-id lists, or multimodal items.
+message OpenAiEmbeddingInput {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_UNTAGGED;
+    string text = 1;
+    StringList texts = 2;
+    TokenIds ids = 3;
+    TokenIdsList ids_list = 4;
+    OpenAiMultimodalEmbeddingInputList multimodal = 5;
+  }
+}
+
+// `POST /v1/embeddings`.
+message OpenAiEmbeddingRequest {
+  OpenAiEmbeddingInput input = 1;
+  optional string model = 2 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "default"
+  ];
+  // "float" | "base64".
+  optional string encoding_format = 3 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "float"
+  ];
+  optional int64 dimensions = 4;
+  optional string user = 5;
+  optional StringOrList rid = 6;
+  optional int64 priority = 7;
+  optional OptionalStringOrList lora_path = 8;
+  optional int64 embed_override_token_id = 9;
+  // One `[num_replacements][hidden]` matrix per input, or null to skip it.
+  repeated string embed_overrides = 10 [(sglang.json.v1.field_json).raw_json = true];
+}
+
+// `embedding`: floats, or base64 with `encoding_format` "base64".
+message OpenAiEmbeddingVector {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_UNTAGGED;
+    DoubleList floats = 1;
+    string base64 = 2;
+  }
+}
+
+message OpenAiEmbeddingObject {
+  OpenAiEmbeddingVector embedding = 1;
+  int64 index = 2;
+  string object = 3;
+}
+
+message OpenAiEmbeddingResponse {
+  repeated OpenAiEmbeddingObject data = 1;
+  string model = 2;
+  string object = 3;
+  optional OpenAiUsage usage = 4 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+}
+
+// ---- Classify --------------------------------------------------------------------
+
+message OpenAiClassifyInput {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_UNTAGGED;
+    string text = 1;
+    StringList texts = 2;
+    TokenIds ids = 3;
+  }
+}
+
+// `POST /v1/classify`.
+message OpenAiClassifyRequest {
+  optional string model = 1 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "default"
+  ];
+  OpenAiClassifyInput input = 2;
+  optional string user = 3;
+  optional StringOrList rid = 4;
+  optional int64 priority = 5;
+}
+
+message OpenAiClassifyData {
+  int64 index = 1;
+  string label = 2;
+  repeated double probs = 3;
+  int64 num_classes = 4;
+}
+
+message OpenAiClassifyResponse {
+  string id = 1;
+  string object = 2;
+  int64 created = 3;
+  string model = 4;
+  repeated OpenAiClassifyData data = 5;
+  OpenAiUsage usage = 6;
+}
+
+// ---- Score -----------------------------------------------------------------------
+
+message OpenAiScoreQuery {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_UNTAGGED;
+    string text = 1;
+    TokenIds ids = 2;
+  }
+}
+
+message OpenAiScoreItems {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_UNTAGGED;
+    string text = 1;
+    StringList texts = 2;
+    TokenIdsList ids_list = 3;
+  }
+}
+
+// `POST /v1/score`.
+message OpenAiScoreRequest {
+  optional OpenAiScoreQuery query = 1;
+  optional OpenAiScoreItems items = 2;
+  optional int64 embed_override_token_id = 3;
+  // `[num_query_embed_overrides][hidden]`.
+  repeated DoubleList query_embed_overrides = 4;
+  // One `[num_item_embed_overrides][hidden]` matrix per item, or null.
+  repeated string item_embed_overrides = 5 [(sglang.json.v1.field_json).raw_json = true];
+  // Shared candidates, or one candidate list per item.
+  optional TokenIdsOrList label_token_ids = 6;
+  bool apply_softmax = 7;
+  optional double temperature = 8 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_f64 = 1.0
+  ];
+  bool return_token_logprobs = 9;
+  bool item_first = 10;
+  bool return_pooled_hidden_states = 11;
+  // Setwise readout: score at every occurrence of this token instead of the
+  // last position; `scores` is then nested per item.
+  optional string score_extraction_token = 12;
+  optional string model = 13 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "default"
+  ];
+  // The base rid; each item's request is `<rid>_<i>`, as Python expands it.
+  optional string rid = 14;
+}
+
+// `[num_rows][num_labels]`.
+message OpenAiScoreMatrix {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated DoubleList rows = 1;
+}
+
+// One matrix per item (setwise).
+message OpenAiScoreMatrixList {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated OpenAiScoreMatrix items = 1;
+}
+
+// `scores`: pointwise `[rows][labels]` or setwise `[items][rows][labels]`;
+// the nesting depth tells them apart.
+message OpenAiScores {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_UNTAGGED;
+    OpenAiScoreMatrix pointwise = 1;
+    OpenAiScoreMatrixList setwise = 2;
+  }
+}
+
+message OpenAiScoreResponse {
+  OpenAiScores scores = 1;
+  // Parallel to `scores`, rows nullable: `[rows][hidden]` or
+  // `[items][rows][hidden]`.
+  optional string pooled_hidden_states = 2 [
+    (sglang.json.v1.field_json).raw_json = true,
+    (sglang.json.v1.field_json).emit_null_when_absent = true
+  ];
+  repeated DoubleList token_logprobs = 3;
+  string model = 4;
+  optional OpenAiUsage usage = 5 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  string object = 6;
+}
+
+// ---- Rerank ----------------------------------------------------------------------
+
+// `POST /v1/rerank` (`V1RerankReqInput`): text or multimodal parts.
+message OpenAiRerankRequest {
+  OpenAiChatContent query = 1;
+  repeated OpenAiChatContent documents = 2;
+  optional string instruct = 3;
+  optional int64 top_n = 4;
+  optional bool return_documents = 5 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_bool = true
+  ];
+}
+
+// One ranked document; the route answers a list of these.
+message OpenAiRerankResult {
+  double score = 1;
+  optional string document = 2;
+  int64 index = 3;
+  optional string meta_info = 4 [
+    (sglang.json.v1.field_json).raw_json = true,
+    (sglang.json.v1.field_json).emit_null_when_absent = true
+  ];
+}
+
+message OpenAiRerankResponse {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated OpenAiRerankResult items = 1;
+}
+
+// ---- Tokenize / detokenize -------------------------------------------------------
+
+// `POST /v1/tokenize`: exactly one of `prompt` or `messages`; the chat form
+// renders the template with the tool and reasoning settings.
+message OpenAiTokenizeRequest {
+  optional string model = 1 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "default"
+  ];
+  optional StringOrList prompt = 2;
+  repeated OpenAiChatMessage messages = 3;
+  repeated OpenAiTool tools = 4;
+  optional OpenAiToolChoice tool_choice = 5;
+  optional OpenAiReasoningEffort reasoning_effort = 6;
+  bool continue_final_message = 7;
+  optional string chat_template_kwargs = 8 [(sglang.json.v1.field_json).raw_json = true];
+  optional bool add_special_tokens = 9 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_bool = true
+  ];
+}
+
+message OpenAiTokenizeResponse {
+  TokenIdsOrList tokens = 1;
+  Int64OrList count = 2;
+  int64 max_model_len = 3;
+}
+
+// `POST /v1/detokenize`.
+message OpenAiDetokenizeRequest {
+  optional string model = 1 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "default"
+  ];
+  TokenIdsOrList tokens = 2;
+  optional bool skip_special_tokens = 3 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_bool = true
+  ];
+}
+
+message OpenAiDetokenizeResponse {
+  StringOrList text = 1;
+}

@@ -1332,6 +1332,116 @@ pub mod sglang_service_client {
             ));
             self.inner.server_streaming(req, path, codec).await
         }
+        pub async fn open_ai_embeddings(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OpenAiEmbeddingRequest>,
+        ) -> std::result::Result<tonic::Response<super::OpenAiEmbeddingResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/OpenAiEmbeddings",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "OpenAiEmbeddings",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn open_ai_classify(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OpenAiClassifyRequest>,
+        ) -> std::result::Result<tonic::Response<super::OpenAiClassifyResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/OpenAiClassify");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "OpenAiClassify",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn open_ai_score(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OpenAiScoreRequest>,
+        ) -> std::result::Result<tonic::Response<super::OpenAiScoreResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/OpenAiScore");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "OpenAiScore",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn open_ai_rerank(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OpenAiRerankRequest>,
+        ) -> std::result::Result<tonic::Response<super::OpenAiRerankResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/OpenAiRerank");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "OpenAiRerank",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn open_ai_tokenize(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OpenAiTokenizeRequest>,
+        ) -> std::result::Result<tonic::Response<super::OpenAiTokenizeResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/OpenAiTokenize");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "OpenAiTokenize",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn open_ai_detokenize(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OpenAiDetokenizeRequest>,
+        ) -> std::result::Result<tonic::Response<super::OpenAiDetokenizeResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/OpenAiDetokenize",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "OpenAiDetokenize",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1705,6 +1815,30 @@ pub mod sglang_service_server {
             tonic::Response<Self::OpenAiStreamChatCompletionsStream>,
             tonic::Status,
         >;
+        async fn open_ai_embeddings(
+            &self,
+            request: tonic::Request<super::OpenAiEmbeddingRequest>,
+        ) -> std::result::Result<tonic::Response<super::OpenAiEmbeddingResponse>, tonic::Status>;
+        async fn open_ai_classify(
+            &self,
+            request: tonic::Request<super::OpenAiClassifyRequest>,
+        ) -> std::result::Result<tonic::Response<super::OpenAiClassifyResponse>, tonic::Status>;
+        async fn open_ai_score(
+            &self,
+            request: tonic::Request<super::OpenAiScoreRequest>,
+        ) -> std::result::Result<tonic::Response<super::OpenAiScoreResponse>, tonic::Status>;
+        async fn open_ai_rerank(
+            &self,
+            request: tonic::Request<super::OpenAiRerankRequest>,
+        ) -> std::result::Result<tonic::Response<super::OpenAiRerankResponse>, tonic::Status>;
+        async fn open_ai_tokenize(
+            &self,
+            request: tonic::Request<super::OpenAiTokenizeRequest>,
+        ) -> std::result::Result<tonic::Response<super::OpenAiTokenizeResponse>, tonic::Status>;
+        async fn open_ai_detokenize(
+            &self,
+            request: tonic::Request<super::OpenAiDetokenizeRequest>,
+        ) -> std::result::Result<tonic::Response<super::OpenAiDetokenizeResponse>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct SglangServiceServer<T> {
@@ -4482,6 +4616,254 @@ pub mod sglang_service_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/OpenAiEmbeddings" => {
+                    #[allow(non_camel_case_types)]
+                    struct OpenAiEmbeddingsSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::OpenAiEmbeddingRequest>
+                        for OpenAiEmbeddingsSvc<T>
+                    {
+                        type Response = super::OpenAiEmbeddingResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OpenAiEmbeddingRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::open_ai_embeddings(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OpenAiEmbeddingsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/OpenAiClassify" => {
+                    #[allow(non_camel_case_types)]
+                    struct OpenAiClassifySvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::OpenAiClassifyRequest>
+                        for OpenAiClassifySvc<T>
+                    {
+                        type Response = super::OpenAiClassifyResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OpenAiClassifyRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::open_ai_classify(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OpenAiClassifySvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/OpenAiScore" => {
+                    #[allow(non_camel_case_types)]
+                    struct OpenAiScoreSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::OpenAiScoreRequest>
+                        for OpenAiScoreSvc<T>
+                    {
+                        type Response = super::OpenAiScoreResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OpenAiScoreRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::open_ai_score(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OpenAiScoreSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/OpenAiRerank" => {
+                    #[allow(non_camel_case_types)]
+                    struct OpenAiRerankSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::OpenAiRerankRequest>
+                        for OpenAiRerankSvc<T>
+                    {
+                        type Response = super::OpenAiRerankResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OpenAiRerankRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::open_ai_rerank(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OpenAiRerankSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/OpenAiTokenize" => {
+                    #[allow(non_camel_case_types)]
+                    struct OpenAiTokenizeSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::OpenAiTokenizeRequest>
+                        for OpenAiTokenizeSvc<T>
+                    {
+                        type Response = super::OpenAiTokenizeResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OpenAiTokenizeRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::open_ai_tokenize(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OpenAiTokenizeSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/OpenAiDetokenize" => {
+                    #[allow(non_camel_case_types)]
+                    struct OpenAiDetokenizeSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::OpenAiDetokenizeRequest>
+                        for OpenAiDetokenizeSvc<T>
+                    {
+                        type Response = super::OpenAiDetokenizeResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OpenAiDetokenizeRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::open_ai_detokenize(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OpenAiDetokenizeSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)
