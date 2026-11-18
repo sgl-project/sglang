@@ -124,7 +124,9 @@ class TestMLPParallelGroups(CustomTestCase):
                                 ) as allocator,
                             ):
                                 torch.testing.assert_close(mlp(self.x), expected)
-                                allocator.assert_called_once_with(tp, disabled=False)
+                                allocator.assert_called_once_with(
+                                    tp, disabled=group == "replicated"
+                                )
                                 self.assertEqual(
                                     tp.all_reduce.call_count,
                                     1 if reduce and size > 1 else 0,
