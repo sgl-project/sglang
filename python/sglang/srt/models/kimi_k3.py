@@ -39,6 +39,7 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStatePacker,
 )
 from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
+from sglang.srt.layers.communication.kda_dwdp import KdaDwdp
 from sglang.srt.layers.cp.interleave import (
     cp_interleave_to_sequence_order,
     cp_sequence_to_interleave_order,
@@ -150,6 +151,7 @@ from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
     get_exec,
+    get_model,
     get_parallel,
     get_platform,
     get_spec,
@@ -535,6 +537,20 @@ def _uses_ep_a2a() -> bool:
     )
 
 
+def _shared_experts_tp_size() -> Optional[int]:
+    parallel = get_parallel()
+    if (
+        parallel.shared_experts_tp_size is None
+        and parallel.enable_shared_experts_attn_tp
+    ):
+        return parallel.attn_tp_size
+    return parallel.shared_experts_tp_size
+
+
+def _replicates_shared_experts() -> bool:
+    return _uses_ep_a2a() and _shared_experts_tp_size() in (None, 1)
+
+
 class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
     """K3 MoE with Latent MoE (experts run in moe_hidden_size space)."""
 
@@ -545,6 +561,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         prefix: str = "",
         layer_idx: int = 0,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        kda_dwdp: Optional[KdaDwdp] = None,
     ):
         super().__init__()
         # K3 allocates one weight slot per logical expert. Online relocation
@@ -692,12 +709,10 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         # the shared-expert TP subgroup and reduce-scatter back to those rows.
         parallel = get_parallel()
         requested_shared_tp = parallel.shared_experts_tp_size
-        shared_tp = requested_shared_tp
-        if shared_tp is None and parallel.enable_shared_experts_attn_tp:
-            shared_tp = parallel.attn_tp_size
+        shared_tp = _shared_experts_tp_size()
         if requested_shared_tp is not None and not self._ep_a2a:
             raise ValueError("Independent shared-expert TP requires an EP a2a backend.")
-        self._shared_experts_tp1 = self._ep_a2a and shared_tp in (None, 1)
+        self._shared_experts_tp1 = _replicates_shared_experts()
         self._shared_experts_tp_comm = (
             self._ep_a2a and shared_tp is not None and shared_tp > 1
         )
@@ -737,6 +752,13 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
                 parallel_group=shared_experts_parallel_group,
             )
+            if kda_dwdp is not None and kda_dwdp.shared is not None:
+                kda_dwdp.shared.bind_pair(
+                    layer_idx,
+                    owner=self.shared_experts,
+                    in_proj=self.shared_experts.gate_up_proj,
+                    out_proj=self.shared_experts.down_proj,
+                )
         else:
             self.shared_experts = None
 
@@ -1847,6 +1869,7 @@ class KimiK3DeltaAttention(nn.Module):
         all_reduce_fusion: bool = False,
         bfa_alt_stream: Optional[torch.cuda.Stream] = None,
         sp_moe: bool = False,
+        kda_dwdp: Optional[KdaDwdp] = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -2142,6 +2165,19 @@ class KimiK3DeltaAttention(nn.Module):
         self._kda_hip_fused_decode_ready = False
         if sp_moe:
             _route_sp_o_proj_output(self.o_proj)
+        self._kda_dwdp = kda_dwdp is not None
+        if self._kda_dwdp:
+            if not self.use_full_rank_gate or self.head_group != "attn_tp":
+                raise ValueError(
+                    "KDA DWDP covers the full-rank-gate K3 layer sharded over attention "
+                    f"TP (full_rank_gate={self.use_full_rank_gate}, group={self.head_group})"
+                )
+            kda_dwdp.kda.bind_pair(
+                layer_idx,
+                owner=self,
+                in_proj=self.fused_qkvg_proj,
+                out_proj=self.o_proj,
+            )
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -2219,7 +2255,7 @@ class KimiK3DeltaAttention(nn.Module):
 
         Returns False when the fusion does not apply, leaving the caller to do
         the plain [f_a | b] merge."""
-        if not self._may_fuse_kda_inproj():
+        if self._kda_dwdp or not self._may_fuse_kda_inproj():
             return False
 
         # [q,k,v,g | f_a | b | pad]; f_a/b keep the same relative order and the
@@ -2971,6 +3007,7 @@ class KimiK3DecoderLayer(nn.Module):
         prefix: str = "",
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
         attn_bank: Optional[AttnBank] = None,
+        kda_dwdp: Optional[KdaDwdp] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -2992,6 +3029,7 @@ class KimiK3DecoderLayer(nn.Module):
                 prefix=f"{prefix}.self_attn",
                 all_reduce_fusion=self.all_reduce_fusion,
                 sp_moe=self._sp_moe,
+                kda_dwdp=kda_dwdp,
                 # Shared with the MLA gate stream: KDA and MLA layers never
                 # run concurrently within one forward, so the stream is free.
                 bfa_alt_stream=(alt_streams[2] if alt_streams is not None else None),
@@ -3020,6 +3058,7 @@ class KimiK3DecoderLayer(nn.Module):
                 layer_idx=layer_idx,
                 prefix=f"{prefix}.mlp",
                 alt_stream=alt_streams[0] if alt_streams is not None else None,
+                kda_dwdp=kda_dwdp,
             )
         else:
             self.mlp = KimiK3MLP(
@@ -3062,6 +3101,11 @@ class KimiK3DecoderLayer(nn.Module):
             )
 
         self._ffn_writes_stream = _latent_moe_writes_stream(config, layer_idx)
+        self._kda_dwdp = (
+            kda_dwdp
+            if kda_dwdp is not None and kda_dwdp.needs_layer_hook(layer_idx)
+            else None
+        )
         self._declare_stages(config, layer_idx, attn_bank)
 
     def _declare_stages(self, config, layer_idx, attn_bank):
@@ -3154,6 +3198,8 @@ class KimiK3DecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
         capture_gathered: Optional[AuxHiddenStateAccumulator] = None,
     ) -> torch.Tensor:
+        if self._kda_dwdp is not None:
+            self._kda_dwdp.on_layer_start(self.layer_idx)
         hidden_states = self.attn_boundary.prepare(
             hidden_states, forward_batch, capture_gathered=capture_gathered
         )
@@ -3161,6 +3207,8 @@ class KimiK3DecoderLayer(nn.Module):
             hidden_states, positions, forward_batch, zero_allocator
         )
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        if self._kda_dwdp is not None:
+            self._kda_dwdp.wait_issued()
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         if isinstance(self.mlp, KimiK3MoE) and self.mlp._use_mega_moe:
             if is_interleave_extend(forward_batch):
@@ -3279,6 +3327,23 @@ class KimiK3LinearModel(nn.Module):
             )
         else:
             self.norm = PPMissingLayer()
+        self.kda_dwdp = None
+        dwdp_size = get_parallel().kda_dwdp_size
+        if dwdp_size is not None:
+            num_layers = config.num_hidden_layers
+            shard_shared = (
+                _replicates_shared_experts() and (config.num_shared_experts or 0) > 0
+            )
+            self.kda_dwdp = KdaDwdp(
+                group_size=dwdp_size,
+                kda_layers=[l for l in config.linear_layer_ids if l < num_layers],
+                shared_expert_layers=(
+                    [l for l in range(num_layers) if _is_moe_layer(config, l)]
+                    if shard_shared
+                    else ()
+                ),
+                dummy_load=get_model().load_format == "dummy",
+            )
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: KimiK3DecoderLayer(
@@ -3288,6 +3353,7 @@ class KimiK3LinearModel(nn.Module):
                 prefix=prefix,
                 alt_streams=self.alt_streams,
                 attn_bank=self.attn_bank,
+                kda_dwdp=self.kda_dwdp,
             ),
             prefix=f"{prefix}.layers",
             final_read=self._final_read if self.pp_group.is_last_rank else None,
@@ -3295,6 +3361,8 @@ class KimiK3LinearModel(nn.Module):
                 config, idx, sp_collective=sp_collective
             ),
         )
+        if self.kda_dwdp is not None:
+            self.kda_dwdp.build()
         if _is_gfx95:
             link_hip_paths(self)
 
@@ -3872,6 +3940,8 @@ class KimiK3LinearForCausalLM(nn.Module):
         # Also invoked by loader post-load hooks (DummyModelLoader,
         # ShardedStateLoader, remote-instance flows -- none of which call
         # load_weights), so e.g. dummy-weight benchmarks get the fused buffers.
+        if self.model.kda_dwdp is not None:
+            self.model.kda_dwdp.finish_load()
         # Post-load: absorb kv_b_proj into w_kc and w_vc for MLA layers
         for layer_id in self.config.full_attention_layer_ids:
             if layer_id >= len(self.model.layers):
