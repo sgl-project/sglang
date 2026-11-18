@@ -955,9 +955,6 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     draft modes).
     """
     from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
-    from sglang.srt.speculative.draft_worker_common import (
-        dflash_draft_reads_rows_by_position,
-    )
 
     cfg = resolving_view(server_args)
 
@@ -1055,12 +1052,14 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
                 fallback_backend,
             )
             draft_backend = fallback_backend
-    if get_platform().is_gfx95 and dflash_draft_reads_rows_by_position(
-        draft_backend, cfg.dcp_size
-    ):
+    if get_platform().is_gfx95:
         from sglang.srt.layers.attention.triton_draft_hip import check_dcp_mla_draft
+        from sglang.srt.speculative.dflash_draft_ring import (
+            dflash_draft_reads_rows_by_position,
+        )
 
-        check_dcp_mla_draft(_load_draft_hf_config(cfg))
+        if dflash_draft_reads_rows_by_position(draft_backend, cfg.dcp_size):
+            check_dcp_mla_draft(_load_draft_hf_config(cfg))
     # FIXME: avoid overriding server args directly; pass the resolved draft
     # backend to the draft worker explicitly instead.
     declare_resolution(
@@ -1072,12 +1071,12 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
 
 def _resolve_dflash_mla_draft_window(server_args: ServerArgs) -> None:
     """Runs after the draft backend is final, which it reads."""
+    from sglang.srt.speculative.dflash_draft_ring import (
+        dflash_draft_reads_rows_by_position,
+    )
     from sglang.srt.speculative.dflash_utils import (
         parse_dflash_draft_config,
         resolve_mla_draft_compact_window,
-    )
-    from sglang.srt.speculative.draft_worker_common import (
-        dflash_draft_reads_rows_by_position,
     )
 
     cfg = resolving_view(server_args)

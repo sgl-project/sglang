@@ -205,7 +205,7 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
                     "Kimi-K3.1 DCP + DSPARK requires SGLANG_RAGGED_VERIFY_MODE=static."
                 )
         if cfg.speculative_algorithm == "DFLASH":
-            from sglang.srt.speculative.draft_worker_common import (
+            from sglang.srt.speculative.dflash_draft_ring import (
                 dflash_dcp_mla_draft_backend,
             )
 
