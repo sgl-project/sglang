@@ -444,7 +444,6 @@ def test_native_label_verifier_uses_leader_only_and_checks_complete_peer_recipe(
     import copy
 
     sampling = pytest.importorskip("simopus.sdk")
-    import simopus.sdk as native_windows
     from sglang_simulator.time_predictor.dspark_progress import (
         _verify_native_progress_context,
         verify_native_progress_rows,
@@ -483,7 +482,7 @@ def test_native_label_verifier_uses_leader_only_and_checks_complete_peer_recipe(
             }
         )
     monkeypatch.setattr(
-        native_windows,
+        sampling,
         "join_native_frames",
         lambda *args, **kwargs: [{"forward_ct": 7, "participants": peers}],
     )
