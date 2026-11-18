@@ -257,9 +257,17 @@ def resolve_draft_embed_and_head(
     load_config: LoadConfig,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Embed/head to bind into a draft; a stage without the target embedding
-    loads the draft's own from the checkpoint."""
+    uses the draft's own, loading it from the checkpoint unless the draft did."""
     embed, head = resolve_target_embed_and_head(target_model, draft_model=draft_model)
-    if embed is None:
+    if embed is None and getattr(draft_model, "loaded_input_embedding", False):
+        found = find_draft_embedding_param(draft_model)
+        if found is None:
+            raise ValueError(
+                f"Draft model {draft_model.__class__.__name__} loaded an input "
+                "embedding but has no single VocabParallelEmbedding to share."
+            )
+        embed = found[1]
+    elif embed is None:
         embed = load_draft_embedding_from_checkpoint(
             draft_model, model_path, revision=revision, load_config=load_config
         )

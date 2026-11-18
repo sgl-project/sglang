@@ -15,10 +15,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.layers.cp.base import is_cp_sharded_padded
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
     get_memory,
     get_serving,
 )
@@ -114,7 +116,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         # A pure-window model keeps no full-attention prefix in LMCache.
         params.tree_slots = tuple(
             slot
-            for slot in storage.tree_slots(window_reach=params.draft_swa_window)
+            for slot in storage.tree_slots()
             if not (is_pure_swa and slot.family == TREE_TOKEN)
         )
         return LMCacheUnifiedRadixCache(
@@ -149,6 +151,13 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         return _flexkv_factory(ctx)
 
     return create_unified_radix_cache(ctx)
+
+
+def keep_full_kv_only(params: CacheInitParams, tree_slots) -> list:
+    from sglang.srt.mem_cache.kv.plan import TREE_STATE
+
+    params.request_mamba_only = True
+    return [slot for slot in tree_slots if slot.family != TREE_STATE]
 
 
 def _static_tree_shape(ctx: TreeCacheBuildContext, allocator):
@@ -190,7 +199,9 @@ def create_unified_radix_cache(
         allocator,
         shape=_static_tree_shape(ctx, allocator),
     )
-    tree_slots = list(storage.tree_slots(window_reach=params.draft_swa_window))
+    tree_slots = list(storage.tree_slots())
+    if ctx.is_hybrid_ssm and get_exec().mamba.decode_state_free_radix:
+        tree_slots = keep_full_kv_only(params, tree_slots)
 
     if hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
         from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
@@ -295,6 +306,15 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
                 f"tree_cache is {type(cache).__name__}. Drop the flag or the "
                 "option that selected another tree cache for this model."
             )
+
+    # Radix trees and streaming-session tails align and free pages, not CP groups.
+    if is_cp_sharded_padded() and (
+        not cache.disable or get_serving().enable_streaming_session
+    ):
+        raise ValueError(
+            "A sharded --cp-kv-layout does not support radix caching or streaming "
+            "sessions; set --disable-radix-cache and drop --enable-streaming-session."
+        )
 
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 

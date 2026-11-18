@@ -7,11 +7,11 @@ from typing import Any
 
 from sglang.srt.arg_groups.arg_utils import record_fields
 from sglang.srt.arg_groups.kv_shard_hook import handle_kv_cache_sharding
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.overrides import (
     _page_size_default,
     _pipeline_parallel_overlap_disable,
     _sampling_backend_default,
-    resolving_view,
     run_post_process_pass,
 )
 from sglang.srt.arg_groups.resolution_hooks import run_hook
@@ -23,6 +23,13 @@ def run_resolution_pipeline(server_args: Any) -> None:
     Keep model-independent validation before the dummy-model return. Call steps
     through ``run_hook`` so plugins can replace them without changing their order.
     """
+
+    from sglang.srt.kernel_plugins.nvidia.kimi_k31_gb_runtime_optimization import (
+        apply_k31_gb_runtime_optimization,
+    )
+
+    # Before any step reads the environment; spawned processes inherit it.
+    apply_k31_gb_runtime_optimization()
 
     # What the caller asked for, before any handler runs; this plus the
     # stash is the resolution result the projection reads.
@@ -39,33 +46,42 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     cfg = resolving_view(server_args)
 
-    from sglang.srt.arg_groups.parallel_hook import handle_deprecated_dp_attention
+    from sglang.srt.arg_groups.validation_hook import validate_removed_options
 
-    # Before any handler reads the DP layout.
-    run_hook(handle_deprecated_dp_attention, server_args)
+    run_hook(validate_removed_options, server_args)
 
     from sglang.srt.arg_groups.mega_moe_hook import handle_mega_moe
 
     run_hook(handle_mega_moe, server_args)
+
+    from sglang.srt.arg_groups.validation_hook import (
+        validate_rust_server_unsupported_args,
+    )
+
+    # Early, on the arguments as given: before the handlers below derive
+    # others from them (e.g. `--lora-paths` turning on `enable_lora`).
+    run_hook(validate_rust_server_unsupported_args, server_args)
     from sglang.srt.arg_groups.serving_hook import (
+        handle_admin_api_key_env,
         handle_asr_validation,
         handle_crash_dump_env,
         handle_debug_utils,
-        handle_deprecated_args,
         handle_environment_variables,
         handle_grammar_backend,
+        handle_grpc_args,
         handle_load_balance_method,
         handle_media_url_security,
         handle_missing_default_values,
         handle_multimodal,
         handle_other_validations,
-        handle_prefill_delayer_env_compat,
         handle_return_hidden_states_mode,
         handle_ssl_validation,
         handle_tokenizer_batching,
         handle_watermark_config,
     )
 
+    # Before any hook reads admin_api_key (the gRPC check in handle_grpc_args).
+    run_hook(handle_admin_api_key_env, server_args)
     run_hook(handle_return_hidden_states_mode, server_args)
     run_hook(handle_media_url_security, server_args)
     run_hook(handle_watermark_config, server_args)
@@ -85,10 +101,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
         validate_prefill_decode_interval,
         validate_response_store,
         validate_sampling_mask_max_tokens,
+        validate_uocr_document_config,
     )
 
     run_hook(validate_prefill_decode_interval, server_args)
     run_hook(validate_response_store, server_args)
+    run_hook(validate_uocr_document_config, server_args)
     run_hook(validate_sampling_mask_max_tokens, server_args)
     # Before any reader of speculative_algorithm: the flag may reset it.
     run_hook(handle_aux_hidden_state_capture, server_args)
@@ -115,19 +133,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_model_source_paths, server_args)
 
-    # Model-arch environment defaults; must precede handle_gpu_memory_settings,
-    # whose heuristic reads the post-capture KV sizing switch.
-    from sglang.srt.arg_groups.muse_spark_hook import apply_muse_spark_env_defaults
-
-    apply_muse_spark_env_defaults(server_args)
-
     run_hook(handle_multimodal, server_args)
     run_hook(handle_ssl_validation, server_args)
     run_hook(handle_asr_validation, server_args)
 
-    run_hook(handle_deprecated_args, server_args)
-
-    run_hook(handle_prefill_delayer_env_compat, server_args)
+    run_hook(handle_grpc_args, server_args)
 
     run_hook(handle_missing_default_values, server_args)
 
@@ -146,12 +156,20 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_pd_disaggregation, server_args)
 
+    # Resolve checkpoint/hardware defaults after explicit quantization opt-outs,
+    # but before GPU memory sizing and the generic backend defaults consume them.
+    from sglang.srt.arg_groups.muse_spark_hook import apply_muse_spark_env_defaults
+
+    apply_muse_spark_env_defaults(server_args)
+
     from sglang.srt.arg_groups.kv_cache_hook import (
         handle_cache_compatibility,
+        handle_indexer_kv_cache_compatibility,
         handle_kv4_compatibility,
         handle_mxfp8_kv_cache_compatibility,
         handle_nvfp4_prefill_kv_dequant_dtype,
         handle_page_major_kv_layout,
+        handle_platform_kv_cache_dtype_compatibility,
         handle_prefill_only_disable_kv_cache,
         handle_unified_memory_pool,
         validate_prefill_only_disable_kv_cache_args,
@@ -177,6 +195,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         apply_inkling_prefill_cuda_graph_default,
         apply_muse_glimmer_prefill_cuda_graph_max_bs_default,
         apply_prefill_cp_cuda_graph_default,
+        apply_unlimited_ocr_v2_cuda_graph_default,
         disable_prefill_cuda_graph_for_deepseek_trtllm_mla,
         finalize_cuda_graph_prefill_max_context,
         handle_cuda_graph_config,
@@ -184,6 +203,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(apply_inkling_prefill_cuda_graph_default, server_args)
     run_hook(apply_muse_glimmer_prefill_cuda_graph_max_bs_default, server_args)
+    run_hook(apply_unlimited_ocr_v2_cuda_graph_default, server_args)
 
     # must run before _handle_cuda_graph_config and _handle_data_parallelism
     run_hook(handle_dwdp, server_args)
@@ -255,6 +275,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_linear_attn_backend, server_args)
     run_hook(handle_kv4_compatibility, server_args)
     run_hook(handle_mxfp8_kv_cache_compatibility, server_args)
+    run_hook(handle_indexer_kv_cache_compatibility, server_args)
+    run_hook(handle_platform_kv_cache_dtype_compatibility, server_args)
     run_post_process_pass(server_args, _page_size_default)
     run_hook(handle_amd_specifics, server_args)
     run_hook(handle_nccl_pre_warm, server_args)

@@ -17,31 +17,16 @@ Modules, in dependency order (there are no cycles)::
     parallel   parallel_compile: several builds at once
 """
 
-from sglang.kernels.jit.utils.compile.cpp_args import (
-    CPP_DTYPE_MAP,
-    CPP_TEMPLATE_TYPE,
-    CPPArgList,
-    make_cpp_args,
-)
+from sglang.kernels.jit.utils.compile.cpp_args import make_cpp_args
 from sglang.kernels.jit.utils.compile.loader import load_jit
 from sglang.kernels.jit.utils.compile.parallel import parallel_compile
-from sglang.kernels.jit.utils.compile.paths import (
-    DEFAULT_CFLAGS,
-    DEFAULT_INCLUDE,
-    DEFAULT_LDFLAGS,
-    KERNEL_PATH,
-)
+from sglang.kernels.jit.utils.compile.paths import DEFAULT_INCLUDE, KERNEL_PATH
 from sglang.kernels.jit.utils.compile.spec import BuildSpec
 from sglang.kernels.jit.utils.compile.toolchain import cuda_stubs_dir
 
 __all__ = [
     "BuildSpec",
-    "CPPArgList",
-    "CPP_DTYPE_MAP",
-    "CPP_TEMPLATE_TYPE",
-    "DEFAULT_CFLAGS",
     "DEFAULT_INCLUDE",
-    "DEFAULT_LDFLAGS",
     "KERNEL_PATH",
     "cuda_stubs_dir",
     "load_jit",

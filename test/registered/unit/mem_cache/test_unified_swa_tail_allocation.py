@@ -2,13 +2,15 @@ import unittest
 
 import torch
 
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.token_demand import demand_windows
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 class TestUnifiedSWATailAllocation(CustomTestCase):
@@ -60,7 +62,13 @@ class TestUnifiedSWATailAllocation(CustomTestCase):
                     allocator = bundle.token_to_kv_pool_allocator
                     if seq_len is None:
                         seq_len = allocator.available_size() + page_size
-                        self.assertFalse(allocator.can_reserve(seq_len, seq_len))
+                        self.assertFalse(
+                            allocator.admits(
+                                KVDemand(
+                                    seq_len, demand_windows(allocator, seq_len, seq_len)
+                                )
+                            )
+                        )
                     prefix_capacity = -(-prefix_len // page_size) * page_size
                     prefix = allocator.alloc(prefix_capacity)[:prefix_len]
                     prefix_swa = allocator.translate_swa_indices_for_transfer(
@@ -79,7 +87,9 @@ class TestUnifiedSWATailAllocation(CustomTestCase):
                             else torch.tensor([-1], device="cuda")
                         ),
                         extend_num_tokens=seq_len - prefix_len,
-                        swa_tail_len=tail_len,
+                        window_tail_lens=dict.fromkeys(
+                            allocator.window_pool_names(), tail_len
+                        ),
                     )
                     self.assertIsNotNone(extended)
                     self.assertEqual(extended.numel(), seq_len - prefix_len)
