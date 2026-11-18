@@ -516,15 +516,24 @@ class TestFusedSharedExpertScaling(CustomTestCase):
             weights[:, :8].gather(-1, order), ref_weights.gather(-1, ref_order)
         )
 
-    def test_glm53_idle_rank_preserves_routed_topk_contract(self):
-        """An idle rank must return the pre-append top-8 shape; returning top-9
-        here would make the AITER postprocessor append shared ID 288 twice."""
+    def test_idle_rank_returns_the_width_of_a_routed_forward(self):
+        """An idle rank must emit K + S columns, like any routed forward.
+
+        The router writes the shared column itself for every shared-slot
+        layout, so the empty output has to be as wide as a populated one: the
+        MoE layer and the dispatchers derive their buffers from
+        `topk_ids.shape[-1]`. Nothing appends the column a second time, because
+        the append is gated on the output being narrower than `top_k`
+        (see `_post_process_topk_ids`).
+        """
         with (
             get_context().override_server_args(enable_waterfill=False),
             get_model().override(
                 shared_experts=SharedExpertsConfig(num_fused_shared_experts=1)
             ),
         ):
+            # 8 routed experts, one of which is replaced by the fused shared
+            # slot, i.e. topk_config.top_k == 8 + 1.
             topk = TopK(top_k=8, layer_id=0)
 
         with (
@@ -545,8 +554,8 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         ):
             output = topk.empty_topk_output(torch.device("cpu"))
 
-        self.assertEqual(output.topk_ids.shape, (0, 8))
-        self.assertEqual(output.topk_weights.shape, (0, 8))
+        self.assertEqual(output.topk_ids.shape, (0, 9))
+        self.assertEqual(output.topk_weights.shape, (0, 9))
 
 
 if __name__ == "__main__":
