@@ -6,7 +6,7 @@ import torch
 pytest.importorskip("aiter")
 
 from sglang.srt.environ import envs  # noqa: E402
-from sglang.srt.models.kimi_k3_rocm_mla import (  # noqa: E402
+from sglang.srt.models.kimi_k3_amd.mla import (  # noqa: E402
     create_q_cache_writer,
     fused_q_cache_available,
 )

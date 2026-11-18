@@ -23,11 +23,11 @@ from sglang.srt.layers.rotary_embedding.rope_variant import (
     DeepseekScalingRotaryEmbedding,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.models import kimi_k3_rocm_mla
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
     forward_mla_rocm,
 )
-from sglang.srt.models.kimi_k3_rocm_mla import KimiK3RocmMlaQCacheWriter
+from sglang.srt.models.kimi_k3_amd import mla as k3_mla
+from sglang.srt.models.kimi_k3_amd.mla import KimiK3RocmMlaQCacheWriter
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -220,13 +220,21 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
     def test_no_writer_without_the_fused_kernel(self):
         """Where the kernel does not run (not gfx950, SGLANG_USE_AITER=0), no writer
         is installed, so every layer keeps the split chain without per-step checks."""
-        with mock.patch.object(
-            kimi_k3_rocm_mla, "fused_q_cache_available", lambda: False
+        with mock.patch.object(k3_mla, "fused_q_cache_available", lambda: False):
+            self.assertIsNone(
+                k3_mla.create_q_cache_writer(kv_lora_rank=512, qk_rope_head_dim=64)
+            )
+
+    def test_no_writer_on_a_non_hip_build(self):
+        """kimi_k3 asks create_q_cache_writer on every platform, so a CUDA build
+        must get None from the writer module itself."""
+        with (
+            envs.SGLANG_USE_AITER.override(True),
+            mock.patch.object(k3_mla.torch.version, "hip", None),
+            mock.patch.object(k3_mla.torch.cuda, "is_available", lambda: True),
         ):
             self.assertIsNone(
-                kimi_k3_rocm_mla.create_q_cache_writer(
-                    kv_lora_rank=512, qk_rope_head_dim=64
-                )
+                k3_mla.create_q_cache_writer(kv_lora_rank=512, qk_rope_head_dim=64)
             )
 
     def test_fused_write_is_available_on_gfx950_with_aiter_only(self):
@@ -242,17 +250,15 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
             with (
                 self.subTest(gcn_arch=gcn_arch, use_aiter=use_aiter),
                 envs.SGLANG_USE_AITER.override(use_aiter),
-                mock.patch.object(kimi_k3_rocm_mla.torch.version, "hip", "7.0"),
+                mock.patch.object(k3_mla.torch.version, "hip", "7.0"),
+                mock.patch.object(k3_mla.torch.cuda, "is_available", lambda: True),
                 mock.patch.object(
-                    kimi_k3_rocm_mla.torch.cuda, "is_available", lambda: True
-                ),
-                mock.patch.object(
-                    kimi_k3_rocm_mla,
+                    k3_mla,
                     "current_arch",
                     lambda: SimpleNamespace(hip=SimpleNamespace(gcn_arch=gcn_arch)),
                 ),
             ):
-                self.assertIs(kimi_k3_rocm_mla.fused_q_cache_available(), expected)
+                self.assertIs(k3_mla.fused_q_cache_available(), expected)
 
     def test_other_backends_keep_the_split_chain(self):
         for verify in (False, True):
@@ -270,7 +276,7 @@ class TestMlaQCacheWriterCallSite(CustomTestCase):
         writer = mock.Mock()
         kv_layer = SimpleNamespace(owner=owner, key=lambda: None)
         attn = SimpleNamespace(
-            rocm_mla_q_cache_writer=writer,
+            mla_q_cache_writer=writer,
             attn_mqa=SimpleNamespace(layer_id=0, k_scale_float=1.0),
             current_attention_backend="aiter",
         )

@@ -17,6 +17,9 @@ K3 MLA applies no RoPE. The writer runs AITER's fused RoPE/concat/cache kernel, 
 one DeepSeek MLA uses on ROCm (rocm_linear_utils), against one-row identity cos/sin
 tables with all-zero positions, which leaves Q and the cache bytes equal to the
 split concat/cache chain's.
+
+kimi_k3 calls create_q_cache_writer on every platform; this module alone decides
+where the fused write runs (fused_q_cache_available) and returns None elsewhere.
 """
 
 from typing import Callable, Optional, Tuple
