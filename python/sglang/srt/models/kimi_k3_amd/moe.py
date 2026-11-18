@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import msgspec
 import torch
 
+from sglang.kernels.jit.utils import cache_once
 from sglang.srt.configs.model_config import is_kimi_k31
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -32,7 +33,7 @@ from sglang.srt.layers.moe.topk import TopKOutputChecker
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import is_gfx95_supported, is_hip, print_info_once
 from sglang.srt.utils.common import cdiv, get_bool_env_var
 
@@ -761,6 +762,28 @@ def link_hip_paths(model) -> None:
     link_row_sharded_stream_hip(model)
 
 
+# A collective over the TP group on its first call: the model makes it at
+# construction, where every rank builds the same layers in the same order.
+@cache_once
+def _ll_comm() -> Optional[LLComm]:
+    """None off gfx950 TP8, or under --disable-custom-all-reduce (the scratch is a
+    dedicated aiter CustomAllreduce)."""
+    if not is_gfx95_supported() or get_exec().comm.disable_custom_all_reduce:
+        return None
+    from sglang.kernels.ops.communication.k3_ll_comm_hip import (
+        WORLD_SIZE,
+        create_ll_comm,
+    )
+
+    parallel = get_parallel()
+    if parallel.tp_size != WORLD_SIZE or parallel.attn_tp_size != parallel.tp_size:
+        return None
+    return create_ll_comm(
+        parallel.tp_group.cpu_group,
+        torch.device("cuda", torch.cuda.current_device()),
+    )
+
+
 def link_column_tails_hip(model) -> None:
     """Hand each stream-writing latent MoE of a KimiK3LinearModel the next layer's
     attention read, which its column-parallel tail's all-gather then runs (gfx950
@@ -779,9 +802,7 @@ def link_column_tails_hip(model) -> None:
     # Every TP rank builds the same layers, so they all skip the collective below.
     if not pairs:
         return
-    from sglang.srt.layers.communication import k3_ll_comm_hip
-
-    comm = k3_ll_comm_hip.get_comm()
+    comm = _ll_comm()
     if comm is None:
         return
     max_tokens = (
