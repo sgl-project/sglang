@@ -515,6 +515,12 @@ class Inkling2Experts(nn.Module):
         )
         if exchange is not None and self._routed_kernels is not None:
             return self._forward_prefill(x, weights, ids, exchange)
+        if self._routed_kernels is not None:
+            raise ValueError(
+                f"Inkling2 quantized experts got a {x.shape[0]}-token MoE forward, "
+                "beyond the prefill exchange and MegaMoE capacity; lower "
+                f"--chunked-prefill-size to at most {PREFILL_EXCHANGE_MAX_TOKENS}"
+            )
         sorted_ids, permutation = torch.sort(ids.to(torch.int16).flatten(), stable=True)
         src2dst = get_src2dst(permutation)
         counts, offsets, block_offsets, schedule = compute_grouped_gemm_metadata(
