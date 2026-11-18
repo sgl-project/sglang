@@ -166,9 +166,13 @@ class TestTargetCheckpointDsparkSubfolderOnHub(CustomTestCase):
 class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
     """Gate contract for DSpark + dp attention + MoE a2a backends."""
 
-    def _dp_server_args(self, *, moe_a2a_backend: str) -> ServerArgs:
+    def _dp_server_args(
+        self, *, moe_a2a_backend: str, arch: str = "DeepseekV4ForCausalLM"
+    ) -> ServerArgs:
+        hf_config = _bundled_hf_config()
+        hf_config.architectures = [arch]
         server_args = _make_dspark_server_args(
-            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+            model_path=_BUNDLED_MODEL_PATH, hf_config=hf_config
         )
         server_args.enable_dp_lm_head = True
         server_args.attn_dp_size = 2
@@ -176,13 +180,22 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
         server_args.moe_a2a_backend = moe_a2a_backend
         return server_args
 
-    def test_only_megamoe_is_admitted(self):
-        """Both sides of the allowlist: megamoe passes, others raise by name."""
+    def test_dsv4_admits_megamoe_and_deepep(self):
+        """Both sides of the DeepSeek-V4 allowlist: megamoe and deepep pass, others raise by name."""
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
-            _handle_dspark(self._dp_server_args(moe_a2a_backend="megamoe"))
-            for backend in ("deepep", "pplx"):
-                with self.assertRaisesRegex(ValueError, backend):
-                    _handle_dspark(self._dp_server_args(moe_a2a_backend=backend))
+            for backend in ("megamoe", "deepep"):
+                _handle_dspark(self._dp_server_args(moe_a2a_backend=backend))
+            with self.assertRaisesRegex(ValueError, "pplx"):
+                _handle_dspark(self._dp_server_args(moe_a2a_backend="pplx"))
+
+    def test_unregistered_arch_keeps_the_default_allowlist(self):
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            with self.assertRaisesRegex(ValueError, "deepep"):
+                _handle_dspark(
+                    self._dp_server_args(
+                        moe_a2a_backend="deepep", arch="Qwen3MoeForCausalLM"
+                    )
+                )
 
     def test_a2a_backend_with_compact_verify_mode_raises(self):
         server_args = self._dp_server_args(moe_a2a_backend="megamoe")
