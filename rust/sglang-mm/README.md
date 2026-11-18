@@ -26,7 +26,7 @@ src/
 │   ├── fetch.rs              # media source → bytes (data:/base64/file/http)
 │   ├── par.rs                # the only fan-out seam (rayon, or inline)
 │   ├── resize.rs             # PIL-exact Lanczos + Bicubic resize
-│   └── token_layout.rs       # TokenLayout mechanics (apply_layout + helpers)
+│   └── expansion.rs          # Placeholder expansion and media spans in token ids
 └── <model>/
     └── mod.rs                # model-specific processor (inkling, qwen_vl, ...)
 ```
@@ -53,6 +53,8 @@ common.image_decode_rgb(bytes)          # -> (h, w, ndarray)
 common.content_hash(bytes)              # -> u64 (blake3, truncated)
 common.content_digest(bytes)            # -> "blake3:<64 hex>" (full blake3)
 common.fetch_bytes(source)              # -> bytes (data:/base64/file/http)
+common.expand_token_placeholders(input_ids, spec, start_len=0)  # -> list[int]
+common.locate_media(input_ids, token_id, expansions)           # -> [[(start, end), ...], ...]
 
 # Model-specific
 inkling.preprocess_images(list[bytes], ps, frac, cap)  # -> [(h, w, bits, hash), ...]

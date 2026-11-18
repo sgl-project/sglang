@@ -1,7 +1,7 @@
+pub mod expansion;
 pub mod fetch;
 pub mod par;
 pub mod resize;
-pub mod token_layout;
 
 #[cfg(feature = "parallel")]
 use std::sync::OnceLock;
@@ -164,6 +164,34 @@ mod python {
     }
 
     #[pyfunction]
+    #[pyo3(signature = (input_ids, mm_token_expansion_spec, mm_token_expansion_start_len=0))]
+    pub fn expand_token_placeholders(
+        py: Python<'_>,
+        input_ids: Vec<i64>,
+        mm_token_expansion_spec: &Bound<'_, PyAny>,
+        mm_token_expansion_start_len: i64,
+    ) -> PyResult<Vec<i64>> {
+        let spec = mm_token_expansion_spec
+            .call_method0("items")?
+            .try_iter()?
+            .map(|item| item?.extract::<(i64, Vec<Vec<i64>>)>())
+            .collect::<PyResult<Vec<_>>>()?;
+        let start_len = usize::try_from(mm_token_expansion_start_len).unwrap_or(usize::MAX);
+        Ok(py
+            .detach(|| super::expansion::expand_token_placeholders(&input_ids, &spec, start_len))?)
+    }
+
+    #[pyfunction]
+    pub fn locate_media(
+        py: Python<'_>,
+        input_ids: Vec<i64>,
+        token_id: i64,
+        expansions: Vec<Vec<i64>>,
+    ) -> PyResult<Vec<Vec<(usize, usize)>>> {
+        Ok(py.detach(|| super::expansion::locate_media(&input_ids, token_id, &expansions))?)
+    }
+
+    #[pyfunction]
     pub fn fetch_bytes<'py>(py: Python<'py>, source: String) -> PyResult<Bound<'py, PyBytes>> {
         let data = py
             .detach(move || super::fetch::fetch_bytes(&source))
@@ -178,6 +206,8 @@ mod python {
         m.add_function(wrap_pyfunction!(image_decode_rgb, &m)?)?;
         m.add_function(wrap_pyfunction!(content_hash, &m)?)?;
         m.add_function(wrap_pyfunction!(content_digest, &m)?)?;
+        m.add_function(wrap_pyfunction!(expand_token_placeholders, &m)?)?;
+        m.add_function(wrap_pyfunction!(locate_media, &m)?)?;
         m.add_function(wrap_pyfunction!(fetch_bytes, &m)?)?;
         parent.add_submodule(&m)?;
         Ok(())
