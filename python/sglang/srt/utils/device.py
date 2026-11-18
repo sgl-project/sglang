@@ -1472,6 +1472,11 @@ def parse_lscpu_topology():
 
 
 def get_physical_cpus_by_numa_or_block():
+    if platform.system() == "Darwin":
+        # macOS has neither lscpu nor per-process CPU affinity, and exposes a
+        # single NUMA node, so every physical core belongs to node 0.
+        return {0: set(range(psutil.cpu_count(logical=False) or 1))}
+
     cpu_info = parse_lscpu_topology()
     n_nodes = len({node for _, _, _, node, _ in cpu_info})
     n_blocks = len({block for _, _, _, _, block in cpu_info})
