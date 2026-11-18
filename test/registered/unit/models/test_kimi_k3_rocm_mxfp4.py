@@ -1,7 +1,7 @@
 """Latent MXFP4 selection, reload lifecycle, and fused/unfused MoE plumbing."""
 
 import unittest
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -12,6 +12,7 @@ from torch.nn import functional as F
 from sglang.kernels.ops.gemm import latent_mxfp4_aiter_hip
 from sglang.srt.environ import envs
 from sglang.srt.models import kimi_k3, kimi_k3_rocm_mxfp4
+from sglang.srt.models.kimi_k3_amd import moe as kimi_k3_moe_hip
 from sglang.srt.models.kimi_k3_rocm_mxfp4 import (
     LatentMXFP4Projections,
     build_latent_mxfp4_projections,
@@ -94,47 +95,125 @@ def _moe(*, prepared: bool | None):
     return moe
 
 
+def _toy_runtime() -> ExitStack:
+    """Replace only the external GEMM and distributed boundaries, and scale the
+    2048-token MXFP4 floor down to toy batches of 2 tokens."""
+    stack = ExitStack()
+    stack.enter_context(get_context().override_server_args(tp_size=1))
+    stack.enter_context(get_parallel().override(tp_group=None))
+    for target, name, value in (
+        (
+            latent_mxfp4_aiter_hip,
+            "run",
+            lambda *, x, weight, scale: F.linear(x, weight),
+        ),
+        (kimi_k3, "use_symmetric_memory", lambda *args, **kwargs: nullcontext()),
+        (kimi_k3, "tensor_model_parallel_all_reduce", lambda x: x),
+    ):
+        stack.enter_context(mock.patch.object(target, name, side_effect=value))
+    stack.enter_context(mock.patch.object(kimi_k3_rocm_mxfp4, "_MIN_TOKENS", 2))
+    return stack
+
+
+def _expected(moe, x, *, use_mxfp4: bool) -> torch.Tensor:
+    down = moe.routed_expert_down_proj.weight
+    up = moe.routed_expert_up_proj.weight
+    if use_mxfp4:
+        down = moe._latent_mxfp4.down_weight
+        up = moe._latent_mxfp4.up_weight
+    routed = F.linear(x, down) * moe.gate(x).sigmoid()
+    return F.linear(routed, up) + moe.shared_experts(x)
+
+
 class TestLatentMXFP4Runtime(CustomTestCase):
     @torch.inference_mode()
     def test_fused_and_unfused_preserve_routing_shared_and_threshold(self):
-        # Only the external GEMM and distributed boundaries are replaced.
-        with (
-            get_context().override_server_args(tp_size=1),
-            get_parallel().override(tp_group=None),
-            mock.patch.object(
-                latent_mxfp4_aiter_hip,
-                "run",
-                side_effect=lambda *, x, weight, scale: F.linear(x, weight),
-            ),
-            mock.patch.object(
-                kimi_k3,
-                "use_symmetric_memory",
-                side_effect=lambda *args, **kwargs: nullcontext(),
-            ),
-            mock.patch.object(
-                kimi_k3, "tensor_model_parallel_all_reduce", side_effect=lambda x: x
-            ),
-            # Scale the 2048-token floor down to the toy batch sizes below.
-            mock.patch.object(kimi_k3_rocm_mxfp4, "_MIN_TOKENS", 2),
-        ):
+        with _toy_runtime():
             for prepared in (None, False, True):
                 moe = _moe(prepared=prepared)
                 for tokens in (1, 2, 3):
                     x = torch.randn(tokens, 4)
-                    use_mxfp4 = prepared and tokens >= 2
-                    down = moe.routed_expert_down_proj.weight
-                    up = moe.routed_expert_up_proj.weight
-                    if use_mxfp4:
-                        down = moe._latent_mxfp4.down_weight
-                        up = moe._latent_mxfp4.up_weight
-                    routed = F.linear(x, down) * moe.gate(x).sigmoid()
-                    expected = F.linear(routed, up) + moe.shared_experts(x)
+                    expected = _expected(
+                        moe, x, use_mxfp4=bool(prepared) and tokens >= 2
+                    )
                     for method in (moe._forward_fused, moe._forward_unfused):
                         with self.subTest(
                             prepared=prepared, tokens=tokens, method=method.__name__
                         ):
                             actual = method(x, prefix_sum=None)
                             torch.testing.assert_close(actual, expected)
+
+    @torch.inference_mode()
+    def test_gfx950_forward_runs_mxfp4_batches_off_the_hip_tails(self):
+        """gfx950's _forward_fused_hip and its row-sharded tail run the BF16
+        latent projections, so taking them for an MXFP4-eligible batch would
+        silently ignore --enable-kimi-k3-latent-mxfp4. Such batches must run
+        the MXFP4 pair on every row; smaller batches keep the gfx950 path."""
+        with (
+            _toy_runtime(),
+            mock.patch.object(kimi_k3, "_is_gfx95", True),
+            mock.patch.object(kimi_k3_moe_hip, "_is_gfx95", True),
+            # None leaves each GEMM to torch; CPU hosts never import the HIP one
+            mock.patch.object(
+                kimi_k3, "k3_bf16_gemm_hip", return_value=None, create=True
+            ),
+            mock.patch.object(
+                kimi_k3.KimiK3MoE,
+                "_forward_fused_hip",
+                side_effect=lambda *args, **kwargs: "gfx950 tail",
+            ),
+        ):
+            moe = _moe(prepared=True)
+            moe._eligible_for_fused_front = True
+            for tokens in (1, 2, 3):
+                with self.subTest(tokens=tokens):
+                    x = torch.randn(tokens, 4)
+                    actual = moe.forward(x)
+                    if tokens < 2:
+                        self.assertEqual(actual, "gfx950 tail")
+                    else:
+                        torch.testing.assert_close(
+                            actual, _expected(moe, x, use_mxfp4=True)
+                        )
+            # nor may the decoder shard the residual by rows for that tail
+            moe.tp_size = 8
+            with (
+                mock.patch.object(kimi_k3_moe_hip, "_ROW_SHARDED_TAIL_MIN_TOKENS", 2),
+                mock.patch.object(
+                    kimi_k3_moe_hip.k3_ar_fusion, "enabled", return_value=False
+                ),
+            ):
+                self.assertFalse(moe.takes_row_sharded_tail(2))
+                moe._latent_mxfp4 = None
+                self.assertTrue(moe.takes_row_sharded_tail(2))
+
+    @torch.inference_mode()
+    def test_mxfp4_front_routes_on_the_same_logits(self):
+        """MXFP4 replaces only the routed input. The router logits must keep the
+        merged front's dtype (fp32 on gfx950 + AITER), or the top-k picks can
+        differ from a run without the flag."""
+        moe = _moe(prepared=True)
+        moe._front_w = moe._front_w.bfloat16()
+        moe._latent_mxfp4.down_weight = moe._latent_mxfp4.down_weight.bfloat16()
+        x = torch.randn(3, 4, dtype=torch.bfloat16)
+
+        def gemm(x, weight, out=None, out_dtype=None):
+            return F.linear(x.float(), weight.float()).to(out_dtype or x.dtype)
+
+        with (
+            _toy_runtime(),
+            # torch has no CPU bf16 -> fp32 mm; the boundary GEMM keeps the dtype contract
+            mock.patch.object(kimi_k3, "_k3_bf16_gemm", side_effect=gemm),
+        ):
+            for front_fp32 in (False, True):
+                moe._front_fp32 = front_fp32
+                with self.subTest(front_fp32=front_fp32):
+                    _, merged_logits, _ = moe._fused_front(x)
+                    _, mxfp4_logits, _ = moe._fused_front(x, latent_mxfp4=True)
+                    self.assertEqual(mxfp4_logits.dtype, merged_logits.dtype)
+                    torch.testing.assert_close(
+                        mxfp4_logits, merged_logits, rtol=0, atol=0
+                    )
 
     def test_prepare_and_reload_refill_the_copies_in_place(self):
         projections = LatentMXFP4Projections()
