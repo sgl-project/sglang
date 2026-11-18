@@ -33,7 +33,6 @@ from sglang.srt.entrypoints.engine import (
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import merge_scheduler_info_layouts
 from sglang.srt.ray.scheduler_actor import SchedulerActor
-from sglang.srt.ray.scheduler_monitor import SchedulerActorMonitor
 from sglang.srt.runtime_context import (
     get_parallel,
 )
@@ -41,14 +40,26 @@ from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 
 logger = logging.getLogger(__name__)
 
+# Bounds how long a stopped scheduler monitor keeps its thread alive; arbitrary.
+_SCHEDULER_MONITOR_POLL_S = 5.0
+
 
 @dataclasses.dataclass
 class RaySchedulerInitResult(SchedulerInitResult):
     """SchedulerInitResult that also holds Ray actor handles for cleanup."""
 
     scheduler_actors: list = dataclasses.field(default_factory=list)
-    # One ref per scheduler actor's run_event_loop, watched by SchedulerActorMonitor.
+    # One ref per scheduler actor's run_event_loop; it resolves only when the loop
+    # returns or the actor dies.
     event_loop_refs: list = dataclasses.field(default_factory=list)
+
+
+def _scheduler_exit_error(event_loop_ref: ray.ObjectRef) -> RuntimeError:
+    try:
+        ray.get(event_loop_ref)
+    except Exception as e:
+        return RuntimeError(f"SGLang scheduler actor died: {e}")
+    return RuntimeError("SGLang scheduler event loop exited")
 
 
 def _find_engine_bundle(
@@ -236,7 +247,7 @@ class RayEngine(Engine):
         # Set before super().__init__(): it launches the subprocesses, which need
         # the group to schedule the scheduler actors onto.
         self._placement_group = kwargs.pop("placement_group", None)
-        self._scheduler_monitor: Optional[SchedulerActorMonitor] = None
+        self._scheduler_monitor_stopped = threading.Event()
         self._scheduler_exit_error: Optional[RuntimeError] = None
         if "log_level" not in kwargs:
             kwargs["log_level"] = "error"
@@ -247,11 +258,9 @@ class RayEngine(Engine):
 
             kwargs["stat_loggers"] = build_ray_stat_loggers()
         super().__init__(server_args=ServerArgs(**kwargs))
-        self._scheduler_monitor = SchedulerActorMonitor(
-            event_loop_refs=self._scheduler_init_result.event_loop_refs,
-            on_exit=self._handle_scheduler_exit,
-        )
-        self._scheduler_monitor.start()
+        threading.Thread(
+            target=self._monitor_schedulers, daemon=True, name="ray_scheduler_monitor"
+        ).start()
 
     def check_health(self) -> None:
         """Raise if a scheduler actor died or its event loop exited.
@@ -261,6 +270,18 @@ class RayEngine(Engine):
         """
         if self._scheduler_exit_error is not None:
             raise self._scheduler_exit_error
+
+    def _monitor_schedulers(self) -> None:
+        """Report the first scheduler event loop to end, unless shutdown() ended it."""
+        refs = self._scheduler_init_result.event_loop_refs
+        done = []
+        # Poll so shutdown() and Ray teardown are not stuck behind a blocking wait.
+        while not done and not self._scheduler_monitor_stopped.is_set():
+            if not ray.is_initialized():
+                return
+            done, _ = ray.wait(refs, num_returns=1, timeout=_SCHEDULER_MONITOR_POLL_S)
+        if done and not self._scheduler_monitor_stopped.is_set():
+            self._handle_scheduler_exit(_scheduler_exit_error(done[0]))
 
     def _handle_scheduler_exit(self, error: RuntimeError) -> None:
         logger.error(f"{error}; failing pending and new requests")
@@ -276,8 +297,7 @@ class RayEngine(Engine):
 
     def shutdown(self):
         """Shutdown the engine — kill Ray scheduler actors then local processes."""
-        if self._scheduler_monitor is not None:
-            self._scheduler_monitor.stop()
+        self._scheduler_monitor_stopped.set()
         for actor in self._scheduler_init_result.scheduler_actors:
             try:
                 ray.kill(actor)
