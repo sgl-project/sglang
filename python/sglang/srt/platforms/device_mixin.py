@@ -26,8 +26,10 @@ Method status annotations:
 """
 
 import enum
+import logging
+import os
 import random
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from functools import cached_property
 from typing import NamedTuple, Optional
@@ -36,6 +38,8 @@ import numpy as np
 import torch
 
 from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 
 
 class PlatformEnum(enum.Enum):
@@ -165,6 +169,120 @@ class DeviceMixin:
     def get_device_total_memory(self, device_id: int = 0) -> int:
         """[Active] Get total device memory in bytes."""
         raise NotImplementedError
+
+    def memory_reserved(self, device_id: int = 0) -> int:
+        """[Active] Bytes the caching allocator holds for this device.
+
+        Routed through ``torch.accelerator`` so it follows whichever device
+        torch was built for, instead of naming one vendor's namespace. Never
+        defaulted to 0: a caller differencing this across a load reads 0 as
+        "nothing was allocated" and would silently under-report. Override when
+        a device's allocator is not reachable this way.
+        """
+        return int(torch.accelerator.memory_reserved(device_id))
+
+    # ---- Weight cache ----
+
+    def weight_cache_transports(self) -> tuple[str, ...]:
+        """[Active] Weight-cache transport names this device can serve, best first.
+
+        Empty means the weight cache daemon refuses to start here. A name must
+        be registered in ``weight_cache.transport``. The default reproduces the
+        platform gate the daemon applied before this was a capability, so a
+        device opts in by overriding rather than by being added to a condition
+        inside the daemon.
+        """
+        if self.is_cuda_alike():
+            return ("vmm_fd", "torch_ipc")
+        if self.is_npu():
+            return ("torch_ipc",)
+        return ()
+
+    def weight_cache_env_stamp(self) -> dict[str, str]:
+        """[Active] Extra identity for the weight cache compatibility fingerprint.
+
+        Merged into ``compute_env_stamp``. A device whose post-processing or
+        kernel selection varies with its architecture or driver stack adds the
+        discriminating fields here, so a cache built on one generation cannot
+        be opened on another. Raise when a required field is unavailable; never
+        substitute a placeholder, because an empty value makes two different
+        devices compare equal. The default adds nothing, which keeps the
+        fingerprint of a device that needs no extra identity unchanged.
+        """
+        return {}
+
+    def validate_weight_cache_allocator(self) -> None:
+        """[Active] Reject an allocator config whose memory cannot be exported.
+
+        Called once by the daemon before it touches the device, so a
+        configuration that would break the handle export fails with an
+        actionable message instead of partway through it. The default carries
+        the CUDA expandable-segments check the daemon applied unconditionally
+        before this was a hook.
+
+        A device that can only export memory it allocated for export overrides
+        this once it has such an allocator. XPU does not override it yet: which
+        torch-xpu allocator configurations yield Level-Zero-exportable memory is
+        unestablished, and it cannot be settled before the Level Zero IPC
+        helpers exist. The hook is deliberately left permissive rather than
+        guessing a restriction, and XPU declares no transport, so the daemon
+        refuses there before reaching this check.
+        """
+        # The expandable-segments allocator hands out memory that cannot be
+        # shared through torch's _share_cuda_ handle, so the export would fail
+        # partway with an opaque CUDA error.
+        for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+            conf = os.environ.get(var, "")
+            for field in conf.split(","):
+                key, _, value = field.partition(":")
+                if (
+                    key.strip() == "expandable_segments"
+                    and value.strip().lower() == "true"
+                ):
+                    raise RuntimeError(
+                        f"[WeightCacheDaemon] {var} sets expandable_segments:True, "
+                        f"which is incompatible with CUDA IPC weight sharing: the "
+                        f"expandable-segments allocator hands out memory that cannot "
+                        f"be exported via _share_cuda_, so the IPC handle export "
+                        f"would fail mid-way. Unset expandable_segments for the "
+                        f"weight cache daemon process (it can stay enabled for the "
+                        f"engine itself)."
+                    )
+
+    def prepare_weight_cache_export(
+        self, state_tensors: "Mapping[str, tuple[torch.Tensor, bool]]"
+    ) -> None:
+        """[Active] Run device setup the handle export needs, before exporting.
+
+        Called by the daemon with every tensor it is about to export, after
+        ``validate_weight_cache_allocator`` and before the transport backend is
+        chosen. The place for an import whose side effect registers a reducer,
+        or for a probe that warns when zero-copy is unavailable on this driver
+        stack. Raise to abort the daemon; log to let it continue degraded.
+        """
+        if not self.is_npu():
+            return
+        # torch_npu must be imported before the first ForkingPickler dump of an
+        # NPU tensor so its reducer is registered; otherwise the tensor falls
+        # back to a CPU copy instead of zero-copy IPC. Probe once and warn
+        # (rather than error) if zero-copy is unavailable, so weight caching
+        # still works by copying the weights through the CPU.
+        import torch.multiprocessing.reductions as _reductions
+        import torch_npu  # noqa: F401
+
+        first = next(iter(state_tensors.values()), None)
+        if first is None:
+            return
+        rebuild_fn, _ = _reductions.reduce_tensor(first[0].data)
+        if rebuild_fn.__name__ != "rebuild_npu_tensor":
+            logger.warning(
+                "NPU weight-cache zero-copy IPC is unavailable: tensor "
+                "reduced to %r instead of torch_npu's rebuild_npu_tensor; "
+                "falling back to a CPU copy. Zero-copy requires Ascend HDK "
+                ">= 25.3.RC1 and CANN >= 8.3.RC1, and is unsupported on "
+                "Ascend 950DT.",
+                rebuild_fn,
+            )
 
     def get_current_memory_usage(
         self, device: Optional["torch.device"] = None

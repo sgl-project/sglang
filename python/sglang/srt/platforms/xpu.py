@@ -15,6 +15,16 @@ from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
 logger = logging.getLogger(__name__)
 
 
+def _sgl_kernel_xpu_version() -> str:
+    """Installed sglang-kernel-xpu version, or "" when the package is absent."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("sglang-kernel-xpu")
+    except PackageNotFoundError:
+        return ""
+
+
 class XpuDeviceMixin(DeviceMixin):
     """XPU implementation of the shared device operations."""
 
@@ -24,6 +34,37 @@ class XpuDeviceMixin(DeviceMixin):
 
     def get_device_total_memory(self, device_id: int = 0) -> int:
         return int(torch.xpu.get_device_properties(device_id).total_memory)
+
+    def memory_reserved(self, device_id: int = 0) -> int:
+        return int(torch.xpu.memory_reserved(device_id))
+
+    def weight_cache_env_stamp(self) -> dict[str, str]:
+        """Architecture, driver and kernel-package identity for the weight cache.
+
+        Read from ``torch.xpu.get_device_capability``, not from the optional
+        ``sgl_kernel.query_device`` op that ``get_device_capability`` below
+        uses: that op is absent from some sgl-kernel-xpu builds, and a missing
+        value would otherwise leave two XPU generations comparing equal.
+        """
+        device_id = torch.xpu.current_device()
+        caps = torch.xpu.get_device_capability(device_id)
+        stamp = {
+            "xpu_architecture": str(caps.get("architecture", "")),
+            "xpu_device_id": str(caps.get("device_id", "")),
+            "xpu_driver_version": str(caps.get("driver_version", "")),
+            "sgl_kernel_xpu_version": _sgl_kernel_xpu_version(),
+        }
+        missing = sorted(key for key, value in stamp.items() if not value)
+        if missing:
+            raise RuntimeError(
+                f"[weight_cache] XPU environment stamp is incomplete: {missing} "
+                f"could not be determined on device {device_id}. The weight cache "
+                f"fingerprint needs them to tell XPU generations and driver stacks "
+                f"apart; without them a cache built elsewhere would look "
+                f"compatible. Check that torch.xpu sees the device and that "
+                f"sglang-kernel-xpu is installed."
+            )
+        return stamp
 
     def get_current_memory_usage(
         self, device: Optional["torch.device"] = None

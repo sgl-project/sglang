@@ -22,15 +22,28 @@ import socket
 import struct
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+import sglang.srt.platforms as platforms_mod
 from sglang.srt.environ import envs
+from sglang.srt.platforms.cpu import CpuSRTPlatform
+from sglang.srt.platforms.cuda import CudaSRTPlatform
+from sglang.srt.platforms.mlu import MluSRTPlatform
+from sglang.srt.platforms.mps import MpsSRTPlatform
+from sglang.srt.platforms.musa import MusaSRTPlatform
+from sglang.srt.platforms.npu import NPUSRTPlatform
+from sglang.srt.platforms.rocm import RocmSRTPlatform
+from sglang.srt.platforms.sail import SailSRTPlatform
+from sglang.srt.platforms.xpu import XpuSRTPlatform
+from sglang.srt.weight_cache import transport as transport_mod
 from sglang.srt.weight_cache.protocol import (
     CacheConfig,
     UnsupportedQuantForIPCError,
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
+    compute_env_stamp,
     compute_global_rank,
     compute_local_gpu_id,
     get_quant_method_name,
@@ -43,13 +56,30 @@ from sglang.srt.weight_cache.protocol import (
 )
 from sglang.srt.weight_cache.transport import (
     TORCH_IPC_BACKEND,
+    TRANSPORT_BACKENDS,
+    VMM_FD_BACKEND,
     TorchIpcTransportBackend,
+    choose_daemon_transport_backend,
     get_client_transport_backend,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+
+# Every in-tree platform, so a new one cannot declare a transport name that no
+# backend implements without a test noticing.
+_ALL_SRT_PLATFORMS = (
+    CpuSRTPlatform,
+    CudaSRTPlatform,
+    MluSRTPlatform,
+    MpsSRTPlatform,
+    MusaSRTPlatform,
+    NPUSRTPlatform,
+    RocmSRTPlatform,
+    SailSRTPlatform,
+    XpuSRTPlatform,
+)
 
 
 def _make_cache_config(**overrides) -> CacheConfig:
@@ -76,6 +106,7 @@ def _make_cache_config(**overrides) -> CacheConfig:
         revision="",
         device_capability="8.0",
         torch_version="2.5.1",
+        platform_env="",
     )
     base.update(overrides)
     return CacheConfig(**base)
@@ -160,6 +191,157 @@ class TestTransportBackend(CustomTestCase):
         finally:
             a.close()
             b.close()
+
+
+class TestTransportSelection(CustomTestCase):
+    """The daemon picks a transport from what the platform declares.
+
+    Selection reads ``weight_cache_transports()`` instead of asking which
+    platform family this is, so a device becomes serveable by overriding that
+    method rather than by being added to a condition in the daemon.
+    """
+
+    @staticmethod
+    def _platform(transports):
+        return SimpleNamespace(
+            device_type="fake",
+            weight_cache_transports=lambda: transports,
+        )
+
+    def _choose(self, transports, state_tensors=None):
+        with patch.object(
+            transport_mod, "current_platform", self._platform(transports)
+        ):
+            return choose_daemon_transport_backend(state_tensors or {})
+
+    def test_every_declared_transport_is_registered(self):
+        # The names are plain string literals, so a typo or a renamed backend
+        # would otherwise surface only when a daemon starts on that hardware.
+        for platform_cls in _ALL_SRT_PLATFORMS:
+            for name in platform_cls().weight_cache_transports():
+                self.assertIn(
+                    name,
+                    TRANSPORT_BACKENDS,
+                    f"{platform_cls.__name__} declares unregistered transport {name!r}",
+                )
+
+    def test_first_declared_transport_that_can_export_wins(self):
+        backend = self._choose((VMM_FD_BACKEND, TORCH_IPC_BACKEND))
+        # vmm_fd is declared first but reports it cannot export, so selection
+        # must fall through rather than instantiate it (its __init__ raises).
+        self.assertEqual(backend.name, TORCH_IPC_BACKEND)
+
+    def test_declared_order_is_honored(self):
+        backend = self._choose((TORCH_IPC_BACKEND, VMM_FD_BACKEND))
+        self.assertEqual(backend.name, TORCH_IPC_BACKEND)
+
+    def test_platform_declaring_no_transport_is_refused(self):
+        # The Phase 1 contract for a device with no transport yet (XPU): the
+        # capability is reported honestly and the daemon refuses, instead of
+        # falling through to a backend that cannot export its memory.
+        with self.assertRaises(RuntimeError) as ctx:
+            self._choose(())
+        self.assertIn("declares no weight cache transport", str(ctx.exception))
+
+    def test_no_declared_transport_can_export_raises(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            self._choose((VMM_FD_BACKEND,))
+        self.assertIn("can export", str(ctx.exception))
+
+    def test_unregistered_declared_transport_raises(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            self._choose(("made_up_backend",))
+        self.assertIn("made_up_backend", str(ctx.exception))
+
+
+class TestEnvStampPlatformContribution(CustomTestCase):
+    """The platform's identity reaches the compatibility fingerprint.
+
+    A device whose weight post-processing varies with its architecture or
+    driver stack must not have a cache built on one generation opened on
+    another. The platform contributes the discriminating fields and
+    ``compute_env_stamp`` canonicalizes them into ``platform_env``.
+    """
+
+    @staticmethod
+    def _with_platform_stamp(stamp):
+        # compute_env_stamp() imports current_platform at call time, so the
+        # patch target is the platforms module, not protocol.
+        return patch.object(
+            platforms_mod,
+            "current_platform",
+            SimpleNamespace(
+                get_device_capability=lambda: None,
+                weight_cache_env_stamp=lambda: stamp,
+            ),
+            create=True,
+        )
+
+    def test_contribution_is_canonicalized_sorted_and_stable(self):
+        # Dict order must not change the fingerprint, or two identical
+        # environments would compare unequal.
+        with self._with_platform_stamp({"b": "2", "a": "1"}):
+            first = compute_env_stamp()["platform_env"]
+        with self._with_platform_stamp({"a": "1", "b": "2"}):
+            second = compute_env_stamp()["platform_env"]
+        self.assertEqual(first, "a=1,b=2")
+        self.assertEqual(first, second)
+
+    def test_platform_with_no_extra_identity_leaves_the_field_empty(self):
+        # Guards every other vendor: an empty contribution must not alter the
+        # fingerprint they produced before this field existed.
+        with self._with_platform_stamp({}):
+            stamp = compute_env_stamp()
+        self.assertEqual(stamp["platform_env"], "")
+        self.assertEqual(
+            set(stamp), {"device_capability", "torch_version", "platform_env"}
+        )
+
+    def test_identity_failure_is_not_swallowed(self):
+        # compute_env_stamp() deliberately swallows errors for its other two
+        # fields. The platform contribution must not be swallowed, or a device
+        # that cannot identify itself would fingerprint as if it had.
+        def boom():
+            raise RuntimeError("incomplete XPU environment stamp")
+
+        with patch.object(
+            platforms_mod,
+            "current_platform",
+            SimpleNamespace(
+                get_device_capability=lambda: None, weight_cache_env_stamp=boom
+            ),
+            create=True,
+        ):
+            with self.assertRaises(RuntimeError):
+                compute_env_stamp()
+
+    def test_differing_platform_identity_breaks_compatibility(self):
+        # One case per field a cache could silently cross: architecture,
+        # driver/compute-runtime version, kernel package version.
+        base = "sgl_kernel_xpu_version=0.5.0,xpu_architecture=21479031808,xpu_driver_version=1.15.39122+11"
+        daemon = _make_cache_config(platform_env=base)
+        for label, other in (
+            ("architecture", base.replace("21479031808", "11476656128")),
+            ("driver version", base.replace("1.15.39122+11", "1.14.38000+5")),
+            ("kernel package", base.replace("0.5.0", "0.6.0")),
+            ("identity absent", ""),
+        ):
+            with self.subTest(differs=label):
+                self.assertFalse(
+                    daemon.matches(_make_cache_config(platform_env=other)),
+                    f"a cache must not be shared across a differing {label}",
+                )
+        self.assertTrue(daemon.matches(_make_cache_config(platform_env=base)))
+
+    def test_peer_predating_the_field_mismatches_rather_than_crashing(self):
+        # An older daemon's dict has no platform_env. Decoding must succeed and
+        # compare unequal, so the client falls back instead of raising.
+        config = _make_cache_config(platform_env="xpu_architecture=21479031808")
+        legacy = config.to_dict()
+        legacy.pop("platform_env")
+        decoded = CacheConfig.from_dict(legacy)
+        self.assertEqual(decoded.platform_env, "")
+        self.assertFalse(config.matches(decoded))
 
 
 class TestCacheConfig(CustomTestCase):

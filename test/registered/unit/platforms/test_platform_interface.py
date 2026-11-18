@@ -11,7 +11,10 @@ import torch
 
 from sglang import _platform_stubs
 from sglang.kernels.jit.utils.arch import _sail_arch_suffix
-from sglang.srt.platforms import _load_platform_class, _resolve_platform, interface
+from sglang.srt.platforms import _load_platform_class, _resolve_platform
+from sglang.srt.platforms import device_mixin as device_mixin_mod
+from sglang.srt.platforms import interface
+from sglang.srt.platforms import xpu as xpu_mod
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
 from sglang.srt.platforms.device_mixin import (
@@ -23,6 +26,7 @@ from sglang.srt.platforms.device_mixin import (
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.platforms.mlu import MluSRTPlatform
 from sglang.srt.platforms.mps import MpsSRTPlatform
+from sglang.srt.platforms.musa import MusaSRTPlatform
 from sglang.srt.platforms.npu import NPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.platforms.sail import SailSRTPlatform
@@ -30,12 +34,22 @@ from sglang.srt.platforms.xpu import XpuSRTPlatform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 
 
 # ---------------------------------------------------------------------------
 # Helpers: factory functions to reduce boilerplate
 # ---------------------------------------------------------------------------
+
+
+def _named_fn(name):
+    """A function whose __name__ is what a reducer probe reads."""
+
+    def fn():
+        pass
+
+    fn.__name__ = name
+    return fn
 
 
 def _make_device_mixin(enum, name, dtype):
@@ -1057,6 +1071,302 @@ class TestCurrentPlatformLazyInit(CustomTestCase):
 
         with self.assertRaises(AttributeError):
             _ = plat_mod.nonexistent_attribute
+
+
+_IPC_CAPABLE_PLATFORMS = (
+    CudaSRTPlatform,
+    RocmSRTPlatform,
+    MusaSRTPlatform,
+    SailSRTPlatform,
+    NPUSRTPlatform,
+)
+_NO_TRANSPORT_PLATFORMS = (
+    XpuSRTPlatform,
+    CpuSRTPlatform,
+    MluSRTPlatform,
+    MpsSRTPlatform,
+)
+
+
+class TestWeightCacheMemoryAccounting(CustomTestCase):
+    """Reserved-memory accounting is per-platform, and never silently zero.
+
+    The weight cache daemon differences this value across the model load to
+    report ``preloaded_weights_bytes`` to the scheduler, which adds it back
+    onto the KV-cache sizing baseline. A value of 0 means "nothing was
+    preloaded" and is skipped, so a platform that answers 0 instead of
+    answering at all under-reports resident weights and oversizes the KV pool.
+    """
+
+    def test_platforms_without_an_override_read_the_active_accelerator(self):
+        # The daemon previously called torch.cuda.memory_reserved() directly,
+        # which answers 0 on a non-CUDA build instead of raising. The default
+        # routes through torch.accelerator, which follows whichever device torch
+        # was built for, so no vendor file has to name its own namespace. XPU
+        # overrides it; see test_xpu_memory_reserved_uses_the_xpu_allocator.
+        for platform_cls in (
+            CudaSRTPlatform,
+            RocmSRTPlatform,
+            MusaSRTPlatform,
+            SailSRTPlatform,
+            NPUSRTPlatform,
+        ):
+            with (
+                patch(
+                    "torch.accelerator.memory_reserved", return_value=4096
+                ) as mock_acc,
+                patch("torch.cuda.memory_reserved", return_value=99) as mock_cuda,
+            ):
+                self.assertEqual(platform_cls().memory_reserved(3), 4096)
+            mock_acc.assert_called_once_with(3)
+            mock_cuda.assert_not_called()
+
+    def test_zero_is_never_substituted_for_an_unavailable_allocator(self):
+        # A silent 0 is the defect this replaced: account_preloaded_weights()
+        # skips 0, so the KV pool would be sized as if the daemon held nothing.
+        with patch(
+            "torch.accelerator.memory_reserved", side_effect=RuntimeError("no acc")
+        ):
+            with self.assertRaises(RuntimeError):
+                DeviceMixin().memory_reserved(0)
+
+    def test_a_platform_can_override_the_accelerator_route(self):
+        # The seam for a device whose allocator torch.accelerator cannot reach.
+        class FakePlatform(DeviceMixin):
+            def memory_reserved(self, device_id: int = 0) -> int:
+                return 777
+
+        with patch("torch.accelerator.memory_reserved", return_value=1) as mock_acc:
+            self.assertEqual(FakePlatform().memory_reserved(0), 777)
+        mock_acc.assert_not_called()
+
+
+class TestWeightCachePlatformHooks(CustomTestCase):
+    """Which devices the weight cache daemon will serve, and how they validate.
+
+    The daemon reads ``weight_cache_transports()`` instead of testing the
+    platform family, so this set is the one place that decides where it runs.
+    """
+
+    def test_ipc_capable_platforms_declare_a_transport(self):
+        # The default must keep serving every platform the pre-capability gate
+        # accepted; a device loses the daemon the moment it reports ().
+        for platform_cls in _IPC_CAPABLE_PLATFORMS:
+            self.assertTrue(
+                platform_cls().weight_cache_transports(),
+                f"{platform_cls.__name__} no longer reports a weight cache "
+                f"transport, so the daemon would refuse to start on it",
+            )
+
+    def test_platforms_without_a_transport_declare_none(self):
+        # XPU reports the capability honestly: no transport exists for it yet,
+        # so the daemon refuses rather than selecting one that cannot export
+        # its memory. This turns red when an XPU transport lands, which is the
+        # point: enabling it must be a deliberate override.
+        for platform_cls in _NO_TRANSPORT_PLATFORMS:
+            self.assertEqual(platform_cls().weight_cache_transports(), ())
+
+    def test_a_platform_opts_in_by_overriding_not_by_editing_the_daemon(self):
+        # The extension point XPU will use. Overriding the method is enough;
+        # no vendor file and no core daemon condition has to change.
+        class FakeXpuPlatform(XpuSRTPlatform):
+            def weight_cache_transports(self):
+                return ("torch_ipc",)
+
+        self.assertEqual(XpuSRTPlatform().weight_cache_transports(), ())
+        self.assertEqual(FakeXpuPlatform().weight_cache_transports(), ("torch_ipc",))
+
+    def test_cuda_alike_platforms_reject_expandable_segments(self):
+        for platform_cls in (
+            CudaSRTPlatform,
+            RocmSRTPlatform,
+            MusaSRTPlatform,
+            SailSRTPlatform,
+        ):
+            for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+                with patch.dict(
+                    "os.environ",
+                    {var: "max_split_size_mb:128,expandable_segments:True"},
+                    clear=True,
+                ):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        platform_cls().validate_weight_cache_allocator()
+                    self.assertIn("expandable_segments", str(ctx.exception))
+
+    def test_cuda_accepts_allocator_configs_that_can_be_exported(self):
+        for conf in (
+            {},
+            {"PYTORCH_CUDA_ALLOC_CONF": ""},
+            {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False"},
+            {"PYTORCH_ALLOC_CONF": "max_split_size_mb:128"},
+        ):
+            with patch.dict("os.environ", conf, clear=True):
+                CudaSRTPlatform().validate_weight_cache_allocator()
+
+    def test_the_allocator_check_is_shared_and_overridable(self):
+        # The daemon ran this check unconditionally before it was a hook, so
+        # the default has to stay unconditional to preserve that. A device
+        # whose exportability rules differ opts out by overriding.
+        class FakePlatform(XpuSRTPlatform):
+            def validate_weight_cache_allocator(self) -> None:
+                pass
+
+        with patch.dict(
+            "os.environ", {"PYTORCH_ALLOC_CONF": "expandable_segments:True"}, clear=True
+        ):
+            with self.assertRaises(RuntimeError):
+                XpuSRTPlatform().validate_weight_cache_allocator()
+            FakePlatform().validate_weight_cache_allocator()
+
+    def test_export_hook_does_nothing_on_a_non_npu_platform(self):
+        tensors = {"w": (torch.zeros(2), True)}
+        with patch("torch.multiprocessing.reductions.reduce_tensor") as mock_reduce:
+            for platform_cls in (CudaSRTPlatform, XpuSRTPlatform, CpuSRTPlatform):
+                self.assertIsNone(platform_cls().prepare_weight_cache_export(tensors))
+        mock_reduce.assert_not_called()
+
+    def test_npu_export_hook_warns_when_zero_copy_is_unavailable(self):
+        # torch_npu registers a reducer whose rebuild function is
+        # rebuild_npu_tensor; anything else means the tensor would be copied
+        # through the CPU instead of shared, which is degraded but not fatal.
+        tensors = {"w": (torch.zeros(2), True)}
+        with (
+            patch.dict("sys.modules", {"torch_npu": MagicMock()}),
+            patch(
+                "torch.multiprocessing.reductions.reduce_tensor",
+                return_value=(_named_fn("rebuild_cpu_tensor"), ()),
+            ),
+            self.assertLogs(
+                "sglang.srt.platforms.device_mixin", level="WARNING"
+            ) as logs,
+        ):
+            NPUSRTPlatform().prepare_weight_cache_export(tensors)
+        self.assertIn("zero-copy IPC is unavailable", "\n".join(logs.output))
+
+    def test_npu_export_hook_is_quiet_when_zero_copy_works(self):
+        tensors = {"w": (torch.zeros(2), True)}
+        with (
+            patch.dict("sys.modules", {"torch_npu": MagicMock()}),
+            patch(
+                "torch.multiprocessing.reductions.reduce_tensor",
+                return_value=(_named_fn("rebuild_npu_tensor"), ()),
+            ),
+            patch.object(device_mixin_mod.logger, "warning") as mock_warning,
+        ):
+            NPUSRTPlatform().prepare_weight_cache_export(tensors)
+        mock_warning.assert_not_called()
+
+    def test_xpu_memory_reserved_uses_the_xpu_allocator(self):
+        # The daemon differences this across the load. It must read the XPU
+        # allocator, never torch.cuda, which answers 0 on a non-CUDA build.
+        with (
+            patch("torch.xpu.memory_reserved", return_value=4096) as mock_xpu,
+            patch("torch.cuda.memory_reserved", return_value=99) as mock_cuda,
+        ):
+            self.assertEqual(XpuSRTPlatform().memory_reserved(3), 4096)
+        mock_xpu.assert_called_once_with(3)
+        mock_cuda.assert_not_called()
+
+    def test_npu_export_hook_tolerates_an_empty_state_dict(self):
+        with (
+            patch.dict("sys.modules", {"torch_npu": MagicMock()}),
+            patch("torch.multiprocessing.reductions.reduce_tensor") as mock_reduce,
+        ):
+            NPUSRTPlatform().prepare_weight_cache_export({})
+        mock_reduce.assert_not_called()
+
+
+class TestXpuWeightCacheEnvStamp(CustomTestCase):
+    """XPU identity that the weight cache fingerprint needs.
+
+    ``get_device_capability`` reads ``sgl_kernel.query_device``, an op some
+    sgl-kernel-xpu builds do not ship; when it is missing the fingerprint field
+    degrades to "" and two XPU generations compare equal. The stamp therefore
+    reads torch.xpu directly and refuses to report a partial identity.
+    """
+
+    CAPS = {
+        "architecture": 21479031808,
+        "device_id": 57873,
+        "driver_version": "1.15.39122+11",
+    }
+
+    def _stamp(self, caps=None, pkg_version="0.5.0"):
+        with (
+            patch("torch.xpu.current_device", return_value=0),
+            patch(
+                "torch.xpu.get_device_capability",
+                return_value=self.CAPS if caps is None else caps,
+            ),
+            patch.object(xpu_mod, "_sgl_kernel_xpu_version", return_value=pkg_version),
+        ):
+            return XpuSRTPlatform().weight_cache_env_stamp()
+
+    def test_stamp_carries_architecture_driver_and_kernel_version(self):
+        stamp = self._stamp()
+        self.assertEqual(
+            stamp,
+            {
+                "xpu_architecture": "21479031808",
+                "xpu_device_id": "57873",
+                "xpu_driver_version": "1.15.39122+11",
+                "sgl_kernel_xpu_version": "0.5.0",
+            },
+        )
+
+    def test_stamp_does_not_depend_on_the_optional_kernel_op(self):
+        # The whole point: an absent query_device op must not affect the stamp.
+        def absent(*_a, **_k):
+            raise AttributeError("sgl_kernel has no attribute query_device")
+
+        with patch.object(
+            XpuSRTPlatform, "get_device_capability", side_effect=absent
+        ) as mock_cap:
+            stamp = self._stamp()
+        self.assertEqual(stamp["xpu_architecture"], "21479031808")
+        mock_cap.assert_not_called()
+
+    def test_missing_identity_fails_explicitly(self):
+        # Each required field, absent in turn. A placeholder here would make a
+        # cache from another generation look compatible.
+        for field in ("architecture", "device_id", "driver_version"):
+            with self.subTest(missing=field):
+                caps = {k: v for k, v in self.CAPS.items() if k != field}
+                with self.assertRaises(RuntimeError) as ctx:
+                    self._stamp(caps=caps)
+                self.assertIn("incomplete", str(ctx.exception))
+                self.assertIn(f"xpu_{field}", str(ctx.exception))
+
+    def test_absent_kernel_package_fails_explicitly(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            self._stamp(pkg_version="")
+        self.assertIn("sgl_kernel_xpu_version", str(ctx.exception))
+        self.assertIn("sglang-kernel-xpu", str(ctx.exception))
+
+    def test_different_architecture_or_runtime_changes_the_stamp(self):
+        base = self._stamp()
+        for label, caps, pkg in (
+            ("architecture", {**self.CAPS, "architecture": 11476656128}, "0.5.0"),
+            ("driver", {**self.CAPS, "driver_version": "1.14.38000+5"}, "0.5.0"),
+            ("kernel package", self.CAPS, "0.6.0"),
+        ):
+            with self.subTest(differs=label):
+                self.assertNotEqual(base, self._stamp(caps=caps, pkg_version=pkg))
+
+    def test_platforms_needing_no_extra_identity_contribute_nothing(self):
+        # Guards every other vendor's fingerprint: an empty contribution leaves
+        # it exactly as it was before this hook existed.
+        for platform_cls in (
+            CudaSRTPlatform,
+            RocmSRTPlatform,
+            MusaSRTPlatform,
+            SailSRTPlatform,
+            NPUSRTPlatform,
+            CpuSRTPlatform,
+            MluSRTPlatform,
+            MpsSRTPlatform,
+        ):
+            self.assertEqual(platform_cls().weight_cache_env_stamp(), {})
 
 
 if __name__ == "__main__":
