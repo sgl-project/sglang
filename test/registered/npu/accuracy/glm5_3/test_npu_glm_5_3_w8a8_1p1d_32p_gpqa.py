@@ -42,12 +42,12 @@ def resolve_accuracy_variant():
 
     # Follow the nightly schedule: the cron fires at 16:00 UTC, i.e. 00:00 the
     # next day in Beijing. Odd dates run DCP, even dates run PCP.
-    day = datetime.now(timezone(timedelta(hours=8))).day
-    variant = "dcp" if day % 2 else "pcp"
+    beijing_day = datetime.now(timezone(timedelta(hours=8))).day
+    accuracy_variant = "dcp" if beijing_day % 2 else "pcp"
     logger.info(
-        f"[accuracy-variant] auto-rotated by date (Beijing day={day}): {variant}"
+        f"[accuracy-variant] auto-rotated by date (Beijing day={beijing_day}): {accuracy_variant}"
     )
-    return variant
+    return accuracy_variant
 
 
 GLM_5_3_PD_SEP_PREFILL_ENVS = {
