@@ -27,7 +27,7 @@ _MAX_N = 65536  # very large N (lm_head) is already at the bandwidth ceiling
 
 
 def _is_sm12x() -> bool:
-    return current_arch().is_sm_at_least(12)
+    return current_arch().is_sm(12)
 
 
 def _config(n: int) -> tuple[int, int, int]:

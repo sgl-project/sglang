@@ -73,7 +73,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
+ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -83,6 +83,9 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
+# Held at the pre-581579ab5 pin: the FlyDSL MoE/MegaMoE AOT replay added
+# between these commits reaches the HIP runtime on this torch 2.9 base and
+# fails in `docker build`, which has no GPU. Bump once that is fixed upstream.
 ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
 ENV TRITON_COMMIT_DEFAULT="42270451990532c67e69d753fbd026f28fcc4840"
 
@@ -94,7 +97,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
+ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
 # filled in after the torch 2.11 upgrade below; it must already exist (empty is
 # valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
@@ -118,7 +121,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
+ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -128,6 +131,9 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
+# Held at the pre-581579ab5 pin: the FlyDSL MoE/MegaMoE AOT replay added
+# between these commits reaches the HIP runtime on this torch 2.9 base and
+# fails in `docker build`, which has no GPU. Bump once that is fixed upstream.
 ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
 ENV TRITON_COMMIT_DEFAULT="42270451990532c67e69d753fbd026f28fcc4840"
 
@@ -139,7 +145,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
+ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
 # filled in after the torch 2.11 upgrade below; it must already exist (empty is
 # valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
@@ -316,7 +322,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
+ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
 # Same reasoning as the rocm724 stages: keep pip from resolving the image's
 # ROCm torch away to a PyPI CUDA build. Populated after the stack is in place.
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
@@ -337,7 +343,7 @@ ENV TRITON_WHEEL_VERSION_SUFFIX=".rocm10.0.0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
+ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
 
@@ -847,6 +853,18 @@ RUN cd sglang \
        else \
          export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install $CONS -e "python[${all_extras}]"; \
        fi
+
+# gfx950: bundle TreeCore, which Kimi-K3.1's env defaults load on every rank so they cannot mix
+# Rust/Python implementations and diverge on HiCache reclaim. Build against the installed ROCm
+# torch; isolation would pull CUDA torch.
+RUN if [ "${GPU_ARCH%%-*}" = "gfx950" ]; then \
+      cd sglang/python \
+      && python -m pip --no-cache-dir install "setuptools-rust>=1.11" \
+      && sed -i -E 's/^rust-extensions = \["multimodal"\]$/rust-extensions = ["multimodal", "rust_tree_core"]/' pyproject.toml \
+      && SGLANG_BUILD_RUST_EXTS=rust_tree_core python setup.py build_rust --inplace \
+      && rm -rf ../rust/sglang-radix-tree/target \
+      && SGLANG_RUST_BUILD_MODE=never python -c "from sglang.srt.mem_cache.rust_tree_core import extension"; \
+    fi
 
 RUN python -m pip cache purge
 

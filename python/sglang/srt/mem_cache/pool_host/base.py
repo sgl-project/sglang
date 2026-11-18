@@ -31,7 +31,7 @@ from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
     hugepage_size_requested,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -229,6 +229,11 @@ def host_memory_budget_plain_hugetlb(
             else free_hugetlb_bytes
         )
     ranks = ranks_per_host()
+    # gfx950 can pin host memory only up to the amdgpu TTM page limit
+    if is_gfx95_supported():
+        from sglang.srt.mem_cache.pool_host.rocm_budget import clamp_plain_budget
+
+        return clamp_plain_budget(plain // ranks), pool // ranks
     return plain // ranks, pool // ranks
 
 
