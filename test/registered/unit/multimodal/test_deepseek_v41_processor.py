@@ -1,12 +1,15 @@
-"""DeepSeek-V4.1 image placeholders in a tokenized prompt."""
+"""DeepSeek-V4.1 image placeholders and preprocess-cache reuse."""
 
 import asyncio
 import base64
 import io
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+import torch
 from PIL import Image
+from transformers import PretrainedConfig
 
 from sglang.srt.multimodal.deepseek_v41_image_processing import (
     image_token_types,
@@ -53,6 +56,10 @@ def _text(value):
     return {"type": "text", "text": value}
 
 
+def _request():
+    return SimpleNamespace(mm_content_hashes=None)
+
+
 class TestDeepseekV41ImageProcessor(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -70,8 +77,9 @@ class TestDeepseekV41ImageProcessor(CustomTestCase):
             model_path="dummy", image_processor_backend="pil", mm_process_config={}
         )
         publish(args, role="tokenizer")
-        # Vision values from the V4.1 checkpoint config.
-        self.config = SimpleNamespace(
+        # Vision values from the V4.1 checkpoint config. A real config, since the
+        # preprocess cache fingerprints it.
+        self.config = PretrainedConfig(
             image_token_id=self.image_token_id,
             vision_patch_size=14,
             vision_downsample_ratio=3,
@@ -100,7 +108,7 @@ class TestDeepseekV41ImageProcessor(CustomTestCase):
 
     def _process(self, prompt, images):
         return asyncio.run(
-            self.processor.process_mm_data_async(images, prompt, request_obj=None)
+            self.processor.process_mm_data_async(images, prompt, _request())
         )
 
     def _expanded(self, name):
@@ -167,6 +175,34 @@ class TestDeepseekV41ImageProcessor(CustomTestCase):
                 f"see {IMAGE_TOKEN} literal {IMAGE_TOKEN}",
                 [ImageData(url=_png("wide"))],
             )
+
+    def test_cached_path_matches_uncached(self):
+        """The preprocess cache must compose the same request as the uncached path."""
+        ids, images = self._prompt([_image("wide"), _text("and"), _image("tall")])
+        cached = self._process(ids, images)
+        uncached = asyncio.run(
+            self.processor._process_mm_data_uncached(images, ids, _request())
+        )
+        self.assertEqual(cached.input_ids, uncached.input_ids)
+        for cached_item, uncached_item in zip(
+            cached.mm_items, uncached.mm_items, strict=True
+        ):
+            self.assertEqual(cached_item.offsets, uncached_item.offsets)
+            self.assertEqual(
+                cached_item.model_specific_data, uncached_item.model_specific_data
+            )
+            torch.testing.assert_close(cached_item.feature, uncached_item.feature)
+
+    def test_repeated_image_skips_patchify(self):
+        """A cache hit reuses the patches and places them at the new prompt's offset."""
+        self.processor.cpu_patchify = Mock(wraps=self.processor.cpu_patchify)
+        first = self._process(*self._prompt([_image("square")]))
+        second = self._process(*self._prompt([_text("again"), _image("square")]))
+        self.assertEqual(self.processor.cpu_patchify.call_count, 1)
+        (first_item,), (second_item,) = first.mm_items, second.mm_items
+        self.assertEqual(first_item.hash, second_item.hash)
+        self.assertNotEqual(first_item.offsets, second_item.offsets)
+        torch.testing.assert_close(first_item.feature, second_item.feature)
 
 
 if __name__ == "__main__":
