@@ -1,5 +1,6 @@
 """Unified MXFP8 payload, scales, page moves, and FA4 attention parity."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -156,3 +157,7 @@ def test_fa4_matches_mxfp8_and_bf16_references(
         bias = kwargs["aux_tensors"][0][..., : loc.numel()].flip(-1).transpose(0, 1)
         expected = torch.einsum("hts,shd->thd", (scores + bias).softmax(-1), values)
         torch.testing.assert_close(outputs[0], expected, atol=3e-3, rtol=3e-3)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
