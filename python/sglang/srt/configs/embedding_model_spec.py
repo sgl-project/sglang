@@ -128,6 +128,11 @@ _EMBEDDING_ARCHITECTURES = {
         EmbeddingExecution.ENCODER_ONLY,
         PoolingStrategy.MODEL_DEFINED,
     ),
+    "Lfm2BidirectionalModel": (
+        "lfm2_bidirectional",
+        EmbeddingExecution.ENCODER_ONLY,
+        PoolingStrategy.CLS,
+    ),
     "LlamaEmbeddingModel": (
         "llama_embedding",
         EmbeddingExecution.DECODER_POOLING,
@@ -151,6 +156,12 @@ _CLASSIFICATION_ARCHITECTURES = {
     "LlamaForSequenceClassificationWithNormal_Weights",
     "Qwen2ForSequenceClassification",
     "Qwen3ForSequenceClassification",
+    "XLMRobertaForSequenceClassification",
+}
+
+# Cross-encoders: classification heads on a bidirectional encoder.
+_ENCODER_CLASSIFICATION_ARCHITECTURES = {
+    "BertForSequenceClassification",
     "XLMRobertaForSequenceClassification",
 }
 
@@ -260,6 +271,11 @@ def _embedding_nemotron3_spec() -> EmbeddingModelSpec:
 def _native_embedding_spec(
     family: str, execution: EmbeddingExecution, pooling: PoolingStrategy
 ) -> EmbeddingModelSpec:
+    # Only a causal decoder's K/V stay valid as the prompt grows. An encoder's
+    # K/V depend on later prompt tokens, and CLIP's text tower runs on the
+    # uncached tokens alone without reading the KV pool, so neither a reused
+    # prefix nor a split prefill is valid for them.
+    decoder_pooling = execution == EmbeddingExecution.DECODER_POOLING
     return EmbeddingModelSpec(
         family=family,
         task=EmbeddingTask.EMBED,
@@ -280,6 +296,8 @@ def _native_embedding_spec(
         auto_enable_embedding=True,
         bidirectional_attention=execution != EmbeddingExecution.DECODER_POOLING,
         bcg_prefill_policy=BCGPrefillPolicy.DEFAULT,
+        safe_disable_radix_cache=not decoder_pooling,
+        safe_disable_chunked_prefill=not decoder_pooling,
     )
 
 
@@ -349,6 +367,7 @@ def resolve_embedding_model_spec(
         return _embedding_nemotron3_spec()
 
     if architecture_set & _CLASSIFICATION_ARCHITECTURES:
+        encoder = bool(architecture_set & _ENCODER_CLASSIFICATION_ARCHITECTURES)
         return EmbeddingModelSpec(
             family="sequence_classification",
             task=EmbeddingTask.CLASSIFY,
@@ -365,6 +384,8 @@ def resolve_embedding_model_spec(
             auto_enable_embedding=False,
             bidirectional_attention=False,
             bcg_prefill_policy=BCGPrefillPolicy.DEFAULT,
+            safe_disable_radix_cache=encoder,
+            safe_disable_chunked_prefill=encoder,
         )
 
     for architecture, (family, execution, pooling) in _EMBEDDING_ARCHITECTURES.items():
