@@ -2370,6 +2370,18 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         with self.assertRaisesRegex(ValueError, r"on the published config"):
             run_post_process_pass(sa, _declares_something)
 
+    def test_model_attention_default_precedes_mlu_fallback(self):
+        """Platform defaults must not suppress Llama4's compatible Triton default."""
+        with patch(
+            "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+            return_value=None,
+        ):
+            args = self._construct("Llama4ForCausalLM", "llama", device="mlu")
+        self.assertEqual(
+            base_module.attention_backends_of(base_module.resolved_view(args)),
+            ("triton", "triton"),
+        )
+
     def test_attention_backend_user_choice_declares_nothing_extra(self):
         sa = self._construct("LlamaForCausalLM", "llama", attention_backend="triton")
         self.assertEqual(self._resolved(sa, "attention_backend"), "triton")

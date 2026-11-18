@@ -34,6 +34,7 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
 )
 from sglang.srt.arg_groups.platform_hook import (
+    handle_mlu_attention_backend_compatibility,
     handle_sail_attention_backend_compatibility,
 )
 from sglang.srt.configs.model_config import uses_kda_attention
@@ -122,6 +123,7 @@ def handle_attention_backend_compatibility(server_args: Any):
     # Split-backend override + default fill.
     run_post_process_pass(server_args, _attention_backend_default)
 
+    handle_mlu_attention_backend_compatibility(server_args)
     handle_sail_attention_backend_compatibility(server_args)
 
     # Torch native and flex attention backends

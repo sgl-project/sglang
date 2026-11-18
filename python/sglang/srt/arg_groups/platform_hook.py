@@ -49,7 +49,7 @@ def handle_npu_backends(server_args: Any):
 
 
 def handle_mlu_backends(server_args: Any):
-    """Resolve MLU attention layouts and their associated runtime defaults."""
+    """Resolve backend-independent MLU runtime defaults."""
     cfg = resolving_view(server_args)
     if cfg.device != "mlu":
         return
@@ -61,26 +61,33 @@ def handle_mlu_backends(server_args: Any):
         raise NotImplementedError("MLU speculative decoding is not supported yet.")
     if cfg.sampling_backend not in (None, "pytorch"):
         raise ValueError("MLU inference requires the pytorch sampling backend.")
-    defaults = {}
-    default_attention_backend = cfg.attention_backend or "mlu"
+    if cfg.sampling_backend is None:
+        declare_resolution(
+            server_args, "handle_mlu_backends", sampling_backend="pytorch"
+        )
+    if cfg.page_size is None:
+        declare_resolution(server_args, "handle_mlu_backends", page_size=16)
+
+
+def handle_mlu_attention_backend_compatibility(server_args: Any):
+    """Validate MLU cache layouts after model and attention defaults resolve."""
+    cfg = resolving_view(server_args)
+    if cfg.device != "mlu":
+        return
     for field in (
         "attention_backend",
         "prefill_attention_backend",
         "decode_attention_backend",
     ):
-        backend = getattr(cfg, field)
-        if backend not in (None, "mlu", "triton"):
+        if getattr(cfg, field) not in (None, "mlu", "triton"):
             raise ValueError(f"MLU inference requires {field}='mlu' or 'triton'.")
-        if backend is None:
-            defaults[field] = default_attention_backend
-    if defaults:
-        declare_resolution(server_args, "handle_mlu_backends", **defaults)
-    if cfg.prefill_attention_backend != cfg.decode_attention_backend:
+    prefill_backend, decode_backend = attention_backends_of(cfg)
+    if prefill_backend != decode_backend:
         raise ValueError(
             "MLU prefill and decode share a KV cache memory pool. "
             "Use the same attention backend to ensure compatible layouts."
         )
-    use_hnd = cfg.prefill_attention_backend == "mlu"
+    use_hnd = prefill_backend == "mlu"
     if (
         envs.SGLANG_USE_HND_KVCACHE.is_set()
         and envs.SGLANG_USE_HND_KVCACHE.get() != use_hnd
@@ -88,15 +95,9 @@ def handle_mlu_backends(server_args: Any):
         # MLA uses token-linear storage independently of the MHA layout.
         if not use_mla_backend(server_args):
             raise ValueError(
-                f"MLU MHA attention backend {cfg.prefill_attention_backend!r} "
+                f"MLU MHA attention backend {prefill_backend!r} "
                 f"requires SGLANG_USE_HND_KVCACHE={int(use_hnd)}."
             )
-    if cfg.sampling_backend is None:
-        declare_resolution(
-            server_args, "handle_mlu_backends", sampling_backend="pytorch"
-        )
-    if cfg.page_size is None:
-        declare_resolution(server_args, "handle_mlu_backends", page_size=16)
 
 
 def handle_mps_backends(server_args: Any):
