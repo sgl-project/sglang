@@ -63,6 +63,7 @@ _TRITON_KERNELS = [
     ("aiter_unified_page_table", "scatter_req_to_token_to_page_table_kernel"),
     ("fused_qk_rope_reshape_and_cache", "fused_qk_rope_reshape_and_cache"),
     ("mla_qk_prep", "concat_and_cast_mha_k_triton"),
+    ("beam_shared_context", "shared_context_attention"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(
@@ -579,6 +580,14 @@ for _mod, _fn in [
         )
     )
 del _mod, _fn
+register_kernel(
+    KernelSpec(
+        op="attention.fused_qkv_gating_gdn_prefill",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.triton_gdn_fused_proj:fused_qkv_gating_gdn_prefill",
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+    )
+)
 # tcgen05 + TMEM: datacenter Blackwell only (SM100 / SM103), not SM120.
 for _mod, _fn in [
     ("linear.gdn_blackwell", "chunk_gated_delta_rule_cutedsl"),
