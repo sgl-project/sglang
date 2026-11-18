@@ -822,9 +822,9 @@ def test_mamba_chunk_scan_isolates_nonfinite_request():
     )
 
     victim_out = out[:, len_a:]
-    expected = (d_state * torch.arange(1, len_b + 1, device=device, dtype=torch.float32))[
-        None, :, None, None
-    ].expand(1, len_b, n_heads, d_head)
+    expected = (
+        d_state * torch.arange(1, len_b + 1, device=device, dtype=torch.float32)
+    )[None, :, None, None].expand(1, len_b, n_heads, d_head)
 
     assert states[1].isfinite().all(), "request B's final state must stay finite"
     assert victim_out.isfinite().all(), "request B's output must stay finite"
