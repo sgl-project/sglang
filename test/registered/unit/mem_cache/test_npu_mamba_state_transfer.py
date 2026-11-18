@@ -7,13 +7,19 @@ import torch
 
 import sglang.srt.mem_cache.pool_host.mamba as mamba_pool_host
 import sglang.srt.mem_cache.pool_host.npu_host_memory as npu_host_memory
-from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
+from sglang.srt.mem_cache.device_pool_info import (
+    MLABufferInfo,
+    MLASplitBuffers,
+    MambaStateBufferInfo,
+)
 from sglang.srt.mem_cache.pool_host.mamba import (
     MambaPoolHost,
 )
 from sglang.srt.mem_cache.pool_host.npu_host_memory import (
     MemfabricHostMemoryBackend,
+    hybrid_host_allocation_bytes,
     mha_host_allocation_bytes,
+    mla_host_allocation_bytes,
     mamba_host_allocation_bytes,
     reserve_hybrid_host_memory,
 )
@@ -469,6 +475,112 @@ class TestNPUMambaStateTransferViews(unittest.TestCase):
 
 
 class TestNPUMambaHostReservation(unittest.TestCase):
+    def test_mla_estimate_includes_drafts_indexer_and_padding_page(self):
+        buffers = MLASplitBuffers(
+            k=None,
+            v=None,
+            index_k=torch.empty(1),
+            index_scales=torch.empty(1),
+            index_layer_indices=(0,),
+            k_width=8,
+            v_width=4,
+            index_width=2,
+        )
+        info = MLABufferInfo(
+            buffers=buffers,
+            data_ptrs=None,
+            layer_indices=(0, 1),
+            device_layer_num=2,
+            page_size=4,
+            kv_lora_rank=8,
+            qk_rope_head_dim=4,
+            kv_cache_dim=12,
+            dtype=torch.float16,
+            device=torch.device("cpu"),
+        )
+        pool = SimpleNamespace(
+            layer_num=2,
+            layer_shard_enabled=False,
+            kv_cache_dim=12,
+            host_capacity_tokens=None,
+            size=10,
+            get_device_pool_infos=lambda: (SimpleNamespace(buffer_info=info),),
+        )
+        mamba_info = MambaStateBufferInfo(
+            temporal=torch.empty(1, 10, 2), conv=(torch.empty(1, 10, 2),)
+        )
+        mamba_pool = SimpleNamespace(host_capacity_tokens=None, size=10)
+        for layout in ("page_first_kv_split", "layer_first_kv_split"):
+            with self.subTest(layout=layout), (
+                patch.object(
+                    npu_host_memory,
+                    "get_memory",
+                    return_value=SimpleNamespace(
+                        hicache_mem_layout=layout, hicache_ratio=2, hicache_size=0
+                    ),
+                ),
+                patch.object(
+                    npu_host_memory,
+                    "get_parallel",
+                    return_value=SimpleNamespace(dcp_enabled=False),
+                ),
+            ):
+                total = mla_host_allocation_bytes(
+                    pool,
+                    info,
+                    draft_count=1,
+                    device_capacity=10,
+                    host_to_device_ratio=2,
+                    host_size=0,
+                    page_size=4,
+                )
+                # 6 pages x 4 tokens: three K/V layers plus one indexer layer.
+                self.assertEqual(total, 24 * (3 * (8 + 4) * 2 + 2 * 2 + 4))
+                kv_bytes, mamba_bytes = hybrid_host_allocation_bytes(
+                    kv_pool=pool,
+                    kv_host_size=None,
+                    kv_draft_pools=(object(),),
+                    page_size=4,
+                    mamba_pool=mamba_pool,
+                    mamba_info=SimpleNamespace(buffer_info=mamba_info),
+                    mamba_host_size=0,
+                    mamba_draft_pools=(),
+                )
+                self.assertEqual(kv_bytes, total)
+                self.assertGreater(mamba_bytes, 0)
+
+        # A fixed host budget is converted to pages from the logical MLA row
+        # width, while the allocation uses the physical split-buffer widths.
+        with (
+            patch.object(
+                npu_host_memory,
+                "get_memory",
+                return_value=SimpleNamespace(
+                    hicache_mem_layout="page_first_kv_split"
+                ),
+            ),
+            patch.object(
+                npu_host_memory,
+                "get_parallel",
+                return_value=SimpleNamespace(dcp_enabled=True, attn_dcp_size=2),
+            ),
+            patch(
+                "sglang.srt.mem_cache.pool_host.base.sync_fixed_hicache_size",
+                return_value=17,
+            ) as sync_size,
+        ):
+            total = mla_host_allocation_bytes(
+                pool,
+                info,
+                draft_count=1,
+                device_capacity=10,
+                host_to_device_ratio=2,
+                host_size=0.001,
+                page_size=8,
+            )
+        sync_size.assert_called_once_with(int(0.001 * 1e9 // 80), 0.001)
+        self.assertEqual(total, 20 * (3 * (8 + 4) * 2 + 2 * 2 + 4))
+
     def test_mha_estimate_includes_draft_layer_and_padding_page(self):
         info = SimpleNamespace(
             buffers=SimpleNamespace(k=(object(), object())),

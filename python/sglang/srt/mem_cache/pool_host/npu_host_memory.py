@@ -31,13 +31,17 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.mem_cache.device_pool_info import MHABufferInfo
+from sglang.srt.mem_cache.device_pool_info import (
+    MHABufferInfo,
+    MLABufferInfo,
+    MLASplitBuffers,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.runtime_context import get_memory
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MLASplitBuffers
+    from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
 
 logger = logging.getLogger(__name__)
 
@@ -318,7 +322,26 @@ def reserve_mla_split_host_memory(
     if backend is None:
         return
 
-    num_tokens = num_pages * page_size
+    total_bytes = _mla_split_host_buffer_bytes(
+        num_tokens=num_pages * page_size,
+        num_layers=num_layers,
+        k_width=k_width,
+        v_width=v_width,
+        dtype=dtype,
+        buffers=buffers,
+    )
+    backend.ensure_capacity(total_bytes, torch.npu.current_device())
+
+
+def _mla_split_host_buffer_bytes(
+    *,
+    num_tokens: int,
+    num_layers: int,
+    k_width: int,
+    v_width: int,
+    dtype: torch.dtype,
+    buffers: MLASplitBuffers,
+) -> int:
     num_kv_rows = num_tokens * num_layers
     total_bytes = num_kv_rows * k_width * dtype.itemsize
     if v_width > 0:
@@ -330,7 +353,7 @@ def reserve_mla_split_host_memory(
     if buffers.index_scales is not None:
         total_bytes += num_indexer_rows * 4  # Host scales are FP32.
 
-    backend.ensure_capacity(total_bytes, torch.npu.current_device())
+    return total_bytes
 
 
 def _mha_host_buffer_bytes(
@@ -453,6 +476,63 @@ def mha_host_allocation_bytes(
     return pages * page_size * bytes_per_token
 
 
+def mla_host_allocation_bytes(
+    kv_pool,
+    buffer_info: MLABufferInfo,
+    *,
+    draft_count: int,
+    device_capacity: int,
+    host_to_device_ratio: float,
+    host_size: float,
+    page_size: int,
+) -> int:
+    """Return the MLA split buffers that its host pool will allocate."""
+    from sglang.srt.mem_cache.pool_host.base import sync_fixed_hicache_size
+
+    buffers = buffer_info.buffers
+    if not isinstance(buffers, MLASplitBuffers) or (
+        get_memory().hicache_mem_layout
+        not in ("page_first_kv_split", "layer_first_kv_split")
+    ):
+        raise NotImplementedError(
+            "MemFabric MLA + Mamba reservation requires an MLA KV split layout"
+        )
+    parallel = get_parallel()
+    if parallel.dcp_enabled:
+        page_size //= parallel.attn_dcp_size
+    target_layers = kv_pool.layer_num
+    if kv_pool.layer_shard_enabled:
+        target_layers = (
+            target_layers + kv_pool.layer_shard_size - 1
+        ) // kv_pool.layer_shard_size
+    layers = target_layers + draft_count
+
+    # HostKVCache sizes fixed hicache-size from the logical MLA row width.
+    bytes_per_token = kv_pool.kv_cache_dim * buffer_info.dtype.itemsize * layers
+    if buffers.index_k is not None:
+        index_layers = len(buffers.index_layer_indices)
+        bytes_per_token += (
+            index_layers * buffers.index_width * buffer_info.dtype.itemsize
+        )
+        if buffers.index_scales is not None:
+            bytes_per_token += index_layers * 4
+    if host_size > 0:
+        slots = sync_fixed_hicache_size(
+            int(host_size * 1e9 // bytes_per_token), host_size
+        )
+    else:
+        slots = int(device_capacity * host_to_device_ratio)
+    pages = slots // page_size + 1
+    return _mla_split_host_buffer_bytes(
+        num_tokens=pages * page_size,
+        num_layers=layers,
+        k_width=buffers.k_width if buffer_info.packed_fp8 else buffer_info.kv_lora_rank,
+        v_width=0 if buffer_info.packed_fp8 else buffers.v_width,
+        dtype=buffer_info.dtype,
+        buffers=buffers,
+    )
+
+
 def hybrid_host_allocation_bytes(
     *,
     kv_pool,
@@ -464,7 +544,7 @@ def hybrid_host_allocation_bytes(
     mamba_host_size: float,
     mamba_draft_pools,
 ) -> tuple[int, int]:
-    """Estimate the MHA KV and Mamba blocks of one hybrid stack."""
+    """Estimate the MHA/MLA KV and Mamba blocks of one hybrid stack."""
     memory = get_memory()
     kv_capacity = kv_pool.host_capacity_tokens
     if kv_capacity is None:
@@ -472,14 +552,18 @@ def hybrid_host_allocation_bytes(
     mamba_capacity = mamba_pool.host_capacity_tokens
     if mamba_capacity is None:
         mamba_capacity = mamba_pool.size
-    kv_bytes = mha_host_allocation_bytes(
-        kv_pool.get_device_pool_infos()[0].buffer_info,
+    kv_info = kv_pool.get_device_pool_infos()[0].buffer_info
+    kv_options = dict(
         draft_count=len(kv_draft_pools),
         device_capacity=kv_capacity,
         host_to_device_ratio=memory.hicache_ratio,
         host_size=memory.hicache_size if kv_host_size is None else kv_host_size,
         page_size=page_size,
     )
+    if isinstance(kv_info, MLABufferInfo):
+        kv_bytes = mla_host_allocation_bytes(kv_pool, kv_info, **kv_options)
+    else:
+        kv_bytes = mha_host_allocation_bytes(kv_info, **kv_options)
     mamba_bytes = mamba_host_allocation_bytes(
         mamba_info.buffer_info,
         tuple(
