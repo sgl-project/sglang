@@ -8,7 +8,7 @@ from sglang.srt.utils import is_sail
 from sglang.test.ci.ci_register import register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_ppu_ci(est_time=20, suite="stage-a-test-1-gpu-ppu")
+register_ppu_ci(est_time=20, suite="extra-test-1-gpu-ppu")
 
 
 class TestSailMxfp4ScaleLayout(CustomTestCase):

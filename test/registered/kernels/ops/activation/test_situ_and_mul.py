@@ -16,7 +16,7 @@ register_cuda_ci(est_time=70, stage="base-b-kernel-unit", runner_config="4-gpu-b
 # backend-specific: the ROCm MoE front fuses routed-input casting with SiTU.
 register_amd_ci(est_time=10, stage="base-a-jit-kernel-unit", runner_config="amd")
 # backend-specific: SAIL FP4 instructions and the DeepEP masked SiTU ABI.
-register_ppu_ci(est_time=70, suite="stage-a-test-1-gpu-ppu")
+register_ppu_ci(est_time=70, suite="extra-test-1-gpu-ppu")
 
 _BETA = 4.0
 _LINEAR_BETA = 25.0
