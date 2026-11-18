@@ -972,7 +972,7 @@ class AiterAttnBackend(AttentionBackend):
         self.use_triton_unified_attention = (
             self.use_sliding_window_kv_pool
             or self._is_dspark_draft
-            or get_bool_env_var("SGLANG_USE_AITER_UNIFIED_ATTN")
+            or envs.SGLANG_USE_AITER_UNIFIED_ATTN.get()
         )
         # Deterministic mode allows aiter decode only for the paged_attention_ragged
         # path and aiter prefill only for the batch prefill path; the unified-attention
