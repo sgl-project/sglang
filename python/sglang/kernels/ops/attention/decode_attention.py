@@ -339,8 +339,17 @@ def _fwd_kernel_stage1(
                 other=0.0,
             )
             # Reduce in fp32; a bf16 tl.sum rounds each partial sum in compiler order.
-            # Cast the product, not q and k, to avoid a fp32 [BLOCK_N, D] tile.
-            qk = tl.sum((q[None, :] * k).to(tl.float32), 1)
+            # Cast the product, not q and k, to avoid a fp32 [BLOCK_N, D] tile --
+            # except when the product itself would be formed in fp16: a single
+            # q*k product above 65504 overflows to inf before the cast, and the
+            # softmax then computes exp(inf - inf), NaN-ing the whole head.
+            # bf16's range matches fp32, so its product cannot overflow in
+            # practice and keeps the cheap form; an fp16 Q with an fp8 K also
+            # promotes to fp16, so it takes the same safe branch.
+            if q.dtype == tl.float16 or k.dtype == tl.float16:
+                qk = tl.sum(q[None, :].to(tl.float32) * k.to(tl.float32), 1)
+            else:
+                qk = tl.sum((q[None, :] * k).to(tl.float32), 1)
             qk *= sm_scale_withk
 
             if logit_cap > 0:
