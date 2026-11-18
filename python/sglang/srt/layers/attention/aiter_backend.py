@@ -228,8 +228,8 @@ _MLA_FP8_Q_ASM_QLENS = frozenset((1, *range(5, 8 + 1)))
 
 @functools.cache
 def _is_gfx950() -> bool:
-    """Exactly gfx950 (MI350X/MI355X), not any gfx95x: the fp8-query ASM MLA
-    kernels' only target."""
+    """Exactly gfx950 (MI350X/MI355X), not any gfx95x: the fp8-Q ASM MLA route's
+    only arch. False off HIP."""
     from sglang.kernels.arch import current_arch
 
     hip = current_arch().hip
