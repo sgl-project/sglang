@@ -4,9 +4,6 @@ from dataclasses import dataclass
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.task_type import DataType
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
 
 IDEOGRAM4_PRESETS: dict[str, dict[str, object]] = {
     "V4_QUALITY_48": {
@@ -71,6 +68,8 @@ IDEOGRAM4_PRESETS: dict[str, dict[str, object]] = {
 
 @dataclass
 class Ideogram4SamplingParams(SamplingParams):
+    _request_size_model_name = "Ideogram 4"
+
     data_type: DataType = DataType.IMAGE
     prompt: str = " "
     negative_prompt: str = " "
@@ -121,39 +120,18 @@ class Ideogram4SamplingParams(SamplingParams):
         self.guidance_scale = float(preset_cfg["guidance_schedule"][-1])
         super().__post_init__()
 
-    def _adjust_visual_fields(self, server_args, pipeline_config) -> None:
-        super()._adjust_visual_fields(server_args, pipeline_config)
-        self._align_resolution(pipeline_config)
-
-    def prepare_synthetic_warmup_request_for_queue(self, req, server_args) -> None:
-        # Warmup overwrites the dimensions after _adjust has run.
-        self._align_resolution(server_args.pipeline_config)
-
-    def _align_resolution(self, pipeline_config) -> None:
+    def _request_size_multiple(self, pipeline_config) -> int | None:
         from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
             Ideogram4PipelineConfig,
         )
 
         # Ideogram4TextEncodingStage._build_inputs rejects sizes off the patch grid.
         if not isinstance(pipeline_config, Ideogram4PipelineConfig):
-            return
+            return None
+        # Non-int sizes are left to request validation.
         if not isinstance(self.width, int) or not isinstance(self.height, int):
-            return
-        if self.width <= 0 or self.height <= 0:
-            return
-        m = pipeline_config.patch_size * pipeline_config.ae_scale_factor
-        requested_size = (self.width, self.height)
-        self.width = max(m, self.width // m * m)
-        self.height = max(m, self.height // m * m)
-        if (self.width, self.height) != requested_size:
-            logger.warning(
-                "Ideogram 4 requires dimensions divisible by %s; adjusted requested "
-                "resolution from %sx%s to %sx%s",
-                m,
-                *requested_size,
-                self.width,
-                self.height,
-            )
+            return None
+        return pipeline_config.patch_size * pipeline_config.ae_scale_factor
 
 
 @dataclass
