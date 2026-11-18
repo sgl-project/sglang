@@ -78,7 +78,9 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import token_req_indices
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
+    LowRatioExtendSlots,
     build_low_ratio_decode_workspaces,
+    build_low_ratio_extend_k_slots,
     low_ratio_candidate_span,
     low_ratio_decode_rows_are_identity,
     low_ratio_identity_skip_enabled,
@@ -967,6 +969,8 @@ class DeepseekV4HipRadixBackend(
         )
         # published by the candidate-source layer, consumed by the later index-source layers
         self.candidate_masks = None
+        # this forward's extend slot tables by ratio, built in _refresh_fp4_prefill_workspace
+        self.low_ratio_extend_k_slots: Dict[int, LowRatioExtendSlots] = {}
         self.enable_deepseek_v4_fp4_indexer: bool = (
             get_exec().kernel.enable_deepseek_v4_fp4_indexer
         )
@@ -1047,7 +1051,6 @@ class DeepseekV4HipRadixBackend(
             self.enable_deepseek_v4_fp4_indexer
             and self.speculative_num_steps == 0
             and self.has_c4
-            and envs.SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP.get()
         ):
             from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
                 aiter_has_fp4_rowgroup,
@@ -1064,10 +1067,9 @@ class DeepseekV4HipRadixBackend(
                     self._fp4_c4_rowgroup_columns,
                 )
             else:
-                logger.warning(
-                    "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP is set but the installed AITER "
-                    "has no row-group FP4 MQA logits kernel (#6145); keeping the "
-                    "schedule-based C4 indexer."
+                logger.info(
+                    "DSv4 C4 indexer: the installed AITER has no row-group FP4 MQA "
+                    "logits kernel (#6145); using the schedule-based C4 indexer."
                 )
         self.speculative_step_id = speculative_step_id
         self.forward_metadata: Union[
@@ -1874,6 +1876,7 @@ class DeepseekV4HipRadixBackend(
         kernel reads, so only the pinned buffers it fills may be read from a graph."""
         if metadata is None:
             metadata = self.forward_metadata
+        self.low_ratio_extend_k_slots = {}
         if (
             isinstance(metadata, DSV4Metadata)
             and metadata.core_metadata.low_ratios
@@ -1892,6 +1895,14 @@ class DeepseekV4HipRadixBackend(
                     max_context_len=self.max_context_len,
                     page8_ratios=self.token_to_kv_pool.low_ratio_index_k_page8_ratios(),
                 )
+            )
+            self.low_ratio_extend_k_slots = build_low_ratio_extend_k_slots(
+                self.req_to_token,
+                ratios=metadata.core_metadata.low_ratios,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
+                req_pool_indices=forward_batch.req_pool_indices,
+                index_topk=self.index_topk,
+                identity_skip=self.low_ratio_identity_skip,
             )
         if not self._fp4_workspaces_enabled(metadata):
             return

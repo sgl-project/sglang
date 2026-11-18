@@ -2,7 +2,7 @@ import sys
 import types
 import unittest
 from contextlib import nullcontext
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
     DeviceCapability,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.test.test_utils import CustomTestCase
 
 SDPA_BACKEND_CLS_STR = (
     "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
@@ -63,6 +64,96 @@ class FakeCudaPlatform(CudaPlatformBase):
     @classmethod
     def get_device_capability(cls, device_id: int = 0):
         return cls.device_capability
+
+
+class TestFlashInferFA2Selection(CustomTestCase):
+    def test_default_fallback_and_explicit_override(self):
+        """An optional model default must not swallow an explicit backend choice."""
+        selector = "sglang.multimodal_gen.runtime.layers.attention.selector"
+        fi = AttentionBackendEnum.FLASHINFER_FA2
+        sdpa = AttentionBackendEnum.TORCH_SDPA
+        module = ModuleType("flashinfer")
+        module.single_prefill_with_kv_cache = Mock()
+        server_args = ServerArgs.__new__(ServerArgs)
+        server_args.attention_backend = None
+        server_args._explicit_arg_names = set()
+        self.addCleanup(_cached_get_attn_backend.cache_clear)
+        with (
+            patch(f"{selector}.get_global_server_args", return_value=server_args),
+            patch(f"{selector}.get_global_forced_attn_backend", return_value=None),
+            patch(
+                "sglang.multimodal_gen.runtime.platforms.current_platform",
+                FakeCudaPlatform,
+            ),
+            patch.object(
+                FakeCudaPlatform, "_resolve_default_attn_backend", return_value=sdpa
+            ),
+        ):
+            for capability, installed, dtype, explicit, expected in (
+                ((12, 0), True, torch.bfloat16, None, fi),
+                ((12, 1), True, torch.bfloat16, None, fi),
+                ((12, 0), True, torch.bfloat16, sdpa, sdpa),
+                ((12, 0), False, torch.bfloat16, None, sdpa),
+                ((12, 0), True, torch.float32, None, sdpa),
+                ((8, 0), True, torch.bfloat16, None, fi),
+                ((8, 6), True, torch.float16, None, fi),
+                ((8, 7), True, torch.bfloat16, None, fi),
+                ((8, 0), True, torch.bfloat16, sdpa, sdpa),
+                ((8, 0), False, torch.bfloat16, None, sdpa),
+                ((8, 0), True, torch.float32, None, sdpa),
+                ((8, 9), True, torch.bfloat16, None, fi),
+                ((9, 0), True, torch.bfloat16, None, fi),
+                ((10, 0), True, torch.bfloat16, None, fi),
+                ((13, 0), True, torch.bfloat16, None, fi),
+            ):
+                with (
+                    self.subTest(
+                        capability=capability,
+                        installed=installed,
+                        dtype=dtype,
+                        explicit=explicit,
+                    ),
+                    patch.object(
+                        FakeCudaPlatform,
+                        "device_capability",
+                        DeviceCapability(*capability),
+                    ),
+                    patch.object(
+                        FakeCudaPlatform, "is_sm120_device", capability[0] == 12
+                    ),
+                ):
+                    _cached_get_attn_backend.cache_clear()
+                    with patch.dict(
+                        sys.modules, {"flashinfer": module if installed else None}
+                    ):
+                        backend = get_attn_backend(
+                            128,
+                            dtype,
+                            supported_attention_backends={fi, sdpa},
+                            default_attention_backend=fi,
+                            selected_attention_backend=explicit,
+                            is_cross_attention=True,
+                        )
+                    self.assertEqual(backend.get_enum(), expected)
+            _cached_get_attn_backend.cache_clear()
+            with (
+                patch.dict(sys.modules, {"flashinfer": None}),
+                patch.object(FakeCudaPlatform, "is_sm120_device", True),
+            ):
+                with self.assertRaisesRegex(ValueError, "flashinfer-python"):
+                    get_attn_backend(128, torch.bfloat16, selected_attention_backend=fi)
+            _cached_get_attn_backend.cache_clear()
+            with (
+                patch.dict(sys.modules, {"flashinfer": module}),
+                patch.object(FakeCudaPlatform, "is_sm120_device", False),
+                patch.object(
+                    FakeCudaPlatform, "device_capability", DeviceCapability(8, 9)
+                ),
+            ):
+                backend = get_attn_backend(
+                    128, torch.bfloat16, selected_attention_backend=fi
+                )
+                self.assertEqual(backend.get_enum(), fi)
 
 
 class TestCudaAttentionBackendSelection(unittest.TestCase):
@@ -167,10 +258,32 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
 
         self.assertEqual(self.resolve(None), SDPA_BACKEND_CLS_STR)
 
-    def test_requested_flash_attention_uses_torch_sdpa_on_sm120(self):
+    def test_requested_flash_attention_on_sm120_initializes_fa4(self):
         FakeCudaPlatform.is_sm120_device = True
+        module_name = (
+            "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn"
+        )
+        fake_flash_attn = ModuleType(module_name)
+        fake_flash_attn.set_fa_ver = Mock()
 
-        self.assertEqual(self.resolve(AttentionBackendEnum.FA), SDPA_BACKEND_CLS_STR)
+        class FakeFlashAttentionBackend:
+            @staticmethod
+            def get_supported_head_sizes():
+                return [128]
+
+        fake_flash_attn.FlashAttentionBackend = FakeFlashAttentionBackend
+        with patch.dict("sys.modules", {module_name: fake_flash_attn}):
+            self.assertEqual(
+                self.resolve(AttentionBackendEnum.FA),
+                f"{module_name}.FlashAttentionBackend",
+            )
+        fake_flash_attn.set_fa_ver.assert_called_once_with(4)
+
+    def test_requested_flash_attention_on_sm120_retains_dtype_fallback(self):
+        FakeCudaPlatform.is_sm120_device = True
+        self.assertEqual(
+            self.resolve(AttentionBackendEnum.FA, torch.float32), SDPA_BACKEND_CLS_STR
+        )
 
     def test_default_backend_falls_back_for_non_flash_attention_dtype(self):
         self.assertEqual(self.resolve(None, torch.float32), SDPA_BACKEND_CLS_STR)
@@ -456,6 +569,75 @@ class TestFlashAttentionForwardInto(unittest.TestCase):
         self.assertTrue(impl.forward_into(q, k, v, out, None))
         self.assertTrue(torch.equal(out, impl.forward(q, k, v, None)))
         self.assertFalse(full[:, :, :4].any() or full[:, :, 8:].any())
+
+
+class TestFlashAttentionSingleSequence(unittest.TestCase):
+    """A packed varlen call holding one live sequence runs FA3's batch kernel."""
+
+    HEADS, HEAD_DIM = 4, 8
+
+    def _run(self, bounds, *, padding=True, max_seqlen=None, writes_out=True):
+        total = bounds[-1]
+        q, k, v = (torch.randn(total, self.HEADS, self.HEAD_DIM) for _ in range(3))
+        impl = SimpleNamespace(
+            _request_skip_softmax_threshold=lambda: (False, None),
+            softmax_scale=self.HEAD_DIM**-0.5,
+            causal=False,
+            packed_trailing_padding=padding,
+        )
+        calls = []
+
+        def fake(q, k, v, *, cu_seqlens_q, out=None, **kwargs):
+            calls.append((tuple(q.shape), cu_seqlens_q, kwargs))
+            if out is None or not writes_out:
+                return torch.ones_like(q)
+            return out.fill_(1)
+
+        with (
+            patch.object(flash_attn, "fa_ver", 3),
+            patch.object(flash_attn, "flash_attn_varlen_func", fake),
+        ):
+            output = FlashAttentionImpl.forward_varlen(
+                impl,
+                q,
+                k,
+                v,
+                cu_seqlens=torch.tensor(bounds, dtype=torch.int32),
+                max_seqlen=max_seqlen or bounds[1],
+                cu_seqlens_host=bounds,
+            )
+        return output, calls
+
+    def test_one_sequence_runs_the_batch_kernel(self):
+        output, [(shape, cu, kwargs)] = self._run((0, 12))
+        self.assertEqual(shape, (1, 12, self.HEADS, self.HEAD_DIM))
+        self.assertIsNone(cu)
+        self.assertEqual(kwargs["max_seqlen_q"], 12)
+        self.assertTrue((output == 1).all())
+
+    def test_trailing_padding_runs_live_rows_and_zeroes_the_rest(self):
+        output, [(shape, cu, kwargs)] = self._run((0, 10, 16))
+        self.assertEqual(shape, (1, 10, self.HEADS, self.HEAD_DIM))
+        self.assertIsNone(cu)
+        self.assertTrue((output[:10] == 1).all())
+        self.assertTrue((output[10:] == 0).all())
+
+    def test_fallback_that_ignores_out_still_fills_the_live_rows(self):
+        """A kernel that returns a fresh tensor instead of writing `out` must
+        not leave the live rows uninitialized."""
+        output, _ = self._run((0, 10, 16), writes_out=False)
+        self.assertTrue((output[:10] == 1).all())
+        self.assertTrue((output[10:] == 0).all())
+
+    def test_several_sequences_keep_the_varlen_kernel(self):
+        _, [(shape, cu, _)] = self._run((0, 6, 12), padding=False, max_seqlen=6)
+        self.assertEqual(shape, (12, self.HEADS, self.HEAD_DIM))
+        self.assertEqual(cu.tolist(), [0, 6, 12])
+
+    def test_padding_is_only_dropped_where_the_layout_declares_it(self):
+        _, [(shape, cu, _)] = self._run((0, 10, 16), padding=False)
+        self.assertEqual(shape, (16, self.HEADS, self.HEAD_DIM))
+        self.assertEqual(cu.tolist(), [0, 10, 16])
 
 
 class TestForwardIntoDefault(unittest.TestCase):

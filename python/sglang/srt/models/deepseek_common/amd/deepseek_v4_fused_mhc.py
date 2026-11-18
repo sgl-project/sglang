@@ -17,13 +17,19 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
 )
-from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
-from sglang.srt.utils.common import is_gfx1250_supported
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_gfx95_supported,
+    is_gfx942_supported,
+    is_hip,
+)
+from sglang.srt.utils.device import is_gfx1250_supported
 
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
+_is_gfx942_supported = is_gfx942_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 
 if _is_hip:
@@ -76,8 +82,9 @@ def _is_fused_mhc_post_pre_enabled() -> bool:
     # Other HIP archs: TileLang's HIP codegen cannot lower the tl.get_lane_idx
     # used by mhc_fused_post_pre_fma_tilelang, so the TileLang fused boundary is
     # unavailable here the same way the standalone TileLang mHC pre/post paths
-    # are (_use_tilelang_mhc_pre / _use_tilelang_mhc_post). gfx95 keeps fusion
-    # through _is_aiter_gfx95_mhc_available; the rest fall back to the unfused
+    # are (_use_tilelang_mhc_pre / _use_tilelang_mhc_post). gfx95 and gfx942 keep
+    # cross-layer fusion through the aiter HIP mhc_fused_post_pre
+    # (_is_aiter_gfx95_mhc_available); the rest fall back to the unfused
     # hc_post + hc_pre sequence.
     if _is_hip:
         return False
@@ -92,7 +99,11 @@ def _is_fused_mhc_post_pre_enabled() -> bool:
 
 
 def _is_aiter_gfx95_mhc_available() -> bool:
-    return _is_hip and get_bool_env_var("SGLANG_USE_AITER") and is_gfx95_supported()
+    return (
+        _is_hip
+        and get_bool_env_var("SGLANG_USE_AITER")
+        and (is_gfx95_supported() or is_gfx942_supported())
+    )
 
 
 def _is_production_mhc_enabled() -> bool:
@@ -104,7 +115,7 @@ def is_cross_layer_mhc_fusion_enabled() -> bool:
 
     Cross-layer fusion requires a fused post+pre kernel to be available: either
     the TileLang path (``SGLANG_OPT_FUSE_MHC_POST_PRE`` + TileLang pre/post) or
-    the aiter HIP path on a supported gfx95 device.
+    the aiter HIP path on gfx95 or gfx942.
     """
     return _is_production_mhc_enabled()
 

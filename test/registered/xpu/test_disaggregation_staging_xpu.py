@@ -7,7 +7,7 @@ The staging buffer reduces RDMA request count from O(tokens * layers) to O(1)
 by gathering scattered KV head slices into contiguous GPU memory before bulk transfer.
 
 Requirements:
-    The ``sglang-router`` package and a mooncake-transfer-engine built with
+    The ``sgl-router`` binary and a mooncake-transfer-engine built with
     -DUSE_XPU=ON -DUSE_TENT=ON (both installed by docker/xpu.Dockerfile). The
     NIXL variant is test/manual/kv_transfer/test_disaggregation_staging_nixl_xpu.py.
 """
@@ -23,7 +23,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
 
-register_xpu_ci(est_time=300, suite="nightly-xpu-kernel-main-4-gpu", nightly=True)
+register_xpu_ci(est_time=300, suite="nightly-kernel-main-test-4-gpu-xpu", nightly=True)
 
 _XPU_AVAILABLE = torch.xpu.is_available()
 # Prefill holds device 0 and decode TP 2 takes devices 1-2. Both backends only

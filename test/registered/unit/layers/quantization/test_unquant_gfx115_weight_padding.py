@@ -17,7 +17,6 @@ import torch
 import torch.nn.functional as F
 
 import sglang.srt.layers.quantization.unquant as unquant
-from sglang.srt.environ import envs
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -129,9 +128,6 @@ class TestGfx115WeightPadding(CustomTestCase):
         weight = torch.randn(64, 4096, dtype=torch.bfloat16)
         with patch.object(unquant, "_is_gfx115", False), self.subTest("not gfx115x"):
             self.assertIs(unquant.maybe_pad_weight_for_gfx115(weight), weight)
-        with _on_gfx115(), envs.SGLANG_DISABLE_GFX115_WEIGHT_PADDING.override(True):
-            with self.subTest("opted out"):
-                self.assertIs(unquant.maybe_pad_weight_for_gfx115(weight), weight)
         with _on_gfx115():
             padded = unquant.maybe_pad_weight_for_gfx115(weight)
             with self.subTest("already padded"):

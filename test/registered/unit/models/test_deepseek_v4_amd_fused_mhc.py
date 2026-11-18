@@ -102,9 +102,9 @@ class TestAmdFusedMhcCrossLayerGating(unittest.TestCase):
     def test_cross_layer_fusion_off_without_a_hip_fused_kernel(
         self, _mock_aiter, _mock_gfx95
     ):
-        # gfx942 has neither the aiter (gfx95) nor the Triton (gfx95/gfx1250)
-        # fused kernel, so the boundary must stay unwired and the layer run the
-        # unfused hc_post + hc_pre sequence, which falls back to torch on HIP.
+        # With aiter off, a HIP arch has no fused kernel (the Triton one is
+        # gfx95/gfx1250 only), so the boundary must stay unwired and the layer
+        # run the unfused hc_post + hc_pre sequence, which falls back to torch.
         with (
             envs.SGLANG_OPT_FUSE_MHC_POST_PRE.override(True),
             envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.override(True),

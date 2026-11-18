@@ -3,7 +3,7 @@
 This test benchmarks the DeepSeek-R1-MXFP4 quantized model on MI35x with 8 GPUs
 using --enable-aiter-allreduce-fusion.
 
-Registry: nightly-perf-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion suite
+Registry: nightly-perf-test-8-gpu-amd-mi35x-deepseek-r1-mxfp4-ar-fusion suite
 """
 
 import os
@@ -18,7 +18,7 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 # Register for AMD CI - DeepSeek-R1-MXFP4 AllReduce Fusion benchmark on MI35x (~300 min)
 register_amd_ci(
     est_time=18000,
-    suite="nightly-perf-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion",
+    suite="nightly-perf-test-8-gpu-amd-mi35x-deepseek-r1-mxfp4-ar-fusion",
     nightly=True,
 )
 
