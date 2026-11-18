@@ -289,6 +289,36 @@
       ]
     },
     {
+      "name": "sglang:time_to_first_answer_token_seconds",
+      "kind": "histogram",
+      "documentation": "Histogram of time to first answer token in seconds: from request creation to the first streamed output that holds a token after the reasoning end marker.",
+      "labelnames": [
+        "model_name",
+        "engine_type",
+        "is_streaming"
+      ],
+      "buckets": [
+        0.1,
+        0.2,
+        0.4,
+        0.6,
+        0.8,
+        1.0,
+        2.0,
+        4.0,
+        6.0,
+        8.0,
+        10.0,
+        20.0,
+        40.0,
+        60.0,
+        80.0,
+        100.0,
+        200.0,
+        400.0
+      ]
+    },
+    {
       "name": "sglang:inter_token_latency_seconds",
       "kind": "histogram",
       "documentation": "Histogram of inter-token latency in seconds.",
