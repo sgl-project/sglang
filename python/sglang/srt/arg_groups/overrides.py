@@ -42,6 +42,7 @@ from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
     get_default_attn_backend,
     is_attention_backend_not_set,
+    mamba_extra_buffer_of,
     model_config_of,
     record_of,
     register_model_override_predicate,
@@ -62,6 +63,7 @@ from sglang.srt.runtime_context import (
     num_dp_ranks_of,
 )
 from sglang.srt.utils.device import (
+    is_confidential_compute,
     is_fi_a2a_supported,
     is_gfx95_supported,
     xpu_has_xmx_support,
@@ -262,9 +264,16 @@ def remote_instance_transfer_engine_of(cfg: Any, load_format: Any = None) -> boo
 def mamba_extra_buffer_lazy_of(cfg: Any) -> bool:
     """The lazy variant of :func:`mamba_extra_buffer_of`."""
     return (
-        cfg.disable_radix_cache is False
+        mamba_extra_buffer_of(cfg)
         and cfg.mamba_radix_cache_strategy == "extra_buffer_lazy"
     )
+
+
+def mamba_path_state_cap_of(cfg: Any) -> int:
+    """The per-path Mamba state cap the tree enforces."""
+    if cfg.mamba_max_states_per_path is not None:
+        return cfg.mamba_max_states_per_path
+    return 1 if cfg.hybrid_cache_checkpoints_level < 3 else -1
 
 
 def collect_model_override_declarations(
@@ -381,6 +390,9 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "MiniCPMV4_7ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        "Lfm3ForCausalLM",
+        "Lfm3VlForConditionalGeneration",
+        "Lfm3AudioForConditionalGeneration",
         "NemotronH_Omni_Reasoning_V3",
         "FalconH1ForCausalLM",
         "JetNemotronForCausalLM",
@@ -416,6 +428,9 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "Glm5NextForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        "Lfm3ForCausalLM",
+        "Lfm3VlForConditionalGeneration",
+        "Lfm3AudioForConditionalGeneration",
         "NemotronH_Omni_Reasoning_V3",
         # KDA-based: same MambaPool ping-pong machinery as GDN; requires the
         # KDA backend's track-snapshot writes (decode + extend) so donated
@@ -435,6 +450,13 @@ def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
     the configured linear-attention backend (pure read)."""
     from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
 
+    if get_platform().is_xpu:
+        return False
+    if hf_config.architectures[0] == "Lfm3ForCausalLM" and get_platform().is_hip:
+        # HIP has no extra-buffer hand-off for LFM3 conv-state checkpointing.
+        return False
+    if get_platform().is_xpu:
+        return False
     spec = get_linear_attn_spec(hf_config)
     if hf_config.architectures[0] in _MAMBA_EXTRA_BUFFER_ARCHS or (
         spec is not None and spec.support_mamba_cache_extra_buffer
@@ -527,11 +549,24 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
             f"got kv_cache_dtype={kv_cache_dtype}."
         )
     if kv_cache_dtype == "auto":
+        # gfx950 reports capability 9.x, but its triton/tilelang DSA kernels
+        # take fp8 KV and the gfx950-tuned sparse-MLA path requires it. The raw
+        # fp8 MLA layout is only read back on the aiter path (forward_mha.py).
+        hip_gfx95_fp8 = (
+            get_platform().is_hip
+            and is_gfx95_supported()
+            and envs.SGLANG_USE_AITER.get()
+            and view.dsa_prefill_backend in (None, "triton", "tilelang")
+            and view.dsa_decode_backend in (None, "triton", "tilelang")
+        )
         kv_cache_dtype = (
-            "fp8_e4m3" if major >= 10 and not has_attention_sinks else "bfloat16"
+            "fp8_e4m3"
+            if (major >= 10 or hip_gfx95_fp8) and not has_attention_sinks
+            else "bfloat16"
         )
         logger.warning(
-            f"Setting KV cache dtype to {kv_cache_dtype} for DeepSeek DSA on SM{major} device."
+            f"Setting KV cache dtype to {kv_cache_dtype} for DeepSeek DSA "
+            f"(device capability major {major})."
         )
     if kv_cache_dtype == "bf16":
         kv_cache_dtype = "bfloat16"
@@ -554,6 +589,12 @@ def _check_dsa_backend_constraints(
 ) -> None:
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
     chosen = {prefill_backend, decode_backend}
+
+    # The SM100/SM103/SM107 check is check_prims_ts_sparse_mla_support, at backend init.
+    if "prims_ts" in chosen and (hip or kv_cache_dtype != "fp8_e4m3"):
+        raise ValueError(
+            "The prims_ts DSA backend needs CUDA and --kv-cache-dtype fp8_e4m3."
+        )
 
     rocm_only = {"triton"} & chosen
     if not hip and rocm_only:
@@ -763,7 +804,7 @@ def _pin_dsa_backends(
 
 # Matches the reference fp8_ds_mla cache; trtllm's 576 B layout does not.
 _KIMI_K31_DSA_BACKEND = "flashmla_kv"
-_KIMI_K31_DSA_BACKENDS = ("flashmla_kv", "trtllm")
+_KIMI_K31_DSA_BACKENDS = ("flashmla_kv", "trtllm", "prims_ts")
 # ROCm: the Triton kernels dequantize the same fp8_ds_mla rows and run BF16 dots.
 _KIMI_K31_DSA_BACKEND_HIP = "triton"
 
@@ -781,9 +822,11 @@ def _kimi_k31_kv_cache_dtype(view: Any) -> dict:
 
 
 def _kimi_k31_dsa_backends(view: Any) -> dict:
-    if view.enable_hisparse:
-        raise ValueError("Kimi-K3.1 does not support --enable-hisparse yet.")
     if get_platform().is_hip:
+        if view.enable_hisparse:
+            raise ValueError(
+                "Kimi-K3.1 does not support --enable-hisparse on ROCm yet."
+            )
         backend = _KIMI_K31_DSA_BACKEND_HIP
         return _pin_dsa_backends(
             view,
@@ -807,16 +850,23 @@ def _kimi_k31_dsa_backends(view: Any) -> dict:
     if len(chosen) > 1:
         raise ValueError(
             "Kimi-K3.1 needs the same --dsa-prefill-backend and "
-            "--dsa-decode-backend (flashmla_kv and trtllm use different KV "
-            f"layouts); got {view.dsa_prefill_backend!r} and "
+            "--dsa-decode-backend (flashmla_kv and trtllm / prims_ts use "
+            f"different KV layouts); got {view.dsa_prefill_backend!r} and "
             f"{view.dsa_decode_backend!r}."
         )
     backend = chosen.pop() if chosen else _KIMI_K31_DSA_BACKEND
-    if backend == "trtllm":
+    if backend in ("trtllm", "prims_ts"):
         logger.warning(
-            "Kimi-K3.1 trtllm DSA uses FP8 q and an unscaled FP8 KV cache, not "
-            "the reference fp8_ds_mla numerics. PD prefill and decode must both "
-            "use trtllm."
+            f"Kimi-K3.1 {backend} DSA uses FP8 q and an unscaled FP8 KV cache, not "
+            "the reference fp8_ds_mla numerics. PD prefill and decode servers must "
+            "both use a raw-FP8-KV backend (trtllm or prims_ts)."
+        )
+    if view.enable_hisparse and backend != _KIMI_K31_DSA_BACKEND:
+        # The HiSparse FP8 backend allow-list (hisparse_hook) admits only
+        # flashmla_kv among the K3.1 backends.
+        raise ValueError(
+            f"Kimi-K3.1 HiSparse requires DSA backend {_KIMI_K31_DSA_BACKEND!r}; "
+            f"got {backend!r}."
         )
     declared = {f: backend for f in fields if getattr(view, f) is None}
     logger.warning(
@@ -1081,7 +1131,14 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
         and (view.nnodes == 1 or get_platform().is_sm100)
         and view.moe_a2a_backend == "none"
     ):
-        backend = "cutedsl" if is_mimo else "auto"
+        if is_confidential_compute():
+            # mnnvl, cutedsl and multi-node fusion need NVLink multicast, which
+            # Confidential Computing does not provide.
+            if is_mimo or view.nnodes > 1:
+                return {}
+            backend = "trtllm"
+        else:
+            backend = "cutedsl" if is_mimo else "auto"
         logger.info(
             "Auto-enabling FlashInfer AllReduce Fusion (%s) for %s", backend, model_arch
         )
@@ -1739,10 +1796,7 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
 
 @register_post_process
 def _moe_runner_fusion_disable(view: Any) -> dict:
-    """Disable shared-expert fusion for incompatible MoE runners.
-
-    Runs before the deprecated cutlass environment override.
-    """
+    """Disable shared-expert fusion for incompatible MoE runners."""
     runner = view.moe_runner_backend
     if runner in ("lora_triton", "lora_cutedsl", "lora_marlin"):
         logger.warning("LoRA MoE keeps shared experts separate for adapter attachment.")
@@ -1775,7 +1829,7 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
             )
             return {"disable_shared_experts_fusion": False}
         return {}
-    if view.moe_a2a_backend in ("flashinfer", "flashinfer_megamoe"):
+    if view.moe_a2a_backend in ("flashinfer_nvlink_one_sided", "flashinfer_megamoe"):
         logger.warning(
             "Flashinfer MoE A2A is enabled. --disable-shared-experts-fusion is automatically set."
         )
@@ -1795,7 +1849,7 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
         "mooncake",
         "nixl",
         "ascend_fuseep",
-        "flashinfer",
+        "flashinfer_nvlink_one_sided",
         "flashinfer_megamoe",
         "mori",
         "pplx",
