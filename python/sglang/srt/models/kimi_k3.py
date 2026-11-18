@@ -160,7 +160,7 @@ from sglang.srt.runtime_context import (
     linear_attn_tp_size,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu
 from sglang.srt.utils.common import BumpAllocator, get_bool_env_var
 from sglang.srt.utils.log_utils import print_warning_once, rank0_log
 
@@ -173,6 +173,7 @@ logger = logging.getLogger(__name__)
 # key FusedMoE.make_expert_params_mapping entries match on.
 _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
+_is_gfx95 = is_gfx95_supported()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 if _is_hip:
@@ -900,8 +901,8 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         slices directly. Every other runner takes routed_input rounded back to
         bf16 in _forward_fused, which is bit-identical to the bf16 front."""
         return (
-            # AITER: a bf16 front would also round the fp32 correction bias
-            (not _is_hip or get_bool_env_var("SGLANG_USE_AITER"))
+            # gfx950 AITER: a bf16 front would also round the fp32 correction bias
+            (not _is_hip or (_is_gfx95 and get_bool_env_var("SGLANG_USE_AITER")))
             and self._eligible_for_fused_front
             and self._front_w.dtype == torch.bfloat16
         )
@@ -1527,7 +1528,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         )
 
     def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
-        if _is_hip and self._forward_routed_a8w4(
+        if _is_gfx95 and self._forward_routed_a8w4(
             hidden_states, router_logits, routed_input, latent
         ):
             return
@@ -1811,14 +1812,14 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         cp_shard_rows: the rows are gathered rank-major over the attention-CP
         group, and only this rank's CP rows of the output are returned."""
         num_tokens, hidden_size = hidden_states.shape
-        if _is_hip and self._row_front_out is not None:
+        if _is_gfx95 and self._row_front_out is not None:
             # the FFN read already ran the front on this rank's rows (shard_front)
             return self._forward_row_front(prefix_sum)
         hidden_states = hidden_states.view(-1, hidden_size)
         if cp_shard_rows:
             return self._forward_cp_shard_rows(hidden_states)
         if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
-            if _is_hip:  # its row-sharded tail may return this rank's rows
+            if _is_gfx95:  # its row-sharded tail may return this rank's rows
                 return self._forward_fused_hip(hidden_states, prefix_sum=prefix_sum)
             out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
         else:
@@ -2256,6 +2257,10 @@ class KimiK3DeltaAttention(nn.Module):
         if not (_is_hip and envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ.get()):
             return False
         if not self.use_full_rank_gate:
+            return False
+        if not (
+            self.do_fuse_qkvbfg or get_exec().kernel.enable_amd_monokernel or _is_gfx95
+        ):
             return False
         # Block-FP8 / MXFP8 in-proj needs dequantized BF16 buffers; a raw row-cat
         # would drop the scales. Leave fusion to the split [f_a|b] path.
@@ -3133,7 +3138,7 @@ class KimiK3DecoderLayer(nn.Module):
         sp_collective = k3_sp_collective.enabled()
         bank = None
         if self.use_attn_residuals:
-            row = row_shard_bank_hooks_hip(self) if _is_hip else {}
+            row = row_shard_bank_hooks_hip(self) if _is_gfx95 else {}
             bank = AttnBankState(
                 attn_bank,
                 self.self_attention_res_proj,
@@ -3357,7 +3362,7 @@ class KimiK3LinearModel(nn.Module):
                 config, idx, sp_collective=sp_collective
             ),
         )
-        if _is_hip:
+        if _is_gfx95:
             link_hip_paths(self)
 
     def forward(
@@ -4022,7 +4027,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                     # graph capture. Other MegaMoE recipes are sized with the
                     # workspace taken from the non-static slack, as on main.
                     layer.mlp._mega_moe_buffer()
-                if _is_hip:
+                if _is_gfx95:
                     prepare_hip_paths(layer)
                 # Convert the correction bias to fp32 once so the per-call
                 # .to(float32) in topk is a no-op, not one upcast kernel per

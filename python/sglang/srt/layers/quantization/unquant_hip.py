@@ -121,6 +121,8 @@ def a16w16_into(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> boo
 
 def a16w16_tuned(x: torch.Tensor, weight: torch.Tensor) -> Optional[torch.Tensor]:
     """``x @ weight.T`` through AITER's tuned FlyDSL kernel, else None."""
+    if not (_use_aiter and _is_gfx95):
+        return None
     out = x.new_empty((x.shape[0], weight.shape[0]))
     return out if a16w16_into(x, weight, out) else None
 
