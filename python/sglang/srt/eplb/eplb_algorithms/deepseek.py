@@ -1,4 +1,5 @@
 # This file is copied from https://github.com/deepseek-ai/EPLB/blob/main/eplb.py since that one is not a pypi package
+from heapq import heappop, heapreplace
 from typing import Tuple
 
 import torch
@@ -35,18 +36,17 @@ def balanced_packing(
     pack_index_list = [[-1] * num_groups for _ in range(num_layers)]
     rank_in_pack_list = [[-1] * num_groups for _ in range(num_layers)]
     for i in range(num_layers):
-        pack_weights = [0] * num_packs
+        available = [(0, rank) for rank in range(num_packs)]
         pack_items = [0] * num_packs
         for group in indices_list[i]:
-            pack = min(
-                (j for j in range(num_packs) if pack_items[j] < groups_per_pack),
-                key=pack_weights.__getitem__,
-            )
-            assert pack_items[pack] < groups_per_pack
+            load, pack = available[0]
             pack_index_list[i][group] = pack
             rank_in_pack_list[i][group] = pack_items[pack]
-            pack_weights[pack] += weight_list[i][group]
             pack_items[pack] += 1
+            if pack_items[pack] == groups_per_pack:
+                heappop(available)
+            else:
+                heapreplace(available, (load + weight_list[i][group], pack))
     pack_index = torch.tensor(pack_index_list, dtype=torch.int64, device="cpu")
     rank_in_pack = torch.tensor(rank_in_pack_list, dtype=torch.int64, device="cpu")
     return pack_index, rank_in_pack
