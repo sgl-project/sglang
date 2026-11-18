@@ -570,5 +570,9 @@ POSITIONAL_FIELD_ORDER = (
     "enable_flashmla_prefill_token_packing",
     "decode_state_free_radix_default",
     "gc_freeze_on_idle_secs",
+    "speculative_use_fly",
+    "speculative_fly_window_size",
+    "speculative_fly_entropy_threshold",
+    "speculative_fly_entropy_top_k",
 )
 # fmt: on

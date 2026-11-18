@@ -21,6 +21,8 @@ from triton.language.extra import libdevice
 from sglang.kernels.ops.speculative.dspark.markov_sample import (
     _markov_sample_finish_kernel,
 )
+from sglang.kernels.ops.speculative.fly import _row_topk_entropy
+from sglang.srt.speculative.fly_config import FlyConfig
 
 _BLOCK = 4096
 _ACCEPT_STEP, _BONUS_STEP = tl.constexpr(0xFFFFFFFE), tl.constexpr(0xFFFFFFFF)
@@ -100,6 +102,86 @@ def _stats_kernel(
 
 
 @triton.jit
+def _fly_kernel(
+    STATS,
+    TARGET,
+    TEMP,
+    VERIFY_LENS,
+    KEY,
+    OFFSET,
+    FLY_OK,
+    BS,
+    TARGET_S,
+    VOCAB,
+    entropy_threshold,
+    SLOTS: tl.constexpr,
+    SLOTS_P2: tl.constexpr,
+    WORLD: tl.constexpr,
+    WORLD_P2: tl.constexpr,
+    WINDOW: tl.constexpr,
+    TOP_K: tl.constexpr,
+    TOP_K_PAD: tl.constexpr,
+    HAS_CUTOFF: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    """
+    FLy (sglang.kernels.ops.speculative.fly) for request b: FLY_OK[b, slot] = 1 for
+    each slot ``_accept_kernel`` takes although its draw rejects it. Every rank holds
+    the whole target row, so the ranks agree.
+    """
+    b = tl.program_id(0)
+    slot = tl.arange(0, SLOTS_P2)
+    rank = tl.arange(0, WORLD_P2)
+    mask = (slot < SLOTS)[:, None] & (rank < WORLD)[None, :]
+    stats = STATS + (rank[None, :] * BS * SLOTS + b * SLOTS + slot[:, None]) * 6
+    t_m, t_s = _merge(
+        tl.load(stats, mask, -float("inf")), tl.load(stats + 1, mask, 0.0)
+    )
+    d_m, d_s = _merge(
+        tl.load(stats + 3, mask, -float("inf")), tl.load(stats + 4, mask, 0.0)
+    )
+    p_x = tl.exp(tl.max(tl.load(stats + 2, mask, -float("inf")), 1) - t_m) / t_s
+    q_x = tl.exp(tl.max(tl.load(stats + 5, mask, -float("inf")), 1) - d_m) / d_s
+    u, _, _, _ = _philox(KEY, slot, b, _ACCEPT_STEP, OFFSET)
+    in_draft = slot < SLOTS - 1
+    native = in_draft & (q_x > 0.0) & (tl.uint_to_uniform_float(u) * q_x < p_x)
+    usable = in_draft & (q_x > 0.0) & (p_x > 0.0)
+    bit = tl.full([SLOTS_P2], 1, tl.int32) << slot
+    native_bits = tl.sum(tl.where(native, bit, 0), 0)
+    usable_bits = tl.sum(tl.where(usable, bit, 0), 0)
+    if HAS_CUTOFF:
+        num_drafts = tl.minimum(SLOTS - 1, tl.load(VERIFY_LENS + b).to(tl.int32) - 1)
+    else:
+        num_drafts = SLOTS - 1
+    inv_t = 1.0 / tl.maximum(tl.load(TEMP + b), 1e-5)
+
+    window_mask = (1 << WINDOW) - 1
+    alive = tl.full((), 1, tl.int32)
+    for pos in tl.static_range(SLOTS - 1):
+        is_native = (native_bits >> pos) & 1
+        can_try = (
+            (((usable_bits >> pos) & 1) != 0)
+            & (((native_bits >> (pos + 1)) & window_mask) == window_mask)
+            & (pos + WINDOW < num_drafts)
+        )
+        if (alive != 0) & (is_native == 0):
+            deferred = tl.full((), 0, tl.int32)
+            if can_try:
+                entropy = _row_topk_entropy(
+                    TARGET + (b * SLOTS + pos).to(tl.int64) * TARGET_S,
+                    VOCAB,
+                    inv_t,
+                    TOP_K=TOP_K,
+                    TOP_K_PAD=TOP_K_PAD,
+                    BLOCK_V=BLOCK_V,
+                )
+                if entropy >= entropy_threshold:
+                    tl.store(FLY_OK + b * SLOTS + pos, 1)
+                    deferred = tl.full((), 1, tl.int32)
+            alive = deferred
+
+
+@triton.jit
 def _accept_kernel(
     STATS,
     TARGET,
@@ -111,6 +193,7 @@ def _accept_kernel(
     OFFSET,
     LENS,
     PARTIAL,
+    FLY_OK,
     BS,
     TARGET_S,
     START,
@@ -123,6 +206,7 @@ def _accept_kernel(
     WORLD: tl.constexpr,
     WORLD_P2: tl.constexpr,
     HAS_CUTOFF: tl.constexpr,
+    HAS_FLY: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """
@@ -151,6 +235,8 @@ def _accept_kernel(
     # 2. Accepted length, capped by VERIFY_LENS; block 0 writes LENS.
     u, _, _, _ = _philox(KEY, slot, b, _ACCEPT_STEP, OFFSET)
     ok = (q_x > 0.0) & (tl.uint_to_uniform_float(u) * q_x < p_x)
+    if HAS_FLY:
+        ok |= tl.load(FLY_OK + b * SLOTS + slot, slot < SLOTS - 1, 0) != 0
     accepted = tl.min(tl.where((slot < SLOTS - 1) & ~ok, slot, SLOTS - 1), 0)
     capped = accepted
     if HAS_CUTOFF:
@@ -203,6 +289,7 @@ def accept_sampling_sharded(
     key: int,
     offset: torch.Tensor,
     verify_lens: Optional[torch.Tensor] = None,
+    fly: Optional[FlyConfig] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Returns (correct_len int32, bonus int64, cap_trim_lens int32), each [bs].
@@ -212,6 +299,7 @@ def accept_sampling_sharded(
     draft_logits   [bs, gamma, padded]
     temperatures   [bs]
     key, offset    the draft's Philox key and its block counter
+    fly            also accept the rejections FLy defers
     """
     bs, slots = candidates.shape
     _, gamma, padded = draft_logits.shape
@@ -246,6 +334,34 @@ def accept_sampling_sharded(
     lens = torch.empty((3, bs), dtype=torch.int32, device=device)
     # Per vocab block: (max key, token_id)
     partial = torch.empty((bs, parts * 2), dtype=torch.float32, device=device)
+    fly_ok = None
+    if fly is not None:
+        fly_ok = torch.zeros((bs, slots), dtype=torch.int32, device=device)
+        vocab = target_logits.shape[-1]
+        top_k = min(fly.entropy_top_k, vocab)
+        _fly_kernel[(bs,)](
+            stats,
+            target_logits,
+            temperatures,
+            lens if verify_lens is None else verify_lens,  # unread without a cutoff
+            key,
+            offset,
+            fly_ok,
+            bs,
+            target_logits.stride(0),
+            vocab,
+            float(fly.entropy_threshold),
+            slots,
+            triton.next_power_of_2(slots),
+            world,
+            triton.next_power_of_2(world),
+            fly.window_size,
+            top_k,
+            triton.next_power_of_2(top_k),
+            verify_lens is not None,
+            2048,
+            num_warps=4,
+        )
     _accept_kernel[(bs, parts)](
         stats,
         target_logits,
@@ -257,6 +373,7 @@ def accept_sampling_sharded(
         offset,
         lens,
         partial,
+        lens if fly_ok is None else fly_ok,  # unread without FLy
         bs,
         target_logits.stride(0),
         vocab_start,
@@ -269,6 +386,7 @@ def accept_sampling_sharded(
         world,
         triton.next_power_of_2(world),
         verify_lens is not None,
+        fly_ok is not None,
         _BLOCK,
         num_warps=8,
     )
