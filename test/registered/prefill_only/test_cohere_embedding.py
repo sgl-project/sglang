@@ -39,7 +39,14 @@ class TestCohereEmbedding(CustomTestCase):
         cls.tokenizer = AutoTokenizer.from_pretrained(
             cls.model, revision=cls.model_revision
         )
-        server_args = ["--context-length", "256"]
+        # Keep cache and scheduling conditions consistent for strict endpoint parity.
+        server_args = [
+            "--context-length",
+            "256",
+            "--disable-radix-cache",
+            "--max-running-requests",
+            "1",
+        ]
         if cls.requires_embedding_flag:
             server_args.append("--is-embedding")
         if cls.model_revision is not None:
