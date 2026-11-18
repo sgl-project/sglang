@@ -431,7 +431,8 @@ class TestNixlTransferWorker(CustomTestCase):
     def test_cached_layout_rejection_blocks_aux_only_transfer(self):
         mgr = self._make_manager(34)
         mgr.decode_kv_args_table["agent"].unified_layout_error = "layout mismatch"
-        mgr._reload_invalidated_peers = MagicMock()
+        mgr.agent.check_remote_metadata = MagicMock(return_value=False)
+        mgr.agent.add_remote_agent = MagicMock()
         mgr.send_kvcache = MagicMock()
         mgr.maybe_send_extra = MagicMock()
         mgr.send_aux = MagicMock()
@@ -444,6 +445,51 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.maybe_send_extra.assert_not_called()
         mgr.send_aux.assert_not_called()
         self.assertIn("layout mismatch", mgr.failure_records[34])
+        mgr.agent.check_remote_metadata.assert_not_called()
+        mgr.agent.add_remote_agent.assert_not_called()
+
+    def test_discarded_chunks_complete_without_transfers(self):
+        for status in (KVPoll.Failed, KVPoll.Success):
+            with self.subTest(status=status):
+                mgr = self._make_manager(35)
+                mgr.request_status[35] = status
+                if status == KVPoll.Success:
+                    mgr.transfer_infos.clear()
+                chunk = self._make_chunk(35, [1], is_last_chunk=False)
+                chunk.send_record = mgr.send_record(35)
+                mgr.note_send_enqueued(35)
+                mgr.send_kvcache = MagicMock()
+                if status == KVPoll.Failed:
+                    wait_event = chunk.wait_event = MagicMock()
+                    indices_event = chunk.indices_event = MagicMock()
+                self._run_worker_once(mgr, chunk)
+                self.assertEqual(mgr.send_counts(35), (1, 1))
+                mgr.send_kvcache.assert_not_called()
+                if status == KVPoll.Failed:
+                    wait_event.synchronize.assert_not_called()
+                    indices_event.synchronize.assert_not_called()
+                    mgr.disaggregation_mode = DisaggregationMode.PREFILL
+                    mgr.transfer_queues = [FakeQueue()]
+                    mgr.add_transfer_request(35, np.array([1]), slice(0, 1), False)
+                    self.assertEqual(mgr.transfer_queues[0].items, [])
+                    self.assertEqual(mgr.send_counts(35), (1, 1))
+
+    def test_abort_during_forward_wait_skips_indices_wait(self):
+        mgr = self._make_manager(36)
+        chunk = self._make_chunk(36, [1], is_last_chunk=False)
+        chunk.send_record = mgr.send_record(36)
+        mgr.note_send_enqueued(36)
+        chunk.wait_event = MagicMock(
+            synchronize=lambda: mgr.update_status(36, KVPoll.Failed)
+        )
+        event = chunk.indices_event = MagicMock()
+        mgr.send_kvcache = MagicMock()
+        device, device_module = self._record_device_bind([])
+        with device, device_module:
+            self._run_worker_once(mgr, chunk)
+        event.synchronize.assert_not_called()
+        mgr.send_kvcache.assert_not_called()
+        self.assertEqual(mgr.send_counts(36), (1, 1))
 
     def test_incompatible_aux_layout_fails_before_transfer_and_worker_continues(self):
         context = get_context().override_server_args(
@@ -1037,6 +1083,7 @@ class TestNixlEarlySendWaitEvent(CustomTestCase):
         mgr.enable_kv_packing = False
         mgr._kv_packers = []
         mgr.transfer_infos = {room: {"agent": SimpleNamespace(dst_port=5555)}}
+        mgr.request_status = {room: KVPoll.WaitingForInput}
         observed = []
 
         def consume(chunk):

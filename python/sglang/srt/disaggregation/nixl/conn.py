@@ -53,7 +53,12 @@ from sglang.srt.disaggregation.utils import (
     slice_dsa_tail_dst_ptrs_for_pp,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_device, get_memory, get_schedule
+from sglang.srt.runtime_context import (
+    get_device,
+    get_memory,
+    get_platform,
+    get_schedule,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import run_with_deadline
 
@@ -565,7 +570,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         backend = envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get()
         if self.enable_unified_memory and (
-            get_device().device != "cuda" or backend != "UCX"
+            not get_platform().is_cuda or backend != "UCX"
         ):
             raise ValueError("NIXL unified-memory PD currently requires CUDA and UCX")
         num_threads = 8 if disaggregation_mode == DisaggregationMode.PREFILL else 0
@@ -1724,6 +1729,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         "Skipping chunk for room %s because it has been cleared",
                         room,
                     )
+                    self.note_send_finished(room, kv_chunk.send_record)
                     self._staging_outstanding.pop(room, None)
                     if self.enable_deferred_decode_kv_release:
                         # clear() keeps the target while a chunk is counted.
@@ -1750,7 +1756,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         kv_chunk.wait_event.synchronize()
                     kv_chunk.wait_event = None
 
-                if kv_chunk.indices_event is not None:
+                if (
+                    kv_chunk.indices_event is not None
+                    and self.check_status(room) != KVPoll.Failed
+                ):
                     if not device_bound:
                         torch.get_device_module(get_device().device).set_device(
                             self.kv_args.gpu_id
@@ -1758,15 +1767,16 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         device_bound = True
                     kv_chunk.indices_event.synchronize()
                     kv_chunk.indices_event = None
-                if isinstance(kv_chunk.prefill_kv_indices, torch.Tensor):
-                    kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices.numpy()
-
                 if self.check_status(room) == KVPoll.Failed:
+                    self.note_send_finished(room, kv_chunk.send_record)
                     self._staging_outstanding.pop(room, None)
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(room)
                     continue
+
+                if isinstance(kv_chunk.prefill_kv_indices, torch.Tensor):
+                    kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices.numpy()
 
                 room_transfer_infos = self.transfer_infos.get(room)
                 if room_transfer_infos is None:
@@ -1775,6 +1785,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         "has been cleared",
                         room,
                     )
+                    self.note_send_finished(room, kv_chunk.send_record)
                     self._staging_outstanding.pop(room, None)
                     if self.enable_deferred_decode_kv_release:
                         self._maybe_ack_drained_abort(room)
@@ -2242,7 +2253,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # restores it; reload it from the registration we already hold.
         for agent_name in list(room_transfer_infos):
             peer_info = self.decode_kv_args_table.get(agent_name)
-            if peer_info is None:
+            if peer_info is None or peer_info.unified_layout_error:
                 continue
             try:
                 if self.agent.check_remote_metadata(agent_name):
@@ -3557,16 +3568,19 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
 
+        if (
+            bootstrap_room not in self.transfer_infos
+            or self.request_status.get(bootstrap_room, KVPoll.Failed) == KVPoll.Failed
+        ):
+            # Dummy rank, failed, or already cleared; nothing to enqueue.
+            return None
+
         # Prefetch STAGING_REQ to decode before enqueueing so decode has
         # already allocated staging by the time the worker picks up the
         # chunk. Internally a no-op when staging is disabled or no peer
         # in this room needs heterogeneous-TP staging.
         if self.enable_staging:
             self._prefetch_staging_reqs(bootstrap_room)
-
-        if bootstrap_room not in self.transfer_infos:
-            # Dummy rank or already cleared; nothing to enqueue.
-            return None
 
         # Shard by destination (mirror mooncake): same dst endpoint(s) -> same
         # worker, keeping a room's chunks on one private staging buffer.
