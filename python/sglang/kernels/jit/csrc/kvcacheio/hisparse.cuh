@@ -165,6 +165,45 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
     asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst8 + lane_id), "l"(tmp) : "memory");
   }
 }
+
+// Copies rows [0, num_rows) with one warp; per 1 KiB chunk, every row's loads issue before any store,
+// so the warp waits one host round trip per chunk. Rows must be 16 B aligned and a multiple of 16 B.
+template <int kRows>
+__device__ __forceinline__ void transfer_rows_warp_batched(
+    int32_t lane_id,
+    const char* const (&src)[kRows],
+    char* const (&dst)[kRows],
+    int num_rows,
+    int64_t item_size_bytes) {
+  constexpr int kPairsPerLane = 2;  // one 1 KiB chunk covers a 656 B MLA row
+  const int total_pairs = item_size_bytes / 16;
+#pragma unroll 1  // unrolling would keep several chunks' loads live at once
+  for (int p0 = 0; p0 < total_pairs; p0 += WARP_SIZE * kPairsPerLane) {
+    uint64_t lo[kRows][kPairsPerLane], hi[kRows][kPairsPerLane];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) {
+#pragma unroll
+      for (int k = 0; k < kPairsPerLane; ++k) {
+        const int j = p0 + k * WARP_SIZE + lane_id;
+        if (r < num_rows && j < total_pairs) {
+          const uint64_t* s = reinterpret_cast<const uint64_t*>(src[r]) + j * 2;
+          asm volatile("ld.global.nc.v2.b64 {%0,%1},[%2];" : "=l"(lo[r][k]), "=l"(hi[r][k]) : "l"(s) : "memory");
+        }
+      }
+    }
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) {
+#pragma unroll
+      for (int k = 0; k < kPairsPerLane; ++k) {
+        const int j = p0 + k * WARP_SIZE + lane_id;
+        if (r < num_rows && j < total_pairs) {
+          uint64_t* d = reinterpret_cast<uint64_t*>(dst[r]) + j * 2;
+          asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(d), "l"(lo[r][k]), "l"(hi[r][k]) : "memory");
+        }
+      }
+    }
+  }
+}
 #endif
 
 __device__ __forceinline__ int popc_mask(BallotMask mask) {
@@ -175,8 +214,8 @@ __device__ __forceinline__ int popc_mask(BallotMask mask) {
 #endif
 }
 
-// Copy one missed item host->device with one warp. Shared by the fused swap-in
-// kernel and copy_cache_planned_kernel so the layout dispatch cannot drift.
+// Copy one missed item host->device with one warp (fused swap-in kernel and copy_cache_planned_kernel);
+// the fused kernel's batched CUDA MLA copy repeats the generic-path addressing below.
 template <bool IsMLA, bool IsDsv4Layout>
 __device__ __forceinline__ void copy_miss_item(
     int32_t lane_id,
@@ -733,9 +772,41 @@ __global__ void load_cache_to_device_buffer_kernel(
 #endif
   }
 
-  // each warp copies one miss directly, can be separated into a new kernel if parallelism is a concern
   if constexpr (!SkipIO) {
-    for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
+    bool batched = false;
+#ifndef USE_ROCM
+    if constexpr (IsMLA && !IsDsv4Layout) {
+      // Warp w copies misses w, w + NUM_WARPS, ... kRows at a time, with their host loads in flight together;
+      // rows that are not a multiple of 16 B keep the per-miss loop.
+      batched = item_size_bytes % 16 == 0;
+      // 2 measured best on B300 (CUDA 13.0): at 3, ptxas can interleave the stores, which loses the gain;
+      // 4 needs 72 registers, over the 64 a 960- or 1024-thread CTA launches with, so loops stay rolled.
+      constexpr int kRows = 2;
+#pragma unroll 1
+      for (int base = warp_id; batched && base < total_misses; base += NUM_WARPS * kRows) {
+        const char* src[kRows];
+        char* dst[kRows];
+        int num_rows = 0;
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) {
+          const int miss_idx = base + r * NUM_WARPS;
+          // Never read past num_rows, yet dropping these cost up to 10 registers (CUDA 13.0).
+          src[r] = nullptr;
+          dst[r] = nullptr;
+          if (miss_idx < total_misses) {
+            const int32_t miss_token = s_top_k_tokens[miss_idx];
+            const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_idx];
+            src[r] = static_cast<const char*>(host_base) + req_host_cache_locs[miss_token] * host_row_bytes;
+            dst[r] = static_cast<char*>(device_buffer_k) +
+                     static_cast<int64_t>(req_device_buffer_locs[evict_slot]) * item_size_bytes;
+            num_rows = r + 1;
+          }
+        }
+        transfer_rows_warp_batched<kRows>(lane_id, src, dst, num_rows, item_size_bytes);
+      }
+    }
+#endif
+    for (int miss_idx = warp_id; !batched && miss_idx < total_misses; miss_idx += NUM_WARPS) {
       const int32_t miss_token = s_top_k_tokens[miss_idx];
       const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_idx];
 
