@@ -502,6 +502,14 @@ class TestHandlerRequestSemantics(CustomTestCase):
             (None, " world"),
         )
 
+    def test_logprob_bytes_are_the_token_bytes(self):
+        """The vocabulary is byte-level even though its first ids are special tokens."""
+        chat = _serving(self, self.tokenizer)
+        [logprob] = chat._build_token_logprobs_from_raw(
+            [(-0.1, self._token("ð"), "�")], None
+        )
+        self.assertEqual(logprob.bytes, [0xF0])
+
     def test_streamed_tool_call(self):
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 

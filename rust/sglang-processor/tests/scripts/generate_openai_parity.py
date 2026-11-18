@@ -217,6 +217,7 @@ def lower(case, settings, model):
         model_path=model.path,
         model_config=SimpleNamespace(
             hf_config=model.hf_config,
+            vocab_size=model.text_config.vocab_size,
             is_multimodal=False,
             get_default_sampling_params=lambda: model.sampling_defaults,
         ),

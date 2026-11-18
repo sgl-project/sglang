@@ -2,6 +2,8 @@ import logging
 from typing import Any, Literal
 
 import torch
+from tokenizers import decoders
+from transformers import PreTrainedTokenizerFast
 
 from sglang.srt.entrypoints.openai.protocol import (
     CachedTokensDetails,
@@ -44,26 +46,29 @@ def _build_byte_decoder() -> dict[str, int]:
 
 
 def _is_byte_level_tokenizer(tokenizer) -> bool:
-    """Heuristically determine whether *tokenizer* uses GPT-2 byte-level BPE.
+    """Determine whether *tokenizer* uses GPT-2 byte-level BPE.
 
     Only GPT-2 family (GPT2Tokenizer, Llama, Qwen, etc.) store vocabulary
     tokens as the ``bytes_to_unicode`` printable-char mapping. SentencePiece
     tokenizers (Mistral, Gemma, T5) store raw Unicode pieces, so applying the
     byte decoder to them corrupts multi-byte characters.
 
-    We probe by checking ``is_byte_level`` (HuggingFace fast tokenizers) or
-    by verifying that a known multi-byte character (é, U+00E9) round-trips:
-    GPT-2 encodes it as a single byte-level piece ``chr(233)`` whose byte
-    decoder output [233] does NOT form valid UTF-8, while SentencePiece stores
-    the full character ``é`` whose UTF-8 is [195, 169].
+    A tokenizer's own ``is_byte_level`` decides first. A HuggingFace fast
+    tokenizer then answers with its declared decoder; other tokenizers are
+    probed on a few sampled vocabulary pieces.
     """
     tid = id(tokenizer)
     if tid in _BYTE_LEVEL_TOKENIZERS:
         return True
 
-    # Fast path: HuggingFace fast tokenizers expose is_byte_level.
     is_bl = getattr(tokenizer, "is_byte_level", None)
     if isinstance(is_bl, bool):
+        if is_bl:
+            _BYTE_LEVEL_TOKENIZERS.add(tid)
+        return is_bl
+
+    if isinstance(tokenizer, PreTrainedTokenizerFast):
+        is_bl = isinstance(tokenizer.backend_tokenizer.decoder, decoders.ByteLevel)
         if is_bl:
             _BYTE_LEVEL_TOKENIZERS.add(tid)
         return is_bl
