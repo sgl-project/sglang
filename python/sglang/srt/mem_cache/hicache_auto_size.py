@@ -100,7 +100,6 @@ def _estimate_hicache_bytes(
 
 
 def _host_allocator_and_device(params: CacheInitParams):
-    """The allocator class and KV device the host pools will map memory with."""
     return (
         get_allocator_class_from_storage(get_allocator_type()),
         params.token_to_kv_pool_allocator.get_kvcache().device,
@@ -109,17 +108,14 @@ def _host_allocator_and_device(params: CacheInitParams):
 
 @contextmanager
 def _explicit_size_budget(params: CacheInitParams):
-    """Book explicitly sized host pools against one snapshot of host memory.
-
-    Sampling per pool charges a rank that builds late for its peers' pools.
-    """
-    budget = host_memory_budget_plain_hugetlb(*_host_allocator_and_device(params))
+    # One snapshot per rank: sampling per pool charges a late rank for its peers' pools.
+    allocator, kvcache_device = _host_allocator_and_device(params)
+    budget = host_memory_budget_plain_hugetlb(
+        allocator=allocator, device=kvcache_device
+    )
     if ranks_per_host() > 1:
-        # Ranks on one host draw on the same free memory. The barrier makes every
-        # rank sample before any rank pins a pool; without it a late rank's share
-        # already lacks its peers' pools. ranks_per_host() is the same on every
-        # rank, so all ranks enter or skip it together. Auto-sizing needs none:
-        # its all_reduce already orders the samples before the pools.
+        # Peers on this host must all sample before any pins a pool;
+        # ranks_per_host() is uniform, so every rank enters or skips the barrier.
         torch.distributed.barrier(group=get_parallel().world_group.cpu_group)
     with host_memory_budget_scope(budget):
         yield
