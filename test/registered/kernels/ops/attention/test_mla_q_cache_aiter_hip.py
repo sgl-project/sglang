@@ -13,7 +13,7 @@ from sglang.test.kernels.mla_q_cache import (  # noqa: E402
     mla_q_cache_reference,
 )
 
-register_amd_ci(est_time=35, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=25, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(
     not mla_q_cache_aiter_hip.available(),

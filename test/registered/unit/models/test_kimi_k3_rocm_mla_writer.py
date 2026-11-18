@@ -2,12 +2,25 @@
 
 import pytest
 import torch
-from aiter import dtypes
 
-from sglang.kernels.ops.attention import mla_q_cache_aiter_hip
-from sglang.srt.models.kimi_k3_rocm_mla import KimiK3RocmMlaQCacheWriter
-from sglang.srt.runtime_context import get_resources
-from sglang.test.kernels.mla_q_cache import mla_q_cache_inputs, mla_q_cache_reference
+pytest.importorskip("aiter")
+from aiter import dtypes  # noqa: E402
+
+from sglang.kernels.ops.attention import mla_q_cache_aiter_hip  # noqa: E402
+from sglang.srt.models.kimi_k3_rocm_mla import KimiK3RocmMlaQCacheWriter  # noqa: E402
+from sglang.srt.runtime_context import get_resources  # noqa: E402
+from sglang.test.ci.ci_register import register_amd_ci  # noqa: E402
+from sglang.test.kernels.mla_q_cache import (  # noqa: E402
+    mla_q_cache_inputs,
+    mla_q_cache_reference,
+)
+
+register_amd_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
+
+pytestmark = pytest.mark.skipif(
+    not mla_q_cache_aiter_hip.available(),
+    reason="Kimi-K3 fused MLA Q/cache tests require AITER on gfx950",
+)
 
 
 def _writer_inputs(values):
@@ -88,3 +101,9 @@ def test_writer_reads_a_strided_out_cache_loc(writer):
     torch.cuda.synchronize()
     _, expected_k = mla_q_cache_reference(dict(values, out=q))
     assert torch.equal(values["kv_cache"][values["slot_mapping"]], expected_k)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
