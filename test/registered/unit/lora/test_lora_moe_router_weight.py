@@ -87,8 +87,12 @@ def test_build_lora_hooks_router_weight_numeric(
         [[0.25, 0.75], [0.4, 0.6]], device=device, dtype=torch.float32
     )
 
-    gate_up_a = torch.randn((1, num_experts, 2 * r, k), device=device, dtype=dtype) * 0.1
-    gate_up_b = torch.randn((1, num_experts, 2 * n, r), device=device, dtype=dtype) * 0.1
+    gate_up_a = (
+        torch.randn((1, num_experts, 2 * r, k), device=device, dtype=dtype) * 0.1
+    )
+    gate_up_b = (
+        torch.randn((1, num_experts, 2 * n, r), device=device, dtype=dtype) * 0.1
+    )
     down_a = torch.randn((1, num_experts, r, n), device=device, dtype=dtype) * 0.1
     down_b = torch.randn((1, num_experts, k, r), device=device, dtype=dtype) * 0.1
 
@@ -143,9 +147,7 @@ def test_build_lora_hooks_router_weight_numeric(
 
             x_dn = inter_in[t * topk + k_idx].float()
             d = (x_dn @ down_a[0, e].float().T) @ down_b[0, e].float().T
-            exp_down[t, k_idx] = (
-                1.0 if apply_router_weight_on_input else w
-            ) * d
+            exp_down[t, k_idx] = (1.0 if apply_router_weight_on_input else w) * d
 
     torch.testing.assert_close(gate_up_out.float(), exp_gate_up, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(down_out.float(), exp_down, atol=1e-2, rtol=1e-2)
