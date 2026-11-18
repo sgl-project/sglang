@@ -100,6 +100,31 @@ class TestFanOutStraggler(CustomTestCase):
 
         self.assertEqual(asyncio.run(body()), [30, 31, 32, 33])
 
+    def test_retiree_replies_do_not_complete_a_narrowed_call(self):
+        """Without senders, the two retirees' replies would satisfy the new fan-out of
+        2 and the survivors' replies would leak into the next call."""
+
+        async def body():
+            comm = _comm()
+            call = asyncio.ensure_future(comm("req"))
+            await asyncio.sleep(0)
+            comm.handle_recv("r3", sender=3)
+            comm.handle_recv("r2", sender=2)
+            comm.set_fan_out(2, live_senders=2)
+            await asyncio.sleep(0.01)
+            pending = not call.done()
+            comm.handle_recv("r0", sender=0)
+            comm.handle_recv("r1", sender=1)
+            out = await asyncio.wait_for(call, timeout=1.0)
+            second = asyncio.ensure_future(comm("next"))
+            await asyncio.sleep(0)
+            comm.handle_recv("late", sender=3)
+            comm.handle_recv("n0", sender=0)
+            comm.handle_recv("n1", sender=1)
+            return pending, out, await asyncio.wait_for(second, timeout=1.0)
+
+        self.assertEqual(asyncio.run(body()), (True, ["r0", "r1"], ["n0", "n1"]))
+
 
 if __name__ == "__main__":
     unittest.main()

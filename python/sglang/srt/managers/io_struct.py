@@ -2586,6 +2586,14 @@ class ScaleElasticEPReqOutput(BaseReq, kw_only=True):
     retry_when_joiner_announces: bool = False  # No joiner announced yet; resend later.
 
 
+class ElasticControlOutput(BaseReq, kw_only=True):
+    """A control reply stamped with its sender's DP rank, so a fan-out that narrows
+    mid-call can drop the replies retirees sent and wait on the survivors."""
+
+    sender_dp_rank: int
+    payload: PickleWrapper
+
+
 class GetInternalStateReq(BaseReq, kw_only=True):
     pass
 

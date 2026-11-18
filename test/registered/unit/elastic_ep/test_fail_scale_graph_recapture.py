@@ -30,10 +30,15 @@ def _fail_scale(live_width, has_decode_graph=True):
     with (
         mock.patch.object(model_runner_module, "ElasticEPStateManager", state),
         mock.patch.object(model_runner_module, "get_parallel", lambda: parallel),
+        mock.patch.object(
+            model_runner_module, "reset_barriers_after_failure"
+        ) as reset_barriers,
     ):
         runner._fail_scale("scale failed", live_width)
     # The recapture request is additive: it must not displace the report.
     state.fail_scale.assert_called_once_with("scale failed")
+    # A rank that died inside a barrier left its counters for nobody to reset.
+    reset_barriers.assert_called_once_with()
     return runner._elastic_pending_graph_recapture
 
 

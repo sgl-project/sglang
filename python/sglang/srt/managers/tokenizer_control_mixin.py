@@ -32,6 +32,7 @@ from sglang.srt.managers.io_struct import (
     DetachHiCacheStorageReqOutput,
     DumperControlReqInput,
     DumperControlReqOutput,
+    ElasticControlOutput,
     EndWeightUpdateReqInput,
     EndWeightUpdateReqOutput,
     ExpertDistributionReq,
@@ -88,6 +89,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
     UpdateWeightVersionReqInput,
     UpdateWeightVersionReqOutput,
+    unwrap_from_pickle,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.platforms import current_platform
@@ -190,6 +192,7 @@ class TokenizerControlMixin:
 
     def init_communicators(self: TokenizerManager):
         dispatch_pairs = []
+        self._control_communicator_by_type = {}
         for spec in _COMMUNICATOR_SPECS:
             name, resp_type = spec[0], spec[1]
             mode = spec[2] if len(spec) > 2 else "queueing"
@@ -200,7 +203,21 @@ class TokenizerControlMixin:
             )
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
+            self._control_communicator_by_type[resp_type] = comm
+        dispatch_pairs.append(
+            (ElasticControlOutput, self._handle_elastic_control_reply)
+        )
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
+
+    def _handle_elastic_control_reply(
+        self: TokenizerManager, reply: ElasticControlOutput
+    ):
+        payload = unwrap_from_pickle(reply.payload)
+        comm = self._control_communicator_by_type.get(type(payload))
+        if comm is None:
+            self._result_dispatcher(payload)
+        else:
+            comm.handle_recv(payload, sender=reply.sender_dp_rank)
 
     def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
         primary_group_control = (
@@ -215,9 +232,13 @@ class TokenizerControlMixin:
             control_fan_out = worker_count
 
         for spec in _COMMUNICATOR_SPECS:
-            getattr(self, f"{spec[0]}_communicator").set_fan_out(worker_count)
+            getattr(self, f"{spec[0]}_communicator").set_fan_out(
+                worker_count, live_senders=worker_count
+            )
 
-        self.get_internal_state_communicator.set_fan_out(control_fan_out)
+        self.get_internal_state_communicator.set_fan_out(
+            control_fan_out, live_senders=worker_count
+        )
 
     async def add_external_corpus(
         self: TokenizerManager, obj: AddExternalCorpusReqInput

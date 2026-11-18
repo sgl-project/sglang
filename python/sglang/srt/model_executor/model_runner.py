@@ -57,6 +57,7 @@ from sglang.srt.elastic_ep.elastic_ep import (
     mooncake_world_settle_probe,
     register_recover_cohort,
     register_scale_cohort,
+    reset_barriers_after_failure,
     scale_ready_barrier_via_store,
     seed_barrier_epochs,
     sync_random_seed_via_store,
@@ -2091,7 +2092,9 @@ class ModelRunner:
             and not self._elastic_cuda_graph_enabled()
         ):
             self.maybe_join_ep_ranks()
-            self.maybe_retire_ep_ranks()
+            # The scheduler ticks the target runner only; a draft has no is_idle.
+            if not self.is_draft_worker:
+                self.maybe_retire_ep_ranks()
 
         return output
 
@@ -2708,6 +2711,7 @@ class ModelRunner:
 
     def _fail_scale(self, error: str, effective_size: int) -> None:
         ElasticEPStateManager.fail_scale(error)
+        reset_barriers_after_failure()
         self._reset_eplb_after_elastic_scale_failure()
         # Report the reconciled width: the tokenizer sizes its control fan-out from it.
         reconciled = ElasticEPStateManager.get_effective_ep_size() or effective_size
@@ -2757,6 +2761,9 @@ class ModelRunner:
             if state is not None and state.has_scaled:
                 # Silent: marking the state failed would block every future scale.
                 return
+            # Fault recovery is Mooncake's peer-state path; nixl only reports the fault.
+            if get_exec().moe.elastic_ep_backend != "mooncake":
+                return
             active_cpu = state.active_ranks_cpu.detach().numpy()
             ranks_to_recover = [i for i in range(effective_size) if not active_cpu[i]]
             if not ranks_to_recover:
@@ -2766,6 +2773,11 @@ class ModelRunner:
                 self._finalize_recovered_ep_ranks(ranks_to_recover)
             return
 
+        # Shrinks run from is_shrink_pending(), whose timeout also abandons the FSM;
+        # voting here would stall peers' mlp_sync.
+        if pending_size < effective_size:
+            return
+
         if (
             state.pending_since is not None
             and time.monotonic() - state.pending_since
@@ -2773,10 +2785,6 @@ class ModelRunner:
         ):
             error = f"Timed out waiting for ranks to join target EP size {pending_size}"
             self._fail_scale(error, effective_size)
-            return
-
-        # Shrinks run from is_shrink_pending(); voting here would stall peers' mlp_sync.
-        if pending_size < effective_size:
             return
 
         # Grow into a retired slot: survivors take try_recover_ranks and skip the cohort
@@ -2893,6 +2901,7 @@ class ModelRunner:
         )
         self._reinit_expert_distribution_recorder()
         ElasticEPStateManager.instance().reset()
+        reset_barriers_after_failure()
         # Every survivor, verbatim: test_elastic_recover.py counts one per survivor.
         logger.info("[Elastic EP] recover ranks %s done", ranks_to_recover)
 

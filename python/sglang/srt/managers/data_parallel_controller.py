@@ -438,14 +438,22 @@ class DataParallelController:
         )
         if has_user_request and self.refresh_load_budget_on_dispatch:
             self.refresh_load_budget()
-        for req in batch_req:
-            self.dispatching_with_trace(req, refresh_load_budget=False)
+        self._dispatch_batch_items(batch_req)
 
     def dispatch_batch_embedding(self, batch_req: BatchTokenizedEmbeddingReqInput):
         if self.refresh_load_budget_on_dispatch:
             self.refresh_load_budget()
+        self._dispatch_batch_items(batch_req)
+
+    def _dispatch_batch_items(self, batch_req) -> None:
+        # Per item: the batch has no rid to abort, and one unroutable item must not
+        # strand the rest.
         for req in batch_req:
-            self.dispatching_with_trace(req, refresh_load_budget=False)
+            try:
+                self.dispatching_with_trace(req, refresh_load_budget=False)
+            except DPRoutingUnavailable as exc:
+                logger.warning("[DPC] %s (%s)", exc, type(req).__name__)
+                self._abort_undispatchable(req, str(exc))
 
     def init_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(

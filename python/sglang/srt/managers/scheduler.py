@@ -2447,7 +2447,36 @@ class Scheduler(
             # not consumed); the Rust api_server shapes it per-endpoint.
             self.rust_server.push_control_output(recv_req, output)
         else:
+            sender = self._elastic_control_sender()
+            if sender is not None:
+                from sglang.srt.managers.io_struct import (
+                    ElasticControlOutput,
+                    wrap_as_pickle,
+                )
+
+                output = ElasticControlOutput(
+                    sender_dp_rank=sender, payload=wrap_as_pickle(output)
+                )
             self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
+
+    @staticmethod
+    def _elastic_control_sender() -> Optional[int]:
+        """This rank's DP slot, where a shrink can narrow the control fan-out mid-call
+        (shrinks need a single tokenizer)."""
+        parallel = get_parallel()
+        if (
+            parallel.elastic_ep_initial_size is None
+            or get_serving().tokenizer_worker_num != 1
+        ):
+            return None
+        from sglang.srt.elastic_ep.topology import (
+            attn_replica_size,
+            physical_ep_rank_to_dp_rank,
+        )
+
+        return physical_ep_rank_to_dp_rank(
+            parallel.tp_rank + parallel.ep_join_rank_offset, attn_replica_size()
+        )
 
     @staticmethod
     def _tokenized_requests(recv_req):
@@ -6858,6 +6887,18 @@ class Scheduler(
             # A fault inside the current width also reads as scaling. A resize's
             # barriers would wait on the faulted rank, so name it instead.
             faulted = ElasticEPStateManager.get_inactive_ranks()
+            pending_ep_size = ElasticEPStateManager.get_pending_ep_size()
+            # The tokenizer resends to every rank while one waits on a joiner; this
+            # rank accepted already, and peers cannot finish the scale without it.
+            if not faulted and pending_ep_size == new_ep_size:
+                return ScaleElasticEPReqOutput(
+                    success=True,
+                    message=f"Scaling to {new_ep_size} already pending",
+                    old_ep_size=old_ep_size,
+                    new_ep_size=new_ep_size,
+                    pending_ep_size=pending_ep_size,
+                    scale_phase=ElasticEPStateManager.get_scale_phase(),
+                )
             return ScaleElasticEPReqOutput(
                 success=False,
                 message=(
@@ -6901,25 +6942,36 @@ class Scheduler(
                     f"Mixed grow (recover {recover_slots} + scale {scale_slots}) "
                     "unsupported; grow into retired slots first, then append."
                 )
-            # A joiner sizes its expert map to the top of its own span, which is at
-            # most the launch width; a target short of that kills the joiner later.
-            if recover_slots and new_ep_size < launch_ep:
-                from sglang.srt.elastic_ep.elastic_ep import required_recover_width
+            # A joiner sizes its expert map to the top of its own span; a target off
+            # that width kills the joiner when it receives the map.
+            if recover_slots:
+                from sglang.srt.elastic_ep.elastic_ep import announced_recover_widths
 
-                required = required_recover_width(recover_slots)
-                if required is None:
+                widths = announced_recover_widths(recover_slots)
+                if widths is None:
                     return _reject(
                         f"No joiner has announced on slots {recover_slots} yet, so "
-                        f"the width to grow to is not known. Retry, or grow to "
-                        f"{launch_ep} and shrink back.",
+                        "the width to grow to is not known. Retry once it has started.",
                         retry_when_joiner_announces=True,
                     )
+                if len(widths) > 1:
+                    return _reject(
+                        f"The joiners waiting on slots {recover_slots} join at widths "
+                        f"{sorted(widths)}. Grow to {min(widths)} first, then on.",
+                    )
+                (required,) = widths
                 if required > new_ep_size:
                     return _reject(
                         f"Grow to {new_ep_size} cannot serve the joiner waiting on "
                         f"slots {recover_slots}: it joins at width {required}. "
                         f"Grow to {required} first, then shrink to {new_ep_size}.",
                         required_ep_size=required,
+                    )
+                if required < new_ep_size:
+                    return _reject(
+                        f"Grow to {new_ep_size} cannot serve the joiner waiting on "
+                        f"slots {recover_slots}: it joins at width {required}. "
+                        f"Grow to {required} first, then on to {new_ep_size}.",
                     )
             pending_recover_ranks = recover_slots
 

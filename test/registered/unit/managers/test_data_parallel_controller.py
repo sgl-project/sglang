@@ -31,6 +31,7 @@ from sglang.srt.managers import io_struct
 from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
     DPBudget,
+    DPRoutingUnavailable,
     LoadBalanceMethod,
     WorkerPortHandshake,
 )
@@ -445,6 +446,23 @@ class TestDispatchingWithTrace(CustomTestCase):
                 self.assertEqual(
                     ctl.dispatching_with_trace.call_args_list,
                     [call(req, refresh_load_budget=False) for req in reqs],
+                )
+
+    def test_batch_aborts_only_the_unroutable_item(self):
+        """The batch itself has no rid, so aborting it would leave every item hanging."""
+        for dispatch in ("dispatch_batch_generate", "dispatch_batch_embedding"):
+            with self.subTest(dispatch=dispatch):
+                ctl = self._make_traced_controller()
+                reqs = [_req(rid=rid) for rid in ("a", "b", "c")]
+                ctl.dispatching_with_trace = MagicMock(
+                    side_effect=[None, DPRoutingUnavailable("retired"), None]
+                )
+                ctl._abort_undispatchable = MagicMock()
+                getattr(ctl, dispatch)(reqs)
+                self.assertEqual(ctl.dispatching_with_trace.call_count, 3)
+                self.assertEqual(
+                    ctl._abort_undispatchable.call_args_list,
+                    [call(reqs[1], "retired")],
                 )
 
 

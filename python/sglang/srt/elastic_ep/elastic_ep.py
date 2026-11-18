@@ -119,16 +119,16 @@ def clear_recover_cohort(rank_offset: int) -> None:
         store.delete_key(key)
 
 
-def required_recover_width(recover_slots: List[int]) -> Optional[int]:
-    """Narrowest width fitting every joiner on these slots, None until all announced
-    (a guess misfits a wider or narrower joiner). Never sleeps (scheduler loop)."""
+def announced_recover_widths(recover_slots: List[int]) -> Optional[set[int]]:
+    """Widths the joiners on these slots sized their expert maps for, None until all
+    announced (a guess misfits a wider or narrower joiner). Never sleeps (scheduler loop)."""
     store = get_global_tcp_store()
     if store is None:
         return None
     keys = [f"{_RECOVER_COHORT_KEY_PREFIX}/{slot}" for slot in recover_slots]
     if not all(store.check([key]) for key in keys):
         return None
-    return max(int(store.get(key)) for key in keys)
+    return {int(store.get(key)) for key in keys}
 
 
 @dataclass
@@ -709,6 +709,22 @@ def seed_barrier_epochs() -> None:
             _last_local_cycle_id[ns] = int(store.add(cycle_key, 0))
         except Exception as exc:
             logger.warning("%s cycle id seed failed (%s)", log, exc)
+
+
+def reset_barriers_after_failure() -> None:
+    """Only a barrier's leader resets ARRIVAL, so one that died after posting leaves
+    every later round leaderless. Rank 0 never retires and clears the counters; every
+    rank re-reads the cycle ids, so a stale one cannot adopt the failed round's epoch."""
+    store = _store_or_none("[Elastic EP][barrier reset]")
+    if store is None:
+        return
+    if torch.distributed.get_rank() == 0:
+        for arrival_key, _, _, log in _BARRIER_NS.values():
+            try:
+                store.set(arrival_key, "0")
+            except Exception as exc:
+                logger.warning("%s ARRIVAL reset failed (%s)", log, exc)
+    seed_barrier_epochs()
 
 
 class _BarrierSkip:

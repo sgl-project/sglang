@@ -18,6 +18,7 @@ from sglang.srt.elastic_ep.elastic_ep import (
     _BARRIER_NS,
     _StoreBarrier,
     cohort_vote_via_store,
+    reset_barriers_after_failure,
     share_expert_map_via_store,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -97,6 +98,27 @@ class TestStoreBarrier(StoreBackedTestCase):
             1,
             "a leaked ARRIVAL should stop the next cycle from electing a leader",
         )
+
+    def test_failure_reset_restores_leader_election_after_a_dead_leader(self):
+        """A leader that dies after posting never consumes; the reset on a failed
+        or recovered scale has to stand in for it."""
+        first = _post(self._store)
+        with mock.patch.object(dist, "get_rank", return_value=0):
+            reset_barriers_after_failure()
+        second = _post(self._store)
+        self.assertIsNotNone(second)
+        self.assertEqual(second.arrival, 1, "ARRIVAL was not reset")
+        self.assertGreater(second.epoch, first.epoch, "epochs must not be reused")
+        second.consume()
+
+    def test_failure_reset_on_a_peer_leaves_the_counters(self):
+        """Only rank 0 clears ARRIVAL, so a peer resetting late cannot wipe a round
+        rank 0 has already started."""
+        first = _post(self._store, target=2)
+        with mock.patch.object(dist, "get_rank", return_value=1):
+            reset_barriers_after_failure()
+        self.assertEqual(int(self._store.add(_BARRIER_NS["world"][0], 0)), 1)
+        self.assertEqual(eep._last_local_cycle_id["world"], first.epoch)
 
     def test_every_declared_namespace_posts_independently(self):
         states = [_post(self._store, ns) for ns in _BARRIER_NS]

@@ -4216,8 +4216,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 r.retry_when_joiner_announces for r in rejects
             ):
                 if time.monotonic() >= deadline:
-                    # Nothing announced in time. The launch width serves any joiner.
-                    obj = self._stage_through(obj, self._elastic_launch_ep())
+                    # Nothing announced in time; the rejects below carry the reason.
                     break
                 await asyncio.sleep(_JOINER_ANNOUNCE_POLL_S)
                 responses = await self.scale_elastic_ep_communicator(obj)

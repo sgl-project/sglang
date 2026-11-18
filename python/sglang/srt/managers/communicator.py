@@ -36,7 +36,11 @@ class FanOutCommunicator(Generic[T]):
         self._mode = mode
         self._result_event: Optional[asyncio.Event] = None
         self._result_values: Optional[List[T]] = None
+        # DP rank of each reply, None when the sender did not stamp one.
+        self._result_senders: Optional[List[Optional[int]]] = None
         self._result_fan_out: Optional[int] = None
+        # Replies from DP ranks at or above this are from retired ranks.
+        self._live_senders: Optional[int] = None
         self._queueing_lock = asyncio.Lock()
 
         assert mode in ["queueing", "watching"]
@@ -52,6 +56,7 @@ class FanOutCommunicator(Generic[T]):
 
             self._result_event = asyncio.Event()
             self._result_values = []
+            self._result_senders = []
             self._result_fan_out = self._fan_out
             requested = self._fan_out
             try:
@@ -67,12 +72,13 @@ class FanOutCommunicator(Generic[T]):
                 return result_values
             finally:
                 self._result_event = self._result_values = None
-                self._result_fan_out = None
+                self._result_senders = self._result_fan_out = None
 
     async def watching_call(self, obj):
         if self._result_event is None:
             assert self._result_values is None
             self._result_values = []
+            self._result_senders = []
             self._result_event = asyncio.Event()
             self._result_fan_out = self._fan_out
 
@@ -88,7 +94,7 @@ class FanOutCommunicator(Generic[T]):
         result_values = copy.deepcopy(values)
         if self._result_event is event:
             self._result_event = self._result_values = None
-            self._result_fan_out = None
+            self._result_senders = self._result_fan_out = None
         return result_values
 
     async def __call__(self, obj):
@@ -97,15 +103,25 @@ class FanOutCommunicator(Generic[T]):
         else:
             return await self.watching_call(obj)
 
-    def set_fan_out(self, fan_out: int):
+    def set_fan_out(self, fan_out: int, live_senders: Optional[int] = None):
         # Shrink mid-call: lower in-flight expected replies (retirees already exited).
         self._fan_out = fan_out
+        self._live_senders = live_senders
         if self._result_fan_out is not None and fan_out < self._result_fan_out:
             self._result_fan_out = fan_out
+            if live_senders is not None:
+                # In place: a watching caller holds a reference to the list.
+                kept = [
+                    (value, sender)
+                    for value, sender in zip(self._result_values, self._result_senders)
+                    if sender is None or sender < live_senders
+                ]
+                self._result_values[:] = [value for value, _ in kept]
+                self._result_senders[:] = [sender for _, sender in kept]
             if len(self._result_values) >= fan_out:
                 self._result_event.set()
 
-    def handle_recv(self, recv_obj: T):
+    def handle_recv(self, recv_obj: T, sender: Optional[int] = None):
         if (
             self._result_values is None
             or self._result_event is None
@@ -116,7 +132,15 @@ class FanOutCommunicator(Generic[T]):
                 type(recv_obj).__name__,
             )
             return
+        if (
+            sender is not None
+            and self._live_senders is not None
+            and sender >= self._live_senders
+        ):
+            logger.debug("Dropping a reply from retired DP rank %d", sender)
+            return
         self._result_values.append(recv_obj)
+        self._result_senders.append(sender)
         # >=, not ==: set_fan_out can lower the target below what already arrived.
         if len(self._result_values) >= self._result_fan_out:
             self._result_event.set()
