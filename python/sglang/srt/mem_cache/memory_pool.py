@@ -1544,11 +1544,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
             replayssm_request_ring=replayssm_request_ring,
             allocate_intermediate_ssm=allocate_intermediate_ssm,
         )
-        from sglang.srt.layers.communication import k3_kda_tp
+        from sglang.srt.layers.communication import kda_tp
 
-        if k3_kda_tp.state_shard_width() > 1:
+        if kda_tp.state_shard_width() > 1:
             # KDA TP: global slot ids; this DP rank allocates its 1/W of them.
-            first_slot, per_rank = k3_kda_tp.slot_partition(mamba_size)
+            first_slot, per_rank = kda_tp.slot_partition(mamba_size)
             self.mamba_allocator = MambaSlotAllocator(
                 size=per_rank, device=device, first_slot=first_slot
             )

@@ -38,8 +38,9 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateList,
     AuxHiddenStatePacker,
 )
-from sglang.srt.layers.communication import k3_ar_fusion, k3_kda_tp, k3_sp_collective
+from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective, kda_tp
 from sglang.srt.layers.communication.kda_dwdp import KdaDwdp
+from sglang.srt.layers.communication.kda_tp import forward as kda_tp_forward
 from sglang.srt.layers.cp.interleave import (
     cp_interleave_to_sequence_order,
     cp_sequence_to_interleave_order,
@@ -1941,7 +1942,7 @@ class KimiK3DeltaAttention(nn.Module):
         self.head_tp_size = linear_attn_tp_size()
         self.head_tp_rank = linear_attn_tp_rank()
         # --enable-kda-tp: heads sharded over the TP group across attention-DP ranks.
-        self._kda_tp = k3_kda_tp.enabled()
+        self._kda_tp = kda_tp.enabled()
         if self._kda_tp:
             self.head_group = "tp"
             self.head_tp_size = get_parallel().tp_size
@@ -2697,8 +2698,8 @@ class KimiK3DeltaAttention(nn.Module):
     def forward_kda_tp(self, hidden_states: torch.Tensor) -> torch.Tensor:
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
-        ctx = k3_kda_tp.current()
-        x = k3_kda_tp.all_gather_rows(hidden_states, ctx.R)
+        ctx = kda_tp_forward.current()
+        x = kda_tp.all_gather_rows(hidden_states, ctx.R)
         backend = get_attn_backend()
         H, D = self.local_num_heads, self.head_dim
         if ctx.sources is None:
@@ -2744,11 +2745,11 @@ class KimiK3DeltaAttention(nn.Module):
             try:
                 for src in ctx.sources:
                     start = src.rank * ctx.R
-                    rows = slice(start, start + k3_kda_tp.source_tokens(src))
+                    rows = slice(start, start + kda_tp_forward.source_tokens(src))
                     linear.forward_metadata = src.metadata
                     if src.batch.forward_mode.is_target_verify():
                         linear.verify_intermediate_state_indices = (
-                            k3_kda_tp.source_scratch_rows(linear, src)
+                            kda_tp_forward.source_scratch_rows(linear, src)
                         )
                     a = forget_gate[rows]
                     if not src.batch.forward_mode.is_decode():
@@ -2780,12 +2781,12 @@ class KimiK3DeltaAttention(nn.Module):
         if not fused_onorm:
             core = self.o_norm(core, g_proj_states.unflatten(-1, (-1, D)))
         core = core.reshape(core.shape[0], H * D)
-        out = k3_kda_tp.o_proj_output(core.shape[0], self.hidden_size, core.dtype)
+        out = kda_tp.o_proj_output(core.shape[0], self.hidden_size, core.dtype)
         if out is not None:
             partial, _ = self.o_proj(core, output_tensor=out)
         else:
             partial = self.o_proj(core)[0]
-        return k3_kda_tp.reduce_scatter_rows(partial, local_rows)
+        return kda_tp.reduce_scatter_rows(partial, local_rows)
 
 
 class KimiK3MLAAttention(DeepseekV2AttentionMLA):
@@ -3533,7 +3534,7 @@ class KimiK3LinearModel(nn.Module):
             )
         else:
             self.norm = PPMissingLayer()
-        self._kda_tp = k3_kda_tp.enabled()
+        self._kda_tp = kda_tp.enabled()
         if self._kda_tp and self.pp_group.world_size > 1:
             raise ValueError("--enable-kda-tp does not support pipeline parallelism")
         if self._kda_tp:
@@ -3605,7 +3606,7 @@ class KimiK3LinearModel(nn.Module):
             # Every rank, idle ones included: gathers this forward's KDA metadata.
             from sglang.srt.model_executor.forward_context import get_attn_backend
 
-            k3_kda_tp.begin_forward(
+            kda_tp_forward.begin_forward(
                 forward_batch,
                 get_attn_backend().linear_attn_backend,
                 hidden_states.shape[0],

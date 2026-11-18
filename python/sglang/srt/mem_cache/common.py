@@ -285,7 +285,7 @@ def _evict_until_allocatable(
 def retraction_needs_rebootstrap(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
 ) -> bool:
-    from sglang.srt.layers.communication import k3_kda_tp
+    from sglang.srt.layers.communication import kda_tp
     from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
@@ -295,7 +295,7 @@ def retraction_needs_rebootstrap(
     return (
         isinstance(token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator)
         or isinstance(token_to_kv_pool_allocator.get_kvcache(), DeepSeekV4TokenToKVPool)
-        or k3_kda_tp.state_shard_width() > 1
+        or kda_tp.state_shard_width() > 1
     )
 
 

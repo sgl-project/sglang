@@ -689,12 +689,9 @@ class ModelRunner:
     def init_kv_cache_configurator(
         self, draft_parallel_layout: DraftParallelLayout | None = None
     ):
-        from sglang.srt.layers.communication import k3_kda_tp
+        from sglang.srt.layers.communication import kda_tp
 
-        if (
-            k3_kda_tp.state_shard_width() > 1
-            and built_megakernel(self.model) is not None
-        ):
+        if kda_tp.state_shard_width() > 1 and built_megakernel(self.model) is not None:
             # Lazy-slot admission and the state mirrors bypass the megakernel's resets and commit.
             raise NotImplementedError(
                 "--enable-kda-tp does not support an installed megakernel"
@@ -2051,11 +2048,14 @@ class ModelRunner:
         """
         pool = self.req_to_token_pool
         if pool.holds_state_slots and not self.is_draft_worker:
-            from sglang.srt.layers.communication import k3_kda_tp
+            from sglang.srt.layers.communication import kda_tp
+            from sglang.srt.layers.communication.kda_tp.staging import (
+                mirror_deferred_state_ops,
+            )
 
-            if k3_kda_tp.state_shard_width() > 1:
+            if kda_tp.state_shard_width() > 1:
                 # Head-sharded KDA state: every rank applies every DP rank's ops.
-                k3_kda_tp.mirror_deferred_state_ops(self, forward_batch)
+                mirror_deferred_state_ops(self, forward_batch)
                 return
         if (
             not pool.holds_state_slots
@@ -2170,10 +2170,12 @@ class ModelRunner:
                     forward_batch.dp_kda_tp_state_imports is not None
                     and not self.is_draft_worker
                 ):
-                    from sglang.srt.layers.communication import k3_kda_tp
+                    from sglang.srt.layers.communication.kda_tp.staging import (
+                        run_pd_imports,
+                    )
 
                     # KDA TP PD decode: import received states before anything reads them.
-                    k3_kda_tp.run_pd_imports(self.req_to_token_pool, forward_batch)
+                    run_pd_imports(self.req_to_token_pool, forward_batch)
 
             # Replay cuda graph if applicable
             if can_run_graph:

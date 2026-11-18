@@ -138,7 +138,7 @@ logger = logging.getLogger(__name__)
 
 
 def _kda_state_shard_width() -> int:
-    from sglang.srt.layers.communication.k3_kda_tp import state_shard_width
+    from sglang.srt.layers.communication.kda_tp import state_shard_width
 
     return state_shard_width()
 

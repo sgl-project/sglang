@@ -377,15 +377,14 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         # Each request needs 1 main mamba slot + ping-pong slots when extra_buffer is enabled.
         # Cap the pool at max concurrent requests * slots_per_req to avoid allocating failed.
         slots_per_req = 1 + self.mamba_initial_tracking_slots
-        from sglang.srt.layers.communication import k3_kda_tp
+        from sglang.srt.layers.communication import kda_tp
+        from sglang.srt.layers.communication.kda_tp.staging import KdaTpStaging
 
         # KDA TP: a head-sharded pool holds every DP rank's slots and verify rows.
-        kda_tp_width = k3_kda_tp.state_shard_width()
+        kda_tp_width = kda_tp.state_shard_width()
         # Lazy slots: requests in their handoff hold staging slots, not state slots.
         handoff = (
-            0
-            if k3_kda_tp.lazy_mamba_slot(enable_mamba_extra_buffer)
-            else pre_alloc_size
+            0 if kda_tp.lazy_mamba_slot(enable_mamba_extra_buffer) else pre_alloc_size
         )
         max_slots_needed = (size + handoff) * slots_per_req * kda_tp_width
         if mamba_size is not None:
@@ -426,7 +425,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             ngram_eos_token_id=ngram_eos_token_id,
         )
         if kda_tp_width > 1:
-            self.mamba_pool.pd_staging = k3_kda_tp.PdStateStaging(
+            self.mamba_pool.pd_staging = KdaTpStaging(
                 self.mamba_pool,
                 cache_params,
                 envs.SGLANG_K3_KDA_TP_PD_STAGING_SLOTS.get(),
@@ -439,9 +438,9 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
 
 
 def _kda_tp_pd_staging(req_to_token_pool):
-    from sglang.srt.layers.communication import k3_kda_tp
+    from sglang.srt.layers.communication import kda_tp
 
-    if k3_kda_tp.state_shard_width() <= 1:
+    if kda_tp.state_shard_width() <= 1:
         return None
     return req_to_token_pool.mamba_pool.pd_staging
 
@@ -450,9 +449,9 @@ def _bind_late_stage(req_to_token_pool, req: Req) -> bool:
     key = getattr(req, "kda_tp_staged_slot", None)
     if key is None:
         return True
-    from sglang.srt.layers.communication import k3_kda_tp
+    from sglang.srt.layers.communication import kda_tp
 
-    if not k3_kda_tp.late_stage():
+    if not kda_tp.late_stage():
         return True
     return req_to_token_pool.mamba_pool.pd_staging.bind(key) is not None
 
@@ -460,7 +459,7 @@ def _bind_late_stage(req_to_token_pool, req: Req) -> bool:
 def _admit_lazy_mamba_slot(req_to_token_pool, req: Req) -> bool:
     if not getattr(req, "kda_tp_lazy_mamba", False) or req.kv.holds_mamba:
         return True
-    from sglang.srt.layers.communication import k3_kda_tp
+    from sglang.srt.layers.communication import kda_tp
 
     mid = req_to_token_pool.mamba_allocator.alloc(1)
     if mid is None:
@@ -473,7 +472,7 @@ def _admit_lazy_mamba_slot(req_to_token_pool, req: Req) -> bool:
     # The one host read of the new slot; release keys the stage by it.
     slot = int(mid[0])
     req.kda_tp_state_slot = slot
-    key = k3_kda_tp.lazy_stage_key(req.kv.req_pool_idx)
+    key = kda_tp.lazy_stage_key(req.kv.req_pool_idx)
     if getattr(req, "kda_tp_staged_slot", None) == key:
         req_to_token_pool.mamba_pool.pd_staging.rekey(key, slot)
         req.kda_tp_staged_slot = slot
@@ -1855,13 +1854,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
-            from sglang.srt.layers.communication import k3_kda_tp
+            from sglang.srt.layers.communication import kda_tp
 
             kda_tp_staging = _kda_tp_pd_staging(self.req_to_token_pool)
             if (
                 kda_tp_staging is not None
                 and not decode_req.req.kv.holds_mamba
-                and k3_kda_tp.lazy_mamba_slot(
+                and kda_tp.lazy_mamba_slot(
                     self.req_to_token_pool.enable_mamba_extra_buffer
                 )
             ):
@@ -1880,7 +1879,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Late staging binds the stage when the prefill sends the state instead.
             if (
                 kda_tp_staging is not None
-                and not k3_kda_tp.late_stage()
+                and not kda_tp.late_stage()
                 and not kda_tp_staging.has_room(
                     self.req_to_token_pool.mamba_allocator, self.req_to_token_pool
                 )
@@ -2035,7 +2034,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_len,
                 total_prefix_len,
             )
-            if kda_tp_staging is not None and not k3_kda_tp.late_stage():
+            if kda_tp_staging is not None and not kda_tp.late_stage():
                 # Deferred publish assigns the stage later; hold it so has_room counts it.
                 kda_tp_staging.reserve()
                 decode_req.req.kda_tp_stage_reserved = True
@@ -2239,19 +2238,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     decode_req.req.kv.req_pool_idx
                 ]
             )
-            from sglang.srt.layers.communication import k3_kda_tp
+            from sglang.srt.layers.communication import kda_tp
 
             staging = _kda_tp_pd_staging(self.req_to_token_pool)
             if staging is not None:
                 slots = indices.cpu().numpy()
                 slot = int(slots.reshape(-1)[0])
                 if getattr(decode_req.req, "kda_tp_lazy_mamba", False):
-                    slot = k3_kda_tp.lazy_stage_key(decode_req.req.kv.req_pool_idx)
+                    slot = kda_tp.lazy_stage_key(decode_req.req.kv.req_pool_idx)
                 else:
                     decode_req.req.kda_tp_state_slot = slot
                 decode_req.req.kda_tp_staged_slot = slot
-                if k3_kda_tp.late_stage():
-                    stage = k3_kda_tp.LATE_STAGE_UNBOUND
+                if kda_tp.late_stage():
+                    stage = kda_tp.LATE_STAGE_UNBOUND
                 else:
                     stage = staging.assign(
                         slot,
@@ -3434,9 +3433,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             req_of=lambda x: x.req,
         )
         self.gloo_group = get_parallel().attn_tp_group.cpu_group
-        from sglang.srt.layers.communication import k3_kda_tp
+        from sglang.srt.layers.communication import kda_tp
 
-        self._kda_late_stage = k3_kda_tp.late_stage()
+        self._kda_late_stage = kda_tp.late_stage()
         # room -> (first KDA_STAGE_REQ time, prefill sessions asking)
         self._kda_stage_waiting: Dict[int, Tuple[float, set]] = {}
         self._kda_stage_stats: List[float] = []

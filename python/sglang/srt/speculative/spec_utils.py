@@ -1243,9 +1243,10 @@ def commit_mamba_states_after_verify(
     model_runner = target_worker.model_runner
     if mambaish_config(model_runner.model_config) is None:
         return
-    from sglang.srt.layers.communication import k3_kda_tp
+    from sglang.srt.layers.communication import kda_tp
+    from sglang.srt.layers.communication.kda_tp.staging import commit_after_verify
 
-    if k3_kda_tp.state_shard_width() > 1:
+    if kda_tp.state_shard_width() > 1:
         # Head-sharded KDA state: a collective that idle ranks join with no requests.
         last_correct_step_indices = mamba_steps_to_track = None
         if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
@@ -1260,7 +1261,7 @@ def commit_mamba_states_after_verify(
                 )
             else:
                 last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
-        k3_kda_tp.commit_after_verify(
+        commit_after_verify(
             model_runner,
             batch,
             last_correct_step_indices,
