@@ -705,7 +705,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             )
 
     def test_npu_mha_transfer_uses_contiguous_hicache_backing(self):
-        """FIA views and packed drafts must restore without querying their owners."""
+        """FIA views and packed drafts restore through their current backing."""
         from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
 
         with mock.patch.dict("os.environ", {"ASCEND_USE_FIA": "True"}):
@@ -724,10 +724,6 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 for layers in (2, 1)
             )
         infos = tuple(pool.get_device_pool_infos()[0].buffer_info for pool in pools)
-        for pool in pools:
-            pool.get_hicache_transfer_buffers = mock.Mock(
-                side_effect=AssertionError("runtime owner query")
-            )
         npu_patch = mock.patch(f"{MHA_POOL_HOST_MODULE}._is_npu", True)
         npu_patch.start()
         self.addCleanup(npu_patch.stop)
@@ -754,8 +750,6 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 host.head_dim,
             ),
         )
-        self.assertEqual(len(host._npu_layer_bindings), 3)
-        self.assertEqual(len(host._npu_pool_bindings), 2)
         expected = []
         for i, info in enumerate(infos):
             for tensor in info.transfer_buffers():
@@ -769,7 +763,10 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 if direction == "D2H":
                     host_buffer[0].copy_(device_buffer[:, 1])
                 else:
-                    device_buffer[:, 1].copy_(host_buffer[0])
+                    layer = kwargs["device_layer_id"]
+                    device_buffer[layer, 1].copy_(
+                        host_buffer[0, kwargs["host_layer_id"]]
+                    )
 
         with (
             mock.patch(

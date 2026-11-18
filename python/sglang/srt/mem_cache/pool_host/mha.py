@@ -250,9 +250,6 @@ class MHATokenToKVPoolHost(HostKVCache):
                 else buffer_info.buffers.v_data_ptrs
             )
         self._initialize_transfer_views(buffer_info, write_back_staging)
-        # Specialized MHA host pools own their transfer paths and buffer shapes.
-        if _is_npu and self.layout == "page_first_direct":
-            self._init_npu_transfer_bindings()
 
     def _initialize_transfer_views(self, buffer_info, write_back_staging) -> None:
         self.element_dim = self.head_num * self.head_dim
@@ -581,63 +578,42 @@ class MHATokenToKVPoolHost(HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_direct":
-                transfer = transfer_kv_per_layer_kv_split_pf_lf
+                layer_start = 0
+                for device_k, device_v, host_k, host_v in self._npu_transfer_buffers():
+                    local_layer = host_layer_id - layer_start
+                    if not 0 <= local_layer < device_k.shape[0]:
+                        layer_start += device_k.shape[0]
+                        continue
+                    transfer_kv_per_layer_kv_split_pf_lf(
+                        device_indices=device_indices,
+                        host_indices=host_indices,
+                        device_k=device_k,
+                        host_k=host_k,
+                        device_v=device_v,
+                        host_v=host_v,
+                        page_size=self.page_size,
+                        device_layer_id=local_layer,
+                        host_layer_id=local_layer,
+                        impl="auto",
+                    )
+                    break
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
-            if not 0 <= host_layer_id < len(self._npu_layer_bindings):
-                return
-            transfer(
-                device_indices=device_indices,
-                host_indices=host_indices,
-                **self._npu_layer_bindings[host_layer_id],
-                impl="auto",
-            )
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
-    def _init_npu_transfer_bindings(self):
-        host_k, host_v = self.k_buffer, self.v_buffer
-        host_layer_axis = 1
-        layer_bindings = []
-        pool_bindings = []
+    def _npu_transfer_buffers(self):
         layer_start = 0
         for info in self._buffer_infos:
             device_k, device_v = info.transfer_buffers()
-            layer_count = device_k.shape[0]
-            pool_host_k = host_k.narrow(host_layer_axis, layer_start, layer_count)
-            pool_host_v = host_v.narrow(host_layer_axis, layer_start, layer_count)
-            pool_bindings.append(
-                dict(
-                    device_k=device_k.flatten(-2).unsqueeze(-2),
-                    host_k=pool_host_k.flatten(-2).unsqueeze(-2),
-                    device_v=device_v.flatten(-2).unsqueeze(-2),
-                    host_v=pool_host_v.flatten(-2).unsqueeze(-2),
-                    page_size=self.page_size,
-                )
+            layer_end = layer_start + device_k.shape[0]
+            yield (
+                device_k,
+                device_v,
+                self.k_buffer[:, layer_start:layer_end],
+                self.v_buffer[:, layer_start:layer_end],
             )
-            for local_layer in range(layer_count):
-                layer_bindings.append(
-                    dict(
-                        device_k=device_k[local_layer : local_layer + 1]
-                        .flatten(-2)
-                        .unsqueeze(-2),
-                        host_k=pool_host_k.narrow(host_layer_axis, local_layer, 1)
-                        .flatten(-2)
-                        .unsqueeze(-2),
-                        device_v=device_v[local_layer : local_layer + 1]
-                        .flatten(-2)
-                        .unsqueeze(-2),
-                        host_v=pool_host_v.narrow(host_layer_axis, local_layer, 1)
-                        .flatten(-2)
-                        .unsqueeze(-2),
-                        page_size=self.page_size,
-                        device_layer_id=0,
-                        host_layer_id=0,
-                    )
-                )
-            layer_start += layer_count
-        self._npu_layer_bindings = tuple(layer_bindings)
-        self._npu_pool_bindings = tuple(pool_bindings)
+            layer_start = layer_end
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
@@ -766,16 +742,19 @@ class MHATokenToKVPoolHost(HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_direct":
-                transfer = transfer_kv_all_layer_kv_split_lf_pf
+                for device_k, device_v, host_k, host_v in self._npu_transfer_buffers():
+                    transfer_kv_all_layer_kv_split_lf_pf(
+                        device_indices=device_indices,
+                        host_indices=host_indices,
+                        device_k=device_k,
+                        host_k=host_k,
+                        device_v=device_v,
+                        host_v=host_v,
+                        page_size=self.page_size,
+                        impl="auto",
+                    )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
-            for binding in self._npu_pool_bindings:
-                transfer(
-                    device_indices=device_indices,
-                    host_indices=host_indices,
-                    **binding,
-                    impl="auto",
-                )
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
