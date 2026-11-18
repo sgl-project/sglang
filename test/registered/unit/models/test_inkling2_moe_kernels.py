@@ -11,6 +11,7 @@ from sglang.kernels.ops.moe.inkling_moe import (
     compute_grouped_gemm_metadata,
 )
 from sglang.srt.layers.quantization.inkling2 import Inkling2QuantConfig
+from sglang.srt.layers.quantization.utils import swizzle_blockscale
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.models.inkling_common import inkling2_moe as moe
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -228,7 +229,7 @@ def test_cute_routed_gemm_matches_reference(tokens, skewed, width):
         dst2src,
         TOP_K,
         weight,
-        nvfp4.swizzle_weight_scales(weight_scales),
+        swizzle_blockscale(weight_scales).flatten(1),
         counts,
         offsets,
         schedule,
@@ -307,7 +308,7 @@ def test_nvfp4_prefill_gemm(tokens, rank):
         dst2src,
         TOPK,
         weight,
-        nvfp4.swizzle_weight_scales(weight_scales),
+        swizzle_blockscale(weight_scales).flatten(1),
         counts,
         offsets,
         schedule,

@@ -26,9 +26,6 @@ from sglang.kernels.ops.gemm.inkling2_linear import (
     uses_k_groups,
 )
 from sglang.kernels.ops.gemm.inkling2_mxfp8 import (
-    cutlass_weight_scales,
-)
-from sglang.kernels.ops.gemm.inkling2_mxfp8 import (
     routed_expert_matmul as mxfp8_routed_matmul,
 )
 from sglang.kernels.ops.gemm.inkling2_mxfp8 import (
@@ -37,7 +34,6 @@ from sglang.kernels.ops.gemm.inkling2_mxfp8 import (
 from sglang.kernels.ops.gemm.inkling2_nvfp4 import (
     routed_expert_matmul,
     routed_swiglu_expert_matmul,
-    swizzle_weight_scales,
 )
 from sglang.kernels.ops.inkling2 import experts_sm90, marlin_sm90
 from sglang.kernels.ops.moe.inkling2_moe import (
@@ -62,6 +58,7 @@ from sglang.kernels.ops.moe.inkling_moe import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.inkling2 import Inkling2QuantConfig
+from sglang.srt.layers.quantization.utils import swizzle_blockscale
 from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.models.inkling_common.moe import renorm_topk_logits_scaled
 from sglang.srt.runtime_context import (
@@ -303,7 +300,7 @@ class Inkling2Experts(nn.Module):
             loaded if dim is None else loaded.chunk(self.tp_size, dim=dim)[self.tp_rank]
         )
         if swizzled:
-            param.data.copy_(swizzle_weight_scales(target))
+            param.data.copy_(swizzle_blockscale(target).flatten(1))
 
     def _mega_covers(self, low, high):
         return self.mega is not None and (
@@ -338,12 +335,14 @@ class Inkling2Experts(nn.Module):
         ):
             return
         for name in ("w13", "w2"):
-            current = getattr(self, name + "_cutlass_scale", None)
-            setattr(
-                self,
-                name + "_cutlass_scale",
-                cutlass_weight_scales(getattr(self, name + "_scale"), current),
+            swizzled = swizzle_blockscale(
+                getattr(self, name + "_scale").view(torch.uint8)
             )
+            current = getattr(self, name + "_cutlass_scale", None)
+            if current is None:
+                setattr(self, name + "_cutlass_scale", swizzled)
+            else:
+                current.copy_(swizzled)
 
     def prepare_mega_moe(self):
         """DeepGEMM MegaMoE over the loaded expert tensors in place (`inkling2`
@@ -486,7 +485,7 @@ class Inkling2Experts(nn.Module):
                     raise ValueError(
                         "NVFP4 expert computation requires an SM100, SM103 or SM107 GPU"
                     )
-                scale.data = swizzle_weight_scales(scale.data)
+                scale.data = swizzle_blockscale(scale.data).flatten(1)
 
     def forward(self, x, weights, ids, combine=True):
         if x.shape[0] == 0:
