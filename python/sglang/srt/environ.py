@@ -2584,8 +2584,6 @@ class Envs:
     SGLANG_K3_KDA_TP_LAZY_MAMBA_SLOT = EnvBool(True)
     # Mamba SSM commit with explicit scratch rows: one program loops over the requests.
     SGLANG_MAMBA_SSM_COMMIT_ROW_LOOP = EnvBool(True)
-    # --enable-kda-tp PD decode: bind a staging slot at the prefill's last chunk (NIXL only).
-    SGLANG_K3_KDA_TP_LATE_STAGE = EnvBool(False)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)

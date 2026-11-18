@@ -63,14 +63,6 @@ def lazy_mamba_slot(enable_mamba_extra_buffer: bool) -> bool:
     )
 
 
-def late_stage() -> bool:
-    return enabled() and envs.SGLANG_K3_KDA_TP_LATE_STAGE.get()
-
-
-# State destination a late-staged request advertises until its stage is bound.
-LATE_STAGE_UNBOUND = -1
-
-
 def lazy_stage_key(req_pool_idx: int) -> int:
     # Negated, so it never collides with a state slot id (>= 1).
     return -int(req_pool_idx)

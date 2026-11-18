@@ -11,10 +11,8 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.communication.kda_tp import (
-    LATE_STAGE_UNBOUND,
     all_gather_padded,
     group,
-    late_stage,
     lazy_mamba_slot,
     lazy_stage_key,
     width,
@@ -223,21 +221,6 @@ class KdaTpStaging:
         self._stage_of[slot] = stage
         return stage
 
-    def bind(self, slot: int) -> Optional[int]:
-        stage = self._stage_of.get(slot)
-        if stage is not None:
-            return stage
-        self._reclaim()
-        if len(self._free) <= self._reserved:
-            return None
-        return self.assign(slot)
-
-    def stage_of(self, slot: int) -> Optional[int]:
-        return self._stage_of.get(slot)
-
-    def num_bound(self) -> int:
-        return len(self._stage_of)
-
     def queue_import(self, slot: int) -> None:
         if slot not in self._stage_of:
             raise RuntimeError(f"KDA TP PD staging: slot {slot} has no staged state")
@@ -423,9 +406,6 @@ class KdaTpStaging:
 
     def admit(self, req_to_token_pool, req) -> bool:
         """Whether a transferred request can join the batch now (its state slot is bound)."""
-        key = getattr(req, "kda_tp_staged_slot", None)
-        if key is not None and late_stage() and self.bind(key) is None:
-            return False
         if not getattr(req, "kda_tp_lazy_mamba", False) or req.kv.holds_mamba:
             return True
         mid = req_to_token_pool.mamba_allocator.alloc(1)
@@ -453,16 +433,12 @@ class KdaTpStaging:
             req.kda_tp_lazy_mamba = True
 
     def has_prealloc_room(self, req_to_token_pool) -> bool:
-        # Late staging binds the stage when the prefill sends the state instead.
-        return late_stage() or self.has_room(
-            req_to_token_pool.mamba_allocator, req_to_token_pool
-        )
+        return self.has_room(req_to_token_pool.mamba_allocator, req_to_token_pool)
 
     def reserve_for(self, req) -> None:
-        if not late_stage():
-            # Deferred publish assigns the stage later; hold it so has_room counts it.
-            self.reserve()
-            req.kda_tp_stage_reserved = True
+        # Deferred publish assigns the stage later; hold it so has_room counts it.
+        self.reserve()
+        req.kda_tp_stage_reserved = True
 
     def drop_reservation(self, req) -> None:
         if getattr(req, "kda_tp_stage_reserved", False):
@@ -477,13 +453,8 @@ class KdaTpStaging:
         else:
             req.kda_tp_state_slot = slot
         req.kda_tp_staged_slot = slot
-        if late_stage():
-            stage = LATE_STAGE_UNBOUND
-        else:
-            stage = self.assign(
-                slot, reserved=getattr(req, "kda_tp_stage_reserved", False)
-            )
-            req.kda_tp_stage_reserved = False
+        stage = self.assign(slot, reserved=getattr(req, "kda_tp_stage_reserved", False))
+        req.kda_tp_stage_reserved = False
         return np.full(slots.shape, stage, dtype=slots.dtype)
 
     def queue_imports(self, reqs) -> None:

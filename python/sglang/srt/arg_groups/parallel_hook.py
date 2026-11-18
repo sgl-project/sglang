@@ -385,15 +385,6 @@ def _check_kda_tp_supported(cfg) -> None:
         problems.append("HiCache (host copies of rank-local head shards)")
     if cfg.enable_unified_memory:
         problems.append("--enable-unified-memory (state slots are global ids)")
-    if (
-        envs.SGLANG_K3_KDA_TP_LATE_STAGE.get()
-        and cfg.disaggregation_transfer_backend != "nixl"
-    ):
-        problems.append(
-            "SGLANG_K3_KDA_TP_LATE_STAGE with transfer backend "
-            f"{cfg.disaggregation_transfer_backend} (the stage negotiation is "
-            "implemented for nixl)"
-        )
     if cfg.disaggregation_decode_enable_radix_cache:
         problems.append(
             "the PD decode radix cache (rank-local state copies on prefix match)"
