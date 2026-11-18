@@ -3285,7 +3285,10 @@ class Scheduler(
         # that binds hinted storage keys to event IDs needs the name as well.
         if (
             self.kv_events_publisher.enable_kv_cache_events
-            or (req.kv_hints is not None and self.tree_cache.forwards_kv_hints())
+            or (
+                req.kv_hints is not None
+                and self.tree_cache.forwards_kv_hint_actions(req.kv_hints)
+            )
         ) and self.tree_cache.supports_prefix_sharing():
             self.kv_event_lora_names.register(req, lora_name)
 

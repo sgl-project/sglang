@@ -2641,7 +2641,7 @@ class UnifiedRadixCache(BasePrefixCache):
         last_hash: Optional[str],
     ) -> Optional[dict[str, Any]]:
         # Binding rehashes the whole prefix, so skip it unless a backend reads it.
-        if kv_hints is None or not kv_hints.actions or not self.forwards_kv_hints():
+        if not self.forwards_kv_hint_actions(kv_hints):
             return None
         metadata: dict[str, Any] = {"kv_hints": kv_hints}
         if key.extra_key is not None or key.cache_salt is not None:

@@ -102,9 +102,11 @@ class DecodeHiCachePreallocMixin:
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
                     kv_hints=req.kv_hints,
+                    # Only a namespaced binding reads the matched prefix.
                     matched_prefix_tokens=(
                         req.origin_input_ids[:matched_len]
-                        if req.kv_hints is not None
+                        if (req.extra_key is not None or req.cache_salt is not None)
+                        and self.tree_cache.forwards_kv_hint_actions(req.kv_hints)
                         else None
                     ),
                 )

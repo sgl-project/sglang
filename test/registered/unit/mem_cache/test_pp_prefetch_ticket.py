@@ -154,6 +154,7 @@ class TestPPPrefetchTicket(CustomTestCase):
         c.mem_pool_host.alloc.side_effect = lambda size, **_: torch.arange(size)
         c.storage_backend_type = "mooncake"
         c.storage_backend = Mock()
+        c.page_get_func = c._page_get_zero_copy
         c._storage_hit_query = Mock(side_effect=self.query_hits)
         c._all_reduce = Mock()
         c._host_pool_schemas = []
@@ -239,15 +240,20 @@ class TestPPPrefetchTicket(CustomTestCase):
             acks.append(self.c.prefetch_sync_queue.get_nowait())
         return acks
 
-    def test_pp_follower_can_lookup_and_read_hinted_pages(self):
+    def follow_hinted_ticket(self, follower_consumes_kv_hints):
+        """Run a hinted PP0 ticket on a follower; return its acks and extra_info."""
         c = self.c
         hint = KvHintsEnvelope(protocol_version="0.1", message_id="pp-hint")
         key = RadixKey(array("q", range(8)), cache_salt="tenant")
         keys = get_storage_hash_str(key, page_size=c.page_size)
         bindings = dict(zip(keys, (42, 43), strict=True))
+        seen = []
 
         def is_bound(key, info):
-            fields = info.extra_info
+            fields = info.extra_info or {}
+            seen.append(fields)
+            if not follower_consumes_kv_hints:
+                return True
             return fields.get("kv_hints") == hint and (
                 fields.get("storage_key_to_event_hash", {}).get(key) == bindings[key]
             )
@@ -280,13 +286,28 @@ class TestPPPrefetchTicket(CustomTestCase):
         ticket = pickle.loads(pickle.dumps(c.pp_prefetch_command_queue.get_nowait()))
         c.pp_prefetch_states.clear()
         c.storage_config.pp_rank = 1
+        c.storage_backend.consumes_kv_hints.return_value = follower_consumes_kv_hints
 
         self.run_commands(ticket)
         acks = self.run_io(1)
-        self.assertEqual(
-            [ack.completed_tokens for ack in acks if ack.completed_tokens is not None],
-            [c.page_size, 2 * c.page_size],
-        )
+        completed = [
+            ack.completed_tokens for ack in acks if ack.completed_tokens is not None
+        ]
+        return completed, seen
+
+    def test_pp_follower_can_lookup_and_read_hinted_pages(self):
+        completed, seen = self.follow_hinted_ticket(True)
+        self.assertEqual(completed, [self.c.page_size, 2 * self.c.page_size])
+        self.assertTrue(seen)
+
+    def test_pp_follower_that_opts_out_gets_no_hints(self):
+        """PP0 opted in, but a follower's own backend still decides."""
+        completed, seen = self.follow_hinted_ticket(False)
+        self.assertEqual(completed, [self.c.page_size, 2 * self.c.page_size])
+        self.assertTrue(seen)
+        for fields in seen:
+            self.assertNotIn("kv_hints", fields)
+            self.assertNotIn("storage_key_to_event_hash", fields)
 
     def test_stop_event_answers_tickets_as_misses_but_still_reduces(self):
         """A ticket delivered after the stop event is answered without a
@@ -385,6 +406,31 @@ class TestPPPrefetchTicket(CustomTestCase):
                 self.assertEqual(c._all_reduce.call_count, 2)
                 self.assertIs(c.prefetch_buffer.get_nowait(), first.operation)
                 self.assertIs(c.prefetch_buffer.get_nowait(), second.operation)
+
+    def test_hint_consumer_on_legacy_reads_is_warned_at_attach(self):
+        """Legacy batch_get() cannot carry hints, so opting in there is flagged."""
+        c = self.c
+        c.host_memory_mode = "cache"
+        for consumes, zero_copy, warns in (
+            (True, False, True),
+            (True, True, False),
+            (False, False, False),
+        ):
+            with self.subTest(consumes=consumes, zero_copy=zero_copy):
+                c.storage_backend = Mock()
+                c.storage_backend.consumes_kv_hints.return_value = consumes
+                c.page_get_func = (
+                    c._page_get_zero_copy if zero_copy else c._generic_page_get
+                )
+                logger = f"{HybridCacheController.__module__}"
+                with patch.object(HiCacheController, "attach_storage_backend"):
+                    if warns:
+                        with self.assertLogs(logger, "WARNING") as logs:
+                            c.attach_storage_backend("dynamic")
+                        self.assertIn("interface_v1=1", logs.output[0])
+                    else:
+                        with self.assertNoLogs(logger, "WARNING"):
+                            c.attach_storage_backend("dynamic")
 
     def test_file_attachment_enables_pp_tickets(self):
         c = self.c

@@ -101,7 +101,8 @@ class HiCacheStorageExtraInfo:
     # prefix_keys + keys is one contiguous chain for KV batches and sidecars.
     prefix_keys: Optional[List[str]] = None
     # Free-form per-call metadata. If the backend's consumes_kv_hints() is True,
-    # a lookup or read for a request whose kv_hints has actions also carries:
+    # lookups (batch_exists, batch_exists_v2) and reads (batch_get_v1,
+    # batch_get_v2) for a request whose kv_hints has actions also carry:
     #   "kv_hints": the request's KvHintsEnvelope (a msgspec Struct). It is
     #       caller-supplied and unauthenticated; validate it before acting on it.
     #   "storage_key_to_event_hash": only for a request with cache_salt or
@@ -110,6 +111,11 @@ class HiCacheStorageExtraInfo:
     #       this rank's event format whether or not it publishes events. An
     #       empty map means the prefix could not be verified, so treat those
     #       pages as unbound. Without the map, the ID is int(storage_key[:16], 16).
+    # Legacy batch_get() takes no extra_info, so a "dynamic" backend needs
+    # extra_config interface_v1=1 for its primary KV reads to carry hints.
+    # With --hicache-host-memory-mode buffer_only and PP > 1, prefetch reads use
+    # PP0's entries, kept only where the local backend also opts in. Lookups
+    # and other prefetches decide on each rank.
     # Decode-side lookups carry request_id "__storage_hit_query__".
     extra_info: Optional[dict] = None
 
@@ -398,7 +404,10 @@ class HiCacheStorage(ABC):
         """Whether lookups and reads should carry request kv_hints in extra_info.
 
         Off by default: binding storage keys to event IDs rehashes the
-        request's prefix on the scheduler.
+        request's prefix on the scheduler. Legacy batch_get() never carries
+        them; see HiCacheStorageExtraInfo.extra_info. Keep the answer the
+        same on every PP rank: buffer_only PP prefetch tickets carry PP0's
+        hint metadata, so a later stage that opts in alone gets none there.
         """
         return False
 

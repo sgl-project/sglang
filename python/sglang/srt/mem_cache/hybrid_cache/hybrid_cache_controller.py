@@ -527,6 +527,17 @@ class HybridCacheController(BaseHiCacheController):
                 self.pp_prefetch_command_group = None
             raise
 
+        if (
+            self.storage_backend.consumes_kv_hints()
+            and self.page_get_func == self._generic_page_get
+        ):
+            logger.warning(
+                "Storage backend %r consumes kv_hints, but its KV reads use the "
+                "legacy batch_get(), which receives no extra_info. Lookups still "
+                "carry hints; set extra_config interface_v1=1 so reads do too.",
+                storage_backend,
+            )
+
         for entry in host_pools or []:
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
         self.storage_backend.on_host_pools_registered()
@@ -1568,7 +1579,12 @@ class HybridCacheController(BaseHiCacheController):
                             ticket.prefetch_key,
                             ticket.last_hash,
                             prefix_keys=ticket.prefix_keys,
-                            storage_read_metadata=ticket.storage_read_metadata,
+                            # PP0 decided from its own backend; honor ours too.
+                            storage_read_metadata=(
+                                ticket.storage_read_metadata
+                                if self.storage_backend.consumes_kv_hints()
+                                else None
+                            ),
                             # Keep sidecar ACKs aligned even if allocation fails.
                             pool_transfers=[
                                 PoolTransfer(

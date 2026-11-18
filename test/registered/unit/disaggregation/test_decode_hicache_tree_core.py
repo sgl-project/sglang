@@ -14,7 +14,10 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
 )
 from sglang.srt.managers.kv_hints import KvHintAction, KvHintsEnvelope
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    CacheRequestHandle,
+)
 from sglang.srt.mem_cache.events import KVCacheEventRecorder, KvEventLoraNames
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
@@ -41,6 +44,7 @@ _HINT = KvHintsEnvelope(
         KvHintAction(action_id="fetch", action_type="kv.fetch", action_version="1.0")
     ],
 )
+_EMPTY_HINT = KvHintsEnvelope(protocol_version="0.1", message_id="no-actions")
 
 
 def _lora_names(extra_key):
@@ -203,11 +207,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
         cases = (
             ("default backend", None, _HINT),
             ("backend opted out", False, _HINT),
-            (
-                "hint has no actions",
-                True,
-                KvHintsEnvelope(protocol_version="0.1", message_id="m"),
-            ),
+            ("hint has no actions", True, _EMPTY_HINT),
         )
         for name, consumes_kv_hints, hint in cases:
             with self.subTest(name):
@@ -242,28 +242,71 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
                 wrapped = HiCacheStorageFailureInjector(backend, 0.0, 0.0)
                 self.assertEqual(wrapped.consumes_kv_hints(), bool(consumes_kv_hints))
 
+    def test_decode_probe_copies_the_prefix_only_for_a_namespaced_binding(self):
+        """The matched prefix is sliced only when a backend will bind it."""
+        page_size = 4
+        tokens = array("q", range(3 * page_size))
+        cases = (
+            ("salted and bound", True, _HINT, "tenant", True),
+            ("no namespace", True, _HINT, None, False),
+            ("backend opted out", False, _HINT, "tenant", False),
+            ("hint has no actions", True, _EMPTY_HINT, "tenant", False),
+            ("no hint", True, None, "tenant", False),
+        )
+        for name, consumes_kv_hints, hint, salt, copies in cases:
+            with self.subTest(name):
+                cache, probe = _decode_probe(
+                    page_size,
+                    KVCacheEventRecorder(enabled=False, page_size=page_size),
+                    Mock(),
+                    consumes_kv_hints=consumes_kv_hints,
+                )
+                cache.get_last_hash_value = lambda node: "00" * 32
+                cache.query_storage_hit_length = Mock(return_value=0)
+                probe(
+                    SimpleNamespace(
+                        origin_input_ids=tokens,
+                        extra_key=None,
+                        cache_salt=salt,
+                        kv_hints=hint,
+                    )
+                )
+                prefix = cache.query_storage_hit_length.call_args.kwargs[
+                    "matched_prefix_tokens"
+                ]
+                if copies:
+                    self.assertEqual(list(prefix), list(tokens[:page_size]))
+                else:
+                    self.assertIsNone(prefix)
+
     def test_scheduler_names_hinted_lora_keys_only_where_hints_are_bound(self):
         """Non-publishing ranks keep LoRA names only for hints a backend reads."""
-        for publishes, has_hint, consumes, expected in (
-            (True, False, False, True),
-            (False, True, True, True),
-            (False, True, False, False),
-            (False, False, True, False),
+        for publishes, hint, consumes, expected in (
+            (True, None, False, True),
+            (False, _HINT, True, True),
+            (False, _HINT, False, False),
+            (False, _EMPTY_HINT, True, False),
+            (False, None, True, False),
         ):
-            with self.subTest(publishes=publishes, hint=has_hint, consumes=consumes):
+            with self.subTest(publishes=publishes, hint=hint, consumes=consumes):
                 names = Mock()
+                tree_cache = SimpleNamespace(
+                    forwards_kv_hints=lambda: consumes,
+                    supports_prefix_sharing=lambda: True,
+                )
+                tree_cache.forwards_kv_hint_actions = lambda kv_hints: (
+                    BasePrefixCache.forwards_kv_hint_actions(tree_cache, kv_hints)
+                )
                 scheduler = SimpleNamespace(
                     kv_events_publisher=SimpleNamespace(
                         enable_kv_cache_events=publishes
                     ),
-                    tree_cache=SimpleNamespace(
-                        forwards_kv_hints=lambda: consumes,
-                        supports_prefix_sharing=lambda: True,
-                    ),
+                    tree_cache=tree_cache,
                     kv_event_lora_names=names,
                 )
-                req = SimpleNamespace(kv_hints=_HINT if has_hint else None)
-                Scheduler._record_kv_event_lora_name(scheduler, req, "lora")
+                Scheduler._record_kv_event_lora_name(
+                    scheduler, SimpleNamespace(kv_hints=hint), "lora"
+                )
                 self.assertEqual(names.register.called, expected)
 
     def test_stale_prefetch_anchor_degrades_to_l2(self):
