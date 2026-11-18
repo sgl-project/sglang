@@ -388,11 +388,11 @@ def _reference(
             predicts[last] = vocab_size - 1
 
 
-def _dyadic_rows(shape, vocab, generator):
+def _dyadic_rows(shape, vocab, pool, generator):
     rows = torch.zeros(*shape, vocab)
     for row in rows.view(-1, vocab):
-        support = int(torch.randint(1, min(vocab, 48) + 1, (1,), generator=generator))
-        tokens = torch.randperm(vocab, generator=generator)[:support]
+        support = int(torch.randint(1, len(pool) + 1, (1,), generator=generator))
+        tokens = pool[torch.randperm(len(pool), generator=generator)[:support]]
         cuts = torch.randint(0, _DYADIC_DENOM + 1, (support - 1,), generator=generator)
         bounds = torch.cat(
             [torch.tensor([0]), cuts.sort().values, torch.tensor([_DYADIC_DENOM])]
@@ -408,8 +408,10 @@ def _make_chain_operands(*, bs, num_nodes, num_spec_tokens, vocab, seed):
     generator = torch.Generator().manual_seed(seed)
     next_token = torch.full((bs, num_nodes), -1, dtype=torch.int64)
     next_token[:, :-1] = torch.arange(1, num_nodes)
-    target = _dyadic_rows((bs, num_nodes), vocab, generator)
-    draft = _dyadic_rows((bs, num_nodes), vocab, generator)
+    # one token pool across the vocab blocks, so draft rows overlap target rows
+    pool = torch.randperm(vocab, generator=generator)[:16]
+    target = _dyadic_rows((bs, num_nodes), vocab, pool, generator)
+    draft = _dyadic_rows((bs, num_nodes), vocab, pool, generator)
     candidates = torch.zeros((bs, num_nodes), dtype=torch.int64)
     for b in range(bs):
         for node in range(1, num_nodes):
@@ -439,10 +441,10 @@ def _make_chain_operands(*, bs, num_nodes, num_spec_tokens, vocab, seed):
 
 @pytest.mark.skipif(torch.version.hip is None, reason="ROCm Triton port")
 def test_target_only_triton_matches_reference():
-    """Random chains over a vocabulary of several 4096-wide blocks with fractional
-    thresholds and random draft rows; the known-answer cases above cover one block
-    and thresholds 1 and 0. Walks truncated below the leaves sample the bonus token
-    after the last slot, where the draft row must not be read."""
+    """Random chains over a vocabulary of several 4096-wide blocks, a fractional
+    threshold_acc and draft rows that overlap the target rows; the known-answer
+    cases above cover one block and thresholds 1 and 0. A walk that fills every
+    slot samples the bonus token from the target row alone."""
     operands = _make_chain_operands(
         bs=16, num_nodes=6, num_spec_tokens=3, vocab=9001, seed=9003
     )
