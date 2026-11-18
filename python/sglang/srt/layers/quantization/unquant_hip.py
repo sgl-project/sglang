@@ -130,6 +130,7 @@ def a16w16_tgemm(x: torch.Tensor, weight: torch.Tensor) -> Optional[torch.Tensor
     and hipBLASLt is not faster there, else None."""
     if not (
         _use_aiter
+        and _is_gfx95
         and x.dim() == 2
         and x.dtype == weight.dtype == torch.bfloat16
         and a16w16_is_tuned(x.shape[0], weight.shape[0], x.shape[1], False)
