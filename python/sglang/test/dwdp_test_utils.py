@@ -168,7 +168,8 @@ PERF_FIXED_SERVER_ARGS = [
     # kept off in both arms to match the measured perf baseline
     "--disable-overlap-schedule",
     # DWDP forces CUDA graphs off, so the TP arm turns them off too
-    "--disable-cuda-graph",
+    "--disable-decode-cuda-graph",
+    "--disable-prefill-cuda-graph",
     "--disable-radix-cache",
 ]
 
