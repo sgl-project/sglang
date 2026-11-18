@@ -1,9 +1,10 @@
 """Opt-in, decode-only context partitioning of MiniMax's replicated index K.
 
 This first implementation gathers the existing post-RoPE index queries rather
-than changing checkpoint loading or fused projections. Both gathers go through
+than changing checkpoint loading or fused projections. The query gather goes through
 SGLang's communicator so AITER registration and graph capture remain owned by
-the runtime. Communication cost must be included in performance comparisons.
+the runtime; the candidates return through a second gather, or on the NVFP4 index cache
+through an IPC exchange. Communication cost must be included in performance comparisons.
 """
 
 import logging
@@ -11,6 +12,10 @@ import logging
 import torch
 
 logger = logging.getLogger(__name__)
+
+# NVFP4 verify batches below this many requests keep the native indexer: there the Q
+# gather and candidate exchange cost more than the index-K reads CP saves (TP4, graphs)
+CP_MIN_VERIFY_REQS = 12
 
 
 def unsupported_reason(
@@ -41,12 +46,15 @@ def unsupported_reason(
             return "requires TP4 with attention CP/DP size 1"
     elif sm90:
         # At TP8 each rank still serves one index head; head pairs are replicated.
-        if attn_tp_size not in (4, 8) or (tp_size, attn_cp_size, attn_dp_size) != (
-            attn_tp_size,
-            1,
-            1,
+        # Under attention DP the CP group is one replica's attention TP group.
+        if (tp_size, attn_tp_size, attn_cp_size, attn_dp_size) not in (
+            (4, 4, 1, 1),
+            (8, 8, 1, 1),
+            (8, 4, 1, 2),
         ):
-            return "requires TP4 or TP8 with attention CP/DP size 1"
+            return (
+                "requires TP4, TP8, or TP8 with attention DP2, and attention CP size 1"
+            )
     else:
         return "requires AMD gfx950 or NVIDIA SM90"
     if (index_heads, kv_heads, head_dim, block_size, topk) != (4, 4, 128, 128, 16):
@@ -65,12 +73,20 @@ def unsupported_reason(
 def draft_is_chain_layout(algorithm, eagle_topk):
     """Whether verify rows reach the indexer as independent chain rows.
 
-    Allowlisted, not tree-denylisted: an unrecognized algorithm (DSPARK's ragged
-    verify, NGRAM's tree-in-mask) must disable CP rather than silently mis-score.
+    Allowlisted, not tree-denylisted: an unrecognized algorithm (NGRAM's
+    tree-in-mask) must disable CP rather than silently mis-score. DSPARK
+    qualifies only under the static (verify-all) schedule, where every request
+    verifies its whole draft block; ragged verify trims rows per request.
     """
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     algo = SpeculativeAlgorithm.from_string(algorithm)
+    if algo.is_dspark():
+        return read_ragged_verify_mode() is RaggedVerifyMode.STATIC
     return algo.is_none() or (algo.is_eagle() and (eagle_topk or 1) == 1)
 
 
@@ -117,11 +133,20 @@ def make_indexer_cp(backend, runner, sparse_cfg):
         logger.warning("MiniMax indexer CP disabled: %s", reason)
         return None
     cp = MiniMaxIndexerCP(parallel.attn_tp_group)
+    # only the NVFP4 index cache reads the exchange; it is a collective on every rank
+    if backend.kv_is_nvfp4:
+        from sglang.kernels.ops.attention.minimax_sparse.decode.verify_topk_gfx950 import (
+            CpExchange,
+        )
+
+        cp.exchange = CpExchange(cp.group, cp.group.device)
     cp.warmup()
     logger.info(
-        "MiniMax indexer CP enabled: TP%d, decode-only, replicated index cache, "
-        "query gather + candidate gather, top-k 16; index-value layers use TP",
+        "MiniMax indexer CP enabled: attention TP%d, decode-only, "
+        "replicated index cache, query gather + %s, top-k 16; "
+        "index-value layers use TP",
         cp.world,
+        "IPC candidate exchange" if cp.exchange is not None else "candidate gather",
     )
     return cp
 
@@ -133,6 +158,7 @@ class MiniMaxIndexerCP:
         self.group = group
         self.world = group.world_size
         self.rank = group.rank_in_group
+        self.exchange = None
 
     def warmup(self):
         """Initialize both runtime and PyNCCL gather paths before graph capture."""
@@ -147,19 +173,47 @@ class MiniMaxIndexerCP:
                 comm.all_gather(output, probe)
         torch.cuda.synchronize(probe.device)
 
-    def supports(self, q, k_cache, max_seqlen, req_to_token):
+    def supports(
+        self, q, k_cache, max_seqlen, req_to_token, packed_queries=1, local_blocks=1
+    ):
         # Shape/dtype/config predicates only. A rank-local exception must never
         # choose a different collective sequence from its peers.
-        return (
+        from sglang.kernels.ops.attention.minimax_sparse.common.nvfp4 import (
+            Nvfp4Cache,
+        )
+
+        common = (
             q.ndim == 3
             and q.shape[1:] == (1, 128)
+            and req_to_token.stride(1) == 1
+            and 0 < max_seqlen <= min(req_to_token.shape[1], 16384 * 128)
+        )
+        if isinstance(k_cache, Nvfp4Cache):
+            from sglang.kernels.ops.attention.minimax_sparse.decode.verify_topk_gfx950 import (
+                CP_MAX_ROWS,
+                can_fuse_verify_topk,
+            )
+
+            return (
+                common
+                and packed_queries > 1
+                and q.shape[0] % packed_queries == 0
+                and q.shape[0] // packed_queries >= CP_MIN_VERIFY_REQS
+                # the fused verify indexer scores all four heads' rows in one 32-row tile
+                and packed_queries * 4 <= 32
+                # the exchange's receive buffers hold CP_MAX_ROWS rows per head
+                and q.shape[0] <= CP_MAX_ROWS
+                and can_fuse_verify_topk(
+                    q, k_cache, packed_queries, 16, local_blocks, k_cache.page_size, 128
+                )
+            )
+        return (
+            common
             and q.dtype in (torch.bfloat16, torch.float16)
             and k_cache.ndim == 3
             and k_cache.shape[1:] == (1, 128)
             and k_cache.dtype
             in (q.dtype, torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2)
-            and req_to_token.stride(1) == 1
-            and 0 < max_seqlen <= min(req_to_token.shape[1], 16384 * 128)
         )
 
     def __call__(
@@ -177,10 +231,17 @@ class MiniMaxIndexerCP:
         k_scale=None,
         packed_queries=1,
     ):
+        from sglang.kernels.ops.attention.minimax_sparse.common.nvfp4 import (
+            Nvfp4Cache,
+        )
+        from sglang.kernels.ops.attention.minimax_sparse.common.utils import unit_scale
         from sglang.kernels.ops.attention.minimax_sparse.decode.indexer_cp import (
             merge_candidates,
             score_local_blocks,
             select_local_candidates,
+        )
+        from sglang.kernels.ops.attention.minimax_sparse.decode.verify_topk_gfx950 import (
+            cp_verify_exchange,
         )
 
         batch = q.shape[0]
@@ -190,10 +251,28 @@ class MiniMaxIndexerCP:
         world = self.world
         gathered_q = torch.empty((world * batch, 128), dtype=q.dtype, device=q.device)
         self.group.all_gather_into_tensor(gathered_q, local_q)
+        q_heads = gathered_q.view(world, batch, 128)
         sm_scale = 128**-0.5 if sm_scale is None else sm_scale
+        if isinstance(k_cache, Nvfp4Cache):
+            # sm_scale folds q and k scales as verify_topk_idx does, so the ids match it
+            return cp_verify_exchange(
+                q_heads=q_heads,
+                k_cache=k_cache,
+                req_to_token=req_to_token,
+                seq_lens=seq_lens,
+                max_seqlen=max_seqlen,
+                slot_ids=slot_ids,
+                num_draft=packed_queries,
+                block_size=128,
+                topk=16,
+                init_blocks=init_blocks,
+                local_blocks=local_blocks,
+                sm_scale=sm_scale * unit_scale(q_scale) * unit_scale(k_scale),
+                exchange=self.exchange,
+            )
         sm_scale *= 1.0 if q_scale is None else q_scale
         scores = score_local_blocks(
-            gathered_q.view(world, batch, 128),
+            q_heads,
             k_cache,
             req_to_token,
             slot_ids,

@@ -2,6 +2,7 @@
 """Guard input rounding, crop geometry and strides across CPU/CUDA preprocessing."""
 
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -140,6 +141,79 @@ class TestImagePreprocessing(CustomTestCase):
             torch.testing.assert_close(
                 stage.preprocess(image), expected, rtol=0, atol=0
             )
+
+    def test_vae_encoding_keeps_bright_edit_inputs(self):
+        # a smooth image whose channels are all >= 160 has no negative value in
+        # [-1, 1], even after Lanczos resampling
+        ramp = np.linspace(160, 250, 517, dtype=np.float32)
+        pixels = np.broadcast_to(ramp[None, :, None], (731, 517, 3))
+        image = Image.fromarray(pixels.astype(np.uint8))
+        flux = Flux2PipelineConfig()
+        flux.vae_config.arch_config.vae_scale_factor = 8
+        flux_pixels, _ = flux.preprocess_condition_image(
+            image, image.width, image.height, Flux2ImageProcessor(vae_scale_factor=16)
+        )
+        flux_batch = _edit_batch(condition_image=[flux_pixels])
+        qwen = QwenImageEditPlusPipelineConfig()
+        qwen_batch = _edit_batch(condition_image=[image])
+        qwen.preprocess_vae_image(qwen_batch, VaeImageProcessor(vae_scale_factor=8))
+        for config, batch, pixels in (
+            (flux, flux_batch, flux_pixels),
+            (qwen, qwen_batch, qwen_batch.vae_image[0]),
+        ):
+            with self.subTest(config=type(config).__name__):
+                self.assertGreaterEqual(pixels.min().item(), 0)
+                torch.testing.assert_close(
+                    _vae_encoder_input(config, batch),
+                    pixels.unsqueeze(2).float(),
+                    rtol=0,
+                    atol=0,
+                )
+
+
+class _StopEncoding(Exception):
+    pass
+
+
+class _RecordingVAE(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.inputs = []
+
+    def encode(self, pixels):
+        self.inputs.append(pixels)
+        raise _StopEncoding
+
+
+def _edit_batch(**kwargs):
+    return Req(
+        sampling_params=SamplingParams(prompt="test", seed=42, num_frames=1),
+        **kwargs,
+    )
+
+
+def _vae_encoder_input(config, batch):
+    vae = _RecordingVAE()
+    with patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.base.get_global_server_args",
+        return_value=SimpleNamespace(comfyui_mode=False),
+    ):
+        stage = ImageVAEEncodingStage(vae=vae)
+    server_args = SimpleNamespace(
+        component_precisions={"vae": "fp32"},
+        pipeline_config=config,
+        disable_autocast=True,
+    )
+    with patch.object(
+        ImageVAEEncodingStage,
+        "use_declared_component",
+        lambda self, *, module, **_: nullcontext(module),
+    ):
+        try:
+            stage.forward(batch, server_args)
+        except _StopEncoding:
+            pass
+    return vae.inputs[0]
 
 
 if __name__ == "__main__":

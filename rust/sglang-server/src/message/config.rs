@@ -5,7 +5,7 @@
 //! pipeline handoff ([`MmSpec`]).
 //!
 //! [`ServerArgs`] / [`ModelConfig`] / [`MetricsConfig`] / [`RequestLogConfig`] /
-//! [`DefaultSamplingParams`] / [`DisaggregationMode`] / [`MmSpec`] /
+//! [`Http2Config`] / [`DefaultSamplingParams`] / [`DisaggregationMode`] / [`MmSpec`] /
 //! [`MmFamily`] / [`MmResample`] are
 //! also `#[pyclass]`es: the Python scheduler (`RustServer._build_server_args`
 //! / `_build_mm_spec`) constructs them directly by keyword and hands them to
@@ -80,6 +80,8 @@ pub struct RuntimeConfig {
     pub generate_hook: Option<Arc<dyn crate::GenerateHook>>,
     /// A model package's admission check on every client generation.
     pub generate_validator: Option<Arc<dyn crate::GenerateValidator>>,
+    /// A model package's hook on every abort that names live requests.
+    pub abort_hook: Option<Arc<dyn crate::AbortHook>>,
     /// A model package's own scheduler `internal_state` fields, which
     /// `/server_info` reports by name after its typed ones. No other
     /// scheduler field is reported: the state also carries the launch
@@ -94,6 +96,7 @@ impl Default for RuntimeConfig {
             server_args: Arc::new(ServerArgs::default()),
             generate_hook: None,
             generate_validator: None,
+            abort_hook: None,
             server_info_state_keys: Vec::new(),
         }
     }
@@ -143,6 +146,9 @@ pub struct ServerArgs {
     /// HTTP bind address (see [`Self::bind`]).
     pub host: String,
     pub port: u16,
+    /// `--enable-http2`: the HTTP listener also serves HTTP/2 over cleartext
+    /// (h2c) on the same port; `None` serves HTTP/1.1 only.
+    pub http2: Option<Http2Config>,
     /// Optional gRPC base port. The same per-rank offset as HTTP is applied at
     /// the Python→Rust startup boundary; `None` keeps gRPC disabled.
     pub grpc_port: Option<u16>,
@@ -185,6 +191,9 @@ pub struct ServerArgs {
     /// `--gc-threshold`: the thresholds the scheduler ranks set when they
     /// freeze their garbage collectors after startup; `None` keeps Python's.
     pub gc_threshold: Option<Vec<i64>>,
+    /// Keep health at 503 until Python reports that its `--warmups` finished
+    /// ([`crate::Server::finish_custom_warmups`]).
+    pub custom_warmups_pending: bool,
     /// Extra headers on a successful `/health_generate` response, for a router
     /// that reads deployment metadata off the deep health probe.
     pub health_generate_headers: BTreeMap<String, String>,
@@ -287,6 +296,7 @@ impl ServerArgs {
         hicache_write_policy,
         host,
         port,
+        http2,
         grpc_port,
         grpc_response_timeout_secs,
         api_key,
@@ -304,6 +314,7 @@ impl ServerArgs {
         skip_tokenizer_init,
         skip_server_warmup,
         gc_threshold,
+        custom_warmups_pending,
         health_generate_headers,
         default_priority_value,
         enable_request_header_overrides,
@@ -351,6 +362,7 @@ impl ServerArgs {
         hicache_write_policy: Option<String>,
         host: String,
         port: u16,
+        http2: Option<Http2Config>,
         grpc_port: Option<u16>,
         grpc_response_timeout_secs: u64,
         api_key: Option<String>,
@@ -368,6 +380,7 @@ impl ServerArgs {
         skip_tokenizer_init: bool,
         skip_server_warmup: bool,
         gc_threshold: Option<Vec<i64>>,
+        custom_warmups_pending: bool,
         health_generate_headers: BTreeMap<String, String>,
         default_priority_value: Option<i64>,
         enable_request_header_overrides: bool,
@@ -413,6 +426,7 @@ impl ServerArgs {
             hicache_write_policy,
             host,
             port,
+            http2,
             grpc_port,
             grpc_response_timeout_secs,
             api_keys: ApiKeys::new(api_key, admin_api_key),
@@ -430,6 +444,7 @@ impl ServerArgs {
             skip_tokenizer_init,
             skip_server_warmup,
             gc_threshold,
+            custom_warmups_pending,
             health_generate_headers,
             default_priority_value,
             enable_request_header_overrides,
@@ -483,6 +498,7 @@ impl Default for ServerArgs {
             hicache_write_policy: None,
             host: "127.0.0.1".into(),
             port: 30000,
+            http2: None,
             grpc_port: None,
             grpc_response_timeout_secs: DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS,
             api_keys: ApiKeys::default(),
@@ -499,6 +515,7 @@ impl Default for ServerArgs {
             skip_tokenizer_init: false,
             skip_server_warmup: false,
             gc_threshold: None,
+            custom_warmups_pending: false,
             health_generate_headers: BTreeMap::new(),
             default_priority_value: None,
             enable_request_header_overrides: false,
@@ -623,6 +640,30 @@ impl<'py> pyo3::FromPyObject<'_, 'py> for DeploymentInfo {
                 "deployment_info is not valid JSON: {e}"
             ))
         })
+    }
+}
+
+/// HTTP/2 settings, as Python's server (Granian) takes them with
+/// `--enable-http2`.
+#[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
+#[derive(Clone, Debug)]
+pub struct Http2Config {
+    /// `--http2-max-concurrent-streams`: the streams one connection may open.
+    pub max_concurrent_streams: u32,
+    /// `--http2-initial-connection-window-size`: the connection-level receive
+    /// window, in bytes.
+    pub initial_connection_window_size: u32,
+}
+
+#[pyo3::pymethods]
+impl Http2Config {
+    #[new]
+    #[pyo3(signature = (*, max_concurrent_streams, initial_connection_window_size))]
+    fn py_new(max_concurrent_streams: u32, initial_connection_window_size: u32) -> Self {
+        Self {
+            max_concurrent_streams,
+            initial_connection_window_size,
+        }
     }
 }
 
@@ -876,6 +917,8 @@ pub enum DisaggregationMode {
 pub struct ModelConfig {
     /// Authoritative HF model type, used to select a native chat formatter.
     pub model_type: Option<String>,
+    /// HF `architectures`, reported by model info.
+    pub architectures: Option<Vec<String>>,
     /// Resolved context length (`max_model_len` in `/v1/models`); the ceiling
     /// for input + `max_new_tokens`.
     pub context_len: u64,
@@ -898,13 +941,14 @@ pub struct ModelConfig {
 #[pyo3::pymethods]
 impl ModelConfig {
     #[new]
-    #[pyo3(signature = (*, context_len, vocab_size, is_multimodal, default_sampling_params, model_type))]
+    #[pyo3(signature = (*, context_len, vocab_size, is_multimodal, default_sampling_params, model_type, architectures))]
     fn py_new(
         context_len: u64,
         vocab_size: u64,
         is_multimodal: bool,
         default_sampling_params: DefaultSamplingParams,
         model_type: Option<String>,
+        architectures: Option<Vec<String>>,
     ) -> Self {
         Self {
             context_len,
@@ -912,6 +956,7 @@ impl ModelConfig {
             is_multimodal,
             default_sampling_params,
             model_type,
+            architectures,
         }
     }
 }
@@ -922,6 +967,7 @@ impl Default for ModelConfig {
         Self {
             context_len: 2048,
             model_type: None,
+            architectures: None,
             vocab_size: 1000,
             is_multimodal: false,
             default_sampling_params: DefaultSamplingParams::default(),

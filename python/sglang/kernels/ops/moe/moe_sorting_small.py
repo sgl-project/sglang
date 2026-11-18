@@ -17,7 +17,6 @@ Output layouts match the aiter kernels bit-for-bit:
 
 from __future__ import annotations
 
-import contextlib
 import functools
 import inspect
 import logging
@@ -547,41 +546,6 @@ _pending_fp4_input: ContextVar[torch.Tensor | None] = ContextVar(
 _emitted_fp4_quant: ContextVar[tuple | None] = ContextVar(
     "aiter_emitted_fp4_quant", default=None
 )
-# (topk_ids, num_experts, block_size, aiter moe_sorting outputs) that a fused router already produced
-_presorted: ContextVar[tuple | None] = ContextVar(
-    "aiter_presorted_routing", default=None
-)
-
-
-@contextlib.contextmanager
-def presorted_moe_sort(
-    topk_ids: torch.Tensor, sorted_bufs: tuple, *, num_experts: int, block_size: int
-):
-    """Hand ``sorted_bufs``, aiter's moe_sorting of ``topk_ids`` with moe_buf unfilled, to the
-    next matching aiter sort in the block: (sorted_ids, sorted_weights, sorted_expert_ids,
-    num_valid_ids, moe_buf)."""
-    token = _presorted.set((topk_ids, num_experts, block_size, sorted_bufs))
-    try:
-        yield
-    finally:
-        _presorted.reset(token)
-
-
-def _take_presorted(topk_ids, num_experts, model_dim, moebuf_dtype, block_size):
-    pre = _presorted.get()
-    if pre is None:
-        return None
-    pre_ids, pre_experts, pre_block, sorted_bufs = pre
-    moe_buf = sorted_bufs[4]
-    if (
-        pre_ids is not topk_ids
-        or int(num_experts) != pre_experts
-        or int(block_size) != pre_block
-        or moe_buf.dtype != moebuf_dtype
-        or moe_buf.shape != (topk_ids.shape[0], model_dim)
-    ):
-        return None
-    return sorted_bufs
 
 
 # aiter's leading parameters of _moe_sorting_impl and the stage1 quant-sort ops, which the
@@ -725,16 +689,6 @@ def apply_aiter_small_moe_sort_patch() -> bool:
         )
         zero_moe_buf = accumulate and addend is None
         unmasked_sort = plain_sort and expert_mask is None and num_local_tokens is None
-        presorted = (
-            _take_presorted(topk_ids, num_experts, model_dim, moebuf_dtype, block_size)
-            if unmasked_sort
-            else None
-        )
-        if presorted is not None:
-            moe_buf = presorted[4] if addend is None else addend
-            if zero_moe_buf:
-                moe_buf.zero_()
-            return (*presorted[:4], moe_buf)
         if plain_sort and _small_sort_supported(
             topk_ids,
             int(block_size),

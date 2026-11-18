@@ -113,6 +113,24 @@ def _merge_comfy_quant_marker(
     previous.update(marker)
 
 
+# Model prefixes ComfyUI strips before matching _quantization_metadata layer names.
+_COMFY_MODEL_PREFIXES = ("model.diffusion_model.", "diffusion_model.", "model.")
+
+
+def _checkpoint_prefix(layer: str, names: set[str]) -> str:
+    """The checkpoint name of a _quantization_metadata layer.
+
+    Some converters write layer names relative to the diffusion model
+    (``blocks.0.attn.qkv_proj``) while the tensors keep the full prefix.
+    """
+    if f"{layer}.weight" in names:
+        return layer
+    for model_prefix in _COMFY_MODEL_PREFIXES:
+        if f"{model_prefix}{layer}.weight" in names:
+            return model_prefix + layer
+    return layer
+
+
 def inspect_comfy_quant_markers(
     safetensors_list: list[str],
     param_name_mapper: Callable[[str], str] | None = None,
@@ -122,6 +140,7 @@ def inspect_comfy_quant_markers(
     raw_markers: dict[str, dict[str, Any]] = {}
     marked_dtype_weight_prefixes: set[str] = set()
     global_quant_formats: set[str] = set()
+    metadata_markers: list[tuple[str, str, dict[str, Any]]] = []
 
     for path in safetensors_list:
         with safe_open(path, framework="pt", device="cpu") as checkpoint:
@@ -150,8 +169,15 @@ def inspect_comfy_quant_markers(
                         raise ValueError(
                             f"Comfy quantization metadata for {prefix!r} must be an object"
                         )
-                    _merge_comfy_quant_marker(raw_markers, prefix, marker)
-            for key in checkpoint.keys():
+                    metadata_markers.append((path, prefix, marker))
+            keys = list(checkpoint.keys())
+            names = set(keys)
+            for path_, prefix, marker in metadata_markers:
+                if path_ == path:
+                    _merge_comfy_quant_marker(
+                        raw_markers, _checkpoint_prefix(prefix, names), marker
+                    )
+            for key in keys:
                 tensor_slice = checkpoint.get_slice(key)
                 checkpoint_meta[key] = (
                     tensor_slice.get_dtype(),

@@ -1,8 +1,8 @@
-"""Window drafts keep their attention mask when placement falls back to FULL.
+"""A fused draft's window layers read their own window storage.
 
-The old multi-step path only built window indices for SWA pools, so accepted
-FULL placements reached decode with no window metadata. Exercise placement,
-binding and the real index reader through eager and captured metadata gathers.
+In the target window of its length or a band of its own, a draft window's
+multi-step and draft-extend metadata read that storage's ids with the layer's
+window mask, through eager and captured metadata gathers.
 """
 
 import unittest
@@ -20,7 +20,7 @@ from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
-from sglang.srt.mem_cache.kv.decl import MHAGeometry, kv_layer_decls
+from sglang.srt.mem_cache.kv.decl import MHAGeometry, WindowLayers, kv_layer_decls
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.kv.plan import plan_kv_storage
 from sglang.srt.mem_cache.kv.routed_cache import RoutedKVCache
@@ -68,29 +68,44 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             ),
             num_runners=1,
             ctx=PlacementContext(
-                host_names=("full", "swa") if target_window else ("full",),
-                target_window=target_window,
+                host_names=(
+                    ("full", f"window_{target_window}") if target_window else ("full",)
+                ),
+                target_windows=(target_window,) if target_window else (),
             ),
             store_dtype=torch.bfloat16,
         )
         self.assertIsNotNone(decision.placement, decision.declined)
         placement = decision.placement
         # A draft window rides in the target window of its length; any other
-        # draft window gets a band of its own.
-        fused = window == target_window
-        host = "swa" if fused or not target_window else "draft_swa"
+        # draft window gets a band of its own, named by its length.
+        host = f"window_{window}"
         self.assertEqual(placement.hosts(), (host,))
-        self.assertEqual(host in placement.new_bands, not fused, placement.new_bands)
-        # The target: a full layer and, when it has one, a window layer.
-        geometry = MHAGeometry(
-            head_num=1, head_dim=8, v_head_dim=8, kv_cache_dtype=torch.bfloat16
+        self.assertEqual(
+            host in placement.new_bands, window != target_window, placement.new_bands
         )
+        # The target: a full layer and, when it has one, a window layer.
         decls = kv_layer_decls(
             full_layer_ids=(0,),
-            full_geometry=geometry,
-            window_layer_ids=(1,) if target_window else (),
-            window_geometry=geometry if target_window else None,
-            window=target_window,
+            full_geometry=MHAGeometry(
+                head_num=1, head_dim=8, v_head_dim=8, kv_cache_dtype=torch.bfloat16
+            ),
+            windows=(
+                [
+                    WindowLayers(
+                        layer_ids=(1,),
+                        geometry=MHAGeometry(
+                            head_num=1,
+                            head_dim=8,
+                            v_head_dim=8,
+                            kv_cache_dtype=torch.bfloat16,
+                        ),
+                        window=target_window,
+                    )
+                ]
+                if target_window
+                else []
+            ),
         )
         storage_plan = plan_kv_storage(decls, page_size=1, fused_draft=placement)
         sized = size_plan(
@@ -115,7 +130,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
                 need_sort=False,
                 max_num_reqs=2,
                 model_context_len=1024,
-                lazy_compaction=False,
+                lazy_compaction=True,
             ),
         )
         allocator = storage.allocator
@@ -153,6 +168,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             device="cuda",
             is_draft_worker=True,
         )
+        self.assertEqual(reader.window_storage, host)
         runner = SimpleNamespace(
             req_to_token_pool=req,
             device="cuda",
@@ -216,10 +232,10 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         full = allocator.translate_kv_loc(virtual)
         draft_window = allocator.id_spaces()[host].ids(virtual)
         self.assertFalse(torch.equal(full, draft_window))
-        if target_window and not fused:
+        if target_window and target_window != window:
             # A draft band of its own: reading the target's window would be a
             # wrong route, and observable.
-            target = allocator.id_spaces()["swa"].ids(virtual)
+            target = allocator.id_spaces()[f"window_{target_window}"].ids(virtual)
             self.assertFalse(torch.equal(target, draft_window))
         return backend, batch, draft_window, host
 
@@ -301,7 +317,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         updater.kv_last_page_len = torch.ones(1, dtype=torch.int32, device="cuda")
         updater._swa_kv_pool = self.bound_pool
         updater._swa_space = reader.space(IdSpaceKind.SLIDING_WINDOW)
-        updater.prefill_wrapper_ragged = None
+        updater.prefill_wrappers_ragged = [None, None]
         planned = []
 
         def begin_forward(qo_indptr, kv_indptr, kv_indices, *args, **kwargs):
@@ -541,7 +557,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
                 },
             ),
             num_runners=1,
-            ctx=PlacementContext(host_names=("full", "swa"), target_window=128),
+            ctx=PlacementContext(host_names=("full", "swa"), target_windows=(128,)),
             store_dtype=torch.bfloat16,
         ).placement
         self.assertEqual(placement.hosts(), ("full",))
