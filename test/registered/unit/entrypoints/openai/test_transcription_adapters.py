@@ -15,6 +15,7 @@ import unittest
 
 from sglang.srt.entrypoints.openai.protocol import TranscriptionRequest
 from sglang.srt.entrypoints.openai.transcription_adapters import (
+    FireRedASR2Adapter,
     GlmAsrAdapter,
     GraniteSpeechAdapter,
     Qwen2AudioAdapter,
@@ -45,6 +46,16 @@ class TestTranscriptionAdapterResolution(CustomTestCase):
         for arch, cls, _, _ in _SPEECH_LM_CASES:
             with self.subTest(arch=arch):
                 self.assertIsInstance(resolve_adapter([arch]), cls)
+
+    def test_fireredasr2_registry_and_chunking(self):
+        adapter = resolve_adapter(["FireRedASR2ForConditionalGeneration"])
+        self.assertIsInstance(adapter, FireRedASR2Adapter)
+        self.assertEqual(adapter.max_audio_clip_s, 30.0)
+        self.assertFalse(adapter.supports_language_detection)
+        request = TranscriptionRequest(model="m", temperature=0.0, audio_duration_s=3.0)
+        self.assertEqual(
+            adapter.build_sampling_params(request)["stop_token_ids"], [151645, 151643]
+        )
 
     def test_unknown_architecture_falls_back_to_whisper(self):
         # Whisper is the registered default; a non-ASR arch must not match one

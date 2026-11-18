@@ -8,6 +8,7 @@ This benchmark evaluates the performance and accuracy (Word Error Rate - WER) of
 - `openai/whisper-large-v3-turbo`
 - `Qwen/Qwen3-ASR-1.7B`
 - `Qwen/Qwen3-ASR-0.6B`
+- `allendou/FireRedASR2-LLM-vllm` (transcription API; 30 s audio chunks)
 
 ## Setup
 

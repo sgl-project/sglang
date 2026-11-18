@@ -275,6 +275,11 @@ curl http://localhost:30000/v1/audio/transcriptions \
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Qwen/Qwen3-ASR-1.7B</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Use <code>--trust-remote-code</code>. Supports 52 languages.</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>FireRedASR2-LLM</strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>allendou/FireRedASR2-LLM-vllm</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Use <code>/v1/audio/transcriptions</code>. Audio is resampled to 16 kHz and split into chunks of at most 30 seconds. Timestamp output is unavailable.</td>
+    </tr>
   </tbody>
 </table>
 
