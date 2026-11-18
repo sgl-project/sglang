@@ -43,11 +43,14 @@ Attention backend arguments are fixed inside the graph:
 
 TritonAttn expects [cu_seqlens, cu_seqlens_kk, max_len]
 FA3 expects [cu_seqlens, max_len]
+FA4 and AiterAttn (`aiter_attn`, ROCm) take the same [cu_seqlens, max_len] as FA3
 
 max_len is frozen as an int constant.
 cu_seqlens is cached into a dict during create_graph(), and its contents are not updated during subsequent replays.
 
 For the same graph_key = S, you not only require the input shape to match, but also require the segmentation pattern in cu_seqlens (and window seqlens) to be identical. Otherwise, attention will segment the sequence incorrectly.
+
+Because the key includes the segmentation pattern, every new image size or batch composition captures a new graph. At most `SGLANG_VIT_CUDA_GRAPH_CACHE_CAPACITY` graphs are captured (default 32); later layouts run the same blocks eagerly instead of growing the cache. Three image sizes with up to 8 images per ViT call need 18 graphs per rank, and each graph adds only its own input, output and attention-workspace buffers (about 7 KB per patch for a 1152-wide encoder); activations share one memory pool.
 
 ### Rotary buffer management
 The feature reallocates a larger sin_cos_ws when seq_len increases.
