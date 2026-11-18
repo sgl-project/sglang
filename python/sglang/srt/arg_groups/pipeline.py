@@ -24,6 +24,13 @@ def run_resolution_pipeline(server_args: Any) -> None:
     through ``run_hook`` so plugins can replace them without changing their order.
     """
 
+    from sglang.srt.kernel_plugins.nvidia.kimi_k31_gb_runtime_optimization import (
+        apply_k31_gb_runtime_optimization,
+    )
+
+    # Before any step reads the environment; spawned processes inherit it.
+    apply_k31_gb_runtime_optimization()
+
     # What the caller asked for, before any handler runs; this plus the
     # stash is the resolution result the projection reads.
     server_args._raw_input = {
@@ -161,10 +168,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     from sglang.srt.arg_groups.kv_cache_hook import (
         handle_cache_compatibility,
+        handle_indexer_kv_cache_compatibility,
         handle_kv4_compatibility,
         handle_mxfp8_kv_cache_compatibility,
         handle_nvfp4_prefill_kv_dequant_dtype,
         handle_page_major_kv_layout,
+        handle_platform_kv_cache_dtype_compatibility,
         handle_prefill_only_disable_kv_cache,
         handle_unified_memory_pool,
         validate_prefill_only_disable_kv_cache_args,
@@ -270,6 +279,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_linear_attn_backend, server_args)
     run_hook(handle_kv4_compatibility, server_args)
     run_hook(handle_mxfp8_kv_cache_compatibility, server_args)
+    run_hook(handle_indexer_kv_cache_compatibility, server_args)
+    run_hook(handle_platform_kv_cache_dtype_compatibility, server_args)
     run_post_process_pass(server_args, _page_size_default)
     run_hook(handle_amd_specifics, server_args)
     run_hook(handle_nccl_pre_warm, server_args)

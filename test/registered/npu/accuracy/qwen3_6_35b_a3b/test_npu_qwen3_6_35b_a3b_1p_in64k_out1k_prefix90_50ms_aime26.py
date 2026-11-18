@@ -10,7 +10,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=2800,
-    suite="nightly-acc-2-npu-a3",
+    suite="nightly-acc-test-2-npu-a3",
     nightly=True,
 )
 

@@ -7,7 +7,9 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils.device import is_hip
+from sglang.srt.utils.device import is_hip, is_npu
+
+_is_npu = is_npu()
 
 try:
     import flashinfer.comm  # noqa: F401
@@ -636,6 +638,12 @@ def qsa_mqa_prefill(
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
+    if _is_npu:
+        if score_scale is not None:
+            raise ValueError("Custom MQA scale is outside the model contract")
+        from sgl_kernel_npu.operators.indexer import qsa_mqa_packed
+
+        return qsa_mqa_packed(q, k, row_starts, row_ends)
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
     return torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
@@ -669,6 +677,12 @@ def qsa_mqa_decode(
     *,
     min_scored_len: int = 0,
 ) -> torch.Tensor:
+    if _is_npu:
+        if score_scale is not None:
+            raise ValueError("Custom MQA scale is outside the model contract")
+        from sgl_kernel_npu.operators.indexer import qsa_mqa_paged
+
+        return qsa_mqa_paged(q, k_cache, page_table, context_lens, max_model_len)
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_decode(
             q,

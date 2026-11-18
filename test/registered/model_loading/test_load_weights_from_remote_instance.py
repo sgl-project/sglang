@@ -28,6 +28,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     ADMIN_API_KEY_FOR_TEST,
     ADMIN_HEADERS_FOR_TEST,
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -131,8 +132,7 @@ def init_process_seed(
             "--tp-size",
             str(tp_size),
             "--remote-instance-weight-loader-start-seed-via-transfer-engine",
-            "--admin-api-key",
-            ADMIN_API_KEY_FOR_TEST,
+            *ADMIN_LAUNCH_ARGS_FOR_TEST,
         ),
     )
     torch.cuda.synchronize()
@@ -234,8 +234,7 @@ def init_process_dst(
                 "--remote-instance-weight-loader-start-seed-via-transfer-engine",
                 "--engine-info-bootstrap-port",
                 str(6789 + rank),
-                "--admin-api-key",
-                ADMIN_API_KEY_FOR_TEST,
+                *ADMIN_LAUNCH_ARGS_FOR_TEST,
             ),
         )
     torch.cuda.synchronize()
