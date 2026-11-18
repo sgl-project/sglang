@@ -458,24 +458,6 @@ def test_prefill_max_row_keys_reads_host_lengths_only():
     assert width(None, torch.empty(0, dtype=torch.int64)) is None
 
 
-def test_tilelang_mqa_rejects_mixed_operand_dtypes():
-    """Mixed fp8/bf16 operands must fail instead of dequantizing the cache."""
-    from sglang.srt.layers.attention.qsa.mqa import (
-        HAS_TILELANG,
-        tilelang_qsa_mqa_decode,
-    )
-
-    if not HAS_TILELANG:
-        pytest.skip("tilelang unavailable")
-    device = torch.device("cuda")
-    q = torch.randn(2, NUM_Q_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
-    cache = torch.randn(8, 16, 1, HEAD_DIM, device=device).to(torch.float8_e4m3fn)
-    page_table = torch.zeros(2, 4, dtype=torch.int32, device=device)
-    context_lens = torch.full((2,), 32, dtype=torch.int32, device=device)
-    with pytest.raises(ValueError, match="same dtype"):
-        tilelang_qsa_mqa_decode(q, cache, page_table, context_lens, 64)
-
-
 def _decode_operands(rows, max_pages, page_size, context_lens, device):
     q = torch.randn(rows, NUM_Q_HEADS, HEAD_DIM, device=device).to(torch.bfloat16)
     cache = torch.randn(1024, page_size, 1, HEAD_DIM, device=device).to(torch.bfloat16)

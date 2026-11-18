@@ -820,5 +820,118 @@ class TestFusedTombstoneWritesBothTables(unittest.TestCase):
         self.assertTrue(torch.equal(v2p, before))
 
 
+def _end_and_float_bands(device):
+    """A state | float | end arena; returns its end `Band` and its `FloatBand`."""
+    from test_multi_ended_allocator import _make_mamba_spec, _make_mha_spec
+
+    reset_context()
+    publish(ServerArgs(model_path="dummy"), role="tokenizer")
+    specs = [
+        _make_mamba_spec("state", "up"),
+        _make_mha_spec("swa", "float"),
+        _make_mha_spec("full", "down"),
+    ]
+    arena = arena_of(
+        total_bytes=16 * sum(spec.entry_bytes() for spec in specs),
+        sub_pool_specs=specs,
+        device=device,
+    )
+    state, flt, end = (
+        (mea.FloatBand if spec.name == "swa" else mea.Band)(
+            arena=arena, sub_pool_name=spec.name, device=device, is_id_owner=True
+        )
+        for spec in specs
+    )
+    state.bind_high_peer(flt)
+    flt.bind_low_peer(state)
+    flt.bind_high_peer(end)
+    end.bind_low_peer(flt)
+    return {"end": end, "float": flt}
+
+
+def _free_an_unbound_page(device, band_kind, case):
+    """Free a page twice, or one never allocated, through one band."""
+    band = _end_and_float_bands(device)[band_kind]
+    if case == "double free":
+        pages = band.alloc(4)
+        band.free(pages)
+    else:
+        pages = torch.tensor([3], dtype=torch.int64, device=device)
+    band.free(pages)
+
+
+_UNBOUND_FREE_CASES = [
+    (band_kind, case, level)
+    for band_kind in ("end", "float")
+    for case in ("double free", "never allocated")
+    for level in (InvariantCheckLevel.WARN, InvariantCheckLevel.STRICT)
+]
+
+
+class TestFreeOfAnUnboundPage(CustomTestCase):
+    """A double free, or a free of a page never allocated, reads physical page -1:
+    the tombstone skips it, and the invariant check reports the free."""
+
+    def test_the_tombstone_skips_an_unbound_page(self):
+        from sglang.kernels.ops.memory.virtual_slot import free_unbind_inplace
+
+        devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+        for device in devices:
+            with self.subTest(device=device):
+                # Guard rows on both sides of p2v catch a write outside it.
+                guarded = torch.arange(10, 20, dtype=torch.int64, device=device)
+                p2v = guarded[1:-1]
+                v2p = torch.full((8,), -1, dtype=torch.int64, device=device)
+                v2p[2], p2v[5] = 5, 2
+                want = guarded.clone()
+                want[1 + 5] = -1
+                freed = torch.tensor([2, 3], dtype=torch.int64, device=device)
+                out = free_unbind_inplace(freed, v2p, p2v)
+                self.assertEqual(out.tolist(), [5, -1])
+                self.assertEqual(guarded.tolist(), want.tolist())
+                self.assertTrue(torch.all(v2p == -1))
+
+    def test_a_free_of_an_unbound_page_is_reported(self):
+        for band_kind, case, level in _UNBOUND_FREE_CASES:
+            with self.subTest(band=band_kind, case=case, level=level.name):
+                with envs.SGLANG_INVARIANT_CHECK.override(int(level)):
+                    with self.assertRaisesRegex(
+                        RuntimeError, r"\[band\.free_of_bound_page\]"
+                    ):
+                        _free_an_unbound_page("cpu", band_kind, case)
+
+    def test_a_free_of_reallocated_pages_is_not_reported(self):
+        """Freeing pages whose virtual ids were freed and reallocated is no
+        double free."""
+        for band_kind in ("end", "float"):
+            for level in (InvariantCheckLevel.WARN, InvariantCheckLevel.STRICT):
+                with (
+                    self.subTest(band=band_kind, level=level.name),
+                    envs.SGLANG_INVARIANT_CHECK.override(int(level)),
+                ):
+                    band = _end_and_float_bands("cpu")[band_kind]
+                    # Take every virtual id, so the reallocation reuses the freed ones.
+                    size = band.free_virtual_ids.numel() * band.page_size
+                    pages = band.alloc(size)
+                    band.free(pages)
+                    again = band.alloc(size)
+                    self.assertEqual(again.tolist(), pages.tolist())
+                    band.free(again)
+
+    def test_a_valid_free_at_off_checks_nothing(self):
+        """With invariant checks off, a free launches no check."""
+        for band_kind in ("end", "float"):
+            with self.subTest(band=band_kind):
+                band = _end_and_float_bands("cpu")[band_kind]
+                pages = band.alloc(4)
+                with (
+                    envs.SGLANG_INVARIANT_CHECK.override(int(InvariantCheckLevel.OFF)),
+                    mock.patch.object(mea, "expect") as expect,
+                ):
+                    band.free(pages)
+                expect.assert_not_called()
+                self.assertTrue(torch.all(band.ids.virtual_to_physical[pages] == -1))
+
+
 if __name__ == "__main__":
     unittest.main()

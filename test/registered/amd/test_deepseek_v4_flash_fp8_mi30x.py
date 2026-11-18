@@ -24,7 +24,7 @@ keeps ~2 points of headroom and still catches every regression worth gating on
 -- the failure modes this guards against (see #36390) collapse output entirely
 rather than shaving a point.
 
-Registry: nightly-amd-accuracy-8-gpu-deepseek-v4-flash suite
+Registry: nightly-accuracy-test-8-gpu-amd-deepseek-v4-flash suite
 """
 
 import os
@@ -44,7 +44,7 @@ from sglang.test.test_utils import (
 
 register_amd_ci(
     est_time=5400,
-    suite="nightly-amd-accuracy-8-gpu-deepseek-v4-flash",
+    suite="nightly-accuracy-test-8-gpu-amd-deepseek-v4-flash",
     nightly=True,
 )
 

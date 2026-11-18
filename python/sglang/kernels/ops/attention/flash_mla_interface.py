@@ -252,3 +252,12 @@ def flash_mla_mega_decode(
         use_legacy=use_legacy,
         **_MEGA_FIXED_PARAMS,
     )
+
+
+def flash_mla_sparse_fwd_small_heads(
+    q, kv, indices, sm_scale, active_heads, attn_sink=None, topk_length=None
+):
+    """Compact, output-only prefill; Q/sink are padded to 64 heads."""
+    return flash_mla.flash_mla_sparse_fwd_small_heads(
+        q, kv, indices, sm_scale, active_heads, attn_sink, topk_length
+    )
