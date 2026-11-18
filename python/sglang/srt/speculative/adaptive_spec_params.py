@@ -55,10 +55,10 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
 
     cfg = resolving_view(server_args)
 
-    if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+    if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "STANDALONE"):
         return (
             f"speculative_algorithm={cfg.speculative_algorithm} "
-            "(only EAGLE/EAGLE3 are supported)"
+            "(only EAGLE/EAGLE3/STANDALONE are supported)"
         )
     platform_worker_cls = SpeculativeAlgorithm.from_string(
         cfg.speculative_algorithm
