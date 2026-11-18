@@ -633,7 +633,7 @@ class MetadataBuffers:
                     dtype=torch.int32,
                     device="cpu",
                 )
-        if req.return_sampling_mask:
+        if req.return_sampling_logprobs:
             # Prefill streams a request only once its KV transfer ends or it aborts,
             # so the first token's row is the only one queued here.
             chunk = req.sampling_mask_rows.view()

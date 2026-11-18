@@ -180,7 +180,10 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.sampling.custom_logit_processor import supports_sampling_mask
-from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
+from sglang.srt.sampling.sampling_mask import (
+    SamplingMaskChunk,
+    returns_sampling_logprobs,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import (
     redact_watermark_command_line,
@@ -1531,19 +1534,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
             if (
-                obj.return_sampling_mask
+                returns_sampling_logprobs(obj)
                 and obj.custom_logit_processor
                 and not supports_sampling_mask(obj.custom_logit_processor)
             ):
                 # Reject before scheduling so aborted requests cannot execute
                 # unsupported processors during sampling batch preparation.
                 raise ValueError(
-                    "return_sampling_mask only supports DisallowedTokensLogitsProcessor "
-                    "among custom logit processors."
+                    "return_sampling_mask or sampling_logprobs_mode only supports "
+                    "DisallowedTokensLogitsProcessor among custom logit processors."
                 )
-            if obj.sampling_logprobs_mode is not None and not obj.return_sampling_mask:
+            if obj.sampling_logprobs_mode == "support" and not obj.return_sampling_mask:
                 raise ValueError(
-                    "sampling_logprobs_mode can only be set when "
+                    "sampling_logprobs_mode='support' requires "
                     "return_sampling_mask=true."
                 )
             if obj.return_flat_raw_sampling_mask and not obj.return_sampling_mask:
@@ -1742,7 +1745,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 top_logprobs_num=obj.top_logprobs_num,
                 token_ids_logprob=obj.token_ids_logprob,
                 return_sampling_mask=obj.return_sampling_mask,
-                sampling_logprobs_mode=obj.sampling_logprobs_mode or "selected",
+                sampling_logprobs_mode=obj.sampling_logprobs_mode,
                 return_flat_raw_top_logprobs=obj.return_flat_raw_top_logprobs,
                 stream=obj.stream,
                 rid=obj.rid,
@@ -2142,7 +2145,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         collector = state.token_output_collector
         if collector is not None:
-            collector.add_sampling_mask(chunk)
+            if state.obj.return_sampling_mask:
+                collector.add_sampling_mask(chunk)
             if not support_logprobs:
                 state.output_token_sampling_logprobs.extend(chunk.logprobs.tolist())
                 meta_info["output_token_sampling_logprobs"] = (
@@ -2153,15 +2157,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             state.output_token_sampling_mask_chunks.append(chunk)
             return
         masks, logprobs = chunk.to_lists(support_logprobs=support_logprobs)
-        state.output_token_sampling_mask.extend(masks)
         state.output_token_sampling_logprobs.extend(logprobs)
-        meta_info["output_token_sampling_mask"] = state.output_token_sampling_mask
         meta_info["output_token_sampling_logprobs"] = (
             state.output_token_sampling_logprobs
         )
-        meta_info["output_token_sampling_mask_length"] = len(
-            state.output_token_sampling_mask
-        )
+        if state.obj.return_sampling_mask:
+            state.output_token_sampling_mask.extend(masks)
+            meta_info["output_token_sampling_mask"] = state.output_token_sampling_mask
+            meta_info["output_token_sampling_mask_length"] = len(
+                state.output_token_sampling_mask
+            )
 
     async def _store_token_outputs(
         self, *, out: dict, state: ReqState, request: Optional[fastapi.Request]
@@ -2826,9 +2831,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     i,
                     finished=recv_obj.finished_reasons[i] is not None,
                 )
-            if (
-                isinstance(state.obj, GenerateReqInput)
-                and state.obj.return_sampling_mask
+            if isinstance(state.obj, GenerateReqInput) and returns_sampling_logprobs(
+                state.obj
             ):
                 output_sampling_mask = recv_obj.output_token_sampling_mask
                 if output_sampling_mask is not None:

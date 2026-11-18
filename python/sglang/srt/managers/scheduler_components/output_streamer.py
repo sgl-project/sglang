@@ -175,8 +175,8 @@ class SchedulerOutputStreamer:
         return_indexer_topk = any(
             req.return_indexer_topk for req in reqs if req is not skip_req
         )
-        return_sampling_mask = any(
-            req.return_sampling_mask for req in reqs if req is not skip_req
+        return_sampling_logprobs = any(
+            req.return_sampling_logprobs for req in reqs if req is not skip_req
         )
 
         acc = _GenerationStreamAccumulator(
@@ -184,7 +184,7 @@ class SchedulerOutputStreamer:
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
             return_indexer_topk=return_indexer_topk,
-            return_sampling_mask=return_sampling_mask,
+            return_sampling_logprobs=return_sampling_logprobs,
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
             default_stream_interval=get_serving().stream_interval,
@@ -343,7 +343,7 @@ class _GenerationStreamAccumulator:
     return_hidden_states: bool
     return_routed_experts: bool
     return_indexer_topk: bool
-    return_sampling_mask: bool = False
+    return_sampling_logprobs: bool = False
     spec_algorithm: Any
     disaggregation_mode: DisaggregationMode
     default_stream_interval: int
@@ -438,7 +438,7 @@ class _GenerationStreamAccumulator:
             self.input_token_ids_logprobs_idx = []
             self.output_token_ids_logprobs_val = []
             self.output_token_ids_logprobs_idx = []
-        if self.return_sampling_mask:
+        if self.return_sampling_logprobs:
             self.output_token_sampling_mask = []
 
     def _beam_admits(self, *, req: Req) -> bool:
@@ -658,8 +658,8 @@ class _GenerationStreamAccumulator:
                 self.output_token_ids_logprobs_val.append([])
                 self.output_token_ids_logprobs_idx.append([])
 
-        if self.return_sampling_mask:
-            if req.return_sampling_mask:
+        if self.return_sampling_logprobs:
+            if req.return_sampling_logprobs:
                 self.output_token_sampling_mask.append(req.sampling_mask_rows.take())
             else:
                 self.output_token_sampling_mask.append(None)

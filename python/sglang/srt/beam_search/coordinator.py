@@ -69,6 +69,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
+from sglang.srt.sampling.sampling_mask import returns_sampling_logprobs
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -153,7 +154,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             return "Beam search does not support return_logprob."
         if recv_req.return_hidden_states:
             return "Beam search does not support return_hidden_states."
-        if recv_req.return_sampling_mask or recv_req.return_routed_experts:
+        if returns_sampling_logprobs(recv_req) or recv_req.return_routed_experts:
             return "Beam search does not support sampling-mask/routed-experts returns."
         if any(
             x is not None

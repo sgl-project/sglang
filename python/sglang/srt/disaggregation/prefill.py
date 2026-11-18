@@ -994,7 +994,7 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 sampling_mask_finish_reason = None
-                if req.return_sampling_mask:
+                if req.return_sampling_logprobs:
                     assert logits_output is not None
                     statuses = logits_output.next_token_sampling_mask_status
                     status = None if statuses is None else statuses[i]
@@ -1063,7 +1063,7 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
-                if req.return_sampling_mask:
+                if req.return_sampling_logprobs:
                     self.batch_result_processor.add_sampling_mask_return_values(
                         i, req, logits_output
                     )

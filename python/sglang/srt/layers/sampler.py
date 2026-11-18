@@ -114,6 +114,19 @@ def _select_sampling_mask_rows(
     return tensor.index_select(0, batch_indices)
 
 
+def _unfiltered_sampling_mask_capture(
+    weights: torch.Tensor, selected_tokens: torch.Tensor, batch_rows: torch.Tensor
+) -> _SamplingMaskCapture:
+    """An unfiltered draw: each opted-in row's whole distribution and its sampled token's weight."""
+    selected_weight = torch.gather(weights, 1, selected_tokens.long().view(-1, 1))
+    return _SamplingMaskCapture(
+        weights=weights,
+        token_ids=None,
+        selected_weight=selected_weight.squeeze(1),
+        batch_rows=batch_rows,
+    )
+
+
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
@@ -265,6 +278,18 @@ class Sampler(nn.Module):
                     sampling_info,
                     positions,
                 )
+                if return_sampling_mask:
+                    select_capture_rows = partial(
+                        _select_sampling_mask_rows,
+                        batch_indices=sampling_mask_batch_indices,
+                    )
+                    sampling_mask_capture = _unfiltered_sampling_mask_capture(
+                        weights=select_capture_rows(logprobs_via_logsoftmax_kernel)
+                        .float()
+                        .exp(),
+                        selected_tokens=select_capture_rows(batch_next_token_ids),
+                        batch_rows=sampling_mask_batch_indices,
+                    )
                 if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
                     logprobs = logprobs_via_logsoftmax_kernel
             else:
@@ -352,6 +377,7 @@ class Sampler(nn.Module):
                     batch_next_token_ids,
                     sampling_mask_capture,
                     sampling_support_logprobs_capture_indices,
+                    return_support=any(sampling_info.return_sampling_masks),
                 )
 
         _trace_e2e_sampler("forward_returned")
@@ -385,15 +411,9 @@ class Sampler(nn.Module):
                 positions=positions,
             )
             if return_sampling_mask:
-                capture_probs = select_capture_rows(probs)
-                capture_tokens = select_capture_rows(batch_next_token_ids)
-                selected_weight = torch.gather(
-                    capture_probs, 1, capture_tokens.long().view(-1, 1)
-                ).squeeze(1)
-                sampling_mask_capture = _SamplingMaskCapture(
-                    weights=capture_probs,
-                    token_ids=None,
-                    selected_weight=selected_weight,
+                sampling_mask_capture = _unfiltered_sampling_mask_capture(
+                    weights=select_capture_rows(probs),
+                    selected_tokens=select_capture_rows(batch_next_token_ids),
                     batch_rows=capture_rows,
                 )
         else:
@@ -539,6 +559,7 @@ class Sampler(nn.Module):
         batch_next_token_ids: torch.Tensor,
         sampling_mask_capture: _SamplingMaskCapture,
         support_capture_indices: Optional[torch.Tensor],
+        return_support: bool = True,
     ) -> SamplingMaskOutput:
         """Pack captured positive support into the fixed-cap device result."""
         batch_indices = sampling_mask_capture.batch_rows
@@ -576,7 +597,11 @@ class Sampler(nn.Module):
             & (support_mass > 0)
             & torch.isfinite(selected_logprobs)
         )
-        realized_lengths = support.sum(dim=-1, dtype=torch.int32)
+        realized_lengths = (
+            support.sum(dim=-1, dtype=torch.int32)
+            if return_support
+            else torch.zeros_like(selected_weight, dtype=torch.int32)
+        )
         overflow = realized_lengths > self.sampling_mask_max_tokens
         statuses = torch.where(
             invalid,
@@ -602,8 +627,15 @@ class Sampler(nn.Module):
                     statuses, op=dist.ReduceOp.MAX, group=self.cp_sync_group
                 )
 
-        packed_size = min(self.sampling_mask_max_tokens, weights.shape[-1])
-        if token_ids is None:
+        packed_size = (
+            min(self.sampling_mask_max_tokens, weights.shape[-1])
+            if return_support
+            else 0
+        )
+        if packed_size == 0:
+            packed_weights = weights[:, :0]
+            packed_token_ids = torch.empty_like(packed_weights, dtype=torch.int32)
+        elif token_ids is None:
             packed_weights, packed_positions = torch.topk(
                 weights, k=packed_size, dim=-1, largest=True, sorted=True
             )

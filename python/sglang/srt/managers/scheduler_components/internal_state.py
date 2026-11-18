@@ -197,10 +197,10 @@ class SchedulerInternalStateController:
         # target policy, which is what a captured sampling mask describes.
         if not self.scheduler.spec_algorithm.is_dflash() or float(value) == 1.0:
             return
-        if self._has_active_sampling_mask_request():
+        if self._has_active_sampling_logprobs_request():
             raise UpdateRejected(
-                f"Updating {key} is rejected while DFlash sampling-mask "
-                "requests are active."
+                f"Updating {key} is rejected while DFlash return_sampling_mask or "
+                "sampling_logprobs_mode requests are active."
             )
 
     def _apply_accept_threshold(self, key: str, value: Any) -> Dict[str, Any]:
@@ -252,8 +252,8 @@ class SchedulerInternalStateController:
             / metrics_reporter.spec_total_num_forward_ct
         )
 
-    def _has_active_sampling_mask_request(self) -> bool:
-        """Whether any unfinished request holding a sampling mask is queued or
+    def _has_active_sampling_logprobs_request(self) -> bool:
+        """Whether any unfinished request returning sampling logprobs is queued or
         running, including PP micro-batches and PD decode queues."""
         scheduler = self.scheduler
         batches = [scheduler.running_batch, scheduler.last_batch]
@@ -279,7 +279,9 @@ class SchedulerInternalStateController:
             )
             queued.extend(prealloc_queue.retracted_queue)
             queued.extend(prealloc_queue.held_rebootstrap_reqs)
-        return any(req.return_sampling_mask and not req.finished() for req in queued)
+        return any(
+            req.return_sampling_logprobs and not req.finished() for req in queued
+        )
 
 
 class _UpdateHandler:

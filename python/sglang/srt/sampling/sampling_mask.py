@@ -9,6 +9,13 @@ import msgspec
 import numpy as np
 
 
+def returns_sampling_logprobs(request) -> bool:
+    """Whether a request returns sampling logprobs: it asked for the mask or for a logprob mode."""
+    return (
+        bool(request.return_sampling_mask) or request.sampling_logprobs_mode is not None
+    )
+
+
 class SamplingMaskChunk(
     msgspec.Struct, frozen=True, kw_only=True, array_like=True, gc=False
 ):

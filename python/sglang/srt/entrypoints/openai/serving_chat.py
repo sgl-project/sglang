@@ -1140,6 +1140,9 @@ class OpenAIServingChat(OpenAIServingBase):
         if request.return_outputs_via_store and not request.return_meta_info:
             return "return_outputs_via_store requires return_meta_info=true."
 
+        if request.sampling_logprobs_mode is not None and not request.return_meta_info:
+            return "sampling_logprobs_mode requires return_meta_info=true."
+
         if self.is_minimax_m3:
             m3_error = _validate_minimax_m3_request(request)
             if m3_error:
