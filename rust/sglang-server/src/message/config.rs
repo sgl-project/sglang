@@ -602,8 +602,22 @@ pub struct DeploymentInfo {
     pub max_prefill_tokens: u64,
     pub enable_dp_attention: bool,
     pub speculative_algorithm: Option<String>,
+    /// `--speculative-ngram-external-corpus-max-tokens`; 0 when the launcher
+    /// did not pass it.
+    pub speculative_ngram_external_corpus_max_tokens: u64,
     /// `--gc-threshold`, which `/freeze_gc` forwards to every scheduler.
     pub gc_threshold: Option<Vec<i64>>,
+    /// `--enable-pd-role-switch`.
+    pub enable_pd_role_switch: bool,
+    /// `--elastic-ep-backend`; `None` when elastic EP is off, which is what
+    /// `/scale_elastic_ep` and `/is_scaling_elastic_ep` report.
+    pub elastic_ep_backend: Option<String>,
+    /// `--enable-streaming-session`, which `/open_session` needs for a
+    /// streaming session.
+    pub enable_streaming_session: bool,
+    /// The engine-info bootstrap server (`--engine-info-bootstrap-port`), as
+    /// the base URL Python's `ServerArgs.engine_info_bootstrap_url` builds.
+    pub engine_info_bootstrap_url: Option<String>,
     pub enable_hierarchical_cache: bool,
     pub hicache_ratio: Option<f64>,
     pub hicache_size: u64,

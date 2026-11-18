@@ -679,10 +679,342 @@
       "canonical": "{\"hicache_storage_backend\":\"file\",\"hicache_storage_backend_extra_config_json\":\"\",\"hicache_storage_prefetch_policy\":\"\",\"hicache_write_policy\":\"\"}"
     },
     {
+      "type": "SetInternalStateRequest",
+      "name": "server_args passes through as an object with integers and floats intact",
+      "input": {
+        "server_args": {
+          "pp_max_micro_batch_size": 4,
+          "speculative_accept_threshold_single": 0.75
+        }
+      },
+      "canonical": "{\"server_args\":{\"pp_max_micro_batch_size\":4,\"speculative_accept_threshold_single\":0.75}}"
+    },
+    {
+      "type": "StartProfileRequest",
+      "name": "optional lists and flags keep Python's absent-versus-set distinction",
+      "input": {
+        "output_dir": "/tmp/prof",
+        "num_steps": 5,
+        "activities": [
+          "CPU",
+          "GPU"
+        ],
+        "with_stack": false
+      },
+      "canonical": "{\"output_dir\":\"/tmp/prof\",\"num_steps\":5,\"activities\":[\"CPU\",\"GPU\"],\"profile_by_stage\":false,\"with_stack\":false,\"merge_profiles\":false,\"detailed_annotations\":false}"
+    },
+    {
+      "type": "SlowDownRequest",
+      "name": "an explicit null sleep time clears the delay",
+      "input": {
+        "forward_sleep_time": null
+      },
+      "canonical": "{}"
+    },
+    {
+      "type": "ReleaseMemoryOccupationRequest",
+      "name": "tags are a bare string list",
+      "input": {
+        "tags": [
+          "weights"
+        ]
+      },
+      "canonical": "{\"tags\":[\"weights\"]}"
+    },
+    {
+      "type": "GetWeightsByNameRequest",
+      "name": "truncate_size defaults to 100 when absent",
+      "input": {
+        "name": "model.embed_tokens.weight"
+      },
+      "canonical": "{\"name\":\"model.embed_tokens.weight\",\"truncate_size\":100}"
+    },
+    {
+      "type": "InitWeightsUpdateGroupRequest",
+      "name": "group name and backend take Python's defaults, null included",
+      "input": {
+        "master_address": "10.0.0.1",
+        "master_port": 29500,
+        "rank_offset": 1,
+        "world_size": 9,
+        "backend": null
+      },
+      "canonical": "{\"master_address\":\"10.0.0.1\",\"master_port\":29500,\"rank_offset\":1,\"world_size\":9,\"group_name\":\"weight_update_group\",\"backend\":\"nccl\"}"
+    },
+    {
+      "type": "SendWeightsToRemoteInstanceRequest",
+      "name": "an explicit group name is kept",
+      "input": {
+        "master_address": "10.0.0.2",
+        "ports": "9000,9001",
+        "group_name": "g"
+      },
+      "canonical": "{\"master_address\":\"10.0.0.2\",\"ports\":\"9000,9001\",\"group_name\":\"g\"}"
+    },
+    {
+      "type": "ParseFunctionCallRequest",
+      "name": "tool parameters pass through as a JSON schema object and type defaults to function",
+      "input": {
+        "text": "t",
+        "tools": [
+          {
+            "function": {
+              "name": "f",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "x": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "tool_call_parser": "qwen25"
+      },
+      "canonical": "{\"text\":\"t\",\"tools\":[{\"function\":{\"name\":\"f\",\"parameters\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"}}}},\"type\":\"function\"}],\"tool_call_parser\":\"qwen25\"}"
+    },
+    {
+      "type": "ParseFunctionCallResponse",
+      "name": "a call with no name is emitted as null",
+      "input": {
+        "normal_text": "",
+        "calls": [
+          {
+            "tool_index": -1,
+            "parameters": "{}"
+          }
+        ]
+      },
+      "canonical": "{\"normal_text\":\"\",\"calls\":[{\"tool_index\":-1,\"name\":null,\"parameters\":\"{}\"}]}"
+    },
+    {
+      "type": "AddExternalCorpusRequest",
+      "name": "pre-tokenized chunks are a bare list of bare lists",
+      "input": {
+        "corpus_id": "c",
+        "token_chunks": [
+          [
+            1,
+            2
+          ],
+          [
+            3
+          ]
+        ]
+      },
+      "canonical": "{\"corpus_id\":\"c\",\"token_chunks\":[[1,2],[3]]}"
+    },
+    {
+      "type": "ListExternalCorporaResponse",
+      "name": "counts are a plain string-keyed object",
+      "input": {
+        "success": true,
+        "corpus_token_counts": {
+          "c": 3
+        }
+      },
+      "canonical": "{\"success\":true,\"corpus_token_counts\":{\"c\":3},\"message\":\"\"}"
+    },
+    {
       "type": "PauseGenerationRequest",
       "name": "mode defaults to abort as in Python",
       "input": {},
       "canonical": "{\"mode\":\"abort\"}"
+    },
+    {
+      "type": "PdRoleSwitchRequest",
+      "name": "the batch-size list is bare and the sentinel role is the default",
+      "input": {
+        "decode_cuda_graph_bs": [
+          1,
+          8
+        ],
+        "prepare_only": true
+      },
+      "canonical": "{\"new_role\":\"\",\"decode_cuda_graph_bs\":[1,8],\"prepare_only\":true}"
+    },
+    {
+      "type": "UpdateWeightVersionRequest",
+      "name": "abort_all_requests defaults on",
+      "input": {
+        "new_version": "v2"
+      },
+      "canonical": "{\"new_version\":\"v2\",\"abort_all_requests\":true}"
+    },
+    {
+      "type": "OllamaChatRequest",
+      "name": "stream defaults to true and the ignored open fields pass through as raw JSON",
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi",
+            "images": [
+              "aGk="
+            ]
+          }
+        ],
+        "format": {
+          "type": "object"
+        },
+        "options": {
+          "temperature": 0.5,
+          "num_predict": 7,
+          "stop": [
+            "x"
+          ],
+          "num_ctx": 4096
+        },
+        "keep_alive": "5m",
+        "think": "low"
+      },
+      "canonical": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\",\"images\":[\"aGk=\"]}],\"stream\":true,\"format\":{\"type\":\"object\"},\"options\":{\"temperature\":0.5,\"num_predict\":7,\"stop\":[\"x\"]},\"keep_alive\":\"5m\",\"think\":\"low\"}"
+    },
+    {
+      "type": "OllamaChatRequest",
+      "name": "an explicit null stream resets to the default",
+      "input": {
+        "model": "m",
+        "messages": [],
+        "stream": null,
+        "options": {
+          "stop": "x",
+          "seed": 3
+        }
+      },
+      "canonical": "{\"model\":\"m\",\"stream\":true,\"options\":{\"stop\":\"x\",\"seed\":3}}"
+    },
+    {
+      "type": "OllamaChatResponse",
+      "name": "a streamed delta carries no counters; a done frame carries the ones it knows",
+      "input": {
+        "model": "m",
+        "created_at": "2026-10-25T00:00:00.000Z",
+        "message": {
+          "role": "assistant",
+          "content": "ok"
+        },
+        "done": true,
+        "done_reason": "stop",
+        "total_duration": 12,
+        "prompt_eval_count": 5,
+        "eval_count": 1
+      },
+      "canonical": "{\"model\":\"m\",\"created_at\":\"2026-10-25T00:00:00.000Z\",\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"done\":true,\"done_reason\":\"stop\",\"total_duration\":12,\"prompt_eval_count\":5,\"eval_count\":1}"
+    },
+    {
+      "type": "OllamaGenerateRequest",
+      "name": "raw defaults to false and the ignored fields are kept",
+      "input": {
+        "model": "m",
+        "prompt": "hi",
+        "system": "be brief",
+        "context": [
+          1,
+          2
+        ],
+        "images": [
+          "aGk="
+        ],
+        "think": true
+      },
+      "canonical": "{\"model\":\"m\",\"prompt\":\"hi\",\"system\":\"be brief\",\"context\":[1,2],\"stream\":true,\"raw\":false,\"images\":[\"aGk=\"],\"think\":true}"
+    },
+    {
+      "type": "OllamaGenerateResponse",
+      "name": "an empty-prompt done frame has no counters",
+      "input": {
+        "model": "m",
+        "created_at": "2026-10-25T00:00:00.000Z",
+        "response": "",
+        "done": true,
+        "done_reason": "stop"
+      },
+      "canonical": "{\"model\":\"m\",\"created_at\":\"2026-10-25T00:00:00.000Z\",\"response\":\"\",\"done\":true,\"done_reason\":\"stop\"}"
+    },
+    {
+      "type": "OllamaTagsResponse",
+      "name": "tags fill the three details Python fills",
+      "input": {
+        "models": [
+          {
+            "name": "m",
+            "model": "m",
+            "modified_at": "2026-10-25T00:00:00.000Z",
+            "size": 0,
+            "digest": "sha256:0",
+            "details": {
+              "format": "sglang",
+              "family": "m",
+              "parameter_size": "unknown"
+            }
+          }
+        ]
+      },
+      "canonical": "{\"models\":[{\"name\":\"m\",\"model\":\"m\",\"modified_at\":\"2026-10-25T00:00:00.000Z\",\"size\":0,\"digest\":\"sha256:0\",\"details\":{\"format\":\"sglang\",\"family\":\"m\",\"parameter_size\":\"unknown\"}}]}"
+    },
+    {
+      "type": "OllamaShowResponse",
+      "name": "model_info is an open object carried as raw JSON",
+      "input": {
+        "license": "",
+        "modelfile": "FROM m\nPARAMETER num_ctx 8\n",
+        "parameters": "num_ctx 8",
+        "template": "",
+        "modified_at": "2026-10-25T00:00:00.000Z",
+        "details": {
+          "parent_model": "",
+          "format": "sglang",
+          "family": "m",
+          "families": [
+            "m"
+          ],
+          "parameter_size": "unknown",
+          "quantization_level": ""
+        },
+        "model_info": {
+          "general.architecture": "m",
+          "m.context_length": 8
+        },
+        "capabilities": [
+          "completion"
+        ]
+      },
+      "canonical": "{\"license\":\"\",\"modelfile\":\"FROM m\\nPARAMETER num_ctx 8\\n\",\"parameters\":\"num_ctx 8\",\"template\":\"\",\"modified_at\":\"2026-10-25T00:00:00.000Z\",\"details\":{\"parent_model\":\"\",\"format\":\"sglang\",\"family\":\"m\",\"families\":[\"m\"],\"parameter_size\":\"unknown\",\"quantization_level\":\"\"},\"model_info\":{\"general.architecture\":\"m\",\"m.context_length\":8},\"capabilities\":[\"completion\"]}"
+    },
+    {
+      "type": "OllamaShowRequest",
+      "name": "the model name",
+      "input": {
+        "model": "m"
+      },
+      "canonical": "{\"model\":\"m\"}"
+    },
+    {
+      "type": "UpdateWeightsFromDiskRequest",
+      "name": "flush_cache defaults on and null resets it; unread fields keep Python's defaults",
+      "input": {
+        "model_path": "/m",
+        "flush_cache": null,
+        "manifest": {
+          "a": 1
+        }
+      },
+      "canonical": "{\"model_path\":\"/m\",\"abort_all_requests\":false,\"is_async\":false,\"torch_empty_cache\":false,\"keep_pause\":false,\"recapture_cuda_graph\":false,\"token_step\":0,\"flush_cache\":true,\"manifest\":{\"a\":1}}"
+    },
+    {
+      "type": "UpdateWeightsFromTensorRequest",
+      "name": "selector defaults to all and payloads stay base64 text",
+      "input": {
+        "serialized_named_tensors": [
+          "gAU="
+        ],
+        "selector": null
+      },
+      "canonical": "{\"serialized_named_tensors\":[\"gAU=\"],\"flush_cache\":true,\"abort_all_requests\":false,\"selector\":\"all\",\"torch_empty_cache\":false}"
     }
   ]
 }

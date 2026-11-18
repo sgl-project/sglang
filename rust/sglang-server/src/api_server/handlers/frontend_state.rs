@@ -47,6 +47,9 @@ pub(crate) struct FrontendState {
     /// time on this listener, and no admission while it runs (see
     /// [`FrontendState::hold_for_update`]).
     update_lock: tokio::sync::Mutex<()>,
+    /// Python's `session_futures`: the session ids an `/open_session` is in
+    /// flight for, so a second open of the same id is refused meanwhile.
+    opening_sessions: std::sync::Mutex<std::collections::HashSet<String>>,
     /// The last facts read, always available; `stale` says a control call
     /// has run since and the next read should refresh first.
     facts: RwLock<Arc<ModelFacts>>,
@@ -58,6 +61,7 @@ impl FrontendState {
         Self {
             paused: watch::Sender::new(false),
             update_lock: tokio::sync::Mutex::new(()),
+            opening_sessions: std::sync::Mutex::new(std::collections::HashSet::new()),
             facts: RwLock::new(Arc::new(ModelFacts::from_launch(metadata))),
             stale: AtomicBool::new(false),
         }
@@ -123,6 +127,20 @@ impl FrontendState {
                 .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire);
         }
         facts
+    }
+}
+
+impl FrontendState {
+    /// Claim `session_id` for an open in flight; `false` if one already is.
+    pub(super) fn begin_opening(&self, session_id: &str) -> bool {
+        self.opening_sessions
+            .lock()
+            .unwrap()
+            .insert(session_id.to_owned())
+    }
+
+    pub(super) fn end_opening(&self, session_id: &str) {
+        self.opening_sessions.lock().unwrap().remove(session_id);
     }
 }
 
