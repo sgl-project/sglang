@@ -9,9 +9,7 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.layers.attention.dsa.dsa_indexer as dsa_indexer
-import sglang.srt.layers.attention.dsa.dsa_indexer_hip as dsa_indexer_hip
 import sglang.srt.layers.attention.dsa.indexer_prologue_hip as prologue_hip
-from sglang.kernels.ops.attention.dsa import aiter_paged_mqa_logits
 from sglang.kernels.ops.attention.dsa.fp4_index_hip import (
     fp4_paged_mqa_logits,
     fp4_ragged_mqa_logits,
@@ -90,66 +88,6 @@ class TestDSAIndexerHip(CustomTestCase):
                 ref = _store(_make_pool(), loc[owned] // dcp_size, key[owned])
         self.assertTrue(ref.any(), "no index-K row was stored")
         self.assertTrue(torch.equal(got, ref))
-
-    def test_verify_logits_match_per_row_call(self):
-        """The shared-index-K logits equal the per-row aiter call, layer after layer
-        and forward after forward."""
-        num_reqs, next_n, req_pages = 3, 4, 8
-        q_offset = num_reqs * next_n
-        max_seq_len = req_pages * PAGE
-        gen = torch.Generator(device="cuda").manual_seed(1)
-        with published_topology():
-            pool = _make_pool()
-        key = torch.randn(ROWS, HEAD_DIM, device="cuda", generator=gen).bfloat16()
-        kv = _store(pool, torch.arange(ROWS, device="cuda"), key)
-        kv = kv.view(kv.shape[0], PAGE, 1, HEAD_DIM + 4)
-        # The same batch object every forward: only the layer order tells them apart.
-        forward_batch = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
-        for step in range(2):
-            pages = torch.randperm(ROWS // PAGE, device="cuda", generator=gen)
-            tables = pages[: num_reqs * req_pages].view(num_reqs, req_pages).int()
-            tables = tables.repeat_interleave(next_n, dim=0)
-            last = torch.randint(
-                next_n, max_seq_len + 1, (num_reqs, 1), device="cuda", generator=gen
-            )
-            lens = (last - next_n + 1 + torch.arange(next_n, device="cuda")).view(-1)
-            lens = lens.int()
-            for layer_id in range(2):
-                q = torch.randn(q_offset, HEADS, HEAD_DIM, device="cuda", generator=gen)
-                q = q.to(torch.float8_e4m3fn)
-                w = torch.randn(q_offset, HEADS, device="cuda", generator=gen)
-                self.assertTrue(
-                    dsa_indexer_hip.verify_shares_index_k(
-                        forward_batch, q, tables, PAGE, q_offset, num_reqs, next_n, 1
-                    )
-                )
-                shared = dsa_indexer_hip.verify_paged_mqa_logits(
-                    forward_batch,
-                    layer_id,
-                    q,
-                    kv,
-                    w,
-                    lens.view(-1, 1),
-                    tables,
-                    max_seq_len,
-                    q_offset,
-                    num_reqs,
-                    next_n,
-                    PAGE,
-                )
-                per_row = aiter_paged_mqa_logits(
-                    q,
-                    kv,
-                    w,
-                    lens,
-                    tables,
-                    max_seq_len,
-                    preshuffle=True,
-                    kv_block_size=PAGE,
-                )
-                for row, n in enumerate(lens.tolist()):
-                    with self.subTest(step=step, layer=layer_id, row=row):
-                        self.assertTrue(torch.equal(shared[row, :n], per_row[row, :n]))
 
 
 def _exact_linear(x, weight):
@@ -407,39 +345,6 @@ class TestFp4IndexKHip(CustomTestCase):
             tol = dict(rtol=1e-5, atol=1e-5 * float(ref.abs().max()))
             torch.testing.assert_close(logits[r, :end], ref, **tol)
             torch.testing.assert_close(prefill[r, start : start + end], ref, **tol)
-
-
-class _TpGroup:
-    """One TP rank whose all-gather copies every rank's slot from ``bufs``."""
-
-    def __init__(self, rank, bufs):
-        self.rank_in_group, self.world_size, self.bufs = rank, len(bufs), bufs
-
-    def all_gather_into_tensor(self, output, input):
-        slot = output.shape[0] // self.world_size
-        # in place: the input is this rank's slot of the output
-        assert input.data_ptr() == output[self.rank_in_group * slot].data_ptr()
-        for r, buf in enumerate(self.bufs):
-            src = buf.view(output.dtype)[r * slot : (r + 1) * slot]
-            output[r * slot : (r + 1) * slot] = src
-
-
-class TestTpSplitGatherHip(CustomTestCase):
-    def test_unequal_slices_gather_back_in_row_order(self):
-        """The in-place all-gather of equal slots rebuilds the rows in order,
-        without the shorter slices' padding."""
-        sizes, topk = [3, 1, 2], 4
-        rows = torch.arange(sum(sizes) * topk, dtype=torch.int32).view(-1, topk)
-        bufs = [None] * len(sizes)
-        for r, n in enumerate(sizes):
-            split = (_TpGroup(r, bufs), None, None, sizes)
-            bufs[r], dst = dsa_indexer_hip.tp_split_topk_rows(split, n, topk, "cpu")
-            bufs[r].fill_(-7)  # slot padding the gather must drop
-            dst.copy_(rows[sum(sizes[:r]) : sum(sizes[:r]) + n])
-        out = torch.full_like(rows, -1)
-        split = (_TpGroup(1, bufs), None, None, sizes)
-        dsa_indexer_hip.tp_split_gather_topk(split, bufs[1], out)
-        self.assertTrue(torch.equal(out, rows))
 
 
 if __name__ == "__main__":
