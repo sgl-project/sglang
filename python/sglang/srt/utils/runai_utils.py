@@ -19,7 +19,7 @@ SUPPORTED_SCHEMES = ["s3://", "gs://", "az://"]
 #     - Downloads config/tokenizer metadata ONCE before launching subprocesses
 #     - This happens in the main process, avoiding multi-process coordination
 #
-#   2. ModelConfig/HF Utils (model_config.py, hf_transformers_utils.py):
+#   2. ModelConfig/HF Utils (model_config.py, hf_transformers/):
 #     - Use ObjectStorageModel.get_path() to retrieve the cached local path
 #     - NO re-download - just path resolution
 #

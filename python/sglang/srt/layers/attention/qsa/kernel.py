@@ -9,7 +9,9 @@ import triton
 import triton.language as tl
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_npu
+
+_is_npu = is_npu()
 
 
 def average_pool_qsa_keys(key_groups: torch.Tensor) -> torch.Tensor:
@@ -29,10 +31,21 @@ def qsa_fast_topk(
     row_ends: torch.Tensor,
     topk: int,
 ) -> torch.Tensor:
-    """Select compressed blocks, with a compatibility fallback for top-k 512."""
+    """Select compressed blocks with platform kernels or a Torch reference.
+
+    Return int32 indices of shape [rows, topk], relative to each row's start.
+    Valid indices precede any -1 padding.
+    """
 
     lengths = (row_ends - row_starts).to(device=logits.device, dtype=torch.int32)
     starts = row_starts.to(device=logits.device, dtype=torch.int32)
+    if _is_npu:
+        from sgl_kernel_npu.operators.indexer import qsa_topk as fast_topk
+
+        # Upstream supplies contiguous bounds and finite scores within each
+        # valid interval. Unsupported metadata/errors must not silently fall back.
+        return fast_topk(logits, lengths, topk, starts)
+
     if logits.is_cuda:
         if is_batch_invariant_mode_enabled() and not is_hip():
             from flashinfer import TopKTieBreak, top_k_ragged_transform
@@ -247,6 +260,77 @@ def triton_expand_qsa_block_indices(
     return output
 
 
+@triton.jit
+def _gather_qsa_compressed_keys_kernel(
+    compressed,
+    output,
+    token_slot_table,
+    cu_blocks,
+    table_stride,
+    total_blocks,
+    RATIO: tl.constexpr,
+    ROW: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+):
+    sequence = tl.program_id(1)
+    start = tl.load(cu_blocks + sequence)
+    count = tl.load(cu_blocks + sequence + 1) - start
+    blocks = tl.program_id(0) * BLOCK_B + tl.arange(0, BLOCK_B)
+    # The device offsets must agree with the host sizes; never write past them.
+    valid = (blocks < count) & (start + blocks < total_blocks)
+    # A block's compressed slot is its first token's slot // ratio: the
+    # allocator is page-aligned, so the group is contiguous in one page.
+    first = tl.load(
+        token_slot_table + sequence.to(tl.int64) * table_stride + blocks * RATIO,
+        mask=valid,
+        other=0,
+    ).to(tl.int64)
+    cols = tl.arange(0, ROW)
+    keys = tl.load(
+        compressed + (first // RATIO)[:, None] * ROW + cols[None, :],
+        mask=valid[:, None],
+    )
+    rows = (start + blocks).to(tl.int64)
+    tl.store(output + rows[:, None] * ROW + cols[None, :], keys, mask=valid[:, None])
+
+
+def gather_qsa_compressed_keys(
+    compressed: torch.Tensor,
+    token_slot_table: torch.Tensor,
+    cu_blocks: torch.Tensor,
+    total_blocks: int,
+    max_blocks: int,
+    compress_ratio: int,
+) -> torch.Tensor:
+    """Every sequence's complete compressed keys, packed in sequence order, in
+    one launch: rows ``cu_blocks[i]:cu_blocks[i + 1]`` are sequence ``i``'s
+    blocks. ``total_blocks``/``max_blocks`` are host ints."""
+    heads, dim = compressed.shape[1:]
+    output = compressed.new_empty((total_blocks, heads, dim))
+    if total_blocks == 0:
+        return output
+    # Copy raw bytes: one kernel for every cache dtype (bf16 or FP8).
+    row = heads * dim * compressed.element_size()
+    assert compressed.is_contiguous() and row == triton.next_power_of_2(row)
+    assert token_slot_table.stride(-1) == 1
+    block_b = 64
+    _gather_qsa_compressed_keys_kernel[
+        (triton.cdiv(max_blocks, block_b), cu_blocks.shape[0] - 1)
+    ](
+        compressed.view(torch.uint8),
+        output.view(torch.uint8),
+        token_slot_table,
+        cu_blocks,
+        token_slot_table.stride(0),
+        total_blocks,
+        RATIO=compress_ratio,
+        ROW=row,
+        BLOCK_B=block_b,
+        num_warps=4,
+    )
+    return output
+
+
 def expand_qsa_block_indices(
     block_indices: torch.Tensor,
     query_positions: torch.Tensor,
@@ -254,7 +338,7 @@ def expand_qsa_block_indices(
     compress_ratio: int,
     token_topk: int,
 ) -> torch.Tensor:
-    """Expand compressed blocks with Triton on CUDA and Torch elsewhere."""
+    """Expand compressed blocks with platform kernels or the Torch fallback."""
 
     block_topk = (token_topk + compress_ratio - 1) // compress_ratio
     if block_indices.ndim != 2 or block_indices.shape[1] != block_topk:
@@ -265,6 +349,18 @@ def expand_qsa_block_indices(
     rows = block_indices.shape[0]
     if query_positions.numel() != rows or sequence_lengths.numel() != rows:
         raise ValueError("query positions and sequence lengths must match top-k rows")
+    if _is_npu:
+        from sgl_kernel_npu.operators.indexer import expand_qsa_blocks as expand_blocks
+
+        # The package wrapper owns the model contract and its internal dispatch.
+        # Unsupported metadata must not silently enter the generic reference.
+        return expand_blocks(
+            block_indices,
+            query_positions,
+            sequence_lengths,
+            compress_ratio,
+            token_topk,
+        )
     if block_indices.is_cuda:
         # The Triton kernel loads positions/lengths as scalars, so any integer
         # dtype works; skip the int64 conversion copies.
@@ -340,6 +436,7 @@ def qsa_sparse_attention_reference(
 __all__ = [
     "average_pool_qsa_keys",
     "expand_qsa_block_indices",
+    "gather_qsa_compressed_keys",
     "torch_expand_qsa_block_indices",
     "triton_expand_qsa_block_indices",
     "qsa_fast_topk",
