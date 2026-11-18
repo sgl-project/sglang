@@ -25,7 +25,7 @@ EXPERTS, LOCAL, TOP_K = 64, 8, 8
 
 def _routing(tokens, seed=0):
     from sglang.kernels.ops.inkling2 import marlin_sm90
-    from sglang.kernels.ops.inkling2.route import route_metadata
+    from sglang.kernels.ops.moe.inkling2_route import route_metadata
 
     g = torch.Generator(device="cuda").manual_seed(seed)
     ids = torch.stack(

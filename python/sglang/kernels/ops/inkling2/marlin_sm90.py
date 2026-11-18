@@ -17,7 +17,7 @@ from sglang.kernels.ops.inkling2.experts_sm90 import (
     _nvfp4_values,
     _ue8m0,
 )
-from sglang.kernels.ops.inkling2.moe import _capped_swiglu, _mxfp8_block
+from sglang.kernels.ops.moe.inkling2_moe import _capped_swiglu, _mxfp8_block
 from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
 from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 from sglang.srt.layers.quantization.marlin_utils import (

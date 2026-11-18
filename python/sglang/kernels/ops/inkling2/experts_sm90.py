@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.inkling2.moe import _mxfp8_block
+from sglang.kernels.ops.moe.inkling2_moe import _mxfp8_block
 
 ROW_LOOP_MIN_ROWS = 1024
 

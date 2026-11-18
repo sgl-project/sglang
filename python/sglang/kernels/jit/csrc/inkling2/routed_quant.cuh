@@ -326,7 +326,7 @@ __global__ void __launch_bounds__(split_threads(N)) swiglu_quantize_routed(
   zero_tails(s_offsets, experts, x_scales, (N + 63) / 64 * 4);
 }
 
-// _mxfp8_block in kernels/moe.py for one 32-value block split over a lane pair.
+// _mxfp8_block in ops/moe/inkling2_moe.py for one 32-value block split over a lane pair.
 __device__ __forceinline__ void mxfp8_half_block(float const (&x)[16], uint4& values, uint8_t& exponent_out) {
   float amax = 0.0f;
 #pragma unroll
@@ -395,7 +395,7 @@ __global__ void __launch_bounds__(threads(N)) mxfp8_swiglu_quantize_routed(
   }
 }
 
-// _mxfp8_quantize in kernels/moe.py over rows of N bf16 values, each row
+// _mxfp8_quantize in ops/moe/inkling2_moe.py over rows of N bf16 values, each row
 // split over kRowParts CTAs.
 constexpr int kRowParts = 3;
 

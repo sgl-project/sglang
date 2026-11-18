@@ -452,11 +452,11 @@ def _verify_meta(m, slots):
 @pytest.mark.parametrize("m", [1, 3, 16])
 def test_sconv_windows_and_routed_epilogue(m):
     from sglang.kernels.ops.elementwise.inkling2_residual_add import residual_add
-    from sglang.kernels.ops.inkling2.moe import unweighted_post_reorder
     from sglang.kernels.ops.mamba.inkling2_sconv import (
         routed_sconv_epilogue,
         short_convolution,
     )
+    from sglang.kernels.ops.moe.inkling2_moe import unweighted_post_reorder
     from sglang.srt.models.inkling_common.kernels.sconv import (
         save_intermediate_conv_windows,
     )
