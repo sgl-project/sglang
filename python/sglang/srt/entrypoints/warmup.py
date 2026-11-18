@@ -211,6 +211,46 @@ async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManag
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
 
 
+def _max_warmup_input_len(
+    tokenizer_manager: Any, max_new_tokens: int = 1
+) -> Optional[int]:
+    """Return the strictest safe prompt length for a warmup request, honoring
+    model ``context_len``, ``num_reserved_tokens``, scheduler ``max_req_input_len``,
+    and unchunked ``max_prefill_tokens``."""
+    server_args = getattr(tokenizer_manager, "server_args", None)
+    model_cfg = getattr(tokenizer_manager, "model_config", None)
+    reserved = max(0, int(getattr(tokenizer_manager, "num_reserved_tokens", 0) or 0))
+    need_out = max(1, int(max_new_tokens or 1))
+
+    limits: List[int] = []
+    for ctx in (
+        getattr(tokenizer_manager, "context_len", None),
+        getattr(model_cfg, "context_len", None),
+        getattr(server_args, "context_length", None),
+    ):
+        if isinstance(ctx, int) and ctx > 0:
+            # TokenizerManager enforces: input_len + reserved < ctx
+            # and input_len + reserved + max_new_tokens <= ctx.
+            limits.append(ctx - reserved - need_out)
+
+    max_req = getattr(tokenizer_manager, "max_req_input_len", None)
+    if isinstance(max_req, int) and max_req > 0:
+        # Scheduler enforces: input_len < max_req_input_len (max_req_len - 5).
+        limits.append(min(max_req - 1, max_req + 5 - reserved - need_out))
+
+    chunked_size = getattr(server_args, "chunked_prefill_size", None)
+    max_prefill = getattr(server_args, "max_prefill_tokens", None)
+    if (
+        isinstance(chunked_size, int)
+        and chunked_size <= 0
+        and isinstance(max_prefill, int)
+        and max_prefill > 0
+    ):
+        limits.append(max_prefill)
+
+    return max(0, min(limits)) if limits else None
+
+
 def _prefill_shape_sizes(max_size: int = 32768) -> List[int]:
     page_size, sizes, base = 64, set(), 64
     while base <= max_size:
@@ -229,8 +269,11 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
     Uses power-of-2 sizes plus intermediate points to cover the shape space
     that fused_moe, attention extend, and other Triton kernels may encounter.
     """
+    max_input = _max_warmup_input_len(tokenizer_manager, max_new_tokens=1)
+    max_size = min(32768, max_input) if max_input is not None else 32768
     for size in tqdm.tqdm(
-        _prefill_shape_sizes(), desc="Warmup prefill shapes (up to 32K)"
+        _prefill_shape_sizes(max_size),
+        desc=f"Warmup prefill shapes (up to {max_size})",
     ):
         generate_req_input = GenerateReqInput(
             input_ids=(np.random.randint(2**16, size=[size])).tolist(),
@@ -255,9 +298,25 @@ async def _send(
     room_id: int = 0,
     **kwargs: Any,
 ) -> None:
-    req = GenerateReqInput(
-        input_ids=input_ids, sampling_params=sampling_params, **kwargs
-    )
+    params = dict(sampling_params)
+    max_new = max(1, int(params.get("max_new_tokens", 1) or 1))
+    budget_min = _max_warmup_input_len(tokenizer_manager, max_new_tokens=1)
+    if budget_min is not None:
+        if budget_min < 1:
+            return
+        limit = _max_warmup_input_len(tokenizer_manager, max_new_tokens=max_new)
+        if (limit is None or limit < 4) and max_new > 1:
+            max_new = max(1, min(max_new, (budget_min + 1) // 2))
+            params["max_new_tokens"] = max_new
+            limit = _max_warmup_input_len(tokenizer_manager, max_new_tokens=max_new)
+        if limit is None or limit < 1:
+            return
+        if len(input_ids) > limit:
+            input_ids = input_ids[:limit]
+    if kwargs.get("logprob_start_len", -1) >= len(input_ids):
+        kwargs["logprob_start_len"] = max(0, len(input_ids) - 1)
+
+    req = GenerateReqInput(input_ids=input_ids, sampling_params=params, **kwargs)
     if disaggregation_mode != "null":
         req.bootstrap_room = room_id
         req.bootstrap_host = FAKE_BOOTSTRAP_HOST
@@ -292,7 +351,10 @@ async def _run_all_gpu_warmups(
         "presence_penalty": 0.1,
     }
 
-    # 1. Sampling & penalties (bs=1 + concurrent mixed/dynamic bs=2)
+    max_input = _max_warmup_input_len(tokenizer_manager, max_new_tokens=1)
+    can_batch_2 = max_input is None or max_input >= 64
+
+    # 1. Sampling & penalties (bs=1 + concurrent mixed/dynamic bs=2 when capacity allows)
     for size, params in (
         (16, greedy),
         (21, {**sampled, "max_new_tokens": 16}),
@@ -304,26 +366,31 @@ async def _run_all_gpu_warmups(
         (21, penalty),
     ):
         await _send(disaggregation_mode, tokenizer_manager, rand_ids(size), params)
-    await asyncio.gather(
-        _send(disaggregation_mode, tokenizer_manager, rand_ids(17), greedy, room_id=0),
-        _send(disaggregation_mode, tokenizer_manager, rand_ids(23), sampled, room_id=1),
-    )
-    await asyncio.gather(
-        _send(
-            disaggregation_mode,
-            tokenizer_manager,
-            rand_ids(19),
-            dict(penalty),
-            room_id=0,
-        ),
-        _send(
-            disaggregation_mode,
-            tokenizer_manager,
-            rand_ids(27),
-            dict(penalty),
-            room_id=1,
-        ),
-    )
+    if can_batch_2:
+        await asyncio.gather(
+            _send(
+                disaggregation_mode, tokenizer_manager, rand_ids(17), greedy, room_id=0
+            ),
+            _send(
+                disaggregation_mode, tokenizer_manager, rand_ids(23), sampled, room_id=1
+            ),
+        )
+        await asyncio.gather(
+            _send(
+                disaggregation_mode,
+                tokenizer_manager,
+                rand_ids(19),
+                dict(penalty),
+                room_id=0,
+            ),
+            _send(
+                disaggregation_mode,
+                tokenizer_manager,
+                rand_ids(27),
+                dict(penalty),
+                room_id=1,
+            ),
+        )
 
     # 2. Output & prompt logprobs
     if getattr(tokenizer_manager, "is_generation", True):
@@ -374,29 +441,36 @@ async def _run_all_gpu_warmups(
     # 4. RadixCache prefix-hit extend (tile buckets + odd KV-slot alignments) & prefill shapes
     env_val = os.environ.get("SGLANG_WARMUP_MAX_PREFILL_SIZE")
     max_size = int(env_val) if env_val and env_val.isdigit() else 32768
-    max_req = getattr(tokenizer_manager, "max_req_input_len", None)
-    if isinstance(max_req, int) and max_req >= 64:
-        max_size = min(max_size, max(64, max_req - 16))
-    max_size = max(64, max_size)
+    if max_input is not None:
+        safe_cap = max_input - 15 if max_input > 80 else max_input
+        max_size = min(max_size, safe_cap)
 
-    prefix = rand_ids(64)
-    ext_params = {**sampled, "max_new_tokens": 2}
-    for tail in (7, 2, 7, 21, 96):
-        if 64 + tail <= max_size:
-            await _send(
-                disaggregation_mode,
-                tokenizer_manager,
-                prefix + rand_ids(tail),
-                ext_params,
-            )
+    ext_cap = _max_warmup_input_len(tokenizer_manager, max_new_tokens=2)
+    ext_max = min(max_size, ext_cap) if ext_cap is not None else max_size
+    prefix_len = min(64, max(0, ext_max - 2))
+    prefix = rand_ids(prefix_len) if prefix_len >= 4 else []
+    if prefix:
+        ext_params = {**sampled, "max_new_tokens": 2}
+        for tail in (7, 2, 7, 21, 96):
+            if prefix_len + tail <= ext_max:
+                await _send(
+                    disaggregation_mode,
+                    tokenizer_manager,
+                    prefix + rand_ids(tail),
+                    ext_params,
+                )
 
     shape_seqs = [rand_ids(s) for s in (3, 7, 21, 48) if s <= max_size]
     shape_seqs += [
-        list(prefix) if s == 64 else rand_ids(s) for s in _prefill_shape_sizes(max_size)
+        list(prefix) if (s == prefix_len and prefix) else rand_ids(s)
+        for s in _prefill_shape_sizes(max_size)
     ]
-    shape_params = {"max_new_tokens": 1, "temperature": 0.0, "ignore_eos": True}
-    for ids in tqdm.tqdm(shape_seqs, desc=f"Warmup prefill shapes (up to {max_size})"):
-        await _send(disaggregation_mode, tokenizer_manager, ids, shape_params)
+    if shape_seqs:
+        shape_params = {"max_new_tokens": 1, "temperature": 0.0, "ignore_eos": True}
+        for ids in tqdm.tqdm(
+            shape_seqs, desc=f"Warmup prefill shapes (up to {max_size})"
+        ):
+            await _send(disaggregation_mode, tokenizer_manager, ids, shape_params)
 
     # Flush synthetic warmup KV / Mamba cache before serving traffic
     flush_fn = getattr(tokenizer_manager, "flush_cache", None)
