@@ -240,13 +240,14 @@ def _asm_cprr_kernel_heads(gathered_heads: int, q_len: int) -> int:
 
 
 def _mla_dcp_asm_selected(
-    *, use_mla: bool, dcp_world_size: int, decode_backend: str, kv_cache_dtype
+    *,
+    use_mla: bool,
+    dcp_world_size: int,
+    decode_backend: str,
+    kv_cache_dtype: torch.dtype,
 ) -> bool:
-    """Whether DCP decode runs on aiter's asm MLA kernel.
-
-    That kernel is a8w8: it casts the query to fp8 and reads the KV cache with its
-    fp8 scale. Any other cache decodes on Gluon.
-    """
+    """Whether DCP decode runs on aiter's asm MLA kernel."""
+    # The kernel is a8w8: it reads the KV cache with its fp8 scale; any other cache decodes on Gluon.
     return (
         use_mla
         and dcp_world_size > 1
@@ -1341,11 +1342,8 @@ class AiterAttnBackend(AttentionBackend):
     def _check_mla_dcp_gluon(
         self, *, gathered_num_head: int, kv_lora_rank: int, qk_rope_head_dim: int
     ) -> None:
-        """Fail at startup if a DCP decode moved off asm by its KV dtype cannot run on Gluon.
-
-        Only this route, which used to crash at the first decode: other Gluon routes
-        are left to mla_gluon's own asserts.
-        """
+        """Fail at startup if a DCP decode moved off asm by its KV dtype cannot run on Gluon."""
+        # Only this route; other routes to Gluon are left to mla_gluon's own asserts.
         reason = mla_gluon_dcp_unsupported_reason(
             gathered_num_head=gathered_num_head,
             q_dtype=self.input_dtype,
