@@ -176,6 +176,13 @@ Families: Qwen-VL (Qwen2-VL, Qwen2.5-VL, Qwen3-VL (+MoE), Qwen3.5 (+MoE)).
 The only SGLang step is in `mod.rs`, mirroring `utils/common.py::_load_image`:
 decode without an EXIF transpose, under PIL's decompression-bomb limit.
 
+**Proposed sampled video ingress.** Extend the `api.v1` shared-memory
+transport from [#50781](https://github.com/sgl-project/sglang/pull/50781)
+to engine-owned RGB frames. The processor and scheduler path follows
+[#51156](https://github.com/sgl-project/sglang/pull/51156) and
+[#51157](https://github.com/sgl-project/sglang/pull/51157). The initial design
+uses constant frame rate and checks source frame indices against timestamps.
+
 To add a family, Dynamo implements its `process_item` and `ProcessorSpec` arm,
 SGLang's Python gate resolves its spec, and a parity fixture checks it.
 
