@@ -58,6 +58,8 @@ Some models may require `--trust-remote-code`.
 
 The native implementation enables embedding mode automatically and uses the checkpoint's query/document template. Prefix caching and chunked prefill are disabled because its attention is bidirectional. No custom template or remote model code is required.
 
+ROCm is not supported: its default AITER prefill path uses causal attention, and alternative ROCm backends have not been validated for this model.
+
 Launch on an NVIDIA GPU with enough memory for the BF16 checkpoint:
 
 ```bash

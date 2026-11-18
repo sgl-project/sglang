@@ -4309,5 +4309,37 @@ class TestDeterministicAttentionBackendOnXpu(unittest.TestCase):
         self.assertEqual(updates, {})
 
 
+class TestNemotron35RerankerPlatformOverride(CustomTestCase):
+    def test_rocm_guard_is_registered_and_scoped_to_the_supported_layout(self):
+        """Reject ROCm instead of silently returning causal reranker scores."""
+        from transformers import Mistral3Config
+
+        config = Mistral3Config(
+            architectures=["Mistral3ForSequenceClassification"],
+            text_config={
+                "model_type": "ministral3",
+                "is_causal": False,
+                "pooling": "avg",
+            },
+            vision_config={"model_type": "pixtral"},
+            is_causal=False,
+            pooling="avg",
+            num_labels=1,
+        )
+        args = SimpleNamespace()
+        architecture = "Mistral3ForSequenceClassification"
+        with override_platform(is_cuda=True, is_hip=False):
+            self.assertEqual(
+                collect_model_override_declarations(architecture, args, config), []
+            )
+        with override_platform(is_cuda=False, is_hip=True):
+            with self.assertRaisesRegex(ValueError, "not supported on ROCm"):
+                collect_model_override_declarations(architecture, args, config)
+            config.pooling = "last"
+            self.assertEqual(
+                collect_model_override_declarations(architecture, args, config), []
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
