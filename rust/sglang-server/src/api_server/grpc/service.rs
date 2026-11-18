@@ -5,12 +5,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::http::StatusCode;
 use futures::{Stream, StreamExt};
 use sglang_api_types::api::v1 as api;
 use sglang_api_types::api::v1::sglang_service_server::SglangService;
 use tonic::{Request, Response, Status};
 
 use super::{info, native_api};
+use crate::api_server::anthropic::Anthropic;
 use crate::api_server::core::{HealthStatus, ReceivedAs};
 use crate::api_server::handlers::{
     AbortEnding, CoreHandle, CorpusSource, DumperOutcome, ElasticEpState, HiCacheError,
@@ -134,6 +136,12 @@ fn response_timeout(secs: u64) -> Duration {
     Duration::from_secs(secs)
 }
 
+fn openai_unimplemented() -> Status {
+    Status::unimplemented(
+        "the OpenAI API is served over HTTP only until its adapter moves onto the api.v1 schema",
+    )
+}
+
 /// A group operation's merged outcome as the gRPC reply; a frontend-side
 /// failure (bad request, unreachable rank) is a status instead.
 fn group_response(
@@ -169,6 +177,14 @@ fn lora_disabled() -> Result<Response<api::LoraUpdateResponse>, Status> {
 }
 
 impl GrpcService {
+    fn anthropic(&self) -> Anthropic<'_> {
+        Anthropic {
+            core: &self.core,
+            chat_formatter: self.chat_formatter.as_ref(),
+            server_args: &self.server_args,
+        }
+    }
+
     fn ollama(&self) -> Ollama<'_> {
         Ollama {
             core: &self.core,
@@ -1130,8 +1146,159 @@ impl SglangService for GrpcService {
         Ok(Response::new(self.ollama().show(request.into_inner())))
     }
 
+    /// `/v1/messages` without `stream`: failures are statuses with the
+    /// Anthropic message.
+    async fn anthropic_messages(
+        &self,
+        request: Request<api::AnthropicMessagesRequest>,
+    ) -> Result<Response<api::AnthropicMessagesResponse>, Status> {
+        let mut request = request.into_inner();
+        request.apply_absent_defaults();
+        self.anthropic()
+            .messages(request)
+            .await
+            .map(Response::new)
+            .map_err(|failure| failure.grpc_status())
+    }
+
+    type AnthropicStreamMessagesStream = ResponseStream<api::AnthropicStreamEvent>;
+
+    /// `/v1/messages` with `stream`: the event sequence; a failure after
+    /// the first event is an `error` event, as on SSE.
+    async fn anthropic_stream_messages(
+        &self,
+        request: Request<api::AnthropicMessagesRequest>,
+    ) -> Result<Response<Self::AnthropicStreamMessagesStream>, Status> {
+        let mut request = request.into_inner();
+        request.apply_absent_defaults();
+        let events = self
+            .anthropic()
+            .messages_stream(request)
+            .await
+            .map_err(|failure| failure.grpc_status())?;
+        Ok(Response::new(Box::pin(events.map(Ok))))
+    }
+
+    async fn anthropic_count_tokens(
+        &self,
+        request: Request<api::AnthropicCountTokensRequest>,
+    ) -> Result<Response<api::AnthropicCountTokensResponse>, Status> {
+        self.anthropic()
+            .count_tokens(request.into_inner())
+            .await
+            .map(Response::new)
+            .map_err(|failure| failure.grpc_status())
+    }
+
     // The OpenAI interface: the schema is in place for the adapter
     // refactor; the gRPC methods answer UNIMPLEMENTED until it lands.
+    async fn open_ai_completions(
+        &self,
+        _request: Request<api::OpenAiCompletionRequest>,
+    ) -> Result<Response<api::OpenAiCompletionResponse>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    async fn open_ai_chat_completions(
+        &self,
+        _request: Request<api::OpenAiChatCompletionRequest>,
+    ) -> Result<Response<api::OpenAiChatCompletionResponse>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    async fn open_ai_embeddings(
+        &self,
+        _request: Request<api::OpenAiEmbeddingRequest>,
+    ) -> Result<Response<api::OpenAiEmbeddingResponse>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    async fn open_ai_classify(
+        &self,
+        _request: Request<api::OpenAiClassifyRequest>,
+    ) -> Result<Response<api::OpenAiClassifyResponse>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    async fn open_ai_score(
+        &self,
+        request: Request<api::OpenAiScoreRequest>,
+    ) -> Result<Response<api::OpenAiScoreResponse>, Status> {
+        let request = request.into_inner();
+        let scored = crate::api_server::http::openai::score::score_request(
+            &self.core,
+            &self.server_args,
+            ReceivedAs::without_headers,
+            &request,
+        )
+        .await
+        .map_err(|(status, message)| {
+            let code = match status {
+                StatusCode::BAD_REQUEST => tonic::Code::InvalidArgument,
+                StatusCode::SERVICE_UNAVAILABLE => tonic::Code::Unavailable,
+                status if status.is_server_error() => tonic::Code::Internal,
+                _ => tonic::Code::Unknown,
+            };
+            Status::new(code, message)
+        })?;
+        Ok(Response::new(scored.into_response(
+            request.model.clone().unwrap_or_else(|| "default".into()),
+        )))
+    }
+
+    async fn open_ai_rerank(
+        &self,
+        _request: Request<api::OpenAiRerankRequest>,
+    ) -> Result<Response<api::OpenAiRerankResponse>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    async fn open_ai_tokenize(
+        &self,
+        _request: Request<api::OpenAiTokenizeRequest>,
+    ) -> Result<Response<api::OpenAiTokenizeResponse>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    async fn open_ai_detokenize(
+        &self,
+        _request: Request<api::OpenAiDetokenizeRequest>,
+    ) -> Result<Response<api::OpenAiDetokenizeResponse>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    async fn open_ai_list_models(
+        &self,
+        _request: Request<api::OpenAiListModelsRequest>,
+    ) -> Result<Response<api::OpenAiModelList>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    async fn open_ai_retrieve_model(
+        &self,
+        _request: Request<api::OpenAiRetrieveModelRequest>,
+    ) -> Result<Response<api::OpenAiModelCard>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    type OpenAiStreamCompletionsStream = ResponseStream<api::OpenAiCompletionStreamResponse>;
+
+    async fn open_ai_stream_completions(
+        &self,
+        _request: Request<api::OpenAiCompletionRequest>,
+    ) -> Result<Response<Self::OpenAiStreamCompletionsStream>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    type OpenAiStreamChatCompletionsStream =
+        ResponseStream<api::OpenAiChatCompletionStreamResponse>;
+
+    async fn open_ai_stream_chat_completions(
+        &self,
+        _request: Request<api::OpenAiChatCompletionRequest>,
+    ) -> Result<Response<Self::OpenAiStreamChatCompletionsStream>, Status> {
+        Err(openai_unimplemented())
+    }
 }
 
 /// `--grpc-port` refuses `--admin-api-key` at startup, so a gRPC server never
@@ -2177,6 +2344,63 @@ mod tests {
             .into_inner();
         assert_eq!(card.details.unwrap().family, "Qwen");
         assert_eq!(card.parameters, "num_ctx 4096");
+    }
+
+    /// `AnthropicMessages` renders through the chat core and shapes the
+    /// reply; `AnthropicCountTokens` counts the rendered prompt's ids.
+    #[tokio::test]
+    async fn anthropic_messages_and_count_tokens_over_grpc() {
+        let mut harness = Harness::new(2, true, Duration::from_secs(1));
+        harness.service.chat_formatter =
+            Some(crate::api_server::http::openai::test_utils::chatml_formatter());
+        let request: api::AnthropicMessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let rpc = harness.service.anthropic_messages(Request::new(request));
+        let runtime = async {
+            let intake = harness.next_generation().await;
+            assert!(intake.admission.try_accept());
+            assert_eq!(intake.request.sampling_params.max_new_tokens, Some(8));
+            intake
+                .sink
+                .try_send(ResponseItem::Done(chunk(&intake.rid, "ok", 7, true)))
+                .unwrap();
+        };
+        let (response, ()) = tokio::join!(rpc, runtime);
+        let message = response.unwrap().into_inner();
+        assert_eq!(message.r#type, "message");
+        assert_eq!(message.stop_reason.as_deref(), Some("end_turn"));
+        let content = message.content.unwrap().items;
+        assert_eq!(content.len(), 1);
+        assert!(matches!(
+            &content[0].block,
+            Some(api::anthropic_content_block::Block::Text(text)) if text.text == "ok"
+        ));
+        assert_eq!(message.usage.unwrap().input_tokens, Some(3));
+
+        let request: api::AnthropicCountTokensRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let rpc = harness
+            .service
+            .anthropic_count_tokens(Request::new(request));
+        let runtime = async {
+            let TmEvent::Intake { request, admission } =
+                harness.intake_rx.recv_async().await.unwrap()
+            else {
+                panic!("expected intake");
+            };
+            assert!(admission.try_accept());
+            assert!(matches!(request.kind, RequestKind::Tokenize { .. }));
+            request
+                .sink
+                .try_send(ResponseItem::TokenIds(vec![1, 2, 3, 4]))
+                .unwrap();
+        };
+        let (response, ()) = tokio::join!(rpc, runtime);
+        assert_eq!(response.unwrap().into_inner().input_tokens, 4);
     }
 
     #[tokio::test]

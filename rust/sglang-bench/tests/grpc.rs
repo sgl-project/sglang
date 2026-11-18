@@ -289,6 +289,117 @@ impl SglangService for Mock {
         unimplemented!()
     }
 
+    async fn anthropic_messages(
+        &self,
+        _: Request<api::AnthropicMessagesRequest>,
+    ) -> Result<Response<api::AnthropicMessagesResponse>, Status> {
+        unimplemented!()
+    }
+
+    type AnthropicStreamMessagesStream = ItemStreamOf<api::AnthropicStreamEvent>;
+
+    async fn anthropic_stream_messages(
+        &self,
+        _: Request<api::AnthropicMessagesRequest>,
+    ) -> Result<Response<Self::AnthropicStreamMessagesStream>, Status> {
+        unimplemented!()
+    }
+
+    async fn anthropic_count_tokens(
+        &self,
+        _: Request<api::AnthropicCountTokensRequest>,
+    ) -> Result<Response<api::AnthropicCountTokensResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_completions(
+        &self,
+        _: Request<api::OpenAiCompletionRequest>,
+    ) -> Result<Response<api::OpenAiCompletionResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_chat_completions(
+        &self,
+        _: Request<api::OpenAiChatCompletionRequest>,
+    ) -> Result<Response<api::OpenAiChatCompletionResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_embeddings(
+        &self,
+        _: Request<api::OpenAiEmbeddingRequest>,
+    ) -> Result<Response<api::OpenAiEmbeddingResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_classify(
+        &self,
+        _: Request<api::OpenAiClassifyRequest>,
+    ) -> Result<Response<api::OpenAiClassifyResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_score(
+        &self,
+        _: Request<api::OpenAiScoreRequest>,
+    ) -> Result<Response<api::OpenAiScoreResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_rerank(
+        &self,
+        _: Request<api::OpenAiRerankRequest>,
+    ) -> Result<Response<api::OpenAiRerankResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_tokenize(
+        &self,
+        _: Request<api::OpenAiTokenizeRequest>,
+    ) -> Result<Response<api::OpenAiTokenizeResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_detokenize(
+        &self,
+        _: Request<api::OpenAiDetokenizeRequest>,
+    ) -> Result<Response<api::OpenAiDetokenizeResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_list_models(
+        &self,
+        _: Request<api::OpenAiListModelsRequest>,
+    ) -> Result<Response<api::OpenAiModelList>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_retrieve_model(
+        &self,
+        _: Request<api::OpenAiRetrieveModelRequest>,
+    ) -> Result<Response<api::OpenAiModelCard>, Status> {
+        unimplemented!()
+    }
+
+    type OpenAiStreamCompletionsStream = ItemStreamOf<api::OpenAiCompletionStreamResponse>;
+
+    async fn open_ai_stream_completions(
+        &self,
+        _: Request<api::OpenAiCompletionRequest>,
+    ) -> Result<Response<Self::OpenAiStreamCompletionsStream>, Status> {
+        unimplemented!()
+    }
+
+    type OpenAiStreamChatCompletionsStream = ItemStreamOf<api::OpenAiChatCompletionStreamResponse>;
+
+    async fn open_ai_stream_chat_completions(
+        &self,
+        _: Request<api::OpenAiChatCompletionRequest>,
+    ) -> Result<Response<Self::OpenAiStreamChatCompletionsStream>, Status> {
+        unimplemented!()
+    }
+
     async fn separate_reasoning(
         &self,
         _: Request<api::SeparateReasoningRequest>,

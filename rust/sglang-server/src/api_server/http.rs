@@ -1,3 +1,4 @@
+mod anthropic;
 pub(crate) mod app;
 mod auth;
 mod connections;
@@ -16,3 +17,4 @@ pub(crate) mod pre_generate;
 mod request_decompression;
 mod request_headers;
 pub(crate) mod weights;
+mod wrappers;

@@ -5842,12 +5842,18 @@ class Scheduler(
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
-        snapshot = self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+        # Extend and idle results always publish; decode steps are throttled
+        # to the publish interval. An idle batch exists only to join
+        # attention-DP collectives while other ranks have work, and on_idle
+        # never runs then, so a throttled idle rank's snapshot would lag its
+        # queues by many group steps.
+        force_publish = batch.forward_mode.is_extend() or batch.forward_mode.is_idle()
+        snapshot = self.publish_load_snapshot(force=force_publish)
         # Router-facing gauge on the dedicated PUB socket, reusing the
         # snapshot above rather than walking the queues again.
         self.load_publisher.publish_load_stat(
             self.load_inquirer.get_loads,
-            force=batch.forward_mode.is_extend(),
+            force=force_publish,
             snapshot=snapshot,
         )
 
