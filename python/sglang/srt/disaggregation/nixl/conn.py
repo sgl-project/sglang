@@ -53,7 +53,7 @@ from sglang.srt.disaggregation.utils import (
     slice_dsa_tail_dst_ptrs_for_pp,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_device, get_schedule
+from sglang.srt.runtime_context import get_device, get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import run_with_deadline
 
@@ -528,6 +528,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
     # Newer NIXL prepares compressed (addr, len, dev_id, stride, count) runs
     # directly; cleared on the first TypeError to expand per block instead.
     _use_strided_descs: bool = True
+    # Set on a DSA cache layer split prefill: each CP rank registers only the
+    # layers it owns (plus the draft's on the last rank), not the whole model.
+    cp_layer_split: bool = False
 
     def __init__(
         self,
@@ -537,6 +540,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.cp_layer_split = (
+            disaggregation_mode == DisaggregationMode.PREFILL
+            and self.attn_cp_size > 1
+            and get_parallel().enable_dsa_cache_layer_split
+        )
         self.kv_args.kv_data_mem_kinds = _normalize_kv_mem_kinds(
             getattr(self.kv_args, "kv_data_mem_kinds", None),
             len(self.kv_args.kv_data_ptrs),
@@ -1475,11 +1483,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
     ) -> List[int]:
         """Map source entries to destination entries for this transfer.
 
-        Heterogeneous PP over a plain MLA pool uses the source stage's layer span.
-        All other layouts use explicit layer IDs, or positional pairing for non-PP.
+        Heterogeneous PP over a plain MLA pool uses the source stage's layer span,
+        and so does a DSA cache layer split CP rank for the layers it owns.
+        All other layouts use explicit layer IDs, or positional pairing for a
+        prefill that registers the whole model.
         """
-        use_pp_mla_offsets = (
-            self.pp_size > 1
+        use_mla_span_offsets = (
+            (self.pp_size > 1 or self.cp_layer_split)
             and n_src != n_dst
             and not self.kv_args.kv_layer_ids
             and not peer_info.dst_kv_layer_ids
@@ -1487,15 +1497,24 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             and not self.is_hybrid_mla_backend
             and not self.kv_args.mla_compression_ratios
         )
-        if not use_pp_mla_offsets:
+        if not use_mla_span_offsets:
             pairs = build_transfer_entry_pairs(
                 self.kv_args.kv_layer_ids,
                 peer_info.dst_kv_layer_ids,
                 n_src,
                 n_dst,
-                allow_positional_fallback=self.pp_size == 1,
+                # A layer split rank holds a slice of the model, so pairing its
+                # entries by position would write them into the first layers.
+                allow_positional_fallback=(
+                    self.pp_size == 1 and not self.cp_layer_split
+                ),
             )
             return [j for _, j in pairs]
+
+        if self.cp_layer_split:
+            return self._build_layer_split_dst_indices(
+                peer_info=peer_info, n_src=n_src, n_dst=n_dst
+            )
 
         start, end = self._mla_kv_entry_span_with_pp(n_src)
         # Bootstrap admits a peer running our pp or 1, so a peer that does not cover the
@@ -1523,6 +1542,39 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
         return indices
 
+    def _build_layer_split_dst_indices(
+        self, *, peer_info: KVArgsRegisterInfo, n_src: int, n_dst: int
+    ) -> List[int]:
+        """Destination entries for a DSA cache layer split CP rank.
+
+        The rank registers the target layers it owns, followed on the last rank
+        by the draft's entries; the decode registers every target layer followed
+        by its draft's. The owned layers land on their span of the target range
+        and the draft entries on the tail. Pointer view: get_mla_kv_ptrs_with_pp.
+        """
+        num_draft = self.kv_args.num_draft_entries
+        start, end = self._mla_kv_entry_span_with_pp(n_src - num_draft)
+        draft_start = n_dst - num_draft
+        # Only the last rank sends the draft, and its layers end where the
+        # decode's draft entries begin.
+        if end > draft_start or (num_draft and end != draft_start):
+            raise RuntimeError(
+                "DSA cache layer split transfer: prefill layers "
+                f"[{start}, {end}) and {num_draft} draft entries do not fit the "
+                f"decode's {n_dst} KV entries; both peers must run the same "
+                "target and draft models"
+            )
+        indices = list(range(start, end)) + list(range(draft_start, n_dst))
+        src_item_lens = list(self.kv_args.kv_item_lens)
+        dst_item_lens = [peer_info.dst_kv_item_lens[j] for j in indices]
+        if src_item_lens != dst_item_lens:
+            raise RuntimeError(
+                "DSA cache layer split transfer: decode KV cell geometry differs "
+                f"from prefill over layers [{start}, {end}): prefill item_lens="
+                f"{src_item_lens}, decode item_lens={dst_item_lens}"
+            )
+        return indices
+
     def _prepare_payload_xfer(self, peer_info: KVArgsRegisterInfo):
         # If prefill does not run speculative decoding (the usual case),
         # decode with speculative decoding will have more kv items.
@@ -1538,6 +1590,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             return
         assert self.src_mem_kind is not None
         src_mem_kind = self.src_mem_kind
+        if self.cp_layer_split and set(peer_info.dst_kv_mem_kinds) != {"VRAM"}:
+            # The host-backed paths below pair entries by position and take a
+            # larger decode pool for decode-only speculative decoding; a layer
+            # split rank always registers fewer entries than the decode.
+            raise NotImplementedError(
+                "NIXL PD transfer does not support DSA cache layer split with a "
+                "host-backed (HiSparse) decode KV pool yet; use the mooncake "
+                "transfer backend for that deployment."
+            )
         decode_only_spec_dec = n_dst > n_src
 
         if peer_info.requires_dcp_relayout:
