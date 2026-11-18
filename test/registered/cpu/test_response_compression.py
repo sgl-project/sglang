@@ -93,6 +93,10 @@ class TestResponseCompressionMiddleware(CustomTestCase):
             ("small", [_start(), _body(SMALL)]),
             ("streamed", [_start(), _body(LARGE, more_body=True), _body(LARGE)]),
             ("encoded", [_start([(b"content-encoding", b"gzip")]), _body(LARGE)]),
+            (
+                "encoded, capitalized",
+                [_start([(b"Content-Encoding", b"gzip")]), _body(LARGE)],
+            ),
         ):
             with self.subTest(case=case):
                 self.assertEqual(_drive(b"zstd", messages), messages)

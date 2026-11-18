@@ -53,7 +53,12 @@ class ResponseCompressionMiddleware:
                 return
             started = True
             body = message.get("body", b"")
-            headers = MutableHeaders(raw=initial_message["headers"])
+            # ASGI header names are lowercase; prometheus_client's app capitalizes them.
+            headers = MutableHeaders(
+                raw=[
+                    (name.lower(), value) for name, value in initial_message["headers"]
+                ]
+            )
             if (
                 message["type"] != "http.response.body"
                 or message.get("more_body", False)
@@ -70,7 +75,7 @@ class ResponseCompressionMiddleware:
             headers["content-encoding"] = "zstd"
             headers["content-length"] = str(len(body))
             headers.add_vary_header("Accept-Encoding")
-            await send(initial_message)
+            await send({**initial_message, "headers": headers.raw})
             await send({**message, "body": body})
 
         await self.app(scope, receive, wrapped_send)
