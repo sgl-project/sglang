@@ -241,12 +241,23 @@ class Parallel(msgspec.Struct):
         Optional[int],
         "Shared-expert TP size for Kimi-K3 with an expert-parallel all-to-all "
         "backend. Must divide attention TP size, or attention TP x CP size "
-        "with interleave prefill CP; never crosses attention DP replicas. Overrides "
-        "--enable-shared-experts-attn-tp when set; 1 replicates the weights.",
+        "with interleave prefill CP. Under attention DP with attention TP 1 it may "
+        "instead divide TP: each group then spans that many consecutive attention-DP "
+        "ranks, whose rows are padded to the DP maximum around the collectives. "
+        "Overrides --enable-shared-experts-attn-tp when set; 1 replicates the weights.",
     ] = None
     enable_dense_mlp_attn_tp: A[
         bool,
         "Shard dense MLP weights across the attention TP group under DP attention.",
+    ] = False
+    enable_kda_tp: A[
+        bool,
+        "Kimi-K3 under attention DP == TP with attention TP 1: run the KDA layers "
+        "tensor-parallel over the whole TP group (MLA stays attention-DP). Each rank "
+        "keeps 1/TP of every KDA layer's weights and of every DP rank's KDA state; "
+        "the layer all-gathers the DP ranks' rows and reduce-scatters its o_proj "
+        "output back. Cuts the per-step KDA weight reads of small-batch decode by TP x. "
+        "PD decode role only (--disaggregation-mode decode).",
     ] = False
     kda_dwdp_size: A[
         Optional[int],

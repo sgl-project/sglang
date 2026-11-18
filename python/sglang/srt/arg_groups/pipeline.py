@@ -183,6 +183,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_eplb_and_dispatch,
         handle_expert_distribution_metrics,
         handle_kda_dwdp,
+        handle_kda_tp,
         handle_shared_experts_tp,
     )
 
@@ -399,5 +400,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Validate after all batch-size declarations are visible.
     run_hook(validate_deepep_v2_speculative_draft, server_args)
     run_hook(validate_deepep_v2_dispatch_token_budget, server_args)
+
+    # Validation only; needs the final cache, graph and speculative settings.
+    run_hook(handle_kda_tp, server_args)
 
     server_args._resolution_finished = True

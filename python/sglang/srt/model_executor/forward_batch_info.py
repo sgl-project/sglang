@@ -523,6 +523,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     can_run_dp_prefill_cuda_graph: bool = False
     dp_prefill_cuda_graph_max_prefix_len: int = 0
     global_forward_mode: Optional[ForwardMode] = None
+    # Every DP rank's ForwardMode value this step (attention DP; see ScheduleBatch).
+    dp_forward_modes: Optional[List[int]] = None
+    # K3 KDA TP PD decode state imports (see ScheduleBatch); run by ModelRunner.
+    kda_tp_state_imports: Optional[List[Tuple[int, int]]] = None
+    dp_kda_tp_state_imports: Optional[List[int]] = None
 
     # Current layer-stack invocation; each TBO child owns a separate stream.
     residual_stream: Optional[ResidualStream] = None
@@ -1067,6 +1072,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             can_run_dp_prefill_cuda_graph=batch.can_run_dp_prefill_cuda_graph,
             dp_prefill_cuda_graph_max_prefix_len=batch.dp_prefill_cuda_graph_max_prefix_len,
             global_forward_mode=batch.global_forward_mode,
+            dp_forward_modes=batch.dp_forward_modes,
+            kda_tp_state_imports=batch.kda_tp_state_imports,
+            dp_kda_tp_state_imports=batch.dp_kda_tp_state_imports,
             is_prefill_only=batch.is_prefill_only,
             beam=beam,
             contains_last_prefill_chunk=contains_last_prefill_chunk,

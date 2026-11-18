@@ -11,6 +11,7 @@ from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
     resolve_cp_tp_group_sharing,
 )
 from sglang.srt.arg_groups.model_override_base import (
+    mamba_extra_buffer_of,
     model_config_of,
     resolved_view,
     resolving_view,
@@ -32,6 +33,7 @@ from sglang.srt.runtime_context import (
     attn_dp_enabled_of,
     derive_attn_tp_size,
     get_platform,
+    shared_experts_tp_spans_dp,
 )
 from sglang.srt.utils.common import parse_connector_type
 
@@ -197,14 +199,17 @@ def handle_shared_experts_tp(server_args: Any):
         attn_cp_size=view.attn_cp_size,
         attn_dp_size=cfg.attn_dp_size,
     )
-    # Shared experts can gather token rows across CP as well as attention TP,
-    # then reduce-scatter to the original shards. A subgroup must still fit
-    # inside one attention-DP replica / PP stage.
+    across_dp = shared_experts_tp_spans_dp(
+        attn_tp_size=attn_tp_size,
+        attn_cp_size=view.attn_cp_size,
+        attn_dp_size=cfg.attn_dp_size,
+    )
     replica_size = attn_tp_size * view.attn_cp_size
-    if size < 1 or replica_size % size != 0:
+    width = cfg.tp_size if across_dp else replica_size
+    if size < 1 or width % size != 0:
         raise ValueError(
-            f"--shared-experts-tp-size ({size}) must be a positive divisor "
-            f"of attention replica size ({replica_size}, attention TP x CP)."
+            f"--shared-experts-tp-size ({size}) must divide attention TP x CP "
+            f"({replica_size}), or TP ({cfg.tp_size}) for attention DP with TP1/CP1."
         )
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         raise ValueError(
@@ -298,6 +303,109 @@ def handle_kda_dwdp(server_args: Any):
                 f"segments and cannot run inside a full {phase} CUDA graph; use "
                 f"--cuda-graph-backend-{phase} breakable or disabled."
             )
+
+
+def handle_kda_tp(server_args: Any):
+    cfg = resolving_view(server_args)
+    if not cfg.enable_kda_tp:
+        return
+    if cfg.disaggregation_mode != "decode":
+        raise ValueError(
+            "--enable-kda-tp runs on the PD decode role only (--disaggregation-mode "
+            f"decode; got {cfg.disaggregation_mode!r})."
+        )
+    view = resolved_view(server_args)
+    attn_tp_size = derive_attn_tp_size(
+        tp_size=cfg.tp_size,
+        attn_cp_size=view.attn_cp_size,
+        attn_dp_size=cfg.attn_dp_size,
+    )
+    if (
+        attn_tp_size != 1
+        or cfg.attn_dp_size != cfg.tp_size
+        or cfg.tp_size < 2
+        or view.attn_cp_size != 1
+    ):
+        raise ValueError(
+            "--enable-kda-tp needs attention DP == TP with attention TP 1 and no "
+            f"attention CP (attention DP {cfg.attn_dp_size}, TP {cfg.tp_size}, "
+            f"attention TP {attn_tp_size}, attention CP {view.attn_cp_size})."
+        )
+    if cfg.kda_dwdp_size is not None:
+        raise ValueError(
+            "--enable-kda-tp and --kda-dwdp-size are mutually exclusive: KDA TP "
+            "already shards the KDA weights over the TP group."
+        )
+    if cfg.pp_size > 1:
+        raise ValueError("--enable-kda-tp does not support pipeline parallelism.")
+    if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
+        raise ValueError("--enable-kda-tp requires a Kimi-K3 model configuration.")
+    from sglang.srt.configs.model_config import is_kimi_k3
+
+    hf_config = model_config_of(server_args).hf_config
+    if not is_kimi_k3(hf_config):
+        raise ValueError(
+            "--enable-kda-tp is only supported for Kimi-K3 "
+            f"(got {hf_config.architectures[0]})."
+        )
+    _check_kda_tp_supported(cfg)
+
+
+def _check_kda_tp_supported(cfg) -> None:
+    # Every KDA TP collective must run on every DP rank.
+    problems = []
+    if cfg.enable_linear_replayssm_spec or cfg.enable_linear_replayssm:
+        problems.append("ReplaySSM rings (per-slot cursors)")
+    if cfg.enable_hierarchical_cache:
+        problems.append("HiCache (host copies of rank-local head shards)")
+    if cfg.enable_unified_memory:
+        problems.append("--enable-unified-memory (state slots are global ids)")
+    if cfg.disaggregation_decode_enable_radix_cache:
+        problems.append(
+            "the PD decode radix cache (rank-local state copies on prefix match)"
+        )
+    if not cfg.disable_radix_cache and not mamba_extra_buffer_of(cfg):
+        problems.append(
+            "the no_buffer mamba radix strategy (eager slot copies on insert)"
+        )
+    if (
+        cfg.cuda_graph_config is not None
+        and cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+    ):
+        problems.append(
+            "breakable prefill CUDA graphs (replay skips the per-forward KDA TP "
+            "metadata exchange)"
+        )
+    algo = cfg.speculative_algorithm
+    if algo is not None and str(algo).upper().split(".")[-1] not in (
+        "EAGLE",
+        "EAGLE3",
+        "NEXTN",
+    ):
+        problems.append(
+            f"speculative algorithm {algo} (its verify state commit is not the "
+            "collective one)"
+        )
+    topk = cfg.speculative_eagle_topk
+    if topk not in (None, 1):
+        problems.append(
+            f"--speculative-eagle-topk {topk} (the gathered verify metadata keeps each "
+            "rank's own draft-tree fields)"
+        )
+    if envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get():
+        problems.append(
+            "SGLANG_SCHEDULER_SKIP_ALL_GATHER (the state imports and forward kinds "
+            "come from the scheduler's DP all-gather)"
+        )
+    if envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get():
+        problems.append(
+            "SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH (the state commit is a "
+            "collective that idle DP ranks must join)"
+        )
+    if problems:
+        raise ValueError(
+            "--enable-kda-tp does not support: " + "; ".join(problems) + "."
+        )
 
 
 def handle_decode_context_parallelism(server_args: Any):
