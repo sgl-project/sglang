@@ -25,9 +25,17 @@ class TestSingleGroupSoftmaxTopk(CustomTestCase):
             torch.bfloat16
         )
         w_grouped, ids_grouped = grouped_topk_gpu(
-            hidden, logits, topk, True, 1, 1, scoring_func="softmax"
+            hidden_states=hidden,
+            gating_output=logits,
+            topk=topk,
+            renormalize=True,
+            num_expert_group=1,
+            topk_group=1,
+            scoring_func="softmax",
         )
-        w_fused, ids_fused = fused_topk(hidden, logits, topk, True)
+        w_fused, ids_fused = fused_topk(
+            hidden_states=hidden, gating_output=logits, topk=topk, renormalize=True
+        )
 
         ids_grouped, order_grouped = ids_grouped.sort(dim=-1)
         ids_fused, order_fused = ids_fused.to(ids_grouped.dtype).sort(dim=-1)
@@ -58,7 +66,9 @@ class TestSingleGroupSoftmaxTopk(CustomTestCase):
                 with self.subTest(
                     num_tokens=num_tokens, num_experts=num_experts, topk=topk
                 ):
-                    self._run_case(num_tokens, num_experts, topk)
+                    self._run_case(
+                        num_tokens=num_tokens, num_experts=num_experts, topk=topk
+                    )
 
 
 if __name__ == "__main__":

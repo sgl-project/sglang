@@ -675,6 +675,7 @@ class DeepseekV2MoE(nn.Module):
         self.tp_size = get_parallel().tp_size
         self.moe_ep_size = get_parallel().moe_ep_size
         self.routed_scaling_factor = config.routed_scaling_factor
+        self._scales_routed_output = self.routed_scaling_factor != 1.0
         self.n_shared_experts = config.n_shared_experts
         self._deferred_finalize_max_tokens = (
             envs.SGLANG_MOE_DEFERRED_FINALIZE_MAX_TOKENS.get()
@@ -1295,7 +1296,7 @@ class DeepseekV2MoE(nn.Module):
             and not _is_musa
             and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
-        ) and self.routed_scaling_factor != 1.0:
+        ) and self._scales_routed_output:
             final_hidden_states *= self.routed_scaling_factor
 
         # Shared expert on alt stream, issued AFTER the main (routed) branch. See note above.
@@ -1493,7 +1494,7 @@ class DeepseekV2MoE(nn.Module):
             and not _is_xpu
             and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
-        ) and self.routed_scaling_factor != 1.0:
+        ) and self._scales_routed_output:
             final_hidden_states *= self.routed_scaling_factor
 
         if (
