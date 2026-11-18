@@ -537,6 +537,26 @@ class TestSqueezeEvictsOld(CustomTestCase):
         )
 
 
+class TestNgramCorpusCapacity(CustomTestCase):
+    """Verify capacity > max_trie_depth: the root takes one node, a max-depth insert the rest."""
+
+    def test_capacity_equal_to_max_trie_depth_is_rejected(self):
+        """capacity == max_trie_depth must fail at construction, not abort the process on insert."""
+        with self.assertRaisesRegex(
+            RuntimeError, "capacity must be greater than max_trie_depth"
+        ):
+            _make_corpus("BFS", capacity=4, max_trie_depth=4, draft_token_num=4)
+
+    def test_minimum_capacity_evicts_whole_trie(self):
+        """capacity == max_trie_depth + 1 is valid; later full-depth inserts must evict the whole trie."""
+        corpus = _make_corpus("BFS", capacity=5, max_trie_depth=4, draft_token_num=4)
+        corpus.batch_put([[1, 2, 3, 4, 5, 6, 7, 8]])
+        corpus.synchronize()
+
+        ids, _ = _batch_get(corpus, [[6, 7]])
+        self.assertEqual(ids.tolist(), [7, 8, 0, 0])
+
+
 class TestNgramCorpusIncremental(CustomTestCase):
     """Verify the incremental matching path matches the stateless path."""
 
