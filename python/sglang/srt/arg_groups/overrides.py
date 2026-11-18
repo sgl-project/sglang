@@ -2126,6 +2126,8 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
         return False
     if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None:
         return False
+    if envs.SGLANG_MORI_CUSTOM_MEM_POOL.get() is not None:
+        return False
     # NIXL registers each unified arena as one region; post-capture VMM backing can
     # span multiple CUDA allocations, not qualified with our UCX registration.
     if (

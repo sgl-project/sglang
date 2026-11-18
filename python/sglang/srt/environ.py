@@ -1022,6 +1022,9 @@ class Envs:
     SGLANG_DEEPEP_V2_FORCE_MAX_LEN = EnvBool(False)
     # Send CPU-resident AUX data via RDMA instead of ZMQ TCP (default: TCP).
     SGLANG_MORI_SEND_AUX_RDMA = EnvBool(False)
+    # Custom memory pool for KV caches that MoRI registers. AMD_GEM (ROCm) keeps
+    # them in amdgpu GEM BOs, which the KFD allocation limit counts once.
+    SGLANG_MORI_CUSTOM_MEM_POOL = EnvStr(None)
     # Number of RDMA Queue Pairs (QPs) used per transfer operation. Higher
     # values can increase parallelism and bandwidth utilization.
     SGLANG_MORI_QP_PER_TRANSFER = EnvInt(4)

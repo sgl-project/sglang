@@ -472,6 +472,31 @@ def check_server_args(server_args: Any):
                 "unset it."
             )
 
+    # MoRI's AMD_GEM pool keeps KV caches in amdgpu GEM BOs. Only mori registers
+    # them correctly (through their dma-buf); the amdgpu peer-memory path other
+    # transfer engines take would dereference a NULL KFD BO in the kernel.
+    if envs.SGLANG_MORI_CUSTOM_MEM_POOL.get() is not None:
+        from sglang.srt.disaggregation.mori.utils import (
+            check_mori_custom_mem_pool_enabled,
+        )
+
+        check_mori_custom_mem_pool_enabled()
+        if not get_platform().is_hip:
+            raise ValueError("SGLANG_MORI_CUSTOM_MEM_POOL needs ROCm; unset it.")
+        if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None:
+            raise ValueError(
+                "Set only one of SGLANG_MORI_CUSTOM_MEM_POOL and "
+                "SGLANG_MOONCAKE_CUSTOM_MEM_POOL."
+            )
+        if (
+            cfg.disaggregation_mode != "null"
+            and cfg.disaggregation_transfer_backend != "mori"
+        ):
+            raise ValueError(
+                "SGLANG_MORI_CUSTOM_MEM_POOL needs --disaggregation-transfer-backend "
+                f"mori, got {cfg.disaggregation_transfer_backend!r}."
+            )
+
     # Check metrics labels
     if (
         not cfg.tokenizer_metrics_custom_labels_header
