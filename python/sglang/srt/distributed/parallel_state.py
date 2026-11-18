@@ -1378,6 +1378,44 @@ class GroupCoordinator:
         else:
             all_gather_single(output, input, group=self.device_group)
 
+    def aiter_all_gather_staged(
+        self, output: torch.Tensor, input: torch.Tensor, stage
+    ) -> bool:
+        """all_gather_into_tensor(output, input) on the aiter custom all-gather, with
+        stage(dst, src) writing input into the registered input pool (dst has input's
+        shape and dtype) in place of the plain copy-in. False when the custom path does
+        not take this call; the caller then runs its own gather."""
+        ca_comm = self.ca_comm
+        if not (
+            is_hip()
+            and envs.SGLANG_USE_AITER_AG.get()
+            and self._has_aiter_custom_all_gather()
+            and input.is_contiguous()
+            and output.is_contiguous()
+            and input.dtype in (torch.float32, torch.float16, torch.bfloat16)
+            and ca_comm.should_custom_ag(input)
+        ):
+            return False
+        try:
+            pool = ca_comm._pool["input"].tensor
+        except (AttributeError, KeyError, RuntimeError):
+            return False
+        nbytes = input.numel() * input.element_size()
+        if nbytes > pool.numel():
+            return False
+        if (
+            getattr(ca_comm, "_IS_CAPTURING", False)
+            and not torch.cuda.is_current_stream_capturing()
+            and not is_in_tc_piecewise_cuda_graph()
+        ):
+            # True CUDA graph warmup: avoid a different host collective.
+            output.zero_()
+            return True
+        staged = pool[:nbytes].view(input.dtype).view(input.shape)
+        stage(staged, input)
+        ca_comm.all_gather_reg(staged, out=output, dim=0)
+        return True
+
     def _has_aiter_custom_all_gather(self) -> bool:
         if self._deterministic_collectives_enabled():
             return False

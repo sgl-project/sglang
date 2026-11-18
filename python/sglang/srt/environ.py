@@ -1105,6 +1105,14 @@ class Envs:
     # DeepSeek-V4.1 DP attention + TP MoE decode on MI355X). Off by default; the
     # DeepSeek-V4.1 MI355X DP-attention recipe sets it.
     SGLANG_AITER_CAPTURE_COPY_IN = EnvBool(False)
+    # MAX_LEN DP gather of the MoE input on HIP: write the local rows straight into the
+    # aiter all-gather's registered input pool with the pad rows zeroed (one kernel),
+    # in place of masked_fill on the rows plus the all-gather's own copy-in.
+    SGLANG_HIP_DP_FUSED_PAD_GATHER = EnvBool(False)
+    # MAX_LEN DP gather + aiter MoE runner on HIP: route the gathered pad rows (zero-filled
+    # before the gather) to an expert this rank masks off, so the MoE sort drops them
+    # instead of piling them (bias-only router logits) onto the same few local experts.
+    SGLANG_HIP_DP_MASK_PAD_TOPK = EnvBool(False)
     # The gfx950 TP4 JIT quick all-reduce (quick_all_reduce_hip) runs an INT4 request below this
     # many MiB in INT8, which is as fast at decode sizes with about 1/16 of INT4's error; 0 runs
     # INT4 at every size.

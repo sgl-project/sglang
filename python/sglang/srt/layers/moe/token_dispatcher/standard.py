@@ -13,6 +13,7 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_max_padding,
     mask_dp_pad_moe_topk_ids,
+    mask_zero_hidden_moe_topk_ids,
 )
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.base import (
@@ -37,6 +38,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 from sglang.srt.environ import envs as _envs
 
 _MASK_DP_PAD_MOE = _envs.SGLANG_OPT_MASK_DP_PAD_MOE.get()
+_MASK_DP_PAD_TOPK_HIP = _is_hip and _envs.SGLANG_HIP_DP_MASK_PAD_TOPK.get()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
@@ -258,6 +260,18 @@ class StandardDispatcher(BaseDispatcher):
                     )
                     .to(torch.int32)
                     .to(device="cuda")
+                )
+            if (
+                self.use_aiter_moe_runner
+                and _MASK_DP_PAD_TOPK_HIP
+                and is_dp_max_padding()
+                and TopKOutputChecker.format_is_standard(topk_output)
+            ):
+                # Any routed id outside this rank's local range is masked off by
+                # expert_mask_gpu; aiter's sort reads the mask unchecked, so -1 is unsafe.
+                pad_id = 0 if self.moe_ep_rank > 0 else self.num_local_routed_experts
+                mask_zero_hidden_moe_topk_ids(
+                    hidden_states, topk_output.topk_ids, pad_id
                 )
             elif not self.use_aiter_moe_runner:
                 if TopKOutputChecker.format_is_standard(topk_output):
