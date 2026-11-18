@@ -85,7 +85,7 @@ class DcpCandidateAllGather:
         self.out: Optional[torch.Tensor] = None
         self.prefix_handle = None
         self.group_name = group.device_group.group_name
-        if get_platform().is_hip:  # no NVLS multimem: keep the group all-gather
+        if get_platform().is_gfx95:  # no NVLS multimem: keep the group all-gather
             return
         if not all(in_the_same_node_as(group.cpu_group)) and not is_one_nvlink_clique(
             group.cpu_group, group.device
@@ -213,7 +213,7 @@ class DcpTopKMerge:
         # the certificate counts rank q's keys as positions p % world == q
         assert group.rank_in_group == dcp_rank, (group.rank_in_group, dcp_rank)
 
-        if get_platform().is_hip:
+        if get_platform().is_gfx95:
             print_info_once("DSA DCP top-k merge off: it needs NVLink multicast")
             return None
         world = group.world_size
@@ -528,7 +528,7 @@ def dcp_gather_request_rows(
     request, the rows of positions 0..seq_len-1 (the layout of the ragged
     top-k indices).
     """
-    if get_platform().is_hip:
+    if get_platform().is_gfx95:
         from sglang.srt.layers.attention.dsa import dsa_dcp_sharded_hip
 
         return dsa_dcp_sharded_hip.dcp_gather_request_rows(local_rows, seq_lens_cpu)
@@ -666,7 +666,7 @@ def init_dcp_fused_topk(
     """Collective over the DCP group; call on every rank before CUDA graph
     capture. Returns whether decode rows select and merge in one kernel."""
     global _FUSED_TOPK, _FUSED_TOPK_CREATED
-    if get_platform().is_hip:  # ROCm's only DCP top-k, for any context length
+    if get_platform().is_gfx95:  # gfx950's only DCP top-k, for any context length
         from sglang.srt.layers.attention.dsa.dsa_dcp_sharded_hip import DcpTopKHip
 
         _FUSED_TOPK = DcpTopKHip(page_size)
