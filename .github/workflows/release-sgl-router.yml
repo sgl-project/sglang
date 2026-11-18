@@ -23,7 +23,7 @@ on:
         required: true
         type: string
       ref:
-        description: "Branch, tag, or commit to build, for a non-production image_repo only (default main); a release to lmsysorg/sgl-router builds the router-v<version> tag"
+        description: "Branch, tag, or commit to build (default main), for a build that publishes nothing to production; a release to lmsysorg/sgl-router or PyPI builds the router-v<version> tag"
         required: false
         type: string
         default: ""
@@ -38,7 +38,7 @@ on:
         type: boolean
         default: true
       publish_pypi:
-        description: "Also upload the wheels to PyPI (a version can be uploaded only once)"
+        description: "Also upload the wheels to PyPI (a version can be uploaded only once; builds the router-v<version> tag)"
         required: false
         type: boolean
         default: false
@@ -67,14 +67,21 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_REF: ${{ inputs.ref }}
           INPUT_IMAGE_REPO: ${{ inputs.image_repo }}
+          INPUT_PUBLISH_PYPI: ${{ inputs.publish_pypi }}
         run: |
           version=${INPUT_VERSION#router-v}
           version=${version#v}
-          if [[ "${INPUT_IMAGE_REPO:-lmsysorg/sgl-router}" == "lmsysorg/sgl-router" ]]; then
-            # A release builds the tagged commit, like release-docker.yml.
+          # The production repo, however its Docker Hub registry is spelled.
+          image_repo=${INPUT_IMAGE_REPO:-lmsysorg/sgl-router}
+          image_repo=${image_repo#index.docker.io/}
+          image_repo=${image_repo#registry-1.docker.io/}
+          image_repo=${image_repo#docker.io/}
+          if [[ "$image_repo" == "lmsysorg/sgl-router" || "$INPUT_PUBLISH_PYPI" == "true" ]]; then
+            # Anything published to production (the image repo or PyPI) is
+            # built from the tagged commit, like release-docker.yml.
             ref="refs/tags/router-v${version}"
             if [[ -n "$INPUT_REF" && "$INPUT_REF" != "router-v${version}" && "$INPUT_REF" != "$ref" ]]; then
-              echo "::error::ref '$INPUT_REF' is for a non-production image_repo only; a release to lmsysorg/sgl-router builds $ref."
+              echo "::error::ref '$INPUT_REF' is for a build that publishes nothing to production; a release to lmsysorg/sgl-router or PyPI builds $ref."
               exit 1
             fi
           else
