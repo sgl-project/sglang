@@ -3,7 +3,7 @@
 import torch
 
 
-def _inputs(tokens: int, cache_dtype=torch.bfloat16, output_dtype=None):
+def mla_q_cache_inputs(tokens: int, cache_dtype=torch.bfloat16, output_dtype=None):
     torch.manual_seed(23)
     heads = 12
     q_nope = torch.randn(
@@ -39,7 +39,7 @@ def _inputs(tokens: int, cache_dtype=torch.bfloat16, output_dtype=None):
     }
 
 
-def _reference(values):
+def mla_q_cache_reference(values):
     return (
         torch.cat((values["q_nope"], values["q_pe"]), dim=-1).to(values["out"].dtype),
         torch.cat((values["k_nope"], values["k_pe"]), dim=-1).to(
