@@ -85,6 +85,37 @@ def _live_batch(batch_size, num_tokens, *, idle=False):
 
 
 class TestDsv4PrefillGraphMetadata(CustomTestCase):
+    def test_capture_preserves_each_kernel_metadata_abi_size(self):
+        backend = _backend()
+        seed = _seed(128)
+        sizes = {
+            "c1a_metadata": 2048,
+            "c4a_metadata": 2048,
+            "c128a_metadata": 2048,
+            "li_quant_metadata": 1024,
+        }
+        seed.kernel_metadata = {
+            key: torch.zeros(size, dtype=torch.int32) for key, size in sizes.items()
+        }
+        state = Dsv4PrefillGraphMetadata.allocate(
+            backend=backend, seed=seed, num_tokens=128
+        )
+        pointers = {}
+        for key, size in sizes.items():
+            self.assertEqual(tuple(state.kernel_metadata[key].shape), (size,), key)
+            pointers[key] = state.kernel_metadata[key].data_ptr()
+
+        rebuilt = {
+            key: torch.full((size,), i + 1, dtype=torch.int32)
+            for i, (key, size) in enumerate(sizes.items())
+        }
+        live = _seed(64)
+        live.kernel_metadata = rebuilt
+        state.refresh(backend=backend, live=live, forward_batch=_live_batch(1, 64))
+        for key, source in rebuilt.items():
+            self.assertEqual(state.kernel_metadata[key].data_ptr(), pointers[key])
+            torch.testing.assert_close(state.kernel_metadata[key], source)
+
     def test_context_bound_sizes_all_page_tables(self):
         backend = _backend()
         backend.req_to_token_pool.c128_page_size = 4

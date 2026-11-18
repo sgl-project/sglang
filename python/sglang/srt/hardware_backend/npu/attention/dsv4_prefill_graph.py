@@ -46,8 +46,8 @@ _KERNEL_METADATA_KEYS = (
     "c128a_metadata",
     "li_quant_metadata",
 )
-# Arbitrary floor; the live metadata ops emit far fewer than this.
-_MIN_KERNEL_METADATA_INTS = 1024
+# Placeholder capacity for operators absent from this model.
+_DEFAULT_KERNEL_METADATA_INTS = 1024
 
 
 def compress_capacity(num_tokens: int, ratio: int, max_reqs: int) -> int:
@@ -159,11 +159,15 @@ class Dsv4PrefillGraphMetadata:
             )
             state.c128_page_table = torch.zeros((max_reqs, groups), **int32)
 
-        metadata_ints = _MIN_KERNEL_METADATA_INTS
-        for tensor in seed.kernel_metadata.values():
-            metadata_ints = max(metadata_ints, tensor.numel())
+        # Each kernel requires its own exact metadata ABI size.
         state.kernel_metadata = {
-            key: torch.zeros(metadata_ints, **int32) for key in _KERNEL_METADATA_KEYS
+            key: torch.zeros(
+                seed.kernel_metadata[key].numel()
+                if key in seed.kernel_metadata
+                else _DEFAULT_KERNEL_METADATA_INTS,
+                **int32,
+            )
+            for key in _KERNEL_METADATA_KEYS
         }
 
         for ratio in state.ratios:
