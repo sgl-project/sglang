@@ -41,9 +41,6 @@ from sglang.srt.utils import is_gfx95_supported
 
 logger = logging.getLogger(__name__)
 
-# most (token, expert) pairs for which the patched sort (+ stage-1 quant) runs; aiter sorts
-# and quantizes larger batches itself
-_SMALL_SORT_MAX_PAIRS = 256
 # Kimi-K3's (E=896, top-16) shape beats aiter's sort + quant up to 1024 pairs on MI355X
 _KIMI_K3_MOE_SHAPE = (896, 16)
 _KIMI_K3_SMALL_SORT_MAX_PAIRS = 1024
@@ -502,7 +499,7 @@ def _small_sort_supported(
     max_pairs = (
         _KIMI_K3_SMALL_SORT_MAX_PAIRS
         if (num_experts, topk) == _KIMI_K3_MOE_SHAPE
-        else _SMALL_SORT_MAX_PAIRS
+        else 256
     )
     return (
         expert_mask is None
