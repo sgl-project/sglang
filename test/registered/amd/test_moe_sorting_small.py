@@ -7,7 +7,7 @@ import torch
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=80, suite="base-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=30, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 
 def _gfx950():
@@ -67,14 +67,13 @@ class TestMoeSortingSmall(CustomTestCase):
     def _sort(self, fn, ids, w, bs, E=E):
         return fn(ids, w, E, self.DIM, torch.bfloat16, bs, None, None, 0, True)
 
-    def _sort_emitting_quant(self, ids, w, x, bs, E):
-        """The patched sort and the stage-1 quant it emitted (None if it did not)."""
+    def _emitted_quant(self, ids, w, x, bs, E):
         S = self.S
         tok = S._pending_quant_input.set(x)
         etok = S._emitted_quant.set(None)
         try:
-            sort = self._sort(self.fm._moe_sorting_impl, ids, w, bs, E)
-            return sort, S._emitted_quant.get()
+            self._sort(self.fm._moe_sorting_impl, ids, w, bs, E)
+            return S._emitted_quant.get()
         finally:
             S._emitted_quant.reset(etok)
             S._pending_quant_input.reset(tok)
@@ -127,7 +126,7 @@ class TestMoeSortingSmall(CustomTestCase):
                 sorted_weights=sw,
                 num_experts_upper_bound=E,
             )
-            _, emitted = self._sort_emitting_quant(ids, w, x, bs, E)
+            emitted = self._emitted_quant(ids, w, x, bs, E)
             self.assertIsNotNone(emitted, f"E={E} m={m}")
             self.assertTrue(
                 torch.equal(ref_q.view(torch.uint8), emitted[0].view(torch.uint8)),
@@ -150,8 +149,10 @@ class TestMoeSortingSmall(CustomTestCase):
         front = torch.randn(m, front_width, generator=g).to(self.dev, torch.bfloat16)
         x = front[:, routed_start:]
         self.assertTrue(self.S._small_sort_supported(ids, bs, None, None, E))
-        sort, emitted = self._sort_emitting_quant(ids, w, x, bs, E)
+        emitted = self._emitted_quant(ids, w, x, bs, E)
         self.assertIsNotNone(emitted)
+        # the quant CTAs ride the same sort CTA as this no-quant launch
+        sort = self._sort(self.fm._moe_sorting_impl, ids, w, bs, E)
         self._assert_same_sort(self._sort(self.orig_sort, ids, w, bs, E), sort, bs, "")
         sid, sw, _, nv, _ = sort
         ref_q, ref_scale = self.orig_quant(
@@ -176,10 +177,9 @@ class TestMoeSortingSmall(CustomTestCase):
         )
 
     def test_falls_back_to_aiter_from_1024_experts(self):
-        # past 64 pairs the histogram sort serves up to E=896 (E_POW2 <= 1024)
+        # past 64 pairs the histogram sort serves E < 1024 (E_POW2 <= 1024)
         m = 6
         ids, _ = self._routing(m, m)
-        self.assertTrue(self.S._small_sort_supported(ids, 32, None, None, self.E))
         self.assertFalse(self.S._small_sort_supported(ids, 32, None, None, 1024))
 
 

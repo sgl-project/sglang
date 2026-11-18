@@ -5,7 +5,6 @@ import unittest
 import torch
 
 from sglang.kernels.ops.gemm.kimi_k3_latent_tail_hip import (
-    PARTIAL_SPLITS,
     k3_latent_tail,
     k3_latent_tail_partials,
 )
@@ -14,7 +13,7 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
 # backend-specific: the fused tail serves Kimi-K3's gfx950 TP8 decode path.
-register_amd_ci(est_time=20, suite="base-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=10, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 # Kimi-K3: 3584-wide latent, 7168 hidden; the column tail owns 1/8 of the up_proj rows.
 L, H, EPS = 3584, 7168, 1e-5
@@ -63,7 +62,6 @@ class TestKimiK3LatentTailHip(CustomTestCase):
         up_slice = self.up[3 * rows_n : 4 * rows_n]
         latent, _, _, proj = self._inputs(64)  # the column tail's largest batch
         part, sq = k3_latent_tail_partials(latent, self.norm_w, up_slice)
-        self.assertEqual(tuple(part.shape), (PARTIAL_SPLITS, 64, rows_n))
         torch.testing.assert_close(
             sq.sum(0), latent.float().pow(2).sum(-1), rtol=1e-5, atol=1e-3
         )

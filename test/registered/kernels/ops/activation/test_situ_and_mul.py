@@ -9,7 +9,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 # backend-specific: the ROCm MoE front fuses routed-input casting with SiTU.
-register_amd_ci(est_time=20, stage="base-a-jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=10, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 _BETA = 4.0
 _LINEAR_BETA = 25.0
@@ -33,7 +33,7 @@ class TestSituAndMul(CustomTestCase):
     def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
-        if torch.version.hip or get_device_sm() < 100:
+        if get_device_sm() < 100:
             raise unittest.SkipTest("Kimi K3 compute kernels require SM100a+")
 
     def test_situ_and_mul(self):

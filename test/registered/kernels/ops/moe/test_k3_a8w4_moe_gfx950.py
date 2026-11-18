@@ -7,7 +7,8 @@ import torch
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=25, suite="base-b-test-1-gpu-small-amd-mi35x")
+# backend-specific: gfx950 HIP kernels on AITER's preshuffled MXFP4 weights.
+register_amd_ci(est_time=16, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 
 def _gfx950():
