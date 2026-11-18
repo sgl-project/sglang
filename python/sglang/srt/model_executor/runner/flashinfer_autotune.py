@@ -33,6 +33,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_model,
     get_parallel,
+    get_platform,
     get_schedule,
     get_spec,
     max_prefill_buffer_tokens,
@@ -222,6 +223,102 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     return cache_dir / f"{rank_key}.json"
 
 
+# FlashInfer's managed store is selected only where its lifecycle was validated
+# end to end: SM90 and SM100-family GPUs.
+_MANAGED_AUTOTUNE_CACHE_SM_MAJORS = (9, 10)
+
+
+def uses_flashinfer_managed_autotune_cache() -> bool:
+    """Whether this process keeps tuned tactics in FlashInfer's managed store.
+
+    The store attaches for the whole process, and serving then reads only the
+    winners tuned under it, so this is one decision per process, shared by the
+    target and the draft. It reads static configuration and platform facts
+    only, so every call in a process answers alike. The rest keeps the per-rank
+    JSON cache: a deployment that can span more than one rank, elastic EP
+    capacity included, until the store is validated with FlashInfer's
+    per-profile agreement across ranks; MegaMoE, for its namespaced per-GPU
+    records; disabled reuse, for its fresh per-run file; and GPUs the store has
+    not been validated on.
+    """
+    if not envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get():
+        return False
+    if get_exec().moe.moe_runner_backend == "flashinfer_megamoe":
+        return False
+    if get_parallel().max_world_size > 1:
+        return False
+    platform = get_platform()
+    return (
+        platform.has_flashinfer
+        and platform.device_capability[0] in _MANAGED_AUTOTUNE_CACHE_SM_MAJORS
+    )
+
+
+def flashinfer_managed_autotune_cache_root(model_runner: ModelRunner) -> Path:
+    """Root of FlashInfer's managed autotune store for this deployment.
+
+    Below the root, FlashInfer namespaces entries by its software and GPU
+    environment and keys each one by op, runner and shape bucket. The root only
+    decides how widely tactics are reused: per model and parallel layout, from
+    the same fields as the JSON cache's key less the FlashInfer version and GPU
+    that the store's environment covers. It has no rank, so data-parallel
+    replicas of one model share it, and after a restart each serves the last
+    tactic published for a shape. Only process-wide configuration goes into
+    it, because the target and the draft must resolve the same root: a process
+    serves from the one store it attached.
+    """
+    skip_ops = get_flashinfer_autotune_skip_ops(model_runner)
+    model_key = "|".join(
+        [
+            str(get_model().model_path),
+            str(get_model().dtype),
+            str(get_model().quantization),
+            str(get_exec().moe.moe_runner_backend),
+            str(get_parallel().tp_size),
+            str(get_parallel().pp_size),
+            str(get_parallel().attn_dp_size),
+            str(get_parallel().moe_ep_size),
+            "candidate_selection=v2_default",
+            "dummy_tokens=varied",
+            "skip_ops=" + ",".join(sorted(skip_ops)),
+        ]
+    )
+    cache_key = hashlib.sha256(model_key.encode()).hexdigest()[:16]
+    return (
+        Path(envs.SGLANG_CACHE_DIR.get()).expanduser()
+        / "flashinfer"
+        / "autotune"
+        / "managed"
+        / cache_key
+    )
+
+
+def attach_flashinfer_managed_autotune_cache(model_runner: ModelRunner) -> None:
+    """Attach the managed store before this runner's warmup can tune.
+
+    Serving reads the attached store's winners only, so a tactic tuned before
+    the attach stays in memory where serving no longer looks. Warmup calls this
+    first, ahead of the workspace and model preparation that can tune, and
+    attaching the root a process already has is a no-op. A runner that will
+    not tune does not attach: the store would also serve its winners to a
+    process that declines tuned tactics, such as deterministic inference.
+    """
+    mr = model_runner
+    if not uses_flashinfer_managed_autotune_cache():
+        return
+    if not (
+        should_run_flashinfer_autotune(mr)
+        or should_run_flashinfer_autotune(mr, for_speculative_draft=True)
+    ):
+        return
+    from flashinfer import autotune_v2
+
+    root = flashinfer_managed_autotune_cache_root(mr)
+    # Replay mode tunes nothing; the process scope leaves the store attached.
+    with autotune_v2(mode="replay", cache_root=root):
+        pass
+
+
 def _autotune_tactic_sync_group(
     tp_group: GroupCoordinator,
 ) -> Optional[torch.distributed.ProcessGroup]:
@@ -298,8 +395,42 @@ def _drop_diverged_autotune_cache(
 def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool):
     from flashinfer import autotune_v2
 
+    from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
+
+    mr = model_runner
+    if uses_flashinfer_managed_autotune_cache():
+        root = flashinfer_managed_autotune_cache_root(mr)
+        logger.info("Running FlashInfer autotune with managed cache: %s", root)
+        # The process scope keeps the store attached for serving after warmup.
+        tuning = autotune_v2(
+            mode="tune",
+            cache_root=root,
+            skip_ops=get_flashinfer_autotune_skip_ops(mr),
+        )
+    else:
+        tuning = _json_cache_autotune(mr)
+
+    # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
+    # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
+    mr.forward_stream.wait_stream(torch.cuda.current_stream())
+    with torch.get_device_module(mr.device).stream(mr.forward_stream):
+        with tuning, autotune_dummy_run_mode(run_lm_head=run_lm_head):
+            yield
+    torch.cuda.current_stream().wait_stream(mr.forward_stream)
+    logger.info("FlashInfer autotune completed.")
+
+
+@contextlib.contextmanager
+def _json_cache_autotune(model_runner: ModelRunner):
+    """Tune with this rank's JSON cache, loading it before and saving it after."""
+    from flashinfer import autotune_v2
+
     # The gate below decides on the same inputs load_configs does.
     from flashinfer.autotuner import AutoTuner, _collect_metadata, autotune
+
+    from sglang.srt.layers.moe.flashinfer_megamoe_autotune import (
+        megamoe_autotune_context,
+    )
 
     mr = model_runner
     cache_path = flashinfer_autotune_cache_path(mr)
@@ -323,58 +454,46 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
             autotune_cache,
         )
 
-    # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
-    # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
-    mr.forward_stream.wait_stream(torch.cuda.current_stream())
-    with torch.get_device_module(mr.device).stream(mr.forward_stream):
-        from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
-        from sglang.srt.layers.moe.flashinfer_megamoe_autotune import (
-            megamoe_autotune_context,
+    skip_ops = get_flashinfer_autotune_skip_ops(mr)
+    # autotune(cache=...) clears all file-loaded tactics on entry, which would drop
+    # the target's tactics when the draft worker loads; load and save them by hand.
+    tuner = AutoTuner.get()
+    if reuse_cache and autotune_cache.is_file():
+        tuner.load_configs(str(autotune_cache))
+    mega_context = empty_context()
+    if (
+        get_exec().moe.moe_runner_backend == "flashinfer_megamoe"
+        and not mr.is_draft_worker
+        and "flashinfer_megamoe" not in skip_ops
+    ):
+        # The chunk size is already per DP rank. Prepare one prefill profile
+        # independently of the optional full-model EXTEND autotune pass.
+        prefill_num_tokens = (
+            max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
         )
-
-        skip_ops = get_flashinfer_autotune_skip_ops(mr)
-        # autotune(cache=...) clears all file-loaded tactics on entry, which would drop
-        # the target's tactics when the draft worker loads; load and save them by hand.
-        tuner = AutoTuner.get()
-        if reuse_cache and autotune_cache.is_file():
-            tuner.load_configs(str(autotune_cache))
-        mega_context = empty_context()
-        if (
-            get_exec().moe.moe_runner_backend == "flashinfer_megamoe"
-            and not mr.is_draft_worker
-            and "flashinfer_megamoe" not in skip_ops
-        ):
-            # The chunk size is already per DP rank. Prepare one prefill profile
-            # independently of the optional full-model EXTEND autotune pass.
-            prefill_num_tokens = (
-                max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
-            )
-            mega_context = megamoe_autotune_context(
-                decode_num_tokens=max(
-                    mr.max_decode_logits_rows(),
-                    get_eager_max_batch_size(mr.max_running_requests)
-                    * mr.decode_num_tokens_per_req(
-                        num_draft_tokens=max_speculative_num_draft_tokens()
-                    ),
+        mega_context = megamoe_autotune_context(
+            decode_num_tokens=max(
+                mr.max_decode_logits_rows(),
+                get_eager_max_batch_size(mr.max_running_requests)
+                * mr.decode_num_tokens_per_req(
+                    num_draft_tokens=max_speculative_num_draft_tokens()
                 ),
-                prefill_num_tokens=prefill_num_tokens,
-            )
-        with (
-            _autotune_process_group(sync_group),
-            autotune(
-                True,
-                cache=None if reuse_cache else str(autotune_cache),
-                skip_ops=skip_ops,
             ),
-            autotune_v2(mode="tune", persistent_cache=False),
-            mega_context,
-            autotune_dummy_run_mode(run_lm_head=run_lm_head),
-        ):
-            yield
-        if reuse_cache:
-            tuner.save_configs(str(autotune_cache))
-    torch.cuda.current_stream().wait_stream(mr.forward_stream)
-    logger.info("FlashInfer autotune completed.")
+            prefill_num_tokens=prefill_num_tokens,
+        )
+    with (
+        _autotune_process_group(sync_group),
+        autotune(
+            True,
+            cache=None if reuse_cache else str(autotune_cache),
+            skip_ops=skip_ops,
+        ),
+        autotune_v2(mode="tune", persistent_cache=False),
+        mega_context,
+    ):
+        yield
+    if reuse_cache:
+        tuner.save_configs(str(autotune_cache))
 
 
 @contextlib.contextmanager

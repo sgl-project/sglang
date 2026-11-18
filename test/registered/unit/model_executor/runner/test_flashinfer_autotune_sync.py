@@ -377,6 +377,12 @@ class TestAutotuneCachePhases(CustomTestCase):
                     )
                 )
             with (
+                # The per-rank JSON cache, which multi-rank and MegaMoE keep.
+                patch.object(
+                    autotune,
+                    "uses_flashinfer_managed_autotune_cache",
+                    return_value=False,
+                ),
                 patch.object(
                     autotune,
                     "flashinfer_autotune_cache_path",
