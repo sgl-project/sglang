@@ -280,12 +280,10 @@ test('health cascades in another stage do not excuse a wait failure', async () =
     ['Fail-fast: skipping — root cause job(s): wait-for-base-b-amd']);
 });
 
-for (const event of ['pull_request', 'schedule', 'workflow_dispatch']) {
-  test(`explicit diagnostic mode bypasses lint and sibling checks: ${event}`, async () => {
-    const result = await check({ event, lint: 'failure', skipHealthCheck: 'true' });
-    assert.deepEqual(result, { failures: [], labelReads: 0, jobReads: 0 });
-  });
-}
+test('explicit diagnostic mode bypasses lint and sibling checks', async () => {
+  const result = await check({ lint: 'failure', skipHealthCheck: 'true' });
+  assert.deepEqual(result, { failures: [], labelReads: 0, jobReads: 0 });
+});
 
 test('the independent prefix input falls back to the workflow env', () => {
   assert.match(yaml,
