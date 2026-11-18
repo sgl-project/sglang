@@ -65,6 +65,7 @@ def _unfused_moe(*, aiter_presort: bool, registrations: list) -> SimpleNamespace
         return hidden_states
 
     return SimpleNamespace(
+        _row_front_out=None,
         _eligible_for_fused_front=False,
         _forward_unfused=route_without_fused_moe,
         _aiter_presort=aiter_presort,
