@@ -67,7 +67,7 @@ import { GLM46VDeployment } from "/src/snippets/autoregressive/glm-46v-deploymen
 <GLM46VDeployment />
 
 ### 3.2 Configuration Tips
-- **TTFT Optimization** : Set `SGLANG_USE_CUDA_IPC_TRANSPORT=1` to use CUDA IPC for transferring multimodal features, which significantly improves TTFT. This consumes additional memory and may require adjusting `--mem-fraction-static` and/or `--max-running-requests`. (additional memory is proportional to image size * number of images in current running requests.)
+- **TTFT Optimization** : Pass `--mm-feature-transport cuda_ipc` to use CUDA IPC for transferring multimodal features, which significantly improves TTFT. This consumes additional memory and may require adjusting `--mem-fraction-static` and/or `--max-running-requests`. (additional memory is proportional to image size * number of images in current running requests.)
 - **TP=8 Configuration**: When using Tensor Parallelism (TP) of 8, the vision attention's 12 heads cannot be evenly divided. You can resolve this by adding `--mm-enable-dp-encoder` (which the generator above handles automatically).
 - **Fast Model Loading**: For large models (like the 106B version), you can speed up model loading by using `--model-loader-extra-config='{"enable_multithread_load": "true","num_threads": 64}'`.
 - **Hardware Notes:**
@@ -80,9 +80,9 @@ import { GLM46VDeployment } from "/src/snippets/autoregressive/glm-46v-deploymen
 
 **Example with full multimodal optimizations:**
 ```bash Command
-SGLANG_USE_CUDA_IPC_TRANSPORT=1 \
 SGLANG_VLM_CACHE_SIZE_MB=0 \
 python -m sglang.launch_server \
+  --mm-feature-transport cuda_ipc \
   --model-path zai-org/GLM-4.6V \
   --host 0.0.0.0 \
   --port 30000 \
