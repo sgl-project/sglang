@@ -47,8 +47,6 @@ class RangeDict(dict):
 
 
 class SlidingTileAttentionBackend(AttentionBackend):
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         # TODO(will-refactor): check this

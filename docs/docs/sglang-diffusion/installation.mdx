@@ -2,9 +2,9 @@
 title: Install SGLang Diffusion
 description: Run SGLang's built-in diffusion engine with Docker, or install the diffusion extra with pip, uv, or from source.
 ---
-SGLang Diffusion is SGLang's built-in image and video generation engine. It ships in the same [repository](https://github.com/sgl-project/sglang) and **`sglang` Python package**, using `sglang generate` and `sglang serve`.
+SGLang Diffusion is SGLang's built-in engine for image, video, audio, and action generation. It ships in the same [repository](https://github.com/sgl-project/sglang) and **`sglang` Python package**, using `sglang generate` and `sglang serve`.
 
-Docker is the recommended setup for Linux GPU deployments. The official NVIDIA images include SGLang, its diffusion dependencies, and the optimized kernel stack; no separate Python installation or `pip install` inside the container is needed for the standard diffusion runtime. Optional backends and model-specific dependencies are documented in the [cookbook](/cookbook/diffusion/intro).
+Docker is the recommended setup for Linux GPU deployments. The official NVIDIA images include SGLang, its diffusion dependencies, and the optimized kernel stack; no separate Python installation or `pip install` inside the container is needed for the standard diffusion runtime. Optional backends and model-specific dependencies are documented in the [diffusion cookbook](/cookbook/diffusion/intro) and [VLA cookbook](/cookbook/vla/intro).
 
 For Python installation, use `sglang[diffusion]`: `[diffusion]` adds optional dependencies to the same package, not a separate engine.
 
@@ -95,10 +95,9 @@ Docker is also recommended for AMD GPUs. Use a ROCm image matched to your GPU an
 
 For **Strix Halo / gfx1151**, use `rocm/sgl-dev:*-gfx1151*` (image sets `SGLANG_USE_AITER=0`) and pass `--attention-backend torch_sdpa --num-gpus 1`. Do not use AITER on wave32 gfx115x. See the Strix Halo section in [AMD GPUs](../hardware-platforms/amd_gpu).
 
-## Platform-Specific: MUSA (Moore Threads GPUs)
 ## Moore Threads GPUs (MUSA)
 
-For Moore Threads GPUs (MTGPU) with the MUSA software stack, follow the platform guide first. If the source tree still requires the alternate platform `pyproject` fallback, keep a backup of the default file before switching:
+For Moore Threads GPUs (MTGPU) with the MUSA software stack, follow the [Moore Threads GPU guide](/docs/hardware-platforms/mthreads_gpu) first. If the source tree still requires the alternate platform `pyproject` fallback, keep a backup of the default file before switching:
 
 ```bash Command
 # Clone the repository

@@ -40,7 +40,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "USE_NPU_MOE_GATING_TOP_K": "1",
     "SGLANG_RAGGED_VERIFY_MODE": "static",
-    "SGLANG_DSPARK_FAST_SAMPLING": "0",
     "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
     "SGLANG_DSPARK_QUANT_AUDIT": "1",
     "SGLANG_DSPARK_QUANT_AUDIT_STRICT": "0",
@@ -79,6 +78,22 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS = {
     "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX": "1",
 }
 
+# DSPARK speculative decoding arguments shared by the prefill and decode nodes:
+# the PD prefill worker prunes the draft to context-KV injection, and both peers
+# must register the same target + draft state sub-pools.
+DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_SPECULATIVE_ARGS = [
+    "--speculative-algorithm",
+    "DSPARK",
+    "--speculative-draft-model-path",
+    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
+    "--speculative-draft-model-quantization",
+    "modelslim",
+    "--speculative-draft-attention-backend",
+    "ascend",
+    "--speculative-num-draft-tokens",
+    6,
+]
+
 # Prefill node launch arguments.
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--page-size",
@@ -108,9 +123,8 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     256,
     "--chunked-prefill-size",
     131072,
-    "--dp-size",
+    "--attn-dp-size",
     8,
-    "--enable-dp-attention",
     "--tokenizer-worker-num",
     16,
     "--moe-a2a-backend",
@@ -122,13 +136,13 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--enable-dp-lm-head",
     "--kv-cache-dtype",
     "bfloat16",
-    "--disable-cuda-graph",
+    "--disable-decode-cuda-graph",
+    "--disable-prefill-cuda-graph",
     "--load-balance-method",
     "round_robin",
     "--enable-prefill-cp",
     "--cp-strategy",
     "interleave",
-    "--enable-cache-report",
     "--enable-hierarchical-cache",
     "--hicache-io-backend",
     "kernel_ascend",
@@ -139,6 +153,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--enable-cache-report",
     "--max-total-tokens",
     140000,
+    *DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_SPECULATIVE_ARGS,
 ]
 
 # Decode node launch arguments.
@@ -162,9 +177,8 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS = [
     "ascend",
     "--max-running-requests",
     256,
-    "--dp-size",
+    "--attn-dp-size",
     16,
-    "--enable-dp-attention",
     "--moe-a2a-backend",
     "deepep",
     "--deepep-mode",
@@ -183,16 +197,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS = [
     4,
     5,
     6,
-    "--speculative-algorithm",
-    "DSPARK",
-    "--speculative-draft-model-path",
-    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
-    "--speculative-draft-model-quantization",
-    "modelslim",
-    "--speculative-draft-attention-backend",
-    "ascend",
-    "--speculative-num-draft-tokens",
-    6,
+    *DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_SPECULATIVE_ARGS,
 ]
 
 # Model config for DSV4-Flash-0731 W8A8 1P+1D PD-Sep deployment.
@@ -202,7 +207,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG = {
     "decode_args": DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS,
     "prefill_envs": DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ENVS,
     "decode_envs": DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS,
-    "router_args": ["--policy", "cache_aware"],
+    "router_args": [],
     "router_envs": {},
 }
 
@@ -227,6 +232,12 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     # (reference: Flash W8A8 GPQA Diamond baseline is 0.874).
     accuracy = 0.874
     datasets = ["gpqa_diamond"]
+    # A single attempt: gsm8k's 3-retry budget would exceed the step timeout.
+    max_retries = 1
+    # Weekday nightly overrides this to gsm8k (baseline is provisional).
+    dataset_baselines = {
+        "gsm8k": 0.90,
+    }
     generation_config = DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH
     eval_batch_size = 128
     min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 0%
