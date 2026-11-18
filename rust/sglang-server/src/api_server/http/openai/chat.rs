@@ -556,6 +556,13 @@ impl SamplingDefaults {
         fallback_temperature: 1.0,
         fallback_top_p: 1.0,
     };
+    /// Python's `ResponsesRequest._DEFAULT_SAMPLING_PARAMS`: 0.7 / 1.0.
+    pub(crate) const RESPONSES: SamplingDefaults = SamplingDefaults {
+        temperature: None,
+        top_p: None,
+        fallback_temperature: 0.7,
+        fallback_top_p: 1.0,
+    };
     /// The resolved model defaults (empty in `--sampling-defaults openai`
     /// mode), which slot between the user's values and the OpenAI terminals.
     pub(super) fn with_model_defaults(mut self, model: &DefaultSamplingParams) -> SamplingDefaults {
@@ -1219,6 +1226,15 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
         content: Some(content),
         refusal: None,
     }
+}
+
+/// V4, GLM-5.3 and Qwen3.8 prefill `<think>` (Qwen3.8 with a newline) when
+/// thinking, so the generated stream has no opening marker.
+pub(crate) fn starts_in_reasoning(reasoning_parser: Option<&str>, prompt: &str) -> bool {
+    matches!(
+        reasoning_parser,
+        Some("deepseek-v4" | "deepseek_v4" | "deepseekv4" | "glm45" | "qwen3")
+    ) && prompt.trim_end_matches('\n').ends_with("<think>")
 }
 
 #[cfg(test)]
