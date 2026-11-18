@@ -60,6 +60,7 @@ pub(crate) struct ServerInfo {
     /// Opaque owning-runtime boot identity. Overrides any stale
     /// `launch_fields.instance_id` when serialized for HTTP.
     pub(crate) instance_id: String,
+    pub(crate) prepared_input_capabilities: Vec<sglang_api_types::api::v1::PreparedInputCapability>,
     pub(crate) frontend: &'static str,
     /// The server's startup phase durations in seconds, Python's
     /// `TokenizerManager.startup_time` shape.

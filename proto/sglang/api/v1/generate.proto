@@ -87,6 +87,65 @@ message GenerateRequest {
   int64 routed_experts_start_len = 38;
   BoolOrList return_sampling_mask = 39;
   OptionalStringList modalities = 40;
+  // Native Rust image ingress. Requires a profile advertised by GetServerInfo,
+  // one already-expanded input_ids prompt and no raw media.
+  // An absent capability means unsupported.
+  PreparedMultimodalInput prepared_multimodal = 41;
+}
+
+// CPU processor output, not post-encoder embeddings. Model-specific meaning
+// belongs to the versioned profile; there are no deployment-specific handles.
+message PreparedMultimodalInput {
+  option (sglang.json.v1.message_json).unknown_fields = UNKNOWN_FIELDS_DENY;
+  string profile = 1;
+  repeated PreparedMediaItem items = 2;
+  // Must match the selected GetServerInfo capability. Binds the request to
+  // the resolved processor configuration, not just a model-family name.
+  string processor_fingerprint = 3;
+}
+
+// Common transport envelope, not a claim that model processor outputs are
+// interchangeable. Each profile defines the allowed tensor/metadata names,
+// dtypes, shapes and token alignment. Unknown names must be rejected.
+message PreparedMediaItem {
+  option (sglang.json.v1.message_json).unknown_fields = UNKNOWN_FIELDS_DENY;
+  // qwen_vl_image_v1 accepts "image" only.
+  string modality = 1;
+  repeated PreparedTensor tensors = 2;
+  repeated PreparedMetadata metadata = 3;
+  // Half-open spans in expanded input_ids. A profile defines whether an item
+  // can occupy multiple ranges; qwen_vl_image_v1 requires exactly one.
+  repeated PreparedTokenSpan spans = 4;
+}
+
+message PreparedTokenSpan {
+  option (sglang.json.v1.message_json).unknown_fields = UNKNOWN_FIELDS_DENY;
+  uint32 start = 1;
+  uint32 end = 2;
+}
+
+message PreparedTensor {
+  option (sglang.json.v1.message_json).unknown_fields = UNKNOWN_FIELDS_DENY;
+  string name = 1;
+  InlineTensor tensor = 2;
+}
+
+// Small model-specific integer metadata, such as an image grid or crop counts.
+// Float/bool data, including masks, belong in typed tensors when a future
+// profile supports them; opaque JSON and private transport handles do not.
+message PreparedMetadata {
+  option (sglang.json.v1.message_json).unknown_fields = UNKNOWN_FIELDS_DENY;
+  string name = 1;
+  repeated int64 values = 2;
+}
+
+message InlineTensor {
+  option (sglang.json.v1.message_json).unknown_fields = UNKNOWN_FIELDS_DENY;
+  // qwen_vl_image_v1 accepts only float32, little-endian, dense row-major.
+  string dtype = 1;
+  repeated uint64 shape = 2;
+  // Binary on gRPC; standard padded base64 in the shared JSON contract.
+  bytes data = 3;
 }
 
 // Per-request Unlimited-OCR options. The processor owns mode validation and
@@ -267,9 +326,9 @@ message GenerateStreamItem {
 // ---- Media inputs ----------------------------------------------------------
 //
 // Every form Python's `/generate` accepts, typed. Preprocessed inputs
-// (`format: "processor_output"` / `"precomputed_embedding"`) are NOT part of
-// the HTTP contract: their values are tensors, which JSON cannot carry; they
-// exist for the in-process Engine only.
+// (`format: "processor_output"` / `"precomputed_embedding"`) stay in-process
+// Engine forms, not MediaInput variants. The native Rust server's separate
+// prepared_multimodal field carries typed inline CPU tensors through api.v1.
 
 // One media item's source and per-item hints. Unknown keys are an error: a
 // hint this schema does not name would otherwise be silently dropped.

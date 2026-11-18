@@ -11,6 +11,8 @@ options exactly as the Rust server does. Decode with
 
 from __future__ import annotations
 
+import base64
+import binascii
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import msgspec
@@ -80,6 +82,17 @@ def _expect_str(v: Any, expected: str) -> str:
     if isinstance(v, str):
         return v
     raise _invalid_type(v, expected=expected)
+
+
+def _expect_bytes(v: Any, expected: str) -> bytes:
+    text = _expect_str(v, expected)
+    try:
+        data = base64.b64decode(text, validate=True)
+    except (ValueError, binascii.Error):
+        raise JsonContractError("invalid base64 bytes") from None
+    if base64.b64encode(data).decode("ascii") != text:
+        raise JsonContractError("invalid base64 bytes")
+    return data
 
 
 def _expect_seq(v: Any, expected: str) -> List[Any]:
@@ -277,6 +290,7 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     routed_experts_start_len: int = 0
     return_sampling_mask: Optional[BoolOrList] = None
     modalities: Optional[OptionalStringList] = None
+    prepared_multimodal: Optional[PreparedMultimodalInput] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateRequest":
@@ -286,6 +300,106 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     def to_json_value(self) -> Dict[str, Any]:
         """Encode to a JSON-ready value (json.dumps-compatible)."""
         return encode_GenerateRequest(self)
+
+
+class PreparedMultimodalInput(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.PreparedMultimodalInput: JSON object (unknown keys rejected)."""
+
+    profile: str = ""
+    items: List[PreparedMediaItem] = []
+    processor_fingerprint: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "PreparedMultimodalInput":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_PreparedMultimodalInput(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_PreparedMultimodalInput(self)
+
+
+class PreparedMediaItem(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.PreparedMediaItem: JSON object (unknown keys rejected)."""
+
+    modality: str = ""
+    tensors: List[PreparedTensor] = []
+    metadata: List[PreparedMetadata] = []
+    spans: List[PreparedTokenSpan] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "PreparedMediaItem":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_PreparedMediaItem(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_PreparedMediaItem(self)
+
+
+class PreparedTokenSpan(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.PreparedTokenSpan: JSON object (unknown keys rejected)."""
+
+    start: int = 0
+    end: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "PreparedTokenSpan":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_PreparedTokenSpan(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_PreparedTokenSpan(self)
+
+
+class PreparedTensor(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.PreparedTensor: JSON object (unknown keys rejected)."""
+
+    name: str = ""
+    tensor: Optional[InlineTensor] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "PreparedTensor":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_PreparedTensor(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_PreparedTensor(self)
+
+
+class PreparedMetadata(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.PreparedMetadata: JSON object (unknown keys rejected)."""
+
+    name: str = ""
+    values: List[int] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "PreparedMetadata":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_PreparedMetadata(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_PreparedMetadata(self)
+
+
+class InlineTensor(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.InlineTensor: JSON object (unknown keys rejected)."""
+
+    dtype: str = ""
+    shape: List[int] = []
+    data: bytes = b""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "InlineTensor":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_InlineTensor(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_InlineTensor(self)
 
 
 class ImagesConfig(msgspec.Struct, kw_only=True, frozen=True):
@@ -787,6 +901,7 @@ class GetServerInfoResponse(msgspec.Struct, kw_only=True, frozen=True):
     skip_tokenizer_init: bool = False
     num_reserved_tokens: int = 0
     instance_id: str = ""
+    prepared_input_capabilities: List[PreparedInputCapability] = []
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GetServerInfoResponse":
@@ -796,6 +911,24 @@ class GetServerInfoResponse(msgspec.Struct, kw_only=True, frozen=True):
     def to_json_value(self) -> Dict[str, Any]:
         """Encode to a JSON-ready value (json.dumps-compatible)."""
         return encode_GetServerInfoResponse(self)
+
+
+class PreparedInputCapability(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.PreparedInputCapability: JSON object (unknown keys ignored)."""
+
+    profile: str = ""
+    max_inline_bytes: int = 0
+    processor_fingerprint: str = ""
+    transports: List[str] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "PreparedInputCapability":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_PreparedInputCapability(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_PreparedInputCapability(self)
 
 
 class DeploymentInfo(msgspec.Struct, kw_only=True, frozen=True):
@@ -1547,6 +1680,8 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
             kw["return_sampling_mask"] = None if x is None else decode_BoolOrList(x)
         elif key == "modalities":
             kw["modalities"] = None if x is None else decode_OptionalStringList(x)
+        elif key == "prepared_multimodal":
+            kw["prepared_multimodal"] = None if x is None else decode_PreparedMultimodalInput(x)
     return GenerateRequest(**kw)
 
 
@@ -1628,6 +1763,165 @@ def encode_GenerateRequest(v: GenerateRequest) -> Dict[str, Any]:
         d["return_sampling_mask"] = encode_BoolOrList(v.return_sampling_mask)
     if v.modalities is not None:
         d["modalities"] = encode_OptionalStringList(v.modalities)
+    if v.prepared_multimodal is not None:
+        d["prepared_multimodal"] = encode_PreparedMultimodalInput(v.prepared_multimodal)
+    return d
+
+
+_FIELDS_PreparedMultimodalInput = ("profile", "items", "processor_fingerprint",)
+
+
+def decode_PreparedMultimodalInput(value: Any) -> PreparedMultimodalInput:
+    m = _expect_map(value, expected="struct PreparedMultimodalInput")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "profile":
+            kw["profile"] = _expect_str(x, expected="a string")
+        elif key == "items":
+            kw["items"] = [] if x is None else [decode_PreparedMediaItem(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "processor_fingerprint":
+            kw["processor_fingerprint"] = _expect_str(x, expected="a string")
+        else:
+            raise _unknown_field(key, fields=_FIELDS_PreparedMultimodalInput)
+    return PreparedMultimodalInput(**kw)
+
+
+def encode_PreparedMultimodalInput(v: PreparedMultimodalInput) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["profile"] = v.profile
+    if v.items:
+        d["items"] = [encode_PreparedMediaItem(e) for e in v.items]
+    d["processor_fingerprint"] = v.processor_fingerprint
+    return d
+
+
+_FIELDS_PreparedMediaItem = ("modality", "tensors", "metadata", "spans",)
+
+
+def decode_PreparedMediaItem(value: Any) -> PreparedMediaItem:
+    m = _expect_map(value, expected="struct PreparedMediaItem")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "modality":
+            kw["modality"] = _expect_str(x, expected="a string")
+        elif key == "tensors":
+            kw["tensors"] = [] if x is None else [decode_PreparedTensor(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "metadata":
+            kw["metadata"] = [] if x is None else [decode_PreparedMetadata(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "spans":
+            kw["spans"] = [] if x is None else [decode_PreparedTokenSpan(e) for e in _expect_seq(x, expected="a sequence")]
+        else:
+            raise _unknown_field(key, fields=_FIELDS_PreparedMediaItem)
+    return PreparedMediaItem(**kw)
+
+
+def encode_PreparedMediaItem(v: PreparedMediaItem) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["modality"] = v.modality
+    if v.tensors:
+        d["tensors"] = [encode_PreparedTensor(e) for e in v.tensors]
+    if v.metadata:
+        d["metadata"] = [encode_PreparedMetadata(e) for e in v.metadata]
+    if v.spans:
+        d["spans"] = [encode_PreparedTokenSpan(e) for e in v.spans]
+    return d
+
+
+_FIELDS_PreparedTokenSpan = ("start", "end",)
+
+
+def decode_PreparedTokenSpan(value: Any) -> PreparedTokenSpan:
+    m = _expect_map(value, expected="struct PreparedTokenSpan")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "start":
+            kw["start"] = _expect_uint(x, expected="u32")
+        elif key == "end":
+            kw["end"] = _expect_uint(x, expected="u32")
+        else:
+            raise _unknown_field(key, fields=_FIELDS_PreparedTokenSpan)
+    return PreparedTokenSpan(**kw)
+
+
+def encode_PreparedTokenSpan(v: PreparedTokenSpan) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["start"] = v.start
+    d["end"] = v.end
+    return d
+
+
+_FIELDS_PreparedTensor = ("name", "tensor",)
+
+
+def decode_PreparedTensor(value: Any) -> PreparedTensor:
+    m = _expect_map(value, expected="struct PreparedTensor")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "name":
+            kw["name"] = _expect_str(x, expected="a string")
+        elif key == "tensor":
+            kw["tensor"] = None if x is None else decode_InlineTensor(x)
+        else:
+            raise _unknown_field(key, fields=_FIELDS_PreparedTensor)
+    return PreparedTensor(**kw)
+
+
+def encode_PreparedTensor(v: PreparedTensor) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["name"] = v.name
+    if v.tensor is not None:
+        d["tensor"] = encode_InlineTensor(v.tensor)
+    return d
+
+
+_FIELDS_PreparedMetadata = ("name", "values",)
+
+
+def decode_PreparedMetadata(value: Any) -> PreparedMetadata:
+    m = _expect_map(value, expected="struct PreparedMetadata")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "name":
+            kw["name"] = _expect_str(x, expected="a string")
+        elif key == "values":
+            kw["values"] = [] if x is None else [_expect_int(e, expected="i64") for e in _expect_seq(x, expected="a sequence")]
+        else:
+            raise _unknown_field(key, fields=_FIELDS_PreparedMetadata)
+    return PreparedMetadata(**kw)
+
+
+def encode_PreparedMetadata(v: PreparedMetadata) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["name"] = v.name
+    if v.values:
+        d["values"] = list(v.values)
+    return d
+
+
+_FIELDS_InlineTensor = ("dtype", "shape", "data",)
+
+
+def decode_InlineTensor(value: Any) -> InlineTensor:
+    m = _expect_map(value, expected="struct InlineTensor")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "dtype":
+            kw["dtype"] = _expect_str(x, expected="a string")
+        elif key == "shape":
+            kw["shape"] = [] if x is None else [_expect_uint(e, expected="u64") for e in _expect_seq(x, expected="a sequence")]
+        elif key == "data":
+            kw["data"] = _expect_bytes(x, expected="a base64 string")
+        else:
+            raise _unknown_field(key, fields=_FIELDS_InlineTensor)
+    return InlineTensor(**kw)
+
+
+def encode_InlineTensor(v: InlineTensor) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["dtype"] = v.dtype
+    if v.shape:
+        d["shape"] = list(v.shape)
+    d["data"] = base64.b64encode(v.data).decode("ascii")
     return d
 
 
@@ -2482,6 +2776,8 @@ def decode_GetServerInfoResponse(value: Any) -> GetServerInfoResponse:
             kw["num_reserved_tokens"] = _expect_uint(x, expected="u64")
         elif key == "instance_id":
             kw["instance_id"] = _expect_str(x, expected="a string")
+        elif key == "prepared_input_capabilities":
+            kw["prepared_input_capabilities"] = [] if x is None else [decode_PreparedInputCapability(e) for e in _expect_seq(x, expected="a sequence")]
     return GetServerInfoResponse(**kw)
 
 
@@ -2506,6 +2802,33 @@ def encode_GetServerInfoResponse(v: GetServerInfoResponse) -> Dict[str, Any]:
     d["skip_tokenizer_init"] = v.skip_tokenizer_init
     d["num_reserved_tokens"] = v.num_reserved_tokens
     d["instance_id"] = v.instance_id
+    if v.prepared_input_capabilities:
+        d["prepared_input_capabilities"] = [encode_PreparedInputCapability(e) for e in v.prepared_input_capabilities]
+    return d
+
+
+def decode_PreparedInputCapability(value: Any) -> PreparedInputCapability:
+    m = _expect_map(value, expected="struct PreparedInputCapability")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "profile":
+            kw["profile"] = _expect_str(x, expected="a string")
+        elif key == "max_inline_bytes":
+            kw["max_inline_bytes"] = _expect_uint(x, expected="u64")
+        elif key == "processor_fingerprint":
+            kw["processor_fingerprint"] = _expect_str(x, expected="a string")
+        elif key == "transports":
+            kw["transports"] = [] if x is None else [_expect_str(e, expected="a string") for e in _expect_seq(x, expected="a sequence")]
+    return PreparedInputCapability(**kw)
+
+
+def encode_PreparedInputCapability(v: PreparedInputCapability) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["profile"] = v.profile
+    d["max_inline_bytes"] = v.max_inline_bytes
+    d["processor_fingerprint"] = v.processor_fingerprint
+    if v.transports:
+        d["transports"] = list(v.transports)
     return d
 
 

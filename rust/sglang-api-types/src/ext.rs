@@ -61,3 +61,26 @@ impl From<Vec<i64>> for MatchedTokens {
         MatchedTokens { ids }
     }
 }
+
+/// The shared JSON contract encodes a protobuf bytes field as canonical padded
+/// base64, never a JSON integer array. gRPC keeps the binary protobuf field.
+pub(crate) fn encode_bytes(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+pub(crate) struct JsonBytes(pub Vec<u8>);
+
+impl<'de> serde::Deserialize<'de> for JsonBytes {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use base64::Engine;
+        let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&text)
+            .map_err(|_| serde::de::Error::custom("invalid base64 bytes"))?;
+        if encode_bytes(&bytes) != text {
+            return Err(serde::de::Error::custom("invalid base64 bytes"));
+        }
+        Ok(Self(bytes))
+    }
+}

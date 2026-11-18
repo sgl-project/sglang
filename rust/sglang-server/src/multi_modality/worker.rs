@@ -103,8 +103,19 @@ pub trait MmProcessor: Send + Sync {
     /// Reject a request's media before any of it is fetched, e.g. a modality
     /// the served model cannot encode. `Err` is a client error (400). Runs on
     /// an async worker, so it must not block.
-    fn check_media(&self, _mm: &MmData) -> Result<(), String> {
+    fn check_media(&self, mm: &MmData) -> Result<(), String> {
+        if mm.prepared.is_some() {
+            return Err("this processor does not support prepared multimodal inputs".into());
+        }
         Ok(())
+    }
+
+    /// Versioned public CPU-input profiles accepted by this installed processor.
+    /// Empty by default: adding the wire field cannot opt a processor in.
+    fn prepared_input_capabilities(
+        &self,
+    ) -> Vec<sglang_api_types::api::v1::PreparedInputCapability> {
+        Vec::new()
     }
 
     /// One I/O-backed source the processor already holds (e.g. in a cache),
@@ -177,10 +188,52 @@ pub trait MmProcessor: Send + Sync {
 /// request's resolved media bytes.
 struct ImageMmProcessor {
     pipeline: sglang_processor::MmProcessor,
+    prepared: Option<super::prepared::PreparedProfile>,
 }
 
 impl MmProcessor for ImageMmProcessor {
-    fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, MediaError> {
+    fn prepared_input_capabilities(
+        &self,
+    ) -> Vec<sglang_api_types::api::v1::PreparedInputCapability> {
+        self.prepared
+            .as_ref()
+            .and_then(|p| p.capability())
+            .into_iter()
+            .collect()
+    }
+
+    fn check_media(&self, mm: &MmData) -> Result<(), String> {
+        if let Some(input) = &mm.prepared {
+            if !mm.image_data.is_empty()
+                || !mm.video_data.is_empty()
+                || !mm.audio_data.is_empty()
+                || !mm.mm_hashes.is_empty()
+            {
+                return Err(
+                    "prepared inputs cannot be combined with raw media or mm_hashes".into(),
+                );
+            }
+            self.prepared
+                .as_ref()
+                .ok_or("unsupported prepared multimodal profile")?
+                .check(input)?;
+        }
+        Ok(())
+    }
+
+    fn process(&self, input_ids: TokenIds, mut mm: MmData) -> Result<MmProcessOutput, MediaError> {
+        self.check_media(&mm).map_err(MediaError::Client)?;
+        if let Some(input) = mm.prepared.take() {
+            let output = self
+                .prepared
+                .as_ref()
+                .ok_or_else(|| {
+                    MediaError::Client("unsupported prepared multimodal profile".into())
+                })?
+                .encode(&self.pipeline, input_ids, input)
+                .map_err(processor_error)?;
+            return encode_prepared_output(output).map_err(MediaError::Server);
+        }
         if !mm.video_data.is_empty() || !mm.audio_data.is_empty() {
             return Err(MediaError::Client(
                 "unsupported modality: video/audio input".into(),
@@ -202,11 +255,35 @@ impl MmProcessor for ImageMmProcessor {
     }
 }
 
+fn processor_error(error: sglang_processor::ProcessorError) -> MediaError {
+    match error {
+        sglang_processor::ProcessorError::Internal(message) => MediaError::Server(message),
+        error => MediaError::Client(error.to_string()),
+    }
+}
+
+/// Prepared inputs have no encoded-source routing hash. Compute the same
+/// typed-content identity used for cache equality, after the common adapter.
+/// Raw processing retains its existing source-byte routing hashes.
+pub(super) fn encode_prepared_output(output: MmOutput) -> Result<MmProcessOutput, String> {
+    let mut output = encode_output(output)?;
+    for item in &mut output.result.items {
+        let identity = item.cache_identity()?;
+        item.hash = u64::from_be_bytes(
+            identity[..8]
+                .try_into()
+                .map_err(|_| "invalid item identity")?,
+        );
+        item.identity = Some(identity);
+    }
+    Ok(output)
+}
+
 /// Map the pipeline's output straight onto the common encoded result: each
 /// feature tensor is moved with its own shape and dtype, the per-item span
 /// and hash ride along, and every auxiliary tensor is translated once into
 /// the sidecar's metadata form. Nothing is reconstructed from lengths.
-fn encode_output(output: MmOutput) -> Result<MmProcessOutput, String> {
+pub(super) fn encode_output(output: MmOutput) -> Result<MmProcessOutput, String> {
     let MmOutput {
         input_ids,
         items,
@@ -296,10 +373,11 @@ pub struct MmContext {
 
 impl MmContext {
     pub fn new(spec: MmSpec) -> Result<Self, String> {
+        let prepared = super::prepared::PreparedProfile::from_spec(&spec.pipeline);
         let pipeline =
             sglang_processor::MmProcessor::from_spec(spec.pipeline).map_err(|e| e.to_string())?;
         Ok(Self {
-            processor: Arc::new(ImageMmProcessor { pipeline }),
+            processor: Arc::new(ImageMmProcessor { pipeline, prepared }),
             feature_shm: spec.feature_shm,
             limits: None,
         })
@@ -403,9 +481,20 @@ fn make_buffers(entry: MmEncodedEntry, feature_shm: bool) -> Result<Vec<Buffer>,
 fn process(
     ctx: &MmContext,
     request: MmRequestInfo<'_>,
-    input_ids: TokenIds,
+    mut input_ids: TokenIds,
     mut mm: MmData,
 ) -> Result<(TokenIds, Vec<Buffer>), Error> {
+    if mm.prepared.is_some()
+        && let Some(limits) = &ctx.limits
+    {
+        // Truncating already-expanded ids would invalidate item spans and
+        // M-RoPE. Prepared requests always reject an oversized prompt.
+        let limits = Limits {
+            allow_auto_truncate: false,
+            ..limits.clone()
+        };
+        fit_input(&mut input_ids, &limits)?;
+    }
     let caller_hashes = std::mem::take(&mut mm.mm_hashes);
     let mut output = ctx
         .processor

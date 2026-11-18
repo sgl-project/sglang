@@ -127,6 +127,7 @@ pub fn into_requests(
         session_params,
         custom_logit_processor,
         return_sampling_mask,
+        prepared_multimodal,
         ..
     } = req;
     let rid = rid.and_then(wire::string_or_list);
@@ -148,6 +149,24 @@ pub fn into_requests(
     let bootstrap_room = bootstrap_room.and_then(wire::optional_int64_or_list);
     let bootstrap_pair_key = bootstrap_pair_key.and_then(wire::optional_string_or_list);
     let decode_tp_size = decode_tp_size.and_then(wire::optional_int64_or_list);
+    if prepared_multimodal.is_some()
+        && (text.is_some()
+            || !matches!(&input_ids, Some(OneOrMany::One(_)))
+            || image_data.is_some()
+            || video_data.is_some()
+            || audio_data.is_some()
+            || mm_hashes.is_some()
+            || bootstrap_host.is_some()
+            || bootstrap_port.is_some()
+            || bootstrap_room.is_some()
+            || bootstrap_pair_key.is_some()
+            || decode_tp_size.is_some()
+            || disagg_prefill_dp_rank.is_some())
+    {
+        return Err(Error::Validation(
+            "prepared_multimodal requires one expanded input_ids prompt without text, raw media, mm_hashes or disaggregation fields".into(),
+        ));
+    }
     let image_data = image_data.map(wire::media_input).transpose()?;
     let video_data = video_data.map(wire::media_input).transpose()?;
     let audio_data = audio_data.map(wire::media_input).transpose()?;
@@ -513,6 +532,12 @@ pub fn into_requests(
     if let Some(mm) = requests.first_mut().and_then(|req| req.mm.as_deref_mut()) {
         mm.mm_hashes = mm_hashes;
     }
+    if let Some(prepared) = prepared_multimodal {
+        let request = requests
+            .first_mut()
+            .ok_or_else(|| Error::Validation("prepared_multimodal requires one request".into()))?;
+        request.mm.get_or_insert_with(Default::default).prepared = Some(prepared);
+    }
     Ok((requests, is_batch))
 }
 
@@ -808,6 +833,8 @@ impl TryFrom<api_v1::KvHintsEnvelope> for KvHintsEnvelope {
 /// `prefetched` field, everything else gets it packed inside a `GenerateRequest`.
 #[derive(Debug, Default)]
 pub struct MmData {
+    /// Owned inline CPU tensors; mutually exclusive with raw media.
+    pub prepared: Option<api_v1::PreparedMultimodalInput>,
     pub image_data: Vec<MmItem>,
     pub video_data: Vec<MmItem>,
     pub audio_data: Vec<MmItem>,
@@ -855,7 +882,10 @@ impl GenerateRequest {
     /// Python `GenerateReqInput.contains_mm_input()`.
     pub fn has_multimodal(&self) -> bool {
         self.mm.as_ref().is_some_and(|mm| {
-            !mm.image_data.is_empty() || !mm.video_data.is_empty() || !mm.audio_data.is_empty()
+            mm.prepared.is_some()
+                || !mm.image_data.is_empty()
+                || !mm.video_data.is_empty()
+                || !mm.audio_data.is_empty()
         })
     }
 
@@ -1092,6 +1122,25 @@ mod tests {
             serde_json::from_str::<api_v1::GenerateRequest>(body).unwrap(),
             policy,
         )
+    }
+
+    #[test]
+    fn prepared_inputs_require_one_id_prompt_and_exclude_legacy_media() {
+        for body in [
+            r#"{"text":"hi","prepared_multimodal":{}}"#,
+            r#"{"input_ids":[[1]],"prepared_multimodal":{}}"#,
+            r#"{"input_ids":[1],"image_data":[],"prepared_multimodal":{}}"#,
+            r#"{"input_ids":[1],"mm_hashes":[],"prepared_multimodal":{}}"#,
+            r#"{"input_ids":[1],"bootstrap_room":123,"prepared_multimodal":{}}"#,
+        ] {
+            assert!(requests(body).is_err(), "{body}");
+        }
+        let (requests, is_batch) =
+            requests(r#"{"input_ids":[1],"prepared_multimodal":{"profile":"qwen_vl_image_v1"}}"#)
+                .unwrap();
+        assert!(!is_batch);
+        assert!(requests[0].has_multimodal());
+        assert!(requests[0].mm.as_ref().unwrap().prepared.is_some());
     }
 
     #[test]

@@ -114,6 +114,10 @@ def load_fixtures():
 # (choice -> regex); Python's SamplingParams never receives them.
 SCHEMA_ONLY_SAMPLING_FIELDS = frozenset({"choice"})
 
+# Native processor inputs are rejected by the Python HTTP contract gate;
+# they must not be forwarded to GenerateReqInput as constructor arguments.
+NATIVE_ONLY_REQUEST_FIELDS = frozenset({"prepared_multimodal"})
+
 
 class TestCrossLanguageFixtures(CustomTestCase):
     def test_fixtures_decode_to_their_canonical_bytes(self):
@@ -163,13 +167,11 @@ class TestHiCacheRequestParity(CustomTestCase):
 
 
 class TestRequestFieldParity(CustomTestCase):
-    def test_schema_request_fields_are_a_subset_of_the_dataclass(self):
-        """Every schema field is a `GenerateReqInput` field, so a schema body
-        constructs the dataclass as-is, and the dataclass-only fields are
-        exactly the pinned list."""
+    def test_schema_request_fields_match_the_dataclass_and_native_only_fields(self):
+        """Pin both adapters' supported fields and explicit native-only inputs."""
         schema = set(GenerateRequest.__struct_fields__)
         dataclass_fields = {f.name for f in dataclasses.fields(GenerateReqInput)}
-        self.assertEqual(schema - dataclass_fields, set())
+        self.assertEqual(schema - dataclass_fields, NATIVE_ONLY_REQUEST_FIELDS)
         self.assertEqual(dataclass_fields - schema, PYTHON_ONLY_REQUEST_FIELDS)
 
     def test_schema_sampling_fields_match_the_python_api(self):

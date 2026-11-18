@@ -154,6 +154,27 @@ message GetServerInfoResponse {
   // `PortArgs.instance_id` (shared IPC/load snapshot namespace). Not a
   // cluster-wide epoch, health check, or request-cleanup proof.
   string instance_id = 16;
+  // Populated only by a compatible installed processor in unified serving.
+  // Clients must check this before sending prepared_multimodal: old protobuf
+  // servers can ignore unknown request fields.
+  repeated PreparedInputCapability prepared_input_capabilities = 17;
+}
+
+message PreparedInputCapability {
+  string profile = 1;
+  // Model geometry belongs to the resolved processor assets, not the
+  // transport capability. Do not reuse the draft's former model fields.
+  reserved 2 to 5;
+  reserved "image_token_id", "patch_size", "merge_size", "temporal_patch_size";
+  // Whole-request inline tensor bytes; transport limits may be smaller.
+  uint64 max_inline_bytes = 6;
+  // Opaque SHA-256 fingerprint of the versioned, resolved processor spec.
+  // Stable for the same spec, independent of an engine's boot instance_id.
+  // A matching value is negotiation, not proof of caller preprocessing quality.
+  string processor_fingerprint = 7;
+  // Byte sources supported by this installed profile; only "inline" today.
+  // A future shared-memory transport uses the same tensor/profile contract.
+  repeated string transports = 8;
 }
 
 message DeploymentInfo {

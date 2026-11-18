@@ -436,6 +436,76 @@ pub struct GenerateRequest {
     pub return_sampling_mask: ::core::option::Option<BoolOrList>,
     #[prost(message, optional, tag = "40")]
     pub modalities: ::core::option::Option<OptionalStringList>,
+    /// Native Rust image ingress. Requires a profile advertised by GetServerInfo,
+    /// one already-expanded input_ids prompt and no raw media.
+    /// An absent capability means unsupported.
+    #[prost(message, optional, tag = "41")]
+    pub prepared_multimodal: ::core::option::Option<PreparedMultimodalInput>,
+}
+/// CPU processor output, not post-encoder embeddings. Model-specific meaning
+/// belongs to the versioned profile; there are no deployment-specific handles.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PreparedMultimodalInput {
+    #[prost(string, tag = "1")]
+    pub profile: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub items: ::prost::alloc::vec::Vec<PreparedMediaItem>,
+    /// Must match the selected GetServerInfo capability. Binds the request to
+    /// the resolved processor configuration, not just a model-family name.
+    #[prost(string, tag = "3")]
+    pub processor_fingerprint: ::prost::alloc::string::String,
+}
+/// Common transport envelope, not a claim that model processor outputs are
+/// interchangeable. Each profile defines the allowed tensor/metadata names,
+/// dtypes, shapes and token alignment. Unknown names must be rejected.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PreparedMediaItem {
+    /// qwen_vl_image_v1 accepts "image" only.
+    #[prost(string, tag = "1")]
+    pub modality: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub tensors: ::prost::alloc::vec::Vec<PreparedTensor>,
+    #[prost(message, repeated, tag = "3")]
+    pub metadata: ::prost::alloc::vec::Vec<PreparedMetadata>,
+    /// Half-open spans in expanded input_ids. A profile defines whether an item
+    /// can occupy multiple ranges; qwen_vl_image_v1 requires exactly one.
+    #[prost(message, repeated, tag = "4")]
+    pub spans: ::prost::alloc::vec::Vec<PreparedTokenSpan>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PreparedTokenSpan {
+    #[prost(uint32, tag = "1")]
+    pub start: u32,
+    #[prost(uint32, tag = "2")]
+    pub end: u32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PreparedTensor {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub tensor: ::core::option::Option<InlineTensor>,
+}
+/// Small model-specific integer metadata, such as an image grid or crop counts.
+/// Float/bool data, including masks, belong in typed tensors when a future
+/// profile supports them; opaque JSON and private transport handles do not.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PreparedMetadata {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(int64, repeated, tag = "2")]
+    pub values: ::prost::alloc::vec::Vec<i64>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InlineTensor {
+    /// qwen_vl_image_v1 accepts only float32, little-endian, dense row-major.
+    #[prost(string, tag = "1")]
+    pub dtype: ::prost::alloc::string::String,
+    #[prost(uint64, repeated, tag = "2")]
+    pub shape: ::prost::alloc::vec::Vec<u64>,
+    /// Binary on gRPC; standard padded base64 in the shared JSON contract.
+    #[prost(bytes = "vec", tag = "3")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
 }
 /// Per-request Unlimited-OCR options. The processor owns mode validation and
 /// defaults: an absent image_mode uses "gundam", an empty prefix adds no tokens.
@@ -969,6 +1039,28 @@ pub struct GetServerInfoResponse {
     /// cluster-wide epoch, health check, or request-cleanup proof.
     #[prost(string, tag = "16")]
     pub instance_id: ::prost::alloc::string::String,
+    /// Populated only by a compatible installed processor in unified serving.
+    /// Clients must check this before sending prepared_multimodal: old protobuf
+    /// servers can ignore unknown request fields.
+    #[prost(message, repeated, tag = "17")]
+    pub prepared_input_capabilities: ::prost::alloc::vec::Vec<PreparedInputCapability>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PreparedInputCapability {
+    #[prost(string, tag = "1")]
+    pub profile: ::prost::alloc::string::String,
+    /// Whole-request inline tensor bytes; transport limits may be smaller.
+    #[prost(uint64, tag = "6")]
+    pub max_inline_bytes: u64,
+    /// Opaque SHA-256 fingerprint of the versioned, resolved processor spec.
+    /// Stable for the same spec, independent of an engine's boot instance_id.
+    /// A matching value is negotiation, not proof of caller preprocessing quality.
+    #[prost(string, tag = "7")]
+    pub processor_fingerprint: ::prost::alloc::string::String,
+    /// Byte sources supported by this installed profile; only "inline" today.
+    /// A future shared-memory transport uses the same tensor/profile contract.
+    #[prost(string, repeated, tag = "8")]
+    pub transports: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DeploymentInfo {

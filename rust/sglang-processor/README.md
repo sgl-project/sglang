@@ -24,7 +24,7 @@ src/
   render/          chat request -> prompt
     models/        model-specific SGLang code
     legacy/        conversation.py templates
-  mm/              image bytes + prompt ids -> model inputs
+  mm/              image bytes + prompt ids -> model inputs; prepared.rs structural tensor contract
   parser/          engine output -> chat events
   deepseek_output.rs  DeepSeek-V4 / V4.1 output ids -> reasoning, content, tool calls
   openai/          OpenAI requests over /generate
@@ -156,6 +156,8 @@ template override with the same checkpoint tokenizer.
 ```rust
 MmProcessor::from_spec(ProcessorSpec) -> Result<MmProcessor, ProcessorError>
 MmProcessor::process(input_ids, images: &[&[u8]]) -> Result<MmOutput, ProcessorError>
+MmProcessor::finish_prepared(&CheckedPreparedInput, Vec<ProcessedItem>)
+    -> Result<MmOutput, ProcessorError>
 ```
 
 `from_spec` builds Dynamo's family processor from a spec SGLang resolved from
@@ -170,7 +172,17 @@ named aux tensors per image, the inclusive item offsets, and the positions. It
 takes prompt ids, not text, and it fetches nothing: tokenizing, fetching and the
 prompt length ceiling stay with the host. Dynamo is built without its `parallel`
 and `fetch` features, so `process` spawns no threads
-(`tests/mm_single_thread.rs`).
+(`tests/mm_single_thread.rs`). The raw encoded-image path is unchanged.
+
+`finish_prepared` is the generic completion bridge for already-expanded prepared
+ids plus canonical `ProcessedItem` values from the installed profile. It checks
+item count, Image-only representation, single feature spans, modality vs input
+and family capabilities, and span/`feature_token_count` alignment; builds
+inclusive offsets; calls the installed `positions`; and returns `MmOutput` with
+`hash = 0` (no encoded-source bytes — the host owns typed-content cache
+identity). It does not re-run `layout` / `apply_layout`. The profile caller must
+finish model-semantic validation before calling it; this is not a universal
+external-tensor admission hook.
 
 Families: Qwen-VL (Qwen2-VL, Qwen2.5-VL, Qwen3-VL (+MoE), Qwen3.5 (+MoE)).
 The only SGLang step is in `mod.rs`, mirroring `utils/common.py::_load_image`:
@@ -178,6 +190,30 @@ decode without an EXIF transpose, under PIL's decompression-bomb limit.
 
 To add a family, Dynamo implements its `process_item` and `ProcessorSpec` arm,
 SGLang's Python gate resolves its spec, and a parity fixture checks it.
+
+### prepared structural contract
+
+`mm::prepared` (re-exported as `sglang_processor::prepared`) provides
+transport-independent structural validation and native tensor decoding; the
+generic completion bridge lives on `MmProcessor::finish_prepared`:
+
+```rust
+PreparedInput::check(expected_profile, expected_fingerprint, &PreparedLimits)
+    -> Result<CheckedPreparedInput, ProcessorError>
+CheckedPreparedInput::decode_tensors(item_index) -> Result<NamedTensors, ProcessorError>
+MmProcessor::finish_prepared(&CheckedPreparedInput, Vec<ProcessedItem>)
+    -> Result<MmOutput, ProcessorError>
+```
+
+`check` validates profile/fingerprint equality, budgets, shape/byte consistency,
+names, and span geometry only. `decode_tensors` converts one item's checked
+little-endian payloads into native `Tensor` / `TensorData`. Passing `check` does
+**not** admit a profile or modality for serving. Profile-owned semantic import
+validation stays outside this module; the structural library and generic
+completion bridge exist, but no automatic prepared serving support is granted.
+Wire ingress stays with
+[#50701](https://github.com/sgl-project/sglang/pull/50701). Tests live in
+`tests/prepared_inputs.rs`.
 
 **Parity.** Each `tests/fixtures/mm_parity/<model>.json` holds cases that
 SGLang's Python CPU path processed, each with the spec SGLang's gate resolved

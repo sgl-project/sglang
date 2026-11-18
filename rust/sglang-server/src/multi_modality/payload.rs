@@ -48,7 +48,13 @@ fn resolve_media_work_with_budget(
         prefetched,
         mm_hashes: _,
         admission: _,
+        prepared,
     } = mm;
+    if prepared.is_some() {
+        return Err(MediaError::Client(
+            "prepared inputs cannot enter the raw media resolver".into(),
+        ));
+    }
     let mut prefetched = prefetched.into_iter();
     let budget = ByteBudget::new(max_request_bytes);
     let (images, image_hints) = collect_media(image_data, &mut prefetched, "image_data", &budget)?;
