@@ -60,11 +60,6 @@ on:
         required: false
         type: string
         default: ''
-      accuracy_variant:
-        description: 'Force the DCP/PCP variant of multi-node accuracy cases. Empty or "auto" rotates by the Beijing date recorded at run start.'
-        required: false
-        type: string
-        default: ''
 concurrency:
   group: nightly-test-npu-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
@@ -78,7 +73,6 @@ jobs:
       image_a5: ${{ steps.set-vars.outputs.image_a5 }}
       run_start_metadata: ${{ steps.set-vars.outputs.run_start_metadata }}
       accuracy_dataset: ${{ steps.set-vars.outputs.accuracy_dataset }}
-      accuracy_variant: ${{ steps.set-vars.outputs.accuracy_variant }}
     steps:
       # When triggered by PR, no inputs parameters are used. The latest community code is tested by default.
       - name: Set image config
@@ -115,7 +109,7 @@ jobs:
           BRANCH_LABEL="$(echo "${BRANCH_LABEL}" | tr -cd 'a-zA-Z0-9._/:' | tr '/:' '--')"
           # Package run metadata (branch/workflow/create_time) as a single JSON for reuse by all
           # test jobs; create_time is UTC+8 date + time (minute precision) recorded once at run
-          # start, shared even across midnight. The same timestamp selects the DCP/PCP variant.
+          # start, shared even across midnight.
           BEIJING_CREATE_TIME="$(TZ=Asia/Shanghai date +%Y%m%d-%H%M)"
           RUN_START_METADATA="$(python3 -c "import json,sys; print(json.dumps({'branch_label':sys.argv[1],'workflow_name':sys.argv[2],'create_time':sys.argv[3]}))" "$BRANCH_LABEL" "${{ github.workflow }}" "${BEIJING_CREATE_TIME}")"
           # Write to GITHUB_OUTPUT and print to the log in one command.
@@ -143,27 +137,6 @@ jobs:
               ;;
           esac
           echo "accuracy_dataset=${ACCURACY_DATASET}" | tee -a $GITHUB_OUTPUT
-          # Select once at run start so every pod in a multi-node case uses the
-          # same variant, even when the pods start on opposite sides of midnight.
-          ACCURACY_VARIANT_INPUT="${{ inputs.accuracy_variant }}"
-          case "${ACCURACY_VARIANT_INPUT}" in
-            dcp|pcp)
-              ACCURACY_VARIANT="${ACCURACY_VARIANT_INPUT}"
-              ;;
-            ""|auto)
-              BEIJING_DAY="${BEIJING_CREATE_TIME:6:2}"
-              if [ "$((10#${BEIJING_DAY} % 2))" -eq 1 ]; then
-                ACCURACY_VARIANT="dcp"
-              else
-                ACCURACY_VARIANT="pcp"
-              fi
-              ;;
-            *)
-              echo "Unsupported accuracy_variant: ${ACCURACY_VARIANT_INPUT}"
-              exit 1
-              ;;
-          esac
-          echo "accuracy_variant=${ACCURACY_VARIANT}" | tee -a $GITHUB_OUTPUT
 
   nightly-1-npu-a3:
     name: nightly-1-npu-a3
@@ -461,7 +434,6 @@ jobs:
       transformers_version: ''
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
       accuracy_dataset: ${{ matrix.test_config.test_type == 'accuracy' && needs.set-image-config.outputs.accuracy_dataset || '' }}
-      accuracy_variant: ${{ matrix.test_config.test_type == 'accuracy' && needs.set-image-config.outputs.accuracy_variant || '' }}
       sgl_router_artifact: ${{ needs.sgl-router-build-aarch64.outputs.artifact_name }}
 
   nightly-poc-multi-node-mix-tests:
@@ -503,7 +475,6 @@ jobs:
       transformers_version: ''
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
       accuracy_dataset: ${{ matrix.test_config.test_type == 'accuracy' && needs.set-image-config.outputs.accuracy_dataset || '' }}
-      accuracy_variant: ${{ matrix.test_config.test_type == 'accuracy' && needs.set-image-config.outputs.accuracy_variant || '' }}
 
   check-all-jobs:
     if: ${{ !cancelled() }}

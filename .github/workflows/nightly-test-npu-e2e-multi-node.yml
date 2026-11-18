@@ -74,11 +74,6 @@ on:
         type: string
         default: ''
         description: 'Accuracy dataset injected into pods as NPU_ACCURACY_DATASET (gsm8k on weekdays, gpqa_diamond on weekends)'
-      accuracy_variant:
-        required: false
-        type: string
-        default: ''
-        description: 'DCP/PCP variant injected into pods as NPU_ACCURACY_VARIANT; empty keeps per-case selection'
       use_image_sglang:
         required: false
         type: string
@@ -312,15 +307,6 @@ jobs:
           esac
           if [ -n "${accuracy_dataset}" ]; then
             CMD="${CMD} --accuracy-dataset ${accuracy_dataset}"
-          fi
-
-          accuracy_variant="${{ inputs.accuracy_variant }}"
-          case "${accuracy_variant}" in
-            ""|dcp|pcp) ;;
-            *) echo "Unsupported accuracy variant: ${accuracy_variant}"; exit 1 ;;
-          esac
-          if [ -n "${accuracy_variant}" ]; then
-            CMD="${CMD} --accuracy-variant ${accuracy_variant}"
           fi
 
           use_image_sglang="${{ inputs.use_image_sglang }}"

@@ -8,6 +8,7 @@ import string
 import subprocess
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import psutil
 import yaml
@@ -643,7 +644,6 @@ def run_npu_e2e_test_case(
     run_id: str = "",
     container_patches: str = "",
     accuracy_dataset: str = "",
-    accuracy_variant: str = "",
     use_image_sglang: str = "false",
     test_method: str = "",
 ):
@@ -664,11 +664,14 @@ def run_npu_e2e_test_case(
             isolation when multiple runs share the same k8s namespace.
         accuracy_dataset (str): dataset name injected into multi-node pods as
             NPU_ACCURACY_DATASET (gsm8k on weekdays, gpqa_diamond on weekends).
-        accuracy_variant (str): DCP/PCP variant injected into multi-node pods as
-            NPU_ACCURACY_VARIANT; empty keeps per-case selection.
         test_method (str): single unittest method ("Class.method") injected into
             pods as NPU_TEST_METHOD; empty runs every test in test_case.
     """
+    # Select once per launcher run so every pod uses the same variant across midnight.
+    beijing_day = datetime.now(timezone(timedelta(hours=8))).day
+    accuracy_variant = "dcp" if beijing_day % 2 else "pcp"
+    logger.info(f"[accuracy-variant] Beijing day={beijing_day}: {accuracy_variant}")
+
     random_str = get_unique_random_string(16, True)
 
     kube_config_map = f"sglang-configmap-{random_str}"
@@ -1006,16 +1009,6 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--accuracy-variant",
-        type=str,
-        required=False,
-        default="",
-        choices=["", "dcp", "pcp"],
-        help="DCP/PCP variant injected into multi-node pods as "
-        "NPU_ACCURACY_VARIANT; empty keeps per-case selection.",
-    )
-
-    parser.add_argument(
         "--use-image-sglang",
         type=str,
         required=False,
@@ -1052,7 +1045,6 @@ if __name__ == "__main__":
     run_id = args.run_id
     container_patches = args.container_patches
     accuracy_dataset = args.accuracy_dataset
-    accuracy_variant = args.accuracy_variant
     use_image_sglang = args.use_image_sglang
     test_method = args.test_method
 
@@ -1086,7 +1078,6 @@ if __name__ == "__main__":
         run_id=run_id,
         container_patches=container_patches,
         accuracy_dataset=accuracy_dataset,
-        accuracy_variant=accuracy_variant,
         use_image_sglang=use_image_sglang,
         test_method=test_method,
     )
