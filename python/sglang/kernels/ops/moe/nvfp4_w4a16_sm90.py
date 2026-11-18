@@ -26,6 +26,8 @@ if TYPE_CHECKING:
 _VARIANTS = {"auto": 0, "single": 1, "pair": 2}
 # "auto" runs a decode kernel up to this many tokens; at 3 and 4 tokens the grouped kernels stay.
 DECODE_MAX_TOKENS = 2
+# Per device: its SM count, read once (decode_pdl's CTA cap under "auto").
+_sm_counts: dict = {}
 # Per device and stream: the one-launch decode kernel's workspace (its call epoch, then its tagged intermediate).
 _fused_ws: dict = {}
 
@@ -113,6 +115,27 @@ def _decode_variant(T: int, R: int, E: int, H: int, I: int) -> str:
     return "decode_fused" if _decode_fused_fits(T, H, I) else "auto"
 
 
+def _decode_ctas(variant: str, T: int, dev: torch.device) -> int:
+    """The CTA count "auto" launches its decode kernel with (0: one CTA per SM). decode_pdl at 1 token takes three
+    quarters of the SMs (99 of 132 on H100). Each of its CTAs reserves almost all of an SM's shared memory for the
+    whole call, so with every SM taken, a shared expert that SGLang runs on a second stream beside the routed experts
+    (GLM-5.3, Qwen3.6, GLM-5.3-Flash, Qwen3.8) waits for the routed experts to finish: at GLM-5.3 TP8 that cost 6us per
+    layer in the server. With a quarter of the SMs left free, the shared GEMMs run beside it (H100, ten-layer CUDA
+    graph with each model's shared expert on a second stream, bench/decode/chain2.py): GLM-5.3 TP8 40.1 to 32.9us
+    per layer, Marlin 33.8us. Without a shared expert the cap costs 0.3us at Qwen3-30B and 1.4us at GLM-5.3. At 2
+    tokens the capped launch moves GEMM2 to more or smaller pieces per CTA and loses up to 15us at GLM-5.3-Flash TP4,
+    so 2 tokens keep one CTA per SM. decode_fused stays on every SM: next to DeepSeek's shared expert it is still the
+    fastest uncapped, and every cap from 84 to 124 CTAs measured slower."""
+    if variant != "decode_pdl" or T != 1:
+        return 0
+    sms = _sm_counts.get(dev.index)
+    if sms is None:
+        sms = _sm_counts[dev.index] = torch.cuda.get_device_properties(
+            dev
+        ).multi_processor_count
+    return sms - sms // 4
+
+
 def nvfp4_w4a16_sm90_moe(
     x: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -129,10 +152,12 @@ def nvfp4_w4a16_sm90_moe(
     local routes (ids in [0, E); other ranks' routes are -1 or any id outside it), into ``out`` [T, H] when given.
     Without: the per-route outputs [T * top_k, H] (row t * top_k + k, zeros for non-local routes), into ``out`` when
     given.
-    x is BF16 [T, H] in natural column order, topk_ids int32 [T, top_k]. With swiglu_limit L, the expert computes
+    x is BF16 [T, H] in natural column order, topk_ids int32 [T, top_k] with distinct local ids per token (the
+    decode kernels assume it and SGLang's routers guarantee it). With swiglu_limit L, the expert computes
     SiLU(min(gate, L)) * clamp(up, -L, L), as SGLang's other MoE paths do for that config field. variant ("auto",
     "single", "pair", "decode_fused" or "decode_pdl") and ctas pin the kernel for tests; "auto" takes a decode kernel
-    up to DECODE_MAX_TOKENS tokens when the padded width is whole 128-column blocks."""
+    up to DECODE_MAX_TOKENS tokens when the padded width is whole 128-column blocks, with the CTA count of
+    _decode_ctas unless ctas is given."""
     T, H = x.shape
     R = T * topk_ids.shape[1]
     E, I = experts.gs13.shape[0], experts.padded
@@ -141,6 +166,8 @@ def nvfp4_w4a16_sm90_moe(
     lim = float(swiglu_limit) if swiglu_limit and swiglu_limit > 0 else math.inf
     if variant == "auto":
         variant = _decode_variant(T, R, E, H, I)
+        if ctas == 0:
+            ctas = _decode_ctas(variant, T, dev)
     if variant in ("decode_fused", "decode_pdl"):
         if topk_weights is None:
             y = (

@@ -737,13 +737,13 @@ def test_decode_routing_kinds(variant, kind, remote):
         _check("qwen3_30b", T, kind=kind, remote=remote, variant=variant)
 
 
-@pytest.mark.parametrize("variant", ["decode_fused", "decode_pdl"])
+@pytest.mark.parametrize("variant", ["decode_fused", "decode_pdl", "auto"])
 def test_decode_weighted_sum_repeat_and_graph(variant):
     """The weighted sum against the reference, then a CUDA graph replayed with new routings: every result must match
     the reference and an eager call bitwise. Eager calls, warm-up and capture share one stream, so the graph runs on
-    the eager calls' live epoch, which must advance by one per call, replays included. Fails on: an epoch that does
-    not advance (a later call takes an earlier call's words), weights or scales staged from the wrong route or slot, a
-    host-side routing decision."""
+    the eager calls' live epoch, which must advance by one per call, replays included. auto covers decode_pdl captured
+    with its 1-token CTA cap. Fails on: an epoch that does not advance (a later call takes an earlier call's words),
+    weights or scales staged from the wrong route or slot, a host-side routing decision."""
     import sglang.kernels.ops.moe.nvfp4_w4a16_sm90 as op
 
     H, I, E, Eg, topk = SHAPES["qwen3_30b"]
@@ -821,6 +821,67 @@ def test_decode_dispatch():
             variant=op._decode_variant(2, 2 * topk, E, H, I),
         )
         assert torch.equal(a, b)
+
+
+def test_decode_dispatch_caps_decode_pdl_at_one_token(monkeypatch):
+    """auto launches decode_pdl at 1 token on three quarters of the SMs, so a shared expert on a second stream keeps
+    SMs to run on, and every other decode launch (decode_pdl at 2 tokens, decode_fused) on every SM; a pinned variant
+    keeps the ctas it is given. The capped launch gives the same result as decode_pdl pinned to that CTA count. Fails
+    on: auto launching decode_pdl on every SM at 1 token (the 6us per layer loss next to GLM-5.3's shared expert), a
+    cap that leaks into 2 tokens or into decode_fused, or into a pinned call."""
+    import sglang.kernels.ops.moe.nvfp4_w4a16_sm90 as op
+
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    cap = sms - sms // 4
+    real = op._module
+    seen = []
+
+    class Spy:
+        def __init__(self, m):
+            self.m = m
+
+        def __getattr__(self, k):
+            return getattr(self.m, k)
+
+        def run_decode_pdl(self, *a):
+            seen.append(("decode_pdl", a[-1]))
+            return self.m.run_decode_pdl(*a)
+
+        def run_decode_fused(self, *a):
+            seen.append(("decode_fused", a[-1]))
+            return self.m.run_decode_fused(*a)
+
+    monkeypatch.setattr(op, "_module", lambda d=0: Spy(real(d)))
+    outs = {}
+    for shape in ("qwen3_30b", "deepseek_ep8"):
+        H, I, E, Eg, topk = SHAPES[shape]
+        ck, experts = _layer(shape)
+        for T in (1, 2):
+            x = torch.randn((T, H), device="cuda").bfloat16()
+            ids = _routing(T, topk, E, Eg, seed=13)
+            w = torch.rand((T, topk), device="cuda")
+            outs[(shape, T)] = (
+                nvfp4_w4a16_sm90_moe(x, ids, experts, topk_weights=w),
+                x,
+                ids,
+                w,
+                experts,
+            )
+    assert seen == [
+        ("decode_pdl", cap),
+        ("decode_pdl", 0),
+        ("decode_fused", 0),
+        ("decode_fused", 0),
+    ], seen
+    seen.clear()
+    auto, x, ids, w, experts = outs[("qwen3_30b", 1)]
+    pinned = nvfp4_w4a16_sm90_moe(
+        x, ids, experts, topk_weights=w, variant="decode_pdl", ctas=cap
+    )
+    nvfp4_w4a16_sm90_moe(x, ids, experts, topk_weights=w, variant="decode_pdl")
+    nvfp4_w4a16_sm90_moe(x, ids, experts, topk_weights=w, ctas=sms)
+    assert seen == [("decode_pdl", cap), ("decode_pdl", 0), ("decode_pdl", sms)], seen
+    assert torch.equal(auto, pinned)
 
 
 # ---- the decode kernels with swiglu_limit, and widths that end on a half block ----
@@ -967,6 +1028,7 @@ def test_decode_dispatch_half_blocks_and_clamp(shape, T):
         (T, topk), device="cuda"
     )  # the weighted sum: deterministic on every kernel
     a = nvfp4_w4a16_sm90_moe(x, ids, experts, topk_weights=w, swiglu_limit=1.0)
+    # Pin auto's CTA count, because GEMM2 splits its K range by grid size and another count sums in another order.
     b = nvfp4_w4a16_sm90_moe(
         x,
         ids,
@@ -974,6 +1036,7 @@ def test_decode_dispatch_half_blocks_and_clamp(shape, T):
         topk_weights=w,
         swiglu_limit=1.0,
         variant="single" if pick == "auto" else pick,
+        ctas=op._decode_ctas(pick, T, x.device),
     )
     assert torch.equal(a, b)
 
