@@ -468,13 +468,13 @@ def test_f_b_non_positive_slots_do_not_modify_caches() -> None:
 def test_fused_kda_backend_is_opt_in():
     from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
 
-    field = envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND
+    field = envs.SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND
     with field.override(None):
         field.clear()
         assert not kda_fused_decode_aiter_hip.enabled()
-    with envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("gfx950"):
+    with envs.SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND.override("gfx950"):
         assert not kda_fused_decode_aiter_hip.enabled()
-    with envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("aiter"):
+    with envs.SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND.override("aiter"):
         assert kda_fused_decode_aiter_hip.enabled()
 
 
@@ -487,9 +487,9 @@ def select_fused_backend():
 
         def select(source: str):
             stack.enter_context(
-                envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("aiter")
+                envs.SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND.override("aiter")
             )
-            stack.enter_context(envs.SGLANG_USE_HIP_K3_FLYDSL_SOURCE.override(source))
+            stack.enter_context(envs.SGLANG_OPT_HIP_K3_FLYDSL_SOURCE.override(source))
             return kda_fused_decode_aiter_hip
 
         yield select
@@ -545,7 +545,7 @@ def fresh_binding():
 
 @_requires_aiter_kda
 def test_aiter_source_binds_the_aiter_kda_decode(select_fused_backend) -> None:
-    """SGLANG_USE_HIP_K3_FLYDSL_SOURCE=aiter must call the kernel ROCm/aiter#6026 publishes."""
+    """SGLANG_OPT_HIP_K3_FLYDSL_SOURCE=aiter must call the kernel ROCm/aiter#6026 publishes."""
     from aiter.ops.flydsl import linear_attention_kernels as aiter_kernels
 
     adapter = select_fused_backend("aiter")

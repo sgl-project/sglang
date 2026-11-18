@@ -2,7 +2,7 @@
 """HIP Kimi-K3 fused KDA decode for gfx950 (MI350X / MI355X).
 
 Same fail-closed interface as ``kda_fused_decode_aiter_hip``: it serves
-``SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND=gfx950`` (the default on ROCm), and inputs
+``SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND=gfx950`` (the default on ROCm), and inputs
 it does not cover keep the unfused KDA decode. The kernel is
 ``attention.kda_decode_gfx950`` (``KernelBackend.KDA``), implemented in
 ``sglang.kernels.kda_kernels.kda_decode_gfx950``.
@@ -24,7 +24,7 @@ _CHANNELS = 3 * _HEADS * _DIM
 
 
 def enabled() -> bool:
-    return envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.get().lower() == "gfx950"
+    return envs.SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND.get().lower() == "gfx950"
 
 
 def _runs_here() -> bool:

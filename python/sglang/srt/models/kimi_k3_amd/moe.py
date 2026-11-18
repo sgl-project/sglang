@@ -128,7 +128,7 @@ class KimiK3MoEHipMixin:
     _row_front_on = False
     _row_front_out: Optional[tuple] = None
     # Set by link_row_sharded_stream_hip when every later layer reads a stream
-    # left on row shards (SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM, PP1).
+    # left on row shards (SGLANG_OPT_HIP_K3_ROW_SHARDED_STREAM, PP1).
     _row_stream = False
 
     def _prepare_hip_paths(self) -> None:
@@ -389,9 +389,9 @@ class KimiK3MoEHipMixin:
         """Post-load on gfx950: turn on shard_front, which runs the MoE front (router
         top-k, latent down-proj) on this rank's rows on top of the row-sharded tail,
         the shared experts TP-sharded on the all-gathered normed input
-        (SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT)."""
+        (SGLANG_OPT_HIP_K3_ROW_SHARDED_ROUTED_FRONT)."""
         if not (
-            envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT.get()
+            envs.SGLANG_OPT_HIP_K3_ROW_SHARDED_ROUTED_FRONT.get()
             and _is_gfx95
             and self.tp_size > 1
             and self._eligible_for_fused_front
@@ -683,8 +683,8 @@ def ffn_row_shards_hip(layer) -> Optional[Callable[[int], bool]]:
 def _row_sharded_switch_on() -> bool:
     """Either opt-in gfx950 row-sharded switch: the routed front or the stream."""
     return (
-        envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT.get()
-        or envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get()
+        envs.SGLANG_OPT_HIP_K3_ROW_SHARDED_ROUTED_FRONT.get()
+        or envs.SGLANG_OPT_HIP_K3_ROW_SHARDED_STREAM.get()
     )
 
 
@@ -743,7 +743,7 @@ def link_row_sharded_stream_hip(model) -> None:
     when every later layer reads it there (its FFN takes the row-sharded read)
     and no pipeline stage boundary follows: a dense layer or a PP send would
     read every row of the stream and of the bank, which the shard left stale."""
-    if not envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get():
+    if not envs.SGLANG_OPT_HIP_K3_ROW_SHARDED_STREAM.get():
         return
     if get_parallel().pp_size > 1:
         return

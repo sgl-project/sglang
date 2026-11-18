@@ -35,14 +35,14 @@ class _Kernel(NamedTuple):
 
 
 def enabled() -> bool:
-    return envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.get().lower() == "aiter"
+    return envs.SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND.get().lower() == "aiter"
 
 
 def _flydsl_source() -> str:
-    source = envs.SGLANG_USE_HIP_K3_FLYDSL_SOURCE.get().lower()
+    source = envs.SGLANG_OPT_HIP_K3_FLYDSL_SOURCE.get().lower()
     if source not in ("auto", "sglang", "aiter"):
         raise ValueError(
-            "SGLANG_USE_HIP_K3_FLYDSL_SOURCE must be one of auto, sglang, or aiter"
+            "SGLANG_OPT_HIP_K3_FLYDSL_SOURCE must be one of auto, sglang, or aiter"
         )
     return source
 

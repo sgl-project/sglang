@@ -1091,9 +1091,13 @@ class Envs:
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
     # Kimi-K3 gfx950 prefill: the MoE front on row shards, shared experts TP-sharded
-    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT = EnvBool(False)
+    SGLANG_OPT_HIP_K3_ROW_SHARDED_ROUTED_FRONT = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT"
+    )
     # Kimi-K3 gfx950 prefill: leave the stream on each rank's rows after the row-sharded tail
-    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM = EnvBool(False)
+    SGLANG_OPT_HIP_K3_ROW_SHARDED_STREAM = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM"
+    )
     # GiB of gfx950 memory kept out of torch's allocator for HSA queue scratch (0: none)
     SGLANG_ROCM_RUNTIME_RESERVE_GB = EnvFloat(0.0)
     # Run the gfx950 TP4 quick all-reduce on the JIT build (quick_all_reduce_hip) instead of
@@ -1203,10 +1207,14 @@ class Envs:
     SGLANG_ROCM_SMALLM_FP8_BS = EnvBool(True)
     # Fused Kimi-K3 KDA decode kernel: "gfx950" (SGLang HIP) or "aiter" (FlyDSL);
     # any other value keeps the unfused KDA decode.
-    SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND = EnvStr("gfx950")
+    SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND = EnvStrWithAlias(
+        "gfx950", deprecated_name="SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND"
+    )
     # FlyDSL kernel behind the "aiter" fused KDA decode: "sglang" or "aiter" pins one;
     # "auto" prefers the vendored copy, and AITER's for a state dtype only it takes.
-    SGLANG_USE_HIP_K3_FLYDSL_SOURCE = EnvStr("auto")
+    SGLANG_OPT_HIP_K3_FLYDSL_SOURCE = EnvStrWithAlias(
+        "auto", deprecated_name="SGLANG_USE_HIP_K3_FLYDSL_SOURCE"
+    )
     # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM
     # (shared a4w4 tuned CSVs) instead of the Triton gemm_afp4wfp4 path.
     SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM = EnvBool(False)
@@ -2748,8 +2756,8 @@ REMOVED_ENVS: Dict[str, str] = {
     "SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW": "use SGLANG_OPT_RELEASE_PREFILL_SWA",
     "SYNC_TOKEN_IDS_ACROSS_TP": "use SGLANG_SYNC_TOKEN_IDS_ACROSS_TP",
     "SGLANG_K31_DECODE_MOE": "use SGLANG_USE_CUDA_MXFP4_DECODE_MOE",
-    "SGLANG_ROCM_K3_KDA_FUSED_BACKEND": "use SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND",
-    "SGLANG_K3_FLYDSL_SOURCE": "use SGLANG_USE_HIP_K3_FLYDSL_SOURCE",
+    "SGLANG_ROCM_K3_KDA_FUSED_BACKEND": "use SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND",
+    "SGLANG_K3_FLYDSL_SOURCE": "use SGLANG_OPT_HIP_K3_FLYDSL_SOURCE",
     "SGLANG_AITER_MLA_DCP_DECODE_BACKEND": "use SGLANG_AITER_MLA_DECODE_BACKEND",
     "SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE": "use SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE",
     "SGLANG_Q35MF_BK_VEC_COPY": "use SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED",

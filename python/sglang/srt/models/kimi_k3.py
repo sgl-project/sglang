@@ -2318,7 +2318,7 @@ class KimiK3DeltaAttention(nn.Module):
             layer._k3_hip_fused_decode_backend = ""
             layer._k3_hip_fused_decode_ops = None
             w = layer.conv_weights
-            backend = envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.get().lower()
+            backend = envs.SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND.get().lower()
             fused_ops = {
                 "aiter": kda_fused_decode_aiter_hip,
                 "gfx950": kda_fused_decode_gfx950,

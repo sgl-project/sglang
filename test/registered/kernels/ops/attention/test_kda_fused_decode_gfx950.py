@@ -103,7 +103,7 @@ class TestGfx950KDAFusedDecode(CustomTestCase):
         expected_inputs = _clone_caches(inputs)
         actual_inputs = _clone_caches(inputs)
         # the default backend
-        with envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("gfx950"):
+        with envs.SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND.override("gfx950"):
             self.assertTrue(
                 kda_fused_decode_gfx950.covered(
                     *(
@@ -137,7 +137,7 @@ class TestGfx950KDAFusedDecode(CustomTestCase):
 
     def test_bf16_pool_is_not_armed(self):
         """The kernel takes an FP32 state only, so a BF16 pool must not arm it."""
-        with envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("gfx950"):
+        with envs.SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND.override("gfx950"):
             device = torch.device("cuda")
             self.assertTrue(
                 kda_fused_decode_gfx950.available(

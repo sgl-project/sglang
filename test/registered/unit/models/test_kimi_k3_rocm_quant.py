@@ -207,7 +207,7 @@ class TestHipFusedDecodeArming(CustomTestCase):
 
         with (
             mock.patch.object(kimi_k3, "_is_hip", True),
-            envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("aiter"),
+            envs.SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND.override("aiter"),
             mock.patch.object(
                 kda_fused_decode_aiter_hip, "available", return_value=False
             ),
@@ -232,7 +232,7 @@ class TestHipFusedDecodeArming(CustomTestCase):
                 self.subTest(flags=flags),
                 get_context().override_server_args(**flags),
                 mock.patch.object(kimi_k3, "_is_hip", True),
-                envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("gfx950"),
+                envs.SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND.override("gfx950"),
                 mock.patch.object(
                     kda_fused_decode_gfx950, "available", return_value=True
                 ),
