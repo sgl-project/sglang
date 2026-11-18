@@ -35,7 +35,7 @@ else:
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # backend-specific: ROCm resolves the kernel to its Triton port
-register_amd_ci(est_time=20, stage="base-a-jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=16, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 test_cases = [
     (
@@ -314,8 +314,6 @@ def test_uno_compact_preserves_original_top_p_nucleus(joint_top_k_top_p_case):
     torch.testing.assert_close(support_probs, expected_probs[:, :4].view(1, 1, 4))
 
 
-rocm_only = pytest.mark.skipif(torch.version.hip is None, reason="ROCm sampled verify")
-DEVICE = "cuda"
 # Probabilities are multiples of 2**-16, so every partial sum is exact in fp32
 # and no reduction order can move a CDF boundary.
 _DYADIC_DENOM = 2**16
@@ -390,11 +388,11 @@ def _reference(
             predicts[last] = vocab_size - 1
 
 
-def _dyadic_rows(shape, vocab, generator):
+def _dyadic_rows(shape, vocab, pool, generator):
     rows = torch.zeros(*shape, vocab)
     for row in rows.view(-1, vocab):
-        support = int(torch.randint(1, min(vocab, 48) + 1, (1,), generator=generator))
-        tokens = torch.randperm(vocab, generator=generator)[:support]
+        support = int(torch.randint(1, len(pool) + 1, (1,), generator=generator))
+        tokens = pool[torch.randperm(len(pool), generator=generator)[:support]]
         cuts = torch.randint(0, _DYADIC_DENOM + 1, (support - 1,), generator=generator)
         bounds = torch.cat(
             [torch.tensor([0]), cuts.sort().values, torch.tensor([_DYADIC_DENOM])]
@@ -403,15 +401,17 @@ def _dyadic_rows(shape, vocab, generator):
     return rows
 
 
-def _make_chain_inputs(*, bs, num_nodes, vocab, seed):
-    """Random draft chains (node 0 is the root) with random draft rows. Candidates
-    mostly come from the parent's target support, so levels accept as well as
-    reject."""
+def _make_chain_operands(*, bs, num_nodes, num_spec_tokens, vocab, seed):
+    """Random draft chains (node 0 is the root) with random draft rows, and outputs
+    filled with -1. Candidates mostly come from the parent's target support, so
+    levels accept as well as reject."""
     generator = torch.Generator().manual_seed(seed)
     next_token = torch.full((bs, num_nodes), -1, dtype=torch.int64)
     next_token[:, :-1] = torch.arange(1, num_nodes)
-    target = _dyadic_rows((bs, num_nodes), vocab, generator)
-    draft = _dyadic_rows((bs, num_nodes), vocab, generator)
+    # one token pool across the vocab blocks, so draft rows overlap target rows
+    pool = torch.randperm(vocab, generator=generator)[:16]
+    target = _dyadic_rows((bs, num_nodes), vocab, pool, generator)
+    draft = _dyadic_rows((bs, num_nodes), vocab, pool, generator)
     candidates = torch.zeros((bs, num_nodes), dtype=torch.int64)
     for b in range(bs):
         for node in range(1, num_nodes):
@@ -433,53 +433,28 @@ def _make_chain_inputs(*, bs, num_nodes, vocab, seed):
         "uniform_samples_for_final_sampling": torch.rand((bs,), generator=generator),
         "target_probs": target,
         "draft_probs": draft,
+        "predicts": torch.full((bs * num_nodes,), -1, dtype=torch.int32),
+        "accept_index": torch.full((bs, num_spec_tokens), -1, dtype=torch.int32),
+        "accept_token_num": torch.full((bs,), -1, dtype=torch.int32),
     }
 
 
-def _outputs(bs, num_nodes, num_spec_tokens, device):
-    return {
-        "predicts": torch.full((bs * num_nodes,), -1, dtype=torch.int32, device=device),
-        "accept_index": torch.full(
-            (bs, num_spec_tokens), -1, dtype=torch.int32, device=device
-        ),
-        "accept_token_num": torch.full((bs,), -1, dtype=torch.int32, device=device),
-    }
-
-
-def _run(inputs, num_spec_tokens, threshold_single=1.0, threshold_acc=1.0):
-    """Run the torch reference and the kernel on copies of ``inputs``."""
-    bs, num_nodes = inputs["candidates"].shape
-    expected = {k: v.clone() for k, v in inputs.items()}
-    expected.update(_outputs(bs, num_nodes, num_spec_tokens, "cpu"))
-    _reference(
-        **expected, threshold_single=threshold_single, threshold_acc=threshold_acc
+@pytest.mark.skipif(torch.version.hip is None, reason="ROCm Triton port")
+def test_target_only_triton_matches_reference():
+    """Random chains over a vocabulary of several 4096-wide blocks, a fractional
+    threshold_acc and draft rows that overlap the target rows; the known-answer
+    cases above cover one block and thresholds 1 and 0. A walk that fills every
+    slot samples the bonus token from the target row alone."""
+    operands = _make_chain_operands(
+        bs=16, num_nodes=6, num_spec_tokens=3, vocab=9001, seed=9003
     )
-    actual = {k: v.to(DEVICE) for k, v in inputs.items()}
-    actual.update(_outputs(bs, num_nodes, num_spec_tokens, DEVICE))
-    tree_speculative_sampling_target_only(
-        **actual,
-        threshold_single=threshold_single,
-        threshold_acc=threshold_acc,
-        deterministic=True,
-    )
-    return expected, actual
-
-
-def _assert_same(expected, actual):
+    thresholds = dict(threshold_single=0.5, threshold_acc=0.25)
+    expected = {name: t.clone() for name, t in operands.items()}
+    _reference(**expected, **thresholds)
+    actual = {name: t.cuda() for name, t in operands.items()}
+    tree_speculative_sampling_target_only(**actual, **thresholds, deterministic=True)
     for name in ("predicts", "accept_index", "accept_token_num", "draft_probs"):
         assert torch.equal(actual[name].cpu(), expected[name]), name
-
-
-@rocm_only
-def test_matches_reference():
-    """Random chains over a vocabulary of several 4096-wide blocks with fractional
-    thresholds and random draft rows; the base known-answer cases cover one block
-    and thresholds 1 and 0."""
-    inputs = _make_chain_inputs(bs=16, num_nodes=6, vocab=9001, seed=9003)
-    # A walk truncated below the leaves samples the bonus token after its last
-    # slot, where the draft row must not be read.
-    expected, actual = _run(inputs, 3, threshold_single=0.5, threshold_acc=0.25)
-    _assert_same(expected, actual)
 
 
 if __name__ == "__main__":
