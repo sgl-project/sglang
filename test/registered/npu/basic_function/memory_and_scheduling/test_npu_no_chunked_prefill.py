@@ -30,7 +30,8 @@ class TestNoChunkedPrefill(CustomTestCase):
         other_args = [
             "--attention-backend",
             "ascend",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
             "--chunked-prefill-size",
             "-1",
             "--disable-radix-cache",
