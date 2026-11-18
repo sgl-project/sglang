@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
-import torch_npu
 
 from sglang.srt.configs.model_config import get_dsa_index_kpool
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
@@ -352,13 +351,13 @@ def _quantize_pooled_indexer_query(
     KPool stores pooled keys without Hadamard rotation, so the query keeps the
     same basis: one FP16 scale per query token and indexer head.
     """
-    quantized, scale = torch_npu.npu_dynamic_quant(
-        query.reshape(-1, query.shape[-1]), dst_type=torch.int8
-    )
+    from sgl_kernel_npu.operators.activation import dynamic_quant
+
+    quantized, scale = dynamic_quant(query, dst_type=torch.int8)
     # The padded sentinel row is all zero and must still carry a positive
     # dequantization scale for the INT8 operator contract.
     scale = torch.where(scale > 0, scale, torch.ones_like(scale))
-    return quantized.view(query.shape), scale.view(query.shape[:-1]).to(torch.float16)
+    return quantized, scale.to(torch.float16)
 
 
 def _quantize_pooled_indexer_query_mxfp8(
@@ -370,25 +369,12 @@ def _quantize_pooled_indexer_query_mxfp8(
     the same basis: one E8M0 scale per 32-element block, pair-packed as
     [D/64, 2] to match the KPool descale layout.
     """
+    from sgl_kernel_npu.operators.activation import dynamic_mx_quant
+
     D = query.shape[-1]
-    if query.numel() == 0:
-        return (
-            torch.empty_like(query, dtype=torch.float8_e4m3fn),
-            torch.zeros(
-                query.shape[:-1] + (D // 64, 2),
-                dtype=torch.uint8,
-                device=query.device,
-            ).view(torch.float8_e8m0fnu),
-        )
-    quantized, scale = torch.ops.npu.npu_dynamic_mx_quant(
-        query.reshape(-1, D), dst_type=torch.float8_e4m3fn, axis=-1
-    )
-    scale = scale.reshape(query.shape[:-1] + (D // 32,)).view(
-        query.shape[:-1] + (D // 64, 2)
-    )
-    if scale.dtype != torch.float8_e8m0fnu:
-        scale = scale.view(torch.float8_e8m0fnu)
-    return quantized.view(query.shape), scale
+    quantized, scale = dynamic_mx_quant(query, dst_type=torch.float8_e4m3fn)
+    scale = scale.reshape(query.shape[:-1] + (D // 64, 2))
+    return quantized, scale
 
 
 def _index_k_scale_cache(pool, layer_id: int):
