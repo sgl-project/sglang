@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from contextlib import contextmanager
+import threading
+from contextlib import contextmanager, nullcontext
 from functools import cache
 from typing import Any, Callable, NamedTuple, Optional
 
@@ -80,6 +81,10 @@ def controller_virtual_ids(
     return ids // dcp_size if dcp_size > 1 else ids
 
 
+class _H2DPlacement(threading.local):
+    on_current_stream = False
+
+
 class L2TransferEngine:
     """Runs resolved device↔host transfers without owning cache state."""
 
@@ -97,20 +102,25 @@ class L2TransferEngine:
         # direct backend reads the device indices back on the host.
         self.index_stream = device_module.Stream()
         # Set inside `on_current_stream`: host-to-device submissions then run on
-        # the caller's current stream instead of the engine's streams.
-        self._h2d_on_current_stream = False
+        # the caller's current stream instead of the engine's streams. Per
+        # thread: the HiCache loader thread submits beside the scheduler's.
+        self._h2d_placement = _H2DPlacement()
+        # The HiCache loader thread and the scheduler thread both submit on
+        # host_to_device_stream, and a host layout keeps the last released
+        # finish event per stream: that must be the newest one recorded.
+        self._own_h2d_submit_lock = threading.Lock()
 
     @contextmanager
     def on_current_stream(self):
         """Run host-to-device submissions made inside the block on the caller's
         current stream, index preparation included, in order with the caller's
         other work there; the engine's own streams stay idle."""
-        previous = self._h2d_on_current_stream
-        self._h2d_on_current_stream = True
+        previous = self._h2d_placement.on_current_stream
+        self._h2d_placement.on_current_stream = True
         try:
             yield
         finally:
-            self._h2d_on_current_stream = previous
+            self._h2d_placement.on_current_stream = previous
 
     @staticmethod
     def _resolve_device_indices(transfer: L2Transfer) -> torch.Tensor:
@@ -223,14 +233,16 @@ class L2TransferEngine:
         start_event=None,
         on_layer_done=None,
     ) -> TransferCompletion:
-        stream = (
-            device_module.current_stream()
-            if self._h2d_on_current_stream
-            else self.host_to_device_stream
-        )
-        with self._submission(transfers, stream, "host_to_device", start_event) as (
-            transfers,
-            completion,
+        if self._h2d_placement.on_current_stream:
+            stream, submit_lock = device_module.current_stream(), nullcontext()
+        else:
+            stream, submit_lock = self.host_to_device_stream, self._own_h2d_submit_lock
+        with (
+            submit_lock,
+            self._submission(transfers, stream, "host_to_device", start_event) as (
+                transfers,
+                completion,
+            ),
         ):
             primary = transfers[0] if transfers else None
             delay_cycles = envs.SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES.get()

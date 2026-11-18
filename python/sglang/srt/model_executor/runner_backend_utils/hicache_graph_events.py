@@ -101,7 +101,10 @@ class HiCacheGraphEvents:
         counter = self.pool.layer_transfer_counter
         if counter is not None and counter.consumer_index >= 0:
             if hasattr(counter, "events"):
-                load_events = counter.events[counter.consumer_index].load_events
+                slot = counter.events[counter.consumer_index]
+                # The graph waits on the raw events: they must be recorded first.
+                slot.wait_enqueue_done()
+                load_events = slot.load_events
                 events = {
                     layer: load_events[layer - self.pool.start_layer]
                     for layer in self.ready_events
