@@ -21,11 +21,14 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     apply_mhc_post_pre_boundary,
     apply_moe_mhc,
     attention_mhc_fusion,
+    can_use_mega_mhc,
 )
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     hc_boundary as make_amd_hc_boundary,
 )
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
+    mega_hc_boundary_input_norm,
+    mega_hc_boundary_post_attention_norm,
     moe_mhc_fusion,
 )
 from sglang.srt.models.deepseek_common.moe_transport import (
@@ -680,18 +683,28 @@ def forward_hc_pre_from_prev_fused_boundary(
     comb); with defer_post this layer's is returned the same way and hidden_states is None."""
     if pending_post is None:
         pending_post = (None, hidden_states, None, None)
-    residual, x, attn_coefficients = make_amd_hc_boundary(
-        layer,
-        *pending_post,
-        prev_pre,
-        layer.hc_attn_fn,
-        layer.hc_attn_scale,
-        layer.hc_attn_base,
-    )
-    # the boundary's reduce + sinkhorn rides in the norm launch
-    x, x_quant = layer._input_norm(
-        x, allow_aiter_quant=False, coefficients=attn_coefficients
-    )
+    if can_use_mega_mhc(layer, pending_post[1], pending_post[0], layer.hc_attn_fn):
+        residual, (x, x_quant), attn_coefficients = mega_hc_boundary_input_norm(
+            layer,
+            *pending_post,
+            prev_pre,
+            layer.hc_attn_fn,
+            layer.hc_attn_scale,
+            layer.hc_attn_base,
+        )
+    else:
+        residual, x, attn_coefficients = make_amd_hc_boundary(
+            layer,
+            *pending_post,
+            prev_pre,
+            layer.hc_attn_fn,
+            layer.hc_attn_scale,
+            layer.hc_attn_base,
+        )
+        # the boundary's reduce + sinkhorn rides in the norm launch
+        x, x_quant = layer._input_norm(
+            x, allow_aiter_quant=False, coefficients=attn_coefficients
+        )
     with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
         mhc = attention_mhc_fusion(layer, residual, attn_coefficients, forward_batch)
         x = layer.self_attn(
@@ -707,7 +720,7 @@ def forward_hc_pre_from_prev_fused_boundary(
         assert isinstance(x, AttnOutput)
         residual = apply_attention_mhc(x.partial, mhc)
         x = None
-    residual, x, ffn_coefficients = make_amd_hc_boundary(
+    ffn_boundary = (
         layer,
         x,
         residual,
@@ -718,7 +731,13 @@ def forward_hc_pre_from_prev_fused_boundary(
         layer.hc_ffn_scale,
         layer.hc_ffn_base,
     )
-    x = _gfx95_dense_post_attention_norm(layer, x, ffn_coefficients)
+    if can_use_mega_mhc(layer, residual, x, layer.hc_ffn_fn):
+        residual, x, ffn_coefficients = mega_hc_boundary_post_attention_norm(
+            *ffn_boundary
+        )
+    else:
+        residual, x, ffn_coefficients = make_amd_hc_boundary(*ffn_boundary)
+        x = _gfx95_dense_post_attention_norm(layer, x, ffn_coefficients)
     mhc = moe_mhc_fusion(layer, residual, ffn_coefficients, forward_batch)
     x = layer._run_moe_ffn_dp_sync(
         x,

@@ -40,7 +40,13 @@ if _is_hip:
         hc_boundary_fused_deferred,
     )
 if _is_gfx95_supported:
+    from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+        Fp8GridActivation,
+        Mxfp8Activation,
+    )
     from sglang.srt.models.deepseek_common.amd.deepseek_v4_gfx95_dense import (
+        _ffn_norm_emits_mxfp8,
+        _mxfp8_consumer,
         post_attention_norm,
     )
 
@@ -513,6 +519,148 @@ def hc_boundary(
     if y is None:
         y = new_residual[:, 0, :].contiguous()
     return new_residual, y, coefficients
+
+
+class HcMixes:
+    """A boundary's pre / post / comb already computed (Mega-mHC), in the
+    HcCoefficients interface the layer reads them through."""
+
+    materialized = True
+
+    def __init__(self, pre: torch.Tensor, post: torch.Tensor, comb: torch.Tensor):
+        self.pre, self.post, self.comb = pre, post, comb
+        self.num_rows = pre.shape[0]
+
+    def materialize(self) -> None:
+        pass
+
+    def tensors(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.pre, self.post, self.comb
+
+
+def can_use_mega_mhc(
+    layer, residual: torch.Tensor, x: Optional[torch.Tensor], hc_fn: torch.Tensor
+) -> bool:
+    """Whether a fused boundary (plus its norm) can run as one FlyDSL Mega-mHC
+    launch: gfx950, the fake-quant norm path, hc_mult 4, and dense bf16 rows."""
+    if not (
+        _is_gfx95_supported
+        and envs.SGLANG_HIP_DSV41_MEGA_MHC.get()
+        and layer.fused_rmsnorm_fake_quant
+        and residual.dim() == 3
+        and residual.shape[1] == 4
+        and 1 <= residual.shape[0] <= envs.SGLANG_HIP_DSV41_MEGA_MHC_MAX_ROWS.get()
+        and residual.dtype == torch.bfloat16
+        and residual.is_contiguous()
+        and hc_fn.dtype == torch.float32
+        and hc_fn.is_contiguous()
+    ):
+        return False
+    return x is None or (
+        x.shape == (residual.shape[0], residual.shape[2])
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+    )
+
+
+def _mega_mhc(
+    layer,
+    x: Optional[torch.Tensor],
+    residual: torch.Tensor,
+    post: Optional[torch.Tensor],
+    comb: Optional[torch.Tensor],
+    pre_prev: Optional[torch.Tensor],
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm,
+    out_dtype: str,
+):
+    from aiter.ops.flydsl import flydsl_mega_mhc
+
+    has_post = x is not None
+    new_residual, post_out, comb_out, layer_input, next_pre = flydsl_mega_mhc(
+        residual,
+        hc_fn,
+        hc_scale.float().contiguous(),
+        hc_base.float().contiguous(),
+        layer.rms_norm_eps,
+        layer.hc_eps,
+        layer.hc_eps,
+        2.0,
+        layer.hc_sinkhorn_iters,
+        pre_prev.contiguous() if pre_prev is not None else None,
+        x,
+        post.contiguous().float() if has_post else None,
+        comb.contiguous().float() if has_post else None,
+        norm.weight.data,
+        norm.variance_epsilon,
+        residual_out=torch.empty_like(residual) if has_post else None,
+        out_dtype=out_dtype,
+    )
+    mixes = HcMixes(next_pre, post_out.view(-1, 4), comb_out)
+    return new_residual, layer_input, mixes
+
+
+def mega_hc_boundary_input_norm(
+    layer, x, residual, post, comb, pre_prev, hc_fn, hc_scale, hc_base
+):
+    """hc_boundary + layer._input_norm in one launch; returns (new_residual,
+    (norm, x_quant), coefficients)."""
+    if not layer._wqkv_a_native_consumer_checked:
+        layer._wqkv_a_native_consumer = _mxfp8_consumer(
+            layer.self_attn.wqkv_a if layer.self_attn.fuse_wqa_wkv else None
+        )
+        layer._wqkv_a_native_consumer_checked = True
+    emit_fp8 = layer._wqkv_a_native_consumer
+    new_residual, out, mixes = _mega_mhc(
+        layer,
+        x,
+        residual,
+        post,
+        comb,
+        pre_prev,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        layer.input_layernorm,
+        "mxfp8" if emit_fp8 else "fp8_grid",
+    )
+    if emit_fp8:
+        norm, q, scale = out
+        x_quant = Mxfp8Activation(q, scale)
+    else:
+        norm, grid = out
+        x_quant = Fp8GridActivation(grid)
+    return new_residual, (norm, x_quant), mixes
+
+
+def mega_hc_boundary_post_attention_norm(
+    layer, x, residual, post, comb, pre_prev, hc_fn, hc_scale, hc_base
+):
+    """hc_boundary + post_attention_norm in one launch; returns (new_residual,
+    norm, coefficients), the norm carrying the shared expert's MXFP8 operand
+    where post_attention_norm would attach one."""
+    emit_fp8 = _ffn_norm_emits_mxfp8(layer, residual.shape[0])
+    new_residual, out, mixes = _mega_mhc(
+        layer,
+        x,
+        residual,
+        post,
+        comb,
+        pre_prev,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        layer.post_attention_layernorm,
+        "mxfp8" if emit_fp8 else "bf16",
+    )
+    if emit_fp8:
+        norm, q, scale = out
+        norm._hip_mxfp8_operand = Mxfp8Activation(q, scale)
+    else:
+        norm = out
+    return new_residual, norm, mixes
 
 
 def _can_fuse_mhc(layer, residual: torch.Tensor, forward_batch) -> bool:
