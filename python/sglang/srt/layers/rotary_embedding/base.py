@@ -60,11 +60,11 @@ if _is_npu:
     # generic rope path. A warning is emitted so the missing kernel is
     # visible in logs instead of being silently swallowed.
     try:
-        from sgl_kernel_npu.norm.fused_rope_qk_mqa import fused_rope_qk_mqa
+        from sgl_kernel_npu.operators.rope import fused_rope_qk_mqa
     except ImportError:
         fused_rope_qk_mqa = None
         logger.warning(
-            "sgl_kernel_npu.norm.fused_rope_qk_mqa is unavailable; "
+            "sgl_kernel_npu.operators.rope.fused_rope_qk_mqa is unavailable; "
             "falling back to the generic rope implementation. Upgrade "
             "sgl_kernel_npu to enable the fused kernel."
         )
