@@ -15,9 +15,10 @@ import sys
 import msgspec
 import pytest
 
-from sglang.kernels.jit.utils.compile import cache, ninja, toolchain
+from sglang.kernels.jit.utils.compile import cache, ninja, sailify, toolchain
 from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
 from sglang.kernels.jit.utils.compile.spec import BuildSpec
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_xpu
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -88,6 +89,37 @@ def _publish_leaf(scope: pathlib.Path, paths, *, module_name="m") -> pathlib.Pat
     (leaf / cache._DEPS_FILE).write_bytes(msgspec.json.encode(entries))
     (leaf / f"{module_name}.so").write_bytes(b"")
     return leaf
+
+
+# --------------------------------------------------------------------------
+# Cache root configuration
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("jit_override", ["unset", None, ""])
+def test_jit_cache_tracks_unified_root(tmp_path, jit_override):
+    """Changing the unified root must relocate builds and SAIL mirrors together."""
+    with envs.SGLANG_JIT_CACHE_DIR.override(jit_override):
+        if jit_override == "unset":
+            envs.SGLANG_JIT_CACHE_DIR.clear()
+        for root in (tmp_path / "first", tmp_path / "second", "~/.cache/sglang"):
+            with envs.SGLANG_CACHE_DIR.override(str(root)):
+                expected = pathlib.Path(root).expanduser() / "jit"
+                if jit_override == "unset":
+                    assert envs.SGLANG_JIT_CACHE_DIR.get() == str(expected)
+                assert cache.cache_root() == expected
+                assert sailify._sailify_root() == expected / "sailified"
+
+
+def test_explicit_jit_cache_overrides_unified_root(tmp_path):
+    """A dedicated JIT mount must retain precedence over the unified root."""
+    with (
+        envs.SGLANG_CACHE_DIR.override(str(tmp_path / "unified")),
+        envs.SGLANG_JIT_CACHE_DIR.override("~/dedicated-jit-cache"),
+    ):
+        expected = pathlib.Path("~/dedicated-jit-cache").expanduser()
+        assert cache.cache_root() == expected
+        assert sailify._sailify_root() == expected / "sailified"
 
 
 # --------------------------------------------------------------------------
