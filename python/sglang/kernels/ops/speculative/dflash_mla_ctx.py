@@ -53,7 +53,7 @@ def _same_rope(rope: torch.nn.Module, other: torch.nn.Module) -> bool:
     )
 
 
-def _latent(attn: torch.nn.Module) -> tuple:
+def _latent_config(attn: torch.nn.Module) -> tuple:
     return (
         attn.kv_lora_rank,
         attn.qk_rope_head_dim,
@@ -70,10 +70,12 @@ class MlaContextKV:
         self.attns = list(attns)
         self.R, self.P = int(a0.kv_lora_rank), int(a0.qk_rope_head_dim)
         self.eps = float(a0.kv_a_layernorm.variance_epsilon)
-        self.w = torch.cat(
+        self.kv_a_weight = torch.cat(
             [a.fused_qkv_a_proj_with_mqa.weight[a.q_lora_rank :] for a in attns], 0
         ).contiguous()
-        self.norm_w = torch.stack([a.kv_a_layernorm.weight for a in attns]).contiguous()
+        self.norm_weight = torch.stack(
+            [a.kv_a_layernorm.weight for a in attns]
+        ).contiguous()
         self.rotary_emb = a0.rotary_emb
 
     @classmethod
@@ -121,14 +123,14 @@ class MlaContextKV:
         MLA layers' context-KV rows, or None when they can."""
         if not attns:
             return "no context attention layers"
-        rank, _, _, dtype = _latent(attns[0])
+        rank, _, _, dtype = _latent_config(attns[0])
         if dtype not in (torch.bfloat16, torch.float16):
             return f"kv_a weight dtype {dtype}"
         # the norm kernel reduces a whole latent row with one tl.arange
         if rank & (rank - 1):
             return f"kv_lora_rank {rank} is not a power of two"
         for i, attn in enumerate(attns[1:], 1):
-            if _latent(attn) != _latent(attns[0]):
+            if _latent_config(attn) != _latent_config(attns[0]):
                 return f"layer {i}'s latent shape, norm eps or kv_a dtype differs"
             if not _same_rope(attn.rotary_emb, attns[0].rotary_emb):
                 return f"layer {i}'s RoPE differs from layer 0's"
@@ -139,11 +141,11 @@ class MlaContextKV:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """(k_nope [L, n, 1, R] normalized, k_pe [L, n, 1, P] rotated); one RoPE head a layer."""
         n, L, R, P = hidden.shape[0], len(self.attns), self.R, self.P
-        lat = F.linear(hidden, self.w).view(n, L, R + P)
+        lat = F.linear(hidden, self.kv_a_weight).view(n, L, R + P)
         k_nope = torch.empty((L, n, R), dtype=lat.dtype, device=hidden.device)
         if n:
             _latent_rmsnorm_kernel[(n, L)](
-                lat, self.norm_w, k_nope, n, self.eps, L=L, R=R, P=P
+                lat, self.norm_weight, k_nope, n, self.eps, L=L, R=R, P=P
             )
         k_pe = lat[..., R:].contiguous()
         _, k_pe = self.rotary_emb(positions, torch.empty_like(k_pe), k_pe)
