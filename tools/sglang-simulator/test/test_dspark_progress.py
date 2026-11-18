@@ -448,7 +448,6 @@ def test_native_label_verifier_uses_leader_only_and_checks_complete_peer_recipe(
         _verify_native_progress_context,
         verify_native_progress_rows,
     )
-    from simopus.sdk import native_windows
 
     recipe = dict.fromkeys(sampling.SAMPLING_FIELDS)
     recipe.update(is_normalized=True, max_new_tokens=20)
@@ -483,7 +482,7 @@ def test_native_label_verifier_uses_leader_only_and_checks_complete_peer_recipe(
             }
         )
     monkeypatch.setattr(
-        native_windows,
+        sampling,
         "join_native_frames",
         lambda *args, **kwargs: [{"forward_ct": 7, "participants": peers}],
     )
