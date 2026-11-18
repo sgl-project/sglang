@@ -380,6 +380,7 @@ class TestRunningReqsHooks(CustomTestCase):
                 self.running_batch = batch
                 self.can_run_list = []
                 self.preempt_list = []
+                self.preempt_aborted = []
 
             def budget_state(self):
                 return AddReqResult.CONTINUE
