@@ -87,9 +87,6 @@ class CosmosDreamsKVHistory:
             buffer[1, :, : self.text_tokens].copy_(value)
             self._kv.append(buffer)
 
-    def __len__(self) -> int:
-        return len(self._kv)
-
     def committed_kv(self, layer_idx: int) -> torch.Tensor:
         """One layer's committed history without the text, ``[2, 1, S, H_kv, D]``."""
         start = self._offset + self.text_tokens
@@ -212,11 +209,6 @@ class SelectedKVHistory:
         self._read = CosmosDreamsKVHistory(
             text_kv, sink_tokens=0, live_tokens=selected_tokens + chunk_tokens
         )
-        self._frame_ids: tuple[int, ...] = ()
-
-    @property
-    def frame_ids(self) -> tuple[int, ...]:
-        return self._frame_ids
 
     def select(
         self, frame_ids: Sequence[int], *, tokens_per_frame: int
@@ -231,7 +223,6 @@ class SelectedKVHistory:
             )
         read = self._read
         read.clear()
-        self._frame_ids = tuple(ids)
         if not ids:
             return self
         selected_tokens = len(ids) * tokens_per_frame

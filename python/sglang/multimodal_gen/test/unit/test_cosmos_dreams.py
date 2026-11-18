@@ -666,11 +666,12 @@ class TestCosmosDreamsPositionIds(unittest.TestCase):
             ),
             RecordOps() as ops,
         ):
-            keys, values = torch.zeros(1, 20, 1, 2), torch.zeros(1, 20, 1, 2)
+            kv = torch.zeros(2, 1, 20, 1, 2)
+            keys, values = kv
             cosmos_dreams._joint_attention(
                 attention,
                 hidden,
-                kv_slot=CosmosDreamsKVSlot(keys, values, keys, values),
+                kv_slot=CosmosDreamsKVSlot(keys, values, keys, values, kv),
                 cos_sin_cache=None,
                 rope_positions=None,
                 null_token_slices=slices,
@@ -842,9 +843,10 @@ class TestCosmosDreamsKVHistory(unittest.TestCase):
         the buffers of an open-ended session double. Tails alternate like the
         control/RGB commits of a transfer rollout."""
         tokens, sink_frames, window_frames = 2, 2, 5
+        text_kv = _text_kv()
         for rollout_frames in (None, 60):
             history = new_kv_history(
-                _text_kv(),
+                text_kv,
                 tokens_per_frame=tokens,
                 sink_frames=sink_frames,
                 window_frames=window_frames,
@@ -868,7 +870,7 @@ class TestCosmosDreamsKVHistory(unittest.TestCase):
                 bound = (sink_frames + tail_frames) * tokens
                 if len(kept) > bound:
                     kept = kept[: sink_frames * tokens] + kept[-tail_frames * tokens :]
-                for layer in range(len(history)):
+                for layer in range(len(text_kv)):
                     key, value = history.committed(layer)
                     self.assertEqual(key[0, :, 0, 0].tolist(), kept)
                     self.assertEqual(value[0, :, 0, 0].tolist(), kept)

@@ -276,7 +276,6 @@ class TestSelectedHistory(unittest.TestCase):
             archive, text_kv, selected_tokens=3 * tokens, chunk_tokens=2 * tokens
         )
         view.select([0, 3, 5], tokens_per_frame=tokens)
-        self.assertEqual(view.frame_ids, (0, 3, 5))
         # Two refreshes of one chunk: the second also reads the first's frame.
         selected = [100.0] * 3 + [103.0] * 3 + [105.0] * 3
         self.assertEqual(write(view, 6), [-1.0] * 2 + selected + [106.0] * 3)

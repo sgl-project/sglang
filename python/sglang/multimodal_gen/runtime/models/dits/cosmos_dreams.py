@@ -56,18 +56,16 @@ logger = init_logger(__name__)
 class CosmosDreamsKVSlot(NamedTuple):
     """One layer's K/V views for one forward.
 
-    ``keys``/``values`` are the ``[1, text + history + chunk, H_kv, D]`` block
-    attention reads; ``chunk_keys``/``chunk_values`` are its last
-    ``[1, chunk, H_kv, D]`` tokens, which the forward writes. ``chunk_kv`` is the
-    same chunk as one ``[2, 1, chunk, H_kv, D]`` tensor, keys first, for the
-    kernel that writes both in one launch; None when the two are stored apart.
+    ``chunk_keys`` and ``chunk_values`` are the last tokens of ``keys`` and
+    ``values``, and ``chunk_kv`` is the same chunk as one ``[2, 1, chunk, H_kv, D]``
+    view, keys first.
     """
 
     keys: torch.Tensor
     values: torch.Tensor
     chunk_keys: torch.Tensor
     chunk_values: torch.Tensor
-    chunk_kv: torch.Tensor | None = None
+    chunk_kv: torch.Tensor
 
 
 class CosmosDreamsForwardOutput(msgspec.Struct):
@@ -232,8 +230,7 @@ def _pack_kernel_applies(
     this only saves the two copies into the slot.
     """
     return (
-        kv_slot.chunk_kv is not None
-        and envs.SGLANG_ENABLE_FUSED_QKNORM_ROPE
+        envs.SGLANG_ENABLE_FUSED_QKNORM_ROPE
         and q.device.type == "cuda"
         and q.dtype == kv_slot.chunk_kv.dtype
         and attention.norm_q.weight.dtype == q.dtype
