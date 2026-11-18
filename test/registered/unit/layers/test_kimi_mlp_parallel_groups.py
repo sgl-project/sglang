@@ -54,6 +54,7 @@ def build_shared_experts(*, ep_a2a=True, width=16, shared=1, quant_config=None):
         is_megamoe=lambda: False,
         is_flashinfer_megamoe=lambda: False,
         is_deepep=lambda: ep_a2a,
+        is_ascend_ops=lambda: False,
         is_mooncake=lambda: False,
         is_ascend_fuseep=lambda: False,
         is_mori=lambda: False,

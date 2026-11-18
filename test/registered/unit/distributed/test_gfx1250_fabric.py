@@ -134,6 +134,24 @@ def test_dpx_pairs(accel_ids, expected):
     assert gfx1250_fabric.dpx_pairs(accel_ids) == expected
 
 
+@pytest.mark.parametrize(
+    ("accel_ids", "expected"),
+    [
+        ([52, 52, 53, 53], [0, 1, 2, 3]),
+        # an accelerator's partitions apart in the group: the ring keeps them together
+        ([52, 53, 52, 53], [0, 2, 1, 3]),
+        ([52, 53, 54, 55, 52, 53, 54, 55], [0, 4, 1, 5, 2, 6, 3, 7]),
+        # one partition of an accelerator in the group, or four
+        ([52, 53, 53], [0, 1, 2]),
+        ([53, 52, 52, 52, 52, 53], [0, 5, 1, 2, 3, 4]),
+        ([52, 53, 54, 55], [0, 1, 2, 3]),  # one partition per accelerator
+        ([52, None, 52], [0, 1, 2]),
+    ],
+)
+def test_accelerator_ring_order(accel_ids, expected):
+    assert gfx1250_fabric.accelerator_ring_order(accel_ids) == expected
+
+
 @pytest.mark.parametrize(("peer_accel_id", "expected"), [(52, [[0, 1]]), (None, None)])
 def test_probe_dpx_pairs_gathers_every_rank(monkeypatch, peer_accel_id, expected):
     """Pairs come from every rank's ID; one rank without an ID disables them."""
