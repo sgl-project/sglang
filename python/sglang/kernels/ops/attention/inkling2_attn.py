@@ -5,7 +5,6 @@ from triton.language.extra import libdevice
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
 
-PDL = is_arch_support_pdl()
 # Below this many rows the Triton _gate_sink_kernel is faster.
 GATE_SINK_CUDA_MIN_ROWS = 64
 
@@ -49,9 +48,11 @@ def _gate_sink_kernel(
     GROUP: tl.constexpr,
     PADDED_GROUP: tl.constexpr,
     BLOCK: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = col < H * D
@@ -100,9 +101,11 @@ def _combine_gate_sink_kernel(
     D: tl.constexpr,
     SPLITS_P: tl.constexpr,
     HAS_L: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0)
     head = tl.program_id(1)
     cols = tl.arange(0, D)
@@ -178,7 +181,7 @@ def combine_gate_sink(o_partial, m_partial, l_partial, *, gate, sinks):
             triton.next_power_of_2(splits),
             l_partial is not None,
             enable_fp_fusion=False,
-            launch_pdl=PDL,
+            **({"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
         )
     return out
 
@@ -223,7 +226,9 @@ def rel_bias_partials(
                 else None
             ),
         )
-    from sglang.kernels.ops.inkling2.decode_attention_sm90 import decode_partials
+    from sglang.kernels.ops.inkling2.decode_attention_sm90 import (
+        decode_partials,
+    )
 
     return decode_partials(
         q,
@@ -276,14 +281,6 @@ def _cuda_gate_sink(output, gate, lse, sinks, result, group, padded_group):
 def gate_sink(output, gate, lse, sinks, *, output_dtype, head_groups=None):
     """head_groups=(group, padded_group): output and lse hold padded_group heads per
     group of group real heads (padding heads are ignored)."""
-    if not output.is_cuda:
-        scale = torch.sigmoid(lse.float() - sinks.float())
-        output = output.float() * torch.sigmoid(gate.float())
-        return (
-            (output.view(*sinks.shape, -1) * scale.unsqueeze(-1))
-            .flatten(1)
-            .to(output_dtype)
-        )
     heads = sinks.shape[-1]
     group, padded_group = head_groups or (heads, heads)
     assert output.shape[1] == heads // group * padded_group * (gate.shape[1] // heads)
@@ -307,7 +304,7 @@ def gate_sink(output, gate, lse, sinks, *, output_dtype, head_groups=None):
             padded_group,
             256,
             enable_fp_fusion=False,
-            launch_pdl=PDL,
+            **({"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
         )
     return result
 
@@ -318,11 +315,13 @@ def _tau_kernel(
     Out,
     FLOOR: tl.constexpr,
     ALPHA: tl.constexpr,
-    N: tl.constexpr,
+    N,
     BLOCK: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     pos = tl.load(Pos + i, i < N, other=0)
     ratio = tl.maximum((pos + 1).to(tl.float32) * (1.0 / FLOOR), 1.0)
@@ -331,10 +330,6 @@ def _tau_kernel(
 
 
 def compute_log_scaling_tau(positions, n_floor, alpha):
-    if not positions.is_cuda:
-        return 1.0 + alpha * torch.log(
-            torch.clamp((positions + 1).float() / n_floor, min=1.0)
-        )
     output = torch.empty(positions.shape, device=positions.device, dtype=torch.float32)
     if positions.numel():
         _tau_kernel[(triton.cdiv(positions.numel(), 256),)](
@@ -345,7 +340,7 @@ def compute_log_scaling_tau(positions, n_floor, alpha):
             positions.numel(),
             256,
             enable_fp_fusion=False,
-            launch_pdl=PDL,
+            **({"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
         )
     return output
 
@@ -360,9 +355,11 @@ def _pad_head_groups(
     PADDED: tl.constexpr,
     D: tl.constexpr,
     BLOCK: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0)
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     padded_heads: tl.constexpr = HEADS // GROUP * PADDED
@@ -389,6 +386,6 @@ def pad_head_groups(x, group, padded_group):
             padded_group,
             width,
             1024,
-            launch_pdl=PDL,
+            **({"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
         )
     return out

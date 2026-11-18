@@ -5,8 +5,6 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 
-PDL = is_arch_support_pdl()
-
 
 @triton.jit
 def _linear_k_groups(
@@ -71,11 +69,13 @@ def _linear_k_group_partials(
     BLOCK_M: tl.constexpr = 16,
     X2=None,
     W2=None,
+    USE_PDL: tl.constexpr = False,
 ):
     """With X2 and W2, groups past the first cdiv(K, 1024) compute X2 @ W2.T
     into the next (groups, M, N) block of P."""
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     group = tl.program_id(2)
@@ -110,10 +110,18 @@ def _linear_k_group_partials(
 
 @triton.jit
 def _linear_k_group_sum(
-    P, B, Y, M, N: tl.constexpr, GROUPS: tl.constexpr, HAS_BIAS: tl.constexpr
+    P,
+    B,
+    Y,
+    M,
+    N: tl.constexpr,
+    GROUPS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     offsets = tl.program_id(0) * 256 + tl.arange(0, 256)
     mask = offsets < M * N
     total = tl.load(P + offsets, mask, other=0)
@@ -140,47 +148,14 @@ def _k_group_blocks(m, n):
     )
 
 
-def linear_k_group_partials(flat, weight, block_k=256, num_stages=3):
-    """Per-1024-wide-K-group partial products of _linear_k_groups, shape (groups, m, n)."""
-    m, n, k = flat.shape[0], weight.shape[0], weight.shape[1]
-    block_m, block_n = _k_group_blocks(m, n)
-    wide = block_n == 128
-    groups = triton.cdiv(k, 1024)
-    partials = torch.empty((groups, m, n), device=flat.device, dtype=torch.float32)
-    _linear_k_group_partials[
-        (triton.cdiv(m, block_m), triton.cdiv(n, block_n), groups)
-    ](
-        flat,
-        weight,
-        partials,
-        m,
-        n,
-        k,
-        flat.stride(0),
-        weight.stride(0),
-        block_n,
-        block_k,
-        block_m,
-        num_warps=8 if wide else 4,
-        num_stages=min(num_stages, 2) if wide else num_stages,
-        enable_fp_fusion=False,
-        launch_pdl=PDL,
-    )
-    return partials
-
-
-def linear_k_group_partials_pair(x, weight, x2, weight2):
-    """linear_k_group_partials of (x, weight) and (x2, weight2) in one launch,
-    shape (2, groups, m, n); bitwise equal to the two separate calls."""
+def _launch_k_group_partials(
+    x, weight, partials, grid_groups, x2=None, weight2=None, block_k=256, num_stages=3
+):
     m, n, k = x.shape[0], weight.shape[0], weight.shape[1]
-    assert x2.shape == x.shape and x2.stride() == x.stride()
-    assert weight2.shape == weight.shape and weight2.stride() == weight.stride()
     block_m, block_n = _k_group_blocks(m, n)
     wide = block_n == 128
-    groups = triton.cdiv(k, 1024)
-    partials = torch.empty((2, groups, m, n), device=x.device, dtype=torch.float32)
     _linear_k_group_partials[
-        (triton.cdiv(m, block_m), triton.cdiv(n, block_n), 2 * groups)
+        (triton.cdiv(m, block_m), triton.cdiv(n, block_n), grid_groups)
     ](
         x,
         weight,
@@ -191,21 +166,46 @@ def linear_k_group_partials_pair(x, weight, x2, weight2):
         x.stride(0),
         weight.stride(0),
         block_n,
-        256,
+        block_k,
         block_m,
         x2,
         weight2,
         num_warps=8 if wide else 4,
-        num_stages=2 if wide else 3,
+        num_stages=min(num_stages, 2) if wide else num_stages,
         enable_fp_fusion=False,
-        launch_pdl=PDL,
+        **({"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
     )
     return partials
 
 
-def _linear_k_groups_split(flat, weight, bias, out, block_k=256, num_stages=3):
+def linear_k_group_partials(flat, weight, block_k=256, num_stages=3):
+    """Per-1024-wide-K-group partial products of _linear_k_groups, shape (groups, m, n)."""
+    groups = triton.cdiv(weight.shape[1], 1024)
+    partials = torch.empty(
+        (groups, flat.shape[0], weight.shape[0]),
+        device=flat.device,
+        dtype=torch.float32,
+    )
+    return _launch_k_group_partials(
+        flat, weight, partials, groups, block_k=block_k, num_stages=num_stages
+    )
+
+
+def linear_k_group_partials_pair(x, weight, x2, weight2):
+    """linear_k_group_partials of (x, weight) and (x2, weight2) in one launch,
+    shape (2, groups, m, n); bitwise equal to the two separate calls."""
+    assert x2.shape == x.shape and x2.stride() == x.stride()
+    assert weight2.shape == weight.shape and weight2.stride() == weight.stride()
+    groups = triton.cdiv(weight.shape[1], 1024)
+    partials = torch.empty(
+        (2, groups, x.shape[0], weight.shape[0]), device=x.device, dtype=torch.float32
+    )
+    return _launch_k_group_partials(x, weight, partials, 2 * groups, x2, weight2)
+
+
+def _linear_k_groups_split(flat, weight, bias, out):
     m, n = flat.shape[0], weight.shape[0]
-    partials = linear_k_group_partials(flat, weight, block_k, num_stages)
+    partials = linear_k_group_partials(flat, weight)
     groups = partials.shape[0]
     _linear_k_group_sum[(triton.cdiv(m * n, 256),)](
         partials,
@@ -216,7 +216,7 @@ def _linear_k_groups_split(flat, weight, bias, out, block_k=256, num_stages=3):
         groups,
         bias is not None,
         enable_fp_fusion=False,
-        launch_pdl=PDL,
+        **({"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
     )
 
 

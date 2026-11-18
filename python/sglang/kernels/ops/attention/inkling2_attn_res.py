@@ -14,20 +14,13 @@ from cutlass.cute.runtime import make_fake_compact_tensor
 from sglang.kernels.ops.attention.flash_attn.cute.copy_utils import (
     store_shared_remote_fp32x4,
 )
-from sglang.kernels.ops.inkling2.cute_utils import (
+from sglang.kernels.ops.layernorm.inkling2_cute_utils import (
     domain_offset_raw_aligned,
-)
-from sglang.kernels.ops.inkling2.primitives import (
     fadd_rn_f32,
     fma_rn_f32,
     fmul_rn_f32,
+    torch_to_cute_dtype,
 )
-
-_TORCH_TO_CUTE = {
-    torch.bfloat16: cute.BFloat16,
-    torch.float32: cute.Float32,
-    torch.int64: cute.Int64,
-}
 
 
 class AttnResFwdKernel:
@@ -43,8 +36,8 @@ class AttnResFwdKernel:
         num_g2s_stages: int,
         vec_size: int,
         reload_X: bool,
-        cluster_size: int = 1,
-        max_N: int = 12,
+        cluster_size: int,
+        max_N: int,
     ):
         assert cluster_size in (1, 2), f"cluster_size={cluster_size!r} must be 1 or 2"
         assert D % cluster_size == 0, (
@@ -55,7 +48,7 @@ class AttnResFwdKernel:
             f"D/{cluster_size}={D_local} must be divisible by num_compute_threads={num_compute_threads!r}"
         )
         if cluster_size > 1:
-            assert D_local * _TORCH_TO_CUTE[dtype].width // 8 % 16 == 0, (
+            assert D_local * torch_to_cute_dtype[dtype].width // 8 % 16 == 0, (
                 f"D/{cluster_size}={D_local} rows of {dtype} must be 16-byte aligned"
             )
         assert 1 <= N_Q <= 3, f"N_Q={N_Q!r} must be in [1, 3]"
@@ -78,11 +71,10 @@ class AttnResFwdKernel:
         self.vec_chunks = D_local // (num_compute_threads * self.vec_size)
         self.tail_elems = self.elem_per_thread - self.vec_chunks * self.vec_size
         self.tail_base = self.vec_chunks * self.vec_size
-        self.dtype = _TORCH_TO_CUTE[dtype]
+        self.dtype = torch_to_cute_dtype[dtype]
         self.X_load_bytes = D_local * self.dtype.width // 8
         self.NORMALIZE_VALUES = normalize_values
         self.HAS_PARTIAL_ADDEND = has_partial_addend
-        self.VECTORIZE_PARTIAL_ADDEND = has_partial_addend
         self.reload_X = reload_X
         self.MAX_N = max_N
         self.xchg_floats = self.MAX_N * (self.N_Q + 1)
@@ -184,7 +176,7 @@ class AttnResFwdKernel:
             pipeline.consumer_wait(addend_consumer_state)
         for chunk in range_constexpr(self.vec_chunks):
             cute.autovec_copy(sX_vec[None, tidx, chunk, consumer_state.index], rXVec)
-            if const_expr(self.VECTORIZE_PARTIAL_ADDEND and use_addend):
+            if const_expr(use_addend):
                 cute.autovec_copy(
                     sX_vec[None, tidx, chunk, addend_consumer_state.index],
                     rPartialAddendVec,
@@ -192,15 +184,7 @@ class AttnResFwdKernel:
             for v in range_constexpr(self.vec_size):
                 x = Float32(rXVec[v])
                 if const_expr(use_addend):
-                    if const_expr(self.VECTORIZE_PARTIAL_ADDEND):
-                        x = fadd_rn_f32(x, Float32(rPartialAddendVec[v]))
-                    else:
-                        x = fadd_rn_f32(
-                            x,
-                            Float32(
-                                sX_vec[v, tidx, chunk, addend_consumer_state.index]
-                            ),
-                        )
+                    x = fadd_rn_f32(x, Float32(rPartialAddendVec[v]))
                 rSumSq = fma_rn_f32(x, x, rSumSq)
                 for q in range_constexpr(self.N_Q):
                     q_val = rQ_vec[v, chunk, q]
@@ -261,7 +245,7 @@ class AttnResFwdKernel:
                 pipeline.consumer_wait(addend_consumer_state)
         for chunk in range_constexpr(self.vec_chunks):
             cute.autovec_copy(sX_vec[None, tidx, chunk, consumer_state.index], rXVec)
-            if const_expr(self.VECTORIZE_PARTIAL_ADDEND and use_addend):
+            if const_expr(use_addend):
                 cute.autovec_copy(
                     sX_vec[None, tidx, chunk, addend_consumer_state.index],
                     rPartialAddendVec,
@@ -270,12 +254,7 @@ class AttnResFwdKernel:
                 idx = chunk * self.vec_size + v
                 x = Float32(rXVec[v])
                 if const_expr(use_addend):
-                    if const_expr(self.VECTORIZE_PARTIAL_ADDEND):
-                        x = fadd_rn_f32(x, Float32(rPartialAddendVec[v]))
-                    else:
-                        x = fadd_rn_f32(
-                            x, sX_vec[v, tidx, chunk, addend_consumer_state.index]
-                        )
+                    x = fadd_rn_f32(x, Float32(rPartialAddendVec[v]))
                 for q in range_constexpr(self.N_Q):
                     prob = sExp[n, q]
                     if const_expr(self.NORMALIZE_VALUES):
@@ -284,7 +263,7 @@ class AttnResFwdKernel:
         for t in range_constexpr(self.tail_elems):
             idx = self.tail_base + t
             x = Float32(sX_unvec[tidx, self.tail_base + t, consumer_state.index])
-            if const_expr(self.HAS_PARTIAL_ADDEND and use_addend):
+            if const_expr(use_addend):
                 x = fadd_rn_f32(
                     x, sX_unvec[tidx, self.tail_base + t, addend_consumer_state.index]
                 )
@@ -390,8 +369,8 @@ class AttnResFwdKernel:
         mBlockBase: cute.Tensor,
         mBlockOffs: tuple,
         mPartialAddend: Optional[cute.Tensor],
-        mPseudoQuery: cute.Tensor | tuple[cute.Tensor, ...],
-        mMergedOutput: Optional[cute.Tensor],
+        mPseudoQuery: cute.Tensor,
+        mMergedOutput: cute.Tensor,
         X_smem_layout_staged: cute.Layout,
         reduction_smem_layout: cute.Layout,
         stat_smem_layout: cute.Layout,
@@ -422,8 +401,7 @@ class AttnResFwdKernel:
                     half_off, mPartialAddend, 16
                 )
             mPseudoQueryL = domain_offset_raw_aligned(half_off, mPseudoQuery, 16)
-            if const_expr(mMergedOutput is not None):
-                mMergedOutputL = domain_offset_raw_aligned(half_off, mMergedOutput, 16)
+            mMergedOutputL = domain_offset_raw_aligned(half_off, mMergedOutput, 16)
         if const_expr(self.HAS_PARTIAL_ADDEND):
             assert mPartialAddend is not None
         else:
@@ -531,10 +509,7 @@ class AttnResFwdKernel:
                 cutlass.pipeline.PipelineUserType.Consumer, self.num_g2s_stages
             )
             for q in range_constexpr(self.N_Q):
-                if const_expr(isinstance(mPseudoQueryL, tuple)):
-                    gQ_query = self.local_row(mPseudoQueryL[q])
-                else:
-                    gQ_query = self.local_row(mPseudoQueryL[q, None])
+                gQ_query = self.local_row(mPseudoQueryL[q, None])
                 gQ_chunks = cute.flat_divide(
                     gQ_query, (self.num_compute_threads * self.vec_size,)
                 )
@@ -646,7 +621,6 @@ class AttnResFwdKernel:
                     exp = cute.math.exp(logit - max_logit, fastmath=False)
                     sExp[n, q] = exp
                     exp_sum = fadd_rn_f32(exp_sum, exp)
-                inv_sum = Float32(0.0)
                 inv_sum = Float32(1.0) / exp_sum
                 sInvSum[q] = inv_sum
             cute.arch.barrier(barrier_id=1, number_of_threads=self.num_compute_threads)
@@ -678,25 +652,22 @@ class AttnResFwdKernel:
                 )
             for q in range_constexpr(self.N_Q):
                 inv_sum = sInvSum[q]
-                if const_expr(mMergedOutput is not None):
-                    gOut_row = self.local_row(mMergedOutputL[q, bid, None])
-                    gOut_chunks = cute.flat_divide(
-                        gOut_row, (self.vec_size * self.num_compute_threads,)
-                    )
-                    gOut_vec = cute.flat_divide(gOut_chunks, (self.vec_size,))
-                    gOut_unvec = cute.flat_divide(gOut_row, (self.num_compute_threads,))
+                gOut_row = self.local_row(mMergedOutputL[q, bid, None])
+                gOut_chunks = cute.flat_divide(
+                    gOut_row, (self.vec_size * self.num_compute_threads,)
+                )
+                gOut_vec = cute.flat_divide(gOut_chunks, (self.vec_size,))
+                gOut_unvec = cute.flat_divide(gOut_row, (self.num_compute_threads,))
                 for chunk in range_constexpr(self.vec_chunks):
                     for v in range_constexpr(self.vec_size):
                         idx = chunk * self.vec_size + v
                         out = fmul_rn_f32(rOut[q, idx], inv_sum)
                         rMergedVec[v] = out
-                    if const_expr(mMergedOutput is not None):
-                        cute.autovec_copy(rMergedVec, gOut_vec[None, tidx, chunk])
+                    cute.autovec_copy(rMergedVec, gOut_vec[None, tidx, chunk])
                 for t in range_constexpr(self.tail_elems):
                     idx = self.tail_base + t
                     out = fmul_rn_f32(rOut[q, idx], inv_sum)
-                    if const_expr(mMergedOutput is not None):
-                        gOut_unvec[tidx, self.tail_base + t] = out
+                    gOut_unvec[tidx, self.tail_base + t] = out
 
 
 _FWD_TUNED = {
@@ -732,23 +703,19 @@ def _attn_res_fwd_cutedsl_config(
     N_Q: int,
     has_partial_addend: bool,
     N: int,
-    dtype: torch.dtype,
-    cluster_size: int | None = None,
 ) -> tuple[int, int, int, int]:
     vec_size = 4
     desired_g2s_stages = N + (1 if has_partial_addend else 0)
 
     tuned = _FWD_TUNED.get((D, N_Q))
-    if tuned is not None and cluster_size in (None, tuned[0]):
+    if tuned is not None:
         tuned_cluster_size, num_compute_threads, stages, vec_size = tuned
         num_g2s_stages = (
             desired_g2s_stages if stages == "full" else min(stages, desired_g2s_stages)
         )
         return num_compute_threads, max(2, num_g2s_stages), vec_size, tuned_cluster_size
 
-    if cluster_size is None:
-        cluster_size = 1
-    D_local = D // cluster_size
+    D_local = D
     target = (
         64
         if (N_Q == 1 and D_local < 2688) or D_local < 1536
@@ -774,13 +741,13 @@ def _attn_res_fwd_cutedsl_config(
         num_g2s_stages = 3
     num_g2s_stages = max(2, min(num_g2s_stages, desired_g2s_stages))
 
-    return num_compute_threads, num_g2s_stages, vec_size, cluster_size
+    return num_compute_threads, num_g2s_stages, vec_size, 1
 
 
 @cache
 def _compile_attn_res(width, queries, sources, dtype, normalize_values, has_addend):
     threads, stages, vector, cluster = _attn_res_fwd_cutedsl_config(
-        width, queries, has_addend, sources, dtype
+        width, queries, has_addend, sources
     )
     reload = not (stages == sources + has_addend and (queries == 1 or cluster == 2))
     kernel = AttnResFwdKernel(
@@ -806,7 +773,7 @@ def _compile_attn_res(width, queries, sources, dtype, normalize_values, has_adde
             assumed_align=16,
         )
 
-    x = tensor(_TORCH_TO_CUTE[dtype], (tokens, width))
+    x = tensor(torch_to_cute_dtype[dtype], (tokens, width))
     offsets = tuple(Int64(0) for _ in range(sources))
     q = tensor(Float32, (queries, width))
     y = tensor(Float32, (queries, tokens, width))
@@ -847,9 +814,8 @@ def attn_res(blocks, partial_addend, queries, *, normalize_values=False):
     )
     if not tokens:
         return tuple(output.unbind(0))
-    offsets = tuple(
-        (block.data_ptr() - base.data_ptr()) // base.element_size() for block in blocks
-    )
+    base_ptr, element_size = base.data_ptr(), base.element_size()
+    offsets = tuple((block.data_ptr() - base_ptr) // element_size for block in blocks)
     compiled = _compile_attn_res(
         width,
         n_queries,

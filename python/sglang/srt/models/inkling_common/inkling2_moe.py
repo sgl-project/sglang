@@ -8,7 +8,6 @@ from typing import NamedTuple
 import torch
 from torch import nn
 
-from sglang.kernels.ops.inkling2 import experts_sm90, marlin_sm90
 from sglang.kernels.ops.communication.inkling2_comm import (
     ROUTED_EXCHANGE_MIN_ROWS,
     all_reduce,
@@ -21,11 +20,12 @@ from sglang.kernels.ops.communication.inkling2_comm import (
     prepare_routed_exchange,
     routed_exchange,
 )
-from sglang.kernels.ops.inkling2.linear import (
+from sglang.kernels.ops.gemm.inkling2_linear import (
     linear,
     linear_k_group_partials,
     uses_k_groups,
 )
+from sglang.kernels.ops.inkling2 import experts_sm90, marlin_sm90
 from sglang.kernels.ops.inkling2.moe import (
     routed_partial,
     routed_rows,

@@ -4,23 +4,23 @@ from typing import NamedTuple
 import torch
 from torch import nn
 
-from sglang.kernels.ops.inkling2.attention import (
+from sglang.kernels.ops.attention.inkling2_attn import (
     combine_gate_sink,
     compute_log_scaling_tau,
     gate_sink,
     pad_head_groups,
 )
+from sglang.kernels.ops.attention.inkling2_attn_prologue import attention_prologue
 from sglang.kernels.ops.communication.inkling2_comm import (
     all_reduce,
     oneshot_all_reduce,
     oneshot_all_reduce_input,
 )
-from sglang.kernels.ops.inkling2.linear import (
+from sglang.kernels.ops.gemm.inkling2_linear import (
     linear,
     linear_k_group_partials_pair,
     uses_k_groups,
 )
-from sglang.kernels.ops.inkling2.prologue import attention_prologue
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -100,7 +100,9 @@ class QKL2Clip(nn.Module):
         param.data.copy_(loaded_weight)
 
     def forward(self, x, *, output_scale=None):
-        from sglang.kernels.ops.inkling2.qk_l2_clip import qk_l2_clip_fwd_cutedsl
+        from sglang.kernels.ops.layernorm.inkling2_qk_l2_clip import (
+            qk_l2_clip_fwd_cutedsl,
+        )
 
         output = qk_l2_clip_fwd_cutedsl(
             x, self.threshold, self.eps, scale=self.scale, output_scale=output_scale

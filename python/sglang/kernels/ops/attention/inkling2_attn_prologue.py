@@ -4,21 +4,9 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
+from sglang.kernels.numerics import rsqrt_approx_f32
 
-PDL = is_arch_support_pdl()
 REL_WORKERS = 4
-
-
-@triton.jit
-def _rsqrt_approx(x):
-    return tl.inline_asm_elementwise(
-        "rsqrt.approx.f32 $0, $1;",
-        "=f,f",
-        [x],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
 
 
 @triton.jit
@@ -77,7 +65,7 @@ def _l2_clip(
                 )
             acc = tl.fma(x, x, acc)
     total = _lane_sum8(acc, ROWS_P)
-    norm = tl.where(total > 0.0, total * _rsqrt_approx(total), 0.0)
+    norm = tl.where(total > 0.0, total * rsqrt_approx_f32(total), 0.0)
     coeff = tl.div_rn(threshold, eps + norm)
     coeff = tl.where(coeff >= 1.0, 1.0, coeff)
     cols = tl.arange(0, D)
@@ -104,7 +92,7 @@ def _rms_norm128(X, eps, ROWS: tl.constexpr):
             x = tl.load(X + rows[:, None] * 128 + cols[None, :]).to(tl.float32)
             acc = tl.fma(x, x, acc)
     total = _lane_sum16(acc, ROWS)
-    rstd = _rsqrt_approx(tl.fma(total, 0.0078125, eps))
+    rstd = rsqrt_approx_f32(tl.fma(total, 0.0078125, eps))
     cols = tl.arange(0, 128)
     x = tl.load(X + rows[:, None] * 128 + cols[None, :]).to(tl.float32)
     return x * rstd[:, None]
@@ -343,9 +331,11 @@ def _attention_prologue(
     VERIFY: tl.constexpr = False,
     dyn_rows=0,
     DYN_GROUPS: tl.constexpr = 0,
+    USE_PDL: tl.constexpr = False,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0).to(tl.int64)
     part = tl.program_id(1)
     tau = 1.0
@@ -853,8 +843,6 @@ def attention_prologue(
         device=device,
         dtype=dtype,
     )
-    k_conv = torch.empty((tokens, kv_width), device=device, dtype=dtype)
-    v_conv = torch.empty_like(k_conv)
     dynamic = k_dynamic is not None
     width = k_sconv.shape[0] if dynamic else k_sconv.shape[1]
     assert k_sconv.stride() == v_sconv.stride() and k_cache.stride() == v_cache.stride()
@@ -905,6 +893,8 @@ def attention_prologue(
     ):
         return q, k, v, rel
     if tokens:
+        k_conv = torch.empty((tokens, kv_width), device=device, dtype=dtype)
+        v_conv = torch.empty_like(k_conv)
         _attention_prologue[(tokens, 2 + REL_WORKERS)](
             q_in,
             k_in,
@@ -966,6 +956,6 @@ def attention_prologue(
             k_dynamic.shape[0] if dynamic and k_dynamic.ndim == 3 else 0,
             num_warps=4,
             enable_fp_fusion=False,
-            launch_pdl=PDL,
+            **({"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
         )
     return q, k, v, rel

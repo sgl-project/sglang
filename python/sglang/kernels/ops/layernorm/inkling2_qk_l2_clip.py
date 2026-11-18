@@ -7,26 +7,22 @@ import cutlass
 import torch
 from cutlass import Float32, Int32, const_expr, cute, range_constexpr
 
-from sglang.kernels.ops.inkling2.cute_utils import (
-    assert_cuda_contig,
-    empty_cuda,
-    make_fake_2d_row_major,
-    torch_to_cute_dtype,
-)
-from sglang.kernels.ops.inkling2.norm_common import (
+from sglang.kernels.ops.attention.flash_attn.cute.utils import predicate_k
+from sglang.kernels.ops.layernorm.inkling2_cute_utils import (
+    BASE_ALIGN,
     ceil_div,
     copy_partition,
     load_norm_rows,
+    make_fake_2d_row_major,
     make_fake_norm_rows,
     make_tiled_copy_2d,
     norm_num_rows,
     norm_row_alignment,
-    predicate_n,
     qk_l2_clip_fwd_layout,
     qk_l2_clip_row_stats,
+    reduction_buffer_layout,
+    torch_to_cute_dtype,
 )
-
-BASE_ALIGN = 16
 
 
 class QKL2ClipFwd:
@@ -61,17 +57,6 @@ class QKL2ClipFwd:
             vecsize=vecsize,
         )
         return tiled_copy, tile_mn, threads_per_row
-
-    def _reduction_buffer_layout(self, tv_layout: cute.Layout) -> cute.Layout:
-        num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
-        warps_per_row = (
-            num_warps
-            if cute.rank(tv_layout.shape[0]) == 1
-            else max(tv_layout.shape[0][0] // cute.arch.WARP_SIZE, 1)
-        )
-        return cute.make_ordered_layout(
-            (num_warps // warps_per_row, warps_per_row), order=(1, 0)
-        )
 
     @cute.jit
     def __call__(
@@ -127,7 +112,7 @@ class QKL2ClipFwd:
         smem = cutlass.utils.SmemAllocator()
         reduction_buffer = smem.allocate_tensor(
             cute.Float32,
-            self._reduction_buffer_layout(tv_layout),
+            reduction_buffer_layout(tv_layout),
             byte_alignment=8,
         )
 
@@ -146,7 +131,7 @@ class QKL2ClipFwd:
 
         is_even_n = const_expr(shape[1] == tile_mn[1])
         pred_n = (
-            None if is_even_n else predicate_n(thr_copy.partition_S(cX), limit=shape[1])
+            None if is_even_n else predicate_k(thr_copy.partition_S(cX), limit=shape[1])
         )
         copy_n = partial(copy_partition, pred=pred_n)
 
@@ -180,7 +165,7 @@ class QKL2ClipFwd:
                                 ]
             x = x * tXrScale.load().to(cute.Float32)
 
-        coeff, _ = qk_l2_clip_row_stats(
+        coeff = qk_l2_clip_row_stats(
             x, threshold, eps, threads_per_row, reduction_buffer
         )
 
@@ -271,7 +256,8 @@ def qk_l2_clip_fwd_cutedsl(
     rows_per_output_scale = 0
     if output_scale is not None:
         assert not torch.is_grad_enabled(), "output_scale requires no_grad"
-        assert_cuda_contig(output_scale, name="output_scale", ndim=1)
+        assert output_scale.is_cuda and output_scale.is_contiguous()
+        assert output_scale.ndim == 1, f"{output_scale.shape=}"
         assert output_scale.device == x.device, f"{output_scale.device=} {x.device=}"
         assert output_scale.dtype == torch.float32, (
             f"{output_scale.dtype=} must be FP32"
@@ -296,7 +282,7 @@ def qk_l2_clip_fwd_cutedsl(
     output_dtype = output_dtype or x.dtype
     assert M < 2**31, f"{M=} must fit in Int32"
     assert N > 0, f"{N=} must be positive"
-    y = empty_cuda(M, N, dtype=output_dtype)
+    y = torch.empty((M, N), device="cuda", dtype=output_dtype)
     if x.numel() == 0:
         return y
 

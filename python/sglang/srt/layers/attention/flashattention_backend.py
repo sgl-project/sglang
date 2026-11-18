@@ -1987,7 +1987,7 @@ class FlashAttentionBackend(AttentionBackend):
             elif rel_bias_compact_decode:
                 assert forward_batch.forward_mode.is_target_verify()
                 assert not (use_local_attn or use_cascade_attn or return_lse)
-                from sglang.kernels.ops.inkling2.attention import rel_bias_partials
+                from sglang.kernels.ops.attention.inkling2_attn import rel_bias_partials
 
                 result = rel_bias_decode_epilogue(
                     *rel_bias_partials(
@@ -2531,7 +2531,9 @@ class FlashAttentionBackend(AttentionBackend):
                     kwargs["max_seqlen_k"] = metadata.max_seq_len_k
                 if rel_bias_compact_decode:
                     assert not (use_cascade_attn or pa_swa_active or return_lse)
-                    from sglang.kernels.ops.inkling2.attention import rel_bias_partials
+                    from sglang.kernels.ops.attention.inkling2_attn import (
+                        rel_bias_partials,
+                    )
 
                     result = rel_bias_decode_epilogue(
                         *rel_bias_partials(

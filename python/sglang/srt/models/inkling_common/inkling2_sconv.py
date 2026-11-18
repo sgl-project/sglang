@@ -1,8 +1,8 @@
 import torch
 from torch import nn
 
-from sglang.kernels.ops.inkling2.linear import linear
-from sglang.kernels.ops.inkling2.sconv import (
+from sglang.kernels.ops.gemm.inkling2_linear import linear
+from sglang.kernels.ops.mamba.inkling2_sconv import (
     routed_sconv_epilogue,
     short_convolution,
 )

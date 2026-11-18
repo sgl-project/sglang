@@ -13,7 +13,7 @@ def _renormalize(x, mean, std):
 
 def _position_embeddings(grid, y, x, heights, widths):
     if grid.is_cuda:
-        from sglang.kernels.ops.inkling2.vision import (
+        from sglang.kernels.ops.embeddings.inkling2_bilinear_interpolate import (
             bilinear_interpolate_rows,
         )
 
@@ -36,7 +36,7 @@ def _position_embeddings(grid, y, x, heights, widths):
 
 def _rotary(q, k, positions):
     if q.is_cuda:
-        from sglang.kernels.ops.inkling2.vision import apply_rotary_qk
+        from sglang.kernels.ops.attention.inkling2_vision_rope import apply_rotary_qk
 
         return apply_rotary_qk(q, k, positions)
     dim = q.shape[-1]

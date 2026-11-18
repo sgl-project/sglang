@@ -34,7 +34,7 @@ W, T8 = 4, 8
 
 
 def _triton_sconv(monkeypatch):
-    from sglang.kernels.ops.inkling2 import sconv
+    from sglang.kernels.ops.mamba import inkling2_sconv as sconv
 
     monkeypatch.setattr(sconv, "_cuda_sconv", lambda *args, **kwargs: False)
 
@@ -84,7 +84,7 @@ def _run_both(monkeypatch, fn, mutable):
 def test_sconv_epilogue(
     monkeypatch, seqs, mode, top_k, with_partial, out_dtype, rows_dtype
 ):
-    from sglang.kernels.ops.inkling2.sconv import routed_sconv_epilogue
+    from sglang.kernels.ops.mamba.inkling2_sconv import routed_sconv_epilogue
 
     torch.manual_seed(seqs + top_k)
     hidden, slots = 4608, 2 * seqs + 5
@@ -136,8 +136,11 @@ def test_cuda_prologue(
     """CUDA compact-rel prologue (MTP verify, or decode with the conv cache shift
     and tracked rows) equals the Triton _attention_prologue, at TP4 and TP8 heads
     per rank."""
-    from sglang.kernels.ops.inkling2 import prologue as P
-    from sglang.kernels.ops.inkling2.linear import linear, linear_k_group_partials_pair
+    from sglang.kernels.ops.attention import inkling2_attn_prologue as P
+    from sglang.kernels.ops.gemm.inkling2_linear import (
+        linear,
+        linear_k_group_partials_pair,
+    )
 
     if partials and not full:
         pytest.skip("dynamic weights are full-layer only")
@@ -244,11 +247,11 @@ def test_prologue_sheared_verify_rel(monkeypatch, m, window, ragged, path, H, KV
     """The verify prologue's sheared rel rows (CUDA, or the Triton fallback, also
     at TP8 heads) equal what FA4's ShearingBias builds from the compact ones, and
     FA4 on them (presheared) equals FA4 on the compact rows, bitwise."""
+    from sglang.kernels.ops.attention import inkling2_attn_prologue as P
     from sglang.kernels.ops.attention.flash_attention_v4 import (
         flash_attn_with_kvcache,
     )
     from sglang.kernels.ops.attention.flash_attn.cute import interface
-    from sglang.kernels.ops.inkling2 import prologue as P
 
     torch.manual_seed(m * 4 + ragged * 2 + (window is None))
     D, DR, G, extent, page = 128, 16, 8, 1024, 128
@@ -391,7 +394,7 @@ def test_rel_bias_decode_multi_query(batch, qlen, window, num_sms):
     from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm100_bias_decode import (
         paged_rel_bias_decode,
     )
-    from sglang.kernels.ops.inkling2.attention import combine_gate_sink
+    from sglang.kernels.ops.attention.inkling2_attn import combine_gate_sink
 
     torch.manual_seed(batch * 10 + qlen)
     H, KVH, D, extent, page = 12, 2, 128, 1024, 128
@@ -448,9 +451,9 @@ def _verify_meta(m, slots):
 @blackwell
 @pytest.mark.parametrize("m", [1, 3, 16])
 def test_sconv_windows_and_routed_epilogue(m):
+    from sglang.kernels.ops.elementwise.inkling2_residual_add import residual_add
     from sglang.kernels.ops.inkling2.moe import unweighted_post_reorder
-    from sglang.kernels.ops.inkling2.residual import residual_add
-    from sglang.kernels.ops.inkling2.sconv import (
+    from sglang.kernels.ops.mamba.inkling2_sconv import (
         routed_sconv_epilogue,
         short_convolution,
     )
