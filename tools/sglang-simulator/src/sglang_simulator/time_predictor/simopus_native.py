@@ -163,8 +163,11 @@ class SimOpusNativeCostAdapter:
         }
 
     def query_phase(self, phase, step):
-        from simopus.sdk import ExtendRequestShape, PredictionResult
-        from simopus.sdk import PerfDataNotAvailableError
+        from simopus.sdk import (
+            ExtendRequestShape,
+            PerfDataNotAvailableError,
+            PredictionResult,
+        )
 
         if (
             step.topology.tp_size != self.native_source_policy.tp_size
