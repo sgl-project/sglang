@@ -8,8 +8,8 @@ import sglang.kernels.ops.layernorm.mhc as mhc
 from sglang.kernels.ops.layernorm.mhc import mhc_fused_post_pre, mhc_post, mhc_pre
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
-register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b", runner_config="4-gpu-b200")
 
 
 @pytest.fixture
@@ -604,12 +604,15 @@ def _hc_head_reference(x, fn, scale, base, norm_eps, hc_eps, eps_outside_sqrt):
     return torch.sum((pre + hc_eps).unsqueeze(-1) * x.float(), dim=1).to(x.dtype)
 
 
+# hc=3 and hc=5 pad to a 4- and 8-wide stream tile; the kernel must mask the
+# padded lanes with the real count or it mixes in the next token's streams.
+@pytest.mark.parametrize("hc", [3, 4, 5])
 @pytest.mark.parametrize("eps_outside_sqrt", [False, True])
-def test_fused_hc_head(eps_outside_sqrt):
+def test_fused_hc_head(eps_outside_sqrt, hc):
     from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
 
     torch.manual_seed(0)
-    num_tokens, hc, hidden = 33, 4, 4096
+    num_tokens, hidden = 33, 4096
     x = torch.randn(num_tokens, hc, hidden, device="cuda").bfloat16()
     fn = torch.randn(hc, hc * hidden, device="cuda") * 0.1
     scale = torch.ones(1, device="cuda")

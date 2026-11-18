@@ -37,6 +37,7 @@ def _hc_head_kernel(
     y_ptr,
     hidden_size: tl.constexpr,
     HC_MULT: tl.constexpr,
+    HC_POW2: tl.constexpr,
     K_TOTAL: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -48,10 +49,14 @@ def _hc_head_kernel(
 
     # ---------- Pass 1: sum_sq over flattened K dim, plus hc_mult inner products ----------
     sumsq = tl.zeros((), dtype=tl.float32)
-    mix = tl.zeros((HC_MULT,), dtype=tl.float32)
+    # The stream axis is padded to a power of two for the tile shape; masks must
+    # use the real stream count, or the padded lanes read the next token's
+    # streams (and past the end of hc_fn / hc_base for the last token).
+    mix = tl.zeros((HC_POW2,), dtype=tl.float32)
 
     x_row = x_ptr + pid * K_TOTAL
-    m_idx = tl.arange(0, HC_MULT)
+    m_idx = tl.arange(0, HC_POW2)
+    m_mask = m_idx < HC_MULT
 
     for k_off in tl.range(0, K_TOTAL, BLOCK_K):
         k_offs = k_off + tl.arange(0, BLOCK_K)
@@ -61,7 +66,7 @@ def _hc_head_kernel(
         sumsq += tl.sum(x_tile * x_tile, axis=0)
 
         fn_offs = m_idx[:, None] * K_TOTAL + k_offs[None, :]
-        fn_mask = (m_idx[:, None] < HC_MULT) & k_mask[None, :]
+        fn_mask = m_mask[:, None] & k_mask[None, :]
         fn_tile = tl.load(fn_ptr + fn_offs, mask=fn_mask, other=0.0)
         mix += tl.sum(fn_tile * x_tile[None, :], axis=1)
 
@@ -70,7 +75,7 @@ def _hc_head_kernel(
     else:
         rsqrt = tl.rsqrt(sumsq / K_TOTAL + norm_eps)
     scale_v = tl.load(scale_ptr).to(tl.float32)
-    base_v = tl.load(base_ptr + m_idx).to(tl.float32)
+    base_v = tl.load(base_ptr + m_idx, mask=m_mask, other=0.0).to(tl.float32)
 
     # pre[m] = sigmoid(mix[m] * rsqrt * scale + base[m]) + hc_eps
     pre = tl.sigmoid(mix * rsqrt * scale_v + base_v) + hc_eps
@@ -83,7 +88,7 @@ def _hc_head_kernel(
         d_mask = d_offs < hidden_size
 
         x_offs = m_idx[:, None] * hidden_size + d_offs[None, :]
-        x_mask = (m_idx[:, None] < HC_MULT) & d_mask[None, :]
+        x_mask = m_mask[:, None] & d_mask[None, :]
         x_block = tl.load(x_row + x_offs, mask=x_mask, other=0.0).to(tl.float32)
 
         y_block = tl.sum(pre[:, None] * x_block, axis=0)
@@ -146,7 +151,8 @@ def fused_hc_head(
         hc_base,
         y,
         hidden_size=hidden_size,
-        HC_MULT=hc_mult_pow2,
+        HC_MULT=hc_mult,
+        HC_POW2=hc_mult_pow2,
         K_TOTAL=hc_mult * hidden_size,
         BLOCK_K=BLOCK_K,
         BLOCK_D=BLOCK_D,
