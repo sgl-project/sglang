@@ -2496,19 +2496,24 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # nvfp4_online overrides this for serialized FP8 source weights.
         return False
 
+    def _trtllm_hidden_alignment(self, layer) -> int:
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            trtllm_nvfp4_hidden_alignment,
+        )
+
+        return trtllm_nvfp4_hidden_alignment(
+            use_per_token_activation=self.quant_config.use_per_token_activation,
+            is_gated=layer.moe_runner_config.is_gated,
+        )
+
     def _align_fp4_moe_weights_for_flashinfer_trtllm(self, layer) -> None:
         """Align TRT-LLM weights, allowing model-specific storage layouts."""
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             align_fp4_moe_weights_for_flashinfer_trtllm,
-            trtllm_nvfp4_hidden_alignment,
         )
 
         align_fp4_moe_weights_for_flashinfer_trtllm(
-            layer,
-            hidden_alignment=trtllm_nvfp4_hidden_alignment(
-                use_per_token_activation=self.quant_config.use_per_token_activation,
-                is_gated=layer.moe_runner_config.is_gated,
-            ),
+            layer, hidden_alignment=self._trtllm_hidden_alignment(layer)
         )
 
     def create_weights(
@@ -2957,10 +2962,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 layer.w13_weight.device,
             )
 
+        # The TRT-LLM runner pads a misaligned hidden dim and so needs BF16
+        # activations; FP4 dispatch would quantize them at the unpadded size.
+        trtllm_pads_hidden = (
+            self.enable_flashinfer_trtllm_moe
+            and layer.hidden_size % self._trtllm_hidden_alignment(layer) != 0
+        )
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
         use_dispatch_fp4 = (
             not self.quant_config.use_per_token_activation
             and not use_w4a16
+            and not trtllm_pads_hidden
             and (
                 use_nvfp4_dispatch or should_use_flashinfer_cutlass_moe_fp4_allgather()
             )
