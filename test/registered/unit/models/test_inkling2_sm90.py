@@ -24,7 +24,7 @@ EXPERTS, LOCAL, TOP_K = 64, 8, 8
 
 
 def _routing(tokens, seed=0):
-    from sglang.kernels.ops.inkling2 import marlin_sm90
+    from sglang.kernels.ops.gemm import inkling2_marlin_sm90 as marlin_sm90
     from sglang.kernels.ops.moe.inkling2_route import route_metadata
 
     g = torch.Generator(device="cuda").manual_seed(seed)
@@ -56,7 +56,8 @@ def _check_rows(out, flat, xq, top_k, weight):
 @hopper
 @pytest.mark.parametrize("tokens", [1, 9, 64])
 def test_marlin_nvfp4(tokens):
-    from sglang.kernels.ops.inkling2 import experts_sm90, marlin_sm90
+    from sglang.kernels.ops.gemm import inkling2_marlin_sm90 as marlin_sm90
+    from sglang.kernels.ops.moe import inkling2_experts_sm90 as experts_sm90
 
     n, k = 512, 1024
     packed = torch.randint(0, 256, (LOCAL, n, k // 2), dtype=torch.uint8, device="cuda")
@@ -84,7 +85,8 @@ def test_marlin_nvfp4(tokens):
 @hopper
 @pytest.mark.parametrize("tokens", [1, 64])
 def test_marlin_mxfp8(tokens):
-    from sglang.kernels.ops.inkling2 import experts_sm90, marlin_sm90
+    from sglang.kernels.ops.gemm import inkling2_marlin_sm90 as marlin_sm90
+    from sglang.kernels.ops.moe import inkling2_experts_sm90 as experts_sm90
 
     n, k = 512, 1024
     weight8 = (torch.randn(LOCAL, n, k, device="cuda") * 50).to(torch.float8_e4m3fn)
@@ -110,7 +112,9 @@ def test_marlin_mxfp8(tokens):
 @pytest.mark.parametrize("qlen", [1, 8])
 @pytest.mark.parametrize("window", [None, 1023])
 def test_decode_attention(window, qlen):
-    from sglang.kernels.ops.inkling2.decode_attention_sm90 import decode_partials
+    from sglang.kernels.ops.attention.inkling2_decode_attention_sm90 import (
+        decode_partials,
+    )
 
     d, group, page, extent = 128, 6, 128, 1024
     seqlens = [qlen, 77, 2049, 0 if qlen == 1 else 2111]

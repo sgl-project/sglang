@@ -226,7 +226,7 @@ def rel_bias_partials(
                 else None
             ),
         )
-    from sglang.kernels.ops.inkling2.decode_attention_sm90 import (
+    from sglang.kernels.ops.attention.inkling2_decode_attention_sm90 import (
         decode_partials,
     )
 

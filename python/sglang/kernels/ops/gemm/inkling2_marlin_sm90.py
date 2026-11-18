@@ -12,7 +12,7 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from sglang.kernels.jit.utils import load_jit
-from sglang.kernels.ops.inkling2.experts_sm90 import (
+from sglang.kernels.ops.moe.inkling2_experts_sm90 import (
     ROW_LOOP_MIN_ROWS,
     _nvfp4_values,
     _ue8m0,

@@ -494,8 +494,8 @@ def test_sconv_windows_and_routed_epilogue(m):
 @blackwell
 def test_markov_rnn_gates_and_softcap():
     from sglang.kernels.ops.activation.softcap import softcap_inplace_logits
-    from sglang.kernels.ops.inkling2.mtp import rnn_gates
     from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
+    from sglang.kernels.ops.speculative.inkling2_mtp import rnn_gates
 
     torch.manual_seed(0)
     for rows in (1, 16, 64):

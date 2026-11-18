@@ -3,7 +3,7 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
-from sglang.kernels.ops.inkling2.mtp import (
+from sglang.kernels.ops.speculative.inkling2_mtp import (
     mix_rmsnorm,
     rnn_gates,
     rnn_inputs,

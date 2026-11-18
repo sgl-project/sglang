@@ -19,6 +19,7 @@ from sglang.kernels.ops.communication.inkling2_comm import (
     prepare_routed_exchange,
     routed_exchange,
 )
+from sglang.kernels.ops.gemm import inkling2_marlin_sm90 as marlin_sm90
 from sglang.kernels.ops.gemm.inkling2_linear import (
     linear,
     linear_k_group_partials,
@@ -34,7 +35,7 @@ from sglang.kernels.ops.gemm.inkling2_nvfp4 import (
     routed_expert_matmul,
     routed_swiglu_expert_matmul,
 )
-from sglang.kernels.ops.inkling2 import experts_sm90, marlin_sm90
+from sglang.kernels.ops.moe import inkling2_experts_sm90 as experts_sm90
 from sglang.kernels.ops.moe.inkling2_moe import (
     routed_partial,
     routed_rows,
