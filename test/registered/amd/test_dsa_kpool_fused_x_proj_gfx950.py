@@ -230,6 +230,108 @@ class TestKPoolFusedXProj(CustomTestCase):
         slots = [(3 + i) % tail_size for i in range(n)]
         self.assertTrue(torch.equal(got[2][0, slots], score_slice.bfloat16()))
 
+    @torch.no_grad()
+    def test_tail_write_with_key_norm_and_query_quant(self):
+        from sglang.kernels.ops.attention.fla.layernorm_gated import _layer_norm_fwd
+        from sglang.kernels.ops.quantization.act_quant_tilelang import act_quant
+        from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
+
+        pool_size, n, d = 4, TOKENS, INDEX_HEAD_DIM
+        pool = type(
+            "Pool",
+            (),
+            dict(
+                page_size=256,
+                index_head_dim=d,
+                index_page_size=64,
+                index_kpool=pool_size,
+                tail_extra_slots=n,
+                quant_block_size=128,
+            ),
+        )()
+        tail_size = pool_size + n
+        k_norm = LayerNorm(d, dtype=torch.float32).cuda()
+        k_norm.weight.uniform_(0.5, 1.5)
+        k_norm.bias.uniform_(-0.1, 0.1)
+        key_norm = (k_norm.weight, k_norm.bias, k_norm.variance_epsilon)
+        head_scale, softmax_scale = N_HEADS**-0.5, d**-0.5
+        page_nbytes = 64 * d + 64 * 4
+
+        for bs, pad, round_scale in ((3, 2, True), (16, 0, False), (1, 7, True)):
+            with self.subTest(bs=bs, pad=pad, round_scale=round_scale):
+                rows = bs * n + pad
+                # one fp32 projection: key | score | head gates; pad rows are MoE padding
+                proj = torch.randn(rows, 2 * d + N_HEADS, device="cuda")
+                query = torch.randn(rows, N_HEADS, d, device="cuda").bfloat16()
+                ape = torch.randn(pool_size, d, device="cuda")
+                tail_k0 = torch.randn(bs, tail_size, d, device="cuda").bfloat16()
+                tail_s0 = torch.randn_like(tail_k0)
+
+                def run(key, **fused):
+                    buf = torch.zeros(
+                        (2 * bs, page_nbytes), dtype=torch.uint8, device="cuda"
+                    )
+                    tail_k, tail_s = tail_k0.clone(), tail_s0.clone()
+                    q_out = kpool_write_tail_and_maybe_compress(
+                        pool=pool,
+                        buf=buf,
+                        key=key[: bs * n],
+                        score=proj[: bs * n, d : 2 * d],
+                        tail_k=tail_k,
+                        tail_score=tail_s,
+                        ape=ape,
+                        req_pool_indices=torch.arange(
+                            bs, dtype=torch.int64, device="cuda"
+                        ),
+                        write_start=torch.full(
+                            (bs,), 3, dtype=torch.int32, device="cuda"
+                        ),
+                        tail_logical_start=torch.zeros(
+                            bs, dtype=torch.int32, device="cuda"
+                        ),
+                        write_loc=torch.arange(
+                            2 * bs, dtype=torch.int64, device="cuda"
+                        ).view(bs, 2),
+                        out_cache_loc=torch.arange(
+                            1, bs * n + 1, dtype=torch.int64, device="cuda"
+                        ),
+                        num_draft_tokens=n,
+                        round_scale=round_scale,
+                        **fused,
+                    )
+                    return (buf, tail_k, tail_s), q_out
+
+                key = torch.empty(rows, d, dtype=torch.bfloat16, device="cuda")
+                _layer_norm_fwd(proj[:, :d], *key_norm, out=key)
+                want, _ = run(key)
+                want_q, want_s = act_quant(
+                    rotate_activation(query), d, "ue8m0" if round_scale else None
+                )
+                want_w = (
+                    (proj[:, 2 * d :] * head_scale).unsqueeze(-1)
+                    * want_s
+                    * softmax_scale
+                )
+
+                got, (q_fp8, q_scale, weights) = run(
+                    proj[:, :d],
+                    key_norm=key_norm,
+                    query=query,
+                    head_weights=proj[:, 2 * d :],
+                    head_scale=head_scale,
+                    softmax_scale=softmax_scale,
+                )
+                # the LayerNorm matches `_layer_norm_fwd` up to reduction order
+                k_diff = (got[1].float() - want[1].float()).abs().max().item()
+                self.assertLessEqual(k_diff, 2e-2)
+                self.assertTrue(torch.equal(got[2], want[2]))
+                self.assertGreater((got[0] == want[0]).float().mean().item(), 0.99)
+                self.assertTrue(
+                    torch.equal(q_fp8.view(torch.uint8), want_q.view(torch.uint8))
+                )
+                self.assertTrue(torch.equal(q_scale, want_s))
+                self.assertTrue(torch.equal(weights, want_w))
+
 
 if __name__ == "__main__":
     unittest.main()
