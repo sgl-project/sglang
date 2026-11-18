@@ -1627,6 +1627,7 @@ def dpsk_v4_fp8_partial_kernel(
     inner_iter_2: int = 0,
     num_stages: int = 0,
     threads: int = 512,
+    fp8_exp_bias: int = 7,
 ) -> Any:
     """
     Read FP8 K cache directly, dequantise to BF16 in-kernel, do flash-attn
@@ -1817,7 +1818,7 @@ def dpsk_v4_fp8_partial_kernel(
                             exp_e4 = (b_u32 & T.uint32(0x78)) >> T.uint32(3)
                             mant_bf = (b_u32 & T.uint32(0x7)) * T.uint32(0x10)
                             scale_byte = scale_byte_local[bi_i, d_i // NOPE_TILE]
-                            exp_combined = exp_e4 + scale_byte - T.uint32(7)
+                            exp_combined = exp_e4 + scale_byte - T.uint32(fp8_exp_bias)
                             bf16_bits = (
                                 sign_bf | (exp_combined << T.uint32(7)) | mant_bf
                             )
@@ -1960,7 +1961,7 @@ def dpsk_v4_fp8_partial_kernel(
                             exp_e4 = (b_u32 & T.uint32(0x78)) >> T.uint32(3)
                             mant_bf = (b_u32 & T.uint32(0x7)) * T.uint32(0x10)
                             scale_byte = scale_byte_local[bi_i, d_i // NOPE_TILE]
-                            exp_combined = exp_e4 + scale_byte - T.uint32(7)
+                            exp_combined = exp_e4 + scale_byte - T.uint32(fp8_exp_bias)
                             bf16_bits = (
                                 sign_bf | (exp_combined << T.uint32(7)) | mant_bf
                             )
@@ -2159,7 +2160,7 @@ def dpsk_v4_fp8_partial_kernel(
                     exp_e4 = (b_u32 & T.uint32(0x78)) >> T.uint32(3)
                     mant_bf = (b_u32 & T.uint32(0x7)) * T.uint32(0x10)
                     scale_byte = scale_byte_local[bi_i, d_i // NOPE_TILE]
-                    exp_combined = exp_e4 + scale_byte - T.uint32(7)
+                    exp_combined = exp_e4 + scale_byte - T.uint32(fp8_exp_bias)
                     bf16_bits = sign_bf | (exp_combined << T.uint32(7)) | mant_bf
                     KV_shared[bi_i, d_i] = T.reinterpret(
                         BF16, T.Cast("uint16", bf16_bits)
@@ -2513,10 +2514,14 @@ def dpsk_v4_fp8_attention_fwd(
     """
     Follows the original `flash_mla.flash_mla_with_kvcache` signature.
     """
+    # num_stages=0 on every arch: TileLang's pipeline planner reorders the
+    # page_idx_shared producer after the gather that reads it (ROCM-33500).
     if _is_gfx95_supported:
         block_I, threads, num_stages, block_per_cu, cu = 64, 512, 0, 2, 256
     else:
-        block_I, threads, num_stages, block_per_cu, cu = 32, 128, 1, 1, 304
+        block_I, threads, num_stages, block_per_cu, cu = 32, 128, 0, 1, 304
+    # The KV writers store e4m3fnuz (exponent bias 8) on fnuz platforms (gfx942).
+    fp8_exp_bias = 8 if _is_fp8_fnuz else 7
 
     batch, seq_len, num_heads, _ = q.shape
     # Partial grid is (seq_len * REPLICATE_H * n_groups, batch, kv_group); the
@@ -2553,6 +2558,7 @@ def dpsk_v4_fp8_attention_fwd(
             inner_iter_1=inner_iter_1,
             num_stages=num_stages,
             threads=threads,
+            fp8_exp_bias=fp8_exp_bias,
         )
         partial_o, partial_lse = partial(q, k1, indices, tk_len_1)
     else:
@@ -2583,6 +2589,7 @@ def dpsk_v4_fp8_attention_fwd(
             inner_iter_2=inner_iter_2,
             num_stages=num_stages,
             threads=threads,
+            fp8_exp_bias=fp8_exp_bias,
         )
         partial_o, partial_lse = partial(
             q,
