@@ -1,5 +1,4 @@
 import logging
-import warnings
 from typing import TYPE_CHECKING
 
 import torch
@@ -205,17 +204,6 @@ def create_qsa_backend(runner):
     )
 
     return QwenSparseAttnBackend(runner)
-
-
-@register_attention_backend("nsa")
-def _create_nsa_compat(runner):
-    warnings.warn(
-        "attention-backend='nsa' is deprecated; use 'dsa' instead. "
-        "The alias will be removed in a future release.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return create_dsa_backend(runner)
 
 
 @register_attention_backend("dsv4")
