@@ -13,7 +13,11 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import requests
 
-from sglang.srt.disaggregation.base.conn import KVPoll, StateType
+from sglang.srt.disaggregation.base.conn import (
+    KVPoll,
+    KVTransferDestination,
+    StateType,
+)
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_handler import PrefillStagingContext
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
@@ -24,6 +28,9 @@ from sglang.srt.disaggregation.nixl.conn import (
     NixlKVReceiver,
     NixlKVSender,
     TransferInfo,
+    _host_prep_key,
+    host_kv_geometry,
+    host_receive_supported,
 )
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -93,6 +100,7 @@ class TestNixlBackendInitialization(CustomTestCase):
         ib_device=None,
         backend_params=None,
         ucx_net_devices="",
+        kv_args_overrides=None,
     ):
         args = SimpleNamespace(
             pp_rank=0,
@@ -101,8 +109,10 @@ class TestNixlBackendInitialization(CustomTestCase):
             ib_device=ib_device,
             kv_data_ptrs=[],
             kv_item_lens=[],
+            host_kv_data_ptrs=None,
             state_types=[],
         )
+        vars(args).update(kv_args_overrides or {})
         mgr = object.__new__(NixlKVManager)
         mgr.kv_args = args
         mgr.disaggregation_mode = mode
@@ -147,6 +157,37 @@ class TestNixlBackendInitialization(CustomTestCase):
             NixlKVManager.__init__(mgr, args, mode, server_args)
             get_device_module.assert_called_once_with("cuda")
             self.assertEqual(os.environ["UCX_NET_DEVICES"], ucx_net_devices)
+        return mgr
+
+    def test_a_decode_with_a_host_pool_derives_the_host_capability(self):
+        """Every other fixture builds the manager with object.__new__, so this
+        is the only case that runs the real __init__ wiring. A decode that did
+        not derive the capability would refuse the host-receive threshold at
+        startup, or advertise a pool it cannot take."""
+        host_pool = {
+            "kv_data_ptrs": [0x1000],
+            "kv_data_lens": [64],
+            "kv_item_lens": [16],
+            "host_kv_data_ptrs": [0x9000],
+            "host_kv_data_lens": [128],
+            "host_kv_item_lens": [32],
+            "state_data_ptrs": None,
+            "host_state_data_ptrs": None,
+        }
+        for name, overrides, expected in (
+            ("kv_only", host_pool, True),
+            ("with_state", {**host_pool, "host_state_data_ptrs": [[0x2000]]}, False),
+        ):
+            with self.subTest(pool=name):
+                mgr = self._initialize_manager(
+                    MagicMock(),
+                    MagicMock(),
+                    DisaggregationMode.DECODE,
+                    1,
+                    kv_args_overrides=overrides,
+                )
+                self.assertIs(mgr.supports_host_destination, expected)
+                self.assertEqual(mgr.host_kv_geometry.num_slots, 4)
 
     def test_backend_initialization_selects_device_in_deadline_thread(self):
         caller_thread = threading.get_ident()
@@ -1031,6 +1072,67 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertEqual(order, [])
         mgr.send_kvcache.assert_not_called()
 
+    def test_a_host_request_is_refused_on_every_path_without_a_host_dlist(self):
+        """Only the prepared equal-TP dlist has a host twin. A HOST request that
+        reached any other send path would write the decode's device pool, which
+        holds live KV, so each path must fail the room instead of sending."""
+        room = 31
+        senders = (
+            "send_kvcache",
+            "send_kvcache_mixed",
+            "send_kvcache_slice",
+            "send_kvcache_dcp",
+            "_send_packed_kvcache",
+        )
+        paths = (
+            ("dcp_relayout", {"requires_dcp_relayout": True}, False),
+            ("mixed_memory_kinds", {"kv_xfer_segments": [object()]}, False),
+            ("kv_packing", {"decode_tp_size": 2}, True),
+            ("tp_slice", {"decode_tp_size": 2}, False),
+        )
+        for name, peer_attrs, packing in paths:
+            with self.subTest(path=name):
+                mgr = self._make_manager(room)
+                req = mgr.transfer_infos[room]["agent"]
+                req.destination = KVTransferDestination.HOST
+                vars(mgr.decode_kv_args_table["agent"]).update(peer_attrs)
+                mgr.enable_kv_packing = packing
+                mgr._kv_packers = [MagicMock()] if packing else []
+                mgr._reload_invalidated_peers = MagicMock()
+                for sender in senders:
+                    setattr(mgr, sender, MagicMock())
+
+                self._run_worker_once(
+                    mgr, self._make_chunk(room, [1], is_last_chunk=False)
+                )
+
+                self.assertEqual(mgr.request_status[room], KVPoll.Failed)
+                self.assertIn("host KV destinations", mgr.failure_records[room])
+                for sender in senders:
+                    getattr(mgr, sender).assert_not_called()
+
+    def test_a_host_request_is_sent_through_the_host_dlist(self):
+        """The worker must hand the request's own destination to the sender. A
+        call site that fell back to the device pool would write rows the decode
+        never reserved under host receive, corrupting another request's KV."""
+        room = 32
+        mgr = self._make_manager(room)
+        mgr.transfer_infos[room]["agent"].destination = KVTransferDestination.HOST
+        vars(mgr.decode_kv_args_table["agent"]).update(
+            dst_host_kv_ptrs=[0x9000], dst_host_num_slots=8
+        )
+        mgr.prep_handles = {_host_prep_key("agent"): "host-dlist"}
+        mgr.send_kvcache = MagicMock(return_value="kv_handle")
+
+        self._run_worker_once(mgr, self._make_chunk(room, [1], is_last_chunk=False))
+
+        mgr.send_kvcache.assert_called_once()
+        call = mgr.send_kvcache.call_args
+        self.assertEqual(call.args[2], [0x9000])
+        self.assertEqual(call.kwargs["dst_mem_kind"], "DRAM")
+        self.assertEqual(call.kwargs["dst_prep_key"], _host_prep_key("agent"))
+        self.assertEqual(call.kwargs["dst_num_slots"], 8)
+
 
 class TestNixlDecodeListener(CustomTestCase):
     def test_decode_listener_receives_zmq_chunk_and_success(self):
@@ -1514,6 +1616,45 @@ class ReloadFakeAgent:
         return "DONE"
 
 
+class HostDestinationFakeAgent:
+    """Records what each dlist was prepared from, so a test can check the
+    geometry the host twin is built with."""
+
+    def __init__(self):
+        self.registered = []
+        self.prepared = {}
+        self._next = 0
+
+    def register_memory(self, addrs, mem_type):
+        self.registered.append((mem_type, list(addrs)))
+        return [f"desc-{mem_type}"]
+
+    def add_remote_agent(self, metadata):
+        return metadata.decode("ascii")
+
+    def check_remote_metadata(self, name):
+        return True
+
+    def prep_xfer_dlist(self, name, descs, mem_kind):
+        self._next += 1
+        handle = f"dlist-{self._next}"
+        self.prepared[handle] = (name, np.asarray(descs).tolist(), mem_kind)
+        return handle
+
+    def make_prepped_xfer(self, op, src, src_indices, dst, dst_indices, notif=b""):
+        return ("xfer", src, dst, list(src_indices), list(dst_indices))
+
+    def transfer(self, handle):
+        return "PROC"
+
+
+# Prefill writes 16 bytes per slot; the decode's host pool strides 32 and holds
+# 8 slots, so a dlist built from device geometry is visibly wrong.
+_HOST_PTRS = [0x9000, 0xA000]
+_HOST_ITEM_LENS = [32, 32]
+_HOST_NUM_SLOTS = 8
+
+
 class TestNixlInvalidatedPeerReload(CustomTestCase):
     def _make_manager(self, peers):
         mgr = object.__new__(NixlKVManager)
@@ -1814,6 +1955,358 @@ class TestNixlUnifiedMemory(CustomTestCase):
         np.testing.assert_array_equal(src[0], [[0x10100, 256, 0]])
         np.testing.assert_array_equal(dst[0], [[0x40280, 256, 0]])
         self.assertEqual(mgr.agent.transfer_calls, ["handle"])
+
+
+class TestNixlHostDestination(CustomTestCase):
+    """Host KV destinations: the decode advertises a second, host-resident
+    destination pool and binds a request to it per transfer."""
+
+    def _make_prefill_manager(self, host_peer=True, decode_only_spec_dec=False):
+        mgr = object.__new__(NixlKVManager)
+        mgr.customized_info_enabled = False
+        mgr.exchange_aux_item_lens = False
+        mgr.agent = HostDestinationFakeAgent()
+        mgr.disaggregation_mode = DisaggregationMode.PREFILL
+        mgr.is_mla_backend = False
+        mgr.is_hybrid_mla_backend = False
+        mgr.attn_tp_size = 1
+        mgr.pp_size = 1
+        mgr.src_mem_kind = "VRAM"
+        mgr._num_slots_src = 4
+        mgr.prep_handles = {}
+        mgr.prep_handles_slice_dst = {}
+        mgr._prepared_state_plans = {}
+        mgr._prepared_state_components = frozenset()
+        mgr._state_layout_rejections = {}
+        mgr.kv_args = SimpleNamespace(
+            gpu_id=0,
+            engine_rank=0,
+            num_draft_entries=0,
+            kv_layer_ids=[],
+            kv_data_ptrs=[0x1000, 0x2000],
+            kv_data_lens=[64, 64],
+            kv_item_lens=[16, 16],
+            kv_data_mem_kinds=["VRAM", "VRAM"],
+            aux_data_ptrs=[0],
+            aux_item_lens=[16],
+        )
+        # A decode that also runs speculative decoding registers more KV
+        # regions than the prefill writes.
+        dst_kv_ptrs = [0x3000, 0x4000]
+        dst_kv_item_lens = [16, 16]
+        host_ptrs, host_item_lens = list(_HOST_PTRS), list(_HOST_ITEM_LENS)
+        if decode_only_spec_dec:
+            dst_kv_ptrs = dst_kv_ptrs + [0x5000]
+            dst_kv_item_lens = dst_kv_item_lens + [16]
+            host_ptrs = host_ptrs + [0xB000]
+            host_item_lens = host_item_lens + [32]
+        info = KVArgsRegisterInfo(
+            room="None",
+            endpoint="127.0.0.1",
+            dst_port=5555,
+            agent_name="agent",
+            agent_metadata=b"agent",
+            dst_kv_ptrs=dst_kv_ptrs,
+            dst_kv_mem_kinds=["VRAM"] * len(dst_kv_ptrs),
+            dst_aux_ptrs=[0],
+            dst_aux_item_lens=None,
+            dst_state_data_ptrs=[],
+            gpu_id=0,
+            decode_tp_size=1,
+            decode_tp_rank=0,
+            dst_kv_item_len=16,
+            dst_kv_item_lens=dst_kv_item_lens,
+            dst_num_slots=4,
+            dst_host_kv_ptrs=host_ptrs if host_peer else None,
+            dst_host_kv_item_lens=host_item_lens if host_peer else None,
+            dst_host_num_slots=_HOST_NUM_SLOTS if host_peer else 0,
+        )
+        mgr.decode_kv_args_table = {"agent": info}
+        return mgr, info
+
+    def _make_decode_manager(self, state_ptrs=(), host_state=None):
+        mgr = object.__new__(NixlKVManager)
+        mgr.customized_info_enabled = False
+        mgr.exchange_aux_item_lens = False
+        mgr.agent = HostDestinationFakeAgent()
+        mgr.agent.name = "decode-agent"
+        mgr.agent.get_agent_metadata = lambda: b"decode-meta"
+        mgr.disaggregation_mode = DisaggregationMode.DECODE
+        mgr.local_ip = "127.0.0.1"
+        mgr.rank_port = 6000
+        mgr.attn_tp_size = 1
+        mgr.dcp_size = 1
+        mgr.dcp_rank = 0
+        mgr.enable_staging = False
+        mgr.is_mla_backend = False
+        mgr.is_hybrid_mla_backend = False
+        mgr.kv_args = SimpleNamespace(
+            # Non-zero so a host region registered under the GPU id, instead of
+            # NIXL's device 0 for host memory, is distinguishable.
+            gpu_id=3,
+            engine_rank=0,
+            draft_rows_dcp_collapsed=False,
+            kv_layer_ids=[0, 1],
+            kv_data_ptrs=[0x3000, 0x4000],
+            kv_data_lens=[64, 64],
+            kv_item_lens=[16, 16],
+            kv_data_mem_kinds=["VRAM", "VRAM"],
+            host_kv_data_ptrs=list(_HOST_PTRS),
+            host_kv_data_lens=[
+                item_len * _HOST_NUM_SLOTS for item_len in _HOST_ITEM_LENS
+            ],
+            host_kv_item_lens=list(_HOST_ITEM_LENS),
+            host_state_data_ptrs=host_state,
+            aux_data_ptrs=[0x7000],
+            aux_data_lens=[64],
+            aux_item_lens=[16],
+            state_data_ptrs=list(state_ptrs),
+            state_data_lens=[[64]] * len(state_ptrs),
+            state_item_lens=[[16]] * len(state_ptrs),
+            state_layer_ids=[[0]] * len(state_ptrs),
+            state_dim_per_tensor=[[0]] * len(state_ptrs),
+        )
+        mgr.host_kv_geometry = host_kv_geometry(mgr.kv_args)
+        mgr.supports_host_destination = host_receive_supported(mgr.kv_args)
+        return mgr
+
+    def test_host_dlist_uses_the_peer_host_stride_and_slot_count(self):
+        """The host twin must be prepared from the host pool's own stride and
+        slot count, with the prefill's per-slot transfer length. Reusing the
+        device geometry would write at the wrong offsets inside the host pool."""
+        mgr, info = self._make_prefill_manager()
+        mgr._prepare_payload_xfer(info)
+
+        host_handle = mgr.prep_handles[_host_prep_key("agent")]
+        name, descs, mem_kind = mgr.agent.prepared[host_handle]
+        self.assertEqual(name, "agent")
+        self.assertEqual(mem_kind, "DRAM")
+        # (addr, transfer len, device id, stride, slot count) per KV region.
+        self.assertEqual(
+            descs,
+            [
+                [_HOST_PTRS[0], 16, 0, _HOST_ITEM_LENS[0], _HOST_NUM_SLOTS],
+                [_HOST_PTRS[1], 16, 0, _HOST_ITEM_LENS[1], _HOST_NUM_SLOTS],
+            ],
+        )
+        # The device twin stays addressable under the plain peer key.
+        _, device_descs, device_mem_kind = mgr.agent.prepared[mgr.prep_handles["agent"]]
+        self.assertEqual(device_mem_kind, "VRAM")
+        self.assertEqual(device_descs[0], [0x3000, 16, 0, 16, 4])
+
+    def test_no_host_dlist_without_a_host_peer(self):
+        """A decode that never advertised a host pool must not get a host twin,
+        so the gate cannot degrade into always preparing one."""
+        mgr, info = self._make_prefill_manager(host_peer=False)
+        mgr._prepare_payload_xfer(info)
+        self.assertNotIn(_host_prep_key("agent"), mgr.prep_handles)
+        self.assertIn("agent", mgr.prep_handles)
+
+    def test_host_peer_with_decode_only_spec_dec_is_rejected_at_registration(self):
+        """A decode-only speculative-decoding peer has more KV regions than the
+        prefill writes; reject it while registering rather than mid-transfer."""
+        mgr, info = self._make_prefill_manager(decode_only_spec_dec=True)
+        with self.assertRaises(NotImplementedError):
+            mgr._prepare_payload_xfer(info)
+
+    def test_registration_message_round_trips_the_host_geometry(self):
+        """The host frames ride at the end of the registration message, so a
+        frame inserted mid-message would silently shift them."""
+        mgr = self._make_decode_manager()
+        msg = mgr.build_receiver_registration_message()[1:]
+        info = KVArgsRegisterInfo.from_zmq(msg)
+        self.assertEqual(info.dst_host_kv_ptrs, list(_HOST_PTRS))
+        self.assertEqual(info.dst_host_kv_item_lens, list(_HOST_ITEM_LENS))
+        self.assertEqual(info.dst_host_num_slots, _HOST_NUM_SLOTS)
+        # The device geometry must survive unchanged next to it.
+        self.assertEqual(info.dst_kv_ptrs, [0x3000, 0x4000])
+        self.assertEqual(info.dst_kv_item_lens, [16, 16])
+
+    def test_registration_message_without_host_frames_reads_as_device_only(self):
+        """A peer running a build that predates host destinations sends no host
+        frames; this rank must read that as 'no host pool', not as zeros."""
+        mgr = self._make_decode_manager()
+        msg = mgr.build_receiver_registration_message()[1:]
+        info = KVArgsRegisterInfo.from_zmq(msg[:26])
+        self.assertIsNone(info.dst_host_kv_ptrs)
+        self.assertEqual(info.dst_host_num_slots, 0)
+
+    def test_inconsistent_host_geometry_is_rejected_on_both_sides(self):
+        """A host pool that does not line up with the device regions would turn
+        into RDMA writes at the wrong addresses, so the decode refuses to build
+        it and the prefill refuses to read it, rather than prepare a dlist."""
+        mgr = self._make_decode_manager()
+        msg = mgr.build_receiver_registration_message()[1:]
+        with self.subTest(side="prefill reads a registration"):
+            truncated = list(msg)
+            truncated[27] = truncated[27][:8]
+            with self.assertRaises(ValueError):
+                KVArgsRegisterInfo.from_zmq(truncated)
+        with self.subTest(side="decode builds its geometry"):
+            for field in (
+                "host_kv_data_ptrs",
+                "host_kv_data_lens",
+                "host_kv_item_lens",
+            ):
+                setattr(mgr.kv_args, field, getattr(mgr.kv_args, field)[:1])
+            with self.assertRaises(ValueError):
+                host_kv_geometry(mgr.kv_args)
+
+    def test_a_state_carrying_pool_does_not_advertise_host_destinations(self):
+        """A state component has no host twin yet, so a pool carrying one keeps
+        device receive instead of splitting a request across two pools."""
+        for kwargs in ({"state_ptrs": [[0xC000]]}, {"host_state": [[0xC000]]}):
+            with self.subTest(**kwargs):
+                mgr = self._make_decode_manager(**kwargs)
+                self.assertFalse(mgr.supports_host_destination)
+                msg = mgr.build_receiver_registration_message()[1:]
+                self.assertIsNone(KVArgsRegisterInfo.from_zmq(msg).dst_host_kv_ptrs)
+
+    def test_host_buffers_are_registered_as_dram(self):
+        """Both pools must reach the NIXL agent: an unregistered host pool makes
+        the peer's write fail at transfer time instead of at startup."""
+        mgr = self._make_decode_manager()
+        mgr.register_buffer_to_engine()
+        # DRAM is registered twice (host KV pool, then aux); keying by kind
+        # would keep only the last call.
+        host_addrs = [
+            (ptr, length, dev)
+            for kind, addrs in mgr.agent.registered
+            if kind == "DRAM"
+            for ptr, length, dev, _ in addrs
+            if ptr in _HOST_PTRS
+        ]
+        # Host memory is not device-attached; NIXL addresses it as device 0.
+        self.assertEqual(
+            host_addrs,
+            [
+                (_HOST_PTRS[0], _HOST_ITEM_LENS[0] * _HOST_NUM_SLOTS, 0),
+                (_HOST_PTRS[1], _HOST_ITEM_LENS[1] * _HOST_NUM_SLOTS, 0),
+            ],
+        )
+
+    def test_transfer_info_round_trips_the_destination(self):
+        """The destination rides in a trailing frame; a decode that predates it
+        must read as DEVICE rather than as an unset enum."""
+        mgr = self._make_decode_manager()
+        for destination in KVTransferDestination:
+            msg = mgr.build_receiver_metadata_message(
+                bootstrap_room=7,
+                required_dst_info_num=1,
+                kv_indices=np.array([1, 2], dtype=np.int32),
+                aux_index=0,
+                state_indices=None,
+                decode_prefix_len=None,
+                is_dummy=False,
+                destination=destination,
+            )[1:]
+            self.assertEqual(TransferInfo.from_zmq(msg).destination, destination)
+            legacy = TransferInfo.from_zmq(msg[:10])
+            self.assertEqual(legacy.destination, KVTransferDestination.DEVICE)
+
+    def test_resolve_kv_destination_picks_the_requested_pool(self):
+        """A HOST request must resolve to the host dlist and the host geometry;
+        resolving to the device pool would overwrite live decode KV."""
+        mgr, info = self._make_prefill_manager()
+        mgr._prepare_payload_xfer(info)
+
+        device = mgr._resolve_kv_destination(
+            peer_name="agent", dst_info=info, destination=KVTransferDestination.DEVICE
+        )
+        # None defers to the peer's own device dlist and slot count, so a
+        # device request takes exactly the path it took before host receive.
+        self.assertIsNone(device.prep_key)
+        self.assertIsNone(device.num_slots)
+        self.assertEqual(device.data_ptrs, [0x3000, 0x4000])
+        self.assertEqual(device.mem_kind, "VRAM")
+
+        host = mgr._resolve_kv_destination(
+            peer_name="agent", dst_info=info, destination=KVTransferDestination.HOST
+        )
+        self.assertEqual(host.prep_key, _host_prep_key("agent"))
+        self.assertEqual(host.data_ptrs, list(_HOST_PTRS))
+        self.assertEqual(host.mem_kind, "DRAM")
+        self.assertEqual(host.num_slots, _HOST_NUM_SLOTS)
+
+    def test_resolve_rejects_a_host_request_from_a_device_only_peer(self):
+        """The two sides must not disagree silently: a HOST request with no
+        prepared host dlist has to fail the transfer, not write the device pool."""
+        mgr, info = self._make_prefill_manager(host_peer=False)
+        mgr._prepare_payload_xfer(info)
+        with self.assertRaises(RuntimeError):
+            mgr._resolve_kv_destination(
+                peer_name="agent",
+                dst_info=info,
+                destination=KVTransferDestination.HOST,
+            )
+
+    def test_the_host_pool_is_addressed_with_its_own_slot_count(self):
+        """A destination row is flat index layer * num_slots + page, so writing
+        the host pool with the device's slot count lands every layer after the
+        first on the wrong rows: silent KV corruption, not an error."""
+        mgr, info = self._make_prefill_manager()
+        mgr._prepare_payload_xfer(info)
+        prefill_pages = np.array([1, 3], dtype=np.int32)
+        decode_pages = np.array([2, 5], dtype=np.int32)
+
+        for destination, dlist_key, slots in (
+            (KVTransferDestination.DEVICE, "agent", 4),
+            (KVTransferDestination.HOST, _host_prep_key("agent"), _HOST_NUM_SLOTS),
+        ):
+            with self.subTest(destination=destination):
+                dst = mgr._resolve_kv_destination(
+                    peer_name="agent", dst_info=info, destination=destination
+                )
+                _, _, dst_dlist, _, dst_rows = mgr.send_kvcache(
+                    "agent",
+                    prefill_pages,
+                    dst.data_ptrs,
+                    decode_pages,
+                    info.gpu_id,
+                    dst_mem_kind=dst.mem_kind,
+                    dst_prep_key=dst.prep_key,
+                    dst_num_slots=dst.num_slots,
+                )
+                self.assertEqual(dst_dlist, mgr.prep_handles[dlist_key])
+                self.assertEqual(dst_rows, [2, 5, slots + 2, slots + 5])
+
+    def _make_receiver(self, mgr, peer_attn_tp=1):
+        receiver = object.__new__(NixlKVReceiver)
+        receiver.kv_mgr = mgr
+        receiver.prefill_info = SimpleNamespace(attn_tp_size=peer_attn_tp)
+        return receiver
+
+    def test_receiver_gate_rejects_every_path_without_a_host_twin(self):
+        """Only the equal-TP/MLA prepared path gets a host dlist. A gate that
+        degraded to always-true would send host addresses the peer cannot use."""
+        mgr = self._make_decode_manager()
+        self.assertTrue(self._make_receiver(mgr).supports_host_destination)
+
+        # Before init() resolves the peer, the geometry is still unknown.
+        unresolved = self._make_receiver(mgr)
+        unresolved.prefill_info = None
+        self.assertFalse(unresolved.supports_host_destination)
+
+        # A pool whose peer runs a different attention TP is sliced or staged.
+        self.assertFalse(
+            self._make_receiver(mgr, peer_attn_tp=2).supports_host_destination
+        )
+        # MLA reaches the same prepared path, but host receive is unvalidated
+        # there, so an unequal TP must stay on device destinations.
+        mgr.is_mla_backend = True
+        self.assertFalse(
+            self._make_receiver(mgr, peer_attn_tp=2).supports_host_destination
+        )
+
+        # A decode running DCP can make the peer relayout the destination.
+        mgr.is_mla_backend = False
+        mgr.dcp_size = 2
+        self.assertFalse(self._make_receiver(mgr).supports_host_destination)
+
+    def test_receiver_gate_follows_the_manager_capability(self):
+        """A decode with no host pool must never offer host destinations."""
+        mgr = self._make_decode_manager(state_ptrs=[[0xC000]])
+        self.assertFalse(self._make_receiver(mgr).supports_host_destination)
 
 
 if __name__ == "__main__":

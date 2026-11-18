@@ -18,7 +18,12 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.common.staging_handler import StagingTransferInfo
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.base.conn import (
+    KVArgs,
+    KVPoll,
+    KVTransferDestination,
+    StateType,
+)
 from sglang.srt.disaggregation.common.conn import (
     ABORT_TAG,
     AbortNotification,
@@ -237,6 +242,11 @@ def _nixl_device_id(mem_kind: str, gpu_id: int) -> int:
     return gpu_id if mem_kind == "VRAM" else 0
 
 
+def _host_prep_key(peer_name: str) -> str:
+    # An agent name is a UUID, so the suffix cannot collide with a device key.
+    return f"{peer_name}:host"
+
+
 def _homogeneous_kv_mem_kind(kinds: List[str], context: str) -> str:
     unique = set(kinds)
     if len(unique) != 1:
@@ -302,6 +312,8 @@ class TransferInfo:
     dst_state_indices: List[List[int]]
     decode_prefix_len: Optional[int] = None  # for decode radix cache
     is_dummy: bool = False
+    # Which of the decode's two registered pools this request's rows land in.
+    destination: KVTransferDestination = KVTransferDestination.DEVICE
     # NOTE: optional staging field; populated via STAGING_RSP. Keep at the
     # end so positional construction in from_zmq() continues to work.
     staging: Optional[StagingTransferInfo] = None
@@ -331,6 +343,13 @@ class TransferInfo:
         else:
             is_dummy = dst_kv_indices.size == 0
 
+        # Frame 10 is absent on decodes that predate host destinations.
+        destination = (
+            KVTransferDestination(msg[10].decode("ascii"))
+            if len(msg) > 10 and msg[10] != b""
+            else KVTransferDestination.DEVICE
+        )
+
         return cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -342,6 +361,7 @@ class TransferInfo:
             dst_state_indices=dst_state_indices,
             decode_prefix_len=decode_prefix_len,
             is_dummy=is_dummy,
+            destination=destination,
         )
 
 
@@ -382,6 +402,11 @@ class KVArgsRegisterInfo:
     dst_aux_item_lens: Optional[List[int]] = None
     dst_unified_layout: Optional[dict] = None
     unified_layout_error: Optional[str] = None
+    # The peer's host pool, advertised only by a host-receive decode. Parallel
+    # to dst_kv_ptrs, with the host pool's own slot stride and slot count.
+    dst_host_kv_ptrs: Optional[List[int]] = None
+    dst_host_kv_item_lens: Optional[List[int]] = None
+    dst_host_num_slots: int = 0
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -422,6 +447,33 @@ class KVArgsRegisterInfo:
             if len(msg) > 21 and msg[21] != b""
             else []
         )
+        # Frames 27:30 follow the unified-memory slot (26) and are absent on
+        # decodes that predate host destinations or run without a host pool.
+        dst_host_kv_ptrs = (
+            list(struct.unpack(f"{len(msg[27]) // 8}Q", msg[27]))
+            if len(msg) > 27 and msg[27] != b""
+            else None
+        )
+        dst_host_kv_item_lens = (
+            list(struct.unpack(f"{len(msg[28]) // 8}Q", msg[28]))
+            if len(msg) > 28 and msg[28] != b""
+            else None
+        )
+        dst_host_num_slots = (
+            int(msg[29].decode("ascii")) if len(msg) > 29 and msg[29] != b"" else 0
+        )
+        if dst_host_kv_ptrs is not None and not (
+            len(dst_host_kv_ptrs) == len(dst_kv_ptrs)
+            and dst_host_kv_item_lens is not None
+            and len(dst_host_kv_item_lens) == len(dst_kv_ptrs)
+            and dst_host_num_slots > 0
+        ):
+            raise ValueError(
+                "Malformed NIXL host KV registration: "
+                f"ptrs={len(dst_host_kv_ptrs)}, "
+                f"item_lens={len(dst_host_kv_item_lens or ())}, "
+                f"num_slots={dst_host_num_slots}, device_ptrs={len(dst_kv_ptrs)}"
+            )
 
         return cls(
             room=str(msg[0].decode("ascii")),
@@ -471,6 +523,9 @@ class KVArgsRegisterInfo:
                 if len(msg) > 24 and len(msg[24]) > 0
                 else []
             ),
+            dst_host_kv_ptrs=dst_host_kv_ptrs,
+            dst_host_kv_item_lens=dst_host_kv_item_lens,
+            dst_host_num_slots=dst_host_num_slots,
         )
 
 
@@ -514,6 +569,58 @@ def num_kv_slots(kv_data_lens: List[int], kv_item_lens: List[int]) -> int:
     )
 
 
+class _HostKVGeometry(msgspec.Struct, frozen=True):
+    # Parallel to the device KV regions, with the host pool's own slot stride.
+    data_ptrs: List[int]
+    data_lens: List[int]
+    item_lens: List[int]
+    num_slots: int
+
+
+def host_kv_geometry(kv_args: KVArgs) -> Optional[_HostKVGeometry]:
+    data_ptrs = kv_args.host_kv_data_ptrs
+    if not data_ptrs:
+        return None
+    data_lens = kv_args.host_kv_data_lens or []
+    item_lens = kv_args.host_kv_item_lens or []
+    if not (len(data_ptrs) == len(data_lens) == len(item_lens)):
+        raise ValueError(
+            "NIXL host KV geometry length mismatch: "
+            f"ptrs={len(data_ptrs)}, data_lens={len(data_lens)}, "
+            f"item_lens={len(item_lens)}"
+        )
+    # decode.py registers the host buffers of the same pool group, so a
+    # per-region mismatch means the two sides describe different pools.
+    if len(data_ptrs) != len(kv_args.kv_data_ptrs):
+        raise ValueError(
+            "NIXL host KV regions must be parallel to the device KV regions: "
+            f"host={len(data_ptrs)}, device={len(kv_args.kv_data_ptrs)}"
+        )
+    return _HostKVGeometry(
+        data_ptrs=list(data_ptrs),
+        data_lens=list(data_lens),
+        item_lens=list(item_lens),
+        num_slots=num_kv_slots(data_lens, item_lens),
+    )
+
+
+def host_receive_supported(kv_args: KVArgs) -> bool:
+    # A state component (window, Mamba, DSA) has no host twin in the prepared
+    # state plan yet, so a pool carrying one keeps device receive.
+    return bool(kv_args.host_kv_data_ptrs) and not (
+        kv_args.state_data_ptrs or kv_args.host_state_data_ptrs
+    )
+
+
+class _KVDestination(msgspec.Struct, frozen=True):
+    # prep_key and num_slots are None for the device pool, which the prepared
+    # path resolves on its own; data_ptrs and mem_kind serve the fallback path.
+    prep_key: Optional[str]
+    data_ptrs: List[int]
+    mem_kind: str
+    num_slots: Optional[int]
+
+
 def repeat_indices_over_layers(
     indices: npt.NDArray[np.int32], num_layers: int, layer_length: int
 ) -> npt.NDArray[np.int32]:
@@ -539,6 +646,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
     # directly; cleared on the first TypeError to expand per block instead.
     _use_strided_descs: bool = True
     enable_unified_memory: bool = False
+    host_kv_geometry: Optional[_HostKVGeometry] = None
 
     def __init__(
         self,
@@ -559,6 +667,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             and self.kv_args.kv_data_mem_kinds
             else None
         )
+        # Registered only by a decode under host receive; None on every prefill
+        # and on a decode that receives straight into device KV.
+        self.host_kv_geometry = host_kv_geometry(self.kv_args)
+        # Startup capability only. Whether a given peer's geometry has a host
+        # twin is NixlKVReceiver.supports_host_destination, per connection.
+        self.supports_host_destination = host_receive_supported(self.kv_args)
         try:
             from nixl._api import nixl_agent, nixl_agent_config, nixl_thread_sync_t
         except ImportError as e:
@@ -1277,6 +1391,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         kv_item_lens: Optional[list[int]] = None,
         kv_data_lens: Optional[list[int]] = None,
         kv_xfer_lens: Optional[list[int]] = None,
+        handle_key: Optional[str] = None,
     ):
         """Pre-build NIXL dlist: all KV slots × all layers.
 
@@ -1286,20 +1401,55 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         Source dlists use prefill geometry; destination dlists must use decode
         stride geometry but source transfer lengths, because HiSparse can transfer
         directly into a host pool whose slot stride differs from prefill.
+        handle_key stores the dlist under a key other than peer_name, for a peer
+        that registered a second destination pool; NIXL still resolves peer_name.
         """
         if kv_item_lens is None:
             kv_item_lens = self.kv_args.kv_item_lens
         if kv_data_lens is None:
             kv_data_lens = self.kv_args.kv_data_lens
-        self.prep_handles[peer_name] = self._prep_equal_tp_dlist(
-            peer_name,
-            kv_ptrs,
-            kv_item_lens,
-            kv_data_lens,
-            gpu_id,
+        self.prep_handles[peer_name if handle_key is None else handle_key] = (
+            self._prep_equal_tp_dlist(
+                peer_name,
+                kv_ptrs,
+                kv_item_lens,
+                kv_data_lens,
+                gpu_id,
+                num_slots=num_slots,
+                mem_kind=mem_kind,
+                kv_xfer_lens=kv_xfer_lens,
+            )
+        )
+
+    def _init_host_prep_handle(
+        self,
+        peer_info: KVArgsRegisterInfo,
+        dst_indices: List[int],
+        decode_only_spec_dec: bool,
+    ) -> None:
+        # The decode picks a pool per request, so the prefill holds a dlist for
+        # each and selects on TransferInfo.destination.
+        if peer_info.dst_host_kv_ptrs is None:
+            return
+        if decode_only_spec_dec:
+            raise NotImplementedError(
+                "NIXL PD transfer does not support decode host destinations "
+                "combined with decode-only speculative decoding. Turn off host "
+                "receive: --disaggregation-decode-host-receive-threshold 1."
+            )
+        host_kv_ptrs = [peer_info.dst_host_kv_ptrs[j] for j in dst_indices]
+        host_kv_item_lens = [peer_info.dst_host_kv_item_lens[j] for j in dst_indices]
+        num_slots = peer_info.dst_host_num_slots
+        self._init_equal_tp_prep_handle(
+            peer_info.agent_name,
+            host_kv_ptrs,
+            peer_info.gpu_id,
             num_slots=num_slots,
-            mem_kind=mem_kind,
-            kv_xfer_lens=kv_xfer_lens,
+            mem_kind="DRAM",
+            kv_item_lens=host_kv_item_lens,
+            kv_data_lens=[item_len * num_slots for item_len in host_kv_item_lens],
+            kv_xfer_lens=self.kv_args.kv_item_lens,
+            handle_key=_host_prep_key(peer_info.agent_name),
         )
 
     def _init_hetero_tp_prep_handle(
@@ -1691,6 +1841,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 kv_data_lens=dst_kv_data_lens,
                 kv_xfer_lens=self.kv_args.kv_item_lens,
             )
+            self._init_host_prep_handle(peer_info, dst_indices, decode_only_spec_dec)
         else:
             dst_mem_kind = _homogeneous_kv_mem_kind(
                 peer_info.dst_kv_mem_kinds, "destination"
@@ -1871,6 +2022,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                         src_prefill_kv_indices = kv_chunk.prefill_kv_indices
 
+                        # Only the prepared equal-TP/MLA dlist has a host twin; the
+                        # other send paths rebuild the destination without one.
+                        host_destination = req.destination == KVTransferDestination.HOST
+
                         # Decide which kv send path to use:
                         #   1. Staging (heterogeneous TP, both sides have
                         #      registered staging, watermark/alloc ready)
@@ -1888,6 +2043,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 or dst_info.staging_total_size != 0
                             )
                         )
+                        if host_destination and (use_staging or is_dcp_transfer):
+                            raise RuntimeError(
+                                "NIXL host KV destinations support neither "
+                                "staging nor DCP relayout"
+                            )
 
                         kv_xfer_handle = None
                         if use_staging:
@@ -1950,21 +2110,27 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 or decode_tp_size == self.attn_tp_size
                             ):
                                 if dst_info.kv_xfer_segments is None:
-                                    if dst_info.dst_homogeneous_mem_kind is None:
-                                        raise RuntimeError(
-                                            "Missing NIXL destination KV memory kind"
-                                        )
+                                    dst = self._resolve_kv_destination(
+                                        peer_name=req.agent_name,
+                                        dst_info=dst_info,
+                                        destination=req.destination,
+                                    )
                                     kv_xfer_handle = self.send_kvcache(
                                         req.agent_name,
                                         src_prefill_kv_indices,
-                                        dst_info.dst_kv_ptrs,
+                                        dst.data_ptrs,
                                         chunked_dst_kv_indice,
                                         dst_info.gpu_id,
-                                        dst_mem_kind=(
-                                            dst_info.dst_homogeneous_mem_kind
-                                        ),
+                                        dst_mem_kind=dst.mem_kind,
+                                        dst_prep_key=dst.prep_key,
+                                        dst_num_slots=dst.num_slots,
                                     )
                                 else:
+                                    if host_destination:
+                                        raise RuntimeError(
+                                            "NIXL host KV destinations do not "
+                                            "support mixed KV memory kinds"
+                                        )
                                     handles.extend(
                                         self.send_kvcache_mixed(
                                             req.agent_name,
@@ -1976,6 +2142,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 self.enable_kv_packing
                                 and self.attn_tp_size < decode_tp_size
                             ):
+                                if host_destination:
+                                    raise RuntimeError(
+                                        "NIXL host KV destinations do not support "
+                                        "TP-heterogeneous KV packing"
+                                    )
                                 self._send_packed_kvcache(
                                     packer=packer,
                                     peer_name=req.agent_name,
@@ -1984,6 +2155,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                     handles=handles,
                                 )
                             else:
+                                if host_destination:
+                                    raise RuntimeError(
+                                        "NIXL host KV destinations do not support "
+                                        "the heterogeneous-TP slice path"
+                                    )
                                 kv_xfer_handle = self.send_kvcache_slice(
                                     req.agent_name,
                                     src_prefill_kv_indices,
@@ -2169,6 +2345,16 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     "",
                 )
             )
+        # A host-receive decode exposes its host pool next to its device pool:
+        # the peer writes one or the other per request, chosen at send_metadata.
+        if self.host_kv_geometry is not None:
+            kv_addrs_by_mem_kind["DRAM"].extend(
+                (host_data_ptr, host_data_len, _nixl_device_id("DRAM", 0), "")
+                for host_data_ptr, host_data_len in zip(
+                    self.host_kv_geometry.data_ptrs,
+                    self.host_kv_geometry.data_lens,
+                )
+            )
         for mem_kind in ("VRAM", "DRAM"):
             kv_addrs = kv_addrs_by_mem_kind[mem_kind]
             if not kv_addrs:
@@ -2306,28 +2492,35 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
         dst_item_lens: Optional[List[int]] = None,
+        dst_prep_key: Optional[str] = None,
+        dst_num_slots: Optional[int] = None,
     ):
         """Generic KV cache transfer supporting both MHA and MLA architectures.
         Used by both send_kvcache and maybe_send_extra.
 
         ``force_flat`` uses the MLA-style flat (single-buffer-per-layer) layout
         even on a non-MLA backend, for K-only state buffers (e.g. MiniMax sparse
-        index) whose per-layer list must not be half-split into K/V."""
+        index) whose per-layer list must not be half-split into K/V.
+        ``dst_prep_key`` and ``dst_num_slots`` select a destination dlist other
+        than the peer's device one, for a request bound to its host pool."""
+        prep_key = peer_name if dst_prep_key is None else dst_prep_key
         # Prepped path (KV only; state transfers use the non-prepped path below).
         if (
             not bypass_prepped
             and src_data_ptrs is self.kv_args.kv_data_ptrs
             and "" in self.prep_handles
-            and peer_name in self.prep_handles
+            and prep_key in self.prep_handles
         ):
             src_prep = self.prep_handles[""]
-            dst_prep = self.prep_handles[peer_name]
+            dst_prep = self.prep_handles[prep_key]
             info = self.decode_kv_args_table[peer_name]
-            num_slots_dst = (
-                info.dst_num_slots
-                if info.dst_num_slots is not None
-                else self._num_slots_src
-            )
+            num_slots_dst = dst_num_slots
+            if num_slots_dst is None:
+                num_slots_dst = (
+                    info.dst_num_slots
+                    if info.dst_num_slots is not None
+                    else self._num_slots_src
+                )
             num_layers = len(item_lens)
             src_indices = repeat_indices_over_layers(
                 prefill_data_indices, num_layers, self._num_slots_src
@@ -2500,6 +2693,37 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._post_xfer(xfer_handle, "KVSender failed to post transfer")
         return xfer_handle
 
+    def _resolve_kv_destination(
+        self,
+        *,
+        peer_name: str,
+        dst_info: KVArgsRegisterInfo,
+        destination: KVTransferDestination,
+    ) -> _KVDestination:
+        if destination == KVTransferDestination.DEVICE:
+            if dst_info.dst_homogeneous_mem_kind is None:
+                raise RuntimeError("Missing NIXL destination KV memory kind")
+            return _KVDestination(
+                prep_key=None,
+                data_ptrs=dst_info.dst_kv_ptrs,
+                mem_kind=dst_info.dst_homogeneous_mem_kind,
+                num_slots=None,
+            )
+        prep_key = _host_prep_key(peer_name)
+        if dst_info.dst_host_kv_ptrs is None or prep_key not in self.prep_handles:
+            # The receiver gates on its own capability, so this means the two
+            # sides disagree: a peer asked for a pool this rank never prepared.
+            raise RuntimeError(
+                f"Peer {peer_name} requested a host KV destination "
+                "but this rank prepared no host dlist for it"
+            )
+        return _KVDestination(
+            prep_key=prep_key,
+            data_ptrs=dst_info.dst_host_kv_ptrs,
+            mem_kind="DRAM",
+            num_slots=dst_info.dst_host_num_slots,
+        )
+
     def send_kvcache(
         self,
         peer_name: str,
@@ -2508,6 +2732,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_kv_indices: npt.NDArray[np.int32],
         dst_gpu_id: int,
         dst_mem_kind: str = "VRAM",
+        dst_prep_key: Optional[str] = None,
+        dst_num_slots: Optional[int] = None,
     ):
         assert self.src_mem_kind is not None
         return self._send_kvcache_generic(
@@ -2520,6 +2746,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             dst_gpu_id=dst_gpu_id,
             src_mem_kind=self.src_mem_kind,
             dst_mem_kind=dst_mem_kind,
+            dst_prep_key=dst_prep_key,
+            dst_num_slots=dst_num_slots,
         )
 
     def _pack_dcp_rank_once(
@@ -3763,6 +3991,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         else:
             dst_kv_item_len = 0
             dst_num_slots = 0
+        # Advertised only while this decode can actually take host destinations,
+        # so a peer never prepares a host dlist the receiver will not ask for.
+        host = self.host_kv_geometry if self.supports_host_destination else None
 
         message = [
             GUARD,
@@ -3800,8 +4031,21 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             packed_state_data_lens,
             b"1" if self.kv_args.draft_rows_dcp_collapsed else b"0",
         ]
-        if self.enable_unified_memory:
-            message.append(json.dumps(self._unified_wire_layout()).encode("ascii"))
+        unified_layout = self._unified_wire_layout()
+        if unified_layout is not None or host is not None:
+            # Frame 26 is the unified-memory layout, empty when only a host pool
+            # is advertised, so the host frames behind it never move it.
+            message.append(
+                b""
+                if unified_layout is None
+                else json.dumps(unified_layout).encode("ascii")
+            )
+        if host is not None:
+            message += [
+                b"".join(struct.pack("Q", ptr) for ptr in host.data_ptrs),
+                b"".join(struct.pack("Q", item_len) for item_len in host.item_lens),
+                str(host.num_slots).encode("ascii"),
+            ]
         return message
 
     def build_receiver_metadata_message(
@@ -3815,6 +4059,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         decode_prefix_len: Optional[int],
         is_dummy: bool,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        destination: KVTransferDestination = KVTransferDestination.DEVICE,
     ) -> List[bytes]:
         packed_state_indices = (
             pack_int_lists(
@@ -3835,6 +4080,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             packed_state_indices,
             str(decode_prefix_len or 0).encode("ascii"),
             str(int(is_dummy)).encode("ascii"),
+            destination.value.encode("ascii"),
         ]
 
 
@@ -3847,7 +4093,21 @@ class NixlKVSender(CommonKVSender):
 
 
 class NixlKVReceiver(CommonKVReceiver):
-    pass
+    kv_mgr: NixlKVManager
+
+    @property
+    def supports_host_destination(self) -> bool:
+        # The prefill prepares a host dlist only on the equal-TP path. MLA with an
+        # unequal TP reaches that path too, but host receive is not validated there.
+        mgr = self.kv_mgr
+        info = self.prefill_info
+        if not mgr.supports_host_destination or info is None:
+            return False
+        # A decode running DCP can make the peer relayout the destination,
+        # which rebuilds its geometry without a host twin.
+        if mgr.dcp_size != 1:
+            return False
+        return info.attn_tp_size == mgr.attn_tp_size
 
 
 class NixlKVBootstrapServer(CommonKVBootstrapServer):

@@ -367,6 +367,9 @@ class TestReceiverControlMessages(CustomTestCase):
                                     state,
                                     b"2",
                                     b"1" if dummy else b"0",
+                                    # Destination pool, trailing so an older
+                                    # prefill ignores it.
+                                    b"device",
                                 ]
                             )
                         else:

@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=331, stage="extra-b", runner_config="8-gpu-h20")
+register_cuda_ci(est_time=480, stage="extra-b", runner_config="8-gpu-h20")
 # base-c 8-GPU runner is required for TP4 prefill + TP4 decode.
 
 NIXL_PREFILL_TP_SIZE = 4
@@ -325,6 +325,59 @@ class TestDisaggregationNixlFailure(NixlPDDisaggregationServerBase):
         assert_process_healthy(
             self, "decode", self.process_decode, self.decode_url, "/health_generate"
         )
+
+
+@unittest.skipUnless(
+    _HAS_CONFIGURED_NIXL_BACKEND,
+    "NIXL with the configured backend is required for this test.",
+)
+class TestDisaggregationNixlDecodeHostReceive(NixlPDDisaggregationServerBase):
+    """Decode receives KV into its pinned host pool and restores it to HBM at
+    admission, instead of reserving the destination in HBM at bootstrap.
+
+    A threshold of 0 takes the host path for every request, so the whole
+    advertise/prepare/write/restore cycle runs on each one. The accuracy gate is
+    the same as the device path's: a host destination that writes at the wrong
+    offsets, or a restore that races the transfer, corrupts the prefix and the
+    score collapses rather than drifting.
+    """
+
+    extra_decode_args = [
+        "--disaggregation-decode-host-receive-threshold",
+        "0",
+    ]
+
+    @classmethod
+    def setUpClass(cls):
+        _require_configured_nixl_backend()
+        _clear_disagg_failure_env()
+        super().setUpClass()
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
+        configure_nixl_pd_backend(cls)
+        cls.launch_all()
+
+    def test_gsm8k_accuracy_through_the_decode_host_pool(self):
+        args = SimpleNamespace(
+            base_url=f"http://{self.base_host}:{self.lb_port}",
+            eval_name="gsm8k",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
+            temperature=0.0,
+        )
+
+        metrics = run_sgl_eval(args)
+        print(f"Evaluation metrics: {metrics}")
+        self.assertGreater(
+            metrics["score"],
+            NIXL_GSM8K_SCORE_THRESHOLD,
+            "Expected a decode host destination to preserve GSM8K accuracy, "
+            f"got {metrics}",
+        )
+
+        assert_process_healthy(self, "load balancer", self.process_lb, self.lb_url)
+        assert_process_healthy(self, "prefill", self.process_prefill, self.prefill_url)
+        assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
 
 
 if __name__ == "__main__":
