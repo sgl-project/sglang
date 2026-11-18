@@ -374,6 +374,9 @@ class ReqState:
     output_token_sampling_selected_logprobs: List[float] = dataclasses.field(
         default_factory=list
     )
+    output_token_sampling_mask_chunks: List[SamplingMaskChunk] = dataclasses.field(
+        default_factory=list
+    )
 
     # Cached flat-format prompt top logprob fields; rebuilt only when more
     # prefill chunks arrive, so streaming decode chunks reuse the payload.
@@ -502,6 +505,29 @@ def _build_flat_top_logprobs_fields_from_arrays(
         fields[f"{side}_top_logprobs_idx_flat"] = idx_arr.reshape(-1).tolist()
     fields[f"{side}_top_logprobs_shape"] = [val_arr.shape[0], val_arr.shape[1]]
     fields[f"{side}_top_logprobs_null_prefix"] = null_prefix
+    return fields
+
+
+def _build_flat_sampling_mask_fields(
+    chunks: List[SamplingMaskChunk], return_b64: bool
+) -> Dict[str, Any]:
+    """A finished request's sampling masks as flat arrays; base64 if ``return_b64``."""
+    fields: Dict[str, Any] = {
+        "output_token_sampling_mask_length": sum(len(c.lengths) for c in chunks)
+    }
+    for name, attr, dtype in (
+        ("output_token_sampling_mask_flat", "token_ids", np.int32),
+        ("output_token_sampling_mask_row_lengths", "lengths", np.int32),
+        ("output_token_sampling_logprobs_flat", "logprobs", np.float32),
+    ):
+        values = np.concatenate(
+            [np.empty(0, dtype)] + [getattr(c, attr) for c in chunks]
+        )
+        if return_b64:
+            fields[f"{name}_b64"] = pybase64.b64encode(values.tobytes()).decode("utf-8")
+            fields[f"{name}_b64_dtype"] = values.dtype.name
+        else:
+            fields[name] = values.tolist()
     return fields
 
 
@@ -1520,6 +1546,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "sampling_logprobs_mode can only be set when "
                     "return_sampling_mask=true."
                 )
+            if obj.return_flat_raw_sampling_mask and not obj.return_sampling_mask:
+                raise ValueError(
+                    "return_flat_raw_sampling_mask can only be set when "
+                    "return_sampling_mask=true."
+                )
             if obj.return_outputs_via_store:
                 if self.output_store is None:
                     raise ValueError(
@@ -2117,6 +2148,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 meta_info["output_token_sampling_logprobs"] = (
                     state.output_token_sampling_logprobs
                 )
+            return
+        if state.obj.return_flat_raw_sampling_mask:
+            state.output_token_sampling_mask_chunks.append(chunk)
             return
         masks, logprobs = chunk.to_lists(support_logprobs=support_logprobs)
         state.output_token_sampling_mask.extend(masks)
@@ -2803,6 +2837,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         state=state,
                         chunk=output_sampling_mask[i],
                         output_ids=recv_obj.output_ids[i],
+                    )
+                # Built once on the finished response; streaming is rejected.
+                if (
+                    state.obj.return_flat_raw_sampling_mask
+                    and recv_obj.finished_reasons[i] is not None
+                ):
+                    meta_info.update(
+                        _build_flat_sampling_mask_fields(
+                            state.output_token_sampling_mask_chunks,
+                            return_b64=state.obj.return_flat_raw_sampling_mask_b64,
+                        )
                     )
 
             if not isinstance(recv_obj, BatchEmbeddingOutput):
