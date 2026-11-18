@@ -53,7 +53,7 @@ def _pool_bytes(pool) -> int:
 
 
 def _leaf_bytes(pool) -> int:
-    sizes = getattr(pool, "host_capacity_bytes", None)
+    sizes = pool.host_capacity_bytes
     if sizes is None:
         sizes = pool.get_kv_size_bytes()
     return sum(sizes) if isinstance(sizes, tuple) else sizes

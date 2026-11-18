@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.device_pool_info import (
     MHABufferInfo,
     MLABufferInfo,
     PageRowBufferInfo,
+    device_capacity_tokens,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -124,18 +125,11 @@ def _dsv4_transfer_layer_mapping(
     return {layer - start_layer: index for index, layer in enumerate(layer_ids)}
 
 
-def _device_capacity_tokens(pool) -> int:
-    # Unified views size host storage from their configured token cap, not the buffer.
-    if pool.host_capacity_tokens is None:
-        return pool.size
-    return pool.host_capacity_tokens
-
-
 def _mha_host_inputs(pool, info, drafts=()):
     return (
         get_mha_host_pool_cls(info),
         dict(
-            device_capacity_tokens=_device_capacity_tokens(pool),
+            device_capacity_tokens=device_capacity_tokens(pool),
             start_layer=pool.start_layer,
             end_layer=pool.end_layer,
             draft_buffer_infos=tuple(
@@ -188,7 +182,7 @@ def build_kv_host_pool(
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
     if use_mla:
         kwargs.update(
-            device_capacity_tokens=_device_capacity_tokens(kv_pool),
+            device_capacity_tokens=device_capacity_tokens(kv_pool),
             start_layer=kv_pool.start_layer,
             end_layer=kv_pool.end_layer,
             draft_buffer_infos=tuple(
@@ -1128,7 +1122,7 @@ def build_mamba_host_pool(
         pool_info.buffer_info,
         get_memory().hicache_ratio,
         host_size,
-        device_capacity=_device_capacity_tokens(mamba_pool),
+        device_capacity=device_capacity_tokens(mamba_pool),
         mtp_draft_buffer_infos=draft_buffer_infos,
         allocator_type=_get_allocator_type(),
         layout=layout,
@@ -1725,7 +1719,7 @@ def _build_mha_mla_host_pool(
         return host_cls(buffer_info, **host_kwargs, **kwargs)
     return MLATokenToKVPoolHost(
         buffer_info,
-        device_capacity_tokens=_device_capacity_tokens(pool),
+        device_capacity_tokens=device_capacity_tokens(pool),
         start_layer=pool.start_layer,
         end_layer=pool.end_layer,
         target_layer_num=pool.layer_num,

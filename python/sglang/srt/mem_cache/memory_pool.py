@@ -521,7 +521,6 @@ class ReqToTokenPool:
 
 class MambaPool:
     host_capacity_tokens: Optional[int] = None
-    host_capacity_bytes: Optional[int] = None
 
     # Axis of each two-dimensional conv state that represents the sliding window.
     # Upstream states use (dim, K-1); subclasses may preserve another layout.
@@ -1104,12 +1103,12 @@ class MambaPool:
     def host_capacity_bytes(self) -> int:
         # Host bytes per device capacity, counting side states registered after
         # __init__; spec verify scratch and ReplaySSM rings are device-only.
-        capacity = (
-            self.size
-            if self.host_capacity_tokens is None
-            else self.host_capacity_tokens
+        from sglang.srt.mem_cache.device_pool_info import device_capacity_tokens
+
+        return (
+            device_capacity_tokens(self)
+            * self._checkpoint_buffer_info().checkpoint_bytes_per_slot()
         )
-        return capacity * self._checkpoint_buffer_info().checkpoint_bytes_per_slot()
 
     def _checkpoint_buffer_info(self) -> MambaStateBufferInfo:
         from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo

@@ -20,6 +20,14 @@ from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
 from sglang.srt.mem_cache.hicache_storage import PoolName
 
 
+def device_capacity_tokens(pool) -> int:
+    """Rows the host pool mirrors: unified views use their configured token cap,
+    other pools their whole buffer."""
+    if pool.host_capacity_tokens is None:
+        return pool.size
+    return pool.host_capacity_tokens
+
+
 class MambaStateBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     """Persistent checkpoint tensors. Layer and checkpoint axes come first.
 
