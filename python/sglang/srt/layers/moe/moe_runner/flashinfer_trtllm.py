@@ -58,7 +58,6 @@ _deferred_finalize_enabled: contextvars.ContextVar[bool] = contextvars.ContextVa
 )
 
 _TRTLLM_MOE_PDL_MAX_TOKENS = envs.SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS.get()
-_MXFP4_MOE_MAX_TOKENS_PER_LAUNCH = envs.SGLANG_MXFP4_MOE_MAX_TOKENS_PER_LAUNCH.get()
 
 
 def trtllm_moe_enable_pdl(num_tokens: int) -> bool:
@@ -1717,7 +1716,7 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
 
             defer_finalize = _deferred_finalize_enabled.get()
             # Deferred finalize carries a global permutation and remains one-shot.
-            launch_tokens = _MXFP4_MOE_MAX_TOKENS_PER_LAUNCH
+            launch_tokens = envs.SGLANG_MXFP4_MOE_MAX_TOKENS_PER_LAUNCH.get()
             if defer_finalize or launch_tokens <= 0:
                 launch_tokens = max(num_tokens, 1)
             for start in range(0, max(num_tokens, 1), launch_tokens):

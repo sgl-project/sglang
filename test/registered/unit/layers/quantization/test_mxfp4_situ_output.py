@@ -1,3 +1,4 @@
+import os
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import call, patch
@@ -5,6 +6,7 @@ from unittest.mock import call, patch
 import pytest
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -171,11 +173,7 @@ def test_situ_routed_moe_returns_published_output_buffer(
     tllm_enums.ActivationType = SimpleNamespace(Situ=SimpleNamespace(value=0))
 
     with (
-        patch.object(
-            flashinfer_trtllm_module,
-            "_MXFP4_MOE_MAX_TOKENS_PER_LAUNCH",
-            launch_limit,
-        ),
+        envs.SGLANG_MXFP4_MOE_MAX_TOKENS_PER_LAUNCH.override(launch_limit),
         patch.object(
             mxfp4_module,
             "_prepare_flashinfer_mxfp8_activations",
@@ -230,6 +228,103 @@ def test_situ_routed_moe_returns_published_output_buffer(
         torch.testing.assert_close(
             combine_input.hidden_states, expected, rtol=0, atol=0
         )
+
+
+def test_situ_routed_moe_reads_launch_limit_from_env_at_runtime(monkeypatch):
+    # Verify post-import env var updates take effect without reloading the module.
+    # isort: off
+    from sglang.srt.layers.quantization import mxfp4 as mxfp4_module
+    from sglang.srt.layers.moe.moe_runner import (
+        flashinfer_trtllm as flashinfer_trtllm_module,
+    )
+    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        FlashInferTrtllmGenMxfp4MoeQuantInfo,
+        _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen,
+    )
+    # isort: on
+
+    tokens, hidden, top_k = 5, 128, 2
+    x = torch.zeros(tokens, hidden, dtype=torch.bfloat16)
+    x_quant = torch.ones(tokens, hidden, dtype=torch.uint8)
+    x_scale = torch.ones(tokens, hidden // 32, dtype=torch.uint8)
+    packed_topk = torch.zeros(tokens, top_k, dtype=torch.int32)
+    dispatch_output = StandardDispatchOutput(
+        hidden_states=x,
+        hidden_states_scale=None,
+        topk_output=StandardTopKOutput(
+            topk_weights=torch.ones(tokens, top_k, dtype=torch.float32),
+            topk_ids=packed_topk.clone(),
+            router_logits=torch.empty(tokens, 0, dtype=torch.float32),
+        ),
+    )
+    dummy = torch.empty(1, dtype=torch.uint8)
+    quant_info = FlashInferTrtllmGenMxfp4MoeQuantInfo(
+        w13_weight=dummy,
+        w2_weight=dummy,
+        w13_weight_scale=dummy,
+        w2_weight_scale=dummy,
+        w13_weight_bias=dummy,
+        w2_weight_bias=dummy,
+        gemm1_alpha=dummy,
+        gemm1_beta=dummy,
+        gemm1_clamp_limit=dummy,
+        global_num_experts=1,
+        local_expert_offset=0,
+        local_num_experts=1,
+        intermediate_size_per_partition=128,
+        hidden_size=hidden,
+        flashinfer_mxfp4_moe_precision="default",
+    )
+    latent = torch.zeros_like(x)
+    launches = []
+
+    def fake_routed_moe(**kwargs):
+        actual_x = kwargs["hidden_states"]
+        start = actual_x.storage_offset() // x_quant.stride(0)
+        end = start + actual_x.shape[0]
+        launches.append((start, end))
+        return kwargs["output"]
+
+    flashinfer = ModuleType("flashinfer")
+    flashinfer.__path__ = []
+    flashinfer.trtllm_fp4_block_scale_moe = None
+    fused_moe = ModuleType("flashinfer.fused_moe")
+    fused_moe.trtllm_fp4_block_scale_routed_moe = fake_routed_moe
+    tllm_enums = ModuleType("flashinfer.tllm_enums")
+    tllm_enums.RoutingMethodType = SimpleNamespace(TopK=SimpleNamespace(value=0))
+    tllm_enums.ActivationType = SimpleNamespace(Situ=SimpleNamespace(value=0))
+
+    assert not hasattr(flashinfer_trtllm_module, "_MXFP4_MOE_MAX_TOKENS_PER_LAUNCH")
+    monkeypatch.setenv("SGLANG_MXFP4_MOE_MAX_TOKENS_PER_LAUNCH", "2")
+    assert os.environ["SGLANG_MXFP4_MOE_MAX_TOKENS_PER_LAUNCH"] == "2"
+
+    with (
+        patch.object(
+            mxfp4_module,
+            "_prepare_flashinfer_mxfp8_activations",
+            return_value=(x, packed_topk, x_quant, x_scale),
+        ),
+        patch.dict(
+            "sys.modules",
+            {
+                "flashinfer": flashinfer,
+                "flashinfer.fused_moe": fused_moe,
+                "flashinfer.tllm_enums": tllm_enums,
+            },
+        ),
+        patch.object(
+            flashinfer_trtllm_module, "trtllm_moe_enable_pdl", return_value=False
+        ),
+        zero_copy_context.set_moe_output(latent),
+    ):
+        _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
+            dispatch_output,
+            quant_info,
+            MoeRunnerConfig(activation="situ"),
+        )
+
+    assert launches == [(0, 2), (2, 4), (4, 5)]
 
 
 if __name__ == "__main__":
