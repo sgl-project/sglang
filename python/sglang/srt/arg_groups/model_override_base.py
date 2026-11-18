@@ -246,25 +246,15 @@ def ep_joiner_of(cfg: Any) -> bool:
     return cfg.ep_join_mode in ("scale", "recover")
 
 
-def context_parallel_attn_dp_size(cfg: Any, layout: str) -> int:
-    """The attention-DP width a DeepSeek context-parallel layout runs.
-
-    These layouts run data-parallel groups as attention DP, so `--dp-size N`
-    alone still means N attention-DP groups there. That reading is deprecated.
-    """
-    assert not (cfg.attn_dp_size > 1 and cfg.dp_size > 1), (
-        f"--dp-size {cfg.dp_size} with --attn-dp-size {cfg.attn_dp_size}: "
-        "data-parallel replicas combined with attention data parallelism "
-        "are not supported."
-    )
+def reject_dp_size_under_context_parallel(cfg: Any, layout: str) -> None:
+    """Reject `--dp-size > 1` under a DeepSeek context-parallel layout;
+    attention DP there is `--attn-dp-size`."""
     if cfg.dp_size > 1:
-        # TODO: reject `--dp-size > 1` here after 2026-12-31.
-        logger.warning(
-            f"--dp-size {cfg.dp_size} under {layout} runs {cfg.dp_size} attention "
-            "data-parallel groups. This is deprecated and will be rejected after "
-            f"2026-12-31; use --attn-dp-size {cfg.dp_size} instead."
+        raise ValueError(
+            f"--dp-size {cfg.dp_size} as attention data parallelism under "
+            f"{layout} was removed in SGLang 1.0; use --attn-dp-size "
+            f"{cfg.dp_size}."
         )
-    return cfg.attn_dp_size * cfg.dp_size
 
 
 def ep_scale_joiner_of(cfg: Any) -> bool:

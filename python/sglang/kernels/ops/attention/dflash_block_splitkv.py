@@ -161,6 +161,8 @@ def dflash_block_splitkv(
     pv_bf16=False,
     out=None,
     window_left=2048,
+    block_m=16,
+    block_n=128,
 ):
     kvh = ke.shape[1]
     if not (
@@ -174,6 +176,8 @@ def dflash_block_splitkv(
         and q.shape[0] == (cuq.numel() - 1) * 8
         and cuk.numel() == cuq.numel()
         and splits in (8, 16, 32)
+        and block_m in (16, 32, 64)
+        and block_n in (64, 128)
         and all(t.stride(-1) == 1 for t in (q, ke, ve, kb, vb))
     ):
         raise ValueError(
@@ -187,7 +191,7 @@ def dflash_block_splitkv(
         out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
     if out.shape != q.shape or out.dtype != q.dtype or not out.is_contiguous():
         raise ValueError("Output must be contiguous BF16 with the query shape")
-    _partials[(4, cuq.numel() - 1, kvh * splits)](
+    _partials[(64 // block_m, cuq.numel() - 1, kvh * splits)](
         q,
         ke,
         ve,
@@ -216,8 +220,8 @@ def dflash_block_splitkv(
         splits,
         pv_bf16,
         window_left,
-        16,
-        128,
+        block_m,
+        block_n,
         num_warps=4,
         num_stages=1,
         matrix_instr_nonkdim=16,

@@ -676,15 +676,7 @@ WORKDIR /build
 COPY sgl-router /build/sgl-router
 COPY rust /build/rust
 
-# Install Rust at sgl-router's pinned toolchain, build the binary, then clean up
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --profile minimal --default-toolchain none \
-    && export PATH="/root/.cargo/bin:${PATH}" \
-    && cd /build/sgl-router \
-    && rustup toolchain install \
-    && cargo build --locked --release --bin sgl-router \
-    && cp target/release/sgl-router /build/sgl-router-bin \
-    && rm -rf /root/.cargo /root/.rustup /build/sgl-router/target
+RUN bash /build/sgl-router/scripts/build.sh /build/sgl-router-bin
 
 ########################################################
 ########## Final Framework Image ######################
@@ -989,7 +981,7 @@ RUN --mount=type=bind,from=mega_source,source=/src,target=/tmp/mega-src \
 
 # MiniMax MSA (https://github.com/MiniMax-AI/MSA, MIT), editable because prefill compiles
 # against its CUTLASS submodule; installed last so nothing overwrites its top-level packages.
-# Its MSA-v1 monokernel plugin (integrations/sglang) registers --monokernel-backend msa, inert
+# Its MSA-v1 monokernel plugin (integrations/sglang) serves --enable-nvidia-megakernel, inert
 # unless a server passes the flag; commits that predate the plugin skip it.
 ARG MSA_COMMIT
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -1013,7 +1005,7 @@ assert not bad, f'MSA top-level packages are shadowed or missing: {bad}'"; \
             python3 -c "from importlib.metadata import entry_points; \
 assert any(e.name == 'msa' for e in entry_points(group='sglang.srt.plugins')), 'MSA monokernel plugin not registered'"; \
         else \
-            echo "MSA ${MSA_COMMIT} has no SGLang monokernel plugin; --monokernel-backend msa is unavailable" >&2; \
+            echo "MSA ${MSA_COMMIT} has no SGLang monokernel plugin; --enable-nvidia-megakernel has no MSA plugin" >&2; \
         fi; \
     fi
 

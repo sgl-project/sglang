@@ -498,6 +498,21 @@ HCCL_BUFFSIZE=256 sglang serve \
   --component-residency text_encoder=layerwise-offload
 ```
 
+For optional MindIE-SD quantized attention on Ascend 950, follow the
+[installation and launch guide](/docs/sglang-diffusion/attention_backends#ascend-quantized-attention-with-mindie-sd)
+and use these attention options:
+
+```bash
+--attention-backend fa \
+--attention-backend-config '{"precision":"mxfp8","head_chunk_size":4}'
+```
+
+Attention precision is independent of linear-weight quantization. Keep
+`--quantization` unchanged when comparing attention backends. Use
+`'{"precision":"bf16"}'` for an explicit native floating-point baseline.
+Quantized attention applies to DiT self-attention; the refiner and text encoder
+do not inherit the DiT quantization settings.
+
 ## 4. Generate video and audio
 
 `num_inference_steps: N` executes **N denoising updates** over N+1 sigma
