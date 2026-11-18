@@ -570,6 +570,22 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
                 expected_prompt_len += len(self.tokenizer.encode(json.dumps(tools)))
             self.assertEqual(row.prompt_len, expected_prompt_len)
 
+    def test_openai_sampler_preserves_completion_budget_and_explicit_zero(self):
+        """Dataset replay must send the output cap recorded by the original API call."""
+        path = Path(self.tmpdir.name) / "completion-budget.jsonl"
+        requests = [
+            {
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_completion_tokens": 17,
+            },
+            {"messages": [{"role": "user", "content": "hello"}], "max_tokens": 0},
+        ]
+        path.write_text("\n".join(json.dumps(request) for request in requests))
+        rows = sample_openai_requests(str(path), 2, self.tokenizer)
+        self.assertEqual([row.output_len for row in rows], [17, 0])
+        rows = sample_openai_requests(str(path), 2, self.tokenizer, fixed_output_len=0)
+        self.assertEqual([row.output_len for row in rows], [0, 0])
+
     def test_generated_shared_prefix_sampler(self):
         args = make_args(gsp_num_groups=2, gsp_prompts_per_group=2)
         rows = sample_generated_shared_prefix_requests(

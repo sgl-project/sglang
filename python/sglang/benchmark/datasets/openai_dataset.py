@@ -45,7 +45,7 @@ def sample_openai_requests(
 
     Each line should be a JSON object with:
     - "messages": list of {"role": str, "content": str}
-    - "max_tokens": int (used as output_len if fixed_output_len not set)
+    - "max_completion_tokens" or "max_tokens": output cap unless overridden
     - "tools": optional list of tool definitions
     - "temperature": optional temperature value
     - "top_p": optional top_p value
@@ -75,8 +75,11 @@ def sample_openai_requests(
         if not messages:
             continue
 
-        # Use max_tokens from the request, or fall back to fixed_output_len
-        output_len = fixed_output_len or data.get("max_tokens", 256)
+        output_len = fixed_output_len
+        if output_len is None:
+            output_len = data.get("max_completion_tokens")
+            if output_len is None:
+                output_len = data.get("max_tokens", 256)
 
         # Extract extra request body parameters (tools, temperature, top_p, etc.)
         extra_body = {k: v for k, v in data.items() if k not in EXCLUDED_FIELDS}
