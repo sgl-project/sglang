@@ -29,6 +29,12 @@ def _reject_unsupported_serving_modes(cfg: Any) -> None:
             "Unlimited-OCR v2 does not support PD disaggregation "
             f"(--disaggregation-mode={cfg.disaggregation_mode})."
         )
+    if cfg.enable_unified_memory:
+        raise ValueError(
+            "Unlimited-OCR v2 does not support --enable-unified-memory: the "
+            "unified pool serves hybrid-Mamba and hybrid sliding-window models "
+            "only."
+        )
     if cfg.uocr_doc_split and (cfg.dp_size > 1 or attn_dp_enabled_of(cfg)):
         raise ValueError(
             "Unlimited-OCR v2 document splitting needs a single DP rank "

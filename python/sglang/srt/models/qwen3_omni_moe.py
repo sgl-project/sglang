@@ -48,6 +48,9 @@ from sglang.srt.models.qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration,
     load_fused_expert_weights,
 )
+from sglang.srt.multimodal.mrope_rope_index import (
+    _get_feat_extract_output_lengths,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cpu, is_npu, logger
 
@@ -185,19 +188,6 @@ class SinusoidsPositionEmbedding(nn.Module):
         return self.positional_embedding[:seqlen, :]
 
 
-def _get_feat_extract_output_lengths(input_lengths):
-    """
-    Computes the output length of the convolutional layers and the output length of the audio encoder
-    """
-
-    input_lengths_leave = input_lengths % 100
-    feat_lengths = (input_lengths_leave - 1) // 2 + 1
-    output_lengths = (
-        ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
-    )
-    return output_lengths
-
-
 class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
     config: Qwen3OmniMoeAudioEncoderConfig
 
@@ -254,11 +244,6 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         )
         self.n_window_infer = self.config.n_window_infer
         self.conv_chunksize = self.config.conv_chunksize
-
-    def _freeze_parameters(self):
-        for param in self.parameters():
-            param.requires_grad = False
-        self._requires_grad = False
 
     def get_input_embeddings(self) -> nn.Module:
         return self.conv1

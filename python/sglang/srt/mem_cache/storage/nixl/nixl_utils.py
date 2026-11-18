@@ -188,7 +188,7 @@ class NixlBackendSelection:
             agent.create_backend(self.backend_name, initparams)
 
             logger.info(
-                f"NixlBackendSelection.create_backend: backend_name {self.backend_name} initparams {initparams} customParams {agent.get_backend_params(self.backend_name)} supported plugins {plugin_list}"
+                f"NixlBackendSelection.create_backend: backend_name {self.backend_name} initparams keys {sorted(initparams)} supported plugins {plugin_list}"
             )
 
             self.mem_type = "OBJ" if self.backend_name in self.OBJ_PLUGINS else "FILE"
@@ -199,7 +199,7 @@ class NixlBackendSelection:
 
         except Exception as e:
             logger.error(
-                f"Failed to create NIXL backend: {e}, backend_name {self.backend_name}, supported plugins {plugin_list} initparams {initparams}"
+                f"Failed to create NIXL backend: {e}, backend_name {self.backend_name}, supported plugins {plugin_list} initparams keys {sorted(initparams)}"
             )
             return False
 
