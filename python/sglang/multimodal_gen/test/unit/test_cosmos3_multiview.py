@@ -7,13 +7,14 @@ wiring."""
 
 import builtins
 import copy
+import functools
 import importlib.util
 import math
 import os
 import tempfile
 import threading
 import unittest
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
@@ -1648,6 +1649,23 @@ def _views(cameras, *, vision=False):
     return views
 
 
+def _fails_if_hung(test):
+    @functools.wraps(test)
+    def bounded(self):
+        outcome = Future()
+
+        def run():
+            try:
+                outcome.set_result(test(self))
+            except BaseException as exc:
+                outcome.set_exception(exc)
+
+        threading.Thread(target=run, daemon=True).start()
+        outcome.result(timeout=60)
+
+    return bounded
+
+
 class TestSamplingParamsAndInputStage(unittest.TestCase):
     def test_defaults_follow_the_reference(self):
         params = Cosmos3MultiviewSamplingParams()
@@ -1943,6 +1961,7 @@ class TestInputLoading(unittest.TestCase):
                 self.assertTrue(np.array_equal(array, np.asarray(image)))
             self.assertEqual(len(list(iter_video_frames(path))), 24)
 
+    @_fails_if_hung
     def test_rig_packing_fills_each_camera_slice_in_place(self):
         """Clips land camera-major, truncated or padded with their own last frame,
         from worker threads that write a rig allocated under the stage's
@@ -2005,6 +2024,7 @@ class TestInputLoading(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "complete RGB video"):
             pack(field="vision", num_frames=5, keep_first=False, require_complete=True)
 
+    @_fails_if_hung
     def test_a_camera_is_encoded_while_the_next_one_still_loads(self):
         """The input stage returns before its clips have decoded, and the latent
         stage encodes camera 0 without waiting for camera 1; the latents are
@@ -2068,6 +2088,7 @@ class TestInputLoading(unittest.TestCase):
             loaded = latent_stage._encode_camera_major(control.result(), **common)
         self.assertTrue(torch.equal(latents, loaded))
 
+    @_fails_if_hung
     def test_camera_loads_start_one_at_a_time_until_the_consumer_waits(self):
         """Loads start in camera order, one at a time, which leaves the CPU to
         the thread driving the GPU; a consumer blocked on a later camera lets
@@ -2085,7 +2106,7 @@ class TestInputLoading(unittest.TestCase):
             parse_multiview_deployment_config(_transformer_config()),
         )
         started = []
-        third_started = threading.Event()
+        second_started, third_started = threading.Event(), threading.Event()
         second_released_by_third = []
 
         def decode(path, max_frames=None):
@@ -2093,6 +2114,7 @@ class TestInputLoading(unittest.TestCase):
             if path == "c.mp4":
                 third_started.set()
             if path == "b.mp4":
+                second_started.set()
                 second_released_by_third.append(third_started.wait(timeout=10))
             return iter(clips[path][:max_frames])
 
@@ -2109,8 +2131,11 @@ class TestInputLoading(unittest.TestCase):
                 completion=False,
             )
             control.camera(0)
+            self.assertTrue(second_started.wait(timeout=10))
             # Nothing has waited for camera 1, so camera 2 may not load beside it.
-            self.assertFalse(third_started.wait(timeout=0.2))
+            gate = control._gate
+            with gate._changed:
+                self.assertEqual((gate._next, gate._running, gate._limit), (2, 1, 1))
             control.camera(1)
             self.assertEqual(second_released_by_third, [True])
             control.result()
@@ -2173,13 +2198,18 @@ class TestInputLoading(unittest.TestCase):
         latents = torch.randn(1, 4, 6, 2, 3)
         parts = []
         with torch.no_grad():
+            expected = torch.cat(
+                [stage._decode_latents(view) for view in latents.split(3, dim=2)],
+                dim=2,
+            )
             clip = stage._decode_views(latents, num_views=2, latent_frames_per_view=3)
             streamed = stage._decode_views(
                 latents, num_views=2, latent_frames_per_view=3, on_frames=parts.append
             )
         self.assertIsNone(streamed)
         self.assertEqual(clip.shape[2], 2 * 9)
-        self.assertTrue(torch.equal(torch.cat(parts, dim=2), clip))
+        self.assertTrue(torch.equal(clip, expected))
+        self.assertTrue(torch.equal(torch.cat(parts, dim=2), expected))
 
     def test_every_rank_repeats_the_decode_after_the_output_rank_encode_failed(self):
         """A rank without the encoder decodes again once the output rank's
