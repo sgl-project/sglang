@@ -27,16 +27,17 @@ from sglang.kernels.ops.moe import moe_route_radix4
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.moe import route_quant_handoff
 from sglang.srt.runtime_context import get_buffer
-from sglang.srt.utils import get_bool_env_var, is_device_stream_capturing
+from sglang.srt.utils import is_device_stream_capturing
 
 logger = logging.getLogger(__name__)
 
 # AITER uses the sort only where its tuned kernel for the batch is BM=16 and sorts
 # again elsewhere. Its Kimi-K3 A8W4 (at or past ROCm/aiter#6464) and A16W4 tables
-# are BM=16 up to 512 tokens. Its stock A4W4 table is BM=32 at 65-256 tokens, where
-# the sort would be computed and dropped (4.2-6.1 us per layer on MI355X).
+# are BM=16 up to 512 tokens, and so is the AgentX A4W4 recipe's replaced table,
+# where 512 measured faster than 64. AITER's stock A4W4 table is BM=32 at 65-256
+# tokens, where the sort is computed and dropped (4.2-6.1 us per layer on MI355X);
+# telling those apart needs AITER to report the block_m it will pick.
 _MAX_TOKENS = 512
-_MAX_TOKENS_A4W4 = 64
 
 
 @cache_once
@@ -51,15 +52,6 @@ def _registrar() -> Optional[Callable[[Optional[dict]], None]]:
 def available() -> bool:
     """Whether this AITER can take a presort (register_presorted_moe)."""
     return _registrar() is not None
-
-
-@cache_once
-def _max_tokens() -> int:
-    # AITER's SiTU activation-mode precedence: A8W4 wins over A4W4.
-    a4w4 = get_bool_env_var("AITER_SITUV2_A4W4", "false") and not get_bool_env_var(
-        "AITER_SITUV2_A8W4", "false"
-    )
-    return _MAX_TOKENS_A4W4 if a4w4 else _MAX_TOKENS
 
 
 def stage() -> None:
@@ -142,7 +134,7 @@ def try_route_and_register(
     Caller must have checked moe_route_radix4.covered().
     """
     requested, num_token_non_padded = route_quant_handoff.take_aiter_presort()
-    if not requested or not 1 <= scores.shape[0] <= _max_tokens():
+    if not requested or not 1 <= scores.shape[0] <= _MAX_TOKENS:
         return None
     sort_ws = get_buffer("aiter_presort_sort_ws", _SortWorkspaces).get(scores.device)
     if sort_ws is None:
