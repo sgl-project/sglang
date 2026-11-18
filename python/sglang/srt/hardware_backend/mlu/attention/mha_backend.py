@@ -34,6 +34,10 @@ class MLUMHABackend(AttentionBackend):
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.forward_metadata = None
 
+    def get_cuda_graph_seq_len_fill_value(self) -> int:
+        # Eager DP attention also uses this value when padding requests.
+        return 1
+
     def init_forward_metadata(self, forward_batch: "ForwardBatch") -> None:
         if forward_batch.forward_mode.is_idle():
             return

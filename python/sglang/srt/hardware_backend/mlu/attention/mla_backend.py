@@ -106,6 +106,10 @@ class MLUMLABackend(AttentionBackend):
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.mha_chunk_kv_runner = MLUMhaChunkKVRunner(self)
 
+    def get_cuda_graph_seq_len_fill_value(self) -> int:
+        # Eager DP attention also uses this value when padding requests.
+        return 1
+
     def init_forward_metadata(self, forward_batch: "ForwardBatch") -> None:
         if forward_batch.forward_mode.is_idle():
             return
