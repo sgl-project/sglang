@@ -267,5 +267,103 @@ class TestRemoteInstanceClientAbortsOnSeedRejection(CustomTestCase):
                     sent.assert_called_once_with(lmu.signal.SIGQUIT)
 
 
+def _resolved_load_format(**kwargs):
+    from sglang.srt.arg_groups.model_override_base import resolving_view
+    from sglang.srt.arg_groups.model_path_hook import handle_load_format
+    from sglang.srt.server_args import ServerArgs
+
+    args = ServerArgs(model_path="dummy", enable_memory_saver=True, **kwargs)
+    handle_load_format(args)
+    return resolving_view(args).load_format
+
+
+_CLIENT = dict(
+    load_format="remote_instance",
+    remote_instance_weight_loader_seed_instance_ip="10.0.0.1",
+    remote_instance_weight_loader_seed_instance_service_port=30000,
+)
+
+
+class TestRemoteInstanceMemorySaver(CustomTestCase):
+    def test_transfer_engine_seed_refuses_memory_saver(self):
+        """A seed asked to serve transfer_engine clients under memory saver used to
+        start without that service, so every client failed later."""
+        with self.assertRaisesRegex(
+            ValueError, "cannot be used with --enable-memory-saver"
+        ):
+            _resolved_load_format(
+                remote_instance_weight_loader_start_seed_via_transfer_engine=True
+            )
+
+    def test_transfer_engine_client_keeps_its_disk_fallback(self):
+        """The seed refusal must not catch a client that also passes the seed flag."""
+        load_format = _resolved_load_format(
+            remote_instance_weight_loader_backend="transfer_engine",
+            remote_instance_weight_loader_start_seed_via_transfer_engine=True,
+            **_CLIENT,
+        )
+        self.assertEqual(load_format, "auto")
+
+
+def _receive_over_xccl(*, xpu, memory_saver):
+    """Run the XCCL client receive with a fake broadcast; returns the model and,
+    per broadcast, (ran on the loading thread, received into a parameter)."""
+    import threading
+
+    model = nn.Linear(4, 4)
+    param_ptrs = {p.data.data_ptr() for p in model.parameters()}
+    calls = []
+
+    def broadcast(tensor, src, group):
+        calls.append(
+            (
+                threading.current_thread() is threading.main_thread(),
+                tensor.data_ptr() in param_ptrs,
+            )
+        )
+        tensor.fill_(7.0)
+
+    loader = loader_mod.RemoteInstanceModelLoader(_load_config("nccl"))
+    dist = loader_mod.torch.distributed
+    with (
+        patch.object(loader_mod, "is_xpu", return_value=xpu),
+        patch.object(loader_mod, "get_exec") as get_exec,
+        patch.object(loader_mod.torch.xpu, "set_device"),
+        patch.object(dist, "broadcast", side_effect=broadcast),
+        patch.object(dist.distributed_c10d, "destroy_process_group"),
+        patch.object(loader_mod, "trigger_transferring_weights_request"),
+        patch.object(loader_mod.current_platform, "synchronize"),
+        patch.object(loader_mod.current_platform, "empty_cache"),
+        patch.object(loader_mod, "post_load_weights"),
+    ):
+        get_exec.return_value.features.enable_memory_saver = memory_saver
+        loader.load_model_from_remote_instance_by_nccl(
+            model,
+            MagicMock(),
+            MagicMock(dtype=torch.float32),
+            MagicMock(gpu_id=0),
+        )
+    return model, calls
+
+
+class TestRemoteInstanceXcclMemorySaver(CustomTestCase):
+    def test_xpu_memory_saver_receives_off_thread_into_staging(self):
+        """Under memory saver on XPU the weights are Level Zero virtual-memory
+        mappings, which oneCCL read on the CPU (SIGSEGV): the receive must leave
+        the loading thread, whose allocations go to the memory-saver pool, and
+        must not target a parameter directly."""
+        model, calls = _receive_over_xccl(xpu=True, memory_saver=True)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(set(calls), {(False, False)})
+        for param in model.parameters():
+            self.assertTrue(bool((param.data == 7.0).all()))
+
+    def test_other_configs_receive_into_the_parameters(self):
+        for xpu, memory_saver in ((True, False), (False, True), (False, False)):
+            with self.subTest(xpu=xpu, memory_saver=memory_saver):
+                _, calls = _receive_over_xccl(xpu=xpu, memory_saver=memory_saver)
+                self.assertEqual(set(calls), {(True, True)})
+
+
 if __name__ == "__main__":
     unittest.main()
