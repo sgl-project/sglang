@@ -18,6 +18,7 @@ import asyncio
 import time
 import unittest
 from array import array
+from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -30,6 +31,10 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
+from sglang.srt.entrypoints.openai.protocol import CompletionRequest  # noqa: E402
+from sglang.srt.entrypoints.openai.serving_completions import (  # noqa: E402
+    OpenAIServingCompletion,
+)
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
@@ -1375,6 +1380,69 @@ class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
         aborts = [m for m in sent if isinstance(m, AbortReq) and m.rid == rid]
         self.assertTrue(aborts, "disconnect must send an AbortReq to the scheduler")
         self.assertIn(rid, tm.rid_to_state)
+
+
+class TestRefusedBatchStreamAbortsOtherPrompts(CustomTestCase):
+    """A batch stream refused before its first chunk must stop its other prompts."""
+
+    @patch(
+        "sglang.srt.managers.tokenizer_manager.wrap_shm_features",
+        side_effect=lambda obj: obj,
+    )
+    def test_refusal_aborts_the_dispatched_prompts_before_it_is_raised(self, _wrap_shm):
+        tm = _make_tm_for_generate(self)
+        tm.cuda_vmm_feature_transport = Mock()
+        tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = AsyncMock(
+            return_value=[]
+        )
+        tm.positional_embeds_transport = Mock()
+        tm._dispatch_to_scheduler = Mock()
+
+        async def tokenize(obj):
+            tokenized = MagicMock()
+            tokenized.rid = obj.rid
+            tokenized.mm_inputs = None
+            return tokenized
+
+        tm._tokenize_one_request = tokenize
+        serving = OpenAIServingCompletion.__new__(OpenAIServingCompletion)
+        serving.tokenizer_manager = tm
+        prompts = ["a", "b", "c", "d"]
+        request = CompletionRequest(model="x", prompt=prompts, stream=True)
+        obj = GenerateReqInput(text=prompts, stream=True)
+        raw_request = Mock(headers={})
+        raw_request.is_disconnected = AsyncMock(return_value=False)
+
+        async def drive():
+            handler = asyncio.create_task(
+                serving._handle_streaming_request(obj, request, raw_request)
+            )
+            for _ in range(100):
+                await asyncio.sleep(0)
+                if tm._dispatch_to_scheduler.call_count == len(prompts):
+                    break
+            self.assertEqual(tm._dispatch_to_scheduler.call_count, len(prompts))
+
+            # The queue held prompts 0 and 1; the scheduler refuses prompt 2.
+            tm._handle_abort_req(
+                AbortReq(
+                    rid=obj.rid[2],
+                    finished_reason={
+                        "type": "abort",
+                        "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                        "message": "The request queue is full.",
+                    },
+                )
+            )
+            with self.assertRaises(HTTPException) as ctx:
+                await handler
+            self.assertEqual(ctx.exception.status_code, 503)
+
+            sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
+            aborted = [m.rid for m in sent if isinstance(m, AbortReq)]
+            self.assertCountEqual(aborted, [obj.rid[0], obj.rid[1], obj.rid[3]])
+
+        asyncio.run(drive())
 
 
 class TestAbortBeforeDispatch(CustomTestCase):

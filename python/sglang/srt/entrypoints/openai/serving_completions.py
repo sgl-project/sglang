@@ -250,15 +250,14 @@ class OpenAIServingCompletion(OpenAIServingBase):
         spec_tokens_details = {}
 
         stream_started = False
+        stream = self.tokenizer_manager.generate_request(adapted_request, raw_request)
         try:
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
                 get_serving().stream_response_default_include_usage,
             )
 
-            async for content in self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            ):
+            async for content in stream:
                 index = content.get("index", 0)
 
                 text = content["text"]
@@ -507,6 +506,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 raise
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
+        finally:
+            # Closing generate_request runs its cleanup, which aborts the
+            # prompts of this request that the scheduler still holds.
+            await stream.aclose()
 
         yield "data: [DONE]\n\n"
 
