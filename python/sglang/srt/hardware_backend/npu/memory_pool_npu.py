@@ -15,7 +15,7 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
-from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.device import is_npu
@@ -749,7 +749,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         kv_scale_ue8m0: bool = False,
         use_fp4_indexer: bool = False,
         modelslim_cache_layout=None,
-        token_interleaved_dcp: bool = False,
     ):
         if use_fp4_indexer:
             raise ValueError("FP4 indexer KV cache is not supported on NPU.")
@@ -860,10 +859,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         parallel = get_parallel()
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
-        self._token_interleaved_dcp = (
-            token_interleaved_dcp or index_head_dim is not None
-        )
-        self.dcp_interleave_size = 1 if self._token_interleaved_dcp else page_size
         self.use_combined_kv_buffer = use_combined_kv_buffer
         global_page_padding = self.dcp_size if self.dcp_size > 1 else 1
         kv_page_padding = global_page_padding if is_draft_worker else 1
@@ -1067,7 +1062,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             indices,
             self.dcp_size,
             self.dcp_rank,
-            self.dcp_interleave_size,
         )
         return local_indices[local_indices >= 0]
 
@@ -1237,35 +1231,20 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             ],
         )
 
-    def get_dcp_remote_decode_layout(self) -> list[bool]:
-        """Whether each PD entry uses allocator-global slots on decode."""
-        return [
-            uses_global_slots
-            for _, uses_global_slots in self._get_disagg_buffer_entries()
-        ]
-
     def configure_pd_dcp(self, kv_args):
-        if not self._token_interleaved_dcp or self.is_draft_worker:
-            return
-        disagg = get_disagg()
-        backend = disagg.disaggregation_transfer_backend
-        if backend not in ("ascend", "mooncake"):
-            if self.dcp_size > 1 and backend != "fake":
-                raise ValueError(
-                    "NPU token-interleaved DCP PD requires the Ascend or Mooncake transfer backend."
-                )
+        if self.is_draft_worker:
             return
         if self.use_fia_nz and self.dcp_size > 1:
             raise ValueError(
                 "NPU token-interleaved PD requires a row-contiguous KV pool."
             )
-        if disagg.disaggregation_mode == "prefill":
-            # Index-K and its scales precede the appended draft entries. All
-            # entries in this suffix keep allocator-global slots on Decode.
-            kv_args.dcp_num_replicated_entries = (
-                sum(self.get_dcp_remote_decode_layout()) + kv_args.num_draft_entries
-            )
-            kv_args.dcp_prepare_token_item_lens = self._prepare_pd_dcp_token_item_lens
+        # Index-K and its scales precede the appended draft entries. All
+        # entries in this suffix keep allocator-global slots on Decode.
+        kv_args.dcp_num_replicated_entries = (
+            sum(global_slots for _, global_slots in self._get_disagg_buffer_entries())
+            + kv_args.num_draft_entries
+        )
+        kv_args.dcp_prepare_token_item_lens = self._prepare_pd_dcp_token_item_lens
 
     def _prepare_pd_dcp_token_item_lens(self, kv_args, peer) -> list[int]:
         from sglang.srt.disaggregation.utils import resolve_dcp_dst_entry_indices

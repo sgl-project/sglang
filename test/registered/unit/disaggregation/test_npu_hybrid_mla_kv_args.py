@@ -1,7 +1,6 @@
 """NPU PD registration uses each hybrid pool's token-KV layout and draft layer count."""
 
 import unittest
-from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -50,7 +49,7 @@ def _npu_mla(layer_num):
     )
 
 
-def _hybrid_npu_mla(full_layer_ids, state_layer_ids, **pool_kwargs):
+def _hybrid_npu_mla(full_layer_ids, state_layer_ids):
     return HybridLinearKVPool(
         **_MLA,
         head_num=1,
@@ -60,7 +59,7 @@ def _hybrid_npu_mla(full_layer_ids, state_layer_ids, **pool_kwargs):
         use_mla=True,
         kv_lora_rank=16,
         qk_rope_head_dim=8,
-        full_kv_pool_class=partial(NPUMLATokenToKVPool, **pool_kwargs),
+        full_kv_pool_class=NPUMLATokenToKVPool,
     )
 
 
@@ -122,22 +121,14 @@ class TestNpuHybridMlaKvArgs(CustomTestCase):
         self._assert_target_registered(kv_args)
         self.assertEqual(kv_args.draft_kv_layers, 0)
 
-    def test_token_interleaved_hybrid_uses_the_inner_pool_for_writes_and_pd(self):
-        target = _hybrid_npu_mla((0, 2, 4), (1, 3, 5), token_interleaved_dcp=True)
+    def test_hybrid_writes_and_pd_use_token_interleaving_by_default(self):
+        target = _hybrid_npu_mla((0, 2, 4), (1, 3, 5))
         with (
             patch.object(runner_ids, "_is_npu", True),
             patch.object(
                 runner_ids,
                 "get_parallel",
                 return_value=SimpleNamespace(dcp_enabled=True, dcp_size=2, dcp_rank=1),
-            ),
-            patch.object(
-                memory_pool_npu,
-                "get_disagg",
-                return_value=SimpleNamespace(
-                    disaggregation_mode="prefill",
-                    disaggregation_transfer_backend="mooncake",
-                ),
             ),
         ):
             ids = runner_ids.RunnerIds(
@@ -154,6 +145,27 @@ class TestNpuHybridMlaKvArgs(CustomTestCase):
         )
         self._assert_target_registered(kv_args)
         self.assertEqual(kv_args.dcp_num_replicated_entries, 2)
+
+    def test_plain_mla_writes_use_token_interleaving_by_default(self):
+        with (
+            patch.object(runner_ids, "_is_npu", True),
+            patch.object(
+                runner_ids,
+                "get_parallel",
+                return_value=SimpleNamespace(dcp_enabled=True, dcp_size=4, dcp_rank=2),
+            ),
+        ):
+            ids = runner_ids.RunnerIds(
+                req_to_token=torch.zeros((1, 8), dtype=torch.int32),
+                token_to_kv_pool_allocator=None,
+                token_to_kv_pool=_npu_mla(layer_num=1),
+                page_size=4,
+                device="cpu",
+            )
+        self.assertEqual(
+            ids.space(IdSpaceKind.FULL).write(torch.arange(8)).tolist(),
+            [-1, -1, 0, -1, -1, -1, 1, -1],
+        )
 
 
 if __name__ == "__main__":
