@@ -894,13 +894,21 @@ def _admit_req(**overrides):
     return SimpleNamespace(**fields)
 
 
+def _admit_scheduler(algo: str, **overrides):
+    fields = dict(
+        enable_overlap=True,
+        spec_algorithm=SimpleNamespace(
+            is_eagle=lambda: algo == "eagle", is_dspark=lambda: algo == "dspark"
+        ),
+        enable_hisparse=False,
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
 class TestAdmissionOverlap(CustomTestCase):
     def test_scope_uses_admitted_requests_and_keeps_host_read_paths_stock(self):
-        scheduler = SimpleNamespace(
-            enable_overlap=True,
-            spec_algorithm=SimpleNamespace(is_eagle=lambda: True),
-            enable_hisparse=False,
-        )
+        scheduler = _admit_scheduler("eagle")
         disagg = SimpleNamespace(
             disaggregation_decode_host_receive_threshold=1,
             disaggregation_decode_enable_radix_cache=False,
@@ -920,6 +928,57 @@ class TestAdmissionOverlap(CustomTestCase):
                             SimpleNamespace(reqs=[_admit_req(grammar=object())]),
                         )
                     )
+
+    def test_dspark_scope(self):
+        scope = SchedulerDisaggregationDecodeMixin._nonblocking_admit_in_scope
+        disagg = SimpleNamespace(
+            disaggregation_decode_host_receive_threshold=1,
+            disaggregation_decode_enable_radix_cache=False,
+        )
+        # DSpark's seed reads neither hidden states nor DSA top-k indices.
+        batch = SimpleNamespace(
+            reqs=[
+                _admit_req(hidden_states_tensor=None),
+                _admit_req(hidden_states_tensor=None, output_dsa_topk_indices=object()),
+            ]
+        )
+        dspark = _admit_scheduler("dspark")
+        with patch("sglang.srt.disaggregation.decode.get_disagg", return_value=disagg):
+            for enabled in (False, True):
+                with envs.SGLANG_OPT_DSPARK_NONBLOCKING_PD_ADMIT.override(enabled):
+                    self.assertEqual(scope(dspark, batch), enabled)
+                    # The DSpark switch leaves EAGLE alone.
+                    self.assertFalse(scope(_admit_scheduler("eagle"), batch))
+            # It follows the megakernel runtime switch unless set; the PD decode
+            # switch turns it off.
+            with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
+                self.assertTrue(scope(dspark, batch))
+                with envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.override(
+                    False
+                ):
+                    self.assertFalse(scope(dspark, batch))
+            with envs.SGLANG_OPT_DSPARK_NONBLOCKING_PD_ADMIT.override(True):
+                # Paths that may read device results back stay blocking.
+                for req in (
+                    _admit_req(grammar=object()),
+                    _admit_req(kv=SimpleNamespace(retraction_backup=object())),
+                ):
+                    self.assertFalse(scope(dspark, SimpleNamespace(reqs=[req])))
+                for scheduler in (
+                    _admit_scheduler("dspark", enable_overlap=False),
+                    _admit_scheduler("dspark", enable_hisparse=True),
+                ):
+                    self.assertFalse(scope(scheduler, batch))
+                for field, value in (
+                    ("disaggregation_decode_enable_radix_cache", True),
+                    ("disaggregation_decode_host_receive_threshold", 0.5),
+                ):
+                    other = SimpleNamespace(**{**vars(disagg), field: value})
+                    with patch(
+                        "sglang.srt.disaggregation.decode.get_disagg",
+                        return_value=other,
+                    ):
+                        self.assertFalse(scope(dspark, batch))
 
     def test_seed_is_ordered_on_forward_stream_without_schedule_wait(self):
         for nonblocking in (False, True):

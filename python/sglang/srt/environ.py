@@ -644,6 +644,12 @@ class Envs:
     SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # PD decode with overlap: admit a DSpark prebuilt batch without the schedule
+    # stream waiting for the in-flight forward. Its seed runs on the forward stream
+    # after that forward, as EAGLE's does under the megakernel runtime switch.
+    SGLANG_OPT_DSPARK_NONBLOCKING_PD_ADMIT = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Memory pools and KV-cache sizing
