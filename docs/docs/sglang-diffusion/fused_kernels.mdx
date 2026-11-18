@@ -132,7 +132,7 @@ Operators are registered in the kernel registry under `diffusion.*`, and some ca
 | `apply_group_norm_silu` | Triton | close | `GroupNorm + SiLU`, NCHW-contiguous |
 | `group_norm_silu_4d`, `group_norm_silu_rows` | Triton | close | channels-last GroupNorm(+SiLU); what lets a VAE decoder run channels_last end to end with no `nchwToNhwc` transposes |
 | `wan_rmsnorm_silu` | Triton | close | Wan VAE `channels_last_3d` RMSNorm + SiLU |
-| `wan_norm_silu_post` | JIT CUDA | bit-exact, first-sight verified | Wan VAE FP32 divide, scale, affine, and SiLU after the unchanged native L2 reduction; dense NCDHW and `channels_last_3d` |
+| `wan_norm_silu_post` | JIT CUDA | bit-exact, first-sight verified | Wan VAE divide, scale, affine, and SiLU after the unchanged native L2 reduction, over dense NCDHW and `channels_last_3d`. FP32 activations, and BF16 ones whose norm autocast promotes, run the chain in FP32. BF16 activations outside autocast round to BF16 after every op, as the eager chain does. Runs in the Wan VAE encoder, and in the Wan-family decoders, including the Qwen-Image VAE decoder, wherever the full fusion does not |
 
 ### adaLN modulation and gating
 
