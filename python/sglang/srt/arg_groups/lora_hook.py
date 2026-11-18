@@ -44,6 +44,21 @@ def check_lora_server_args(server_args: Any):
                 "--enable-lora is set to False, any provided lora_paths will be ignored."
             )
 
+    if cfg.enable_lora_cpu_preparation:
+        if not cfg.enable_lora or not cfg.enable_lora_overlap_loading:
+            raise ValueError(
+                "--enable-lora-cpu-preparation requires --enable-lora and "
+                "--enable-lora-overlap-loading"
+            )
+        if cfg.pp_size != 1 or cfg.attn_dp_size > 1:
+            raise ValueError(
+                "--enable-lora-cpu-preparation requires PP=1 and no DP attention"
+            )
+        if cfg.speculative_algorithm is not None:
+            raise ValueError(
+                "--enable-lora-cpu-preparation does not support speculative decoding"
+            )
+
     if cfg.enable_lora:
         if cfg.lora_backend == "triton_v2" and not cfg.moe_runner_backend.startswith(
             "lora"

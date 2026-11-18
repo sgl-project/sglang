@@ -63,6 +63,10 @@ class Lora(msgspec.Struct):
         Optional[bool],
         "Enable asynchronous LoRA weight loading in order to overlap H2D transfers with GPU compute. This should be enabled if you find that your LoRA workloads are bottlenecked by adapter weight loading, for example when frequently loading large LoRA adapters.",
     ] = None
+    enable_lora_cpu_preparation: A[
+        bool,
+        "Prepare dynamic file/HF LoRA adapters and pinned GPU-layout CPU buffers in a background worker. Requires overlap loading, CUDA, PP=1, no DP attention and no speculative decoding. Uses additional pinned CPU memory.",
+    ] = False
     max_lora_rank: A[
         Optional[int],
         "The maximum rank of LoRA adapters. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",

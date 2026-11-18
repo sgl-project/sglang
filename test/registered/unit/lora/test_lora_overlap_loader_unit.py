@@ -46,7 +46,9 @@ class TestLoRAOverlapLoader(CustomTestCase):
     mock_torch: MagicMock
 
     def setUp(self):
-        self.torch_patcher = patch("sglang.srt.lora.lora_overlap_loader.torch")
+        self.torch_patcher = patch(
+            "sglang.srt.lora.lora_overlap_loader.torch.get_device_module"
+        )
         self.mock_torch = self.torch_patcher.start()
 
         self.mock_device_module = MagicMock()
@@ -59,8 +61,7 @@ class TestLoRAOverlapLoader(CustomTestCase):
         self.mock_device_module.Stream.return_value = self.mock_stream
         self.mock_device_module.stream.return_value = self.mock_stream_context
         self.mock_device_module.Event.return_value = self.mock_event
-        self.mock_torch.get_device_module.return_value = self.mock_device_module
-        self.mock_torch.cuda.current_stream.return_value = MagicMock(spec=CudaStream)
+        self.mock_torch.return_value = self.mock_device_module
 
         self.mock_lora_manager = MagicMock(spec=LoRAManager)
         self.mock_lora_manager.device = DEVICE

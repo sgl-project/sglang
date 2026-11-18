@@ -32,6 +32,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.lora_registry import get_backend_from_name
+from sglang.srt.lora.cpu_upload import build_upload_plan
 from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
@@ -118,6 +119,17 @@ class LoRAManager:
                 f"size {get_parallel().attn_cp_size})"
             )
         self.pending_lora_load_events = {}
+        if get_lora().enable_lora_cpu_preparation and self.device.type != "cuda":
+            raise ValueError("--enable-lora-cpu-preparation requires CUDA")
+        if get_lora().enable_lora_cpu_preparation and (
+            get_parallel().pp_size != 1
+            or self.attn_dp_enabled
+            or get_spec().speculative_algorithm is not None
+        ):
+            raise ValueError(
+                "--enable-lora-cpu-preparation requires PP=1, no DP attention "
+                "and no speculative decoding"
+            )
 
         self.eviction_policy = get_lora().lora_eviction_policy
         self._experts_shared_outer_override: Optional[bool] = (
@@ -318,6 +330,25 @@ class LoRAManager:
                 error_message=str(e),
             )
 
+        return self.create_lora_update_result(success=True)
+
+    def prepare_lora_adapter(self, lora_ref: LoRARef):
+        """Build CPU state without changing the registry or any GPU slot."""
+        config = LoRAConfig(
+            lora_ref.lora_path, base_vocab_size=self.base_hf_config.vocab_size
+        )
+        adapter = self._prepare_lora_weights(lora_ref, config)
+        adapter.cpu_upload_plan = build_upload_plan(
+            self, adapter, LoRAMemoryPool.load_lora_weight_to_buffer
+        )
+        return config, adapter
+
+    def install_prepared_lora_adapter(self, lora_ref: LoRARef, prepared):
+        config, adapter = prepared
+        self.configs[lora_ref.lora_id] = config
+        self.loras[lora_ref.lora_id] = adapter
+        self.lora_refs[lora_ref.lora_id] = lora_ref
+        self.num_pinned_loras += int(lora_ref.pinned)
         return self.create_lora_update_result(success=True)
 
     def _validate_replicated_q_targets(self, target_modules):
@@ -920,9 +951,14 @@ class LoRAManager:
         """
         Load the weights of a LoRA adapter to CPU memory and conducts post-loading validation.
         """
+        self.loras[lora_ref.lora_id] = self._prepare_lora_weights(
+            lora_ref, self.configs[lora_ref.lora_id]
+        )
+
+    def _prepare_lora_weights(self, lora_ref: LoRARef, config: LoRAConfig):
         lora_adapter = LoRAAdapter(
             lora_ref.lora_id,
-            self.configs[lora_ref.lora_id],
+            config,
             self.base_hf_config,
             self.load_config,
             self.lora_backend,
@@ -936,7 +972,7 @@ class LoRAManager:
             speculative_algorithm=self.speculative_algorithm,
         )
 
-        self.loras[lora_ref.lora_id] = lora_adapter
+        return lora_adapter
 
     def load_lora_weights_from_tensors(
         self, lora_ref: LoRARef, tensors: Dict[str, torch.Tensor]

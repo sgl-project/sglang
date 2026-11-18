@@ -934,6 +934,9 @@ class LoRAMemoryPool:
             return
 
         assert lora_adapter is not None
+        upload_plan = getattr(lora_adapter, "cpu_upload_plan", None)
+        if upload_plan is not None and upload_plan.copy_to(self, buffer_id):
+            return
         lora_rank = lora_adapter.config.r
 
         # Pre-validate weight names against target modules across all layers

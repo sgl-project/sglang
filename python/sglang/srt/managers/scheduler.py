@@ -139,6 +139,7 @@ from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
+from sglang.srt.lora.cpu_preparation import LoRAPreparationQueue
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.deferred_output import ResponseCompletion
@@ -2404,6 +2405,7 @@ class Scheduler(
                 else:
                     self.send_control_output(output, recv_req)
 
+        self._poll_lora_prepares()
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
@@ -4290,6 +4292,18 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
+        if self.enable_lora_overlap_loading:
+            requests = list(self.waiting_queue)
+            for batch in (running_batch, last_batch):
+                if batch is not None:
+                    requests.extend(batch.reqs)
+            if self.chunked_req is not None:
+                requests.append(self.chunked_req)
+            if get_parallel().pp_size > 1:
+                requests.extend(self._get_all_pp_reqs())
+            self.lora_overlap_loader.prepare_admission(
+                {req.lora_id for req in requests if not req.finished()}
+            )
         self.process_pending_chunked_abort()
         self._process_hicache_events()
 
@@ -4985,6 +4999,8 @@ class Scheduler(
         1. The drainer allows scheduling (based on draining state)
         2. The LoRA adapter can be loaded (either already running or can be added)
         """
+        if self.enable_lora_overlap_loading:
+            self.lora_overlap_loader.completed_loras.discard(req.lora_id)
         if self.lora_drainer and not self.lora_drainer.can_schedule(req):
             return False
 
@@ -6123,6 +6139,7 @@ class Scheduler(
         idle &= not any(lists.get(name) for name in busy_lists)
 
         if not for_health_check:
+            idle &= not bool(getattr(self, "lora_preparation_queue", None))
             idle &= not self.request_receiver.has_pending()
             if self.uocr_runtime is not None:
                 idle &= not self.uocr_runtime.blocks_flush(
@@ -6802,15 +6819,46 @@ class Scheduler(
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput
-    ) -> LoadLoRAAdapterReqOutput:
+    ) -> Optional[LoadLoRAAdapterReqOutput]:
         """In-place loading a new lora adapter from disk or huggingface."""
 
+        if get_lora().enable_lora_cpu_preparation:
+            if not hasattr(self, "lora_preparation_queue"):
+                self.lora_preparation_queue = LoRAPreparationQueue(
+                    self.tp_worker.model_runner.lora_manager.prepare_lora_adapter
+                )
+            self.lora_preparation_queue.submit(recv_req)
+            return None
         result = self.tp_worker.load_lora_adapter(recv_req)
         if result.success:
             self.kv_event_lora_names.register(
                 lora_id=recv_req.lora_id, lora_name=recv_req.lora_name
             )
         return result
+
+    def _poll_lora_prepares(self):
+        queue = getattr(self, "lora_preparation_queue", None)
+        if not queue:
+            return
+        manager = self.tp_worker.model_runner.lora_manager
+
+        def validate(request, prepared):
+            if request.lora_id in manager.loras:
+                raise ValueError(f"LoRA adapter {request.lora_id} is already loaded")
+            manager.validate_new_adapter(prepared[0], request.to_ref())
+
+        completed = queue.poll(validate, self.tp_cpu_group)
+        if completed is None:
+            return
+        request, prepared, error = completed
+        if error is not None:
+            result = manager.create_lora_update_result(False, error)
+        else:
+            result = manager.install_prepared_lora_adapter(request.to_ref(), prepared)
+            self.kv_event_lora_names.register(
+                lora_id=request.lora_id, lora_name=request.lora_name
+            )
+        self.send_control_output(result, request)
 
     def load_lora_adapter_from_tensors(
         self, recv_req: LoadLoRAAdapterFromTensorsReqInput
@@ -6833,6 +6881,9 @@ class Scheduler(
             # The unload zeroes the adapter's pool slot on this stream; a step
             # launched before this request may still run that adapter.
             self.schedule_stream.wait_stream(self.forward_stream)
+        queue = getattr(self, "lora_preparation_queue", None)
+        if queue:
+            queue.cancel(recv_req.lora_id)
         result = self.tp_worker.unload_lora_adapter(recv_req)
         return result
 
@@ -6919,6 +6970,9 @@ class Scheduler(
             self.uocr_runtime.release_doc(recv_req.doc_id)
 
     def maybe_sleep_on_idle(self):
+        if getattr(self, "lora_preparation_queue", None):
+            time.sleep(0.001)
+            return
         if self.idle_sleeper is not None:
             self.idle_sleeper.maybe_sleep()
 
@@ -7153,6 +7207,9 @@ def run_scheduler_process(
                 pass
     finally:
         if scheduler is not None:
+            queue = getattr(scheduler, "lora_preparation_queue", None)
+            if queue is not None:
+                queue.close(wait=scheduler.gracefully_exit)
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()
