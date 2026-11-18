@@ -4,11 +4,13 @@ On HIP there is neither flash_attn (FA2) nor flash-attn-4, so
 ``_resolve_flash_attn_varlen_func`` resolves to aiter's FA2-compatible varlen
 kernel. The first two tests are device-independent (fake modules); the third
 runs the real aiter kernel against a torch reference and only executes on ROCm.
-The last one checks the grouped verify scoring of the indexer on gfx950.
+The fourth checks the grouped verify scoring of the indexer on gfx950; the last
+two check the rows per request the indexer passes it for verify and draft-extend
+graphs and the draft-extend graph layout the grouping relies on.
 """
 
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -164,6 +166,122 @@ def test_qsa_gfx950_grouped_verify_scoring_is_bitwise(
         assert torch.equal(
             out[row, :length].view(torch.int32), ref[row, :length].view(torch.int32)
         )
+
+
+class _ForwardMode:
+    def __init__(self, mode):
+        self.mode = mode
+
+    def is_decode(self):
+        return self.mode == "decode"
+
+    def is_target_verify(self):
+        return self.mode == "verify"
+
+    def is_draft_extend_v2(self):
+        return self.mode == "draft_extend"
+
+
+@pytest.mark.parametrize(
+    "mode, graph, expected",
+    [
+        ("draft_extend", True, 4),
+        ("draft_extend", False, 1),
+        ("verify", True, 4),
+        ("verify", False, 1),
+        ("decode", True, 1),
+    ],
+)
+def test_qsa_decode_rows_per_request(mode, graph, expected):
+    """Verify and draft-extend graphs pass their per-request row count to the
+    decode scorer; eager batches and plain decode score row by row."""
+    from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
+
+    rows, seen = 8, []
+
+    def select_decode_tokens(*args, rows_per_request, **kwargs):
+        seen.append(rows_per_request)
+
+    indexer = SimpleNamespace(
+        layer_id=0,
+        index_n_heads=4,
+        project_qk=lambda *args, **kwargs: (torch.zeros(rows, 8, 128), None, True),
+        update_key_state_and_compress=lambda *args, **kwargs: None,
+        select_decode_tokens=select_decode_tokens,
+    )
+    metadata = SimpleNamespace(
+        is_cuda_graph=graph,
+        defer_block_expansion=False,
+        token_to_kv_pool=None,
+        decode_logical_positions=torch.arange(rows),
+        pending_ring_slots=torch.zeros(rows, dtype=torch.int64),
+        get_token_to_batch_idx=lambda: torch.arange(rows) // 4,
+        get_decode_mqa_inputs=lambda layer_id: (None, None, None, 1),
+        get_seqlens_int32=lambda: torch.ones(rows, dtype=torch.int32),
+    )
+    # Each mode's spec info carries only its own field: the draft-extend window
+    # width (and logprob rows), or verify's draft_token_num. Decode carries both.
+    spec_info = {
+        "draft_extend": SimpleNamespace(
+            num_tokens_per_req=4, num_tokens_for_logprob_per_req=1
+        ),
+        "verify": SimpleNamespace(draft_token_num=4),
+        "decode": SimpleNamespace(num_tokens_per_req=4, draft_token_num=4),
+    }[mode]
+    batch = SimpleNamespace(forward_mode=_ForwardMode(mode), spec_info=spec_info)
+    QSAIndexer._forward_impl(
+        indexer,
+        torch.zeros(rows, 16),
+        torch.zeros(rows, dtype=torch.int64),
+        batch,
+        metadata,
+    )
+    assert seen == [expected]
+
+
+def test_qsa_draft_extend_graph_layout_groups_rows_by_request():
+    """The draft-extend graph layout the grouped decode scorer reads: each request's
+    window rows back to back on its request slot, the last row the longest. Request
+    0 is shorter than the window; the last two are the graph runners' padding
+    requests (slot 0, length 1)."""
+    from sglang.srt.layers.attention.qsa.graph_metadata import (
+        _qsa_graph_layout_kernel,
+    )
+
+    if not torch.cuda.is_available():
+        pytest.skip("Triton kernel")
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    width, bs, padding = 4, 12, 2
+    rows = bs * width
+    # Post-extend lengths and request slots.
+    seq_lens = torch.randint(width, 70000, (bs,), device=device)
+    req_pool = torch.randperm(bs, device=device) + 1
+    seq_lens[0] = 2
+    seq_lens[-padding:] = 1
+    req_pool[-padding:] = 0
+    extend_lens = torch.full((bs,), width, dtype=torch.int32, device=device)
+    row_seq_lens, row_prefix_lens, row_req_pool = (
+        torch.full((rows,), -1, dtype=torch.int32, device=device) for _ in range(3)
+    )
+    _qsa_graph_layout_kernel[(bs + 1,)](
+        seq_lens,
+        req_pool,
+        extend_lens,
+        row_seq_lens,
+        row_prefix_lens,
+        row_req_pool,
+        bs,
+        rows,
+        0,
+        num_warps=1,
+    )
+    groups = row_seq_lens.view(bs, width)
+    assert torch.equal(
+        row_req_pool.view(bs, width), req_pool[:, None].expand(bs, width).int()
+    )
+    assert bool((groups.diff(dim=1) >= 0).all())
+    assert torch.equal(groups[:, -1], seq_lens.int())
 
 
 if __name__ == "__main__":

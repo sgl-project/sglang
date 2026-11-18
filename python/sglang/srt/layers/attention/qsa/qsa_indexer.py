@@ -51,6 +51,24 @@ def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
     return min(rows, max_padded_rows)
 
 
+def _decode_rows_per_request(
+    forward_batch, indexer_metadata, is_target_verify: bool, is_draft_extend: bool
+) -> int:
+    """Rows per request for the decode scorer, which may share one key read across
+    them. Verify and draft-extend CUDA graphs lay out each request's rows back to
+    back on its page-table row with non-decreasing lengths (graph_metadata.py) and
+    the runners' padding requests last; eager batches score row by row."""
+    if not indexer_metadata.is_cuda_graph:
+        return 1
+    if is_target_verify:
+        return int(forward_batch.spec_info.draft_token_num)
+    if is_draft_extend:
+        # Every draft-extend batch fills its whole window (prepare_for_draft_extend),
+        # and the graph runners replay only their captured width.
+        return int(forward_batch.spec_info.num_tokens_per_req)
+    return 1
+
+
 class QSAIndexer(MultiPlatformOp):
     """Config-driven fused-QK, weight-free sparse-attention indexer."""
 
@@ -788,10 +806,8 @@ class QSAIndexer(MultiPlatformOp):
                 logical_positions,
                 indexer_metadata.get_seqlens_int32(),
                 defer_expansion=q.is_cuda and indexer_metadata.defer_block_expansion,
-                rows_per_request=(
-                    int(forward_batch.spec_info.draft_token_num)
-                    if is_target_verify and indexer_metadata.is_cuda_graph
-                    else 1
+                rows_per_request=_decode_rows_per_request(
+                    forward_batch, indexer_metadata, is_target_verify, is_draft_extend
                 ),
             )
 
