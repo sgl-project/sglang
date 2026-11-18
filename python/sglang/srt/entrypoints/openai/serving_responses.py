@@ -1577,6 +1577,36 @@ class OpenAIServingResponses(OpenAIServingChat):
         return output
 
     @staticmethod
+    def _computer_call_output_content(output: Any) -> Any:
+        """``computer_call_output.output`` may be a string, a dict with an
+        ``image_url`` (computer_screenshot), or an array of content parts; keep
+        screenshots as ``image_url`` content so the model sees the image."""
+        if isinstance(output, str):
+            return output
+        if isinstance(output, dict):
+            if output.get("image_url"):
+                return [
+                    OpenAIServingResponses._normalize_response_content_part_for_chat(
+                        {"type": "input_image", "image_url": output["image_url"]}
+                    )
+                ]
+            return orjson.dumps(output).decode("utf-8")
+        if isinstance(output, list):
+            content = [
+                OpenAIServingResponses._normalize_response_content_part_for_chat(part)
+                for part in output
+            ]
+            texts = [
+                p.get("text", "")
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            ]
+            if len(content) == len(texts):
+                return "".join(texts)
+            return content
+        return output
+
+    @staticmethod
     def _chat_tool_call_message(message: dict, name: Any, arguments: str) -> dict:
         return {
             "role": "assistant",
@@ -1667,6 +1697,24 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "role": "tool",
                 "tool_call_id": message.get("call_id"),
                 "content": orjson.dumps(message.get("tools") or []).decode("utf-8"),
+            }
+        if msg_type == "computer_call":
+            # The action dict is the tool arguments; "computer" is the built-in
+            # tool name OpenAI assigns to computer_use_preview calls.
+            action = message.get("action")
+            raw = (
+                orjson.dumps(action).decode("utf-8")
+                if isinstance(action, dict)
+                else "{}"
+            )
+            return cls._chat_tool_call_message(
+                message, message.get("name") or "computer", raw
+            )
+        if msg_type == "computer_call_output":
+            return {
+                "role": "tool",
+                "tool_call_id": message.get("call_id"),
+                "content": cls._computer_call_output_content(message.get("output")),
             }
         if msg_type in ("function_call_output", "custom_tool_call_output"):
             return {

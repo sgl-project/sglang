@@ -1274,6 +1274,80 @@ class InputItemNormalizationTestCase(CustomTestCase):
         self.assertEqual(normalized["role"], "user")
         self.assertIn("Qwen API reference", normalized["content"])
 
+    def test_computer_call_becomes_assistant_tool_call(self):
+        # Regression: computer_call input items used to raise "Unsupported
+        # Responses API input item type", breaking computer-use replay loops.
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "computer_call",
+                "id": "cc-1",
+                "call_id": "call-computer-1",
+                "pending_safety_checks": [],
+                "status": "completed",
+                "action": {"type": "screenshot"},
+            }
+        )
+        self.assertEqual(
+            normalized,
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-computer-1",
+                        "type": "function",
+                        "function": {
+                            "name": "computer",
+                            "arguments": '{"type":"screenshot"}',
+                        },
+                    }
+                ],
+            },
+        )
+
+    def test_computer_call_output_keeps_screenshot_image(self):
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "computer_call_output",
+                "call_id": "call-computer-1",
+                "output": {
+                    "type": "computer_screenshot",
+                    "image_url": "data:image/png;base64,iVBOR",
+                },
+                "acknowledged_safety_checks": [],
+            }
+        )
+        self.assertEqual(normalized["role"], "tool")
+        self.assertEqual(normalized["tool_call_id"], "call-computer-1")
+        self.assertEqual(
+            normalized["content"],
+            [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,iVBOR",
+                        "detail": "auto",
+                    },
+                }
+            ],
+        )
+
+    def test_computer_call_output_string_output_stays_text(self):
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "computer_call_output",
+                "call_id": "call-computer-1",
+                "output": "screenshot taken",
+            }
+        )
+        self.assertEqual(
+            normalized,
+            {
+                "role": "tool",
+                "tool_call_id": "call-computer-1",
+                "content": "screenshot taken",
+            },
+        )
+
 
 class FullResponseUsageTestCase(CustomTestCase):
     def test_full_response_uses_dict_meta_info_for_usage(self):
