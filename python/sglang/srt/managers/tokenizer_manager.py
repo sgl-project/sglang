@@ -3917,7 +3917,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and not get_serving().skip_tokenizer_init,
                 finished=True,
             )
-        if isinstance(state.obj, GenerateReqInput) and state.obj.return_sampling_mask:
+        if is_generate and state.obj.return_sampling_mask:
             _add_sampling_mask_to_meta_info(meta_info, state, None, finished=True)
 
         output_ids = state.output_ids
@@ -3940,6 +3940,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         return_b64=state.obj.return_flat_raw_top_logprobs_b64,
                     )
                 )
+            if "output_token_sampling_mask_length" in meta_info:
+                if state.obj.return_flat_raw_sampling_mask:
+                    meta_info.update(
+                        _build_flat_sampling_mask_fields(
+                            [], return_b64=state.obj.return_flat_raw_sampling_mask_b64
+                        )
+                    )
+                else:
+                    meta_info["output_token_sampling_mask_length"] = 0
         meta_info["completion_tokens"] = len(output_ids)
         if is_stream and self.incremental_streaming_output:
             output_ids = [output_ids[-1]] if len(output_ids) > 0 else []

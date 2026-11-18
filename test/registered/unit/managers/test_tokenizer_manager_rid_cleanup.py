@@ -15,6 +15,7 @@ Covers:
 """
 
 import asyncio
+import itertools
 import time
 import unittest
 from array import array
@@ -501,13 +502,14 @@ class TestAbortOutputPayload(CustomTestCase):
             token_ids=np.asarray([5, 7, 9, 2], dtype=np.int32),
             logprobs=np.asarray([-0.5, -1.0], dtype=np.float32),
         )
-        for flat in (False, True):
-            with self.subTest(flat=flat):
+        for flat, routed_experts in itertools.product((False, True), repeat=2):
+            with self.subTest(flat=flat, routed_experts=routed_experts):
                 tm = _make_tokenizer_manager(self)
                 obj = GenerateReqInput(
                     text="hi",
                     return_sampling_mask=True,
                     return_flat_raw_sampling_mask=flat,
+                    return_routed_experts=routed_experts,
                 )
                 obj.normalize_batch_and_arguments()
                 state = ReqState(
@@ -524,7 +526,10 @@ class TestAbortOutputPayload(CustomTestCase):
                 tm._handle_abort_req(_make_abort_req(obj.rid))
 
                 meta_info = state.out_list[-1]["meta_info"]
-                self.assertEqual(meta_info["output_token_sampling_mask_length"], 2)
+                self.assertEqual(
+                    meta_info["output_token_sampling_mask_length"],
+                    len(state.out_list[-1]["output_ids"]),
+                )
 
     def test_abort_includes_prompt_token_ids_only_when_requested(self):
         """The abort chunk carries prompt_token_ids captured at tokenization,
