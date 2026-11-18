@@ -280,9 +280,7 @@ def test_draft_folds_static_commit_needs_the_targets_unremapped_slots():
 
     def injector(target_space, draft_space):
         def runner(space):
-            return SimpleNamespace(
-                runner_ids=SimpleNamespace(space=lambda kind: space)
-            )
+            return SimpleNamespace(runner_ids=SimpleNamespace(space=lambda kind: space))
 
         return SimpleNamespace(
             model_runner=runner(target_space), draft_model_runner=runner(draft_space)
