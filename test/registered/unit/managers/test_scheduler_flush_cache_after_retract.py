@@ -59,7 +59,6 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.result_queue = deque()
         scheduler.waiting_queue = []
         scheduler.dllm_manager = MagicMock()
-        scheduler.dllm_manager.any_staging_reqs.return_value = False
         scheduler._pp_microbatches_drained = MagicMock(return_value=True)
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.grammar_queue = []
@@ -75,9 +74,11 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.disagg_decode_prealloc_queue = None
         scheduler.disagg_decode_transfer_queue = None
         scheduler.hisparse_coordinator = None
+        scheduler.decode_offload_manager = None
         scheduler.deferred_responses = DeferredResponses(
             disaggregation_mode=DisaggregationMode.NULL,
             output_streamer=None,
+            request_retirer=None,
             send_abort=None,
         )
         scheduler.tree_cache = MagicMock()
@@ -86,6 +87,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.draft_worker = None
         scheduler.metrics_reporter = MagicMock()
         scheduler.invariant_checker = MagicMock()
+        scheduler.gc_freezer = MagicMock()
         return scheduler
 
     def test_flush_cache_succeeds_when_only_retracted_reqs_are_waiting(self):
@@ -94,6 +96,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
 
         self.assertTrue(scheduler.flush_cache())
         scheduler.tree_cache.reset.assert_called_once()
+        scheduler.gc_freezer.on_cache_reset.assert_called_once()
         scheduler.req_to_token_pool.clear.assert_called_once()
         scheduler.token_to_kv_pool_allocator.clear.assert_called_once()
 

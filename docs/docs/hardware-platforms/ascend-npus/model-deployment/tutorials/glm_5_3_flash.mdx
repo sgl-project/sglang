@@ -19,7 +19,7 @@ The examples use W8A8 weights on A3 series and W8A8_MXFP8 weights on 950PR/DT se
 | --- | --- |
 | Tensor Parallelism | `--tp-size 16` |
 | Pipeline Parallelism | `--pp-size 4` |
-| Data Parallelism | `--dp-size 16` and `--enable-dp-attention` |
+| Data Parallelism | `--attn-dp-size 16` |
 | DeepEP | `--moe-a2a-backend deepep` and `--deepep-mode auto` |
 | PD Disaggregation | `--disaggregation-mode prefill` and `--disaggregation-transfer-backend ascend` |
 | Quantization | `--quantization modelslim` |
@@ -32,7 +32,7 @@ The examples use W8A8 weights on A3 series and W8A8_MXFP8 weights on 950PR/DT se
 <Note>
 The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
 mode, and workload. For parameter details, see
-[Feature descriptions](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-descriptions); for
+[Parameter Reference](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#parameter-reference); for
 recommended configurations for each deployment scenario, see [Best practices](#best-practices).
 </Note>
 
@@ -367,8 +367,7 @@ if [[ "$LOCAL_IPS" == *" $PREFILL_IP "* ]]; then
         --disaggregation-bootstrap-port 8998 \
         --disaggregation-transfer-backend ascend \
         --dist-init-addr "${PREFILL_IP}:5000" \
-        --tp-size 4 --pp-size 4 --dp-size 4 --nnodes 1 \
-        --enable-dp-attention \
+        --tp-size 4 --pp-size 4 --attn-dp-size 4 --nnodes 1 \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
         --moe-a2a-backend deepep --deepep-mode normal \
@@ -402,8 +401,7 @@ elif [[ "$LOCAL_IPS" == *" $DECODE_IP "* ]]; then
         --disaggregation-mode decode \
         --disaggregation-transfer-backend ascend \
         --dist-init-addr "${DECODE_IP}:5000" \
-        --tp-size 16 --pp-size 1 --dp-size 16 --nnodes 1 \
-        --enable-dp-attention \
+        --tp-size 16 --pp-size 1 --attn-dp-size 16 --nnodes 1 \
         --moe-a2a-backend deepep --deepep-mode low_latency \
         --load-balance-method round_robin \
         --mem-fraction-static 0.75 \
@@ -464,7 +462,7 @@ if [[ "$LOCAL_IPS" == *" $PREFILL_IP "* ]]; then
         --disaggregation-mode prefill \
         --disaggregation-bootstrap-port 8998 \
         --disaggregation-transfer-backend ascend \
-        --tp-size 8 --pp-size 1 --dp-size 2 --enable-dp-attention --nnodes 1 \
+        --tp-size 8 --pp-size 1 --attn-dp-size 2 --nnodes 1 \
         --chunked-prefill-size 16384 --max-prefill-tokens 16384 \
         --mem-fraction-static 0.83 --page-size 64 --max-running-requests 16 \
         --speculative-draft-model-path "$MODEL_PATH" \
@@ -483,7 +481,7 @@ elif [[ "$LOCAL_IPS" == *" $DECODE_IP "* ]]; then
         --disaggregation-mode decode \
         --disaggregation-bootstrap-port 8998 \
         --disaggregation-transfer-backend ascend \
-        --tp-size 8 --pp-size 1 --dp-size 2 --enable-dp-attention --nnodes 1 \
+        --tp-size 8 --pp-size 1 --attn-dp-size 2 --nnodes 1 \
         --chunked-prefill-size 16384 --max-prefill-tokens 16384 \
         --mem-fraction-static 0.83 --page-size 64 --max-running-requests 16 \
         --speculative-draft-model-path "$MODEL_PATH" \
@@ -502,8 +500,8 @@ fi
 </Tabs>
 
 Launch the router after the prefill and decode services are ready. Use the same node IP addresses as in the worker
-scripts. Client requests go to the router on port 8000; the worker ports are 8810 and 8811, and the prefill bootstrap
-port is 8998.
+scripts. Client requests go to the router on port 8000; the worker ports are 8810 and 8811. The router reads each
+worker's role and the prefill bootstrap port (8998) from the workers themselves.
 
 ```shell
 # ============================================================
@@ -519,15 +517,14 @@ ROUTER_HOST_IP="<your router ip>"
 export no_proxy="127.0.0.1,localhost,${PREFILL_IP},${DECODE_IP},${ROUTER_HOST_IP},${no_proxy:-}"
 export NO_PROXY="$no_proxy"
 
-python3 -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill "http://${PREFILL_IP}:8810" 8998 \
-    --decode "http://${DECODE_IP}:8811" \
+sgl-router \
+    --model-id GLM-5.3-Flash \
+    --no-tokenizer \
+    --worker-urls "http://${PREFILL_IP}:8810" "http://${DECODE_IP}:8811" \
     --host "$ROUTER_HOST_IP" --port 8000 \
     --policy round_robin \
-    --worker-startup-timeout-secs 3600 \
     --request-timeout-secs 7200 \
-    --disable-retries
+    --stale-request-timeout-secs 7200
 ```
 
 ## Functional verification
