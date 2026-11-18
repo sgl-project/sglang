@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Set, 
 
 import torch
 
+from sglang.srt.beam_search.batch_tail import beam_decode_budget
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.managers.schedule_batch import (
     Req,
@@ -1040,12 +1041,13 @@ class PrefillAdder:
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         # Fixed-length requests cannot benefit from the early-EOS estimate.
         ratio = 1.0 if req.sampling_params.ignore_eos else self.new_token_ratio
-        return (
+        return beam_decode_budget(
+            req,
             min(
                 (req.sampling_params.max_new_tokens - len(req.output_ids)),
                 CLIP_MAX_NEW_TOKENS,
             )
-            * ratio
+            * ratio,
         )
 
     @property
@@ -1061,9 +1063,12 @@ class PrefillAdder:
         the remaining-then-clip order of add_one_req's max_new: clip-then-subtract
         would zero out a request that has already generated >= CLIP tokens but
         still has a long decode ahead, under-reserving its window."""
-        return min(
-            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
+        return beam_decode_budget(
+            req,
+            min(
+                max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+                CLIP_MAX_NEW_TOKENS,
+            ),
         )
 
     def _check_prefill_budget(
@@ -1628,7 +1633,9 @@ class PrefillAdder:
             prefix_tokens,
             req.extend_len,
             (
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                beam_decode_budget(
+                    req, min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                )
                 if not truncated
                 else 0
             ),
@@ -1642,7 +1649,9 @@ class PrefillAdder:
             cached_tokens=req.prefix_len,
             unfinished_input_len=cand_extend_input_len - new_len,
             deferred_max_new_tokens=(
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                beam_decode_budget(
+                    req, min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                )
                 if truncated
                 else 0
             ),
@@ -2220,7 +2229,11 @@ class PrefillAdder:
         self._update_prefill_budget(
             admission.prefix_len,
             admission.extend_len,
-            admission.max_new_tokens,
+            (
+                0
+                if admission.is_chunked
+                else beam_decode_budget(req, admission.max_new_tokens)
+            ),
             req.retracted_stain,
             state_slots=state_slots,
             request_rows=self._request_rows_for_req(req),
@@ -2236,7 +2249,9 @@ class PrefillAdder:
                 else 0
             ),
             deferred_max_new_tokens=(
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                beam_decode_budget(
+                    req, min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                )
                 if admission.is_chunked
                 else 0
             ),
@@ -2265,7 +2280,7 @@ class PrefillAdder:
         valid_running_reqs = (
             r
             for r in self.running_batch.reqs
-            if r not in self.preempt_list and not r.finished()
+            if r not in self.preempt_list and not r.finished() and r.beam_group is None
         )
 
         sorted_valid_running_reqs = sorted(
