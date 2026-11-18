@@ -1442,6 +1442,42 @@ pub mod sglang_service_client {
             ));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn open_ai_list_models(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OpenAiListModelsRequest>,
+        ) -> std::result::Result<tonic::Response<super::OpenAiModelList>, tonic::Status> {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/OpenAiListModels",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "OpenAiListModels",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn open_ai_retrieve_model(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OpenAiRetrieveModelRequest>,
+        ) -> std::result::Result<tonic::Response<super::OpenAiModelCard>, tonic::Status> {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/OpenAiRetrieveModel",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "OpenAiRetrieveModel",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1839,6 +1875,14 @@ pub mod sglang_service_server {
             &self,
             request: tonic::Request<super::OpenAiDetokenizeRequest>,
         ) -> std::result::Result<tonic::Response<super::OpenAiDetokenizeResponse>, tonic::Status>;
+        async fn open_ai_list_models(
+            &self,
+            request: tonic::Request<super::OpenAiListModelsRequest>,
+        ) -> std::result::Result<tonic::Response<super::OpenAiModelList>, tonic::Status>;
+        async fn open_ai_retrieve_model(
+            &self,
+            request: tonic::Request<super::OpenAiRetrieveModelRequest>,
+        ) -> std::result::Result<tonic::Response<super::OpenAiModelCard>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct SglangServiceServer<T> {
@@ -4853,6 +4897,90 @@ pub mod sglang_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = OpenAiDetokenizeSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/OpenAiListModels" => {
+                    #[allow(non_camel_case_types)]
+                    struct OpenAiListModelsSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::OpenAiListModelsRequest>
+                        for OpenAiListModelsSvc<T>
+                    {
+                        type Response = super::OpenAiModelList;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OpenAiListModelsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::open_ai_list_models(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OpenAiListModelsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/OpenAiRetrieveModel" => {
+                    #[allow(non_camel_case_types)]
+                    struct OpenAiRetrieveModelSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::OpenAiRetrieveModelRequest>
+                        for OpenAiRetrieveModelSvc<T>
+                    {
+                        type Response = super::OpenAiModelCard;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OpenAiRetrieveModelRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::open_ai_retrieve_model(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OpenAiRetrieveModelSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
