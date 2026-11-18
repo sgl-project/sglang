@@ -161,7 +161,7 @@ def set_ulimit(target_soft_limit=65535):
     resource_type = resource.RLIMIT_NOFILE
     current_soft, current_hard = resource.getrlimit(resource_type)
 
-    if current_soft < target_soft_limit:
+    if current_soft != resource.RLIM_INFINITY and current_soft < target_soft_limit:
         try:
             resource.setrlimit(resource_type, (target_soft_limit, current_hard))
         except ValueError as e:
@@ -171,7 +171,10 @@ def set_ulimit(target_soft_limit=65535):
     resource_type = resource.RLIMIT_STACK
     current_soft, current_hard = resource.getrlimit(resource_type)
     target_soft_limit_stack_size = 1024 * target_soft_limit
-    if current_soft < target_soft_limit_stack_size:
+    if (
+        current_soft != resource.RLIM_INFINITY
+        and current_soft < target_soft_limit_stack_size
+    ):
         try:
             resource.setrlimit(
                 resource_type, (target_soft_limit_stack_size, current_hard)

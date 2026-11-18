@@ -152,7 +152,7 @@ def set_ulimit(target_soft_limit=65535):
     resource_type = resource.RLIMIT_NOFILE
     current_soft, current_hard = resource.getrlimit(resource_type)
 
-    if current_soft < target_soft_limit:
+    if current_soft != resource.RLIM_INFINITY and current_soft < target_soft_limit:
         try:
             resource.setrlimit(resource_type, (target_soft_limit, current_hard))
         except ValueError as e:
