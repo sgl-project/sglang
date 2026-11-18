@@ -801,7 +801,7 @@ def build_decode_registry(
                 axis="none",
                 post_fill=lambda buf, fb, ctx: (
                     buf.fill_(ctx.padded_num_tokens)
-                    if getattr(fb, "moe_dp_valid_counts", None) is None
+                    if fb.moe_dp_valid_counts is None
                     else None
                 ),
             ),

@@ -266,6 +266,7 @@ class _DpGatheredBufferWrapper:
     _dp_max_padding: bool = False
     _global_num_tokens: Optional[List[int]] = None
     _global_num_tokens_gpu: Optional[torch.Tensor] = None
+    _moe_dp_valid_counts: Optional[torch.Tensor] = None
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
@@ -412,7 +413,7 @@ def set_dp_buffer_len_from_batch(forward_batch: ForwardBatch) -> None:
         forward_batch.dp_padding_mode.is_max_len(),
         global_num_tokens,
         forward_batch.global_num_tokens_gpu,
-        getattr(forward_batch, "moe_dp_valid_counts", None),
+        forward_batch.moe_dp_valid_counts,
     )
 
 
@@ -875,7 +876,7 @@ def _copy_mask_dp_pad_topk_ids_kernel(
 
 def copy_mask_dp_moe_padding(topk_ids: torch.Tensor) -> torch.Tensor:
     """Copy router-owned global IDs and drop unused MAX_LEN prefixes for CUTLASS."""
-    counts = getattr(_DpGatheredBufferWrapper, "_moe_dp_valid_counts", None)
+    counts = _DpGatheredBufferWrapper._moe_dp_valid_counts
     max_len = get_local_dp_buffer_len()
     if (
         not is_dp_max_padding()
