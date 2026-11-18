@@ -233,33 +233,29 @@ def encode_frame(frame):
 def encode_video_base64(video_path: str, num_frames: int = 16):
     import cv2  # pip install opencv-python-headless
 
+    if num_frames <= 0:
+        raise ValueError("num_frames must be positive")
+        
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise IOError(f"Could not open video file:{video_path}")
 
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"target_frames: {num_frames}")
-
-    frame_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
-
     frames = []
-    for _ in range(total_frames):
-        ret, frame = cap.read()
-        if ret:
+    try:
+        # Read to EOF because some video backends report an unreliable frame count.
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
             frames.append(frame)
-        else:
-            # Handle the case where the frame could not be read
-            # print(f"Warning: Could not read frame at index {i}.")
-            pass
+    finally:
+        cap.release()
 
-    cap.release()
+    if not frames:
+        raise IOError(f"No frames could be decoded from video: {video_path}")
 
-    # Safely select frames based on frame_indices, avoiding IndexError
-    frames = [frames[i] for i in frame_indices if i < len(frames)]
-
-    # If there are not enough frames, duplicate the last frame until we reach the target
-    while len(frames) < num_frames:
-        frames.append(frames[-1])
+    frame_indices = np.linspace(0, len(frames) - 1, num_frames, dtype=int)
+    frames = [frames[i] for i in frame_indices]
 
     # Use ThreadPoolExecutor to process and encode frames in parallel
     with ThreadPoolExecutor() as executor:
