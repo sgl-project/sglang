@@ -142,6 +142,8 @@ from sglang.srt.utils import (
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _IS_GFX95 = is_gfx95_supported()
+if _IS_GFX95:
+    from sglang.srt.layers.attention.dsa import dsa_backend_hip
 
 if TYPE_CHECKING:
     from flash_mla.flash_mla_interface import FlashMLASchedMeta
@@ -1019,7 +1021,8 @@ class DeepseekSparseAttnBackend(
             assert not get_exec().features.enable_return_indexer_topk
             if not init_dcp_topk_merge(max_rows, self.dsa_index_topk):
                 init_dcp_candidate_all_gather(max_rows, self.dsa_index_topk)
-            if envs.SGLANG_ENABLE_DSA_DCP_FUSED_TOPK.get():
+            # gfx950's DCP top-k takes the fused top-k's place
+            if envs.SGLANG_ENABLE_DSA_DCP_FUSED_TOPK.get() or _IS_GFX95:
                 init_dcp_fused_topk(
                     max_rows,
                     self.dsa_index_topk,
@@ -1468,6 +1471,10 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
         # DCP prefill: the batch's KV rows from all ranks, request after request
         # in position order, padded to whole pages (the ragged top-k layout)
+        if _IS_GFX95:
+            return dsa_backend_hip.dcp_gather_kv_cache(
+                self, kv_cache, forward_batch, metadata
+            )
         rows = kv_cache.view(torch.uint8).view(-1, self.kv_cache_dim)
         gathered = dcp_gather_request_rows(
             rows[metadata.dcp_local_kv_rows], forward_batch.seq_lens_cpu
@@ -1839,6 +1846,14 @@ class DeepseekSparseAttnBackend(
             # require SPLIT_KV = 256; this is independent of the cache page size.
             paged_mqa_schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
                 paged_mqa_ctx_lens_2d, 64, resolve_num_sms()
+            )
+        elif _IS_GFX95:
+            paged_mqa_ctx_lens_2d = dsa_backend_hip.sharded_index_k_ctx_lens(
+                self,
+                forward_batch.forward_mode,
+                cache_seqlens_int32,
+                seqlens_expanded,
+                forward_batch.batch_size,
             )
 
         metadata = DSAMetadata(
@@ -2244,6 +2259,10 @@ class DeepseekSparseAttnBackend(
             paged_mqa_schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
                 paged_mqa_ctx_lens_2d, 64, resolve_num_sms()
             )
+        elif _IS_GFX95:
+            paged_mqa_ctx_lens_2d = dsa_backend_hip.sharded_index_k_ctx_lens(
+                self, forward_mode, cache_seqlens_int32, seqlens_expanded, bs
+            )
 
         metadata = DSAMetadata(
             page_size=self.physical_page_size,
@@ -2555,6 +2574,12 @@ class DeepseekSparseAttnBackend(
                     object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
                 else:
                     metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
+        elif _IS_GFX95:
+            lens = dsa_backend_hip.sharded_index_k_ctx_lens(
+                self, forward_mode, metadata.cache_seqlens_int32, seqlens_expanded, bs
+            )
+            if lens is not None:
+                metadata.paged_mqa_ctx_lens_2d.copy_(lens)
         seqlens_expanded_size = seqlens_expanded.shape[0]
         assert (
             metadata.dsa_cache_seqlens_int32 is not None
@@ -2645,6 +2670,16 @@ class DeepseekSparseAttnBackend(
                 object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
             else:
                 metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
+        elif _IS_GFX95:
+            lens = dsa_backend_hip.sharded_index_k_ctx_lens(
+                self,
+                forward_mode,
+                metadata.cache_seqlens_int32,
+                metadata.dsa_seqlens_expanded,
+                bs,
+            )
+            if lens is not None:
+                metadata.paged_mqa_ctx_lens_2d.copy_(lens)
 
         self._update_kpool_metadata_from_precomputed(
             metadata, precomputed, forward_mode
@@ -2862,6 +2897,15 @@ class DeepseekSparseAttnBackend(
                     sm_scale=layer.scaling,
                     layer=layer,
                     topk_indices=shared_topk_indices,
+                )
+            # the dcp_partial of _forward_flashmla_kv on gfx950's sharded index-K
+            if (
+                _IS_GFX95
+                and self.dsa_shards_index_k
+                and forward_batch.forward_mode.is_target_verify()
+            ):
+                return dsa_backend_hip.forward_triton_dcp_partial(
+                    self, q_nope, q_rope, kv_cache, page_table_1, layer
                 )
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
                 triton_sparse_mla_fwd,
@@ -3235,6 +3279,10 @@ class DeepseekSparseAttnBackend(
                     sm_scale=layer.scaling,
                     layer=layer,
                     topk_indices=shared_topk_indices,
+                )
+            if _IS_GFX95 and self.dsa_shards_index_k:
+                return dsa_backend_hip.forward_triton_dcp_partial(
+                    self, q_nope, q_rope, kv_cache, page_table_1, layer
                 )
             return self._forward_triton_decode(
                 q_nope=q_nope,
