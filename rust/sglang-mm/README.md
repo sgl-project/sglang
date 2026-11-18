@@ -4,6 +4,9 @@ Rust-accelerated multimodal preprocessing for SGLang. Fused image decode,
 fetch, resize, patchify, normalize, and content hash — all parallel and
 GIL-released.
 
+The processing stages and their dependencies are in
+[docs/pipeline.md](docs/pipeline.md).
+
 Built two ways:
 
 - **PyO3 extension** `sglang.srt.rust_extensions._multimodal` (features

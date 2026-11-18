@@ -10,6 +10,7 @@ pub mod common;
 pub mod dsv41;
 pub mod error;
 pub mod inkling;
+pub mod plan;
 pub mod qwen_vl;
 pub mod tensor;
 
@@ -23,5 +24,6 @@ fn _multimodal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     inkling::register(m)?;
     dsv41::register(m)?;
     qwen_vl::register(m)?;
+    plan::register(m)?;
     Ok(())
 }
