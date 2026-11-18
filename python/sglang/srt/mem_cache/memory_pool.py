@@ -5569,7 +5569,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
         assert len(self.skip_topk_layers) == layer_num
 
         physical_page_size = self.index_page_size
-        self.index_k_fp4 = get_exec().kernel.enable_dsa_fp4_indexer
+        self.index_k_fp4 = (
+            _is_gfx95_supported and get_exec().kernel.enable_dsa_fp4_indexer
+        )
         if self.index_k_fp4:
             from sglang.kernels.ops.attention.dsa.fp4_index_hip import check_pool
 

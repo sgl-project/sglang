@@ -1696,11 +1696,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 )
             # under DCP (gfx950), block_tables cover only this rank's index-K shard
             row_lens = seqlens_32_2d.view(-1) if dcp_size > 1 else seqlens_32
-            schedule = None
+            schedule_kwargs = {}
             # gfx950: balance the grid over each row's real length, not a fixed split
             if _use_aiter_preshuffle and _is_gfx95_supported:
-                schedule = dsa_indexer_hip.paged_logits_persistent_schedule(
-                    forward_batch, layer_id, row_lens, max_seq_len
+                schedule_kwargs["persistent_schedule"] = (
+                    dsa_indexer_hip.paged_logits_persistent_schedule(
+                        forward_batch, layer_id, row_lens, max_seq_len
+                    )
                 )
             # DP-attention can pad q/weights beyond the real metadata rows.
             # Aiter has no q_offset argument, so trim its inputs explicitly;
@@ -1714,7 +1716,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 max_seq_len,
                 preshuffle=_use_aiter_preshuffle,
                 kv_block_size=block_kv,
-                persistent_schedule=schedule,
+                **schedule_kwargs,
             )
         elif _is_xpu:
             logits = sgl_fp8_paged_mqa_logits(
