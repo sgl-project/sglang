@@ -61,6 +61,9 @@ from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
     assert_empty,
 )
+from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    unwrap_local_serialized_tensors,
+)
 from sglang.srt.model_executor.weight_checker import overall_checksum
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_model, get_parallel
@@ -287,6 +290,10 @@ class SchedulerWeightUpdaterManager:
             named_tensors = self.tp_worker.deserialize_own_rank(
                 recv_req.serialized_named_tensors
             )
+            if recv_req.load_format != "flattened_bucket":
+                named_tensors = unwrap_local_serialized_tensors(
+                    named_tensors, device=self.tp_worker.model_runner.device
+                )
             success, message = True, "Success"
             for _, runner in self._select_runners(recv_req.selector):
                 success, message = runner.weight_updater.update_weights_from_tensor(
