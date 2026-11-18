@@ -29,7 +29,7 @@ use super::native_api::native_error;
 use crate::api_server::core::{CoreError, FORWARD_PEER_PATH};
 use crate::api_server::handlers::{AbortEnding, ProfileOutcome};
 use crate::message::info::ServerInfo;
-use crate::message::io_struct::{ExpertDistributionAction, ProfileOptions};
+use crate::message::io_struct::{ExpertDistributionAction, PdRoleSwitch, ProfileOptions};
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<Arc<AppState>> {
@@ -79,6 +79,8 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .declared_route("/freeze_gc", get(freeze_gc).post(freeze_gc))
         .declared_route("/pause_generation", post(pause_generation))
         .declared_route("/continue_generation", post(continue_generation))
+        .declared_route("/pd_role_switch", post(pd_role_switch))
+        .declared_route("/update_weight_version", post(update_weight_version))
         .declared_route("/abort_request", post(abort_request))
         // Listener-to-listener: another DP rank's control request for this
         // rank's scheduler (see `api_server::core::peer`).
@@ -338,6 +340,83 @@ async fn continue_generation(
     }
 }
 
+/// `POST /pd_role_switch` — Python's `PdRoleSwitchReqOutput` as JSON, 200 on
+/// success and 400 otherwise; a frontend failure is its `{"error": ...}` 400.
+async fn pd_role_switch(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<api::PdRoleSwitchRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+        }
+    };
+    let switch = PdRoleSwitch {
+        new_role: body.new_role.unwrap_or_default(),
+        decode_cuda_graph_bs: body.decode_cuda_graph_bs.map(|list| list.items),
+        decode_cuda_graph_memory_gb: body.decode_cuda_graph_memory_gb,
+        prepare_only: body.prepare_only,
+    };
+    match state.core.pd_role_switch(switch).await {
+        Ok(outcome) => {
+            let status = if outcome.success {
+                StatusCode::OK
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (
+                status,
+                Json(api::PdRoleSwitchResponse {
+                    success: outcome.success,
+                    message: outcome.message,
+                    old_role: outcome.old_role,
+                    new_role: outcome.new_role,
+                    safe_to_restore: outcome.safe_to_restore,
+                }),
+            )
+                .into_response()
+        }
+        Err(error) => native_error(StatusCode::BAD_REQUEST, &error.to_string(), false),
+    }
+}
+
+/// `POST /update_weight_version` — Python's `{"success", "message", "new_version"}`
+/// on success, `{"success": false, "message"}` 400 on failure.
+async fn update_weight_version(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<api::UpdateWeightVersionRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+        }
+    };
+    let new_version = body.new_version;
+    match state
+        .core
+        .update_weight_version(new_version.clone(), body.abort_all_requests.unwrap_or(true))
+        .await
+    {
+        Ok(()) => Json(api::UpdateWeightVersionResponse {
+            success: true,
+            message: format!("Weight version updated to {new_version}"),
+            new_version: Some(new_version),
+        })
+        .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(api::UpdateWeightVersionResponse {
+                success: false,
+                message: format!("Failed to update weight version: {error}"),
+                new_version: None,
+            }),
+        )
+            .into_response(),
+    }
+}
+
 /// `POST /internal/peer` — the body is a control message's wire bytes,
 /// encoded by another DP rank's listener; the reply body is this scheduler's
 /// encoded output. Errors are plain text so the relaying side can carry the
@@ -398,6 +477,8 @@ const RELAYED_BY: &[(&str, &[&str])] = &[
     ),
     ("PauseGenerationReqInput", &["/pause_generation"]),
     ("ContinueGenerationReqInput", &["/continue_generation"]),
+    ("PdRoleSwitchReqInput", &["/pd_role_switch"]),
+    ("UpdateWeightVersionReqInput", &["/update_weight_version"]),
     ("ClearHiCacheReqInput", &["/hicache/storage-backend/clear"]),
     (
         "DetachHiCacheStorageReqInput",
@@ -2450,6 +2531,12 @@ mod tests {
                 r#"{"message":"Generation continued successfully.","status":"ok"}"#,
             ),
             ("GET", "/freeze_gc", "", "Garbage collection frozen.\n"),
+            (
+                "POST",
+                "/update_weight_version",
+                r#"{"new_version": "v2"}"#,
+                r#"{"success":true,"message":"Weight version updated to v2","new_version":"v2"}"#,
+            ),
         ] {
             let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
             let mut builder = HttpRequest::builder().method(method).uri(uri);

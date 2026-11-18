@@ -127,6 +127,8 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
                 "ResumeMemoryOccupationReqInput",
                 "PauseGenerationReqInput",
                 "ContinueGenerationReqInput",
+                "PdRoleSwitchReqInput",
+                "UpdateWeightVersionReqInput",
                 "ClearHiCacheReqInput",
                 "DetachHiCacheStorageReqInput",
                 "AttachHiCacheStorageReqInput",
