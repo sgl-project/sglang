@@ -415,6 +415,8 @@ class SamplingParams:
     # warning) and overrides _request_size_multiple; None means no alignment rule.
     _request_size_model_name: ClassVar[str | None] = None
     _request_size_missing_side: ClassVar[MissingSidePolicy] = MissingSidePolicy.KEEP
+    # True aligns in __post_init__ instead of _adjust_visual_fields.
+    _request_size_aligned_at_init: ClassVar[bool] = False
 
     height: int | None = None
     width: int | None = None
@@ -591,6 +593,9 @@ class SamplingParams:
             from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
 
             self.spectrum_params = SpectrumParams()
+
+        if self._request_size_aligned_at_init:
+            self._align_request_size(pipeline_config=None)
 
     def build_request_extra(self) -> dict[str, Any]:
         """Return optional request-scoped extras for downstream pipeline stages."""
@@ -1116,7 +1121,8 @@ class SamplingParams:
             self._set_output_file_name()
 
         # After the output name, which hashes the requested size.
-        self._align_request_size(pipeline_config)
+        if not self._request_size_aligned_at_init:
+            self._align_request_size(pipeline_config)
 
     @classmethod
     def from_pretrained(cls, model_path: str, **kwargs) -> "SamplingParams":
