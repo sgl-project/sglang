@@ -71,6 +71,12 @@ jobs:
         run: |
           version=${INPUT_VERSION#router-v}
           version=${version#v}
+          # Same check as "Resolve version and tags", here so a typo fails with
+          # this message rather than as a tag the checkout cannot find.
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::Invalid version '$version' (expected X.Y.Z, optionally with a pre-release suffix)"
+            exit 1
+          fi
           # The production repo, however its Docker Hub registry is spelled.
           image_repo=${INPUT_IMAGE_REPO:-lmsysorg/sgl-router}
           image_repo=${image_repo#index.docker.io/}
