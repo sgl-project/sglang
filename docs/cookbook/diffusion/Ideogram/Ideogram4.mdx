@@ -105,7 +105,7 @@ HF_TOKEN=$HF_TOKEN sglang serve \
   --port 30010
 ```
 
-IntelXeon CPU deployment is supported for the fal checkpoints with `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu`; omit GPU-only flags.
+Intel Xeon CPU deployment is supported for the fal checkpoints with `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu`; omit GPU-only flags.
 
 ```bash Command
 SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu HF_TOKEN=$HF_TOKEN sglang serve --model-path fal/ideogram-v4-fast --port 30010

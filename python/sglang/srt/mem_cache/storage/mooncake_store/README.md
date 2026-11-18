@@ -255,7 +255,7 @@ Mooncake loads configuration in the following priority order:
 2. If not, Mooncake checks whether the environment variable `DEFAULT_MOONCAKE_CONFIG_PATH_ENV` is set, and loads the JSON config file from that path.
 3. If neither of the above is provided, Mooncake falls back to environment variables.
 
-For multi-node deployments that attach Mooncake at runtime via `PUT /hicache/storage-backend`, omit `local_hostname` from the attach payload and set `MOONCAKE_LOCAL_HOSTNAME` (or `LOCAL_HOSTNAME`) per node before launching SGLang. Each rank resolves `local_hostname` from its own process environment instead of a shared default.
+For multi-node deployments that attach Mooncake at runtime via `PUT /hicache/storage-backend` (an admin endpoint: launch SGLang with `SGLANG_ADMIN_API_KEY=<key>` set or with `--admin-api-key <key>`, and send `Authorization: Bearer <key>`), omit `local_hostname` from the attach payload and set `MOONCAKE_LOCAL_HOSTNAME` (or `LOCAL_HOSTNAME`) per node before launching SGLang. Each rank resolves `local_hostname` from its own process environment instead of a shared default.
 
 When loading from a JSON config file, `local_hostname` follows the same per-process precedence: `MOONCAKE_LOCAL_HOSTNAME`, then `LOCAL_HOSTNAME`, then the value in the JSON file, then `"localhost"`.
 
@@ -522,10 +522,10 @@ python -m sglang.launch_server \
 **Router**:
 
 ```bash
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill "http://127.0.0.1:30000" \
-    --decode "http://127.0.0.1:30001" \
+sgl-router \
+    --model-id [model_path] \
+    --no-tokenizer \
+    --worker-urls "http://127.0.0.1:30000" "http://127.0.0.1:30001" \
     --host 0.0.0.0 \
     --port 8000
 ```

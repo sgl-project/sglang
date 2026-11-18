@@ -202,7 +202,13 @@ impl SglangService for GrpcService {
         &self,
         _request: Request<api::GetHiCacheStorageRequest>,
     ) -> Result<Response<api::HiCacheStatus>, Status> {
-        Ok(Response::new(self.hicache_manager.status().await))
+        // Unlike the admin-only HTTP route, this RPC takes no key, so the
+        // backend config (it can carry S3 keys) is not returned.
+        let mut status = self.hicache_manager.status().await;
+        if status.hicache_storage_backend_extra_config.is_some() {
+            status.hicache_storage_backend_extra_config = Some("<redacted>".into());
+        }
+        Ok(Response::new(status))
     }
 
     async fn attach_hi_cache_storage(
@@ -1089,6 +1095,7 @@ mod tests {
                 success,
                 service.attach_hi_cache_storage(Request::new(api::AttachHiCacheStorageRequest {
                     hicache_storage_backend: Some("file".into()),
+                    hicache_storage_backend_extra_config_json: Some(r#"{"secret_key":"s"}"#.into()),
                     hicache_write_policy: Some("write_through".into()),
                     ..Default::default()
                 })),
@@ -1097,6 +1104,15 @@ mod tests {
             assert_eq!(response.success, success);
             assert_eq!(response.message, "backend detail");
         }
+        let status = service
+            .get_hi_cache_storage(Request::new(api::GetHiCacheStorageRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            status.hicache_storage_backend_extra_config.as_deref(),
+            Some("<redacted>")
+        );
         for success in [false, true] {
             let response = hicache_reply(
                 &h,
@@ -1220,6 +1236,46 @@ mod tests {
         assert!(info.allow_auto_truncate);
         assert!(info.skip_tokenizer_init);
         assert_eq!(info.num_reserved_tokens, 4);
+    }
+
+    /// gRPC `GetServerInfo` advertises the same nonempty owning-runtime id on
+    /// repeated calls against the same core-backed adapter.
+    #[tokio::test]
+    async fn server_info_instance_id_is_stable_across_grpc_reads() {
+        let Harness {
+            service,
+            intake_rx,
+            abort_rx: _,
+        } = Harness::new(1, false, Duration::from_secs(1));
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let call = service.get_server_info(Request::new(api::GetServerInfoRequest {}));
+            let scheduler = async {
+                let TmEvent::Intake {
+                    request: control,
+                    admission,
+                } = intake_rx.recv_async().await.unwrap()
+                else {
+                    panic!("server info must submit one control request");
+                };
+                assert!(admission.try_accept());
+                let envelope = rmpv::Value::Map(vec![(
+                    rmpv::Value::from("internal_state"),
+                    rmpv::Value::Map(Vec::new()),
+                )]);
+                let mut payload = Vec::new();
+                rmpv::encode::write_value(&mut payload, &envelope).unwrap();
+                control
+                    .sink
+                    .try_send(ResponseItem::Control(bytes::Bytes::from(payload)))
+                    .unwrap();
+            };
+            let (response, ()) = tokio::join!(call, scheduler);
+            ids.push(response.unwrap().into_inner().instance_id);
+        }
+        let uuid = uuid::Uuid::parse_str(&ids[0]).unwrap();
+        assert_eq!(uuid.get_version(), Some(uuid::Version::Random));
+        assert_eq!(ids[0], ids[1]);
     }
 
     #[tokio::test]
