@@ -1264,6 +1264,41 @@ def _fall_back_xpu_draft_attention_for_head_size(server_args: ServerArgs) -> Non
     )
 
 
+def _reject_aiter_mla_draft_under_dcp(server_args: ServerArgs) -> None:
+    """Refuse an EAGLE-family MLA draft that runs on aiter under DCP."""
+    view = resolved_view(server_args)
+    if view.dcp_size <= 1 or not get_platform().is_hip:
+        return
+    draft_backend = view.speculative_draft_attention_backend
+    draft_backends = (draft_backend,) if draft_backend else attention_backends_of(view)
+    if "aiter" not in draft_backends:
+        return
+
+    from sglang.srt.configs.model_config import (
+        AttentionArch,
+        ModelConfig,
+        dsa_draft_shards_under_dcp,
+    )
+
+    draft_model_config = ModelConfig.from_server_args(
+        server_args,
+        model_path=view.speculative_draft_model_path,
+        model_revision=view.speculative_draft_model_revision,
+        is_draft_model=True,
+    )
+    if draft_model_config.attention_arch != AttentionArch.MLA:
+        return
+    # A ROCm DSA draft shards its KV like the target; any other MLA draft keeps a
+    # replicated pool, yet its extend takes the model's DCP branch without the step's keys.
+    if dsa_draft_shards_under_dcp(draft_model_config.hf_config, view.dcp_size):
+        return
+    raise ValueError(
+        f"aiter cannot run an MLA draft model with --dcp-size {view.dcp_size}: "
+        "its draft extend has no DCP path. Use --dcp-size 1, or a draft model "
+        "without MLA attention."
+    )
+
+
 def _handle_eagle_family(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     _check_oot_speculative_algorithm(
@@ -1353,6 +1388,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
     _handle_iquest_q1_mtp_draft(server_args)
     _fall_back_xpu_draft_attention_for_head_size(server_args)
+    _reject_aiter_mla_draft_under_dcp(server_args)
     if not cfg.speculative_adaptive and cfg.speculative_num_steps is None:
         assert (
             cfg.speculative_eagle_topk is None
