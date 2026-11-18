@@ -79,6 +79,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
+    draft_folds_static_commit,
     target_model_type,
     verify_logits_adjustments_are_noop,
 )
@@ -425,7 +426,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         static_epilogue_supported = (
             (
                 (target_is_dsv41 and self._draft_is_moe)
-                or getattr(self.draft_model, "folds_static_verify_commit", False)
+                or draft_folds_static_commit(
+                    draft_model=self.draft_model, kv_injector=self._kv_injector
+                )
             )
             and self._verify_planner.mode_value == "static"
             and not get_parallel().attn_dp_enabled
