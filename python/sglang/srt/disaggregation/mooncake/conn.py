@@ -1144,6 +1144,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     f"decode={registration_info.dst_attn_tp_size}"
                 )
         state_types = getattr(self.kv_args, "state_types", [])
+        if (
+            StateType.DRAFT_RING in state_types
+            and self.kv_args.draft_kv_ring_paged
+            and registration_info.dst_attn_tp_size != self.attn_tp_size
+        ):
+            # An MHA draft's ring rows hold this rank's head shard, sent unsliced.
+            return False, (
+                "A DFLASH MHA draft KV ring needs the same attention TP size: "
+                f"prefill={self.attn_tp_size}, "
+                f"decode={registration_info.dst_attn_tp_size}"
+            )
         fully_checked = True
         for i, st in enumerate(state_types):
             if not self._is_generic_kvcache_state_type(st):
