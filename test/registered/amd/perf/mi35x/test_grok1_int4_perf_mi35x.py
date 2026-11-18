@@ -2,7 +2,7 @@
 
 This test benchmarks Grok-1 (314B MOE) with INT4 weight quantization on 8 GPUs.
 
-Registry: nightly-perf-8-gpu-mi35x-grok1-int4 suite
+Registry: nightly-perf-test-8-gpu-amd-mi35x-grok1-int4 suite
 """
 
 import os
@@ -16,7 +16,7 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 # Register for AMD CI - Grok-1 INT4 benchmark on MI35x (~25 min)
 register_amd_ci(
-    est_time=1500, suite="nightly-perf-8-gpu-mi35x-grok1-int4", nightly=True
+    est_time=1500, suite="nightly-perf-test-8-gpu-amd-mi35x-grok1-int4", nightly=True
 )
 
 

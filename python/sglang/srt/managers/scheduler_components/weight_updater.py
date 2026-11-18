@@ -56,6 +56,11 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    PD_KINDS,
+    ListKind,
+    assert_empty,
+)
 from sglang.srt.model_executor.weight_checker import overall_checksum
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_model, get_parallel
@@ -175,6 +180,7 @@ class SchedulerWeightUpdaterManager:
                 num_paused_requests=0,
             )
         with self._observe_weight_load("disk"):
+            self.scheduler.wait_for_launched_forward()
             success, message = True, "Succeeded to update model weights."
             target_updated = False
             for role, runner in self._select_runners():
@@ -233,6 +239,7 @@ class SchedulerWeightUpdaterManager:
                 "begin_weight_update() and end_weight_update()",
             )
         with self._observe_weight_load("distributed"):
+            self.scheduler.wait_for_launched_forward()
             # only the target runner joined the update group; drafts load its receive
             target = self.tp_worker.model_runner.weight_updater
             try:
@@ -284,6 +291,7 @@ class SchedulerWeightUpdaterManager:
                 "begin_weight_update() and end_weight_update()",
             )
         with self._observe_weight_load("tensor"):
+            self.scheduler.wait_for_launched_forward()
             named_tensors = self.tp_worker.deserialize_own_rank(
                 recv_req.serialized_named_tensors
             )
@@ -311,6 +319,7 @@ class SchedulerWeightUpdaterManager:
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
         with self._observe_weight_load("ipc"):
+            self.scheduler.wait_for_launched_forward()
             success, message = True, "Succeeded to update model weights."
             target_updated = False
             for role, runner in self._select_runners():
@@ -374,6 +383,7 @@ class SchedulerWeightUpdaterManager:
             )
             if error is not None:
                 return BeginWeightUpdateReqOutput(success=False, message=error)
+        self.scheduler.wait_for_launched_forward()
         for _, runner in runners:
             runner.weight_updater.begin_weight_update()
         self._session = _WeightUpdateSession(selector=recv_req.selector)
@@ -388,6 +398,7 @@ class SchedulerWeightUpdaterManager:
                 message="no weight-update session is open; call begin_weight_update() first",
             )
         run_post_load = not self._session.loaded_weights
+        self.scheduler.wait_for_launched_forward()
         for _, runner in self._select_runners(self._session.selector):
             runner.weight_updater.end_weight_update(run_post_load=run_post_load)
         self._session = None
@@ -422,6 +433,7 @@ class SchedulerWeightUpdaterManager:
             state=self._plugin_state,
         )
         with self._observe_weight_load("plugin"):
+            self.scheduler.wait_for_launched_forward()
             try:
                 weights = handler(context=context, payload=recv_req.payload)
                 error = None
@@ -473,9 +485,15 @@ class SchedulerWeightUpdaterManager:
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         scheduler = self.scheduler
-        if not self.is_fully_idle(
+        idle = self.is_fully_idle(
             ignore_waiting=scheduler is not None and scheduler.pause_state.paused
-        ):
+        )
+        # A rank refusing alone would leave its peers in the barriers below.
+        busy = torch.tensor([int(not idle)])
+        torch.distributed.all_reduce(
+            busy, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
+        )
+        if busy.item():
             return ReleaseMemoryOccupationReqOutput(
                 success=False,
                 message="Memory was not released because requests are still "
@@ -493,14 +511,12 @@ class SchedulerWeightUpdaterManager:
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             if scheduler is not None:
+                # Held requests keep no KV and wait out the release.
+                assert_empty(scheduler.request_lists(), PD_KINDS - {ListKind.PD_HELD})
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-                    for queue_name in (
-                        "disagg_decode_transfer_queue",
-                        "disagg_decode_prealloc_queue",
-                    ):
-                        queue = getattr(scheduler, queue_name, None)
-                        if queue is not None:
-                            queue.release_memory_occupation()
+                    queue = getattr(scheduler, "disagg_decode_prealloc_queue", None)
+                    if queue is not None:
+                        queue.release_memory_occupation()
                 elif scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
@@ -521,6 +537,8 @@ class SchedulerWeightUpdaterManager:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         torch.get_device_module().synchronize()
+        # The verdict leaves on return; every TP peer must have released by then.
+        torch.distributed.barrier(group=self.tp_cpu_group)
 
         return ReleaseMemoryOccupationReqOutput(success=True, message="Success")
 
@@ -551,13 +569,9 @@ class SchedulerWeightUpdaterManager:
             scheduler = self.scheduler
             if scheduler is not None:
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-                    for queue_name in (
-                        "disagg_decode_transfer_queue",
-                        "disagg_decode_prealloc_queue",
-                    ):
-                        queue = getattr(scheduler, queue_name, None)
-                        if queue is not None:
-                            queue.resume_memory_occupation()
+                    queue = getattr(scheduler, "disagg_decode_prealloc_queue", None)
+                    if queue is not None:
+                        queue.resume_memory_occupation()
                 elif scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
