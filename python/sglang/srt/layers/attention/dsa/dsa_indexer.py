@@ -201,16 +201,10 @@ DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 # decode rows up to which the merged [wk | weights_proj] GEMM uses tiny_gemm
 # (cuBLAS beyond: same at 32 rows, faster at 48+ on B300)
 _MERGED_K_GATE_MAX_M = 16
-# MI355X, 140k keys: unsplit 512 rows cost ~0.6 ms/layer in logits + top-k vs
-# ~0.16 ms for a 64-row slice; re-measure if the top-k all-gather gets slower.
-_INDEXER_TP_SPLIT_MIN_ROWS_HIP = 64
-
-
-def indexer_tp_split_min_rows(cuda_rows: int) -> int:
-    rows = envs.SGLANG_OPT_DSA_INDEXER_TP_SPLIT_MIN_ROWS.get()
-    if rows is not None:
-        return rows
-    return _INDEXER_TP_SPLIT_MIN_ROWS_HIP if _is_hip else cuda_rows
+# gfx950's tp_split_min_rows for any indexer that sets one. MI355X, 140k keys:
+# unsplit 512 rows cost ~0.6 ms/layer in logits + top-k vs ~0.16 ms for a 64-row
+# slice; re-measure if the top-k all-gather gets slower.
+_INDEXER_TP_SPLIT_MIN_ROWS_GFX950 = 64
 
 
 # once per process: a missing FlyDSL warns once, not once per layer
@@ -2214,18 +2208,25 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     ) -> Optional[_IndexerTpSplit]:
         # Every input is identical across the group, so all ranks take the same
         # branch and the all-gather cannot diverge.
-        if not (_is_cuda or _is_hip) or self.tp_split_min_rows is None:
+        if not (_is_cuda or _is_gfx95_supported) or self.tp_split_min_rows is None:
             return None
         if self.dsa_enable_prefill_cp or is_cp_active(forward_batch):
             return None
-        # ROCm breakable-graph replay keeps the capture mode on while this runs eagerly.
-        if (get_is_capture_mode() and not _is_hip) or (
+        # gfx950 breakable-graph replay keeps the capture mode on while this runs eagerly.
+        if (get_is_capture_mode() and not _is_gfx95_supported) or (
             torch.cuda.is_current_stream_capturing()
         ):
             return None
         group = get_parallel().attn_tp_group
         tp = group.world_size
-        min_rows = max(tp, self.tp_split_min_rows)
+        min_rows = max(
+            tp,
+            (
+                _INDEXER_TP_SPLIT_MIN_ROWS_GFX950
+                if _is_gfx95_supported
+                else self.tp_split_min_rows
+            ),
+        )
         if (
             tp <= 1
             or q_offset < min_rows

@@ -32,7 +32,6 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
-from sglang.srt.layers.attention.dsa.dsa_indexer import indexer_tp_split_min_rows
 from sglang.srt.layers.attn_residual import aggregate_stream, get_cw
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -4043,9 +4042,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 and layer.self_attn.indexer is not None
             ):
                 layer.self_attn.indexer.prepare_merged_k_gate()
-                layer.self_attn.indexer.tp_split_min_rows = indexer_tp_split_min_rows(
-                    1024
-                )
+                layer.self_attn.indexer.tp_split_min_rows = 1024
 
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer) or not isinstance(
