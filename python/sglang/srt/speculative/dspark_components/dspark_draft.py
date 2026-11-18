@@ -651,6 +651,9 @@ class DraftBlockProposer:
             out_cache_loc=draft_cache_loc,
             seq_lens_sum=draft_seq_lens_sum,
             seq_lens_cpu=draft_seq_lens_cpu,
+            # Hand-built batch bypasses init_new: carry the scheduler's host
+            # length bound so mirrorless replay prep can narrow its copies.
+            max_seq_len_host=getattr(batch, "max_seq_len_host", None),
             positions=draft_positions,
             input_embeds=draft_input_embeds,
             spec_algorithm=SpeculativeAlgorithm.DSPARK,

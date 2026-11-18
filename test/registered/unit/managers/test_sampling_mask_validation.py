@@ -38,6 +38,7 @@ class TestSamplingMaskValidation(CustomTestCase):
         processor,
         return_sampling_mask=True,
         sampling_logprobs_mode=None,
+        return_flat_raw_sampling_mask=False,
     ):
         req = GenerateReqInput(
             input_ids=[1, 2, 3],
@@ -45,6 +46,7 @@ class TestSamplingMaskValidation(CustomTestCase):
             custom_logit_processor=processor,
             return_sampling_mask=return_sampling_mask,
             sampling_logprobs_mode=sampling_logprobs_mode,
+            return_flat_raw_sampling_mask=return_flat_raw_sampling_mask,
         )
         self.manager._validate_one_request(req, req.input_ids)
 
@@ -194,6 +196,15 @@ class TestSamplingMaskValidation(CustomTestCase):
         for mode in (None, "selected", "support"):
             with self.subTest(mode=mode):
                 self._validate(None, sampling_logprobs_mode=mode)
+
+    def test_flat_raw_sampling_mask_requires_sampling_mask(self):
+        self._validate(None, return_flat_raw_sampling_mask=True)
+        with self.assertRaisesRegex(
+            ValueError, "return_flat_raw_sampling_mask can only be set when"
+        ):
+            self._validate(
+                None, return_sampling_mask=False, return_flat_raw_sampling_mask=True
+            )
 
 
 if __name__ == "__main__":

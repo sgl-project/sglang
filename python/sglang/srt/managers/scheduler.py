@@ -130,7 +130,6 @@ from sglang.srt.hf_transformers import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
-    resolve_image_processor_backend,
 )
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import from_cp_sharded
@@ -973,7 +972,7 @@ class Scheduler(
                     tokenizer_mode=get_serving().tokenizer_mode,
                     trust_remote_code=get_model().trust_remote_code,
                     revision=get_model().revision,
-                    image_processor_backend=resolve_image_processor_backend(get_mm()),
+                    image_processor_backend=get_mm().image_processor_backend,
                     tokenizer_backend=get_serving().tokenizer_backend,
                     model_name=get_model().model_path,
                 )
@@ -2839,8 +2838,7 @@ class Scheduler(
     def init_gc_freezer(self) -> None:
         """Freeze the heap when idle; warn on heap growth and frozen garbage."""
         self.gc_freezer = GCFreezer(
-            freeze_on_idle_secs=get_device().gc_freeze_on_idle_secs,
-            enable_frozen_garbage_check=envs.SGLANG_ENABLE_GC_FROZEN_GARBAGE_CHECK.get(),
+            freeze_on_idle_secs=get_device().gc_freeze_on_idle_secs
         )
 
     def init_rank_consensus_checker(self) -> None:

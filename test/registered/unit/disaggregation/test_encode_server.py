@@ -15,12 +15,14 @@ from sglang.srt.disaggregation.encoder import runtime as encoder_runtime
 from sglang.srt.disaggregation.encoder.preprocessor import (
     EncoderPreprocessor,
     EncoderPreprocessResult,
+    _convert,
 )
 from sglang.srt.disaggregation.encoder.receiver import EmbeddingData
 from sglang.srt.disaggregation.encoder.runtime import (
     _DP_RELEASE_AFTER_ENCODE,
     DPDispatcher,
     _retire_abandoned_encode,
+    validate_encode_request,
 )
 from sglang.srt.disaggregation.encoder.server import (
     EncodeContext,
@@ -115,6 +117,34 @@ class TestEncoderDPErrorHandling(CustomTestCase):
             self.assertEqual(future.result(), valid)
 
         asyncio.run(run())
+
+
+class TestEncodeRequestInputEdges(CustomTestCase):
+    def test_scalar_hashes_are_rejected_before_dispatch(self):
+        request = {
+            "req_id": "r",
+            "modality": "image",
+            "mm_items": ["x"],
+            "num_parts": 1,
+            "part_idx": 0,
+            "hashes": 5,
+        }
+        self.assertIsNotNone(validate_encode_request(request))
+
+    def test_convert_leaves_an_empty_list_alone(self):
+        self.assertEqual(_convert([]), [])
+
+    def test_media_load_error_does_not_carry_the_payload(self):
+        preprocessor = EncoderPreprocessor.__new__(EncoderPreprocessor)
+        preprocessor.model_audio_sr = 16000
+        payload = "A" * 100_000
+        with patch(
+            "sglang.srt.disaggregation.encoder.preprocessor.load_audio",
+            side_effect=RuntimeError("decode failed"),
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                preprocessor._load_single_item(payload, Modality.AUDIO)
+        self.assertLess(len(str(raised.exception)), 1000)
 
 
 class TestEncoderCacheIdentity(CustomTestCase):

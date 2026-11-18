@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=160, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=220, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=220, suite="base-b-test-1-gpu-small-amd")
 
 
 class ServerWithGrammar(CustomTestCase):

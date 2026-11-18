@@ -1797,10 +1797,7 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
 
 @register_post_process
 def _moe_runner_fusion_disable(view: Any) -> dict:
-    """Disable shared-expert fusion for incompatible MoE runners.
-
-    Runs before the deprecated cutlass environment override.
-    """
+    """Disable shared-expert fusion for incompatible MoE runners."""
     runner = view.moe_runner_backend
     if runner in ("lora_triton", "lora_cutedsl", "lora_marlin"):
         logger.warning("LoRA MoE keeps shared experts separate for adapter attachment.")
