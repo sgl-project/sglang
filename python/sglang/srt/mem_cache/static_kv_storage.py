@@ -1199,18 +1199,6 @@ def _static_state_entries(
                 layer_ids=token_to_kv_pool.get_c128_layer_ids(),
             )
 
-        # Register C4 state by row on both A3 and Ascend 950 so prefill and
-        # decode can pair logical positions even when their ring sizes differ.
-        c4_ptrs, c4_lens, c4_item_lens = token_to_kv_pool.get_c4_state_buf_infos()
-        if c4_ptrs:
-            add(
-                StateType.DSV4_C4_STATE,
-                c4_ptrs,
-                c4_lens,
-                c4_item_lens,
-                layer_ids=token_to_kv_pool.get_c4_state_layer_ids(),
-            )
-
     # DSV4 NextN shares the target allocator, so target and draft use the same
     # local SWA indices. Keep draft buffers in a separate positional component
     # to avoid mixing them into the target's heterogeneous state layout, while

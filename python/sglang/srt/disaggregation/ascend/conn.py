@@ -21,7 +21,7 @@ from sglang.srt.utils.network import get_local_ip_auto
 logger = logging.getLogger(__name__)
 
 
-_DSV4_KVCACHE_STATE_TYPES = (StateType.DSV4_C128, StateType.DSV4_C4_STATE)
+_DSV4_KVCACHE_STATE_TYPES = (StateType.DSV4_C128,)
 
 
 def _build_page_interleaved_dcp_plan(
@@ -208,31 +208,11 @@ class AscendKVManager(MooncakeKVManager):
                 dst = dst_kv_ptrs[c128_start:c128_end]
                 return src_kv_ptrs, dst, len(src_kv_ptrs)
 
-            if state_type == StateType.DSV4_C4_STATE:
-                # Layout: [attn_state_0..attn_{c4_full-1},
-                #          idx_state_0..idx_{c4_full-1}]
-                # Two groups, each c4_full entries; slice both by PP stage.
-                dst = []
-                for offset in (0, c4_full):
-                    dst.extend(dst_kv_ptrs[offset + c4_start : offset + c4_end])
-                return src_kv_ptrs, dst, len(src_kv_ptrs)
-
             # NPU main KV layout: [C4 KV, index K, index scale].
             if state_type is None and len(dst_kv_ptrs) == 3 * c4_full:
                 dst = []
                 for offset in (0, c4_full, 2 * c4_full):
                     dst.extend(dst_kv_ptrs[offset + c4_start : offset + c4_end])
-                return src_kv_ptrs, dst, len(src_kv_ptrs)
-
-            # On Ascend 950, StateType.SWA only contains SWA KV
-            # buffers (C4 compress state is registered separately as
-            # DSV4_C4_STATE).  The common _mla_slice_ptrs_for_pp assumes
-            # SWA + C4 state are bundled (swa_L + 2*c4_full), so intercept
-            # here and slice SWA KV by layer index directly.
-            if state_type == StateType.SWA and StateType.DSV4_C4_STATE in (
-                self.kv_args.state_types or []
-            ):
-                dst = list(dst_kv_ptrs[start_layer:end_layer])
                 return src_kv_ptrs, dst, len(src_kv_ptrs)
 
             return super().get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs, state_type)
