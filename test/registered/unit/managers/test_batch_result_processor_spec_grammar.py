@@ -10,7 +10,9 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
+from llguidance import LLTokenizer, grammar_from
 
+from sglang.srt.constrained.llguidance_backend import GuidanceGrammar
 from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
@@ -24,6 +26,7 @@ from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
     SamplingParams,
 )
+from sglang.srt.speculative.spec_utils import generate_token_bitmask
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import release_only_retirer
 from sglang.test.test_utils import CustomTestCase
@@ -236,6 +239,90 @@ class TestSpecV2GrammarTruncation(CustomTestCase):
         self.assertEqual(predict_tokens, [[304, 305]])
         self.assertEqual(req.kv.kv_committed_len, 5)
         self.assertEqual(req.grammar.accepted, [301, 302])
+
+
+# Real llguidance grammar over llguidance's byte tokenizer: the regex "ab"
+# stops the matcher after "a", "b"; its EOS (261) then terminates the grammar.
+_LL_A, _LL_B, _LL_EOS = 97, 98, 261
+_LL_VOCAB_SIZE = 262
+
+
+def _make_llguidance_req(ignore_eos: bool) -> Req:
+    req = _make_req(terminate_after=99, ignore_eos=ignore_eos)
+    req.grammar = GuidanceGrammar(
+        llguidance_tokenizer=LLTokenizer("byte"),
+        serialized_grammar=grammar_from("regex", "ab"),
+    )
+    return req
+
+
+def _spec_decode_step(proc, req, run, num_draft_tokens=4):
+    """One spec-v2 verify step as process_batch_result_decode settles it."""
+    flat = run + [0] * (num_draft_tokens - len(run))
+    result = _make_result(num_draft_tokens, [len(run)], flat)
+    (tokens,) = proc._resolve_spec_v2_tokens(result, _FakeBatch([req]), [True])
+    req.output_ids.extend(tokens)
+    req.update_finish_state(len(tokens))
+    # process_batch_result_decode syncs the grammar to the request's finish state.
+    req.grammar.finished = req.finished()
+    return tokens
+
+
+def _verify_mask(req, draft_tokens):
+    """The next verify step's grammar mask over a linear draft chain."""
+    n = len(draft_tokens)
+    next_token = torch.tensor([list(range(1, n)) + [-1]])
+    next_sibling = torch.full((1, n), -1)
+    mask, _ = generate_token_bitmask(
+        [req], next_token, next_sibling, torch.tensor([draft_tokens]), _LL_VOCAB_SIZE
+    )
+    return mask
+
+
+class TestSpecV2LLGuidanceIgnoreEos(CustomTestCase):
+    def test_terminated_grammar_stays_unconstrained_under_ignore_eos(self):
+        req = _make_llguidance_req(ignore_eos=True)
+        proc = _make_processor()
+
+        # The grammar terminates on EOS inside the run; the request keeps going.
+        tokens = _spec_decode_step(proc, req, [_LL_A, _LL_B, _LL_EOS, 120])
+        self.assertEqual(tokens, [_LL_A, _LL_B, _LL_EOS, 120])
+        self.assertFalse(req.finished())
+        self.assertTrue(req.grammar.is_terminated())
+
+        # The next verify step is not constrained by the stopped matcher: every
+        # row allows every token instead of forcing EOS.
+        mask = _verify_mask(req, [120, 121, 122])
+        self.assertTrue((mask == -1).all())
+
+        tokens = _spec_decode_step(proc, req, [121, 122])
+        self.assertEqual(tokens, [121, 122])
+        self.assertFalse(req.finished())
+        self.assertTrue(req.grammar.is_terminated())
+
+    def test_terminated_grammar_finishes_request_without_ignore_eos(self):
+        req = _make_llguidance_req(ignore_eos=False)
+        proc = _make_processor()
+
+        tokens = _spec_decode_step(proc, req, [_LL_A, _LL_B, _LL_EOS, 120])
+
+        self.assertEqual(tokens, [_LL_A, _LL_B, _LL_EOS])
+        self.assertTrue(req.finished())
+        self.assertTrue(req.grammar.is_terminated())
+
+    def test_rollback_past_eos_reopens_grammar(self):
+        req = _make_llguidance_req(ignore_eos=True)
+        for token in (_LL_A, _LL_B, _LL_EOS):
+            req.grammar.accept_token(token)
+        req.grammar.finished = False
+        self.assertTrue(req.grammar.is_terminated())
+
+        req.grammar.rollback(1)
+
+        self.assertFalse(req.grammar.is_terminated())
+        mask = _verify_mask(req, [_LL_EOS])
+        self.assertEqual(mask[0, _LL_EOS // 32].item() >> (_LL_EOS % 32) & 1, 1)
+        self.assertEqual(mask[0, _LL_A // 32].item() >> (_LL_A % 32) & 1, 0)
 
 
 class TestReasoningTokenAccounting(CustomTestCase):

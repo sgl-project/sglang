@@ -137,11 +137,17 @@ class GuidanceGrammar(BaseGrammarObject):
         self._check_err()
 
         self.eos_tokens = set(self.llguidance_tokenizer.eos_tokens)
+        # Set when the stopped matcher accepts its EOS. Kept apart from
+        # `finished`, which the scheduler syncs to the request's finish state:
+        # an ignore_eos request keeps decoding past grammar termination, and
+        # resetting the terminal state would let the stopped matcher force EOS.
+        self.terminated = False
 
     def accept_token(self, token: int):
-        if self.finished:
+        if self.is_terminated():
             return
         if self.ll_matcher.is_stopped() and token in self.eos_tokens:
+            self.terminated = True
             self.finished = True
             return
         self.ll_matcher.consume_token(token)
@@ -150,7 +156,8 @@ class GuidanceGrammar(BaseGrammarObject):
     def rollback(self, num_tokens: int) -> None:
         if num_tokens <= 0:
             return
-        if self.finished:
+        if self.terminated:
+            self.terminated = False
             self.finished = False
             # EOS token after stop isn't tracked in ll_matcher
             num_tokens -= 1
@@ -158,7 +165,7 @@ class GuidanceGrammar(BaseGrammarObject):
         self._check_err()
 
     def is_terminated(self):
-        return self.finished
+        return self.terminated or self.finished
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         fill_next_token_bitmask(self.ll_matcher, vocab_mask, idx)
