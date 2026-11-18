@@ -9,7 +9,6 @@ from contextlib import contextmanager
 from functools import wraps
 
 import zmq
-
 from sglang_simulator.compat import validate_coordinator_endpoint
 from sglang_simulator.simulation.coordinator import (
     Cancel,

@@ -15,7 +15,6 @@ from functools import lru_cache
 from typing import Protocol
 
 import msgspec
-
 from sglang_simulator.time_predictor.base import PredictorError
 
 STEP_ATTRIBUTE = "_sglang_simulator_dspark_step"

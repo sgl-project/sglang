@@ -5,8 +5,8 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
-from test_simulation_coordinated_bridge import harness  # noqa: F401
 from sglang_simulator.simulation.sglang.execution_events import ExecutionEventRecorder
+from test_simulation_coordinated_bridge import harness  # noqa: F401
 
 
 def test_original_prefix_and_request_identity(tmp_path):
@@ -83,13 +83,13 @@ def recorded_harness(execution_path, request):
 def test_real_coordinator_records_processed_result_before_finished_grant(
     recorded_harness,
 ):
-    from test_simulation_coordinated_bridge import NativeRequest, rid
     from sglang_simulator.simulation.coordinator import (
         Ready,
         Submit,
         decode_grant,
         encode_message,
     )
+    from test_simulation_coordinated_bridge import NativeRequest, rid
 
     instance, path = recorded_harness
 

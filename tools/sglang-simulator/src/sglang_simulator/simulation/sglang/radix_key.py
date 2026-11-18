@@ -5,7 +5,6 @@ from array import array
 from functools import wraps
 
 import numpy as np
-
 from sglang_simulator.hook import BaseHook
 
 
