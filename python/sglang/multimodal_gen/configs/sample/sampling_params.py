@@ -235,18 +235,45 @@ def align_num_frames_for_num_gpus(
     return new_latent_num_frames
 
 
+class MissingSidePolicy(Enum):
+    """How request-size alignment treats an unset or non-positive side."""
+
+    # Align only when both sides are set and positive.
+    KEEP = "keep"
+    # Align each set, positive side on its own.
+    PER_SIDE = "per_side"
+    # Derive an unset side from 16:9 first, as InputValidationStage does, then KEEP.
+    FILL_16_9 = "fill_16_9"
+
+
+def _fill_missing_side_16_9(
+    *, width: int | None, height: int | None
+) -> tuple[int | None, int | None]:
+    if height is None and width is not None:
+        return width, width * 720 // 1280
+    if width is None and height is not None:
+        return height * 1280 // 720, height
+    return width, height
+
+
 def _floor_to_multiple(size: int, multiple: int) -> int:
     return max(multiple, size // multiple * multiple)
 
 
 def _round_down_request_size(
-    *, width: int | None, height: int | None, multiple: int
-) -> tuple[int, int] | None:
+    *, width: int | None, height: int | None, multiple: int, per_side: bool
+) -> tuple[int | None, int | None] | None:
     """Round a request size down to ``multiple``; None leaves it unchanged.
 
-    A missing or non-positive side is never rounded up, so request validation still
-    rejects it.
+    A non-positive side is never rounded up, so request validation still rejects it.
     """
+    if per_side:
+        return tuple(
+            _floor_to_multiple(size, multiple)
+            if size is not None and size > 0
+            else size
+            for size in (width, height)
+        )
     if width is None or height is None or width <= 0 or height <= 0:
         return None
     return _floor_to_multiple(width, multiple), _floor_to_multiple(height, multiple)
@@ -387,6 +414,7 @@ class SamplingParams:
     # A model whose pipeline rejects sizes off its grid names itself here (for the
     # warning) and overrides _request_size_multiple; None means no alignment rule.
     _request_size_model_name: ClassVar[str | None] = None
+    _request_size_missing_side: ClassVar[MissingSidePolicy] = MissingSidePolicy.KEEP
 
     height: int | None = None
     width: int | None = None
@@ -677,8 +705,16 @@ class SamplingParams:
         if multiple is None:
             return
         requested_size = (self.width, self.height)
+        if self._request_size_missing_side is MissingSidePolicy.FILL_16_9:
+            # Kept even when the size is then left to validation.
+            self.width, self.height = _fill_missing_side_16_9(
+                width=self.width, height=self.height
+            )
         aligned_size = _round_down_request_size(
-            width=self.width, height=self.height, multiple=multiple
+            width=self.width,
+            height=self.height,
+            multiple=multiple,
+            per_side=self._request_size_missing_side is MissingSidePolicy.PER_SIDE,
         )
         if aligned_size is None:
             return
