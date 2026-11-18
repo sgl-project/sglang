@@ -533,7 +533,8 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td><strong>Discrete.</strong> Verified on NPU: `NEXTN`, `EAGLE`, `EAGLE3`, `DFLASH`, `DSPARK`;
       `STANDALONE` and `UNO` are unverified, and `NGRAM` is CUDA/CPU/XPU-only (any plugin-registered name is
       accepted). For non-greedy requests, target verification applies request-level `temperature`, `top_k`, and
-      `top_p`; `--speculative-use-rejection-sampling` supports linear candidates only, requires
+      `top_p`, except under `DFLASH`, which verifies greedily on NPU and rejects non-greedy requests with a 400;
+      `--speculative-use-rejection-sampling` supports linear candidates only, requires
       `--speculative-eagle-topk 1`, and is incompatible with non-default accept thresholds and deterministic
       inference.</td>
       <td>`NEXTN`</td>

@@ -530,6 +530,8 @@ class Scheduler(
     # Class-level defaults so stub schedulers built via __new__ skip the log.
     log_schedule_decisions: bool = False
     _last_empty_schedule_decision: Optional[Tuple[int, ...]] = None
+    # Class-level default so stub schedulers built via __new__ admit every request.
+    dflash_greedy_verify_only: bool = False
 
     def __init__(
         self,
@@ -1148,6 +1150,16 @@ class Scheduler(
         else:
             self.external_corpus_manager = None
 
+    def init_dflash_greedy_verify_only(self) -> None:
+        """Record whether DFLASH must reject non-greedy requests at admission."""
+        # A PD prefill server never verifies, and its non-last PP stages hold no draft.
+        self.dflash_greedy_verify_only = (
+            self.spec_algorithm.is_dflash()
+            and DisaggregationMode(get_disagg().disaggregation_mode)
+            != DisaggregationMode.PREFILL
+            and not self.draft_worker.supports_sampling_verify()
+        )
+
     def init_target_memory_pool(self):
         """Allocate target KV cache pools if they have not been allocated yet."""
         if (
@@ -1204,6 +1216,7 @@ class Scheduler(
         if get_model().is_startup_weight_load_overlap:
             self.tp_worker.start_startup_weight_load()
         self.maybe_init_draft_worker()
+        self.init_dflash_greedy_verify_only()
 
         # Prepare KV cache pools for all workers
         tic = time.perf_counter()
@@ -3579,6 +3592,14 @@ class Scheduler(
                 f"{get_disagg().disaggregation_max_top_logprobs_num}. Lower "
                 "top_logprobs_num or raise --disaggregation-max-top-logprobs-num "
                 "on prefill and decode.",
+            )
+            return
+
+        if self.dflash_greedy_verify_only and req.sampling_params.top_k > 1:
+            self._reject_bad_request(
+                req,
+                "This DFLASH server only supports greedy sampling (temperature=0 "
+                f"or top_k=1), got temperature={req.sampling_params.temperature}.",
             )
             return
 

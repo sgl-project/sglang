@@ -3662,36 +3662,31 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         return accept_len, commit_lens, bonus, out_tokens, new_seq_lens, cap_trim_lens
 
+    def supports_sampling_verify(self) -> bool:
+        """False means _accept_block verifies non-greedy rows by greedy argmax."""
+        if self._is_domino:
+            # Domino proposes by greedy rollout; selector and LiLiCorr heads sit unused.
+            return is_dflash_sampling_verify_available()
+        if self.selector is not None:
+            return self._selector_sampling_enabled
+        # The sampled head hands verify the q it drew from, so no fallback is needed.
+        if self.lilicorr is not None and self._lilicorr_sampling_enabled:
+            return True
+        return is_dflash_sampling_verify_available()
+
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
         sampling_info = batch.sampling_info
         if sampling_info is None or sampling_info.is_all_greedy:
             return
-
-        if self.selector is not None:
-            if self._selector_sampling_enabled:
-                return
-            if not self._warned_sampling_fallback and get_parallel().tp_rank == 0:
-                logger.warning(
-                    "DFLASH non-greedy verification is unavailable on this "
-                    "build/device; falling back to greedy argmax verification. "
-                    "The requested sampling distribution will not be preserved; "
-                    "use temperature=0 and top_k=1 for lossless greedy decoding."
-                )
-                self._warned_sampling_fallback = True
+        if self.supports_sampling_verify() or self._warned_sampling_fallback:
             return
-
-        # The sampled head hands verify the q it drew from, so no fallback is needed.
-        if self.lilicorr is not None and self._lilicorr_sampling_enabled:
-            return
-
-        if (
-            not is_dflash_sampling_verify_available()
-            and not self._warned_sampling_fallback
-            and get_parallel().tp_rank == 0
-        ):
+        # Admission rejects these except on a PD prefill server, which never verifies.
+        if get_parallel().tp_rank == 0:
             logger.warning(
-                "DFLASH non-greedy verification is unavailable on this build/device; "
-                "falling back to greedy argmax verification."
+                "DFLASH non-greedy verification is unavailable on this "
+                "build/device; falling back to greedy argmax verification. "
+                "The requested sampling distribution will not be preserved; "
+                "use temperature=0 and top_k=1 for lossless greedy decoding."
             )
             self._warned_sampling_fallback = True
 
