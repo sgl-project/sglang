@@ -272,6 +272,23 @@ class TestMergeKdaInprojFp8(CustomTestCase):
     """The merged buffer has to carry every projection's channel scales; a raw
     row-cat of FP8 payloads would silently drop them."""
 
+    def setUp(self):
+        # The merge runs on ROCm only; that gate lives in kimi_k3_rocm_quant.
+        patcher = mock.patch.object(kimi_k3_rocm_quant, "_is_hip", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_no_tail_off_rocm(self):
+        """kimi_k3 asks for the tail on every platform, so a non-HIP build must
+        get 0 rows from this module, and the layer then skips the FP8 merge."""
+        with mock.patch.object(kimi_k3_rocm_quant, "_is_hip", False):
+            mods = _kda_inproj_linears()
+        self.assertEqual(mods["qkvg_proj"].weight.shape[0], 32)
+        attn = self._kda_attention()
+        attn._kda_inproj_tail_rows = 0
+        self.assertFalse(KimiK3DeltaAttention._merge_kda_inproj_fp8(attn))
+        self.assertFalse(attn._qkvgbfa_in_qkvg_proj)
+
     def test_tail_pads_the_merged_width_to_64(self):
         # 32 + 8 + 3 = 43 rows; N % 64 == 0 keeps AITER's preshuffled FP8 GEMM.
         mods = _kda_inproj_linears()
@@ -434,6 +451,7 @@ class TestMergeKdaInprojFp8(CustomTestCase):
             f_a_proj=mods["f_a_proj"],
             b_proj=mods["b_proj"],
             f_b_proj=mods["f_b_proj"],
+            _kda_inproj_tail_rows=mods["qkvg_proj"].weight.shape[0] - 32,
             _qkvgbfa_in_qkvg_proj=False,
             _qkvgbfa_sizes=None,
             _bfa_f_b_w=None,
@@ -448,7 +466,7 @@ class TestMergeKdaInprojFp8(CustomTestCase):
         model = torch.nn.Sequential(attn)
         self.assertIsNone(_unsupported_derived_weight_cache_error(model))
 
-        self.assertTrue(KimiK3DeltaAttention._merge_kda_inproj_fp8_hip(attn))
+        self.assertTrue(KimiK3DeltaAttention._merge_kda_inproj_fp8(attn))
 
         self.assertEqual(attn.fused_qkvg_proj.weight.shape[0], 64)
         self.assertIn(
@@ -466,7 +484,7 @@ class TestMergeKdaInprojFp8(CustomTestCase):
             f_b_proj=mods["f_b_proj"],
         )
 
-        self.assertTrue(KimiK3DeltaAttention._merge_kda_inproj_fp8_hip(attn))
+        self.assertTrue(KimiK3DeltaAttention._merge_kda_inproj_fp8(attn))
 
         self.assertEqual(attn._qkvgbfa_sizes, [24, 8, 8, 3, 21])
         self.assertIsNone(attn._bfa_f_b_w)
@@ -475,10 +493,10 @@ class TestMergeKdaInprojFp8(CustomTestCase):
         """A second post_load_weights must keep the FP8 merge, not fall back to the
         BF16 merge over weights that no longer have the checkpoint layout."""
         attn = self._kda_attention()
-        self.assertTrue(KimiK3DeltaAttention._merge_kda_inproj_fp8_hip(attn))
+        self.assertTrue(KimiK3DeltaAttention._merge_kda_inproj_fp8(attn))
         weight, sizes = attn.fused_qkvg_proj.weight, attn._qkvgbfa_sizes
 
-        self.assertTrue(KimiK3DeltaAttention._merge_kda_inproj_fp8_hip(attn))
+        self.assertTrue(KimiK3DeltaAttention._merge_kda_inproj_fp8(attn))
 
         self.assertIs(attn.fused_qkvg_proj.weight, weight)
         self.assertEqual(attn._qkvgbfa_sizes, sizes)

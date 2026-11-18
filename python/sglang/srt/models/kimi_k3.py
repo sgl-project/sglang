@@ -133,6 +133,11 @@ from sglang.srt.models.kimi_k3_amd.moe import (
     prepare_hip_paths,
     row_shard_bank_hooks_hip,
 )
+from sglang.srt.models.kimi_k3_rocm_quant import (
+    k3_kda_inproj_fp8_f_b,
+    k3_kda_inproj_fp8_tail_rows,
+    k3_merge_kda_inproj_fp8,
+)
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3MultiModalProjector,
     KimiK3VisionTower,
@@ -1929,28 +1934,24 @@ class KimiK3DeltaAttention(nn.Module):
             )
             qkvg_prefix = f"{prefix}.fused_qkvg_proj"
             qkvg_output_sizes = [projection_size] * 4
-            if _is_hip:
-                from sglang.srt.models.kimi_k3_rocm_quant import (
-                    k3_kda_inproj_fp8_tail_rows,
-                )
-
-                # Quark FP8: rows the post-load merge fills with [f_a | b | pad].
-                tail_rows = k3_kda_inproj_fp8_tail_rows(
-                    wide_rows=4 * projection_size // self.head_tp_size,
-                    quant_config=quant_config,
-                    qkvg_prefix=qkvg_prefix,
-                    f_a_proj=f_a_proj,
-                    b_proj=b_proj,
-                    f_b_proj=f_b_proj,
-                )
-                if tail_rows:
-                    qkvg_output_sizes.append(tail_rows * self.head_tp_size)
+            # Quark FP8 on ROCm: rows the post-load merge fills with [f_a | b | pad];
+            # 0 wherever the merge does not run (k3_kda_inproj_fp8_tail_rows decides).
+            self._kda_inproj_tail_rows = k3_kda_inproj_fp8_tail_rows(
+                wide_rows=4 * projection_size // self.head_tp_size,
+                quant_config=quant_config,
+                qkvg_prefix=qkvg_prefix,
+                f_a_proj=f_a_proj,
+                b_proj=b_proj,
+                f_b_proj=f_b_proj,
+            )
+            if self._kda_inproj_tail_rows:
+                qkvg_output_sizes.append(self._kda_inproj_tail_rows * self.head_tp_size)
             # Fuse only the wide projections [q, k, v, g]: folding b (12/rank)
             # and f_a (128, replicated) in skews the output dim and degrades
             # GEMM kernel selection; they stay as separate tiny GEMVs. ROCm
             # reverses this below the token threshold
             # (_merge_kda_inproj_weights_hip), or for Quark FP8 at every batch
-            # size (_merge_kda_inproj_fp8_hip).
+            # size (_merge_kda_inproj_fp8).
             self.fused_qkvg_proj = MergedColumnParallelLinear(
                 self.hidden_size,
                 qkvg_output_sizes,
@@ -1970,6 +1971,10 @@ class KimiK3DeltaAttention(nn.Module):
             # _merge_bfa_weights().
             self._bfa_w: Optional[torch.Tensor] = None
             self._bfa_f_b_w: Optional[torch.Tensor] = None
+            # Quark FP8: fused_qkvg_proj's own weight holds the merged rows, so
+            # every batch size runs the merged GEMM (_merge_kda_inproj_fp8).
+            self._qkvgbfa_in_qkvg_proj = False
+            self._derived_weight_cache_error: Optional[str] = None
             if _is_hip:
                 # ROCm only: _merge_kda_inproj_weights_hip() may merge the
                 # whole [q,k,v,g | f_a | b] in-proj instead, making _bfa_w a
@@ -1981,10 +1986,6 @@ class KimiK3DeltaAttention(nn.Module):
                 self._qkvgbfa_bs_limit = (
                     envs.SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ_MAX_TOKENS.get()
                 )
-                # Quark FP8: fused_qkvg_proj's own weight holds the merged rows,
-                # so every batch size runs the merged GEMM and the limit is moot.
-                self._qkvgbfa_in_qkvg_proj = False
-                self._derived_weight_cache_error: Optional[str] = None
         elif self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -2191,7 +2192,7 @@ class KimiK3DeltaAttention(nn.Module):
             return
         if _is_npu:
             return
-        if _is_hip and self._merge_kda_inproj_fp8_hip():
+        if self._merge_kda_inproj_fp8():
             return
         if _is_hip and self._merge_kda_inproj_weights_hip():
             # Split-path f_b GEMM still uses this when the fused in-proj
@@ -2236,16 +2237,16 @@ class KimiK3DeltaAttention(nn.Module):
                 m_ranges.append(m_lo=m_lo, m_hi=m_hi, tactic=tactic)
             self._bfa_side_tgv_m_ranges = m_ranges
 
-    def _merge_kda_inproj_fp8_hip(self) -> bool:
-        """ROCm only: copy the Quark FP8 [f_a | b] rows into the tail that
-        fused_qkvg_proj reserved at init.
+    def _merge_kda_inproj_fp8(self) -> bool:
+        """Copy the Quark FP8 [f_a | b] rows into the tail that fused_qkvg_proj
+        reserved at init; False where no tail was reserved.
 
         Leaves _bfa_w None. A re-run after weight processing keeps the merge,
         since the weights no longer have the checkpoint layout it reads."""
         if self._qkvgbfa_in_qkvg_proj:
             return True
-        from sglang.srt.models.kimi_k3_rocm_quant import k3_merge_kda_inproj_fp8
-
+        if not self._kda_inproj_tail_rows:
+            return False
         merged = k3_merge_kda_inproj_fp8(
             qkvg_proj=self.fused_qkvg_proj,
             qkvg_sizes=self.split_sizes,
@@ -2490,30 +2491,13 @@ class KimiK3DeltaAttention(nn.Module):
         self, hidden_states: torch.Tensor, defer_f_b: bool = False
     ):
         if self.use_full_rank_gate:
-            if (
-                _is_hip
-                and self._qkvgbfa_sizes is not None
-                and (
-                    self._qkvgbfa_in_qkvg_proj
-                    or 0 < hidden_states.shape[0] <= self._qkvgbfa_bs_limit
-                )
-            ):
-                # ROCm only. One GEMM for the whole in-proj: the [f_a|b]
-                # tail rides the wide projection's bandwidth (~30% of the
-                # in-proj at decode on gfx950, SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ).
-                if self._qkvgbfa_in_qkvg_proj:
-                    fused_states, _ = self.fused_qkvg_proj(hidden_states)
-                else:
-                    fused_states = self.fused_qkvg_proj.quant_method.apply(
-                        self._qkvgbfa_layer, hidden_states, None
-                    )
+            if self._qkvgbfa_in_qkvg_proj:
+                # Quark FP8: one GEMM through fused_qkvg_proj's own weight, which
+                # holds the [f_a | b] tail (_merge_kda_inproj_fp8), at every batch.
+                fused_states, _ = self.fused_qkvg_proj(hidden_states)
                 qkv, g_proj_states, f_a, beta, _pad = torch.split(
                     fused_states, self._qkvgbfa_sizes, dim=-1
                 )
-                from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm as gemm
-
-                if _is_gfx95:  # AITER's tuned f_b GEMM reads f_a in place
-                    gemm = kda_f_b_gemm_hip
                 # Fused KDA decode consumes f_a and applies f_b itself.
                 if defer_f_b:
                     forget_gate = f_a
@@ -2521,13 +2505,33 @@ class KimiK3DeltaAttention(nn.Module):
                     # Restored from an already-processed state: no BF16 f_b cache.
                     forget_gate = self.f_b_proj(f_a.contiguous())[0]
                 else:
-                    forget_gate = gemm(f_a, self._bfa_f_b_w)
+                    forget_gate = k3_kda_inproj_fp8_f_b(f_a, self._bfa_f_b_w)
                 return qkv, beta, forget_gate, g_proj_states
 
             if self._bfa_w is not None:
                 w = self._bfa_w
                 n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
                 from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm as gemm
+
+                if (
+                    _is_hip
+                    and self._qkvgbfa_sizes is not None
+                    and 0 < hidden_states.shape[0] <= self._qkvgbfa_bs_limit
+                ):
+                    # ROCm only. One GEMM for the whole in-proj: the [f_a|b]
+                    # tail rides the wide projection's bandwidth (~30% of the
+                    # in-proj at decode on gfx950, SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ).
+                    fused_states = self.fused_qkvg_proj.quant_method.apply(
+                        self._qkvgbfa_layer, hidden_states, None
+                    )
+                    qkv, g_proj_states, f_a, beta, _pad = torch.split(
+                        fused_states, self._qkvgbfa_sizes, dim=-1
+                    )
+                    if _is_gfx95:  # AITER's tuned f_b GEMM reads f_a in place
+                        gemm = kda_f_b_gemm_hip
+                    # Fused KDA decode consumes f_a and applies f_b itself.
+                    forget_gate = f_a if defer_f_b else gemm(f_a, self._bfa_f_b_w)
+                    return qkv, beta, forget_gate, g_proj_states
 
                 if (
                     self._bfa_alt_stream is not None

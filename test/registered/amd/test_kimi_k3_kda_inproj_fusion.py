@@ -224,6 +224,7 @@ class TestKimiK3QuarkFp8KDAInProj(CustomTestCase):
             f_b_proj=_QuarkFp8Linear(PROJ_TP, HEAD_DIM, dev),
             _bfa_w=None,
             _qkvgbfa_sizes=None,
+            _qkvgbfa_in_qkvg_proj=False,
         )
         cls.exact = {
             name: getattr(split, name).dequant()
@@ -244,13 +245,14 @@ class TestKimiK3QuarkFp8KDAInProj(CustomTestCase):
             pad = param.data.new_empty((tail, *param.shape[1:]))
             param.data = torch.cat([param.data, pad])
         merged.__dict__.update(
+            _kda_inproj_tail_rows=tail,
             _qkvgbfa_layer=None,
             _qkvgbfa_bs_limit=256,
             _qkvgbfa_in_qkvg_proj=False,
             _bfa_f_b_w=None,
             _derived_weight_cache_error=None,
         )
-        cls.merged_rows = KimiK3DeltaAttention._merge_kda_inproj_fp8_hip(merged)
+        cls.merged_rows = KimiK3DeltaAttention._merge_kda_inproj_fp8(merged)
         # The loader's process_weights_after_loading pass, after post_load_weights.
         for attn in (split, merged):
             for name in ("fused_qkvg_proj", "f_a_proj", "b_proj", "f_b_proj"):

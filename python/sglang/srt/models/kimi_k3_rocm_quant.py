@@ -15,7 +15,9 @@
 
 Quark serializes K3 as per-output-channel FP8, which is not the layout the
 AITER kernels want. The conversions live here; ``kimi_k3.py`` calls every entry
-point behind ``_is_hip`` and keeps the checkpoint's own layout otherwise.
+point behind ``_is_hip`` and keeps the checkpoint's own layout otherwise, except
+the KDA in-proj merge hooks (k3_kda_inproj_fp8_tail_rows, k3_kda_inproj_fp8_f_b),
+which it calls on every platform: they decide here where the merge runs.
 """
 
 from typing import Optional
@@ -26,7 +28,12 @@ from torch import nn
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import LinearBase, MergedColumnParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import print_warning_once
+from sglang.srt.utils import is_gfx95_supported, is_hip, print_warning_once
+
+_is_hip = is_hip()
+_is_gfx95 = is_gfx95_supported()
+if _is_gfx95:
+    from sglang.srt.models.kimi_k3_amd.kimi_k3_hip import kda_f_b_gemm_hip
 
 
 def _k3_channel_fp8_to_bf16(module: nn.Module, weight: torch.Tensor) -> torch.Tensor:
@@ -170,7 +177,7 @@ def k3_kda_inproj_fp8_tail_rows(
     one per layer, which strands caching-allocator segments that empty_cache
     cannot return (~1 GB per GPU at Kimi-K3 TP8).
     """
-    if not envs.SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ.get():
+    if not (_is_hip and envs.SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ.get()):
         return 0
     if not all(_is_quark_channel_fp8(m) for m in (f_a_proj, b_proj, f_b_proj)):
         return 0
@@ -191,6 +198,16 @@ def k3_kda_inproj_fp8_tail_rows(
     rows = f_a_proj.weight.shape[0] + b_proj.weight.shape[0]
     # N % 64 == 0 keeps AITER's preshuffled FP8 GEMM (use_aiter_bpreshuffle_gemm).
     return rows + (-(wide_rows + rows)) % 64
+
+
+def k3_kda_inproj_fp8_f_b(f_a: torch.Tensor, f_b_weight: torch.Tensor) -> torch.Tensor:
+    """f_b on f_a, a row slice of the merged Quark FP8 in-proj output: AITER's tuned
+    GEMM reads it in place on gfx95x, the tiny GEMM runs it elsewhere."""
+    if _is_gfx95:
+        return kda_f_b_gemm_hip(f_a, f_b_weight)
+    from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm
+
+    return kimi_k3_tiny_gemm(f_a, f_b_weight)
 
 
 def k3_merge_kda_inproj_fp8(
