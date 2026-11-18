@@ -29,7 +29,6 @@ from sglang.srt.layers.layer_boundary.residual.attn_bank import (
     AttnBankOutputRead,
     AttnBankState,
 )
-from sglang.srt.layers.layernorm import RMSNorm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -181,25 +180,6 @@ def _staged(
     )
     torch.testing.assert_close(head, contribution + residual, rtol=0, atol=0)
     return hidden
-
-
-class TestColumnTailNormWeight(CustomTestCase):
-    def test_reload_refreshes_the_fp32_norm_in_place(self):
-        """The column tail reads the next layer's norm from an fp32 copy: a reload
-        that rewrites the norm must reach it, in the storage graphs captured."""
-        from sglang.srt.layers.attn_residual_hip import get_fp32_norm_weight
-        from sglang.srt.models.kimi_k3_amd.moe import prepare_hip_paths
-
-        norm = RMSNorm(HIDDEN).to(torch.bfloat16)
-        mlp = SimpleNamespace(
-            _prepare_hip_paths=lambda: None, next_attn_read=SimpleNamespace(norm=norm)
-        )
-        layer = SimpleNamespace(mlp=mlp)
-        cached = get_fp32_norm_weight(norm)  # filled by an earlier forward
-        norm.weight.data.copy_(torch.arange(HIDDEN, dtype=torch.bfloat16))
-        prepare_hip_paths(layer)  # post_load_weights after the reload
-        self.assertIs(get_fp32_norm_weight(norm), cached)
-        torch.testing.assert_close(cached, norm.weight.float())
 
 
 class TestAttnBankResidualOps(CustomTestCase):

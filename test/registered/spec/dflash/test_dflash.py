@@ -170,7 +170,10 @@ class TestDFlashServerOverlapPlanStream(TestDFlashServerOverlap):
     overlap_plan_stream = True
 
 
-@unittest.skipIf(is_hip(), "graph-pool borrowing is CUDA-only")
+@unittest.skipIf(
+    is_hip(),
+    "borrowing is CUDA-only and ROCm has no DFLASH sampling-verify kernel",
+)
 class TestDFlashServerGraphPoolBorrow(TestDFlashServerBase):
     """Verify probabilities served out of idle CUDA graph storage. Only the
     non-greedy accept path borrows, hence the sampled GSM8K below."""
