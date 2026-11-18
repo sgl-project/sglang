@@ -169,7 +169,7 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
             )
 
     def test_xpu_int4_auto_uses_the_native_kernel(self):
-        for group_size in (32, 128):
+        for group_size in (32, 64, 128, 256):
             with self.subTest(group_size=group_size):
                 scheme = self._xpu_moe_scheme(
                     MoeRunnerBackend.AUTO, group_size=group_size
@@ -184,14 +184,22 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
         self.assertIs(type(scheme), CompressedTensorsWNA16TritonMoE)
 
     def test_xpu_rejects_unvalidated_layouts(self):
-        cases = {
+        rejected_by_both = {
             "asymmetric": (4, {"symmetric": False}),
             "channel": (4, {"strategy": "channel", "group_size": None}),
-            "group64": (4, {"group_size": 64}),
+            "group16": (4, {"group_size": 16}),
             "actorder": (4, {"actorder": "group"}),
             "int8": (8, {}),
         }
-        for backend in (MoeRunnerBackend.AUTO, MoeRunnerBackend.TRITON):
+        # The native kernel takes these group sizes; the Triton scheme isn't validated on them.
+        rejected_by_triton = {
+            "group64": (4, {"group_size": 64}),
+            "group256": (4, {"group_size": 256}),
+        }
+        for backend, cases in (
+            (MoeRunnerBackend.AUTO, rejected_by_both),
+            (MoeRunnerBackend.TRITON, {**rejected_by_both, **rejected_by_triton}),
+        ):
             for name, (num_bits, overrides) in cases.items():
                 with self.subTest(backend=backend, name=name):
                     quant_config = CompressedTensorsConfig.from_config(
