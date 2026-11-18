@@ -1,5 +1,6 @@
 """Pinned host memory is planned against the cgroup cap, not the whole machine."""
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -200,6 +201,43 @@ class TestNestedCgroup:
 
 
 class TestCgroupPageCache:
+    @pytest.mark.parametrize("version", ["v1", "v2"])
+    @pytest.mark.parametrize("cached_gib", [0, 14])
+    def test_pins_leave_room_for_mmap_and_activation_growth(
+        self, monkeypatch, tmp_path, version, cached_gib
+    ):
+        """#51188: reclaimable cache must not all become unreclaimable pins."""
+        prefix = "total_" if version == "v1" else ""
+        self._capped(
+            monkeypatch,
+            tmp_path,
+            **{version: (32 * GIB_BYTES, (15 + cached_gib) * GIB_BYTES)},
+            stat={
+                "anon": 13 * GIB_BYTES,
+                "shmem": 2 * GIB_BYTES,
+                "file": (2 + cached_gib) * GIB_BYTES,
+                f"{prefix}active_file": cached_gib * GIB_BYTES,
+                f"{prefix}inactive_file": 0,
+            },
+        )
+        monkeypatch.setattr(
+            host_memory_budget.current_platform,
+            "device_shares_host_memory",
+            lambda: False,
+        )
+        budget = HostPinBudget()
+        assert budget.available_bytes == 17 * GIB_BYTES
+        # The report's ~1.2 GiB layers: keep some transfer overlap, but leave
+        # room for ~8 GiB of activation growth and a streaming working set.
+        layer_bytes = int(1.2 * GIB_BYTES)
+        pinned_layers = 0
+        while budget.request(component_name="dit", weight_bytes=layer_bytes):
+            pinned_layers += 1
+        assert 0 < pinned_layers <= 4
+        assert (
+            15 * GIB_BYTES + budget.committed_bytes + 12 * GIB_BYTES <= 32 * GIB_BYTES
+        )
+
     @staticmethod
     def _capped(monkeypatch, tmp_path, *, v2=None, v1=None, stat):
         # psutil sees a large machine, so the cgroup reading decides
@@ -283,18 +321,17 @@ class TestHostPinBudget:
 
     def test_the_reserve_is_not_spendable(self):
         budget = HostPinBudget(available_bytes=40 * GIB_BYTES)
-        # 5% of 40 GiB is 2 GiB, so 38 GiB is spendable and 39 GiB is not
-        assert not budget.request(component_name="dit", weight_bytes=39 * GIB_BYTES)
-        assert budget.request(component_name="dit", weight_bytes=38 * GIB_BYTES)
+        assert not budget.request(component_name="dit", weight_bytes=21 * GIB_BYTES)
+        assert budget.request(component_name="dit", weight_bytes=20 * GIB_BYTES)
 
     def test_the_reserve_has_a_floor_on_a_small_host(self):
         budget = HostPinBudget(available_bytes=8 * GIB_BYTES)
-        # 5% of 8 GiB is well under the 2 GiB floor
-        assert budget.reserve_bytes == 2 * GIB_BYTES
+        assert budget.reserve_bytes == 12 * GIB_BYTES
+        assert budget.spendable_bytes == 0
 
     def test_a_later_component_is_denied_once_the_budget_is_spent(self):
         budget = HostPinBudget(available_bytes=40 * GIB_BYTES)
-        assert budget.request(component_name="dit", weight_bytes=30 * GIB_BYTES)
+        assert budget.request(component_name="dit", weight_bytes=15 * GIB_BYTES)
         assert not budget.request(
             component_name="text_encoder", weight_bytes=20 * GIB_BYTES
         )

@@ -2956,8 +2956,10 @@ class ServerArgs(DisaggServerArgsMixin):
         parser.add_argument(
             "--pin-cpu-memory",
             action=StoreBoolean,
-            help='Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument". '
-            "Should be enabled in almost all cases",
+            help="Pin CPU-offloaded weights for faster host-to-device transfers, "
+            "subject to the host memory budget. Pinned memory cannot be reclaimed; "
+            "use --pin-cpu-memory false to reduce host/cgroup memory pressure "
+            'or work around CUDA pinning errors such as "invalid argument".',
         )
         parser.add_argument(
             "--ltx2-two-stage-device-mode",

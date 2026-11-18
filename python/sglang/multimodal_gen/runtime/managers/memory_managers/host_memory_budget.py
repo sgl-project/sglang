@@ -38,12 +38,14 @@ _PROC_SELF_CGROUP = "/proc/self/cgroup"
 # file, so treat anything implausibly large as "no cap".
 _UNLIMITED_ABOVE = 1 << 62
 
-# Left unpinned so the process can still allocate activations, staging buffers
-# and whatever the allocator needs mid-request. A share of the cap rather than a
-# flat number, because the same absolute headroom is generous on a desktop and
-# nothing on a serving host.
-HOST_RESERVE_FRACTION = 0.05
-MIN_HOST_RESERVE_BYTES = 2 * GIB_BYTES
+# Available memory includes reclaimable file cache. Converting all of it into
+# pinned memfd/shmem leaves mmap-streamed weights nowhere to fault their pages,
+# and shmem cannot be reclaimed without swap even before CUDA registers it.
+# Keep half the available memory uncommitted, with a floor allowing 8 GiB of
+# activation/allocator growth plus 4 GiB for mmap streaming and staging. In the
+# 32 GiB MiniMax-H3 case (#51188), this leaves ~5 GiB for pins, not ~15 GiB.
+HOST_RESERVE_FRACTION = 0.5
+MIN_HOST_RESERVE_BYTES = 12 * GIB_BYTES
 
 # Left free when weighing a checkpoint against host memory: activations, staging
 # buffers and allocator slack are none of them in the weight total.
