@@ -8,6 +8,7 @@ from array import array
 
 import msgspec
 from msgspec.structs import replace
+
 from sglang_simulator.simulation.sglang.dspark import (
     STEP_ATTRIBUTE,
     DSparkGroup,
@@ -196,7 +197,6 @@ def prepare_cpu_decode(draft_input, batch):
     uses ReqToTokenPool.write for the same table update.
     """
     import torch
-
     from sglang.srt.mem_cache.allocation import (
         alloc_paged_token_slots_extend,
         alloc_token_slots,
@@ -294,7 +294,6 @@ class NativeDSparkResults:
 
     def build(self, *, batch, prediction):
         import torch
-
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
         from sglang.srt.managers.utils import GenerationBatchResult
         from sglang.srt.speculative.draft_worker_common import make_draft_input_v2

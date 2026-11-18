@@ -36,10 +36,7 @@ def public_adapter(request, monkeypatch):
             "simopus.sdk",
             reason="install the current SimOpus SDK for native public integration controls",
         )
-    from simopus.sdk import DecodeExecutionProfile
-    from simopus.sdk import DatabaseProvenance
-    from simopus.sdk import DatabaseProvenance
-    from simopus.sdk import DatabaseMode
+    from simopus.sdk import DatabaseMode, DatabaseProvenance, DecodeExecutionProfile
 
     root = (
         Path(__file__).parent / "fixtures/simopus-native-source" / f"tp{request.param}"
@@ -155,8 +152,8 @@ def step_for(adapter, mode="DECODE", batch=2):
 
 @pytest.fixture
 def leaves(monkeypatch):
-    from simopus.sdk.estimator.operations.compute.region.cost import DSV41NativeSegment
     from simopus.sdk import PerformanceResult
+    from simopus.sdk.estimator.operations.compute.region.cost import DSV41NativeSegment
 
     calls = []
 
