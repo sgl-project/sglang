@@ -807,7 +807,6 @@ class LagunaForCausalLM(nn.Module):
         # Only the checkpoint load must be complete; later calls are update buckets.
         if self._checkpoint_loaded:
             return
-        self._checkpoint_loaded = True
 
         # If any routed-expert tensor was silently dropped (e.g. a future
         # checkpoint renaming `gate_proj`, or a ckpt-vs-mapping shape mismatch),
@@ -826,6 +825,7 @@ class LagunaForCausalLM(nn.Module):
                 f"(sample: {sample}). Expected {len(expected)} (layers={moe_layer_ids}, "
                 f"num_experts={self.config.num_experts}, shards=3)."
             )
+        self._checkpoint_loaded = True
 
     def post_load_weights(self) -> None:
         # Loaders that skip load_weights (dummy, sharded state, remote instance) call this.

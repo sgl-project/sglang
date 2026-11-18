@@ -62,8 +62,10 @@ _NORM_ONLY = [("model.norm.weight", torch.zeros(1))]
 
 class TestLagunaBucketedWeightUpdate(CustomTestCase):
     def test_checkpoint_load_rejects_missing_experts(self):
+        model = _laguna([])
         with self.assertRaisesRegex(RuntimeError, "routed-expert tensors"):
-            LagunaForCausalLM.load_weights(_laguna([]), iter(_laguna_experts([0])))
+            LagunaForCausalLM.load_weights(model, iter(_laguna_experts([0])))
+        self.assertFalse(model._checkpoint_loaded)
 
     def test_update_accepts_partial_bucket(self):
         calls = []
@@ -87,8 +89,10 @@ class TestLagunaBucketedWeightUpdate(CustomTestCase):
 
 class TestStep3p5BucketedWeightUpdate(CustomTestCase):
     def test_checkpoint_load_rejects_missing_params(self):
+        model = _step3p5([])
         with self.assertRaisesRegex(AssertionError, "lm_head.weight"):
-            Step3p5ForCausalLM.load_weights(_step3p5([]), iter(_NORM_ONLY))
+            Step3p5ForCausalLM.load_weights(model, iter(_NORM_ONLY))
+        self.assertFalse(model._checkpoint_loaded)
 
     def test_update_accepts_partial_bucket(self):
         calls = []

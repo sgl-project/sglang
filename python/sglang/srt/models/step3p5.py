@@ -932,7 +932,6 @@ class Step3p5ForCausalLM(nn.Module):
         # Only the checkpoint load must be complete; later calls are update buckets.
         if self._checkpoint_loaded:
             return
-        self._checkpoint_loaded = True
 
         # Derived parameters (e.g. blockscale_swizzled from NVFP4 quantization)
         # are computed in process_weights_after_loading, not loaded from checkpoint.
@@ -942,6 +941,7 @@ class Step3p5ForCausalLM(nn.Module):
             if "blockscale_swizzled" not in p
         }
         assert len(print_params) == 0, f"Some parameters are not loaded: {print_params}"
+        self._checkpoint_loaded = True
 
     def post_load_weights(self) -> None:
         # Loaders that skip load_weights (dummy, sharded state, remote instance) call this.
