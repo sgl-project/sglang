@@ -7,6 +7,35 @@ SGLang exposes the following metrics via Prometheus. You can enable it by adding
 
 An example of the monitoring dashboard is available in [examples/monitoring/grafana.json](https://github.com/sgl-project/sglang/blob/main/examples/monitoring/grafana/dashboards/json/sglang-dashboard.json).
 
+## Scheduler-to-detokenizer-router delivery time
+
+With `--enable-metrics` and multiple Python detokenizers, `sglang:detokenizer_router_delivery_seconds` measures the elapsed time from immediately before the scheduler serializes a message to immediately after the router decodes it. This includes serialization, ZMQ send, queueing and deserialization. The router observes each eligible scheduler message once, before grouping requests or broadcasting control messages and empty batches. The histogram has no request labels.
+
+On Linux, the scheduler timestamps messages sent over IPC, in-process sockets and numeric loopback TCP endpoints. Each sender and router reads its own boot ID and time namespace. The router samples a message only when the identities match. Metrics-off, single-detokenizer, `--skip-tokenizer-init` and Rust-server paths keep the single-frame protocol and skip the delivery clock reads.
+
+Use compatible scheduler and router versions when enabling this metric. Both pickle and msgpack send the payload and 33-byte metadata frame in one atomic multipart message. The new router also routes legacy single-frame messages and older 8-byte timestamp frames without sampling them. Older routers cannot decode the new metadata.
+
+You can estimate the 99th percentile of sampled delivery time per Prometheus target over five minutes:
+
+```promql
+histogram_quantile(
+  0.99,
+  sum by (job, instance, le) (
+    rate(sglang:detokenizer_router_delivery_seconds_bucket[5m])
+  )
+)
+```
+
+To see the rate of eligible sampled messages:
+
+```promql
+sum by (job, instance) (
+  rate(sglang:detokenizer_router_delivery_seconds_count[5m])
+)
+```
+
+The rate counts sampled messages. Traffic on other endpoints and messages with missing, unknown or mismatched clock identities are excluded. A zero count can therefore coexist with a backlog.
+
 ## Language model metrics
 
 `sglang:time_to_first_token_seconds` measures the time from request creation in the API server to the first token. For streaming requests it ends when the first output arrives after detokenization, which may contain no printable text. Non-streaming clients only see the final response, so for them it ends when the scheduler produced the first token.
