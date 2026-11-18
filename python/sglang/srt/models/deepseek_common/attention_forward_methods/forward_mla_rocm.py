@@ -49,6 +49,7 @@ from sglang.srt.lora.deepseek_mla_correction import (
     is_kv_b_lora_active,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+from sglang.srt.mem_cache.kv.router import KVLayer
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
@@ -439,6 +440,19 @@ def rocm_absorb_v_bmm(
     return attn_bmm_output
 
 
+def _mla_cache_write_target(
+    *, layer_id: int, out_cache_loc: torch.Tensor
+) -> Tuple[KVLayer, torch.Tensor]:
+    kv_pool = get_token_to_kv_pool()
+    if isinstance(kv_pool, HiSparseDSATokenToKVPool):
+        # The fused write bypasses set_mla_kv_buffer()'s logical-to-device mapping.
+        out_cache_loc = kv_pool.translate_loc_to_hisparse_device(out_cache_loc)
+    # AITER reads slot_mapping with stride 1, including on the resident path.
+    out_cache_loc = out_cache_loc.contiguous()
+    kv_layer = kv_pool.layer_router.read(layer_id)
+    return kv_layer, out_cache_loc
+
+
 def _fused_rope_cat_and_cache(
     attn: DeepseekV2AttentionMLA,
     q_nope_out: torch.Tensor,
@@ -472,13 +486,9 @@ def _fused_rope_cat_and_cache(
     else:
         cos, sin = attn.rotary_emb.cos_cache, attn.rotary_emb.sin_cache
     layer_id = attn.attn_mqa.layer_id
-    kv_pool = get_token_to_kv_pool()
-    if isinstance(kv_pool, HiSparseDSATokenToKVPool):
-        # The fused write bypasses set_mla_kv_buffer()'s logical-to-device mapping.
-        out_cache_loc = kv_pool.translate_loc_to_hisparse_device(out_cache_loc)
-    # AITER reads slot_mapping with stride 1, including on the resident path.
-    out_cache_loc = out_cache_loc.contiguous()
-    kv_layer = kv_pool.layer_router.read(layer_id)
+    kv_layer, out_cache_loc = _mla_cache_write_target(
+        layer_id=layer_id, out_cache_loc=out_cache_loc
+    )
     return fused_qk_rope_cat_and_cache_mla(
         q_nope_out,
         q_pe,
