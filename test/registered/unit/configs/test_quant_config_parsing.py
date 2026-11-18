@@ -80,6 +80,36 @@ class TestQuantLogString(CustomTestCase):
 
 
 class TestCPUGPTQDynamicConfig(CustomTestCase):
+    def test_per_layer_symmetry_override(self):
+        """CPU GPTQ must honor layer symmetry without changing other layers."""
+        for global_sym, layer_sym in ((True, False), (False, True)):
+            with self.subTest(global_sym=global_sym, layer_sym=layer_sym):
+                config = CPUGPTQConfig.from_config(
+                    {
+                        "bits": 4,
+                        "group_size": 128,
+                        "desc_act": False,
+                        "sym": global_sym,
+                        "dynamic": {r"+:.*\.gate_proj$": {"sym": layer_sym}},
+                    }
+                )
+                for projection, expected_sym in (
+                    ("gate_proj", layer_sym),
+                    ("up_proj", global_sym),
+                ):
+                    with self.subTest(projection=projection):
+                        layer = LinearBase(
+                            input_size=128,
+                            output_size=32,
+                            quant_config=config,
+                            prefix=f"model.layers.0.mlp.{projection}",
+                        )
+                        self.assertIsInstance(layer.quant_method, GPTQLinearMethod)
+                        self.assertEqual(
+                            layer.quant_method.quant_config.is_sym, expected_sym
+                        )
+                self.assertEqual(config.is_sym, global_sym)
+
     def test_parallel_lm_head_is_not_selected(self):
         """CPU GPTQ must not assign a LinearBase-only method to ParallelLMHead."""
         layer = ParallelLMHead.__new__(ParallelLMHead)
