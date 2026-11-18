@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
+from sglang.kernels.jit.cute_aot_cache import persist_flashinfer_compile_cache
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -178,6 +179,8 @@ def _get_flashinfer_gdn_kernels():
             logger.warning(f"FlashInfer GDN kernels not available: {e}")
             _flashinfer_gdn_available = False
             _flashinfer_gated_delta_rule_decode = None
+        if _flashinfer_gdn_available:
+            persist_flashinfer_compile_cache()
     return (
         _flashinfer_gdn_available,
         _flashinfer_chunk_gated_delta_rule,

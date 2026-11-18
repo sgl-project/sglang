@@ -388,6 +388,63 @@ class JITPersistentCache(JITCache):
             child.unlink()
 
 
+# FlashInfer reads its compile dict with get() and writes it with [key] = fn;
+# only those two reach disk, so clear() and patch.dict() never purge the cache.
+class _PersistentCompileDict(dict):
+    def __init__(self, persistent: JITPersistentCache):
+        super().__init__()
+        self._persistent = persistent
+
+    def get(self, key, default=None):
+        if not dict.__contains__(self, key) and _is_persistable(key):
+            if key in self._persistent:
+                dict.__setitem__(self, key, self._persistent[key])
+        return dict.get(self, key, default)
+
+    def __setitem__(self, key, fn) -> None:
+        if _is_persistable(key):
+            self._persistent[key] = fn
+        else:
+            logger.info("CuTe DSL kernel stays process-local: %r", key)
+        dict.__setitem__(self, key, fn)
+
+
+def _is_persistable(key: CompileKeyType) -> bool:
+    import cutlass.cute as cute
+
+    # FlashInfer keys end with the compile options as (option type, value) pairs;
+    # only a TVM-FFI build reloads with the in-process calling convention.
+    options = key[-1] or ()
+    if (cute.EnableTVMFFI, True) not in options:
+        return False
+    try:
+        pickle.dumps(_normalize_disk_key(key))
+    except (pickle.PicklingError, TypeError, AttributeError):
+        return False
+    return True
+
+
+def persist_flashinfer_compile_cache() -> None:
+    """Persist the CuTe DSL kernels FlashInfer compiles through ``cached_compile``
+    (the delta-rule prefill kernels), which FlashInfer keeps per process."""
+    import flashinfer
+    from flashinfer.gdn_kernels.delta_rule_dsl import custom_compile_cache
+
+    if isinstance(custom_compile_cache._in_mem_compile_cache, _PersistentCompileDict):
+        return
+    package = Path(flashinfer.__file__).resolve().parent
+    persistent = get_jit_cache(
+        "flashinfer_cached_compile",
+        source_paths=(package / "gdn_kernels", package / "version.py"),
+    )
+    if not isinstance(persistent, JITPersistentCache):
+        return
+    cache = _PersistentCompileDict(persistent)
+    # Kernels compiled before this call stay in memory only.
+    dict.update(cache, custom_compile_cache._in_mem_compile_cache)
+    custom_compile_cache._in_mem_compile_cache = cache
+
+
 def get_jit_cache(
     name: str | None = None,
     *,
