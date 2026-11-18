@@ -150,7 +150,7 @@ def _down(
     return y, pos
 
 
-def _k3_a8w4_moe(
+def k3_a8w4_moe(
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -161,11 +161,18 @@ def _k3_a8w4_moe(
     *,
     beta: float,
     linear_beta: float,
-    out: Optional[torch.Tensor],
-    block_m: int,
-    seg_blocks: int,
+    out: Optional[torch.Tensor] = None,
     a_mx: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
+    """Routed experts of one K3 MoE layer.
+
+    hidden_states [T, K] bf16; topk_ids [T, topk] int32; topk_weights [T, topk] fp32;
+    a_mx: hidden_states already through quant_mxfp8 (hidden_states then only gives the shape);
+    w13 [E, 2I, K/2] / w13_scale [E * 2I, K/32] in AITER's gate/up-interleaved preshuffle
+    (``shuffle_weight_a16w4(w, 16, True)`` / ``shuffle_scale_a16w4(s, E, True)``);
+    w2 [E, N, I/2] / w2_scale [E * N, pad8(I/32)] likewise with ``gate_up=False``.
+    out [T, N] bf16 may be a row-strided view.
+    """
     num_tokens, hidden = hidden_states.shape
     num_experts = w13.shape[0]
     if out is None:
@@ -174,6 +181,7 @@ def _k3_a8w4_moe(
         )
     if num_tokens == 0:
         return out
+    block_m = pick_block_m(num_tokens, topk_ids.shape[1], num_experts)
     sorted_ids, expert_ids, num_valid = _sort_routes(
         topk_ids, topk_weights, num_experts=num_experts, hidden=hidden, block_m=block_m
     )
@@ -200,48 +208,7 @@ def _k3_a8w4_moe(
         num_valid,
         topk_weights,
         block_m=block_m,
-        seg_blocks=seg_blocks,
+        seg_blocks=_DOWN_SEG_BLOCKS,
     )
     _module().reduce(y, topk_weights, pos, out, _Y_CHUNK_COLS)
     return out
-
-
-def k3_a8w4_moe(
-    hidden_states: torch.Tensor,
-    topk_ids: torch.Tensor,
-    topk_weights: torch.Tensor,
-    w13: torch.Tensor,
-    w13_scale: torch.Tensor,
-    w2: torch.Tensor,
-    w2_scale: torch.Tensor,
-    *,
-    beta: float,
-    linear_beta: float,
-    out: Optional[torch.Tensor] = None,
-    a_mx: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-) -> torch.Tensor:
-    """Routed experts of one K3 MoE layer.
-
-    hidden_states [T, K] bf16; topk_ids [T, topk] int32; topk_weights [T, topk] fp32;
-    a_mx: hidden_states already through quant_mxfp8 (hidden_states then only gives the shape);
-    w13 [E, 2I, K/2] / w13_scale [E * 2I, K/32] in AITER's gate/up-interleaved preshuffle
-    (``shuffle_weight_a16w4(w, 16, True)`` / ``shuffle_scale_a16w4(s, E, True)``);
-    w2 [E, N, I/2] / w2_scale [E * N, pad8(I/32)] likewise with ``gate_up=False``.
-    out [T, N] bf16 may be a row-strided view.
-    """
-    block_m = pick_block_m(hidden_states.shape[0], topk_ids.shape[1], w13.shape[0])
-    return _k3_a8w4_moe(
-        hidden_states,
-        topk_ids,
-        topk_weights,
-        w13,
-        w13_scale,
-        w2,
-        w2_scale,
-        beta=beta,
-        linear_beta=linear_beta,
-        out=out,
-        block_m=block_m,
-        seg_blocks=_DOWN_SEG_BLOCKS,
-        a_mx=a_mx,
-    )
