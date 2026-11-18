@@ -76,6 +76,7 @@ from sglang.srt.utils.device import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.beam_search.forward_inputs import BeamForwardInputs
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
@@ -407,6 +408,24 @@ class NgramEmbeddingInfo:
         )
 
 
+def spec_mrope_token_deltas(
+    *,
+    deltas: torch.Tensor,
+    num_tokens: int,
+    verify_lens: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Each spec-forward token's mRoPE delta: the tokens split evenly over the
+    requests, or verify_lens[i] tokens for request i under a ragged verify,
+    then graph-padding tokens with delta 0."""
+    if verify_lens is None:
+        return deltas.repeat_interleave(num_tokens // deltas.numel())
+    ends = torch.cumsum(verify_lens.to(device=deltas.device, dtype=torch.int64), 0)
+    req = torch.searchsorted(
+        ends, torch.arange(num_tokens, device=deltas.device), right=True
+    )
+    return torch.cat((deltas, deltas.new_zeros(1)))[req]
+
+
 @dataclass
 class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     """Store all inputs of a forward pass."""
@@ -488,6 +507,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     return_logprob: bool = False
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+    beam: Optional[BeamForwardInputs] = None
     spec_algorithm: SpeculativeAlgorithm = None
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
@@ -962,6 +982,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # block there). Use it directly.
         seq_lens_cpu = batch.seq_lens_cpu
 
+        beam = None
+        if batch.beam_tail is not None:
+            from sglang.srt.beam_search.forward_inputs import (
+                build_beam_forward_inputs,
+            )
+
+            beam = build_beam_forward_inputs(batch, model_runner)
+
         # TODO(seq-lens-removal): the whole ScheduleBatch seq_lens family
         # (incl. seq_lens_sum) is slated for removal in favor of kv-committed
         # lengths, so this init_new-time backfill onto the ScheduleBatch is
@@ -1048,6 +1076,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             kda_tp_state_imports=batch.kda_tp_state_imports,
             dp_kda_tp_state_imports=batch.dp_kda_tp_state_imports,
             is_prefill_only=batch.is_prefill_only,
+            beam=beam,
             contains_last_prefill_chunk=contains_last_prefill_chunk,
             extend_is_final_cpu=extend_is_final_cpu,
             spec_algorithm=batch.spec_algorithm,
@@ -1518,31 +1547,33 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         mm_inputs = batch.multimodal_inputs
 
         # target_verify / draft_decode read spec_info.positions; draft_extend
-        # passes its own positions (uniform num_draft_tokens per request).
+        # passes its own positions (uniform num_draft_tokens per request). A
+        # ragged target verify packs verify_lens[i] positions per request.
+        ragged_layout = None
         if seq_positions is None:
             seq_positions = batch.spec_info.positions
-        seq_positions = seq_positions.view(batch_size, -1)
+            ragged_layout = self.ragged_verify_layout
+        seq_positions = seq_positions.reshape(-1)
         # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
         if all(mm_input is None for mm_input in mm_inputs):
             self.mrope_positions = (
-                seq_positions.to(torch.int64).flatten().unsqueeze(0).repeat(3, 1)
+                seq_positions.to(torch.int64).unsqueeze(0).repeat(3, 1)
             )
             return
-        else:
-            mrope_deltas = [
-                (
-                    torch.zeros(1, dtype=torch.int64)
-                    if mm_inputs[i] is None
-                    else mm_inputs[i].mrope_position_delta.squeeze(0)
-                )
-                for i in range(batch_size)
-            ]
-            mrope_delta_tensor = async_h2d_stack(mrope_deltas, device=device)
-        next_input_positions = (
-            (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
+        mrope_deltas = [
+            (
+                torch.zeros(1, dtype=torch.int64)
+                if mm_inputs[i] is None
+                else mm_inputs[i].mrope_position_delta.reshape(1)
+            )
+            for i in range(batch_size)
+        ]
+        token_deltas = spec_mrope_token_deltas(
+            deltas=async_h2d_stack(mrope_deltas, device=device).reshape(-1),
+            num_tokens=seq_positions.numel(),
+            verify_lens=None if ragged_layout is None else ragged_layout.verify_lens,
         )
-
-        self.mrope_positions = next_input_positions
+        self.mrope_positions = (seq_positions + token_deltas).unsqueeze(0).repeat(3, 1)
 
     def _expand_mrope_from_input(
         self,

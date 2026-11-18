@@ -168,6 +168,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
     get_parallel,
+    get_spec,
 )
 from sglang.srt.utils import ceil_align, is_npu, rank_consensus_checker
 from sglang.srt.utils.device import async_h2d
@@ -979,6 +980,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             window_tails=storage.retained_window_lengths(),
             draft_kv_ring=self.draft_kv_ring,
+            empty_draft_kv_ring=get_spec().speculative_dflash_draft_kv_ring,
         )
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool
@@ -4762,9 +4764,9 @@ class SchedulerDisaggregationDecodeMixin:
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         self.disagg_decode_prealloc_queue.move_resumed(self.waiting_queue)
-        if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
-            # if there are still retracted requests, we do not allocate new requests
-            return False
+        # if there are still retracted requests, we do not allocate new requests;
+        # transfers already hold their pages and are still polled, so they can finish
+        has_retracted = len(self.disagg_decode_prealloc_queue.retracted_queue) > 0
 
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
@@ -4774,7 +4776,10 @@ class SchedulerDisaggregationDecodeMixin:
 
         prealloc_deferred = False
         if self.polling_count % self.polling_interval == 0:
-            if get_disagg().disaggregation_decode_host_receive_threshold == 1:
+            if (
+                not has_retracted
+                and get_disagg().disaggregation_decode_host_receive_threshold == 1
+            ):
                 if defer_prealloc:
                     prealloc_deferred = True
                 else:
@@ -4787,7 +4792,10 @@ class SchedulerDisaggregationDecodeMixin:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
-            if get_disagg().disaggregation_decode_host_receive_threshold < 1:
+            if (
+                not has_retracted
+                and get_disagg().disaggregation_decode_host_receive_threshold < 1
+            ):
                 # Give completed host transfers device space before new arrivals.
                 self._preallocate_new_requests()
         return prealloc_deferred

@@ -25,6 +25,7 @@ from typing import List, Optional, Union
 import torch
 import torch.distributed as dist
 
+from sglang.srt.beam_search.trie_output_head import configure_model_trie_output_heads
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import (
     _DEFAULT_LOAD_GROUP,
@@ -35,6 +36,7 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
     ModelImpl,
+    is_kimi_k31,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
@@ -153,6 +155,7 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     drop_elastic_cuda_graph_state,
     finalize_cuda_graph_capture,
     recapture_elastic_cuda_graph,
+    release_decode_cuda_graph,
     resolve_elastic_cuda_graph_config,
     sync_elastic_cuda_graph_config,
     validate_elastic_cuda_graph_recapture,
@@ -772,6 +775,7 @@ class ModelRunner:
                 model=self.model, model_config=self.model_config
             )
         prepare_moe_topk(model=self.model, model_config=self.model_config)
+        self.maybe_warmup_bf16_gemms()
 
         self.maybe_init_dwdp()
 
@@ -789,6 +793,12 @@ class ModelRunner:
         )
         self.maybe_apply_post_load_model_transforms()
         self.maybe_init_lora_manager()
+        self.beam_trie_compact_enabled = configure_model_trie_output_heads(
+            self.model,
+            self.model_config,
+            self.device,
+            lora_enabled=self.lora_manager is not None,
+        )
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
         # after every post-load change to the model, before the KV cache is sized
@@ -1359,6 +1369,18 @@ class ModelRunner:
         # value from the context where it is used.
         self.pp_group = get_parallel().pp_group
 
+    def maybe_warmup_bf16_gemms(self):
+        """Load cuBLASLt's kernel libraries, which CUDA_MODULE_LOADING=EAGER does not
+        cover; a first load during a PP prefill can hang in cuLibraryLoadData."""
+        max_m = envs.SGLANG_WARMUP_BF16_GEMM_MAX_M.get()
+        if max_m is None:
+            max_m = 16384 if is_kimi_k31(self.model_config.hf_config) else 0
+        if max_m <= 0 or self.device != "cuda":
+            return
+        from sglang.srt.layers.quantization.unquant import warmup_bf16_gemms
+
+        warmup_bf16_gemms(self.model, max_m)
+
     def load_model(self):
         tic_total = time.perf_counter()
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -1719,6 +1741,9 @@ class ModelRunner:
             self.capture_tail_hooks.append(self.uocr_greedy_graph.capture_tail_hook)
 
     def init_decode_cuda_graph(self):
+        release_decode_cuda_graph(
+            decode_runner=self.decode_cuda_graph_runner, eager_runner=self.eager_runner
+        )
         self.decode_cuda_graph_runner = None
         capture = capture_decode_graph(model_runner=self)
         self.decode_cuda_graph_runner = capture.runner
