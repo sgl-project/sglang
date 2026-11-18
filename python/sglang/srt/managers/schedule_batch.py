@@ -593,6 +593,8 @@ class Req(ReqDllmMixin):
         self.finished_reason: Optional[BaseFinishReason] = None
         # finished position (in output_ids), used when checking stop conditions with speculative decoding
         self.finished_len = None
+        # With ignore_eos: the finished_len its first stop token would have set. Reported, never trimmed.
+        self.ignored_stop_token_len: Optional[int] = None
         # Whether this request has finished output
         self.finished_output = None
         # Set by exit_ledger (CI only).
@@ -1299,7 +1301,7 @@ class Req(ReqDllmMixin):
         return False
 
     def _check_token_based_finish(self, new_accepted_tokens: List[int]) -> bool:
-        if self.sampling_params.ignore_eos:
+        if self.sampling_params.ignore_eos and self.ignored_stop_token_len is not None:
             return False
 
         # Check stop token ids
@@ -1315,8 +1317,12 @@ class Req(ReqDllmMixin):
                 if self.tokenizer.additional_stop_token_ids:
                     matched_eos |= token_id in self.tokenizer.additional_stop_token_ids
             if matched_eos:
-                self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
                 matched_pos = len(self.output_ids) - len(new_accepted_tokens) + i
+                if self.sampling_params.ignore_eos:
+                    if matched_pos + 1 <= self.sampling_params.max_new_tokens:
+                        self.ignored_stop_token_len = matched_pos + 1
+                    return False
+                self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
                 self.finished_len = matched_pos + 1
                 return True
 
@@ -1444,7 +1450,10 @@ class Req(ReqDllmMixin):
         """
         max_new_tokens = self.sampling_params.max_new_tokens
         if self.finished_len is not None and self.finished_len > max_new_tokens:
-            self.finished_reason = FINISH_LENGTH(length=max_new_tokens)
+            self.finished_reason = FINISH_LENGTH(
+                length=max_new_tokens,
+                ignored_stop_position=self.ignored_stop_token_len,
+            )
             self.finished_len = max_new_tokens
 
     def request_finish(self, reason: BaseFinishReason) -> None:
@@ -1498,7 +1507,8 @@ class Req(ReqDllmMixin):
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
             self.finished_reason = FINISH_LENGTH(
-                length=self.sampling_params.max_new_tokens
+                length=self.sampling_params.max_new_tokens,
+                ignored_stop_position=self.ignored_stop_token_len,
             )
             self.finished_len = self.sampling_params.max_new_tokens
             return
@@ -1542,6 +1552,7 @@ class Req(ReqDllmMixin):
         # to ensure shape consistency in KV cache.
         if self.input_embeds is not None:
             self.output_ids = array("q")
+            self.ignored_stop_token_len = None
             self.weight_version_events = truncate_weight_version_events(
                 self.weight_version_events, num_kept_tokens=self.send_token_offset
             )
