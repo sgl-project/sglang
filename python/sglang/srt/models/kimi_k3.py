@@ -10,6 +10,7 @@ import logging
 import re
 from array import array
 from collections.abc import Iterable
+from dataclasses import replace
 from functools import cached_property
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -119,6 +120,10 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import (
+    forward_context,
+    get_forward_context,
+)
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -1787,7 +1792,8 @@ class KimiK3MoE(nn.Module):
         )
         router_logits, routed_input = torch.split(front, self._front_sizes[1:], dim=-1)
         route_quant_handoff.clear()
-        topk_output = self.topk(normed, router_logits)
+        with forward_context(replace(get_forward_context(), topk_rows_scattered=True)):
+            topk_output = self.topk(normed, router_logits)
         _, _, x_q, x_s = _prepare_flashinfer_mxfp8_activations(
             routed_input, self.experts.quant_method.hidden_size
         )

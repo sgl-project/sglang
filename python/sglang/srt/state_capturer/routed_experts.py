@@ -116,7 +116,10 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             )
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
-        if self.device_cache is None and not _is_scattered_a2a_backend():
+        context = get_forward_context() if has_forward_context() else None
+        scattered_a2a = _is_scattered_a2a_backend()
+        scattered_rows = context is not None and context.topk_rows_scattered
+        if self.device_cache is None and not (scattered_a2a or scattered_rows):
             return
         device_width = self.device_topk_size
         if topk_indices.shape[1] != device_width:
@@ -130,16 +133,21 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             topk_indices = F.pad(
                 topk_indices, (0, self.num_fused_shared_experts), value=-1
             )
-        if _is_scattered_a2a_backend():
+        if scattered_a2a:
             local_topk = topk_indices
             topk_indices = self.gather_buffer[
                 : local_topk.size(0) * get_parallel().attn_tp_size
             ]
             attn_tp_all_gather_into_tensor(topk_indices, local_topk)
+        elif scattered_rows:
+            local_topk = topk_indices
+            topk_indices = local_topk.new_empty(
+                (local_topk.size(0) * get_parallel().attn_tp_size, local_topk.size(1))
+            )
+            attn_tp_all_gather_into_tensor(topk_indices, local_topk)
         if self.device_cache is None:
             # Joined the all-gather; the output rank keeps the rows.
             return
-        context = get_forward_context() if has_forward_context() else None
         if context is None or context.tbo_parent_token_range is None:
             super().capture(layer_id, topk_indices)
             return

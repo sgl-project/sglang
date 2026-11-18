@@ -213,6 +213,72 @@ class TestCaptureRoutedIdsOnly(CustomTestCase):
             self._capture(self._capturer(), ids, "none")
 
 
+class TestScatteredTopkRows(CustomTestCase):
+    K = 2
+    WORLD = 4
+
+    def _capture(self, cap, ids, scattered):
+        calls = []
+
+        def gather(out, inp):
+            calls.append(tuple(out.shape))
+            out.copy_(torch.cat([inp + 10 * r for r in range(self.WORLD)]))
+
+        with (
+            mock.patch.object(
+                re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("none")
+            ),
+            mock.patch.object(
+                re_mod,
+                "get_parallel",
+                return_value=SimpleNamespace(attn_tp_size=self.WORLD),
+            ),
+            mock.patch.object(
+                re_mod, "attn_tp_all_gather_into_tensor", side_effect=gather
+            ),
+        ):
+            if scattered:
+                with forward_context(
+                    ForwardContext(attn_backend=None, topk_rows_scattered=True)
+                ):
+                    cap.capture(layer_id=0, topk_indices=ids)
+            else:
+                cap.capture(layer_id=0, topk_indices=ids)
+        return calls
+
+    def _capturer(self, keeps_rows):
+        cap = object.__new__(re_mod.RoutedExpertsCapturer)
+        cap.num_fused_shared_experts = 0
+        cap.device_topk_size = self.K
+        cap.device_cache = (
+            BaseDeviceCache(
+                max_batch_size=8,
+                num_layers=1,
+                topk_size=self.K,
+                device="cpu",
+                name="routed_experts",
+            )
+            if keeps_rows
+            else None
+        )
+        return cap
+
+    def test_rows_held_by_other_ranks_are_recorded(self):
+        """Top-k over one share of the rows records the rows of every rank."""
+        cap = self._capturer(keeps_rows=True)
+        ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+        self._capture(cap, ids, scattered=True)
+        expected = torch.cat([ids + 10 * r for r in range(self.WORLD)])
+        self.assertTrue(torch.equal(cap.device_cache.buffer[:8, 0], expected))
+
+    def test_rank_without_rows_joins_the_gather_only_when_scattered(self):
+        """Ranks that keep no rows join the gather for scattered top-k only."""
+        ids = torch.zeros((2, self.K), dtype=torch.int32)
+        cap = self._capturer(keeps_rows=False)
+        self.assertEqual(self._capture(cap, ids, scattered=True), [(8, self.K)])
+        self.assertEqual(self._capture(cap, ids, scattered=False), [])
+
+
 class TestCapturerWidthFollowsTheInstalledCount(CustomTestCase):
     def test_a_wrapper_model_gets_room_for_the_fused_shared_column(self):
         """Capture sizing must use the supplied wrapper model's shared-expert layout."""

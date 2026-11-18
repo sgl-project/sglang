@@ -50,6 +50,8 @@ class ForwardContext:
     tbo_parent_token_range: Optional[tuple[int, int]] = None
     # This DP rank's first parent row when the child's MoE sees gathered rows.
     tbo_parent_dp_offset: Optional[int] = None
+    # Top-k sees only the rows held by this attention-TP rank.
+    topk_rows_scattered: bool = False
 
 
 _current: Optional[ForwardContext] = None
