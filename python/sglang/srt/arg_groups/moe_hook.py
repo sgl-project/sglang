@@ -77,6 +77,25 @@ def handle_moe_kernel_config(server_args: Any):
         raise ValueError(
             "The argument paged-experts-enable-disk requires --enable-paged-experts."
         )
+    if cfg.paged_experts_copy_engine_rows is not None:
+        if not cfg.enable_paged_experts:
+            raise ValueError(
+                "--paged-experts-copy-engine-rows requires --enable-paged-experts"
+            )
+        if not 1 <= cfg.paged_experts_copy_engine_rows <= 32:
+            raise ValueError(
+                "--paged-experts-copy-engine-rows must be between 1 and 32"
+            )
+        if cfg.paged_experts_enable_disk:
+            raise ValueError(
+                "--paged-experts-copy-engine-rows requires a RAM-backed store"
+            )
+        if cfg.paged_experts_num_resident in (None, "auto"):
+            raise ValueError(
+                "--paged-experts-copy-engine-rows requires an explicit "
+                "--paged-experts-num-resident so staging is allocated before the KV cache"
+            )
+
     if cfg.paged_experts_host_memory_gb is not None:
         if not cfg.enable_paged_experts:
             raise ValueError(

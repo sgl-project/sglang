@@ -1129,7 +1129,10 @@ class TestDecodeCaptureCap(CustomTestCase):
         ):
             with self.subTest(requested=requested):
                 caps = []
-                moe = SimpleNamespace(paged_experts_num_resident=requested)
+                moe = SimpleNamespace(
+                    paged_experts_num_resident=requested,
+                    paged_experts_copy_engine_rows=None,
+                )
                 with (
                     patch(_METHOD + "get_exec", return_value=SimpleNamespace(moe=moe)),
                     patch(_METHOD + "format_for", return_value=UnquantizedFormat()),
@@ -1178,6 +1181,7 @@ class TestCompat(CustomTestCase):
         moe = SimpleNamespace(
             enable_eplb=False,
             paged_experts_num_resident=num_resident,
+            paged_experts_copy_engine_rows=flags.get("copy_engine_rows"),
             enable_fused_moe_sum_all_reduce=False,
         )
         features = SimpleNamespace(
@@ -1187,7 +1191,11 @@ class TestCompat(CustomTestCase):
             enable_nvidia_megakernel=flags.get("enable_nvidia_megakernel", False)
         )
         lora = SimpleNamespace(enable_lora=flags.get("enable_lora", False))
-        layer = SimpleNamespace(top_k=TOP_K, num_fused_shared_experts=0)
+        layer = SimpleNamespace(
+            top_k=TOP_K,
+            num_fused_shared_experts=0,
+            params_dtype=flags.get("params_dtype", torch.bfloat16),
+        )
         with (
             patch(
                 method + "get_parallel",
@@ -1212,7 +1220,22 @@ class TestCompat(CustomTestCase):
             ),
             patch(method + "check_cuda_graph_backend", return_value=True),
         ):
-            check_paged_experts_compat(layer=layer, expert_format=object())
+            check_paged_experts_compat(
+                layer=layer, expert_format=flags.get("expert_format", object())
+            )
+
+    def test_copy_engine_supports_only_unquantized_bf16(self):
+        with (
+            patch("sglang.srt.utils.device.is_cuda", return_value=True),
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+        ):
+            self._check(copy_engine_rows=4, expert_format=UnquantizedFormat())
+            with self.assertRaisesRegex(RuntimeError, "only for unquantized BF16"):
+                self._check(
+                    copy_engine_rows=4,
+                    expert_format=UnquantizedFormat(),
+                    params_dtype=torch.float16,
+                )
 
     def test_accepts_a_supported_config(self):
         self._check()
@@ -2619,6 +2642,80 @@ class TestHostMemoryFlag(CustomTestCase):
             )
             with self.assertRaises(_Next):
                 moe_hook.handle_moe_kernel_config(args)
+
+
+class TestCopyEngineFlag(CustomTestCase):
+    def test_requires_paged_experts_with_explicit_slots_in_ram(self):
+        from sglang.srt.arg_groups import moe_hook
+        from sglang.srt.server_args import ServerArgs
+
+        for overrides, error in (
+            ({"enable_paged_experts": False}, "requires --enable-paged-experts"),
+            ({"paged_experts_copy_engine_rows": 33}, "between 1 and 32"),
+            ({"paged_experts_enable_disk": True}, "RAM-backed store"),
+            ({"paged_experts_num_resident": None}, "requires an explicit"),
+        ):
+            args = {
+                "enable_paged_experts": True,
+                "paged_experts_num_resident": 8,
+                "paged_experts_copy_engine_rows": 8,
+                **overrides,
+            }
+            with self.subTest(args=args), self.assertRaisesRegex(ValueError, error):
+                moe_hook.handle_moe_kernel_config(
+                    ServerArgs(model_path="dummy", **args)
+                )
+
+
+class TestCopyEngineGather(CustomTestCase):
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.version.cuda, "CUDA required"
+    )
+    def test_replays_changed_plans_and_falls_back_on_late_or_oversized_copies(self):
+        from sglang.srt.layers.moe.paged_experts.copy_engine import CopyEngineTransfer
+
+        if torch.cuda.get_device_capability() < (7, 0):
+            self.skipTest("SM70 or newer required")
+        host = torch.arange(8 * 16, dtype=torch.int32).view(8, 16).pin_memory()
+        for delay, timeout in ((0, 20_000_000), (2000, 1000)):
+            with self.subTest(delay=delay):
+                slots = torch.zeros((4, 16), dtype=host.dtype, device="cuda")
+                src = torch.zeros(4, dtype=torch.int32, device="cuda")
+                dst = torch.tensor([3, 0, 2, 1], dtype=torch.int32, device="cuda")
+                count = torch.zeros(1, dtype=torch.int32, device="cuda")
+                transfer = CopyEngineTransfer(
+                    [host],
+                    [slots],
+                    2,
+                    timeout_ns=timeout,
+                    delay_us=delay,
+                    collect_stats=True,
+                )
+                try:
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        transfer.gather(src, dst, count)
+                    expected = slots.cpu()
+                    for experts in ([1], [3, 4], [5, 0, 6], [], [7, 2]):
+                        if experts:
+                            src[: len(experts)].copy_(torch.tensor(experts))
+                        count.fill_(len(experts))
+                        graph.replay()
+                        expected[dst[: len(experts)].cpu().long()] = host[experts]
+                        torch.testing.assert_close(
+                            slots.cpu(), expected, atol=0, rtol=0
+                        )
+                    staged, fallback = transfer.stats.tolist()
+                    self.assertGreaterEqual(
+                        fallback, 1
+                    )  # The three-row plan cannot fit.
+                    if delay:
+                        self.assertEqual((staged, fallback), (0, 4))
+                    else:
+                        self.assertGreaterEqual(staged, 1)
+                    del graph
+                finally:
+                    transfer.close()
 
 
 class TestExpertReader(CustomTestCase):

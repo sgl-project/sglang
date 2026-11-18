@@ -1123,6 +1123,12 @@ class ExecMoe(msgspec.Struct):
             type_parser=_paged_experts_num_resident,
         ),
     ] = None
+    paged_experts_copy_engine_rows: A[
+        Optional[int],
+        "Stage up to this many missing experts per MoE layer with the CUDA copy engine "
+        "(1 to 32). Requires Paged Experts with an explicit resident count, full decode "
+        "CUDA graphs, and unquantized BF16 experts in RAM. Unset uses SM gather.",
+    ] = None
     paged_experts_enable_disk: A[
         bool,
         "Let Paged Experts write to disk under $SGLANG_CACHE_DIR/paged_experts: each MoE "
