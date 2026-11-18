@@ -2153,6 +2153,8 @@ class Envs:
     # Prefill index top-k by the sampled-threshold indexers of kernels/ops/attention/dsa/litetopk_prefill
     # (after LiteTopK, https://arxiv.org/abs/2607.11976) instead of dense logits + top-k, on SM100.
     SGLANG_OPT_USE_PREFILL_LITE_TOPK = EnvBool(False)
+    # Raise the per-rank prefill Indexer score tile limit to 2 GiB.
+    SGLANG_OPT_DSV41_LARGE_PREFILL_SCORE_BUDGET = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
@@ -2351,6 +2353,9 @@ class Envs:
     SGLANG_ROCM_MUSE_EXTEND_SWA_GLUON = EnvBool(True)
     # Full-layer FP8 extend on the FlyDSL kernel; =0 keeps the Gluon kernel there.
     SGLANG_ROCM_MUSE_EXTEND_FLYDSL = EnvBool(True)
+    # gfx1250: prefix-free FP8 extends (full and sliding layers) on the FlyDSL m32x8 kernel over this step's K/V
+    # gathered from the cache; =0 keeps the Triton kernel.
+    SGLANG_ROCM_MUSE_GFX1250_EXTEND_FLY = EnvBool(True)
     # Spec-v2 decode without the per-step seq_lens_cpu D2H (the aiter Muse verify path reads GPU lengths only).
     SGLANG_ROCM_MUSE_SYNC_FREE_VERIFY = EnvBool(True)
     # Target verify: merge the split-KV attention partials inside the output norm-gate kernel (one launch for both).
@@ -2413,6 +2418,8 @@ class Envs:
     SGLANG_ROCM_MUSE_FUSED_UNPOOL_BOUNDARY = EnvBool(True)
     SGLANG_ROCM_MUSE_COMPACT_A4_VERIFY = EnvBool(True)
     SGLANG_ROCM_MUSE_A4W4_MOE = EnvBool(True)
+    # gfx1250: every Quark MXFP4 expert batch on aiter's A8W4 TDM fused MoE (FP8 activations).
+    SGLANG_ROCM_MUSE_GFX1250_A8W4 = EnvBool(True)
     SGLANG_ROCM_MUSE_PREFILL_SP = EnvBool(True)
     SGLANG_ROCM_MUSE_PREFILL_ULYSSES = EnvBool(True)
     # Ulysses keeps the attention output gate on the token shard: the QKV all-to-all carries only q|k|v and the
