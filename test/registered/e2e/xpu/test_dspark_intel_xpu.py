@@ -31,7 +31,7 @@ from sglang.test.test_utils import (
 
 register_xpu_ci(
     est_time=3000,
-    suite="nightly-xpu-kernel-main-2-gpu",
+    suite="nightly-kernel-main-test-2-gpu-xpu",
     nightly=True,
     disabled="XPU full decode graph with --tp 2: TP ranks diverge on draft graph "
     "replay, so DecodeGraph drafts are all rejected (accept_length ~1.0); "
