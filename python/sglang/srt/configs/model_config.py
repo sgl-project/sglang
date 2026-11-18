@@ -1263,6 +1263,16 @@ class ModelConfig:
             self.hf_config.architectures[0] = "GigaChat35ForCausalLMNextN"
         if (
             is_draft_model
+            and self.hf_config.architectures[0]
+            == "GigaChat35OmniForConditionalGeneration"
+        ):
+            quantization_config = getattr(self.hf_config, "quantization_config", None)
+            self.hf_config = self.hf_text_config
+            self.hf_config.architectures = ["GigaChat35ForCausalLMNextN"]
+            # The MTP layers are quantized like the LM they are served with.
+            self.hf_config.quantization_config = quantization_config
+        if (
+            is_draft_model
             and self.hf_config.architectures[0] == "Step3p7ForConditionalGeneration"
         ):
             self.hf_config = self.hf_text_config
@@ -1562,6 +1572,7 @@ class ModelConfig:
             or "Eagle3DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "GigaChat35ForCausalLM" in self.hf_config.architectures
             or "GigaChat35ForCausalLMNextN" in self.hf_config.architectures
+            or "GigaChat35OmniForConditionalGeneration" in self.hf_config.architectures
             or "Xing4_0ForCausalLM" in self.hf_config.architectures
         ):
             self.head_dim = 256
@@ -2596,6 +2607,7 @@ multimodal_model_archs = [
     "EmbeddingGemma2Model",
     "Gemma4UnifiedForConditionalGeneration",
     "DiffusionGemmaForBlockDiffusion",
+    "GigaChat35OmniForConditionalGeneration",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
     "Glm5NextForConditionalGeneration",

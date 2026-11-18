@@ -10,6 +10,8 @@ CPU-only: exercises mm_schedule internals directly, no engine or GPU.
 """
 
 import logging
+from dataclasses import dataclass, field
+from typing import List, Tuple
 from unittest.mock import Mock
 
 import pytest
@@ -17,6 +19,7 @@ import torch
 
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.req_types import MultimodalDataItem
+from sglang.srt.multimodal.gigachat35_omni import GigaChat35OmniVideoEmbedding
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.transport.cuda_ipc import (
     BORROW_CUDA_IPC_FEATURE_KEY,
@@ -582,6 +585,147 @@ def test_multimodal_mask_matches_broadcast_compare(n_ids, n_placeholders, ids_dt
     broadcast = (input_ids.unsqueeze(-1) == placeholders).any(-1).unsqueeze(-1)
     assert torch.equal(mask, broadcast)
     assert torch.equal(mask, torch.isin(input_ids, placeholders).unsqueeze(-1))
+
+
+@dataclass(kw_only=True)
+class _FixedLayout(GigaChat35OmniVideoEmbedding):
+    """Lays every chunk out from one rewritten prompt and records the calls."""
+
+    frame_counts: List[List[int]] = field(default_factory=list)
+    layout: List[int]
+    runs: List[Tuple[int, int]]
+    calls: List[Tuple[int, int, int]] = field(default_factory=list)
+
+    @staticmethod
+    def item(offsets):
+        """Builds a video item whose embedding rewrites its layout.
+
+        Args:
+            offsets: The item's runs.
+
+        Returns:
+            The item.
+        """
+        key = GigaChat35OmniVideoEmbedding.REWRITES_LAYOUT_KEY
+        item = MultimodalDataItem(
+            modality=Modality.VIDEO,
+            hash=500,
+            feature=torch.zeros(1),
+            offsets=offsets,
+            model_specific_data={key: True},
+        )
+        item.set_pad_value()
+        return item
+
+    def rewrite_layout(
+        self, input_ids, *, items, extend_prefix_len, extend_seq_len, extend_start
+    ):
+        """Copies the chunk of `layout` into the request's rows.
+
+        Args:
+            input_ids: Token ids of the whole batch.
+            items: The request's items.
+            extend_prefix_len: Tokens of the request already in the KV cache.
+            extend_seq_len: Tokens of the request in this batch.
+            extend_start: Where the request's tokens start in `input_ids`.
+
+        Returns:
+            The rewritten copy of `input_ids` and `runs`.
+        """
+        self.calls.append((extend_prefix_len, extend_seq_len, extend_start))
+        input_ids = input_ids.clone()
+        chunk = self.layout[extend_prefix_len : extend_prefix_len + extend_seq_len]
+        input_ids[extend_start : extend_start + len(chunk)] = torch.tensor(chunk)
+        return input_ids, self.runs
+
+
+def test_layout_rewriting_item_takes_the_full_path():
+    """A one-run item whose embedding rewrites its layout is not encoded per image."""
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    item = _FixedLayout.item([(2, 5)])
+    pad = item.pad_value
+    result = _FixedLayout(
+        embedding=torch.ones(4, HIDDEN),
+        layout=[1, 2, 3, pad, pad, pad, pad, 8],
+        runs=[(3, 6)],
+    )
+    encoder = Mock(return_value=result)
+
+    chunk, input_ids = mm_schedule._get_chunked_prefill_embedding(
+        encoder,
+        [item],
+        [0, 1],
+        [0],
+        [8],
+        [item.offsets],
+        torch.tensor([1, 2, pad, pad, pad, pad, 7, 8]),
+    )
+
+    encoder.assert_called_once_with([item])
+    assert result.calls == [(0, 8, 0)]
+    assert input_ids.tolist() == result.layout
+    assert torch.equal(chunk, result.embedding)
+
+
+@pytest.mark.parametrize(
+    "rewrites, prefix, calls", [(True, 4, 1), (False, 4, 0), (True, 10, 0)]
+)
+def test_chunk_between_runs_meets_a_layout_rewriting_item(rewrites, prefix, calls):
+    """A chunk between the runs is rewritten only if the item rewrites its layout."""
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    item = _FixedLayout.item([(2, 3), (8, 9)])
+
+    if not rewrites:
+        item.model_specific_data.clear()
+
+    result = _FixedLayout(
+        embedding=torch.ones(4, HIDDEN), layout=list(range(12)), runs=item.offsets
+    )
+
+    chunk, _ = mm_schedule._get_chunked_prefill_embedding(
+        Mock(return_value=result),
+        [item],
+        [0, 1],
+        [prefix],
+        [3],
+        [item.offsets],
+        torch.zeros(3, dtype=torch.long),
+    )
+
+    assert len(result.calls) == calls
+    assert (chunk is None) == (calls == 0)
+    assert chunk is None or len(chunk) == 0
+
+
+def test_layout_rewrite_gets_its_request_start_in_the_batch():
+    """The rewrite changes its own request's rows, and the mask follows them."""
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    item = _FixedLayout.item([(1, 2), (5, 6)])
+    pad = item.pad_value
+    result = _FixedLayout(
+        embedding=torch.ones(4, HIDDEN),
+        layout=[0, pad, pad, pad, 4, 5, pad, 7],
+        runs=[(1, 3), (6, 6)],
+    )
+    # A text-only request of 3 tokens comes first in the batch.
+    input_ids = torch.tensor([100, 101, 102, 0, pad, pad, 3, 4, pad, pad, 7, 200])
+
+    embedding, mask, new_ids = mm_schedule.get_embedding_and_mask(
+        Mock(return_value=result),
+        [item],
+        torch.tensor(sorted(item.padding_values())),
+        input_ids,
+        [0, 1],
+        [0],
+        [8],
+        [item.offsets],
+        extend_starts=[3],
+    )
+
+    assert result.calls == [(0, 8, 3)]
+    assert new_ids.tolist() == [100, 101, 102] + result.layout + [200]
+    assert mask.flatten().nonzero().flatten().tolist() == [4, 5, 6, 9]
+    assert torch.equal(embedding, result.embedding)
 
 
 if __name__ == "__main__":

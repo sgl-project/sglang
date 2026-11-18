@@ -209,6 +209,9 @@ _NO_WORKER_POOL_ROUTE = {
     # hasher needs; the shared chain would re-tokenize them.
     "deepseek_v41.py",
     "dots_note_omni.py",
+    # Decoding and log-mel run on io_executor through the checkpoint's own
+    # processor; only the placeholder expansion runs on the event loop.
+    "gigachat35_omni.py",
     "inkling.py",
     # Expands audio placeholders and extracts per-clip features in io_executor.
     "lfm3_audio.py",

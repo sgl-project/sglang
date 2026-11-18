@@ -1752,20 +1752,25 @@ class ServingChatTestCase(CustomTestCase):
         self.tm.model_config.is_multimodal = True
         _use_chat_encoding(self.chat, None)
         self.template_manager.chat_template_name = None
-        self.chat._tokenizer_auto_adds_specials = False
         self.chat._prompt_text_round_trip_is_lossy = False
-        # (architecture, image_data, reuses the rendered token ids)
+        llama, moss = "LlamaForCausalLM", "MossVLForConditionalGeneration"
+        ids, bos_ids = [11, 22, 33], [1, 22, 33]
+        # (architecture, image_data, tokenizer adds BOS, prompt ids, reuses the
+        # rendered token ids); re-encoding the text would add a second BOS.
         cases = {
-            "text only": ("LlamaForCausalLM", None, True),
-            "media": ("LlamaForCausalLM", ["image"], False),
-            "always-on processor": ("MossVLForConditionalGeneration", None, False),
+            "text only": (llama, None, False, ids, True),
+            "media": (llama, ["image"], False, ids, False),
+            "always-on processor": (moss, None, False, ids, False),
+            "BOS tokenizer, template wrote BOS": (llama, None, True, bos_ids, True),
+            "BOS tokenizer, no BOS": (llama, None, True, ids, False),
         }
-        for name, (architecture, image_data, reuses_ids) in cases.items():
+        for name, (arch, image_data, adds_bos, prompt_ids, reuses_ids) in cases.items():
             with self.subTest(name):
-                self.tm.model_config.hf_config.architectures = [architecture]
+                self.tm.model_config.hf_config.architectures = [arch]
+                self.chat._tokenizer_auto_adds_specials = adds_bos
                 processed = MessageProcessingResult(
                     prompt="rendered prompt",
-                    prompt_ids=[11, 22, 33],
+                    prompt_ids=prompt_ids,
                     image_data=image_data,
                     audio_data=None,
                     video_data=None,
@@ -1777,7 +1782,7 @@ class ServingChatTestCase(CustomTestCase):
                 ):
                     adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
                 if reuses_ids:
-                    self.assertEqual(adapted.input_ids, [11, 22, 33])
+                    self.assertEqual(adapted.input_ids, prompt_ids)
                     self.assertIsNone(adapted.text)
                 else:
                     self.assertEqual(adapted.text, "rendered prompt")

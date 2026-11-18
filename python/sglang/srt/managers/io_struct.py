@@ -1190,6 +1190,10 @@ class GenerateReqInput:
                 if self.token_indices_to_pool is not None
                 else None
             ),
+            use_audio_in_video=(
+                self.use_audio_in_video and has_valid_data(self.video_data[i])
+            ),
+            video_config=self.video_config,
         )
         cache[i] = sub
         return sub

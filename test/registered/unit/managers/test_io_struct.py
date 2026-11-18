@@ -1342,6 +1342,24 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertTrue(req[0].return_prompt_token_ids)
         self.assertTrue(req[1].return_prompt_token_ids)
 
+    def test_getitem_preserves_video_options(self):
+        """Items with a video keep the soundtrack switch; all keep the video config."""
+        req = GenerateReqInput(
+            input_ids=[[1, 2, 3], [4, 5, 6], [7, 8, 9]],
+            video_data=[["a.mp4"], ["b.mp4"], None],
+            sampling_params=[{}, {}, {}],
+            rid=["id1", "id2", "id3"],
+            use_audio_in_video=True,
+            video_config={"fps": 2},
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(
+            [req[i].use_audio_in_video for i in range(3)], [True, True, False]
+        )
+        for i in range(3):
+            self.assertEqual(req[i].video_config, {"fps": 2})
+
     def test_regenerate_rid(self):
         """Test the regenerate_rid method."""
         req = GenerateReqInput(text="Hello")

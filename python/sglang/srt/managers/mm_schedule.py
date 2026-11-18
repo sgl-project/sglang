@@ -10,6 +10,7 @@ import torch
 from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
+from sglang.srt.multimodal.gigachat35_omni import GigaChat35OmniVideoEmbedding
 from sglang.srt.multimodal.transport.cuda_ipc import BORROW_CUDA_IPC_FEATURE_KEY
 from sglang.srt.runtime_context import get_schedule
 from sglang.srt.utils import is_hip, is_npu, is_xpu
@@ -150,7 +151,8 @@ def _get_precomputed_embedding(
 
 
 # A modality's embedding function. May return the combined [tokens, hidden]
-# tensor, an EVSEmbeddingResult, or one tensor per input item. The per-item
+# tensor, an EVSEmbeddingResult or GigaChat35OmniVideoEmbedding, or one
+# tensor per input item. The per-item
 # form lets encoders that naturally produce per-item outputs (e.g. a wav
 # AutoEncoder looping over clips) skip an encoder-side torch.cat that
 # per-item consumers (_get_chunked_embedding_by_item) would immediately
@@ -158,7 +160,10 @@ def _get_precomputed_embedding(
 # being a view pinning the concatenated buffer.
 DataEmbeddingFunc = Callable[
     [List[MultimodalDataItem]],
-    torch.Tensor | List[torch.Tensor] | EVSEmbeddingResult,
+    torch.Tensor
+    | List[torch.Tensor]
+    | EVSEmbeddingResult
+    | GigaChat35OmniVideoEmbedding,
 ]
 
 
@@ -311,10 +316,11 @@ def _get_chunked_embedding_full(
     extend_seq_len: int,
     input_ids: torch.Tensor,
     device: torch.device,
+    extend_start: int = 0,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
     """
     Fallback: encode all items at once, cache combined result, extract chunk.
-    Used for non-bundled items or EVS results.
+    Used for non-bundled items, EVS or GigaChat3.5-Omni video results.
     """
     item_hashes = [item.cache_key for item in embedding_items_per_req]
     embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
@@ -363,6 +369,14 @@ def _get_chunked_embedding_full(
                 extend_prefix_len=extend_prefix_len,
                 extend_seq_len=extend_seq_len,
             )
+        )
+    elif isinstance(embedding_per_req, GigaChat35OmniVideoEmbedding):
+        input_ids, items_offset = embedding_per_req.rewrite_layout(
+            input_ids,
+            items=embedding_items_per_req,
+            extend_prefix_len=extend_prefix_len,
+            extend_seq_len=extend_seq_len,
+            extend_start=extend_start,
         )
 
     embedding_per_req_chunk, _, _ = get_embedding_chunk(
@@ -598,11 +612,15 @@ def _get_chunked_prefill_embedding(
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
     input_ids: torch.Tensor,
+    extend_starts: Optional[List[int]] = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """
     Chunked prefill embedding: encode items across all requests and extract
     per-request chunks. Images from all requests are batched into a single
     ViT call for efficiency.
+
+    `extend_starts[i]` is where request i's tokens start in `input_ids`;
+    GigaChat3.5-Omni video results need it when the batch holds several requests.
     """
     device = input_ids.device
     # FIXME(Xinyuan): temporary workaround for eagle3
@@ -627,9 +645,20 @@ def _get_chunked_prefill_embedding(
 
         # Multi-span items (e.g. videos) use the full encoder path below.
         # Do not encode them for chunks before, after, or between their spans.
+        # A GigaChat3.5-Omni video may move tokens anywhere in its span, so a
+        # chunk between its runs is rewritten too.
+        rewriting = [
+            item
+            for item in embedding_items_per_req
+            if GigaChat35OmniVideoEmbedding.REWRITES_LAYOUT_KEY
+            in item.model_specific_data
+        ]
+        spans = items_offset + [
+            (item.offsets[0][0], item.offsets[-1][1]) for item in rewriting
+        ]
         if not any(
             end >= extend_prefix_len and start < extend_prefix_len + extend_seq_len
-            for start, end in items_offset
+            for start, end in spans
         ):
             continue
 
@@ -642,7 +671,7 @@ def _get_chunked_prefill_embedding(
         )
 
         # Audio items may span several runs (interleaved with transcript text).
-        is_per_image = all(
+        is_per_image = not rewriting and all(
             len(item.offsets) == 1 or item.is_audio()
             for item in embedding_items_per_req
         )
@@ -689,6 +718,7 @@ def _get_chunked_prefill_embedding(
             req_info.extend_seq_len,
             input_ids,
             device,
+            extend_start=extend_starts[req_info.req_idx] if extend_starts else 0,
         )
         if chunk_embedding is not None:
             all_chunks.append((req_info.req_idx, chunk_embedding))
@@ -777,6 +807,7 @@ def get_embedding_and_mask(
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
+    extend_starts: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
     """
     Generate multimodal embeddings and create a mask for identifying their positions in the input sequence.
@@ -790,6 +821,7 @@ def get_embedding_and_mask(
         prefix_length: Prefix lengths for each request
         extend_length: Sequence lengths for each request
         items_offset_list: List of offset ranges for multimodal items in each request
+        extend_starts: Start of each request's tokens in input_ids (needed by GigaChat3.5-Omni video results)
 
     Returns:
         A tuple containing:
@@ -817,6 +849,7 @@ def get_embedding_and_mask(
             extend_length,
             items_offset_list,
             input_ids,
+            extend_starts,
         )
         if embedding is None:
             return None, None, input_ids

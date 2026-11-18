@@ -1198,9 +1198,13 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.chat_encoding_spec is None
             and self.template_manager.chat_template_name is None
             and not self._prompt_text_round_trip_is_lossy
-            and not self._tokenizer_auto_adds_specials
             and isinstance(processed_messages.prompt_ids, list)
             and bool(processed_messages.prompt_ids)
+            and (
+                not self._tokenizer_auto_adds_specials
+                or processed_messages.prompt_ids[0]
+                == self.tokenizer_manager.tokenizer.bos_token_id
+            )
             and not processed_messages.image_data
             and not processed_messages.video_data
             and not processed_messages.audio_data

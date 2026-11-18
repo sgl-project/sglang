@@ -245,8 +245,10 @@ register_linear_attn_model(
         arch_names=[
             "GigaChat35ForCausalLM",
             "GigaChat35ForCausalLMNextN",
+            "GigaChat35OmniForConditionalGeneration",
         ],
         uses_mamba_radix_cache=True,
         support_mamba_cache=True,
+        unwrap_text_config=True,
     )
 )
