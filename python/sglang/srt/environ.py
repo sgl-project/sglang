@@ -1113,8 +1113,6 @@ class Envs:
     SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM = EnvBool(False)
     # Kimi-K3 gfx950 TP8: the column-split latent-MoE tail's row cap (at most 384)
     SGLANG_ROCM_K3_COLUMN_TAIL_MAX_TOKENS = EnvInt(64)
-    # Use the gfx950 MXFP8 opus port instead of Triton split-K for fp8_ds_mla decode.
-    SGLANG_ENABLE_ROCM_DSA_OPUS_DECODE = EnvBool(True)
     # GiB of ROCm memory kept out of torch's allocator for HSA queue scratch (0: none)
     SGLANG_ROCM_RUNTIME_RESERVE_GB = EnvFloat(0.0)
     # Run the gfx950 TP4 quick all-reduce on the JIT build (quick_all_reduce_hip) instead of

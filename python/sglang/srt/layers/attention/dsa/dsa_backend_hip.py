@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import functools
 from typing import TYPE_CHECKING
 
 import torch
@@ -11,7 +10,6 @@ from sglang.kernels.ops.attention.dsa.sparse_mla_decode_gfx950 import (
     sparse_mla_decode_gfx950,
     supports_sparse_mla_decode_gfx950,
 )
-from sglang.srt.environ import envs
 from sglang.srt.utils import is_gfx95_supported
 
 if TYPE_CHECKING:
@@ -22,10 +20,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-
-@functools.cache
-def _gfx950_decode_enabled() -> bool:
-    return is_gfx95_supported() and envs.SGLANG_ENABLE_ROCM_DSA_OPUS_DECODE.get()
+_is_gfx95 = is_gfx95_supported()
 
 
 def forward_triton_dcp_partial(
@@ -46,7 +41,8 @@ def forward_triton_dcp_partial(
         topk_length = torch.nn.functional.pad(topk_length, (0, pad))
     # Each rank holds about 1/N of the global top-k; bound rows by their share.
     expected_topk = -(-page_table_1.shape[-1] // backend.attn_dcp_size)
-    if _gfx950_decode_enabled() and supports_sparse_mla_decode_gfx950(
+    # gfx950: the MXFP8 opus port instead of Triton split-K for fp8_ds_mla decode
+    if _is_gfx95 and supports_sparse_mla_decode_gfx950(
         q_nope, kv_cache, layer.v_head_dim
     ):
         o, lse = sparse_mla_decode_gfx950(

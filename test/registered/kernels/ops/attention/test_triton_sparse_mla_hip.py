@@ -451,7 +451,7 @@ def test_dcp_partial_reads_the_indexer_local_slots():
     o, lse = dsa_backend_hip.forward_triton_dcp_partial(backend, qn, qr, kv, idx, layer)
     # the slots past each row's count hold -1, so the reference reads only its keys
     o_ref, lse_ref = _decode_reference(
-        qn, qr, idx, kd, sm, mxfp8_q=dsa_backend_hip._gfx950_decode_enabled()
+        qn, qr, idx, kd, sm, mxfp8_q=dsa_backend_hip._is_gfx95
     )
     finite = torch.isfinite(lse_ref)
     assert torch.equal(torch.isfinite(lse), finite)
