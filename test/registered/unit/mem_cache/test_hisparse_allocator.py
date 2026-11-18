@@ -99,9 +99,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
-    def test_free_returns_c4_slots(self):
-        """Freeing a request's logical row must return the C4 HiSparse slots its
-        compressed tokens were mapped to."""
+    def _one_page_request(self):
         from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             DeepSeekV4TokenToKVPool,
@@ -147,12 +145,37 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         slots = allocator.hisparse_attn_allocator.alloc(len(compressed))
         allocator.full_to_hisparse_device_index_mapping[compressed] = slots
 
-        allocator.free(locs)
+        return allocator, locs, compressed, c4_free
 
+    def _assert_c4_slots_returned(self, allocator, compressed, c4_free):
         self.assertEqual(allocator.hisparse_attn_allocator.available_size(), c4_free)
         self.assertFalse(
             allocator.full_to_hisparse_device_index_mapping[compressed].any()
         )
+
+    def test_free_returns_c4_slots(self):
+        """Freeing a request's logical row must return the C4 HiSparse slots its
+        compressed tokens were mapped to."""
+        allocator, locs, compressed, c4_free = self._one_page_request()
+        allocator.free(locs)
+        self._assert_c4_slots_returned(allocator, compressed, c4_free)
+
+    def test_free_full_returns_c4_slots(self):
+        allocator, locs, compressed, c4_free = self._one_page_request()
+        allocator.free_full(locs)
+        self._assert_c4_slots_returned(allocator, compressed, c4_free)
+
+    def test_free_full_segments_returns_c4_slots(self):
+        allocator, locs, compressed, c4_free = self._one_page_request()
+        allocator.free_full_segments([(locs, 0)])
+        self._assert_c4_slots_returned(allocator, compressed, c4_free)
+
+    def test_grouped_free_full_returns_c4_slots(self):
+        allocator, locs, compressed, c4_free = self._one_page_request()
+        allocator.free_group_begin()
+        allocator.free_full(locs)
+        allocator.free_group_end()
+        self._assert_c4_slots_returned(allocator, compressed, c4_free)
 
     def test_forwards_swa_tail_allocation_to_logical_allocator(self):
         allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
