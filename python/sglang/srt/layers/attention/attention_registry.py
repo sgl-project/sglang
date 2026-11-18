@@ -80,6 +80,9 @@ def _create_linear_attention_backend(runner, fallback):
 @register_attention_backend("flashinfer")
 def create_flashinfer_backend(runner):
     if not runner.use_mla_backend:
+        from sglang.srt.beam_search.shared_context_backend import (
+            flashinfer_backend_cls,
+        )
         from sglang.srt.layers.attention.flashinfer_backend import (
             FlashInferAttnBackend,
         )
@@ -91,7 +94,7 @@ def create_flashinfer_backend(runner):
                 or not runner.plan_stream_for_flashinfer
             ):
                 runner.plan_stream_for_flashinfer = torch.cuda.Stream()
-        return FlashInferAttnBackend(
+        return flashinfer_backend_cls(FlashInferAttnBackend)(
             runner, init_new_workspace=runner.init_new_workspace
         )
     else:
@@ -165,9 +168,18 @@ def create_wave_backend(runner):
 
 @register_attention_backend("ascend")
 def create_ascend_backend(runner):
+    from sglang.srt.configs.model_config import get_dsa_index_kpool, is_deepseek_dsa
     from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
         AscendAttnBackend,
     )
+
+    config = runner.model_config.hf_config
+    if is_deepseek_dsa(config) and get_dsa_index_kpool(config) > 1:
+        from sglang.srt.hardware_backend.npu.attention.ascend_dsa_backend import (
+            AscendDSAAttnBackend,
+        )
+
+        return AscendDSAAttnBackend(runner)
 
     return AscendAttnBackend(runner)
 
@@ -238,6 +250,13 @@ def create_dsv4_backend(runner):
             f"Using {type(backend).__name__} for dsv4 attention backend (CUDA)."
         )
         return backend
+
+
+@register_attention_backend("ernie55")
+def create_ernie55_backend(runner):
+    from sglang.srt.layers.attention.ernie55_backend import Ernie5_5AttnBackend
+
+    return Ernie5_5AttnBackend(runner)
 
 
 @register_attention_backend("triton")
@@ -483,7 +502,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         from sglang.srt.utils import (
             is_blackwell,
             is_npu,
-            is_xpu,
         )
 
         if not is_npu():
@@ -496,10 +514,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 flashinfer_gdn_prefill_default,
             )
 
-            if is_xpu():
-                from sglang.srt.hardware_backend.xpu.attention.xpu_gdn_backend import (
-                    XpuGDNAttnBackend as GDNAttnBackend,
-                )
         else:
             from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
                 AscendGDNAttnBackend as GDNAttnBackend,
@@ -614,9 +628,20 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     runner, KDAAttnBackend
                 )
         elif glm5_next_config(runner.model_config) is not None:
-            linear_attn_backend = _create_linear_attention_backend(
-                runner, KDAAttnBackend
-            )
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.attention.ascend_kda_backend import (
+                    AscendKDAAttnBackend,
+                    AscendKDAHybridLinearAttnBackend,
+                )
+
+                linear_attn_backend = _create_linear_attention_backend(
+                    runner, AscendKDAAttnBackend
+                )
+                hybrid_backend_cls = AscendKDAHybridLinearAttnBackend
+            else:
+                linear_attn_backend = _create_linear_attention_backend(
+                    runner, KDAAttnBackend
+                )
         elif hybrid_lightning_config(runner.model_config) is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:

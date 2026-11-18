@@ -22,6 +22,7 @@ class TestDSV4CutedslH16Dispatch(CustomTestCase):
         )
         backend = SimpleNamespace(
             trtllm_attn=False,
+            is_dsv41=False,
             dsv4_prefill_backend="cutedsl_h16",
             forward_metadata=SimpleNamespace(late_layer_tail=None),
         )

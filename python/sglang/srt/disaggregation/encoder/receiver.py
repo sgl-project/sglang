@@ -27,14 +27,23 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import (
+    get_processor,
+    resolve_image_processor_backend,
+)
 from sglang.srt.managers.io_struct import (
     EncoderDispatchErrorReq,
     GenerateReqInput,
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.mem_cache.events import attach_mm_routing_labels
 from sglang.srt.multimodal.cache import media_preprocess_kwargs
+from sglang.srt.multimodal.media_io import ImageData, VideoData
 from sglang.srt.multimodal.modality import Modality
+from sglang.srt.multimodal.token_space_mm_process.registry import (
+    register_token_space_models,
+)
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
 from sglang.srt.runtime_context import (
@@ -47,17 +56,12 @@ from sglang.srt.runtime_context import (
     get_serving,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import ImageData, VideoData
-from sglang.srt.utils.common import safe_pickle_loads
-from sglang.srt.utils.hf_transformers import (
-    get_processor,
-    resolve_image_processor_backend,
-)
 from sglang.srt.utils.network import (
     NetworkAddress,
     get_local_ip_auto,
     get_zmq_socket_on_host,
 )
+from sglang.srt.utils.serialization import safe_pickle_loads
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +124,6 @@ class EncoderBootstrapServer:
         health_check_timeout: Optional[float] = None,
         evicted_ttl: Optional[float] = None,
     ):
-
         self.host = host
         self.port = port
         self._urls: List[str] = urls if urls is not None else []
@@ -331,7 +334,6 @@ class EncoderBootstrapServer:
     # Lifecycle                                                          #
     # ------------------------------------------------------------------ #
     def _run_server(self):
-
         config = uvicorn.Config(
             self.app,
             host=self.host,
@@ -379,14 +381,15 @@ def _normalize_embedding_ports(embedding_port):
 
 async def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count):
     import grpc
-    from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
+
+    from sglang.encoder.v1 import encoder_pb2, encoder_pb2_grpc
 
     timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
     channel = grpc.aio.insecure_channel(target)
-    stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
+    stub = encoder_pb2_grpc.SglangEncoderStub(channel)
     try:
         await stub.SchedulerReceiveUrl(
-            sglang_encoder_pb2.SchedulerReceiveUrlRequest(
+            encoder_pb2.SchedulerReceiveUrlRequest(
                 req_id=req_id,
                 receive_url=receive_url,
                 receive_count=receive_count,
@@ -399,14 +402,15 @@ async def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count
 
 def _grpc_encode_request(target, encode_request):
     import grpc
-    from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
+
+    from sglang.encoder.v1 import encoder_pb2, encoder_pb2_grpc
 
     timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
     channel = grpc.insecure_channel(target)
-    stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
+    stub = encoder_pb2_grpc.SglangEncoderStub(channel)
     try:
         response = stub.Encode(
-            sglang_encoder_pb2.EncodeRequest(
+            encoder_pb2.EncodeRequest(
                 mm_items=encode_request["mm_items"],
                 req_id=encode_request["req_id"],
                 num_parts=encode_request["num_parts"],
@@ -1077,6 +1081,10 @@ class WaitingMMRequestBase(ABC):
             recv_embedding,
             **self.recv_embedding_data.get_mm_extra_meta(),
         )
+        attach_mm_routing_labels(
+            mm_inputs.mm_items,
+            self.recv_req.mm_routing_labels,
+        )
         self._bind_pool_slot_to_mm_inputs(mm_inputs)
         self.recv_req.mm_inputs = mm_inputs
         self.recv_req.input_ids = array("q", mm_inputs.input_ids)
@@ -1312,7 +1320,9 @@ class WaitingZmqRequestGrpc(WaitingZmqRequest):
                 if assigned_num == 0:
                     continue
                 encoder_url = self.encoder_urls[idx]
-                receive_url = f"{host_name}:{embedding_port}"
+                receive_url = NetworkAddress(
+                    host_name, embedding_port
+                ).to_host_port_str()
                 target_url = f"{encoder_url}/SchedulerReceiveUrl"
                 logger.info(f"Preparing to send to {target_url}")
                 tasks.append(
@@ -2002,6 +2012,7 @@ class MMReceiverBase(ABC):
         """Load processor and initialize mm_processor, shared by all backends."""
         transport_mode = determine_tensor_transport_mode()
         import_processors("sglang.srt.multimodal.processors")
+        register_token_space_models()
 
         extra_kwargs = {}
         if get_serving().tokenizer_backend is not None:
@@ -2422,7 +2433,10 @@ class MMReceiverBase(ABC):
             # Per-request sockets receive here; shared-socket requests use this
             # tick to retry pool staging after _drain_scheduler_embeddings().
             waiting_req._try_recv_mm_data()
-            if current_time - waiting_req.start_time > self.wait_timeout:
+            if (
+                waiting_req.status == WaitingMMRequestStatus.PENDING
+                and current_time - waiting_req.start_time > self.wait_timeout
+            ):
                 waiting_req.status = WaitingMMRequestStatus.TIMEOUT
                 waiting_req.release_resources()
                 waiting_req.close_recv_socket()

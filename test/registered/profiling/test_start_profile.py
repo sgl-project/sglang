@@ -23,16 +23,19 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
+    ADMIN_HEADERS_FOR_TEST,
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    admin_post,
     is_rust_server_built,
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=115, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=115, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=120, suite="base-b-test-1-gpu-small-amd")
 
 OUTPUT_DIR = "./profiler_dir"
 
@@ -62,6 +65,7 @@ class TestStartProfile(CustomTestCase):
         # server. These tests cover the /start_profile request surface rather
         # than graph replay, so run them eagerly on HIP.
         other_args = ["--disable-cuda-graph"] if is_hip() else []
+        other_args += ADMIN_LAUNCH_ARGS_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -95,7 +99,7 @@ class TestStartProfile(CustomTestCase):
         self._check_empty_profile_dir()
 
         # Post /stop_profile and check the profile directory is non-empty
-        response = requests.post(
+        response = admin_post(
             f"{DEFAULT_URL_FOR_TEST}/stop_profile",
         )
         self._check_non_empty_profile_dir()
@@ -113,17 +117,19 @@ class TestStartProfile(CustomTestCase):
         a profile runs, are refused with the scheduler's error surfaced as a
         bare 500; the running profile is unaffected and stops normally. Runs
         after test_start_profile_3, whose num_steps profile stopped itself."""
-        self._assert_refused(requests.post(f"{DEFAULT_URL_FOR_TEST}/stop_profile"))
+        self._assert_refused(admin_post(f"{DEFAULT_URL_FOR_TEST}/stop_profile"))
 
         self._start_profile()
         self._assert_refused(
-            requests.post(
+            admin_post(
                 f"{DEFAULT_URL_FOR_TEST}/start_profile",
                 json={"start_step": "1", "num_steps": 1},
             )
         )
         self._post_request()
-        response = requests.get(f"{DEFAULT_URL_FOR_TEST}/stop_profile")
+        response = requests.get(
+            f"{DEFAULT_URL_FOR_TEST}/stop_profile", headers=ADMIN_HEADERS_FOR_TEST
+        )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.text, "Stop profiling. This will take some time.\n")
         self._check_non_empty_profile_dir()
@@ -134,7 +140,7 @@ class TestStartProfile(CustomTestCase):
 
     def _start_profile(self, **kwargs):
         """Start profiling with optional parameters."""
-        response = requests.post(
+        response = admin_post(
             f"{DEFAULT_URL_FOR_TEST}/start_profile",
             json=kwargs if kwargs else None,
         )
@@ -291,6 +297,7 @@ class TestStartProfileWithNsys(CustomTestCase):
             host,
             "--port",
             port,
+            *ADMIN_LAUNCH_ARGS_FOR_TEST,
         ]
 
         # Create output directory if it doesn't exist
@@ -370,7 +377,7 @@ class TestStartProfileWithNsys(CustomTestCase):
 
     def _start_profile(self, **kwargs):
         """Start profiling with optional parameters."""
-        response = requests.post(
+        response = admin_post(
             f"{self.base_url}/start_profile",
             json=kwargs if kwargs else None,
         )

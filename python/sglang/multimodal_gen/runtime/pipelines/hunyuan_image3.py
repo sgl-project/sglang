@@ -111,8 +111,10 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         pipeline_config.vae_config.update_model_arch(vae_config_dict)
         pipeline_config.vae_config.post_init()
 
-        flow_shift = self._read_flow_shift(model_path)
-        pipeline_config.flow_shift = flow_shift
+        # an explicit --flow-shift outranks the checkpoint's generation default
+        if pipeline_config.flow_shift is None:
+            pipeline_config.flow_shift = self._read_flow_shift(model_path)
+        flow_shift = pipeline_config.flow_shift
 
         ar_model = self._load_ar_model(
             server_args, pipeline_config, model_path, config_dict

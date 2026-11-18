@@ -13,8 +13,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=207, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-large-amd")
+register_cuda_ci(est_time=207, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=200, suite="base-b-test-1-gpu-large-amd")
 
 
 class TestAWQ(CustomTestCase):
