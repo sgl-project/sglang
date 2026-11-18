@@ -239,11 +239,10 @@ def _split_hicache_size(
 
 
 def _split_hicache_size_with_mamba(
-    kv_pools: tuple[Any, ...], mamba_pools: tuple[Any, ...]
+    *, kv_pools: tuple[Any, ...], mamba_pools: tuple[Any, ...]
 ) -> tuple[float, ...]:
-    """--hicache-size shares for each KV pool, then one for the Mamba host pool,
-    which packs every pool in mamba_pools. --hicache-mamba-size pins the Mamba
-    share; otherwise every pool's share follows its device bytes."""
+    # One share per KV pool, then one Mamba host share that covers every pool
+    # in mamba_pools, since the Mamba host pool packs them into each slot.
     hicache_size = get_memory().hicache_size
     mamba_size = get_memory().hicache_mamba_size
     if mamba_size == 0:

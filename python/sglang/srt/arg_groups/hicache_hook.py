@@ -13,7 +13,6 @@ logger = logging.getLogger(__name__)
 
 
 def validate_hicache_mamba_size(server_args: Any):
-    """--hicache-mamba-size: a share of --hicache-size for the host Mamba pool."""
     cfg = resolving_view(server_args)
     size = cfg.hicache_mamba_size
     if size == 0:

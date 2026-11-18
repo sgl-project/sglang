@@ -525,8 +525,7 @@ def build_kv_cache(
         tp_rank=parallel.tp_rank,
         tp_group=parallel.tp_group,
     )
-    if enable_hierarchical_cache:
-        _warn_unused_hicache_mamba_size(is_hybrid_ssm=is_hybrid_ssm)
+    _warn_unused_hicache_mamba_size(is_hybrid_ssm=is_hybrid_ssm)
     with auto_size_hicache(
         params,
         hicache_draft_plan,
