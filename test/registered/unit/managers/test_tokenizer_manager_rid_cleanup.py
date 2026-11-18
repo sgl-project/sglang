@@ -1839,6 +1839,73 @@ class TestChatDisconnectAbort(CustomTestCase):
         self.assertEqual([m.rid for m in sent], [state.obj.rid])
         self.assertTrue(state.abort_sent)
 
+    def _make_streaming_state(self, tm, rid):
+        state = _make_req_state(rid)
+        state.obj.stream = True
+        state.obj.background = False
+        state.dispatched = True
+        tm.rid_to_state[rid] = state
+        return state
+
+    @staticmethod
+    async def _next_chunk(stream, state, i):
+        state.out_list.append({"text": f"token{i}", "meta_info": {}})
+        state.event.set()
+        return await anext(stream)
+
+    def test_stream_polls_disconnect_once_per_wait_timeout(self):
+        """A stream must not poll is_disconnected() for every output.
+
+        Each poll costs an event-loop pass; polling per output cut 8k/1k
+        concurrency-256 streaming throughput by 10-25%.
+        """
+        tm = _make_tokenizer_manager(self)
+        state = self._make_streaming_state(tm, "stream_poll_rid")
+        request = Mock()
+        request.is_disconnected = AsyncMock(return_value=False)
+
+        async def drive():
+            stream = tm._stream_one_response(
+                obj=state.obj, state=state, request=request
+            )
+            for i in range(8):
+                await self._next_chunk(stream, state, i)
+            await stream.aclose()
+
+        with patch(
+            "sglang.srt.managers.tokenizer_manager._REQUEST_STATE_WAIT_TIMEOUT", 3600
+        ):
+            asyncio.run(drive())
+        request.is_disconnected.assert_awaited_once()
+
+    def test_stream_polls_again_once_wait_timeout_elapses(self):
+        """A stream that keeps producing outputs still aborts when a later
+        poll finds its client gone."""
+        tm = _make_tokenizer_manager(self)
+        tm._dispatch_to_scheduler = Mock()
+        tm.server_args.tokenizer_worker_num = 1
+        state = self._make_streaming_state(tm, "stream_repoll_rid")
+        request = Mock()
+        request.is_disconnected = AsyncMock(side_effect=[False, True])
+
+        async def drive():
+            stream = tm._stream_one_response(
+                obj=state.obj, state=state, request=request
+            )
+            await self._next_chunk(stream, state, 0)
+            await asyncio.sleep(0.01)
+            await self._next_chunk(stream, state, 1)
+
+        with patch(
+            "sglang.srt.managers.tokenizer_manager._REQUEST_STATE_WAIT_TIMEOUT", 0.001
+        ):
+            with self.assertRaisesRegex(ValueError, "type 3"):
+                asyncio.run(drive())
+        self.assertEqual(request.is_disconnected.await_count, 2)
+        sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
+        self.assertEqual([m.rid for m in sent], [state.obj.rid])
+        self.assertTrue(state.abort_sent)
+
 
 class TestChatStreamDisconnect(CustomTestCase):
     """A /v1/chat/completions stream that loses its client must stop its own

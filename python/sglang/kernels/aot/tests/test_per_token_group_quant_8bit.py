@@ -179,5 +179,15 @@ def test_per_token_group_quant_with_column_major(
         raise
 
 
+def test_int8_oracle_rejects_magnitude_error():
+    """The int8 comparison must fail when the two quantized outputs differ by 2 or more."""
+    a = torch.tensor([10, -20, 30, 127], dtype=torch.int8)
+    absmax_step = torch.tensor([10, -20, 30, 126], dtype=torch.int8)
+    assert_all_close_or_tiny_diff(a, absmax_step)
+    magnitude_error = torch.tensor([10, -20, 35, 127], dtype=torch.int8)
+    with pytest.raises(AssertionError):
+        assert_all_close_or_tiny_diff(a, magnitude_error)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

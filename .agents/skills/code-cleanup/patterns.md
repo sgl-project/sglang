@@ -301,11 +301,13 @@ Examples: #34492, #24884 / #25317 / #25406, #48399.
 `arg_groups/argparse_actions.py` documents five shapes: `DeprecatedAction`
 (`error_message=` stops the launch), `DeprecatedStoreTrueAction`,
 `DeprecatedStoreConstAction` and `DeprecatedAliasStoreAction` (`new_flag=`), and
-`DeprecatedChoiceToFlagAction` (`flags={value: (dest, new_flag)}`). Choice values are aliased
-in `handle_deprecated_args` and stay in `choices`: `tokenspeed_mla` becomes `cutedsl_mla` and
-also forces the FP8 KV, prefill backend and verify mode the old backend implied (#44803).
-`--dp-size N --enable-dp-attention` becomes `attn_dp_size=N, dp_size=1`, and passing both
-spellings raises (#41818). #5005 mapped a flag to a choice value that was already the
+`DeprecatedChoiceToFlagAction` (`flags={value: (dest, new_flag)}`). While deprecated, choice
+values were aliased in `handle_deprecated_args` and stayed in `choices`: `tokenspeed_mla`
+became `cutedsl_mla` and also forced the FP8 KV, prefill backend and verify mode the old
+backend implied (#44803). `--dp-size N --enable-dp-attention` became `attn_dp_size=N,
+dp_size=1`, and passing both spellings raised (#41818). Once removed, a flag stays registered
+in `server_args.REMOVED_FLAGS` (a `DeprecatedAction` with `error_message=`), and a choice value
+moves to `choices.REMOVED_CHOICES`; both stop the launch naming the replacement. #5005 mapped a flag to a choice value that was already the
 default, so every MLA model switched backend; reverted (#5048), re-landed with an MLA-aware
 default (#5052).
 Spot: entries deleted from `choices`; an `add_argument` removed with no deprecation action;
@@ -329,7 +331,8 @@ Spot: `*WithAlias(`, `deprecated_name=`, `_DEPRECATED_ENVS`, `Deprecated*Action`
 `FutureWarning` shims, dated `TODO: remove ... after <date>`. The warning must be visible
 (`logger.warning`, `UserWarning`, `FutureWarning`): `DeprecationWarning` from library code is
 filtered by default. An env var replaced by a flag keeps a `_DEPRECATED_ENVS` note naming
-the flag (#35060).
+the flag (#35060). Once removed, an env var moves to `environ.REMOVED_ENVS`, which stops
+server startup while it is still set.
 Not this pattern: internal names need no alias; #25821's internal re-export shims only
 became cleanup work for #40795 and #47990. A path a pinned out-of-tree plugin imports is
 user-facing (#46625). External protocol surfaces are a separate decision. The repo has no
@@ -338,9 +341,9 @@ follows.
 Examples: #40795, #13273, #38375, #47990, #29108, #13607 / #14533.
 
 **C6. A deprecated spelling is translated once, at one seam before any reader, and a test pins that it resolves to exactly the new configuration through every entry point.**
-`handle_deprecated_dp_attention` runs before any handler reads the DP layout, and a test
-checks the old spelling resolves like `--attn-dp-size`, the single warning and the rejected
-combinations (#41818). The `tokenspeed_mla` alias resolves in one place, so downstream
+`handle_deprecated_dp_attention` ran before any handler read the DP layout, and a test
+checked the old spelling resolved like `--attn-dp-size`, the single warning and the rejected
+combinations (#41818). The `tokenspeed_mla` alias resolved in one place, so downstream
 overrides lost their branch for it (#44803). #35060 folded four env deprecation mechanisms
 into `_DEPRECATED_ENVS` with `transform=`, and found an old mapping that copied a `DISABLE`
 value into an `ENABLE` name without inverting it. #45389 found a `--config` YAML rejected the
@@ -769,5 +772,5 @@ inactivity bot with work left (G9); treat them as stalled, with their rules stil
   into `moe_runner/<backend>.py`; several methods have not moved.
 - NPU (#46487), platform capabilities and the `is_cuda_alike` audit (#42173),
   parallelism-independent model code (#47170), the Rust frontend (#23206, #45816, #40920).
-- Monokernels (#43949): `--monokernel-backend` is a deprecated alias of the per-vendor flags
-  (#45389); keep the alias.
+- Monokernels (#43949): `--monokernel-backend` was a deprecated alias of the per-vendor flags
+  (#45389), removed in SGLang 1.0.

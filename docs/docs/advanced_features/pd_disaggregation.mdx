@@ -82,13 +82,7 @@ When you need to profile prefill or decode workers in PD disaggregation mode, pl
 
 For deploying PD disaggregation at scale with load balancing and fault tolerance, SGLang provides a router. The router can distribute requests between prefill and decode instances using various routing policies.
 
-The router is the `sgl-router` binary. It is pre-installed on the `PATH` of the SGLang Docker images; if you installed SGLang from source, build it from the `sgl-router` directory of the SGLang repository (this needs a Rust toolchain, e.g., from [rustup](https://rustup.rs)) and put it on your `PATH`:
-
-```bash Command
-cd sgl-router
-cargo build --release --bin sgl-router
-cp target/release/sgl-router /usr/local/bin/
-```
+The router is the `sgl-router` binary. It is pre-installed on the `PATH` of the SGLang Docker images; otherwise install it with `pip install sgl-router`, or see [installing sgl-router](/docs/advanced_features/dp_dpa_router_guide#quick-start-for-sgl-router) for the container image and building from source.
 
 Launch it in front of the prefill and decode servers:
 
@@ -690,7 +684,7 @@ python3 -m sglang.launch_server \
         --disaggregation-bootstrap-port 8996 \
         --base-gpu-id 0 \
         --disable-radix-cache \
-        --disable-cuda-graph \
+        --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --moe-a2a-backend deepep --deepep-mode normal \
         # 2>&1 | tee $SGLANG_LOG_PATH
 ```

@@ -68,7 +68,7 @@ from sglang.test.test_utils import enter_override, enter_scope
 register_cpu_ci(2.0, "base-a-test-cpu")
 
 
-register_cpu_ci(est_time=5, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=5, suite="extra-test-cpu-intel")
 
 
 def _make_scheduler(grammar_backend_name="none", skip_tokenizer=False):

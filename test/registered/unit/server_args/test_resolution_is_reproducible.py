@@ -131,8 +131,7 @@ _SHAPES = (
             speculative_num_draft_tokens=3,
         ),
     ),
-    # The multimodal transport handler is the one that writes
-    # SGLANG_USE_CUDA_IPC_TRANSPORT and reads `is_set()` on the way in, so the
+    # The multimodal transport handler auto-selects the transport, so the
     # shape that exercises it belongs in the dual-resolve matrix.
     ("multimodal", _MULTIMODAL_MINI_CONFIG, {}),
     # device="cpu" is the one device every host can resolve, and it is what
@@ -155,10 +154,7 @@ if torch.cuda.is_available():
 # Since #34662 made cuda_ipc opt-in, no auto-resolution reaches the handler's
 # cuda_ipc arm any more -- an explicit request is the only way in, so without
 # this shape that arm (two raises and the pool-budget logging) is resolved by
-# nothing in this file. It is also the only shape whose env write differs from
-# what the *next* resolution would pick on its own, which is what keeps the
-# sticky-carry assertion in `test_a_resolution_does_not_leak_into_the_next`
-# from being vacuous. Gated on `is_cuda()` rather than
+# nothing in this file. Gated on `is_cuda()` rather than
 # `torch.cuda.is_available()`: the handler raises for cuda_ipc off NVIDIA CUDA,
 # ROCm included.
 _CUDA_IPC_SHAPES = ()
@@ -172,16 +168,6 @@ if is_cuda():
     )
     _SHAPES = _SHAPES + _CUDA_IPC_SHAPES
 
-# The one field a previous resolution genuinely dictates for the next one in
-# this process: `_handle_multimodal_feature_transport` writes
-# SGLANG_USE_CUDA_IPC_TRANSPORT so tokenizer workers inherit the decision, and
-# the next resolution reads `is_set()` and adopts it -- even for a text-only
-# model, and even across Engines. That is main's behaviour (reproduced on the
-# stack's base commit), it is inert for a text model, and pinning it here is
-# deliberate: the assertion below states the exception explicitly so a *new*
-# sticky field fails this case instead of hiding behind it.
-_STICKY_ACROSS_RESOLUTIONS = frozenset({"mm_feature_transport"})
-
 # `random_seed` is pinned by `_resolved` so it would compare equal anyway; it
 # stays listed because a case that stops pinning it must not silently start
 # comparing a value resolution randomizes.
@@ -189,12 +175,8 @@ _NOT_COMPARABLE = frozenset({"random_seed"})
 
 
 class _RestoresProcessState:
-    """Resolution leaves process state behind, so a case that resolves has to
-    put it back. `_handle_multimodal_feature_transport` sets
-    `SGLANG_USE_CUDA_IPC_TRANSPORT` and the same handler reads `is_set()` on the
-    way in, so one resolution is visible to the next one in this process -- and
-    `TestMultimodalFeatureTransport` is the case that notices.
-    """
+    """Resolution may leave process state behind, so a case that resolves
+    has to put it back."""
 
     def _process_state(self):
         """What a resolution may leave behind: the environment and the
@@ -220,13 +202,9 @@ class _RestoresProcessState:
             getattr(type(envs), name)._set_to_none = was_none
 
     def setUp(self):
-        # Resolution writes process state on the way through --
-        # `_handle_multimodal_feature_transport` sets SGLANG_USE_CUDA_IPC_TRANSPORT
-        # so tokenizer workers inherit the decision, and the same handler reads
-        # `is_set()` on the way in. One resolution is therefore visible to the
-        # next one in this process. These cases restore what they touched, and
-        # it is a standing caveat on the determinism pinned here: the guarantee
-        # holds per raw input *and* the process state a previous resolution left.
+        # Resolution can write process state on the way through, which would
+        # make one resolution visible to the next one in this process. These
+        # cases restore what they touched.
         self._pristine_state = self._process_state()
         self.addCleanup(self._restore_process_state, self._pristine_state)
 
@@ -322,21 +300,16 @@ class TestResolutionIsReproducible(_RestoresProcessState, CustomTestCase):
         )
 
         # A backend probe only diverges on the kernel fields. The shapes whose
-        # handlers write process state on the way through -- the multimodal
-        # transport one sets SGLANG_USE_CUDA_IPC_TRANSPORT and reads `is_set()`
-        # on the way in, DSA fans out the furthest -- are the ones that can
-        # leave something the *next* default reads, so each gets its own turn as
-        # the intermediate. Whether those writes actually fire is
+        # handlers branch on the most state -- the multimodal transport one,
+        # DSA fans out the furthest -- are the ones that could leave something
+        # the *next* default reads, so each gets its own turn as the
+        # intermediate. Whether those writes actually fire is
         # device-dependent, which is why this case is registered on the GPU
         # runners as well as CPU.
         intermediates = (
             ("multimodal", _MULTIMODAL_MINI_CONFIG, {}),
             ("torch_compile", _MINI_CONFIG, dict(enable_torch_compile=True)),
         )
-        # Auto-resolution picks cpu on every runner this case runs on now that
-        # cuda_ipc is opt-in, so the auto shape above writes what the next
-        # resolution would have picked anyway; the explicit shape is what makes
-        # the carry observable at all.
         intermediates += _CUDA_IPC_SHAPES
         if torch.cuda.is_available():
             # Same device gate as _SHAPES: the DSA arm probes the device
@@ -344,51 +317,13 @@ class TestResolutionIsReproducible(_RestoresProcessState, CustomTestCase):
             intermediates += (("deepseek_dsa", _DEEPSEEK_MINI_CONFIG, {}),)
         for label, config, kwargs in intermediates:
             with self.subTest(intermediate=label):
-                # Each intermediate starts from the pristine process, for two
-                # reasons: it must not inherit what the previous iteration left,
-                # and the handlers under test branch on *unset* state -- the
-                # multimodal one auto-selects the transport only when
-                # SGLANG_USE_CUDA_IPC_TRANSPORT is not set, and any earlier
-                # resolution in this process has already set it. `default_before`
-                # is the control precisely because it was taken on this state.
+                # Each intermediate starts from the pristine process: it must
+                # not inherit what the previous iteration left.
                 self._restore_process_state(self._pristine_state)
-                # The auto-selection branch under test requires the legacy
-                # variable UNSET; a runner that exports it (a supported
-                # deployment setting) would otherwise pin every resolution to
-                # its value and this subtest would assert the environment
-                # rather than the handler. `_STICKY_ACROSS_RESOLUTIONS`
-                # already excludes the affected field from the equality
-                # against `default_before`, so clearing it here does not skew
-                # that comparison.
-                envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
-                intermediate = self._resolved(self._config_dir(config), **kwargs)
+                self._resolved(self._config_dir(config), **kwargs)
                 after = self._resolved(model_path)
-                without_sticky = lambda snapshot: {
-                    k: v
-                    for k, v in snapshot.items()
-                    if k not in _STICKY_ACROSS_RESOLUTIONS
-                }
                 self.assertEqual(
-                    without_sticky(self._comparable(after)),
-                    without_sticky(self._comparable(default_before)),
-                )
-                # And the documented exception, asserted rather than assumed,
-                # for every intermediate: each one runs the transport handler,
-                # so each one writes the variable the next resolution reads.
-                # What carries is the legacy *boolean*, not the tri-state field
-                # -- the handler writes 1 only for cuda_ipc -- so every other
-                # selection comes back as cpu, which is what keeps this honest
-                # if a cuda_vmm shape is ever added (its carry is cpu, not
-                # cuda_vmm). The `cuda_ipc` shape is the one whose carry
-                # differs from the cpu that `default_before` resolved to.
-                expected = (
-                    "cuda_ipc"
-                    if resolution_result(intermediate, "mm_feature_transport")
-                    == "cuda_ipc"
-                    else "cpu"
-                )
-                self.assertEqual(
-                    resolution_result(after, "mm_feature_transport"), expected
+                    self._comparable(after), self._comparable(default_before)
                 )
 
     def test_resolving_a_sibling_leaves_the_first_alone(self):

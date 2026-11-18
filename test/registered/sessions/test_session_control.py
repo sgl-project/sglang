@@ -45,7 +45,8 @@ class TestSessionControl(CustomTestCase):
             other_args=[
                 "--attention-backend",
                 "triton",
-                "--disable-cuda-graph",
+                "--disable-decode-cuda-graph",
+                "--disable-prefill-cuda-graph",
                 "--cuda-graph-backend-prefill=disabled",
             ],
         )

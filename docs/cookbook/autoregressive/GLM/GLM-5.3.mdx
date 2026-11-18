@@ -353,7 +353,7 @@ Here is how you can calculate it:
 
 ### 3.2 Tool Calling
 
-Generated commands enable `--tool-call-parser auto` by default, so structured calls are returned in `message.tool_calls` with `finish_reason: "tool_calls"`. `auto` resolves to **`glm47`** for GLM-5.3: the model emits the newer `<tool_call>…<arg_key>…<arg_value>…` format, which the older `glm45` parser does not parse (the call would be left as raw text in `content`). Running with no tool-call parser fails the same way, and `finish_reason` stays `"stop"`, so an agent loop never sees the call. You can disable **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground) when tool calling is not needed. On thinking mode the turn also fills `reasoning_content`, so print both fields.
+Generated commands enable `--tool-call-parser auto` by default, so structured calls are returned in `message.tool_calls` with `finish_reason: "tool_calls"`. `auto` resolves to **`glm47`** for GLM-5.3: the model emits the newer `<tool_call>…<arg_key>…<arg_value>…` format, which the older `glm` parser does not parse (the call would be left as raw text in `content`). Running with no tool-call parser fails the same way, and `finish_reason` stays `"stop"`, so an agent loop never sees the call. You can disable **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground) when tool calling is not needed. On thinking mode the turn also fills `reasoning_content`, so print both fields.
 
 <Accordion title="Tool Calling Example (Python)">
 

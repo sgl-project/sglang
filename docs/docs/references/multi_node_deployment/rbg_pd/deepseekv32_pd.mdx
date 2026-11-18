@@ -155,7 +155,7 @@ spec:
                   value: "5"
                 - name: SGLANG_SET_CPU_AFFINITY
                   value: "true"
-                - name: SGL_ENABLE_JIT_DEEPGEMM
+                - name: SGLANG_ENABLE_JIT_DEEPGEMM
                   value: "1"
                 - name:  NCCL_IB_QPS_PER_CONNECTION
                   value: "8"
@@ -445,7 +445,7 @@ spec:
                   value: ^=mlx5_0,mlx5_5,mlx5_6
                 - name: MC_TE_METRIC
                   value: "false"
-                - name: SGL_ENABLE_JIT_DEEPGEMM
+                - name: SGLANG_ENABLE_JIT_DEEPGEMM
                   value: "1"
             dnsPolicy: ClusterFirstWithHostNet
             hostIPC: true

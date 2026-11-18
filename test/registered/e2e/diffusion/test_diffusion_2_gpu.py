@@ -4,8 +4,8 @@ from sglang.test.ci.diffusion_suite_bridge import run_diffusion_suite
 # ci-cost-override: compatibility bridge preserves the existing diffusion lane.
 register_cuda_ci(
     est_time=14400,
-    stage="base-b",
-    runner_config="diffusion-2-gpu-h100",
+    stage="base-b-diffusion",
+    runner_config="2-gpu-large",
 )
 
 

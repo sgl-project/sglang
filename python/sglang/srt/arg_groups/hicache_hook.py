@@ -59,6 +59,16 @@ def handle_hicache(server_args: Any):
                 "--enable-unified-cache-external-linker does not use "
                 "--hicache-storage-backend."
             )
+        if (
+            config is None
+            and cfg.hicache_storage_backend_extra_config
+            and cfg.unified_cache_external_linker_backend in ("mooncake", "mori")
+        ):
+            raise ValueError(
+                "--hicache-storage-backend-extra-config as the external linker "
+                "config was removed in SGLang 1.0; pass the same options as a "
+                "JSON object to --unified-cache-external-linker-config."
+            )
         return
 
     # Skip all normalization when neither hicache nor decode-offload path is active.

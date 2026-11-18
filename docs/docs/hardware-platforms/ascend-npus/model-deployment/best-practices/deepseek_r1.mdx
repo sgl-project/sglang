@@ -10,10 +10,7 @@ This page focuses on optimal configuration and benchmark results for DeepSeek-R1
 On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
 </Note>
 
-<Warning>
-{/* NOTE(agent): The image version and scripts in this file are frozen (validated best practice). Skip this file in batch image-version updates and when deprecating or renaming parameters/flags. */}
-The optimal configurations on this page are validated with the image `quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3`. Use exactly this version; later versions are not covered by this page and may introduce breaking changes.
-</Warning>
+The configurations on this page use the daily build image `quay.io/ascend/sglang:main-cann9.1.0-a3`.
 
 ### Low Latency
 
@@ -130,7 +127,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --enable-dp-attention --dp-size 8 \
+        --attn-dp-size 8 \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --reasoning-parser deepseek-r1 \
@@ -164,7 +161,7 @@ do
         --port 8001 \
         --nnodes 1 \
         --tp-size 16 \
-        --enable-dp-attention --dp-size 16 \
+        --attn-dp-size 16 \
         --mem-fraction-static 0.9 \
         --max-running-requests 416 \
         --quantization modelslim \
@@ -282,12 +279,12 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=72
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_NPU_USE_MLAPO=1
-export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
-export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_USE_FIA_NZ=1
 export STREAMS_PER_DEVICE=32
 
 python3 -m sglang.launch_server \
+    --enable-prefill-delayer \
+    --prefill-delayer-max-delay-passes 200 \
     --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 6688 \
     --tp-size 16 \
@@ -305,7 +302,7 @@ python3 -m sglang.launch_server \
     --max-prefill-tokens 3000 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
-    --enable-dp-attention --dp-size 16 \
+    --attn-dp-size 16 \
     --enable-dp-lm-head \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
@@ -432,7 +429,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --enable-dp-attention --dp-size 2 \
+        --attn-dp-size 2 \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
@@ -469,7 +466,7 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
-        --enable-dp-attention --dp-size 16 \
+        --attn-dp-size 16 \
         --mem-fraction-static 0.75 \
         --max-running-requests 32 \
         --quantization modelslim \
@@ -636,7 +633,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --enable-dp-attention --dp-size 4 \
+        --attn-dp-size 4 \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
@@ -674,7 +671,7 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
-        --enable-dp-attention --dp-size 32 \
+        --attn-dp-size 32 \
         --mem-fraction-static 0.82 \
         --max-running-requests 1024 \
         --quantization modelslim \
@@ -836,7 +833,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --enable-dp-attention --dp-size 2 \
+        --attn-dp-size 2 \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
@@ -873,7 +870,7 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
-        --enable-dp-attention --dp-size 16 \
+        --attn-dp-size 16 \
         --mem-fraction-static 0.75 \
         --max-running-requests 32 \
         --quantization modelslim \
@@ -1036,7 +1033,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --enable-dp-attention --dp-size 2 \
+        --attn-dp-size 2 \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
@@ -1073,7 +1070,7 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
-        --enable-dp-attention --dp-size 16 \
+        --attn-dp-size 16 \
         --mem-fraction-static 0.75 \
         --max-running-requests 32 \
         --quantization modelslim \
@@ -1235,7 +1232,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --enable-dp-attention --dp-size 2 \
+        --attn-dp-size 2 \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
@@ -1272,7 +1269,7 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
-        --enable-dp-attention --dp-size 8 \
+        --attn-dp-size 8 \
         --mem-fraction-static 0.75 \
         --max-running-requests 32 \
         --quantization modelslim \

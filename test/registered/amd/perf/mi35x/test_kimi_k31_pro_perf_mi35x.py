@@ -10,7 +10,7 @@ checkpoint is already in the container cache, the job takes one 8-GPU MI35x
 slot instead of two, and a failed eval fails the job before throughput is
 measured.
 
-Registry: nightly-perf-8-gpu-mi35x-kimi-k31-pro suite
+Registry: nightly-perf-test-8-gpu-amd-mi35x-kimi-k31-pro suite
 """
 
 import os
@@ -24,7 +24,7 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 # Register for AMD CI - Kimi K3.1 Pro perf benchmark on MI35x (313 s on rocm10
 # with the checkpoint cached by the accuracy step that runs first)
 register_amd_ci(
-    est_time=600, suite="nightly-perf-8-gpu-mi35x-kimi-k31-pro", nightly=True
+    est_time=600, suite="nightly-perf-test-8-gpu-amd-mi35x-kimi-k31-pro", nightly=True
 )
 
 KIMI_K31_MODEL_PATH = os.environ.get("KIMI_K31_MODEL_PATH", "moonshotai/Kimi-K3.1-Pro")

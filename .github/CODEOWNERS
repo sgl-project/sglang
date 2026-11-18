@@ -63,6 +63,7 @@
 /python/sglang/srt/mem_cache/rust_tree_core @Jialin @hzh0425 @xiezhq-hermann @ispobock @alphabetc1
 /python/sglang/srt/mem_cache/storage/mooncake_store @huangtingwei9988 @stmatengss
 /python/sglang/srt/mem_cache/storage/nixl @iyastreb @ovidiusm @lluki
+/python/sglang/srt/mem_cache/storage/umbp @TianDi101 @Duyi-Wang
 /python/sglang/srt/mem_cache/embedding_*.py @liusy58
 /python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_embedding_store.py @liusy58
 /python/sglang/srt/model_executor @merrymercy @Ying1123 @hnyls2002 @Fridge003 @ispobock
@@ -78,7 +79,7 @@
 /python/sglang/srt/ray @Qiaolin-Yu @xyuzh
 /python/sglang/srt/speculative @Ying1123 @merrymercy @hnyls2002 @Qiaolin-Yu
 /python/sglang/srt/hf_transformers @JustinTong0323
-/python/sglang/srt/weight_cache @liusy58 @QiuMike @alexnails
+/python/sglang/srt/weight_cache @liusy58 @QiuMike @alexnails @Shunkangz
 /python/sglang/kernels/aot @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
 /python/sglang/kernels/aot/csrc/musa @yeahdongcn
 /rust/sglang-grpc @alexnails @ishandhanani

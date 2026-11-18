@@ -52,6 +52,50 @@ def compile_inkling_attn_prologue(
     _jit_attn_prologue_module(dtype, w, use_silu, use_residual, use_mxfp8)
 
 
+def _prologue_buffers(
+    *,
+    qkvr: torch.Tensor,
+    k_buf: torch.Tensor,
+    dq: int,
+    dkv: int,
+    mxfp8_quant: bool,
+    sfk: torch.Tensor | None,
+    sfv: torch.Tensor | None,
+    page_size: int,
+    label: str,
+) -> tuple[torch.Tensor, ...]:
+    """Check the MXFP8 scale buffers and allocate one call's outputs:
+    (q_out, k_out, v_out, sfq_u8, sfk_u8, sfv_u8); the scale views are empty without MXFP8."""
+    t = qkvr.shape[0]
+    if mxfp8_quant:
+        if dq % 128 != 0 or dkv % 128 != 0:
+            raise ValueError(f"MXFP8 {label} requires head_dim-aligned Q/K/V.")
+        if sfk is None or sfv is None:
+            raise ValueError(f"MXFP8 {label} requires K/V scale buffers.")
+        sf_shape = (k_buf.shape[0] // page_size, dkv // 128, 32, page_size // 32, 4)
+        if sfk.shape != sf_shape or sfv.shape != sf_shape:
+            raise ValueError(
+                f"MXFP8 {label} requires interleaved K/V scale buffers "
+                f"with shape {sf_shape}, got {tuple(sfk.shape)} and {tuple(sfv.shape)}."
+            )
+        if not sfk.is_contiguous() or not sfv.is_contiguous():
+            raise ValueError(f"MXFP8 {label} requires contiguous interleaved SFK/SFV.")
+        q_out = torch.empty(t, dq, dtype=torch.float8_e4m3fn, device=qkvr.device)
+        sfq_u8 = torch.empty(
+            (t, dq // 128, 128 // 32), dtype=torch.uint8, device=qkvr.device
+        )
+        sfk_u8 = sfk.view(torch.uint8)
+        sfv_u8 = sfv.view(torch.uint8)
+    else:
+        q_out = torch.empty(t, dq, dtype=qkvr.dtype, device=qkvr.device)
+        sfq_u8 = torch.empty(0, dtype=torch.uint8, device=qkvr.device)
+        sfk_u8 = torch.empty(0, dtype=torch.uint8, device=qkvr.device)
+        sfv_u8 = torch.empty(0, dtype=torch.uint8, device=qkvr.device)
+    k_out = torch.empty(t, dkv, dtype=qkvr.dtype, device=qkvr.device)
+    v_out = torch.empty(t, dkv, dtype=qkvr.dtype, device=qkvr.device)
+    return q_out, k_out, v_out, sfq_u8, sfk_u8, sfv_u8
+
+
 def inkling_attn_prologue_verify(
     qkvr: torch.Tensor,
     k_cache: torch.Tensor,
@@ -86,35 +130,17 @@ def inkling_attn_prologue_verify(
     """Returns fresh contiguous (q_normed, k_normed, v_conv) [T, dq/dkv];
     KV rows are also scattered into k_buf/v_buf at ``loc`` (the attention call
     should pass save_kv_cache=False)."""
-    t = qkvr.shape[0]
-    if mxfp8_quant:
-        if dq % 128 != 0 or dkv % 128 != 0:
-            raise ValueError("MXFP8 fused prologue requires head_dim-aligned Q/K/V.")
-        if sfk is None or sfv is None:
-            raise ValueError("MXFP8 fused prologue requires K/V scale buffers.")
-        sf_shape = (k_buf.shape[0] // page_size, dkv // 128, 32, page_size // 32, 4)
-        if sfk.shape != sf_shape or sfv.shape != sf_shape:
-            raise ValueError(
-                "MXFP8 fused prologue requires interleaved K/V scale buffers "
-                f"with shape {sf_shape}, got {tuple(sfk.shape)} and {tuple(sfv.shape)}."
-            )
-        if not sfk.is_contiguous() or not sfv.is_contiguous():
-            raise ValueError(
-                "MXFP8 fused prologue requires contiguous interleaved SFK/SFV."
-            )
-        q_out = torch.empty(t, dq, dtype=torch.float8_e4m3fn, device=qkvr.device)
-        sfq_u8 = torch.empty(
-            (t, dq // 128, 128 // 32), dtype=torch.uint8, device=qkvr.device
-        )
-        sfk_u8 = sfk.view(torch.uint8)
-        sfv_u8 = sfv.view(torch.uint8)
-    else:
-        q_out = torch.empty(t, dq, dtype=qkvr.dtype, device=qkvr.device)
-        sfq_u8 = torch.empty(0, dtype=torch.uint8, device=qkvr.device)
-        sfk_u8 = torch.empty(0, dtype=torch.uint8, device=qkvr.device)
-        sfv_u8 = torch.empty(0, dtype=torch.uint8, device=qkvr.device)
-    k_out = torch.empty(t, dkv, dtype=qkvr.dtype, device=qkvr.device)
-    v_out = torch.empty(t, dkv, dtype=qkvr.dtype, device=qkvr.device)
+    q_out, k_out, v_out, sfq_u8, sfk_u8, sfv_u8 = _prologue_buffers(
+        qkvr=qkvr,
+        k_buf=k_buf,
+        dq=dq,
+        dkv=dkv,
+        mxfp8_quant=mxfp8_quant,
+        sfk=sfk,
+        sfv=sfv,
+        page_size=page_size,
+        label="fused prologue",
+    )
     if activation == "swish":
         activation = "silu"
     use_silu = activation in ("silu", "swish")
@@ -203,35 +229,17 @@ def inkling_attn_prologue_extend(
     to disable). Returns fresh contiguous (q_normed, k_normed, v_conv) and
     scatters KV rows into k_buf/v_buf at ``loc`` when ``do_store`` (the
     attention call should then pass save_kv_cache=False)."""
-    t = qkvr.shape[0]
-    if mxfp8_quant:
-        if dq % 128 != 0 or dkv % 128 != 0:
-            raise ValueError("MXFP8 fused prologue requires head_dim-aligned Q/K/V.")
-        if sfk is None or sfv is None:
-            raise ValueError("MXFP8 fused prologue requires K/V scale buffers.")
-        sf_shape = (k_buf.shape[0] // page_size, dkv // 128, 32, page_size // 32, 4)
-        if sfk.shape != sf_shape or sfv.shape != sf_shape:
-            raise ValueError(
-                "MXFP8 fused prologue requires interleaved K/V scale buffers "
-                f"with shape {sf_shape}, got {tuple(sfk.shape)} and {tuple(sfv.shape)}."
-            )
-        if not sfk.is_contiguous() or not sfv.is_contiguous():
-            raise ValueError(
-                "MXFP8 fused prologue requires contiguous interleaved SFK/SFV."
-            )
-        q_out = torch.empty(t, dq, dtype=torch.float8_e4m3fn, device=qkvr.device)
-        sfq_u8 = torch.empty(
-            (t, dq // 128, 128 // 32), dtype=torch.uint8, device=qkvr.device
-        )
-        sfk_u8 = sfk.view(torch.uint8)
-        sfv_u8 = sfv.view(torch.uint8)
-    else:
-        q_out = torch.empty(t, dq, dtype=qkvr.dtype, device=qkvr.device)
-        sfq_u8 = torch.empty(0, dtype=torch.uint8, device=qkvr.device)
-        sfk_u8 = torch.empty(0, dtype=torch.uint8, device=qkvr.device)
-        sfv_u8 = torch.empty(0, dtype=torch.uint8, device=qkvr.device)
-    k_out = torch.empty(t, dkv, dtype=qkvr.dtype, device=qkvr.device)
-    v_out = torch.empty(t, dkv, dtype=qkvr.dtype, device=qkvr.device)
+    q_out, k_out, v_out, sfq_u8, sfk_u8, sfv_u8 = _prologue_buffers(
+        qkvr=qkvr,
+        k_buf=k_buf,
+        dq=dq,
+        dkv=dkv,
+        mxfp8_quant=mxfp8_quant,
+        sfk=sfk,
+        sfv=sfv,
+        page_size=page_size,
+        label="fused prologue",
+    )
     if activation == "swish":
         activation = "silu"
     use_silu = activation in ("silu", "swish")
@@ -317,37 +325,17 @@ def inkling_attn_prologue_decode(
     The k/v conv caches are shift-updated in place (fused_decode_update
     semantics). With ``do_store`` the KV rows are scattered into k_buf/v_buf at
     ``loc``; MXFP8 mode also quantizes Q and writes interleaved K/V scales."""
-    t = qkvr.shape[0]
-    if mxfp8_quant:
-        if dq % 128 != 0 or dkv % 128 != 0:
-            raise ValueError(
-                "MXFP8 fused decode prologue requires head_dim-aligned Q/K/V."
-            )
-        if sfk is None or sfv is None:
-            raise ValueError("MXFP8 fused decode prologue requires K/V scale buffers.")
-        sf_shape = (k_buf.shape[0] // page_size, dkv // 128, 32, page_size // 32, 4)
-        if sfk.shape != sf_shape or sfv.shape != sf_shape:
-            raise ValueError(
-                "MXFP8 fused decode prologue requires interleaved K/V scale buffers "
-                f"with shape {sf_shape}, got {tuple(sfk.shape)} and {tuple(sfv.shape)}."
-            )
-        if not sfk.is_contiguous() or not sfv.is_contiguous():
-            raise ValueError(
-                "MXFP8 fused decode prologue requires contiguous interleaved SFK/SFV."
-            )
-        q_out = torch.empty(t, dq, dtype=torch.float8_e4m3fn, device=qkvr.device)
-        sfq_u8 = torch.empty(
-            (t, dq // 128, 128 // 32), dtype=torch.uint8, device=qkvr.device
-        )
-        sfk_u8 = sfk.view(torch.uint8)
-        sfv_u8 = sfv.view(torch.uint8)
-    else:
-        q_out = torch.empty(t, dq, dtype=qkvr.dtype, device=qkvr.device)
-        sfq_u8 = torch.empty(0, dtype=torch.uint8, device=qkvr.device)
-        sfk_u8 = torch.empty(0, dtype=torch.uint8, device=qkvr.device)
-        sfv_u8 = torch.empty(0, dtype=torch.uint8, device=qkvr.device)
-    k_out = torch.empty(t, dkv, dtype=qkvr.dtype, device=qkvr.device)
-    v_out = torch.empty(t, dkv, dtype=qkvr.dtype, device=qkvr.device)
+    q_out, k_out, v_out, sfq_u8, sfk_u8, sfv_u8 = _prologue_buffers(
+        qkvr=qkvr,
+        k_buf=k_buf,
+        dq=dq,
+        dkv=dkv,
+        mxfp8_quant=mxfp8_quant,
+        sfk=sfk,
+        sfv=sfv,
+        page_size=page_size,
+        label="fused decode prologue",
+    )
     if activation == "swish":
         activation = "silu"
     use_silu = activation in ("silu", "swish")

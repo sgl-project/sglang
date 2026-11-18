@@ -48,6 +48,7 @@ from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.kvcache.mla_buffer import (
     get_mla_kv_buffer_triton,
+    set_mla_kv_buffer_cast_triton,
     set_mla_kv_buffer_dcp_sharded_triton,
     set_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton_fp8_quant,
@@ -864,13 +865,13 @@ class MambaPool:
                             raise ValueError(
                                 f"spec-verify ring length must be a power of two, got {L}"
                             )
-                        if (
-                            speculative_num_draft_tokens is not None
-                            and L < 2 * speculative_num_draft_tokens
-                        ):
+                        # Fold-every-commit restarts at offset zero, so needs one window.
+                        min_ring_len = (speculative_num_draft_tokens or 0) * (
+                            1 if self.replayssm_spec_fold else 2
+                        )
+                        if L < min_ring_len:
                             raise ValueError(
-                                f"spec-verify ring too small: {L} < "
-                                f"2 * {speculative_num_draft_tokens} (early-flush margin)"
+                                f"spec-verify ring too small: {L} < {min_ring_len}"
                             )
                     replayssm_rawv = torch.zeros(
                         size=(num_mamba_layers, num_slots, hv, record_len, v_dim),
@@ -4278,6 +4279,7 @@ class HybridLinearKVPool(KVCache):
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
         kv_scale_ue8m0: bool = False,
+        fp8_cast_on_write: bool = False,
         start_layer: Optional[int] = None,
         full_kv_pool_class: Optional[type] = None,
         quant_method=None,
@@ -4366,6 +4368,7 @@ class HybridLinearKVPool(KVCache):
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
                 kv_scale_ue8m0=kv_scale_ue8m0,
+                fp8_cast_on_write=fp8_cast_on_write,
                 **hisparse_kwargs,
                 use_fp4_indexer=use_fp4_indexer,
             )
@@ -4858,6 +4861,7 @@ def _prefix_valid_mla_write_loc(loc_2d, commit_lens, cache_k_nope):
 class MLATokenToKVPool(KVCache, MLAKVView):
     # fp8_ds_mla tile scales rounded up to powers of two (Kimi-K3.1)
     kv_scale_ue8m0 = False
+    fp8_cast_on_write = False
 
     def __init__(
         self,
@@ -5133,6 +5137,23 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             # NoPE bytes are [FP8 values | one FP32 scale per 128 values].
             # RoPE bytes contain the raw BF16 tail and may have zero width.
             self._scatter_mla_rows(dst_buffer, loc, cache_k_nope_fp8, cache_k_rope_fp8)
+        elif (
+            self.fp8_cast_on_write
+            and cache_k_nope.dtype == torch.bfloat16
+            and cache_k_rope is not None
+            and cache_k_rope.dtype == torch.bfloat16
+            and cache_k_rope.numel() > 0
+        ):
+            world = self._write_loc_dcp_span
+            rank = get_parallel().attn_dcp_rank if world > 1 else 0
+            set_mla_kv_buffer_cast_triton(
+                dst_buffer.view(self.dtype),
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                dcp_world_size=world,
+                dcp_rank=rank,
+            )
         else:
             if cache_k_nope.dtype != self.dtype:
                 cache_k_nope = cache_k_nope.to(self.dtype)
@@ -5473,6 +5494,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         skip_topk_layers: Optional[List[bool]] = None,
         dcp_replicated: bool = False,
         kv_scale_ue8m0: bool = False,
+        fp8_cast_on_write: bool = False,
         use_fp4_indexer: bool = False,
     ):
         override_dim = (
@@ -5495,6 +5517,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
             dcp_replicated=dcp_replicated,
         )
         self.kv_scale_ue8m0 = kv_scale_ue8m0
+        # Only the raw fp8 layout (no fp8_ds_mla tiles) casts on write.
+        self.fp8_cast_on_write = (
+            fp8_cast_on_write
+            and _is_cuda
+            and dtype == torch.float8_e4m3fn
+            and not self.dsa_kv_cache_store_fp8
+        )
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
         self.index_head_dim = index_head_dim

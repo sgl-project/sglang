@@ -34,7 +34,7 @@ concurrency:
   cancel-in-progress: ${{ !inputs.ref && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
-  nightly-xpu-kernel-main-1-gpu:
+  nightly-kernel-main-test-1-gpu-xpu:
     # sglang main + sgl-kernel-xpu main.
     if: github.repository == 'sgl-project/sglang'
     runs-on: intel-bmg-nightly
@@ -108,15 +108,15 @@ jobs:
       - name: Nightly Test (1-GPU XPU)
         timeout-minutes: 240
         run: |
-          touch github_summary.md nightly-xpu-kernel-main-1-gpu-metrics.jsonl
+          touch github_summary.md nightly-kernel-main-test-1-gpu-xpu-metrics.jsonl
           docker exec ci_sglang_xpu bash -c "
             source /opt/venv/bin/activate &&
             cd /sglang-checkout/test &&
             OLMOCR_BENCH_DIR=/sglang-checkout/olmOCR-bench/bench_data \
             GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md \
             SGLANG_IS_IN_CI=true \
-            SGLANG_TEST_METRICS_FILE=/sglang-checkout/nightly-xpu-kernel-main-1-gpu-metrics.jsonl \
-            python3 run_suite.py --hw xpu --suite nightly-xpu-kernel-main-1-gpu --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+            SGLANG_TEST_METRICS_FILE=/sglang-checkout/nightly-kernel-main-test-1-gpu-xpu-metrics.jsonl \
+            python3 run_suite.py --hw xpu --suite nightly-kernel-main-test-1-gpu-xpu --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           " || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md)" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
@@ -125,8 +125,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nightly-xpu-kernel-main-1-gpu-metrics
-          path: nightly-xpu-kernel-main-1-gpu-metrics.jsonl
+          name: nightly-kernel-main-test-1-gpu-xpu-metrics
+          path: nightly-kernel-main-test-1-gpu-xpu-metrics.jsonl
           if-no-files-found: warn
           retention-days: 30
 
@@ -143,7 +143,7 @@ jobs:
             docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
           fi
 
-  nightly-xpu-kernel-main-2-gpu:
+  nightly-kernel-main-test-2-gpu-xpu:
     # sglang main + sgl-kernel-xpu main.
     if: github.repository == 'sgl-project/sglang'
     runs-on: intel-bmg-nightly
@@ -207,14 +207,14 @@ jobs:
       - name: Nightly Test (2-GPU XPU)
         timeout-minutes: 240
         run: |
-          touch github_summary.md nightly-xpu-kernel-main-2-gpu-metrics.jsonl
+          touch github_summary.md nightly-kernel-main-test-2-gpu-xpu-metrics.jsonl
           docker exec ci_sglang_xpu bash -c "
             source /opt/venv/bin/activate &&
             cd /sglang-checkout/test &&
             GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md \
             SGLANG_IS_IN_CI=true \
-            SGLANG_TEST_METRICS_FILE=/sglang-checkout/nightly-xpu-kernel-main-2-gpu-metrics.jsonl \
-            python3 run_suite.py --hw xpu --suite nightly-xpu-kernel-main-2-gpu --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+            SGLANG_TEST_METRICS_FILE=/sglang-checkout/nightly-kernel-main-test-2-gpu-xpu-metrics.jsonl \
+            python3 run_suite.py --hw xpu --suite nightly-kernel-main-test-2-gpu-xpu --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           " || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md)" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
@@ -223,8 +223,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nightly-xpu-kernel-main-2-gpu-metrics
-          path: nightly-xpu-kernel-main-2-gpu-metrics.jsonl
+          name: nightly-kernel-main-test-2-gpu-xpu-metrics
+          path: nightly-kernel-main-test-2-gpu-xpu-metrics.jsonl
           if-no-files-found: warn
           retention-days: 30
 
@@ -241,7 +241,7 @@ jobs:
             docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
           fi
 
-  nightly-xpu-kernel-main-4-gpu:
+  nightly-kernel-main-test-4-gpu-xpu:
     # sglang main + sgl-kernel-xpu main.
     if: github.repository == 'sgl-project/sglang'
     runs-on: intel-bmg-nightly
@@ -305,14 +305,14 @@ jobs:
       - name: Nightly Test (4-GPU XPU)
         timeout-minutes: 480
         run: |
-          touch github_summary.md nightly-xpu-kernel-main-4-gpu-metrics.jsonl
+          touch github_summary.md nightly-kernel-main-test-4-gpu-xpu-metrics.jsonl
           docker exec ci_sglang_xpu bash -c "
             source /opt/venv/bin/activate &&
             cd /sglang-checkout/test &&
             GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md \
             SGLANG_IS_IN_CI=true \
-            SGLANG_TEST_METRICS_FILE=/sglang-checkout/nightly-xpu-kernel-main-4-gpu-metrics.jsonl \
-            python3 run_suite.py --hw xpu --suite nightly-xpu-kernel-main-4-gpu --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+            SGLANG_TEST_METRICS_FILE=/sglang-checkout/nightly-kernel-main-test-4-gpu-xpu-metrics.jsonl \
+            python3 run_suite.py --hw xpu --suite nightly-kernel-main-test-4-gpu-xpu --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           " || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md)" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
@@ -321,8 +321,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nightly-xpu-kernel-main-4-gpu-metrics
-          path: nightly-xpu-kernel-main-4-gpu-metrics.jsonl
+          name: nightly-kernel-main-test-4-gpu-xpu-metrics
+          path: nightly-kernel-main-test-4-gpu-xpu-metrics.jsonl
           if-no-files-found: warn
           retention-days: 30
 
@@ -342,9 +342,9 @@ jobs:
   check-all-jobs:
     if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch')
     needs:
-      - nightly-xpu-kernel-main-1-gpu
-      - nightly-xpu-kernel-main-2-gpu
-      - nightly-xpu-kernel-main-4-gpu
+      - nightly-kernel-main-test-1-gpu-xpu
+      - nightly-kernel-main-test-2-gpu-xpu
+      - nightly-kernel-main-test-4-gpu-xpu
     runs-on: ubuntu-latest
     steps:
       - name: Check if any job failed

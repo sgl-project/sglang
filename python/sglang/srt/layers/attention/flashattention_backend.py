@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.dflash_draft_ring import DFlashDraftKVRing
 
 from sgl_kernel import merge_state_v2
 
@@ -189,6 +190,8 @@ class FlashAttentionBackend(AttentionBackend):
     # Set from the pool type in __init__; the class default keeps the extend
     # metadata guard readable on instances built with __new__ (test stubs).
     _kv_shard_pool: Optional[PageInterleaveKVPoolMixin] = None
+    _draft_kv_ring: Optional[DFlashDraftKVRing] = None
+    _ring_page_cols: Optional[torch.Tensor] = None
 
     # Chunked-prefix attention reads the stable ForwardBatch cu-seqlens and
     # KV-index buffers directly, so it needs no backend-private replay state.
@@ -965,6 +968,50 @@ class FlashAttentionBackend(AttentionBackend):
             m.max_seq_len_k = self.max_context_len
         self.forward_metadata = m
 
+    def set_draft_kv_ring(self, ring: DFlashDraftKVRing) -> None:
+        if (
+            not ring.paged
+            or self.use_mla
+            or self.use_sliding_window_kv_pool
+            or self.runner_ids.is_translating
+            or self._kv_shard_pool is not None
+            or self.is_prefill_aware_swa
+            or self.topk > 1
+        ):
+            raise ValueError(
+                "fa4 reads only a paged ring on a plain MHA pool with topk 1."
+            )
+        self._draft_kv_ring = ring
+        self._ring_page_cols = (
+            torch.arange(self.max_num_pages, device=self.device) % ring.pages_per_req
+        ).to(torch.int32)
+
+    def _ring_seq_lens(
+        self,
+        forward_mode: ForwardMode,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        # The draft only runs TARGET_VERIFY; other modes (warmup, idle) just
+        # stay inside the ring through its page table.
+        ring = self._draft_kv_ring
+        if ring is None or not forward_mode.is_target_verify():
+            return seq_lens
+        return ring.relative_seq_lens(req_pool_indices, seq_lens)
+
+    def _fill_ring_page_table(
+        self, req_pool_indices: torch.Tensor, page_table: torch.Tensor
+    ) -> None:
+        cols = self._ring_page_cols
+        width = page_table.shape[1]
+        if width > cols.numel():
+            # Eager verify tables can run past max_num_pages by the draft block.
+            cols = (
+                torch.arange(width, device=cols.device)
+                % self._draft_kv_ring.pages_per_req
+            ).to(torch.int32)
+        self._draft_kv_ring.fill_page_table(req_pool_indices, cols[:width], page_table)
+
     def _spec_read_seq_len_delta(
         self, forward_mode: ForwardMode, spec_info: Optional[SpecInput]
     ) -> int:
@@ -1136,10 +1183,15 @@ class FlashAttentionBackend(AttentionBackend):
             self._maybe_init_local_attn_metadata(metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
             if self.topk <= 1:
+                verify_seq_lens = self._ring_seq_lens(
+                    forward_batch.forward_mode,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                )
                 ragged_layout = forward_batch.ragged_verify_layout
                 if ragged_layout is not None:
                     geometry = build_ragged_target_verify_geometry(
-                        seq_lens=forward_batch.seq_lens, layout=ragged_layout
+                        seq_lens=verify_seq_lens, layout=ragged_layout
                     )
                     metadata.cache_seqlens_int32 = geometry.cache_seqlens_int32
                     # Device-only layouts carry no host lens; the verify
@@ -1156,7 +1208,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.cu_seqlens_k = geometry.cu_seqlens_k
                 else:
                     metadata.cache_seqlens_int32 = (
-                        forward_batch.seq_lens + self.speculative_num_draft_tokens
+                        verify_seq_lens + self.speculative_num_draft_tokens
                     ).to(torch.int32)
                     metadata.max_seq_len_q = self.speculative_num_draft_tokens
                     metadata.max_seq_len_k = (
@@ -1436,6 +1488,11 @@ class FlashAttentionBackend(AttentionBackend):
                     page_size=self.page_size,
                 )
                 self.forward_metadata_spec_decode_expand.page_table = expand_page_table
+
+        if self._draft_kv_ring is not None and metadata.page_table is not None:
+            page_table = torch.empty_like(metadata.page_table, dtype=torch.int32)
+            self._fill_ring_page_table(forward_batch.req_pool_indices, page_table)
+            metadata.page_table = page_table
 
         self.forward_metadata = metadata
 
@@ -3074,6 +3131,7 @@ class FlashAttentionBackend(AttentionBackend):
         the fused kernel is left with the prefix sum alone.
         """
         translated = self.runner_ids.reads_are_translated
+        ring = self._draft_kv_ring is not None
         normal_decode_set_metadata(
             metadata.cache_seqlens_int32,
             metadata.cu_seqlens_k,
@@ -3091,8 +3149,11 @@ class FlashAttentionBackend(AttentionBackend):
                 and not self.runner_ids.is_translating
                 else None
             ),
-            skip_page_table=translated,
+            skip_page_table=translated or ring,
         )
+        if ring:
+            bs = int(req_pool_indices.numel())
+            self._fill_ring_page_table(req_pool_indices, metadata.page_table[:bs])
         if translated:
             # The plan's table reaches `cache_seqlens_int32`, which the kernels
             # bound their reads by: a draft decode reads past `seq_lens`.
@@ -3282,6 +3343,7 @@ class FlashAttentionBackend(AttentionBackend):
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
                 metadata = self.target_verify_metadata[bs]
+                seq_lens = self._ring_seq_lens(forward_mode, req_pool_indices, seq_lens)
                 if ragged_verify_layout is not None:
                     padded = ragged_verify_layout.padded_to_bucket(padded_bs=bs)
                     geometry = build_ragged_target_verify_geometry(

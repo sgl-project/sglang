@@ -26,6 +26,11 @@ on:
         description: "Caller's ID for this dispatch, shown in the run name"
         type: string
         required: true
+      models:
+        description: "Space-separated model names from test/e2e/ci_models.yaml; empty runs every model"
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -44,10 +49,12 @@ jobs:
           MEGA_REPO: ${{ inputs.mega_repo }}
           MEGA_SHA: ${{ inputs.mega_sha }}
           MEGA_PR: ${{ inputs.mega_pr }}
+          MODELS: ${{ inputs.models }}
         run: |
           [[ "$MEGA_REPO" =~ ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]] || { echo "bad mega_repo: $MEGA_REPO"; exit 1; }
           [[ "$MEGA_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "bad mega_sha: $MEGA_SHA"; exit 1; }
           [[ "$MEGA_PR" =~ ^[0-9]+$ ]] || { echo "bad mega_pr: $MEGA_PR"; exit 1; }
+          [[ "$MODELS" =~ ^[a-z0-9_\ ]*$ ]] || { echo "bad models: $MODELS"; exit 1; }
 
       - uses: actions/checkout@v4
 
@@ -72,14 +79,16 @@ jobs:
 
       # End-to-end tests only; sgl-nvidia-mega runs its unit tests in its own CI.
       # Its test/e2e/ci_models.yaml lists each model's tests and the GPUs on one
-      # host they need. Models this runner cannot hold are skipped with a notice.
-      # A Mega commit without that file runs the DeepSeek-V4.1-Flash tests.
+      # host they need. The models input narrows it to the named models. Models
+      # this runner cannot hold are skipped with a notice. A Mega commit without
+      # that file runs the DeepSeek-V4.1-Flash tests.
       - name: Select end-to-end tests
         id: select
         working-directory: sgl-nvidia-mega
         env:
           RUNNER_GPU: GB300
           RUNNER_GPUS: "4"
+          MODELS: ${{ inputs.models }}
         run: |
           python3 - <<'EOF'
           import os, pathlib, re, sys
@@ -94,8 +103,14 @@ jobs:
               print(f"::notice::No {manifest}: running the DeepSeek-V4.1-Flash tests")
               models = {"deepseek_v41": {"gpu": "GB300", "gpus": 4, "tests": [
                   "test_deepseek_v41_server.py", "test_deepseek_v41_switch.py"]}}
+          requested = os.environ["MODELS"].split()
+          unknown = [name for name in requested if name not in models]
+          if unknown:
+              print(f"::error::Not in {manifest}: {unknown}")
+              sys.exit(1)
+          selected = {name: models[name] for name in requested} if requested else models
           tests = []
-          for name, model in models.items():
+          for name, model in selected.items():
               need = f"{model['gpus']} {model['gpu']} GPUs"
               if model["gpu"] != gpu or model["gpus"] > gpus:
                   print(f"::notice::Skipping {name}: needs {need}, runner has {gpus} {gpu}")

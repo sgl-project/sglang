@@ -64,6 +64,7 @@ def _dsv4_hisparse_allocator():
 def _offloading_allocator():
     """A pool that keeps a host copy, as plain PD decode does."""
     return SimpleNamespace(
+        state=None,
         cpu_copy_carries_mamba=True,
         get_kvcache=lambda: SimpleNamespace(device="cpu"),
         get_cpu_copy=lambda indices, mamba_indices=None, req_pool_index=None: _CPU_COPY,
