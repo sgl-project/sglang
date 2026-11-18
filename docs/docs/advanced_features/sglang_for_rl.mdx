@@ -338,7 +338,7 @@ This path trades some I/O overhead for simplicity and flexibility. It integrates
 
 **Endpoints:** `POST /begin_weight_update`, `POST /end_weight_update`
 
-`begin_weight_update` accepts `selector`: `"target"`, `"draft"`, or `"all"` (default). Under speculative decoding it picks the model runners the session opens; the update calls inside the session load into them, and `end_weight_update` finalizes them. Open the session with `selector="target"` when the draft is trained apart from the target (EAGLE, EAGLE3, or a standalone draft): under `"all"` the target's tensors also reach the draft, overwriting same-named parameters, and a name match with another shape can end the server. An MTP (`NEXTN`) draft loads from the target checkpoint and needs `"all"`.
+`begin_weight_update` accepts `selector`: `"target"`, `"draft"`, or `"all"` (default). Under speculative decoding it picks the model runners the session opens; the update calls inside the session load into them, and `end_weight_update` finalizes them. A selector that picks no runner, such as `"draft"` on a server without a draft model, is rejected. Open the session with `selector="target"` when the draft is trained apart from the target (EAGLE, EAGLE3, or a standalone draft): under `"all"` the target's tensors also reach the draft, overwriting same-named parameters, and a name match with another shape can end the server. An MTP (`NEXTN`) draft loads from the target checkpoint and needs `"all"`.
 
 ```python
 engine.begin_weight_update()
@@ -410,7 +410,7 @@ This strategy requires the training process and rollout engine to share access t
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>selector</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Runners to load into; defaults to the session's, and one beyond the session is rejected.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Runners to load into; defaults to the session's. One beyond the session, or with no runner on the server, is rejected.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>target</code>, <code>draft</code>, <code>all</code></td>
     </tr>
@@ -565,7 +565,7 @@ Training workers gather weights (typically on TP rank 0), broadcast them to the 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>selector</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Runners to load into; defaults to the session's, and one beyond the session is rejected.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Runners to load into; defaults to the session's. One beyond the session, or with no runner on the server, is rejected.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>target</code>, <code>draft</code>, <code>all</code></td>
     </tr>

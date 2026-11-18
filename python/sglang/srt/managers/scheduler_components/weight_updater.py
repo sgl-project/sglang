@@ -233,6 +233,15 @@ class SchedulerWeightUpdaterManager:
             runners += self.draft_worker.weight_update_runners()
         return runners
 
+    def _empty_selection_error(self, selector: str) -> Optional[str]:
+        # a load into no runner would still succeed and record the weight version
+        if self._select_runners(selector):
+            return None
+        return (
+            f"selector {selector!r} selects no model runner; "
+            "this server has no draft model"
+        )
+
     def update_weights_from_distributed(
         self,
         recv_req: UpdateWeightsFromDistributedReqInput,
@@ -247,6 +256,8 @@ class SchedulerWeightUpdaterManager:
         selector, error = _resolve_load_selector(
             selector=recv_req.selector, session_selector=self._session.selector
         )
+        if error is None:
+            error = self._empty_selection_error(selector)
         if error is not None:
             return UpdateWeightsFromDistributedReqOutput(success=False, message=error)
         with self._observe_weight_load("distributed"):
@@ -302,6 +313,8 @@ class SchedulerWeightUpdaterManager:
         selector, error = _resolve_load_selector(
             selector=recv_req.selector, session_selector=self._session.selector
         )
+        if error is None:
+            error = self._empty_selection_error(selector)
         if error is not None:
             return UpdateWeightsFromTensorReqOutput(success=False, message=error)
         with self._observe_weight_load("tensor"):
@@ -383,6 +396,9 @@ class SchedulerWeightUpdaterManager:
                 message="a weight-update session is already open; "
                 "call end_weight_update() first",
             )
+        error = self._empty_selection_error(recv_req.selector)
+        if error is not None:
+            return BeginWeightUpdateReqOutput(success=False, message=error)
         from sglang.srt.model_executor.model_runner_components.weight_updater import (
             _unsupported_derived_weight_cache_error,
         )
@@ -436,6 +452,8 @@ class SchedulerWeightUpdaterManager:
         selector, error = _resolve_load_selector(
             selector=recv_req.selector, session_selector=self._session.selector
         )
+        if error is None:
+            error = self._empty_selection_error(selector)
         if error is not None:
             return PluginWeightUpdateReqOutput(success=False, message=error)
         runners = self._select_runners(selector)

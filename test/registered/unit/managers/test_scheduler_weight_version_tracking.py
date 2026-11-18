@@ -541,6 +541,29 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
                 self.assertEqual(target.weight_updater.mock_calls, [])
                 self.assertEqual(draft.weight_updater.mock_calls, [])
 
+    def test_selectors_that_select_no_runner_are_rejected_without_a_draft(self):
+        """Without a draft model, a "draft" session or load would report success and
+        record the weight version having loaded nothing."""
+        target = _runner()
+        manager = self._manager(target, session=False)
+
+        begun = manager.begin_weight_update(BeginWeightUpdateReqInput(selector="draft"))
+
+        self.assertFalse(begun.success)
+        self.assertIsNone(manager._session)
+        manager._session = _WeightUpdateSession(selector="all")
+        for name, update in (
+            ("distributed", manager.update_weights_from_distributed),
+            ("tensor", manager.update_weights_from_tensor),
+        ):
+            with self.subTest(load=name):
+                output = update(_request(selector="draft"))
+
+                self.assertFalse(output.success)
+                self.assertIn("no model runner", output.message)
+        self.assertEqual(target.weight_updater.mock_calls, [])
+        self.assertEqual(self.recorded, [])
+
     def test_end_runs_post_load_on_both_when_load_was_bypassed(self):
         """A P2P/RDMA session never calls load_weights, so end must run post_load_weights."""
         target, draft = _runner(), _runner()
@@ -682,6 +705,20 @@ class TestPluginWeightUpdate(_WeightUpdaterManagerTestBase):
         transport.assert_called_once()
         target.weight_updater.load_weights_from_distributed.assert_called_once()
         self.assertEqual(draft.weight_updater.mock_calls, [])
+
+    def test_a_draft_load_without_a_draft_is_refused_before_the_transport_runs(self):
+        """Selecting no runner, the load would report success and record the version."""
+        transport = Mock(return_value=[("w", object())])
+        manager = self._manager_serving({"ici": transport})
+
+        output = manager.plugin_weight_update(
+            PluginWeightUpdateReqInput(handler="ici", selector="draft")
+        )
+
+        self.assertFalse(output.success)
+        self.assertIn("no model runner", output.message)
+        transport.assert_not_called()
+        self.assertEqual(self.recorded, [])
 
     def test_end_runs_post_load_only_after_writes_that_bypassed_load_weights(self):
         """A transport that writes parameters itself returns no tensors, like p2p peer writes."""
