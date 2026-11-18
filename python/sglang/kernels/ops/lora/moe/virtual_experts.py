@@ -690,6 +690,13 @@ def _merged_experts_fused_moe_lora_add_impl(
         a_stage_config,
     )
 
+    expand_mul_routed_weight = mul_routed_weight
+    if mul_routed_weight and a_output_slices == 2:
+        # invoke_fused_moe_kernel rejects mul_routed_weight=True when a_output_slices=2,
+        # so apply topk_weights to the shrink output before the linear expand GEMM.
+        intermediate.mul_(topk_weights.unsqueeze(-1).to(intermediate.dtype))
+        expand_mul_routed_weight = False
+
     b_stage_config = _get_stage_config(lora_b_virtual, 1)
     (
         sorted_token_ids,
@@ -717,7 +724,7 @@ def _merged_experts_fused_moe_lora_add_impl(
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
-        mul_routed_weight,
+        expand_mul_routed_weight,
         1,
         b_stage_config,
         tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16,
