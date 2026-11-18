@@ -2319,6 +2319,7 @@ def test_dynamo_format_events_match_python_hashes_and_name_the_adapter():
 
 @pytest.mark.parametrize("backend", ["python", "rust"])
 @pytest.mark.parametrize("dynamo_format", [False, True])
+@pytest.mark.parametrize("is_eagle", [False, True])
 @pytest.mark.parametrize(
     "salt, adapter",
     [
@@ -2329,9 +2330,13 @@ def test_dynamo_format_events_match_python_hashes_and_name_the_adapter():
     ],
 )
 def test_storage_key_binding_matches_published_event_ids(
-    backend, dynamo_format, salt, adapter
+    backend, dynamo_format, is_eagle, salt, adapter
 ):
-    """Hinted storage keys bind to the IDs each tree core publishes."""
+    """Hinted storage keys bind to the IDs each tree core publishes.
+
+    With EAGLE, keys are bigrams: the matched prefix holds one raw token per
+    bigram and the new key's raw tokens start with the shared boundary token.
+    """
     lora_id = "a" * 32
     extra_key = None if adapter is None else "user-" + lora_id
     lora_names = KvEventLoraNames()
@@ -2344,9 +2349,10 @@ def test_storage_key_binding_matches_published_event_ids(
         page_size=2,
         dynamo_kv_event_format=dynamo_format,
         kv_event_lora_names=lora_names,
+        is_eagle=is_eagle,
     )
-    tokens = array("q", range(1, 9))
-    key = RadixKey(tokens, extra_key=extra_key, cache_salt=salt)
+    tokens = array("q", range(1, 9 + is_eagle))
+    key = RadixKey(tokens, extra_key=extra_key, cache_salt=salt, is_bigram=is_eagle)
     _pump_insert(
         core, InsertParams(key=key, value=torch.arange(10, 18, dtype=torch.int64))
     )
@@ -2366,7 +2372,12 @@ def test_storage_key_binding_matches_published_event_ids(
     for prefix_pages in range(4):
         split = 2 * prefix_pages
         binding = storage_key_to_event_hashes(
-            RadixKey(tokens[split:], extra_key=extra_key, cache_salt=salt),
+            RadixKey(
+                tokens[split:],
+                extra_key=extra_key,
+                cache_salt=salt,
+                is_bigram=is_eagle,
+            ),
             2,
             tokens[:split].tolist(),
             storage_keys[prefix_pages - 1] if prefix_pages else None,
