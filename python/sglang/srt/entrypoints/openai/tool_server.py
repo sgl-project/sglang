@@ -29,28 +29,77 @@ async def list_server_and_tools(server_url: str):
 
 
 def trim_schema(schema: dict) -> dict:
-    # Turn JSON Schema from MCP generated into Harmony's variant.
-    if "title" in schema:
-        del schema["title"]
-    if "default" in schema and schema["default"] is None:
-        del schema["default"]
-    if "anyOf" in schema:
-        # Turn "anyOf": [{"type": "type-1"}, {"type": "type-2"}]
-        # into "type": ["type-1", "type-2"]
-        # if there's more than 1 types, also remove "null" type as Harmony will
-        # just ignore it
-        types = [
-            type_dict["type"]
-            for type_dict in schema["anyOf"]
-            if type_dict["type"] != "null"
-        ]
-        schema["type"] = types
-        del schema["anyOf"]
-    if "properties" in schema:
-        schema["properties"] = {
-            k: trim_schema(v) for k, v in schema["properties"].items()
-        }
-    return schema
+    """Adapt MCP JSON Schema to Harmony's descriptive schema format."""
+    root = schema
+
+    def normalize(node, seen_refs=()):
+        if not isinstance(node, dict):
+            return node
+        node = node.copy()
+
+        ref = node.get("$ref")
+        if ref is not None:
+            if not isinstance(ref, str) or not (ref == "#" or ref.startswith("#/")):
+                raise ValueError("MCP tool schemas only support local JSON references")
+            if len(seen_refs) >= 64:
+                raise ValueError("MCP tool schema reference depth exceeds 64")
+            if ref in seen_refs:
+                raise ValueError(
+                    f"MCP tool schema has a recursive JSON reference: {ref}"
+                )
+            target = root
+            try:
+                for part in ref[2:].split("/") if ref != "#" else []:
+                    key = part.replace("~1", "/").replace("~0", "~")
+                    target = (
+                        target[int(key)] if isinstance(target, list) else target[key]
+                    )
+            except (KeyError, IndexError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"Unresolved MCP tool schema reference: {ref}"
+                ) from error
+            if not isinstance(target, dict):
+                raise ValueError(f"MCP tool schema reference is not an object: {ref}")
+            node = {
+                **target,
+                **{key: value for key, value in node.items() if key != "$ref"},
+            }
+            return normalize(node, seen_refs + (ref,))
+
+        node.pop("title", None)
+        if "default" in node and node["default"] is None:
+            del node["default"]
+        if "anyOf" in node:
+            variants = [normalize(variant, seen_refs) for variant in node.pop("anyOf")]
+            variants = [
+                variant for variant in variants if variant.get("type") != "null"
+            ]
+            if variants and all(
+                set(variant) == {"type"} and isinstance(variant["type"], str)
+                for variant in variants
+            ):
+                # Keep the existing shape for primitive unions.
+                node["type"] = [variant["type"] for variant in variants]
+            elif len(variants) == 1:
+                node = {**variants[0], **node}
+            elif variants:
+                # Flattening these into type names loses enum values, object
+                # properties and array items. Harmony renders oneOf as a union.
+                node["oneOf"] = variants
+            else:
+                node["type"] = "null"
+        if "properties" in node:
+            node["properties"] = {
+                key: normalize(value, seen_refs)
+                for key, value in node["properties"].items()
+            }
+        if "items" in node:
+            node["items"] = normalize(node["items"], seen_refs)
+        if "oneOf" in node:
+            node["oneOf"] = [normalize(value, seen_refs) for value in node["oneOf"]]
+        return node
+
+    return normalize(schema)
 
 
 def post_process_tools_description(
