@@ -283,8 +283,6 @@ class TestXPUGraphMetadata(CustomTestCase):
         from sglang.srt.hardware_backend.xpu.xpu_scratchpad_patch import (
             _ACTIVE_GRAPH_FINALIZERS,
             _GRAPH_SCRATCHPAD_STATE,
-            _HAS_GDN_WS_CUSTOM_OP,
-            _HAS_MOE_WS_CUSTOM_OP,
             patch_sgl_kernel_scratchpad_buffers,
             register_graph_scratchpad_owner,
             reset_sgl_kernel_graph_scratchpads,
@@ -308,8 +306,6 @@ class TestXPUGraphMetadata(CustomTestCase):
         patch_sgl_kernel_scratchpad_buffers()
 
         # Verify custom ops are registered and infer symbolic schemas (SymInt[] / SymInt)
-        self.assertTrue(_HAS_MOE_WS_CUSTOM_OP)
-        self.assertTrue(_HAS_GDN_WS_CUSTOM_OP)
         self.assertIn("SymInt[]", str(torch.ops.sgl_xpu.get_moe_ws_op.default._schema))
         self.assertIn(
             "SymInt nbytes", str(torch.ops.sgl_xpu.get_gdn_ws_op.default._schema)
@@ -321,8 +317,8 @@ class TestXPUGraphMetadata(CustomTestCase):
         except ImportError:
             self.skipTest("sgl_kernel not available")
 
-        if not (torch.xpu.is_available() and hasattr(torch.xpu, "XPUGraph")):
-            self.skipTest("torch.xpu.XPUGraph not available")
+        if not torch.xpu.is_available():
+            self.skipTest("torch.xpu not available")
 
         device = torch.device("xpu:0")
 
@@ -447,6 +443,14 @@ class TestXPUGraphMetadata(CustomTestCase):
         )
 
         # Verify torch.compile + XPUGraph joint capture & replay across 2 back-to-back layers
+        from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import (
+            register_fake_ops,
+        )
+        from sglang.srt.utils import register_xpu_device_properties_for_dynamo
+
+        register_fake_ops()
+        register_xpu_device_properties_for_dynamo()
+
         def _two_layer_compiled_moe(x, w1_p, w2_p, tw, ti):
             h = fused_experts(x, w1_p, w2_p, tw, ti)
             return fused_experts(h, w1_p, w2_p, tw, ti)
@@ -504,8 +508,12 @@ class TestXPUGraphMetadata(CustomTestCase):
         self.assertTrue(all(len(c) == 0 for c in _GRAPH_SCRATCHPAD_STATE.values()))
 
         # 6. Dual compatibility bypass & self-patch recursion guard
-        orig_moe_fn = lambda *a, **kw: None
-        orig_gdn_fn = lambda *a, **kw: None
+        def orig_moe_fn(*a, **kw):
+            return None
+
+        def orig_gdn_fn(*a, **kw):
+            return None
+
         mock_moe = SimpleNamespace(
             _XPU_GRAPH_SAFE=True,
             _get_moe_ws=orig_moe_fn,

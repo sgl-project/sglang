@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""XPU graph-safe scratchpad buffer management for sgl_kernel.
+"""XPU graph-safe scratchpad buffer management for sgl_kernel (PyTorch 2.14+).
 
 Ensures that sgl_kernel internal scratchpads (MoE and GDN) are graph-safe,
 memory-efficient, and compatible with both current and future sgl-kernel-xpu releases:
@@ -31,15 +31,14 @@ memory-efficient, and compatible with both current and future sgl-kernel-xpu rel
 
 from __future__ import annotations
 
-import logging
 import weakref
-from typing import Any, Callable, Dict, Optional
+from collections.abc import Callable
+from typing import Any
 
 import torch
+from torch._guards import detect_fake_mode
 
-logger = logging.getLogger(__name__)
-
-_GRAPH_SCRATCHPAD_STATE: Dict[str, Any] = {
+_GRAPH_SCRATCHPAD_STATE: dict[str, Any] = {
     "moe_cache": {},
     "moe_views": {},
     "moe_retired": [],
@@ -47,7 +46,7 @@ _GRAPH_SCRATCHPAD_STATE: Dict[str, Any] = {
     "gdn_retired": [],
 }
 
-_ACTIVE_GRAPH_FINALIZERS: Dict[int, weakref.finalize] = {}
+_ACTIVE_GRAPH_FINALIZERS: dict[int, weakref.finalize] = {}
 
 
 def _on_owner_finalized(owner_id: int) -> None:
@@ -83,55 +82,28 @@ def reset_sgl_kernel_graph_scratchpads() -> None:
 
 
 def _normalize_xpu_device(device: torch.device | str | None) -> torch.device:
-    if device is None:
-        device = "xpu"
-    dev = torch.device(device)
+    if isinstance(device, torch.device):
+        if device.type == "xpu" and device.index is None:
+            idx = torch.xpu.current_device() if torch.xpu.is_available() else 0
+            return torch.device("xpu", idx)
+        return device
+    dev = torch.device("xpu" if device is None else device)
     if dev.type == "xpu" and dev.index is None:
-        dev = torch.device("xpu", torch.xpu.current_device())
+        idx = torch.xpu.current_device() if torch.xpu.is_available() else 0
+        return torch.device("xpu", idx)
     return dev
 
 
 def _is_xpu_capturing(dev: torch.device) -> bool:
     return (
         dev.type == "xpu"
-        and hasattr(torch, "xpu")
         and torch.xpu.is_available()
-        and hasattr(torch.xpu, "is_current_stream_capturing")
         and torch.xpu.is_current_stream_capturing()
     )
 
 
-def _in_fake_mode() -> bool:
-    try:
-        from torch._guards import detect_fake_mode
-
-        return detect_fake_mode() is not None
-    except Exception:
-        return False
-
-
-def _is_fake(t: torch.Tensor) -> bool:
-    if hasattr(t, "fake_mode") and t.fake_mode is not None:
-        return True
-    try:
-        from torch._subclasses.fake_tensor import is_fake
-
-        return is_fake(t)
-    except Exception:
-        return False
-
-
-def _is_compiling() -> bool:
-    try:
-        import torch.compiler
-
-        return torch.compiler.is_compiling()
-    except Exception:
-        return False
-
-
-_orig_moe_ws: Optional[Callable] = None
-_orig_gdn_ws: Optional[Callable] = None
+_orig_moe_ws: Callable | None = None
+_orig_gdn_ws: Callable | None = None
 
 
 def _get_shared_graph_moe_ws(
@@ -141,7 +113,7 @@ def _get_shared_graph_moe_ws(
     for d in shape:
         numel *= d
     shape_tuple = tuple(shape)
-    if numel == 0 or _in_fake_mode():
+    if numel == 0 or detect_fake_mode() is not None:
         return torch.empty(shape_tuple, dtype=dtype, device=dev)
 
     key = (name, dtype, dev)
@@ -153,10 +125,9 @@ def _get_shared_graph_moe_ws(
     if cur is None or cur.numel() < numel:
         old_cur = cur
         cur = torch.empty(numel, dtype=dtype, device=dev)
-        if not _is_fake(cur):
-            graph_moe_ws_cache[key] = cur
-            if old_cur is not None:
-                graph_moe_retired_buffers.append(old_cur)
+        graph_moe_ws_cache[key] = cur
+        if old_cur is not None:
+            graph_moe_retired_buffers.append(old_cur)
 
     cached_view = graph_moe_ws_view_cache.get(key)
     if (
@@ -165,14 +136,13 @@ def _get_shared_graph_moe_ws(
         or cached_view[1] != shape_tuple
     ):
         view = cur.narrow(0, 0, numel).view(shape_tuple)
-        if not _is_fake(cur):
-            graph_moe_ws_view_cache[key] = (cur, shape_tuple, view)
+        graph_moe_ws_view_cache[key] = (cur, shape_tuple, view)
         return view
     return cached_view[2]
 
 
 def _get_shared_graph_gdn_workspace(nbytes: int, dev: torch.device) -> torch.Tensor:
-    if nbytes <= 0 or _in_fake_mode():
+    if nbytes <= 0 or detect_fake_mode() is not None:
         return torch.empty(max(nbytes, 0), dtype=torch.uint8, device=dev)
 
     graph_gdn_ws_cache = _GRAPH_SCRATCHPAD_STATE["gdn_cache"]
@@ -182,74 +152,67 @@ def _get_shared_graph_gdn_workspace(nbytes: int, dev: torch.device) -> torch.Ten
     if cur is None or cur.numel() < nbytes:
         old_cur = cur
         cur = torch.empty(nbytes, dtype=torch.uint8, device=dev)
-        if not _is_fake(cur):
-            graph_gdn_ws_cache[dev] = cur
-            if old_cur is not None:
-                graph_gdn_retired_buffers.append(old_cur)
+        graph_gdn_ws_cache[dev] = cur
+        if old_cur is not None:
+            graph_gdn_retired_buffers.append(old_cur)
     return cur.narrow(0, 0, nbytes)
 
 
 # Custom ops for zero-break torch.compile integration.
-# Note: torch.library.infer_schema maps `list[int]` -> `SymInt[]` and `int` -> `SymInt`
-# (using `torch.SymInt` directly in type annotations is rejected by infer_schema).
-try:
+# torch.library.infer_schema maps `list[int]` -> `SymInt[]` and `int` -> `SymInt`.
+@torch.library.custom_op("sgl_xpu::get_moe_ws_op", mutates_args=())
+def _get_moe_ws_op(
+    name: str,
+    shape: list[int],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    dev = _normalize_xpu_device(device)
+    shape_tuple = tuple(int(d) for d in shape)
+    if _is_xpu_capturing(dev):
+        return _get_shared_graph_moe_ws(name, shape_tuple, dtype, dev)
+    if _orig_moe_ws is not None:
+        return _orig_moe_ws(name, shape_tuple, dtype, device)
+    return torch.empty(shape_tuple, dtype=dtype, device=device)
 
-    @torch.library.custom_op("sgl_xpu::get_moe_ws_op", mutates_args=())
-    def _get_moe_ws_op(
-        name: str,
-        shape: list[int],
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> torch.Tensor:
-        dev = _normalize_xpu_device(device)
-        shape_tuple = tuple(int(d) for d in shape)
-        if _is_xpu_capturing(dev):
-            return _get_shared_graph_moe_ws(name, shape_tuple, dtype, dev)
-        if _orig_moe_ws is not None:
-            return _orig_moe_ws(name, shape_tuple, dtype, device)
-        return torch.empty(shape_tuple, dtype=dtype, device=device)
 
-    @_get_moe_ws_op.register_fake
-    def _(
-        name: str,
-        shape: list[int],
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> torch.Tensor:
-        return torch.empty(tuple(shape), dtype=dtype, device=device)
+@_get_moe_ws_op.register_fake
+def _(
+    name: str,
+    shape: list[int],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    return torch.empty(tuple(shape), dtype=dtype, device=device)
 
-    _HAS_MOE_WS_CUSTOM_OP = True
-except Exception:
-    logger.warning("Failed to register sgl_xpu::get_moe_ws_op", exc_info=True)
-    _HAS_MOE_WS_CUSTOM_OP = False
 
-try:
+@torch.library.custom_op("sgl_xpu::get_gdn_ws_op", mutates_args=())
+def _get_gdn_ws_op(
+    nbytes: int,
+    device: torch.device,
+) -> torch.Tensor:
+    dev = _normalize_xpu_device(device)
+    size = int(nbytes)
+    if _is_xpu_capturing(dev):
+        return _get_shared_graph_gdn_workspace(size, dev)
+    if _orig_gdn_ws is not None:
+        return _orig_gdn_ws(size, device)
+    return torch.empty(size, dtype=torch.uint8, device=device)
 
-    @torch.library.custom_op("sgl_xpu::get_gdn_ws_op", mutates_args=())
-    def _get_gdn_ws_op(nbytes: int, device: torch.device) -> torch.Tensor:
-        dev = _normalize_xpu_device(device)
-        size = int(nbytes)
-        if _is_xpu_capturing(dev):
-            return _get_shared_graph_gdn_workspace(size, dev)
-        if _orig_gdn_ws is not None:
-            return _orig_gdn_ws(size, device)
-        return torch.empty(size, dtype=torch.uint8, device=device)
 
-    @_get_gdn_ws_op.register_fake
-    def _(nbytes: int, device: torch.device) -> torch.Tensor:
-        return torch.empty(nbytes, dtype=torch.uint8, device=device)
-
-    _HAS_GDN_WS_CUSTOM_OP = True
-except Exception:
-    logger.warning("Failed to register sgl_xpu::get_gdn_ws_op", exc_info=True)
-    _HAS_GDN_WS_CUSTOM_OP = False
+@_get_gdn_ws_op.register_fake
+def _(
+    nbytes: int,
+    device: torch.device,
+) -> torch.Tensor:
+    return torch.empty(nbytes, dtype=torch.uint8, device=device)
 
 
 def safe_get_moe_ws(
     name: str, shape: tuple, dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
     dev = _normalize_xpu_device(device)
-    if _is_compiling() and _HAS_MOE_WS_CUSTOM_OP:
+    if torch.compiler.is_compiling():
         return _get_moe_ws_op(name, list(shape), dtype, dev)
     if _is_xpu_capturing(dev):
         return _get_shared_graph_moe_ws(name, shape, dtype, dev)
@@ -260,7 +223,7 @@ def safe_get_moe_ws(
 
 def safe_get_gdn_workspace(nbytes: int, device: torch.device) -> torch.Tensor:
     dev = _normalize_xpu_device(device)
-    if _is_compiling() and _HAS_GDN_WS_CUSTOM_OP:
+    if torch.compiler.is_compiling():
         return _get_gdn_ws_op(nbytes, dev)
     if _is_xpu_capturing(dev):
         return _get_shared_graph_gdn_workspace(nbytes, dev)
@@ -286,7 +249,7 @@ def patch_sgl_kernel_scratchpad_buffers() -> None:
             _orig_moe_ws = sk_moe._get_moe_ws
             sk_moe._get_moe_ws = safe_get_moe_ws
             sk_moe._xpu_graph_safe_ws_patched = True
-    except Exception:
+    except (ImportError, AttributeError, OSError):
         pass
 
     # 2. Independently patch sgl_kernel.gdn_attn
@@ -302,5 +265,5 @@ def patch_sgl_kernel_scratchpad_buffers() -> None:
             _orig_gdn_ws = sk_gdn._get_gdn_workspace
             sk_gdn._get_gdn_workspace = safe_get_gdn_workspace
             sk_gdn._xpu_graph_safe_ws_patched = True
-    except Exception:
+    except (ImportError, AttributeError, OSError):
         pass
