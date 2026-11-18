@@ -178,6 +178,26 @@ class TestDraftModelConfig(CustomTestCase):
         self.assertEqual(config.hf_config.num_nextn_predict_layers, 1)
         self.assertEqual(config.hf_text_config.num_nextn_predict_layers, 1)
 
+    def test_eagle3_llama_alias_maps_only_for_the_draft(self):
+        cases = [
+            # (is_draft_model, expected architecture)
+            (True, "LlamaForCausalLMEagle3"),
+            (False, "Eagle3LlamaForCausalLM"),
+        ]
+        for is_draft_model, expected in cases:
+            with self.subTest(is_draft_model=is_draft_model):
+                config = object.__new__(ModelConfig)
+                config.is_draft_model = is_draft_model
+                config.speculative_algorithm = "EAGLE3"
+                config.hf_config = SimpleNamespace(
+                    architectures=["Eagle3LlamaForCausalLM"]
+                )
+                config.hf_text_config = SimpleNamespace()
+
+                config._config_draft_model()
+
+                self.assertEqual(config.hf_config.architectures, [expected])
+
     def test_draft_is_hybrid_swa_only_by_the_listed_rules(self):
         """FROZEN_KV_MTP gives its draft a single-pool dummy config, so a draft
         whose layer_types mix sliding and full layers keeps one KV pool."""
