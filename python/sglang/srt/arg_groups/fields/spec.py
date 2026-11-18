@@ -186,7 +186,8 @@ class Spec(msgspec.Struct):
         Arg(
             help="(Resolved) A DFLASH draft keeps its KV in a per-request ring of "
             "window + verify-block rows. On for an all-sliding-window MLA draft on "
-            "trtllm_mla / cutedsl_mla unless SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=0.",
+            "trtllm_mla / cutedsl_mla, and for an all-sliding-window MHA draft on "
+            "trtllm_mha / fa4, unless SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=0.",
             no_cli=True,
             resolvable=True,
         ),
