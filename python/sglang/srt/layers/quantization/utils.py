@@ -754,9 +754,9 @@ def sort_weights(q_w: torch.Tensor, g_idx: torch.Tensor):
 
 def swizzle_blockscale(scale: torch.Tensor):
     """
-    Swizzle the scale tensor into a blockwise interleaved format for NVFP4 quantization.
+    Swizzle NVFP4 (E4M3) or MXFP8 (UE8M0 as uint8) block scales into CUTLASS 128x4 atoms.
     """
-    assert scale.dtype == torch.float8_e4m3fn
+    assert scale.dtype in (torch.float8_e4m3fn, torch.uint8)
     # Pad and blockwise interleave weight_scale
     scale_ndim = scale.ndim
     if scale.ndim == 2:
