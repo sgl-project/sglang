@@ -427,13 +427,13 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
     def _to_page_indices(self, indices: torch.Tensor) -> torch.Tensor:
         return indices.reshape(-1, self.slot_page_size)[:, 0] // self.slot_page_size
 
-    def _to_native_page_indices(
-        self, indices: torch.Tensor, native_page_size: int
+    def _to_page_slots(
+        self, indices: torch.Tensor, slots_per_page: int
     ) -> torch.Tensor:
-        """Expand logical page indices into a device buffer's native slots."""
+        """Expand logical page indices into one page's token slots."""
         rows = self._to_page_indices(indices)
-        offsets = torch.arange(native_page_size, dtype=rows.dtype, device=rows.device)
-        return (rows[:, None] * native_page_size + offsets).reshape(-1)
+        offsets = torch.arange(slots_per_page, dtype=rows.dtype, device=rows.device)
+        return (rows[:, None] * slots_per_page + offsets).reshape(-1)
 
     def _unaligned_transfer_error(
         self, host_indices: torch.Tensor, device_indices: torch.Tensor
@@ -584,40 +584,35 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             )
         elif io_backend == "kernel_ascend":
             # HiCache keeps KV-derived pools in the FULL logical coordinate
-            # space. Ascend consumes the native slots of the shaped device
-            # buffer, so translate the already resolved page rows only at this
-            # backend boundary.
-            native_page_size = int(self.device_buffers[0].shape[1])
-            native_device_indices = self._to_native_page_indices(
-                device_indices, native_page_size
-            )
-            native_host_indices = self._to_native_page_indices(
-                host_indices, native_page_size
-            )
+            # space. Ascend consumes one full page's slots, so translate the
+            # already resolved page rows only at this backend boundary.
+            page_slots = int(self.device_buffers[0].shape[1])
+            page_device_indices = self._to_page_slots(device_indices, page_slots)
+            page_host_indices = self._to_page_slots(host_indices, page_slots)
             for l in range(self.layer_num):
                 dev_view = self.device_buffers[l].unsqueeze(0)
-                # dev_view: [1, dev_pages, native_page_size, 1, kv_dim]
+                # dev_view: [1, dev_pages, page_slots, 1, kv_dim]
                 host_view = self._host_page_view(l)
                 if self.layout == "layer_first":
                     transfer_kv_all_layer_kv_split(
-                        device_indices=native_device_indices,
-                        host_indices=native_host_indices,
+                        device_indices=page_device_indices,
+                        host_indices=page_host_indices,
                         device_k=dev_view,
                         host_k=host_view,
                         device_v=torch.empty(0, device=dev_view.device),
                         host_v=torch.empty(0, device="cpu"),
-                        page_size=native_page_size,
+                        page_size=page_slots,
                         impl="auto",
                     )
                 else:
                     transfer_kv_all_layer_kv_split_lf_pf(
-                        device_indices=native_device_indices,
-                        host_indices=native_host_indices,
+                        device_indices=page_device_indices,
+                        host_indices=page_host_indices,
                         device_k=dev_view,
                         host_k=host_view,
                         device_v=torch.empty(0, device=dev_view.device),
                         host_v=torch.empty(0, device="cpu"),
-                        page_size=native_page_size,
+                        page_size=page_slots,
                         host_layer_start=0,
                         impl="auto",
                     )
@@ -694,38 +689,34 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             )
         elif io_backend == "kernel_ascend":
             # NPU whole-page H2D via Ascend dim-exchange op, for layer_id only.
-            native_page_size = int(self.device_buffers[layer_id].shape[1])
-            native_device_indices = self._to_native_page_indices(
-                device_indices, native_page_size
-            )
-            native_host_indices = self._to_native_page_indices(
-                host_indices, native_page_size
-            )
+            page_slots = int(self.device_buffers[layer_id].shape[1])
+            page_device_indices = self._to_page_slots(device_indices, page_slots)
+            page_host_indices = self._to_page_slots(host_indices, page_slots)
             dev_view = self.device_buffers[layer_id].unsqueeze(0)
-            # dev_view: [1, dev_pages, native_page_size, 1, kv_dim]
+            # dev_view: [1, dev_pages, page_slots, 1, kv_dim]
             host_view = self._host_page_view(layer_id)
             if self.layout == "layer_first":
                 transfer_kv_per_layer_kv_split(
-                    device_indices=native_device_indices,
-                    host_indices=native_host_indices,
+                    device_indices=page_device_indices,
+                    host_indices=page_host_indices,
                     device_k=dev_view,
                     host_k=host_view,
                     device_v=torch.empty(0, device=dev_view.device),
                     host_v=torch.empty(0, device="cpu"),
-                    page_size=native_page_size,
+                    page_size=page_slots,
                     device_layer_id=0,
                     host_layer_id=0,
                     impl="auto",
                 )
             else:
                 transfer_kv_per_layer_kv_split_pf_lf(
-                    device_indices=native_device_indices,
-                    host_indices=native_host_indices,
+                    device_indices=page_device_indices,
+                    host_indices=page_host_indices,
                     device_k=dev_view,
                     host_k=host_view,
                     device_v=torch.empty(0, device=dev_view.device),
                     host_v=torch.empty(0, device="cpu"),
-                    page_size=native_page_size,
+                    page_size=page_slots,
                     device_layer_id=0,
                     host_layer_id=0,
                     impl="auto",
