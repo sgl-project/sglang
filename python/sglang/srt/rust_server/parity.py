@@ -142,6 +142,7 @@ RUST_SERVER_HANDLED_ELSEWHERE: Dict[str, str] = {
 # Python-frontend reads Rust-server mode ignores but should not: each changes
 # what a client or operator gets. Refuse or implement each, then drop it here.
 RUST_SERVER_KNOWN_GAPS: Dict[str, str] = {
+    "SGLANG_ENABLE_RESPONSE_COMPRESSION": "Responses are sent uncompressed. TODO: drop when the Rust server compresses them.",
     "SGLANG_PYSPY_DUMP_BEFORE_CRASH": "No crash diagnostics when a scheduler crashes.",
     "SGLANG_CUDA_COREDUMP_BEFORE_CRASH": "No crash diagnostics when a scheduler crashes.",
     "SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS": "No crash diagnostics when a scheduler crashes.",
