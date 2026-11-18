@@ -27,6 +27,7 @@ from transformers import PretrainedConfig
 from transformers.utils import cached_file
 
 from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.beam_search.trie_config import TRIE_OUTPUT_HEAD_FILENAME
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.ernie55 import (
@@ -2440,7 +2441,9 @@ class ModelConfig:
             # with statement to avoid closing the client.
             client = create_remote_connector(self.model_path)
             if is_remote_url(self.model_path):
-                client.pull_files(allow_pattern=["*config.json"])
+                client.pull_files(
+                    allow_pattern=["*config.json", f"*{TRIE_OUTPUT_HEAD_FILENAME}"]
+                )
                 self.model_weights = self.model_path
                 self.model_path = client.get_local_dir()
 
