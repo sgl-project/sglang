@@ -209,7 +209,8 @@ Decisions log, in the order they came up:
    Result: 186 cells = 87 low-latency + 87 high-throughput + 12 balanced; the
    page ships the full trio and the engine greys unused chips per selection.
 2. **Verified cell follows the measurement**: H200/397B/BF16/low-latency =
-   `SGLANG_USE_CUDA_IPC_TRANSPORT=1` env + `--speculative-algorithm EAGLE`
+   `--mm-feature-transport cuda_ipc` (the measured run's
+   `SGLANG_USE_CUDA_IPC_TRANSPORT=1`) + `--speculative-algorithm EAGLE`
    (the bench reported NEXTN, an alias of EAGLE — normalized to EAGLE, §2) +
    measured flag set **minus the parser flags** (the measured run had both
    parsers on; cells never carry them — noted in the benchmarks header). All
