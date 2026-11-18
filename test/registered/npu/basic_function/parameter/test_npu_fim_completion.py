@@ -34,7 +34,8 @@ class TestFimCompletion(CustomTestCase):
         "deepseek_coder",
         "--attention-backend",
         "ascend",
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph",
+        "--disable-prefill-cuda-graph",
         "--mem-fraction-static",
         0.8,
     ]
@@ -95,7 +96,8 @@ class TestFimCompletionJson(TestFimCompletion):
         str(Path(__file__).with_name("deepseek_coder.json")),
         "--attention-backend",
         "ascend",
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph",
+        "--disable-prefill-cuda-graph",
         "--mem-fraction-static",
         0.8,
     ]
