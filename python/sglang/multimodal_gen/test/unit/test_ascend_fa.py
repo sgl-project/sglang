@@ -509,7 +509,10 @@ def test_metadata_scope_preserves_native_dispatch(
     monkeypatch, legacy_native, packed, scope
 ):
     from sglang.multimodal_gen.runtime import server_args
-    from sglang.multimodal_gen.runtime.layers.attention.backends import ascend_fa
+    from sglang.multimodal_gen.runtime.layers.attention.backends import (
+        ascend_fa,
+        ascend_quant_fa,
+    )
 
     config, sd, build, quant, native_mx, native_float = legacy_native
     config["precision"] = "fp8"
@@ -520,6 +523,7 @@ def test_metadata_scope_preserves_native_dispatch(
     )
     loader = Mock(side_effect=AssertionError("Native FA must not load MindIE-SD"))
     monkeypatch.setattr(ascend_fa, "load_mindiesd_quant_attention", loader)
+    monkeypatch.setattr(ascend_quant_fa, "load_mindiesd_quant_attention", loader)
     monkeypatch.setitem(sys.modules, "mindiesd", None)
     impl = build(
         quant_config=type("MXFP8Config", (), {})(),
@@ -598,11 +602,15 @@ def test_metadata_changes_do_not_leak_between_calls(legacy_native, packed):
 def test_legacy_mxfp8_stays_native_with_sdk_installed(
     monkeypatch, legacy_native, kind, packed, offline
 ):
-    from sglang.multimodal_gen.runtime.layers.attention.backends import ascend_fa
+    from sglang.multimodal_gen.runtime.layers.attention.backends import (
+        ascend_fa,
+        ascend_quant_fa,
+    )
 
     config, sd, build, quant, native_mx, native_float = legacy_native
     loader = Mock(side_effect=AssertionError("Legacy FA must not load MindIE-SD"))
     monkeypatch.setattr(ascend_fa, "load_mindiesd_quant_attention", loader)
+    monkeypatch.setattr(ascend_quant_fa, "load_mindiesd_quant_attention", loader)
     qc = type(kind, (), {"use_offline_qk_rotation": offline})()
     # Ulysses can reduce the head count passed to the kernel.
     impl = build(num_heads=12, quant_config=qc)
@@ -691,12 +699,14 @@ def test_legacy_nonquantized_calls_remain_native_float(
     "failure", [ImportError("missing SDK"), OSError("missing shared library")]
 )
 def test_sd_dependency_failure_never_falls_back(monkeypatch, legacy_native, failure):
-    from sglang.multimodal_gen.runtime.layers.attention.backends import ascend_fa
+    from sglang.multimodal_gen.runtime.layers.attention.backends import (
+        ascend_quant_fa,
+    )
 
     config, sd, build, quant, native_mx, native_float = legacy_native
     config["precision"] = "fp8"
     loader = Mock(side_effect=failure)
-    monkeypatch.setattr(ascend_fa, "load_mindiesd_quant_attention", loader)
+    monkeypatch.setattr(ascend_quant_fa, "load_mindiesd_quant_attention", loader)
     impl = build(quant_config=type("MXFP8Config", (), {})())
     loader.assert_not_called()
     query = torch.randn(1, 64, 4, 64)

@@ -652,11 +652,9 @@ class PipelineConfig:
                         "number of frames."
                     )
                 logger.info(
-                    "Latent time dim %d is not divisible by SP degree %d; "
-                    "using the token-level sequence shard instead of the "
-                    "frame shard.",
-                    time_dim,
-                    sp_world_size,
+                    f"Latent time dim {time_dim} is not divisible by SP degree "
+                    f"{sp_world_size}; using the token-level sequence shard "
+                    "instead of the frame shard."
                 )
                 batch.enable_sequence_shard = True
                 return latents, False
