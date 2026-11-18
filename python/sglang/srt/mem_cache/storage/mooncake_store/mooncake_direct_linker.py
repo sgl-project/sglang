@@ -619,7 +619,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def offload(
         self, transfers: list[PoolTransfer], session_id: str | None = None
     ) -> bool:
-        expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
+        # A state-only offload (a Mamba checkpoint attached to a node whose KV
+        # is already stored) carries no KV transfer.
+        expanded = self.pool_group.resolve_transfers(
+            transfers, allow_partial=True, allow_missing_kv=True
+        )
         if not expanded:
             return False
         self.freeze_gc_once()
@@ -627,8 +631,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if not expanded:
             self.offload_results.put(True)
             return True
-        kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
-        tokens = len(kv.keys) * self.page_size
+        tokens = sum(
+            len(transfer.keys) * self.page_size
+            for transfer in transfers
+            if transfer.name == PoolName.KV
+        )
         ready = self.record_transfer_ready()
         self.offload_queue.put((expanded, tokens, ready, session_id))
         return True
