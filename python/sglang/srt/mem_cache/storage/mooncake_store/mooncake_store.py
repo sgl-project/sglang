@@ -103,6 +103,12 @@ def _normalize_tenant_id(value) -> str:
     return tenant_id if tenant_id else DEFAULT_TENANT_ID
 
 
+def _parse_optional_int(value) -> Optional[int]:
+    if value is None:
+        return None
+    return int(value)
+
+
 @dataclass
 class MooncakeStoreConfig:
     local_hostname: str
@@ -120,6 +126,9 @@ class MooncakeStoreConfig:
     tenant_id: str = DEFAULT_TENANT_ID
     # TCP and other staged GPU transports need space for in-flight transfers.
     local_buffer_size: int = DEFAULT_LOCAL_BUFFER_SIZE
+    enable_ssd_prefetch: bool = False
+    ssd_prefetch_cooldown_sec: Optional[int] = None
+    ssd_prefetch_dedup_ttl_sec: Optional[int] = None
 
     def __post_init__(self):
         self.local_buffer_size = int(self.local_buffer_size)
@@ -207,6 +216,17 @@ class MooncakeStoreConfig:
             local_buffer_size=config.get(
                 "local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE
             ),
+            enable_ssd_prefetch=bool(
+                config.get(
+                    "enable_ssd_prefetch", envs.MOONCAKE_ENABLE_SSD_PREFETCH.get()
+                )
+            ),
+            ssd_prefetch_cooldown_sec=_parse_optional_int(
+                config.get("ssd_prefetch_cooldown_sec")
+            ),
+            ssd_prefetch_dedup_ttl_sec=_parse_optional_int(
+                config.get("ssd_prefetch_dedup_ttl_sec")
+            ),
         )
 
     @staticmethod
@@ -239,6 +259,7 @@ class MooncakeStoreConfig:
             enable_ssd_offload=envs.MOONCAKE_ENABLE_SSD_OFFLOAD.get(),
             ssd_offload_path=envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.get(),
             tenant_id=_normalize_tenant_id(envs.MOONCAKE_TENANT_ID.get()),
+            enable_ssd_prefetch=envs.MOONCAKE_ENABLE_SSD_PREFETCH.get(),
         )
 
     @staticmethod
@@ -292,6 +313,17 @@ class MooncakeStoreConfig:
             local_buffer_size=extra_config.get(
                 "local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE
             ),
+            enable_ssd_prefetch=bool(
+                extra_config.get(
+                    "enable_ssd_prefetch", envs.MOONCAKE_ENABLE_SSD_PREFETCH.get()
+                )
+            ),
+            ssd_prefetch_cooldown_sec=_parse_optional_int(
+                extra_config.get("ssd_prefetch_cooldown_sec")
+            ),
+            ssd_prefetch_dedup_ttl_sec=_parse_optional_int(
+                extra_config.get("ssd_prefetch_dedup_ttl_sec")
+            ),
         )
 
 
@@ -336,6 +368,27 @@ class MooncakeBaseStore:
             except Exception:
                 supports_group_ids = False
         return ReplicateConfig, supports_group_ids
+
+    def _import_mooncake_prefetch_types(self):
+        exist_options = None
+        try:
+            from mooncake.store import ExistOptions
+
+            exist_options = ExistOptions()
+            exist_options.prefetch_to_memory = True
+        except Exception:
+            exist_options = None
+
+        complete_status = None
+        terminal_statuses = ()
+        try:
+            from mooncake.store import ReplicaStatus
+
+            complete_status = ReplicaStatus.COMPLETE
+            terminal_statuses = (ReplicaStatus.FAILED, ReplicaStatus.REMOVED)
+        except Exception:
+            pass
+        return exist_options, complete_status, terminal_statuses
 
     def _load_config(self, storage_config: Any = None):
         extra_config = (
@@ -468,6 +521,10 @@ class MooncakeBaseStore:
 
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
+    _prefetch_exist_options = None
+    _replica_complete_status = None
+    _replica_terminal_statuses = ()
+
     @staticmethod
     def _standalone_required_bytes(mem_pool: Any) -> int:
         """Compute total bytes of host buffers that must be visible to the real client.
@@ -526,6 +583,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Mooncake builds with ReplicateConfig.session_ids publish the writing
         # session on their stored KV events.
         self._supports_session_ids = self._replicate_config_supports("session_ids")
+        (
+            self._prefetch_exist_options,
+            self._replica_complete_status,
+            self._replica_terminal_statuses,
+        ) = self._import_mooncake_prefetch_types()
         try:
             self.store = MooncakeDistributedStore()
 
@@ -681,8 +743,47 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     setup_kwargs["ssd_offload_path"] = ssd_offload_path
                 if self.config.tenant_id != DEFAULT_TENANT_ID:
                     setup_kwargs["tenant_id"] = self.config.tenant_id
+                use_config_dict = transfer_engine is None and (
+                    self.config.enable_ssd_prefetch
+                    or self.config.ssd_prefetch_cooldown_sec is not None
+                    or self.config.ssd_prefetch_dedup_ttl_sec is not None
+                )
+                ret_code = None
+                if use_config_dict:
+                    setup_dict = {
+                        "local_hostname": client_hostname,
+                        "metadata_server": self.config.metadata_server,
+                        "global_segment_size": per_rank_global_segment_size,
+                        "local_buffer_size": self.config.local_buffer_size,
+                        "protocol": self.config.protocol,
+                        "rdma_devices": device_name,
+                        "master_server_addr": self.config.master_server_address,
+                        "enable_ssd_offload": self.config.enable_ssd_offload,
+                        "tenant_id": self.config.tenant_id,
+                        "enable_ssd_prefetch": self.config.enable_ssd_prefetch,
+                    }
+                    if "ssd_offload_path" in setup_kwargs:
+                        setup_dict["ssd_offload_path"] = setup_kwargs[
+                            "ssd_offload_path"
+                        ]
+                    if self.config.ssd_prefetch_cooldown_sec is not None:
+                        setup_dict["ssd_prefetch_cooldown_sec"] = (
+                            self.config.ssd_prefetch_cooldown_sec
+                        )
+                    if self.config.ssd_prefetch_dedup_ttl_sec is not None:
+                        setup_dict["ssd_prefetch_dedup_ttl_sec"] = (
+                            self.config.ssd_prefetch_dedup_ttl_sec
+                        )
+                    try:
+                        ret_code = self.store.setup(setup_dict)
+                    except TypeError:
+                        logger.warning(
+                            "The installed Mooncake version does not support "
+                            "dict-based setup() for SSD prefetch; falling back "
+                            "to positional setup()."
+                        )
 
-                while True:
+                while ret_code is None:
                     try:
                         ret_code = self.store.setup(
                             client_hostname,
@@ -1190,14 +1291,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         keys: List[str],
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
+        prefetch_to_memory: bool = False,
     ) -> PoolTransferResult:
         if self.mem_pool_host.kv_buffer is None:
             # Logical anchor: no physical KV object exists in Mooncake, so the
             # usable prefix is determined entirely by required sidecar objects.
             kv_pages = len(keys)
         else:
-            kv_pages = self.batch_exists(keys, extra_info)
-
+            kv_pages = self.batch_exists(
+                keys, extra_info, prefetch_to_memory=prefetch_to_memory
+            )
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         # Start from every KV prefix and let each pool remove the stop points it
         # cannot serve. Collect the whole set, not just its maximum: a
@@ -1221,7 +1324,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         with self.request_context(**self._request_context_from_extra_info(extra_info)):
             all_exists = (
-                self._batch_exist(all_component_keys) if all_component_keys else []
+                self._batch_exist(
+                    all_component_keys, prefetch_to_memory=prefetch_to_memory
+                )
+                if all_component_keys
+                else []
             )
         for transfer, key_multiplier, start, end in prepared:
             if not restorable:
@@ -1781,7 +1888,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return exist_result[0] == 1
 
     def batch_exists(
-        self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
+        self,
+        keys,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+        prefetch_to_memory: bool = False,
     ) -> int:
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
@@ -1804,7 +1914,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 key_multiplier = 2
 
         with self.request_context(**self._request_context_from_extra_info(extra_info)):
-            exist_result = self._batch_exist(query_keys)
+            exist_result = self._batch_exist(
+                query_keys, prefetch_to_memory=prefetch_to_memory
+            )
         for i in range(len(query_keys)):
             if exist_result[i] != 1:
                 return i // key_multiplier
@@ -1860,8 +1972,51 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
         return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
 
-    def _batch_exist(self, key_strs: List[str]) -> List[int]:
+    def _batch_exist(
+        self, key_strs: List[str], prefetch_to_memory: bool = False
+    ) -> List[int]:
+        if prefetch_to_memory and self._prefetch_exist_options is not None:
+            try:
+                return self.store.batch_is_exist(key_strs, self._prefetch_exist_options)
+            except TypeError:
+                self._prefetch_exist_options = None
         return self.store.batch_is_exist(key_strs)
+
+    def _is_complete_memory_replica(self, desc: Any) -> bool:
+        if not desc.is_memory_replica():
+            return False
+        if self._replica_complete_status is None:
+            return True
+        return desc.status == self._replica_complete_status
+
+    def filter_pending_memory_keys(self, key_strs: List[str]) -> List[str]:
+        """Return the subset of ``key_strs`` still waiting on DRAM promotion."""
+        if not key_strs or self.store is None:
+            return []
+        try:
+            replica_map = self.store.batch_get_replica_desc(key_strs)
+        except AttributeError:
+            return []
+        except Exception:
+            logger.warning(
+                "Mooncake replica status query failed during prefetch poll",
+                exc_info=True,
+            )
+            return []
+        if not replica_map:
+            return []
+        pending: List[str] = []
+        terminal = self._replica_terminal_statuses
+        for key in key_strs:
+            replicas = replica_map.get(key)
+            if not replicas:
+                continue
+            if any(self._is_complete_memory_replica(r) for r in replicas):
+                continue
+            if terminal and all(r.status in terminal for r in replicas):
+                continue
+            pending.append(key)
+        return pending
 
     def get_stats(self):
         storage_metrics = StorageMetrics()

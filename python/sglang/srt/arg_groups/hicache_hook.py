@@ -26,7 +26,9 @@ def handle_hicache(server_args: Any):
     )
 
     config = cfg.unified_cache_external_linker_config
-    _, _, backend_config = parse_linker_load_options(config)
+    _, _, backend_config = parse_linker_load_options(
+        config, default_prefetch_policy=cfg.hicache_storage_prefetch_policy
+    )
     if cfg.unified_cache_external_linker_backend == "dynamic" and (
         cfg.enable_unified_cache_external_linker or config is not None
     ):

@@ -37,26 +37,24 @@ Set common load options alongside Mooncake connection settings:
 
 ```bash
 --enable-unified-cache-external-linker \
---unified-cache-external-linker-config '{"load_mode":"prefetch","prefetch_policy":"timeout","master_server_address":"HOST:50051"}'
+--hicache-storage-prefetch-policy timeout \
+--unified-cache-external-linker-config '{"master_server_address":"HOST:50051","enable_ssd_offload":true,"ssd_offload_path":"/mnt/nvme/mooncake","enable_ssd_prefetch":true}'
 ```
 
-`load_mode` defaults to `layer_wise`. Prefetch starts at `_prefetch_kvcache()` on
-enqueue and reuses the load thread for concurrent requests. It supports
-Full/SWA/Mamba within existing linker layout limits and requires PP=1.
-All attention TP ranks read into private GPU slots; only complete KV confirmed
-successful by every rank joins the radix tree. Failed reads fall back to recomputation.
+`load_mode` defaults to `layer_wise` (PP=1 for queue-time prefetch, Full/SWA/Mamba):
 
-Set `prefetch_policy` in the same JSON:
+- `layer_wise` (default): on enqueue (`_prefetch_kvcache()`), the linker probes Mooncake with `ExistOptions(prefetch_to_memory=True)` so SSD-only KV hits promote asynchronously into Mooncake's DRAM while the request waits in the queue, holding zero GPU KV slots and zero radix-tree locks. Once DRAM replicas are ready (or the policy stops waiting), admission loads layers directly from DRAM into request-private GPU slots.
+- `prefetch`: on enqueue, all attention TP ranks read every layer directly into private GPU slots (`{"load_mode":"prefetch",...}`); only complete KV confirmed by every rank joins the radix tree, and failed reads fall back to recomputation.
 
-- `best_effort`: use completed KV at admission; otherwise stop waiting and recompute.
-- `wait_complete`: wait until every rank finishes.
+`prefetch_policy` defaults to `--hicache-storage-prefetch-policy` and can also be overridden in `--unified-cache-external-linker-config`:
+
+- `best_effort`: kick off store-DRAM promotion (or consume already-completed GPU prefetch) without delaying admission.
+- `wait_complete`: hold admission until every rank's prefetch is ready.
 - `timeout` (default): wait from the first blocked admission poll for
   `prefetch_timeout_base` + tokens / 1024 * `prefetch_timeout_per_ki_token` seconds.
   These JSON options default to 1 and 0.25 respectively.
 
-Stopping the wait cancels queued reads. Running reads retain their private slots
-until every rank stops writing, then discard them without publishing. Pending
-slots count toward GPU capacity. Reset and shutdown drain reads before freeing slots.
+In `prefetch` mode, stopping the wait cancels queued GPU reads while running reads retain their private slots until every rank stops writing; pending slots count toward GPU capacity, and reset/shutdown drain reads before freeing slots.
 The deprecated HiCache extra config is used only when linker JSON is omitted.
 
 ### Decode context parallelism (DCP)

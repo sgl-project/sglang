@@ -12,7 +12,8 @@ from sglang.srt.mem_cache.unified_cache.linker_config import (
     UnifiedCacheLinkerConfig,
     parse_linker_load_options,
 )
-from sglang.srt.runtime_context import get_memory
+from sglang.srt.runtime_context import get_context, get_memory
+from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     import torch
@@ -22,7 +23,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
         UnifiedCacheLinker,
     )
-    from sglang.srt.server_args import ServerArgs
 
 
 logger = logging.getLogger(__name__)
@@ -68,7 +68,14 @@ def create_unified_cache_linker(
     components: set[ComponentType],
     forward_stream: torch.cuda.Stream | None = None,
 ) -> UnifiedCacheLinker:
-    load_mode, prefetch_policy, backend_config = parse_linker_load_options(config)
+    default_policy = "timeout"
+    if get_context().is_config_namespace_published("memory"):
+        default_policy = get_memory().hicache_storage_prefetch_policy
+    elif isinstance(server_args, ServerArgs):
+        default_policy = server_args.hicache_storage_prefetch_policy
+    load_mode, prefetch_policy, backend_config = parse_linker_load_options(
+        config, default_prefetch_policy=default_policy
+    )
     extra_config = backend_config
     if backend == "dynamic":
         config = UnifiedCacheLinkerConfig.from_dict(
