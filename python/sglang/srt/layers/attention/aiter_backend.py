@@ -54,6 +54,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_used_len,
 )
 from sglang.srt.utils import (
+    is_device_stream_capturing,
     is_gfx95_supported,
     is_gfx1250_supported,
     print_info_once,
@@ -2414,7 +2415,7 @@ class AiterAttnBackend(AttentionBackend):
             return None
         buf = self._fp8_q_buffer
         if buf is None or buf.shape[0] < num_tokens or buf.shape[2] != head_dim:
-            if torch.cuda.is_current_stream_capturing():
+            if is_device_stream_capturing(torch.device(self.device)):
                 # A zero fill recorded into a graph runs only at replay.
                 return None
             if buf is None:

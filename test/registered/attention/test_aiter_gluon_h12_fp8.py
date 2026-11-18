@@ -959,7 +959,8 @@ class TestFp8QOut(CustomTestCase):
         be = self._make_backend()
         with mock.patch.object(be, "_mla_verify_runs_gluon", return_value=False):
             with mock.patch(
-                "torch.cuda.is_current_stream_capturing", return_value=True
+                "sglang.srt.layers.attention.aiter_backend.is_device_stream_capturing",
+                return_value=True,
             ):
                 self.assertIsNone(
                     be.mla_fp8_q_out(
