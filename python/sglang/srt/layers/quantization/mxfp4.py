@@ -205,7 +205,6 @@ _is_cpu = is_cpu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_aiter_k3_opt = _use_aiter and envs.SGLANG_OPT_HIP_K3_AITER.get()
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 _is_cpu_amx_available = cpu_has_amx_support()
 
@@ -514,7 +513,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # default costs +33% mem (3072/8=384 -> 512). K3 FlyDSL MoE works with
             # 128 padding, so relaxing to 128 saves that memory and lets the TP8
             # decode CUDA graph range grow from 20 to 120.
-            _inter_align = 128 if _aiter_k3_opt else 256
+            _inter_align = (
+                128 if _use_aiter and layer.aiter_mxfp4_intermediate_align_128 else 256
+            )
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, _inter_align
             )

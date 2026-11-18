@@ -166,7 +166,6 @@ logger = logging.getLogger(__name__)
 _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
 _is_npu = is_npu()
-_aiter_k3_opt = envs.SGLANG_OPT_HIP_K3_AITER.get()
 
 # (n, k) -> ((m_lo, m_hi, tactic), ...); tactic None = the ladder pick.
 _K3_TGV_M_RANGES = {
@@ -583,6 +582,9 @@ class KimiK3MoE(nn.Module):
 
             moe_quant_config = Mxfp4Config(is_checkpoint_mxfp4_serialized=True)
 
+        aiter_k3_opt = envs.SGLANG_OPT_HIP_K3_AITER.get()
+        self._router_logits_contiguous = _is_hip and not aiter_k3_opt
+
         # Routed experts (operate in moe_hidden_size space)
         # gate_up_interleaved=False: K3 loads per-expert w1/w3 into non-interleaved layout
         self.experts = get_moe_impl_class(moe_quant_config)(
@@ -597,6 +599,8 @@ class KimiK3MoE(nn.Module):
             gemm1_alpha=config.activation_situ_beta,
             gemm1_clamp_limit=config.activation_situ_linear_beta,
             gate_up_interleaved=False,
+            # The K3 FlyDSL MoE runs the 128-aligned intermediate (384 at TP8).
+            aiter_mxfp4_intermediate_align_128=aiter_k3_opt,
             # trtllm fused-routing MoE backends (e.g. nvfp4 w4a4) route inside
             # the kernel and require the routing method; K3 uses DSv3-style
             # grouped topk with e_score_correction_bias.
@@ -1569,7 +1573,7 @@ class KimiK3MoE(nn.Module):
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
-        if hidden_states.shape[0] > 1 and _is_hip and not _aiter_k3_opt:
+        if hidden_states.shape[0] > 1 and self._router_logits_contiguous:
             router_logits = router_logits.contiguous()
         if self._moe_front_needs_dense_bf16:
             # off an fp32 front the cast allocates the dense buffer, so the

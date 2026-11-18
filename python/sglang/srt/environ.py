@@ -1206,8 +1206,9 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
-    # Pad the AITER MXFP4 MoE intermediate to 128, not 256 (Quark W4A4 keeps the
-    # checkpoint width), and skip the router-logits contiguous copy on HIP.
+    # Read only by the Kimi-K3 MoE: declare a 128-aligned AITER MXFP4 MoE
+    # intermediate on its experts (FusedMoE.aiter_mxfp4_intermediate_align_128)
+    # and skip the router-logits contiguous copy on HIP.
     SGLANG_OPT_HIP_K3_AITER = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_AITER_K3_OPT"
     )

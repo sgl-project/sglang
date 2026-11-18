@@ -412,6 +412,7 @@ class FusedMoE(torch.nn.Module):
         quant_method: Optional[FusedMoEMethodBase] = None,
         uses_expert_location: bool = True,
         allow_fp8_blockwise_tail: bool = False,
+        aiter_mxfp4_intermediate_align_128: bool = False,
     ):
         super().__init__()
         if params_dtype is None:
@@ -432,6 +433,10 @@ class FusedMoE(torch.nn.Module):
         self.with_bias = with_bias
         self.num_fused_shared_experts = num_fused_shared_experts
         self.allow_fp8_blockwise_tail = allow_fp8_blockwise_tail
+        # The model's AITER MXFP4 MoE kernels take an intermediate width aligned
+        # to 128 rather than AITER's generic 256 (see the MXFP4 and Quark W4A4
+        # MXFP4 create_weights).
+        self.aiter_mxfp4_intermediate_align_128 = aiter_mxfp4_intermediate_align_128
 
         self.enable_flashinfer_cutlass_moe = (
             get_moe_runner_backend().is_flashinfer_cutlass()
