@@ -1,6 +1,8 @@
 """Unified radix tree backed by the LMCache multiprocess service.
 
 LMCache owns external storage; retrieved KV is published after reaching GPU.
+With KV events on, the LMCache server's committed CPU copies are published
+under the page hashes the tree uses for its own events.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from lmcache.integration.sglang.unified_lmcache_mp_connector import (
     UnifiedLMCacheMPConnector,
 )
 
+from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     EvictParams,
@@ -35,6 +38,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.mem_cache.utils import hash_str_to_int64
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -56,11 +60,22 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         tp_rank: int,
         lmcache_config_file: Optional[str],
         forward_stream: Any,
+        kv_events_configured: bool,
     ) -> None:
         # The parent constructor calls reset() before the connector exists.
         self.lmcache_connector: Optional[UnifiedLMCacheMPConnector] = None
         super().__init__(params)
         self._mamba_component = self._find_mamba_component()
+        # Without --kv-events-config the connector is built exactly as before.
+        kv_event_args = (
+            {
+                "enable_kv_events": True,
+                "kv_event_publisher": params.enable_kv_cache_events,
+                "dynamo_format": params.dynamo_kv_event_format,
+            }
+            if kv_events_configured
+            else {}
+        )
         self.lmcache_connector = UnifiedLMCacheMPConnector(
             config_file=lmcache_config_file,
             model_config=model_config,
@@ -76,7 +91,11 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             tree_components=self.tree_components,
             mamba_component=self._mamba_component,
             sliding_window_size=self.sliding_window_size,
+            **kv_event_args,
         )
+        # Only the tree's publisher rank holds page hashes, so only it binds stores
+        # and drains CPU events.
+        self._lmcache_kv_publisher = params.enable_kv_cache_events
         self._external_flows: dict[str, LMCacheExternalFlow] = {}
         self._forward_stream = forward_stream
         self._pending_stores: list[LMCachePendingStore] = []
@@ -320,6 +339,12 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
     def has_pending_cache_operations(self) -> bool:
         return bool(self._external_flows or self._pending_stores)
 
+    def take_events(self):
+        events = super().take_events()
+        if self._lmcache_kv_publisher:
+            events.extend(self.lmcache_connector.take_events())
+        return events
+
     def _abandon_attempt(self, handle: CacheRequestHandle) -> None:
         rid = handle.rid
         self.prefetch_loaded_tokens_by_reqid.pop(handle, None)
@@ -433,6 +458,28 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
 
     def release_host_resources(self) -> None:
         self.shutdown()
+
+    def _native_block_hashes(
+        self, key: RadixKey, *, node_id: NodeId, path_tokens: int
+    ) -> Optional[list[int]]:
+        """Event hash of every page of ``key``, a prefix of the path to ``node_id``.
+
+        None if the request has no native identity or the path is not fully hashed.
+        """
+        # Namespaced and multimodal requests keep caching without CPU events.
+        if key.extra_key is not None or key.cache_salt is not None:
+            return None
+        if max(key.raw_token_ids()) >= MM_PAD_SHIFT_VALUE:
+            return None
+        page_hashes = [
+            *self.get_prefix_hash_values(node_id),
+            *self.tree_core.get_hash_values(node_id),
+        ]
+        # An unhashed node restarts the chain below it, which shifts every page.
+        if len(page_hashes) * self.page_size != path_tokens:
+            return None
+        num_pages = len(key) // self.page_size
+        return [hash_str_to_int64(page_hash) for page_hash in page_hashes[:num_pages]]
 
     def _find_mamba_component(self):
         return next(
@@ -925,9 +972,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             key = key[:resident_len]
             # Re-match so the lock and Mamba state use the shortened boundary.
             matched = super().match_prefix(MatchPrefixParams(key=key))
-        store_indices = self.path_device_indices(matched.last_device_node)[
-            store_start : len(key)
-        ]
+        path_indices = self.path_device_indices(matched.last_device_node)
+        store_indices = path_indices[store_start : len(key)]
         if len(store_indices) != len(key) - store_start:
             logger.debug(
                 "LMCache store skipped for %s: store indices length: %d, "
@@ -962,6 +1008,15 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 len(key),
             )
             return
+        # Read the hashes before the try: a rank that skipped submit_store would
+        # miss its cross-rank collectives.
+        kv_event_args = {}
+        if self._lmcache_kv_publisher:
+            kv_event_args["native_block_hashes"] = self._native_block_hashes(
+                key,
+                node_id=matched.last_device_node,
+                path_tokens=len(path_indices),
+            )
         try:
             operation = self.lmcache_connector.submit_store(
                 req.rid,
@@ -974,6 +1029,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 cache_salt=self.lmcache_connector.build_cache_salt(
                     req.cache_salt, req.extra_key
                 ),
+                **kv_event_args,
             )
         except Exception:
             self.dec_lock_ref(matched.last_device_node, lock_params)

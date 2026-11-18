@@ -59,6 +59,7 @@ def _make_ctx(
     disable_radix_cache=False,
     full_tokens_per_layer=None,
     enable_kv_cache_sharding=False,
+    kv_events_config=None,
 ):
     # The factory reads the published bags for the cache-backend leaves, so the
     # fixture publishes them; the instance stays for the whole-object contract
@@ -71,6 +72,7 @@ def _make_ctx(
         enable_flexkv=False,
         enable_unified_cache_external_linker=False,
         enable_kv_cache_sharding=enable_kv_cache_sharding,
+        kv_events_config=kv_events_config,
     )
     params = MagicMock()
     # Static pools: the tree's slots follow the pool shape.
@@ -375,9 +377,32 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
                 tp_rank=ctx.tp_rank,
                 lmcache_config_file=None,
                 forward_stream=ctx.tp_worker.model_runner.forward_stream,
+                kv_events_configured=False,
             )
             self.assertEqual(_slots(ctx), [("FULL", "token")])
             self.assertIs(result, fake_module.LMCacheUnifiedRadixCache.return_value)
+
+    def test_lmcache_cpu_events_follow_kv_events_config(self):
+        # LMCache CPU events have no flag of their own.
+        ctx = _make_ctx(
+            self,
+            enable_lmcache=True,
+            kv_events_config='{"publisher": "zmq", "topic": "kv-events"}',
+        )
+        fake_module = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache": fake_module,
+                "sglang.srt.mem_cache.unified_cache.components": MagicMock(),
+            },
+        ):
+            default_radix_cache_factory(ctx)
+        self.assertTrue(
+            fake_module.LMCacheUnifiedRadixCache.call_args.kwargs[
+                "kv_events_configured"
+            ]
+        )
 
     def test_lmcache_supports_hybrid_swa_components(self):
         ctx = _make_ctx(self, enable_lmcache=True, is_hybrid_swa=True)

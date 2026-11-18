@@ -219,7 +219,7 @@ The startup handshake and `GET /get_hicache_l3_cache_layout` use the same layout
 
 - **`--hicache-storage-backend {file,fast_file,mooncake,hf3fs,nixl,aibrix,dynamic}`**: Choose the storage backend for the L3 tier. Built-in backends: file, fast_file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: `backend_name` (custom name), `module_path` (Python module path), `class_name` (backend class name). See [Unified Interfaces and Rich L3 Storage Backends](#unified-interfaces-and-rich-l3-storage-backends) for available backends.
 
-- **`--enable-lmcache`**: Using LMCache as an alternative hierarchical cache solution.
+- **`--enable-lmcache`**: Using LMCache as an alternative hierarchical cache solution. With --kv-events-config, the CPU copies held by the LMCache server are published as CPU_PINNED KV events under the page hashes of the GPU events.
 
 - **`--lmcache-config-file`**: Path to the LMCache YAML configuration file.
 

@@ -22,6 +22,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_memory,
+    get_observability,
     get_serving,
 )
 
@@ -126,6 +127,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             tp_rank=ctx.tp_rank,
             lmcache_config_file=get_memory().lmcache_config_file,
             forward_stream=ctx.tp_worker.model_runner.forward_stream,
+            kv_events_configured=bool(get_observability().kv_events_config),
         )
 
     if get_memory().enable_unified_cache_external_linker:

@@ -2312,7 +2312,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
   <tbody>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-lmcache`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Using LMCache as an alternative hierarchical cache solution</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Using LMCache as an alternative hierarchical cache solution. With --kv-events-config, the CPU copies held by the LMCache server are published as CPU_PINNED KV events under the page hashes of the GPU events</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>

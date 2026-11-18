@@ -315,7 +315,10 @@ class Memory(msgspec.Struct):
     # LMCache
     # -------------------------------------------------------------------------
     enable_lmcache: A[
-        bool, "Using LMCache as an alternative hierarchical cache solution"
+        bool,
+        "Using LMCache as an alternative hierarchical cache solution. With "
+        "--kv-events-config, the CPU copies held by the LMCache server are "
+        "published as CPU_PINNED KV events under the page hashes of the GPU events",
     ] = False
     lmcache_config_file: A[
         Optional[str],
