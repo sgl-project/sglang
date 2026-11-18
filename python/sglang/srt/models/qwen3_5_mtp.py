@@ -253,7 +253,11 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
             hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
 
-            if not forward_batch.forward_mode.is_idle():
+            if forward_batch.forward_mode.is_idle():
+                hidden_states = hidden_states.new_zeros(
+                    (hidden_states.shape[0], self.config.hidden_size)
+                )
+            else:
                 hidden_states, _ = self.fc(hidden_states)
 
             with get_global_expert_distribution_recorder().disable_this_region():
