@@ -1,15 +1,12 @@
-"""Unit tests for srt/models/kimi_k3_rocm_{quant,moe} and the K3 weight-merge guard."""
+"""Unit tests for srt/models/kimi_k3_rocm_quant, the K3 weight-merge guard and the ROCm MoE front."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
-import sys
-import types
 import unittest
 from types import SimpleNamespace
 from unittest import mock
-from unittest.mock import patch
 
 import torch
 
@@ -21,11 +18,12 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import unquant
 from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
 from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.models import kimi_k3, kimi_k3_rocm_quant
-from sglang.srt.models.kimi_k3 import KimiK3DeltaAttention, _is_unquantized_mergeable
-from sglang.srt.models.kimi_k3_rocm_moe import (
-    _first_untuned_tokens,
-    build_tuned_front_gemm,
+from sglang.srt.models.kimi_k3 import (
+    KimiK3DeltaAttention,
+    KimiK3MoE,
+    _is_unquantized_mergeable,
 )
 from sglang.srt.models.kimi_k3_rocm_quant import (
     _k3_channel_fp8_to_bf16,
@@ -115,113 +113,75 @@ class TestMergeDtypeGuard(CustomTestCase):
         self.assertFalse(_is_unquantized_mergeable(weights))
 
 
-def _shaped(rows: int, cols: int, dtype=torch.bfloat16) -> torch.Tensor:
-    # Only shape and dtype are read; expand keeps the 6016x7168 front at one element.
-    return torch.zeros(1, dtype=dtype).expand(rows, cols)
+class TestHipTunedMoeFront(CustomTestCase):
+    """SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT hands the merged front to
+    UnquantizedLinearMethod.apply, so AITER's tgemm must see the whole merged
+    [N, K] weight untransposed, and deterministic mode must still skip AITER."""
 
+    def _merged_front(self):
+        class Owner(SimpleNamespace):
+            @property
+            def _front_shard(self):
+                return None
 
-def _fake_aiter(*, gfx: str = "gfx950", cu_num: int = 256, rows_up_to=192) -> dict:
-    tuned_gemm = types.ModuleType("aiter.tuned_gemm")
-    tuned_gemm.tgemm = SimpleNamespace(mm=lambda **kwargs: None)
-    tuned_gemm.get_GEMM_A16W16_tuned_config = lambda *, M, **kwargs: (
-        {"libtype": "flydsl"} if M <= rows_up_to else None
-    )
-    chip_info = types.ModuleType("aiter.jit.utils.chip_info")
-    chip_info.get_gfx = lambda: gfx
-    chip_info.get_cu_num = lambda: cu_num
-    return {
-        "aiter": types.ModuleType("aiter"),
-        "aiter.tuned_gemm": tuned_gemm,
-        "aiter.jit": types.ModuleType("aiter.jit"),
-        "aiter.jit.utils": types.ModuleType("aiter.jit.utils"),
-        "aiter.jit.utils.chip_info": chip_info,
-    }
+            @property
+            def _front_fp32(self):
+                return False
 
+        def module(rows):
+            return SimpleNamespace(weight=torch.randn(rows, 16, dtype=torch.bfloat16))
 
-class TestTunedFrontGemm(CustomTestCase):
-    """AITER has tuned rows for one bf16 front shape (TP8) on gfx950 only;
-    the builder declines every other target, and a broken AITER fails the load."""
-
-    def _build(
-        self,
-        *,
-        use_aiter=True,
-        enabled=True,
-        weight=None,
-        aiter=None,
-        window=(48, 192),
-        deterministic=False,
-    ):
-        _first_untuned_tokens.cache_clear()
+        owner = Owner(
+            use_latent_moe=True,
+            shared_experts=SimpleNamespace(gate_up_proj=module(6)),
+            gate=module(4),
+            routed_expert_down_proj=module(8),
+            _front_w=None,
+            _front_quant_method=UnquantizedLinearMethod(),
+            _front_quant_layer=None,
+            _moe_front_needs_dense_bf16=False,
+        )
         with (
-            patch.dict(sys.modules, _fake_aiter() if aiter is None else aiter),
-            patch.object(unquant, "_skip_aiter_unquant", deterministic),
-            envs.SGLANG_USE_AITER.override(use_aiter),
-            envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT.override(enabled),
-            envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MIN_TOKENS.override(window[0]),
-            envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MAX_TOKENS.override(window[1]),
-        ):
-            return build_tuned_front_gemm(
-                weight=_shaped(6016, 7168) if weight is None else weight
-            )
-
-    def test_covers_the_inclusive_env_window(self):
-        tuned = self._build()
-        for num_tokens, covered in ((47, False), (48, True), (192, True), (193, False)):
-            with self.subTest(num_tokens=num_tokens):
-                self.assertIs(tuned.covers(num_tokens), covered)
-
-    def test_declines_outside_the_tuned_target(self):
-        no_aiter = {"aiter": None, "aiter.tuned_gemm": None}
-        for name, kwargs in (
-            ("SGLANG_USE_AITER off", dict(use_aiter=False, aiter=no_aiter)),
-            ("switch off", dict(enabled=False, aiter=no_aiter)),
-            # Shape and dtype declines need no AITER, so they hold even without tgemm.
-            ("TP4 front shape", dict(weight=_shaped(7552, 7168), aiter=no_aiter)),
-            (
-                "fp16 front",
-                dict(weight=_shaped(6016, 7168, torch.float16), aiter=no_aiter),
+            mock.patch.object(
+                kimi_k3,
+                "get_platform",
+                return_value=SimpleNamespace(is_cuda=False, is_hip=True),
             ),
-            ("gfx942", dict(aiter=_fake_aiter(gfx="gfx942"))),
-            # A partitioned gfx950 has fewer CUs, and AITER keys rows on the CU count.
-            ("gfx950 with 32 CUs", dict(aiter=_fake_aiter(cu_num=32))),
-            # AITER picks the kernel and split-K by batch size.
-            ("deterministic inference", dict(deterministic=True, aiter=no_aiter)),
+            mock.patch.object(
+                kimi_k3,
+                "get_moe_a2a_backend",
+                return_value=SimpleNamespace(is_none=lambda: True),
+            ),
         ):
-            with self.subTest(name):
-                self.assertIsNone(self._build(**kwargs))
+            KimiK3MoE._merge_front_weights(owner)
+        return owner
 
-    def test_fails_at_load_on_an_aiter_without_tgemm_or_its_rows(self):
-        without_tgemm = {**_fake_aiter(), "aiter.tuned_gemm": None}
-        with self.assertRaises(ImportError):
-            self._build(aiter=without_tgemm)
-        without_probe = _fake_aiter()
-        del without_probe["aiter.tuned_gemm"].get_GEMM_A16W16_tuned_config
-        with self.assertRaisesRegex(ImportError, "get_GEMM_A16W16_tuned_config"):
-            self._build(aiter=without_probe)
-        with self.assertRaises(RuntimeError):
-            self._build(aiter=_fake_aiter(rows_up_to=0))
+    def test_front_runs_aiter_tgemm_through_unquantized_apply(self):
+        owner = self._merged_front()
+        x = torch.randn(3, 16, dtype=torch.bfloat16)
+        expected = torch.nn.functional.linear(x, owner._front_w)
+        mm = mock.Mock(
+            side_effect=lambda x, w, bias, otype: torch.nn.functional.linear(x, w)
+        )
+        for deterministic in (False, True):
+            mm.reset_mock()
+            with (
+                self.subTest(deterministic=deterministic),
+                mock.patch.object(unquant, "_use_aiter", True),
+                mock.patch.object(unquant, "_is_gfx95", False),
+                mock.patch.object(unquant, "_skip_aiter_unquant", deterministic),
+                mock.patch.object(
+                    unquant, "tgemm", SimpleNamespace(mm=mm), create=True
+                ),
+            ):
+                fused = torch.cat(KimiK3MoE._fused_front(owner, x), dim=-1)
 
-    def test_fails_at_load_when_the_window_runs_past_the_tuned_rows(self):
-        """tgemm runs an untuned default kernel for a batch without a row, so a
-        window that only its smallest batch probes would pass a partial AITER."""
-        with self.assertRaisesRegex(RuntimeError, "M=193"):
-            self._build(window=(1, 256))
-        with self.assertRaisesRegex(RuntimeError, "M=65"):
-            self._build(aiter=_fake_aiter(rows_up_to=64), window=(1, 192))
-
-    def test_rejects_an_invalid_window_on_every_target(self):
-        """A bad MIN/MAX fails the load even where the target then declines the tuned front."""
-        no_aiter = {"aiter": None, "aiter.tuned_gemm": None}
-        for name, kwargs in (
-            ("tuned target", {}),
-            ("TP4 front shape", dict(weight=_shaped(7552, 7168), aiter=no_aiter)),
-            ("gfx942", dict(aiter=_fake_aiter(gfx="gfx942"))),
-            ("deterministic inference", dict(deterministic=True, aiter=no_aiter)),
-        ):
-            for window in ((64, 32), (0, 128)):
-                with self.subTest(name, window=window), self.assertRaises(ValueError):
-                    self._build(window=window, **kwargs)
+                torch.testing.assert_close(fused, expected, rtol=0, atol=0)
+                if deterministic:
+                    mm.assert_not_called()
+                else:
+                    mm.assert_called_once()
+                    self.assertIs(mm.call_args.args[1], owner._front_w)
 
 
 class TestFusedDecodeFbWeight(CustomTestCase):

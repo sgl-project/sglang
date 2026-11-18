@@ -98,6 +98,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
@@ -127,7 +128,6 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
-from sglang.srt.models.kimi_k3_rocm_moe import TunedFrontGemm, build_tuned_front_gemm
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3MultiModalProjector,
     KimiK3VisionTower,
@@ -548,8 +548,16 @@ class KimiK3MoE(nn.Module):
         # True when _front_w merges only [gate, routed_expert_down_proj] (the EP
         # a2a pair) rather than the three-way fused-front weight.
         self._front_is_ep_pair = False
-        # AITER tuned BF16 GEMM for the three-way merged front; set at merge time.
-        self._tuned_front: Optional[TunedFrontGemm] = None
+        # ROCm opt-in: run the merged front through the unmerged linears' dispatch,
+        # so AITER serves its tuned rows; None runs _k3_bf16_gemm.
+        self._front_quant_method: Optional[UnquantizedLinearMethod] = (
+            UnquantizedLinearMethod()
+            if _is_hip and envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT.get()
+            else None
+        )
+        # Stand-in layer over _front_w for _front_quant_method, set at merge time;
+        # not an nn.Module, so state_dict gains no duplicate entry.
+        self._front_quant_layer: Optional[SimpleNamespace] = None
         self.moe_hidden_size = (
             config.routed_expert_hidden_size if self.use_latent_moe else hidden_size
         )
@@ -847,9 +855,8 @@ class KimiK3MoE(nn.Module):
                 "writes do not refresh. Restart with SGLANG_K3_SHARDED_MOE=0 "
                 "to allow online updates."
             )
-        # _fused_front is the only reader; skip the AITER probe when it never runs.
-        if _is_hip and self._eligible_for_fused_front:
-            self._tuned_front = build_tuned_front_gemm(weight=self._front_w)
+        if self._front_quant_method is not None:
+            self._front_quant_layer = SimpleNamespace(weight=self._front_w)
 
     @cached_property
     def _routed_needs_reduce(self):
@@ -1523,10 +1530,11 @@ class KimiK3MoE(nn.Module):
         """Read hidden_states once through the merged [H, gate_up + E + latent]
         weight: the shared experts' gate_up, the router logits and the routed
         input."""
-        num_tokens = hidden_states.shape[0]
-        # The tuned GEMM writes bf16; _front_fp32 is always False on HIP.
-        if self._tuned_front is not None and self._tuned_front.covers(num_tokens):
-            fused = self._tuned_front(hidden_states, self._front_w)
+        if self._front_quant_layer is not None:
+            # Writes x.dtype; _front_fp32 is always False on HIP.
+            fused = self._front_quant_method.apply(
+                layer=self._front_quant_layer, x=hidden_states
+            )
         else:
             fused = _k3_bf16_gemm(
                 hidden_states,
@@ -1536,7 +1544,7 @@ class KimiK3MoE(nn.Module):
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
-        if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
+        if hidden_states.shape[0] > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
         if self._moe_front_needs_dense_bf16:
             # off an fp32 front the cast allocates the dense buffer, so the
