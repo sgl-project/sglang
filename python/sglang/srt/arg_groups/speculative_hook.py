@@ -6,6 +6,7 @@ import os
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
+from sglang.srt.arg_groups.model_override_base import dspark_dp_a2a_backends
 from sglang.srt.arg_groups.overrides import (
     _speculative_moe_runner_default,
     attention_backends_of,
@@ -674,10 +675,13 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if cfg.attn_dp_size > 1:
         if not cfg.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        if not _is_npu and cfg.moe_a2a_backend not in ("none", "megamoe", "mori"):
+        allowed_a2a_backends = dspark_dp_a2a_backends(
+            model_config_of(server_args).hf_config.architectures[0]
+        )
+        if not _is_npu and cfg.moe_a2a_backend not in allowed_a2a_backends:
             raise ValueError(
-                "DSpark with dp attention supports moe_a2a_backend 'none' "
-                "(built-in TP MoE), 'megamoe', or 'mori', got "
+                "DSpark with dp attention supports moe_a2a_backend "
+                f"{', '.join(map(repr, allowed_a2a_backends))} for this model, got "
                 f"{cfg.moe_a2a_backend!r}."
             )
         if not _is_npu and (
