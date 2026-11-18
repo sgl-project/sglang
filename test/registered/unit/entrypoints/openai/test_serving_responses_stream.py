@@ -806,6 +806,29 @@ class NonHarmonyStreamTestCase(CustomTestCase):
         )
         self.assertEqual(streamed, "Answer<|e")
 
+    def test_reasoning_effort_outside_sdk_literal_echoes_on_the_wire(self):
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            store=False,
+            reasoning={"effort": "none"},
+        )
+        payloads = event_payloads(
+            StreamFixture(serving, request).run(
+                [engine_chunk("answer", 2, finish=True)]
+            )
+        )
+        responses = [
+            p["response"]
+            for p in payloads
+            if p.get("type", "").startswith("response.") and "response" in p
+        ]
+        self.assertTrue(responses)
+        for response in responses:
+            self.assertEqual(response["reasoning"]["effort"], "none")
+
 
 class HarmonyStreamLifecycleTestCase(CustomTestCase):
     def test_truncated_harmony_arguments_close_the_emitted_item(self):
