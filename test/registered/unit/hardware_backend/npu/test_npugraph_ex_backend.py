@@ -11,7 +11,7 @@ import torch
 from sglang.srt.hardware_backend.npu import compile_backend as backend_module
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=1, suite="base-a-test-npu")
+register_npu_ci(est_time=1, suite="extra-a-test-npu")
 
 
 class TestNpugraphExBackend(unittest.TestCase):

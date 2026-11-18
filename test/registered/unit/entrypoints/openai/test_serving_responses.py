@@ -1733,7 +1733,7 @@ class ChatEncodingAdapterDispatchTestCase(CustomTestCase):
         )
 
         for reasoning_parser, tool_call_parser in (
-            ("inkling", "qwen25"),
+            ("inkling", "qwen"),
             ("qwen3", "inkling"),
         ):
             with self.subTest(reasoning=reasoning_parser, tool=tool_call_parser):
@@ -2094,7 +2094,7 @@ class EnginePassthroughTestCase(CustomTestCase):
         # _process_messages turns it off so tool-call markers survive detokenize;
         # create_responses must re-apply it to the engine sampling dict.
         serving = make_serving()
-        serving.tool_call_parser = "qwen25"
+        serving.tool_call_parser = "qwen"
 
         captured = self._capture(
             serving,

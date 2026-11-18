@@ -25,6 +25,7 @@ from typing import List, Optional, Union
 import torch
 import torch.distributed as dist
 
+from sglang.srt.beam_search.trie_output_head import configure_model_trie_output_heads
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import (
     _DEFAULT_LOAD_GROUP,
@@ -153,6 +154,7 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     drop_elastic_cuda_graph_state,
     finalize_cuda_graph_capture,
     recapture_elastic_cuda_graph,
+    release_decode_cuda_graph,
     resolve_elastic_cuda_graph_config,
     sync_elastic_cuda_graph_config,
     validate_elastic_cuda_graph_recapture,
@@ -779,6 +781,12 @@ class ModelRunner:
         )
         self.maybe_apply_post_load_model_transforms()
         self.maybe_init_lora_manager()
+        self.beam_trie_compact_enabled = configure_model_trie_output_heads(
+            self.model,
+            self.model_config,
+            self.device,
+            lora_enabled=self.lora_manager is not None,
+        )
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
         # after every post-load change to the model, before the KV cache is sized
@@ -1721,6 +1729,9 @@ class ModelRunner:
             self.capture_tail_hooks.append(self.uocr_greedy_graph.capture_tail_hook)
 
     def init_decode_cuda_graph(self):
+        release_decode_cuda_graph(
+            decode_runner=self.decode_cuda_graph_runner, eager_runner=self.eager_runner
+        )
         self.decode_cuda_graph_runner = None
         capture = capture_decode_graph(model_runner=self)
         self.decode_cuda_graph_runner = capture.runner
@@ -1966,6 +1977,11 @@ class ModelRunner:
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
         if isinstance(output.logits_output, LogitsProcessorOutput):
             output.logits_output.own_customized_info()
+        if (
+            not self.is_draft_worker
+            and (placement := getattr(self.model, "expert_placement", None)) is not None
+        ):
+            placement.on_forward_end(forward_batch)
 
         no_copy_to_cpu = not get_schedule().disable_overlap_schedule
         if (
