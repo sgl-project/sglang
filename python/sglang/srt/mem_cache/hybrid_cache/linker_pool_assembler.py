@@ -539,7 +539,8 @@ def _split_sidecar_draft_pools(
     kv_drafts, swa_drafts = [], []
     for draft in draft_pools:
         if type(draft) is MHATokenToKVPool:
-            kv_drafts.append(draft)
+            # A DFlash draft on the target's SWA ids is sized to the SWA pool.
+            (swa_drafts if draft.follows_target_swa_ids else kv_drafts).append(draft)
             continue
         if not isinstance(draft, BaseSWAKVPool) or not all(
             type(sub) is MHATokenToKVPool
