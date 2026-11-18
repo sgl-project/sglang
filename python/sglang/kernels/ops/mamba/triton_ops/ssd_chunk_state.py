@@ -322,6 +322,14 @@ def _chunk_state_fwd_kernel(
             mask=(offs_k[:, None] < chunk_size_limit - k) & (offs_n[None, :] < dstate),
             other=0.0,
         ).to(tl.float32)
+        # A non-finite x or B from one sequence must not reach the dot product below:
+        # for another sequence in this chunk, scale masks its own contribution to 0,
+        # but 0 * inf (or 0 * nan) is still nan, which tl.dot then sums into every
+        # output of this chunk, not just the sequence the non-finite value belongs to.
+        # `v - v` is 0 for every finite v and nan for +-inf/nan, so this replaces only
+        # the non-finite elements, same as the `x == x` idiom used elsewhere for nan.
+        x = tl.where((x - x) == 0.0, x, 0.0)
+        b = tl.where((b - b) == 0.0, b, 0.0)
         dA_cs_k = tl.load(
             dA_cumsum_ptrs, mask=offs_k < chunk_size_limit - k, other=0.0
         ).to(tl.float32)

@@ -780,6 +780,58 @@ def test_mamba_chunk_scan_track_states_at_request_boundary(chunk_size, seqlens):
         )
 
 
+def test_mamba_chunk_scan_isolates_nonfinite_request():
+    """Regression test for https://github.com/sgl-project/sglang/issues/51108.
+
+    One request's non-finite input must not corrupt another request's output or
+    final state in the same packed prefill, even though both share a chunk.
+    """
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    torch.manual_seed(0)
+    n_heads, d_head, d_state = 2, 4, 8
+    len_a, len_b = 5, 30
+    seqlen = len_a + len_b
+
+    x = torch.ones(1, seqlen, n_heads, d_head, device=device)
+    x[0, 2, 0, 1] = torch.inf  # only request A (the first len_a tokens) is affected
+    dt = torch.ones(1, seqlen, n_heads, device=device)
+    A = torch.zeros(n_heads, device=device)
+    B = torch.ones(1, seqlen, 1, d_state, device=device)
+    C = torch.ones(1, seqlen, 1, d_state, device=device)
+    seq_idx = torch.repeat_interleave(
+        torch.arange(2, dtype=torch.int32, device=device),
+        torch.tensor([len_a, len_b], device=device),
+    ).unsqueeze(0)
+    cu_seqlens = torch.tensor([0, len_a, seqlen], dtype=torch.int32, device=device)
+
+    out = torch.empty_like(x)
+    states = mamba_chunk_scan_combined(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        16,  # chunk_size: both requests share chunk 0 (16 < seqlen)
+        seq_idx=seq_idx,
+        cu_seqlens=cu_seqlens,
+        out=out,
+        return_varlen_states=True,
+    )
+
+    victim_out = out[:, len_a:]
+    expected = (d_state * torch.arange(1, len_b + 1, device=device, dtype=torch.float32))[
+        None, :, None, None
+    ].expand(1, len_b, n_heads, d_head)
+
+    assert states[1].isfinite().all(), "request B's final state must stay finite"
+    assert victim_out.isfinite().all(), "request B's output must stay finite"
+    torch.testing.assert_close(victim_out, expected)
+    torch.testing.assert_close(states[1], torch.full_like(states[1], float(len_b)))
+
+
 if __name__ == "__main__":
     import sys
 

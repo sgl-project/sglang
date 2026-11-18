@@ -486,6 +486,14 @@ def _chunk_scan_fwd_kernel(
             mask=(offs_k[:, None] < chunk_size_limit - k) & (offs_n[None, :] < hdim),
             other=0.0,
         )
+        if HAS_SEQ_IDX:
+            # cb[m, k] is already exactly 0 for seq_idx[m] != seq_idx[k] (comment
+            # above), but x does not carry an m axis, so a non-finite x here would
+            # still turn into nan at 0 * inf (or 0 * nan) for every m row that reads
+            # this k, not just the row(s) whose own sequence contains it. Sanitize x
+            # itself so that case multiplies two finite zeros instead.
+            # `v - v` is 0 for every finite v and nan for +-inf/nan.
+            x = tl.where((x - x) == 0.0, x, 0.0)
         acc += tl.dot(cb, x)
         cb_ptrs += BLOCK_SIZE_K * stride_cb_csize_k
         x_ptrs += BLOCK_SIZE_K * stride_x_seqlen
