@@ -795,7 +795,7 @@ def handle_model_capability_adjustments(server_args: Any):
         logger.warning(
             "HRM-Text (prefix_lm) detected: forcing --attention-backend "
             "triton, --chunked-prefill-size -1, --disable-radix-cache, and "
-            "--disable-cuda-graph for correctness of the bidirectional "
+            "--disable-decode-cuda-graph --disable-prefill-cuda-graph for correctness of the bidirectional "
             "prompt attention."
         )
 

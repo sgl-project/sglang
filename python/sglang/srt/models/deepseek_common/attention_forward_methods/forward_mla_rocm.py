@@ -1260,7 +1260,7 @@ class DeepseekMLARocmForwardMixin:
         q, and it casts q to the KV dtype on load anyway: casting before the
         wire halves the bytes without changing a single dot-product input.
         """
-        if not (self.use_dsa and self.current_attention_backend in ("dsa", "nsa")):
+        if not (self.use_dsa and self.current_attention_backend == "dsa"):
             return None
         kernel = get_exec().kernel
         if (
@@ -1301,7 +1301,7 @@ class DeepseekMLARocmForwardMixin:
         return (
             _use_aiter_gfx95
             and self.dcp_size == 1
-            and self.current_attention_backend in ("dsa", "nsa")
+            and self.current_attention_backend == "dsa"
             and (
                 get_exec().kernel.dsa_decode_backend in ("tilelang", "triton")
                 or get_exec().kernel.dsa_prefill_backend in ("tilelang", "triton")

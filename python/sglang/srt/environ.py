@@ -714,8 +714,6 @@ class Envs:
     # Window for the token-weighted recent cache-hit rate used to estimate
     # waiting-queue prefill load.
     SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS = EnvFloat(15.0)
-    SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(None)
-    SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK = EnvFloat(None)
     # Compact extend-attention scheduler tile-budget admission (AMD/HIP-only).
     # Budget <= 0 disables; >0 sets the max prefix-extend tiles per batch.
     SGLANG_PREFILL_TILE_BUDGET = EnvInt(0)
@@ -736,7 +734,6 @@ class Envs:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)
     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
-    SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
@@ -758,9 +755,7 @@ class Envs:
     # Overlap scheduler and pipeline parallelism
     # ===================================================================
     # Process a prefill step's result before scheduling the next step, for TTFT.
-    SGLANG_DISABLE_OVERLAP_AFTER_PREFILL = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP"
-    )
+    SGLANG_DISABLE_OVERLAP_AFTER_PREFILL = EnvBool(False)
     # Force delay_sample_func for all overlap decode (not just grammar mode),
     # allowing CPU result processing to overlap with subsequent forward computation
     # and reducing the impact of sampling overhead on the critical path.
@@ -824,9 +819,7 @@ class Envs:
     SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("rust")
     # Once decode passes the sliding window, drop the SWA part of the prefill's
     # tree lock; its SWA KV becomes evictable rather than freed.
-    SGLANG_OPT_RELEASE_PREFILL_SWA = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW"
-    )
+    SGLANG_OPT_RELEASE_PREFILL_SWA = EnvBool(False)
 
     # ===================================================================
     # PD disaggregation runtime
@@ -838,8 +831,6 @@ class Envs:
     SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES = EnvInt(0)
     # Enable on both P and D with the same --sampling-mask-max-tokens value.
     SGLANG_ENABLE_DISAGG_SAMPLING_MASK = EnvBool(False)
-    # Retained only to reject the removed setting during startup.
-    SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(None)
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT = EnvInt(1)
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
@@ -882,9 +873,7 @@ class Envs:
     # Set to "env://" to use an externally-created TCPStore via MASTER_ADDR/MASTER_PORT.
     SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE = EnvStr(None)
     SGLANG_IS_FIRST_RANK_ON_NODE = EnvBool(True)
-    SGLANG_SYNC_TOKEN_IDS_ACROSS_TP = EnvBoolWithAlias(
-        False, deprecated_name="SYNC_TOKEN_IDS_ACROSS_TP"
-    )
+    SGLANG_SYNC_TOKEN_IDS_ACROSS_TP = EnvBool(False)
     SGLANG_ENABLE_COLOCATED_BATCH_GEN = EnvBool(False)
     SGLANG_SHARED_EXPERT_TP1 = EnvBool(False)
     # Replicate the input embedding across TP ranks instead of sharding it
@@ -1071,9 +1060,7 @@ class Envs:
     # routing + persistent FC1 / FC2 kernels (kernels/ops/moe/mxfp4_decode_moe.py) on
     # every layer whose shape, activation (SiTU, or SwiGLU with a limit) and MXFP8
     # activations they cover; anything else runs flashinfer.
-    SGLANG_USE_CUDA_MXFP4_DECODE_MOE = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_K31_DECODE_MOE"
-    )
+    SGLANG_USE_CUDA_MXFP4_DECODE_MOE = EnvBool(False)
     # Manual MoE input row limit (EPv1 and EPv2); 0 leaves it to SGLANG_MORI_RECV_BOUND.
     SGLANG_MORI_MOE_MAX_INPUT_TOKENS = EnvInt(0)
 
@@ -1216,14 +1203,10 @@ class Envs:
     SGLANG_ROCM_SMALLM_FP8_BS = EnvBool(True)
     # Fused Kimi-K3 KDA decode kernel: "gfx950" (SGLang HIP) or "aiter" (FlyDSL);
     # any other value keeps the unfused KDA decode.
-    SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND = EnvStrWithAlias(
-        "gfx950", deprecated_name="SGLANG_ROCM_K3_KDA_FUSED_BACKEND"
-    )
+    SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND = EnvStr("gfx950")
     # FlyDSL kernel behind the "aiter" fused KDA decode: "sglang" or "aiter" pins one;
     # "auto" prefers the vendored copy, and AITER's for a state dtype only it takes.
-    SGLANG_USE_HIP_K3_FLYDSL_SOURCE = EnvStrWithAlias(
-        "auto", deprecated_name="SGLANG_K3_FLYDSL_SOURCE"
-    )
+    SGLANG_USE_HIP_K3_FLYDSL_SOURCE = EnvStr("auto")
     # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM
     # (shared a4w4 tuned CSVs) instead of the Triton gemm_afp4wfp4 path.
     SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM = EnvBool(False)
@@ -1267,9 +1250,7 @@ class Envs:
     # --decode-attention-backend triton; gfx1250 with bf16 activations, no DCP
     # and qk_rope_head_dim > 0, else startup raises). "auto" is "triton" there,
     # else "asm". Explicit values are honored as-is.
-    SGLANG_AITER_MLA_DECODE_BACKEND = EnvStrWithAlias(
-        "auto", deprecated_name="SGLANG_AITER_MLA_DCP_DECODE_BACKEND"
-    )
+    SGLANG_AITER_MLA_DECODE_BACKEND = EnvStr("auto")
     # Select the AITER MLA kernel for target verify, "asm" or "gluon".
     SGLANG_AITER_MLA_VERIFY_BACKEND = EnvStr("asm")
     # Let aiter plan the KV splits for the asm persistent MLA decode.
@@ -1528,9 +1509,7 @@ class Envs:
     SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL = EnvInt(0)
     # Chunk size for the rebalance expert-weight P2P exchange; set
     # >= num_physical_experts to submit a single batch_isend_irecv.
-    SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE = EnvIntWithAlias(
-        32, deprecated_name="SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE"
-    )
+    SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE = EnvInt(32)
 
     # ===================================================================
     # DeepGEMM
@@ -1786,60 +1765,50 @@ class Envs:
     SGLANG_OPT_SPEC_RELAY_IN_PLACE = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
-    # Runtime optimizations that follow SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION. Each
-    # still accepts its former name (deprecated_name) until the alias is removed.
+    # Runtime optimizations that follow SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.
     # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.
-    SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED = EnvBoolWithAlias(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
-        deprecated_name="SGLANG_Q35MF_BK_VEC_COPY",
+    SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     # Verify input staging, bit-identical: reuse last round's mamba track indices while their
     # inputs are unchanged, and skip the replay-time input_ids / positions copies that the
     # same-stream pre-planned load_batch already made.
-    SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS = EnvBoolWithAlias(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
-        deprecated_name="SGLANG_Q35MF_MKH_N3B",
+    SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     # The post-verify graphs' per-round input load as one small_field_copy launch that also
     # reads the injected acceptance length from its pinned host slot (bit-identical); needs
     # SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.
-    SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD = EnvBoolWithAlias(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
-        deprecated_name="SGLANG_Q35MF_MKH_N3C",
+    SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     # A topk-1 chain against TRT-LLM MHA, which masks the draft window itself, is built
     # with build_chain_tree instead of a full-context tree mask.
-    SGLANG_OPT_TRTLLM_MHA_CHAIN_VERIFY = EnvBoolWithAlias(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
-        deprecated_name="SGLANG_Q35MF_EDGE_CHAIN_TREE",
+    SGLANG_OPT_TRTLLM_MHA_CHAIN_VERIFY = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     # A verify whose requests all sample with a finite top-k within the compact limit
     # samples on that support (eagle_sample's compact branch), graphed or eager.
-    SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING = EnvBoolWithAlias(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
-        deprecated_name="SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING",
+    SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     # A sampled verify result (predict, accept_index, num_correct_drafts) is one int32
     # buffer, broadcast to the TP group once.
-    SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST = EnvBoolWithAlias(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
-        deprecated_name="SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST",
+    SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     # The scheduler's per-pass TP syncs (request broadcast size, HiCache ready counts)
     # through a shared-memory table when the group shares a host (shm_tag_exchange.py).
-    SGLANG_OPT_SCHEDULER_SHM_SYNC = EnvBoolWithAlias(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
-        deprecated_name="SGLANG_Q35MF_EDGE_SHM_SYNC",
+    SGLANG_OPT_SCHEDULER_SHM_SYNC = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     # With SGLANG_OPT_SCHEDULER_SHM_SYNC, a group across hosts exchanges per host and only
     # the host leaders meet (HierTagExchange); with two hosts, optionally over one TCP link.
-    SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST = EnvBoolWithAlias(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
-        deprecated_name="SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST",
+    SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
-    SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP = EnvBoolWithAlias(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
-        deprecated_name="SGLANG_Q35MF_EDGE_MULTIHOST_TCP",
+    SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     # PD decode optimizations follow the shared switch unless explicitly disabled.
     SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION = EnvBool(True)
@@ -1952,7 +1921,6 @@ class Envs:
     # ===================================================================
     # Multimodal CUDA IPC transport
     # ===================================================================
-    SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
     # Reuse the mapping for the already-allocated bounded CUDA IPC pool. This
     # has no effect unless CUDA IPC feature transport is explicitly selected.
     SGLANG_USE_IPC_POOL_HANDLE_CACHE = EnvBool(True)
@@ -2154,18 +2122,11 @@ class Envs:
     SGLANG_DSV4_FP8_HCA_PERSIST = EnvBool(True)
     SGLANG_DSV4_FP8_HCA_PERSIST_MIN_ROWS = EnvInt(15)
 
-    # Deprecated for --engram-config "placement". The deprecated engram variables
-    # are read only by _resolve_engram_config.
-    SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
-    # Deprecated for --engram-config "replication".
-    SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("per_rank")
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
     # (engram_staging.py); pays off for large prefill batches.
     SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING = EnvBool(False)
-    # Deprecated for --engram-config "lookup".
-    SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
@@ -2469,9 +2430,7 @@ class Envs:
     SGLANG_ROCM_MUSE_DENSE_TUNED = EnvBool(True)
     SGLANG_ROCM_MUSE_SHARED_ROUTER_POOLER = EnvBool(True)
     SGLANG_ROCM_MUSE_JOINT_ROUTER_POOLER = EnvBool(True)
-    SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_USE_TRITON_ROUTER_SUM"
-    )
+    SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBool(False)
 
     # ===================================================================
     # MiniMax M3
@@ -2720,63 +2679,72 @@ class _DeprecatedEnv:
 # The single registry for deprecated environment variables, processed once at
 # import by _handle_deprecated_envs(). Add new deprecations here instead of
 # ad-hoc warnings. For a rename where the old name must keep working through a
-# descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead.
-_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
-    "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION": _DeprecatedEnv(
-        note=(
-            "Pass --flashinfer-allreduce-fusion-backend cutedsl instead. "
-            "Without it an eligible model auto-enables the legacy mnnvl "
-            "backend rather than the CuTe DSL fusion."
-        )
-    ),
-    # Removed without replacement.
-    "SGLANG_ENABLE_CP_V2": _DeprecatedEnv(
-        note="Strategy-based prefill context parallelism is now the only generic implementation."
-    ),
-    "SGLANG_TRACE_QWEN35_FINAL_NORM": _DeprecatedEnv(),
-    "SGLANG_OPT_SM120_MTP_ROUTER_TOP22": _DeprecatedEnv(
-        note="The default MoE router is faster for this shape."
-    ),
-    "SGLANG_DSPARK_FAST_SAMPLING": _DeprecatedEnv(
-        note="DSpark draft sampling always uses Gumbel-max."
-    ),
-    "SGLANG_DSPARK_FOLDED_SAMPLING": _DeprecatedEnv(
-        note="A folded DSpark draft proposal samples; set "
-        "SGLANG_DSPARK_USE_GREEDY_DRAFT=1 for an argmax-only draft, or "
-        "SGLANG_DSPARK_FOLDED_PROPOSAL=0 to keep the proposal out of the graph."
-    ),
-    # Replaced by CLI flags.
-    "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": _DeprecatedEnv(
-        note="Please use '--enable-prefill-delayer' instead."
-    ),
-    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": _DeprecatedEnv(
-        note="Please use '--prefill-delayer-max-delay-passes' instead."
-    ),
-    "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK": _DeprecatedEnv(
-        note="Please use '--prefill-delayer-token-usage-low-watermark' instead."
-    ),
-    "SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD": _DeprecatedEnv(
-        note="Please use '--speculative-dspark-lm-head-dtype fp8' instead."
-    ),
-    "SGLANG_USE_SGL_XPU": _DeprecatedEnv(
-        note="Intel XPU always uses the sgl-kernel MoE kernels; pass "
-        "'--moe-runner-backend triton' for the Triton path."
-    ),
-}
+# descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead. Once the
+# deprecation period ends, move the entry to REMOVED_ENVS.
+_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {}
 
 
 def _handle_deprecated_envs():
     for old_name, deprecation in _DEPRECATED_ENVS.items():
         deprecation.apply(old_name)
 
-    # Rewrite the legacy SGL_ prefix to SGLANG_ (names not covered above).
-    for key, value in list(os.environ.items()):
-        if key.startswith("SGL_") and key not in _DEPRECATED_ENVS:
-            new_key = key.replace("SGL_", "SGLANG_", 1)
-            warnings.warn(
-                f"Environment variable {key} is deprecated, please use {new_key}"
-            )
-            os.environ[new_key] = value
+
+# Environment variables that no longer work, each with what to do instead.
+# Server startup stops when one is set (`validate_removed_options`), and also when
+# a legacy `SGL_<X>` is set for a registered `SGLANG_<X>`.
+REMOVED_ENVS: Dict[str, str] = {
+    # Replaced by CLI flags.
+    "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION": "pass "
+    "--flashinfer-allreduce-fusion-backend cutedsl",
+    "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "pass --enable-prefill-delayer",
+    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "pass "
+    "--prefill-delayer-max-delay-passes",
+    "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK": "pass "
+    "--prefill-delayer-token-usage-low-watermark",
+    "SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD": "pass --speculative-dspark-lm-head-dtype fp8",
+    "SGLANG_USE_CUDA_IPC_TRANSPORT": "pass --mm-feature-transport cuda_ipc (or cpu)",
+    "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": """pass --engram-config '{"placement": "cpu"}'""",
+    "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": """pass --engram-config '{"placement": "cpu"}', """
+    """adding "replication": "per_node" for the shared layout""",
+    "SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS": """pass --engram-config '{"lookup": "peer_read"}'""",
+    "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS": "to enable sampling masks "
+    "for disaggregated serving, set SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1 and use "
+    "the same positive --sampling-mask-max-tokens value on both prefill and "
+    "decode servers",
+    # Removed without replacement.
+    "SGLANG_ENABLE_CP_V2": "strategy-based prefill context parallelism is now "
+    "the only generic implementation; unset it",
+    "SGLANG_TRACE_QWEN35_FINAL_NORM": "it had no effect; unset it",
+    "SGLANG_OPT_SM120_MTP_ROUTER_TOP22": "the default MoE router is faster for "
+    "this shape; unset it",
+    "SGLANG_DSPARK_FAST_SAMPLING": "DSpark draft sampling always uses "
+    "Gumbel-max; unset it",
+    "SGLANG_DSPARK_FOLDED_SAMPLING": "a folded DSpark draft proposal samples; "
+    "set SGLANG_DSPARK_USE_GREEDY_DRAFT=1 for an argmax-only draft, or "
+    "SGLANG_DSPARK_FOLDED_PROPOSAL=0 to keep the proposal out of the graph",
+    "SGLANG_USE_SGL_XPU": "Intel XPU always uses the sgl-kernel MoE kernels; "
+    "pass --moe-runner-backend triton for the Triton path",
+    # Renamed.
+    "SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP": "use SGLANG_DISABLE_OVERLAP_AFTER_PREFILL",
+    "SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW": "use SGLANG_OPT_RELEASE_PREFILL_SWA",
+    "SYNC_TOKEN_IDS_ACROSS_TP": "use SGLANG_SYNC_TOKEN_IDS_ACROSS_TP",
+    "SGLANG_K31_DECODE_MOE": "use SGLANG_USE_CUDA_MXFP4_DECODE_MOE",
+    "SGLANG_ROCM_K3_KDA_FUSED_BACKEND": "use SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND",
+    "SGLANG_K3_FLYDSL_SOURCE": "use SGLANG_USE_HIP_K3_FLYDSL_SOURCE",
+    "SGLANG_AITER_MLA_DCP_DECODE_BACKEND": "use SGLANG_AITER_MLA_DECODE_BACKEND",
+    "SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE": "use SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE",
+    "SGLANG_Q35MF_BK_VEC_COPY": "use SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED",
+    "SGLANG_Q35MF_MKH_N3B": "use SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS",
+    "SGLANG_Q35MF_MKH_N3C": "use SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD",
+    "SGLANG_Q35MF_EDGE_CHAIN_TREE": "use SGLANG_OPT_TRTLLM_MHA_CHAIN_VERIFY",
+    "SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING": "use SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING",
+    "SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST": "use SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST",
+    "SGLANG_Q35MF_EDGE_SHM_SYNC": "use SGLANG_OPT_SCHEDULER_SHM_SYNC",
+    "SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST": "use SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST",
+    "SGLANG_Q35MF_EDGE_MULTIHOST_TCP": "use SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP",
+    "SGLANG_USE_TRITON_ROUTER_SUM": "use SGLANG_USE_CUSTOM_ROUTER_SUM",
+    "SGL_DSA_TOPK_ROW_SPLIT": "use SGLANG_DSA_TOPK_ROW_SPLIT",
+}
 
 
 def third_party_cache_defaults() -> Dict[str, str]:
