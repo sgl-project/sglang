@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     dequantize_k_cache_paged_dsa,
 )
 from sglang.kernels.ops.quantization.dsa_quant_k_cache import quantize_k_cache
+from sglang.srt.batch_invariant_ops import set_batch_invariant_mode
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -127,6 +128,44 @@ class TestTileLangDSAZeroRope(CustomTestCase):
         for use_fp8 in (False, True):
             with self.subTest(use_fp8=use_fp8):
                 self._assert_matches_torch(use_fp8=use_fp8, d_v=512, d_tail=64)
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and is_hip() and is_gfx95_supported(),
+    "the partial/combine TileLang DSA path runs on gfx950",
+)
+class TestTileLangDSABatchInvariant(CustomTestCase):
+    def test_rows_do_not_depend_on_the_batch_token_count(self):
+        """In batch-invariant mode a row's output must not change with the number of tokens in the call:
+        the kernel used to group a row's selected key blocks by the call's token count."""
+        from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+            FP8_DTYPE,
+            tilelang_sparse_fwd,
+        )
+
+        torch.manual_seed(11)
+        heads, topk, d_v = 64, 2048, 256
+        for use_fp8 in (False, True):
+            with self.subTest(use_fp8=use_fp8), set_batch_invariant_mode(True):
+                tokens = 4096
+                q = torch.randn(tokens, heads, d_v, device="cuda", dtype=torch.bfloat16)
+                kv = torch.randn(topk, 1, d_v, device="cuda", dtype=torch.bfloat16)
+                if use_fp8:
+                    kv = kv.to(FP8_DTYPE)
+                indices = torch.randperm(topk, device="cuda").to(torch.int32)
+                indices = indices.view(1, 1, topk).expand(tokens, -1, -1).clone()
+                indices[..., 1900:] = -1
+                scale = 1.0 / math.sqrt(d_v)
+                full = tilelang_sparse_fwd(q, kv, indices, scale, d_v=d_v).squeeze(0)
+                for rows in (1, 3, 300):
+                    part = tilelang_sparse_fwd(
+                        q[:rows].contiguous(),
+                        kv,
+                        indices[:rows].contiguous(),
+                        scale,
+                        d_v=d_v,
+                    ).squeeze(0)
+                    self.assertTrue(torch.equal(part, full[:rows]), f"rows={rows}")
 
 
 if __name__ == "__main__":
