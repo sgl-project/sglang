@@ -7,10 +7,15 @@ import subprocess
 from collections import defaultdict
 from pathlib import Path, PurePosixPath
 
-SUITE = "stage-b-test-1-gpu-small-amd"
-RUNNER = "linux-mi300-1gpu-sglang"
-ROCM_VERSION = "rocm10"
+# pr-test-amd.yml passes scripts/ci/amd/partition-model-<runner_arch>-<rocm_version>.json
+# to this suite, so one file per lane needs no workflow change.
+SUITE = "base-b-test-1-gpu-small-amd"
 REPOSITORY = "sgl-project/sglang"
+MODEL_DIR = Path(__file__).resolve().parent
+
+
+def runner_name(runner_arch):
+    return f"linux-{runner_arch}-1gpu-sglang"
 
 
 def parse_test_timings(log):
@@ -50,7 +55,7 @@ def parse_test_timings(log):
     return timings
 
 
-def build_model(traces, source_runs):
+def build_model(traces, source_runs, runner_arch, rocm_version):
     if len(traces) != len(source_runs) or not traces:
         raise ValueError("Supply one non-empty timing trace per source run")
     if len(source_runs) != len(set(source_runs)):
@@ -69,8 +74,8 @@ def build_model(traces, source_runs):
         "version": 1,
         "metadata": {
             "backend": "amd",
-            "runner": RUNNER,
-            "rocm_version": ROCM_VERSION,
+            "runner": runner_name(runner_arch),
+            "rocm_version": rocm_version,
             "source_runs": source_runs,
             "samples": {
                 filename: len(values) for filename, values in sorted(samples.items())
@@ -89,8 +94,11 @@ def github_api(endpoint, *, raw=False):
     return response if raw else json.loads(response)
 
 
-def collect_run_timings(run_id, *, expected_shards):
-    pattern = re.compile(rf"{re.escape(SUITE)} \({ROCM_VERSION}, {RUNNER}, (\d+)\)")
+def collect_run_timings(run_id, runner_arch, rocm_version, *, expected_shards):
+    runner = runner_name(runner_arch)
+    pattern = re.compile(
+        rf"{re.escape(SUITE)} \({re.escape(rocm_version)}, {re.escape(runner)}, (\d+)\)"
+    )
     jobs = []
     page = 1
     while True:
@@ -107,7 +115,7 @@ def collect_run_timings(run_id, *, expected_shards):
         job["conclusion"] != "success" for job in selected
     ):
         raise ValueError(
-            f"Run {run_id} needs {expected_shards} successful {ROCM_VERSION}/{RUNNER} shards"
+            f"Run {run_id} needs {expected_shards} successful {rocm_version}/{runner} shards"
         )
     trace = {}
     for job in selected:
@@ -127,21 +135,28 @@ def collect_run_timings(run_id, *, expected_shards):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Build MI300/ROCm 10 AMD shard estimates from completed CI runs."
+        description=f"Build {SUITE} shard estimates for one runner/ROCm lane from completed CI runs."
     )
+    parser.add_argument("--runner-arch", default="mi300")
+    parser.add_argument("--rocm-version", default="rocm10")
     parser.add_argument("--run-id", type=int, action="append", required=True)
     parser.add_argument("--expected-shards", type=int, default=8)
-    parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.expected_shards <= 0 or any(run_id <= 0 for run_id in args.run_id):
         parser.error("run IDs and expected shard count must be positive")
     traces = [
-        collect_run_timings(run_id, expected_shards=args.expected_shards)
+        collect_run_timings(
+            run_id,
+            args.runner_arch,
+            args.rocm_version,
+            expected_shards=args.expected_shards,
+        )
         for run_id in args.run_id
     ]
-    args.output.write_text(
-        json.dumps(build_model(traces, args.run_id), indent=2) + "\n"
-    )
+    model = build_model(traces, args.run_id, args.runner_arch, args.rocm_version)
+    output = MODEL_DIR / f"partition-model-{args.runner_arch}-{args.rocm_version}.json"
+    output.write_text(json.dumps(model, indent=2) + "\n")
+    print(f"Wrote {output}")
 
 
 if __name__ == "__main__":

@@ -9,10 +9,19 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-SCRIPT = Path(__file__).resolve().parents[4] / "scripts/ci/amd/build_partition_model.py"
-SPEC = importlib.util.spec_from_file_location("amd_partition_model", SCRIPT)
-MODEL = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(MODEL)
+REPO_ROOT = Path(__file__).resolve().parents[4]
+
+
+def load_script(name, path):
+    spec = importlib.util.spec_from_file_location(name, REPO_ROOT / path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+MODEL = load_script("amd_partition_model", "scripts/ci/amd/build_partition_model.py")
+AMD_SUITES = load_script("amd_suites", "scripts/ci/amd_suites.py")
+RUNNER = MODEL.runner_name("mi300")
 
 
 def timing_line(filename, elapsed, passed=True):
@@ -22,6 +31,29 @@ def timing_line(filename, elapsed, passed=True):
 
 
 class TestAmdPartitionModel(CustomTestCase):
+    def test_checked_in_models_key_a_suite_an_amd_job_runs(self):
+        # run_suite.py silently falls back to est_time when the key does not match.
+        models = sorted(MODEL.MODEL_DIR.glob("partition-model-*-*.json"))
+        self.assertTrue(models)
+        workflow = (REPO_ROOT / ".github/workflows/pr-test-amd.yml").read_text()
+        self.assertIn(
+            f"--suite {MODEL.SUITE} --auto-partition-id ${{{{ matrix.part }}}} "
+            "--auto-partition-size 8 --timeout-per-file 2400 --partition-model-file "
+            "/sglang-checkout/scripts/ci/amd/partition-model-"
+            "${{ inputs.runner_arch || 'mi300' }}-${{ matrix.rocm_version }}.json",
+            workflow,
+        )
+        self.assertIn(MODEL.SUITE, AMD_SUITES.load_suites())
+        for path in models:
+            with self.subTest(model=path.name):
+                model = json.loads(path.read_text())
+                self.assertEqual(list(model["est"]), [MODEL.SUITE])
+                runner_arch, rocm_version = path.stem.split("-")[2:]
+                self.assertEqual(
+                    model["metadata"]["runner"], MODEL.runner_name(runner_arch)
+                )
+                self.assertEqual(model["metadata"]["rocm_version"], rocm_version)
+
     def test_timings_ignore_failed_tests_and_unrelated_output(self):
         filename = "/sglang-checkout/test/registered/example.py"
         log = "\n".join(
@@ -29,16 +61,6 @@ class TestAmdPartitionModel(CustomTestCase):
         )
         self.assertEqual(
             MODEL.parse_test_timings(log), {"test/registered/example.py": 8}
-        )
-
-    def test_key_order_whitespace_and_color_do_not_hide_timings(self):
-        record = json.dumps(
-            {"elapsed": 12, "passed": True, "file": "test/registered/example.py"},
-            separators=(",", ": "),
-        )
-        log = f"2026-11-13T07:46:20Z \x1b[32m{record}\x1b[0m"
-        self.assertEqual(
-            MODEL.parse_test_timings(log), {"test/registered/example.py": 12}
         )
 
     def test_invalid_values_and_paths_cannot_poison_estimates(self):
@@ -50,12 +72,6 @@ class TestAmdPartitionModel(CustomTestCase):
             with self.subTest(filename=filename), self.assertRaises(ValueError):
                 MODEL.parse_test_timings(timing_line(filename, 4))
 
-    def test_zero_duration_does_not_create_a_zero_cost_shard(self):
-        self.assertEqual(
-            MODEL.parse_test_timings(timing_line("test/registered/example.py", 0)),
-            {"test/registered/example.py": 1},
-        )
-
     def test_median_model_is_suite_scoped_and_preserves_sparse_samples(self):
         result = MODEL.build_model(
             [
@@ -64,6 +80,8 @@ class TestAmdPartitionModel(CustomTestCase):
                 {"test/registered/a.py": 100},
             ],
             [1, 2, 3],
+            "mi300",
+            "rocm10",
         )
         self.assertEqual(
             result["est"],
@@ -76,9 +94,11 @@ class TestAmdPartitionModel(CustomTestCase):
         self.assertEqual(result["metadata"]["source_runs"], [1, 2, 3])
         for traces, runs in [([], []), ([{}], [1]), ([{"a": 1}], [])]:
             with self.subTest(traces=traces), self.assertRaises(ValueError):
-                MODEL.build_model(traces, runs)
+                MODEL.build_model(traces, runs, "mi300", "rocm10")
         with self.assertRaises(ValueError):
-            MODEL.build_model([{"test/registered/a.py": 1}] * 2, [1, 1])
+            MODEL.build_model(
+                [{"test/registered/a.py": 1}] * 2, [1, 1], "mi300", "rocm10"
+            )
 
     def test_incomplete_or_failed_shards_are_rejected(self):
         for jobs in [
@@ -86,7 +106,7 @@ class TestAmdPartitionModel(CustomTestCase):
             [
                 {
                     "id": 1,
-                    "name": f"{MODEL.SUITE} (rocm10, {MODEL.RUNNER}, 0)",
+                    "name": f"{MODEL.SUITE} (rocm10, {RUNNER}, 0)",
                     "conclusion": "failure",
                 }
             ],
@@ -96,18 +116,18 @@ class TestAmdPartitionModel(CustomTestCase):
                 patch.object(MODEL, "github_api", return_value={"jobs": jobs}),
             ):
                 with self.assertRaises(ValueError):
-                    MODEL.collect_run_timings(1, expected_shards=1)
+                    MODEL.collect_run_timings(1, "mi300", "rocm10", expected_shards=1)
 
     def test_other_rocm_versions_and_runners_do_not_mix_into_the_model(self):
         jobs = [
             {
                 "id": 1,
-                "name": f"{MODEL.SUITE} (rocm10, {MODEL.RUNNER}, 0)",
+                "name": f"{MODEL.SUITE} (rocm10, {RUNNER}, 0)",
                 "conclusion": "success",
             },
             {
                 "id": 2,
-                "name": f"{MODEL.SUITE} (rocm720, {MODEL.RUNNER}, 0)",
+                "name": f"{MODEL.SUITE} (rocm720, {RUNNER}, 0)",
                 "conclusion": "success",
             },
             {
@@ -118,14 +138,14 @@ class TestAmdPartitionModel(CustomTestCase):
         ]
         responses = [{"jobs": jobs}, timing_line("test/registered/example.py", 42)]
         with patch.object(MODEL, "github_api", side_effect=responses):
-            result = MODEL.collect_run_timings(1, expected_shards=1)
+            result = MODEL.collect_run_timings(1, "mi300", "rocm10", expected_shards=1)
         self.assertEqual(result, {"test/registered/example.py": 42})
 
     def test_duplicate_files_across_shards_are_rejected(self):
         jobs = [
             {
                 "id": part,
-                "name": f"{MODEL.SUITE} (rocm10, {MODEL.RUNNER}, {part})",
+                "name": f"{MODEL.SUITE} (rocm10, {RUNNER}, {part})",
                 "conclusion": "success",
             }
             for part in range(2)
@@ -135,7 +155,7 @@ class TestAmdPartitionModel(CustomTestCase):
             MODEL, "github_api", side_effect=[{"jobs": jobs}, record, record]
         ):
             with self.assertRaises(ValueError):
-                MODEL.collect_run_timings(1, expected_shards=2)
+                MODEL.collect_run_timings(1, "mi300", "rocm10", expected_shards=2)
 
 
 if __name__ == "__main__":

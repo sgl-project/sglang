@@ -115,7 +115,7 @@
     }
   },
   "est": {
-    "stage-b-test-1-gpu-small-amd": {
+    "base-b-test-1-gpu-small-amd": {
       "test/registered/amd/test_aiter_intree_tune.py": 12.0,
       "test/registered/amd/test_asm_context_prefill_gather_indices.py": 14.0,
       "test/registered/amd/test_fp8_gemm_gfx1250.py": 10.0,
