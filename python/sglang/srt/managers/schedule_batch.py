@@ -148,7 +148,10 @@ from sglang.srt.observability.req_time_stats import (
     SchedulerReqTimeStats,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.sampling_mask import SamplingMaskRows
+from sglang.srt.sampling.sampling_mask import (
+    SamplingMaskRows,
+    returns_sampling_logprobs,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
@@ -691,9 +694,7 @@ class Req(ReqDllmMixin):
         self.top_p_normalized_logprobs = False
         self.return_sampling_mask = return_sampling_mask
         self.sampling_logprobs_mode = sampling_logprobs_mode
-        self.return_sampling_logprobs = (
-            return_sampling_mask or sampling_logprobs_mode is not None
-        )
+        self.return_sampling_logprobs = returns_sampling_logprobs(self)
         self.return_flat_raw_top_logprobs = return_flat_raw_top_logprobs
 
         # Logprobs (return values)

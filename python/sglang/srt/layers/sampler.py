@@ -117,7 +117,7 @@ def _select_sampling_mask_rows(
     return tensor.index_select(0, batch_indices)
 
 
-def _unfiltered_capture(
+def _unfiltered_sampling_mask_capture(
     weights: torch.Tensor, selected_tokens: torch.Tensor, batch_rows: torch.Tensor
 ) -> _SamplingMaskCapture:
     """An unfiltered draw: each opted-in row's whole distribution and its sampled token's weight."""
@@ -292,7 +292,7 @@ class Sampler(nn.Module):
                         _select_sampling_mask_rows,
                         batch_indices=sampling_mask_batch_indices,
                     )
-                    sampling_mask_capture = _unfiltered_capture(
+                    sampling_mask_capture = _unfiltered_sampling_mask_capture(
                         select_capture_rows(logprobs_via_logsoftmax_kernel)
                         .float()
                         .exp(),
@@ -415,7 +415,7 @@ class Sampler(nn.Module):
                 positions=positions,
             )
             if return_sampling_mask:
-                sampling_mask_capture = _unfiltered_capture(
+                sampling_mask_capture = _unfiltered_sampling_mask_capture(
                     select_capture_rows(probs),
                     select_capture_rows(batch_next_token_ids),
                     capture_rows,

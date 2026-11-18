@@ -203,7 +203,10 @@ from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     supports_sampling_mask,
 )
-from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
+from sglang.srt.sampling.sampling_mask import (
+    SamplingMaskChunk,
+    returns_sampling_logprobs,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import (
     resolve_watermark_request,
@@ -1561,7 +1564,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
             if (
-                (obj.return_sampling_mask or obj.sampling_logprobs_mode is not None)
+                returns_sampling_logprobs(obj)
                 and obj.custom_logit_processor
                 and not supports_sampling_mask(obj.custom_logit_processor)
             ):
@@ -2902,9 +2905,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     i,
                     finished=recv_obj.finished_reasons[i] is not None,
                 )
-            if isinstance(state.obj, GenerateReqInput) and (
-                state.obj.return_sampling_mask
-                or state.obj.sampling_logprobs_mode is not None
+            if isinstance(state.obj, GenerateReqInput) and returns_sampling_logprobs(
+                state.obj
             ):
                 output_sampling_mask = recv_obj.output_token_sampling_mask
                 _add_sampling_mask_to_meta_info(
