@@ -92,6 +92,10 @@ class TestDsv4PrefillGraphMetadata(CustomTestCase):
 
         self.assertIs(state.metadata, seed)
         self.assertIs(seed.dsv4_prefill_graph_state, state)
+        # The V4 protocol object must not carry V4.1-only state.
+        self.assertFalse(hasattr(state, "live_mask"))
+        self.assertFalse(hasattr(state, "win_sparse_indices"))
+        self.assertFalse(hasattr(state, "index_page_tables"))
 
         # Capture must not write through to a real request slot.
         self.assertEqual(seed.c4_loc.shape, (compress_capacity(128, 4, 1),))

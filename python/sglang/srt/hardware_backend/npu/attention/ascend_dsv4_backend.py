@@ -22,6 +22,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
 from sglang.srt.hardware_backend.npu.attention.dsv4_prefill_graph import (
     MAX_PREFILL_GRAPH_REQS,
     Dsv4PrefillGraphMetadata,
+    Dsv41PrefillGraphMetadata,
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
@@ -3092,7 +3093,7 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_has_low_ratio = any(
             ratio in (1, 2) for ratio in self._dsv4_compress_ratios
         )
-        if self._dsv4_has_low_ratio and (self._dsv4_has_c4 or self._dsv4_has_c128):
+        if self._dsv4_is_v41_model and (self._dsv4_has_c4 or self._dsv4_has_c128):
             raise ValueError(
                 "DeepSeek-V4 generation mixes ratio 1/2 with ratio 4/128; the "
                 "prefill-graph metadata contracts are generation-exclusive: "
@@ -3163,7 +3164,7 @@ class DeepseekV4AscendAttnBackend(
         # captured attention reading a bridge written by an eager source (or
         # the reverse) is not a supported contract.  See dsv4_prefill_graph.py.
         self.low_ratio_prefill_graph = (
-            self._dsv4_has_low_ratio
+            self._dsv4_is_v41_model
             and self.use_captured_forward_metadata_for_breakable_cuda_graph
         )
         if self.use_captured_forward_metadata_for_breakable_cuda_graph:
@@ -3202,12 +3203,18 @@ class DeepseekV4AscendAttnBackend(
                 "indexer and requires a model without CP/DCP. Disable "
                 "--cuda-graph-backend-prefill=breakable for this model."
             )
-        if self._dsv4_has_low_ratio:
+        if self._dsv4_is_v41_model:
             return self._supports_dsv41_prefill_graph_capture()
         # Ascend 950 shares the explicit cache_mode=2 compressor state table
         # and npu.compressor with A3; its arch-specific KV / indexer fused
         # epilogs write through the same fixed loc buffers inside the segment.
         return True
+
+    def _prefill_graph_metadata_cls(self):
+        """The fixed-metadata protocol owned by this model generation."""
+        if self._dsv4_is_v41_model:
+            return Dsv41PrefillGraphMetadata
+        return Dsv4PrefillGraphMetadata
 
     def _supports_dsv41_prefill_graph_capture(self) -> bool:
         """V4.1: capture the low-ratio source and attention as one dataflow."""
@@ -4764,11 +4771,15 @@ class DeepseekV4AscendAttnBackend(
         self.init_forward_metadata(forward_batch)
         # allocate() refreshes the eager metadata in place, so this object is
         # also the one the capture forward reads.
-        return Dsv4PrefillGraphMetadata.allocate(
-            backend=self,
-            seed=self.forward_metadata,
-            num_tokens=int(forward_batch.positions.shape[0]),
-        ).metadata
+        return (
+            self._prefill_graph_metadata_cls()
+            .allocate(
+                backend=self,
+                seed=self.forward_metadata,
+                num_tokens=int(forward_batch.positions.shape[0]),
+            )
+            .metadata
+        )
 
     def prepare_forward_metadata_for_breakable_cuda_graph_replay(
         self,

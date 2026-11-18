@@ -67,6 +67,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
 )
 from sglang.srt.hardware_backend.npu.attention.dsv4_prefill_graph import (
     Dsv4PrefillGraphMetadata,
+    Dsv41PrefillGraphMetadata,
 )
 from sglang.srt.hardware_backend.npu.dsv4 import dsv4_memory_pool
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import NPUDSV4KVLayout
@@ -139,6 +140,7 @@ def _low_ratio_backend(*, ratios=(1, 2), window=128):
     backend._dsv4_has_low_ratio = any(
         r in (1, 2) for r in backend._dsv4_compress_ratios
     )
+    backend._dsv4_is_v41_model = backend._dsv4_has_low_ratio
     backend._dsv4_sliding_window_size = window
     backend._dsv4_q_head_num = 64
     backend._dsv4_head_dim = 512
@@ -2531,14 +2533,14 @@ class TestV41PrefillGraphMetadata(unittest.TestCase):
             block_tables=full,
             swa_page_table=swa,
         )
-        state = Dsv4PrefillGraphMetadata.allocate(
+        state = Dsv41PrefillGraphMetadata.allocate(
             backend=backend, seed=seed, num_tokens=num_tokens
         )
         return backend, seed, state, full, swa
 
     def test_allocate_binds_generation_fields_and_shared_page_table(self):
         _, seed, state, full, _ = self._allocate()
-        self.assertTrue(state.is_v41)
+        self.assertIsInstance(state, Dsv41PrefillGraphMetadata)
         self.assertEqual(state.win_sparse_indices.shape, (8, 1, 128))
         self.assertEqual(state.win_topk_length.shape, (8, 1))
         self.assertEqual(state.cmp_topk_length[1].shape, (8, 1))
@@ -2568,7 +2570,8 @@ class TestV41PrefillGraphMetadata(unittest.TestCase):
         self.assertFalse(hasattr(seed, "c4_page_table"))
         self.assertFalse(hasattr(seed, "c4_loc"))
         self.assertEqual(seed.dsv4_explicit_state_block_tables, {})
-        self.assertEqual(state.state_tables, {})
+        self.assertFalse(hasattr(state, "state_tables"))
+        self.assertFalse(hasattr(state, "c4_page_table"))
 
     def test_refresh_updates_in_place_and_neutralizes_dead_rows(self):
         backend, seed, state, _, _ = self._allocate()
@@ -2786,6 +2789,7 @@ class TestV41PrefillCapability(unittest.TestCase):
     def _backend(self, *, low_ratio=True):
         backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
         backend._dsv4_has_low_ratio = low_ratio
+        backend._dsv4_is_v41_model = low_ratio
         backend.is_draft_worker = False
         backend._dsv41_candidate_source_layer = -1
         return backend
@@ -2816,6 +2820,16 @@ class TestV41PrefillCapability(unittest.TestCase):
             self.assertTrue(
                 self._backend(low_ratio=False)._supports_dsv4_prefill_graph_capture()
             )
+
+    def test_metadata_protocol_is_selected_by_generation(self):
+        self.assertIs(
+            self._backend()._prefill_graph_metadata_cls(),
+            Dsv41PrefillGraphMetadata,
+        )
+        self.assertIs(
+            self._backend(low_ratio=False)._prefill_graph_metadata_cls(),
+            Dsv4PrefillGraphMetadata,
+        )
 
     def test_unsupported_parallel_and_arch_are_rejected(self):
         with self._patch(cp=2):
