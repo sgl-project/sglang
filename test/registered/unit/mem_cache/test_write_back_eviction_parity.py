@@ -5,18 +5,24 @@ host hits load back, the host pool stays full) runs batched and per-victim
 through a real UnifiedRadixCache on CPU: both tree cores, Full-only and
 FULL+SWA with a window spanning several turns' nodes. After every eviction
 call the device and host residency, SWA tombstones, pool sizes and the
-evicted, backed-up and loaded-back token counters must match.
+evicted, backed-up and loaded-back token counters must match. The same holds
+for the batched walk with its host wait replaced by stream waits
+(SGLANG_OPT_HICACHE_WRITE_BACK_ORDERED_DEMOTE).
 """
 
 import random
 import unittest
 from array import array
 from collections import Counter, deque
+from contextlib import ExitStack
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache import unified_radix_cache
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -111,7 +117,14 @@ class _Workload:
     load the host hit back, allocate the extend (evicting for it), insert, and
     hold the request's lock for a step."""
 
-    def __init__(self, tree_core_backend: str, seed: int, batched: bool, swa: bool):
+    def __init__(
+        self,
+        tree_core_backend: str,
+        seed: int,
+        batched: bool,
+        swa: bool,
+        ordered: bool = False,
+    ):
         self.swa = swa
         if swa:
             self.cache, self.allocator, self.host_pool, self.swa_host_pool = (
@@ -137,6 +150,13 @@ class _Workload:
         if not batched:
             # Each victim is copied and demoted before the walk advances.
             self.cache._write_back_batch_tokens = lambda *args: 0
+        self.ordered = ordered
+        self.stream_waits = 0
+        if ordered:
+            stream = SimpleNamespace(wait_event=self._count_stream_wait)
+            cc = self.cache.cache_controller
+            cc.write_fence_stream = cc.load_fence_stream = stream
+            cc.l2_transfer_engine = SimpleNamespace(host_to_device_stream=stream)
         self.rng = random.Random(seed)
         self.next_sid = 0
         self.sessions = [self._new_session(0) for _ in range(SESSIONS)]
@@ -146,6 +166,9 @@ class _Workload:
         self.snapshots = []
         self.copy_waits = 0
         self._instrument()
+
+    def _count_stream_wait(self, event):
+        self.stream_waits += 1
 
     def _new_session(self, now: int) -> _Session:
         session = _Session(self.next_sid, self.rng, now)
@@ -342,6 +365,23 @@ class _Workload:
         assert indices is not None
         return indices
 
+    def run_with_switch(self):
+        """run() with the ordered-demotion switch set to ``ordered``; the cache's
+        current stream counts its waits."""
+        with ExitStack() as stack:
+            stack.enter_context(
+                envs.SGLANG_OPT_HICACHE_WRITE_BACK_ORDERED_DEMOTE.override(self.ordered)
+            )
+            stream = SimpleNamespace(wait_event=self._count_stream_wait)
+            stack.enter_context(
+                mock.patch.object(
+                    unified_radix_cache,
+                    "device_module",
+                    SimpleNamespace(current_stream=lambda: stream),
+                )
+            )
+            return self.run()
+
     def run(self):
         cache = self.cache
         for step in range(STEPS):
@@ -408,11 +448,34 @@ class _WriteBackParitySuite:
                     {"evicted", "backup", "load_back"},
                 )
 
+    def _assert_ordered_parity(self, swa: bool = False):
+        for seed in SEEDS:
+            with self.subTest(seed=seed):
+                blocking = _Workload(self.tree_core_backend, seed, True, swa)
+                want, want_waits, want_metrics = blocking.run_with_switch()
+                ordered = _Workload(self.tree_core_backend, seed, True, swa, True)
+                got, got_waits, got_metrics = ordered.run_with_switch()
+                self.assertEqual(len(got), len(want))
+                for call, (g, w) in enumerate(zip(got, want)):
+                    self.assertEqual(g[:2], w[:2], f"eviction call {call} differs")
+                    for name, value in g[2].items():
+                        if value != w[2][name]:
+                            self.fail(f"{name} differ after eviction call {call}")
+                self.assertEqual(got_metrics, want_metrics)
+                # The demotions' host waits became stream waits.
+                self.assertGreater(want_waits, 0)
+                self.assertEqual(got_waits, 0)
+                self.assertGreater(ordered.stream_waits, 0)
+                self.assertEqual(blocking.stream_waits, 0)
+
     def test_batched_eviction_makes_the_per_victim_decisions(self):
         self._assert_parity(swa=False)
 
     def test_batched_swa_eviction_makes_the_per_victim_decisions(self):
         self._assert_parity(swa=True)
+
+    def test_ordered_demotion_makes_the_blocking_decisions(self):
+        self._assert_ordered_parity(swa=False)
 
 
 class TestWriteBackParityRustCore(_WriteBackParitySuite, CustomTestCase):
