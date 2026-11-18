@@ -24,6 +24,9 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_parallel_rank,
     get_sp_world_size,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 # Distilled 3-step stage-2 sigma schedule. Single source of truth shared by
 # LTX2TwoStagePipeline and the SANA-WM refiner stages (matches NVlabs
@@ -202,6 +205,29 @@ class LTX2PipelineConfig(PipelineConfig):
     @property
     def vae_temporal_compression(self):
         return self.vae_config.arch_config.temporal_compression_ratio
+
+    def adjust_num_frames(self, num_frames, *, log_adjustment: bool = True):
+        """Round ``num_frames`` down so ``(num_frames - 1) % ratio == 0``.
+
+        The video VAE only decodes ``(latent_frames - 1) * ratio + 1`` frames,
+        while the audio length is derived from ``num_frames / fps``. Without
+        this, e.g. 128 frames at 24 fps decodes 121 video frames but ~5.33 s
+        of audio. Rounding down keeps the decoded video unchanged and makes
+        the audio match it.
+        """
+        ratio = int(self.vae_temporal_compression)
+        if num_frames is None or num_frames < 1 or (num_frames - 1) % ratio == 0:
+            return num_frames
+        adjusted = (num_frames - 1) // ratio * ratio + 1
+        if log_adjustment:
+            logger.warning(
+                "`num_frames - 1` must be divisible by %d for LTX-2; "
+                "rounding num_frames from %d down to %d.",
+                ratio,
+                num_frames,
+                adjusted,
+            )
+        return adjusted
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
