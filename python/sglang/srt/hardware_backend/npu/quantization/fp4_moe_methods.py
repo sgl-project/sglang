@@ -18,7 +18,7 @@ from sglang.srt.hardware_backend.npu.quantization.moe_utils import (
     process_npu_fp4_expert_weights,
 )
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
@@ -52,8 +52,12 @@ class NPUW4A8MXFP4FusedMoEMethod(FusedMoEMethodBase):
         # npu_grouped_matmul_swiglu_quant_v2 once it accepts swiglu_limit.
         # V4 sets swiglu_limit=10.0; the current fused op implements only
         # standard SwiGLU and would skip the required gate/up clamps.
-        self.w13_kernel = NPUW4A8MXFP4MoEMethod(dynamic_quant_kwargs=None)
-        self.w2_kernel = NPUW4A8MXFP4MoEMethod(dynamic_quant_kwargs=None)
+        self.w13_kernel = NPUW4A8MXFP4MoEMethod(
+            dynamic_quant_kwargs=None, weight_prefix="w13"
+        )
+        self.w2_kernel = NPUW4A8MXFP4MoEMethod(
+            dynamic_quant_kwargs=None, weight_prefix="w2"
+        )
         self.runner = None
 
     def create_weights(

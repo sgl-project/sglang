@@ -75,6 +75,8 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.hf_transformers import get_tokenizer
+from sglang.srt.layers.dp_attention import require_mlp_sync, require_mlp_tp_gather
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -105,12 +107,9 @@ from sglang.srt.utils import (
     get_bool_env_var,
     kill_process_tree,
     maybe_reindex_device_id,
-    require_mlp_sync,
-    require_mlp_tp_gather,
     set_gpu_proc_affinity,
     suppress_other_loggers,
 )
-from sglang.srt.utils.hf_transformers import get_tokenizer
 
 
 def _init_process_global_configs() -> None:

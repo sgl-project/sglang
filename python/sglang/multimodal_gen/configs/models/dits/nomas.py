@@ -21,6 +21,7 @@ class NomasArchConfig(DiTArchConfig):
     # Upstream checkpoint names -> the shared MLP / ModulateProjection layers.
     param_names_mapping: dict = field(
         default_factory=lambda: {
+            r"^(.*)\.weight_q$": r"\1.weight",
             r"^(.*)\.fc1\.(.*)$": r"\1.fc_in.\2",
             r"^(.*)\.fc2\.(.*)$": r"\1.fc_out.\2",
             r"^(.*)\.adaLN_modulation\.1\.(.*)$": r"\1.adaLN_modulation.linear.\2",

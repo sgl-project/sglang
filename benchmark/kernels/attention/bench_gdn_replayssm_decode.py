@@ -3,7 +3,7 @@ existing packed GDN decode kernel.
 
 Compares per-step decode latency of
 ``fused_recurrent_gated_delta_rule_packed_decode`` (writes the full recurrent
-state S every step) against ``fused_recurrent_gdn_replayssm_decode`` at
+state S every step) against ``fused_recurrent_linear_replayssm_decode`` at
 L in {1, 8, 16} (writes the full state only every L steps) across batch sizes
 {1, 16, 64, 256} for a realistic GDN config (HV=32, K=V=128).
 
@@ -38,7 +38,7 @@ from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule_packed_decode,
 )
 from sglang.kernels.ops.attention.linear.fused_recurrent_linear_replayssm import (
-    fused_recurrent_gdn_replayssm_decode,
+    fused_recurrent_linear_replayssm_decode,
 )
 
 
@@ -122,7 +122,7 @@ def _bench_cfg(
         rout = mixed_qkv.new_empty(B, 1, HV, V)
 
         def run_replay():
-            fused_recurrent_gdn_replayssm_decode(
+            fused_recurrent_linear_replayssm_decode(
                 mixed_qkv=mixed_qkv,
                 a=a,
                 b=b,
