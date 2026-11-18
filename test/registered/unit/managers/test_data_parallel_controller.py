@@ -38,6 +38,7 @@ from sglang.srt.managers.incremental_detokenize import LimitedCapacityDict
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
+    TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
@@ -450,6 +451,22 @@ class TestFollowRoutingKeyScheduler(CustomTestCase):
         ctl.follow_routing_key_scheduler(_req())
         ctl.workers[1].send_pyobj.assert_called_once()
         self.assertEqual(len(ctl.routing_key_to_rank), 0)
+
+    def test_an_embedding_request_follows_its_key(self):
+        ctl = _make_controller(num_dp_ranks=4)
+        ctl.follow_routing_key_scheduler(_req(routing_key="session"))
+        rank = ctl.routing_key_to_rank[hash("session")]
+        ctl.follow_routing_key_scheduler(
+            TokenizedEmbeddingReqInput(
+                input_text="",
+                input_ids=[1],
+                mm_inputs=None,
+                token_type_ids=None,
+                sampling_params=SamplingParams(),
+                routing_key="session",
+            )
+        )
+        self.assertEqual(ctl.workers[rank].send_pyobj.call_count, 2)
 
     def test_the_least_recently_used_key_is_forgotten_first(self):
         ctl = _make_controller(num_dp_ranks=2)
