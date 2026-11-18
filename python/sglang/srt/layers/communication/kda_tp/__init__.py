@@ -28,6 +28,9 @@ def group():
 
 
 def slot_partition(pool_slots: int) -> Tuple[int, int]:
+    """(first slot id, slot count) this DP rank allocates from a pool of ``pool_slots``."""
+    if not enabled():
+        return 1, pool_slots
     W = width()
     per_rank = pool_slots // W
     if per_rank < 1:

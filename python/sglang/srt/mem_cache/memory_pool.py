@@ -704,14 +704,7 @@ class MambaPool:
             maybe_init_custom_mem_pool(device=self.device)
         )
 
-        with (
-            self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE),
-            (
-                torch.cuda.use_mem_pool(self.custom_mem_pool)
-                if self.enable_custom_mem_pool
-                else nullcontext()
-            ),
-        ):
+        with self.state_allocation_region():
             if envelope_layout:
                 # Page-granularity envelope layout (page_size==1 for state): all
                 # mamba layers/slots share one contiguous byte buffer; conv and
@@ -1546,17 +1539,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
         from sglang.srt.layers.communication import kda_tp
 
-        if kda_tp.enabled():
-            # KDA TP: global slot ids; this DP rank allocates its 1/W of them.
-            first_slot, per_rank = kda_tp.slot_partition(mamba_size)
-            self.mamba_allocator = MambaSlotAllocator(
-                size=per_rank, device=device, first_slot=first_slot
-            )
-        else:
-            self.mamba_allocator = MambaSlotAllocator(
-                size=mamba_size,
-                device=device,
-            )
+        # KDA TP: global slot ids; this DP rank allocates its 1/W of them.
+        first_slot, size = kda_tp.slot_partition(mamba_size)
+        self.mamba_allocator = MambaSlotAllocator(
+            size=size, device=device, first_slot=first_slot
+        )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
         # Qwen4-Exp PLE side states; built disabled rather than None without a config,
