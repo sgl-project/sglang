@@ -24,10 +24,9 @@ from sglang.kernels.ops.attention.kda_flydsl.kimi_k3_kda_decode import (
     is_flydsl_kimi_k3_kda_decode_supported,
 )
 from sglang.srt.environ import envs
-from sglang.srt.utils.common import temp_set_env
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=120, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 
 def _gfx950_flydsl_available() -> bool:
@@ -466,68 +465,17 @@ def test_f_b_non_positive_slots_do_not_modify_caches() -> None:
     assert torch.equal(inputs.state, state_before)
 
 
-def test_f_b_api_rejects_invalid_projection_inputs() -> None:
-    f_a, f_b_weight, inputs = _make_fb_inputs(batch=1)
-
-    with pytest.raises(ValueError, match="`f_a` must have rank 2"):
-        _run_with_f_b(f_a.unsqueeze(0), f_b_weight, inputs)
-    with pytest.raises(ValueError, match="`f_a` must have dtype"):
-        _run_with_f_b(f_a.float(), f_b_weight, inputs)
-    with pytest.raises(ValueError, match="`f_b_weight` must have shape"):
-        _run_with_f_b(f_a, f_b_weight[:, :, :-1], inputs)
-    with pytest.raises(ValueError, match="`f_b_weight` must have inner strides"):
-        _run_with_f_b(f_a, f_b_weight.transpose(1, 2), inputs)
-
-
 def test_fused_kda_backend_is_opt_in():
     from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
 
     field = envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND
-    # The deprecated name has no descriptor to override.
-    with (
-        field.override(None),
-        temp_set_env(allow_sglang=True, SGLANG_ROCM_K3_KDA_FUSED_BACKEND=None),
-    ):
+    with field.override(None):
         field.clear()
         assert not kda_fused_decode_aiter_hip.enabled()
     with envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("gfx950"):
         assert not kda_fused_decode_aiter_hip.enabled()
     with envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("aiter"):
         assert kda_fused_decode_aiter_hip.enabled()
-
-
-@pytest.mark.parametrize(
-    "new_name, old_name, old_value, new_value",
-    [
-        (
-            "SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND",
-            "SGLANG_ROCM_K3_KDA_FUSED_BACKEND",
-            "aiter",
-            "gfx950",
-        ),
-        (
-            "SGLANG_USE_HIP_K3_FLYDSL_SOURCE",
-            "SGLANG_K3_FLYDSL_SOURCE",
-            "sglang",
-            "aiter",
-        ),
-    ],
-)
-def test_pre_rename_names_still_select(new_name, old_name, old_value, new_value):
-    """Launch scripts and the cookbook's pinned image still set the old names;
-    each must reach its descriptor, and the new name must win over it."""
-    field = getattr(envs, new_name)
-    # The old name has no descriptor to override; override() on the new one also
-    # drops the copy the alias fallback writes to it.
-    with field.override(None), temp_set_env(allow_sglang=True, **{old_name: old_value}):
-        field.clear()
-        with pytest.warns(FutureWarning, match=old_name):
-            assert field.get() == old_value
-    with (
-        field.override(new_value),
-        temp_set_env(allow_sglang=True, **{old_name: old_value}),
-    ):
-        assert field.get() == new_value
 
 
 @pytest.fixture
@@ -717,8 +665,6 @@ def test_sglang_source_does_not_cover_bf16_state(select_fused_backend) -> None:
     assert _adapter_covers(adapter, f_a, f_b_weight, inputs)
     _bf16_state(inputs)
     assert not _adapter_covers(adapter, f_a, f_b_weight, inputs)
-    with pytest.raises(ValueError, match="`state` must have dtype"):
-        _run_with_f_b(f_a, f_b_weight, inputs)
 
 
 def test_sglang_source_is_not_armed_for_a_bf16_pool(

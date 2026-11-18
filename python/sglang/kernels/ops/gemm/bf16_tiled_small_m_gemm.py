@@ -75,6 +75,116 @@ ROW_MAJOR = {
     (14336, 8192, 16): (64, 256, 1, 4, 3),
     (14336, 8192, 32): (64, 256, 1, 8, 3),
 }
+# (N, K, BM) -> per-N-block K-start rotation stride (coprime to the per-split K-tile count, 16 or 32 here) of the
+# long-K launches, so concurrent workgroups stream different K tiles; 0 or absent: the canonical in-order K loop.
+# Measured per bucket over its M range: KT_PER <= 8 launches and every [8192, 7168] bucket lose with rotation.
+ROW_MAJOR_ROT = {
+    (8192, 4096, 64): 7,
+    (8192, 4096, 128): 5,
+    (8192, 2048, 128): 5,
+    (4096, 8192, 128): 5,
+    (4608, 8192, 64): 3,
+    (4608, 8192, 128): 3,
+    (2560, 8192, 128): 3,
+    (14336, 8192, 16): 7,
+    (14336, 8192, 32): 7,
+}
+
+
+# gfx1250 (wave32): row-major launches tuned at the Muse TP8 decode / verify shapes (M 8 / 32 / 64 / 128).
+_GFX1250_ROW_MAJOR = {
+    (8192, 4096, 16): (64, 256, 1, 4, 3),
+    (8192, 4096, 32): (64, 256, 1, 4, 3),
+    (8192, 4096, 64): (128, 256, 1, 4, 3),
+    (8192, 4096, 128): (128, 128, 1, 4, 3),
+    (4096, 8192, 16): (64, 128, 4, 4, 3),
+    (4096, 8192, 32): (64, 128, 4, 4, 3),
+    (4096, 8192, 64): (64, 128, 4, 4, 3),
+    (4096, 8192, 128): (64, 128, 4, 4, 2),
+    (4608, 8192, 16): (64, 128, 4, 4, 3),
+    (4608, 8192, 32): (64, 128, 4, 4, 3),
+    (4608, 8192, 64): (64, 128, 4, 4, 3),
+    (4608, 8192, 128): (64, 128, 4, 4, 2),
+    (8192, 1024, 16): (128, 256, 1, 8, 3),
+    (8192, 1024, 32): (128, 256, 1, 4, 3),
+    (8192, 1024, 64): (128, 256, 1, 4, 3),
+    (8192, 1024, 128): (128, 128, 1, 4, 3),
+    # DFlash draft shapes (attention [2560, 8192], down [8192, 7168], gate_up [14336, 8192]); the down projection
+    # at 128 rows stays on hipBLASLt.
+    (2560, 8192, 16): (64, 128, 8, 4, 3),
+    (2560, 8192, 32): (64, 256, 4, 8, 3),
+    (2560, 8192, 64): (128, 256, 4, 4, 3),
+    (2560, 8192, 128): (128, 256, 4, 4, 2),
+    (8192, 7168, 16): (64, 256, 1, 4, 3),
+    (8192, 7168, 32): (32, 256, 1, 4, 3),
+    (8192, 7168, 64): (128, 256, 1, 4, 3),
+    (14336, 8192, 16): (64, 128, 1, 4, 3),
+    (14336, 8192, 32): (64, 128, 1, 4, 3),
+    (14336, 8192, 64): (64, 128, 1, 4, 3),
+    (14336, 8192, 128): (256, 128, 1, 4, 3),
+    # DFlash draft context projection at TP8, faster than hipBLASLt at M 8 / 64 / 128: stacked K/V of the 5 layers
+    # [1280, 8192] (also against hipBLASLt on the transposed copy) and this rank's fc slice [1024, 40960] (32 rows take
+    # the 64-row launch).
+    (1280, 8192, 16): (128, 256, 16, 8, 2),
+    (1280, 8192, 32): (64, 128, 8, 4, 3),
+    (1280, 8192, 64): (64, 128, 8, 4, 3),
+    (1280, 8192, 128): (64, 256, 4, 4, 3),
+    (1024, 40960, 16): (64, 128, 16, 4, 3),
+    (1024, 40960, 32): (64, 128, 16, 4, 3),
+    (1024, 40960, 64): (64, 128, 16, 4, 3),
+}
+# gfx1250: aiter's FlyDSL a16w16 GEMM (TDM pipeline, split-K summed in-kernel in a fixed order) where it beats the
+# incumbent, (N, K, BM) -> (out dtype, launch): the joint router / pooler [4608, 8192] with an FP32 output at 16 rows
+# (one split for the epilogue to sum instead of eight), the unpooler [8192, 4096] at 16 and 64 rows, and the DFlash
+# draft gate/up [7168, 8192] and down [8192, 3584] at 65..128 rows (vs aiter tgemm).
+FLYDSL: dict = {}
+_GFX1250_FLYDSL = {
+    (4608, 8192, 16): (
+        torch.float32,
+        dict(tile_m=16, tile_n=64, tile_k=256, m_warp=1, n_warp=2, num_buffers=6),
+    ),
+    (8192, 4096, 16): (
+        torch.bfloat16,
+        dict(tile_m=16, tile_n=64, tile_k=128, m_warp=1, n_warp=4, num_buffers=6),
+    ),
+    (8192, 4096, 64): (
+        torch.bfloat16,
+        dict(
+            tile_m=64,
+            tile_n=64,
+            tile_k=128,
+            m_warp=2,
+            n_warp=2,
+            num_buffers=3,
+            split_k=2,
+        ),
+    ),
+    (7168, 8192, 128): (
+        torch.bfloat16,
+        dict(tile_m=64, tile_n=160, tile_k=128, m_warp=1, n_warp=2, num_buffers=4),
+    ),
+    (8192, 3584, 128): (
+        torch.bfloat16,
+        dict(
+            tile_m=64,
+            tile_n=192,
+            tile_k=128,
+            m_warp=4,
+            n_warp=2,
+            num_buffers=3,
+            variant="compute_bound",
+        ),
+    ),
+}
+try:
+    if (
+        torch.cuda.is_available()
+        and "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
+    ):
+        ROW_MAJOR.update(_GFX1250_ROW_MAJOR)
+        FLYDSL.update(_GFX1250_FLYDSL)
+except Exception:
+    pass
 
 
 @triton.jit
@@ -130,21 +240,37 @@ def _rowmajor_partial(
     BN: tl.constexpr,
     BK: tl.constexpr,
     SK: tl.constexpr,
+    ROT: tl.constexpr,
 ):
     pn, pk = tl.program_id(0), tl.program_id(1)
     KT_PER: tl.constexpr = K // BK // SK
     m = tl.arange(0, BM)
     kk = tl.arange(0, BK)
     n = pn * BN + tl.arange(0, BN)
-    bp = W + n[None, :].to(tl.int64) * K + (pk * KT_PER * BK + kk)[:, None]
-    ap = X + m[:, None] * K + (pk * KT_PER * BK + kk)[None, :]
     acc = tl.zeros((BM, BN), tl.float32)
-    for _ in range(KT_PER):
-        a = tl.load(ap, mask=m[:, None] < M, other=0.0)
-        b = tl.load(bp, cache_modifier=".cg")
-        acc = tl.dot(a, b, acc)
-        ap += BK
-        bp += BK
+    if ROT > 0:
+        # Long K loops: rotate each N-block's K start so the workgroups do not all stream the same K tile at once.
+        start = (pn * ROT) % KT_PER
+        for i in range(KT_PER):
+            kt = (start + i) % KT_PER
+            k0 = (pk * KT_PER + kt) * BK
+            a = tl.load(
+                X + m[:, None] * K + (k0 + kk)[None, :], mask=m[:, None] < M, other=0.0
+            )
+            b = tl.load(
+                W + n[None, :].to(tl.int64) * K + (k0 + kk)[:, None],
+                cache_modifier=".cg",
+            )
+            acc = tl.dot(a, b, acc)
+    else:
+        bp = W + n[None, :].to(tl.int64) * K + (pk * KT_PER * BK + kk)[:, None]
+        ap = X + m[:, None] * K + (pk * KT_PER * BK + kk)[None, :]
+        for _ in range(KT_PER):
+            a = tl.load(ap, mask=m[:, None] < M, other=0.0)
+            b = tl.load(bp, cache_modifier=".cg")
+            acc = tl.dot(a, b, acc)
+            ap += BK
+            bp += BK
     tl.store(
         P + pk * M * N + m[:, None] * N + n[None, :],
         acc.to(P.dtype.element_ty),
@@ -154,10 +280,19 @@ def _rowmajor_partial(
 
 @triton.jit
 def _sum_partials(P, Y, MN, SK: tl.constexpr, B: tl.constexpr):
+    # Flat 1-D reduction: each thread owns contiguous elements, all SK partial loads are independent and in flight.
     i = tl.program_id(0) * B + tl.arange(0, B)
-    s = tl.arange(0, SK)
-    p = tl.load(P + s[:, None] * MN + i[None, :], mask=i[None, :] < MN, other=0.0)
-    tl.store(Y + i, tl.sum(p, axis=0).to(Y.dtype.element_ty), mask=i < MN)
+    msk = i < MN
+    acc = tl.load(P + i, mask=msk, other=0.0)
+    for s in tl.static_range(1, SK):
+        acc += tl.load(P + s * MN + i, mask=msk, other=0.0)
+    tl.store(Y + i, acc.to(Y.dtype.element_ty), mask=msk)
+
+
+def _sum_block(mn: int):
+    """(elements per program, warps) of the partial sum: 4 FP32 per thread (one 16 B load per partial); one-wave
+    programs below 64K elements so small products still spread over the CUs."""
+    return (1024, 4) if mn >= 1 << 16 else (256, 1)
 
 
 @torch.no_grad()
@@ -230,14 +365,41 @@ def rowmajor_gemm_applies(x: torch.Tensor, weight: torch.Tensor) -> bool:
     )
 
 
+def flydsl_gemm_applies(
+    x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype
+) -> bool:
+    """Whether ``flydsl_gemm(x, weight)`` has a tuned launch with this output dtype."""
+    cfg = FLYDSL.get((*weight.shape, _bm(x.shape[0])))
+    return (
+        cfg is not None
+        and cfg[0] == out_dtype
+        and x.dim() == 2
+        and x.is_contiguous()
+        and weight.is_contiguous()
+        and x.dtype == weight.dtype == torch.bfloat16
+        and weight.shape[1] == x.shape[1]
+    )
+
+
+def flydsl_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``x @ W.T`` with FP32 accumulate on the tuned FlyDSL launch (``flydsl_gemm_applies``)."""
+    from aiter.ops.flydsl.gemm_a16w16_gfx1250 import gemm_a16w16
+
+    out_dtype, launch = FLYDSL[(*weight.shape, _bm(x.shape[0]))]
+    return gemm_a16w16(x, weight, dtype=out_dtype, **launch)
+
+
 def rowmajor_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """``x @ W.T`` (BF16 out) reading the stored row-major ``W [n, k]``."""
+    if flydsl_gemm_applies(x, weight, torch.bfloat16):
+        return flydsl_gemm(x, weight)
     p = rowmajor_gemm_partials(x, weight)
     if p.dtype == torch.bfloat16:
         return p
     m, n = p.shape[1:]
     y = torch.empty((m, n), device=x.device, dtype=torch.bfloat16)
-    _sum_partials[(triton.cdiv(m * n, 256),)](p, y, m * n, p.shape[0], 256, num_warps=4)
+    b, w = _sum_block(m * n)
+    _sum_partials[(triton.cdiv(m * n, b),)](p, y, m * n, p.shape[0], b, num_warps=w)
     return y
 
 
@@ -270,6 +432,7 @@ def rowmajor_gemm_partials(x: torch.Tensor, weight: torch.Tensor) -> torch.Tenso
         bn,
         bk,
         sk,
+        ROW_MAJOR_ROT.get((n, k, bm), 0),
         num_warps=warps,
         num_stages=stages,
         matrix_instr_nonkdim=16,
