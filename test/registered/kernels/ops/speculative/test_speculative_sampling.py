@@ -19,9 +19,9 @@ if torch.version.cuda is not None:
     from sglang.srt.speculative.uno_utils import _build_sparse_target_support_tensors
 else:
     if torch.version.hip is not None:
-        # ROCm resolves the name to the Triton port of the CUDA kernel.
-        from sglang.kernels.ops.speculative.verify_sampling import (
-            tree_speculative_sampling_target_only,
+        # the Triton port of the CUDA kernel, which gfx950 resolves the name to
+        from sglang.kernels.ops.speculative.target_only_sampling import (
+            tree_speculative_sampling_target_only_triton as tree_speculative_sampling_target_only,
         )
     else:
         from sgl_kernel import tree_speculative_sampling_target_only
@@ -34,7 +34,7 @@ else:
     )
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
-# backend-specific: ROCm resolves the kernel to its Triton port
+# backend-specific: gfx950 serves this kernel with its Triton port
 register_amd_ci(est_time=16, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 test_cases = [
