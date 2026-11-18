@@ -19,7 +19,7 @@ from sglang.srt.multimodal.media_io import (
     read_local_media_file,
 )
 from sglang.srt.runtime_context import get_model, publish, reset_context
-from sglang.srt.server_args import REMOVED_FLAGS, ServerArgs
+from sglang.srt.server_args import REMOVED_FLAGS, ServerArgs, reject_removed_kwargs
 from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -177,7 +177,7 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
     def test_removed_flags_name_their_replacement(self):
         """A flag removed in SGLang 1.0 stops the launch with a message naming
         what to pass instead, not argparse's generic "unrecognized arguments";
-        so does its key in a YAML `--config` file."""
+        so does its key in a YAML `--config` file and its keyword to `Engine`."""
         # A bare flag, and one that took a value.
         for argv in (["--show-time-cost"], ["--monokernel-backend", "amd"]):
             flag = argv[0]
@@ -205,6 +205,14 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
                 "--show-time-cost was removed in SGLang 1.0; "
                 f"{REMOVED_FLAGS['--show-time-cost']}.",
             )
+
+        with self.assertRaisesRegex(
+            TypeError,
+            "enable_dp_attention was removed in SGLang 1.0; use --attn-dp-size",
+        ):
+            reject_removed_kwargs(ServerArgs, {"enable_dp_attention": True})
+        # `disable_cuda_graph` is still a field; only its flag was removed.
+        reject_removed_kwargs(ServerArgs, {"disable_cuda_graph": True})
 
     def test_removed_choices_name_their_replacement(self):
         """A removed choice value stops the launch with a message naming the

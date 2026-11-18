@@ -236,6 +236,15 @@ REMOVED_FLAGS = {
 }
 
 
+def reject_removed_kwargs(server_args_class: type, kwargs: dict) -> None:
+    """Stop on a keyword for a flag in `REMOVED_FLAGS` that is no longer a
+    field, naming what to use, instead of the constructor's generic error."""
+    for key in kwargs:
+        flag = "--" + key.replace("_", "-")
+        if flag in REMOVED_FLAGS and key not in server_args_class.__struct_fields__:
+            raise TypeError(f"{key} was removed in SGLang 1.0; {REMOVED_FLAGS[flag]}.")
+
+
 class ServerArgs:
     """Raw server configuration, sealed when resolution starts.
 
