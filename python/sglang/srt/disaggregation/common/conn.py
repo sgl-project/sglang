@@ -310,6 +310,8 @@ class SendRecord:
 
 class CommonKVManager(BaseKVManager):
     defer_decode_allocation: bool = False
+    # Prefill only: rooms whose request was rejected before a sender existed.
+    _abandoned_rooms: Optional[Dict[int, float]] = None
     deferred_bootstrap: Optional[DeferredBootstrap] = None
     _staging_ctx = None
 
@@ -506,6 +508,8 @@ class CommonKVManager(BaseKVManager):
             # fail to receive the KV indices from the decode instance of this request.
             # These timeout requests should be aborted to release the tree cache.
             self.bootstrap_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+            self._abandoned_rooms = {}
+            self._abandoned_rooms_lock = threading.Lock()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.enable_staging: bool = False
             self._staging_handler = None
@@ -785,6 +789,19 @@ class CommonKVManager(BaseKVManager):
             )
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
+        if status != KVPoll.WaitingForInput or self._abandoned_rooms is None:
+            self._set_status(bootstrap_room, status)
+            return
+        # Serialized with abandon_room: a decode registration completing after
+        # the request was rejected must not recreate the room.
+        with self._abandoned_rooms_lock:
+            if bootstrap_room not in self._abandoned_rooms:
+                self._set_status(bootstrap_room, status)
+                return
+            targets = self._drop_room(bootstrap_room)
+        self._fail_abandoned_room(bootstrap_room, targets)
+
+    def _set_status(self, bootstrap_room: int, status: KVPoll):
         current = self.request_status.get(bootstrap_room)
         if current is None:
             # The room does not exist yet, or clear() already popped it. Only a
@@ -886,6 +903,55 @@ class CommonKVManager(BaseKVManager):
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
+
+    def abandon_room(self, bootstrap_room: int) -> None:
+        """Fail a room whose request prefill rejected before creating a sender.
+
+        Decode registers the room anyway, and only a sender would clear it.
+        """
+        now = time.monotonic()
+        with self._abandoned_rooms_lock:
+            # Re-insert to keep the dict ordered by time.
+            self._abandoned_rooms.pop(bootstrap_room, None)
+            self._abandoned_rooms[bootstrap_room] = now
+            cutoff = now - self.bootstrap_timeout
+            while True:
+                room, abandoned_at = next(iter(self._abandoned_rooms.items()))
+                if abandoned_at >= cutoff:
+                    break
+                del self._abandoned_rooms[room]
+                # Clear what an incomplete registration left behind.
+                if room not in self.request_status:
+                    self._drop_room(room)
+            # An incomplete registration is still being written by the
+            # bootstrap thread; update_status fails it once complete.
+            targets = (
+                self._drop_room(bootstrap_room)
+                if self.request_status.get(bootstrap_room) == KVPoll.WaitingForInput
+                else []
+            )
+        if self.deferred_bootstrap is not None:
+            self._notify_bootstrap(
+                bootstrap_room, self.deferred_bootstrap.fail(bootstrap_room)
+            )
+        self._fail_abandoned_room(bootstrap_room, targets)
+
+    def _drop_room(self, bootstrap_room: int) -> List[Tuple[str, int]]:
+        targets = self._room_notify_targets(bootstrap_room)
+        self.request_status.pop(bootstrap_room, None)
+        self.req_to_decode_prefix_len.pop(bootstrap_room, None)
+        self.transfer_infos.pop(bootstrap_room, None)
+        return targets
+
+    def _fail_abandoned_room(
+        self, bootstrap_room: int, targets: List[Tuple[str, int]]
+    ) -> None:
+        self.send_kv_status_message(
+            targets=targets,
+            bootstrap_room=bootstrap_room,
+            status=KVPoll.Failed,
+            failure_reason="Rejected by prefill before transfer.",
+        )
 
     def _room_notify_targets(self, bootstrap_room: int) -> List[Tuple[str, int]]:
         infos = self.transfer_infos.get(bootstrap_room)

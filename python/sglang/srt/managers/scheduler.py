@@ -255,6 +255,9 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
     mamba_prefill_chunk_grid,
 )
+from sglang.srt.managers.scheduler_components.admission_estimator import (
+    AdmissionController,
+)
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -525,6 +528,8 @@ class Scheduler(
     kv_checksum_computer: Optional[KvChecksumComputer] = None
     # Unlimited-OCR collaborators; None for every other model.
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
+    # Early reject; None when off.
+    admission: Optional[AdmissionController] = None
     resolve_forward_inputs = staticmethod(resolve_forward_inputs)
     # Class-level defaults so stub schedulers built via __new__ skip the log.
     log_schedule_decisions: bool = False
@@ -800,6 +805,8 @@ class Scheduler(
         self.init_request_retirer()
 
         self.init_deferred_responses()
+
+        self.admission = AdmissionController.maybe_create(self)
 
         self.init_request_receiver()
 
@@ -2351,6 +2358,8 @@ class Scheduler(
             local_reqs = self._poll_timeout_aborts()
         recv_start_ns = time.monotonic_ns()
         received_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
+        if self.admission is not None and received_reqs:
+            self.admission.on_recv(received_reqs)
         recv_reqs = self.pause_state.take_inputs(
             received_reqs, stop_at_pause=stop_at_pause
         )
@@ -3873,6 +3882,8 @@ class Scheduler(
         # Every request the scheduler keeps owes its output from here; one rejected
         # at intake without being queued sends it in the call that built it.
         self.invariant_checker.expect_output(req)
+        if self.admission is not None and self.admission.reject_on_enqueue(req):
+            return
         if not self._set_or_validate_priority(req):
             return
         if is_retracted:
@@ -5406,10 +5417,18 @@ class Scheduler(
                         if input_ids_from_graph:
                             fwd_kwargs["input_ids_from_graph"] = True
 
+                        gpu_timer = (
+                            self.admission.start_gpu_timer(batch, self.forward_stream)
+                            if self.admission is not None
+                            else None
+                        )
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
+                        if gpu_timer is not None:
+                            gpu_timer[1].record(stream=self.forward_stream)
+                            batch_result.prefill_gpu_events = gpu_timer
                         # Deferred decode graph I/O owns this step's relay.
                         if batch.spec_algorithm.is_none() and not input_ids_from_graph:
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
@@ -5850,6 +5869,8 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
         self._on_step_processed(batch, result)
+        if self.admission is not None and batch.forward_mode.is_extend():
+            self.admission.on_extend_processed(batch)
 
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
@@ -5909,6 +5930,8 @@ class Scheduler(
         if is_prefill:
             self.total_prefill_busy_us += step_us
             self.total_prefill_uncached_tokens += batch.extend_num_tokens
+            if self.admission is not None:
+                self.admission.on_prefill_step(batch, result, step_us, contiguous)
         else:
             batch_size = len(batch.reqs)
             _accumulate_decode_moment(

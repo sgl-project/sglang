@@ -737,6 +737,11 @@ class Envs:
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
+    # Reject a request whose predicted prefill-side TTFT exceeds this many
+    # seconds; <= 0 disables.
+    SGLANG_EARLY_REJECT_THRESHOLD = EnvFloat(-1)
+    # Prefill steps observed before early reject starts predicting.
+    SGLANG_EARLY_REJECT_REGRESSION_MIN_SAMPLES = EnvInt(32)
     # Non-streaming requests flush intermediate outputs every N decoded tokens.
     SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
     # Most per-request states the detokenizer keeps; past it, the oldest is

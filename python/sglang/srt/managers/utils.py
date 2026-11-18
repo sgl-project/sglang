@@ -111,6 +111,9 @@ class GenerationBatchResult:
     delay_sample_func: Optional[callable] = None
     # The step's launch record, for the unified pool's processing.
     forward_launch: Optional[ForwardLaunch] = None
+    # (start, end) CUDA events around a prefill forward, for early reject: GPU
+    # time free of CPU scheduling and of skew between overlapped steps.
+    prefill_gpu_events: Optional[tuple] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
     # Padded row width in flattened speculative output. Existing algorithms

@@ -175,6 +175,7 @@ class _DecodeNode:
             enable_skip_finishing_decode=False,
             scheduler_stage_metrics=None,
             uocr_runtime=None,
+            admission=None,
             decode_offload_manager=None,
             hisparse_coordinator=None,
             kv_checksum_computer=None,
