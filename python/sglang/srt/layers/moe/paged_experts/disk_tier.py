@@ -78,15 +78,15 @@ def current_model() -> ModelContext:
 
 def _local_tp_size() -> int:
     """TP ranks sharing this host's RAM, measured once before allocating host stores."""
-    from sglang.srt.distributed import get_tp_group
     from sglang.srt.distributed.parallel_state import in_the_same_node_as
     from sglang.srt.runtime_context import get_parallel
 
     model = current_model()
     if model.local_tp_size is None:
         model.local_tp_size = 1
-        if get_parallel().tp_size > 1:
-            group = get_tp_group()
+        parallel = get_parallel()
+        if parallel.tp_size > 1:
+            group = parallel.tp_group
             remaining = set(range(group.world_size))
             # Every rank must probe the same sources, including ranks whose host has
             # already been found. Global TP size would overcharge multi-node hosts.
