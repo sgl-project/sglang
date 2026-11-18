@@ -24,6 +24,16 @@ Choose your **Hardware Platform**, **Strategy**, and **Quantization** below. The
 
 With a current SGLang build, the commands omit settings inferred from the checkpoint and GPU. Muse Spark NVFP4 selects `modelopt_fp4`, with `flashinfer_trtllm` MoE on B200/B300/GB300 or `marlin` on H200. The default static memory fraction is `0.8` on Blackwell and `0.85` on Hopper; recipes with a different budget keep an explicit override. LayerNorm-SP enables MegaMoE automatically for NVFP4 on data-center Blackwell when EP equals TP and is greater than 1, except on PD decode workers. Use `--no-enable-megamoe-for-layernorm-sp` to opt out. Muse Spark DFlash2 drafts default to FA4 on these NVIDIA platforms and eight draft tokens. Explicit settings take precedence.
 
+### Quark PTPC-FP8 on AMD
+
+The published [`amd/Muse-Spark-Open-816B-A42B-Quark-PTPC-FP8`](https://huggingface.co/amd/Muse-Spark-Open-816B-A42B-Quark-PTPC-FP8) export uses static FP8 E4M3 weights with one scale per output channel and dynamic per-token FP8 activations. On a build containing this support, the checkpoint configuration selects the Quark scheme; this is separate from selecting an FP8 KV cache.
+
+The ROCm path is restricted to gfx950 and expert parallelism equal to tensor parallelism (expert TP1). Use the Triton expert backend. It preserves each route's output until Muse's per-expert normalization is applied, then weights and sums the routes. The generic Quark attention linears load q/k scales with the same row permutation as their weights.
+
+Serialized FP8 attention weights use Quark's GEMM layout. The bf16-derived dense-FP8 and Ulysses attention paths are bypassed for these linears; token-gather and reduce-scatter sequence-parallel prefill remain available. Unsupported quantization overrides and partial exclusions fail at model construction; missing or mis-typed weights and scales fail during weight loading rather than being silently cast.
+
+The initial qualification is on MI350X/gfx950 with TP8/EP8. Do not extend it to gfx942, DFlash2 or monokernel deployments without their own conversion and validation. The existing Deployment panel's other quantization recipes are unchanged; PTPC-FP8 coverage does not imply that every existing image or every FP8 format is supported.
+
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/meta-models/muse-spark.jsx";
 
