@@ -41,7 +41,7 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["reasoning_parser"] = "inkling"
         # Inkling2's MegaMoE path slices the replicated attention-TP tokens itself;
         # the scheduler-side attn-TP gather would only pad batches to attn_tp_size.
-        if cfg.moe_a2a_backend == "megamoe" and not cfg.enable_dp_attention:
+        if cfg.moe_a2a_backend == "megamoe" and cfg.attn_dp_size == 1:
             overrides["disable_attn_tp_gather"] = True
         # NVFP4 experts need expert parallelism. ep_size == 1 is the field
         # default; any other value is the user's and wins.
