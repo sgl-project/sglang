@@ -1,4 +1,4 @@
-"""ROCm glue of kimi_k3: the branches the model takes under ``_is_hip``. Its dense BF16
+"""gfx950 glue of kimi_k3: the branches the model takes under ``_is_gfx95``. Its dense BF16
 GEMMs that bypass UnquantizedLinearMethod go through AITER's tuned table (or hipBLASLt
 where it is faster) and AITER's tuned FlyDSL kernel into caller storage; the gfx950 MoE
 layer lives in ``moe``."""

@@ -174,7 +174,7 @@ _is_hip = is_hip()
 _is_gfx95 = is_gfx95_supported()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
-if _is_hip:
+if _is_gfx95:
     from sglang.srt.models.kimi_k3_amd.kimi_k3_hip import (
         aggregate_stream_hip,
         k3_bf16_gemm_hip,
@@ -292,7 +292,7 @@ def _k3_bf16_gemm(
                 if out is None:
                     return cutedsl_bf16_gemm(x, weight)
                 return cutedsl_bf16_gemm_out(x, weight, out)
-    if _is_hip and (hip_out := k3_bf16_gemm_hip(x, weight, out)) is not None:
+    if _is_gfx95 and (hip_out := k3_bf16_gemm_hip(x, weight, out)) is not None:
         return hip_out
     if out is None:
         return torch.nn.functional.linear(x, weight)
@@ -2453,10 +2453,10 @@ class KimiK3DeltaAttention(nn.Module):
                     qkv, g_proj_states, f_a, beta, _pad = torch.split(
                         fused_states, self._qkvgbfa_sizes, dim=-1
                     )
+                    if _is_gfx95:  # AITER's tuned f_b GEMM reads f_a in place
+                        gemm = kda_f_b_gemm_hip
                     # Fused KDA decode consumes f_a and applies f_b itself.
-                    forget_gate = (
-                        f_a if defer_f_b else kda_f_b_gemm_hip(f_a, self._bfa_f_b_w)
-                    )
+                    forget_gate = f_a if defer_f_b else gemm(f_a, self._bfa_f_b_w)
                     return qkv, beta, forget_gate, g_proj_states
 
                 if (
@@ -2826,7 +2826,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     def _compute_output_gate(self, hidden_states: torch.Tensor) -> torch.Tensor:
         alt = self._gate_pending_stream
         self._gate_pending_stream = None
-        pre = self.__dict__.get("_mono_pre") if _is_hip else None
+        pre = self.__dict__.get("_mono_pre") if _is_gfx95 else None
         if pre is not None and "gate" in pre:
             return mono_output_gate_hip(pre, alt)
         if alt is None:
