@@ -23,8 +23,9 @@ split documented in coordinator.py.
 
 from __future__ import annotations
 
-import enum
 from collections import deque
+
+import enum
 from typing import List, Optional, Sequence
 
 import msgspec
@@ -243,17 +244,20 @@ class BeamGroup:
     def finalize(self) -> List[BeamResult]:
         """Materialize the top beam_width sequences, best score first."""
         assert self.state == BeamGroupState.FINISHED
-        scored = [
-            (self.beam_score(beam.cum_logprob, beam.num_tokens), beam)
-            for beam in self.completed
-        ]
-        scored.sort(key=lambda item: item[0], reverse=True)
-        return [
+        results = [
             BeamResult(
                 tokens=materialize_tokens(beam.leaf),
                 cum_logprob=beam.cum_logprob,
                 beam_score=score,
                 matched_token=beam.matched_token,
             )
-            for score, beam in scored[: self.beam_width]
+            for score, beam in sorted(
+                (
+                    (self.beam_score(beam.cum_logprob, beam.num_tokens), beam)
+                    for beam in self.completed
+                ),
+                key=lambda item: item[0],
+                reverse=True,
+            )[: self.beam_width]
         ]
+        return results
