@@ -370,6 +370,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight_scale,  # w2_scale
                 None,  # w1_zp
                 None,  # w2_zp
+                None,  # a1_scale
                 None,  # block_size
                 None,  # w1 bias
                 None,  # w3 bias

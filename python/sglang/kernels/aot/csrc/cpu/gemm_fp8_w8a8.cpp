@@ -3,6 +3,7 @@
 #include <torch/all.h>
 
 #include "common.h"
+#include "gemm.h"
 #include "vec.h"
 
 namespace {
@@ -362,22 +363,42 @@ void _float8_linear_impl(
       int64_t m_size = mci * block_m + block_m > M ? M - mci * block_m : block_m;
       zero_buffer(y_buf, m_size * block_n);
       for (int kci = 0; kci < Kc; ++kci) {
-        auto scales_a = a_scales_ptr + mci * block_m * num_groups + kci / block_per_group;
         auto scales_b = b_scales_ptr + nc * block_n * num_groups + kci / block_per_group * block_n;
-        _micro_gemm<cpublas_can_pack, block_n, act_quant_mode, wei_quant_mode>(
-            /* C */ y_buf,
-            /* A */ a_ptr + mci * block_m * K + kci * block_k,
-            /* scales_a */ scales_a,
-            /* B */ b_ptr + (nc * Kc + kci) * block_n * block_k,
-            /* scales_b */ scales_b,
-            /* M */ m_size,
-            /* K */ block_k,
-            /* lda */ K,
-            /* ldc */ block_n,
-            /* ldsa */ ldsa,
-            /* ukernel_buf */ ukernel_buf,
-            /* dqA_buf */ dqA_buffer,
-            /* dqB_buf */ dqB_buffer);
+        if constexpr (cpublas_can_pack && act_quant_mode != PER_GROUP && wei_quant_mode == PER_GROUP) {
+          tinygemm_kernel(
+              y_buf,
+              a_ptr + mci * block_m * K + kci * block_k,
+              a_scales_ptr + (act_quant_mode == PER_ROW ? mci * block_m : 0),
+              b_ptr + (nc * Kc + kci) * block_n * block_k,
+              scales_b,
+              m_size,
+              block_k,
+              K,
+              block_n,
+              ldsa,
+              ukernel_buf,
+              dqA_buffer,
+              dqB_buffer);
+        } else {
+          auto scales_a =
+              a_scales_ptr + (act_quant_mode == PER_GROUP ? mci * block_m * num_groups + kci / block_per_group
+                              : act_quant_mode == PER_ROW ? mci * block_m
+                                                          : 0);
+          _micro_gemm<cpublas_can_pack, block_n, act_quant_mode, wei_quant_mode>(
+              /* C */ y_buf,
+              /* A */ a_ptr + mci * block_m * K + kci * block_k,
+              /* scales_a */ scales_a,
+              /* B */ b_ptr + (nc * Kc + kci) * block_n * block_k,
+              /* scales_b */ scales_b,
+              /* M */ m_size,
+              /* K */ block_k,
+              /* lda */ K,
+              /* ldc */ block_n,
+              /* ldsa */ ldsa,
+              /* ukernel_buf */ ukernel_buf,
+              /* dqA_buf */ dqA_buffer,
+              /* dqB_buf */ dqB_buffer);
+        }
       }
       auto scales_a = act_quant_mode == PER_TENSOR ? a_scales_ptr
                       : act_quant_mode == PER_ROW  ? a_scales_ptr + mci * block_m
@@ -398,6 +419,41 @@ void _float8_linear_impl(
 
 }  // anonymous namespace
 
+void tinygemm_kernel(
+    float* C,
+    const at::Float8_e4m3fn* A,
+    const float* scales_a,
+    const at::Float8_e4m3fn* B,
+    const float* scales_b,
+    int64_t M,
+    int64_t K,
+    int64_t lda,
+    int64_t ldc,
+    int64_t ldsa,
+    float* ukernel_buf,
+    at::BFloat16* dqA_buf,
+    at::BFloat16* dqB_buf) {
+  // cpublas_can_pack = True, act_quant_mode = per row (2), wei_quant_mode = per group (3)
+  _micro_gemm<true, BLOCK_N, 2, 3>(C, A, scales_a, B, scales_b, M, K, lda, ldc, ldsa, ukernel_buf, dqA_buf, dqB_buf);
+}
+
+#define INSTANTIATE_TINYGEMM_TEMPLATE() \
+  void tinygemm_kernel(                 \
+      float* C,                         \
+      const at::Float8_e4m3fn* A,       \
+      const float* scales_a,            \
+      const at::Float8_e4m3fn* B,       \
+      const float* scales_b,            \
+      int64_t M,                        \
+      int64_t K,                        \
+      int64_t lda,                      \
+      int64_t ldc,                      \
+      int64_t ldsa,                     \
+      float* ukernel_buf,               \
+      at::BFloat16* dqA_buf,            \
+      at::BFloat16* dqB_buf)
+
+INSTANTIATE_TINYGEMM_TEMPLATE();
 /*
 return: packed_weight, packed_scales
 */
@@ -768,6 +824,15 @@ __attribute__((target("avx10.2"))) void quantize_bf16_block_avx10_2(
     _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), fp8_vec1);
     _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i + 16), fp8_vec2);
   }
+}
+
+void check_fp8_brgemm_cpu() {
+#if defined(CPU_CAPABILITY_AVX512) && defined(CPUBLAS_BRGEMM_F8F8F32)
+  static const bool available = at::native::cpublas::could_pack(at::kFloat8_e4m3fn);
+  TORCH_CHECK(available, "FP8 W8A8 requires CPU FP8 BRGEMM support.");
+#else
+  TORCH_CHECK(false, "FP8 W8A8 requires a PyTorch build with CPU FP8 BRGEMM support.");
+#endif
 }
 
 float quantize_fp8_cpu_row(const at::BFloat16* input, at::Float8_e4m3fn* output, int64_t count) {

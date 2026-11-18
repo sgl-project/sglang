@@ -1338,6 +1338,8 @@ class Envs:
     # ===================================================================
     SGLANG_INT4_WEIGHT = EnvBool(False)
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
+    # Fp8MoEMethod inherits the effective CPU DeepSeek FP8A8 mode when unset.
+    SGLANG_ENABLE_DEEPSEEK_MOE_FP8_DOWN = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
     # Cache BF16 expansions of Hopper group32 FP8 weights for larger GEMMs.
     # Disable to save the additional weight memory or allow online updates.

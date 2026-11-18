@@ -425,6 +425,7 @@ at::Tensor fused_experts_cpu(
     const std::optional<at::Tensor>& w2_scale,
     const std::optional<at::Tensor>& w1_zero,
     const std::optional<at::Tensor>& w2_zero,
+    const std::optional<at::Tensor>& a1_scale,
     const std::optional<std::vector<int64_t>> block_size,
     const std::optional<at::Tensor>& w1_bias,
     const std::optional<at::Tensor>& w2_bias,
@@ -432,6 +433,60 @@ at::Tensor fused_experts_cpu(
     const std::optional<double>& limit,
     bool is_vnni,
     const std::optional<std::string>& activation);
+
+// Inductor's cpp_wrapper calls an op natively only if its schema has no list or string argument, and otherwise goes
+// back through Python on every call; the `scalar_args` overloads below spell those arguments as scalars.
+
+// block_size_n == 0 means no block size; activation is a CPUActMethod value
+at::Tensor fused_experts_cpu_scalar_args(
+    at::Tensor& hidden_states,
+    at::Tensor& w1,
+    at::Tensor& w2,
+    at::Tensor& topk_weights,
+    at::Tensor& topk_ids,
+    bool inplace,
+    int64_t moe_comp_method,
+    const std::optional<at::Tensor>& w1_scale,
+    const std::optional<at::Tensor>& w2_scale,
+    const std::optional<at::Tensor>& w1_zero,
+    const std::optional<at::Tensor>& w2_zero,
+    const std::optional<at::Tensor>& a1_scale,
+    int64_t block_size_n,
+    int64_t block_size_k,
+    const std::optional<at::Tensor>& w1_bias,
+    const std::optional<at::Tensor>& w2_bias,
+    const std::optional<double>& alpha,
+    const std::optional<double>& limit,
+    bool is_vnni,
+    int64_t activation) {
+  // indexed by CPUActMethod in gemm.h
+  static const char* const kActivationNames[] = {"silu", "swiglu", "gelu"};
+  TORCH_CHECK(activation >= 0 && activation < 3, "fused_experts_cpu: unknown activation ", activation);
+  std::optional<std::vector<int64_t>> block_size;
+  if (block_size_n > 0) {
+    block_size = std::vector<int64_t>{block_size_n, block_size_k};
+  }
+  return fused_experts_cpu(
+      hidden_states,
+      w1,
+      w2,
+      topk_weights,
+      topk_ids,
+      inplace,
+      moe_comp_method,
+      w1_scale,
+      w2_scale,
+      w1_zero,
+      w2_zero,
+      a1_scale,
+      block_size,
+      w1_bias,
+      w2_bias,
+      alpha,
+      limit,
+      is_vnni,
+      std::string(kActivationNames[activation]));
+}
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
 at::Tensor shared_expert_cpu(
@@ -968,10 +1023,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor topk_ids, bool "
       "inplace, int moe_comp_method, Tensor? w1_scale, Tensor? w2_scale, "
-      "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, Tensor? w1_bias, Tensor? w2_bias, "
+      "Tensor? w1_zero, Tensor? w2_zero, Tensor? a1_scale, int[]? block_size, Tensor? w1_bias, Tensor? w2_bias, "
       "float? alpha, float? "
       "limit, bool is_vnni, str? activation=None) -> Tensor");
   m.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
+  m.def(
+      "fused_experts_cpu.scalar_args(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor "
+      "topk_ids, bool inplace, int moe_comp_method, Tensor? w1_scale, Tensor? w2_scale, Tensor? w1_zero, Tensor? "
+      "w2_zero, Tensor? a1_scale, int block_size_n, int block_size_k, Tensor? w1_bias, Tensor? w2_bias, float? alpha, "
+      "float? limit, bool is_vnni, int activation) -> Tensor");
+  m.impl("fused_experts_cpu.scalar_args", torch::kCPU, &fused_experts_cpu_scalar_args);
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
   // weight absorption

@@ -16,11 +16,111 @@ class CPUQuantMethod(IntEnum):
     FP8_W8A16 = 2
     INT4_W4A8 = 3
     MXFP4 = 4
+    FP8_W8A8 = 5
+    FP8_W8A8_FULL = 6
 
 
 class CPUQuantAlgo(IntEnum):
     AWQ = 0
     GPTQ = 1
+
+
+# mirrors CPUActMethod in sglang/kernels/aot/csrc/cpu/gemm.h
+class CPUActMethod(IntEnum):
+    SILU_AND_MUL = 0
+    SWIGLU = 1
+    GELU_AND_MUL = 2
+
+
+_CPU_ACT_METHOD_BY_NAME = {
+    None: CPUActMethod.SILU_AND_MUL,
+    "silu": CPUActMethod.SILU_AND_MUL,
+    "swiglu": CPUActMethod.SWIGLU,
+    "gelu": CPUActMethod.GELU_AND_MUL,
+}
+
+
+def _cpu_act_method(activation: str | None) -> CPUActMethod:
+    if activation not in _CPU_ACT_METHOD_BY_NAME:
+        raise ValueError(f"Unsupported CPU MoE activation: {activation}")
+    return _CPU_ACT_METHOD_BY_NAME[activation]
+
+
+def cpp_wrapper_enabled() -> bool:
+    # cpp_wrapper calls ops with list or str arguments back through Python, so
+    # under it the scalar_args overloads are used instead
+    from torch._inductor import config as inductor_config
+
+    return inductor_config.cpp_wrapper
+
+
+def call_fused_experts_cpu(
+    cpp_wrapper: bool,
+    hidden_states,
+    w1,
+    w2,
+    topk_weights,
+    topk_ids,
+    inplace,
+    moe_comp_method,
+    w1_scale,
+    w2_scale,
+    w1_zero,
+    w2_zero,
+    a1_scale,
+    block_size,
+    w1_bias,
+    w2_bias,
+    alpha,
+    limit,
+    is_vnni,
+    activation,
+):
+    if not cpp_wrapper:
+        return torch.ops.sgl_kernel.fused_experts_cpu(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            inplace,
+            moe_comp_method,
+            w1_scale,
+            w2_scale,
+            w1_zero,
+            w2_zero,
+            a1_scale,
+            block_size,
+            w1_bias,
+            w2_bias,
+            alpha,
+            limit,
+            is_vnni,
+            activation,
+        )
+    block_size_n, block_size_k = block_size or (0, 0)
+    return torch.ops.sgl_kernel.fused_experts_cpu.scalar_args(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        inplace,
+        moe_comp_method,
+        w1_scale,
+        w2_scale,
+        w1_zero,
+        w2_zero,
+        a1_scale,
+        block_size_n,
+        block_size_k,
+        w1_bias,
+        w2_bias,
+        alpha,
+        limit,
+        is_vnni,
+        _cpu_act_method(activation),
+    )
 
 
 def fast_preprocess_cpu(
@@ -215,11 +315,55 @@ def _amx_process_weight_after_loading(
 
 
 class PackWeightMethod:
-    def __init__(self, weight_names, transpose_dims=None):
+    def __init__(self, weight_names, transpose_dims=None, use_fp8_w8a8=False):
         self.weight_names = weight_names
         self.transpose_dims = transpose_dims
+        self.use_fp8_w8a8 = use_fp8_w8a8
 
     def process_weights_after_loading(self, module) -> None:
+        if self.use_fp8_w8a8 and all(
+            getattr(module, name).dtype == torch.float8_e4m3fn
+            for name in self.weight_names
+        ):
+            if self.transpose_dims is not None and len(self.transpose_dims) != len(
+                self.weight_names
+            ):
+                raise ValueError(
+                    "Weight names and transpose dimensions must have equal lengths."
+                )
+            packed = {}
+            for index, name in enumerate(self.weight_names):
+                weight = getattr(module, name)
+                if self.transpose_dims and self.transpose_dims[index]:
+                    weight = weight.transpose(*self.transpose_dims[index])
+                weight = weight.contiguous()
+                if weight.ndim != 3 or weight.shape[1] % 32 or weight.shape[2] % 128:
+                    raise ValueError(
+                        "FP8 CPU MLA requires unpacked head weights with "
+                        "output divisible by 32 and input divisible by 128."
+                    )
+                scales = (
+                    module.w_scale.float()
+                    .expand(weight.shape[1], weight.shape[2] // 128)
+                    .contiguous()
+                )
+                heads = [
+                    torch.ops.sgl_kernel.float8_linear_prepack_cpu(head, scales)
+                    for head in weight
+                ]
+                packed[name] = (
+                    torch.nn.Parameter(
+                        torch.stack([head[0] for head in heads]), requires_grad=False
+                    ),
+                    torch.nn.Parameter(
+                        torch.stack([head[1] for head in heads]), requires_grad=False
+                    ),
+                )
+            for name, (weight, scales) in packed.items():
+                setattr(module, name, weight)
+                setattr(module, name + "_scale", scales)
+            module.use_intel_amx_backend = True
+            return
         _amx_process_weight_after_loading(
             module, self.weight_names, self.transpose_dims
         )

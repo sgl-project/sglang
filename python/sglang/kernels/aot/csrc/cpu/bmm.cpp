@@ -4,6 +4,93 @@
 
 namespace {
 
+void bmm_fp8_w8a8(
+    at::Tensor& out, const at::Tensor& input, const at::Tensor& weight, const at::Tensor& scales, bool is_vnni) {
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(out);
+  CHECK_INPUT(weight);
+  CHECK_INPUT(scales);
+  CHECK_DIM(3, input);
+  CHECK_DIM(3, out);
+  CHECK_DIM(5, weight);
+  CHECK_DIM(4, scales);
+  CHECK_EQ(input.scalar_type(), at::kBFloat16);
+  CHECK_EQ(out.scalar_type(), at::kBFloat16);
+  CHECK_EQ(weight.scalar_type(), at::kFloat8_e4m3fn);
+  CHECK_EQ(scales.scalar_type(), at::kFloat);
+  TORCH_CHECK(is_vnni, "FP8 W8A8 bmm requires prepacked weights.");
+  constexpr int64_t BM = block_size_m();
+  constexpr int64_t BN = block_size_n();
+  const int64_t B = input.size(0);
+  const int64_t M = input.size(1);
+  const int64_t K = input.size(2);
+  const int64_t N = weight.size(1) * BN;
+  const int64_t KB = weight.size(2);
+  const int64_t NB = weight.size(1);
+  TORCH_CHECK(B > 0 && N > 0 && K > 0 && K % BLOCK_K == 0, "Invalid FP8 W8A8 bmm dimensions.");
+  TORCH_CHECK(
+      weight.size(0) == B && weight.size(3) == BLOCK_K && weight.size(4) == BN && KB * BLOCK_K == K,
+      "FP8 W8A8 bmm weight shape mismatch.");
+  TORCH_CHECK(scales.sizes() == at::IntArrayRef({B, NB, KB, BN}), "FP8 W8A8 bmm scale shape mismatch.");
+  TORCH_CHECK(out.sizes() == at::IntArrayRef({B, M, N}), "FP8 W8A8 bmm output shape mismatch.");
+  if (M == 0) {
+    return;
+  }
+  check_fp8_brgemm_cpu();
+  auto quantized = at::empty({B, M, K}, weight.options());
+  auto input_scales = at::empty({B, M}, scales.options());
+  auto* Aq = quantized.data_ptr<at::Float8_e4m3fn>();
+  auto* As = input_scales.data_ptr<float>();
+  const auto* A = input.data_ptr<at::BFloat16>();
+  at::parallel_for(0, B * M, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t row = begin; row < end; ++row) {
+      As[row] = quantize_fp8_cpu_row(A + (row / M) * input.stride(0) + (row % M) * input.stride(1), Aq + row * K, K);
+    }
+  });
+  const auto* W = weight.data_ptr<at::Float8_e4m3fn>();
+  const auto* Ws = scales.data_ptr<float>();
+  auto* output = out.data_ptr<at::BFloat16>();
+  const int64_t MB = div_up(M, BM);
+  at::parallel_for(0, B * MB * NB, 0, [&](int64_t begin, int64_t end) {
+    alignas(64) float C[BM * BN];
+    alignas(64) float ukernel[BM * BN];
+    for (int64_t i = begin; i < end; ++i) {
+      const int64_t bs = i / (MB * NB);
+      const int64_t mb = (i / NB) % MB;
+      const int64_t nb = i % NB;
+      const int64_t rows = std::min(BM, M - mb * BM);
+      zero_buffer(C, BM * BN);
+      for (int64_t kb = 0; kb < KB; ++kb) {
+        tinygemm_kernel(
+            C,
+            Aq + (bs * M + mb * BM) * K + kb * BLOCK_K,
+            As + bs * M + mb * BM,
+            W + bs * N * K + (nb * KB + kb) * BN * BLOCK_K,
+            Ws + bs * N * KB + (nb * KB + kb) * BN,
+            rows,
+            BLOCK_K,
+            K,
+            BN,
+            1,
+            ukernel,
+            nullptr,
+            nullptr);
+      }
+      using Vec = at::vec::Vectorized<float>;
+      for (int64_t row = 0; row < rows; ++row) {
+        const Vec scale(As[bs * M + mb * BM + row]);
+        auto* dst = output + bs * out.stride(0) + (mb * BM + row) * out.stride(1) + nb * BN;
+        for (int64_t n = 0; n < BN; n += 2 * Vec::size()) {
+          auto lo = Vec::loadu(C + row * BN + n) * scale;
+          auto hi = Vec::loadu(C + row * BN + n + Vec::size()) * scale;
+          convert_from_float_ext<at::BFloat16>(lo, hi).store(dst + n);
+        }
+      }
+    }
+    at::native::cpublas::brgemm_release();
+  });
+}
+
 template <typename scalar_t, typename packed_t>
 void bmm_kernel_impl(
     scalar_t* __restrict__ out,
@@ -138,6 +225,11 @@ void bmm_kernel_impl(
 //
 void bmm_cpu(
     at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, const std::optional<at::Tensor>& scale) {
+  if (mat2.dim() == 5) {
+    TORCH_CHECK(scale.has_value(), "FP8 W8A8 bmm requires packed weight scales.");
+    bmm_fp8_w8a8(out, mat1, mat2, scale.value(), is_vnni);
+    return;
+  }
   auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
 
   // input and out could be non-contiguous

@@ -20,6 +20,8 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
+    call_fused_experts_cpu,
+    cpp_wrapper_enabled,
 )
 from sglang.srt.layers.moe import (
     MoeRunner,
@@ -1254,6 +1256,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 "--moe-runner-backend aiter is batch-size dependent and cannot be "
                 "combined with --enable-deterministic-inference on gfx95"
             )
+        self.cpp_wrapper = cpp_wrapper_enabled()
         self._cache_permute_indices = dict({})
         self.runner: Optional[MoeRunner] = None
         self._aiter_runner: Optional[MoeRunner] = None
@@ -1835,7 +1838,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             x, topk_weights = apply_topk_weights_cpu(
                 moe_runner_config.apply_router_weight_on_input, topk_weights, x
             )
-            output = torch.ops.sgl_kernel.fused_experts_cpu(
+            output = call_fused_experts_cpu(
+                self.cpp_wrapper,
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
@@ -1847,6 +1851,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 None,  # w2_scale
                 None,  # w1_zp
                 None,  # w2_zp
+                None,  # a1_scale
                 None,  # block_size
                 getattr(layer, "w13_weight_bias", None),
                 getattr(layer, "w2_weight_bias", None),
