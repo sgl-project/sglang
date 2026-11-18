@@ -622,6 +622,7 @@ _KEEP_16 = {
     "below_multiple": (16, 992, True),
     "float": (992.0, 512, True),
 }
+_KEEP_32 = {**_KEEP_16, "below_multiple": (32, 992, True)}
 
 
 def _size_alignment_models():
@@ -632,7 +633,18 @@ def _size_alignment_models():
     from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
         DiffusersGenericPipelineConfig,
     )
+    from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+        Wan2_2_T2V_A14B_Config,
+        Wan2_2_TI2V_5B_Config,
+        WanI2V480PConfig,
+        WanT2V480PConfig,
+        WanT2V720PConfig,
+    )
     from sglang.multimodal_gen.configs.sample.anima import AnimaSamplingParams
+    from sglang.multimodal_gen.configs.sample.wan import (
+        Wan2_2_T2V_A14B_SamplingParam,
+        Wan2_2_TI2V_5B_SamplingParam,
+    )
 
     diffusers = DiffusersGenericPipelineConfig()
 
@@ -650,6 +662,71 @@ def _size_alignment_models():
             both(_KEEP_16),
         ),
         ("anima-diffusers", "Anima", 16, AnimaSamplingParams, diffusers, unchanged),
+        (
+            "wan-t2v-1.3b",
+            "Wan T2V",
+            16,
+            WanT2V_1_3B_SamplingParams,
+            WanT2V480PConfig(),
+            both(_KEEP_16),
+        ),
+        (
+            "wan-t2v-14b",
+            "Wan T2V",
+            16,
+            WanT2V_14B_SamplingParams,
+            WanT2V720PConfig(),
+            both(_KEEP_16),
+        ),
+        (
+            "wan2.2-t2v-a14b",
+            "Wan T2V",
+            16,
+            Wan2_2_T2V_A14B_SamplingParam,
+            Wan2_2_T2V_A14B_Config(),
+            both(_KEEP_16),
+        ),
+        # I2V configs subclass the T2V config but size the output from the input image.
+        (
+            "wan-t2v-params-i2v-config",
+            "Wan T2V",
+            16,
+            WanT2V_1_3B_SamplingParams,
+            WanI2V480PConfig(),
+            unchanged,
+        ),
+        (
+            "wan-i2v-480p",
+            "Wan T2V",
+            16,
+            WanI2V_14B_480P_SamplingParam,
+            WanI2V480PConfig(),
+            unchanged,
+        ),
+        (
+            "wan-t2v-diffusers",
+            "Wan T2V",
+            16,
+            WanT2V_1_3B_SamplingParams,
+            diffusers,
+            unchanged,
+        ),
+        (
+            "wan2.2-ti2v-5b",
+            "Wan2.2 TI2V",
+            32,
+            Wan2_2_TI2V_5B_SamplingParam,
+            Wan2_2_TI2V_5B_Config(),
+            both(_KEEP_32),
+        ),
+        (
+            "wan2.2-ti2v-diffusers",
+            "Wan2.2 TI2V",
+            16,
+            Wan2_2_TI2V_5B_SamplingParam,
+            diffusers,
+            unchanged,
+        ),
     ]
 
 
