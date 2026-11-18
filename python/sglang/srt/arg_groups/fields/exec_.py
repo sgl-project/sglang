@@ -646,7 +646,7 @@ class ExecMamba(msgspec.Struct):
     linear_attn_verify_backend: A[
         Optional[str],
         Arg(
-            help="Override the kernel backend for linear attention speculative target-verify. If not set, follows the decode backend (flashinfer decode -> flashinfer verify, otherwise triton). KDA supports triton, nv_cutedsl, and flashinfer verify backends. aiter (ROCm, GDN only) runs linear-chain verify on aiter's FlyDSL kernels.",
+            help="Override the kernel backend for linear attention speculative target-verify. If not set, follows the decode backend (flashinfer decode -> flashinfer verify, otherwise triton). KDA supports triton, nv_cutedsl, flashinfer, and aiter verify backends. aiter (ROCm) runs GDN linear-chain verify on aiter's FlyDSL kernels; for KDA it runs Kimi-K3's fused FlyDSL verify (with SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND=aiter on gfx950) and the triton verify for batches and models it does not cover.",
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES + ["nv_cutedsl", "aiter"],
         ),
     ] = None

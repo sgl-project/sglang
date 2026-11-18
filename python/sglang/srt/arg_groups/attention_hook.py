@@ -467,11 +467,16 @@ def handle_linear_attn_backend(server_args: Any):
                 "EAGLE tree verify. Got "
                 f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
             )
-        if verify == "aiter":
+        # KDA's aiter verify (Kimi-K3's fused kernel, triton otherwise) writes
+        # the ring; GDN's does not.
+        kda_aiter_verify = verify == "aiter" and uses_kda_attention(
+            model_config_of(server_args).hf_config
+        )
+        if verify == "aiter" and not kda_aiter_verify:
             raise ValueError(
                 "--enable-linear-replayssm-spec verifies through its own "
                 "ReplaySSM kernels and cannot use "
-                "--linear-attn-verify-backend aiter."
+                "--linear-attn-verify-backend aiter with GDN."
             )
         if decode not in ("triton", "flashinfer"):
             raise ValueError(
@@ -487,17 +492,17 @@ def handle_linear_attn_backend(server_args: Any):
         ragged_mode = read_ragged_verify_mode()
         if ragged_mode is not RaggedVerifyMode.STATIC:
             # Ragged ring-writes need the KDA fold-every-commit family
-            # (DSPARK/DFLASH) + the triton verify kernel (nv_cutedsl falls
-            # back to it for ragged layouts). The GDN ring-write kernels do
+            # (DSPARK/DFLASH) + the triton verify kernel (nv_cutedsl and KDA's
+            # aiter fall back to it for ragged layouts). The GDN ring-write kernels do
             # not take the ragged layout and the flashinfer verify kernel
             # never writes the ring -> a stale ring would be folded; keep
             # refusing those combinations.
             _algo = (cfg.speculative_algorithm or "").upper()
             verify = cfg.linear_attn_verify_backend
-            if _algo not in ("DSPARK", "DFLASH") or verify not in (
-                "triton",
-                "nv_cutedsl",
-            ):
+            ring_writing = ("triton", "nv_cutedsl") + (
+                ("aiter",) if kda_aiter_verify else ()
+            )
+            if _algo not in ("DSPARK", "DFLASH") or verify not in ring_writing:
                 raise ValueError(
                     "--enable-linear-replayssm-spec with "
                     f"SGLANG_RAGGED_VERIFY_MODE={ragged_mode.value} requires the "

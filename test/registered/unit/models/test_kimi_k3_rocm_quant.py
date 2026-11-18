@@ -21,6 +21,7 @@ from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
 from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
 from sglang.srt.models import kimi_k3, kimi_k3_rocm_quant
 from sglang.srt.models.kimi_k3 import KimiK3DeltaAttention, _is_unquantized_mergeable
+from sglang.srt.models.kimi_k3_rocm_kda_verify import KimiK3HipFusedVerify
 from sglang.srt.models.kimi_k3_rocm_quant import (
     _k3_channel_fp8_to_bf16,
     k3_fused_decode_f_b_weight,
@@ -190,7 +191,7 @@ def _armable_hip_attention() -> SimpleNamespace:
 
 
 class TestHipFusedDecodeArming(CustomTestCase):
-    """_prepare_fused_decode on ROCm, on a stand-in attention module."""
+    """_prepare_fused_decode_hip on a stand-in attention module."""
 
     def test_failed_rearm_drops_the_previous_arming(self):
         """A re-run that cannot arm (here the backend reports unavailable) must not
@@ -201,7 +202,7 @@ class TestHipFusedDecodeArming(CustomTestCase):
             _k3_hip_fused_decode_args=stale,
             _k3_hip_fused_decode_backend="aiter",
             _k3_hip_fused_decode_ops=kda_fused_decode_aiter_hip,
-            _k3_hip_fused_verify_args=stale,
+            kda_fused_verify="stale hook",
         )
         attention = SimpleNamespace(
             attn=layer,
@@ -217,24 +218,23 @@ class TestHipFusedDecodeArming(CustomTestCase):
 
         with (
             get_context().override_server_args(),
-            mock.patch.object(kimi_k3, "_is_hip", True),
             envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("aiter"),
             mock.patch.object(
                 kda_fused_decode_aiter_hip, "available", return_value=False
             ),
         ):
-            KimiK3DeltaAttention._prepare_fused_decode(attention)
+            KimiK3DeltaAttention._prepare_fused_decode_hip(attention)
 
         self.assertFalse(attention._kda_hip_fused_decode_ready)
         self.assertFalse(attention._kda_hip_fused_verify_ready)
         self.assertIsNone(layer._k3_hip_fused_decode_args)
         self.assertIsNone(layer._k3_hip_fused_decode_ops)
-        self.assertIsNone(layer._k3_hip_fused_verify_args)
+        self.assertIsNone(layer.kda_fused_verify)
 
     def test_fused_verify_arms_only_for_supported_verify_layouts(self):
         """The fused verify covers chain verify with a slot-indexed ring only. Tree
         speculative decoding and the host-only request ring must not probe, arm or
-        warm it; an armed layer records the warmed draft-token count."""
+        warm it; an armed layer installs a hook for the warmed draft-token count."""
         decode_args = (torch.empty(12, 128, 128), None, 1e-5, None)
         for topk, host_only, armed in (
             (4, False, False),
@@ -246,7 +246,7 @@ class TestHipFusedDecodeArming(CustomTestCase):
                 dt_bias=None,
                 lower_bound=-5.0,
                 _k3_hip_fused_decode_args=decode_args,
-                _k3_hip_fused_verify_args=None,
+                kda_fused_verify=None,
             )
             attention = SimpleNamespace(
                 attn=layer, use_full_rank_gate=True, _kda_hip_fused_verify_ready=False
@@ -273,10 +273,11 @@ class TestHipFusedDecodeArming(CustomTestCase):
                 self.assertEqual(available.called, armed)
                 self.assertEqual(warmup.called, armed)
                 self.assertEqual(warn.called, not armed)
-                self.assertEqual(
-                    layer._k3_hip_fused_verify_args,
-                    (*decode_args, 5) if armed else None,
-                )
+                hook = layer.kda_fused_verify
+                self.assertEqual(hook is not None, armed)
+                if armed:
+                    self.assertIsInstance(hook, KimiK3HipFusedVerify)
+                    self.assertEqual(hook.num_draft_tokens, 5)
 
     def test_replayssm_ring_keeps_decode_from_deferring_f_b(self):
         """ReplaySSM decode must keep f_b projected and skip unused fused weights
@@ -294,9 +295,7 @@ class TestHipFusedDecodeArming(CustomTestCase):
                 with (
                     self.subTest(backend=backend, flags=flags),
                     get_context().override_server_args(**flags),
-                    mock.patch.object(kimi_k3, "_is_hip", True),
                     envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override(backend),
-                    envs.SGLANG_OPT_HIP_K3_KDA_FLYDSL_VERIFY.override(False),
                     mock.patch.object(
                         fused_ops, "available", return_value=True
                     ) as available,
@@ -308,7 +307,7 @@ class TestHipFusedDecodeArming(CustomTestCase):
                     mock.patch.object(fused_ops, "warmup") as warmup,
                     mock.patch.object(kimi_k3, "print_warning_once") as warn,
                 ):
-                    KimiK3DeltaAttention._prepare_fused_decode(attention)
+                    KimiK3DeltaAttention._prepare_fused_decode_hip(attention)
 
                     self.assertEqual(attention._kda_hip_fused_decode_ready, armed)
                     self.assertFalse(attention._kda_hip_fused_verify_ready)
@@ -336,11 +335,10 @@ class TestHipFusedDecodeArming(CustomTestCase):
                 get_context().override_server_args(
                     speculative_num_draft_tokens=5,
                     speculative_eagle_topk=1,
+                    linear_attn_verify_backend="aiter",
                     **flags,
                 ),
-                mock.patch.object(kimi_k3, "_is_hip", True),
                 envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("aiter"),
-                envs.SGLANG_OPT_HIP_K3_KDA_FLYDSL_VERIFY.override(True),
                 envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.override(False),
                 mock.patch.object(
                     kda_fused_decode_aiter_hip, "available", return_value=True
@@ -356,16 +354,13 @@ class TestHipFusedDecodeArming(CustomTestCase):
                 ) as verify_warmup,
                 mock.patch.object(kimi_k3, "print_warning_once"),
             ):
-                KimiK3DeltaAttention._prepare_fused_decode(attention)
+                KimiK3DeltaAttention._prepare_fused_decode_hip(attention)
 
                 self.assertFalse(attention._kda_hip_fused_decode_ready)
                 self.assertTrue(attention._kda_hip_fused_verify_ready)
                 self.assertIsNotNone(attention.attn._k3_hip_fused_decode_args)
                 self.assertIsNone(attention.attn._k3_hip_fused_decode_ops)
-                self.assertEqual(
-                    attention.attn._k3_hip_fused_verify_args,
-                    (*attention.attn._k3_hip_fused_decode_args, 5),
-                )
+                self.assertEqual(attention.attn.kda_fused_verify.num_draft_tokens, 5)
                 decode_warmup.assert_not_called()
                 verify_warmup.assert_called_once()
                 self.assertEqual(
@@ -396,25 +391,26 @@ class TestHipFusedDecodeArming(CustomTestCase):
         warn.assert_called_once()
 
 
-class TestHipFusedVerifyRejection(CustomTestCase):
-    def test_fused_accept_keeps_verify_off_the_stale_committed_state(self):
-        """Fused accept skips the commit scatter, so the committed pool is stale
-        between verifies; the AITER verify reads that pool and must reject it."""
+class TestFusedVerifyUnsupported(CustomTestCase):
+    def test_request_indexed_ring_keeps_the_unfused_verify(self):
+        """The fused kernel writes the ReplaySSM ring at the pool slot; a ring
+        indexed per request (unified memory, host-only checkpoints) must take the
+        unfused chain, which writes at the request's ring rows."""
         backend = KDAAttnBackend.__new__(KDAAttnBackend)
-        backend.state_pool = SimpleNamespace(replayssm_request_ring=False)
-        for accept_lens_pool, rejection in (
-            (None, None),
-            (torch.ones(2, dtype=torch.int32), "fused-accept state"),
+        for request_ring, replayssm_on, unsupported in (
+            (False, True, None),
+            (True, False, None),
+            (True, True, "request-indexed ReplaySSM ring"),
         ):
-            backend.accept_lens_pool = accept_lens_pool
-            with self.subTest(fused_accept=accept_lens_pool is not None):
+            backend.state_pool = SimpleNamespace(replayssm_request_ring=request_ring)
+            with self.subTest(request_ring=request_ring, replayssm_on=replayssm_on):
                 self.assertEqual(
-                    backend._hip_fused_verify_rejection(
+                    backend._fused_verify_unsupported(
                         ragged_layout=None,
                         retrieve_parent_token=None,
-                        replayssm_on=False,
+                        replayssm_on=replayssm_on,
                     ),
-                    rejection,
+                    unsupported,
                 )
 
 

@@ -298,6 +298,15 @@ for _mod, _fn, _backend, _device in [
         )
     )
 del _mod, _fn, _backend, _device
+# AITER's FlyDSL KDA target verify; available() checks the device and state dtype.
+register_kernel(
+    KernelSpec(
+        op="attention.kda_fused_verify_aiter_hip",
+        backend=KernelBackend.AITER,
+        target="sglang.kernels.ops.attention.kda_fused_verify_aiter_hip:run",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
 # Called through ops.attention.kda_fused_decode_gfx950, which checks for gfx950.
 register_kernel(
     KernelSpec(

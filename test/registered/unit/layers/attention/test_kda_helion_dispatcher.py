@@ -175,6 +175,44 @@ class TestHelionKDADispatcher(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Triton, or Helion"):
                 handle_linear_attn_backend(flashinfer_args)
 
+    def test_replayssm_spec_accepts_aiter_verify_for_kda_only(self):
+        """KDA's aiter verify (Kimi-K3's fused kernel, else triton) writes the
+        ReplaySSM ring and is allowed with it; GDN's aiter verify does not and
+        stays rejected."""
+        cases = (
+            ("KimiK3LinearForCausalLM", {"kda_layers": [0]}, None),
+            (
+                "Qwen3NextForCausalLM",
+                {"linear_attention_layers": [0]},
+                "verify-backend aiter",
+            ),
+        )
+        for architecture, linear_config, error in cases:
+            with self.subTest(architecture=architecture):
+                args = ServerArgs(
+                    model_path="dummy",
+                    linear_attn_verify_backend="aiter",
+                    enable_linear_replayssm_spec=True,
+                )
+                config = SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        architectures=[architecture], linear_attn_config=linear_config
+                    )
+                )
+                with (
+                    patch(
+                        "sglang.srt.arg_groups.attention_hook.model_config_of",
+                        return_value=config,
+                    ),
+                    override_platform(is_sm100=False),
+                    override_platform(is_cuda=False),
+                ):
+                    if error is None:
+                        handle_linear_attn_backend(args)
+                    else:
+                        with self.assertRaisesRegex(ValueError, error):
+                            handle_linear_attn_backend(args)
+
     def test_explicit_base_backend_is_not_replaced_by_flashinfer(self):
         args = ServerArgs(
             model_path="dummy",

@@ -34,6 +34,7 @@ from sglang.srt.model_executor.runner_utils.prefill_graph import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.linear.kda_backend import KDAFusedVerify
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -78,19 +79,8 @@ class RadixLinearAttention(nn.Module):
         self.A_log = A_log
         self.dt_bias = dt_bias
         self.lower_bound = lower_bound
-
-        # Kimi-K3 fused KDA handoff, set around each forward by the model.
-        self._k3_deferred_f_b = False
-        self._k3_onorm_gate = None
-        self._k3_onorm_consumed = False
-        # (f_b_weight, norm_weight, norm_eps, A_log) once the HIP fused decode is armed,
-        # with its backend name and adapter module.
-        self._k3_hip_fused_decode_args = None
-        self._k3_hip_fused_decode_backend = ""
-        self._k3_hip_fused_decode_ops = None
-        # The decode's static inputs plus the warmed draft-token count once the HIP
-        # fused verify is armed too.
-        self._k3_hip_fused_verify_args = None
+        # A model-owned fused KDA target verify, installed by the model once armed.
+        self.kda_fused_verify: Optional[KDAFusedVerify] = None
 
     def refresh_conv_weights(self, weight: torch.Tensor) -> None:
         """Rebuild the cached convolution view after replacing its parameter."""

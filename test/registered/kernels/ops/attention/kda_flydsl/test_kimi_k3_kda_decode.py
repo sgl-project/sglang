@@ -779,14 +779,14 @@ def test_aiter_fused_verify_matches_unfused_backend(ring: bool) -> None:
     """The fused verify must reproduce the backend's unfused chain plus o_norm.
 
     Goes through forward_extend with MoE token padding past the verify rows, so
-    it covers the padding trim of the deferred f_a [tokens, K] and the o_norm
+    it covers the padding trim of the deferred f_a [1, tokens, K] and the o_norm
     gate, the slot/scratch index slices and the transposed conv-cache views.
     """
     from sglang.kernels.ops.attention.fla.fused_norm_gate import rms_norm_gated
-    from sglang.kernels.ops.attention.kda_fused_verify_aiter_hip import materialize_f_b
     from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
     from sglang.srt.mem_cache.memory_pool import MambaPool
     from sglang.srt.model_executor.forward_mode import ForwardMode
+    from sglang.srt.models.kimi_k3_rocm_kda_verify import KimiK3HipFusedVerify
 
     torch.manual_seed(20261104)
     batch, steps, num_slots, ring_len = 3, 5, 7, 8
@@ -810,18 +810,19 @@ def test_aiter_fused_verify_matches_unfused_backend(ring: bool) -> None:
         lower_bound=_LOWER_BOUND,
     )
     norm_weight = randn(_DIM)
-    layer._k3_hip_fused_verify_args = (
-        randn(_HEADS, _DIM, _DIM, scale=0.05),
-        norm_weight,
-        _NORM_EPS,
-        layer.A_log,
-        steps,
+    fused_verify = KimiK3HipFusedVerify(
+        f_b_weight=randn(_HEADS, _DIM, _DIM, scale=0.05),
+        norm_weight=norm_weight,
+        norm_eps=_NORM_EPS,
+        a_log=layer.A_log,
+        num_draft_tokens=steps,
     )
     # The model slices these out of one in-projection: [q,k,v,g | f_a | b | pad].
     wide = randn(padded_tokens, _CHANNELS + _HEADS * _DIM + _DIM + _HEADS + 4)
     mixed_qkv, gate, f_a, beta, _ = wide.split(
         [_CHANNELS, _HEADS * _DIM, _DIM, _HEADS, 4], dim=-1
     )
+    f_a = f_a.unsqueeze(0)
     beta = beta.unsqueeze(0)
 
     template = MambaPool.SpeculativeState(
@@ -868,7 +869,7 @@ def test_aiter_fused_verify_matches_unfused_backend(ring: bool) -> None:
         )
 
     fused_state = clone_state()
-    layer._k3_deferred_f_b = True
+    layer.kda_fused_verify = fused_verify
     layer._k3_onorm_gate = gate
     layer._k3_onorm_consumed = False
     fused = _verify_backend(fused_state, slots, steps).forward_extend(
@@ -880,10 +881,10 @@ def test_aiter_fused_verify_matches_unfused_backend(ring: bool) -> None:
     fused = fused[:, :tokens]
 
     ref_state = clone_state()
-    layer._k3_deferred_f_b = False
+    layer.kda_fused_verify = None
     layer._k3_onorm_gate = None
     unfused = _verify_backend(ref_state, slots, steps).forward_extend(
-        layer, forward_batch, mixed_qkv, materialize_f_b(layer=layer, f_a=f_a), beta
+        layer, forward_batch, mixed_qkv, fused_verify.unfused_gate(f_a), beta
     )[:, :tokens]
     unfused = rms_norm_gated(
         unfused,
@@ -965,36 +966,9 @@ def test_verify_warmup_builds_every_wave_count(monkeypatch, ring: bool) -> None:
     monkeypatch.setattr(adapter, "_WARMED", set())
     _verify_warmup(adapter, replay_ring=ring)
 
-    # The pinned AITER stack's op has no tag but takes 8 and 4 waves by keyword.
-    wave_counts = getattr(flydsl_kda_verify_with_f_b, "num_warps", (8, 4))
+    wave_counts = flydsl_kda_verify_with_f_b.num_warps
     assert sorted(wave_counts) == [4, 8]
     assert built == [(1, n) for n in wave_counts]
-
-
-@pytest.mark.parametrize("takes_num_warps", [True, False])
-def test_verify_warmup_without_wave_tag_builds_both_policy_wave_counts(
-    monkeypatch, takes_num_warps: bool
-) -> None:
-    """An AITER verify op without the num_warps tag picks 8 waves up to batch 16
-    and 4 above; warmup builds both by keyword, else with one batch on each side."""
-    from sglang.kernels.ops.attention import kda_fused_verify_aiter_hip as adapter
-
-    built = []
-
-    def recording_run(**kwargs):
-        built.append((kwargs["cache_indices"].numel(), kwargs["num_warps"]))
-        if kwargs["num_warps"] is not None and not takes_num_warps:
-            raise TypeError("unexpected keyword argument 'num_warps'")
-
-    monkeypatch.setattr(adapter, "_op", lambda: SimpleNamespace())
-    monkeypatch.setattr(adapter, "run", recording_run)
-    monkeypatch.setattr(adapter, "_WARMED", set())
-    _verify_warmup(adapter, replay_ring=False)
-
-    if takes_num_warps:
-        assert built == [(1, 8), (1, 4)]
-    else:
-        assert built == [(1, 8), (1, None), (17, None)]
 
 
 @pytest.mark.skipif(not _aiter_has_kda_verify(), reason="AITER without KDA verify")

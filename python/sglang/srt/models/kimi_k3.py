@@ -32,6 +32,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
+from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.layers.attn_residual import aggregate_stream, get_cw
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -2280,89 +2281,7 @@ class KimiK3DeltaAttention(nn.Module):
         unfused chain. Called once from load_weights (after all weights are
         loaded, before cuda graph capture)."""
         if _is_hip:
-            from sglang.kernels.ops.attention import (
-                kda_fused_decode_aiter_hip,
-                kda_fused_decode_gfx950,
-            )
-
-            layer = self.attn
-            # A failed re-arm must not leave the previous f_b serving decode or verify.
-            self._kda_hip_fused_decode_ready = False
-            self._kda_hip_fused_verify_ready = False
-            layer._k3_hip_fused_decode_args = None
-            layer._k3_hip_fused_decode_backend = ""
-            layer._k3_hip_fused_decode_ops = None
-            layer._k3_hip_fused_verify_args = None
-            w = layer.conv_weights
-            backend = envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.get().lower()
-            fused_ops = {
-                "aiter": kda_fused_decode_aiter_hip,
-                "gfx950": kda_fused_decode_gfx950,
-            }.get(backend)
-            if fused_ops is None:
-                return
-            # Either ReplaySSM flag allocates the ring (kv_cache_configurator.py),
-            # whose decode skips the fused kernel and needs f_b already applied.
-            mamba = get_exec().mamba
-            replayssm_ring = (
-                mamba.enable_linear_replayssm or mamba.enable_linear_replayssm_spec
-            )
-            if replayssm_ring:
-                print_warning_once(
-                    "Kimi-K3 fused KDA decode stays off: ReplaySSM uses the unfused "
-                    "ring decode"
-                )
-                if (
-                    backend != "aiter"
-                    or not envs.SGLANG_OPT_HIP_K3_KDA_FLYDSL_VERIFY.get()
-                ):
-                    return
-            state_dtype = self.config.mamba2_cache_params.dtype.temporal
-            backend_available = fused_ops.available(
-                device=self.f_b_proj.weight.device, state_dtype=state_dtype
-            )
-            f_b_weight = self._fused_decode_f_b_weight() if backend_available else None
-            if (
-                backend_available
-                and w is not None
-                and tuple(w.shape) == (3 * 12 * 128, 4)
-                and w.dtype == torch.float32
-                and f_b_weight is not None
-                and f_b_weight.shape == (12 * 128, 128)
-                and f_b_weight.dtype == torch.bfloat16
-                and layer.A_log is not None
-                and layer.A_log.numel() == 12
-                and layer.A_log.dtype == torch.float32
-                and layer.dt_bias is not None
-                and tuple(layer.dt_bias.shape) == (12 * 128,)
-                and layer.dt_bias.dtype == torch.float32
-                and layer.lower_bound is not None
-            ):
-                norm_weight = self.o_norm.weight.data.to(torch.bfloat16).contiguous()
-                f_b_weight = f_b_weight.view(12, 128, 128).contiguous()
-                a_log = layer.A_log.detach().reshape(-1).contiguous()
-                layer._k3_hip_fused_decode_args = (
-                    f_b_weight,
-                    norm_weight,
-                    float(self.o_norm.eps),
-                    a_log,
-                )
-                if not replayssm_ring:
-                    fused_ops.warmup(
-                        f_b_weight=f_b_weight,
-                        conv_weight=w,
-                        A_log=a_log,
-                        dt_bias=layer.dt_bias,
-                        lower_bound=float(layer.lower_bound),
-                        norm_weight=norm_weight,
-                        norm_eps=float(self.o_norm.eps),
-                        state_dtype=state_dtype,
-                    )
-                    layer._k3_hip_fused_decode_backend = backend
-                    layer._k3_hip_fused_decode_ops = fused_ops
-                    self._kda_hip_fused_decode_ready = True
-                if backend == "aiter":
-                    self._prepare_fused_verify_hip(state_dtype=state_dtype)
+            self._prepare_fused_decode_hip()
             return
         layer = self.attn
         w = layer.conv_weights
@@ -2421,9 +2340,104 @@ class KimiK3DeltaAttention(nn.Module):
             layer._k3_fused_decode_args = fused_decode_args
         self._kda_fused_decode_ready = True
 
+    def _prepare_fused_decode_hip(self) -> None:
+        """ROCm half of _prepare_fused_decode: arm the AITER or gfx950 fused decode,
+        and the AITER fused verify under --linear-attn-verify-backend aiter."""
+        from sglang.kernels.ops.attention import (
+            kda_fused_decode_aiter_hip,
+            kda_fused_decode_gfx950,
+        )
+
+        layer = self.attn
+        # A failed re-arm must not leave the previous f_b serving decode or verify.
+        self._kda_hip_fused_decode_ready = False
+        self._kda_hip_fused_verify_ready = False
+        layer._k3_hip_fused_decode_args = None
+        layer._k3_hip_fused_decode_backend = ""
+        layer._k3_hip_fused_decode_ops = None
+        layer.kda_fused_verify = None
+        w = layer.conv_weights
+        backend = envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.get().lower()
+        verify_selected = (
+            get_exec().mamba.linear_attn_verify_backend
+            == LinearAttnKernelBackend.AITER.value
+        )
+        if verify_selected and backend != "aiter":
+            print_warning_once(
+                "Kimi-K3 fused KDA verify stays off: --linear-attn-verify-backend "
+                "aiter needs SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND=aiter; verify "
+                "runs the Triton chain"
+            )
+        fused_ops = {
+            "aiter": kda_fused_decode_aiter_hip,
+            "gfx950": kda_fused_decode_gfx950,
+        }.get(backend)
+        if fused_ops is None:
+            return
+        # Either ReplaySSM flag allocates the ring (kv_cache_configurator.py),
+        # whose decode skips the fused kernel and needs f_b already applied.
+        mamba = get_exec().mamba
+        replayssm_ring = (
+            mamba.enable_linear_replayssm or mamba.enable_linear_replayssm_spec
+        )
+        if replayssm_ring:
+            print_warning_once(
+                "Kimi-K3 fused KDA decode stays off: ReplaySSM uses the unfused "
+                "ring decode"
+            )
+            if backend != "aiter" or not verify_selected:
+                return
+        state_dtype = self.config.mamba2_cache_params.dtype.temporal
+        backend_available = fused_ops.available(
+            device=self.f_b_proj.weight.device, state_dtype=state_dtype
+        )
+        f_b_weight = self._fused_decode_f_b_weight() if backend_available else None
+        if (
+            backend_available
+            and w is not None
+            and tuple(w.shape) == (3 * 12 * 128, 4)
+            and w.dtype == torch.float32
+            and f_b_weight is not None
+            and f_b_weight.shape == (12 * 128, 128)
+            and f_b_weight.dtype == torch.bfloat16
+            and layer.A_log is not None
+            and layer.A_log.numel() == 12
+            and layer.A_log.dtype == torch.float32
+            and layer.dt_bias is not None
+            and tuple(layer.dt_bias.shape) == (12 * 128,)
+            and layer.dt_bias.dtype == torch.float32
+            and layer.lower_bound is not None
+        ):
+            norm_weight = self.o_norm.weight.data.to(torch.bfloat16).contiguous()
+            f_b_weight = f_b_weight.view(12, 128, 128).contiguous()
+            a_log = layer.A_log.detach().reshape(-1).contiguous()
+            layer._k3_hip_fused_decode_args = (
+                f_b_weight,
+                norm_weight,
+                float(self.o_norm.eps),
+                a_log,
+            )
+            if not replayssm_ring:
+                fused_ops.warmup(
+                    f_b_weight=f_b_weight,
+                    conv_weight=w,
+                    A_log=a_log,
+                    dt_bias=layer.dt_bias,
+                    lower_bound=float(layer.lower_bound),
+                    norm_weight=norm_weight,
+                    norm_eps=float(self.o_norm.eps),
+                    state_dtype=state_dtype,
+                )
+                layer._k3_hip_fused_decode_backend = backend
+                layer._k3_hip_fused_decode_ops = fused_ops
+                self._kda_hip_fused_decode_ready = True
+            if backend == "aiter" and verify_selected:
+                self._prepare_fused_verify_hip(state_dtype=state_dtype)
+
     def _prepare_fused_verify_hip(self, *, state_dtype: torch.dtype) -> None:
-        """Arm the AITER fused KDA verify over the decode kernel's static inputs."""
+        """Install the AITER fused KDA verify over the decode kernel's static inputs."""
         from sglang.kernels.ops.attention import kda_fused_verify_aiter_hip
+        from sglang.srt.models.kimi_k3_rocm_kda_verify import KimiK3HipFusedVerify
 
         # Only the full-rank gate projection can hand f_a over unprojected.
         if not self.use_full_rank_gate:
@@ -2449,6 +2463,11 @@ class KimiK3DeltaAttention(nn.Module):
             state_dtype=state_dtype,
             num_draft_tokens=num_draft_tokens,
         ):
+            print_warning_once(
+                "Kimi-K3 fused KDA verify stays off: AITER's kernel does not cover "
+                f"this device, a {state_dtype} state or {num_draft_tokens} draft "
+                "tokens; verify runs the Triton chain"
+            )
             return
         kda_fused_verify_aiter_hip.warmup(
             f_b_weight=f_b_weight,
@@ -2462,10 +2481,12 @@ class KimiK3DeltaAttention(nn.Module):
             num_draft_tokens=num_draft_tokens,
             replay_ring=replay_ring,
         )
-        # The warmed draft-token count is the only one the verify may run.
-        layer._k3_hip_fused_verify_args = (
-            *layer._k3_hip_fused_decode_args,
-            num_draft_tokens,
+        layer.kda_fused_verify = KimiK3HipFusedVerify(
+            f_b_weight=f_b_weight,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            a_log=a_log,
+            num_draft_tokens=num_draft_tokens,
         )
         self._kda_hip_fused_verify_ready = True
 
@@ -2580,9 +2601,10 @@ class KimiK3DeltaAttention(nn.Module):
                 hidden_states
             )
 
-        # A deferred f_b leaves f_a [tokens, head_dim], which the backend takes as is.
-        if not forward_batch.logical_forward_mode.is_decode() and not defer_f_b:
-            forget_gate = forget_gate.unflatten(-1, (-1, self.head_dim))
+        if not forward_batch.logical_forward_mode.is_decode():
+            # A deferred f_b leaves f_a [tokens, head_dim] for the fused verify.
+            if not defer_f_b:
+                forget_gate = forget_gate.unflatten(-1, (-1, self.head_dim))
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 

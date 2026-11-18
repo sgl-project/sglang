@@ -15,7 +15,6 @@ from sglang.kernels.ops.attention.kda_fused_decode_aiter_hip import (
     _STATE_SLOT_STRIDES,
     _dense_slots,
 )
-from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, print_warning_once
 from sglang.srt.utils.log_utils import rank0_log
 
@@ -48,7 +47,7 @@ def available(
     *, device: torch.device, state_dtype: torch.dtype, num_draft_tokens: int
 ) -> bool:
     """Whether the kernel runs a ``num_draft_tokens`` verify over a ``state_dtype`` pool."""
-    if not is_hip() or not envs.SGLANG_OPT_HIP_K3_KDA_FLYDSL_VERIFY.get():
+    if not is_hip():
         return False
     op = _op()
     if op is None:
@@ -182,8 +181,7 @@ def run(
     replay_ring: tuple[torch.Tensor, ...] | None = None,
     num_warps: int | None = None,
 ) -> torch.Tensor:
-    # None keeps AITER's batch-based wave count; older verify ops take no num_warps.
-    wave_kwargs = {} if num_warps is None else {"num_warps": num_warps}
+    # None keeps AITER's batch-based wave count.
     return _op()(
         f_a=f_a,
         f_b_weight=f_b_weight,
@@ -205,75 +203,7 @@ def run(
         num_tokens=num_draft_tokens,
         intermediate_states=intermediate_states,
         replay_ring=replay_ring,
-        **wave_kwargs,
-    )
-
-
-def materialize_f_b(layer: torch.nn.Module, f_a: torch.Tensor) -> torch.Tensor:
-    """The deferred f_b projection of f_a [tokens, K], as [1, tokens, H, K]."""
-    from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm
-
-    f_b_weight = layer._k3_hip_fused_verify_args[0]
-    gate = kimi_k3_tiny_gemm(f_a, f_b_weight.flatten(0, 1))
-    return gate.unflatten(-1, f_b_weight.shape[:2]).unsqueeze(0)
-
-
-def run_layer(
-    *,
-    layer: torch.nn.Module,
-    mixed_qkv: torch.Tensor,
-    f_a: torch.Tensor,
-    raw_beta: torch.Tensor,
-    conv_states: torch.Tensor,
-    ssm_states: torch.Tensor,
-    cache_indices: torch.Tensor,
-    intermediate_state_indices: torch.Tensor,
-    intermediate_state_cache: torch.Tensor | None,
-    intermediate_conv_window_cache: torch.Tensor,
-    num_draft_tokens: int,
-    replay_ring: tuple[torch.Tensor, ...] | None,
-) -> torch.Tensor | None:
-    """Fused dense chain verify of a layer whose f_b the model deferred, or None."""
-    f_b_weight, norm_weight, norm_eps, a_log, armed_draft_tokens = (
-        layer._k3_hip_fused_verify_args
-    )
-    tokens = mixed_qkv.shape[0]
-    batch = tokens // num_draft_tokens
-    kwargs = dict(
-        f_a=f_a,
-        mixed_qkv=mixed_qkv,
-        raw_beta=raw_beta,
-        output_gate=layer._k3_onorm_gate[:tokens].view(
-            -1, layer.num_v_heads, layer.head_v_dim
-        ),
-        conv_state=conv_states.transpose(-1, -2),
-        state=ssm_states,
-        cache_indices=cache_indices[:batch],
-        intermediate_indices=intermediate_state_indices[:batch],
-        intermediate_conv_window=intermediate_conv_window_cache.transpose(-1, -2),
-        intermediate_states=intermediate_state_cache if replay_ring is None else None,
-        replay_ring=replay_ring,
-        num_draft_tokens=num_draft_tokens,
-    )
-    if not covered(**kwargs, armed_draft_tokens=armed_draft_tokens):
-        warn_rejected_once(
-            f"tokens={tokens}, draft_tokens={num_draft_tokens} "
-            f"(armed {armed_draft_tokens}), "
-            f"conv_state={conv_states.dtype}, "
-            f"cache_indices={cache_indices.dtype}, "
-            f"inter_indices={intermediate_state_indices.dtype}, "
-            f"state={tuple(ssm_states.shape)}/{ssm_states.dtype}"
-        )
-        return None
-    return run(
-        **kwargs,
-        f_b_weight=f_b_weight,
-        conv_weight=layer.conv_weights,
-        A_log=a_log,
-        dt_bias=layer.dt_bias,
-        lower_bound=float(layer.lower_bound),
-        norm_weight=norm_weight,
-        norm_eps=norm_eps,
+        num_warps=num_warps,
     )
 
 
@@ -331,23 +261,8 @@ def warmup(
         num_draft_tokens=num_draft_tokens,
         replay_ring=replay_ring,
     )
-    try:
-        wave_counts = _op().num_warps
-    except AttributeError:
-        wave_counts = None
-    if wave_counts is not None:
-        for num_warps in wave_counts:
-            build(batch=1, num_warps=num_warps)
-    else:
-        # An untagged op dispatches 8 waves up to batch 16 and 4 above.
-        try:
-            # The pinned AITER stack's untagged op still takes num_warps.
-            for num_warps in (8, 4):
-                build(batch=1, num_warps=num_warps)
-        except TypeError:
-            # Older ops take no num_warps, so let the batch pick each count.
-            for batch in (1, 17):
-                build(batch=batch, num_warps=None)
+    for num_warps in _op().num_warps:
+        build(batch=1, num_warps=num_warps)
     torch.cuda.synchronize(device)
     _WARMED.add(key)
     logger.info(
