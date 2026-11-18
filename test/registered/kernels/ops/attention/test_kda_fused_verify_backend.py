@@ -169,6 +169,9 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
             retrieve_next_token=None,
             retrieve_next_sibling=None,
             retrieve_parent_token=None,
+            has_direct_parent=False,
+            tree_depths=None,
+            tree_max_depth=0,
             replayssm_ring_indices=None,
         )
         backend.verify_intermediate_state_indices = torch.arange(

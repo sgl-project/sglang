@@ -21,6 +21,7 @@ from sglang.kernels.ops.attention.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
+from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
@@ -74,6 +75,13 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.dflash_draft_ring import DFlashDraftKVRing
 
 from sgl_kernel import merge_state_v2
+
+
+def _is_qlen_only_mask(spec_info: SpecInput) -> bool:
+    return (
+        getattr(spec_info, "tree_mask_mode", TreeMaskMode.FULL_MASK)
+        == TreeMaskMode.QLEN_ONLY
+    )
 
 
 def _load_fa4_kernels(device_capability):
@@ -1282,6 +1290,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata_expand.page_table,
                     metadata_expand.cache_seqlens_int32,
                     num_queries,
+                    qlen_only_mask=_is_qlen_only_mask(forward_batch.spec_info),
                 )
                 metadata_expand.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(
@@ -3400,6 +3409,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata_expand.page_table,
                     metadata_expand.cache_seqlens_int32,
                     spec_info.positions.numel(),
+                    qlen_only_mask=_is_qlen_only_mask(spec_info),
                 )
                 metadata_expand.cu_seqlens_k[1:].copy_(
                     torch.cumsum(

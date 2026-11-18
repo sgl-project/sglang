@@ -1,0 +1,105 @@
+"""UBTree rejects unsupported requests before admission and stays usable."""
+
+import unittest
+from array import array
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+def _request(rid, *, params=None, return_logprob=False):
+    return TokenizedGenerateReqInput(
+        rid=rid,
+        input_text="hello",
+        input_ids=array("q", [1, 2, 3]),
+        input_embeds=None,
+        mm_inputs=None,
+        token_type_ids=None,
+        sampling_params=SamplingParams(
+            **({"temperature": 0, "max_new_tokens": 32} | (params or {}))
+        ),
+        return_logprob=return_logprob,
+        logprob_start_len=-1,
+        top_logprobs_num=0,
+        token_ids_logprob=None,
+        stream=False,
+        bootstrap_port=1,
+    )
+
+
+class TestSchedulerUBTreeAdmission(CustomTestCase):
+    def test_rejection_does_not_enter_queue_or_poison_next_request(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_session_radix_cache = False
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.model_config = SimpleNamespace(hf_eos_token_id={0}, vocab_size=128)
+        scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        scheduler.kv_events_publisher = SimpleNamespace(enable_kv_cache_events=False)
+        scheduler.tokenizer = None
+        scheduler.dllm_config = None
+        scheduler.spec_algorithm = SpeculativeAlgorithm.from_string("UBTREE")
+        scheduler._maybe_namespace_elastic_radix_cache = lambda req: None
+        scheduler._record_kv_event_lora_name = lambda req, lora_name: None
+        scheduler.init_req_max_new_tokens = lambda req: None
+        scheduler.max_req_input_len = 128
+        scheduler.tree_cache = SimpleNamespace(
+            cache_controller=SimpleNamespace(pp_prefetch_command_group=None),
+            finish=Mock(),
+        )
+        scheduler.grammar_manager = SimpleNamespace(
+            process_req_with_grammar=Mock(return_value=False)
+        )
+        scheduler.ipc_channels = SimpleNamespace(send_to_tokenizer=Mock())
+        scheduler.rust_server = None
+        scheduler.output_streamer = Mock()
+        scheduler.invariant_checker = Mock()
+        scheduler.beam_coordinator = Mock()
+        scheduler.hisparse_coordinator = None
+        scheduler.uocr_runtime = None
+        scheduler.init_request_retirer()
+        scheduler._add_request_to_queue = Mock()
+
+        with (
+            get_context().override_server_args(sampling_backend="flashinfer"),
+            get_parallel().override(tp_rank=0, pp_rank=0),
+        ):
+            scheduler.handle_generate_request(_request("invalid", return_logprob=True))
+            scheduler._add_request_to_queue.assert_not_called()
+            scheduler.grammar_manager.process_req_with_grammar.assert_not_called()
+            sender = scheduler.ipc_channels.send_to_tokenizer.send_output
+            sender.assert_called_once()
+            abort = sender.call_args.args[0]
+            self.assertEqual(abort.finished_reason["status_code"], 400)
+            self.assertIn("UBTREE", abort.finished_reason["message"])
+            scheduler.handle_generate_request(_request("valid"))
+            scheduler._add_request_to_queue.assert_called_once()
+            self.assertEqual(
+                scheduler._add_request_to_queue.call_args.args[0].rid, "valid"
+            )
+
+            # UBTree's target sampler supports min_p even though the upstream
+            # generic speculative path rejects it.
+            scheduler._add_request_to_queue.reset_mock()
+            scheduler.ipc_channels.send_to_tokenizer.reset_mock()
+            scheduler.handle_generate_request(
+                _request("valid-min-p", params={"temperature": 0.8, "min_p": 0.1})
+            )
+            scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+            scheduler._add_request_to_queue.assert_called_once()
+            queued = scheduler._add_request_to_queue.call_args.args[0]
+            self.assertEqual(queued.rid, "valid-min-p")
+            self.assertIsNone(queued.to_finish)
+
+
+if __name__ == "__main__":
+    unittest.main()

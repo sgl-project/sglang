@@ -17,6 +17,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import SessionController
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -110,7 +111,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
 
     def test_rejected_streaming_turn_leaves_session_idle(self):
         """A turn rejected after `create_req` must not wedge its streaming session."""
-        for name in ("sampling_mask", "dllm"):
+        for name in ("sampling_mask", "dllm", "ubtree"):
             with self.subTest(rejection=name):
                 scheduler = Scheduler.__new__(Scheduler)
                 scheduler.enable_session_radix_cache = False
@@ -131,6 +132,8 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                     is_uno=lambda: False,
                     is_none=lambda: True,
                 )
+                if name == "ubtree":
+                    scheduler.spec_algorithm = SpeculativeAlgorithm.UBTREE
                 scheduler.send_abort_output = MagicMock()
                 scheduler.output_streamer = MagicMock()
                 scheduler.tree_cache = MagicMock()
@@ -167,7 +170,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                     sampling_params=SamplingParams(max_new_tokens=8),
                     return_sampling_mask=name == "sampling_mask",
                     return_logprob=False,
-                    return_hidden_states=False,
+                    return_hidden_states=name == "ubtree",
                     pp_prefetch_ticketed=False,
                     bootstrap_port=1,
                 )
