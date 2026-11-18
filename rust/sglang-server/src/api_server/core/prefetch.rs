@@ -24,7 +24,6 @@ use bytes::Bytes;
 use sglang_mm::common::fetch::{
     ByteBudget, MAX_REQUEST_BYTES, fetch_bytes_budgeted, fetch_local_file_budgeted,
 };
-use sglang_mm::error::MmError;
 use tokio::sync::Semaphore;
 
 use crate::message::request::{GenerateRequest, MmData, ProcessorFetch};
@@ -194,11 +193,9 @@ async fn fetch_ordered(
                 } else if src.starts_with("http://") || src.starts_with("https://") {
                     fetch_bytes_budgeted(&src, &budget)
                 } else {
-                    Err(MmError::invalid(format!(
-                        "media fetch: unsupported URI: {src}"
-                    )))
+                    Err(format!("media fetch: unsupported URI: {src}"))
                 };
-                let bytes = fetched.map(Bytes::from).map_err(MediaError::from)?;
+                let bytes = fetched.map(Bytes::from).map_err(MediaError::Client)?;
                 Ok(Fetched {
                     bytes,
                     by_processor: None,
@@ -400,7 +397,7 @@ mod tests {
                     let bytes = Bytes::from(format!("{modality:?}:{name}"));
                     budget
                         .charge_existing(bytes.len(), source)
-                        .map_err(MediaError::from)?;
+                        .map_err(MediaError::Client)?;
                     Ok(Some(bytes))
                 }
             }

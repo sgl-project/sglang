@@ -31,13 +31,3 @@ impl fmt::Display for MmError {
 }
 
 impl std::error::Error for MmError {}
-
-#[cfg(feature = "python")]
-impl From<MmError> for pyo3::PyErr {
-    fn from(error: MmError) -> Self {
-        match error {
-            MmError::InvalidRequest(message) => pyo3::exceptions::PyValueError::new_err(message),
-            MmError::Internal(message) => pyo3::exceptions::PyRuntimeError::new_err(message),
-        }
-    }
-}

@@ -86,15 +86,6 @@ pub enum MediaError {
     Server(String),
 }
 
-impl From<sglang_mm::error::MmError> for MediaError {
-    fn from(error: sglang_mm::error::MmError) -> Self {
-        match error {
-            sglang_mm::error::MmError::InvalidRequest(message) => Self::Client(message),
-            sglang_mm::error::MmError::Internal(message) => Self::Server(message),
-        }
-    }
-}
-
 /// Multimodal processor shared by built-in and external implementations.
 /// Implementations run on the fixed Rust worker pool and must not retain
 /// request-scoped Python objects. `input_ids` arrive tokenized (the FSM runs

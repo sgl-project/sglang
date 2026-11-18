@@ -89,14 +89,14 @@ fn collect_media(
                 })?;
                 budget
                     .charge_existing(bytes.len(), field)
-                    .map_err(MediaError::from)?;
+                    .map_err(MediaError::Client)?;
                 bytes
             } else {
                 // Only data URLs and bare base64 get here: malformed or over
                 // budget, the request's fault.
                 fetch_bytes_budgeted(&source, budget)
                     .map(Bytes::from)
-                    .map_err(MediaError::from)?
+                    .map_err(MediaError::Client)?
             };
             Ok((bytes, hints))
         })

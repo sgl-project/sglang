@@ -1,6 +1,5 @@
 //! V4.1 PIL bicubic resize, centered padding and CHW patch packing.
 use crate::common::{par, resize};
-use crate::error::{MmError, Result};
 use half::bf16;
 
 pub struct ImagePlan {
@@ -13,7 +12,12 @@ pub struct ImagePlan {
     pub patch_size: usize,
 }
 
-pub fn resize_patchify(rgb: &[u8], h: usize, w: usize, plan: ImagePlan) -> Result<Vec<u16>> {
+pub fn resize_patchify(
+    rgb: &[u8],
+    h: usize,
+    w: usize,
+    plan: ImagePlan,
+) -> Result<Vec<u16>, String> {
     let ImagePlan {
         out_h,
         out_w,
@@ -38,12 +42,12 @@ pub fn resize_patchify(rgb: &[u8], h: usize, w: usize, plan: ImagePlan) -> Resul
         || left > out_w - resize_w
         || h.checked_mul(w).and_then(|n| n.checked_mul(3)) != Some(rgb.len())
     {
-        return Err(MmError::invalid("invalid V4.1 image geometry"));
+        return Err("invalid V4.1 image geometry".into());
     }
     let len = out_h
         .checked_mul(out_w)
         .and_then(|n| n.checked_mul(3))
-        .ok_or_else(|| MmError::invalid("V4.1 output size overflow"))?;
+        .ok_or("V4.1 output size overflow")?;
     let resized = resize::resize_rgb(
         rgb,
         h,
@@ -105,22 +109,24 @@ mod python {
             .as_slice()
             .map_err(|_| PyValueError::new_err("expected contiguous RGB"))?
             .to_vec();
-        let bits = py.detach(move || {
-            super::resize_patchify(
-                &data,
-                h,
-                w,
-                super::ImagePlan {
-                    out_h,
-                    out_w,
-                    resize_h,
-                    resize_w,
-                    top,
-                    left,
-                    patch_size,
-                },
-            )
-        })?;
+        let bits = py
+            .detach(move || {
+                super::resize_patchify(
+                    &data,
+                    h,
+                    w,
+                    super::ImagePlan {
+                        out_h,
+                        out_w,
+                        resize_h,
+                        resize_w,
+                        top,
+                        left,
+                        patch_size,
+                    },
+                )
+            })
+            .map_err(PyValueError::new_err)?;
         Ok(bits.into_pyarray(py))
     }
     pub fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
