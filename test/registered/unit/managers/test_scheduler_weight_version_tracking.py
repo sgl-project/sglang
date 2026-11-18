@@ -5,7 +5,6 @@ from unittest.mock import DEFAULT, MagicMock, Mock, patch
 
 import torch
 
-from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
@@ -40,7 +39,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import release_only_retirer
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -104,9 +103,9 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         self.assertIsNone(scheduler.kv_weight_version_tracker)
 
     def _scheduler(self) -> Scheduler:
+        enter_scope(self, published_topology())
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.deferred_responses = DeferredResponses(
-            disaggregation_mode=DisaggregationMode.NULL,
             output_streamer=None,
             request_retirer=None,
             send_abort=None,
@@ -131,7 +130,6 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         )
         scheduler.batch_result_processor = SchedulerBatchResultProcessor(
             is_generation=True,
-            disaggregation_mode=DisaggregationMode.NULL,
             model_config=SimpleNamespace(think_end_ids=None),
             token_to_kv_pool_allocator=MagicMock(),
             tree_cache=scheduler.tree_cache,
@@ -161,7 +159,6 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
             )
             patcher.start()
             self.addCleanup(patcher.stop)
-        scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler._record_step_counters = MagicMock()
         scheduler.metrics_reporter = MagicMock()
         scheduler.enable_fpm = False

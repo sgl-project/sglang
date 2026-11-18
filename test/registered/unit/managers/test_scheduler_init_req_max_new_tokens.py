@@ -5,13 +5,13 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv.alloc.demand import WindowRetirement
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import enter_scope, published_topology
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -60,6 +60,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         cls._scheduler_logger.setLevel(cls._old_level)
 
     def setUp(self):
+        enter_scope(self, published_topology())
         # Tests use an unsharded topology unless they explicitly override it.
         cm = get_parallel().override(attn_dcp_size=1)
         cm.__enter__()
@@ -73,7 +74,6 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         kv_shard_widening: int = 1,
     ) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.max_req_len = max_req_len
         scheduler.max_total_num_tokens = max_total_num_tokens
         scheduler.page_size = page_size
@@ -265,7 +265,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         # Pool of 32 with a 30-token prompt: the memory clamp below the
         # PREFILL branch would compute max(0, 32 - 30 - 1 - 1) = 0.
         scheduler = self._new_scheduler(max_total_num_tokens=32)
-        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        get_context().override("test", disaggregation_mode="prefill")
 
         req = self._new_req(max_new_tokens=64, input_len=30, min_new_tokens=8)
         scheduler.init_req_max_new_tokens(req)

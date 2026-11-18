@@ -495,7 +495,6 @@ class TestMambaDonationCheckpointIntegration(CustomTestCase):
         from sglang.srt.managers.scheduler import Scheduler
 
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.disaggregation_mode = None
         scheduler.tree_cache = cache
         scheduler.stash_chunked_request(req)
 

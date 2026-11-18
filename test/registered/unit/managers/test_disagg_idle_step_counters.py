@@ -11,7 +11,6 @@ from unittest.mock import Mock, patch
 
 from parameterized import parameterized
 
-from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.managers.io_struct import (
@@ -28,7 +27,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 )
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -288,7 +287,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
     def test_mlx_pending_job_preserves_inflight_request_inventory(self):
         module = load_mlx_scheduler_module()
         scheduler = self.make_scheduler([])
-        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        get_context().override("test", disaggregation_mode="null")
         req = Req("mlx-pending", "", [1], SamplingParams())
         batch = ScheduleBatch(reqs=[req], forward_mode=ForwardMode.DECODE)
         scheduler.last_batch = batch
@@ -361,7 +360,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def test_pause_between_prefills_is_not_charged(self):
         scheduler = self.make_scheduler([])
-        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        get_context().override("test", disaggregation_mode="prefill")
         first, second = (self.make_batch(ForwardMode.EXTEND) for _ in range(2))
         self.launch_batch(scheduler, first, 0.0)
         self.record_result(scheduler, first, 0.125)
@@ -375,7 +374,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
     def test_result_held_across_a_pause_excludes_the_pause(self):
         # An overlapped prefill launched before the pause has its result processed after resume.
         scheduler = self.make_scheduler([])
-        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        get_context().override("test", disaggregation_mode="prefill")
         batch = self.make_batch(ForwardMode.EXTEND)
         self.launch_batch(scheduler, batch, 0.0)
         self.pause_and_resume(scheduler, 0.05, 10.0)
@@ -386,7 +385,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
     def test_result_processed_during_an_open_pause_excludes_it(self):
         # A retract after an in-place pause processes the held result before resume.
         scheduler = self.make_scheduler([])
-        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        get_context().override("test", disaggregation_mode="prefill")
         first, second = (self.make_batch(ForwardMode.EXTEND) for _ in range(2))
         self.launch_batch(scheduler, first, 0.0)
         self.pause(scheduler, 0.125)
@@ -400,7 +399,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def test_many_pauses_inside_one_step_are_all_excluded(self):
         scheduler = self.make_scheduler([])
-        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        get_context().override("test", disaggregation_mode="prefill")
         batch = self.make_batch(ForwardMode.EXTEND)
         self.launch_batch(scheduler, batch, 0.0)
         for i in range(100):
@@ -413,7 +412,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def test_pause_inside_an_idle_gap_is_not_subtracted_from_the_next_prefill(self):
         scheduler = self.make_scheduler([])
-        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        get_context().override("test", disaggregation_mode="prefill")
         first, second = (self.make_batch(ForwardMode.EXTEND) for _ in range(2))
         self.launch_batch(scheduler, first, 0.0)
         self.record_result(scheduler, first, 0.125)
@@ -588,7 +587,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.enable_continuous_input_polling = False
         scheduler.is_generation = True
         scheduler.dllm_config = None
-        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        get_context().override("test", disaggregation_mode="prefill")
         scheduler._poll_timeout_aborts = Mock(return_value=[])
         scheduler.scheduler_stage_metrics = None
         scheduler.metrics_reporter = SimpleNamespace(record_scheduler_active=Mock())

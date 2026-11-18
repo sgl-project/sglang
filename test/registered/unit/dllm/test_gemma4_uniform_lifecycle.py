@@ -378,7 +378,6 @@ class TestGemma4RequestValidation(unittest.TestCase):
         return SchedulerDllmMixin.validate_dllm_request(scheduler, req)
 
     def test_logprob_rejection_never_enters_the_generation_queue(self):
-        from sglang.srt.disaggregation.mode import DisaggregationMode
         from sglang.srt.managers.io_struct import AbortReq
         from sglang.srt.managers.scheduler import Scheduler
         from sglang.srt.runtime_context import get_context, get_parallel
@@ -386,7 +385,6 @@ class TestGemma4RequestValidation(unittest.TestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.enable_session_radix_cache = False
         scheduler.model_config = SimpleNamespace(hf_eos_token_id={1}, vocab_size=128)
-        scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
         scheduler.tokenizer = None
         scheduler.dllm_config = _Scheduler(fdfo=False).dllm_config

@@ -22,7 +22,10 @@ from sglang.srt.beam_search.output import (
     beam_completion_tokens,
     pack_beam_search_output,
 )
-from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.mode import (
+    DisaggregationMode,
+    current_disaggregation_mode,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.incremental_detokenize import build_detokenize_header
 from sglang.srt.managers.io_struct import (
@@ -94,7 +97,6 @@ class SchedulerOutputStreamer:
     server_args: ServerArgs
     is_generation: bool
     spec_algorithm: SpeculativeAlgorithm
-    disaggregation_mode: DisaggregationMode
     skip_tokenizer_init: InitVar[bool]
     enable_hicache_storage: Callable[[], bool]
     # When SGLANG_RUST_SERVER is on, generation output is pushed to the embedded
@@ -144,7 +146,7 @@ class SchedulerOutputStreamer:
         return self.rust_server is not None and (
             self.server_args.enable_hierarchical_cache
             or self.server_args.enable_lmcache
-            or self.disaggregation_mode == DisaggregationMode.DECODE
+            or current_disaggregation_mode() == DisaggregationMode.DECODE
         )
 
     def get_cached_tokens_details(self, req: Req) -> Optional[CachedTokensDetails]:
@@ -285,7 +287,7 @@ class SchedulerOutputStreamer:
             return_indexer_topk=return_indexer_topk,
             return_sampling_mask=return_sampling_mask,
             spec_algorithm=self.spec_algorithm,
-            disaggregation_mode=self.disaggregation_mode,
+            disaggregation_mode=current_disaggregation_mode(),
             default_stream_interval=get_serving().stream_interval,
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
             build_request_stats=self.build_request_stats,

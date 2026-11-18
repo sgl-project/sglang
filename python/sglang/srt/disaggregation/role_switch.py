@@ -144,7 +144,6 @@ def handle_pd_role_switch(
             scheduler.gc_freezer.on_cache_reset()
             get_context().override("role_switch.flip", disaggregation_mode=new_role)
             scheduler.init_disaggregation()
-            scheduler._sync_disaggregation_mode_to_subcomponents()
         except Exception as e:
             scheduler._pd_role_switch_unhealthy = True
             logger.critical(

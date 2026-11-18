@@ -270,7 +270,6 @@ class _SpecRequest:
         self.req = req
         self.processor = SchedulerBatchResultProcessor(
             is_generation=True,
-            disaggregation_mode=None,
             model_config=SimpleNamespace(
                 think_end_ids=None, self_opened_think_start_ids=None
             ),

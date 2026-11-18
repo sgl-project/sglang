@@ -18,8 +18,10 @@ from sglang.srt.managers.scheduler_components.request_list import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.observability.metrics_collector import SchedulerStats
+from sglang.srt.runtime_context import get_disagg
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import FakeReq, decode_queue
+from sglang.test.test_utils import enter_scope, published_topology
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -47,6 +49,9 @@ class TestSchedulePolicyWaitingQueueMatching(unittest.TestCase):
 
 
 class TestSchedulerLoadInquirer(unittest.TestCase):
+    def setUp(self):
+        enter_scope(self, published_topology())
+
     def make_inquirer(
         self,
         waiting_queue_prefix_matched=True,
@@ -59,8 +64,10 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             cache_request_handle=CacheRequestHandle("waiting", 0),
         )
         chunked_req = SimpleNamespace(seqlen=50, prefix_len=10)
+        enter_scope(
+            self, get_disagg().override(disaggregation_mode=disaggregation_mode.value)
+        )
         return SchedulerLoadInquirer(
-            disaggregation_mode=disaggregation_mode,
             server_args=None,
             max_total_num_tokens=1000,
             max_running_requests=10,
@@ -227,7 +234,6 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
         req = self.make_inquirer().get_waiting_queue()[0]
         get_storage_span = Mock(return_value=(20, 80))
         scheduler = SimpleNamespace(
-            disaggregation_mode=DisaggregationMode.PREFILL,
             server_args=None,
             max_total_num_tokens=1000,
             kv_shard_widening=1,

@@ -7,14 +7,19 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_disagg
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import SessionController
 
@@ -25,7 +30,6 @@ def _handle_pd_request(mode, req):
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.enable_session_radix_cache = False
     scheduler.model_config = SimpleNamespace(hf_eos_token_id={1}, vocab_size=128)
-    scheduler.disaggregation_mode = mode
     scheduler.disagg_metadata_buffers = SimpleNamespace(enable_sampling_mask=False)
     scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
     scheduler.tokenizer = None
@@ -54,6 +58,7 @@ def _handle_pd_request(mode, req):
     req.exit_via = req.send_via = req.kv.retraction_backup = None
     req.kv.holds_kv = req.kv.holds_mamba = False
     with (
+        get_disagg().override(disaggregation_mode=mode.value),
         patch(
             "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
             return_value=1,
@@ -68,6 +73,7 @@ def _handle_pd_request(mode, req):
 class TestSchedulerSamplingMaskValidation(CustomTestCase):
     def test_disabled_pd_masks_return_bad_request_before_admission(self):
         """Neither PD role may queue mask requests without metadata buffers."""
+        enter_scope(self, published_topology())
         for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
             with self.subTest(mode=mode):
                 abort, add_to_queue = _handle_pd_request(
@@ -110,6 +116,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
 
     def test_rejected_streaming_turn_leaves_session_idle(self):
         """A turn rejected after `create_req` must not wedge its streaming session."""
+        enter_scope(self, published_topology())
         for name in ("sampling_mask", "dllm"):
             with self.subTest(rejection=name):
                 scheduler = Scheduler.__new__(Scheduler)
@@ -117,7 +124,6 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 scheduler.model_config = SimpleNamespace(
                     hf_eos_token_id={1}, vocab_size=128
                 )
-                scheduler.disaggregation_mode = DisaggregationMode.NULL
                 scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
                 scheduler.tokenizer = None
                 scheduler.dllm_config = None

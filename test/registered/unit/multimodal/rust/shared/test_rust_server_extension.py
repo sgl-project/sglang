@@ -12,7 +12,11 @@ from unittest.mock import Mock, patch, sentinel
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import FakeReq
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
@@ -134,8 +138,7 @@ def build_rust_frame_metadata_fixture() -> dict:
     `sglang:cached_tokens_total` increments by `cache_source` its metrics
     collector records for each request of the cache-tier batches.
     Regenerate the fixture with ``json.dump(build_rust_frame_metadata_fixture(),
-    f, indent=2)`` after changing either side."""
-    from sglang.srt.disaggregation.mode import DisaggregationMode
+    f, indent=2)`` under ``published_topology()`` after changing either side."""
     from sglang.srt.managers.io_struct import AbortReq
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
@@ -269,7 +272,6 @@ def build_rust_frame_metadata_fixture() -> dict:
                 server_args=SimpleNamespace(enable_lmcache=False),
                 is_generation=True,
                 spec_algorithm=SpeculativeAlgorithm.NONE,
-                disaggregation_mode=DisaggregationMode.NULL,
                 skip_tokenizer_init=False,
                 enable_hicache_storage=lambda: storage_attached,
             )
@@ -397,7 +399,6 @@ def build_rust_frame_metadata_fixture() -> dict:
                 ),
                 is_generation=True,
                 spec_algorithm=SpeculativeAlgorithm.EAGLE,
-                disaggregation_mode=DisaggregationMode.NULL,
                 skip_tokenizer_init=False,
                 enable_hicache_storage=lambda: False,
                 rust_server=rust_server,
@@ -1250,7 +1251,7 @@ class TestRustServerExtension(CustomTestCase):
         self.assertEqual(len(msgspec.msgpack.decode(header)), 6)
 
     def test_frame_metadata_fixture_matches_python(self):
-        with open(RUST_FRAME_METADATA_FIXTURE) as f:
+        with open(RUST_FRAME_METADATA_FIXTURE) as f, published_topology():
             self.assertEqual(json.load(f), build_rust_frame_metadata_fixture())
         with open(RUST_CUSTOMIZED_INFO_FIXTURE) as f:
             self.assertEqual(json.load(f), build_rust_customized_info_fixture())

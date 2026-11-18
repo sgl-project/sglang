@@ -13,7 +13,11 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    maybe_stub_sgl_kernel,
+)
 
 maybe_stub_sgl_kernel()
 
@@ -29,6 +33,7 @@ from sglang.srt.managers.scheduler_components.request_list import (  # noqa: E40
     move,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome  # noqa: E402
+from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.srt.rust_server.server import RustServer  # noqa: E402
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.test.scheduler_test_utils import (  # noqa: E402
@@ -92,7 +97,12 @@ class TestWaitingHealthCheckAck(CustomTestCase):
 
     def _scheduler(self, waiting, disaggregation_mode=DisaggregationMode.NULL):
         s = Scheduler.__new__(Scheduler)
-        s.disaggregation_mode = disaggregation_mode
+        enter_scope(
+            self,
+            get_context().override_server_args(
+                disaggregation_mode=disaggregation_mode.value
+            ),
+        )
         empty_request_lists(s)
         move(waiting, s.waiting_queue)
         s.return_health_check_ipcs = deque()

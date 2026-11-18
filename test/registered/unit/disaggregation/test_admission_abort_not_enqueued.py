@@ -94,6 +94,7 @@ def _make_scheduler():
 def _prefill_queue(sched):
     q = SimpleNamespace(
         scheduler=sched,
+        request_retirer=sched.request_retirer,
         queue=IndexedReqList(ListKind.PD_BOOTSTRAP),
         create_sender=MagicMock(),
         _check_if_req_exceed_kv_capacity=MagicMock(return_value=False),
@@ -104,6 +105,7 @@ def _prefill_queue(sched):
 def _decode_queue(sched):
     q = SimpleNamespace(
         scheduler=sched,
+        request_retirer=sched.request_retirer,
         token_to_kv_pool_allocator=MagicMock(),
         retracted_queue=IndexedReqList(ListKind.PD_RETRACTED),
         _check_if_req_exceed_kv_capacity=MagicMock(return_value=False),

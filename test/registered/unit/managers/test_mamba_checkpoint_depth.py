@@ -258,7 +258,6 @@ class TestChunkedPrefillStaysOnTheChunkGrid(unittest.TestCase):
         scheduler.truncation_align_size = None
         scheduler.tree_cache = self._window_tree()
         scheduler.chunked_prefill_size = CHUNK // 2
-        scheduler.disaggregation_mode = None
         with get_context().override_server_args(
             disable_radix_cache=False,
             mamba_radix_cache_strategy="extra_buffer",

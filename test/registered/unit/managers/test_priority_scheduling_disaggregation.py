@@ -53,7 +53,7 @@ from sglang.test.scheduler_test_utils import (
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
 )
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -66,8 +66,8 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
     def _new_scheduler(self, disaggregation_mode: DisaggregationMode) -> Scheduler:
+        get_context().override("test", disaggregation_mode=disaggregation_mode.value)
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.disaggregation_mode = disaggregation_mode
         scheduler.enable_priority_scheduling = True
         scheduler.schedule_low_priority_values_first = False
         scheduler.abort_on_priority_when_disabled = False
@@ -488,7 +488,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         scheduler.ipc_channels = MagicMock()
         scheduler.rust_server = None
         scheduler.output_streamer = MagicMock()
-        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        enter_scope(self, published_topology(disaggregation_mode="prefill"))
         scheduler.disagg_prefill_pending_chunk_rids = {"req"}
         scheduler.req_to_metadata_buffer_idx_allocator = MagicMock()
         scheduler.collect_inflight_reqs = MagicMock(return_value=set())
@@ -594,7 +594,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         )
         queue.tree_cache = MagicMock()
 
-        scheduler = MagicMock(request_retirer=leaving_retirer())
+        scheduler = MagicMock()
         scheduler.enable_priority_scheduling = True
         scheduler.schedule_low_priority_values_first = low_priority_values_first
         scheduler.running_batch.reqs = []
@@ -605,6 +605,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         scheduler.last_batch = None
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
+        queue.request_retirer = leaving_retirer()
         return queue
 
     def test_hisparse_prealloc_reserves_scratch_for_pending_transfers(self):

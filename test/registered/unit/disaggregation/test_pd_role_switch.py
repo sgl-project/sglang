@@ -40,7 +40,6 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
 
     def _scheduler(self, mode, *, enable=True, idle=True):
         s = Scheduler.__new__(Scheduler)
-        s.disaggregation_mode = mode
         sa = ServerArgs(
             model_path="dummy",
             disaggregation_mode=mode.value,
@@ -55,7 +54,6 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         self.addCleanup(teardown_patcher.stop)
         s.init_disaggregation = MagicMock()
         s.gc_freezer = MagicMock()
-        s._sync_disaggregation_mode_to_subcomponents = MagicMock()
         s._event_loop_should_restart = False
         s._pd_role_switch_in_progress = False
         s._pd_role_switch_unhealthy = False
@@ -236,7 +234,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         # The pristine startup record is never mutated.
         self.assertEqual(s.server_args.disaggregation_mode, "prefill")
         s.init_disaggregation.assert_called_once()
-        s._sync_disaggregation_mode_to_subcomponents.assert_called_once()
+        self.assertEqual(s.disaggregation_mode, DisaggregationMode.DECODE)
         self.assertTrue(s._event_loop_should_restart)
         # Flip to decode ensures decode CUDA graphs exist (idempotent capture).
         s.tp_worker.ensure_decode_cuda_graphs.assert_called_once()
@@ -299,7 +297,8 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         # Teardown + rebuild attempted exactly once (no rollback).
         self.assertEqual(s.teardown_disaggregation.call_count, 1)
         self.assertEqual(s.init_disaggregation.call_count, 1)
-        s._sync_disaggregation_mode_to_subcomponents.assert_not_called()
+        # The override stands: every reader sees the new role.
+        self.assertEqual(s.disaggregation_mode, DisaggregationMode.DECODE)
         # A subsequent switch is rejected because the instance is unhealthy.
         out2 = Scheduler.handle_pd_role_switch(
             s, PdRoleSwitchReqInput(new_role="prefill")
@@ -328,7 +327,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         # Teardown raised, so rebuild is never attempted.
         self.assertEqual(s.teardown_disaggregation.call_count, 1)
         s.init_disaggregation.assert_not_called()
-        s._sync_disaggregation_mode_to_subcomponents.assert_not_called()
+        self.assertEqual(s.disaggregation_mode, DisaggregationMode.PREFILL)
 
 
 class TestPdRoleSwitchReqSerialization(unittest.TestCase):
@@ -714,25 +713,22 @@ class TestDPRoleSwitch(unittest.IsolatedAsyncioTestCase):
             scheduler.tp_worker.get_decode_cuda_graph_bs.return_value = (
                 [] if insufficient_memory else [1]
             )
-            scheduler.init_disaggregation.side_effect = lambda s=scheduler: setattr(
-                s,
-                "disaggregation_mode",
-                DisaggregationMode(rc.get_disagg().disaggregation_mode),
-            )
+        # The workers share this process's context, so each one's role is kept
+        # here and published before its handler runs.
+        roles = [DisaggregationMode.PREFILL.value] * len(schedulers)
 
         async def fanout(req):
             results = []
             for index, scheduler in enumerate(schedulers):
                 rc.get_context().set_server_args(scheduler.server_args)
-                rc.get_context().override(
-                    "test.role", disaggregation_mode=scheduler.disaggregation_mode.value
-                )
+                rc.get_context().override("test.role", disaggregation_mode=roles[index])
                 with patch.object(
                     role_switch,
                     "get_available_gpu_memory",
                     return_value=available_memory[index],
                 ):
                     results.append(role_switch.handle_pd_role_switch(scheduler, req))
+                roles[index] = rc.get_disagg().disaggregation_mode
             if req.prepare_only:
                 for scheduler in schedulers:
                     scheduler.init_disaggregation.assert_not_called()
@@ -776,9 +772,7 @@ class TestDPRoleSwitch(unittest.IsolatedAsyncioTestCase):
             for scheduler in schedulers:
                 scheduler.init_disaggregation.assert_not_called()
                 scheduler.teardown_disaggregation.assert_not_called()
-                self.assertEqual(
-                    scheduler.disaggregation_mode, DisaggregationMode.PREFILL
-                )
+            self.assertEqual(roles, ["prefill"] * len(schedulers))
 
             available_memory[1] = 2.0
             schedulers[1].is_fully_idle.return_value = True
@@ -787,9 +781,7 @@ class TestDPRoleSwitch(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(manager.disaggregation_mode, DisaggregationMode.DECODE)
             for scheduler in schedulers:
                 scheduler.init_disaggregation.assert_called_once()
-                self.assertEqual(
-                    scheduler.disaggregation_mode, DisaggregationMode.DECODE
-                )
+            self.assertEqual(roles, ["decode"] * len(schedulers))
 
 
 class TestStartupDecodeGraphReuse(unittest.TestCase):

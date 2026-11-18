@@ -104,7 +104,10 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
 )
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.kv_events import uses_dynamo_format
-from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.mode import (
+    DisaggregationMode,
+    current_disaggregation_mode,
+)
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -744,14 +747,20 @@ class Scheduler(
         # its ingress transport.
         self.maybe_init_rust_server(port_args)
 
-        # Init prefill-decodedisaggregation
-        self.init_disaggregation()
-
         # Init overlap schedule
         self.init_overlap()
 
         # Init Unlimited-OCR document-window hooks and crop transfer
         self.maybe_init_uocr_runtime()
+
+        self.init_output_streamer()
+
+        self.init_beam_coordinator()
+
+        self.init_request_retirer()
+
+        # Init PD disaggregation; its queues take the request retirer.
+        self.init_disaggregation()
 
         # Init Ngram Embedding
         self.maybe_init_ngram_embedding()
@@ -792,12 +801,6 @@ class Scheduler(
         self.init_load_inquirer()
 
         self.init_kv_weight_version_tracker()
-
-        self.init_output_streamer()
-
-        self.init_beam_coordinator()
-
-        self.init_request_retirer()
 
         self.init_deferred_responses()
 
@@ -1623,6 +1626,10 @@ class Scheduler(
 
         configure_gc_logging("Scheduler")
 
+    @property
+    def disaggregation_mode(self) -> DisaggregationMode:
+        return current_disaggregation_mode()
+
     def init_disaggregation(self):
         self.mm_receiver = None
         self.disagg_prefill_bootstrap_queue = None
@@ -1632,7 +1639,6 @@ class Scheduler(
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None
 
-        self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
         self.transfer_backend = TransferBackend(
             get_disagg().disaggregation_transfer_backend
         )
@@ -1713,6 +1719,7 @@ class Scheduler(
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
+                request_retirer=self.request_retirer,
                 tree_cache=self.tree_cache,
             )
 
@@ -1724,6 +1731,7 @@ class Scheduler(
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
+                request_retirer=self.request_retirer,
                 transfer_queue=self.disagg_decode_transfer_queue,
                 tree_cache=self.tree_cache,
                 gpu_id=get_device().gpu_id,
@@ -1760,6 +1768,7 @@ class Scheduler(
                 bootstrap_port=get_disagg().disaggregation_bootstrap_port,
                 max_total_num_tokens=self.max_total_num_tokens,
                 scheduler=self,
+                request_retirer=self.request_retirer,
                 scheduler_stage_metrics=self.scheduler_stage_metrics,
                 transfer_backend=self.transfer_backend,
                 draft_kv_ring=draft_kv_ring,
@@ -2809,7 +2818,6 @@ class Scheduler(
 
     def init_invariant_checker(self) -> None:
         self.invariant_checker = SchedulerInvariantChecker(
-            disaggregation_mode=self.disaggregation_mode,
             page_size=self.logical_page_size,
             tree_cache=self.tree_cache,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -2889,7 +2897,6 @@ class Scheduler(
         if is_cp_sharded_padded():
             global_tokens = from_cp_sharded(global_tokens)
         self.load_inquirer = SchedulerLoadInquirer(
-            disaggregation_mode=self.disaggregation_mode,
             server_args=self.server_args,
             # The worker reports logical DCP capacity; add KV shard widening.
             max_total_num_tokens=global_tokens,
@@ -2939,7 +2946,6 @@ class Scheduler(
             server_args=self.server_args,
             is_generation=self.is_generation,
             spec_algorithm=self.spec_algorithm,
-            disaggregation_mode=self.disaggregation_mode,
             skip_tokenizer_init=self.skip_tokenizer_init,
             enable_hicache_storage=lambda: (
                 self.enable_hicache_storage or self.enable_lmcache
@@ -2953,7 +2959,6 @@ class Scheduler(
 
     def init_deferred_responses(self) -> None:
         self.deferred_responses = DeferredResponses(
-            disaggregation_mode=self.disaggregation_mode,
             output_streamer=self.output_streamer,
             request_retirer=self.request_retirer,
             send_abort=lambda req, finished_reason: self.send_abort_output(
@@ -3001,7 +3006,6 @@ class Scheduler(
     def init_batch_result_processor(self) -> None:
         self.batch_result_processor = SchedulerBatchResultProcessor(
             is_generation=self.is_generation,
-            disaggregation_mode=self.disaggregation_mode,
             model_config=self.model_config,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
@@ -4650,7 +4654,6 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
-            request_retirer=self.request_retirer,
             kv_awaiting_transfer=bool(self.disagg_prefill_transfer_queue),
         )
 
@@ -4751,7 +4754,7 @@ class Scheduler(
 
             if running_batch.batch_is_full:
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-                    req
+                    req, self.request_retirer
                 ):
                     break
 
@@ -6863,22 +6866,6 @@ class Scheduler(
 
     def handle_pd_role_switch(self, recv_req: PdRoleSwitchReqInput):
         return role_switch.handle_pd_role_switch(self, recv_req)
-
-    def _sync_disaggregation_mode_to_subcomponents(self):
-        # Push the (possibly flipped) mode into sub-components that cache it.
-        # object.__setattr__ because some are frozen dataclasses.
-        for name in (
-            "invariant_checker",
-            "load_inquirer",
-            "output_streamer",
-            "batch_result_processor",
-            "deferred_responses",
-        ):
-            comp = getattr(self, name, None)
-            if comp is not None and hasattr(comp, "disaggregation_mode"):
-                object.__setattr__(
-                    comp, "disaggregation_mode", self.disaggregation_mode
-                )
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
         action = recv_req.action

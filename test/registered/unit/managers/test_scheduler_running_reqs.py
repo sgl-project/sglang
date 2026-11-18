@@ -16,7 +16,6 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
@@ -77,7 +76,6 @@ class _Scheduler(Scheduler):
 
 def _invariant_checker(s):
     return SchedulerInvariantChecker(
-        disaggregation_mode=DisaggregationMode.NULL,
         page_size=1,
         tree_cache=None,
         token_to_kv_pool_allocator=None,
@@ -96,7 +94,6 @@ def _scheduler():
     s.dllm_manager = SimpleNamespace(waiting_queue=IndexedReqList(ListKind.DLLM))
     s.running_batch = ScheduleBatch(reqs=[])
     s.invariant_checker = _invariant_checker(s)
-    s.disaggregation_mode = DisaggregationMode.NULL
     s.enable_hisparse = False
     # run_batch up to the forward
     s.scheduler_stage_metrics = None
@@ -288,7 +285,6 @@ class TestRunningReqsHooks(CustomTestCase):
         s.running_batch = running
         s.last_batch = None
         move(running.reqs, s.running_reqs)
-        s.disaggregation_mode = DisaggregationMode.NULL
         s.enable_hisparse = False
         s.invariant_checker = _invariant_checker(s)
         s._confidence_budget_prepare = None
@@ -384,7 +380,7 @@ class TestRunningReqsHooks(CustomTestCase):
             def budget_state(self):
                 return AddReqResult.CONTINUE
 
-            def preempt_to_schedule(self, req):
+            def preempt_to_schedule(self, req, request_retirer):
                 self.preempt_list.append(self.running_batch.reqs.pop(0))
                 return True
 

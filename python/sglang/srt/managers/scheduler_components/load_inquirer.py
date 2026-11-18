@@ -5,7 +5,10 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
-from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.mode import (
+    DisaggregationMode,
+    current_disaggregation_mode,
+)
 from sglang.srt.managers.load_snapshot import (
     DisaggregationMetrics,
     LoadSnapshot,
@@ -33,7 +36,6 @@ logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerLoadInquirer:
-    disaggregation_mode: DisaggregationMode
     server_args: ServerArgs
     max_total_num_tokens: int
     max_running_requests: int
@@ -80,7 +82,7 @@ class SchedulerLoadInquirer:
 
     def get_num_waiting_uncached_tokens(self) -> int:
         """Estimate input tokens waiting for prefill compute."""
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
+        if current_disaggregation_mode() == DisaggregationMode.DECODE:
             return 0
         waiting_queue_prefix_matched = self.waiting_queue_prefix_matched()
         cache_miss_rate = 1.0 - self.get_recent_cache_hit_rate()
@@ -114,11 +116,12 @@ class SchedulerLoadInquirer:
         waiting_queues = [self.get_waiting_queue()]
         pending_token_queues = [self.get_waiting_queue()]
         awaiting_kv_tokens = 0
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+        mode = current_disaggregation_mode()
+        if mode == DisaggregationMode.PREFILL:
             prefill_bootstrap_queue = lists[ListKind.PD_BOOTSTRAP]
             waiting_queues.append(prefill_bootstrap_queue)
             pending_token_queues.append(prefill_bootstrap_queue)
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+        elif mode == DisaggregationMode.DECODE:
             decode_prealloc_queue = lists[ListKind.PD_PREALLOC]
             decode_transfer_queue = lists[ListKind.PD_RECEIVING]
             decode_retracted_queue = lists[ListKind.PD_RETRACTED]
@@ -184,11 +187,12 @@ class SchedulerLoadInquirer:
         decode_prealloc = decode_transfer = decode_retracted = 0
         decode_prealloc_ready = 0
         num_prealloc_ready_tokens = 0
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+        mode = current_disaggregation_mode()
+        if mode == DisaggregationMode.PREFILL:
             mode_str = "prefill"
             prefill_bootstrap = len(lists[ListKind.PD_BOOTSTRAP])
             prefill_inflight = len(lists[ListKind.PD_SENDING])
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+        elif mode == DisaggregationMode.DECODE:
             mode_str = "decode"
             decode_prealloc = len(lists[ListKind.PD_PREALLOC])
             decode_transfer = len(lists[ListKind.PD_RECEIVING])

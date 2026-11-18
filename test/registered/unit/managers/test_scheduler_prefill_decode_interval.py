@@ -16,7 +16,6 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     RecentPrefillBatchSizeTracker,
@@ -191,7 +190,6 @@ def _make_dp_rank(group, *, min_bs, delayer, waiting=0) -> Scheduler:
     with `waiting` requests it asks to prefill and admits when allowed."""
     s = _make_scheduler(interval=2, min_bs=min_bs, require_mlp_sync=True)
     s.scheduler_stage_metrics = None
-    s.disaggregation_mode = DisaggregationMode.NULL
     s.process_pending_chunked_abort = Mock()
     s._process_hicache_events = Mock()
     s.enable_fpm = False

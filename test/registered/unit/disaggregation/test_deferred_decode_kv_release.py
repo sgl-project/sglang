@@ -513,8 +513,8 @@ def _make_queue(timeout=30.0, enable_metrics=False):
         q.metadata_buffers.bootstrap_room.__setitem__(idx, 0)
     )
     q.req_to_metadata_buffer_idx_allocator = _FakeIdxAllocator()
+    q.request_retirer = leaving_retirer()
     q.scheduler = SimpleNamespace(
-        request_retirer=leaving_retirer(),
         enable_decode_hicache=False,
         enable_hisparse=False,
         output_streamer=MagicMock(),
@@ -578,7 +578,7 @@ class TestResolveDeferredReleases(CustomTestCase):
         queue._defer_release(entry)
         self.assertEqual(list(queue._deferred_releases.items())[0][-1], 0)
         queue.resolve_deferred_releases()
-        queue.scheduler.request_retirer.release.assert_called_once_with(
+        queue.request_retirer.release.assert_called_once_with(
             entry.req, checkpoint=False
         )
         self.assertEqual(list(queue._deferred_releases.items()), [])
@@ -597,7 +597,7 @@ class TestResolveDeferredReleases(CustomTestCase):
             generations[room] = mgr.register_deferred_abort_room(room)
             move([entry], q.queue)
             q._defer_release(entry)
-        release = q.scheduler.request_retirer.release
+        release = q.request_retirer.release
         with (
             patch("torch.distributed.get_world_size", return_value=2),
             patch("torch.distributed.all_reduce") as reduce,
@@ -631,7 +631,7 @@ class TestResolveDeferredReleases(CustomTestCase):
         ):
             move([dreq], q.queue)
             q._defer_release(dreq)
-            rel = q.scheduler.request_retirer.release
+            rel = q.request_retirer.release
             # Not yet acked -> held, not released.
             q.resolve_deferred_releases()
             rel.assert_not_called()
@@ -671,9 +671,7 @@ class TestResolveDeferredReleases(CustomTestCase):
 
         with patch.object(decode_mod.time, "monotonic", return_value=42.0):
             q.resolve_deferred_releases()
-        q.scheduler.request_retirer.release.assert_called_once_with(
-            dreq.req, checkpoint=False
-        )
+        q.request_retirer.release.assert_called_once_with(dreq.req, checkpoint=False)
 
         self.assertEqual(list(q._deferred_releases.items()), [])
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [idx])
@@ -692,7 +690,7 @@ class TestResolveDeferredReleases(CustomTestCase):
         move([(bad, 10.0, float("-inf"), 2, 1)], q._deferred_releases)
         move([(good, 10.0, float("-inf"), 1, 1)], q._deferred_releases)
 
-        retirer = q.scheduler.request_retirer
+        retirer = q.request_retirer
         leave = retirer.release.side_effect
 
         def release(req, *, checkpoint):
@@ -856,7 +854,7 @@ def _make_pop_queue():
 
 def _released(q):
     """The requests the queue released, in order."""
-    return [c.args[0] for c in q.scheduler.request_retirer.release.call_args_list]
+    return [c.args[0] for c in q.request_retirer.release.call_args_list]
 
 
 def _make_failed_req(mgr, room, idx, abort_notified, notifiable=True):
@@ -1088,7 +1086,7 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         rooms = {10}
         q.enable_staging = True
         q._poll_with_staging = q._poll_with_metadata_gate
-        release = q.scheduler.request_retirer.release
+        release = q.request_retirer.release
         q.staging_handler = SimpleNamespace(
             is_staging_room=lambda room: room in rooms,
             unregister_decode_req=lambda room: (
@@ -1116,7 +1114,7 @@ class TestHiSparseDestinationFollowsTheHold(CustomTestCase):
 
     def _queue(self, mgr, log):
         q = _make_pop_queue()
-        q.scheduler.request_retirer = release_only_retirer(
+        q.request_retirer = release_only_retirer(
             q.tree_cache,
             SimpleNamespace(
                 release_request=lambda req: log.append(("hisparse", req.rid))
@@ -1131,7 +1129,7 @@ class TestHiSparseDestinationFollowsTheHold(CustomTestCase):
         )
         with (
             patch.object(decode_mod, "prepare_abort", side_effect=abort),
-            patch.object(q.scheduler.request_retirer, "_detach"),
+            patch.object(q.request_retirer, "_detach"),
             patch.object(retirer_mod, "release_kv_cache", side_effect=release),
         ):
             q.move_transferred(IndexedReqList(ListKind.WAITING))

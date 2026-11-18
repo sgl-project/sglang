@@ -5,11 +5,14 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
@@ -51,9 +54,9 @@ class _RunningBatch:
 
 class TestDpConvertedBatchFull(unittest.TestCase):
     def _scheduler(self, seen):
+        enter_scope(self, published_topology())
         s = Scheduler.__new__(Scheduler)
         s.scheduler_stage_metrics = None
-        s.disaggregation_mode = DisaggregationMode.NULL
         s.process_pending_chunked_abort = Mock()
         s._process_hicache_events = Mock()
         s.enable_fpm = False

@@ -72,9 +72,7 @@ class _BatchBuilt(Exception):
 
 
 class TestHeldRowAdmission(CustomTestCase):
-    def _scheduler(
-        self, disaggregation_mode, running, final_chunk, waiting, adder_class=_Adder
-    ):
+    def _scheduler(self, running, final_chunk, waiting, adder_class=_Adder):
         s = Scheduler.__new__(Scheduler)
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.enable_priority_preemption = False
@@ -98,7 +96,6 @@ class TestHeldRowAdmission(CustomTestCase):
             model_runner=SimpleNamespace(attn_backend=SimpleNamespace())
         )
         s.get_prefill_adder_class = lambda: adder_class
-        s.request_retirer = None
         s.page_size = 1
         s.tree_cache = SimpleNamespace(
             buffer_pipeline=None, storage_prefetch_retries=None
@@ -114,7 +111,6 @@ class TestHeldRowAdmission(CustomTestCase):
         s.max_running_requests = NUM_ROWS
         s.dllm_config = None
         s.enable_lora = False
-        s.disaggregation_mode = disaggregation_mode
         s.disagg_prefill_bootstrap_queue = None
         s.disagg_prefill_transfer_queue = []
         s.enable_hicache_storage = False
@@ -140,13 +136,16 @@ class TestHeldRowAdmission(CustomTestCase):
         final_chunk = _Req(holds_row=True)
         waiting = _Req(holds_row=False)
         running_batch = ScheduleBatch(reqs=running)
-        s = self._scheduler(disaggregation_mode, running, final_chunk, [waiting])
+        s = self._scheduler(running, final_chunk, [waiting])
 
         def capture(can_run_list, *args, **kwargs):
             raise _BatchBuilt(list(can_run_list))
 
         with (
-            get_context().override_server_args(pp_max_micro_batch_size=NUM_ROWS),
+            get_context().override_server_args(
+                pp_max_micro_batch_size=NUM_ROWS,
+                disaggregation_mode=disaggregation_mode.value,
+            ),
             patch.object(ScheduleBatch, "init_new", side_effect=capture),
             patch("sglang.srt.managers.scheduler.set_time_batch"),
         ):
@@ -173,9 +172,7 @@ class TestHeldRowAdmission(CustomTestCase):
         parked = _Req(holds_row=True)
         waiting = _Req(holds_row=False)
         running_batch = ScheduleBatch(reqs=running)
-        s = self._scheduler(
-            DisaggregationMode.NULL, running, parked, [waiting], _ParkingAdder
-        )
+        s = self._scheduler(running, parked, [waiting], _ParkingAdder)
         with (
             get_context().override_server_args(pp_max_micro_batch_size=NUM_ROWS),
             patch.object(ScheduleBatch, "init_new", side_effect=_BatchBuilt),
@@ -207,9 +204,7 @@ class TestBoundedV2SkippedAdmission(TestHeldRowAdmission):
                     req.finished = lambda: False
                     req.cache_request_handle = req
                     req.time_stats = Mock()
-                s = self._scheduler(
-                    DisaggregationMode.NULL, running, final_chunk, waiting
-                )
+                s = self._scheduler(running, final_chunk, waiting)
                 s.policy = SchedulePolicy(
                     "lpm", RadixCache.create_simulated(), False, False, False
                 )

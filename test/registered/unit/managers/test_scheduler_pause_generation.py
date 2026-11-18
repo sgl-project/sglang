@@ -123,7 +123,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.req_to_token_pool = MagicMock()
         scheduler.hisparse_coordinator = MagicMock()
         scheduler.result_queue = deque()
-        scheduler.disaggregation_mode = DisaggregationMode.NULL
         # Support _kv_snap diagnostic logging in patched schedulers
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.token_to_kv_pool_allocator.available_size.return_value = 1000
@@ -138,7 +137,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                 full_evictable_size=0,
             )
         )
-        scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.hisparse_coordinator = None
         scheduler.decode_offload_manager = None
         scheduler.disagg_prefill_bootstrap_queue = None
@@ -279,7 +277,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         return req, frees
 
     def _retract_by_pause(self, scheduler: Scheduler, req: Req):
-        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        get_context().override("test", disaggregation_mode="decode")
         scheduler.disagg_decode_prealloc_queue = MagicMock()
         scheduler.running_batch = self._make_batch(
             scheduler, reqs=[req], with_tensors=True
@@ -395,7 +393,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.draft_worker = None
         scheduler.request_receiver = object.__new__(SchedulerRequestReceiver)
         scheduler.deferred_responses = DeferredResponses(
-            disaggregation_mode=DisaggregationMode.NULL,
             output_streamer=None,
             request_retirer=None,
             send_abort=None,
@@ -573,7 +570,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
     def test_retract_disagg_prefill_excludes_last_batch(self):
         """retract under disagg prefill must not release or requeue last extend reqs."""
         scheduler = self._new_scheduler()
-        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        get_context().override("test", disaggregation_mode="prefill")
         run_req = self._make_req("run")
         last_req = self._make_req("last")
         scheduler.running_batch = self._make_batch(
@@ -653,7 +650,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
     def test_retract_disagg_prefill_keeps_live_chunked_req(self):
         """disagg-PREFILL retract must leave a live mid-chunk chunked_req untouched."""
         scheduler = self._new_scheduler()
-        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        get_context().override("test", disaggregation_mode="prefill")
         scheduler._add_request_to_queue = MagicMock()
         scheduler.last_batch = None
 
@@ -679,7 +676,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             with self.subTest(mode=mode):
                 scheduler = self._new_scheduler()
                 scheduler.enable_overlap = True
-                scheduler.disaggregation_mode = mode
+                get_context().override("test", disaggregation_mode=mode.value)
                 batch = ScheduleBatch(reqs=[], forward_mode=ForwardMode.EXTEND)
                 result = SimpleNamespace(delay_sample_func=None)
                 scheduler.last_batch = batch
@@ -696,7 +693,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         """A transferred request waiting for a running slot holds a request row
         and KV; retract must rebuild it too, so a paused flush cannot free it."""
         scheduler = self._new_scheduler()
-        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        get_context().override("test", disaggregation_mode="decode")
         scheduler.disagg_decode_prealloc_queue = MagicMock()
         held = IndexedReqList(ListKind.PD_HELD)
         scheduler.disagg_decode_prealloc_queue.hold_rebootstrap.side_effect = (
@@ -735,7 +732,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                 scheduler.disagg_decode_prealloc_queue = MagicMock()
                 requeue_log = self._spy_requeue(scheduler)
                 if decode:
-                    scheduler.disaggregation_mode = DisaggregationMode.DECODE
                     get_context().override("test", disaggregation_mode="decode")
                 plain, sent, unsent = map(self._make_req, ("plain", "sent", "unsent"))
                 for req in (plain, sent, unsent):
@@ -873,7 +869,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
     def test_pd_decode_continue_releases_held_rebootstrap(self):
         """continue_generation must enqueue staged rebootstrap reqs on resume."""
         scheduler = self._new_scheduler()
-        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        get_context().override("test", disaggregation_mode="decode")
         scheduler.disagg_decode_prealloc_queue = MagicMock()
         scheduler.pause_state = PauseState()
         scheduler.pause_state.pause()
@@ -887,7 +883,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
     def test_pd_decode_abort_finishes_a_held_rebootstrap(self):
         scheduler = self._new_scheduler()
-        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        get_context().override("test", disaggregation_mode="decode")
         prealloc_queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         prealloc_queue.scheduler = scheduler
         prealloc_queue.queue = IndexedReqList(ListKind.PD_PREALLOC)
@@ -907,6 +903,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.send_abort_output = MagicMock()
         scheduler.beam_coordinator = MagicMock()
         scheduler.init_request_retirer()
+        prealloc_queue.request_retirer = scheduler.request_retirer
         scheduler.enable_continuous_input_polling = False
         scheduler.pause_state = PauseState()
         scheduler.pause_state.pause()
@@ -937,6 +934,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.init_request_retirer()
         prealloc_queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         prealloc_queue.scheduler = scheduler
+        prealloc_queue.request_retirer = scheduler.request_retirer
         prealloc_queue.retracted_queue = IndexedReqList(
             ListKind.PD_RETRACTED, abort=prealloc_queue._abort_retracted
         )

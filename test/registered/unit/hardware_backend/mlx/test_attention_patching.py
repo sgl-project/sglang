@@ -1209,7 +1209,6 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         tree_cache = object()
         processor = SchedulerBatchResultProcessor(
             is_generation=True,
-            disaggregation_mode=None,
             model_config=None,
             token_to_kv_pool_allocator=None,
             tree_cache=tree_cache,

@@ -738,7 +738,7 @@ class TestPrefillAdder(CustomTestCase):
 
         new_req = self.create_mock_req("new1", priority=1, max_new_tokens=49)
 
-        success = adder.preempt_to_schedule(new_req)
+        success = adder.preempt_to_schedule(new_req, MagicMock())
 
         self.assertTrue(success)
         self.assertIn(running_reqs[0], adder.preempt_list)
@@ -1034,7 +1034,7 @@ class TestPrefillAdder(CustomTestCase):
 
         new_req = self.create_mock_req("new1", priority=1, max_new_tokens=49)
 
-        success = adder.preempt_to_schedule(new_req)
+        success = adder.preempt_to_schedule(new_req, MagicMock())
 
         self.assertTrue(success)
         self.assertIn(running_reqs[2], adder.preempt_list)
@@ -1069,7 +1069,7 @@ class TestPrefillAdder(CustomTestCase):
         )
 
         success_by_priority_check = adder.preempt_to_schedule(
-            new_req_fail_by_priority_check
+            new_req_fail_by_priority_check, MagicMock()
         )
         self.assertFalse(success_by_priority_check)
 
@@ -1077,7 +1077,7 @@ class TestPrefillAdder(CustomTestCase):
             "new2", priority=1, max_new_tokens=110
         )
         success_by_capacity_check = adder.preempt_to_schedule(
-            new_req_fail_by_priority_check
+            new_req_fail_by_priority_check, MagicMock()
         )
         self.assertFalse(success_by_capacity_check)
 
@@ -1107,7 +1107,7 @@ class TestPrefillAdder(CustomTestCase):
         )
 
         success_by_priority_check = adder.preempt_to_schedule(
-            new_req_fail_by_priority_check
+            new_req_fail_by_priority_check, MagicMock()
         )
         self.assertFalse(success_by_priority_check)
 
@@ -1115,7 +1115,7 @@ class TestPrefillAdder(CustomTestCase):
             "new2", priority=-1, max_new_tokens=110
         )
         success_by_capacity_check = adder.preempt_to_schedule(
-            new_req_fail_by_priority_check
+            new_req_fail_by_priority_check, MagicMock()
         )
         self.assertFalse(success_by_capacity_check)
 
@@ -1142,7 +1142,7 @@ class TestPrefillAdder(CustomTestCase):
         first_req = self.create_mock_req(
             "new_req_prio_1", priority=1, max_new_tokens=49
         )
-        first_success = adder.preempt_to_schedule(first_req)
+        first_success = adder.preempt_to_schedule(first_req, MagicMock())
         self.assertTrue(first_success)
         self.assertIn(running_reqs[0], adder.preempt_list)
         self.assertEqual(adder.memory_budget.total_offset, 175)
@@ -1153,7 +1153,7 @@ class TestPrefillAdder(CustomTestCase):
         second_req = self.create_mock_req(
             "second_new_req_prio_1", priority=1, max_new_tokens=76
         )
-        second_success = adder.preempt_to_schedule(second_req)
+        second_success = adder.preempt_to_schedule(second_req, MagicMock())
 
         self.assertFalse(second_success)
         self.assertEqual(adder.memory_budget.total_offset, 175)
@@ -1185,7 +1185,7 @@ class TestPrefillAdder(CustomTestCase):
 
         new_req = self.create_mock_req("new1", priority=1, max_new_tokens=75)
 
-        success = adder.preempt_to_schedule(new_req)
+        success = adder.preempt_to_schedule(new_req, MagicMock())
         self.assertTrue(success)
         self.assertIn(running_reqs[2], adder.preempt_list)
         self.assertEqual(
@@ -1218,7 +1218,7 @@ class TestPrefillAdder(CustomTestCase):
 
         new_req = self.create_mock_req("new1", priority=1, max_new_tokens=200)
 
-        success = adder.preempt_to_schedule(new_req)
+        success = adder.preempt_to_schedule(new_req, MagicMock())
         self.assertTrue(success)
         self.assertIn(running_reqs[2], adder.preempt_list)
         self.assertIn(running_reqs[3], adder.preempt_list)
@@ -1563,9 +1563,7 @@ class TestPrefillAdder(CustomTestCase):
         for shard_size in (1, 2, 4):
             capacity = shard_size * tokens_per_rank
             queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
-            queue.scheduler = SimpleNamespace(
-                request_retirer=SimpleNamespace(retire_unadmitted=MagicMock())
-            )
+            queue.request_retirer = SimpleNamespace(retire_unadmitted=MagicMock())
             queue.max_input_len = max_bootstrap_input_len(
                 capacity=capacity, page_size=page_size, shard_size=shard_size
             )
@@ -2590,7 +2588,9 @@ class TestPrefillAdder(CustomTestCase):
                 adder.chunked_req_waits = waits
                 new_req = self.create_mock_req("new", priority=1, max_new_tokens=49)
                 # Without a waiting chunk the same request preempts run1.
-                self.assertEqual(adder.preempt_to_schedule(new_req), not waits)
+                self.assertEqual(
+                    adder.preempt_to_schedule(new_req, MagicMock()), not waits
+                )
                 self.assertEqual(adder.preempt_list, [] if waits else [running[0]])
 
     def test_mamba_chunk_continuation_does_not_charge_restored_state_again(self):

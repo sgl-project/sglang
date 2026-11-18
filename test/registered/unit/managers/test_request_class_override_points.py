@@ -13,11 +13,15 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     GenerateReqInput,
@@ -65,7 +69,6 @@ def _scheduler(sessions, queued):
     scheduler = Scheduler.__new__(_TaggedScheduler)
     scheduler.session_controller = sessions
     scheduler.enable_session_radix_cache = False
-    scheduler.disaggregation_mode = DisaggregationMode.NULL
     scheduler.model_config = SimpleNamespace(hf_eos_token_id=None, vocab_size=VOCAB)
     scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
     scheduler.kv_events_publisher = SimpleNamespace(enable_kv_cache_events=False)
@@ -99,6 +102,7 @@ def _recv(rid, session_params=None):
 class TestRequestClassOverridePoints(CustomTestCase):
     def test_scheduler_builds_every_generation_request_through_the_factory(self):
         """Plain, session, and unknown-session paths all yield the subclass."""
+        enter_scope(self, published_topology())
         live = Session(capacity_of_str_len=0, session_id="live", streaming=True)
         paths = {
             "plain": (None, {}),
