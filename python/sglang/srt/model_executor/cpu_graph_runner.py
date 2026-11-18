@@ -29,6 +29,7 @@ import torch
 import torch.nn.functional as F
 import tqdm
 
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -1047,11 +1048,20 @@ class CPUGraphRunner:
     prefill_dynamic_graph: Optional[Callable] = None
     prefill_dynamic_graph_bs1: Optional[Callable] = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
+    use_mla: bool = False
 
     def __init__(self, model_runner: ModelRunner):
         # Parse args
         self.model_runner = model_runner
         self.device = model_runner.device
+        self.use_mla = bool(
+            getattr(model_runner, "use_mla_backend", False)
+            or (
+                hasattr(model_runner, "model_config")
+                and getattr(model_runner.model_config, "attention_arch", None)
+                == AttentionArch.MLA
+            )
+        )
         # Decode steps (and hence decode graphs) only exist for generation
         # models -- embedding/reward/classification models only ever run
         # EXTEND. Gate the decode-only setup below on this instead of
@@ -2400,6 +2410,18 @@ class CPUGraphRunner:
             return False
         if forward_batch.batch_size > self.prefill_max_bs:
             return False
+        if self.use_mla:
+            # MLA models on CPU compile prefill graphs using the MHA companion
+            # path, which assumes pure prefill (no cached prefix). A prefix cache
+            # hit (extend_prefix_lens > 0) requires absorbed MLA over the latent
+            # KV pool, which cannot run via the compiled MHA prefill graph.
+            # Reject here to safely fall back to eager MLA.
+            if forward_batch.extend_prefix_lens_cpu is not None:
+                if any(forward_batch.extend_prefix_lens_cpu):
+                    return False
+            elif forward_batch.extend_prefix_lens is not None:
+                if bool((forward_batch.extend_prefix_lens > 0).any()):
+                    return False
 
         raw_num_tokens = forward_batch.input_ids.shape[0]
         if forward_batch.contains_mm_inputs():
