@@ -448,7 +448,7 @@ jobs:
   nightly-poc-multi-node-accuracy-odd-day:
     name: multi-node-poc-accuracy-odd-day
     if: ${{ !cancelled() && needs.set-image-config.outputs.accuracy_date_parity == 'odd' && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-accuracy-odd-day,')) }}
-    needs: [set-image-config, nightly-poc-multi-node-tests]
+    needs: [set-image-config, nightly-poc-multi-node-tests, sgl-router-build-aarch64]
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -480,7 +480,7 @@ jobs:
   nightly-poc-multi-node-accuracy-even-day:
     name: multi-node-poc-accuracy-even-day
     if: ${{ !cancelled() && needs.set-image-config.outputs.accuracy_date_parity == 'even' && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-accuracy-even-day,')) }}
-    needs: [set-image-config, nightly-poc-multi-node-tests]
+    needs: [set-image-config, nightly-poc-multi-node-tests, sgl-router-build-aarch64]
     strategy:
       fail-fast: false
       max-parallel: 1
