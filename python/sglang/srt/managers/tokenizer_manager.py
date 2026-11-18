@@ -2184,6 +2184,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
         is_stream = getattr(obj, "stream", False)
+        # 0.0 polls on the first output, catching a client lost while queued.
+        next_disconnect_poll = 0.0
         while True:
             try:
                 if request is None:
@@ -2283,17 +2285,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 yield out
                 break
 
+            # is_disconnected() costs an event-loop pass, so poll at most once per wait
+            # timeout; StreamingResponse cancels a disconnected stream without polling.
+            now = time.monotonic()
             if (
                 request is not None
                 and not obj.background
-                and await request.is_disconnected()
+                and now >= next_disconnect_poll
             ):
-                # Abort the request for disconnected requests (running)
-                self.abort_request(obj.rid)
-                # Use exception to kill the whole call stack and asyncio task
-                raise ValueError(
-                    f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
-                )
+                next_disconnect_poll = now + _REQUEST_STATE_WAIT_TIMEOUT
+                if await request.is_disconnected():
+                    # Abort the request for disconnected requests (running)
+                    self.abort_request(obj.rid)
+                    # Use exception to kill the whole call stack and asyncio task
+                    raise ValueError(
+                        f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
+                    )
 
             if is_stream:
                 # Record response sent time right before we send response.
