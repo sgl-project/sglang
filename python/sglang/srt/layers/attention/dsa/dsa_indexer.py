@@ -150,6 +150,7 @@ else:
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
+_use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 _is_gfx1250_supported = is_gfx1250_supported()
 # Whether the aiter preshuffle paged-MQA path (page_size=64 + Preshuffle=True +
 # KVBlockSize=64) can be used. Falls back to the legacy page_size=1 / KVBlockSize=1
@@ -475,7 +476,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self.k_norm = RMSNorm(self.head_dim, **k_norm_eps_kwargs)
         else:
             k_norm_cls = LayerNorm
-            if _is_hip and getattr(config, "index_k_norm_fp32", False):
+            if _is_gfx95_supported and getattr(config, "index_k_norm_fp32", False):
                 # Kimi-K3.1's fp32 index k_norm runs in one launch on gfx950
                 from sglang.srt.layers.attention.dsa.dsa_indexer_hip import (
                     Fp32LayerNormHip as k_norm_cls,
@@ -1680,7 +1681,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             return torch.cat(logits_chunks, dim=0)
 
         # verify_shares_index_k's 64-key pages imply AITER's preshuffled layout
-        if _use_aiter and dsa_indexer_hip.verify_shares_index_k(
+        if _use_aiter_gfx95 and dsa_indexer_hip.verify_shares_index_k(
             forward_batch, q_fp8, block_tables, page_size, q_offset, B, next_n, dcp_size
         ):
             logits = dsa_indexer_hip.verify_paged_mqa_logits(
@@ -1697,7 +1698,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     dtype=torch.int32,
                     device=q_fp8.device,
                 )
-            # under DCP, block_tables cover only this rank's index-K shard
+            # under DCP (gfx950), block_tables cover only this rank's index-K shard
             row_lens = seqlens_32_2d.view(-1) if dcp_size > 1 else seqlens_32
             schedule = None
             if _use_aiter_preshuffle and envs.SGLANG_DSA_MQA_PERSISTENT_SCHEDULE.get():
@@ -1810,10 +1811,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         # Graph capture cannot sync the host; use the static guard and do not
         # cache it, so the first eager prefill still measures the real budget.
-        # ROCm breakable-graph replay keeps the capture mode on while this runs eagerly.
+        # gfx950 breakable-graph replay keeps the capture mode on while this runs eagerly.
         if (
             torch.cuda.is_current_stream_capturing()
-            if _is_hip
+            if _is_gfx95_supported
             else get_is_capture_mode()
         ):
             return mqa_logits_static_budget_bytes(device_index=device_index)
@@ -2442,7 +2443,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     )
             return
 
-        assert dcp_size == 1 or _use_aiter, (
+        assert dcp_size == 1 or _use_aiter_gfx95, (
             "DSA index-K writes under DCP need the CUDA fused store"
         )
 
