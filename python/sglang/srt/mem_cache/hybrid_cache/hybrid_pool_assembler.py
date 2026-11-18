@@ -57,6 +57,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import (
     tree_slot_ids,
 )
 from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
+from sglang.srt.utils import is_gfx95_supported
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -1125,7 +1126,9 @@ def build_mamba_host_pool(
         (draft_info,) = draft_pool.get_device_pool_infos()
         draft_info.buffer_info.validate(layer_ids=draft_info.layer_ids)
         draft_buffer_infos.append(draft_info.buffer_info)
-    mamba_host_ratio = envs.SGLANG_HICACHE_MAMBA_HOST_RATIO.get()
+    mamba_host_ratio = (
+        envs.SGLANG_HICACHE_MAMBA_HOST_RATIO.get() if is_gfx95_supported() else None
+    )
     return MambaPoolHost(
         pool_info.buffer_info,
         get_memory().hicache_ratio if mamba_host_ratio is None else mamba_host_ratio,
