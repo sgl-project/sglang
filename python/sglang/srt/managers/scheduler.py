@@ -414,6 +414,7 @@ from sglang.srt.utils import (
     DynamicGradMode,
     configure_gc_logging,
     configure_logger,
+    disable_transparent_hugepages,
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -7071,6 +7072,8 @@ def configure_scheduler_process(
     # Set cpu affinity to this gpu process
     if envs.SGLANG_SET_CPU_AFFINITY.get():
         set_gpu_proc_affinity(gpu_id)
+    if envs.SGLANG_DISABLE_THP.get():
+        disable_transparent_hugepages()
     if not envs.SGLANG_NUMA_BIND_V2.get():
         numa_node = get_numa_node_if_available(server_args, gpu_id)
         if numa_node is not None:
