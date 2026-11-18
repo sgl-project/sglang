@@ -25,8 +25,13 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
 )
+from sglang.srt.managers.io_struct import (
+    AbortReq,
+    CloseSessionReqInput,
+    OpenSessionReqInput,
+)
 from sglang.srt.managers.req_types import FINISH_LENGTH
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch, release_req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -42,12 +47,15 @@ from sglang.srt.managers.scheduler_components.request_list import (
 )
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context, get_disagg
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_override
@@ -67,10 +75,11 @@ class _Receiver:
     abort_notified = True
     kv_mgr = SimpleNamespace(enable_deferred_decode_kv_release=False)
 
-    def __init__(self, node, room, done_at):
+    def __init__(self, node, room, done_at, token=TOKEN):
         self.node = node
         self.room = room
         self.done_at = done_at
+        self.token = token
         self.decode_req = None
         self.prefill_info = None
         self.landed = False
@@ -81,7 +90,7 @@ class _Receiver:
         if not self.landed:
             idx = self.decode_req.metadata_buffer_index
             self.node.metadata_buffers.bootstrap_room[idx, 0] = self.room
-            self.node.metadata_buffers.output_ids[idx, 0] = TOKEN
+            self.node.metadata_buffers.output_ids[idx, 0] = self.token
             self.landed = True
         return KVPoll.Success
 
@@ -101,7 +110,7 @@ class _Receiver:
 class _DecodeNode:
     """A single-rank PD decode scheduler: real queues, pools, batches and retraction."""
 
-    def __init__(self, pool_size):
+    def __init__(self, pool_size, *, radix_cache=False):
         self.pool_size = pool_size
         self.step_count = 0
         self.retractions = []
@@ -142,7 +151,7 @@ class _DecodeNode:
         )
         self.tree_cache = UnifiedRadixCache(
             CacheInitParams(
-                disable=True,
+                disable=not radix_cache,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.allocator,
                 page_size=1,
@@ -465,6 +474,179 @@ class TestDecodeRetractionTransferProgress(CustomTestCase):
         )
         self.assertEqual(node.retractions, [])
         self._assert_all_finished(node, reqs)
+
+    def _streaming_turn(self):
+        node = _DecodeNode(SMALL_POOL, radix_cache=True)
+        free_rows = node.req_to_token_pool.available_size()
+        sessions = SessionController(node.tree_cache)
+        sessions.open(
+            OpenSessionReqInput(
+                capacity_of_str_len=32, session_id="session", streaming=True
+            )
+        )
+        req = node.arrive("turn", prompt_len=8, max_new_tokens=8, done_at=0)
+        req.session = sessions.get("session")
+        req.session._inflight = True
+        node.step()
+        self._lock_streaming_prefix(node, req)
+        self.assertEqual(node.req_to_token_pool.available_size(), free_rows - 1)
+        return node, sessions, req, free_rows
+
+    def _lock_streaming_prefix(self, node, req):
+        req.refresh_fill_ids()
+        node.tree_cache.checkpoint(req, up_to=len(req.origin_input_ids))
+        self.assertEqual(
+            node.tree_cache.full_protected_size(), len(req.origin_input_ids)
+        )
+
+    def _retract_streaming_turn(self, node, req, free_rows, *, offload_kv):
+        record = req.kv
+        self.assertTrue(
+            release_req(
+                req=req,
+                remaing_req_count=0,
+                tree_cache=node.tree_cache,
+                request_retirer=node.scheduler.request_retirer,
+                offload_kv=offload_kv,
+            )
+        )
+        node.scheduler.running_batch.filter_batch(reqs_to_exclude=req)
+        self.assertIs(req.kv, record)
+        self.assertIsNone(node.tree_cache.session.borrowed_slot(req))
+        self.assertEqual(node.req_to_token_pool.available_size(), free_rows)
+        self.assertEqual(node.tree_cache.full_protected_size(), 0)
+        self.assertEqual(
+            node.tree_cache.full_evictable_size(), len(req.origin_input_ids)
+        )
+        self.assertTrue(req.session._inflight)
+
+    def _finish_and_close_streaming_turn(self, node, sessions, req, free_rows):
+        self.assertIs(node.tree_cache.session.borrowed_slot(req).kv, req.kv)
+        self.assertEqual(node.req_to_token_pool.available_size(), free_rows - 1)
+        self._lock_streaming_prefix(node, req)
+        req.finish_outside_step(FINISH_LENGTH(len(req.output_ids)))
+        node.scheduler.request_retirer.release(req, checkpoint=True)
+        self.assertEqual(node.req_to_token_pool.available_size(), free_rows - 1)
+        sessions.close(CloseSessionReqInput(session_id="session"))
+        self.assertNotIn("session", sessions)
+        self.assertEqual(node.req_to_token_pool.available_size(), free_rows)
+        self.assertEqual(node.tree_cache.full_protected_size(), 0)
+        node.tree_cache.evict(EvictParams(num_tokens=node.pool_size))
+        self.assertEqual(node.allocator.available_size(), node.pool_size)
+
+    def _resume_streaming_turn(self, node, req):
+        queue = node.scheduler.disagg_decode_prealloc_queue
+        queue.add(req, is_retracted=True)
+        self.assertEqual(queue.move_resumed(node.scheduler.waiting_queue), [req])
+        self.assertIsNone(req.kv.retraction_backup)
+        self.assertFalse(queue.retracted_queue)
+
+    def test_streaming_turn_restores_host_backup(self):
+        node, sessions, req, free_rows = self._streaming_turn()
+        pool = node.allocator.get_kvcache()
+        before = node.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, : req.seqlen - 1
+        ].long()
+        pool.k_buffer[0][before] = 2
+        pool.v_buffer[0][before] = 3
+
+        self._retract_streaming_turn(node, req, free_rows, offload_kv=True)
+        self.assertIsNotNone(req.kv.retraction_backup)
+        self._resume_streaming_turn(node, req)
+        after = node.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, : req.seqlen - 1
+        ].long()
+        for buffer, value in ((pool.k_buffer[0], 2), (pool.v_buffer[0], 3)):
+            torch.testing.assert_close(
+                buffer[after], torch.full_like(buffer[after], value)
+            )
+        self._finish_and_close_streaming_turn(node, sessions, req, free_rows)
+
+    def test_streaming_turn_reclaims_host_pool_backup(self):
+        get_context().override(
+            "test", disaggregation_decode_retraction_backup="host_pool"
+        )
+        node, sessions, req, free_rows = self._streaming_turn()
+        cache = node.tree_cache
+        backup = RetractionBackup(host_indices=torch.arange(req.seqlen - 1))
+        event = MagicMock()
+        host_pool = MagicMock()
+
+        def copy_from_host(req, backup):
+            req.kv.restore_done_event = event
+            cache._pending_restore_backups.append((event, backup))
+
+        with (
+            patch.object(cache, "backup_kv_cache", return_value=backup),
+            patch.object(
+                cache, "start_restore_kv_cache", side_effect=copy_from_host
+            ) as restore,
+            patch.object(cache, "host_pool_group", host_pool),
+            patch("sglang.srt.mem_cache.unified_radix_cache.device_module"),
+        ):
+            self._retract_streaming_turn(node, req, free_rows, offload_kv=True)
+            self.assertIs(req.kv.retraction_backup, backup)
+            host_pool.free.assert_not_called()
+            self._resume_streaming_turn(node, req)
+            restore.assert_called_once_with(req, backup)
+            self._finish_and_close_streaming_turn(node, sessions, req, free_rows)
+        event.synchronize.assert_called_once()
+        host_pool.free.assert_called_once_with(backup.host_indices)
+        self.assertFalse(cache._pending_restore_backups)
+
+    def test_closing_a_retracted_streaming_turn_waits_for_abort(self):
+        node, sessions, req, free_rows = self._streaming_turn()
+        self._retract_streaming_turn(node, req, free_rows, offload_kv=True)
+        queue = node.scheduler.disagg_decode_prealloc_queue
+        queue.add(req, is_retracted=True)
+        sessions.close(CloseSessionReqInput(session_id="session"))
+        self.assertTrue(req.session.close_on_finish)
+        self.assertIn("session", sessions)
+        queue._abort_retracted(AbortReq(rid=req.rid))
+        self.assertFalse(queue.retracted_queue)
+        self.assertIsNone(req.kv.retraction_backup)
+        sessions.maybe_reap(now=2)
+        self.assertNotIn("session", sessions)
+        self.assertEqual(node.req_to_token_pool.available_size(), free_rows)
+        self.assertEqual(node.tree_cache.full_protected_size(), 0)
+        node.tree_cache.evict(EvictParams(num_tokens=node.pool_size))
+        self.assertEqual(node.allocator.available_size(), node.pool_size)
+
+    def test_streaming_turn_rebootstraps_with_a_new_kv_row(self):
+        node, sessions, req, free_rows = self._streaming_turn()
+        output_ids = req.output_ids[:]
+        self._retract_streaming_turn(node, req, free_rows, offload_kv=False)
+        self.assertIsNone(req.kv.retraction_backup)
+
+        queue = node.scheduler.disagg_decode_prealloc_queue
+        receiver = _Receiver(node, req.bootstrap_room, node.step_count, token=TOKEN + 1)
+        receiver.init = MagicMock()
+        receiver.send_metadata = MagicMock()
+        queue.kv_manager.submit_prefill_recompute = MagicMock()
+        del queue._publish_destination  # Exercise the real recompute dispatch.
+        queue.hold_rebootstrap(req)
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode.get_kv_class",
+                return_value=lambda **_: receiver,
+            ),
+            patch.object(queue, "_resolve_prefill_dp_rank", return_value=0),
+        ):
+            queue.enqueue_held_rebootstrap()
+        (receiver.decode_req,) = queue.queue.items()
+        self.assertTrue(receiver.decode_req.is_rebootstrap)
+        receiver.decode_req.waiting_for_input = True
+
+        SchedulerDisaggregationDecodeMixin.process_decode_queue(node.scheduler)
+        self.assertEqual(list(node.scheduler.waiting_queue), [req])
+        self.assertEqual(req.output_ids, output_ids)
+        queue.kv_manager.submit_prefill_recompute.assert_called_once()
+        peer, payload = queue.kv_manager.submit_prefill_recompute.call_args.args
+        self.assertIs(peer, receiver)
+        self.assertEqual(
+            payload["input_ids"], list(req.origin_input_ids + output_ids[:-1])
+        )
+        self._finish_and_close_streaming_turn(node, sessions, req, free_rows)
 
 
 if __name__ == "__main__":

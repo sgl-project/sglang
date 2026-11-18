@@ -113,7 +113,8 @@ class RequestRetirer:
 
         # PD decode backs the KV up to host to restore it without recompute; a caller
         # that will rebootstrap passes offload_kv=False to skip the copy.
-        if get_disagg().disaggregation_mode != "decode":
+        pd_decode = get_disagg().disaggregation_mode == "decode"
+        if not pd_decode:
             resumable = req.resumable_by_reprefill
         elif offload_kv:
             resumable = backup_kv_cache(
@@ -127,7 +128,9 @@ class RequestRetirer:
             resumable = req.resumable_by_rebootstrap
         # TODO (csy): for preempted requests, we may want to insert into the tree
         if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, checkpoint=False)
+            release_kv_cache(
+                req, self.tree_cache, checkpoint=False, pd_retraction=pd_decode
+            )
         return resumable
 
     def abort_retracted(self, req: Req, *, reason: FINISH_ABORT) -> None:

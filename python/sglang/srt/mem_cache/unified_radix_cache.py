@@ -1553,6 +1553,14 @@ class UnifiedRadixCache(BasePrefixCache):
             super().free_kv_row(kv, ranges)
 
     def claim_kv_row(self, req: Req) -> bool:
+        return self._claim_kv_row(req, keep_session_kv=True)
+
+    def claim_kv_row_on_pd_retract(self, req: Req) -> bool:
+        if self.session.borrowed_slot(req) is None:
+            return self.claim_kv_row(req)
+        return self._claim_kv_row(req, keep_session_kv=False)
+
+    def _claim_kv_row(self, req: Req, *, keep_session_kv: bool) -> bool:
         if (
             self.linker is not None
             and self.linker.load_mode == "prefetch"
@@ -1566,7 +1574,7 @@ class UnifiedRadixCache(BasePrefixCache):
             and req.finished()
         ):
             self.cache_controller.release_pp_prefetch(req.rid)
-        return self.session.try_cache_finished_req(req)
+        return self.session.try_cache_finished_req(req, keep_session_kv=keep_session_kv)
 
     @rank_consensus(same_params=["req.rid", "checkpointed"])
     def on_release(self, req: Req, *, checkpointed: bool) -> None:

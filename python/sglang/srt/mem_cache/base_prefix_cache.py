@@ -738,6 +738,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         Return True after taking the row; the caller then releases nothing."""
         return False
 
+    def claim_kv_row_on_pd_retract(self, req: Req) -> bool:
+        """Decide whether the cache keeps a row during PD decode retraction."""
+        return self.claim_kv_row(req)
+
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
         """The row is freed and the lock dropped; ``checkpointed`` says whether
         the KV went into the tree first. Drop per-request state kept outside the tree."""

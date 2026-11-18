@@ -382,7 +382,13 @@ def discard_kv_cache_backup(req: Req, tree_cache: BasePrefixCache) -> None:
     req.kv.retraction_backup = None
 
 
-def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool):
+def release_kv_cache(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    *,
+    checkpoint: bool,
+    pd_retraction: bool = False,
+):
     """Give the request's kv row back; with ``checkpoint`` the tree first keeps
     what it can key."""
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
@@ -397,7 +403,12 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
                 tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
             ).release_state_slot(req)
         return
-    if tree_cache.claim_kv_row(req):
+    claimed = (
+        tree_cache.claim_kv_row_on_pd_retract(req)
+        if pd_retraction
+        else tree_cache.claim_kv_row(req)
+    )
+    if claimed:
         # A streaming session detached the kv record to keep the row; the
         # request's network transfers end here as they would with the row.
         assert not req.kv.holds_kv

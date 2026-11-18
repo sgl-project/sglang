@@ -164,11 +164,12 @@ class StreamingSession:
             cache_protected_len=slot.kv.cache_protected_len,
         )
 
-    def try_cache_finished_req(self, req: Req) -> bool:
-        """Keeps a finished or retracted turn's record in the session slot.
+    def try_cache_finished_req(self, req: Req, *, keep_session_kv: bool = True) -> bool:
+        """Keeps a turn's record in the session slot when requested.
         An aborted turn gets the record and the tree lock back and is released
         like any request (returns False); the session re-prefills from its
-        last finished request next turn."""
+        last finished request next turn. PD retraction returns the active row
+        without ending the turn."""
         if (
             self.uocr_doc_reuse is not None
             and self.uocr_doc_reuse.on_cache_finished_req(req)
@@ -181,12 +182,15 @@ class StreamingSession:
 
         slot = self.borrowed_slot(req)
         assert slot is not None, f"streaming {req.rid=} does not run on its slot"
-        if isinstance(req.finished_reason, FINISH_ABORT):
-            # Hand the record and the tree lock back; the caller releases them.
+        aborting = isinstance(req.finished_reason, FINISH_ABORT)
+        if aborting or not keep_session_kv:
+            # PD retraction releases the row but keeps the turn in flight and the
+            # backup on the request's record.
             del self.slots[req.session.session_id]
             req.lock, slot.lock = slot.lock, None
-            req.release_mm_inputs_on_abort()
-            req.session.abort_req()
+            if aborting:
+                req.release_mm_inputs_on_abort()
+                req.session.abort_req()
             return False
 
         finished_len = (
