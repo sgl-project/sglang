@@ -20,8 +20,10 @@ import platform
 import shutil
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import AbstractSet, Dict, List, Optional, Sequence, Tuple
+from uuid import UUID
 
 import numpy as np
 import torch
@@ -76,31 +78,36 @@ def current_model() -> ModelContext:
     return _MODEL
 
 
+def _host_boot_id() -> Optional[str]:
+    """Identify the Linux kernel independently of the container's hostname or IPC."""
+    try:
+        return str(UUID(Path("/proc/sys/kernel/random/boot_id").read_text().strip()))
+    except (OSError, ValueError):
+        return None
+
+
 def _local_tp_size() -> int:
     """TP ranks sharing this host's RAM, measured once before allocating host stores."""
-    from sglang.srt.distributed.parallel_state import in_the_same_node_as
     from sglang.srt.runtime_context import get_parallel
 
     model = current_model()
     if model.local_tp_size is None:
-        model.local_tp_size = 1
         parallel = get_parallel()
-        if parallel.tp_size > 1:
+        if parallel.tp_size == 1 or parallel.nnodes == 1:
+            # With PP=1 the single-node launcher places every TP rank on this host.
+            model.local_tp_size = parallel.tp_size
+        else:
             group = parallel.tp_group
-            remaining = set(range(group.world_size))
-            # Every rank must probe the same sources, including ranks whose host has
-            # already been found. Global TP size would overcharge multi-node hosts.
-            while remaining:
-                source = min(remaining)
-                same = in_the_same_node_as(group.cpu_group, source_rank=source)
-                peers = {rank for rank in remaining if same[rank]}
-                if source not in peers:
-                    raise RuntimeError(
-                        "Paged experts: cannot determine TP host membership"
-                    )
-                if group.rank_in_group in peers:
-                    model.local_tp_size = len(peers)
-                remaining -= peers
+            # Everyone gathers a result, even when the local proc file cannot be read.
+            # Isolated /dev/shm namespaces on the same kernel still share a RAM budget.
+            host_ids = group.all_gather_object(_host_boot_id())
+            if None in host_ids:
+                raise RuntimeError(
+                    "Paged experts: cannot determine the host-memory budget because a TP "
+                    "rank could not read its Linux kernel boot ID from "
+                    "/proc/sys/kernel/random/boot_id"
+                )
+            model.local_tp_size = host_ids.count(host_ids[group.rank_in_group])
     return model.local_tp_size
 
 

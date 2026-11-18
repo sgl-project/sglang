@@ -1081,7 +1081,7 @@ class ExecMoe(msgspec.Struct):
         "Keep only --paged-experts-num-resident (K) routed experts per MoE layer on the GPU and "
         "page the rest from pinned host memory on demand. TP is supported for unquantized BF16 "
         "experts on the triton runner (other supported configurations: see the Paged Experts "
-        "docs); requires --ep-size, --pp-size, --dp-size and --attn-dp-size 1, and "
+        "docs); requires --ep-size, --pp-size, --dp-size, --attn-dp-size and --attn-cp-size 1, and "
         "--tp-size 1 with --paged-experts-enable-disk. "
         "Decode CUDA graphs (full backend) are captured up to K // top_k requests; prefill "
         "graphs must be breakable or disabled.",

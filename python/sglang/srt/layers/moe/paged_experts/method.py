@@ -493,7 +493,7 @@ def check_paged_experts_compat(layer, expert_format) -> None:
 
     problems = []
     parallel = get_parallel()
-    for name in ("ep_size", "pp_size", "dp_size", "attn_dp_size"):
+    for name in ("ep_size", "pp_size", "dp_size", "attn_dp_size", "attn_cp_size"):
         if getattr(parallel, name) > 1:
             problems.append(f"--{name.replace('_', '-')} must be 1 with paged experts")
     if parallel.tp_size > 1:

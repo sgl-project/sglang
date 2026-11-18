@@ -1203,7 +1203,12 @@ class TestCompat(CustomTestCase):
             top_k=TOP_K, num_fused_shared_experts=0, params_dtype=params_dtype
         )
         parallel = SimpleNamespace(
-            tp_size=tp_size, ep_size=1, pp_size=1, dp_size=1, attn_dp_size=1
+            tp_size=tp_size,
+            ep_size=1,
+            pp_size=1,
+            dp_size=1,
+            attn_dp_size=1,
+            attn_cp_size=1,
         )
         for name, size in (parallel_sizes or {}).items():
             setattr(parallel, name, size)
@@ -1249,7 +1254,7 @@ class TestCompat(CustomTestCase):
         self._check(expert_format=formats.Fp8BlockFormat())
 
     def test_tp_keeps_other_parallel_modes_rejected(self):
-        for name in ("ep_size", "pp_size", "dp_size", "attn_dp_size"):
+        for name in ("ep_size", "pp_size", "dp_size", "attn_dp_size", "attn_cp_size"):
             with self.subTest(name):
                 with self.assertRaisesRegex(
                     RuntimeError, f"--{name.replace('_', '-')}"
@@ -2743,12 +2748,15 @@ class TestDiskTierGuards(CustomTestCase):
 
 
 class TestTpHostBudget(CustomTestCase):
-    def _rows(self, hosts, rank, budget_gb, num_resident=K):
+    def _rows(self, hosts, rank, budget_gb, num_resident=K, *, nnodes=None):
         from sglang.srt.layers.moe.paged_experts import method as method_module
 
-        group = SimpleNamespace(
-            world_size=len(hosts), rank_in_group=rank, cpu_group=object()
-        )
+        def gather(boot_id):
+            self.assertEqual(boot_id, hosts[rank])
+            return hosts
+
+        group = SimpleNamespace(rank_in_group=rank, all_gather_object=gather)
+        nnodes = len(set(hosts)) if nnodes is None else nnodes
         exec_ctx = SimpleNamespace(
             moe=SimpleNamespace(
                 paged_experts_host_memory_gb=budget_gb, paged_experts_enable_disk=False
@@ -2758,17 +2766,12 @@ class TestTpHostBudget(CustomTestCase):
             patch.object(disk_tier, "_MODEL", disk_tier.ModelContext()),
             patch.object(method_module, "get_exec", return_value=exec_ctx),
             patch("sglang.srt.runtime_context.get_exec", return_value=exec_ctx),
-            get_parallel().override(tp_size=len(hosts), tp_group=group),
+            get_parallel().override(tp_size=len(hosts), nnodes=nnodes, tp_group=group),
             patch(
                 "sglang.srt.runtime_context.process_model_config",
                 return_value=SimpleNamespace(num_hidden_layers=2),
             ),
-            patch(
-                "sglang.srt.distributed.parallel_state.in_the_same_node_as",
-                side_effect=lambda pg, source_rank: [
-                    host == hosts[source_rank] for host in hosts
-                ],
-            ),
+            patch.object(disk_tier, "_host_boot_id", return_value=hosts[rank]),
         ):
             # Layout only: 2 GiB per rank across two layers, without allocating it.
             return method_module._host_rows(
@@ -2792,6 +2795,21 @@ class TestTpHostBudget(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "3 TP ranks.*in total"):
                 self._rows([0, 0, 0, 1], rank, budget_gb=4)
         self.assertEqual(self._rows([0, 0, 0, 1], 3, budget_gb=4), E)
+
+    def test_ranks_in_separate_launch_nodes_on_one_kernel_share_the_budget(self):
+        for rank in range(2):
+            with self.subTest(rank=rank):
+                with self.assertRaisesRegex(RuntimeError, "2 TP ranks.*in total"):
+                    self._rows([0, 0], rank, budget_gb=2, nnodes=2)
+                self.assertEqual(self._rows([0, 0], rank, budget_gb=4, nnodes=2), E)
+
+    def test_missing_host_boot_id_fails_on_all_ranks(self):
+        for rank in range(2):
+            with self.subTest(rank=rank):
+                with self.assertRaisesRegex(
+                    RuntimeError, "could not read its Linux kernel boot ID"
+                ):
+                    self._rows([0, None], rank, budget_gb=4, nnodes=2)
 
     def test_tp1_and_fully_resident_experts_obey_the_budget(self):
         for num_resident in (K, E):

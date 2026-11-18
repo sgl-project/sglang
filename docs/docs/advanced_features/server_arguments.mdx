@@ -2344,7 +2344,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
   <tbody>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-paged-experts`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Keep only `--paged-experts-num-resident` (K) routed experts per MoE layer on the GPU and page the rest from pinned host memory on demand. TP is currently validated for unquantized BF16 experts on the triton runner (other TP1 formats: see the Paged Experts docs). Requires `--ep-size`, `--pp-size`, `--dp-size` and `--attn-dp-size` 1, and `--tp-size` 1 with `--paged-experts-enable-disk`. Decode CUDA graphs (full backend) are captured up to K // top_k requests; prefill graphs must be breakable or disabled.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Keep only `--paged-experts-num-resident` (K) routed experts per MoE layer on the GPU and page the rest from pinned host memory on demand. TP is currently validated for unquantized BF16 experts on the triton runner (other TP1 formats: see the Paged Experts docs). Requires `--ep-size`, `--pp-size`, `--dp-size`, `--attn-dp-size` and `--attn-cp-size` 1, and `--tp-size` 1 with `--paged-experts-enable-disk`. Decode CUDA graphs (full backend) are captured up to K // top_k requests; prefill graphs must be breakable or disabled.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
