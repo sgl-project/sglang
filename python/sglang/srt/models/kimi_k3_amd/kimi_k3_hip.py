@@ -1,6 +1,7 @@
-"""Kimi-K3's dense BF16 GEMMs that bypass UnquantizedLinearMethod, on ROCm: AITER's
-tuned table (or hipBLASLt where it is faster) and AITER's tuned FlyDSL kernel into
-caller storage. ``kimi_k3`` calls these behind ``_is_hip``."""
+"""ROCm glue of kimi_k3: the branches the model takes under ``_is_hip``. Its dense BF16
+GEMMs that bypass UnquantizedLinearMethod go through AITER's tuned table (or hipBLASLt
+where it is faster) and AITER's tuned FlyDSL kernel into caller storage; the gfx950 MoE
+layer lives in ``moe``."""
 
 from typing import Optional
 
@@ -33,3 +34,11 @@ def kda_f_b_gemm_hip(f_a: torch.Tensor, f_b_weight: torch.Tensor) -> torch.Tenso
 
         forget_gate = kimi_k3_tiny_gemm(f_a, f_b_weight)
     return forget_gate
+
+
+def mono_output_gate_hip(pre: dict, alt: Optional[torch.cuda.Stream]) -> torch.Tensor:
+    """g_proj(x) from a monokernel plugin's projection front (``_mono_pre``),
+    once the gate stream the layer left pending has finished."""
+    if alt is not None:
+        torch.cuda.current_stream().wait_stream(alt)
+    return pre["gate"]

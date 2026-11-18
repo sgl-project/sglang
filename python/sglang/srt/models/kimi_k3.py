@@ -177,8 +177,11 @@ _is_gfx95 = is_gfx95_supported()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 if _is_hip:
-    from sglang.srt.models.kimi_k3_amd.attention import mono_output_gate_hip
-    from sglang.srt.models.kimi_k3_amd.gemm import k3_bf16_gemm_hip, kda_f_b_gemm_hip
+    from sglang.srt.models.kimi_k3_amd.kimi_k3_hip import (
+        k3_bf16_gemm_hip,
+        kda_f_b_gemm_hip,
+        mono_output_gate_hip,
+    )
 
 # (n, k) -> ((m_lo, m_hi, tactic), ...); tactic None = the ladder pick.
 _K3_TGV_M_RANGES = {
