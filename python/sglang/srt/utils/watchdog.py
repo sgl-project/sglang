@@ -12,7 +12,11 @@ from typing import Callable, List, Optional
 
 import psutil
 
-from sglang.srt.utils.cudacore_pyspy_dump_utils import pyspy_dump_schedulers
+from sglang.srt.environ import envs
+from sglang.srt.utils.cudacore_pyspy_dump_utils import (
+    allow_pyspy_attach,
+    pyspy_dump_schedulers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +127,9 @@ class WatchdogRaw:
         self.before_crash = before_crash
 
         self.parent_process = psutil.Process().parent()
+        # CI containers lack CAP_SYS_PTRACE, so py-spy cannot attach without this.
+        if envs.SGLANG_IS_IN_CI.get():
+            allow_pyspy_attach()
         t = threading.Thread(target=self._watchdog_thread, daemon=True)
         t.start()
 

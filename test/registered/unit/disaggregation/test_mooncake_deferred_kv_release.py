@@ -36,6 +36,7 @@ def _manager(
 ) -> MooncakeKVManager:
     manager = MooncakeKVManager.__new__(MooncakeKVManager)
     manager.customized_info_enabled = False
+    manager.exchange_aux_item_lens = False
     manager.enable_deferred_decode_kv_release = enabled
     manager.request_status = {} if status is None else {ROOM: status}
     manager._deferred_ack_targets = {}

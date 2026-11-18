@@ -19,8 +19,8 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_interleave
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 from sglang.srt.runtime_context import get_parallel, get_platform
-from sglang.srt.utils import is_gfx95_supported, is_hip
-from sglang.srt.utils.device import is_gfx1250_supported
+from sglang.srt.utils import is_gfx95_supported, is_gfx942_supported, is_hip
+from sglang.srt.utils.device import is_gfx1250_supported, is_npu
 
 _is_hip = is_hip()
 if _is_hip:
@@ -37,7 +37,7 @@ _AITER_MHC_ACTIVE_LOGGED = False
 def _use_aiter_mhc() -> bool:
     return (
         not _AITER_MHC_RUNTIME_DISABLED
-        and is_gfx95_supported()
+        and (is_gfx95_supported() or is_gfx942_supported())
         and envs.SGLANG_USE_AITER.get()
     )
 
@@ -88,7 +88,7 @@ def _try_aiter_mhc_pre(
         return None
 
     if not _AITER_MHC_ACTIVE_LOGGED:
-        logger.info("Using AITER gfx950 mHC pre/post kernels")
+        logger.info("Using AITER mHC pre/post kernels")
         _AITER_MHC_ACTIVE_LOGGED = True
     return result
 
@@ -233,10 +233,7 @@ def _use_tilelang_mhc_post() -> bool:
     return envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get() and not is_hip()
 
 
-FP8 = "float8_e4m3"
-BF16 = "bfloat16"
 FP32 = "float32"
-INT32 = "int32"
 
 
 @tilelang.jit(pass_configs=pass_configs)
@@ -774,44 +771,7 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
             if ENABLE_PDL:
                 T.pdl_trigger()
 
-    @tilelang.jit
-    def mhc_pre_gemm_sqrsum_splitk_stage_1(
-        out_partial: T.Tensor[(split_k, num_tokens, 32), T.float32],
-        sqrsum_partial: T.Tensor[(split_k, num_tokens), T.float32],
-        out: T.Tensor[(num_tokens, hc_mult3), T.float32],
-        sqrsum: T.Tensor[(num_tokens,), T.float32],
-    ):
-        warps_per_cta = threads // 32
-        num_reduce = T.ceildiv(split_k, 32)
-        with T.Kernel(T.ceildiv(num_tokens, warps_per_cta), threads=threads) as (px,):
-            tx = T.get_thread_binding()
-            warp = tx // 32
-            lane = tx % 32
-            t = px * warps_per_cta + warp
-            s = T.alloc_local((1,), T.float32)
-            acc = T.alloc_local((1,), T.float32)
-            s[0] = 0
-            acc[0] = 0
-            if ENABLE_PDL:
-                T.pdl_sync()
-
-            if t < num_tokens:
-                for r in T.serial(num_reduce):
-                    bz = r * 32 + lane
-                    s[0] += T.if_then_else(bz < split_k, sqrsum_partial[bz, t], 0.0)
-                sqrsum[t] = T.warp_reduce_sum(s[0])
-                if lane < hc_mult3:
-                    for bz in T.serial(split_k):
-                        acc[0] += out_partial[bz, t, lane]
-                    out[t, lane] = acc[0]
-
-            if ENABLE_PDL:
-                T.pdl_trigger()
-
-    return (
-        mhc_pre_gemm_sqrsum_splitk_stage_0,
-        mhc_pre_gemm_sqrsum_splitk_stage_1,
-    )
+    return mhc_pre_gemm_sqrsum_splitk_stage_0
 
 
 def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
@@ -1161,7 +1121,7 @@ def mhc_pre(
                     f"mhc_pre splitk kernel only supports hc_hidden_size in {{16384, 28672, 14336}}, "
                     f"got {hc_hidden_size}"
                 )
-            kernel_0, _ = mhc_pre_gemm_sqrsum_splitk_kernel(
+            kernel_0 = mhc_pre_gemm_sqrsum_splitk_kernel(
                 hc_mult3,
                 hc_hidden_size,
                 split_k=n_splits_pre,
@@ -1184,7 +1144,7 @@ def mhc_pre(
                 partial_out,
                 partial_sqrsum,
             )
-            # Stage_1 reduction is folded into big_fuse below; skip launching it.
+            # big_fuse below reduces the split-K partials.
             gemm_out_mul = partial_out
             gemm_out_sqrsum = partial_sqrsum
             gemm_last_dim = 32
@@ -1633,8 +1593,6 @@ def mhc_fused_post_pre(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
-    n_splits: int = 1,
-    tile_n: int = 1,
     *,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
@@ -2049,6 +2007,10 @@ def _mhc_post_dispatch(
         if result is not None:
             return result
 
+    if is_npu():
+        from sgl_kernel_npu.operators.hyper_conn import mhc_post as npu_mhc_post
+
+        return npu_mhc_post(residual, comb_res_mix, x, post_layer_mix.squeeze(-1))
     if not _use_tilelang_mhc_post():
         return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
     return mhc_post(x, residual, post_layer_mix, comb_res_mix)
@@ -2085,20 +2047,35 @@ def hc_pre(
 
     fn = hc_fn if hc_norm_weight is None else hc_fn * hc_norm_weight
     residual_3d = x.view(s, hc_mult, hidden_size)
-    post_mix, comb_mix, layer_input, norm_fused = _mhc_pre_dispatch(
-        residual=residual_3d,
-        fn=fn,
-        hc_scale=hc_scale,
-        hc_base=hc_base,
-        rms_eps=rms_eps,
-        hc_pre_eps=hc_eps,
-        hc_sinkhorn_eps=hc_eps,
-        hc_post_mult_value=post_mult_value,
-        sinkhorn_repeat=sinkhorn_iters,
-        norm_weight=out_norm_weight,
-        norm_eps=out_norm_eps,
-        n_splits_pre=n_splits_pre,
-    )
+    if is_npu():
+        from sgl_kernel_npu.operators.hyper_conn import mhc_pre_sinkhorn
+
+        y, post, comb = mhc_pre_sinkhorn(
+            residual_3d,
+            fn,
+            hc_scale,
+            hc_base,
+            hc_mult=hc_mult,
+            num_iters=sinkhorn_iters,
+            norm_eps=rms_eps,
+            hc_eps=hc_eps,
+        )
+        post_mix, comb_mix, layer_input, norm_fused = post, comb, y, False
+    else:
+        post_mix, comb_mix, layer_input, norm_fused = _mhc_pre_dispatch(
+            residual=residual_3d,
+            fn=fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_eps,
+            hc_sinkhorn_eps=hc_eps,
+            hc_post_mult_value=post_mult_value,
+            sinkhorn_repeat=sinkhorn_iters,
+            norm_weight=out_norm_weight,
+            norm_eps=out_norm_eps,
+            n_splits_pre=n_splits_pre,
+        )
     return (
         layer_input,
         comb_mix.reshape(s, hc_mult * hc_mult),
@@ -2135,7 +2112,7 @@ def npu_hc_pre(
     hc_eps: float,
     forward_batch=None,
 ) -> tuple:
-    """NPU-accelerated hc_pre via the custom_ops kernel.
+    """NPU-accelerated hc_pre via the fused pre+sinkhorn op.
 
     Returns (y, post, comb, norm_fused).  norm_fused is always False
     because npu_hc_pre does not fold input_layernorm — the caller must
@@ -2160,25 +2137,12 @@ def npu_hc_pre(
         )
         return y, post, comb, False
 
-    # Note the return order: (y, post, comb) — y is the (T, hidden)
-    # mixed activation, post / comb are the hc_post inputs. The
-    # fused kernel emits y in fp32 (sinkhorn iterates in fp32), so
-    # cast back to the input dtype before the downstream
-    # aclnnRmsNorm (which has no x=fp32 / gamma=bf16 overload).
-    y, post, comb = torch.ops.custom.npu_hc_pre(
-        x,
-        hc_fn,
-        hc_scale,
-        hc_base,
-        hc_mult=hc_mult,
-        hc_sinkhorn_iters=hc_sinkhorn_iters,
-        norm_eps=rms_norm_eps,
-        hc_eps=hc_eps,
+    from sgl_kernel_npu.operators.hyper_conn import mhc_pre_dpskv4
+
+    y, post, comb = mhc_pre_dpskv4(
+        x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps
     )
-    # npu_hc_pre uses norm_eps for sinkhorn's internal RMS only; it does
-    # not fold input_layernorm. Return norm_fused=False so the caller
-    # applies the layernorm itself, matching the deepgemm/torch paths.
-    return y.to(dtype), post, comb, False
+    return y, post, comb, False
 
 
 @triton.jit
@@ -2352,10 +2316,23 @@ def _block_m_for(m: int) -> int:
     return _HC_MIX_BLOCK_M
 
 
-def _num_slices_for(k: int) -> int:
-    """Slice count depends only on K, never on batch size M."""
-    blocks = k // _HC_MIX_BLOCK_K
-    assert k % _HC_MIX_BLOCK_K == 0, k
+@functools.lru_cache(maxsize=None)
+def _hc_mix_stats_sinkhorn_block_k(device: torch.device) -> int:
+    # Query the input device lazily to avoid initializing CUDA before fork.
+    # SM121 has not been measured.
+    if (
+        device.type == "cuda"
+        and not _is_hip
+        and torch.cuda.get_device_capability(device) == (12, 0)
+    ):
+        return 32
+    return _HC_MIX_BLOCK_K
+
+
+def _num_slices_for(k: int, block_k: int = _HC_MIX_BLOCK_K) -> int:
+    """Slice count depends only on K and tile width, never on batch size M."""
+    blocks = k // block_k
+    assert k % block_k == 0, k
     for n in _HC_MIX_SLICE_CHOICES:
         if blocks % n == 0:
             return n
@@ -2513,11 +2490,15 @@ def hc_mix_stats_sinkhorn(
     if m == 0:
         return pre, post, comb
 
-    num_slices = _num_slices_for(k)
+    block_k = _hc_mix_stats_sinkhorn_block_k(dev)
+    num_slices = _num_slices_for(k, block_k)
     mix_pad = max(16, triton.next_power_of_2(mix))
     part_mix = torch.empty((num_slices, m, mix), dtype=torch.float32, device=dev)
     part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=dev)
     block_m = _block_m_for(m)
+    if block_k == 32:
+        # SM120's 8-row tile changes rounding relative to 16/32-row batches.
+        block_m = max(16, block_m)
     _hc_mix_stats_partial_kernel[(triton.cdiv(m, block_m), num_slices)](
         x_flat,
         hc_fn,
@@ -2531,7 +2512,7 @@ def hc_mix_stats_sinkhorn(
         MIX_PAD=mix_pad,
         NUM_SLICES=num_slices,
         BLOCK_M=block_m,
-        BLOCK_K=_HC_MIX_BLOCK_K,
+        BLOCK_K=block_k,
         DOT_PRECISION=_HC_MIX_DOT_PRECISION,
         num_warps=_HC_MIX_NUM_WARPS,
         num_stages=_HC_MIX_NUM_STAGES,
@@ -2580,6 +2561,7 @@ def hc_mix_stats_sinkhorn(
 # residual), accumulated over a fixed slice count to bound the fp32 error.
 _HC_MIX_COMPENSATED_SLICES = 16
 _HC_MIX_BF16X3_BLOCK_M = 128
+_HC_MIX_BF16X3_BLOCK_K = 64
 _HC_PRENORM_BLOCK_M = 64
 
 
@@ -2664,15 +2646,19 @@ def hc_mix_stats_sinkhorn_bf16x3(
     rms_eps: float,
     hc_eps: float,
     hc_mult: int = 4,
+    decode_grid: bool = False,
 ):
     m, k = x.shape
     mix = (2 + hc_mult) * hc_mult
-    slices = _HC_MIX_COMPENSATED_SLICES
     hopper_medium = get_platform().is_sm90 and 32 <= m < 4096
-    block_m = 64 if hopper_medium else _HC_MIX_BF16X3_BLOCK_M
+    if decode_grid:
+        slices, block_m = 64, 64
+    else:
+        slices = _HC_MIX_COMPENSATED_SLICES
+        block_m = 64 if hopper_medium else _HC_MIX_BF16X3_BLOCK_M
     assert x.is_contiguous() and x.dtype == torch.bfloat16
-    assert hopper_medium or 4096 <= m <= 65536
-    assert k % (slices * _HC_MIX_BLOCK_K) == 0
+    assert decode_grid or hopper_medium or 4096 <= m <= 65536
+    assert k % (slices * _HC_MIX_BF16X3_BLOCK_K) == 0
     assert len(weight_parts) == 3
     assert all(
         w.shape == (mix, k) and w.dtype == torch.bfloat16 and w.is_contiguous()
@@ -2693,7 +2679,7 @@ def hc_mix_stats_sinkhorn_bf16x3(
         K_PER_SLICE=k // slices,
         MIX_COLS=mix,
         MIX_PAD=triton.next_power_of_2(mix),
-        BLOCK_K=_HC_MIX_BLOCK_K,
+        BLOCK_K=_HC_MIX_BF16X3_BLOCK_K,
         BLOCK_M=block_m,
         num_warps=4,
         num_stages=3,
@@ -2729,7 +2715,10 @@ def hc_mix_stats_sinkhorn_deepgemm(
     hc_eps: float,
     hc_mult: int = 4,
 ):
-    from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
+    from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
+        tf32_hc_prenorm_gemm,
+        tf32_hc_prenorm_gemm_dual,
+    )
 
     assert x_flat.dtype == torch.bfloat16 and x_flat.is_contiguous()
     m, k = x_flat.shape
@@ -2747,10 +2736,13 @@ def hc_mix_stats_sinkhorn_deepgemm(
     mix_hi = torch.empty((slices, m, mix), dtype=torch.float32, device=dev)
     mix_lo = torch.empty_like(mix_hi)
     sq = torch.empty((slices, m), dtype=torch.float32, device=dev)
-    tf32_hc_prenorm_gemm(x_flat, high, mix_hi, sq, slices)
-    # sq depends only on x_flat, so the second projection recomputes the same
-    # values; overwriting it avoids a throwaway (slices, m) scratch, 4 MiB at m=65536.
-    tf32_hc_prenorm_gemm(x_flat, low, mix_lo, sq, slices)
+    if current_arch().is_sm(10):
+        tf32_hc_prenorm_gemm_dual(x_flat, high, low, mix_hi, mix_lo, sq, slices)
+    else:
+        tf32_hc_prenorm_gemm(x_flat, high, mix_hi, sq, slices)
+        # sq depends only on x_flat, so the second projection recomputes the same
+        # values; overwriting it avoids a throwaway (slices, m) scratch, 4 MiB at m=65536.
+        tf32_hc_prenorm_gemm(x_flat, low, mix_lo, sq, slices)
     _hc_mix_reduce_sinkhorn_kernel[(m,)](
         mix_hi,
         sq,

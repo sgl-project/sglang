@@ -195,3 +195,63 @@ def probe_fabric_clique(group: ProcessGroup, device: torch.device) -> bool:
             reasons,
         )
     return supported
+
+
+def dpx_pairs(accel_ids: List[Optional[int]]) -> Optional[List[List[int]]]:
+    """Group ranks by SoC when every SoC holds exactly two (DPX) partitions.
+
+    ``accel_ids[r]`` is rank r's accelerator ID. Returns the rank pairs sorted
+    by their lower rank, or None for any other layout (SPX, CPX, a missing ID
+    or a SoC only half in the group).
+    """
+    if not accel_ids or any(a is None for a in accel_ids):
+        return None
+    socs: dict[int, List[int]] = {}
+    for rank, accel_id in enumerate(accel_ids):
+        socs.setdefault(accel_id, []).append(rank)
+    if any(len(ranks) != 2 for ranks in socs.values()):
+        return None
+    return sorted(socs.values())
+
+
+def accelerator_ring_order(accel_ids: List[Optional[int]]) -> List[int]:
+    """Ranks in ring order: the partitions of each accelerator next to each other.
+
+    ``accel_ids[r]`` is rank r's accelerator ID. Accelerators keep the order of
+    their lowest rank, and ranks within one their own order. A missing ID
+    leaves the group order.
+    """
+    if any(a is None for a in accel_ids):
+        return list(range(len(accel_ids)))
+    accels: dict[int, List[int]] = {}
+    for rank, accel_id in enumerate(accel_ids):
+        accels.setdefault(accel_id, []).append(rank)
+    return [rank for ranks in sorted(accels.values()) for rank in ranks]
+
+
+def _probe_accel_ids(group: ProcessGroup, device: torch.device) -> List[Optional[int]]:
+    """Every rank's accelerator ID (None where unknown); collective."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    try:
+        properties = torch.cuda.get_device_properties(index)
+        fields = read_ualink_sysfs(pci_function0_bus_id(properties)) or {}
+        local = _parse_int(fields.get("accel_id"))
+    except Exception:
+        local = None
+    accel_ids: List[Optional[int]] = [None] * dist.get_world_size(group=group)
+    dist.all_gather_object(accel_ids, local, group=group)
+    return accel_ids
+
+
+def probe_dpx_pairs(
+    group: ProcessGroup, device: torch.device
+) -> Optional[List[List[int]]]:
+    """``dpx_pairs`` of ``group``; collective, every rank gets the same answer."""
+    return dpx_pairs(_probe_accel_ids(group, device))
+
+
+def probe_accelerator_ring_order(
+    group: ProcessGroup, device: torch.device
+) -> List[int]:
+    """``accelerator_ring_order`` of ``group``; collective, every rank gets the same answer."""
+    return accelerator_ring_order(_probe_accel_ids(group, device))
