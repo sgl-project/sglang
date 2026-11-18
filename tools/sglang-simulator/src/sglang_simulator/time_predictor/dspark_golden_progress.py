@@ -36,7 +36,7 @@ class SourceGoldenDSparkProgress:
     """
 
     def __init__(self, source_policy, *, model_seed):
-        from simopus.sdk.native_segment_projection import NativeSegmentSourcePolicy
+        from simopus.sdk import NativeSegmentSourcePolicy
 
         _require(
             type(source_policy) is NativeSegmentSourcePolicy,

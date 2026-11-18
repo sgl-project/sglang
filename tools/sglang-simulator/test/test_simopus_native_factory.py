@@ -73,7 +73,7 @@ def test_factory_loads_real_native_assets_and_public_umd(
     args["model_revision"] = "main"
     # An exact pin is still required; the packaged model resource accepts its
     # declared checkpoint rather than arbitrary main for actual initialization.
-    from simopus.sdk.perf_database.dsv41_dspark_proposal import MODEL_REVISION
+    MODEL_REVISION = "5254448103b6254fc646dacbca1cbbf20e9216c1"
 
     args["model_revision"] = MODEL_REVISION
     raw = json.dumps(options["execution_profile"].to_dict()).encode()
