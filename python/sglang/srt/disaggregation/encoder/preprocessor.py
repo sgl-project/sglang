@@ -26,6 +26,12 @@ from sglang.srt.multimodal.encoder_preprocessing import (
     EncoderPreprocessOutput,
     invoke_encoder_preprocessor,
 )
+from sglang.srt.multimodal.media_io import (
+    CLIENT_MEDIA_EXCEPTIONS,
+    load_audio,
+    load_image,
+    load_video,
+)
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.glm4v import (
     _glm_effective_presize_budget,
@@ -48,13 +54,6 @@ from sglang.srt.runtime_context import (
     get_serving,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    CLIENT_MEDIA_EXCEPTIONS,
-    load_audio,
-    load_image,
-    load_video,
-)
-from sglang.srt.utils.hf_transformers_utils import resolve_image_processor_backend
 
 logger = logging.getLogger(__name__)
 
@@ -72,9 +71,9 @@ def _convert(data):
         return data
     elif isinstance(data, np.ndarray):
         return torch.tensor(data)
-    elif isinstance(data, list) and isinstance(data[0], np.ndarray):
+    elif isinstance(data, list) and data and isinstance(data[0], np.ndarray):
         return torch.tensor(np.array(data))
-    elif isinstance(data, list) and isinstance(data[0], (int, float)):
+    elif isinstance(data, list) and data and isinstance(data[0], (int, float)):
         return torch.tensor(data)
     else:
         return data
@@ -139,8 +138,7 @@ class EncoderPreprocessor:
 
         use_image_processor_gpu = envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get()
         self.use_image_processor_gpu = (
-            use_image_processor_gpu
-            and resolve_image_processor_backend(get_mm()) != "pil"
+            use_image_processor_gpu and get_mm().image_processor_backend != "pil"
         )
 
         self._load_mm_processor(server_args)
@@ -171,7 +169,7 @@ class EncoderPreprocessor:
     def _load_mm_processor(self, server_args: ServerArgs):
         from transformers import AutoImageProcessor, AutoVideoProcessor
 
-        image_processor_backend = resolve_image_processor_backend(get_mm())
+        image_processor_backend = get_mm().image_processor_backend
         image_processor_kwargs = (
             {}
             if image_processor_backend == "auto"
@@ -371,9 +369,11 @@ class EncoderPreprocessor:
         except CLIENT_MEDIA_EXCEPTIONS as e:
             # Not ValueError: the DP envelope classifies by `.code`, which only
             # MMError carries.
-            raise BadRequestError(f"Error while loading data {data}: {e}") from e
+            raise BadRequestError(
+                f"Error while loading data {str(data)[:128]}: {e}"
+            ) from e
         except Exception as e:
-            raise RuntimeError(f"Error while loading data {data}: {e}")
+            raise RuntimeError(f"Error while loading data {str(data)[:128]}: {e}")
 
     def _submit_data_loading_tasks(self, items, modalities):
         futures = []

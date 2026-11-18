@@ -2,10 +2,7 @@
 from dataclasses import dataclass, field
 from typing import Any
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.sensenova_u1 import (
     DEFAULT_CFG_INTERVAL,
     DEFAULT_CFG_NORM,
@@ -17,6 +14,7 @@ from sglang.multimodal_gen.configs.sensenova_u1 import (
     SENSENOVA_U1_CFG_NORM_CHOICES,
     SENSENOVA_U1_REQUEST_EXTRA_KEY,
 )
+from sglang.multimodal_gen.configs.task_type import DataType
 
 _PUBLIC_OVERRIDE_FIELDS = {
     "prompt",

@@ -20,7 +20,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 if not torch.cuda.is_available():
     pytest.skip(
@@ -137,6 +137,9 @@ def test_ring_fold_parity(bs, T, HV, H, K, V, lower_bound, pad):
         fold = ckpt[slots[j]]
         rel = ((fold - base).abs().max() / base.abs().max().clamp_min(1e-6)).item()
         assert rel < 1e-3, f"row={j}: rel={rel:.3e}"
+        # Production head dim; K=64 rounds slightly differently on main too.
+        if K == 128:
+            assert torch.equal(fold, base), f"row={j}: K=128 fold not bit-identical"
 
 
 if __name__ == "__main__":

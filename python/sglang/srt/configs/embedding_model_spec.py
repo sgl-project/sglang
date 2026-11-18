@@ -95,6 +95,9 @@ class EmbeddingModelSpec:
     safe_disable_chunked_prefill: bool = False
     safe_disable_kv_cache: bool = False
     rerank_input_format: RerankInputFormat = RerankInputFormat.DEFAULT
+    # Every attention layer is AttentionType.ENCODER_ONLY; with
+    # safe_disable_kv_cache, the FA prefill backend runs without a KV pool.
+    encoder_only_attention: bool = False
 
     @property
     def bcg_eligibility(self) -> BCGEligibility:
@@ -126,6 +129,7 @@ class EmbeddingModelSpec:
             "safe_disable_kv_cache": self.safe_disable_kv_cache,
             "safe_disable_radix_cache": self.safe_disable_radix_cache,
             "safe_disable_chunked_prefill": self.safe_disable_chunked_prefill,
+            "encoder_only_attention": self.encoder_only_attention,
         }
 
 
@@ -188,6 +192,12 @@ def embedding_support_matrix() -> list[dict[str, Any]]:
             **_embedding_gemma2_spec().as_dict(),
         }
     )
+    rows.append(
+        {
+            "architecture": "Ministral3Model (is_causal=false, pooling=avg)",
+            **_embedding_nemotron3_spec().as_dict(),
+        }
+    )
     return rows
 
 
@@ -233,6 +243,30 @@ def _embedding_gemma_spec() -> EmbeddingModelSpec:
         safe_disable_radix_cache=True,
         safe_disable_chunked_prefill=True,
         safe_disable_kv_cache=True,
+    )
+
+
+def _embedding_nemotron3_spec() -> EmbeddingModelSpec:
+    return EmbeddingModelSpec(
+        family="embedding_nemotron3",
+        task=EmbeddingTask.EMBED,
+        execution=EmbeddingExecution.ENCODER_ONLY,
+        attention=AttentionPattern.BIDIRECTIONAL,
+        pooling=PoolingStrategy.MEAN,
+        normalize=True,
+        postprocessor="model_defined",
+        tokenizer_special_tokens="model_default",
+        supports_dimensions=False,
+        supports_token_embeddings=False,
+        supports_multimodal=False,
+        requires_embedding_flag=False,
+        auto_enable_embedding=True,
+        bidirectional_attention=True,
+        bcg_prefill_policy=BCGPrefillPolicy.DEFAULT,
+        safe_disable_radix_cache=True,
+        safe_disable_chunked_prefill=True,
+        safe_disable_kv_cache=True,
+        encoder_only_attention=True,
     )
 
 
@@ -350,6 +384,9 @@ def resolve_embedding_model_spec(
             safe_disable_chunked_prefill=True,
             rerank_input_format=RerankInputFormat.QUERY_DOCUMENT_CHAT,
         )
+
+    if "EmbeddingNemotron3Model" in architecture_set:
+        return _embedding_nemotron3_spec()
 
     if architecture_set & _CLASSIFICATION_ARCHITECTURES:
         return EmbeddingModelSpec(

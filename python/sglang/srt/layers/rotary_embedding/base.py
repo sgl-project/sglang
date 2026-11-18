@@ -9,7 +9,10 @@ import torch
 
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.environ import envs
-from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
+from sglang.srt.layers.rotary_embedding.utils import (
+    apply_rotary_emb,
+    rotary_embedding_cpu,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, publish_role
 from sglang.srt.utils import (
@@ -81,6 +84,8 @@ if _is_xpu:
             "XPU rotary embedding will use the generic rotary_embedding kernel. "
             "Upgrade sgl_kernel to enable the fused XPU kernel."
         )
+# Head sizes sgl_kernel.rotary_embedding accepts on XPU; it raises on any other.
+_XPU_ROTARY_EMBEDDING_HEAD_SIZES = (32, 64, 96, 128, 256)
 
 
 class RotaryEmbedding(BaseFusedOp):
@@ -437,7 +442,7 @@ class RotaryEmbedding(BaseFusedOp):
             # rotary_embedding_cpu requires query and the cache to share a dtype;
             # forward_cuda/forward_xpu already align them, forward_cpu did not.
             self._match_cos_sin_cache_dtype(query)
-            return torch.ops.sgl_kernel.rotary_embedding_cpu(
+            return rotary_embedding_cpu(
                 positions,
                 query,
                 key,
@@ -570,7 +575,10 @@ class RotaryEmbedding(BaseFusedOp):
                 self.is_neox_style,
             )
             return query, key
-        elif self.head_size != self.rotary_dim:
+        elif (
+            self.head_size != self.rotary_dim
+            or self.head_size not in _XPU_ROTARY_EMBEDDING_HEAD_SIZES
+        ):
             return self.forward_native(positions, query, key)
         else:
             self._match_cos_sin_cache_dtype(query)

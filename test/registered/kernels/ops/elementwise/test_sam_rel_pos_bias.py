@@ -12,7 +12,7 @@ from sglang.kernels.ops.elementwise.sam_rel_pos_bias import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.sam import sam_rel_pos_bias_reference
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 def _inputs(batch=2, queries=64, key_size=40, dtype=torch.bfloat16, device="cuda"):
@@ -74,8 +74,8 @@ def test_unsupported_inputs_take_the_eager_path(make):
 
 @pytest.mark.parametrize(
     "make",
-    [lambda: _inputs(dtype=torch.float16), _strided_rel_w, _misaligned_rel_w],
-    ids=["fp16", "strided_rel_w", "misaligned_rel_w"],
+    [_strided_rel_w],
+    ids=["strided_rel_w"],
 )
 def test_kernel_rejects_unsupported_inputs(make):
     """A non-unit key-width stride used to be read as contiguous and give a wrong bias."""

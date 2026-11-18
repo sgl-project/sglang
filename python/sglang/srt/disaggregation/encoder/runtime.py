@@ -35,6 +35,7 @@ from sglang.srt.disaggregation.encoder.server import (
     await_task_completion_on_cancel,
     launch_encoder,
 )
+from sglang.srt.entrypoints.server_utils import set_prometheus_multiproc_dir
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     ProfileReq,
@@ -59,8 +60,8 @@ from sglang.srt.runtime_context import (
     publish,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, random_uuid, set_prometheus_multiproc_dir
-from sglang.srt.utils.common import maybe_reindex_device_id
+from sglang.srt.utils import configure_logger, random_uuid
+from sglang.srt.utils.device import maybe_reindex_device_id
 from sglang.srt.utils.network import NetworkAddress, get_free_port, get_zmq_socket
 
 logger = logging.getLogger(__name__)
@@ -116,8 +117,8 @@ def validate_encode_request(request: dict) -> Optional[str]:
         return f"part_idx must be in [0, {num_parts})"
 
     hashes = request.get("hashes")
-    if hashes is not None and not isinstance(hashes, (list, tuple, str, int, bytes)):
-        return f"hashes must be list/scalar, got {type(hashes).__name__}"
+    if hashes is not None and not isinstance(hashes, (list, tuple)):
+        return f"hashes must be a list, got {type(hashes).__name__}"
     return None
 
 

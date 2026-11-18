@@ -4,14 +4,10 @@ import pytest
 import torch
 
 from sglang.kernels.ops.sampling import argmax as sampling_argmax
-from sglang.kernels.ops.sampling.argmax_jit import (
-    argmax,
-    can_argmax,
-    create_argmax_workspace,
-)
+from sglang.kernels.ops.sampling.argmax_jit import argmax, can_argmax
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
@@ -127,7 +123,8 @@ def test_argmax_out_param() -> None:
 
 def test_argmax_explicit_workspace() -> None:
     logits = torch.randn(2, 262144, dtype=torch.bfloat16, device="cuda")
-    workspace = create_argmax_workspace(2, logits.device)
+    # Zeroed int64 slots, one per row; the kernel hands every slot back zeroed.
+    workspace = torch.zeros(2, dtype=torch.int64, device=logits.device)
     for _ in range(3):
         _check(logits, workspace=workspace)
     assert torch.all(workspace == 0)

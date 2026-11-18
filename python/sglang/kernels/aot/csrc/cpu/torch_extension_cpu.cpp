@@ -310,10 +310,11 @@ at::Tensor flash_attn_varlen_func(
     const at::Tensor& cu_seqlens_k,
     int64_t max_seqlen_q,
     int64_t max_seqlen_k,
-    bool causal);
+    bool causal,
+    const std::optional<double>& sm_scale);
 
 // linear attention
-std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
+at::Tensor chunk_gated_delta_rule_cpu(
     const at::Tensor& query,
     const at::Tensor& key,
     const at::Tensor& value,
@@ -335,6 +336,12 @@ at::Tensor convert_scale_packed(at::Tensor& scale);
 
 // quant
 std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A);
+std::tuple<at::Tensor, at::Tensor>
+sgl_per_token_group_quant_8bit_cpu(const at::Tensor& input, int64_t group_size, double eps);
+std::tuple<at::Tensor, at::Tensor> sgl_per_token_quant_fp8_cpu(const at::Tensor& input);
+std::tuple<at::Tensor, at::Tensor>
+sgl_per_tensor_quant_fp8_cpu(const at::Tensor& input, const std::optional<at::Tensor>& scale);
+std::tuple<at::Tensor, at::Tensor> mxfp8_group_quantize_cpu(const at::Tensor& input);
 
 // igemm
 at::Tensor int8_scaled_mm_cpu(
@@ -537,15 +544,15 @@ void shm_allgather_into_tensor(at::Tensor& output_tensor, at::Tensor& data, int6
 void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int64_t op, int64_t handle = -1);
 
 // rope
-std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
+void rotary_embedding_cpu(
     at::Tensor& positions,
     at::Tensor& query,
     at::Tensor& key,
     int64_t head_size,
     at::Tensor& cos_sin_cache,
     bool is_neox);
-std::tuple<at::Tensor, at::Tensor>
-apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
+void apply_rotary_pos_emb_cpu(
+    at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin, int64_t unsqueeze_dim);
 
 // multidimensional rope
 void apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
@@ -839,14 +846,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // flash attn
   m.def(
       "flash_attn_varlen_func(Tensor q, Tensor k, Tensor v, Tensor cu_seqlens_q, Tensor cu_seqlens_k, "
-      "int max_seqlen_q, int max_seqlen_k, bool causal) -> Tensor");
+      "int max_seqlen_q, int max_seqlen_k, bool causal, float? sm_scale=None) -> Tensor");
   m.impl("flash_attn_varlen_func", torch::kCPU, &flash_attn_varlen_func);
 
   // linear attn
   m.def(
       "chunk_gated_delta_rule_cpu(Tensor query, Tensor key, Tensor value, Tensor g, Tensor beta, "
-      "Tensor initial_state, bool output_final_state, Tensor cu_seqlens, bool head_first, "
-      "bool use_qk_l2norm_in_kernel, Tensor initial_state_indices, float eps=1e-6) -> (Tensor, Tensor)");
+      "Tensor(a!) initial_state, bool output_final_state, Tensor cu_seqlens, bool head_first, "
+      "bool use_qk_l2norm_in_kernel, Tensor initial_state_indices, float eps=1e-6) -> Tensor");
   m.impl("chunk_gated_delta_rule_cpu", torch::kCPU, &chunk_gated_delta_rule_cpu);
 
   // weight prepack
@@ -860,6 +867,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // quant
   m.def("per_token_quant_int8_cpu(Tensor A) -> (Tensor, Tensor)");
   m.impl("per_token_quant_int8_cpu", torch::kCPU, &per_token_quant_int8_cpu);
+  m.def("sgl_per_token_group_quant_8bit_cpu(Tensor input, int group_size, float eps) -> (Tensor, Tensor)");
+  m.impl("sgl_per_token_group_quant_8bit_cpu", torch::kCPU, &sgl_per_token_group_quant_8bit_cpu);
+  m.def("sgl_per_token_quant_fp8_cpu(Tensor input) -> (Tensor, Tensor)");
+  m.impl("sgl_per_token_quant_fp8_cpu", torch::kCPU, &sgl_per_token_quant_fp8_cpu);
+  m.def("sgl_per_tensor_quant_fp8_cpu(Tensor input, Tensor? scale) -> (Tensor, Tensor)");
+  m.impl("sgl_per_tensor_quant_fp8_cpu", torch::kCPU, &sgl_per_tensor_quant_fp8_cpu);
+  m.def("mxfp8_group_quantize_cpu(Tensor input) -> (Tensor, Tensor)");
+  m.impl("mxfp8_group_quantize_cpu", torch::kCPU, &mxfp8_group_quantize_cpu);
 
   // igemm
   m.def(
@@ -916,7 +931,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor topk_ids, bool "
       "inplace, int moe_comp_method, Tensor? w1_scale, Tensor? w2_scale, "
-      "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, Tensor? w1_bias, Tensor? w2_bias, float? alpha, float? "
+      "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, Tensor? w1_bias, Tensor? w2_bias, "
+      "float? alpha, float? "
       "limit, bool is_vnni, str? activation=None) -> Tensor");
   m.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
 
@@ -950,7 +966,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("causal_conv1d_weight_pack", torch::kCPU, &causal_conv1d_weight_pack);
 
   m.def(
-      "causal_conv1d_fwd_cpu(Tensor x, Tensor weight, Tensor? bias, Tensor? conv_states, Tensor? query_start_loc,"
+      "causal_conv1d_fwd_cpu(Tensor x, Tensor weight, Tensor? bias, Tensor(a!)? conv_states, Tensor? query_start_loc,"
       "Tensor? cache_indices, Tensor? has_initial_state, bool silu_activation, int pad_slot_id, bool is_vnni) -> "
       "Tensor");
   m.impl("causal_conv1d_fwd_cpu", torch::kCPU, &causal_conv1d_fwd_cpu);
@@ -995,10 +1011,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // rope
   m.def(
-      "rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
-      "bool is_neox) -> (Tensor, Tensor)");
+      "rotary_embedding_cpu(Tensor positions, Tensor(a!) query, Tensor(b!) key, int head_size, Tensor cos_sin_cache, "
+      "bool is_neox) -> ()");
   m.impl("rotary_embedding_cpu", torch::kCPU, &rotary_embedding_cpu);
-  m.def("apply_rotary_pos_emb_cpu(Tensor query, Tensor key, Tensor cos, Tensor sin) -> (Tensor, Tensor)");
+  m.def(
+      "apply_rotary_pos_emb_cpu(Tensor(a!) query, Tensor(b!) key, Tensor cos, Tensor sin, int unsqueeze_dim=1) -> ()");
   m.impl("apply_rotary_pos_emb_cpu", torch::kCPU, &apply_rotary_pos_emb_cpu);
 
   // multidimensional rope

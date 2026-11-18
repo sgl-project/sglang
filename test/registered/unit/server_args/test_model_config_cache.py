@@ -23,7 +23,8 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.arg_groups.overrides import declare_resolution, model_config_of
+from sglang.srt.arg_groups.model_override_base import model_config_of
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.environ import EnvField, envs
 from sglang.srt.server_args import ServerArgs
@@ -50,8 +51,7 @@ _OBJECT_STORE_URI = "gs://sglang-test-bucket/mini-llama/"
 
 class TestTheModelConfigCache(CustomTestCase):
     def setUp(self):
-        # Resolution writes the environment on the way through
-        # (`SGLANG_USE_CUDA_IPC_TRANSPORT` among others) and flips the
+        # Resolution can write the environment on the way through and flip the
         # descriptor-level flag `EnvField.set()` keeps, which `os.environ` does
         # not carry. The cases that resolve put both back.
         fields = {}

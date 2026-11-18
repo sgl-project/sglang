@@ -24,11 +24,11 @@ from sglang.srt.configs.nemotron35_reranker import is_nemotron35_reranker_config
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.ministral3 import Ministral3Model
 from sglang.srt.models.mistral import Mistral3ForConditionalGeneration
-from sglang.srt.utils import add_prefix
 
 
 class Ministral3ForSequenceClassification(nn.Module):
