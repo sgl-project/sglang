@@ -640,12 +640,15 @@ class KimiK3MoE(nn.Module):
             self.experts.runner_backend,
             routing_method_type=self.experts.routing_method_type,
         )
-        # AITER fused_moe drops the radix-4 router's presort under an expert mask
-        # (EP), and other runners never see it.
-        self.topk.topk_config.fused_aiter_presort = (
-            self.experts.runner_backend is not None
+        # Ask the radix-4 router for AITER fused_moe's sort only where it is
+        # consumed: AITER drops it under an expert mask (EP), and other runners
+        # never see it.
+        self._aiter_presort = (
+            envs.SGLANG_K3_RADIX4_TOPK.get()
+            and self.experts.runner_backend is not None
             and self.experts.runner_backend.is_aiter()
             and self.experts.moe_ep_size == 1
+            and aiter_presort.available()
         )
 
         # MegaMoE (deep_gemm fused a2a+GEMM over the EP symm buffer) replaces
@@ -1803,6 +1806,8 @@ class KimiK3MoE(nn.Module):
         group, and only this rank's CP rows of the output are returned."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
+        if self._aiter_presort:
+            aiter_presort.stage()
         try:
             if cp_shard_rows:
                 return self._forward_cp_shard_rows(hidden_states)
@@ -1815,10 +1820,10 @@ class KimiK3MoE(nn.Module):
                     valid_token_count=valid_token_count,
                 )
         finally:
-            # Only a router with fused_aiter_presort registers a radix-4 presort; one
-            # that no fused_moe consumed must not outlive this layer (AITER's contract).
-            if self.topk.topk_config.fused_aiter_presort:
-                aiter_presort.clear_registration()
+            # A presort that no fused_moe consumed must not outlive this layer
+            # (AITER's contract).
+            if self._aiter_presort:
+                aiter_presort.clear()
         return out.view(num_tokens, hidden_size)
 
 

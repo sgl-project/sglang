@@ -35,12 +35,6 @@ _MAX_TOKENS = 1024
 
 logger = logging.getLogger(__name__)
 
-# Per (device, stream): the sort's arrival counters, which launches in flight on
-# two streams must not share. Four int32 (see RouteRadix4Params::sort_ws). A
-# captured graph keeps its capture stream's counters, so it must not replay
-# alongside eager launches on that stream.
-_SORT_WS: dict[tuple[torch.device, int], torch.Tensor] = {}
-
 
 def supported_hardware() -> bool:
     """Whether this device is one the kernel targets, before asking whether it
@@ -150,29 +144,13 @@ def route_radix4(
     return out_w, out_i
 
 
-def fused_sort_ready(device: torch.device) -> bool:
-    """Whether route_radix4_with_sort may launch on the current stream now.
+def new_sort_workspace(device: torch.device) -> torch.Tensor:
+    """Arrival counters for route_radix4_with_sort (see RouteRadix4Params::sort_ws).
 
-    Its arrival counters must start at zero, and counters first allocated
-    during CUDA graph capture are only zeroed when that one graph replays.
+    Zeroed once; every launch leaves them ready for the next one. Launches that
+    can be in flight together must not share one, so a caller keeps one per stream.
     """
-    key = (device, torch.cuda.current_stream(device).cuda_stream)
-    return key in _SORT_WS or not torch.cuda.is_current_stream_capturing()
-
-
-def _sort_workspace(device: torch.device) -> torch.Tensor:
-    key = (device, torch.cuda.current_stream(device).cuda_stream)
-    ws = _SORT_WS.get(key)
-    if ws is None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "route_radix4_with_sort first ran on this stream during graph "
-                "capture; run it once eagerly on the capture stream first"
-            )
-        # Zeroed once; every launch leaves it ready for the next one.
-        ws = torch.zeros(4, dtype=torch.int32, device=device)
-        _SORT_WS[key] = ws
-    return ws
+    return torch.zeros(4, dtype=torch.int32, device=device)
 
 
 def _sorted_capacity(n_tokens: int) -> int:
@@ -193,11 +171,13 @@ def route_radix4_with_sort(
     renormalize: bool,
     routed_scaling_factor: float,
     *,
+    sort_ws: torch.Tensor,
     moe_buf: Optional[torch.Tensor] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
     """route_radix4 plus AITER's BM=16 sort of its routes, in one launch.
 
+    sort_ws comes from new_sort_workspace and belongs to the launching stream.
     Returns (weights, ids, aux), where aux is the dict AITER's
     register_presorted_moe takes; it keeps weights, ids and moe_buf alive for as
     long as it is registered. A given moe_buf ([M, D] packed bf16, D a
@@ -223,7 +203,7 @@ def route_radix4_with_sort(
         bias,
         out_w,
         out_i,
-        _sort_workspace(device),
+        sort_ws,
         sorted_token_ids,
         sorted_expert_ids,
         sorted_weights,

@@ -2572,13 +2572,6 @@ class Envs:
     SGLANG_K3_SHARDED_MOE = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
-    # With the radix-4 router on, also emit AITER's BM=16 MoE sort from its launch
-    # for a non-EP AITER fused_moe (needs ROCm/aiter#6484).
-    SGLANG_OPT_HIP_K3_RADIX4_FUSE_SORT = EnvBool(True)
-    # AITER drops the sort wherever its tuned kernel is not BM=16. Its K3 A8W4
-    # (>= ROCm/aiter#6464) and A16W4 tables are BM=16 up to 512 tokens; its stock
-    # A4W4 table is BM=32 at 65-256, where 64 avoids a sort that is then dropped.
-    SGLANG_OPT_HIP_K3_RADIX4_FUSE_SORT_MAX_TOKENS = EnvInt(512)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)

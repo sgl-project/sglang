@@ -4,8 +4,15 @@ At decode and verify batch sizes AITER's fused_moe spends one or two launches on
 moe_sorting, which also zeroes its output. route_radix4_with_sort emits both from
 the routing launch; register_presorted_moe (ROCm/aiter#6484) hands that sort to
 the next fused_moe call, which uses it when the call's topk tensors, M and
-block_m match and ignores it otherwise. Without that AITER API the router runs
-unfused. Only a layer whose TopKConfig sets fused_aiter_presort asks for the sort.
+block_m match and ignores it otherwise.
+
+Only a Kimi-K3 MoE layer whose experts take the sort asks for it, through the
+consume-once stash in route_quant_handoff, so the shared routing functions keep
+their signatures:
+
+    KimiK3MoE.forward           stage() before routing, clear() after the layer
+    biased_grouped_topk_gpu     try_route_and_register() replaces route_radix4
+                                when a staged request covers the batch
 """
 
 from __future__ import annotations
@@ -17,10 +24,19 @@ import torch
 
 from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.moe import moe_route_radix4
-from sglang.srt.environ import envs
 from sglang.srt.layers import zero_copy_context
+from sglang.srt.layers.moe import route_quant_handoff
+from sglang.srt.runtime_context import get_buffer
+from sglang.srt.utils import get_bool_env_var, is_device_stream_capturing
 
 logger = logging.getLogger(__name__)
+
+# AITER uses the sort only where its tuned kernel for the batch is BM=16 and sorts
+# again elsewhere. Its Kimi-K3 A8W4 (at or past ROCm/aiter#6464) and A16W4 tables
+# are BM=16 up to 512 tokens. Its stock A4W4 table is BM=32 at 65-256 tokens, where
+# the sort would be computed and dropped (4.2-6.1 us per layer on MI355X).
+_MAX_TOKENS = 512
+_MAX_TOKENS_A4W4 = 64
 
 
 @cache_once
@@ -32,29 +48,54 @@ def _registrar() -> Optional[Callable[[Optional[dict]], None]]:
     return register_presorted_moe
 
 
-def clear_registration() -> None:
-    """Drop a registration that no fused_moe consumed, as AITER's caller contract requires."""
-    registrar = _registrar()
-    if registrar is not None:
-        registrar(None)
+def available() -> bool:
+    """Whether this AITER can take a presort (register_presorted_moe)."""
+    return _registrar() is not None
 
 
-def enabled(scores: torch.Tensor) -> bool:
-    return (
-        envs.SGLANG_OPT_HIP_K3_RADIX4_FUSE_SORT.get()
-        and 1
-        <= scores.shape[0]
-        <= envs.SGLANG_OPT_HIP_K3_RADIX4_FUSE_SORT_MAX_TOKENS.get()
-        and _registrar() is not None
-        and _workspace_ready(scores.device)
+@cache_once
+def _max_tokens() -> int:
+    # AITER's SiTU activation-mode precedence: A8W4 wins over A4W4.
+    a4w4 = get_bool_env_var("AITER_SITUV2_A4W4", "false") and not get_bool_env_var(
+        "AITER_SITUV2_A8W4", "false"
     )
+    return _MAX_TOKENS_A4W4 if a4w4 else _MAX_TOKENS
 
 
-def _workspace_ready(device: torch.device) -> bool:
-    ready = moe_route_radix4.fused_sort_ready(device)
-    if not ready:
-        _warn_captured_without_workspace()
-    return ready
+def stage() -> None:
+    """Ask the next radix-4 routing call for the fused sort. The caller pairs
+    this with clear() after the layer (try/finally)."""
+    route_quant_handoff.stage_aiter_presort()
+
+
+def clear() -> None:
+    """Drop the request and a registration that no fused_moe consumed, as
+    AITER's caller contract requires."""
+    route_quant_handoff.clear()
+    _registrar()(None)
+
+
+class _SortWorkspaces:
+    """The sort's arrival counters per (device, stream): launches in flight on
+    two streams must not share them. A captured graph keeps its capture stream's
+    counters, so it must not replay alongside eager launches on that stream."""
+
+    def __init__(self) -> None:
+        self.by_stream: dict[tuple[torch.device, int], torch.Tensor] = {}
+
+    def get(self, device: torch.device) -> Optional[torch.Tensor]:
+        """The current stream's counters, or None when they would first be
+        allocated inside a graph capture, where they are only zeroed when that
+        one graph replays."""
+        key = (device, torch.cuda.current_stream(device).cuda_stream)
+        ws = self.by_stream.get(key)
+        if ws is None:
+            if is_device_stream_capturing(device):
+                _warn_captured_without_workspace()
+                return None
+            ws = moe_route_radix4.new_sort_workspace(device)
+            self.by_stream[key] = ws
+        return ws
 
 
 @cache_once
@@ -86,25 +127,33 @@ def _published_moe_output(n_tokens: int) -> Optional[torch.Tensor]:
     return None
 
 
-def route_and_register(
-    *,
+def try_route_and_register(
     scores: torch.Tensor,
     bias: torch.Tensor,
+    *,
     topk: int,
     renormalize: bool,
     routed_scaling_factor: float,
-    num_token_non_padded: Optional[torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Route with the fused sort and register it for the next fused_moe call.
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Route with the fused sort and register it for the next fused_moe call
+    when a staged request covers this batch. Returns (weights, ids) on a hit,
+    None otherwise (the caller runs route_radix4).
 
-    Caller must have checked moe_route_radix4.covered() and enabled().
+    Caller must have checked moe_route_radix4.covered().
     """
+    requested, num_token_non_padded = route_quant_handoff.take_aiter_presort()
+    if not requested or not 1 <= scores.shape[0] <= _max_tokens():
+        return None
+    sort_ws = get_buffer("aiter_presort_sort_ws", _SortWorkspaces).get(scores.device)
+    if sort_ws is None:
+        return None
     weights, ids, aux = moe_route_radix4.route_radix4_with_sort(
         scores=scores,
         bias=bias,
         topk=topk,
         renormalize=renormalize,
         routed_scaling_factor=routed_scaling_factor,
+        sort_ws=sort_ws,
         moe_buf=_published_moe_output(scores.shape[0]),
         num_token_non_padded=num_token_non_padded,
     )
