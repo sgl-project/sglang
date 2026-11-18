@@ -4295,10 +4295,9 @@ class AiterAttnBackend(AttentionBackend):
         metadatas: list[Optional[MlaPrefillPsMetadata]] = []
         for i in range(forward_batch.num_prefix_chunks):
             chunk_lens_cpu = forward_batch.prefix_chunk_seq_lens_cpu[i].to(torch.int32)
-            if not chunk_lens_cpu.any():
-                # A chunk without keys has nothing to plan;
-                # leaving the list unset keeps every chunk in bf16 on varlen.
-                return
+            # num_prefix_chunks is ceil(max prefix / chunk len),
+            # so the longest prefix has keys in every chunk.
+            assert chunk_lens_cpu.any(), f"prefix chunk {i} has no keys"
             if forward_batch.prefix_chunk_has_zero_kv[i]:
                 # None leaves the chunk to bf16 varlen in _forward_extend_prefix_chunk.
                 metadatas.append(
@@ -4338,6 +4337,7 @@ class AiterAttnBackend(AttentionBackend):
         # the chunk's k/v hold the others' keys in order, so the identity page table holds.
         active = chunk_lens_cpu > 0
         q_lens_cpu = extend_lens_cpu[active]
+        assert q_lens_cpu.any(), "a prefix chunk with keys needs a query row"
         kv_lens_cpu = chunk_lens_cpu[active]
         qo_indptr_cpu = torch.zeros(len(q_lens_cpu) + 1, dtype=torch.int32)
         qo_indptr_cpu[1:] = torch.cumsum(q_lens_cpu, dim=0)
@@ -4454,7 +4454,7 @@ class AiterAttnBackend(AttentionBackend):
         # so one pass writes both in fp8; without it they stay bf16 for varlen.
         if self.forward_metadata.chunked_prefix_ps_metadatas is not None:
             return mla_kv_pack_quantize_fp8(
-                k_nope, k_pe, v, fp8_dtype=fp8_dtype, enable_pdl=False
+                k_nope=k_nope, k_pe=k_pe, v=v, fp8_dtype=fp8_dtype, enable_pdl=False
             )
         nope_dim = k_nope.shape[-1]
         k = k_nope.new_empty((*k_nope.shape[:-1], nope_dim + k_pe.shape[-1]))
@@ -4476,8 +4476,10 @@ class AiterAttnBackend(AttentionBackend):
         if ps is not None:
             rows = ps.active_q_rows
             if rows is None:
-                return self._mla_fp8_prefill_attn_ps(q, k, v, layer, ps)
-            out_rows, lse_rows = self._mla_fp8_prefill_attn_ps(q[rows], k, v, layer, ps)
+                return self._mla_fp8_prefill_attn_ps(q=q, k=k, v=v, layer=layer, ps=ps)
+            out_rows, lse_rows = self._mla_fp8_prefill_attn_ps(
+                q=q[rows], k=k, v=v, layer=layer, ps=ps
+            )
             # merge_state weights a -inf LSE row by zero,
             # so its output only has to be finite.
             output = out_rows.new_zeros((q.shape[0], *out_rows.shape[1:]))

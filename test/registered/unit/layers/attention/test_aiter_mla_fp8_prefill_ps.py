@@ -209,36 +209,6 @@ class TestAiterMlaFp8PrefillPs(CustomTestCase):
                 self.assertFalse(merged.isnan().any())
                 torch.testing.assert_close(merged[keyless], other_out[keyless])
 
-    def test_prefix_chunk_without_any_keys(self):
-        """A prefix chunk where no request has keys has nothing for the PS scheduler to plan;
-        it must still run (bf16 varlen) and leave the merged state unchanged."""
-        q_lens, chunk_lens = [130, 40], [0, 0]
-        num_heads = KIMI_K3_TP8_HEADS
-        backend = _backend(num_heads, q_lens)
-        batch = SimpleNamespace(
-            extend_seq_lens_cpu=q_lens,
-            num_prefix_chunks=1,
-            prefix_chunk_idx=0,
-            prefix_chunk_seq_lens_cpu=torch.tensor([chunk_lens], dtype=torch.int32),
-            prefix_chunk_has_zero_kv=[True],
-            prefix_chunk_cu_seq_lens=torch.zeros(
-                1, len(chunk_lens) + 1, dtype=torch.int32, device="cuda"
-            ),
-            prefix_chunk_max_seq_lens=[0],
-        )
-        backend.init_mha_chunk_metadata(batch, disable_flashinfer_ragged=True)
-        q, k_nope, k_pe, v = _qkv(num_heads, q_lens, chunk_lens)
-        k, v = backend.pack_prefix_chunk_kv(k_nope, k_pe, v)
-        self.assertEqual(k.dtype, torch.bfloat16)
-        out, lse = backend._forward_extend_prefix_chunk(
-            q, k, v, _layer(num_heads), batch
-        )
-
-        other_out = torch.randn_like(out)
-        other_lse = torch.randn_like(lse)
-        merged, _ = merge_state(out, lse, other_out, other_lse)
-        torch.testing.assert_close(merged, other_out)
-
     def test_keyless_prefix_chunk_stays_bf16_off_kimi_k3(self):
         """Keyless prefix chunks run on the asm fp8 prefill only for Kimi-K3;
         every other MLA model keeps such a chunk on bf16 varlen, at bf16 accuracy."""
