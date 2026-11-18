@@ -43,6 +43,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner import (
+    BaseRunner,
     DecodeCudaGraphRunner,
     PrefillCudaGraphRunner,
     get_batch_sizes_to_capture,
@@ -174,6 +175,14 @@ def _qsa_index_share_requested(hf_config) -> bool:
             getattr(hf_config, "index_share_for_mtp_iteration", False),
         )
     )
+
+
+def _prefill_graph_max_tokens(graph_runner: Optional[BaseRunner]) -> int:
+    """The largest prefill batch this runner captured a graph for; 0 for an eager
+    runner, which captures none."""
+    if isinstance(graph_runner, PrefillCudaGraphRunner):
+        return graph_runner.max_num_tokens
+    return 0
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
@@ -1085,7 +1094,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if self.can_split_prefill_draft_extend and should_split_prefill_draft_extend(
             batch,
             mm_input_embeds=mm_input_embeds,
-            draft_prefill_graph_max_tokens=self._draft_prefill_graph_max_tokens(),
+            draft_prefill_graph_max_tokens=_prefill_graph_max_tokens(
+                self.draft_runner.prefill_cuda_graph_runner
+            ),
+            target_prefill_graph_max_tokens=_prefill_graph_max_tokens(
+                self.target_worker.model_runner.prefill_cuda_graph_runner
+            ),
         ):
             return self._draft_extend_for_prefill_split(
                 batch,
@@ -1161,12 +1175,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # pass computes none. Read the flag: this runs before the capturer exists.
             and not get_exec().features.enable_return_indexer_topk
         )
-
-    def _draft_prefill_graph_max_tokens(self) -> int:
-        runner = self.draft_runner.prefill_cuda_graph_runner
-        if isinstance(runner, PrefillCudaGraphRunner):
-            return runner.max_num_tokens
-        return 0
 
     def _draft_extend_for_prefill_split(
         self,

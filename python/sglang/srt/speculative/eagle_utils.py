@@ -171,6 +171,7 @@ def should_split_prefill_draft_extend(
     *,
     mm_input_embeds: Optional[torch.Tensor],
     draft_prefill_graph_max_tokens: int,
+    target_prefill_graph_max_tokens: int,
 ) -> bool:
     """Whether the draft extend after this prefill runs as a KV-only pass over
     every request's tokens but its last, plus a pass over the last tokens."""
@@ -195,6 +196,12 @@ def should_split_prefill_draft_extend(
         # A captured draft prefill graph replays the full layer for batches it fits.
         and batch.extend_num_tokens - len(batch.extend_lens)
         > max(_MAX_UNSPLIT_PREFILL_DRAFT_EXTEND_TOKENS, draft_prefill_graph_max_tokens)
+        # 0 = the target captured no prefill graph. A batch above that bound can
+        # replay none of them, and splitting those measured slower on B300.
+        and (
+            target_prefill_graph_max_tokens == 0
+            or batch.extend_num_tokens <= target_prefill_graph_max_tokens
+        )
     )
 
 

@@ -75,11 +75,18 @@ def _draft_rows(batch, hidden_rows):
     )
 
 
-def _should_split(batch, *, mm_input_embeds=None, draft_prefill_graph_max_tokens=0):
+def _should_split(
+    batch,
+    *,
+    mm_input_embeds=None,
+    draft_prefill_graph_max_tokens=0,
+    target_prefill_graph_max_tokens=0,
+):
     return should_split_prefill_draft_extend(
         batch,
         mm_input_embeds=mm_input_embeds,
         draft_prefill_graph_max_tokens=draft_prefill_graph_max_tokens,
+        target_prefill_graph_max_tokens=target_prefill_graph_max_tokens,
     )
 
 
@@ -175,6 +182,25 @@ class TestSplitPrefillDraftExtend(CustomTestCase):
         self.assertTrue(
             _should_split(
                 _prefill_batch([0], [n + 2]), draft_prefill_graph_max_tokens=n
+            )
+        )
+
+    def test_batch_above_the_target_prefill_graphs_keeps_the_single_draft_extend(self):
+        """A batch with more tokens than the target captured a prefill graph for can
+        replay none of them, so it stays whole. A target that captured no prefill
+        graph (0) does not bound the split: measured faster there on 4 GPUs."""
+        n = 2 * _MAX_UNSPLIT_PREFILL_DRAFT_EXTEND_TOKENS
+        self.assertTrue(
+            _should_split(_prefill_batch([0], [n]), target_prefill_graph_max_tokens=n)
+        )
+        self.assertFalse(
+            _should_split(
+                _prefill_batch([0], [n + 1]), target_prefill_graph_max_tokens=n
+            )
+        )
+        self.assertTrue(
+            _should_split(
+                _prefill_batch([0], [n + 1]), target_prefill_graph_max_tokens=0
             )
         )
 
