@@ -9,7 +9,6 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.utils.device import is_hip, is_npu
 
 _is_npu = is_npu()
@@ -695,7 +694,7 @@ def qsa_mqa_decode(
         from sgl_kernel_npu.operators.indexer import qsa_mqa_paged
 
         return qsa_mqa_paged(q, k_cache, page_table, context_lens, max_model_len)
-    if q.is_cuda and is_hip() and envs.SGLANG_ROCM_QSA_TRITON_DECODE.get():
+    if q.is_cuda and is_hip():
         from sglang.kernels.ops.attention.qsa_mqa_decode_triton import (
             can_use_qsa_mqa_decode_triton,
             qsa_mqa_decode_triton,

@@ -12,7 +12,6 @@ from sglang.kernels.ops.attention.qsa_mqa_decode_triton import (
     can_use_qsa_mqa_decode_triton,
     qsa_mqa_decode_triton,
 )
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qsa.mqa import qsa_mqa_decode, torch_qsa_mqa_decode
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
@@ -133,19 +132,6 @@ def test_qsa_mqa_decode_dispatches_triton_on_rocm(monkeypatch):
         rows_per_request=4,
         num_heads=4,
     )
-    assert groups == [4]
-    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
-
-    with envs.SGLANG_ROCM_QSA_TRITON_DECODE.override(False):
-        actual = qsa_mqa_decode(
-            q,
-            k_cache,
-            page_table,
-            context_lens,
-            max_model_len,
-            rows_per_request=4,
-            num_heads=4,
-        )
     assert groups == [4]
     torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
 
