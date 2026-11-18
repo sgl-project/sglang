@@ -116,6 +116,8 @@ class TestNativeEagerVerify(CustomTestCase):
                                 simulated_acc_len_rng=scope["simulated_acc_len_rng"],
                                 sparse_bonus_argmax=True,
                             )
+                        else:
+                            kwargs["is_ngram"] = True
                         sample.assert_called_once_with(
                             scope["verify_input"],
                             batch,
