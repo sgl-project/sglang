@@ -29,7 +29,7 @@ from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=60, stage="base-b", runner_config="diffusion-1-gpu-5090")
+register_cuda_ci(est_time=60, stage="base-b-diffusion", runner_config="1-gpu-small")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")

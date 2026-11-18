@@ -25,6 +25,7 @@ from typing import List, Optional, Union
 import torch
 import torch.distributed as dist
 
+from sglang.srt.beam_search.trie_output_head import configure_model_trie_output_heads
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import (
     _DEFAULT_LOAD_GROUP,
@@ -780,6 +781,12 @@ class ModelRunner:
         )
         self.maybe_apply_post_load_model_transforms()
         self.maybe_init_lora_manager()
+        self.beam_trie_compact_enabled = configure_model_trie_output_heads(
+            self.model,
+            self.model_config,
+            self.device,
+            lora_enabled=self.lora_manager is not None,
+        )
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
         # after every post-load change to the model, before the KV cache is sized

@@ -8,7 +8,7 @@ serving stack rather than at a different recipe.
 MI30x cannot serve the MXFP4 checkpoints natively, which is why the model
 paths differ from the MI35x benchmark.
 
-Registry: nightly-perf-8-gpu-gpt-oss suite
+Registry: nightly-perf-test-8-gpu-amd-gpt-oss suite
 
 Example usage:
     python3 test_gpt_oss_perf_amd.py
@@ -23,7 +23,9 @@ from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 # Register for AMD CI - MI30x GPT-OSS perf benchmark (~60 min for both sizes)
-register_amd_ci(est_time=3600, suite="nightly-perf-8-gpu-gpt-oss", nightly=True)
+register_amd_ci(
+    est_time=3600, suite="nightly-perf-test-8-gpu-amd-gpt-oss", nightly=True
+)
 
 RESULT_DIR = "performance_results_gpt_oss_mi30x"
 
