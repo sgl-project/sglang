@@ -2128,6 +2128,8 @@ class Envs:
     SGLANG_DSV4_FP8_HCA_PERSIST_MIN_ROWS = EnvInt(15)
 
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
+    # Single-pass Mega-mHC prefill. SM100 uses DeepGEMM; gfx950 uses aiter
+    # flydsl_mega_mhc (ROCm/aiter#6179). Off by default.
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
     # (engram_staging.py); pays off for large prefill batches.
