@@ -2568,9 +2568,7 @@ class TestPrefillAdder(CustomTestCase):
         # Continuing chunks retain the original host-hit metadata.
         self.assertEqual(req.mamba_host_hit_length, 1)
         next_adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=4)
-        self.mock_token_allocator.mamba_allocator.schedulable_available_size.return_value = (
-            0
-        )
+        self.mock_token_allocator.mamba_allocator.schedulable_available_size.return_value = 0
         self.assertIsNone(next_adder.add_chunked_req(req))
         self.assertEqual(self._unreserved_state_slots(next_adder), 0)
         self.assertEqual(next_adder.memory_budget.total_offset, 4 + 8 + 1)
