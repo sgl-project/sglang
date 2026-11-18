@@ -528,6 +528,19 @@ def test_action_parallel_info_reports_single_rank_without_process_group():
     }
 
 
+def test_pi05_checkpoint_config_follows_declared_tokenizer(tmp_path):
+    (tmp_path / "tokenizer").mkdir()
+    (tmp_path / "policy_preprocessor.json").write_text(
+        '{"steps": [{"artifacts": {"tokenizer_name": "tokenizer"}}]}'
+    )
+    config = Pi05PipelineConfig()
+    Pi05PolicyModel._apply_checkpoint_config(str(tmp_path), config)
+    assert config.tokenizer_name == str(tmp_path / "tokenizer")
+    config = Pi05PipelineConfig(tokenizer_name="custom")
+    Pi05PolicyModel._apply_checkpoint_config(str(tmp_path), config)
+    assert config.tokenizer_name == "custom"
+
+
 def test_pi05_siglip_reuses_srt_model_with_layerwise_groups():
     config = SimpleNamespace(
         hidden_size=8,

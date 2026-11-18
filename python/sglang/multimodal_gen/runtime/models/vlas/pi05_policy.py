@@ -520,6 +520,20 @@ class Pi05PolicyModel(nn.Module):
         model_path: str,
         config: Pi05PipelineConfig,
     ) -> None:
+        if config.tokenizer_name == Pi05PipelineConfig.tokenizer_name:
+            processor_path = Path(model_path) / "policy_preprocessor.json"
+            try:
+                if processor_path.is_file():
+                    with processor_path.open(encoding="utf-8") as f:
+                        steps = json.load(f)["steps"]
+                    for step in steps:
+                        name = step.get("artifacts", {}).get("tokenizer_name")
+                        if name and (Path(model_path) / name).is_dir():
+                            config.tokenizer_name = str(Path(model_path) / name)
+            except Exception as e:
+                logger.warning(
+                    "Ignoring LeRobot processor config %s: %s", processor_path, e
+                )
         config_path = Path(model_path) / "config.json"
         if not config_path.exists():
             return
