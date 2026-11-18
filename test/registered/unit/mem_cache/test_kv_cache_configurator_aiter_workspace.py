@@ -51,6 +51,7 @@ def _per_row(model, context_len=None):
         num_heads=model.num_attention_heads,
         head_dim=model.head_dim,
         context_len=context_len or model.context_len,
+        slack_context_len=kcc._AITER_WORKSPACE_SLACK_CONTEXT_LEN,
     )
 
 
@@ -134,6 +135,9 @@ class TestAiterDecodeWorkspaceReserve(CustomTestCase):
         other_pp_rank=None,
         budgets=None,
         sent_flags=None,
+        extra_claims_mb=0,
+        req_to_token_row=0,
+        alignment=1,
     ):
         """Run _resolve_memory_pool_config with a KV pool of KV_BYTES_PER_TOKEN
         per token; returns the config and the KV budgets it was sized from.
@@ -141,7 +145,9 @@ class TestAiterDecodeWorkspaceReserve(CustomTestCase):
         other_pp_rank: (request_cap or None, does_not_fit, needs_reserve) of a
         second PP rank, merged into this rank's all-reduce. budgets /
         sent_flags: lists that collect the KV budgets and the flags this rank
-        sent to the all-reduce, still filled when the run raises."""
+        sent to the all-reduce, still filled when the run raises.
+        extra_claims_mb: CUDA graph + DeepEP + VLM slack terms; req_to_token_row:
+        bytes of one request-table row; alignment: CUDA graph batch alignment."""
         budgets = [] if budgets is None else budgets
         sent_flags = [] if sent_flags is None else sent_flags
 
@@ -222,6 +228,27 @@ class TestAiterDecodeWorkspaceReserve(CustomTestCase):
             stack.enter_context(
                 patch.object(
                     kcc.KVCacheConfigurator,
+                    "_default_slack_extra_claims_mb",
+                    lambda self, gpu_mem: extra_claims_mb,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    kcc.KVCacheConfigurator,
+                    "_req_to_token_bytes_per_row",
+                    lambda self: req_to_token_row,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    kcc.KVCacheConfigurator,
+                    "_cuda_graph_batch_alignment",
+                    lambda self: alignment,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    kcc.KVCacheConfigurator,
                     "_profile_available_bytes",
                     lambda self, pre: (
                         budget_gb * GB if budget_bytes is None else budget_bytes
@@ -287,6 +314,97 @@ class TestAiterDecodeWorkspaceReserve(CustomTestCase):
         kvc = self._configurator(_llama_8b(context_len=8192))
         config, budgets = self._run(kvc)
         self.assertEqual(budgets, [140 * GB])
+
+    def test_short_context_keeps_the_workspace_in_the_slack(self):
+        # The default fraction at 8192 is not 0.816: the slack is the 10 GB
+        # activation floor plus the graph terms. Contexts up to 8192 tokens ran
+        # their workspace from it before the reserve, and still do (no KV loss
+        # even with 4096 requests and the other slack claims counted).
+        fraction = round(1 - (10 * 1024 + 1024) / GPU_MEM_MB, 3)
+        kvc = self._configurator(_llama_8b(context_len=8192))
+        self.assertEqual(self._per_row_total(kvc), 0)
+        _, budgets = self._run(kvc, mem_fraction_static=fraction, extra_claims_mb=1024)
+        self.assertEqual(budgets, [140 * GB])
+
+    def test_contexts_just_above_the_short_limit_reserve_the_full_workspace(self):
+        model = _llama_8b(context_len=8193)
+        self.assertEqual(
+            self._per_row_total(self._configurator(model)),
+            kcc.aiter_decode_workspace_bytes_per_row(
+                num_heads=32, head_dim=128, context_len=8193
+            ),
+        )
+
+    def test_other_slack_claims_are_not_spent_on_the_workspace(self):
+        # The CUDA graph / DeepEP / VLM terms of the default fraction (here
+        # 6 GB) take their part of the slack first, so that much more of the
+        # workspace is reserved from the KV budget.
+        kvc = self._configurator()
+        _, without = self._run(kvc)
+        _, with_claims = self._run(self._configurator(), extra_claims_mb=6 * 1024)
+        self.assertEqual(with_claims[1], without[1] - 6 * GB)
+
+    def test_request_table_is_part_of_the_demand(self):
+        # req_to_token: rows x (context_len + 4) x 4 bytes, allocated after the
+        # KV pool out of the same slack (~2 GB for 4096 rows at 128K).
+        row = (131072 + 4) * 4
+        _, without = self._run(self._configurator())
+        _, with_table = self._run(self._configurator(), req_to_token_row=row)
+        self.assertAlmostEqual(4096 * row / GB, 2.0, places=2)
+        self.assertEqual(with_table[1], without[1] - 4096 * row)
+
+    def test_request_cap_is_aligned_to_the_graph_batch_size(self):
+        # Capture pads the batch up to 2 (two-batch overlap) x attn_tp (gathered
+        # buffer); the workspace is sized by the pool, so the cap rounds down.
+        model = _llama_8b(context_len=10_000_000)
+        for alignment in (1, 16):
+            with self.subTest(alignment=alignment):
+                config, _ = self._run(
+                    self._configurator(model),
+                    budget_gb=60,
+                    mem_fraction_static=0.95,
+                    max_running_requests=4096,
+                    alignment=alignment,
+                )
+                self.assertGreaterEqual(config.max_running_requests, alignment)
+                self.assertEqual(config.max_running_requests % alignment, 0)
+        # An unaligned cap exists without the alignment: 37-ish requests.
+        unaligned, _ = self._run(
+            self._configurator(model),
+            budget_gb=60,
+            mem_fraction_static=0.95,
+            max_running_requests=4096,
+        )
+        self.assertNotEqual(unaligned.max_running_requests % 16, 0)
+
+    def test_reserved_bytes_are_left_for_paged_experts(self):
+        kvc = self._configurator()
+        self.assertEqual(getattr(kvc, "aiter_workspace_reserved_bytes", 0), 0)
+        _, budgets = self._run(kvc)
+        self.assertEqual(kvc.aiter_workspace_reserved_bytes, budgets[0] - budgets[1])
+        self.assertGreater(kvc.aiter_workspace_reserved_bytes, 0)
+
+    def test_error_does_not_suggest_an_explicit_mem_fraction(self):
+        # An explicit --mem-fraction-static skips the reserve.
+        kvc = self._configurator(_llama_8b(context_len=100_000_000))
+        with self.assertRaises(RuntimeError) as cm:
+            self._run(kvc, budget_gb=2, mem_fraction_static=0.95)
+        self.assertNotIn("mem-fraction-static", str(cm.exception))
+        self.assertIn("--context-length", str(cm.exception))
+
+    def test_backend_reads_the_unified_attention_env_like_the_configurator(self):
+        # EnvBool accepts "yes"; get_bool_env_var does not.
+        from pathlib import Path
+
+        source = (
+            Path(kcc.__file__).parents[1] / "layers" / "attention" / "aiter_backend.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotRegex(
+            source, r'get_bool_env_var\(\s*"SGLANG_USE_AITER_UNIFIED_ATTN"'
+        )
+        with envs.SGLANG_USE_AITER_UNIFIED_ATTN.override("yes"):
+            self.assertTrue(envs.SGLANG_USE_AITER_UNIFIED_ATTN.get())
+            self.assertEqual(self._per_row_total(self._configurator()), 0)
 
     def test_speculative_request_cap_and_draft_backends(self):
         # EAGLE3 sets max_running_requests=48. The draft runner builds its own

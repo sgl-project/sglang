@@ -12,6 +12,11 @@ import torch
 
 from sglang.kernels.ops.quantization.dsa_quant_k_cache import fp8_ds_mla_row_width
 from sglang.srt.arg_groups.kv_cache_hook import draft_rows_refusal
+from sglang.srt.arg_groups.memory_hook import (
+    adjust_mem_fraction_for_vlm,
+    reserve_for_deepep_a2a_mb,
+    reserve_for_graph_mb,
+)
 from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.configs.attention_execution import attention_dcp_size
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
@@ -199,13 +204,23 @@ def replayssm_ring_memory_charge(
 
 # Mirrors _AITER_PARTITION_SIZE_ROCM in layers/attention/aiter_backend.py.
 _AITER_DECODE_PARTITION_SIZE = 256
+# Models with a context up to this length ran their workspace out of the
+# runtime slack before the reserve existed, and still do: no reserve for them.
+_AITER_WORKSPACE_SLACK_CONTEXT_LEN = 8192
 
 
 def aiter_decode_workspace_bytes_per_row(
-    *, num_heads: int, head_dim: int, context_len: int
+    *,
+    num_heads: int,
+    head_dim: int,
+    context_len: int,
+    slack_context_len: int = 0,
 ) -> int:
     """Bytes of one AiterAttnBackend.workspace_buffer per request-pool row: fp32
-    partial outputs plus two fp32 stats for every (head, partition)."""
+    partial outputs plus two fp32 stats for every (head, partition).
+    slack_context_len: contexts up to this length return 0 (left to the slack)."""
+    if context_len <= slack_context_len:
+        return 0
     num_partitions = -(-context_len // _AITER_DECODE_PARTITION_SIZE)
     return num_heads * num_partitions * (head_dim + 2) * 4
 
@@ -426,6 +441,9 @@ def draft_loc_space_scale(*, hf_config, use_mla_backend: bool, dcp_size: int) ->
 
 @dataclass(slots=True, kw_only=True)
 class KVCacheConfigurator:
+    # Bytes _reserve_aiter_decode_workspace took out of the KV budget for the
+    # aiter decode workspaces; paged-expert slots must leave them free.
+    aiter_workspace_reserved_bytes: int = 0
     device: str
     gpu_id: int
     # Capture draft placement at construction; the configurator outlives the scope.
@@ -3441,6 +3459,7 @@ class KVCacheConfigurator:
                 // get_parallel().attn_tp_size,
                 head_dim=self.model_config.head_dim,
                 context_len=self.model_config.context_len,
+                slack_context_len=_AITER_WORKSPACE_SLACK_CONTEXT_LEN,
             )
         num_draft_backends = self._num_aiter_draft_backends(
             prefill_backend, decode_backend, adaptive_steps
@@ -3458,6 +3477,7 @@ class KVCacheConfigurator:
                 # context length, and AiterAttnBackend sizes its partitions
                 # from the runner's context_len, not the draft checkpoint's.
                 context_len=self.model_config.context_len,
+                slack_context_len=_AITER_WORKSPACE_SLACK_CONTEXT_LEN,
             )
         return total
 
@@ -3563,9 +3583,22 @@ class KVCacheConfigurator:
         slack_bytes = (
             pre_model_load_memory * (1 - get_schedule().mem_fraction_static) * (1 << 30)
         )
+        # The default mem_fraction_static sizes the slack for more than the
+        # activations: the CUDA graph, DeepEP and VLM terms, and req_to_token
+        # (allocated after the KV pool) take their share first.
         headroom = max(
-            0, int(slack_bytes - pre_capture_activation_reserve_mb(gpu_mem) * (1 << 20))
+            0,
+            int(
+                slack_bytes
+                - (
+                    pre_capture_activation_reserve_mb(gpu_mem)
+                    + self._default_slack_extra_claims_mb(gpu_mem)
+                )
+                * (1 << 20)
+            ),
         )
+        # The request table grows with the request count too.
+        per_row += self._req_to_token_bytes_per_row()
         per_request = per_row * self._req_pool_rows(1)
 
         def charge(max_running_requests: int) -> int:
@@ -3579,6 +3612,11 @@ class KVCacheConfigurator:
         # with them) instead of starving the KV cache.
         if not explicit_max_running_requests and reserved > budget_bytes // 2:
             request_cap = max(1, (budget_bytes // 2 + headroom) // per_request)
+            # Graph capture pads the batch size up to this alignment, and the
+            # workspace is sized by the pool's request count: round the cap
+            # down so no captured batch outgrows it.
+            alignment = self._cuda_graph_batch_alignment()
+            request_cap = max(alignment, request_cap // alignment * alignment)
         local_reserved = charge(
             config.max_running_requests
             if request_cap is None
@@ -3637,9 +3675,7 @@ class KVCacheConfigurator:
                 f"reserve{where} (this rank: "
                 f"{budget_bytes / (1 << 30):.2f} GB + "
                 f"{headroom / (1 << 30):.2f} GB). Try {fix}a smaller "
-                f"--context-length, a larger --tp-size (fewer heads per rank), "
-                f"or an explicit --mem-fraction-static, which skips this "
-                f"workspace reserve."
+                f"--context-length or a larger --tp-size (fewer heads per rank)."
             )
         if not needs_reserve:
             return config
@@ -3657,6 +3693,7 @@ class KVCacheConfigurator:
                 per_request / (1 << 20),
             )
 
+        self.aiter_workspace_reserved_bytes = reserved
         config = self.config_from_budget(budget_bytes - reserved)
         # A smaller budget never yields more requests, so `reserved` still
         # covers the workspace of the final pool.
@@ -3673,6 +3710,39 @@ class KVCacheConfigurator:
             reserved / (1 << 30),
         )
         return config
+
+    def _default_slack_extra_claims_mb(self, gpu_mem: float) -> float:
+        """The slack terms the default mem_fraction_static adds on top of the
+        activation reserve (arg_groups/memory_hook.py): CUDA graphs, DeepEP
+        all-to-all buffers and the VLM adjustment."""
+        server_args = self.server_args
+        claims = reserve_for_graph_mb(server_args) + reserve_for_deepep_a2a_mb(
+            server_args
+        )
+        model_config = self.model_config
+        if (
+            model_config.is_multimodal
+            and not get_disagg().language_only
+            and not get_disagg().language_model_only
+            and get_disagg().disaggregation_mode != "decode"
+        ):
+            fraction = get_schedule().mem_fraction_static
+            # The adjustment scales the fraction by a constant factor.
+            factor = adjust_mem_fraction_for_vlm(1.0, model_config, False, gpu_mem)
+            if factor > 0:
+                claims += max(0.0, fraction / factor - fraction) * gpu_mem
+        return claims
+
+    def _req_to_token_bytes_per_row(self) -> int:
+        """Bytes of one req_to_token row (int32 per context position)."""
+        return (
+            self.model_config.context_len + get_req_to_token_extra_context_len()
+        ) * 4
+
+    def _cuda_graph_batch_alignment(self) -> int:
+        from sglang.srt.layers.dp_attention import get_cuda_graph_batch_size_alignment
+
+        return max(1, get_cuda_graph_batch_size_alignment())
 
     def _budget_holds_min_kv_pool(self, budget_bytes: int) -> bool:
         """Whether a KV budget left after the workspace reserve still sizes a

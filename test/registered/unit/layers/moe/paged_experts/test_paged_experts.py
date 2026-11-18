@@ -1390,6 +1390,7 @@ class TestSizing(CustomTestCase):
         context_length=None,
         refuse=False,
         reserve_slots=0,
+        aiter_reserved_slots=0,
         **schedule,
     ):
         """Two layers built with K = top_k, sized through ``ExpertSlotSizing`` against a static
@@ -1403,6 +1404,8 @@ class TestSizing(CustomTestCase):
         layers = [layer for _, layer, _ in built]
         row = sizing._bytes_per_slot(built[0][0])
         kvc = self._kvc()
+        # Bytes the KV configurator held back for the aiter decode workspaces.
+        kvc.aiter_workspace_reserved_bytes = aiter_reserved_slots * row
         caps = []
         with (
             self._patched(context_length, **schedule) as overrides,
@@ -1456,6 +1459,14 @@ class TestSizing(CustomTestCase):
                     )
                 self.assertEqual(slots is not None, sized)
                 self.assertEqual(bool(overrides), sized)
+
+    def test_slots_leave_the_aiter_workspace_reserve_free(self):
+        """The bytes the KV configurator reserved for the aiter decode workspaces are
+        not given to slots: 2 reserved slots' worth leaves 2 of the 4 budgeted."""
+        full, _, _, _ = self._sized(budget_slots=4)
+        ks, _, _, _ = self._sized(budget_slots=4, aiter_reserved_slots=2 * 2)
+        self.assertEqual(full, [K, K])
+        self.assertLess(ks[0], full[0])
 
     def test_the_kv_target_is_applied_as_max_total_tokens_unless_set(self):
         _, _, _, overrides = self._sized(budget_slots=4, max_running_requests=2)

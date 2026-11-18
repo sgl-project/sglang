@@ -830,9 +830,7 @@ class AiterAttnBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool:
             self.use_triton_unified_attention = True
         else:
-            self.use_triton_unified_attention = get_bool_env_var(
-                "SGLANG_USE_AITER_UNIFIED_ATTN"
-            )
+            self.use_triton_unified_attention = envs.SGLANG_USE_AITER_UNIFIED_ATTN.get()
         # Deterministic mode allows aiter decode only for the paged_attention_ragged
         # path and aiter prefill only for the batch prefill path; the unified-attention
         # and 5D-pool kernels are not verified batch-invariant.

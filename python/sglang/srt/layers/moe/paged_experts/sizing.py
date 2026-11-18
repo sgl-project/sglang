@@ -247,6 +247,9 @@ class ExpertSlotSizing:
             m.release_slots(layer)
         spare = static_budget_bytes(self.kv_configurator, self.pre_model_load_memory)
         spare -= sum(k * r for k, r in zip(base, row))
+        # The aiter decode workspaces are allocated after this, out of the bytes
+        # the KV configurator held back for them.
+        spare -= getattr(self.kv_configurator, "aiter_workspace_reserved_bytes", 0)
         # A host-planned step (a prefill chunk) needs its merged entries and one compacted
         # runner call beyond what the runner itself takes; one MoE layer runs at a time.
         tokens = _step_tokens(self.floor.minimum)
