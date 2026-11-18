@@ -13,6 +13,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.moe import route_quant_handoff
+from sglang.srt.layers.moe.moe_runner import aiter_route_sort
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -176,6 +177,16 @@ class AiterRunnerCore(MoeRunnerCore):
         )
 
         apply_aiter_small_moe_sort_patch()
+        self._route_sort_consumer: Optional[aiter_route_sort.AiterRouteSortConsumer] = (
+            None
+        )
+
+    def route_sort_consumer(self) -> Optional[aiter_route_sort.AiterRouteSortConsumer]:
+        # AITER drops a registered sort under an expert mask, which EP passes.
+        if self.config.moe_ep_size != 1 or not aiter_route_sort.available():
+            return None
+        self._route_sort_consumer = aiter_route_sort.AiterRouteSortConsumer()
+        return self._route_sort_consumer
 
     def run(
         self,
@@ -353,9 +364,11 @@ class AiterRunnerCore(MoeRunnerCore):
             intermediate_pad=quant_info.intermediate_pad,
             **extra,
         )
-        presort_gate = route_quant_handoff.staged_aiter_presort()
-        if presort_gate is not None:
-            presort_gate.observe(fused_moe_args)
+        # The consumer learns which batch sizes take the router's sort from the
+        # arguments of its layer's own fused_moe call.
+        consumer = self._route_sort_consumer
+        if consumer is not None and route_quant_handoff.staged_route_sort() is consumer:
+            consumer.observe(fused_moe_args)
         output = fused_moe(**fused_moe_args)
         return AiterRunnerOutput(hidden_states=output)
 

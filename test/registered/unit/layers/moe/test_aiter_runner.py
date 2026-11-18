@@ -8,13 +8,15 @@ import sglang.srt.layers.moe.moe_runner.aiter as aiter_runner
 from sglang.srt.environ import envs
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.moe import route_quant_handoff
+from sglang.srt.layers.moe.moe_runner import MoeRunner, aiter_route_sort
 from sglang.srt.layers.moe.moe_runner.aiter import (
     AiterMoeQuantInfo,
     AiterQuantType,
     AiterRunnerCore,
     AiterRunnerInput,
 )
-from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig, MoeRunnerCore
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=7, suite="extra-test-cpu-intel")
@@ -91,25 +93,77 @@ def test_aiter_runner_forwards_no_combine_and_extra_fused_moe_kwargs(monkeypatch
     assert captured["custom_fused_moe_kwarg"] == "enabled"
 
 
-def test_aiter_runner_shows_a_staged_presort_gate_its_fused_moe_call(monkeypatch):
-    """The radix-4 router's presort gate asks AITER for the config of exactly
-    the call fused_moe gets."""
-    captured = {}
+def _route_sort_runner(monkeypatch, *, moe_ep_size=1, available=True):
+    monkeypatch.setattr(aiter_route_sort, "available", lambda: available)
+    layer = SimpleNamespace(moe_ep_size=moe_ep_size)
+    return AiterRunnerCore(MoeRunnerConfig(activation="silu", layer=layer))
+
+
+def test_aiter_runner_declares_a_route_sort_consumer_only_without_ep(monkeypatch):
+    """AITER drops a registered sort under EP's expert mask, and an AITER without
+    register_presorted_moe cannot take one, so only then is there no consumer."""
+    runner = _route_sort_runner(monkeypatch)
+    assert isinstance(
+        runner.route_sort_consumer(), aiter_route_sort.AiterRouteSortConsumer
+    )
+    assert _route_sort_runner(monkeypatch, moe_ep_size=2).route_sort_consumer() is None
+    assert (
+        _route_sort_runner(monkeypatch, available=False).route_sort_consumer() is None
+    )
+
+
+def test_aiter_runner_shows_its_staged_route_sort_consumer_its_fused_moe_call(
+    monkeypatch,
+):
+    """The AITER route-sort consumer asks AITER for the config of exactly the
+    call its own layer's fused_moe gets."""
+    captured = []
 
     def fused_moe(**kwargs):
-        captured.update(kwargs)
+        captured.append(kwargs)
         return kwargs["hidden_states"]
 
     _install_fake_aiter(monkeypatch, fused_moe)
-    gate = SimpleNamespace(calls=[])
-    gate.observe = gate.calls.append
-    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu"))
-    route_quant_handoff.stage_aiter_presort(gate)
-    try:
-        runner.run(_runner_input(), _quant_info(), {})
-    finally:
-        route_quant_handoff.clear()
-    assert gate.calls == [captured]
+    runner = _route_sort_runner(monkeypatch)
+    consumer = runner.route_sort_consumer()
+    calls = []
+    consumer.observe = calls.append
+    for staged in (consumer, aiter_route_sort.AiterRouteSortConsumer()):
+        route_quant_handoff.stage_route_sort(staged)
+        try:
+            runner.run(_runner_input(), _quant_info(), {})
+        finally:
+            route_quant_handoff.clear()
+    # Shown its own layer's call only, not another staged layer's.
+    assert len(calls) == 1 and calls[0].keys() == captured[0].keys()
+    assert all(calls[0][name] is value for name, value in captured[0].items())
+
+
+class _Core(MoeRunnerCore):
+    def run(self, runner_input, quant_info, running_state, hooks=None):
+        raise NotImplementedError
+
+    @property
+    def runner_backend(self):
+        return MoeRunnerBackend.TRITON
+
+
+class _SortingCore(_Core):
+    def route_sort_consumer(self):
+        return "consumer"
+
+
+def test_moe_runner_asks_its_core_for_a_route_sort_consumer():
+    """A layer gets a consumer only from a core that declares one and runs."""
+    runner = MoeRunner.__new__(MoeRunner)
+    for core, fused_func, expected in (
+        (_SortingCore(MoeRunnerConfig()), None, "consumer"),
+        (_SortingCore(MoeRunnerConfig()), lambda *args: None, None),
+        (_Core(MoeRunnerConfig()), None, None),
+        (None, None, None),
+    ):
+        runner.runner_core, runner.fused_func = core, fused_func
+        assert runner.route_sort_consumer() == expected
 
 
 def test_aiter_runner_rejects_no_combine_when_fused_moe_does_not_support_it(
