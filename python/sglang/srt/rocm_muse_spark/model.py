@@ -89,7 +89,7 @@ from sglang.srt.rocm_muse_spark import (
 )
 from sglang.srt.rocm_muse_spark.all_reduce_boundary import (
     AllReduceAttnBoundary,
-    ar_boundary_modes,
+    ar_boundary_enabled,
 )
 from sglang.srt.rocm_muse_spark.attention_kv_write import (
     FUSED_QKV_CACHE,
@@ -1568,10 +1568,9 @@ class MuseSpark1xDecoderLayer(nn.Module):
             self.pre_feedforward_layernorm,
         )
         # the attention O projection's all-reduce inside the attention boundary kernel (BF16 dense weights)
-        ar_modes = ar_boundary_modes()
         self._attn_ar_boundary = (
-            AllReduceAttnBoundary(self._fused_attn_boundary, ar_modes)
-            if any(ar_modes) and not _DENSE_FP8
+            AllReduceAttnBoundary(self._fused_attn_boundary)
+            if ar_boundary_enabled() and not _DENSE_FP8
             else None
         )
 
@@ -1600,9 +1599,7 @@ class MuseSpark1xDecoderLayer(nn.Module):
         ar_boundary = (
             sp is None
             and self._attn_ar_boundary is not None
-            and self._attn_ar_boundary.applicable(
-                stream, forward_batch.forward_mode.is_extend()
-            )
+            and self._attn_ar_boundary.applicable(stream)
         )
         if sp is not None and not sp.verify and ulysses_prepared(self.self_attn):
             attn_output = ulysses_attention(

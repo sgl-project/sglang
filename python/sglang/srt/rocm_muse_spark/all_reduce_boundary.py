@@ -1,5 +1,5 @@
 """The attention O projection's TP all-reduce fused into the attention boundary (gfx1250,
-``--enable-aiter-allreduce-fusion`` or ``SGLANG_ROCM_MUSE_AR_BOUNDARY``).
+``SGLANG_ROCM_MUSE_AR_BOUNDARY=1``).
 
 ``muse_spark/all_reduce_norm_residual_hip.cuh`` runs a row-owned 2shot_push on the carv2 push plane and the
 boundary of ``FusedPostNormResidualPreNorm`` on the reduced row: weight-free post-norm, per-channel gated
@@ -63,21 +63,10 @@ def _jit_module(world_size: int, mode: int) -> Module:
     )
 
 
-def ar_boundary_modes() -> tuple[bool, bool]:
-    """(decode, prefill): whether those batches take the kernel. ``SGLANG_ROCM_MUSE_AR_BOUNDARY`` turns on
-    both, as does ``--enable-aiter-allreduce-fusion`` less its ``--disable-aiter-allreduce-fusion-in-*``."""
+def ar_boundary_enabled() -> bool:
     from sglang.srt.environ import envs
-    from sglang.srt.runtime_context import get_exec
 
-    if envs.SGLANG_ROCM_MUSE_AR_BOUNDARY.get():
-        return True, True
-    comm = get_exec().comm
-    if not comm.enable_aiter_allreduce_fusion:
-        return False, False
-    return (
-        not comm.disable_aiter_allreduce_fusion_in_decode,
-        not comm.disable_aiter_allreduce_fusion_in_prefill,
-    )
+    return envs.SGLANG_ROCM_MUSE_AR_BOUNDARY.get()
 
 
 def _ensure_comm(hidden: int) -> None:
@@ -157,11 +146,8 @@ class AllReduceAttnBoundary:
     ``applicable`` must hold for the batch, and the caller must skip its own all-reduce.
     """
 
-    def __init__(
-        self, boundary: FusedPostNormResidualPreNorm, modes: tuple[bool, bool]
-    ):
+    def __init__(self, boundary: FusedPostNormResidualPreNorm):
         self._boundary = boundary
-        self._decode, self._prefill = modes
         self._form_supported = is_gfx1250_supported() and _boundary_form_supported(
             boundary
         )
@@ -198,9 +184,7 @@ class AllReduceAttnBoundary:
         )
         return rows_per_rank * slot_row <= comm._max_push_size
 
-    def applicable(self, stream: torch.Tensor, is_extend: bool) -> bool:
-        if not (self._prefill if is_extend else self._decode):
-            return False
+    def applicable(self, stream: torch.Tensor) -> bool:
         if not self._form_supported:
             return False
         if stream.dtype != torch.float32 or not stream.is_contiguous():
