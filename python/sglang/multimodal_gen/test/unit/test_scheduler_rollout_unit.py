@@ -773,6 +773,37 @@ class TestRolloutStopStepUnit(unittest.TestCase):
             ).prev_sample
         return scheduler, current_rollout_controller, step_inputs, latents
 
+    @unittest.skipUnless(torch.cuda.device_count() >= 2, "two GPUs required")
+    def test_transition_matches_when_the_controller_grid_is_on_another_gpu(self):
+        """Under CFG parallel the scheduler's grid and the controller's sit on different GPUs."""
+
+        def run(controller_device: str) -> torch.Tensor:
+            scheduler = FlowMatchEulerDiscreteScheduler(shift=3.0)
+            scheduler.set_timesteps(4, device=controller_device)
+            batch = self._batch("cps")
+            batch.latents = batch.latents.to("cuda:1")
+            pipeline_config = types.SimpleNamespace(
+                shard_latents_for_sp=lambda batch, latents: (latents, False)
+            )
+            controller = _make_rollout_controller(
+                batch,
+                pipeline_config,
+                generator=torch.Generator("cuda:1").manual_seed(1),
+                sigmas=scheduler.sigmas,
+                timesteps=scheduler.timesteps,
+            )
+            scheduler.sigmas = scheduler.sigmas.to("cuda:1")
+            scheduler.timesteps = scheduler.timesteps.to("cuda:1")
+            transition = functools.partial(controller.transition, batch=batch)
+            latents = batch.latents
+            for t in scheduler.timesteps:
+                latents = scheduler.step(
+                    torch.tanh(latents), t, latents, transition=transition
+                ).prev_sample
+            return latents
+
+        torch.testing.assert_close(run("cuda:0"), run("cuda:1"), rtol=0, atol=0)
+
     def test_stopped_rollout_keeps_prefix_and_returns_x0_prediction(self):
         """Stopping at step i must replay the full rollout's x_i bit for bit and
         land on x_i's x0 prediction, while the scheduler's own grid is untouched:
