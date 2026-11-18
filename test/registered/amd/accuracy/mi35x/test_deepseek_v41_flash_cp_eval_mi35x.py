@@ -10,7 +10,7 @@ CP, so the server is text only.
 The eval uses the few-shot *completion* harness, as the non-CP DeepSeek-V4.1-Flash
 MI35x test does, so it measures whether the ROCm kernels produce correct tokens.
 
-Registry: nightly-amd-4-gpu-mi35x-deepseek-v41-flash suite
+Registry: nightly-test-4-gpu-amd-mi35x-deepseek-v41-flash suite
 """
 
 import os
@@ -31,7 +31,7 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=1200, suite="nightly-amd-4-gpu-mi35x-deepseek-v41-flash", nightly=True
+    est_time=1200, suite="nightly-test-4-gpu-amd-mi35x-deepseek-v41-flash", nightly=True
 )
 
 DEEPSEEK_V41_FLASH_MODEL_PATH = os.environ.get(
