@@ -13,7 +13,7 @@ from sglang.test.kernels.deepseek_v4.common import (
     store_fp4_index_cache_ref,
 )
 
-register_cuda_ci(est_time=5, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=5, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 HEAD_DIM = 128
 FP4_DIM = HEAD_DIM // 2

@@ -6,10 +6,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from sglang.srt.arg_groups.overrides import (
-    declare_resolution,
-    resolving_view,
-)
+from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.runtime_context import get_platform
@@ -20,7 +18,6 @@ logger = logging.getLogger(__name__)
 def _check_v2_lora_modes(cfg: Any, option: str):
     for unsupported, mode in (
         (cfg.attn_dp_size > 1, "DP-attention with --attn-dp-size > 1"),
-        (cfg.enable_pdmux, "PD-multiplexing"),
         (cfg.enable_two_batch_overlap, "two-batch overlap"),
         # Both reach the legacy kv_b correction kernels with V2 batch metadata.
         (envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get(), "SGLANG_EXPERIMENTAL_LORA_OPTI"),

@@ -22,7 +22,7 @@ from sglang.srt.mem_cache.mamba_slot_fused import (
     warmup_fused_copy_conv_slots,
 )
 from sglang.srt.utils import get_device
-from sglang.srt.utils.common import get_device_module
+from sglang.srt.utils.device import get_device_module
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cuda_ci,
@@ -31,8 +31,8 @@ from sglang.test.ci.ci_register import (
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=13, suite="stage-b-test-1-gpu-small-amd")
-register_xpu_ci(est_time=20, suite="stage-b-test-1-gpu-xpu")
+register_amd_ci(est_time=13, suite="base-b-test-1-gpu-small-amd")
+register_xpu_ci(est_time=20, suite="extra-test-1-gpu-xpu")
 
 # Backends these kernels are verified against; extend as others gain Triton.
 TRITON_DEVICES = ("cuda", "xpu")

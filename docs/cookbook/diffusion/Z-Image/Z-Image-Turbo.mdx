@@ -42,9 +42,9 @@ Use the [command builder](#1-quick-start) above.
 
 See [Performance Optimization](/docs/sglang-diffusion/performance-optimization) for acceleration features and their runtime requirements.
 
-- `--vae-path`: Path to a custom VAE model or HuggingFace model ID (e.g., fal/FLUX.2-Tiny-AutoEncoder). If not specified, the VAE will be loaded from the main model path.
+- `--vae-path`: Path to a custom VAE model or HuggingFace model ID. If not specified, the VAE will be loaded from the main model path.
 - `--num-gpus`: Number of GPUs to use
-- `--tp-size`: Tensor parallelism size (only for the encoder; should not be larger than 1 if text encoder offload is enabled, as layer-wise offload plus prefetch is faster)
+- `--tp-size`: Tensor parallelism size. Depending on the pipeline it shards the DiT, the encoders, or both.
 - `--sp-degree`: Sequence parallelism size (typically should match the number of GPUs)
 - `--ulysses-degree`: The degree of DeepSpeed-Ulysses-style SP in USP
 - `--ring-degree`: The degree of ring attention-style SP in USP
@@ -56,6 +56,12 @@ See [Performance Optimization](/docs/sglang-diffusion/performance-optimization) 
 For complete API documentation, please refer to the [official API usage guide](/docs/sglang-diffusion/api/openai_api).
 
 ### 4.1 Generate an Image
+
+Choose a width and height divisible by 16 for the native Z-Image pipeline.
+Other positive dimensions are rounded down to the nearest multiple of 16,
+with a minimum of 16 pixels per side: `size="1000x1000"` produces `992x992`.
+Startup warmup resolutions use the same alignment. This applies to Z-Image
+and Z-Image-Turbo; the diffusers backend keeps its own size handling.
 
 ```python Example
 import base64

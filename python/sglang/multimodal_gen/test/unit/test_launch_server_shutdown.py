@@ -68,9 +68,7 @@ class TestLaunchServerShutdown(unittest.TestCase):
             scheduler_port=15000,
             disagg_dispatch_policy="round_robin",
             disagg_timeout=30,
-            get_role_parallelism=lambda role: dict(
-                tp_size=None, sp_degree=None, ulysses_degree=None, ring_degree=None
-            ),
+            for_disagg_role=lambda role, **overrides: SimpleNamespace(**overrides),
         )
         for failure in ("later_role", "router"):
             workers = [_FakeProcess() for _ in range(3)]
@@ -83,11 +81,8 @@ class TestLaunchServerShutdown(unittest.TestCase):
                 self.subTest(failure=failure),
                 patch.object(ls, "configure_logger"),
                 patch.object(ls, "_find_available_port", side_effect=lambda port: port),
-                patch.object(ls.dataclasses, "fields", return_value=[]),
-                patch.object(
-                    ls.ServerArgs, "from_kwargs", return_value=SimpleNamespace()
-                ),
                 patch.object(ls, "_start_scheduler_processes", side_effect=starts),
+                patch.object(ls, "resolve_sampling_params_cls"),
                 patch.object(ls, "DiffusionServer", return_value=router),
             ):
                 with self.assertRaises(RuntimeError):

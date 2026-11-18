@@ -16,7 +16,7 @@ from sglang.test.ci.ci_register import (
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=10, suite="base-b-test-1-gpu-small-amd")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -75,7 +75,7 @@ def _epilogue_for_accept(*, fused, bs, stride, history):
     epi.gated_commit_lens_buf = z(bs, dtype=torch.int32)
     epi.block_accept_lens_buf = torch.full((bs,), -1, dtype=torch.int32)
     epi.simulated_correct_len = None
-    epi.simulate_fold = epi._tail_broadcasts = epi._fused_argmax = False
+    epi.simulate_fold = False
     epi._fused_accept_tail = fused
     epi._accept_tail_bs = (1, 0)
     epi._accept_tail_logged = set()

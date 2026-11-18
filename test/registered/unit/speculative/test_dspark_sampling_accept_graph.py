@@ -24,7 +24,7 @@ from sglang.test.ci.ci_register import (
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=30, suite="base-b-test-1-gpu-small-amd")
 
 STRIDE = 6
 GAMMA = STRIDE - 1
@@ -80,6 +80,8 @@ def test_routes_only_all_sampled_static_steps():
     assert not _eligible(worker, _sampling_info(), folded=False)
     assert not _eligible(worker, _sampling_info(), grammar=True)
     assert not _eligible(worker, _sampling_info(), sim_bonus=_sampling_info())
+    info = _sampling_info()
+    assert _eligible(worker, info, sim_bonus=info)
     assert not _eligible(_worker(enabled=False), _sampling_info())
     assert not _eligible(_worker(mode="compact"), _sampling_info())
 
@@ -166,7 +168,6 @@ def _graph(epi, sampler, monkeypatch, rejection_noise=None):
         epilogue=epi,
         resolve_draft_sampler=lambda: sampler,
         tp_sync=_tp_sync(),
-        fused_argmax=False,
         block_verification=False,
         device="cuda",
         rejection_noise=rejection_noise,
@@ -238,12 +239,12 @@ def test_replay_acceptance_distribution_matches_eager(monkeypatch):
     assert (p_graph - p_eager).abs().max().item() < 0.042, (p_graph, p_eager)
 
 
-def test_region_stages_the_deferred_commit_from_the_joined_projection():
-    """The verify graph replayed this step already joined the deferred commit's
+def test_region_stages_the_deferred_draft_kv_from_the_joined_projection():
+    """The verify graph replayed this step already joined the deferred store's
     projection (its host flag is spent), so the region must stage from it instead of
     joining again, which would find nothing and fall back to an unprojected inject."""
     calls = []
-    commit = SimpleNamespace(
+    deferred_draft_kv = SimpleNamespace(
         join_projection=lambda: calls.append("join") or False,
         stage=lambda **k: calls.append(("stage", int(k["commit_lens"].sum()))),
     )
@@ -252,7 +253,7 @@ def test_region_stages_the_deferred_commit_from_the_joined_projection():
     epi.verify_lens_buf = torch.full((2,), STRIDE, dtype=torch.int64)
     epi.commit_lens_buf = torch.tensor([3, 4], dtype=torch.int32)
     epi._post_fold = False
-    epi.deferred_commit = commit
+    epi.deferred_draft_kv = deferred_draft_kv
     epi.commit_ctx = SimpleNamespace(
         resolve_engram_hasher=None,
         resolve_pool=lambda: SimpleNamespace(

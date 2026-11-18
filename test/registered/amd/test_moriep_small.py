@@ -44,7 +44,7 @@ def wait_all_ports_release(base_url, timeout_s=60):
 
 # The low-latency, MTP-only and EPLB configs run nightly from
 # test_moriep_small_extra.py.
-register_amd_ci(est_time=2400, suite="stage-c-test-large-8-gpu-amd")
+register_amd_ci(est_time=2400, suite="nightly-test-8-gpu-amd", nightly=True)
 
 common_args = [
     "--tp-size",

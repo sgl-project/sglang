@@ -51,7 +51,7 @@ class TestDeepSeekV4FlashUnifiedCacheLinkerKL(
                     "--tp-size",
                     "4",
                     "--attention-backend",
-                    "compressed",
+                    "dsv4",
                     "--page-size",
                     str(cls.page_size),
                     "--chunked-prefill-size",

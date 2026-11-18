@@ -17,10 +17,8 @@ from sglang.multimodal_gen.configs.models.vaes.ltx_video import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.sample.joy_echo import JoyEchoSamplingParams
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     _sample_to_uint8_frames,
     _save_video_ffmpeg,
@@ -257,13 +255,9 @@ def test_memory_bank_retains_decoded_frames(enable_memory_bank):
     server_args = SimpleNamespace(
         enable_torch_compile=False, pipeline_config=PipelineConfig()
     )
-    with mock.patch(
-        "sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding.current_platform.is_cuda",
-        return_value=True,
-    ):
-        assert can_encode_while_decoding(request, server_args, 1) == (
-            not enable_memory_bank
-        )
+    assert can_encode_while_decoding(request, server_args, 1) == (
+        not enable_memory_bank
+    )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA video transfer")

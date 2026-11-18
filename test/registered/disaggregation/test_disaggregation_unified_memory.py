@@ -1,18 +1,26 @@
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.customized_info_sampler import (
+    CUSTOMIZED_INFO_ARRAY_FIELD,
+    CUSTOMIZED_INFO_FIELD,
+    CUSTOMIZED_INFO_SAMPLER_BACKEND,
+)
 from sglang.test.kits.pd_parity_kit import PDLogprobParityMixin
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 
-register_cuda_ci(est_time=315, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=315, stage="extra-a", runner_config="2-gpu-large")
 
 KIMI_LINEAR_MODEL = "yujiepan/kimi-linear-tiny-random"
 # Smallest in-tree GDN hybrid: MHA full attention + gated-delta-net linear
 # layers, i.e. the unified pool's MHA sub-pool rather than the MLA one.
 QWEN_GDN_MODEL = "Qwen/Qwen3.5-0.8B"
-SERVER_ENV = {"SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM": "0"}
+SERVER_ENV = {
+    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM": "0",
+    "SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES": "4096",
+}
 
 # --attention-backend and --enable-deterministic-inference are deliberately
 # absent: bytes are backend-independent and both paths run identical shapes.
@@ -47,9 +55,21 @@ class TestUnifiedMemoryDisaggregation(PDLogprobParityMixin, PDDisaggregationServ
     prefill_tp_size = 1
     decode_tp_size = 1
     decode_base_gpu_id = 1
+    launch_module = "sglang.test.customized_info_sampler"
     baseline_args = UNIFIED_MEMORY_ARGS
-    extra_prefill_args = UNIFIED_MEMORY_ARGS
-    extra_decode_args = UNIFIED_MEMORY_ARGS
+    extra_prefill_args = UNIFIED_MEMORY_ARGS + [
+        "--sampling-backend",
+        CUSTOMIZED_INFO_SAMPLER_BACKEND,
+    ]
+    extra_decode_args = extra_prefill_args
+
+    def _assert_logprob_parity(self, *, reference, actual, label):
+        super()._assert_logprob_parity(reference=reference, actual=actual, label=label)
+        token_ids = [item[1] for item in actual["output_token_logprobs"]]
+        self.assertEqual(actual[CUSTOMIZED_INFO_FIELD], token_ids, label)
+        self.assertEqual(
+            actual[CUSTOMIZED_INFO_ARRAY_FIELD], [[token] for token in token_ids], label
+        )
 
 
 class TestUnifiedMemoryDisaggregationChunkedPrefill(TestUnifiedMemoryDisaggregation):
@@ -62,8 +82,11 @@ class TestUnifiedMemoryDisaggregationChunkedPrefill(TestUnifiedMemoryDisaggregat
 
     _chunked_args = UNIFIED_MEMORY_ARGS + ["--chunked-prefill-size", "64"]
     baseline_args = _chunked_args
-    extra_prefill_args = _chunked_args
-    extra_decode_args = _chunked_args
+    extra_prefill_args = TestUnifiedMemoryDisaggregation.extra_prefill_args + [
+        "--chunked-prefill-size",
+        "64",
+    ]
+    extra_decode_args = extra_prefill_args
 
 
 class TestUnifiedMemoryDisaggregationMHA(TestUnifiedMemoryDisaggregation):

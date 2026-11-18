@@ -9,6 +9,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import l2_transfer as transfer_module
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
@@ -35,6 +36,15 @@ from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+
+def _window_hit(req):
+    """The one window's ``Req.window_host_hit_lengths`` entry, read off a
+    stand-in request."""
+    from sglang.srt.managers.schedule_batch import Req
+
+    return max(Req.window_host_hit_lengths.fget(req).values(), default=0)
+
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -218,6 +228,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         op = CacheOperation(_indices(0, 4), _indices(4, 8), 7)
         op.pool_transfers = [transfer]
         controller = mock.Mock(spec=HybridCacheController)
+        controller.is_kv_sharded = False
         controller.load_queue = [op, op]
         controller.layer_done_counter = mock.MagicMock()
         controller.layer_done_counter.update_producer.return_value = 0
@@ -228,8 +239,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
         controller.mem_pool_host = _host_group_stub([], can_use_write_back_jit=False)
         controller.mem_pool_device_allocator = mock.Mock()
-        controller._l2_transfers.side_effect = lambda *args: (
-            HybridCacheController._l2_transfers(controller, *args)
+        controller.kv_storage = None
+        controller._l2_transfers.side_effect = lambda *args, **kwargs: (
+            HybridCacheController._l2_transfers(controller, *args, **kwargs)
         )
         controller._l2_load_transfers.side_effect = lambda *args: (
             HybridCacheController._l2_load_transfers(controller, *args)
@@ -285,6 +297,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             anchor_entry=entries[PoolName.KV], entry_map=entries
         )
         controller.mem_pool_device_allocator = object()
+        controller.kv_storage = None
         controller.load_queue = []
         return controller
 
@@ -363,14 +376,14 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         window outruns the splice left by a device prefix of 6."""
         handle = CacheRequestHandle("r", 0)
         pipeline = BufferModePipeline.__new__(BufferModePipeline)
-        pipeline._cache = mock.Mock()
+        pipeline._cache = mock.Mock(page_size=swa_page_size)
         pipeline._cache.components = {}
         pipeline._swa_component = SimpleNamespace(
             pool_name=PoolName.SWA,
             component_type=ComponentType.SWA,
             full_window_pages=1,
         )
-        pipeline._auxiliary_swa_component = None
+        pipeline._further_window_components = ()
         pipeline._cache.cache_controller.mem_pool_host.entry_map = {
             PoolName.SWA: SimpleNamespace(
                 host_pool=SimpleNamespace(page_size=swa_page_size)
@@ -417,12 +430,13 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                         rid="r",
                         cache_request_handle=handle,
                         prefix_len=0,
-                        kv=SimpleNamespace(cache_protected_len=0),
+                        kv=ReqKvInfo(cache_protected_len=0),
                     )
                     self.assertTrue(pipeline.prepare_staged_prefetch(req))
                     self.assertEqual(req.host_hit_length, 2)
                     self.assertEqual(
-                        req.swa_host_hit_length, 2 if resident_prefix else 4
+                        _window_hit(req),
+                        2 if resident_prefix else 4,
                     )
                     window = req.staged_prefetch_plan.windows[ComponentType.SWA]
                     self.assertEqual((window.start, window.end), (4, 8))
@@ -1166,6 +1180,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
 
         host = DSAIndexerPoolHost.__new__(DSAIndexerPoolHost)
+        host._layer_sharded = False
+        host._draft_device_layer_ids = []
+        host.packed_device_index_buffers = list(device_layers)
         host.device_pool = device_pool
         host.layout = "page_first"
         host.page_size = page_size
@@ -1279,6 +1296,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
         controller.mem_pool_device = None
         controller.mem_pool_device_allocator = mock.Mock()
+        controller.kv_storage = None
         controller.ack_write_queue = []
         controller.write_fence_stream = None
         controller.move_hybrid_indices = mock.Mock(
@@ -1315,6 +1333,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
         controller.mem_pool_device = None
         controller.mem_pool_device_allocator = mock.Mock()
+        controller.kv_storage = None
         controller.ack_write_queue = []
         controller.write_fence_stream = None
         controller.move_hybrid_indices = mock.Mock(
@@ -1374,6 +1393,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
         controller.mem_pool_device = None
         controller.mem_pool_device_allocator = mock.Mock()
+        controller.kv_storage = None
         controller.ack_write_queue = []
         controller.write_fence_stream = None
         with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
@@ -1467,6 +1487,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.mem_pool_host = FakeHostPool.__new__(FakeHostPool)
         controller.mem_pool_device = None
         controller.mem_pool_device_allocator = mock.Mock()
+        controller.kv_storage = None
         controller.device = "cuda"
         controller.ack_write_queue = []
         controller.write_fence_stream = None
@@ -1505,6 +1526,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.mem_pool_host = FakeHostPool.__new__(FakeHostPool)
         controller.mem_pool_device = None
         controller.mem_pool_device_allocator = mock.Mock()
+        controller.kv_storage = None
         controller.device = "cuda"
         controller.ack_write_queue = []
         controller.write_fence_stream = None
