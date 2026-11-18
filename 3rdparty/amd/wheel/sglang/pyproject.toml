@@ -67,7 +67,6 @@ runtime_common = [
   "uvicorn",
   "uvloop",
   "xgrammar==0.2.9",
-  "smg-grpc-servicer>=0.9.0",
 ]
 
 # ROCm specific packages (https://repo.radeon.com/rocm/manylinux/)
