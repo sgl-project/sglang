@@ -785,6 +785,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._target_logits_processor = self._defer_target_verify_gather()
         self._aux_graphs = {}
+        self._share_aux_hidden = get_schedule().disable_overlap_schedule
         self._mamba_commit_buffers = None
         self._use_commit_metadata = (
             is_cuda() and envs.SGLANG_OPT_DFLASH_COMMIT_METADATA.get()
@@ -2525,8 +2526,21 @@ class DFlashWorkerV2(BaseSpecWorker):
         key = (tuple(target_hidden.shape), tuple(cache_loc_2d.shape))
         entry = self._aux_graphs.get(key)
         inputs = (target_hidden, cache_loc, positions, commit_lens)
-        if entry is None:
-            static = tuple(torch.empty_like(t) for t in inputs)
+        if entry is None or (entry[2] and not target_hidden.is_set_to(entry[0][0])):
+            # A target graph may publish a view of its persistent packed aux output.
+            # The synchronous scheduler finishes this append before reusing it.
+            runner = self.target_worker.model_runner.decode_cuda_graph_runner
+            shared = getattr(
+                getattr(runner, "buffers", None), "aux_hidden_states", None
+            )
+            direct = (
+                self._share_aux_hidden
+                and entry is None
+                and shared is not None
+                and target_hidden.data_ptr() == shared.data_ptr()
+            )
+            hidden_buf = target_hidden if direct else torch.empty_like(target_hidden)
+            static = (hidden_buf, *(torch.empty_like(t) for t in inputs[1:]))
             for dst, src in zip(static, inputs):
                 dst.copy_(src)
             hidden_buf, loc_buf, pos_buf, commit_buf = static
@@ -2552,7 +2566,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             with torch.cuda.graph(graph, stream=stream):
                 append()
             current.wait_stream(stream)
-            entry = (static, graph)
+            entry = (static, graph, direct)
             self._aux_graphs[key] = entry
             logger.info(
                 "DFLASH aux CUDA graph captured rows=%d", target_hidden.shape[0]
