@@ -40,7 +40,7 @@ def init_draft_backend(backend: TritonAttnBackend, model_runner: ModelRunner) ->
         and get_exec().kernel.enable_amd_monokernel
         and model_runner.model_config.is_dflash_mla_draft
     ):
-        from sglang.kernels.ops.attention.verify_mla import verify_mla_draft_fwd
+        from sglang.kernels.ops.attention.verify_mla_draft import verify_mla_draft_fwd
 
         backend.verify_mla_draft_fwd = torch.compiler.disable(verify_mla_draft_fwd)
     if algorithm.is_dflash() and backend.use_mla and backend.dcp_size > 1:
