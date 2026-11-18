@@ -101,14 +101,17 @@ async def _wait_until_http_live(server_args: ServerArgs) -> None:
     # on a malformed proxy env var, since httpx parses *_PROXY/NO_PROXY when the
     # client is constructed (raising httpx.InvalidURL before any request). See #28493.
     async with httpx.AsyncClient(trust_env=False) as client:
-        for _ in range(120):
+        # the first probe runs during the lifespan startup, before uvicorn
+        # listens; it is live a few milliseconds later, so poll often (still
+        # 120 s in all)
+        for _ in range(2400):
             try:
                 response = await client.get(liveness_url, timeout=5.0)
                 if response.status_code == 200:
                     return
             except httpx.HTTPError:
                 pass
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.05)
     raise RuntimeError(f"HTTP server did not become live at {liveness_url}")
 
 
