@@ -17,7 +17,7 @@ combination stays numerically equivalent to CP-only (>0.92 on GSM8K, same bar as
 test_deepseek_v4_pro_fp4_cp.py) and that neither the per-ubatch CP metadata setup
 nor the concurrent CP communicators deadlock or corrupt state.
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-pro suite
+Registry: nightly-test-8-gpu-amd-mi35x-deepseek-v4-pro suite
 """
 
 import os
@@ -37,7 +37,7 @@ from sglang.test.test_utils import (
 
 register_amd_ci(
     est_time=5400,
-    suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro",
+    suite="nightly-test-8-gpu-amd-mi35x-deepseek-v4-pro",
     nightly=True,
     disabled="DeepSeek-V4 prefill CP on HIP does not support two-batch overlap yet.",
 )
