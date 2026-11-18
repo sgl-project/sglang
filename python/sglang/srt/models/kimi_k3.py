@@ -544,18 +544,8 @@ def _uses_ep_a2a() -> bool:
     )
 
 
-def _shared_experts_tp_size() -> Optional[int]:
-    parallel = get_parallel()
-    if (
-        parallel.shared_experts_tp_size is None
-        and parallel.enable_shared_experts_attn_tp
-    ):
-        return parallel.attn_tp_size
-    return parallel.shared_experts_tp_size
-
-
 def _replicates_shared_experts() -> bool:
-    return _uses_ep_a2a() and _shared_experts_tp_size() in (None, 1)
+    return _uses_ep_a2a() and get_parallel().shared_experts_tp_width in (None, 1)
 
 
 class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
@@ -716,7 +706,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         # the shared-expert TP subgroup and reduce-scatter back to those rows.
         parallel = get_parallel()
         requested_shared_tp = parallel.shared_experts_tp_size
-        shared_tp = _shared_experts_tp_size()
+        shared_tp = parallel.shared_experts_tp_width
         if requested_shared_tp is not None and not self._ep_a2a:
             raise ValueError("Independent shared-expert TP requires an EP a2a backend.")
         self._shared_experts_tp1 = _replicates_shared_experts()
@@ -727,7 +717,6 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         # Spans DP ranks: rows differ per rank and idle ranks must join the collectives.
         self._shared_experts_tp_across_dp = (
             self._shared_experts_tp_comm
-            and requested_shared_tp is not None
             and shared_experts_tp_spans_dp(
                 attn_tp_size=parallel.attn_tp_size,
                 attn_cp_size=parallel.attn_cp_size,
@@ -738,16 +727,10 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         if self._shared_experts_tp1:
             shared_experts_parallel_group = "replicated"
         elif self._shared_experts_tp_comm:
-            group = (
-                parallel.shared_experts_tp_group
-                if requested_shared_tp is not None
-                else parallel.attn_tp_group
-            )
+            group = parallel.shared_experts_tp_group
             assert group.world_size == shared_tp
             self._shared_experts_tp_group = group
-            shared_experts_parallel_group = (
-                "shared_experts_tp" if requested_shared_tp is not None else "attn_tp"
-            )
+            shared_experts_parallel_group = "shared_experts_tp"
         else:
             # The full TP group, which _reduce_shared sums over, whatever the
             # dense MLP's sharding.
