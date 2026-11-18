@@ -143,13 +143,6 @@ def _max4(vec):
     )
 
 
-def _sum4(vec):
-    return arith.addf(
-        arith.addf(_to_raw(vec[0]), _to_raw(vec[1])),
-        arith.addf(_to_raw(vec[2]), _to_raw(vec[3])),
-    )
-
-
 @functools.lru_cache(maxsize=64)
 def _launcher(
     heads,
