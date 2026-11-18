@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import functools
+import logging
 from typing import Any, Callable, Optional, Tuple
 
 import torch
@@ -14,6 +16,8 @@ from sglang.kernels.ops.attention.fla.layernorm_gated import rms_norm_gated
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.utils import is_gfx95_supported, print_info_once
+
+logger = logging.getLogger(__name__)
 
 _is_gfx95 = is_gfx95_supported()
 
@@ -236,6 +240,8 @@ def init_indexer_hip(indexer, config) -> None:
     if _is_gfx95:
         indexer.rocm_nope_prologue = make_rocm_nope_prologue(indexer)
     indexer._hist_topk = hist_topk_workspace(indexer, config)
+    # pick the prefill logits kernel now, not inside a graph capture
+    _prefill_mqa_logits_fn()
 
 
 def hist_topk_paged(
@@ -538,6 +544,50 @@ def fp4_prefill(
         act_quant=act_quant,
     )
     return fp4_prefill_q(indexer, query, x)
+
+
+# once per process: a missing FlyDSL warns once, not once per layer
+@functools.cache
+def _prefill_mqa_logits_fn():
+    # gfx950: AITER's FlyDSL fp8_mqa_logits instead of Triton; same fp8 inputs and
+    # fp32 accumulation, only the summation order differs
+    if _is_gfx95:
+        try:
+            from aiter.ops.flydsl import flydsl_fp8_mqa_logits
+
+            return flydsl_fp8_mqa_logits
+        except ImportError:
+            logger.warning(
+                "FlyDSL fp8_mqa_logits unavailable; DSA prefill indexer uses Triton",
+                exc_info=True,
+            )
+    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+
+    return fp8_mqa_logits
+
+
+def ragged_mqa_logits(
+    indexer,
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    kv_fp8,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    metadata=None,
+) -> torch.Tensor:
+    """gfx950 prefill logits of the rows ``q`` over the gathered index-K ``kv_fp8``:
+    the MXFP4 kernel for FP4 keys (with the batch's schedules, fp4_logits_plans, when
+    ``metadata`` is given), else FlyDSL fp8_mqa_logits."""
+    if indexer.fp4_index_k:
+        from sglang.kernels.ops.attention.dsa import fp4_index_hip
+
+        plans = None if metadata is None else fp4_logits_plans(metadata)
+        return fp4_index_hip.fp4_ragged_mqa_logits(
+            q, weights, indexer.softmax_scale, kv_fp8, ks, ke, plans
+        )
+    kv, scale = kv_fp8
+    # clean_logits=False: the top-k transform masks invalid positions via ks/ke
+    return _prefill_mqa_logits_fn()(q, kv, scale, weights, ks, ke, clean_logits=False)
 
 
 def tp_split_topk_rows(

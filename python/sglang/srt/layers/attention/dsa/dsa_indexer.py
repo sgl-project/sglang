@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import functools
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
@@ -174,8 +173,7 @@ if _is_xpu:
 
 if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
-if _use_aiter_gfx95:
-    from sglang.kernels.ops.attention.dsa import fp4_index_hip
+if _is_gfx95_supported:
     from sglang.srt.layers.attention.dsa import dsa_indexer_hip
 
 from sglang.srt.layers import deep_gemm_wrapper
@@ -205,26 +203,6 @@ _MERGED_K_GATE_MAX_M = 16
 # unsplit 512 rows cost ~0.6 ms/layer in logits + top-k vs ~0.16 ms for a 64-row
 # slice; re-measure if the top-k all-gather gets slower.
 _INDEXER_TP_SPLIT_MIN_ROWS_GFX950 = 64
-
-
-# once per process: a missing FlyDSL warns once, not once per layer
-@functools.cache
-def _resolve_hip_prefill_mqa_logits():
-    # gfx950: AITER's FlyDSL fp8_mqa_logits instead of Triton; same fp8 inputs and
-    # fp32 accumulation, only the summation order differs
-    if _is_gfx95_supported:
-        try:
-            from aiter.ops.flydsl import flydsl_fp8_mqa_logits
-
-            return flydsl_fp8_mqa_logits
-        except ImportError:
-            logger.warning(
-                "FlyDSL fp8_mqa_logits unavailable; DSA prefill indexer uses Triton",
-                exc_info=True,
-            )
-    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
-
-    return fp8_mqa_logits
 
 
 class _IndexerTpSplit(NamedTuple):
@@ -526,9 +504,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # Prefill extends with at least this many rows split the indexer (logits and
         # top-k) across the attention-TP ranks; None never splits.
         self.tp_split_min_rows: Optional[int] = None
-        self._hip_prefill_mqa_logits = (
-            _resolve_hip_prefill_mqa_logits() if _is_hip else None
-        )
         if config is not None:
             self.num_init_tokens = getattr(config, "index_init_tokens", 0)
             self.num_local_tokens = getattr(config, "index_local_tokens", 0)
@@ -1980,22 +1955,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if not need_chunk and not split and tp_split is None:
             assert q_fp8[:q_offset].shape[0] != 0
             with self._with_real_sm_count():
-                if self.fp4_index_k:
-                    logits = fp4_index_hip.fp4_ragged_mqa_logits(
-                        q_fp8[:q_offset],
-                        weights[:q_offset],
-                        self.softmax_scale,
-                        kv_fp8,
-                        ks,
-                        ke,
+                if _is_gfx95_supported:
+                    logits = dsa_indexer_hip.ragged_mqa_logits(
+                        self, q_fp8[:q_offset], weights[:q_offset], kv_fp8, ks, ke
                     )
                 elif _is_hip:
+                    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+
                     kv, scale = kv_fp8
                     # Match the CUDA deep_gemm path (clean_logits=False): the topk
                     # transform masks invalid positions via ks/ke/lengths, so the
                     # -inf pre-fill of the [tokens x seq_len_kv] logits buffer is
                     # redundant and grows quadratically with context length.
-                    logits = self._hip_prefill_mqa_logits(
+                    logits = fp8_mqa_logits(
                         q_fp8[:q_offset],
                         kv,
                         scale,
@@ -2061,20 +2033,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             end = min(start + max_rows, row_hi)
 
             with self._with_real_sm_count():
-                if self.fp4_index_k:
-                    logits_chunk = fp4_index_hip.fp4_ragged_mqa_logits(
-                        q_fp8[start:end],
-                        weights[start:end],
-                        self.softmax_scale,
-                        kv_fp8,
-                        ks[start:end],
-                        ke[start:end],
-                        dsa_indexer_hip.fp4_logits_plans(metadata),
-                    )
+                if _is_gfx95_supported:
+                    logits_chunk = dsa_indexer_hip.ragged_mqa_logits(
+                        self, q_fp8[start:end], weights[start:end], kv_fp8,
+                        ks[start:end], ke[start:end], metadata,
+                    )  # fmt: skip
                 elif _is_hip:
+                    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+
                     kv, scale = kv_fp8
                     # clean_logits=False: topk transform handles masking (see above)
-                    logits_chunk = self._hip_prefill_mqa_logits(
+                    logits_chunk = fp8_mqa_logits(
                         q_fp8[start:end],
                         kv,
                         scale,
