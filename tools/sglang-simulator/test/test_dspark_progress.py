@@ -19,9 +19,9 @@ def raw(value):
 
 @pytest.fixture
 def artifact(tmp_path, monkeypatch):
-    sdk = pytest.importorskip("simopus.sdk.native_sampling")
+    sdk = pytest.importorskip("simopus.sdk")
     from sglang_simulator.time_predictor import dspark_progress
-    from simopus.sdk.native_sources import NATIVE_SOURCE_0522
+    from simopus.sdk import NATIVE_SOURCE_0522
 
     # Distribution/leakage tests isolate the native source reader. Production
     # always invokes the real shared SDK frame join, tested separately.
@@ -148,7 +148,7 @@ def before(recipe, profile):
 def test_native_original_over_64mib_preserves_custody_and_progress(
     native_artifact, tmp_path
 ):
-    from simopus.sdk.native_windows import MAX_NATIVE_WINDOW_BYTES
+    from simopus.sdk import MAX_NATIVE_WINDOW_BYTES
 
     recipe, profile, _, _, _, load = native_artifact
     window = {
@@ -192,7 +192,7 @@ def test_native_original_above_sdk_bound_rejects_before_reading(
 ):
     from pathlib import Path
 
-    from simopus.sdk.native_windows import MAX_NATIVE_WINDOW_BYTES
+    from simopus.sdk import MAX_NATIVE_WINDOW_BYTES
 
     *_, load = native_artifact
     path = tmp_path / "native-too-large.json"
@@ -443,7 +443,7 @@ def test_native_label_verifier_uses_leader_only_and_checks_complete_peer_recipe(
 ):
     import copy
 
-    sampling = pytest.importorskip("simopus.sdk.native_sampling")
+    sampling = pytest.importorskip("simopus.sdk")
     from sglang_simulator.time_predictor.dspark_progress import (
         _verify_native_progress_context,
         verify_native_progress_rows,

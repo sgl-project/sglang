@@ -35,7 +35,7 @@ def policy(monkeypatch):
         tp_size = 2
         runtime_profile_json = RUNTIME
 
-    module = ModuleType("simopus.sdk.native_segment_projection")
+    module = ModuleType("simopus.sdk")
     module.NativeSegmentSourcePolicy = Policy
     monkeypatch.setitem(sys.modules, module.__name__, module)
     return Policy()

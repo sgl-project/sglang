@@ -63,8 +63,8 @@ class EmpiricalDSparkProgress:
     """
 
     def __init__(self, path, *, expected_sha256, runtime_profile_json):
-        from simopus.sdk.native_sources import NATIVE_SOURCE_0522
-        from simopus.sdk.native_windows import MAX_NATIVE_WINDOW_BYTES
+        from simopus.sdk import NATIVE_SOURCE_0522
+        from simopus.sdk import MAX_NATIVE_WINDOW_BYTES
 
         path = Path(path)
         if (
@@ -306,7 +306,7 @@ class EmpiricalDSparkProgress:
 
     @staticmethod
     def _validate_row(row):
-        from simopus.sdk.native_sampling import SAMPLING_FIELDS
+        from simopus.sdk import SAMPLING_FIELDS
 
         fields = {
             "native_key",
@@ -464,8 +464,8 @@ def verify_native_progress_rows(document, read_evidence):
 
 def _verify_native_progress_context(document, read_evidence):
     """Return original row identities and local batch sizes from one SDK join."""
-    from simopus.sdk.native_sampling import native_sampling_params
-    from simopus.sdk.native_windows import join_native_frames
+    from simopus.sdk import native_sampling_params
+    from simopus.sdk import join_native_frames
 
     rows = document["observations"]
     if (
