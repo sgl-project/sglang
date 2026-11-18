@@ -85,19 +85,62 @@ def _is_qwen3_vl_model(model_path: str) -> bool:
     return "qwen3-vl" in model_lower or "qwen3vl" in model_lower
 
 
+# Layout of the reference JinaForRanking prompt (thinking off); the model reads
+# the hidden states at these two special tokens.
+_JINA_DOC_EMBED_TOKEN = "<|embed_token|>"
+_JINA_QUERY_EMBED_TOKEN = "<|rerank_token|>"
+_JINA_RERANK_PREFIX = (
+    "<|im_start|>system\n"
+    "You are a search relevance expert who can determine a ranking of the passages "
+    "based on how relevant they are to the query. If the query is a question, how "
+    "relevant a passage is depends on how well it answers the question. If not, try "
+    "to analyze the intent of the query and assess how well each passage satisfies "
+    "the intent. If an instruction is provided, you should follow the instruction "
+    "when determining the ranking.<|im_end|>\n<|im_start|>user\n"
+)
+_JINA_RERANK_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+
+def _strip_jina_special_tokens(text: str) -> str:
+    return text.replace(_JINA_DOC_EMBED_TOKEN, "").replace(_JINA_QUERY_EMBED_TOKEN, "")
+
+
+def _build_jina_rerank_prompt(
+    *, query: str, documents: List[str], instruct: Optional[str]
+) -> str:
+    query = _strip_jina_special_tokens(query)
+    docs = [_strip_jina_special_tokens(doc) for doc in documents]
+    body = (
+        f"I will provide you with {len(docs)} passages, each indicated by a "
+        f"numerical identifier. Rank the passages based on their relevance to "
+        f"query: {query}\n"
+    )
+    if instruct:
+        body += f"<instruct>\n{instruct}\n</instruct>\n"
+    body += "\n".join(
+        f'<passage id="{i}">\n{doc}{_JINA_DOC_EMBED_TOKEN}\n</passage>'
+        for i, doc in enumerate(docs)
+    )
+    body += f"\n<query>\n{query}{_JINA_QUERY_EMBED_TOKEN}\n</query>"
+    return _JINA_RERANK_PREFIX + body + _JINA_RERANK_SUFFIX
+
+
 def _detect_rerank_backend(
     *,
     request: V1RerankReqInput,
     chat_template: Optional[str],
     model_path: str,
+    is_jina_listwise: bool,
 ) -> str:
     """
     Unify rerank routing decisions used by both `_convert_to_internal_request` and
     `_handle_non_streaming_request`.
 
     Returns:
-        "vl_decoder" | "text_decoder" | "cross_encoder"
+        "jina_listwise" | "vl_decoder" | "text_decoder" | "cross_encoder"
     """
+    if is_jina_listwise:
+        return "jina_listwise"
     is_multimodal = request.is_multimodal()
     is_vl_model = _is_qwen3_vl_model(model_path)
     is_vl_template = _is_qwen3_vl_reranker_template(chat_template)
@@ -215,6 +258,9 @@ class OpenAIServingRerank(OpenAIServingBase):
         self._yes_token_id, self._no_token_id = _get_yes_no_token_ids(
             tokenizer_manager.tokenizer
         )
+        self._is_jina_listwise = (
+            "JinaForRanking" in tokenizer_manager.model_config.hf_config.architectures
+        )
 
     # NOTE: /v1/rerank is not an official OpenAI endpoint. This module may be moved
     # to another module in the future.
@@ -261,8 +307,9 @@ class OpenAIServingRerank(OpenAIServingBase):
             request=request,
             chat_template=chat_template if isinstance(chat_template, str) else None,
             model_path=model_path,
+            is_jina_listwise=self._is_jina_listwise,
         )
-        if backend in ("vl_decoder", "text_decoder"):
+        if backend in ("jina_listwise", "vl_decoder", "text_decoder"):
             return request, request
 
         # Cross-encoder rerank: Create pairs of [query, document] for each document.
@@ -325,7 +372,7 @@ class OpenAIServingRerank(OpenAIServingBase):
         model_path: str,
     ) -> Optional[Union[List[RerankResponse], ErrorResponse, ORJSONResponse]]:
         """
-        Handle decoder-only rerank paths (VL/text) and return a response if matched.
+        Handle listwise and decoder-only rerank paths and return a response if matched.
 
         Returns None if the request should fall back to cross-encoder rerank.
         """
@@ -333,7 +380,13 @@ class OpenAIServingRerank(OpenAIServingBase):
             request=request,
             chat_template=chat_template,
             model_path=model_path,
+            is_jina_listwise=self._is_jina_listwise,
         )
+
+        if backend == "jina_listwise":
+            return await self._handle_jina_reranker_request(
+                request=request, raw_request=raw_request
+            )
 
         # Qwen3-VL reranker path (decoder-only scoring with query/document template format)
         if backend == "vl_decoder":
@@ -350,6 +403,36 @@ class OpenAIServingRerank(OpenAIServingBase):
             )
 
         return None
+
+    async def _handle_jina_reranker_request(
+        self,
+        *,
+        request: V1RerankReqInput,
+        raw_request: Request,
+    ) -> Union[List[RerankResponse], ErrorResponse]:
+        """Score all documents in one listwise JinaForRanking prompt."""
+        if request.is_multimodal():
+            return self.create_error_response(
+                "JinaForRanking rerankers accept text queries and documents only."
+            )
+        prompt = _build_jina_rerank_prompt(
+            query=request.query,
+            documents=request.documents,
+            instruct=request.instruct,
+        )
+        try:
+            ret = await self.tokenizer_manager.generate_request(
+                EmbeddingReqInput(text=prompt), raw_request
+            ).__anext__()
+        except ValueError as e:
+            return self.create_error_response(str(e))
+
+        scores = ret["embedding"]
+        if len(scores) != len(request.documents):
+            return self.create_error_response(
+                f"Expected {len(request.documents)} scores, got {len(scores)}"
+            )
+        return self._build_rerank_response(scores, request)
 
     async def _handle_text_reranker_request(
         self,

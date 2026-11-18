@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 from sglang.srt.entrypoints.openai.protocol import V1RerankReqInput
@@ -13,6 +14,7 @@ register_amd_ci(est_time=10, suite="base-b-test-1-gpu-small-amd")
 try:
     from sglang.srt.entrypoints.openai.serving_rerank import (
         OpenAIServingRerank,
+        _build_jina_rerank_prompt,
         _is_qwen3_reranker_template,
         _qwen3_rerank_score,
         _render_jinja_chat_template,
@@ -29,6 +31,7 @@ except ModuleNotFoundError as e:
 class _DummyModelConfig:
     # Keep consistent with TokenizerManager.model_config usage
     is_generation = False
+    hf_config = SimpleNamespace(architectures=["XLMRobertaForSequenceClassification"])
 
 
 class _DummyTokenizer:
@@ -151,6 +154,7 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
                 self.server_args = object()
                 self.model_config = Mock()
                 self.model_config.is_generation = True
+                self.model_config.hf_config.architectures = ["Qwen3ForCausalLM"]
                 self.model_config.model_path = "qwen/qwen3"
                 self.tokenizer = Mock()
                 self.tokenizer.chat_template = (
@@ -177,6 +181,68 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
         self.assertEqual([r.document for r in res], ["d1", "d2"])
         self.assertAlmostEqual(res[0].score, 0.9 / (0.9 + 0.1))
         self.assertAlmostEqual(res[1].score, 0.2 / (0.2 + 0.8))
+
+    def test_build_jina_rerank_prompt_matches_reference(self):
+        """Pins the prompt of the reference JinaForRanking (jina-reranker-v3.5
+        modeling.py, thinking off); the model reads scores at its marker tokens."""
+        prompt = _build_jina_rerank_prompt(
+            query="what <|embed_token|>is q",
+            documents=["doc a", "doc b"],
+            instruct="Be strict.",
+        )
+        self.assertEqual(
+            prompt,
+            "<|im_start|>system\nYou are a search relevance expert who can determine "
+            "a ranking of the passages based on how relevant they are to the query. "
+            "If the query is a question, how relevant a passage is depends on how "
+            "well it answers the question. If not, try to analyze the intent of the "
+            "query and assess how well each passage satisfies the intent. If an "
+            "instruction is provided, you should follow the instruction when "
+            "determining the ranking.<|im_end|>\n<|im_start|>user\nI will provide "
+            "you with 2 passages, each indicated by a numerical identifier. Rank the "
+            "passages based on their relevance to query: what is q\n<instruct>\n"
+            'Be strict.\n</instruct>\n<passage id="0">\ndoc a<|embed_token|>\n'
+            '</passage>\n<passage id="1">\ndoc b<|embed_token|>\n</passage>\n'
+            "<query>\nwhat is q<|rerank_token|>\n</query><|im_end|>\n"
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        )
+
+    def test_handle_non_streaming_request_jina_scores_all_documents_in_one_prompt(
+        self,
+    ):
+        """A JinaForRanking server must not fall back to per-pair cross-encoder
+        requests: one prompt carries every document and yields one score each."""
+
+        class _TM(_DummyTokenizerManager):
+            def __init__(self):
+                self.server_args = object()
+                self.model_config = SimpleNamespace(
+                    is_generation=False,
+                    model_path="jinaai/jina-reranker-v3.5",
+                    hf_config=SimpleNamespace(architectures=["JinaForRanking"]),
+                )
+                self.tokenizer = _DummyTokenizer()
+                self.prompts = []
+
+            def generate_request(self, obj, _request):
+                self.prompts.append(obj.text)
+
+                async def _results():
+                    yield {"embedding": [0.1, 0.7, 0.4]}
+
+                return _results()
+
+        tm = _TM()
+        handler = OpenAIServingRerank(tm)
+        req = V1RerankReqInput(query="q", documents=["a", "b", "c"])
+        adapted, _ = handler._convert_to_internal_request(req)
+
+        res = asyncio.run(handler._handle_non_streaming_request(adapted, req, Mock()))
+
+        self.assertEqual(len(tm.prompts), 1)
+        self.assertEqual(tm.prompts[0].count("<|embed_token|>"), 3)
+        self.assertEqual([r.index for r in res], [1, 2, 0])
+        self.assertAlmostEqual(res[0].score, 0.7)
 
     def test_build_rerank_response_return_documents_false(self):
         """Test that document field is None when return_documents=False"""
@@ -249,6 +315,7 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
                 self.server_args = object()
                 self.model_config = Mock()
                 self.model_config.is_generation = True
+                self.model_config.hf_config.architectures = ["Qwen3ForCausalLM"]
                 self.model_config.model_path = "qwen/qwen3-vl"
                 self.tokenizer = Mock()
                 # Mock VL template detection
