@@ -133,6 +133,9 @@ class SchedulerPPMixin:
     # ran init_pp_loop_state (plain TP, unit-test doubles) read False;
     # init_pp_loop_state overwrites it per instance.
     _pp_spec_relay: bool = False
+    # HiCache controller told about PP launches for the relaxed write_back
+    # eviction fence; Scheduler.__init__ sets it per instance.
+    _pp_fence_controller = None
     # Side stream of `_pp_result_done_event`; made on first use.
     _pp_skip_output_stream = None
     # Unified memory under PP with invariant checks: the allocator whose decisions
@@ -1932,6 +1935,12 @@ class SchedulerPPMixin:
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
                 self._pp_wait_forward_dependencies()
+                if self._pp_fence_controller is not None:
+                    # Same stream as every earlier micro-batch's forward, after the
+                    # schedule work this one waited on: the event covers both.
+                    self._pp_fence_controller.record_forward_start(
+                        self.forward_stream.record_event()
+                    )
                 set_time_batch(
                     cur_batch.reqs,
                     "set_run_batch_cpu_start_time",
@@ -1972,6 +1981,12 @@ class SchedulerPPMixin:
                             ),
                         )
                     )
+        if self._pp_fence_controller is not None:
+            # Recorded before the proxy or output send makes the schedule stream
+            # wait on this forward, as _apply_war_barrier does in the overlap loop.
+            self._pp_fence_controller.record_war_barrier(
+                self.schedule_stream.record_event()
+            )
         return result, event
 
     def get_rids(

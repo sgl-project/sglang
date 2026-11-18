@@ -1088,10 +1088,14 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         waits = []
         writing_check = cache.writing_check
 
-        def count_waits(write_back=False, finish_count=None):
+        def count_waits(write_back=False, finish_count=None, relaxed_fence=False):
             if write_back and cache.ongoing_write_through:
                 waits.append(len(cache.ongoing_write_through))
-            return writing_check(write_back=write_back, finish_count=finish_count)
+            return writing_check(
+                write_back=write_back,
+                finish_count=finish_count,
+                relaxed_fence=relaxed_fence,
+            )
 
         return waits, mock.patch.object(cache, "writing_check", side_effect=count_waits)
 

@@ -114,7 +114,8 @@ class InstantWriteBackController:
             timing_enabled=False,
         )
 
-    def start_writing(self):
+    def start_writing(self, fence_event=None):
+        # The copies complete at once, so there is no fence to order.
         if self.write_queue:
             self.ack_write_queue.append(self._done_ack(self.write_queue))
 

@@ -705,5 +705,39 @@ class TestPrefillOverlapShutdownVote(CustomTestCase):
         self.assertEqual(self._selections_after_shutdown(vote_pending=False), 0)
 
 
+class TestPPLaunchWriteBackEvictionFence(CustomTestCase):
+    def test_pp_launch_records_forward_start_and_war_barrier(self):
+        """Under PP each micro-batch launch hands the eviction fence the event
+        before its forward and a WAR-barrier event after it, as the overlap
+        loop's run_batch and barrier do."""
+        order = Mock()
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.scheduler_stage_metrics = None
+        scheduler._pp_fence_controller = order.controller
+        scheduler.forward_stream = SimpleNamespace(record_event=lambda: "fwd-start")
+        scheduler.schedule_stream = SimpleNamespace(record_event=lambda: "barrier")
+        scheduler.forward_stream_ctx = nullcontext()
+        scheduler._pp_wait_forward_dependencies = order.wait_dependencies
+        scheduler.run_batch = order.run_batch
+        scheduler.device_module = SimpleNamespace(Event=Mock, current_stream=Mock())
+        scheduler.pp_group = SimpleNamespace(is_last_rank=False)
+        batch = SimpleNamespace(
+            reqs=[], spec_algorithm=SpeculativeAlgorithm.NONE, copy=Mock()
+        )
+        with patch("sglang.srt.managers.scheduler_pp_mixin.set_time_batch"):
+            scheduler._pp_launch_batch(0, batch, None, [None], deque())
+        self.assertEqual(
+            [c[0] for c in order.mock_calls],
+            [
+                "wait_dependencies",
+                "controller.record_forward_start",
+                "run_batch",
+                "controller.record_war_barrier",
+            ],
+        )
+        order.controller.record_forward_start.assert_called_once_with("fwd-start")
+        order.controller.record_war_barrier.assert_called_once_with("barrier")
+
+
 if __name__ == "__main__":
     unittest.main()
