@@ -105,6 +105,16 @@ from sglang.srt.rocm_muse_spark.layers import (
     QKVOGateParallelLinear,
 )
 from sglang.srt.rocm_muse_spark.muse_qk_norm import fused_qk_norm, qk_norm_supported
+from sglang.srt.rocm_muse_spark.quark_ptpc_fp8 import (
+    FP8_DTYPE,
+    LoadCoverage,
+    check_channel_scales,
+    check_rope_rows,
+    check_serialized_dtype,
+    excluded_expert_layers,
+    is_quark_ptpc_fp8,
+    ptpc_fp8_rejection,
+)
 from sglang.srt.rocm_muse_spark.sequence_parallel import (
     SPShape,
     prepare_ulysses,
@@ -544,6 +554,22 @@ def _dense_linear(
     return linear(x)
 
 
+def _check_ptpc_linear(linear: nn.Module, prefix: str) -> None:
+    """A PTPC attention projection must resolve to the per-channel weight x per-token activation Quark scheme."""
+    from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
+
+    scheme = linear.scheme
+    if not (
+        isinstance(scheme, QuarkW8A8Fp8)
+        and scheme.weight_qscheme == "per_channel"
+        and scheme.per_token
+    ):
+        raise ValueError(
+            f"{prefix}: Quark PTPC-FP8 attention needs the per-channel/per-token QuarkW8A8Fp8 "
+            f"scheme, got {type(scheme).__name__}"
+        )
+
+
 class MuseSpark1xRouter(nn.Module):
     """Router with the checkpoint-native ``[hidden, experts]`` layout."""
 
@@ -558,7 +584,15 @@ class MuseSpark1xRouter(nn.Module):
 
 
 class MuseSpark1xAttention(nn.Module):
-    def __init__(self, config: MuseSparkTextConfig, layer_idx: int, prefix: str):
+    def __init__(
+        self,
+        config: MuseSparkTextConfig,
+        layer_idx: int,
+        prefix: str,
+        quant_config: QuantizationConfig | None = None,
+    ):
+        """``quant_config`` is set only for Quark PTPC-FP8 exports, whose q/k/v/o-gate and o projections are
+        serialized W8A8 FP8; every other checkpoint keeps these projections in BF16."""
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
@@ -606,6 +640,7 @@ class MuseSpark1xAttention(nn.Module):
                 bias=False,
                 prefix=add_prefix("qkv_proj", prefix),
                 parallel_group="attn_tp",
+                quant_config=quant_config,
             )
         else:
             self.qkv_proj = QKVParallelLinear(
@@ -623,10 +658,18 @@ class MuseSpark1xAttention(nn.Module):
             output_size=config.hidden_size,
             bias=False,
             reduce_results=True,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
             parallel_group="attn_tp",
         )
+        self.fp8_serialized = quant_config is not None
+        if self.fp8_serialized:
+            _check_ptpc_linear(self.qkv_proj, prefix)
+            _check_ptpc_linear(self.o_proj, prefix)
+            # The dense FP8 fast paths read these copies of BF16 weights; serialized FP8 weights are stored
+            # preshuffled for the generic Quark GEMM, so those paths stay off and the Quark linears run instead.
+            self.qkv_proj.small_m_fp8_weight = None
+            self.o_proj.small_m_fp8_weight = None
         self.rotary_emb = (
             get_rope(
                 self.head_dim,
@@ -1024,6 +1067,74 @@ class MuseSpark1xMxfp4Experts(nn.Module):
     _forward_capturable = forward
 
 
+class MuseSpark1xFp8Experts(nn.Module):
+    """AMD Quark PTPC-FP8 experts: FP8 e4m3 weights with fp32 per-output-channel scales; activations are
+    quantized per token at run time (``muse_moe_fp8``)."""
+
+    def __init__(
+        self,
+        num_local_experts: int,
+        expert_hidden_size: int,
+        intermediate_size: int,
+    ):
+        super().__init__()
+        if _moe_backend() != "triton":
+            raise ValueError(
+                "Quark PTPC-FP8 experts run on the Triton MoE backend; "
+                f"MUSE_MOE_BACKEND={_moe_backend()!r} has no FP8 path"
+            )
+        from sglang.srt.rocm_muse_spark.muse_moe_fp8 import check_moe_fp8_supported
+
+        check_moe_fp8_supported()
+        self.num_local_experts = num_local_experts
+        self.expert_hidden_size = expert_hidden_size
+        self.intermediate_size = intermediate_size
+
+        def param(*shape, dtype):
+            data = torch.empty(*shape, dtype=dtype)
+            if dtype == torch.float32:
+                data.fill_(float("nan"))  # an unloaded scale fails the post-load check
+            return nn.Parameter(data, requires_grad=False)
+
+        two_i, hidden = 2 * intermediate_size, expert_hidden_size
+        self.w13_weight = param(num_local_experts, two_i, hidden, dtype=FP8_DTYPE)
+        self.w13_weight_scale = param(num_local_experts, two_i, dtype=torch.float32)
+        self.w2_weight = param(
+            num_local_experts, hidden, intermediate_size, dtype=FP8_DTYPE
+        )
+        self.w2_weight_scale = param(num_local_experts, hidden, dtype=torch.float32)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_scores: torch.Tensor,
+        topk_ids: torch.Tensor,
+        local_expert_start: int,
+        post_expert_norm: nn.Module | None,
+    ) -> torch.Tensor:
+        if hidden_states.shape[0] == 0:
+            return hidden_states
+        from sglang.srt.rocm_muse_spark.muse_moe_fp8 import muse_moe_fp8
+
+        weight, gain, has_norm = _post_expert_norm_args(post_expert_norm)
+        return muse_moe_fp8(
+            hidden_states,
+            topk_scores,
+            topk_ids,
+            self.w13_weight,
+            self.w13_weight_scale,
+            self.w2_weight,
+            self.w2_weight_scale,
+            int(local_expert_start),
+            weight,
+            float(post_expert_norm.eps) if post_expert_norm is not None else 0.0,
+            post_norm_gain=gain,
+            has_norm=has_norm,
+        )
+
+    _forward_capturable = forward
+
+
 class MuseSpark1xMoE(nn.Module):
     def __init__(
         self,
@@ -1103,6 +1214,9 @@ class MuseSpark1xMoE(nn.Module):
         )
         self.nvfp4_checkpoint = nvfp4_checkpoint
         self.mxfp4_checkpoint = _uses_quark_mxfp4_experts(quant_config, prefix)
+        self.fp8_checkpoint = is_quark_ptpc_fp8(
+            quant_config, self.num_experts
+        ) and layer_idx not in excluded_expert_layers(quant_config, self.num_experts)
         if nvfp4_checkpoint:
             # Packed NVFP4: the FlashInfer TRT-LLM kernel runs the experts and we
             # finalize in torch so the post-expert norm lands before the top-k sum.
@@ -1117,6 +1231,12 @@ class MuseSpark1xMoE(nn.Module):
             )
         elif self.mxfp4_checkpoint:
             self.experts = MuseSpark1xMxfp4Experts(
+                self.num_local_experts,
+                self.expert_hidden_size,
+                self.intermediate_size,
+            )
+        elif self.fp8_checkpoint:
+            self.experts = MuseSpark1xFp8Experts(
                 self.num_local_experts,
                 self.expert_hidden_size,
                 self.intermediate_size,
@@ -1508,7 +1628,14 @@ class MuseSpark1xDecoderLayer(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.self_attn = MuseSpark1xAttention(
-            config, layer_idx, add_prefix("self_attn", prefix)
+            config,
+            layer_idx,
+            add_prefix("self_attn", prefix),
+            quant_config=(
+                quant_config
+                if is_quark_ptpc_fp8(quant_config, config.num_local_experts)
+                else None
+            ),
         )
         self.post_attn_norm = MuseSpark1xRMSNorm(
             config.hidden_size,
@@ -1690,6 +1817,8 @@ class MuseSpark1xDecoderLayer(nn.Module):
             and (
                 (
                     sp is None
+                    # Serialized FP8 attention has no FP8 weight copy to feed (every layer is alike).
+                    and not self.self_attn.fp8_serialized
                     and 0 < ffn_output.shape[0] <= _FP8_MAX_ROWS
                     and (
                         forward_batch.forward_mode.is_decode()
@@ -2035,17 +2164,21 @@ class MuseSparkTextForCausalLM(nn.Module):
         quant_name = _quantization_name(quant_config)
         if quant_name not in (None, "modelopt_fp4", "quark"):
             raise ValueError(
-                "Only BF16, serialized ModelOpt NVFP4, and Quark MXFP4 are "
-                f"supported, got {quant_name}"
+                "Only BF16, serialized ModelOpt NVFP4, Quark MXFP4, and Quark "
+                f"PTPC-FP8 are supported, got {quant_name}"
             )
         if quant_name == "quark" and not _is_quark_mxfp4(quant_config):
-            raise ValueError(
-                "Unsupported Quark format; expected FP4/E8M0/group-size 32"
-            )
+            reason = ptpc_fp8_rejection(quant_config, config.num_local_experts)
+            if reason is not None:
+                raise ValueError(
+                    "Unsupported Quark format; expected FP4/E8M0/group-size 32 or "
+                    f"PTPC-FP8 (per-channel weights, per-token activations): {reason}"
+                )
         self.config = config
         self.quant_config = quant_config
         self.nvfp4_checkpoint = quant_name == "modelopt_fp4"
         self.mxfp4_checkpoint = _is_quark_mxfp4(quant_config)
+        self.fp8_checkpoint = quant_name == "quark" and not self.mxfp4_checkpoint
         # ``--quantization quark_mxfp4`` on a ModelOpt NVFP4 checkpoint: Quark builds
         # an online MXFP4 config with the NVFP4 export as its dequantization source.
         # The generic requantizer only drives FusedMoE, so this model converts its
@@ -2056,6 +2189,8 @@ class MuseSparkTextForCausalLM(nn.Module):
         )
         self._nvfp4_pending: dict[tuple[str, str], dict[str, torch.Tensor]] = {}
         self.model = MuseSparkModel(config, quant_config, add_prefix("model", prefix))
+        if self.fp8_checkpoint:
+            self._log_ptpc_fp8_methods()
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
@@ -2071,6 +2206,22 @@ class MuseSparkTextForCausalLM(nn.Module):
         self.capture_aux_hidden_states = False
         # Called by the model runner after each forward (outside graphs); see expert_placement.
         self.expert_placement = None
+
+    def _log_ptpc_fp8_methods(self) -> None:
+        layers = self.model.language_model.layers
+        attn = layers[0].self_attn
+        experts = [
+            type(layer.mlp.experts).__name__ for layer in layers if layer.is_moe_layer
+        ]
+        logger.info(
+            "Quark PTPC-FP8 checkpoint: attention qkv_proj=%s/%s o_proj=%s/%s; experts %s; "
+            "Ulysses prefill off for FP8 attention",
+            type(attn.qkv_proj.quant_method).__name__,
+            type(attn.qkv_proj.scheme).__name__,
+            type(attn.o_proj.quant_method).__name__,
+            type(attn.o_proj.scheme).__name__,
+            ", ".join(f"{n}x{experts.count(n)}" for n in sorted(set(experts))),
+        )
 
     def forward(
         self,
@@ -2296,6 +2447,10 @@ class MuseSparkTextForCausalLM(nn.Module):
             raise ValueError(
                 f"Checkpoint weight '{name}' has no parameter '{param_name}'"
             )
+        if self.fp8_checkpoint:
+            self._track_fp8_piece(
+                param, loaded_weight, name, (prefix, local_id, projection), suffix
+            )
         if suffix == "weight_scale_2":
             if is_w13 and param.ndim == 2:
                 shard = 0 if projection == "gate_proj" else 1
@@ -2316,7 +2471,45 @@ class MuseSparkTextForCausalLM(nn.Module):
         target.copy_(loaded_weight)
         return True
 
+    def _track_fp8_piece(self, param, loaded_weight, name: str, key, suffix: str):
+        check_serialized_dtype(param, loaded_weight, name)
+        if param.dtype == FP8_DTYPE or suffix == "weight_scale":
+            self._fp8_coverage.add(key, suffix)
+
+    @torch.no_grad()
+    def _check_ptpc_fp8_load(self) -> None:
+        """Every FP8 weight has finite, positive per-channel scales, and the generic Quark post-processing will
+        keep it FP8 (it dequantizes outputs narrower than a multiple of 16 rows to BF16)."""
+        self._fp8_coverage.check()
+        for layer in self.model.layers:
+            tag = f"layers.{layer.layer_idx}"
+            for attr in ("qkv_proj", "o_proj"):
+                linear = getattr(layer.self_attn, attr)
+                rows = linear.weight.shape[0]
+                if linear.weight.dtype != FP8_DTYPE or rows % 16:
+                    raise RuntimeError(
+                        f"{tag}.self_attn.{attr}: expected an FP8 weight with rows % 16 == 0, "
+                        f"got {tuple(linear.weight.shape)} {linear.weight.dtype}"
+                    )
+                check_channel_scales(
+                    f"{tag}.self_attn.{attr}.weight_scale", linear.weight_scale, rows
+                )
+            experts = layer.mlp.experts if layer.is_moe_layer else None
+            if isinstance(experts, MuseSpark1xFp8Experts):
+                tag = f"{tag}.mlp.experts"
+                check_channel_scales(
+                    f"{tag}.w13_weight_scale",
+                    experts.w13_weight_scale,
+                    experts.w13_weight.shape[1],
+                )
+                check_channel_scales(
+                    f"{tag}.w2_weight_scale",
+                    experts.w2_weight_scale,
+                    experts.w2_weight.shape[1],
+                )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        self._fp8_coverage = LoadCoverage()
         params = dict(self.named_parameters())
         params.update(
             {name: value for name, value in self.named_buffers() if name not in params}
@@ -2340,13 +2533,23 @@ class MuseSparkTextForCausalLM(nn.Module):
                 params, name, loaded_weight
             ):
                 continue
-            if name.endswith((".self_attn.q_proj.weight", ".self_attn.k_proj.weight")):
-                loaded_weight = self._deinterleave_rope_halves(
-                    loaded_weight,
-                    self.config.num_attention_heads
-                    if name.endswith(".q_proj.weight")
-                    else self.config.num_key_value_heads,
+            if name.endswith(
+                (".self_attn.q_proj.weight", ".self_attn.k_proj.weight")
+            ) or (
+                # Per-output-channel scales move with their rows.
+                self.fp8_checkpoint
+                and name.endswith(
+                    (".self_attn.q_proj.weight_scale", ".self_attn.k_proj.weight_scale")
                 )
+            ):
+                heads = (
+                    self.config.num_attention_heads
+                    if ".q_proj." in name
+                    else self.config.num_key_value_heads
+                )
+                if self.fp8_checkpoint:
+                    check_rope_rows(loaded_weight, heads, self.config.head_dim, name)
+                loaded_weight = self._deinterleave_rope_halves(loaded_weight, heads)
             for old, new in self._WEIGHT_REMAPS:
                 if old in name:
                     name = name.replace(old, new)
@@ -2385,6 +2588,11 @@ class MuseSparkTextForCausalLM(nn.Module):
                 param = params.get(candidate)
                 if param is None:
                     continue
+                if self.fp8_checkpoint:
+                    base, _, suffix = candidate.rpartition(".")
+                    self._track_fp8_piece(
+                        param, loaded_weight, raw_name, (base, shard_id), suffix
+                    )
                 loader = getattr(param, "weight_loader", default_weight_loader)
                 loader(param, loaded_weight, shard_id)
                 handled = True
@@ -2399,6 +2607,9 @@ class MuseSparkTextForCausalLM(nn.Module):
                 )
             if "router.weight" in name and param.shape != loaded_weight.shape:
                 loaded_weight = loaded_weight.t().contiguous()
+            if self.fp8_checkpoint:
+                base, _, suffix = name.rpartition(".")
+                self._track_fp8_piece(param, loaded_weight, raw_name, (base,), suffix)
             if ".experts.w" in name:
                 self._copy_expert_stack(param, loaded_weight, name)
             else:
@@ -2411,6 +2622,8 @@ class MuseSparkTextForCausalLM(nn.Module):
                 "Incomplete NVFP4 expert tensors for "
                 + ", ".join(f"{p}.{proj}" for p, proj in sorted(self._nvfp4_pending))
             )
+        if self.fp8_checkpoint:
+            self._check_ptpc_fp8_load()
         self.post_load_weights()
 
     @torch.no_grad()
@@ -2460,7 +2673,10 @@ class MuseSparkTextForCausalLM(nn.Module):
                         )
         if ulysses_enabled():
             for layer in self.model.layers:
-                prepare_ulysses(layer.self_attn, fp8=_PREFILL_DENSE_FP8)
+                # Ulysses gathers the projection weights and runs them as BF16 (or its own FP8 copies of BF16);
+                # serialized FP8 attention keeps the gather + reduce-scatter sequence parallelism instead.
+                if not layer.self_attn.fp8_serialized:
+                    prepare_ulysses(layer.self_attn, fp8=_PREFILL_DENSE_FP8)
         if _PREFILL_DENSE_FP8:
             for moe in moe_layers:
                 _prepare_prefill_fp8_projections(moe)
