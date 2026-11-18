@@ -1,12 +1,17 @@
 """gfx950 host-pool budgets: the amdgpu driver pins host memory only up to its TTM
-page limit, past which hipHostMalloc fails while RAM is still free."""
+page limit, past which hipHostMalloc fails while RAM is still free.
+
+The shared HiCache sizing code calls the helpers below unconditionally; each one
+leaves main's behavior unchanged off gfx950."""
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import resource
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, ContextManager, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.pool_host import base
 from sglang.srt.utils import is_gfx95_supported
 
@@ -42,11 +47,33 @@ def clamp_plain_budget(plain: int) -> int:
     return plain
 
 
+def explicit_size_scope(enabled: bool) -> ContextManager:
+    """With explicit HiCache sizes on gfx950, book every host pool against one
+    pinnable-share snapshot, so the ratio-sized Mamba pool built last clamps to
+    what the others left. A nullcontext when HiCache is off, off gfx950, or when
+    the TTM limit is not visible."""
+    if not enabled or rocm_pinnable_share_bytes() is None:
+        return contextlib.nullcontext()
+    return base.host_memory_budget_scope(base.host_memory_budget_plain_hugetlb())
+
+
+def mamba_host_ratio(hicache_ratio: float) -> float:
+    """The Mamba host pool's host-to-device ratio: SGLANG_HICACHE_MAMBA_HOST_RATIO
+    when set on gfx950, else ``hicache_ratio``."""
+    ratio = envs.SGLANG_HICACHE_MAMBA_HOST_RATIO.get() if is_gfx95_supported() else None
+    return hicache_ratio if ratio is None else ratio
+
+
 def clamp_mamba_pool(
-    pool: MambaPoolHost, allocation_bytes: int, available_bytes: int
+    pool: MambaPoolHost, host_size: float, allocation_bytes: int, available_bytes: int
 ) -> tuple[int, int]:
-    """A ratio-sized Mamba host pool takes what the pinnable budget left rather than
-    failing: shrink it to ``available_bytes`` and return its new preflight."""
+    """On gfx950 a ratio-sized Mamba host pool that does not fit takes what the
+    pinnable budget left rather than failing: shrink it to ``available_bytes`` and
+    return its new preflight. Any other pool's preflight is returned unchanged."""
+    if not (
+        is_gfx95_supported() and allocation_bytes > available_bytes and host_size <= 0
+    ):
+        return allocation_bytes, available_bytes
     page_bytes = pool.size_per_token * pool.page_size
     pool.page_num = max(available_bytes // page_bytes, 1)
     pool.size = pool.page_num * pool.page_size

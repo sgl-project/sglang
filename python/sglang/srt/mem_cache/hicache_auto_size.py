@@ -23,7 +23,6 @@ from sglang.srt.mem_cache.pool_host.common import (
     get_allocator_class_from_storage,
     get_allocator_type,
 )
-from sglang.srt.mem_cache.pool_host.rocm_budget import rocm_pinnable_share_bytes
 from sglang.srt.runtime_context import get_context, get_memory, get_parallel
 
 if TYPE_CHECKING:
@@ -121,12 +120,10 @@ def auto_size_hicache(
     """
     fraction = get_memory().hicache_host_memory_fraction
     if not enabled or fraction is None:
-        if not enabled or rocm_pinnable_share_bytes() is None:
-            yield
-            return
-        # explicit sizes book every pool against the pinnable share, so the
-        # ratio-sized Mamba pool built last clamps to what the others left
-        with host_memory_budget_scope(host_memory_budget_plain_hugetlb()):
+        from sglang.srt.mem_cache.pool_host.rocm_budget import explicit_size_scope
+
+        # gfx950 pins only its TTM share: book explicit sizes against it; else no-op
+        with explicit_size_scope(enabled):
             yield
         return
     requested = get_memory().hicache_ratio
