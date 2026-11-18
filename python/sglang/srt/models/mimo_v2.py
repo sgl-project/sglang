@@ -520,7 +520,9 @@ class MiMoV2MoE(nn.Module):
                 else TopKOutputFormat.STANDARD
             )
         self.supports_deferred_finalize = (
-            use_bypassed_topk and envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get()
+            use_bypassed_topk
+            and envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get()
+            and not get_exec().deterministic.enable_deterministic_inference
         )
 
         # todo : implement tbo forward needed
