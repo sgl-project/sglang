@@ -266,8 +266,9 @@ def _should_record_nolora_graph(model_runner, explicitly_requested=False) -> boo
 
 
 # Arbitrary; only has to exceed any per-rank row count, so the DP pad-row mask
-# (SGLANG_OPT_MASK_DP_PAD_MOE) drops nothing.
-_DP_NO_PAD_ROWS = 1 << 30
+# (SGLANG_OPT_MASK_DP_PAD_MOE) drops nothing. write_host_ints passes 16 * v + 3
+# as a kernel argument, so keep that within int32.
+_DP_NO_PAD_ROWS = 1 << 26
 
 
 def _dp_real_num_tokens_per_rank(
