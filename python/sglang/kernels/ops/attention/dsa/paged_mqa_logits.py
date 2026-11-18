@@ -123,7 +123,12 @@ def aiter_paged_mqa_logits(
         max_seq_len,
         Preshuffle=preshuffle,
         KVBlockSize=kv_block_size,
-        PersistentSchedule=persistent_schedule,
+        # older aiter pins (the gfx1151 image's) have no PersistentSchedule
+        **(
+            {}
+            if persistent_schedule is None
+            else {"PersistentSchedule": persistent_schedule}
+        ),
     )
     return logits
 
