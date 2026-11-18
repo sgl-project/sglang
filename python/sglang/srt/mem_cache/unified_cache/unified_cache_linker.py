@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import time
 from abc import ABC, abstractmethod
+from collections import deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from contextlib import contextmanager
@@ -327,7 +328,7 @@ class UnifiedCacheLinkerWrapper:
         self.private_load_indices: dict[str, torch.Tensor] = {}
         self.inflight_load_index = -1
         # Offloads in flight, each holding a lock on its node until it lands.
-        self.pending_offloads: list[_PendingOffload] = []
+        self.pending_offloads: deque[_PendingOffload] = deque()
         # Page-aligned radix-key prefix excluded from offload during an insert.
         self.offload_skip_prefix_len = 0
 
@@ -844,7 +845,7 @@ class UnifiedCacheLinkerWrapper:
     def commit_completed_offloads(self, successes: Sequence[bool]) -> None:
         assert len(successes) <= len(self.pending_offloads)
         for success in successes:
-            pending = self.pending_offloads.pop(0)
+            pending = self.pending_offloads.popleft()
             self.cache.tree_core.finish_external_linker_offload(
                 pending.publish_node_ids, pending.lock_node_id, success
             )
