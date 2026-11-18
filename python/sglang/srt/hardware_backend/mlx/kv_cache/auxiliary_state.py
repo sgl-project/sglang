@@ -96,6 +96,11 @@ class MlxAuxiliaryStatePool:
         self.device = device
         self.mamba_cache = None
         self.mem_usage = 0
+        # No speculative ReplaySSM cursors: `StateStorage.reset_request_rows`
+        # skips a pool whose cursors are None.
+        self.replayssm_spec_write_pos = None
+        self.replayssm_cache_base = None
+        self.replayssm_is_flush = None
         self._snapshots: dict[int, dict[int, _CacheSnapshot]] = {}
         self._alloc_iter: Optional[Iterator[torch.Tensor]] = None
         self.clear()
@@ -113,6 +118,10 @@ class MlxAuxiliaryStatePool:
 
     def schedulable_available_size(self) -> int:
         return self.available_size()
+
+    def slots_fit(self, count: int) -> bool:
+        """Whether ``count`` slots can be taken now."""
+        return self.schedulable_available_size() >= count
 
     def alloc_group_begin(self, num_reqs: int) -> None:
         self._alloc_iter = None
@@ -222,7 +231,7 @@ class MlxAuxiliaryStateStorage(StateStorage):
     them through the token allocator. The MLX table binds a request's slot when
     it binds the row, and release keeps the MLX table's rules."""
 
-    def acquire(self, table, reqs, rows, fresh_rows) -> None:
+    def acquire(self, table, reqs, rows) -> None:
         """Nothing left to bind: the MLX table's ``alloc`` gave each request
         its auxiliary slot, or kept the one it holds, with its row."""
 

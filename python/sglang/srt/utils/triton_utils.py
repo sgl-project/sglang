@@ -16,10 +16,8 @@
 from __future__ import annotations
 
 import functools
-import importlib
 import inspect
 import logging
-from functools import lru_cache
 
 import triton
 
@@ -32,7 +30,6 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "support_triton",
     "next_power_of_2",
-    "is_triton_kernels_available",
     "CachedKernel",
     "cached_triton_kernel",
 ]
@@ -50,11 +47,6 @@ def next_power_of_2(n: int):
 
 
 setattr(triton, "next_power_of_2", next_power_of_2)
-
-
-@lru_cache(maxsize=1)
-def is_triton_kernels_available() -> bool:
-    return importlib.util.find_spec("triton_kernels") is not None
 
 
 class CachedKernel:

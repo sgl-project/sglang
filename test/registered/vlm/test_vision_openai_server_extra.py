@@ -16,7 +16,8 @@ class TestQwen3OmniServer(OmniOpenAITestMixin):
     model = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
     extra_args = [  # workaround to fit into H100
         "--mem-fraction-static=0.90",
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph",
+        "--disable-prefill-cuda-graph",
         "--image-processor-backend=pil",
         "--grammar-backend=none",
     ]

@@ -5,6 +5,7 @@ import logging
 from typing import TYPE_CHECKING, List
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.capacity import tokens_fit
 from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
@@ -147,8 +148,10 @@ def add_spec_decode_headroom_pages(
     if extra == 0:
         return nxt_kv_lens, num_needed_tokens
     # Paged extend evicts up to needed + bs pages; stay clear of that demand.
-    free = batch.token_to_kv_pool_allocator.available_size()
-    if free < num_needed_tokens + len(lens) * page_size + 4 * extra:
+    if not tokens_fit(
+        batch.token_to_kv_pool_allocator,
+        num_needed_tokens + len(lens) * page_size + 4 * extra,
+    ):
         return nxt_kv_lens, num_needed_tokens
     return lens, num_needed_tokens + extra
 
