@@ -263,6 +263,12 @@ impl Server {
         })
     }
 
+    /// End a parked [`Server::wait_request`] at once, for work the scheduler
+    /// must act on without a request.
+    pub fn wake_request_wait(&self) {
+        let _ = self.rt.to_scheduler_rx.waker().send(());
+    }
+
     /// Push a whole decode batch as ONE frame: a columnar msgpack `header` plus
     /// the raw `data_cols` (per-column `bytes`), concatenated here. Blocks for
     /// backpressure; `False` only on shutdown.

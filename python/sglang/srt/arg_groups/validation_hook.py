@@ -148,8 +148,6 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     # Python's changes the pad values of the items it serves. A model package
     # whose Rust server caches honors it (`rust_server_unsupported_args`).
     "mm_preprocess_cache_size_mb",
-    # The Rust server has no encoder dispatch.
-    "language_only",
     # The Rust listener reports ready without waiting for weight updates.
     "checkpoint_engine_wait_weights_before_ready",
     "delete_ckpt_after_loading",
@@ -209,6 +207,26 @@ def validate_rust_server_unsupported_args(server_args: Any) -> None:
     offending = rust_server_unsupported_args(server_args)
     if offending:
         raise rust_server_refusal(offending)
+    validate_rust_server_language_only(server_args)
+
+
+def validate_rust_server_language_only(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if not cfg.language_only:
+        return
+    if cfg.encoder_transfer_backend in ("zmq_to_tokenizer", "mooncake"):
+        unsupported = f"--encoder-transfer-backend {cfg.encoder_transfer_backend}"
+    elif cfg.enable_adaptive_dispatch_to_encoder:
+        unsupported = "--enable-adaptive-dispatch-to-encoder"
+    elif num_dp_ranks_of(cfg) > 1:
+        unsupported = "data parallelism"
+    else:
+        return
+    raise ValueError(
+        "Rust-server mode (SGLANG_RUST_SERVER=1) does not support "
+        f"--language-only with {unsupported}. Remove it or unset "
+        "SGLANG_RUST_SERVER."
+    )
 
 
 def validate_response_store(server_args: Any) -> None:

@@ -5724,7 +5724,6 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
             "tenant",
         ],
         "mm_preprocess_cache_size_mb": ["--mm-preprocess-cache-size-mb", "512"],
-        "language_only": ["--language-only"],
         "checkpoint_engine_wait_weights_before_ready": [
             "--checkpoint-engine-wait-weights-before-ready"
         ],
@@ -5767,6 +5766,38 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
             ):
                 self._resolve([])
             self._resolve([], rust_server=False)
+
+    def test_language_only_refuses_what_the_dispatch_does_not_run(self):
+        for cli_args, unsupported in (
+            (["--encoder-transfer-backend", "auto"], None),
+            (
+                ["--encoder-transfer-backend", "zmq_to_tokenizer"],
+                "--encoder-transfer-backend zmq_to_tokenizer",
+            ),
+            (
+                ["--encoder-transfer-backend", "mooncake"],
+                "--encoder-transfer-backend mooncake",
+            ),
+            (
+                ["--enable-adaptive-dispatch-to-encoder"],
+                "--enable-adaptive-dispatch-to-encoder",
+            ),
+            (["--dp-size", "2"], "data parallelism"),
+        ):
+            with self.subTest(cli_args=cli_args):
+                if unsupported is None:
+                    self._resolve(["--language-only", *cli_args])
+                    continue
+                with self.assertRaises(ValueError) as ctx:
+                    self._resolve(["--language-only", *cli_args])
+                self.assertEqual(
+                    str(ctx.exception),
+                    "Rust-server mode (SGLANG_RUST_SERVER=1) does not support "
+                    f"--language-only with {unsupported}. Remove it or unset "
+                    "SGLANG_RUST_SERVER.",
+                )
+                self._resolve(["--language-only", *cli_args], rust_server=False)
+                self._resolve(cli_args)
 
     def test_args_a_model_package_honors_are_not_refused(self):
         args = prepare_server_args(
