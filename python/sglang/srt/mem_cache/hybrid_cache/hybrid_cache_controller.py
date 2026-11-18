@@ -47,7 +47,6 @@ from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.page_interleave import PageInterleaveHostPool
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
-from sglang.srt.mem_cache.pp_ticket_worker import run_pp_ticket_loop
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.observability.trace import (
     TraceNullContext,
@@ -62,6 +61,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.utils import broadcast_pyobj
 
 logger = logging.getLogger(__name__)
 
@@ -1518,91 +1518,117 @@ class HybridCacheController(BaseHiCacheController):
             return True
 
     def pp_prefetch_command_thread_func(self) -> None:
-        try:
-            run_pp_ticket_loop(
-                self.pp_prefetch_command_group,
-                self.pp_prefetch_command_queue,
-                self._handle_pp_prefetch_ticket,
-            )
-        except Exception:
-            # An unexpected failure cannot safely continue the collectives.
-            logger.exception("PP HiCache ticket processing failed.")
+        group = self.pp_prefetch_command_group
+        assert group is not None
+        rank = torch.distributed.get_rank()
+        source = torch.distributed.get_process_group_ranks(group)[0]
+        is_source = self.storage_config.pp_rank == 0
 
-    def _handle_pp_prefetch_ticket(self, ticket: PPPrefetchTicket) -> None:
-        rid = ticket.handle.rid
-        with self.pp_prefetch_state_lock:
-            state = self.pp_prefetch_states.get(rid)
-            if state is None:
-                operation = PrefetchOperation(
-                    ticket.handle,
-                    ticket.prefetch_key,
-                    ticket.last_hash,
-                    prefix_keys=ticket.prefix_keys,
-                    # Keep sidecar ACKs aligned even if allocation fails.
-                    pool_transfers=[
-                        PoolTransfer(
-                            name=spec.name,
-                            keys=spec.keys,
-                            hit_policy=spec.hit_policy,
-                            indices_from_pool=spec.indices_from_pool,
+        while True:
+            objects = []
+            if is_source:
+                try:
+                    objects = [self.pp_prefetch_command_queue.get(timeout=60)]
+                except Empty:
+                    pass  # Complete idle broadcasts before the group times out.
+            try:
+                objects = broadcast_pyobj(objects, rank, group, src=source)
+                if not objects:
+                    continue
+                ticket = objects[0]
+                if ticket is None:
+                    return
+
+                rid = ticket.handle.rid
+                with self.pp_prefetch_state_lock:
+                    state = self.pp_prefetch_states.get(rid)
+                    if state is None:
+                        operation = PrefetchOperation(
+                            ticket.handle,
+                            ticket.prefetch_key,
+                            ticket.last_hash,
+                            prefix_keys=ticket.prefix_keys,
+                            # Keep sidecar ACKs aligned even if allocation fails.
+                            pool_transfers=[
+                                PoolTransfer(
+                                    name=spec.name,
+                                    keys=spec.keys,
+                                    hit_policy=spec.hit_policy,
+                                    indices_from_pool=spec.indices_from_pool,
+                                )
+                                for spec in ticket.pool_specs
+                            ]
+                            or None,
                         )
-                        for spec in ticket.pool_specs
-                    ]
-                    or None,
-                )
-                operation.is_pp_broadcast = True
-                state = PPPrefetchState(ticket=ticket, operation=operation)
-                self.pp_prefetch_states[rid] = state
-            decision = self.pp_prefetch_decisions.get(rid)
-            if decision is PPPrefetchDecision.CANCELLED:
-                state.release_requested = True
-                self.pp_prefetch_decisions.pop(rid)
-            operation = state.operation
+                        operation.is_pp_broadcast = True
+                        state = PPPrefetchState(ticket=ticket, operation=operation)
+                        self.pp_prefetch_states[rid] = state
+                    decision = self.pp_prefetch_decisions.get(rid)
+                    if decision is PPPrefetchDecision.CANCELLED:
+                        state.release_requested = True
+                        self.pp_prefetch_decisions.pop(rid)
+                    operation = state.operation
 
-        try:
-            if self.storage_stop_event.is_set():
-                # Stopping: a miss without a backend query or a host
-                # allocation; the reduce below still pairs the stages.
-                operation.query_pool_hit_pages = {}
-                hash_value, storage_hit_count = [], 0
-            else:
-                hash_value, storage_hit_count = self._storage_hit_query(operation)
-                storage_hit_count = min(
-                    storage_hit_count,
-                    self.mem_pool_host.available_size(pool=PoolName.KV),
+                try:
+                    if self.storage_stop_event.is_set():
+                        # Stopping: a miss without a backend query or a host
+                        # allocation; the reduce below still pairs the stages.
+                        operation.query_pool_hit_pages = {}
+                        hash_value, storage_hit_count = [], 0
+                    else:
+                        hash_value, storage_hit_count = self._storage_hit_query(
+                            operation
+                        )
+                        storage_hit_count = min(
+                            storage_hit_count,
+                            self.mem_pool_host.available_size(pool=PoolName.KV),
+                        )
+                        storage_hit_count -= storage_hit_count % self.page_size
+                        operation.storage_hit_count = storage_hit_count
+                        if (
+                            storage_hit_count == 0
+                            or storage_hit_count < self.prefetch_threshold
+                            or not self._allocate_pp_prefetch_buffers(ticket, operation)
+                        ):
+                            storage_hit_count = 0
+                except Exception:
+                    logger.exception(
+                        "PP HiCache query or allocation failed for req=%s.", rid
+                    )
+                    operation.query_pool_hit_pages = {}
+                    hash_value, storage_hit_count = [], 0
+
+                # A failed query/allocation votes zero in the same MIN as hits.
+                storage_hit_count = self._sync_prefetch_hit_query(
+                    operation, storage_hit_count
                 )
-                storage_hit_count -= storage_hit_count % self.page_size
+                if operation.host_indices is not None:
+                    tail = operation.host_indices[storage_hit_count:]
+                    if tail.numel():
+                        self.mem_pool_host.free(tail, pool=PoolName.KV)
+                        self.prefetch_tokens_occupied -= len(tail)
+                        operation.host_indices = operation.host_indices[
+                            :storage_hit_count
+                        ]
+                operation.hash_value = hash_value[: storage_hit_count // self.page_size]
                 operation.storage_hit_count = storage_hit_count
-                if (
-                    storage_hit_count == 0
-                    or storage_hit_count < self.prefetch_threshold
-                    or not self._allocate_pp_prefetch_buffers(ticket, operation)
-                ):
-                    storage_hit_count = 0
-        except Exception:
-            logger.exception("PP HiCache query or allocation failed for req=%s.", rid)
-            operation.query_pool_hit_pages = {}
-            hash_value, storage_hit_count = [], 0
-
-        # A failed query/allocation votes zero in the same MIN as hits.
-        storage_hit_count = self._sync_prefetch_hit_query(operation, storage_hit_count)
-        if operation.host_indices is not None:
-            tail = operation.host_indices[storage_hit_count:]
-            if tail.numel():
-                self.mem_pool_host.free(tail, pool=PoolName.KV)
-                self.prefetch_tokens_occupied -= len(tail)
-                operation.host_indices = operation.host_indices[:storage_hit_count]
-        operation.hash_value = hash_value[: storage_hit_count // self.page_size]
-        operation.storage_hit_count = storage_hit_count
-        operation.storage_start = len(ticket.matched_prefix_tokens)
-        operation.pool_storage_result = PoolTransferResult.empty()
-        if storage_hit_count == 0:
-            if operation.host_indices is None:
-                operation.host_indices = torch.empty(0, dtype=torch.int64)
-            operation.mark_terminate()
-        if operation.pool_transfers:
-            self._resolve_sidecar_kv_derived_pool_transfers(operation)
-        self.prefetch_buffer.put(operation)
+                operation.storage_start = len(ticket.matched_prefix_tokens)
+                operation.pool_storage_result = PoolTransferResult.empty()
+                if storage_hit_count == 0:
+                    if operation.host_indices is None:
+                        operation.host_indices = torch.empty(0, dtype=torch.int64)
+                    operation.mark_terminate()
+                if operation.pool_transfers:
+                    self._resolve_sidecar_kv_derived_pool_transfers(operation)
+                self.prefetch_buffer.put(operation)
+            except Exception:
+                logger.exception("PP HiCache ticket processing failed.")
+                # Query/allocation failures already follow the agreed ACK path.
+                # An unexpected failure cannot safely continue the collectives.
+                return
+            finally:
+                if is_source and objects:
+                    self.pp_prefetch_command_queue.task_done()
 
     def write_storage(
         self,

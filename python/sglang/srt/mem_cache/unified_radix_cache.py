@@ -3059,9 +3059,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
-        if self.linker is not None and (
-            self.linker.load_mode == "prefetch" or self.linker.pp_tickets is not None
-        ):
+        if self.linker is not None:
             return self.linker.check_prefetch_progress(request)
         if self._is_pp_ticketed(request):
             return self._check_pp_prefetch_progress(request)

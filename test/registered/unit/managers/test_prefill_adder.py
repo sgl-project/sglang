@@ -186,7 +186,6 @@ class TestPrefillAdder(CustomTestCase):
         req.storage_hit_start = None
         req.host_hit_is_storage = False
         req.host_loaded_length = 0
-        req.external_cache_hit_length = None
         req.materialized_host_hit_len.return_value = 0
         req.fulfilled_storage_hit_len.return_value = 0
         req.finished.return_value = False
@@ -2668,8 +2667,6 @@ class TestPrefillAdder(CustomTestCase):
                     tail=extend if chunk is None and dllm is None else 8,
                 )
                 req.retracted_stain = name == "retracted_unaligned"
-                if name == "pp_linker":
-                    req.external_cache_hit_length = prefix_len + host_hit
                 if name.startswith("overdelivery"):
                     req.host_hit_length -= 4
                 old_node, restored_node = req.last_node, object()

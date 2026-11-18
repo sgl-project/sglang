@@ -32,7 +32,7 @@ from bisect import bisect_left
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
@@ -56,7 +56,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     LinkerTransferPhase,
     TreeComponent,
 )
-from sglang.srt.mem_cache.unified_cache.linker_pp import LinkerPPTickets
+from sglang.srt.mem_cache.unified_cache.linker_pp import _LinkerPPTickets
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.session.streaming_session import is_virtual_node
 from sglang.srt.utils import get_device_module
@@ -269,8 +269,10 @@ class ExternalCacheHitMarker(NamedTuple):
 class _ExternalCachePrefetch:
     key: RadixKey
     anchor_node_id: NodeId
-    anchor_lock: DecLockRefParams
-    component_transfers: list[tuple[TreeComponent, PoolTransfer]]
+    anchor_lock: DecLockRefParams | None = None
+    component_transfers: list[tuple[TreeComponent, PoolTransfer]] = field(
+        default_factory=list
+    )
     future: Future[bool] | None = None
     timeout_s: float = 0.0
     wait_started: float | None = None
@@ -336,7 +338,7 @@ class UnifiedCacheLinkerWrapper:
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
         self.pp_tickets = (
-            LinkerPPTickets(self)
+            _LinkerPPTickets(self)
             if cache.pp_size > 1 and cache.pp_group is not None
             else None
         )
@@ -376,14 +378,9 @@ class UnifiedCacheLinkerWrapper:
         if not tail_hashes:
             return result
 
-        lookup_transfers = []
-        for component in self._components:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOOKUP, None, tail_hashes
-            )
-            if transfer is None:
-                return result
-            lookup_transfers.append(transfer)
+        lookup_transfers = self._lookup_transfers(tail_hashes)
+        if not lookup_transfers:
+            return result
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
@@ -421,6 +418,40 @@ class UnifiedCacheLinkerWrapper:
             ),
         )
 
+    def _lookup_transfers(self, hashes: list[str]) -> list[PoolTransfer]:
+        transfers = []
+        for component in self._components:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.LOOKUP, None, hashes
+            )
+            if transfer is None:
+                return []
+            transfers.append(transfer)
+        return transfers
+
+    def _prefetch_key(self, req: Req) -> RadixKey:
+        tokens = req.full_untruncated_fill_ids
+        return RadixKey(
+            tokens,
+            extra_key=req.extra_key,
+            cache_salt=req.cache_salt,
+            is_bigram=self.cache.tree_core.is_eagle,
+            limit=req._compute_max_prefix_len(len(tokens)),
+        ).page_aligned(self.cache.page_size)
+
+    def _lookup_prefetch(self, rid: str, hashes: list[str]) -> list[int]:
+        try:
+            transfers = self._lookup_transfers(hashes)
+            if not transfers:
+                return []
+            hits = self.cache_linker.lookup(rid, transfers)
+            return [pages for pages in hits if 0 < pages <= len(hashes)]
+        except Exception:
+            logger.warning(
+                "External linker prefetch lookup failed for %s", rid, exc_info=True
+            )
+            return []
+
     def prefetch(self, req: Req) -> None:
         """Stage a queued request; publish only after all ranks succeed."""
         if self.pp_tickets is not None:
@@ -441,37 +472,28 @@ class UnifiedCacheLinkerWrapper:
         if is_virtual_node(req.last_node) or req.positional_embed_overrides is not None:
             return
         page = self.cache.page_size
-        key = RadixKey(
-            req.full_untruncated_fill_ids,
-            extra_key=req.extra_key,
-            cache_salt=req.cache_salt,
-            is_bigram=self.cache.tree_core.is_eagle,
-            limit=req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)),
-        ).page_aligned(page)
+        key = self._prefetch_key(req)
         start = req.prefix_len
         last_hash = self.cache.get_last_hash_value(req.last_node)
         if len(key) <= start or (start and last_hash is None):
             return
         hashes = get_storage_hash_str(key[start:], last_hash, page_size=page)
-        lookups = [
-            c.build_external_linker_transfer(LinkerTransferPhase.LOOKUP, None, hashes)
-            for c in self._components
-        ]
-        if any(t is None for t in lookups):
-            return
-        try:
-            # TODO: Run storage lookup asynchronously to avoid blocking scheduling.
-            restorable = self.cache_linker.lookup(req.rid, lookups)
-        except Exception:
-            logger.warning("External linker prefetch lookup failed", exc_info=True)
-            restorable = []
         pages = self._sync_restorable_prefix(
-            restorable, num_pages=len(hashes), device_hit_pages=0
+            self._lookup_prefetch(req.rid, hashes),
+            num_pages=len(hashes),
+            device_hit_pages=0,
         )
         if not pages:
             return
         end = start + pages * page
-        state = self._new_prefetch(request, req.last_node, key[:end], len(hashes))
+        state = _ExternalCachePrefetch(
+            key[:end],
+            req.last_node,
+            self.cache.inc_lock_ref(req.last_node).to_dec_params(),
+            timeout_s=self.cache.prefetch_timeout_base
+            + len(hashes) * self.cache.prefetch_timeout_per_page,
+        )
+        self.prefetches[request] = state
         try:
             if self._allocate_prefetch(state, hashes[:pages]):
                 state.future = self.cache_linker.prefetch(
@@ -484,24 +506,6 @@ class UnifiedCacheLinkerWrapper:
         if not accepted.item():
             self._cancel_prefetch(request)
             self.check_prefetch_events()
-
-    def _new_prefetch(
-        self,
-        request: CacheRequestHandle,
-        anchor_node_id: NodeId,
-        key: RadixKey,
-        lookup_pages: int,
-    ) -> _ExternalCachePrefetch:
-        state = _ExternalCachePrefetch(
-            key,
-            anchor_node_id,
-            self.cache.inc_lock_ref(anchor_node_id).to_dec_params(),
-            [],
-            timeout_s=self.cache.prefetch_timeout_base
-            + lookup_pages * self.cache.prefetch_timeout_per_page,
-        )
-        self.prefetches[request] = state
-        return state
 
     def _allocate_prefetch(
         self,
@@ -558,7 +562,9 @@ class UnifiedCacheLinkerWrapper:
         pages = len(hashes)
         if not pages or request in self.prefetches:
             return start_page
-        state = self._new_prefetch(request, anchor_node_id, key, pages)
+        # The ticket holds the anchor through publication or discard on this stage.
+        state = _ExternalCachePrefetch(key, anchor_node_id)
+        self.prefetches[request] = state
         try:
             if not self._pp_prefetch_fits(pages):
                 pages = bisect_left(
@@ -596,15 +602,15 @@ class UnifiedCacheLinkerWrapper:
         try:
             if end < len(state.key):
                 hashes = full.keys[: (end - start) // page]
-                for component, transfer in state.component_transfers:
-                    # A smaller boundary changes the window tail and the Mamba
-                    # checkpoint key even when both need the same number of slots.
-                    lookup = component.build_external_linker_transfer(
-                        LinkerTransferPhase.LOOKUP, None, hashes
-                    )
-                    if lookup is None:
-                        self._finish_prefetch(request, publish=False)
-                        return None
+                lookups = self._lookup_transfers(hashes)
+                if not lookups:
+                    self._finish_prefetch(request, publish=False)
+                    return None
+                # A smaller boundary changes the window tail and the Mamba
+                # checkpoint key even when both need the same number of slots.
+                for (component, transfer), lookup in zip(
+                    state.component_transfers, lookups, strict=True
+                ):
                     indices = transfer.device_indices
                     keep = len(lookup.keys) * (len(indices) // len(transfer.keys))
                     if keep < len(indices):
@@ -755,7 +761,8 @@ class UnifiedCacheLinkerWrapper:
             self.cache.prefetch_loaded_tokens_by_reqid[request] = len(full)
             self.cache.prefetch_loaded_storage_start_by_reqid[request] = start
         finally:
-            self.cache.dec_lock_ref(state.anchor_node_id, state.anchor_lock)
+            if state.anchor_lock is not None:
+                self.cache.dec_lock_ref(state.anchor_node_id, state.anchor_lock)
 
     def _sync_restorable_prefix(
         self, restorable: list[int], *, num_pages: int, device_hit_pages: int
@@ -1061,7 +1068,7 @@ class UnifiedCacheLinkerWrapper:
         self.cache_linker.reset()
         self._clear_state()
         if self.pp_tickets is not None:
-            self.pp_tickets = LinkerPPTickets(self)
+            self.pp_tickets = _LinkerPPTickets(self)
 
     def _clear_state(self) -> None:
         for request in list(self.prefetches):
@@ -1082,7 +1089,8 @@ class UnifiedCacheLinkerWrapper:
         self.hit_markers.pop(rid, None)
         if self.pp_tickets is not None:
             self.pp_tickets.release(request)
-        self._cancel_prefetch(request)
+        else:
+            self._cancel_prefetch(request)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):
