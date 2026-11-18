@@ -323,10 +323,14 @@ class SchedulerMetricsReporter:
         )
         self.forward_pass_device_timer: Optional[DeviceTimer] = None
         self._forward_occupancy_log_window: Optional[_ForwardOccupancyLogWindow] = None
-        # Per-category FIFO of each completed forward's own GPU elapsed time
-        # (seconds), populated from the device timer below. Used by
-        # _consume_device_gpu_time{,_sum} to give the SoL hooks an accurate
-        # per-forward duration instead of the wall-clock gap between log lines.
+        # FIFO of each completed "extend" (prefill) forward's own GPU elapsed
+        # time (seconds), populated from the device timer below and drained by
+        # _consume_device_gpu_time -- gives _prefill_sol_suffix an accurate
+        # per-forward duration instead of the wall-clock gap between log
+        # lines. Keyed by category (currently only "extend" is populated) so
+        # a future consumer (e.g. a decode equivalent) can reuse the same
+        # structure without resurrecting the unbounded-growth bug this
+        # avoids: only append for categories something actually drains.
         self._device_timer_elapsed_by_category: Dict[str, Deque[float]] = defaultdict(
             deque
         )
@@ -343,9 +347,13 @@ class SchedulerMetricsReporter:
             def _wrap_execution_reporter(**kwargs):
                 self._device_timer_window_gpu_time += kwargs["t"]
                 self._forward_occupancy_log_window.gpu_seconds += kwargs["t"]
-                category = kwargs.get("category")
-                if category is not None:
-                    self._device_timer_elapsed_by_category[category].append(
+                # Only "extend" (prefill) is ever drained, via
+                # _consume_device_gpu_time below -- tracking every category
+                # here (decode, idle, eagle_draft, ...) would queue entries
+                # that nothing consumes, growing unboundedly for the life of
+                # the process.
+                if kwargs.get("category") == "extend":
+                    self._device_timer_elapsed_by_category["extend"].append(
                         kwargs["t"]
                     )
                 if self.enable_metrics:
@@ -963,22 +971,6 @@ class SchedulerMetricsReporter:
         if not queue:
             return None
         return queue.popleft()
-
-    def _consume_device_gpu_time_sum(self, category: str) -> Optional[float]:
-        """Sum and clear every not-yet-consumed per-forward GPU elapsed time
-        (seconds) recorded for `category`. Unlike `_consume_device_gpu_time`,
-        this is for stats aggregated across many forwards in one report (e.g.
-        decode, logged every `decode_log_interval` iterations) where every
-        forward in the window legitimately belongs to that one report."""
-        if self.forward_pass_device_timer is None:
-            return None
-        self.forward_pass_device_timer._report()
-        queue = self._device_timer_elapsed_by_category.get(category)
-        if not queue:
-            return None
-        total = sum(queue)
-        queue.clear()
-        return total
 
     def _prefill_sol_suffix(self, batch, elapsed_s: float) -> str:
         """Device-timer-based replacement for the wall-clock `est. prefill
