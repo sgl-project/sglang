@@ -398,7 +398,7 @@ class TestDiskUpdateMemoryState(_WeightUpdaterManagerTestBase):
                 self.assertEqual(manager.offload_tags, tags)
 
     def test_queued_update_is_rejected_after_memory_release(self):
-        """A release can overtake an update waiting for the generation reader lock."""
+        """A release can overtake an update waiting for the tokenizer writer lock."""
         target = _runner()
         manager = self._manager(target)
         manager.memory_saver_adapter = Mock()
@@ -422,7 +422,7 @@ class TestDiskUpdateMemoryState(_WeightUpdaterManagerTestBase):
             )
             async with tokenizer.model_update_lock.reader_lock:
                 update = asyncio.create_task(
-                    TokenizerManager.update_weights_from_disk(tokenizer, request)
+                    TokenizerManager.update_weights_from_disk(tokenizer, obj=request)
                 )
                 await asyncio.sleep(0)
                 self.assertFalse(update.done())

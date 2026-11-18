@@ -157,7 +157,7 @@ class UpdateWeightsFromDiskBase:
 
     def _offload_engine_and_resume_weights(self):
         self._post_json("/release_memory_occupation", {})
-        response = requests.post(
+        response = admin_post(
             f"{self.base_url}/update_weights_from_disk",
             json={"model_path": self.model},
             timeout=self.update_timeout,
