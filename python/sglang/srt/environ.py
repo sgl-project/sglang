@@ -1197,14 +1197,6 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
-    # With the Kimi-K3 radix-4 router on (SGLANG_K3_RADIX4_TOPK), also emit
-    # AITER's BM=16 MoE sort from its launch, up to the size cap below (needs
-    # ROCm/aiter#6484).
-    SGLANG_OPT_HIP_K3_RADIX4_FUSE_SORT = EnvBool(True)
-    # AITER takes the sort only where its tuned kernel for M uses BM=16: up to
-    # 512 tokens in its Kimi-K3 A8W4 table. Its A4W4 table picks BM=32 for 65-256
-    # tokens, where the sort is computed and dropped; set 64 there.
-    SGLANG_OPT_HIP_K3_RADIX4_FUSE_SORT_MAX_TOKENS = EnvInt(512)
     SGLANG_ROCM_SMALLM_MOE = EnvBool(True)
     SGLANG_ROCM_SMALLM_FP8_BS = EnvBool(True)
     # Fused Kimi-K3 KDA decode kernel: "gfx950" (SGLang HIP) or "aiter" (FlyDSL);
@@ -2580,6 +2572,13 @@ class Envs:
     SGLANG_K3_SHARDED_MOE = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
+    # With the radix-4 router on, also emit AITER's BM=16 MoE sort from its launch
+    # for a non-EP AITER fused_moe (needs ROCm/aiter#6484).
+    SGLANG_OPT_HIP_K3_RADIX4_FUSE_SORT = EnvBool(True)
+    # AITER drops the sort wherever its tuned kernel is not BM=16. Its K3 A8W4
+    # (>= ROCm/aiter#6464) and A16W4 tables are BM=16 up to 512 tokens; its stock
+    # A4W4 table is BM=32 at 65-256, where 64 avoids a sort that is then dropped.
+    SGLANG_OPT_HIP_K3_RADIX4_FUSE_SORT_MAX_TOKENS = EnvInt(512)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)

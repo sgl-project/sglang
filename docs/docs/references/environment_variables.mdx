@@ -1978,6 +1978,16 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>256</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_RADIX4_FUSE_SORT</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi-K3 on ROCm with <code>SGLANG_K3_RADIX4_TOPK</code> on: also write AITER's BM=16 MoE sort, and zero the MoE output buffer, from the radix-4 routing launch, so AITER <code>fused_moe</code> skips its own <code>moe_sorting</code>. Applies only to a non-EP layer on the AITER MoE runner, and needs an AITER with <code>register_presorted_moe</code> (<a href="https://github.com/ROCm/aiter/pull/6484">ROCm/aiter#6484</a>); otherwise the router runs unfused. AITER ignores the sort and sorts again wherever its tuned kernel for the batch is not BM=16.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_RADIX4_FUSE_SORT_MAX_TOKENS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Largest batch, in tokens, for which <code>SGLANG_OPT_HIP_K3_RADIX4_FUSE_SORT</code> applies. AITER's Kimi-K3 A8W4 (at or past <a href="https://github.com/ROCm/aiter/pull/6464">ROCm/aiter#6464</a>) and A16W4 tuned tables use BM=16 up to 512 tokens. Its stock A4W4 table (<code>AITER_SITUV2_A4W4=1</code> without a replaced table) uses BM=32 for 65-256 tokens, where the sort is computed and then dropped, measured at 4.2-6.1 us per layer on MI355X; set <code>64</code> there.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>512</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_GDN_ONLINE_MXFP4</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On gfx95x with <code>SGLANG_USE_AITER=1</code>, quantize the BF16 GDN <code>in_proj_qkvz</code> and <code>out_proj</code> of Qwen3.5 / Qwen3.8 to MXFP4 after load. Projections with N or K not a multiple of 256 stay BF16. Batches of up to 64 rows run the AITER preshuffled MXFP4 GEMM if AITER has a tuned config for the shape. All other batches run the ASM <code>gemm_a4w4</code>. Set to <code>0</code> to keep the BF16 projections.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
