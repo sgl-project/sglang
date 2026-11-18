@@ -74,9 +74,34 @@ def _checkout_inferencex(commit: str) -> Path:
     return root / "inferencex-e2e"
 
 
+def _normalized_entry(entry: dict) -> dict:
+    """``entry`` with the defaults InferenceX's schema gives a search-space row.
+
+    The row goes through InferenceX's own ``AgenticCodingSearchSpaceEntry`` (so
+    a row InferenceX rejects is rejected here too), and the fields it defaults
+    are filled the way InferenceX's matrix generator does: ``spec-decoding``
+    ``none``, ``dcp-size`` 1, ``ep`` 1 when null, and ``conc-list`` expanded
+    from ``conc-start``/``conc-end`` (powers of two, as its default step).
+    Everything else stays as written. Needs ``infx`` on sys.path.
+    """
+    from infx.matrix.generate import _concurrency_range
+    from infx.matrix.validation import AgenticCodingSearchSpaceEntry
+
+    row = AgenticCodingSearchSpaceEntry.model_validate(entry)
+    conc_list = row.conc_list or _concurrency_range(row.conc_start, row.conc_end, 2)
+    return {
+        **entry,
+        "spec-decoding": row.spec_decoding,
+        "dcp-size": row.dcp_size,
+        "ep": 1 if row.ep is None else row.ep,
+        "conc-list": conc_list,
+    }
+
+
 def _matrix_entry(master: dict, point: str, label: str) -> tuple:
     """``(scenario, entry, tp, dp_attention, dcp, conc)`` for ``point``
-    (``tp<N>[-dpa][-dcp<M>]-c<CONC>``)."""
+    (``tp<N>[-dpa][-dcp<M>]-c<CONC>``). Each row is normalized by
+    ``_normalized_entry`` first."""
     match = re.fullmatch(r"tp(\d+)(-dpa)?(?:-dcp(\d+))?-c(\d+)", point)
     if not match:
         raise ValueError(
@@ -84,14 +109,13 @@ def _matrix_entry(master: dict, point: str, label: str) -> tuple:
         )
     tp, dp_attention = int(match[1]), bool(match[2])
     dcp, conc = int(match[3] or 1), int(match[4])
-    # A row without dcp-size, or with dcp-size: null, is DCP 1.
     entries = [
         (scenario, entry)
         for scenario in master["scenarios"]["agentic-coding"]
-        for entry in scenario["search-space"]
+        for entry in map(_normalized_entry, scenario["search-space"])
         if entry["tp"] == tp
         and bool(entry.get("dp-attn")) == dp_attention
-        and (entry.get("dcp-size") or 1) == dcp
+        and entry.get("dcp-size", 1) == dcp
         and conc in entry["conc-list"]
     ]
     if len(entries) != 1:
@@ -129,8 +153,7 @@ def _bind_point(e2e: Path, config_key: str, commit: str, point: str) -> tuple:
         "FRAMEWORK": master["framework"],
         "PRECISION": master["precision"],
         "TP": str(tp),
-        # A row without ep, or with ep: null, runs EP 1 as InferenceX's matrix does.
-        "EP_SIZE": str(entry.get("ep") or 1),
+        "EP_SIZE": str(entry["ep"]),
         "PP_SIZE": "1",
         "DCP_SIZE": str(dcp),
         "PCP_SIZE": "1",
