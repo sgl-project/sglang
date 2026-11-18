@@ -1113,7 +1113,7 @@ class Envs:
     SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM = EnvBool(False)
     # Kimi-K3 gfx950 TP8: the column-split latent-MoE tail's row cap (at most 384)
     SGLANG_ROCM_K3_COLUMN_TAIL_MAX_TOKENS = EnvInt(64)
-    # GiB of ROCm memory kept out of torch's allocator for HSA queue scratch (0: none)
+    # GiB of gfx950 memory kept out of torch's allocator for HSA queue scratch (0: none)
     SGLANG_ROCM_RUNTIME_RESERVE_GB = EnvFloat(0.0)
     # Run the gfx950 TP4 quick all-reduce on the JIT build (quick_all_reduce_hip) instead of
     # sgl-kernel's; off by default, MiniMax-M3.1 turns it on at TP4 under INT4 or INT8.
