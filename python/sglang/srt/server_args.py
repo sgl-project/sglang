@@ -34,6 +34,8 @@ from sglang.srt.arg_groups.arg_utils import (
     record_fields,
 )
 from sglang.srt.arg_groups.argparse_actions import (
+    DeprecatedAction,
+    DeprecatedAliasStoreAction,
     DeprecatedChoiceToFlagAction,
     DeprecatedStoreTrueAction,
 )
@@ -110,6 +112,7 @@ from sglang.srt.arg_groups.choices import (  # noqa: F401
     GRAMMAR_BACKEND_CHOICES,
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
     LOAD_FORMAT_CHOICES,
+    LORA_BACKEND_CHOICES,
     MOE_RUNNER_BACKEND_CHOICES,
     MXFP8_MOE_RUNNER_BACKEND_CHOICES,
     QUANTIZATION_CHOICES,
@@ -228,6 +231,17 @@ class ServerArgs:
 
     def __post_init__(self):
         """Leave construction unresolved; launchers and publishers call ``resolve_once``."""
+        for name in (
+            "disable_outlines_disk_cache",
+            "show_time_cost",
+            "triton_attention_reduce_in_fp32",
+        ):
+            if getattr(self, name) is not None:
+                logger.warning(
+                    "'%s' is deprecated and has no effect. It will be removed "
+                    "in a future release.",
+                    name,
+                )
 
     def resolve_once(self) -> None:
         """Resolve once, preserving declarations across pickling to child processes.
@@ -333,6 +347,7 @@ class ServerArgs:
         "MuseGlimmerForConditionalGeneration",
         "Cosmos3ForConditionalGeneration",
         "Cosmos3EdgeForConditionalGeneration",
+        "Gemma4ForConditionalGeneration",
     )
 
     # The attention-backend allow-list is enforced via
@@ -430,6 +445,27 @@ class ServerArgs:
             "--monokernel-backend amd, and --enable-nvidia-megakernel instead of "
             "--monokernel-backend msa.",
         )
+        # `mamba_max_states_per_path` is `no_cli=True`; any cap still applies.
+        parser.add_argument(
+            "--mamba-max-states-per-path",
+            action=DeprecatedAliasStoreAction,
+            new_flag="--hybrid-cache-checkpoints-level 2",
+            dest="mamba_max_states_per_path",
+            type=int,
+            default=None,
+            help="Deprecated. Use --hybrid-cache-checkpoints-level 2 instead.",
+        )
+        for flag in (
+            "--disable-outlines-disk-cache",
+            "--show-time-cost",
+            "--triton-attention-reduce-in-fp32",
+        ):
+            parser.add_argument(
+                flag,
+                action=DeprecatedAction,
+                default=argparse.SUPPRESS,
+                help="Deprecated. Has no effect.",
+            )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
@@ -665,10 +701,17 @@ def _declared_default(name: str):
     )
 
 
-# Credentials -- the access keys and the TLS key's password: no display, log or
-# dump of the configuration carries them.
+# Credentials -- the access keys, the TLS key's password and the HiCache and
+# external-linker storage configs (they can carry storage credentials): no
+# display, log or dump of the configuration carries them.
 SERVER_ARGS_SECRET_FIELD_NAMES = frozenset(
-    {"api_key", "admin_api_key", "ssl_keyfile_password"}
+    {
+        "api_key",
+        "admin_api_key",
+        "ssl_keyfile_password",
+        "hicache_storage_backend_extra_config",
+        "unified_cache_external_linker_config",
+    }
 )
 _REDACTED = "<redacted>"
 

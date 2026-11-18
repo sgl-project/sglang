@@ -28,6 +28,7 @@ DEEPSEEK_V4_PRO_W4A8_16P_ENVS = {
     "SGLANG_SET_CPU_AFFINITY": "1",
     "SGLANG_NPU_USE_MULTI_STREAM": "1",
     "SGLANG_DSV4_FP4_EXPERTS": "False",
+    "TRITON_CACHE_DIR": "/tmp/triton_cache",
     # skip gpu branch
     "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
     "FORCE_DRAFT_MODEL_NON_QUANT": "1",
