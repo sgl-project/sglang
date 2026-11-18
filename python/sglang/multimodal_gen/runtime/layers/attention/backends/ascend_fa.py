@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_parallel_world_size,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
@@ -16,6 +19,10 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context_or_none,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.mxfp4_utils import (
+    resolve_precision,
+    uses_mxfp4_attention,
 )
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -309,19 +316,49 @@ class AscendFAImpl(AttentionImpl):
         self.softmax_scale = softmax_scale
         self._head_size = head_size
         self._extra_impl_args = extra_impl_args
-        self._sd_metadata = None
+        self._sd_config = None
         self._sd_executor = None
         quant_config = extra_impl_args.get("quant_config")
+        self._attention_description = (
+            getattr(quant_config, "quant_description", {}) or {}
+        )
+        attention_prefix = prefix.removesuffix(".impl")
+        self.use_mxfp4_attention = uses_mxfp4_attention(quant_config, prefix)
         self._quant_scheme = resolve_mx_fa_scheme(quant_config)
-        self.use_offline_qk_rotation = (
-            quant_config.use_offline_qk_rotation
-            if hasattr(quant_config, "use_offline_qk_rotation")
-            else False
+        self._use_mxfp8_attention = (
+            not self.use_mxfp4_attention and self._quant_scheme == "MXFP8"
+        )
+        # Offline rotations bind per layer from descriptor aliases; a
+        # prefix-less config can still declare them through the shared flag.
+        self.use_offline_qk_rotation = all(
+            any(
+                self._attention_description.get(f"{attention_prefix}.{name}")
+                == "FLOAT"
+                for name in names
+            )
+            for names in (("to_q_rot", "q_rot"), ("to_k_rot", "k_rot"))
+        ) or (
+            not attention_prefix
+            and getattr(quant_config, "use_offline_qk_rotation", False)
         )
         self._is_cross_attention = bool(
             extra_impl_args.get("is_cross_attention", False)
         )
-        if self._quant_scheme is not None:
+        if self.use_mxfp4_attention:
+            if self._is_cross_attention or self.causal:
+                raise NotImplementedError(
+                    "Quantized MXFP4 attention is supported only for unmasked "
+                    "DiT self-attention"
+                )
+            if current_platform.is_npu():
+                if get_ring_parallel_world_size() > 1:
+                    raise NotImplementedError(
+                        "Quantized MXFP4 attention does not support Ring/LSE"
+                    )
+                # The checkpoint may quantize any timestep, so the SDK must be
+                # available even when the public precision config omits it.
+                load_mindiesd_quant_attention()
+        if self._use_mxfp8_attention:
             self._mxfp8_head_chunk_size = envs.SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE
             self._rot_device: torch.Tensor | None = None
             if not self.use_offline_qk_rotation:
@@ -335,28 +372,75 @@ class AscendFAImpl(AttentionImpl):
             attn_metadata = context.attn_metadata if context is not None else None
         return attn_metadata if isinstance(attn_metadata, AscendFAMetadata) else None
 
+    def _sd_precision(self, metadata: AscendFAMetadata | None) -> str | None:
+        """Effective delegate precision; None keeps the native paths.
+
+        An explicit public precision wins over the checkpoint. Without one,
+        a descriptor-selected MXFP4 layer follows its fa timestep policy
+        (MXFP4 now, FLOAT meaning native BF16 for that step). The native
+        MXFP8 path stays on its torch_npu operator.
+        """
+        explicit = metadata.precision if metadata is not None else None
+        if explicit is not None:
+            return None if explicit == "bf16" else explicit
+        if self.use_mxfp4_attention and resolve_precision(
+            self._attention_description, "fa", "MXFP4"
+        ) == "MXFP4":
+            return "mxfp4"
+        return None
+
     def _get_sd_executor(self, metadata: AscendFAMetadata | None):
-        if metadata is None or metadata.precision in (None, "bf16"):
+        precision = self._sd_precision(metadata)
+        if precision in (None, "bf16"):
             return None
-        if metadata != self._sd_metadata:
-            config = {
-                "precision": metadata.precision,
-                "head_chunk_size": metadata.head_chunk_size,
-            }
-            if metadata.precision == "fp8":
-                config["fp8_fa_mode"] = metadata.fp8_fa_mode
-            if metadata.qk_rotation is not None:
-                config["qk_rotation"] = metadata.qk_rotation
+        config = {
+            "precision": precision,
+            "head_chunk_size": (
+                metadata.head_chunk_size if metadata is not None else 4
+            ),
+        }
+        if precision == "fp8":
+            config["fp8_fa_mode"] = (
+                metadata.fp8_fa_mode if metadata is not None else "HIGH_PRECISION"
+            )
+        if metadata is not None and metadata.qk_rotation is not None:
+            config["qk_rotation"] = metadata.qk_rotation
+        if config != self._sd_config:
             executor = AscendQuantAttention(
                 config,
                 head_size=self._head_size,
                 softmax_scale=self.softmax_scale,
                 causal=self.causal,
+                # The layer-local decision replaces the shared quant-config
+                # flag so exported rotations are never doubled by the SDK.
+                offline_qk_rotation=self.use_offline_qk_rotation,
                 **self._extra_impl_args,
             )
             self._sd_executor = executor
-            self._sd_metadata = metadata
+            self._sd_config = config
         return self._sd_executor
+
+    def should_apply_qk_rot(self, query, key, value) -> bool:
+        """Whether callers must apply the checkpoint's exported rotations.
+
+        Apply them exactly once on quantized steps; native BF16 steps and an
+        explicit public precision override skip them. Legacy native MXFP8
+        keeps its shape-gated TND contract.
+        """
+        if not self.use_offline_qk_rotation:
+            return False
+        metadata = self._resolve_metadata(None)
+        if self.use_mxfp4_attention:
+            return self._sd_precision(metadata) == "mxfp4"
+        return (
+            self._use_mxfp8_attention
+            and self._sd_precision(metadata) is None
+            and not self.causal
+            and not self._is_cross_attention
+            and query.shape[1:3] == key.shape[1:3]
+            and key.shape == value.shape
+            and (query.shape[0] * query.shape[1]) % 64 == 0
+        )
 
     @classmethod
     def _ensure_rot_matrix(cls, head_size: int) -> None:
@@ -402,7 +486,7 @@ class AscendFAImpl(AttentionImpl):
             )
 
         if (
-            self._quant_scheme == "MXFP8"
+            self._use_mxfp8_attention
             and (metadata is None or metadata.precision is None)
             and not self.causal
             and not self._is_cross_attention
@@ -480,7 +564,7 @@ class AscendFAImpl(AttentionImpl):
 
         del max_seqlen
         if (
-            self._quant_scheme == "MXFP8"
+            self._use_mxfp8_attention
             and (metadata is None or metadata.precision is None)
             and not self.causal
             and not self._is_cross_attention
@@ -680,6 +764,7 @@ class AscendQuantAttention:
         head_size: int,
         causal: bool,
         softmax_scale: float | None,
+        offline_qk_rotation: bool | None = None,
         **extra_impl_args,
     ) -> None:
         if causal:
@@ -703,8 +788,11 @@ class AscendQuantAttention:
             or self.head_chunk_size < 0
         ):
             raise ValueError("head_chunk_size must be a non-negative integer")
-        offline_rotation = getattr(
-            extra_impl_args.get("quant_config"), "use_offline_qk_rotation", False
+        quant_config = extra_impl_args.get("quant_config")
+        offline_rotation = (
+            getattr(quant_config, "use_offline_qk_rotation", False)
+            if offline_qk_rotation is None
+            else offline_qk_rotation
         )
         self.qk_rotation = config.get("qk_rotation", not offline_rotation)
         if not isinstance(self.qk_rotation, bool):

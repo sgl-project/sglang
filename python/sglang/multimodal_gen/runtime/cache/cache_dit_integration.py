@@ -54,6 +54,9 @@ except ImportError:
     # DMD calibrator requires cache-dit >= 1.5.0; guarded at enable time
     DMDCalibratorConfig = None
 
+from sglang.multimodal_gen.runtime.cache.quant_precision_guard import (
+    set_quant_precision_guard,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_dit_group
 
 _original_similarity = None
@@ -680,6 +683,7 @@ def enable_cache_on_transformer(
 
             context_manager._sglang_tp_sp_group = tp_sp_group
 
+    set_quant_precision_guard(transformer)
     if joint_cfg_decision and get_classifier_free_guidance_world_size() > 1:
         context_manager = getattr(transformer, "_context_manager", None)
         if context_manager is not None:
@@ -898,6 +902,8 @@ def enable_cache_on_dual_transformer(
                         tp_sp_group = None
                 context_manager._sglang_tp_sp_group = tp_sp_group
 
+    set_quant_precision_guard(transformer)
+    set_quant_precision_guard(transformer_2)
     return transformer, transformer_2
 
 
