@@ -169,7 +169,14 @@ from sglang.srt.speculative.spec_utils import (
     sample_simulated_acc_len,
     simulated_acc_len_generator,
 )
-from sglang.srt.utils import async_h2d, is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import (
+    async_h2d,
+    is_cuda,
+    is_gfx95_supported,
+    is_hip,
+    is_npu,
+    is_xpu,
+)
 
 _is_npu = is_npu()
 
@@ -1212,7 +1219,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         "Disable DFLASH draft cuda graph because dp attention "
                         "is enabled (draft runs eager)."
                     )
-            if (is_cuda() or is_hip()) and capture_decode_cuda_graph:
+            if (is_cuda() or is_gfx95_supported()) and capture_decode_cuda_graph:
                 available_mem = self._tp_sync.available_memory_gb(
                     SpecTpSyncSite.DFLASH_MEM,
                     self.device,
@@ -1296,10 +1303,10 @@ class DFlashWorkerV2(BaseSpecWorker):
     def prewarm_sampling(self) -> SamplingPrewarmResult:
         """Rehearse the non-greedy verify path so an undersized graph-pool
         borrow surfaces at startup rather than under traffic."""
-        # ROCm prewarms the sampler without graph-pool borrowing; KV is sized before capture.
+        # gfx950 prewarms the sampler without graph-pool borrowing; KV is sized before capture.
         if (
             not self._hosts_draft
-            or not (is_cuda() or is_hip())
+            or not (is_cuda() or is_gfx95_supported())
             or not is_dflash_sampling_verify_available()
         ):
             return self.model_runner.prewarm_sampling()
@@ -2635,7 +2642,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         self._use_fused_kv_materialize = False
                         self._fused_kv_helper = None
 
-                if is_hip() and (ctx := self._mla_context_kv()) is not None:
+                if is_gfx95_supported() and (ctx := self._mla_context_kv()) is not None:
                     pool = self.draft_model_runner.token_to_kv_pool
                     ctx.write(pool, positions, ctx_hidden, cache_loc_2d, commit_lens)
                     return

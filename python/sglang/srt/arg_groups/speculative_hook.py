@@ -1054,7 +1054,7 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
                 fallback_backend,
             )
             draft_backend = fallback_backend
-    if get_platform().is_hip and dflash_draft_reads_rows_by_position(
+    if get_platform().is_gfx95 and dflash_draft_reads_rows_by_position(
         draft_backend, cfg.dcp_size
     ):
         from sglang.srt.layers.attention.triton_draft_hip import check_dcp_mla_draft

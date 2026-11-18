@@ -34,9 +34,9 @@ class DraftWorkerBundle(msgspec.Struct, frozen=True):
 
 
 def dflash_dcp_mla_draft_backend() -> str:
-    """The draft backend of a DFLASH MLA draft under DCP; on ROCm, triton's
+    """The draft backend of a DFLASH MLA draft under DCP; on gfx950, triton's
     rank-local MLA window verify."""
-    return "triton" if get_platform().is_hip else "cutedsl_mla"
+    return "triton" if get_platform().is_gfx95 else "cutedsl_mla"
 
 
 def dflash_draft_reads_rows_by_position(

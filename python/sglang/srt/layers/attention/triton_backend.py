@@ -183,7 +183,7 @@ class TritonAttnBackend(AttentionBackend):
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
 
-    # Set for ROCm draft workers by triton_draft_hip.init_draft_backend.
+    # Set for gfx950 draft workers by triton_draft_hip.init_draft_backend.
     draft_bf16_dot: bool = False
     # Set for the monokernel's DFLASH MLA draft by triton_draft_hip.init_draft_backend.
     verify_mla_draft_fwd: Optional[Callable[..., bool]] = None
@@ -302,7 +302,7 @@ class TritonAttnBackend(AttentionBackend):
             is_hip=_is_hip,
         )
         self.dcp_rank = get_parallel().attn_dcp_rank if self.dcp_size > 1 else 0
-        if _is_hip and model_runner.is_draft_worker:
+        if is_gfx95_supported() and model_runner.is_draft_worker:
             from sglang.srt.layers.attention.triton_draft_hip import init_draft_backend
 
             init_draft_backend(self, model_runner)
