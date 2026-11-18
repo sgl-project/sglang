@@ -38,19 +38,22 @@ _TARGET_VERIFY_BACKENDS = frozenset({"aiter"})
 
 
 class _ZeroPositions:
-    """Int64 zeros that every K3 MLA layer passes as the identity-RoPE positions."""
+    """Int64 zeros that every K3 MLA layer passes as the identity-RoPE positions.
+
+    Only eager steps lease or grow the buffer; the graph runner's eager warmups before
+    each capture size it, so a capture never allocates.
+    """
 
     def __init__(self) -> None:
         self.buf: Optional[torch.Tensor] = None
         self.retired: list[torch.Tensor] = []
 
-    def get(self, tokens: int, device: torch.device) -> torch.Tensor:
+    def get(self, tokens: int, device: torch.device) -> Optional[torch.Tensor]:
+        """The first `tokens` zeros, or None inside a capture the warmup did not size."""
         buf = self.buf
         if buf is None or buf.numel() < tokens or buf.device != device:
             if is_device_stream_capturing(device):
-                # A memset recorded into a graph runs only at replay,
-                # so it cannot seed the shared buffer.
-                return torch.zeros((tokens,), dtype=torch.int64, device=device)
+                return None
             if buf is not None:
                 # Captured graphs keep reading the old pointer;
                 # power-of-two growth keeps retired buffers smaller than the live one.
@@ -191,13 +194,16 @@ class KimiK3RocmMlaQCacheWriter(nn.Module):
     def _write_hip(self, *, kernel_args: dict) -> Optional[torch.Tensor]:
         q_nope = kernel_args["q_nope"]
         tokens, num_heads = q_nope.shape[0], q_nope.shape[1]
+        # The identity tables have one row and not every AITER build clamps positions
+        # in every kernel, so every token reads row 0.
+        positions = get_buffer("kimi_k3_mla_zero_positions", _ZeroPositions).get(
+            tokens=tokens, device=q_nope.device
+        )
+        if positions is None:
+            return None
         return mla_q_cache_aiter_hip.run(
             **kernel_args,
-            # The identity tables have one row and not every kernel clamps positions,
-            # so every token reads row 0.
-            positions=get_buffer("kimi_k3_mla_zero_positions", _ZeroPositions).get(
-                tokens=tokens, device=q_nope.device
-            ),
+            positions=positions,
             cos_cache=self._identity_cos,
             sin_cache=self._identity_sin,
             out=torch.empty(

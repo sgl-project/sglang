@@ -105,6 +105,19 @@ def test_writer_graph_survives_a_larger_eager_batch(writer):
     assert torch.equal(small["kv_cache"][:4], expected_k)
 
 
+def test_capture_never_allocates_the_zero_positions():
+    """A capture the eager warmup did not size must not allocate the shared buffer
+    inside the graph; the HIP path declines and that step keeps the split chain."""
+    get_resources().buffers.pop("kimi_k3_mla_zero_positions", None)
+    writer = _writer(use_hip=True, use_triton=False)
+    values = mla_q_cache_inputs(4)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = writer.write(**_writer_inputs(values))
+    assert result is None
+    assert get_resources().buffers["kimi_k3_mla_zero_positions"].buf is None
+
+
 def test_writer_rejects_a_strided_slot_mapping(writer):
     """Both kernels read slot_mapping at stride 1, so a strided one must be refused
     rather than land tokens in the wrong slots; the caller makes it contiguous."""
