@@ -15,6 +15,8 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
     AscendFAImpl,
     AscendFAMetadata,
     AscendFAMetadataBuilder,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_quant_fa import (
     AscendQuantAttention,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
