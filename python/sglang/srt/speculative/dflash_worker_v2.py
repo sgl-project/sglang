@@ -3206,13 +3206,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             if has_track:
                 mamba_steps_to_track = track_buf[:bs]
         else:
-            last_correct_step_indices, mamba_steps_to_track = (
-                self._mamba_commit_steps(
-                    batch=batch,
-                    commit_lens=commit_lens,
-                    seq_lens_pre_verify=seq_lens_pre_verify,
-                    seq_lens_post_verify=seq_lens_post_verify,
-                )
+            last_correct_step_indices, mamba_steps_to_track = self._mamba_commit_steps(
+                batch=batch,
+                commit_lens=commit_lens,
+                seq_lens_pre_verify=seq_lens_pre_verify,
+                seq_lens_post_verify=seq_lens_post_verify,
             )
             if batch.mamba_track_indices is not None and mamba_steps_to_track is None:
                 mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
@@ -4473,6 +4471,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_pre_verify = (
             batch.seq_lens.clone() if self._need_mamba_verify_commit else None
         )
+        positions_2d = self._draft_block_positions_buf[:bs]
         confidence, verify_token_budget, layout = self._plan_verify(
             batch=batch, draft_input=draft_input, prefix_lens=prefix_lens
         )

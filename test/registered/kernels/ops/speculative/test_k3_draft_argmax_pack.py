@@ -33,7 +33,7 @@ def reference_argmax(logits_shards):
     return torch.gather(gi, 0, best[None]).view(-1)
 
 
-register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=30, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 TP, VOCAB_TP = 8, 20480
 ROWS = [1, 7, 14, 28, 56, 63, 112, 448]
