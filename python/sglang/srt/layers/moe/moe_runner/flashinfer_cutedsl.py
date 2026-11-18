@@ -335,6 +335,7 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
         # gathered together, so scale the per-rank forward bound by num_dp_ranks.
         max_num_tokens = get_parallel().num_dp_ranks * cutedsl_moe_max_num_tokens()
     top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
+    swiglu_limit = layer.moe_runner_config.swiglu_limit
     # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
     # buffers are normal tensors.  This call typically happens inside
     # _dummy_run which runs under inference_mode(); inference tensors cannot
@@ -366,6 +367,7 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             quant_mode=quant_mode,
             swap_ab=use_cutedsl_moe_swap_ab(layer.w13_weight.device),
             **situ_kwargs,
+            **(dict(swiglu_limit=swiglu_limit) if swiglu_limit is not None else {}),
         )
 
         w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
@@ -639,6 +641,9 @@ def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
         "relu2",
     ), (
         f"CuteDSL masked MoE supports 'silu' or 'relu2', got {runner_config.activation!r}."
+    )
+    assert runner_config.swiglu_limit is None, (
+        f"CuteDSL masked MoE does not support swiglu_limit, got {runner_config.swiglu_limit}."
     )
     assert not runner_config.apply_router_weight_on_input, (
         "apply_router_weight_on_input is not supported for Flashinfer"
