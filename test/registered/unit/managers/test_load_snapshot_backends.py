@@ -381,7 +381,7 @@ class TestZmqReaderOwner(CustomTestCase):
         )
 
     def test_data_parallel_controller_owns_load_aware(self):
-        for method in ("total_tokens", "total_requests"):
+        for method in ("total_tokens", "total_requests", "follow_routing_key"):
             self.assertEqual(
                 self._owners(
                     attn_dp_size=4, tokenizer_worker_num=8, load_balance_method=method
