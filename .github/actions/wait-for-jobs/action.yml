@@ -143,8 +143,43 @@ runs:
             }
           }
 
+          // A poll whose jobs-API request still fails after the step-level
+          // `retries` used to crash the whole gate (row I1 in #42752). This
+          // step only waits on other jobs, so a missed poll costs nothing:
+          // log the error and try again at the next interval, failing only
+          // after several consecutive failed polls.
+          const MAX_CONSECUTIVE_FAILED_POLLS = 3;
+          let consecutiveFailedPolls = 0;
+
           for (let attempt = 0; ; attempt++) {
-            const { jobs, cached } = await fetchJobs();
+            let jobs;
+            let cached;
+            try {
+              ({ jobs, cached } = await fetchJobs());
+              consecutiveFailedPolls = 0;
+            } catch (err) {
+              consecutiveFailedPolls++;
+              core.warning(
+                `[${stageName}] jobs API poll #${attempt + 1} failed ` +
+                `(${consecutiveFailedPolls}/${MAX_CONSECUTIVE_FAILED_POLLS} consecutive failed polls): ${err.message}`
+              );
+              if (consecutiveFailedPolls >= MAX_CONSECUTIVE_FAILED_POLLS) {
+                core.setOutput('result', 'failure');
+                core.setFailed(
+                  `jobs-API errors persisted across ${MAX_CONSECUTIVE_FAILED_POLLS} consecutive polls ` +
+                  `while waiting for ${stageName} (row I1 in #42752)`
+                );
+                return;
+              }
+              const remainingMs = deadlineMs - Date.now();
+              if (remainingMs <= 0) {
+                break;
+              }
+              const sleepMs = Math.min(pollIntervalSeconds * 1000, remainingMs);
+              console.log(`Waiting ${Math.ceil(sleepMs / 1000)}s... (attempt ${attempt + 1}, ${Math.ceil(remainingMs / 60000)} min left of ${maxWaitMinutes})`);
+              await new Promise(resolve => setTimeout(resolve, sleepMs));
+              continue;
+            }
 
             let allCompleted = true;
             let failedJobs = [];
