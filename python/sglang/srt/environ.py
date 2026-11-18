@@ -1206,7 +1206,12 @@ class Envs:
     SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND = EnvStr("gfx950")
     # FlyDSL kernel behind the "aiter" fused KDA decode: "sglang" or "aiter" pins one;
     # "auto" prefers the vendored copy, and AITER's for a state dtype only it takes.
-    SGLANG_USE_HIP_K3_FLYDSL_SOURCE = EnvStr("auto")
+    SGLANG_USE_HIP_K3_FLYDSL_SOURCE = EnvStrWithAlias(
+        "auto", deprecated_name="SGLANG_K3_FLYDSL_SOURCE"
+    )
+    # Route single-row bf16 decode projections to the RDNA split-K GEMV on
+    # gfx1151. Set to 1 to benchmark the rocBLAS path without the kernel.
+    SGLANG_ROCM_DISABLE_RDNA_SPLITK_GEMV = EnvBool(False)
     # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM
     # (shared a4w4 tuned CSVs) instead of the Triton gemm_afp4wfp4 path.
     SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM = EnvBool(False)
