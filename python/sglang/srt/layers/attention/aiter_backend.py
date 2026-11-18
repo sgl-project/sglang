@@ -216,12 +216,10 @@ _MLA_ASM_PS_MAX_QLEN = 4
 
 # (query head count -> query lengths) at which aiter's scheduler treats the
 # count as native, on gfx950 with an fp8 query and KV. None means any length.
-# The keys are also the head counts a gathered query may be padded to.
-# Copied from natively_supported in aiter/ops/attention.py. It decides where aiter
-# is not asked (off the asm verify route, before ROCm/aiter#6107), and on gfx950
-# where aiter cannot confirm a kernel; never against aiter's fold. Once sglang
-# requires an aiter with get_mla_decode_shape_support, keep only the candidate
-# head counts and drop the query lengths. See
+# The keys are also the head counts a gathered query may be padded to. Decides only
+# where aiter is not asked or cannot confirm a kernel; drop the query lengths once
+# sglang requires get_mla_decode_shape_support (ROCm/aiter#6107). Copied from
+# natively_supported in aiter/ops/attention.py, see
 # https://github.com/ROCm/aiter/blob/bf37db00749722ae29ac27c101f534da43c586f5/aiter/ops/attention.py#L1669-L1706
 _MLA_ASM_CPRR_NATIVE_QLENS = {
     16: None,
@@ -232,9 +230,9 @@ _MLA_ASM_CPRR_NATIVE_QLENS = {
 
 
 def _asm_cprr_shape_verdict(
+    *,
     heads: int,
     q_len: int,
-    *,
     ask_aiter: bool,
     cp_world_size: int,
     fast_mode: bool,
@@ -242,7 +240,7 @@ def _asm_cprr_shape_verdict(
     v_head_dim: int,
 ) -> tuple[bool, str]:
     """Whether aiter runs this head count natively at this query length, and why not."""
-    in_table = _in_asm_cprr_native_table(heads, q_len)
+    in_table = _in_asm_cprr_native_table(heads=heads, q_len=q_len)
     table_verdict = (in_table, "" if in_table else "not in the copied gfx950 table")
     if not ask_aiter or get_mla_decode_shape_support is None:
         return table_verdict
@@ -290,12 +288,14 @@ def _asm_cprr_shape_verdict(
     return support.native and supported, "; ".join(reasons)
 
 
-def _in_asm_cprr_native_table(heads: int, q_len: int) -> bool:
+def _in_asm_cprr_native_table(*, heads: int, q_len: int) -> bool:
     allowed = _MLA_ASM_CPRR_NATIVE_QLENS.get(heads, frozenset())
     return allowed is None or q_len in allowed
 
 
-def _asm_cprr_kernel_heads(gathered_heads: int, supports: Callable[[int], bool]) -> int:
+def _asm_cprr_kernel_heads(
+    *, gathered_heads: int, supports: Callable[[int], bool]
+) -> int:
     """The smallest head count at or above the gathered one that supports, or 0."""
     for heads in sorted(_MLA_ASM_CPRR_NATIVE_QLENS):
         if heads >= gathered_heads and supports(heads):
@@ -2301,7 +2301,9 @@ class AiterAttnBackend(AttentionBackend):
         """Whether the asm PS MLA kernels support both decode and target verify."""
         verify_q_len = self.num_draft_tokens or 1
         if self.dcp_world_size > 1:
-            if self._asm_cprr_supports(self.cprr_kernel_heads, verify_q_len):
+            if self._asm_cprr_supports(
+                heads=self.cprr_kernel_heads, q_len=verify_q_len
+            ):
                 return True
             logger.info(
                 "aiter MLA decode and verify stay on the Gluon kernel: the cp "
@@ -2335,11 +2337,9 @@ class AiterAttnBackend(AttentionBackend):
         )
 
     def _asm_cprr_verify_requested(self) -> bool:
-        """Whether this topology asks for DCP target verify on the asm cp kernel.
-
-        Fixed for the backend's lifetime, unlike _use_mla_ps_kernel, which the
-        persist block of __init__ may still turn off from the answer to this.
-        """
+        """Whether this topology asks for DCP target verify on the asm cp kernel."""
+        # Fixed for the backend's lifetime, unlike _use_mla_ps_kernel, which the
+        # persist block of __init__ may still turn off from the answer to this.
         return (
             self.mla_verify_backend == "asm"
             and self.dcp_world_size > 1
@@ -2355,7 +2355,7 @@ class AiterAttnBackend(AttentionBackend):
         return (
             self._asm_cprr_verify_enabled()
             and q_len is not None
-            and self._asm_cprr_supports(self.cprr_kernel_heads, q_len)
+            and self._asm_cprr_supports(heads=self.cprr_kernel_heads, q_len=q_len)
         )
 
     def _init_cprr_verify(self, *, kv_lora_rank: int) -> None:
@@ -2363,10 +2363,8 @@ class AiterAttnBackend(AttentionBackend):
         self._cprr_supports_cache: dict[tuple[int, int], tuple[bool, str]] = {}
         self.cprr_v_head_dim = 0
         self.cprr_kernel_heads = 0
-        # Only the asm cp verify launches aiter's kernel, so only it asks aiter;
-        # elsewhere the copied table decides. Decided from the request, not from
-        # _use_mla_ps_kernel: the persist block runs after this and may turn
-        # persist off from these answers.
+        # Only the asm cp verify asks aiter. Decided from the request, not from
+        # _use_mla_ps_kernel, which the later persist block sets from these answers.
         self._cprr_ask_aiter = False
         if not (self.use_mla and self.dcp_world_size > 1):
             return
@@ -2374,22 +2372,22 @@ class AiterAttnBackend(AttentionBackend):
         self.cprr_v_head_dim = kv_lora_rank
         self._cprr_ask_aiter = self._asm_cprr_verify_requested()
         self.cprr_kernel_heads = _asm_cprr_kernel_heads(
-            self.num_head * self.dcp_world_size,
-            lambda heads: self._asm_cprr_supports(heads, self.num_draft_tokens or 1),
+            gathered_heads=self.num_head * self.dcp_world_size,
+            supports=lambda heads: self._asm_cprr_supports(
+                heads=heads, q_len=self.num_draft_tokens or 1
+            ),
         )
 
-    def _asm_cprr_supports(self, heads: int, q_len: int) -> bool:
-        """Whether aiter runs the DCP verify natively at this padded head count.
-
-        Cached: target verify asks on every step, and the answer is fixed.
-        """
+    def _asm_cprr_supports(self, *, heads: int, q_len: int) -> bool:
+        """Whether aiter runs the DCP verify natively at this padded head count."""
+        # Cached: target verify asks on every step, and the answer is fixed.
         if heads <= 0:
             return False
         key = (heads, q_len)
         if key not in self._cprr_supports_cache:
             self._cprr_supports_cache[key] = _asm_cprr_shape_verdict(
-                heads,
-                q_len,
+                heads=heads,
+                q_len=q_len,
                 ask_aiter=self._cprr_ask_aiter,
                 cp_world_size=self.dcp_world_size,
                 fast_mode=self.cprr_fast_mode,

@@ -140,9 +140,9 @@ _CPRR_QUERY = dict(
 
 def _cprr_kernel_heads(gathered_heads, q_len):
     return aiter_backend._asm_cprr_kernel_heads(
-        gathered_heads,
-        lambda heads: aiter_backend._asm_cprr_shape_verdict(
-            heads, q_len, ask_aiter=True, **_CPRR_QUERY
+        gathered_heads=gathered_heads,
+        supports=lambda heads: aiter_backend._asm_cprr_shape_verdict(
+            heads=heads, q_len=q_len, ask_aiter=True, **_CPRR_QUERY
         )[0],
     )
 
