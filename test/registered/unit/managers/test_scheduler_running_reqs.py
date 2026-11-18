@@ -401,6 +401,7 @@ class TestRunningReqsHooks(CustomTestCase):
             _bounded_active=False,
             calc_priority=lambda waiting, *args, **kwargs: list(waiting),
             admission_candidates=lambda waiting: iter(waiting),
+            prefill_token_budget=lambda **kwargs: None,
         )
         s.disagg_prefill_bootstrap_queue = None
         s.chunked_prefill_size = 8192
@@ -473,6 +474,7 @@ class TestPriorityPreemptionUnderUnifiedMemory(CustomTestCase):
         s.enable_hierarchical_cache = False
         s.enable_priority_scheduling = True
         s.schedule_low_priority_values_first = False
+        s.chunked_prefill_size = None
         s.metrics_reporter = SimpleNamespace(enable_metrics=False)
         s.dllm_config = None
         Scheduler.init_schedule_policy(s)
