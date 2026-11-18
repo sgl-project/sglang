@@ -79,6 +79,42 @@ def test_writer_matches_split_chain_bytes(writer, cache_dtype, tokens):
     assert torch.count_nonzero(cache[untouched]).item() == 0
 
 
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("tokens", [1, 8, 33])
+def test_writer_fp8_q_out_matches_quant_then_pad(writer, cache_dtype, tokens):
+    """With the backend's FP8 query buffer, the writer must store the bytes the asm
+    verify built for itself before: the static FP8 quant at its unit q scale of
+    cat(q_nope, q_pe), saturating at +-448, in a zeroed 16-head buffer. The cache
+    keeps the split chain's bytes."""
+    from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
+
+    values = _inputs(tokens, cache_dtype=cache_dtype)
+    values["q_nope"][:, 0, :4] = 1.0e4
+    values["q_nope"][:, 1, :4] = -1.0e4
+    values["q_pe"][:, 2, :4] = 1.0e4
+    values["q_pe"][:, 3, :4] = -600.0
+    buf = torch.zeros(64, 16, 576, device="cuda", dtype=torch.float8_e4m3fn)[:tokens]
+
+    q, _ = writer.write(
+        **values,
+        k_scale_float=1.0,
+        attention_backend="aiter",
+        is_target_verify=True,
+        get_fp8_q_out=lambda: buf,
+    )
+    torch.cuda.synchronize()
+
+    bf16_q, expected_k = _split_chain(values)
+    unit_scale = torch.ones(1, device="cuda", dtype=torch.float32)
+    quant, _ = scaled_fp8_quant(bf16_q.reshape(tokens, -1), unit_scale)
+    expected = torch.zeros_like(buf)
+    expected[:, :12] = quant.view(tokens, 12, 576)
+    assert q is buf
+    assert torch.equal(q.view(torch.uint8), expected.view(torch.uint8))
+    cache = values["kv_cache"].view(torch.uint8)
+    assert torch.equal(cache[:tokens], expected_k.view(torch.uint8))
+
+
 def test_writer_graph_survives_a_larger_eager_batch(writer):
     """A captured step keeps reading the zero positions it saw,
     even after a larger eager batch replaces the shared buffer."""

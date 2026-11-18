@@ -16,7 +16,8 @@
 K3 MLA applies no RoPE. The writer runs AITER's fused RoPE/concat/cache kernel, the
 one DeepSeek MLA uses on ROCm (rocm_linear_utils), against one-row identity cos/sin
 tables with all-zero positions, which leaves Q and the cache bytes equal to the
-split concat/cache chain's.
+split concat/cache chain's. Where the attention backend reads an FP8 query padded
+to its kernel head count (mla_fp8_q_out), the same launch casts Q into that buffer.
 """
 
 from typing import Callable, Optional, Tuple
@@ -137,6 +138,27 @@ def _supports_cache(kv_cache: torch.Tensor) -> bool:
     )
 
 
+def _check_fp8_q_out(
+    fp8_q: torch.Tensor, *, q_nope: torch.Tensor, head_dim: int
+) -> None:
+    """The backend's FP8 query buffer must be [tokens, >= q heads, head_dim] in
+    e4m3fn with stride 1 over head_dim; anything else is a backend bug."""
+    tokens, heads = q_nope.shape[:2]
+    if not (
+        fp8_q.dtype == torch.float8_e4m3fn
+        and fp8_q.ndim == 3
+        and fp8_q.shape[0] == tokens
+        and fp8_q.shape[1] >= heads
+        and fp8_q.shape[2] == head_dim
+        and fp8_q.stride(2) == 1
+    ):
+        raise ValueError(
+            f"mla_fp8_q_out must be a [{tokens}, >={heads}, {head_dim}] "
+            f"float8_e4m3fn buffer, got {tuple(fp8_q.shape)} {fp8_q.dtype} "
+            f"stride {fp8_q.stride()}"
+        )
+
+
 class KimiK3RocmMlaQCacheWriter:
     def __init__(
         self,
@@ -161,9 +183,15 @@ class KimiK3RocmMlaQCacheWriter:
         k_scale_float: Optional[float],
         attention_backend: str,
         is_target_verify: bool,
+        get_fp8_q_out: Optional[Callable[[], Optional[torch.Tensor]]] = None,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Return (q, k placeholder) after writing Q and the KV cache,
-        or None to leave both to the split rope/concat/cache chain."""
+        or None to leave both to the split rope/concat/cache chain.
+
+        ``get_fp8_q_out`` is the attention backend's ``mla_fp8_q_out``, called only
+        once the launch will run. If it returns a buffer, Q is cast into its first
+        heads in FP8 and the padded buffer is returned as q.
+        """
         backends = _TARGET_VERIFY_BACKENDS if is_target_verify else _DECODE_BACKENDS
         if (
             # An idle rank has nothing to write.
@@ -188,6 +216,7 @@ class KimiK3RocmMlaQCacheWriter:
             k_pe=k_pe,
             kv_cache=kv_cache,
             slot_mapping=slot_mapping,
+            get_fp8_q_out=get_fp8_q_out,
         )
         if q is None:
             return None
@@ -208,6 +237,7 @@ class KimiK3RocmMlaQCacheWriter:
         k_pe: torch.Tensor,
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
+        get_fp8_q_out: Optional[Callable[[], Optional[torch.Tensor]]],
     ) -> Optional[torch.Tensor]:
         """Q from the fused launch, or None inside a capture the eager warmup did
         not size the zero positions for."""
@@ -220,6 +250,9 @@ class KimiK3RocmMlaQCacheWriter:
         if rope is None:
             return None
         cos, sin, unit_scale, positions = rope
+        fp8_q = None if get_fp8_q_out is None else get_fp8_q_out()
+        if fp8_q is not None:
+            _check_fp8_q_out(fp8_q, q_nope=q_nope, head_dim=self._head_dim)
         q, _, _, _ = self._fused_rope_cat_and_cache(
             q_nope,
             q_pe,
@@ -232,6 +265,9 @@ class KimiK3RocmMlaQCacheWriter:
             sin,
             unit_scale,
             True,  # is_neox; identity tables make the layout moot
+            # The kernel casts unscaled and saturating, which is the asm verify's
+            # static FP8 quant at its unit q scale; the pad heads stay zero.
+            q_out=None if fp8_q is None else fp8_q[:, : q_nope.shape[1]],
             q_out_dtype=q_nope.dtype,
         )
-        return q
+        return q if fp8_q is None else fp8_q

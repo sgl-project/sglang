@@ -236,7 +236,7 @@ class HybridAttnBackend(AttentionBackend):
 
     def mla_fp8_q_out(
         self, *, forward_batch: ForwardBatch, num_tokens: int, head_dim: int
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Optional[torch.Tensor]:
         backend = self._select_backend(forward_batch.forward_mode)
         return backend.mla_fp8_q_out(
             forward_batch=forward_batch, num_tokens=num_tokens, head_dim=head_dim

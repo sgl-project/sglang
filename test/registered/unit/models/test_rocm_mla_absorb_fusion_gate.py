@@ -142,7 +142,14 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
         # The kernel is the boundary; the gate in front of it is under test.
         self.writer._write_fused = lambda **_: self.fused_q
 
-    def _write(self, *, attention_backend, is_target_verify, k_scale_float=1.0):
+    def _write(
+        self,
+        *,
+        attention_backend,
+        is_target_verify,
+        k_scale_float=1.0,
+        get_fp8_q_out=None,
+    ):
         return self.writer.write(
             q_nope=torch.zeros(2, 12, 512, dtype=torch.bfloat16),
             q_pe=torch.zeros(2, 12, 64, dtype=torch.bfloat16),
@@ -153,6 +160,7 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
             k_scale_float=k_scale_float,
             attention_backend=attention_backend,
             is_target_verify=is_target_verify,
+            get_fp8_q_out=get_fp8_q_out,
         )
 
     def test_triton_target_verify_keeps_the_split_chain(self):
@@ -261,10 +269,97 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
                     self._write(attention_backend="dsa", is_target_verify=verify)
                 )
 
+    def _use_kernel(self, rope=(None, None, None, None)):
+        """Run the real _write_fused against a recording kernel stub."""
+        del self.writer._write_fused
+        kernel = mock.Mock(side_effect=lambda *a, **kw: (kw["q_out"], None, None, None))
+        self.writer._fused_rope_cat_and_cache = kernel
+        patch = mock.patch.object(
+            kimi_k3_rocm_mla,
+            "get_buffer",
+            return_value=SimpleNamespace(get=lambda **_: rope),
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
+        return kernel
+
+    def test_declined_write_requests_no_fp8_query_buffer(self):
+        """The backend allocates and logs its FP8 query buffer on the first request,
+        so a write that falls back to the split chain must not make one."""
+        get_fp8_q_out = mock.Mock()
+        self.assertIsNone(
+            self._write(
+                attention_backend="aiter",
+                is_target_verify=True,
+                k_scale_float=2.0,
+                get_fp8_q_out=get_fp8_q_out,
+            )
+        )
+        kernel = self._use_kernel(rope=None)
+        self.assertIsNone(
+            self._write(
+                attention_backend="aiter",
+                is_target_verify=True,
+                get_fp8_q_out=get_fp8_q_out,
+            )
+        )
+        get_fp8_q_out.assert_not_called()
+        kernel.assert_not_called()
+
+    def test_fp8_query_buffer_takes_q_in_its_first_heads(self):
+        """With the backend's padded FP8 buffer, the launch writes q into its first
+        12 heads (the pad heads stay zero) and that buffer is returned as q."""
+        kernel = self._use_kernel()
+        buf = torch.zeros(2, 16, 576, dtype=torch.float8_e4m3fn)
+        fused = self._write(
+            attention_backend="aiter",
+            is_target_verify=True,
+            get_fp8_q_out=lambda: buf,
+        )
+        self.assertIs(fused[0], buf)
+        q_out = kernel.call_args.kwargs["q_out"]
+        self.assertEqual(tuple(q_out.shape), (2, 12, 576))
+        self.assertEqual(q_out.data_ptr(), buf.data_ptr())
+        self.assertEqual(q_out.stride(), buf.stride())
+
+    def test_without_an_fp8_query_buffer_q_stays_bf16(self):
+        kernel = self._use_kernel()
+        kernel.side_effect = lambda *a, **kw: (self.fused_q, None, None, None)
+        fused = self._write(
+            attention_backend="aiter",
+            is_target_verify=True,
+            get_fp8_q_out=lambda: None,
+        )
+        self.assertIs(fused[0], self.fused_q)
+        self.assertIsNone(kernel.call_args.kwargs["q_out"])
+        self.assertEqual(kernel.call_args.kwargs["q_out_dtype"], torch.bfloat16)
+
+    def test_malformed_fp8_query_buffer_raises(self):
+        """A buffer the launch cannot fill as the asm verify reads it is a backend
+        bug; it must fail before anything is written."""
+        kernel = self._use_kernel()
+        for buf in (
+            torch.zeros(2, 16, 576, dtype=torch.bfloat16),
+            torch.zeros(3, 16, 576, dtype=torch.float8_e4m3fn),
+            torch.zeros(2, 8, 576, dtype=torch.float8_e4m3fn),
+            torch.zeros(2, 16, 512, dtype=torch.float8_e4m3fn),
+        ):
+            with self.subTest(shape=tuple(buf.shape), dtype=buf.dtype):
+                with self.assertRaises(ValueError):
+                    self._write(
+                        attention_backend="aiter",
+                        is_target_verify=True,
+                        get_fp8_q_out=lambda buf=buf: buf,
+                    )
+        kernel.assert_not_called()
+
 
 class TestMlaQCacheWriterCallSite(CustomTestCase):
     """forward_absorb_rocm_core consults the writer only for non-DCP decode
     and target-verify; every other step keeps the split chain."""
+
+    # The backend's fp8 query buffer, which the writer must receive unchanged.
+    fp8_q_out = object()
 
     def _call(self, *, mode, dcp_enabled=False, owner=True, out_cache_loc=None):
         writer = mock.Mock()
@@ -272,6 +367,8 @@ class TestMlaQCacheWriterCallSite(CustomTestCase):
         attn = SimpleNamespace(
             rocm_mla_q_cache_writer=writer,
             attn_mqa=SimpleNamespace(layer_id=0, k_scale_float=1.0),
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
             current_attention_backend="aiter",
         )
         forward_batch = SimpleNamespace(
@@ -294,10 +391,15 @@ class TestMlaQCacheWriterCallSite(CustomTestCase):
                     layer_router=SimpleNamespace(read=lambda _: kv_layer)
                 ),
             ),
+            mock.patch.object(
+                forward_mla_rocm,
+                "get_attn_backend",
+                return_value=SimpleNamespace(mla_fp8_q_out=lambda **_: self.fp8_q_out),
+            ),
         ):
             result = forward_mla_rocm.DeepseekMLARocmForwardMixin._maybe_fused_q_cache(
                 attn,
-                q_nope_out=None,
+                q_nope_out=torch.zeros(2, 12, 512),
                 q_pe=None,
                 k_nope=None,
                 k_pe=None,
@@ -314,6 +416,7 @@ class TestMlaQCacheWriterCallSite(CustomTestCase):
                 self.assertEqual(
                     write.call_args.kwargs["is_target_verify"], mode == "target_verify"
                 )
+                self.assertIs(write.call_args.kwargs["get_fp8_q_out"](), self.fp8_q_out)
 
     def test_dcp_and_extend_keep_the_split_chain(self):
         """DCP decode all-gathers q from the split chain, and extend is not covered."""

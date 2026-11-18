@@ -218,7 +218,7 @@ class TboAttnBackend(AttentionBackend):
 
     def mla_fp8_q_out(
         self, *, forward_batch: ForwardBatch, num_tokens: int, head_dim: int
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Optional[torch.Tensor]:
         # The base method shadows __getattr__, so delegate explicitly.
         return self.primary.mla_fp8_q_out(
             forward_batch=forward_batch, num_tokens=num_tokens, head_dim=head_dim

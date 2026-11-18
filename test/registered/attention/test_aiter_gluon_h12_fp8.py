@@ -947,11 +947,10 @@ class TestFp8QOut(CustomTestCase):
                     forward_batch=self._fb(verify=True), num_tokens=8, head_dim=576
                 )
             )
-        buf, scale = be.mla_fp8_q_out(
+        buf = be.mla_fp8_q_out(
             forward_batch=self._fb(verify=True), num_tokens=8, head_dim=576
         )
         self.assertEqual((buf.shape, buf.dtype), ((8, 16, 576), fp8_dtype))
-        self.assertIs(scale, be.q_scale)
         # The writer fills heads 0..11 only; the pad heads must start zero.
         self.assertEqual(torch.count_nonzero(buf.view(torch.uint8)).item(), 0)
 

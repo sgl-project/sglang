@@ -2402,7 +2402,7 @@ class AiterAttnBackend(AttentionBackend):
 
     def mla_fp8_q_out(
         self, *, forward_batch: ForwardBatch, num_tokens: int, head_dim: int
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Optional[torch.Tensor]:
         # Target verify only: forward_decode reshapes q to the model head count.
         if not (
             self.use_mla_fp8_q_asm
@@ -2432,7 +2432,7 @@ class AiterAttnBackend(AttentionBackend):
                 device=self.device,
             )
             self._fp8_q_buffer = buf
-        return buf[:num_tokens], self.q_scale
+        return buf[:num_tokens]
 
     def _mla_decode_fwd_with_head_pad(
         self,
@@ -2466,7 +2466,8 @@ class AiterAttnBackend(AttentionBackend):
             and q.dtype == fp8_dtype
             and q.shape[1] == self.num_head_padded
         ):
-            # The query writer quantized and padded q into mla_fp8_q_out's buffer.
+            # The query writer cast q to FP8 at scale 1 into mla_fp8_q_out's buffer;
+            # self.q_scale is that unit scale.
             kwargs["q_scale"] = self.q_scale
             o = q.new_empty(
                 (q.shape[0], self.num_head_padded, layer.v_head_dim),
