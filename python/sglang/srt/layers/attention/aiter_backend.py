@@ -1196,7 +1196,8 @@ class AiterAttnBackend(AttentionBackend):
         # Target-verify FP8 query for the fp8-Q asm MLA kernel, written by the
         # model's query writer (mla_fp8_q_out); pad heads are zeroed once.
         self._fp8_q_buffer: Optional[torch.Tensor] = None
-        # Captured graphs keep reading a replaced buffer's pointer.
+        # Captured graphs keep reading a replaced buffer's pointer. Rows only grow,
+        # by powers of two, so this holds at most log2(max verify tokens) buffers.
         self._retired_fp8_q_buffers: list[torch.Tensor] = []
 
         self.logits_soft_cap = 0.0
@@ -2460,7 +2461,8 @@ class AiterAttnBackend(AttentionBackend):
             # replaces, does not read row 0.
             k_buffer_flat[0].zero_()
         if (
-            self.head_pad_mode == "zero"
+            self.use_mla_fp8_q_asm
+            and self.head_pad_mode == "zero"
             and q.dtype == fp8_dtype
             and q.shape[1] == self.num_head_padded
         ):

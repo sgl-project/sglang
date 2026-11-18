@@ -986,6 +986,55 @@ class TestFp8QOut(CustomTestCase):
         self.assertIs(mock_mla.call_args.kwargs["q_scale"], be.q_scale)
         self.assertEqual(out.shape, (8, 12, 512))
 
+    @mock.patch("sglang.srt.layers.attention.aiter_backend.mla_decode_fwd", create=True)
+    @mock.patch("sglang.srt.layers.attention.aiter_backend.scaled_fp8_quant")
+    def test_default_route_never_takes_the_writer_passthrough(
+        self, mock_quant, mock_mla
+    ):
+        """Off the opt-in, a query at the padded head count keeps main's zero-pad
+        launch with the caller's q scale, even if it is already fp8."""
+        be = self._make_backend()
+        be.use_mla_fp8_q_asm = False
+        be.num_head = 16
+        be._mla_ps_kernel_enabled = mock.Mock(return_value=False)
+        q = torch.ones(8, 16, 576).to(fp8_dtype)
+        caller_scale = torch.full((1,), 3.0)
+        be._mla_decode_fwd_with_head_pad(
+            q,
+            torch.zeros(4, 1, 1, 576, dtype=fp8_dtype),
+            _layer(num_head=16),
+            max_seqlen_q=8,
+            q_scale=caller_scale,
+        )
+        mock_quant.assert_not_called()
+        q_in = mock_mla.call_args.args[0]
+        self.assertIsNot(q_in, q)
+        self.assertTrue(torch.equal(q_in.view(torch.uint8), q.view(torch.uint8)))
+        self.assertIs(mock_mla.call_args.kwargs["q_scale"], caller_scale)
+
+    def test_wrapper_backends_forward_the_hook(self):
+        """Behind a TBO or prefill/decode-split wrapper the writer must still reach
+        the AITER backend's buffer; the base hook would silently return None."""
+        from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+        from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+
+        inner = mock.Mock()
+        fb = self._fb(verify=True)
+        tbo = TboAttnBackend.__new__(TboAttnBackend)
+        tbo.primary = inner
+        hybrid = HybridAttnBackend.__new__(HybridAttnBackend)
+        hybrid._select_backend = mock.Mock(return_value=inner)
+        for wrapper in (tbo, hybrid):
+            with self.subTest(wrapper=type(wrapper).__name__):
+                inner.mla_fp8_q_out.reset_mock()
+                out = wrapper.mla_fp8_q_out(
+                    forward_batch=fb, num_tokens=8, head_dim=576
+                )
+                self.assertIs(out, inner.mla_fp8_q_out.return_value)
+                inner.mla_fp8_q_out.assert_called_once_with(
+                    forward_batch=fb, num_tokens=8, head_dim=576
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

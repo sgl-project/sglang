@@ -10,6 +10,8 @@ from sglang.srt.layers.attention.base_attn_backend import (
 )
 
 if TYPE_CHECKING:
+    import torch
+
     from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -213,6 +215,14 @@ class TboAttnBackend(AttentionBackend):
 
     def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
         return self.primary.get_indexer_metadata(layer_id, forward_batch)
+
+    def mla_fp8_q_out(
+        self, *, forward_batch: ForwardBatch, num_tokens: int, head_dim: int
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        # The base method shadows __getattr__, so delegate explicitly.
+        return self.primary.mla_fp8_q_out(
+            forward_batch=forward_batch, num_tokens=num_tokens, head_dim=head_dim
+        )
 
     @property
     def verify_mask(self) -> Optional[VerifyMask]:

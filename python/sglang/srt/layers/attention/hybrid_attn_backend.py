@@ -234,6 +234,14 @@ class HybridAttnBackend(AttentionBackend):
         backend = self._select_backend(forward_batch.forward_mode)
         return backend.get_indexer_metadata(layer_id, forward_batch)
 
+    def mla_fp8_q_out(
+        self, *, forward_batch: ForwardBatch, num_tokens: int, head_dim: int
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        backend = self._select_backend(forward_batch.forward_mode)
+        return backend.mla_fp8_q_out(
+            forward_batch=forward_batch, num_tokens=num_tokens, head_dim=head_dim
+        )
+
     def update_mamba_state_after_mtp_verify(self, *args, **kwargs):
         return self.target_verify_backend().update_mamba_state_after_mtp_verify(
             *args, **kwargs

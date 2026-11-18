@@ -11,7 +11,7 @@ from sglang.srt.models.kimi_k3_rocm_mla import KimiK3RocmMlaQCacheWriter  # noqa
 from sglang.srt.runtime_context import get_resources  # noqa: E402
 from sglang.test.ci.ci_register import register_amd_ci  # noqa: E402
 
-register_amd_ci(est_time=35, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=35, stage="base-b", runner_config="1-gpu-small-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(
     not mla_q_cache_aiter_hip.available(),
