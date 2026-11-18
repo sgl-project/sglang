@@ -181,10 +181,14 @@ class _WriteBackBatchingSuite:
         waits = []
         writing_check = cache.writing_check
 
-        def count_waits(write_back=False, finish_count=None):
+        def count_waits(write_back=False, finish_count=None, relaxed_fence=False):
             if write_back and cache.ongoing_write_through:
                 waits.append(len(cache.ongoing_write_through))
-            return writing_check(write_back=write_back, finish_count=finish_count)
+            return writing_check(
+                write_back=write_back,
+                finish_count=finish_count,
+                relaxed_fence=relaxed_fence,
+            )
 
         return waits, mock.patch.object(cache, "writing_check", side_effect=count_waits)
 
@@ -371,11 +375,11 @@ class _WriteBackBatchingSuite:
         controller = cache.cache_controller
         start_writing = controller.start_writing
 
-        def record_submission():
+        def record_submission(fence_event=None):
             tokens = sum(len(op.host_indices) for op in controller.write_queue)
             if tokens:
                 submitted.append(tokens)
-            return start_writing()
+            return start_writing(fence_event=fence_event)
 
         waits, count_waits = self._count_waits(cache)
         with (

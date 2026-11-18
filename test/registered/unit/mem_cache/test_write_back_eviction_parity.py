@@ -171,10 +171,14 @@ class _Workload:
             setattr(cache, name, evict)
         writing_check = cache.writing_check
 
-        def count_copy_waits(write_back=False, finish_count=None):
+        def count_copy_waits(write_back=False, finish_count=None, relaxed_fence=False):
             if write_back and cache.ongoing_write_through:
                 self.copy_waits += 1
-            return writing_check(write_back=write_back, finish_count=finish_count)
+            return writing_check(
+                write_back=write_back,
+                finish_count=finish_count,
+                relaxed_fence=relaxed_fence,
+            )
 
         cache.writing_check = count_copy_waits
 
