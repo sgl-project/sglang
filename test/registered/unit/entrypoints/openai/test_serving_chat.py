@@ -431,7 +431,7 @@ class TestFieldContinuationRendering(CustomTestCase):
         serving = OpenAIServingChat.__new__(OpenAIServingChat)
         serving.tokenizer_manager = SimpleNamespace(
             tokenizer=tokenizer,
-            model_config=SimpleNamespace(is_multimodal=False),
+            model_config=SimpleNamespace(is_multimodal=False, vocab_size=32000),
         )
         serving.template_manager = SimpleNamespace(
             chat_template_name=None,
