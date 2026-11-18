@@ -258,6 +258,11 @@ def gemv(xq, marlin, out_size, metadata, top_k, tokens, splits=None, warps=None)
     out = torch.empty((rows * top_k, out_size), dtype=torch.bfloat16, device=xq.device)
     if splits is None:
         splits, warps = _gemv_config(tokens, width)
+    if out_size % 64 or width % (16 * splits * warps):
+        raise ValueError(
+            f"Marlin MoE GEMV needs N % 64 == 0 and K % {16 * splits * warps} == 0,"
+            f" got N={out_size}, K={width}"
+        )
     slots = min(counts.numel(), rows * top_k)
     if slots:
         module = _gemv_module(global_scale is not None, out_size, width, splits, warps)

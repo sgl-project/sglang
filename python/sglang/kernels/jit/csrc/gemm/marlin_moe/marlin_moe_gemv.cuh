@@ -6,6 +6,8 @@
 // per MMA are the B operand. The K splits of an n tile form a cluster and are
 // summed in split order through distributed shared memory.
 
+#include <sgl_kernel/tensor.h>
+#include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <tvm/ffi/container/tensor.h>
@@ -13,6 +15,7 @@
 #include <cooperative_groups.h>
 #include <cstdint>
 #include <cuda_bf16.h>
+#include <type_traits>
 
 namespace sglang::marlin_moe_gemv {
 
@@ -141,7 +144,7 @@ __global__ void __launch_bounds__(kWarps * 32) marlin_gemv(
   constexpr int kPerWarp = kKTiles / kSplits / kWarps;
   constexpr int kBatch = batch_size(kPerWarp);
   constexpr int64_t kExpertWords = static_cast<int64_t>(kKTiles) * kNTiles * L::kTileWords;
-  static_assert(kKTiles % (kSplits * kWarps) == 0);
+  static_assert(kN % kTileN == 0 && kKTiles % (kSplits * kWarps) == 0);
 
   const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
   const int g = lane / 4, t = lane % 4;
@@ -296,8 +299,31 @@ void run(
     tvm::ffi::TensorView dst2src,
     int64_t slots,
     int64_t top_k) {
-  using host::RuntimeCheck;
-  RuntimeCheck(y.size(1) == kN && x.size(1) == kK && counts.size(0) <= kMaxExperts, "Unsupported Marlin GEMV shape");
+  using namespace host;
+  using ScaleT = std::conditional_t<kNvfp4, fp8_e4m3_t, bf16_t>;
+  constexpr int64_t kExpertWords = static_cast<int64_t>(kK) * kN / (kNvfp4 ? 8 : 4);
+  constexpr int64_t kExpertScales = static_cast<int64_t>(kK) / (kNvfp4 ? 16 : 32) * kN;
+  auto device = SymbolicDevice{};
+  device.set_options<kDLCUDA>();
+  auto M = SymbolicSize{"tokens"};
+  auto R = SymbolicSize{"routed_rows"};
+  auto E = SymbolicSize{"num_experts"};
+  auto O = SymbolicSize{"num_offsets"};
+  TensorMatcher({M, kK}).with_dtype<bf16_t>().with_device(device).verify(x);
+  TensorMatcher({R, kN}).with_dtype<bf16_t>().with_device(device).verify(y);
+  TensorMatcher({-1, -1, -1}).with_dtype<int32_t>().with_device(device).verify(weight);
+  TensorMatcher({-1, -1, -1}).with_dtype<ScaleT>().with_device(device).verify(scales);
+  TensorMatcher({E}).with_dtype<int32_t>().with_device(device).verify(counts);
+  TensorMatcher({O}).with_dtype<int32_t>().with_device(device).verify(offsets);
+  TensorMatcher({-1}).with_dtype<int32_t>().with_device(device).verify(dst2src);
+  RuntimeCheck(R.unwrap() == M.unwrap() * top_k, "y must have tokens * top_k rows");
+  RuntimeCheck(E.unwrap() <= kMaxExperts && O.unwrap() >= E.unwrap(), "Unsupported Marlin GEMV expert count");
+  RuntimeCheck(
+      weight.size(0) >= E.unwrap() && weight.size(1) * weight.size(2) == kExpertWords,
+      "weight is not Marlin-packed (K, N) experts");
+  RuntimeCheck(
+      scales.size(0) == weight.size(0) && scales.size(1) * scales.size(2) == kExpertScales,
+      "scales do not match the Marlin weights");
   constexpr auto kernel = marlin_gemv<kNvfp4, kN, kK, kSplits, kWarps>;
   static const int max_clusters = [] {
     cudaLaunchConfig_t config = {};
