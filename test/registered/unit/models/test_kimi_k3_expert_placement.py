@@ -59,25 +59,41 @@ class TestKimiK3ExpertPlacement(CustomTestCase):
                     KimiK3MoE(config)
 
 
+def _unfused_moe(*, fused_aiter_presort: bool, registrations: list) -> SimpleNamespace:
+    def route_without_fused_moe(hidden_states, *, prefix_sum, valid_token_count):
+        registrations.append({"M": hidden_states.shape[0]})
+        return hidden_states
+
+    return SimpleNamespace(
+        _eligible_for_fused_front=False,
+        _forward_unfused=route_without_fused_moe,
+        topk=SimpleNamespace(
+            topk_config=SimpleNamespace(fused_aiter_presort=fused_aiter_presort)
+        ),
+    )
+
+
 class TestKimiK3MoEPresortLifetime(CustomTestCase):
     def test_unconsumed_presort_is_cleared_on_the_unfused_path(self):
         """AITER matches a registered presort by topk tensor address, so one that no
         fused_moe consumed must not outlive the layer, whichever path routed it."""
         registrations = []
-
-        def route_without_fused_moe(hidden_states, *, prefix_sum, valid_token_count):
-            registrations.append({"M": hidden_states.shape[0]})
-            return hidden_states
-
-        moe = SimpleNamespace(
-            _eligible_for_fused_front=False,
-            _forward_unfused=route_without_fused_moe,
-        )
+        moe = _unfused_moe(fused_aiter_presort=True, registrations=registrations)
         with patch.object(
             aiter_presort, "_registrar", return_value=registrations.append
         ):
             KimiK3MoE.forward(moe, torch.zeros(2, 4))
         self.assertIsNone(registrations[-1])
+
+    def test_layer_without_presort_never_probes_aiter(self):
+        """CUDA, non-AITER runners and EP layers cannot register a presort, so
+        they skip the cleanup and never import AITER."""
+        registrations = []
+        moe = _unfused_moe(fused_aiter_presort=False, registrations=registrations)
+        with patch.object(aiter_presort, "_registrar") as registrar:
+            KimiK3MoE.forward(moe, torch.zeros(2, 4))
+        registrar.assert_not_called()
+        self.assertEqual(registrations, [{"M": 2}])
 
 
 if __name__ == "__main__":

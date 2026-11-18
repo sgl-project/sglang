@@ -1815,9 +1815,10 @@ class KimiK3MoE(nn.Module):
                     valid_token_count=valid_token_count,
                 )
         finally:
-            # Every self.topk call may register a radix-4 presort; one that no
-            # fused_moe consumed must not outlive this layer (AITER's contract).
-            aiter_presort.clear_registration()
+            # Only a router with fused_aiter_presort registers a radix-4 presort; one
+            # that no fused_moe consumed must not outlive this layer (AITER's contract).
+            if self.topk.topk_config.fused_aiter_presort:
+                aiter_presort.clear_registration()
         return out.view(num_tokens, hidden_size)
 
 
