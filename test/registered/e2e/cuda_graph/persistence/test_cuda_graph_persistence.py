@@ -206,6 +206,9 @@ class TestFoundryGraphPersistence(CustomTestCase):
     # Batched outputs are compared with native unless a subclass opts out;
     # DP attention composes batches per rank, which differs run to run natively.
     compare_batched = True
+    # LOAD's capture loops against the same run's native ones;
+    # restore is a few percent, SGLang's per-shape prep is the rest.
+    load_capture_ratio = 0.25
     # Skip, not fail, a layout whose native engine cannot start on this machine,
     # such as DeepEP without a usable NVSHMEM transport.
     native_failure_skips = False
@@ -462,7 +465,7 @@ class TestFoundryGraphPersistence(CustomTestCase):
         )
         # The same run's native engine is the reference, whatever the machine:
         # it warms every shape up twice and captures it once.
-        self.assertLess(load[1], 0.5 * native[1])
+        self.assertLess(load[1], self.load_capture_ratio * native[1])
         self.assertLess(load_init_s, native_init_s)
 
     def test_greedy_output_matches_native(self):
@@ -500,6 +503,8 @@ class TestFoundryGraphPersistenceSpecPrefill(TestFoundryGraphPersistence):
         "--load-format",
         "dummy",
     ]
+    # Prefill's per-shape prep runs on LOAD too and is most of its capture loop.
+    load_capture_ratio = 0.5
 
 
 if __name__ == "__main__":
