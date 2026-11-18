@@ -20,7 +20,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -209,7 +209,11 @@ class MambaPoolHost(HostKVCache):
             self.allocator,
             self._buffer_device,
         )
-        if _is_hip and allocation_bytes > available_bytes and host_size <= 0:
+        if (
+            is_gfx95_supported()
+            and allocation_bytes > available_bytes
+            and host_size <= 0
+        ):
             from sglang.srt.mem_cache.pool_host.rocm_budget import clamp_mamba_pool
 
             allocation_bytes, available_bytes = clamp_mamba_pool(

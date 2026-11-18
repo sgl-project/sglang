@@ -1,4 +1,4 @@
-"""ROCm host-pool budgets: the amdgpu driver pins host memory only up to its TTM
+"""gfx950 host-pool budgets: the amdgpu driver pins host memory only up to its TTM
 page limit, past which hipHostMalloc fails while RAM is still free."""
 
 from __future__ import annotations
@@ -7,9 +7,8 @@ import logging
 import resource
 from typing import TYPE_CHECKING, Optional
 
-import torch
-
 from sglang.srt.mem_cache.pool_host import base
+from sglang.srt.utils import is_gfx95_supported
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
@@ -23,8 +22,8 @@ ROCM_PINNED_RESERVE_BYTES: int = 4 * (1024**3)
 def rocm_pinnable_share_bytes() -> Optional[int]:
     """A local rank's share of the host memory the amdgpu driver can pin: the TTM
     page limit (half of RAM by default), past which hipHostMalloc fails while RAM
-    is still free. None off ROCm or when the limit is not visible."""
-    if not torch.version.hip:
+    is still free. None off gfx950 or when the limit is not visible."""
+    if not is_gfx95_supported():
         return None
     try:
         with open("/sys/module/ttm/parameters/pages_limit") as f:
