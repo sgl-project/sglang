@@ -230,7 +230,8 @@ class LoadCoverage:
     """Pairs each FP8 weight piece loaded in one ``load_weights`` call with its scale.
 
     A checkpoint shard that carries a scale without its weight (or the reverse)
-    would leave uninitialised FP8 codes behind a valid-looking scale.
+    would leave uninitialised FP8 codes behind a valid-looking scale, and a piece
+    that arrives twice would silently keep whichever copy came last.
     """
 
     def __init__(self):
@@ -238,10 +239,12 @@ class LoadCoverage:
         self.scales: set = set()
 
     def add(self, key, suffix: str) -> None:
-        if suffix == "weight":
-            self.weights.add(key)
-        elif suffix == "weight_scale":
-            self.scales.add(key)
+        seen = {"weight": self.weights, "weight_scale": self.scales}.get(suffix)
+        if seen is None:
+            return
+        if key in seen:
+            raise RuntimeError(f"Quark PTPC-FP8 {suffix} {key} loaded twice")
+        seen.add(key)
 
     def check(self) -> None:
         unpaired = sorted(map(str, self.weights ^ self.scales))

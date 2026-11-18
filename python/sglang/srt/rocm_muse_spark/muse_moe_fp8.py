@@ -182,7 +182,36 @@ def muse_moe_fp8(
     y = torch.empty((num_slots, H), dtype=torch.bfloat16, device=dev)
     moe_fp8_gemm(inter, w2, w2_scale, y, scores32, ids32, align, 1, down)
 
-    out = torch.empty((M, H), dtype=hidden_states.dtype, device=dev)
+    return finalize_slots(
+        y,
+        scores32,
+        ids32,
+        local_expert_start,
+        E,
+        post_norm_weight,
+        eps,
+        post_norm_gain,
+        has_norm,
+        hidden_states.dtype,
+    )
+
+
+def finalize_slots(
+    y: torch.Tensor,  # [M * top_k, H] per-slot expert outputs; rows of non-local slots are never read
+    scores32: torch.Tensor,  # [M, top_k] fp32
+    ids32: torch.Tensor,  # [M, top_k] int32 global expert ids
+    local_expert_start: int,
+    num_local: int,
+    post_norm_weight: torch.Tensor | None,
+    eps: float,
+    post_norm_gain: float,
+    has_norm: bool,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Muse finalize of this rank's slots: per-slot post-expert norm, then the score-weighted sum, [M, H]."""
+    M, top_k = ids32.shape
+    H = y.shape[1]
+    out = torch.empty((M, H), dtype=dtype, device=y.device)
     has_scale = has_norm and post_norm_weight is not None
     finalize_norm_weighted_sum_kernel[(M,)](
         y,
@@ -192,7 +221,7 @@ def muse_moe_fp8(
         out,
         H,
         local_expert_start,
-        E,
+        num_local,
         eps,
         float(post_norm_gain),
         0,

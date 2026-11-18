@@ -129,14 +129,18 @@ class TestMuseSparkFp8MoE(CustomTestCase):
 
     def stages(self, x, scores, ids, w2_scale):
         """Production stage outputs with the alignment and configs the glue uses."""
+        return self.stages_at(x, scores, ids, LOCAL_START, w2_scale)
+
+    def stages_at(self, x, scores, ids, local_start, w2_scale=None):
         from sglang.kernels.ops.activation import silu_and_mul
         from sglang.srt.rocm_muse_spark.muse_moe_fp8 import moe_fp8_gemm, pick_configs
         from sglang.srt.rocm_muse_spark.muse_moe_triton import moe_align_block_size
 
+        w2_scale = self.s2 if w2_scale is None else w2_scale
         m = x.shape[0]
         ids32, scores32 = ids.to(torch.int32), scores.float()
         up, down = pick_configs(m * TOP_K)
-        align = moe_align_block_size(ids32, LOCAL, LOCAL_START, up["BLOCK_SIZE_M"])
+        align = moe_align_block_size(ids32, LOCAL, local_start, up["BLOCK_SIZE_M"])
         gate_up = torch.empty(m * TOP_K, 2 * INTER, device="cuda", dtype=torch.bfloat16)
         moe_fp8_gemm(x, self.w13, self.s13, gate_up, scores32, ids32, align, TOP_K, up)
         inter = silu_and_mul(gate_up)
@@ -220,6 +224,26 @@ class TestMuseSparkFp8MoE(CustomTestCase):
         )
         out = self.run_moe(x, scores, ids, w2_scale=w2_scale, has_norm=has_norm)
         self.assert_finalize(out, y, scores, slots, has_norm=has_norm)
+        # The finalize must not read rows of slots routed to other ranks: fill them with NaN first.
+        from sglang.srt.rocm_muse_spark.muse_moe_fp8 import finalize_slots
+
+        remote = torch.ones(y.shape[0], dtype=torch.bool, device="cuda")
+        remote[slots] = False
+        poisoned = y.masked_fill(remote.unsqueeze(-1), float("nan"))
+        ids32, scores32 = ids.to(torch.int32), scores.float()
+        out_poisoned = finalize_slots(
+            poisoned,
+            scores32,
+            ids32,
+            LOCAL_START,
+            LOCAL,
+            self.norm,
+            EPS,
+            GAIN,
+            has_norm,
+            torch.bfloat16,
+        )
+        self.assert_finalize(out_poisoned, y, scores, slots, has_norm=has_norm)
         return x, scores, ids, out
 
     def test_stages_on_production_inputs(self):
@@ -241,6 +265,61 @@ class TestMuseSparkFp8MoE(CustomTestCase):
             for has_norm in (True, False):
                 with self.subTest(m=m, has_norm=has_norm):
                     self.check_stages(m, gen, w2_scale=tiny, has_norm=has_norm)
+
+    def test_ep_ranks_sum_to_the_global_routes(self):
+        """256 experts over eight EP ranks of 32 (offsets 0, 32, ..., 224; each rank's bank differs): every route
+        is computed by exactly the rank owning its expert, so the rank outputs sum to the per-rank exact
+        finalizes of the teacher-forced slots within the sum of their bounds (triangle inequality)."""
+        gen = torch.Generator().manual_seed(7)
+        banks = [
+            [_bank(2 * INTER, HIDDEN, gen) for _ in range(LOCAL)],
+            [_bank(HIDDEN, INTER, gen) for _ in range(LOCAL)],
+        ]
+        # Ranks permute and rescale one set of 32 experts, so no two global experts share weights.
+        m = 64
+        x = _tokens(m, gen)
+        ids = torch.stack(
+            [torch.randperm(NUM_EXPERTS, generator=gen)[:TOP_K] for _ in range(m)]
+        ).cuda()
+        scores = torch.rand(m, TOP_K, generator=gen).cuda() + 0.05
+        scores = scores / scores.sum(-1, keepdim=True)
+        total = torch.zeros(m, HIDDEN, dtype=torch.float64, device="cuda")
+        ref_total = torch.zeros_like(total)
+        bound_total = torch.zeros(m, dtype=torch.float64, device="cuda")
+        for rank in range(NUM_EXPERTS // LOCAL):
+            perm = torch.roll(torch.arange(LOCAL), rank)
+            self.w13 = torch.stack([banks[0][i][0] for i in perm])
+            self.s13 = torch.stack([banks[0][i][1] for i in perm]) * (1 + rank / 8)
+            self.w2 = torch.stack([banks[1][i][0] for i in perm])
+            self.s2 = torch.stack([banks[1][i][1] for i in perm])
+            start = rank * LOCAL
+            out = self.moe(
+                x,
+                scores,
+                ids,
+                self.w13,
+                self.s13,
+                self.w2,
+                self.s2,
+                start,
+                self.norm,
+                EPS,
+                post_norm_gain=GAIN,
+            )
+            self.assertTrue(bool(torch.isfinite(out).all()))
+            flat = ids.reshape(-1) - start
+            slots = ((flat >= 0) & (flat < LOCAL)).nonzero().squeeze(1)
+            _, _, y = self.stages_at(x, scores, ids, start)
+            ref, cancellation = finalize_reference(
+                y[slots], scores, slots, m, self.norm, GAIN, EPS
+            )
+            total += out.double()
+            ref_total += ref
+            bound_total += finalize_bound(ref, cancellation, HIDDEN)
+        err = (total - ref_total).norm(dim=-1)
+        self.assertFalse(
+            bool(exceeds(err, bound_total).any()), (err / bound_total).max()
+        )
 
     def test_empty_and_all_non_local(self):
         gen = torch.Generator().manual_seed(3)

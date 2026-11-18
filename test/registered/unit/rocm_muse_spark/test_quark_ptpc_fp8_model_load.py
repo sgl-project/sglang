@@ -10,6 +10,7 @@ the checkpoint contract and the projection loaders are covered on CPU by
 """
 
 import copy
+import os
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -226,7 +227,9 @@ class TestPtpcFp8Loading(CustomTestCase):
             patch.object(muse, "_PREFILL_DENSE_FP8", False),
         ):
             self.assertEqual(muse.ulysses_enabled(), tp_size > 1)
-            model.load_weights(list(tensors.items()))
+            model.load_weights(
+                list(tensors.items()) if isinstance(tensors, dict) else list(tensors)
+            )
         return model
 
     def test_attention_rows_and_scales_per_tp_rank(self):
@@ -383,6 +386,17 @@ class TestPtpcFp8Loading(CustomTestCase):
                 ValueError,
                 "expected 32 rows",
             ),
+            "unexpected scale suffix": (
+                {**base, ATTN.format(0) + ".q_proj.weight_scale_inv": base[q_scale]},
+                ValueError,
+                "outside the Muse Spark text model",
+            ),
+            # The same local expert piece twice with different values: the second copy must not win silently.
+            "duplicate local expert weight": (
+                list(base.items()) + [(local_weight, base[remote + ".weight"].clone())],
+                RuntimeError,
+                "loaded twice",
+            ),
         }
         for label, (tensors, error, fragment) in cases.items():
             with self.subTest(label):
@@ -437,6 +451,22 @@ class TestPtpcFp8Loading(CustomTestCase):
         layer = model.model.layers[0]
         self.assertIsInstance(layer.mlp.experts, muse.MuseSpark1xMxfp4Experts)
         self.assertFalse(layer.self_attn.fp8_serialized)
+
+    def test_fp8_experts_need_the_triton_backend(self):
+        """MUSE_MOE_BACKEND=flydsl / native have no FP8 expert path; auto resolves to Triton on ROCm."""
+        for backend in ("flydsl", "native"):
+            with self.subTest(backend=backend):
+                with patch.dict(os.environ, {"MUSE_MOE_BACKEND": backend}):
+                    with self.assertRaisesRegex(ValueError, "has no FP8 path"):
+                        muse.MuseSpark1xFp8Experts(2, MOE_HIDDEN, MOE_INTER)
+        from sglang.kernels.ops.moe import fused_moe_triton_kernels as wrapper
+
+        # Backend selection only: an unpadded wrapper, whatever SGLANG_MOE_PADDING this runner sets.
+        with (
+            patch.dict(os.environ, {"MUSE_MOE_BACKEND": "auto"}),
+            patch.object(wrapper, "padding_size", 0),
+        ):
+            muse.MuseSpark1xFp8Experts(2, MOE_HIDDEN, MOE_INTER)
 
     def test_fp8_experts_refuse_padded_k_without_aiter(self):
         """Without aiter the generic MoE wrapper subtracts SGLANG_MOE_PADDING from K; Muse weights are unpadded."""
