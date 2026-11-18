@@ -72,6 +72,33 @@ def copy_or_rebind_param(
         setattr(module, name, Parameter(new_value, requires_grad=False))
 
 
+def copy_into_param_storage(param: Parameter, new_value: torch.Tensor) -> None:
+    """Write `new_value` into `param`'s own storage and view `param` as it.
+
+    Unlike `copy_or_rebind_param`, the shape and dtype may change, as when a
+    repack turns a checkpoint-layout weight into a kernel layout of the same
+    size and back. The Parameter keeps its attributes (`weight_loader`) and
+    its address, so CUDA graphs captured before a weight update stay valid.
+    The storage must belong to `param` alone. A value larger than it, such
+    as a padded first repack, gets new storage, and so does a parameter that
+    is a view at a nonzero offset or lives on another device.
+    """
+    new_value = new_value.detach()
+    data = param.data
+    storage = data.untyped_storage()
+    if (
+        data.storage_offset() != 0
+        or data.device != new_value.device
+        or storage.nbytes() < new_value.nbytes
+    ):
+        param.data = new_value.contiguous()
+        return
+    buffer = torch.empty(0, dtype=torch.uint8, device=data.device).set_(storage)
+    view = buffer[: new_value.nbytes].view(new_value.dtype).view(new_value.shape)
+    view.copy_(new_value)
+    param.data = view
+
+
 def alias_or_bind_derived_param(
     module: torch.nn.Module,
     source_name: str,

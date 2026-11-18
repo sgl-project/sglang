@@ -54,6 +54,8 @@ from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     apply_fp4_marlin_linear,
     prepare_moe_nvfp4_layer_for_marlin,
     prepare_nvfp4_layer_for_marlin,
+    restore_moe_nvfp4_layer_from_marlin,
+    restore_nvfp4_layer_from_marlin,
 )
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     prepare_fp8_layer_for_marlin,
@@ -68,7 +70,7 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
-from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.layers.utils.common import copy_into_param_storage, set_weight_attrs
 from sglang.srt.runtime_context import get_exec, get_platform
 from sglang.srt.utils.common import round_up
 from sglang.srt.utils.custom_op import register_custom_op
@@ -1865,6 +1867,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.output_size_per_partition = output_size_per_partition
         layer.params_dtype = params_dtype
         layer.quant_config = self.quant_config
+        layer.nvfp4_marlin_repacked = False
         if input_size_per_partition % 16 != 0:
             raise ValueError(
                 "Unsupported model when in features size is not multiple of 16"
@@ -1972,6 +1975,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             layer.quant_config = self.quant_config
             prepare_nvfp4_layer_for_marlin(layer)
             layer.weights_padding_cols = 0
+            layer.nvfp4_marlin_repacked = True
             return
 
         if not get_platform().is_blackwell:
@@ -2119,6 +2123,11 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 device=layer.weight_scale_interleaved.device,
             )
 
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        if layer.nvfp4_marlin_repacked:
+            restore_nvfp4_layer_from_marlin(layer)
+            layer.nvfp4_marlin_repacked = False
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -2265,6 +2274,7 @@ class ModelOptNvFp4A16LinearMethod(LinearMethodBase):
         layer.output_size_per_partition = output_size_per_partition
         layer.params_dtype = params_dtype
         layer.quant_config = self.quant_config
+        layer.nvfp4_marlin_repacked = False
 
         if input_size_per_partition % 16 != 0:
             raise ValueError(
@@ -2313,9 +2323,8 @@ class ModelOptNvFp4A16LinearMethod(LinearMethodBase):
         layer.register_parameter("input_scale", input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if hasattr(layer, "input_scale"):
-            del layer.input_scale
-
+        # input_scale and weight_scale_2 stay registered, so a weight update
+        # has somewhere to load them.
         if torch.unique(layer.weight_scale_2).numel() != 1:
             logger.warning(
                 "In NVFP4A16 linear, weight_scale_2 differs across fused "
@@ -2327,7 +2336,6 @@ class ModelOptNvFp4A16LinearMethod(LinearMethodBase):
             "weight_global_scale",
             layer.weight_scale_2.max().to(torch.float32),
         )
-        del layer.weight_scale_2
 
         if self.quant_config.group_size != 16:
             raise ValueError(
@@ -2335,6 +2343,12 @@ class ModelOptNvFp4A16LinearMethod(LinearMethodBase):
             )
         layer.quant_config = self.quant_config
         prepare_nvfp4_layer_for_marlin(layer)
+        layer.nvfp4_marlin_repacked = True
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        if layer.nvfp4_marlin_repacked:
+            restore_nvfp4_layer_from_marlin(layer)
+            layer.nvfp4_marlin_repacked = False
 
     def apply(
         self,
@@ -2658,6 +2672,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             weight_loader=weight_loader,
         )
         layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
+        layer.nvfp4_marlin_repacked = False
 
         if self._uses_serialized_fp8_source():
             # FP8 checkpoints usually store expert scales as weight_scale_inv.
@@ -2762,6 +2777,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer._mega_moe_nvfp4 = True
         layer._mega_moe_weights_built = True
 
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        if layer.nvfp4_marlin_repacked:
+            restore_moe_nvfp4_layer_from_marlin(layer)
+            if layer.moe_runner_config.is_gated:
+                # Marlin serves the gate scale only, so the up scale comes back
+                # from the copy taken before the repack.
+                copy_into_param_storage(
+                    layer.w13_weight_scale_2, layer.w13_weight_scale_2_checkpoint
+                )
+            layer.nvfp4_marlin_repacked = False
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Transform packed FP4 MoE weights and scales for the selected backend."""
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
@@ -2793,6 +2819,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # the gate/up columns to the gate scale here. Other backends keep the
             # raw scale and split the halves later (see _compute_gemm1_alphas).
             if layer.moe_runner_config.is_gated:
+                # Restore gives the loader back this layout, both columns included.
+                layer.w13_weight_scale_2_checkpoint = (
+                    layer.w13_weight_scale_2.data.clone()
+                )
                 if layer.w13_weight_scale_2.dim() == 1:
                     # Some checkpoints store a shared scale for w1/w3.
                     w13_weight_scale_2 = layer.w13_weight_scale_2
@@ -2809,12 +2839,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
             else:
                 w13_weight_scale_2 = layer.w13_weight_scale_2[:]
-            copy_or_rebind_param(
-                layer,
-                "w13_weight_scale_2",
-                w13_weight_scale_2.contiguous(),
+            copy_into_param_storage(
+                layer.w13_weight_scale_2, w13_weight_scale_2.contiguous()
             )
             prepare_moe_nvfp4_layer_for_marlin(layer)
+            layer.nvfp4_marlin_repacked = True
             return
 
         # Calculate input scales based on strategy

@@ -94,6 +94,7 @@ class MuseSparkNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         **extra_weight_attrs,
     ):
         """Allocate the serialized HF expert tensors without renaming them."""
+        layer.nvfp4_marlin_repacked = False
         n, h, i = num_experts, hidden_size, intermediate_size_per_partition
         group = self.quant_config.group_size
         for name, shape, dtype in (
@@ -128,9 +129,8 @@ class MuseSparkNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         for alias, native in self._MARLIN_PARAM_ALIASES:
             setattr(layer, alias, getattr(layer, native))
         result = super().process_weights_after_loading(layer)
-        # Marlin repacks into freshly allocated parameters. Drop the native
-        # names so the unpacked originals are freed instead of being kept
-        # alive at full size alongside the repacked copies.
+        # Marlin repacks in place, so each alias now holds the kernel layout.
+        # Drop the native names so only the aliases address it.
         for _, native in self._MARLIN_PARAM_ALIASES:
             if native in layer._parameters:
                 del layer._parameters[native]
