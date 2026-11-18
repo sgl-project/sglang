@@ -206,6 +206,13 @@ class SchedulerWeightUpdaterManager:
                 success=False,
                 message="ModelExpress does not support pipeline parallelism",
             )
+        # Attention DP keeps dp_size at 1 (its groups are attn_dp_size) and is
+        # supported; independent data-parallel replicas are not validated yet.
+        if get_parallel().dp_size > 1:
+            return UpdateWeightsFromModelExpressReqOutput(
+                success=False,
+                message="ModelExpress does not support data-parallel replicas (dp_size > 1)",
+            )
         if self.draft_worker is not None and self.draft_worker.weight_update_runners():
             return UpdateWeightsFromModelExpressReqOutput(
                 success=False, message="ModelExpress does not support draft models"

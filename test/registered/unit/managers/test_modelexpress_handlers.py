@@ -67,7 +67,9 @@ def modelexpress_modules(monkeypatch):
     monkeypatch.setattr(weight_updater_module, "get_parallel", lambda: parallel)
     monkeypatch.setattr(
         "sglang.srt.managers.scheduler_components.weight_updater.get_parallel",
-        lambda: SimpleNamespace(tp_group=SimpleNamespace(cpu_group=None), pp_size=1),
+        lambda: SimpleNamespace(
+            tp_group=SimpleNamespace(cpu_group=None), pp_size=1, dp_size=1
+        ),
     )
     return integration
 
@@ -271,27 +273,41 @@ def test_scheduler_rejects_only_draft_workers_with_weights(draft_runners):
     assert update.called is not has_draft_weights
 
 
-def test_scheduler_rejects_pipeline_parallelism_before_updating(monkeypatch):
+@pytest.mark.parametrize(
+    "parallel, rejection",
+    [
+        ({"pp_size": 2}, "pipeline parallelism"),
+        ({"dp_size": 2}, "data-parallel replicas"),
+        # --dp-size N --enable-dp-attention resolves to attn_dp_size=N, dp_size=1.
+        ({"attn_dp_size": 2}, None),
+    ],
+    ids=["pipeline", "data_parallel_replicas", "attention_data_parallelism"],
+)
+def test_scheduler_rejects_unsupported_parallelism_before_updating(
+    monkeypatch, parallel, rejection
+):
+    sizes = {"pp_size": 1, "dp_size": 1, "attn_dp_size": 1, **parallel}
     monkeypatch.setattr(
         "sglang.srt.managers.scheduler_components.weight_updater.get_parallel",
-        lambda: SimpleNamespace(tp_group=SimpleNamespace(cpu_group=None), pp_size=2),
+        lambda: SimpleNamespace(tp_group=SimpleNamespace(cpu_group=None), **sizes),
     )
-    update = MagicMock()
+    update = MagicMock(return_value=(True, ""))
     scheduler = SchedulerWeightUpdaterManager(
         tp_worker=SimpleNamespace(update_weights_from_modelexpress=update),
         draft_worker=None,
         memory_saver_adapter=None,
-        flush_cache=MagicMock(),
+        flush_cache=MagicMock(return_value=True),
         is_fully_idle=MagicMock(),
+        scheduler=SimpleNamespace(record_weight_version_change=MagicMock()),
     )
 
     result = scheduler.update_weights_from_modelexpress(
         UpdateWeightsFromModelExpressReqInput(weight_version="2")
     )
 
-    assert result.success is False
-    assert "pipeline parallelism" in result.message
-    update.assert_not_called()
+    assert result.success is (rejection is None)
+    assert rejection is None or rejection in result.message
+    assert update.called is (rejection is None)
 
 
 @pytest.mark.parametrize("cache", ["shared", "derived"])
