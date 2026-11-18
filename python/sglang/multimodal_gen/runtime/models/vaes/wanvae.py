@@ -1778,15 +1778,16 @@ class AutoencoderKLWan(ParallelTiledVAE):
             )
         patch_size = self.config.patch_size
         self.clear_cache()
-        out = self._encode_causal_groups(
-            group if patch_size is None else patchify(group, patch_size=patch_size)
-            for group in groups
-        )
-        if out is None:
-            raise ValueError("AutoencoderKLWan.encode_causal_groups got no frames.")
-        enc = self._posterior(out)
-        self.clear_cache()
-        return enc
+        try:
+            out = self._encode_causal_groups(
+                group if patch_size is None else patchify(group, patch_size=patch_size)
+                for group in groups
+            )
+            if out is None:
+                raise ValueError("AutoencoderKLWan.encode_causal_groups got no frames.")
+            return self._posterior(out)
+        finally:
+            self.clear_cache()
 
     def _encode_causal_groups(
         self, groups: Iterable[torch.Tensor]

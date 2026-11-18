@@ -490,6 +490,14 @@ class TestTransferFramesAndHistory(unittest.TestCase):
                 )
                 self.assertTrue(torch.equal(latent, expected))
 
+        def failing_groups():
+            yield torch.zeros((1, 3, 1, 48, 48))
+            raise OSError("truncated file")
+
+        with self.assertRaisesRegex(OSError, "truncated file"), torch.no_grad():
+            vae.encode_causal_groups(failing_groups())
+        self.assertEqual([t for t in vae._enc_feat_map if t is not None], [])
+
     def test_long_prompt_is_truncated_like_training(self):
         tokenizer = _FakeTokenizer()
         tokenizer.template_ids = list(range(5000))
