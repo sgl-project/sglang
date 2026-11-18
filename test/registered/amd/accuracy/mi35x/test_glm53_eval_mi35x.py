@@ -36,7 +36,7 @@ Threshold: the cookbook's CUDA cells measure 97.12-97.73% on GSM8K. 0.92
 follows this repo's `measured - 0.05` convention for sgl-eval gsm8k thresholds
 and matches the GLM-5.2-FP8 and GLM-5.3-Flash tests on AMD.
 
-Registry: nightly-amd-8-gpu-mi35x-glm53 suite
+Registry: nightly-test-8-gpu-amd-mi35x-glm53 suite
 """
 
 import unittest
@@ -59,7 +59,7 @@ from sglang.test.test_utils import (
 # checkpoint dominates startup, then a full-split thinking GSM8K at TP8)
 register_amd_ci(
     est_time=7200,
-    suite="nightly-amd-8-gpu-mi35x-glm53",
+    suite="nightly-test-8-gpu-amd-mi35x-glm53",
     nightly=True,
 )
 
