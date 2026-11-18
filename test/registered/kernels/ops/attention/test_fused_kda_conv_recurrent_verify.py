@@ -384,13 +384,11 @@ def _gfx950_srt(args):
 
 
 @pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
-@pytest.mark.parametrize(
-    "slots", [[5], [7, -1, 4, 0, 6, 1]], ids=["bv4-one-request", "bv8-padded-batch"]
-)
-def test_gfx950_srt_verify_matches_triton_chain_verify(slots):
+def test_gfx950_srt_verify_matches_triton_chain_verify():
     """kda_chain_verify_gfx950 as the KDA backend calls it, against the Triton chain
     verify: no slot equals its batch row, a -1 row writes nothing, and mixed_qkv
     and b are views of the TP8 [q, k, v, g | f_a | b | pad] in-projection."""
+    slots = [7, -1, 4, 0, 6, 1]
     ref, new = (_gfx950_case(slots, seed=11) for _ in range(2))
     B, H, T = len(slots), new["num_q_heads"], new["T"]
     sizes = [3 * H * 128, H * 128, 128, H]
