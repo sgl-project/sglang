@@ -305,6 +305,18 @@ def test_tokenizer_model_max_length_matches_python_tokenize(tokenizer, expected)
     assert rust_config._tokenizer_model_max_length(tokenizer, 2048) == expected
 
 
+def test_resolved_beam_parser_refused_before_listener_start():
+    """Auto-detected parsers must not bypass unsupported per-turn grammar validation."""
+    with get_context().override_server_args(
+        tool_call_parser="beam", grammar_backend="xgrammar"
+    ):
+        scheduler = SimpleNamespace(model_config=SimpleNamespace(is_generation=True))
+        with pytest.raises(
+            ValueError, match="--tool-call-parser beam.*--grammar-backend xgrammar"
+        ):
+            rust_server.RustServer.launch(scheduler)
+
+
 @pytest.mark.parametrize(
     "nnodes,tp_size,attn_dp_size,ep_join_mode,ranks,expected",
     [

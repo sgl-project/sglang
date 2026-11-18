@@ -411,6 +411,7 @@ impl CoreHandle {
 pub(crate) struct CoreCall {
     runtime: RuntimeCall,
     events_finished: bool,
+    first_event: Option<CoreEvent>,
     /// The launch weight version and this listener's DP rank, stamped on
     /// every output (see [`CoreOutput`](crate::api_server::core::CoreOutput)).
     weight_version: Option<Arc<str>>,
@@ -438,6 +439,7 @@ impl CoreCall {
         Self {
             runtime,
             events_finished: false,
+            first_event: None,
             weight_version,
             dp_rank,
             metrics,
@@ -486,10 +488,24 @@ impl CoreCall {
         self.runtime.rid.client_facing()
     }
 
+    /// Preserve initial client validation failures before HTTP stream headers are sent.
+    pub(crate) async fn preflight(&mut self) -> Result<(), CoreError> {
+        match self.recv().await {
+            Some(CoreEvent::Failed(error)) if error.http_status().as_u16() == 400 => Err(error),
+            event => {
+                self.first_event = event;
+                Ok(())
+            }
+        }
+    }
+
     /// Receive the next semantic event. A runtime channel that closes before a
     /// terminal response is converted into one terminal failure event; adapters
     /// never need to infer whether an empty runtime channel means success.
     pub(crate) async fn recv(&mut self) -> Option<CoreEvent> {
+        if let Some(event) = self.first_event.take() {
+            return Some(event);
+        }
         if self.events_finished {
             return None;
         }
@@ -509,6 +525,9 @@ impl CoreCall {
     /// Append every semantic event that is ready without waiting. Channel
     /// emptiness and closure remain private runtime details.
     pub(crate) fn drain_ready(&mut self, events: &mut Vec<CoreEvent>) {
+        if let Some(event) = self.first_event.take() {
+            events.push(event);
+        }
         while !self.events_finished {
             let event = match self.runtime.try_recv() {
                 Ok(item) => {
