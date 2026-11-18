@@ -65,6 +65,8 @@ def _moe(*, prepared: bool | None):
     moe._front_fp32 = False
     moe._moe_front_needs_dense_bf16 = True
     moe._route_quant_fuse_eligible = False
+    # gfx950: AITER's fused_moe, not the A8W4 grouped GEMMs, runs the toy experts
+    moe._a8w4_moe_min_tokens = None
     moe.gate = nn.Linear(4, 1, bias=False)
     moe.routed_expert_down_proj = _Linear(4, 2, bias=False)
     moe.routed_expert_up_proj = _Linear(2, 4, bias=False)
