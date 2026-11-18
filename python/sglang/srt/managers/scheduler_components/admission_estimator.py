@@ -695,7 +695,7 @@ class AdmissionController:
         if start <= 0:
             return
         actual_s = ts.prefill_finished_time - start
-        logger.info(
+        logger.debug(
             "Admission check (prefill) rid=%s predicted_drain_s=%.2f actual_s=%.2f "
             "diff_s=%.2f n=%d adm_matched=%d exec_device=%d exec_host=%d "
             "exec_storage=%d bootstrap_s=%.2f queue_s=%.2f forward_s=%.2f",
