@@ -7,7 +7,7 @@ import torch
 import torch_npu  # noqa: F401
 from sgl_kernel_npu.attention.ngram_attention import build_ngram_attention_mask
 
-from sglang.srt.arg_groups.overrides import resolved_view
+from sglang.srt.arg_groups.model_override_base import resolved_view
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnBackend,
     ForwardMetadata,
@@ -20,7 +20,7 @@ from sglang.srt.hardware_backend.npu.memory_pool_npu import (
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH

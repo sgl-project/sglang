@@ -15,13 +15,13 @@ from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
     resolved_view,
     resolving_view,
+    use_mla_backend,
 )
 from sglang.srt.arg_groups.overrides import (
     _speculative_moe_runner_default,
     declare_resolution,
     record_foreign_defaults,
     run_post_process_pass,
-    use_mla_backend,
 )
 from sglang.srt.configs.ernie55 import ERNIE5_5_MOE_ARCH
 from sglang.srt.environ import envs
