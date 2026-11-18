@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 
 
 def validate_experimental_sgl_marlin_server_args(

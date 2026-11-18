@@ -128,6 +128,37 @@ SGL_DEVICE T apply_norm_warp(const T& input, const T& weight, float eps) {
 }
 
 /**
+ * \brief Normalize a 128-element row with 16 lanes, preserving the warp reduction.
+ * \param input Eight FP16/BF16 elements per lane, packed into four pairs
+ * \param weight Matching normalization weights
+ * \param eps Normalization epsilon
+ * \return Rounded normalized pairs
+ */
+template <typename PackedFloat>
+SGL_DEVICE AlignedVector<PackedFloat, 4>
+apply_norm_half_warp(AlignedVector<PackedFloat, 4> input, const AlignedVector<PackedFloat, 4>& weight, float eps) {
+  // Each lane retains the two original warp-lane partials; the last addition
+  // reproduces the original xor-1 step after the xor-16..2 butterfly.
+  float part[2] = {0.0f, 0.0f};
+#pragma unroll
+  for (auto i = 0u; i < 4; ++i) {
+    const auto x = cast<fp32x2_t>(input[i]);
+    part[i / 2] += x.x * x.x;
+    part[i / 2] += x.y * x.y;
+  }
+  part[0] = warp::reduce_sum<16>(part[0]);
+  part[1] = warp::reduce_sum<16>(part[1]);
+  const float norm_factor = math::rsqrt((part[0] + part[1]) / 128 + eps);
+#pragma unroll
+  for (auto i = 0u; i < 4; ++i) {
+    const auto x = cast<fp32x2_t>(input[i]);
+    const auto w = cast<fp32x2_t>(weight[i]);
+    input[i] = cast<PackedFloat, fp32x2_t>({x.x * norm_factor * w.x, x.y * norm_factor * w.y});
+  }
+  return input;
+}
+
+/**
  * \brief Apply norm using CTA-level implementation.
  * \tparam kDim Dimension size
  * \tparam T Element type (fp16_t or bf16_t)

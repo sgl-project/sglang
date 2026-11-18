@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import math
+from collections import OrderedDict
 
 import torch
 from PIL import Image
@@ -27,7 +28,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import Denois
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
 )
+from sglang.multimodal_gen.runtime.utils.common import upload_without_sync
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.vision import load_image
+
+logger = init_logger(__name__)
 
 SYSTEM_PROMPT = "Comprehend and analyze the provided prompt."
 SYSTEM_TEMPLATE = f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
@@ -41,6 +46,14 @@ def collapse_image_slots(hidden, input_ids, image_token_id):
     return hidden[keep], image_mask[keep]
 
 
+def reference_size(width, height, area=1024 * 1024):
+    """Diffusers' `calculate_dimensions` at the pipeline's default 1024x1024 area."""
+    ratio = width / height
+    out_width = math.sqrt(area * ratio)
+    out_height = out_width / ratio
+    return max(32, round(out_width / 32) * 32), max(32, round(out_height / 32) * 32)
+
+
 class QwenImage21InputValidationStage(InputValidationStage):
     def load_condition_image(self, image):
         return load_image(image, convert_method=lambda image: image.convert("RGBA"))
@@ -48,8 +61,23 @@ class QwenImage21InputValidationStage(InputValidationStage):
     def preprocess_condition_image(
         self, batch, server_args, condition_image_width, condition_image_height
     ):
-        # one model-owned resize is shared by the VLM and VAE in the encoding stage
-        return None
+        # One model-owned resize is shared by the VLM and VAE in the encoding
+        # stage. Here an unset output size follows the last reference, as in
+        # Diffusers; warmup and prewarm requests keep the size they chose.
+        images = batch.condition_image
+        image = images[-1] if isinstance(images, list) else images
+        if (
+            image is None
+            or batch.is_warmup
+            or batch.extra.get("server_internal_prewarm")
+        ):
+            return
+        explicit_fields = set(batch.extra.get("explicit_fields", []))
+        width, height = reference_size(image.width, image.height)
+        if "width" not in explicit_fields:
+            batch.width = width
+        if "height" not in explicit_fields:
+            batch.height = height
 
     def forward(self, batch, server_args):
         if batch.prompt is None:
@@ -69,6 +97,83 @@ class QwenImage21InputValidationStage(InputValidationStage):
         return batch
 
 
+class TextEncoderGraphs:
+    """CUDA graphs of the text-only encoder forward, one per prompt length.
+
+    The eager forward launches ~2600 small kernels and is host-bound; a replay
+    runs the same kernels, so the output is bit-identical. A length is captured
+    on its second request; moved or replaced weights drop every graph.
+    """
+
+    max_graphs = 8
+
+    def __init__(self):
+        self.graphs = OrderedDict()
+        self.seen = set()
+        self.weights = None
+        self.pool = None
+        self.disabled = False
+
+    def __call__(self, encoder, inputs, run):
+        ids = inputs["input_ids"]
+        if (
+            self.disabled
+            or ids.shape[0] != 1
+            or "pixel_values" in inputs
+            or not all(torch.is_tensor(v) and v.is_cuda for v in inputs.values())
+            or torch.compiler.is_compiling()
+            or torch.cuda.is_current_stream_capturing()
+            or (model_parallel_is_initialized() and get_tp_group().world_size > 1)
+        ):
+            return run(inputs)
+        tensors = [*encoder.parameters(), *encoder.buffers()]
+        if not all(t.is_cuda for t in tensors):
+            return run(inputs)
+        # graphs read weights by address; offload, reload or replacement moves them
+        weights = tuple(t.data_ptr() for t in tensors)
+        if weights != self.weights:
+            self.graphs.clear()
+            self.seen.clear()
+            self.weights = weights
+        key = ids.shape[1]
+        entry = self.graphs.get(key)
+        if entry is None:
+            if key not in self.seen:
+                self.seen.add(key)
+                return run(inputs)
+            try:
+                entry = self._capture(inputs, run)
+            except Exception as e:
+                logger.warning("Text encoder CUDA graph disabled: %s", e)
+                self.disabled = True
+                return run(inputs)
+            self.graphs[key] = entry
+            if len(self.graphs) > self.max_graphs:
+                self.graphs.popitem(last=False)
+        self.graphs.move_to_end(key)
+        graph, static_inputs, output = entry
+        for name, tensor in static_inputs.items():
+            tensor.copy_(inputs[name])
+        graph.replay()
+        return output
+
+    def _capture(self, inputs, run):
+        static_inputs = {name: tensor.clone() for name, tensor in inputs.items()}
+        # the side-stream warmup settles lazy allocations before capture
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run(static_inputs)
+        torch.cuda.current_stream().wait_stream(stream)
+        if self.pool is None:
+            self.pool = torch.cuda.graph_pool_handle()
+        graph = torch.cuda.CUDAGraph()
+        # thread_local: an async output-save thread may use CUDA during capture
+        with torch.cuda.graph(graph, pool=self.pool, capture_error_mode="thread_local"):
+            output = run(static_inputs)
+        return graph, static_inputs, output
+
+
 class QwenImage21EncodingStage(PipelineStage):
     def __init__(self, text_encoder, processor, vae, scheduler):
         super().__init__()
@@ -84,6 +189,7 @@ class QwenImage21EncodingStage(PipelineStage):
         # blocks the host on the VAE encode it should overlap with prompt prep
         self.latent_stats = {}
         self.image_token_id = processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        self.text_graphs = TextEncoderGraphs()
         system_message = [
             {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]}
         ]
@@ -141,15 +247,22 @@ class QwenImage21EncodingStage(PipelineStage):
                     image = white
                 vision_images.append(image)
             kwargs["images"] = vision_images
-        inputs = self.processor(**kwargs).to(device)
+        inputs = upload_without_sync(self.processor(**kwargs), device)
         with self.use_declared_component(
             component_name="text_encoder", module=self.text_encoder
         ) as encoder:
-            outputs = encoder(
-                **inputs, output_hidden_states=True, use_cache=False, logits_to_keep=1
-            )
-            # the checkpoint expects Transformers 4.57's pre-final-norm hidden state
-            final_hidden = outputs.hidden_states[-1]
+
+            def run(encoder_inputs):
+                outputs = encoder(
+                    **encoder_inputs,
+                    output_hidden_states=True,
+                    use_cache=False,
+                    logits_to_keep=1,
+                )
+                # the checkpoint expects Transformers 4.57's pre-final-norm hidden state
+                return outputs.hidden_states[-1]
+
+            final_hidden = self.text_graphs(encoder, inputs, run)
         valid = inputs.attention_mask[0].bool()
         hidden = final_hidden[0, valid][self.drop_idx :]
         ids = inputs.input_ids[0, valid][self.drop_idx :]
@@ -164,19 +277,14 @@ class QwenImage21EncodingStage(PipelineStage):
             [] if images is None else images if isinstance(images, list) else [images]
         )
         resized, shapes, conditions = [], [], []
-        area = batch.height * batch.width
         image_mode = "RGBA" if ac.in_channels == 4 else "RGB"
         for image in images:
             if not isinstance(image, Image.Image):
                 image = load_image(
                     image, convert_method=lambda image: image.convert(image_mode)
                 )
-            width = max(
-                32, round(math.sqrt(area * image.width / image.height) / 32) * 32
-            )
-            height = max(
-                32, round(math.sqrt(area * image.height / image.width) / 32) * 32
-            )
+            # the reference sizes do not depend on the output size, as in Diffusers
+            width, height = reference_size(image.width, image.height)
             resized.append(
                 image.convert(image_mode).resize(
                     (width, height), Image.Resampling.LANCZOS
@@ -372,6 +480,8 @@ class QwenImage21ComfyUIConditionStage(PipelineStage):
     def forward(self, batch, server_args):
         _, _, height, width = batch.latents.shape
         batch.latents = batch.latents.flatten(2).transpose(1, 2).contiguous()
+        # Request sizes are rounded to 32 px; ComfyUI latents can have odd sides.
+        batch.extra["qwen21_latent_hw"] = (height, width)
         payload = batch.extra[COMFYUI_COND_EXTRA_KEY]
         conds = get_or_create_run_state(batch, dict)
         key = (batch.extra["comfyui_cond_key"], height, width)
