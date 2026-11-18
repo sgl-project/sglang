@@ -290,73 +290,6 @@ class KdaTpStaging:
             )
         self.import_states(mamba_pool, local, counts)
 
-    def commit_after_verify(
-        self,
-        model_runner,
-        batch,
-        last_correct_step_indices,
-        mamba_steps_to_track,
-        state_slots=None,
-    ):
-        # A collective: idle DP ranks call it with no requests.
-        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
-            scatter_mamba_states_after_mtp_verify,
-        )
-        from sglang.srt.mem_cache.kv.decl import STATE_PART
-
-        req_pool = model_runner.req_to_token_pool
-        W = width()
-        n = req_pool.size  # per-DP-rank request capacity
-        dev = torch.device("cuda", torch.cuda.current_device())
-        bs = (
-            0
-            if last_correct_step_indices is None
-            else last_correct_step_indices.shape[0]
-        )
-        if bs > n:
-            raise RuntimeError(
-                f"KDA TP commit: {bs} requests exceed the per-rank capacity {n}"
-            )
-        pack = torch.zeros((5, n), dtype=torch.int64, device=dev)
-        # Padding rows commit nothing (step -1); a step 0 would copy into slot 0 every step.
-        pack[1].fill_(-1)
-        pack[3].fill_(-1)  # no track step
-        if bs:
-            if state_slots is None:
-                # Not the request table, which the scheduler may have rewritten since the forward.
-                state_slots = model_runner.attn_backend.forward_state_slots(
-                    bs, batch.mamba_track_indices
-                )
-            slots = state_slots.working[:bs]
-            track = state_slots.track
-            pack[0, :bs] = slots.to(torch.int64)
-            pack[1, :bs] = last_correct_step_indices.to(torch.int64)
-            if (
-                batch.mamba_track_indices is not None
-                and track is not None
-                and mamba_steps_to_track is not None
-            ):
-                pack[2, :bs] = track[:bs].to(torch.int64)
-                pack[3, :bs] = mamba_steps_to_track.to(torch.int64)
-        rank = get_parallel().attn_dp_rank
-        pack[4] = rank * n + torch.arange(
-            n, device=dev
-        )  # see _fast_context's scratch rows
-        mamba_pool = model_runner.token_to_kv_pool.layer_router.part_view(STATE_PART)
-        caches = mamba_pool.get_speculative_mamba2_params_all_layers()
-        out = pack.new_empty((W, 5, n))
-        group().all_gather_into_tensor(out.view(W * 5, n), pack)
-        slots, last, track, steps, rows = out.permute(1, 0, 2).reshape(5, W * n)
-        scatter_mamba_states_after_mtp_verify(
-            caches,
-            slots,
-            last,
-            track,
-            steps,
-            src_indices_raw=rows,
-            rows_loop=envs.SGLANG_MAMBA_SSM_COMMIT_ROW_LOOP.get(),
-        )
-
     def admit(self, req_to_token_pool, req) -> bool:
         """Whether a transferred request can join the batch now (its state slot is bound)."""
         if not getattr(req, "kda_tp_lazy_mamba", False) or req.kv.holds_mamba:
@@ -461,3 +394,64 @@ def mirror_deferred_state_ops(model_runner, forward_batch) -> None:
             torch.tensor(src, dtype=torch.int64, device=dev),
             torch.tensor(dst, dtype=torch.int64, device=dev),
         )
+
+
+def commit_after_verify(
+    model_runner,
+    batch,
+    last_correct_step_indices,
+    mamba_steps_to_track,
+    state_slots=None,
+):
+    # A collective: idle DP ranks call it with no requests.
+    from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+        scatter_mamba_states_after_mtp_verify,
+    )
+    from sglang.srt.mem_cache.kv.decl import STATE_PART
+
+    req_pool = model_runner.req_to_token_pool
+    W = width()
+    n = req_pool.size  # per-DP-rank request capacity
+    dev = torch.device("cuda", torch.cuda.current_device())
+    bs = 0 if last_correct_step_indices is None else last_correct_step_indices.shape[0]
+    if bs > n:
+        raise RuntimeError(
+            f"KDA TP commit: {bs} requests exceed the per-rank capacity {n}"
+        )
+    pack = torch.zeros((5, n), dtype=torch.int64, device=dev)
+    # Padding rows commit nothing (step -1); a step 0 would copy into slot 0 every step.
+    pack[1].fill_(-1)
+    pack[3].fill_(-1)  # no track step
+    if bs:
+        if state_slots is None:
+            # Not the request table, which the scheduler may have rewritten since the forward.
+            state_slots = model_runner.attn_backend.forward_state_slots(
+                bs, batch.mamba_track_indices
+            )
+        slots = state_slots.working[:bs]
+        track = state_slots.track
+        pack[0, :bs] = slots.to(torch.int64)
+        pack[1, :bs] = last_correct_step_indices.to(torch.int64)
+        if (
+            batch.mamba_track_indices is not None
+            and track is not None
+            and mamba_steps_to_track is not None
+        ):
+            pack[2, :bs] = track[:bs].to(torch.int64)
+            pack[3, :bs] = mamba_steps_to_track.to(torch.int64)
+    rank = get_parallel().attn_dp_rank
+    pack[4] = rank * n + torch.arange(n, device=dev)  # see _fast_context's scratch rows
+    mamba_pool = model_runner.token_to_kv_pool.layer_router.part_view(STATE_PART)
+    caches = mamba_pool.get_speculative_mamba2_params_all_layers()
+    out = pack.new_empty((W, 5, n))
+    group().all_gather_into_tensor(out.view(W * 5, n), pack)
+    slots, last, track, steps, rows = out.permute(1, 0, 2).reshape(5, W * n)
+    scatter_mamba_states_after_mtp_verify(
+        caches,
+        slots,
+        last,
+        track,
+        steps,
+        src_indices_raw=rows,
+        rows_loop=envs.SGLANG_MAMBA_SSM_COMMIT_ROW_LOOP.get(),
+    )
