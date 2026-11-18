@@ -82,9 +82,6 @@ from sglang.srt.utils import (
 from sglang.srt.utils.device import get_compiler_backend
 
 _is_cuda = is_cuda()
-_is_hip = is_hip()
-if _is_hip:
-    from sglang.srt.models import dflash_hip
 _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
@@ -104,6 +101,7 @@ if _is_gfx95:
         conv_finish_add_rmsnorm,
         conv_prepare,
     )
+    from sglang.srt.models import dflash_hip
 
 # MI355X, TP4 Muse Spark draft (SGLANG_ROCM_MUSE_DFLASH_DENSE): the QKV [2560, 8192], MLP down [8192, 7168] and
 # gate/up [14336, 8192] weights on the row-major split-K GEMM at the widths it is tuned for (the ROW_MAJOR table);
@@ -1303,7 +1301,7 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        if _is_hip and dflash_hip.projects_row_sharded(self, target_hidden):
+        if _is_gfx95 and dflash_hip.projects_row_sharded(self, target_hidden):
             return dflash_hip.project_row_sharded(self, target_hidden)
         projected = self.fc(target_hidden)
         if self.quantizable:

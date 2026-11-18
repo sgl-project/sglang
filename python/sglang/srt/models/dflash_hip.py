@@ -1,10 +1,10 @@
-"""The DFLASH draft's ROCm paths. ``dflash`` calls these behind ``_is_hip``."""
+"""The DFLASH draft's gfx950 paths. ``dflash`` calls these behind ``_is_gfx95``."""
 
 import torch
 
 from sglang.srt.runtime_context import get_parallel
 
-# ROCm prefill: each rank projects its 1/TP of the rows, then all-gathers;
+# gfx950 prefill: each rank projects its 1/TP of the rows, then all-gathers;
 # CUDA keeps the replicated fc, which its DFLASH aux graph overlaps on a side stream
 _FC_ROW_SHARD_MIN_ROWS = 4096
 
