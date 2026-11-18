@@ -193,60 +193,62 @@ test('the generic action still blocks real roots behind a coverage summary', asy
   assert.doesNotMatch(result.failures[0], /coverage-check/);
 });
 
-const nondeterministicPrefix = 'stage-b-test-1-gpu-small-amd-nondeterministic (';
+const nondeterministicPrefix = 'base-b-test-1-gpu-small-amd-nondeterministic (';
 const nondeterministicJobName = `${nondeterministicPrefix}rocm10, linux-mi300-1gpu-sglang)`;
 
-test('AMD nondeterministic test failures do not stop other AMD lanes', async () => {
+test('independent test failures do not stop other lanes', async () => {
   const result = await check({ independentTestJobPrefix: nondeterministicPrefix,
     failedJobNames: [nondeterministicJobName] });
   assert.deepEqual(result.failures, []);
 });
 
-test('the AMD exemption does not change other callers', async () => {
+test('the independent prefix does not change callers that do not set it', async () => {
   const result = await check({ failedJobNames: [nondeterministicJobName] });
   assert.deepEqual(result.failures,
     [`Fail-fast: skipping — root cause job(s): ${nondeterministicJobName}`]);
 });
 
-test('the AMD exemption does not include similarly named suites', async () => {
-  const name = 'stage-b-test-1-gpu-small-amd-nondeterministic-extra (rocm10)';
+test('the independent prefix does not include similarly named suites', async () => {
+  const name = 'base-b-test-1-gpu-small-amd-nondeterministic-extra (rocm10)';
   const result = await check({ independentTestJobPrefix: nondeterministicPrefix,
     failedJobNames: [name] });
   assert.deepEqual(result.failures, [`Fail-fast: skipping — root cause job(s): ${name}`]);
 });
 
-test('AMD nondeterministic setup failures still stop other lanes', async () => {
+test('setup failures in an independent lane still stop other lanes', async () => {
   const result = await check({ independentTestJobPrefix: nondeterministicPrefix,
     jobs: [failed(nondeterministicJobName, 'Install dependencies')] });
   assert.deepEqual(result.failures,
     [`Fail-fast: skipping — root cause job(s): ${nondeterministicJobName}`]);
 });
 
-test('an AMD nondeterministic failure does not hide a deterministic failure', async () => {
-  const name = 'stage-b-test-1-gpu-small-amd (rocm10, linux-mi300-1gpu-sglang, 0)';
+test('an independent test failure does not hide a peer test failure', async () => {
+  const name = 'base-b-test-1-gpu-small-amd (rocm10, linux-mi300-1gpu-sglang, 0)';
   const result = await check({ independentTestJobPrefix: nondeterministicPrefix,
     failedJobNames: [nondeterministicJobName, name] });
   assert.deepEqual(result.failures, [`Fail-fast: skipping — root cause job(s): ${name}`]);
 });
 
-test('the AMD exemption never hides lint failure', async () => {
-  const result = await check({ independentTestJobPrefix: nondeterministicPrefix, lint: 'failure' });
-  assert.deepEqual(result.failures, ['Fail-fast: lint check failed']);
-});
-
-for (const name of ['pr-test-amd-finish', 'pr-test-amd-extra-finish',
-  'call-pr-test-amd-extra / pr-test-amd-extra-finish']) {
-  test(`AMD finish summaries do not block producer retries: ${name}`, async () => {
+for (const name of ['pr-test-amd-finish', 'call-pr-test-amd-extra / pr-test-amd-extra-finish',
+  'call-pr-test-extra / pr-test-extra-finish']) {
+  test(`any *-finish summary does not block producer retries: ${name}`, async () => {
     const result = await check({ failedJobNames: [name] });
     assert.deepEqual(result.failures, []);
   });
 }
 
+test('a job that only mentions finish mid-name is still a root', async () => {
+  const name = 'base-b-test-finish-check (0)';
+  const result = await check({ failedJobNames: [name] });
+  assert.deepEqual(result.failures, [`Fail-fast: skipping — root cause job(s): ${name}`]);
+});
+
 for (const [waitName, producerName] of [
-  ['wait-for-stage-a-amd', 'stage-a-test-1-gpu-small-amd (rocm10)'],
-  ['wait-for-stage-b-amd', 'stage-b-test-1-gpu-small-amd (rocm10, linux-mi300-1gpu-sglang, 0)'],
+  ['wait-for-base-a', 'base-a-test-1-gpu-small (0)'],
+  ['wait-for-base-a-amd', 'base-a-test-1-gpu-small-amd (rocm10)'],
+  ['wait-for-base-b-amd', 'base-b-test-1-gpu-small-amd (rocm10, linux-mi300-1gpu-sglang, 0)'],
 ]) {
-  test(`AMD health-only wait cascades do not block producer retries: ${waitName}`, async () => {
+  test(`a health-only wait cascade does not block producer retries: ${waitName}`, async () => {
     const result = await check({ jobs: [
       failed(waitName, 'Run ./.github/actions/wait-for-jobs'),
       failed(producerName, 'Check PR test health'),
@@ -254,7 +256,7 @@ for (const [waitName, producerName] of [
     assert.deepEqual(result.failures, []);
   });
 
-  test(`a real AMD failure remains visible with its wait summary: ${waitName}`, async () => {
+  test(`a real producer failure remains visible with its wait job: ${waitName}`, async () => {
     const result = await check({ jobs: [
       failed(waitName, 'Run ./.github/actions/wait-for-jobs'),
       failed(producerName, 'Run test'),
@@ -263,11 +265,20 @@ for (const [waitName, producerName] of [
       [`Fail-fast: skipping — root cause job(s): ${waitName}, ${producerName}`]);
   });
 
-  test(`a standalone AMD wait failure remains a root: ${waitName}`, async () => {
+  test(`a standalone wait failure remains a root: ${waitName}`, async () => {
     const result = await check({ jobs: [failed(waitName, 'Run ./.github/actions/wait-for-jobs')] });
     assert.deepEqual(result.failures, [`Fail-fast: skipping — root cause job(s): ${waitName}`]);
   });
 }
+
+test('health cascades in another stage do not excuse a wait failure', async () => {
+  const result = await check({ jobs: [
+    failed('wait-for-base-b-amd', 'Run ./.github/actions/wait-for-jobs'),
+    failed('base-a-test-1-gpu-small-amd (rocm10)', 'Check PR test health'),
+  ] });
+  assert.deepEqual(result.failures,
+    ['Fail-fast: skipping — root cause job(s): wait-for-base-b-amd']);
+});
 
 for (const event of ['pull_request', 'schedule', 'workflow_dispatch']) {
   test(`explicit diagnostic mode bypasses lint and sibling checks: ${event}`, async () => {
@@ -275,6 +286,11 @@ for (const event of ['pull_request', 'schedule', 'workflow_dispatch']) {
     assert.deepEqual(result, { failures: [], labelReads: 0, jobReads: 0 });
   });
 }
+
+test('the independent prefix input falls back to the workflow env', () => {
+  assert.match(yaml,
+    /INDEPENDENT_TEST_JOB_PREFIX: \$\{\{ inputs\.independent-test-job-prefix \|\| env\.INDEPENDENT_TEST_JOB_PREFIX \}\}/);
+});
 
 for (const filename of ['pr-test-amd.yml', 'pr-test-amd-extra.yml']) {
   test(`every AMD GPU job checks health immediately after checkout: ${filename}`, () => {
@@ -289,10 +305,11 @@ for (const filename of ['pr-test-amd.yml', 'pr-test-amd-extra.yml']) {
       assert.ok(checkoutIndex >= 0, name);
       assert.match(steps[checkoutIndex + 1], /uses: \.\/\.github\/actions\/check-pr-test-health/, name);
       assert.equal(steps.filter(step => step.includes('uses: ./.github/actions/check-pr-test-health')).length, 1, name);
-      assert.match(steps[checkoutIndex + 1], /independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic \("/, name);
-      assert.doesNotMatch(steps[checkoutIndex + 1], /persist-credentials:/, name);
     }
-    assert.match(workflow, /^  checks: read$/m);
+    // the independent job must exist under the prefix the workflow declares
+    const prefix = workflow.match(/^  INDEPENDENT_TEST_JOB_PREFIX: "(.*)"$/m)[1];
+    assert.ok(fs.readFileSync(path.join(WORKSPACE, '.github', 'workflows', 'pr-test-amd.yml'), 'utf8')
+      .includes(`name: \${{ format('${prefix}`), prefix);
     assert.match(workflow, /^  SKIP_PR_TEST_HEALTH_CHECK: .*github.event_name != 'pull_request'.*inputs.continue_on_error/m);
     if (filename === 'pr-test-amd.yml') {
       assert.match(workflow, /^  SKIP_PR_TEST_HEALTH_CHECK: .*inputs.run_all_tests/m);

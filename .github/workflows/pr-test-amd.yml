@@ -141,13 +141,14 @@ on:
 # validation ("requesting actions: write... but only allowed ...none").
 permissions:
   actions: write
-  checks: read
   contents: read
   issues: read
   pull-requests: read
 
 env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ github.event_name != 'pull_request' || inputs.run_all_tests || inputs.continue_on_error }}
+  # Nondeterministic-suite test failures are collected without stopping the other AMD lanes.
+  INDEPENDENT_TEST_JOB_PREFIX: "base-b-test-1-gpu-small-amd-nondeterministic ("
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
   AMD_CI_IMAGE: ${{ inputs.amd_ci_image }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
@@ -322,8 +323,6 @@ jobs:
 
       - name: Check PR test health
         uses: ./.github/actions/check-pr-test-health
-        with:
-          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - uses: ./.github/actions/setup-amd-ci
         with:
@@ -382,8 +381,6 @@ jobs:
 
       - name: Check PR test health
         uses: ./.github/actions/check-pr-test-health
-        with:
-          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - uses: ./.github/actions/setup-amd-ci
         with:
@@ -425,8 +422,6 @@ jobs:
 
       - name: Check PR test health
         uses: ./.github/actions/check-pr-test-health
-        with:
-          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - uses: ./.github/actions/setup-amd-ci
         with:
@@ -464,8 +459,6 @@ jobs:
 
       - name: Check PR test health
         uses: ./.github/actions/check-pr-test-health
-        with:
-          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - uses: ./.github/actions/setup-amd-ci
         with:
@@ -503,8 +496,6 @@ jobs:
 
       - name: Check PR test health
         uses: ./.github/actions/check-pr-test-health
-        with:
-          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - uses: ./.github/actions/setup-amd-ci
         with:
@@ -571,8 +562,6 @@ jobs:
 
       - name: Check PR test health
         uses: ./.github/actions/check-pr-test-health
-        with:
-          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - uses: ./.github/actions/setup-amd-ci
         with:
@@ -609,8 +598,6 @@ jobs:
 
       - name: Check PR test health
         uses: ./.github/actions/check-pr-test-health
-        with:
-          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - uses: ./.github/actions/setup-amd-ci
         with:
@@ -661,8 +648,6 @@ jobs:
 
       - name: Check PR test health
         uses: ./.github/actions/check-pr-test-health
-        with:
-          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - uses: ./.github/actions/setup-amd-ci
         if: matrix.runner != 'linux-sglang-mi35x-spur'
@@ -731,8 +716,6 @@ jobs:
 
       - name: Check PR test health
         uses: ./.github/actions/check-pr-test-health
-        with:
-          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - uses: ./.github/actions/setup-amd-ci
         with:
@@ -771,8 +754,6 @@ jobs:
 
       - name: Check PR test health
         uses: ./.github/actions/check-pr-test-health
-        with:
-          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - uses: ./.github/actions/setup-amd-ci
         with:
@@ -812,8 +793,6 @@ jobs:
 
       - name: Check PR test health
         uses: ./.github/actions/check-pr-test-health
-        with:
-          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
@@ -973,8 +952,6 @@ jobs:
 
       - name: Check PR test health
         uses: ./.github/actions/check-pr-test-health
-        with:
-          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
@@ -1149,8 +1126,6 @@ jobs:
 
       - name: Check PR test health
         uses: ./.github/actions/check-pr-test-health
-        with:
-          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - uses: ./.github/actions/setup-amd-ci
         with:
@@ -1209,8 +1184,6 @@ jobs:
 
       - name: Check PR test health
         uses: ./.github/actions/check-pr-test-health
-        with:
-          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - uses: ./.github/actions/setup-amd-ci
         with:
@@ -1263,8 +1236,6 @@ jobs:
 
       - name: Check PR test health
         uses: ./.github/actions/check-pr-test-health
-        with:
-          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - uses: ./.github/actions/setup-amd-ci
         if: matrix.runner != 'linux-sglang-mi35x-spur'
@@ -1337,8 +1308,6 @@ jobs:
 
       - name: Check PR test health
         uses: ./.github/actions/check-pr-test-health
-        with:
-          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       # Cache-only: no sgl-router-build here. amd_ci_exec.sh maps the path into the container.
       - uses: ./.github/actions/download-sgl-router

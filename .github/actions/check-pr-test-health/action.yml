@@ -8,7 +8,7 @@ inputs:
     default: ${{ github.token }}
 
   independent-test-job-prefix:
-    description: 'Run independent test lanes under this job-name prefix even if a peer test failed; setup and lint failures still stop them.'
+    description: 'Run independent test lanes under this job-name prefix even if a peer test failed; setup and lint failures still stop them. Falls back to the INDEPENDENT_TEST_JOB_PREFIX env var so a workflow can set it once.'
     required: false
     default: ''
 
@@ -19,7 +19,7 @@ runs:
       uses: actions/github-script@v8
       env:
         SKIP_PR_TEST_HEALTH_CHECK: ${{ env.SKIP_PR_TEST_HEALTH_CHECK }}
-        INDEPENDENT_TEST_JOB_PREFIX: ${{ inputs.independent-test-job-prefix }}
+        INDEPENDENT_TEST_JOB_PREFIX: ${{ inputs.independent-test-job-prefix || env.INDEPENDENT_TEST_JOB_PREFIX }}
       with:
         github-token: ${{ inputs.github-token }}
         retries: 3
@@ -103,14 +103,11 @@ runs:
               core.info(`[health-check] Filtered out multimodal-gen NPU job: ${j.name}`);
               return false;
             }
-            // a base-b wait can fail solely because health checks stopped its producers
-            const producerPrefixes = {
-              'wait-for-base-b': 'base-b-test-',
-              'wait-for-stage-a-amd': 'stage-a-test-',
-              'wait-for-stage-b-amd': 'stage-b-test-',
-            };
-            const producerPrefix = producerPrefixes[baseName];
-            if (producerPrefix) {
+            // a wait-for-<tier>-<stage>[-<suffix>] job can fail solely because health
+            // checks stopped its <tier>-<stage>-test-* producers
+            const waitStage = baseName.match(/^wait-for-([a-z]+-[a-z])(?:-|$)/)?.[1];
+            if (waitStage) {
+              const producerPrefix = `${waitStage}-test-`;
               const failedProducers = failedJobs.filter(job => job.name.startsWith(producerPrefix));
               if (failedProducers.length > 0 && failedProducers.every(job => {
                 const failedStep = (job.steps || []).find(s => s.conclusion === 'failure');
@@ -127,11 +124,7 @@ runs:
             }
             // finish only aggregates producer results; it cannot be a producer prerequisite
             const leafJobName = j.name.split(' / ').pop().split(/[ (]/)[0];
-            if (
-              baseName === 'pr-test-finish' ||
-              leafJobName === 'pr-test-amd-finish' ||
-              leafJobName === 'pr-test-amd-extra-finish'
-            ) {
+            if (leafJobName.endsWith('-finish')) {
               core.info(`[health-check] Filtered out finish summary: ${j.name}`);
               return false;
             }

@@ -99,6 +99,8 @@ on:
 
 env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ github.event_name != 'pull_request' || inputs.continue_on_error }}
+  # Nondeterministic-suite test failures are collected without stopping the other AMD lanes.
+  INDEPENDENT_TEST_JOB_PREFIX: "base-b-test-1-gpu-small-amd-nondeterministic ("
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
   AMD_CI_IMAGE: ${{ inputs.amd_ci_image }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
@@ -114,7 +116,6 @@ concurrency:
 
 permissions:
   actions: write
-  checks: read
   contents: read
   issues: read
   pull-requests: read
@@ -150,8 +151,6 @@ jobs:
 
       - name: Check PR test health
         uses: ./.github/actions/check-pr-test-health
-        with:
-          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       # `inputs` is empty on pull_request events, so fall back explicitly to
       # the ROCm 10 PR default. Reusable callers can request another variant.
@@ -185,8 +184,6 @@ jobs:
 
       - name: Check PR test health
         uses: ./.github/actions/check-pr-test-health
-        with:
-          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - uses: ./.github/actions/setup-amd-ci
         with:
@@ -218,8 +215,6 @@ jobs:
 
       - name: Check PR test health
         uses: ./.github/actions/check-pr-test-health
-        with:
-          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - uses: ./.github/actions/setup-amd-ci
         with:
@@ -247,8 +242,6 @@ jobs:
 
       - name: Check PR test health
         uses: ./.github/actions/check-pr-test-health
-        with:
-          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - uses: ./.github/actions/setup-amd-ci
         with:
