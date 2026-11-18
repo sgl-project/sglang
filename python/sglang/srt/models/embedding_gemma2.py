@@ -40,6 +40,7 @@ from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
@@ -57,7 +58,7 @@ from sglang.srt.models.gemma4_mm import (
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_mm, get_parallel
-from sglang.srt.utils import add_prefix, flatten_nested_list
+from sglang.srt.utils import flatten_nested_list
 
 logger = logging.getLogger(__name__)
 

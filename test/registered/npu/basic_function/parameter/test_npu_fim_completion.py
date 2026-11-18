@@ -1,13 +1,11 @@
 import unittest
+from pathlib import Path
 
 import openai
 
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.hf_transformers import get_tokenizer
-from sglang.test.ascend.test_ascend_utils import (
-    DEEPSEEK_CODER_1_3_B_BASE_PATH,
-    DEEPSEEK_CODER_JSON_PATH,
-)
+from sglang.test.ascend.test_ascend_utils import DEEPSEEK_CODER_1_3_B_BASE_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -18,7 +16,7 @@ from sglang.test.test_utils import (
 
 register_npu_ci(
     est_time=400,
-    suite="full-1-npu-a3",
+    suite="full-test-1-npu-a3",
     nightly=True,
 )
 
@@ -94,7 +92,7 @@ class TestFimCompletion(CustomTestCase):
 class TestFimCompletionJson(TestFimCompletion):
     other_args = [
         "--completion-template",
-        DEEPSEEK_CODER_JSON_PATH,
+        str(Path(__file__).with_name("deepseek_coder.json")),
         "--attention-backend",
         "ascend",
         "--disable-cuda-graph",

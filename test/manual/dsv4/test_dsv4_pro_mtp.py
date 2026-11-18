@@ -184,7 +184,7 @@ class TestDSV4ProMTPHongloumeng(CustomTestCase):
         # on-the-fly token-level slicing matches what the server will see.
         info = requests.get(cls.base_url + "/server_info", timeout=60).json()
         tokenizer_path = info.get("tokenizer_path") or DSV4_PRO_MODEL_PATH
-        from sglang.srt.utils.hf_transformers import get_tokenizer
+        from sglang.srt.hf_transformers import get_tokenizer
 
         cls.tokenizer = get_tokenizer(tokenizer_path)
 
