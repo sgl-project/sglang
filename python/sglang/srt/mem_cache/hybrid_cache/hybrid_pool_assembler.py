@@ -1214,8 +1214,8 @@ def build_hybrid_mamba_stack(
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
         kv_host_size, *mamba_shares = _split_hicache_size(
-            get_memory().hicache_size,
-            (kv_pool, mamba_pool, *params.mtp_draft_mamba_pools),
+            hicache_size=get_memory().hicache_size,
+            kv_pools=(kv_pool, mamba_pool, *params.mtp_draft_mamba_pools),
         )
         mamba_host_size = sum(mamba_shares)
     index_bytes = _kv_budget_index_bytes(config)
@@ -1289,8 +1289,13 @@ def build_hybrid_mamba_swa_stack(
     kv_host_size, swa_host_size, mamba_host_size = None, None, 0
     if get_memory().hicache_size > 0:
         kv_host_size, swa_host_size, *mamba_shares = _split_hicache_size(
-            get_memory().hicache_size,
-            (full_kv_pool, swa_kv_pool, mamba_pool, *params.mtp_draft_mamba_pools),
+            hicache_size=get_memory().hicache_size,
+            kv_pools=(
+                full_kv_pool,
+                swa_kv_pool,
+                mamba_pool,
+                *params.mtp_draft_mamba_pools,
+            ),
         )
         mamba_host_size = sum(mamba_shares)
     host_pool_group = build_hybrid_swa_group(
