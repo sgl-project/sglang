@@ -309,6 +309,15 @@ def _prepare_src_rows(src: torch.Tensor | None, steps: torch.Tensor) -> torch.Te
     return src.to(torch.int32).contiguous()
 
 
+def _conv_dst_entry_contiguous(dst: torch.Tensor) -> bool:
+    expected = 1
+    for axis in range(dst.ndim - 1, 1, -1):
+        if dst.shape[axis] != 1 and dst.stride(axis) != expected:
+            return False
+        expected *= dst.shape[axis]
+    return True
+
+
 def fused_mamba_state_scatter_with_mask(
     dst: torch.Tensor,  # [num_layers, cache_size, *state_shape]
     src: torch.Tensor,  # [num_layers, spec_size, draft_tokens, *state_shape]
@@ -428,9 +437,12 @@ def _fused_conv_window_scatter_with_mask_kernel(
     src_win_stride,
     dst_layer_stride,
     dst_req_stride,
+    dst_dim_stride,
+    dst_win_stride,
     src_req_size,
     src_step_size,
     dst_req_size,
+    DST_ENTRY_CONTIGUOUS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """Scatter accepted conv windows from the deduplicated sliding-window source.
@@ -441,7 +453,7 @@ def _fused_conv_window_scatter_with_mask_kernel(
     and step ``t``'s window is the slice ``shared[:, t:t+K-1]``. That window is
     non-contiguous, so we index every ``(dim, win)`` element through the view's
     strides (``src_step_stride`` / ``src_dim_stride`` / ``src_win_stride``). The
-    destination conv-state row stays contiguous in ``(dim, K-1)`` order.
+    destination is indexed through its ``(dim, K-1)`` strides as well.
     """
     pid_req = tl.program_id(0)
     pid_layer = tl.program_id(1).to(tl.int64)
@@ -477,15 +489,18 @@ def _fused_conv_window_scatter_with_mask_kernel(
         + d * src_dim_stride
         + w * src_win_stride
     )
-    # dst window is contiguous in (dim, K-1) order -> flat element index `e`.
-    dst_off = pid_layer * dst_layer_stride + dst_idx * dst_req_stride + e
+    dst_base = pid_layer * dst_layer_stride + dst_idx * dst_req_stride
+    if DST_ENTRY_CONTIGUOUS:
+        dst_off = dst_base + e
+    else:
+        dst_off = dst_base + d * dst_dim_stride + w * dst_win_stride
 
     data = tl.load(src_ptr + src_off, mask=mask, other=0.0)
     tl.store(dst_ptr + dst_off, data, mask=mask)
 
 
 def fused_conv_window_scatter_with_mask(
-    dst: torch.Tensor,  # conv_states [num_layers, cache_size, dim, K-1] (contiguous)
+    dst: torch.Tensor,  # conv_states [num_layers, cache_size, dim, K-1]
     src: torch.Tensor,  # deduped conv-window view [num_layers, spec_size, draft_tokens, dim, K-1]
     dst_indices_raw: torch.Tensor,  # [total_requests]
     step_indices_raw: torch.Tensor,  # [total_requests], entry >= 0 means valid
@@ -497,8 +512,8 @@ def fused_conv_window_scatter_with_mask(
     overlapping ``as_strided`` view over a shared ``[..., dim, D+K-2]`` buffer,
     so its per-step windows are intentionally non-contiguous. This kernel indexes
     ``(dim, win)`` elements through the view's strides instead of flat-copying.
-    ``dst`` (the real conv-state pool) is the usual contiguous
-    ``[layers, cache, dim, K-1]``.
+    ``dst`` (the real conv-state pool) is ``[layers, cache, dim, K-1]``, indexed
+    through its strides (XPU stores it channel-contiguous).
     """
     total_requests = step_indices_raw.shape[0]
     if total_requests == 0 or dst.numel() == 0:
@@ -533,11 +548,6 @@ def fused_conv_window_scatter_with_mask(
     src_step_size = src.shape[2]
     dst_req_size = dst.shape[1]
 
-    # `src` is an intentionally non-contiguous (overlapping) view indexed per
-    # dim through its real strides, so we do NOT assert src contiguity here
-    # (unlike the dense scatter).
-    _require_entry_contiguous_dst(dst, 2, "fused_conv_window_scatter_with_mask")
-
     dst_indices_raw = dst_indices_raw.to(torch.int32).contiguous()
     step_indices_raw = step_indices_raw.to(torch.int32).contiguous()
     src_indices_raw = _prepare_src_rows(src_indices_raw, step_indices_raw)
@@ -560,21 +570,24 @@ def fused_conv_window_scatter_with_mask(
         src.stride(4),
         dst.stride(0),
         dst.stride(1),
+        dst.stride(2),
+        dst.stride(3),
         src_req_size,
         src_step_size,
         dst_req_size,
+        DST_ENTRY_CONTIGUOUS=_conv_dst_entry_contiguous(dst),
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
 
 _CONV_MULTI_MAX_TYPES = 8
-_CONV_MULTI_META_COLS = 12
+_CONV_MULTI_META_COLS = 14
 _conv_multi_meta_cache: dict = {}
 
 
 @triton.jit(do_not_specialize=["idx1_ptr", "step1_ptr", "idx2_ptr", "step2_ptr", "n1"])
 def _fused_conv_window_scatter_multi_kernel(
-    meta_ptr,  # int64 [num_types, 12]: src_ptr, dst_ptr, elem, s_l, s_r, s_s, s_d, s_w, d_l, d_r, block_start, last_axis
+    meta_ptr,  # int64 [num_types, 14]: src_ptr, dst_ptr, elem, s_l, s_r, s_s, s_d, s_w, d_l, d_r, block_start, last_axis, d_d, d_w
     idx1_ptr,
     step1_ptr,
     idx2_ptr,
@@ -585,6 +598,7 @@ def _fused_conv_window_scatter_multi_kernel(
     dst_req_size,
     NUM_TYPES: tl.constexpr,
     META_COLS: tl.constexpr,
+    DST_ENTRY_CONTIGUOUS_MASK: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid_req = tl.program_id(0)
@@ -613,6 +627,7 @@ def _fused_conv_window_scatter_multi_kernel(
     ):
         return
 
+    # One bit per type lets the static loop fold each destination-layout branch.
     for t in tl.static_range(NUM_TYPES):
         block_start = tl.load(meta_ptr + t * META_COLS + 10)
         block_end = tl.load(
@@ -649,7 +664,13 @@ def _fused_conv_window_scatter_multi_kernel(
                 + d * src_dim_stride
                 + w * src_win_stride
             )
-            dst_off = pid_layer * dst_layer_stride + dst_idx * dst_req_stride + e
+            dst_base = pid_layer * dst_layer_stride + dst_idx * dst_req_stride
+            if ((DST_ENTRY_CONTIGUOUS_MASK >> t) & 1) != 0:
+                dst_off = dst_base + e
+            else:
+                dst_dim_stride = tl.load(meta_ptr + t * META_COLS + 12)
+                dst_win_stride = tl.load(meta_ptr + t * META_COLS + 13)
+                dst_off = dst_base + d * dst_dim_stride + w * dst_win_stride
             data = tl.load(src_ptr + src_off, mask=mask, other=0.0)
             tl.store(dst_ptr + dst_off, data, mask=mask)
 
@@ -673,6 +694,8 @@ def _conv_multi_build_meta(pairs, block_size: int):
                 dst.stride(1),
                 block_start,
                 dst.shape[3],
+                dst.stride(2),
+                dst.stride(3),
             ]
         )
         block_start += triton.cdiv(elem, block_size)
@@ -692,12 +715,6 @@ def _conv_multi_eligible(pairs) -> bool:
         if dst.shape[0] != layers:
             return False
         if src.shape[0] != layers or src.shape[3:] != dst.shape[2:]:
-            return False
-        # The descriptor carries layer/slot strides. Only the trailing
-        # feature block is flat-copied, including for unified pool views.
-        if (dst.shape[3] != 1 and dst.stride(3) != 1) or (
-            dst.shape[2] != 1 and dst.stride(2) != dst.shape[3]
-        ):
             return False
         if src.shape[1:3] != pairs[0][1].shape[1:3]:
             return False
@@ -762,6 +779,9 @@ def fused_conv_window_scatter_multi(
 
     dst0, src0 = pairs[0]
     grid = (n1 + n2, dst0.shape[0], total_blocks)
+    dst_entry_contiguous_mask = sum(
+        int(_conv_dst_entry_contiguous(dst)) << i for i, (dst, _) in enumerate(pairs)
+    )
     _fused_conv_window_scatter_multi_kernel[grid](
         meta,
         idx1,
@@ -774,6 +794,7 @@ def fused_conv_window_scatter_multi(
         dst0.shape[1],
         NUM_TYPES=len(pairs),
         META_COLS=_CONV_MULTI_META_COLS,
+        DST_ENTRY_CONTIGUOUS_MASK=dst_entry_contiguous_mask,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 

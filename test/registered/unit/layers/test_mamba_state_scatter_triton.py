@@ -455,6 +455,32 @@ class TestFusedConvWindowScatterMulti(CustomTestCase):
         for i, (exp, (got, _)) in enumerate(zip(expect, pairs)):
             torch.testing.assert_close(got, exp, msg=f"conv type {i} mismatch")
 
+    def test_channel_contiguous_dst(self):
+        """XPU keeps conv states as [win, dim] storage viewed as [dim, win]."""
+        torch.manual_seed(13)
+        layers, slots, batch, steps, dim, km1 = 2, 16, 5, 3, 24, 3
+        dst = torch.randn(
+            layers, slots, km1, dim, dtype=torch.bfloat16, device=DEVICE
+        ).transpose(-1, -2)
+        src = torch.randn(
+            layers, batch, steps, dim, km1, dtype=torch.bfloat16, device=DEVICE
+        )
+        dst_idx = torch.randperm(slots, device=DEVICE)[:batch]
+        step_idx = torch.randint(0, steps, (batch,), device=DEVICE)
+        step_idx[0] = -1
+        valid = step_idx >= 0
+        expect = dst.clone()
+        expect[:, dst_idx[valid]] = src[:, valid.nonzero().flatten(), step_idx[valid]]
+
+        got_single = dst.clone().transpose(-1, -2).contiguous().transpose(-1, -2)
+        fused_conv_window_scatter_with_mask(got_single, src, dst_idx, step_idx)
+        got_multi = dst.clone().transpose(-1, -2).contiguous().transpose(-1, -2)
+        self.assertTrue(_conv_multi_eligible([(got_multi, src)]))
+        fused_conv_window_scatter_multi([(got_multi, src)], dst_idx, step_idx)
+        get_device_module().synchronize()
+        torch.testing.assert_close(got_single, expect, rtol=0, atol=0)
+        torch.testing.assert_close(got_multi, expect, rtol=0, atol=0)
+
     def test_strided_envelope_commit_and_track(self):
         """Outer strides must not disable fusion or overwrite adjacent state."""
         layers, slots, batch, steps = 3, 16, 5, 4
@@ -494,8 +520,8 @@ class TestFusedConvWindowScatterMulti(CustomTestCase):
         step2 = torch.tensor([1, 2, -1], device=DEVICE, dtype=torch.int32)
         pairs = list(zip(conv, sources))
         self.assertTrue(_conv_multi_eligible(pairs))
-        # Transposing the feature block is not supported by its flat store.
-        self.assertFalse(
+        # dst (dim, win) strides are carried in the descriptor.
+        self.assertTrue(
             _conv_multi_eligible(
                 [(conv[0].transpose(2, 3), sources[0].transpose(3, 4))]
             )
