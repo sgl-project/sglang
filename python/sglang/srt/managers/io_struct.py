@@ -430,6 +430,7 @@ class GenerateReqInput:
     kv_hints: Optional[
         Union[List[Optional[Union[Dict, KvHintsEnvelope]]], Dict, KvHintsEnvelope]
     ] = None
+    _max_new_tokens_defaulted: bool = field(default=False, init=False, repr=False)
 
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
@@ -1191,6 +1192,7 @@ class GenerateReqInput:
                 else None
             ),
         )
+        sub._max_new_tokens_defaulted = self._max_new_tokens_defaulted
         cache[i] = sub
         return sub
 

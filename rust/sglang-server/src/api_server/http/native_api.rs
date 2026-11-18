@@ -827,6 +827,9 @@ async fn generate_single(
     let incremental = state.server_args.incremental_streaming_output;
 
     if stream {
+        if let Err(error) = call.preflight().await {
+            return native_core_error(error, false);
+        }
         // A single request is a 1-element batch without the `index` field — reuse
         // the same stream so the frame/abort/truncation logic lives in one place.
         use futures::StreamExt;
@@ -921,7 +924,7 @@ async fn generate_batch(
     // No cross-item rid collision to worry about: `into_requests` rejected duplicate
     // rids within this batch, and `Rid::from_client` made each one unique against
     // every other in-flight request.
-    let calls = match state
+    let mut calls: Vec<_> = match state
         .core
         .generate_batch(requests, ReceivedAs::Body(snapshot))
         .await
@@ -930,6 +933,11 @@ async fn generate_batch(
         Err(error) => return native_core_error(error, stream),
     };
 
+    if let Err(error) =
+        futures::future::try_join_all(calls.iter_mut().map(|(call, _)| call.preflight())).await
+    {
+        return native_core_error(error, false);
+    }
     if stream {
         // Multiplex the N streams (mirrors the Python `_handle_batch_request` path);
         // Calls move into the stream so a disconnect aborts what's unfinished.

@@ -10,10 +10,12 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_rust_server_built,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=64, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=240, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestRequestLengthValidation(CustomTestCase):
@@ -167,6 +169,200 @@ class TestRequestLengthValidation(CustomTestCase):
             },
         )
         self.assertEqual(response.status_code, 200)
+
+
+class TestKVCapacityValidation(CustomTestCase):
+    process = None
+    rust_frontend = False
+
+    @classmethod
+    def setUpClass(cls):
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=(
+                "--max-total-tokens",
+                "512",
+                "--context-length",
+                "4096",
+                "--max-running-requests",
+                "2",
+            ),
+            env={"SGLANG_RUST_SERVER": "1" if cls.rust_frontend else "0"},
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.process is not None:
+            terminate_and_kill_process_tree(cls.process)
+
+    def test_batch_kv_rejection_is_independent_of_item_order(self):
+        for budgets in ((1, 1024), (1024, 1), (1024, 1024)):
+            for stream in (False, True):
+                with self.subTest(budgets=budgets, stream=stream):
+                    response = requests.post(
+                        self.base_url + "/generate",
+                        json={
+                            "text": ["Hello", "Hello"],
+                            "stream": stream,
+                            "sampling_params": [{"max_new_tokens": n} for n in budgets],
+                        },
+                        timeout=30,
+                    )
+                    self.assertEqual(response.status_code, 400, response.text)
+                    self.assertIn("max_new_tokens=1024", response.text)
+                    control = requests.post(
+                        self.base_url + "/generate",
+                        json={
+                            "text": "Hello",
+                            "sampling_params": {"max_new_tokens": 1},
+                        },
+                        timeout=30,
+                    )
+                    self.assertEqual(control.status_code, 200, control.text)
+
+    def test_parallel_choices_reject_kv_budget_before_streaming(self):
+        for path, payload in (
+            (
+                "/generate",
+                {"text": "Hello", "sampling_params": {"max_new_tokens": 1024, "n": 2}},
+            ),
+            (
+                "/v1/completions",
+                {
+                    "model": DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                    "prompt": ["Hello", "Hello"],
+                    "max_tokens": 1024,
+                    "n": 2,
+                },
+            ),
+            (
+                "/v1/chat/completions",
+                {
+                    "model": DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 1024,
+                    "n": 2,
+                },
+            ),
+        ):
+            with self.subTest(path=path):
+                response = requests.post(
+                    self.base_url + path, json={**payload, "stream": True}, timeout=30
+                )
+                self.assertEqual(response.status_code, 400, response.text)
+                if self.rust_frontend and path == "/generate":
+                    self.assertIn("parallel sampling is not supported", response.text)
+                else:
+                    self.assertIn("max_new_tokens=1024", response.text)
+
+    def test_valid_batch_stream_keeps_all_items(self):
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": ["Hello"] * 4,
+                "stream": True,
+                "sampling_params": {"max_new_tokens": 1},
+            },
+            timeout=30,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        import json
+
+        items = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: {")
+        ]
+        self.assertEqual(sorted(item["index"] for item in items), list(range(4)))
+
+    def test_completion_omitted_budget_is_not_explicit_sixteen(self):
+        for stream in (False, True):
+            for explicit in (False, True):
+                with self.subTest(stream=stream, explicit=explicit):
+                    body = {
+                        "model": DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                        "prompt": [100] * 500,
+                        "stream": stream,
+                        "temperature": 0,
+                    }
+                    if explicit:
+                        body["max_tokens"] = 16
+                    response = requests.post(
+                        self.base_url + "/v1/completions", json=body, timeout=30
+                    )
+                    self.assertEqual(
+                        response.status_code, 400 if explicit else 200, response.text
+                    )
+                    if explicit:
+                        self.assertIn("max_new_tokens=16", response.text)
+                    else:
+                        self.assertNotIn('"error"', response.text)
+
+    def test_default_budget_is_not_an_explicit_request(self):
+        for params, expected_status in (({}, 200), ({"max_new_tokens": 128}, 400)):
+            with self.subTest(params=params):
+                response = requests.post(
+                    self.base_url + "/generate",
+                    json={"input_ids": [100] * 400, "sampling_params": params},
+                    timeout=30,
+                )
+                self.assertEqual(response.status_code, expected_status, response.text)
+                if expected_status == 400:
+                    self.assertIn("max_new_tokens=128", response.text)
+
+    def test_explicit_kv_budget_is_rejected_and_server_recovers(self):
+        """A KV-limited output budget is a client error, never a shortened success."""
+        payloads = (
+            (
+                "/generate",
+                {"text": "Hello", "sampling_params": {"max_new_tokens": 1024}},
+            ),
+            (
+                "/v1/completions",
+                {
+                    "model": DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                    "prompt": "Hello",
+                    "max_tokens": 1024,
+                },
+            ),
+            (
+                "/v1/chat/completions",
+                {
+                    "model": DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 1024,
+                },
+            ),
+        )
+        for path, payload in payloads:
+            for stream in (False, True):
+                with self.subTest(path=path, stream=stream):
+                    response = requests.post(
+                        self.base_url + path,
+                        json={**payload, "stream": stream},
+                        timeout=30,
+                    )
+                    self.assertEqual(response.status_code, 400, response.text)
+                    self.assertIn("max_new_tokens=1024", response.text)
+                    self.assertIn("KV cache capacity", response.text)
+                    self.assertIn("Maximum supported max_new_tokens", response.text)
+                    control = requests.post(
+                        self.base_url + "/generate",
+                        json={
+                            "text": "Hello",
+                            "sampling_params": {"max_new_tokens": 1},
+                        },
+                        timeout=30,
+                    )
+                    self.assertEqual(control.status_code, 200, control.text)
+
+
+@unittest.skipUnless(is_rust_server_built(), "embedded rust server extension not built")
+class TestRustKVCapacityValidation(TestKVCapacityValidation):
+    rust_frontend = True
 
 
 if __name__ == "__main__":

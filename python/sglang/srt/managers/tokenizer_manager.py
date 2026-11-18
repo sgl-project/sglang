@@ -1761,6 +1761,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             custom_params["thinking_budget"] = obj.max_thinking_tokens
             sampling_kwargs["custom_params"] = custom_params
         sampling_params = self.sampling_params_class(**sampling_kwargs)
+        sampling_params.max_new_tokens_defaulted = (
+            "max_new_tokens" not in obj.sampling_params
+            or isinstance(obj, GenerateReqInput)
+            and obj._max_new_tokens_defaulted
+        )
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
         _validate_watermark_request(sampling_params)
@@ -2515,19 +2520,42 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         rid_to_index = {rid: i for i, rid in enumerate(rids)}
         task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
         try:
+            # Validate every child's first result before committing batch stream headers.
+            initial = []
             while task_map:
                 done, _ = await asyncio.wait(
                     task_map.keys(), return_when=asyncio.FIRST_COMPLETED
                 )
+                for task in done:
+                    gen = task_map.pop(task)
+                    try:
+                        result = task.result()
+                    except StopAsyncIteration:
+                        continue
+                    reason = result["meta_info"].get("finish_reason") or {}
+                    if (
+                        reason.get("type") == "abort"
+                        and reason.get("status_code") == 400
+                    ):
+                        raise ValueError(reason["message"])
+                    result["index"] = rid_to_index[result["meta_info"]["id"]]
+                    initial.append((gen, result))
 
+            for gen, result in initial:
+                yield result
+                task_map[asyncio.create_task(gen.__anext__())] = gen
+
+            while task_map:
+                done, _ = await asyncio.wait(
+                    task_map.keys(), return_when=asyncio.FIRST_COMPLETED
+                )
                 for task in done:
                     gen = task_map.pop(task)
                     try:
                         result = task.result()
                         result["index"] = rid_to_index[result["meta_info"]["id"]]
                         yield result
-                        new_task = asyncio.create_task(gen.__anext__())
-                        task_map[new_task] = gen
+                        task_map[asyncio.create_task(gen.__anext__())] = gen
                     except StopAsyncIteration:
                         pass
         finally:

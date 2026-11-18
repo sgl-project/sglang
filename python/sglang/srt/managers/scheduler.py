@@ -3059,6 +3059,10 @@ class Scheduler(
                 )
             max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
 
+        # TpModelWorker also folds KV capacity into max_req_len.
+        max_new_tokens_before_kv = max(
+            0, min(max_new_tokens, self.model_config.context_len - input_len - 2)
+        )
         # Keep this bound consistent with PrefillAdder's admission budget.
         max_new_tokens = max(
             0,
@@ -3102,6 +3106,18 @@ class Scheduler(
         if max_new_tokens is None:
             req.set_finish_with_abort(
                 f"Request prompt exceeds the KV memory budget: input_len={input_len}."
+            )
+            max_new_tokens = 0
+
+        elif (
+            req.sampling_params.max_new_tokens is not None
+            and not req.sampling_params.max_new_tokens_defaulted
+            and max_new_tokens < max_new_tokens_before_kv
+        ):
+            req.set_finish_with_abort(
+                f"max_new_tokens={req.sampling_params.max_new_tokens} exceeds the "
+                f"KV cache capacity for input_len={input_len}. "
+                f"Maximum supported max_new_tokens is {max_new_tokens}."
             )
             max_new_tokens = 0
 

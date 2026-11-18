@@ -204,10 +204,17 @@ pub(super) async fn chat(
         .map(|request| RequestState::new(state, request, headers, None, timing.clone()))
         .collect();
     let received = ReceivedAs::Typed(state.core.logged_headers(headers));
-    let calls: Vec<_> = match state.core.generate_batch(requests, received).await {
+    let mut calls: Vec<_> = match state.core.generate_batch(requests, received).await {
         Ok(calls) => calls.into_iter().zip(request_states).collect(),
         Err(error) => return Some(error_response(error.http_status(), &error.to_string())),
     };
+
+    if stream
+        && let Err(error) =
+            futures::future::try_join_all(calls.iter_mut().map(|(call, _)| call.preflight())).await
+    {
+        return Some(error_response(error.http_status(), &error.to_string()));
+    }
 
     if !stream {
         // One failed choice fails the request, as Python's batch does; the
@@ -605,8 +612,7 @@ mod tests {
         assert!(message.contains("byte limit"), "{message}");
     }
 
-    /// A scheduler abort in a stream, whatever its status, is Python's error
-    /// event under that status, then the stream's end, not a unary 400.
+    /// Initial bad requests retain HTTP400; other aborts keep their stream error shape.
     #[tokio::test]
     async fn streamed_abort_keeps_its_status() {
         for (status, name) in [
@@ -626,6 +632,12 @@ mod tests {
             let messages = json!([{"role": "user", "content": "hi"}]);
             let body = json!({"model": "model", "messages": messages, "stream": true});
             let response = post_json(app, "/v1/chat/completions", body).await;
+            if status == 400 {
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let value = body_json(response).await;
+                assert!(value.to_string().contains("aborted"));
+                continue;
+            }
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(
                 response.headers()[CONTENT_TYPE],

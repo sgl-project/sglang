@@ -2575,6 +2575,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     if finish_reason_type == "abort" and isinstance(
                         finish_reason.get("status_code"), HTTPStatus
                     ):
+                        if not stream_started and finish_reason["status_code"] == 400:
+                            raise ValueError(finish_reason["message"])
                         wire.check_abort(finish_reason, stream_started=stream_started)
                         if wire.errors_end_choices:
                             finish_reasons[index] = finish_reason

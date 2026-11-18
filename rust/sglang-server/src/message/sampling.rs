@@ -262,6 +262,8 @@ pub struct SamplingParams {
     /// strip that wrapper from its own grammar, so it is a pipeline output only.
     #[serde(skip_deserializing)]
     pub ebnf_full_assistant: bool,
+    #[serde(skip_deserializing)]
+    pub max_new_tokens_defaulted: bool,
 }
 
 impl Default for SamplingParams {
@@ -304,6 +306,7 @@ impl Default for SamplingParams {
             stop_regex_max_len: 0,
             is_normalized: false,
             ebnf_full_assistant: false,
+            max_new_tokens_defaulted: false,
         }
     }
 }
@@ -762,6 +765,7 @@ mod tests {
         "stop_regex_max_len",
         "is_normalized",
         "ebnf_full_assistant",
+        "max_new_tokens_defaulted",
     ];
 
     /// Every field reaches the wire, at the position Python expects.

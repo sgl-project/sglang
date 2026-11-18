@@ -982,12 +982,21 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
     if obj.stream:
+        generator = _global_state.tokenizer_manager.generate_request(obj, request)
+        try:
+            first = await generator.__anext__()
+        except ValueError as error:
+            await generator.aclose()
+            return _create_error_response(error)
+        reason = first.get("meta_info", {}).get("finish_reason") or {}
+        if reason.get("type") == "abort" and reason.get("status_code") == 400:
+            await generator.aclose()
+            return _create_error_response(ValueError(reason["message"]))
 
         async def stream_results() -> AsyncIterator[bytes]:
             try:
-                async for out in _global_state.tokenizer_manager.generate_request(
-                    obj, request
-                ):
+                yield b"data: " + dumps_json(first) + b"\n\n"
+                async for out in generator:
                     yield b"data: " + dumps_json(out) + b"\n\n"
             except ValueError as e:
                 # A client disconnect also surfaces here. It's a client-side
@@ -1007,6 +1016,8 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
                 }
                 logger.error(f"[http_server] Error: {e}")
                 yield b"data: " + dumps_json(out) + b"\n\n"
+            finally:
+                await generator.aclose()
             yield b"data: [DONE]\n\n"
 
         return StreamingResponse(

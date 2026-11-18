@@ -40,6 +40,21 @@ pub(super) fn generate_stream(
 
         // Poll all receivers concurrently; re-arm a receiver's future after each
         // non-terminal event so its stream keeps flowing.
+        let mut calls = calls;
+        match tokio::time::timeout(
+            options.response_timeout,
+            futures::future::try_join_all(calls.iter_mut().map(|call| call.preflight())),
+        ).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                yield Err(status(error));
+                return;
+            }
+            Err(_) => {
+                yield Err(Status::deadline_exceeded("Stream chunk timed out"));
+                return;
+            }
+        }
         let mut pending = FuturesUnordered::new();
         for (i, call) in calls.into_iter().enumerate() {
             pending.push(recv_indexed(i, call));
@@ -169,6 +184,15 @@ mod tests {
         let cases = [
             (
                 CoreError::InvalidArgument("bad".into()),
+                Code::InvalidArgument,
+            ),
+            (
+                CoreError::RuntimeRejected {
+                    kind: CoreErrorKind::InvalidArgument,
+                    message: "max_new_tokens=1024 exceeds the KV cache capacity".into(),
+                    legacy_http_status: 400,
+                    output: Box::default(),
+                },
                 Code::InvalidArgument,
             ),
             (
