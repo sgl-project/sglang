@@ -2,6 +2,7 @@ import inspect
 import logging
 from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union
 
+from sglang.srt.arg_groups.choices import removed_choice_message
 from sglang.srt.entrypoints.openai.protocol import (
     LegacyStructuralTagResponseFormat,
     StructuralTagResponseFormat,
@@ -89,7 +90,6 @@ class FunctionCallParser:
         "dots": DotsToolDetector,
         "ernie55": Ernie5_5Detector,
         "glm": Glm4MoeDetector,
-        "glm45": Glm4MoeDetector,
         "glm47": Glm47MoeDetector,
         "flint": Glm47MoeDetector,
         "gpt-oss": GptOssDetector,
@@ -107,7 +107,6 @@ class FunctionCallParser:
         "poolside_v1": PoolsideV1Detector,
         "pythonic": PythonicDetector,
         "qwen": Qwen25Detector,
-        "qwen25": Qwen25Detector,
         "qwen3_coder": Qwen3CoderDetector,
         "spark25": Spark25Detector,
         "step3": Step3Detector,
@@ -154,7 +153,10 @@ class FunctionCallParser:
                 kwargs["tools"] = self.structural_tag_tools()
             detector = detector_class(**kwargs)
         else:
-            raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
+            message = removed_choice_message("tool_call_parser", tool_call_parser)
+            raise ValueError(
+                message or f"Unsupported tool_call_parser: {tool_call_parser}"
+            )
 
         if isinstance(detector, Glm47MoeDetector):
             detector.use_full_assistant_constraint = not any(

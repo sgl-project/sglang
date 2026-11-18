@@ -64,7 +64,11 @@ class TestStartProfile(CustomTestCase):
         # scheduler in at::cuda::CUDAGraph::replay until the watchdog kills the
         # server. These tests cover the /start_profile request surface rather
         # than graph replay, so run them eagerly on HIP.
-        other_args = ["--disable-cuda-graph"] if is_hip() else []
+        other_args = (
+            ["--disable-decode-cuda-graph", "--disable-prefill-cuda-graph"]
+            if is_hip()
+            else []
+        )
         other_args += ADMIN_LAUNCH_ARGS_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,

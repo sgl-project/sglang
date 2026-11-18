@@ -155,9 +155,21 @@ def _jit_module(world_size: int) -> Module:
         cuda_files=["kimi_k3/comm/sp_collective.cuh"],
         cuda_wrappers=[
             ("reduce_scatter_res", f"{cls}::reduce_scatter_res"),
+            ("reduce_scatter_pushed", f"{cls}::reduce_scatter_pushed"),
             ("reduce_scatter_pull", f"{cls}::reduce_scatter_pull"),
             ("all_gather", f"{cls}::all_gather"),
+            ("all_gather_push", f"{cls}::all_gather_push"),
             ("all_gather_direct", f"{cls}::all_gather_direct"),
+            *(
+                [
+                    (
+                        "reduce_scatter_res_unrolled",
+                        f"{cls}::reduce_scatter_res_unrolled",
+                    ),
+                ]
+                if torch.version.hip
+                else []
+            ),
         ],
         extra_cuda_cflags=["-O3"],
     )
@@ -195,6 +207,40 @@ def _reduce_scatter_res_op(
 
 
 @register_custom_op(mutates_args=["output"])
+def _reduce_scatter_res_unrolled_op(
+    world_size: int,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    residual_is_local: bool,
+    num_blocks: int,
+    block_size: int,
+) -> None:
+    _jit_module(world_size).reduce_scatter_res_unrolled(
+        _COMMS.get(world_size),
+        input.view(-1),
+        output.view(-1),
+        None if residual is None else residual.view(-1),
+        residual_is_local,
+        num_blocks,
+        block_size,
+    )
+
+
+@register_custom_op(mutates_args=["output"])
+def _reduce_scatter_pushed_op(
+    world_size: int,
+    output: torch.Tensor,
+    num_blocks: int,
+    block_size: int,
+    unrolled: bool,
+) -> None:
+    _jit_module(world_size).reduce_scatter_pushed(
+        _COMMS.get(world_size), output.view(-1), num_blocks, block_size, unrolled
+    )
+
+
+@register_custom_op(mutates_args=["output"])
 def _reduce_scatter_pull_op(
     world_size: int,
     input: torch.Tensor,
@@ -226,6 +272,23 @@ def _all_gather_op(
     block_size: int,
 ) -> None:
     _jit_module(world_size).all_gather(
+        _COMMS.get(world_size),
+        input.view(-1),
+        output.view(-1),
+        num_blocks,
+        block_size,
+    )
+
+
+@register_custom_op(mutates_args=["output"])
+def _all_gather_push_op(
+    world_size: int,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    num_blocks: int,
+    block_size: int,
+) -> None:
+    _jit_module(world_size).all_gather_push(
         _COMMS.get(world_size),
         input.view(-1),
         output.view(-1),
@@ -274,6 +337,44 @@ def reduce_scatter_res(
     return output
 
 
+def reduce_scatter_res_unrolled(
+    world_size: int,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    residual: Optional[torch.Tensor] = None,
+    *,
+    tuning: Tuning = DEFAULT_TUNING,
+) -> torch.Tensor:
+    """ROCm ``reduce_scatter_res`` with peer-spread, unrolled pushes (one warp group per peer)."""
+    residual_is_local = residual is not None and residual.numel() == output.numel()
+    _reduce_scatter_res_unrolled_op(
+        world_size,
+        input,
+        output,
+        residual,
+        residual_is_local,
+        tuning.num_blocks,
+        tuning.block_size,
+    )
+    return output
+
+
+def reduce_scatter_pushed(
+    world_size: int,
+    output: torch.Tensor,
+    *,
+    tuning: Tuning = DEFAULT_TUNING,
+    unrolled: bool = False,
+) -> torch.Tensor:
+    """The reduction half of ``reduce_scatter_res`` (into this rank's shard ``output``) for partial rows a fused
+    producer already pushed into every owner's slot of the current phase (``sp_push_target``); ``unrolled``: the
+    ROCm ``reduce_scatter_res_unrolled`` reduction."""
+    _reduce_scatter_pushed_op(
+        world_size, output, tuning.num_blocks, tuning.block_size, unrolled
+    )
+    return output
+
+
 def reduce_scatter_pull(
     world_size: int,
     input: torch.Tensor,
@@ -305,6 +406,24 @@ def all_gather(
     tuning: Tuning = DEFAULT_TUNING,
 ) -> torch.Tensor:
     _all_gather_op(
+        world_size,
+        input,
+        output,
+        tuning.num_blocks,
+        tuning.block_size,
+    )
+    return output
+
+
+def all_gather_push(
+    world_size: int,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    tuning: Tuning = DEFAULT_TUNING,
+) -> torch.Tensor:
+    """``all_gather`` through unicast pushes, for push planes without multicast (ROCm)."""
+    _all_gather_push_op(
         world_size,
         input,
         output,

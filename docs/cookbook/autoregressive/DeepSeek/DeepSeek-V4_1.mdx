@@ -24,10 +24,10 @@ DeepSeek-V4.1 Flash support has **not shipped in an SGLang release yet**, so a s
 
 For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker).
 
-**NVIDIA GPUs** — every NVIDIA cell on this page uses the preview build `lmsysorg/sglang:dev-dsv41` (H200 / B200 / B300 / GB300); the command panel picks it automatically.
+**NVIDIA GPUs** — every NVIDIA cell on this page uses `lmsysorg/sglang:latest` (H200 / B200 / B300 / GB300); the command panel picks it automatically.
 
 ```bash Command
-docker pull lmsysorg/sglang:dev-dsv41
+docker pull lmsysorg/sglang:latest
 
 docker run --gpus all \
     --shm-size 32g \
@@ -35,7 +35,7 @@ docker run --gpus all \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<your-hf-token>" \
     --ipc=host \
-    lmsysorg/sglang:dev-dsv41 \
+    lmsysorg/sglang:latest \
     sglang serve <use args below>
 ```
 

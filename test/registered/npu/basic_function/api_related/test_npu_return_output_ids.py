@@ -34,7 +34,8 @@ class TestNpuReturnOutputIds(CustomTestCase):
         other_args = [
             "--attention-backend",
             "ascend",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
             "--return-output-ids",
         ]
         cls.process = popen_launch_server(

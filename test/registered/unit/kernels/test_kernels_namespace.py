@@ -334,6 +334,19 @@ def test_import_stays_metadata_only():
     assert "CLEAN" in r.stdout
 
 
+def test_minicpm_sala_package_exports_the_function_after_its_submodule():
+    """Importing get_block_table from the minicpm_sala package must give the function
+    even when the same-named submodule was imported first."""
+    code = (
+        "import sglang.kernels.ops.attention.minicpm_sala.get_block_table; "
+        "from sglang.kernels.ops.attention.minicpm_sala import get_block_table; "
+        "print(type(get_block_table).__name__)"
+    )
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "function"
+
+
 @pytest.mark.parametrize(
     "op, backend, device",
     [
@@ -360,6 +373,14 @@ def test_kimi_k3_kernels_are_inventoried_by_operator(op, backend, device):
 def test_router_gemv_is_inventoried_for_cuda_and_hip():
     """CUDA serves FP32 gates and ROCm gfx950 BF16 gates through one Triton GEMV."""
     spec = K.select_kernel("gemm.router_gemv", backend=KernelBackend.TRITON)
+    for platform in (_SM90, _HIP):
+        assert K.capabilities_satisfied(spec.capabilities, platform)
+    assert not K.capabilities_satisfied(spec.capabilities, _CPU)
+
+
+def test_softcap_row_argmax_is_inventoried_for_cuda_and_hip():
+    """The op has its own ROCm split path and its caller runs it on HIP."""
+    spec = K.registry.get_backend("sampling.softcap_row_argmax", KernelBackend.TRITON)
     for platform in (_SM90, _HIP):
         assert K.capabilities_satisfied(spec.capabilities, platform)
     assert not K.capabilities_satisfied(spec.capabilities, _CPU)

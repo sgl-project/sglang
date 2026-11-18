@@ -411,6 +411,25 @@ def handle_tag_run_ci(
     return True
 
 
+PR_STATES_WORKFLOW_FILE = "pr-states.yml"
+
+
+def _refresh_pr_states(gh_repo, pr):
+    """Redraw the CI-states block in the PR body after a command.
+
+    Labels added with GITHUB_TOKEN start no `labeled` run, and a rerun raises
+    no `workflow_run` `requested` event, so pr-states.yml would keep the old
+    block until the rerun finishes. workflow_dispatch is the event
+    GITHUB_TOKEN can still start.
+    """
+    try:
+        gh_repo.get_workflow(PR_STATES_WORKFLOW_FILE).create_dispatch(
+            gh_repo.default_branch, {"pr_number": str(pr.number)}, throw=True
+        )
+    except Exception as e:
+        print(f"Could not refresh the CI-states block: {e}")
+
+
 def _latest_run_per_workflow(runs):
     """
     Collapse a head_sha's workflow runs to the newest run per workflow.
@@ -764,6 +783,7 @@ def handle_run_hardware_ci(gh_repo, pr, comment, user_perms, selected_tiers):
         skip_missing=not tier_labels,
         optional_workflows=set(workflow_files) - required_workflows,
     )
+    _refresh_pr_states(gh_repo, pr)
     pr.create_issue_comment(message)
     comment.create_reaction("+1" if acted else "confused")
     return acted
@@ -2118,13 +2138,15 @@ def main():
     tier_labels = [tiers[name]["label"] for name in tier_names if tiers[name]["label"]]
 
     if is_tag:
-        handle_tag_run_ci(repo, pr, comment, user_perms, tier_labels=tier_labels)
+        if handle_tag_run_ci(repo, pr, comment, user_perms, tier_labels=tier_labels):
+            _refresh_pr_states(repo, pr)
 
     elif first_line.startswith("/run-cpu-ci"):
         handle_run_cpu_ci(repo, pr, comment, user_perms, token)
 
     elif first_line.startswith("/rerun-failed-ci"):
-        handle_rerun_failed_ci(repo, pr, comment, user_perms)
+        if handle_rerun_failed_ci(repo, pr, comment, user_perms):
+            _refresh_pr_states(repo, pr)
 
     elif is_tag_and_rerun:
         # Perform both actions, but suppress individual reactions
@@ -2150,6 +2172,7 @@ def main():
 
         # If at least one action was successful, add the reaction here
         if tagged or rerun:
+            _refresh_pr_states(repo, pr)
             comment.create_reaction("+1")
             print("Combined command processed successfully; reaction added.")
         else:

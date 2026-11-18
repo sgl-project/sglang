@@ -15,6 +15,7 @@
 
 import dataclasses
 import logging
+import os
 from contextlib import contextmanager
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
@@ -122,6 +123,27 @@ def _runtime_optimized_vocab_shards_enabled() -> bool:
 VERIFY_VOCAB_SHARDS = "vocab_shards"
 VERIFY_FULL_LOGITS = "full_logits"
 VERIFY_LOGITS_VARIANTS = (VERIFY_VOCAB_SHARDS, VERIFY_FULL_LOGITS)
+
+_GFX1250_LMHEAD = None
+
+
+def _gfx1250_lmhead_applies(x: torch.Tensor, w: torch.Tensor) -> bool:
+    """gfx1250: split-K Triton FP32-output lm_head for decode widths."""
+    global _GFX1250_LMHEAD
+    if _GFX1250_LMHEAD is None:
+        try:
+            _GFX1250_LMHEAD = os.environ.get(
+                "SGLANG_ROCM_MUSE_GFX1250_LMHEAD", "1"
+            ) == "1" and (
+                "gfx1250" in torch.cuda.get_device_properties(x.device).gcnArchName
+            )
+        except Exception:
+            _GFX1250_LMHEAD = False
+    if not _GFX1250_LMHEAD:
+        return False
+    from sglang.kernels.ops.gemm.lmhead_splitk_fp32 import applies, wide_applies
+
+    return applies(x, w) or wide_applies(x, w)
 
 
 class SamplingMaskStatus(IntEnum):
@@ -1395,12 +1417,23 @@ class LogitsProcessor(nn.Module):
             if use_mm_out_dtype and (
                 self.use_fp32_lm_head or self.use_fp32_lm_head_output
             ):
-                logits = torch.mm(
-                    hidden_states,
-                    lm_head.weight.T,
-                    out_dtype=torch.float32,
-                    out=out,
-                )
+                if out is None and _gfx1250_lmhead_applies(
+                    hidden_states, lm_head.weight
+                ):
+                    # gfx1250: hipBLASLt's FP32-output pick is slow at decode
+                    # widths; split-K Triton head instead.
+                    from sglang.kernels.ops.gemm.lmhead_splitk_fp32 import (
+                        lmhead_fp32,
+                    )
+
+                    logits = lmhead_fp32(hidden_states, lm_head.weight)
+                else:
+                    logits = torch.mm(
+                        hidden_states,
+                        lm_head.weight.T,
+                        out_dtype=torch.float32,
+                        out=out,
+                    )
             elif self.use_fp32_lm_head:
                 logits = torch.matmul(
                     hidden_states.to(torch.float32),

@@ -18,6 +18,7 @@ from sglang.srt.arg_groups.choices import (
     LOAD_FORMAT_CHOICES,
     MOE_RUNNER_BACKEND_CHOICES,
     QUANTIZATION_CHOICES,
+    reject_removed_choice,
 )
 
 
@@ -138,6 +139,7 @@ class Spec(msgspec.Struct):
         Optional[str],
         Arg(
             help="Attention backend for speculative decoding drafting.",
+            type_parser=reject_removed_choice("speculative_draft_attention_backend"),
             resolvable=True,
         ),
     ] = None
@@ -205,7 +207,8 @@ class Spec(msgspec.Struct):
     speculative_moe_a2a_backend: A[
         Optional[str],
         Arg(
-            help="Choose the backend for MoE A2A in speculative decoding. Defaults to --moe-a2a-backend, except flashinfer_megamoe defaults the draft to none (draft layers are typically unquantized, which flashinfer_megamoe's global-expert-id dispatch doesn't support). ascend_ops is supported on NPU and uses --moe-ascend-ops-config. 'flashinfer' is a deprecated alias for 'flashinfer_nvlink_one_sided'.",
+            help="Choose the backend for MoE A2A in speculative decoding. Defaults to --moe-a2a-backend, except flashinfer_megamoe defaults the draft to none (draft layers are typically unquantized, which flashinfer_megamoe's global-expert-id dispatch doesn't support). ascend_ops is supported on NPU and uses --moe-ascend-ops-config.",
+            type_parser=reject_removed_choice("speculative_moe_a2a_backend"),
             choices=[
                 "none",
                 "deepep",
@@ -214,7 +217,6 @@ class Spec(msgspec.Struct):
                 "mori",
                 "ascend_fuseep",
                 "flashinfer_nvlink_one_sided",
-                "flashinfer",  # Deprecated alias for "flashinfer_nvlink_one_sided"
                 "megamoe",
                 "deepep_v2",
                 "pplx",

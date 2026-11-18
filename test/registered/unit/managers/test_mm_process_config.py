@@ -102,7 +102,6 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
             tokenizer_worker_num=1,
             trust_mm_content_hashes=False,
             media_url_max_file_size_mb=64,
-            disable_fast_image_processor=False,
         )
 
         hf_config = MagicMock()
@@ -290,7 +289,6 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
         return SimpleNamespace(
             mm_feature_transport=mm_feature_transport,
             image_processor_backend="auto",
-            disable_fast_image_processor=False,
             skip_tokenizer_init=False,
             mm_process_config={},
             mm_preprocess_cache_size_mb=0,
@@ -722,7 +720,6 @@ class TestProcessMmDataKwargs(CustomTestCase):
         server_args = MagicMock()
         server_args.mm_process_config = mm_process_config
         server_args.mm_feature_transport = "cpu"
-        server_args.disable_fast_image_processor = True
         server_args.skip_tokenizer_init = False
 
         mock_processor = MagicMock()
@@ -744,7 +741,7 @@ class TestProcessMmDataKwargs(CustomTestCase):
         proc._feature_transport = MultimodalFeatureTransport(
             server_args.mm_feature_transport, base_gpu_id=0, skip_mm_pool=True
         )
-        proc.disable_fast_image_processor = server_args.disable_fast_image_processor
+        proc.disable_fast_image_processor = True
         proc.skip_tokenizer_init = server_args.skip_tokenizer_init
         proc._processor = mock_processor
         proc._tokenizer = MagicMock()
@@ -862,7 +859,6 @@ class TestOverrideProcessorsConfigInjection(CustomTestCase):
         server_args = MagicMock()
         server_args.mm_process_config = mm_process_config
         server_args.mm_feature_transport = "cpu"
-        server_args.disable_fast_image_processor = True
         server_args.skip_tokenizer_init = False
 
         mock_hf_processor = MagicMock()
@@ -878,7 +874,7 @@ class TestOverrideProcessorsConfigInjection(CustomTestCase):
         proc._feature_transport = MultimodalFeatureTransport(
             server_args.mm_feature_transport, base_gpu_id=0, skip_mm_pool=True
         )
-        proc.disable_fast_image_processor = server_args.disable_fast_image_processor
+        proc.disable_fast_image_processor = True
         proc.skip_tokenizer_init = server_args.skip_tokenizer_init
         proc._processor = mock_hf_processor
         proc._tokenizer = mock_hf_processor.tokenizer
@@ -947,7 +943,7 @@ class TestOverrideProcessorsConfigInjection(CustomTestCase):
 
 class TestQwenVideoConfigRouting(CustomTestCase):
     def test_preprocessed_video_drops_sglang_owned_config(self):
-        from sglang.srt.multimodal.processors.qwen_vl import (
+        from sglang.srt.multimodal.qwen_vl_media_processing import (
             _get_processor_video_config,
         )
 
@@ -964,7 +960,7 @@ class TestQwenVideoConfigRouting(CustomTestCase):
         self.assertEqual(processor_config, {"do_normalize": False})
 
     def test_unprocessed_video_uses_original_config(self):
-        from sglang.srt.multimodal.processors.qwen_vl import (
+        from sglang.srt.multimodal.qwen_vl_media_processing import (
             _get_processor_video_config,
         )
 
@@ -1002,7 +998,6 @@ class TestDoubleBosGuard(CustomTestCase):
         server_args = MagicMock()
         server_args.mm_processor_worker_num = 0
         server_args.mm_io_worker_num = 0
-        server_args.disable_fast_image_processor = True
         server_args.mm_preprocess_cache_size_mb = None
         server_args.tokenizer_worker_num = 1
         server_args.trust_mm_content_hashes = False

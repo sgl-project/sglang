@@ -485,7 +485,7 @@ python -m sglang.launch_server \
 ```
 
 ```bash Monokernels (low concurrency)
-  --monokernel-backend amd \
+  --enable-amd-monokernel \
   --max-running-requests 2 \
   --cuda-graph-max-bs-decode 2 \
   --prefill-decode-interval 64 \

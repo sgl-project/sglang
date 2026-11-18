@@ -27,10 +27,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
-from sglang.srt.hf_transformers import (
-    get_processor,
-    resolve_image_processor_backend,
-)
+from sglang.srt.hf_transformers import get_processor
 from sglang.srt.managers.io_struct import (
     EncoderDispatchErrorReq,
     GenerateReqInput,
@@ -2023,7 +2020,7 @@ class MMReceiverBase(ABC):
             tokenizer_mode=get_serving().tokenizer_mode,
             trust_remote_code=get_model().trust_remote_code,
             revision=get_model().revision,
-            image_processor_backend=resolve_image_processor_backend(get_mm()),
+            image_processor_backend=get_mm().image_processor_backend,
             **extra_kwargs,
         )
 

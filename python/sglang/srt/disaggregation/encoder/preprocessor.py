@@ -20,7 +20,6 @@ from transformers import AutoProcessor
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.environ import envs
-from sglang.srt.hf_transformers import resolve_image_processor_backend
 from sglang.srt.multimodal.cache import parse_content_hash, snapshot_media
 from sglang.srt.multimodal.encoder_preprocessing import (
     EncoderMediaProcessorConfig,
@@ -139,8 +138,7 @@ class EncoderPreprocessor:
 
         use_image_processor_gpu = envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get()
         self.use_image_processor_gpu = (
-            use_image_processor_gpu
-            and resolve_image_processor_backend(get_mm()) != "pil"
+            use_image_processor_gpu and get_mm().image_processor_backend != "pil"
         )
 
         self._load_mm_processor(server_args)
@@ -171,7 +169,7 @@ class EncoderPreprocessor:
     def _load_mm_processor(self, server_args: ServerArgs):
         from transformers import AutoImageProcessor, AutoVideoProcessor
 
-        image_processor_backend = resolve_image_processor_backend(get_mm())
+        image_processor_backend = get_mm().image_processor_backend
         image_processor_kwargs = (
             {}
             if image_processor_backend == "auto"

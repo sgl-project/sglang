@@ -74,8 +74,9 @@ export const GLMOCRDeployment = () => {
 
     const modelName = 'zai-org/GLM-OCR';
 
-    let cmd = 'SGLANG_USE_CUDA_IPC_TRANSPORT=1 python -m sglang.launch_server \\\n';
+    let cmd = 'python -m sglang.launch_server \\\n';
     cmd += `  --model ${modelName}`;
+    cmd += ` \\\n  --mm-feature-transport cuda_ipc`;
 
     if (strategyArray.includes('mtp')) {
       cmd += ` \\\n  --speculative-algorithm EAGLE`;
