@@ -752,7 +752,9 @@ def link_row_sharded_stream_hip(model) -> None:
         layer = model.layers[i]
         if isinstance(layer.mlp, KimiK3MoEHipMixin):
             layer.mlp._row_stream = later_on_shards
-        later_on_shards = later_on_shards and layer._row_shards is not None
+        # set by row_shard_bank_hooks_hip, which a layer without a bank skips
+        row_shards = getattr(layer, "_row_shards", None)
+        later_on_shards = later_on_shards and row_shards is not None
 
 
 def link_hip_paths(model) -> None:

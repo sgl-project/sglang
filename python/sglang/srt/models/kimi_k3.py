@@ -3023,9 +3023,6 @@ def _stage_facts(
 class KimiK3DecoderLayer(nn.Module):
     """Decoder layer carrying the K3 attention-residual stream."""
 
-    # gfx950 row-sharded FFN read (row_shard_bank_hooks_hip)
-    _row_shards = None
-
     def __init__(
         self,
         config: KimiLinearConfig,
