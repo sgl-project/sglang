@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.dflash_draft_ring import DFlashDraftKVRing
 
 
 def init_draft_backend(backend: TritonAttnBackend, model_runner: ModelRunner) -> None:
@@ -43,7 +44,7 @@ def init_draft_backend(backend: TritonAttnBackend, model_runner: ModelRunner) ->
 
         backend.verify_mla_draft_fwd = torch.compiler.disable(verify_mla_draft_fwd)
     if algorithm.is_dflash() and backend.use_mla and backend.dcp_size > 1:
-        backend.mla_dcp_window_verify = MlaDcpWindowVerify(backend, model_runner)
+        backend.mla_dcp_window_verify = MlaDcpWindowVerify(backend)
         # Each layer applies its own window there, so the backend builds no
         # window rail.
         backend.sliding_window_size = None
@@ -82,10 +83,10 @@ class MlaDcpWindowVerify:
     Read window rows from req_to_token or the draft ring, without a global prefix rail.
     """
 
-    def __init__(self, backend: TritonAttnBackend, model_runner: ModelRunner):
+    def __init__(self, backend: TritonAttnBackend):
         self.backend = backend
-        # The DFLASH worker attaches the draft KV ring after the backends exist.
-        self.draft_runner = model_runner
+        # The DFLASH worker hands the ring over (set_draft_kv_ring) after the backends exist.
+        self.draft_kv_ring: Optional[DFlashDraftKVRing] = None
         # Built at the first sliding layer of a forward and reused by the next ones:
         # (forward_batch, layer_id, window, indices, counts).
         self._index_cache = None
@@ -104,7 +105,7 @@ class MlaDcpWindowVerify:
             indices, counts = cache[3], cache[4]
         else:
             backend = self.backend
-            ring = self.draft_runner.draft_kv_ring
+            ring = self.draft_kv_ring
             indices, counts = mla_window_sparse_indices(
                 req_to_token=backend.req_to_token,
                 req_pool_indices=forward_batch.req_pool_indices,
