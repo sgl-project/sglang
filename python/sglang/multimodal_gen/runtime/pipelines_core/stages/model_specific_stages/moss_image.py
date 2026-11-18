@@ -194,6 +194,11 @@ class MOSSImageDenoisingStage(DenoisingStage):
         with set_forward_context(0, None):
             for branch in ctx.cfg_policy.branches:
                 kwargs = branch.kwargs
+                # A wider GEMM may change BF16 rounding; keep exact/lossless
+                # requests on the separate checkpoint projections.
+                kwargs["fuse_qkv"] = quality_allows(
+                    batch.sampling_params.quality, "high"
+                )
                 kwargs["prepared_conditioning"] = self.transformer.prepare_conditioning(
                     kwargs["encoder_hidden_states"],
                     kwargs.get("encoder_attention_mask"),

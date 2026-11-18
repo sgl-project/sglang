@@ -14,7 +14,7 @@ from sglang.multimodal_gen.runtime.models.dits import qwen_image21
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is not None,
@@ -114,7 +114,14 @@ def assert_bits_equal(actual, expected):
 
 @torch.no_grad()
 @pytest.mark.parametrize(
-    "shape", [(1, 4096, 32, 128), (1, 18, 32, 128), (2, 17, 4, 128), (1, 1, 1, 128)]
+    "shape",
+    [
+        (1, 4096, 32, 128),
+        (1, 18, 32, 128),
+        (2, 17, 4, 128),
+        (1, 9, 6, 128),
+        (1, 1, 1, 128),
+    ],
 )
 @pytest.mark.parametrize("amplitude", [1e-3, 1.0, 40.0])
 def test_norm_rope_matches_eager(shape, amplitude):
@@ -156,7 +163,9 @@ def _pack_inputs(batch, seq, prefix, heads):
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("batch,seq,prefix,heads", [(1, 4096, 18, 32), (2, 17, 5, 4)])
+@pytest.mark.parametrize(
+    "batch,seq,prefix,heads", [(1, 4096, 18, 32), (2, 17, 5, 4), (2, 9, 3, 6)]
+)
 @pytest.mark.parametrize("in_place", [False, True])
 def test_pack_matches_eager(batch, seq, prefix, heads, in_place):
     q, k, v, kp, vp, rope = _pack_inputs(batch, seq, prefix, heads)

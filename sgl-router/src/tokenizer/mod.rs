@@ -156,6 +156,7 @@ impl TokenizerRegistry {
             always_thinks: false,
             reasoning_toggle: None,
             chat_encoding_spec: None,
+            deepseek: None,
         };
         me.inner.insert(m.id.clone(), t);
         me.stats = stats;
@@ -168,7 +169,9 @@ impl TokenizerRegistry {
             .ok();
         match ChatFormatter::load_from(&m.id, &files) {
             Ok(Some(formatter)) => {
-                let formatter = formatter.with_defaults(&m.default_chat_template_kwargs);
+                let formatter = formatter
+                    .with_defaults(&m.default_chat_template_kwargs)
+                    .with_prompt_affixes(me.prompt_affixes.as_ref());
                 me.chat_model.always_thinks = formatter.always_thinks();
                 me.chat_model.reasoning_toggle =
                     formatter
@@ -177,8 +180,11 @@ impl TokenizerRegistry {
                             toggle_param: toggle_param.into(),
                             default_enabled,
                         });
-                if formatter.is_kimi_k3() {
-                    me.chat_model.chat_encoding_spec = Some("kimi_k3".into());
+                // Kimi-K3's encoding spec, or DeepSeek's with the checkpoint its output is parsed with.
+                if let Some(processor) = formatter.processor() {
+                    let model = ChatModel::for_formatter(processor);
+                    me.chat_model.chat_encoding_spec = model.chat_encoding_spec;
+                    me.chat_model.deepseek = model.deepseek;
                 }
                 me.formatters
                     .insert(m.id.clone(), Arc::new(ChatFormatterEntry::new(formatter)));
@@ -201,8 +207,9 @@ impl TokenizerRegistry {
                      and SGLANG_DSV4_REASONING_EFFORT or SGLANG_DSV41_REASONING_EFFORT"),
                 ForwardingScope::Guarded => tracing::warn!(model = %m.id,
                     "UNVERIFIED input_ids forwarding: router rendering is verified against SGLang only \
-                     for DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3 and Qwen3.8, so this model forwards only guarded shapes (plain text \
-                     chat). Requires the workers' model files and --default-chat-template-kwargs; \
+                     for DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3, MiniMax-M3, Qwen3.8 and StepFun, so this \
+                     model forwards only guarded shapes (plain text chat). Requires the workers' \
+                     model files and --default-chat-template-kwargs; \
                      worker parser overrides, content-format detection, and conversation-template stop \
                      strings are not replicated. Pass --disable-input-ids-forwarding unless you have \
                      verified parity for this model"),
@@ -230,10 +237,23 @@ impl TokenizerRegistry {
 
     /// Encode a raw prompt as the engine's `tokenizer(text)` does, special tokens included.
     pub fn encode_prompt(&self, model_id: &str, text: &str) -> Option<Vec<u32>> {
+        if !self.can_encode_prompt(model_id) {
+            return None;
+        }
+        crate::off_worker::run(|| self.encode_prompt_now(model_id, text))
+    }
+
+    /// Whether [`Self::encode_prompt`] can tokenize for `model_id`; callers check
+    /// it before handing a batch off the worker for nothing.
+    pub fn can_encode_prompt(&self, model_id: &str) -> bool {
+        self.prompt_affixes.is_some() && self.inner.contains_key(model_id)
+    }
+
+    fn encode_prompt_now(&self, model_id: &str, text: &str) -> Option<Vec<u32>> {
         let affixes = self.prompt_affixes.as_ref()?;
         let tokenizer = self.get(model_id)?;
         // The supported tiktoken models use Kimi's chunked encoding, also used for chat.
-        let ids = if self.stats.backend() == stats::EncodeBackend::Tiktoken {
+        let ids = if self.stats.backend().is_tiktoken() {
             kimi::encode(&tokenizer, &[EncodeSegment::control(text)])
         } else {
             adapter::encode(&tokenizer, text)
@@ -248,6 +268,13 @@ impl TokenizerRegistry {
         self.formatters.contains_key(model_id)
     }
 
+    /// Whether `model_id` is MiniMax-M3.1 (see [`ChatFormatter::is_minimax_m31`]).
+    pub fn is_minimax_m31(&self, model_id: &str) -> bool {
+        self.formatters
+            .get(model_id)
+            .is_some_and(|e| e.formatter.is_minimax_m31())
+    }
+
     pub fn forwarding_scope(&self, model_id: &str) -> ForwardingScope {
         self.formatters
             .get(model_id)
@@ -256,6 +283,10 @@ impl TokenizerRegistry {
 
     /// Render with dynamo-render and tokenize; return `None` when unavailable or unsuccessful.
     pub fn encode_chat(&self, model_id: &str, request: &serde_json::Value) -> Option<Vec<u32>> {
+        crate::off_worker::run(|| self.encode_chat_now(model_id, request))
+    }
+
+    fn encode_chat_now(&self, model_id: &str, request: &serde_json::Value) -> Option<Vec<u32>> {
         // Clone the Arc and drop the DashMap guard before the CPU-bound
         // render+encode (mirrors `get`), so no shard read-lock is held across it.
         let entry = Arc::clone(&*self.formatters.get(model_id)?);
@@ -319,6 +350,7 @@ mod tests {
             },
             observability: Default::default(),
             model: crate::config::ModelConfig {
+                aliases: Vec::new(),
                 id: "tiny".into(),
                 tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
                 disable_input_ids_forwarding: false,
@@ -506,7 +538,12 @@ mod tests {
     fn chat_formatter_load_preserves_native_precedence() {
         let dir = tempfile::tempdir().unwrap();
         let tok = dir.path().join("tokenizer.json");
-        std::fs::write(&tok, "{}").unwrap();
+        // DeepSeek-V4 loads the checkpoint tokenizer, so it must parse.
+        std::fs::write(
+            &tok,
+            include_str!("../../tests/fixtures/tiny_tokenizer.json"),
+        )
+        .unwrap();
         std::fs::write(dir.path().join("chat_template.jinja"), "T").unwrap();
         let resolve = |model_type: &str| {
             let cfg = serde_json::json!({ "model_type": model_type }).to_string();
@@ -660,6 +697,38 @@ mod tests {
         assert!(
             reg.encode_chat("tiny", &request).is_none(),
             "a failing render must yield None so routing falls back to raw text"
+        );
+    }
+
+    /// A slow chat render keeps the runtime serving: with ONE worker, an
+    /// `encode_chat` from a spawned task must not keep another task's timer
+    /// from firing, whatever task calls it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn slow_chat_encode_leaves_the_runtime_serving() {
+        use crate::off_worker::test_support::{
+            slow_chat_body, slow_template_dir, time_beside_a_timer,
+        };
+        use std::time::Duration;
+
+        let dir = slow_template_dir();
+        let mut config = cfg();
+        config.model.tokenizer_path =
+            Some(dir.path().join("tokenizer.json").to_str().unwrap().into());
+        let registry = Arc::new(TokenizerRegistry::load_from_config(&config).unwrap());
+        let body = slow_chat_body(
+            |b| assert!(registry.encode_chat("tiny", b).is_some()),
+            Duration::from_millis(400),
+        );
+        let (took, ticked_after) = time_beside_a_timer(move || async move {
+            assert!(
+                registry.encode_chat("tiny", &body).is_some(),
+                "rendered nothing"
+            );
+        })
+        .await;
+        assert!(
+            ticked_after < took / 2,
+            "timer task waited {ticked_after:?} while the encode took {took:?}"
         );
     }
 }

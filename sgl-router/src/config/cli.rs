@@ -67,6 +67,11 @@ pub struct ModelArgs {
     #[arg(long)]
     pub model_id: String,
 
+    /// Extra `model` value rewritten to --model-id in the forwarded body (repeatable),
+    /// preserving a LoRA suffix. /v1/models lists only --model-id.
+    #[arg(long = "model-alias", value_name = "MODEL")]
+    pub model_alias: Vec<String>,
+
     /// Local tokenizer.json or HuggingFace repo id. Defaults to --model-id; honors HF_TOKEN / HF_HOME.
     #[arg(long)]
     pub tokenizer_path: Option<String>,
@@ -169,7 +174,7 @@ pub struct ServerArgs {
     /// Upper bound on the backoff between retries, in milliseconds.
     #[arg(long, default_value_t = ProxyConfig::default().max_backoff_ms)]
     pub retry_max_backoff_ms: u64,
-    /// PD: return decode's stream only once prefill completes, as sgl-model-gateway does.
+    /// PD: return decode's stream only once prefill completes.
     #[arg(long)]
     pub pd_stream_after_prefill: bool,
 
@@ -261,7 +266,8 @@ pub struct RoutingArgs {
     pub dp_aware: bool,
 
     /// How --dp-aware picks a rank that no routing key or cached prefix decides,
-    /// which in PD mode is every decode rank. Defaults to least_in_flight.
+    /// which in PD mode is every decode rank. Defaults to least_in_flight;
+    /// least_tokens needs the engine's --load-publish-endpoint feed.
     #[arg(long, value_enum, requires = "dp_aware")]
     pub dp_rank_policy: Option<DpRankPolicy>,
 
@@ -332,6 +338,26 @@ pub struct CacheArgs {
     /// sharing a cold prefix lands together. Requires the radix_tree provider.
     #[arg(long)]
     pub cache_pending_prefix_ttl_ms: Option<u64>,
+
+    /// Max requests one pending stake may attract within its TTL. Past the
+    /// cap the stake is ignored: the request is routed as if it did not
+    /// exist, by its confirmed KV-event matches or else by the load policy,
+    /// so a burst sharing a cold prefix stops piling onto one worker.
+    /// 0 (default) leaves it unbounded. Requires --cache-pending-prefix-ttl-ms.
+    #[arg(long)]
+    pub cache_pending_prefix_max_followers: Option<u64>,
+
+    /// Confirmed-first pending prefixes: a stake counts only where it is
+    /// strictly deeper than the confirmed KV-event match, and the pending
+    /// store is consulted and staked only while the confirmed match covers
+    /// less than this share of the prompt (above 0, at most 1; 1 = always
+    /// consult; to switch the tier off, unset the TTL instead). A
+    /// warm turn routes on its confirmed history and pays nothing for the
+    /// tier. Unset keeps the original behavior: pending depths merge with the
+    /// confirmed ones by maximum on every request. Requires
+    /// --cache-pending-prefix-ttl-ms; 0.5 is a good starting point.
+    #[arg(long)]
+    pub cache_pending_prefix_consult_below: Option<f64>,
 
     /// External KV indexer gRPC endpoint used as the authoritative cache signal.
     /// Needs an explicit scheme, e.g. `http://10.0.0.1:50051`.
@@ -638,6 +664,7 @@ impl Cli {
                         .unwrap_or_else(|| self.model.model_id.clone())
                 }),
                 id: self.model.model_id,
+                aliases: self.model.model_alias,
                 disable_input_ids_forwarding: self.model.disable_input_ids_forwarding,
                 tokenizer: TokenizerConfig {
                     backend: self.model.tokenizer_backend,
@@ -892,6 +919,21 @@ impl CacheArgs {
                     && cache_prefix_provider == CachePrefixProvider::RadixTree),
             "--cache-pending-prefix-ttl-ms requires --policy cache_aware with the radix_tree prefix provider"
         );
+        ensure!(
+            self.cache_pending_prefix_max_followers.is_none()
+                || self.cache_pending_prefix_ttl_ms.is_some(),
+            "--cache-pending-prefix-max-followers requires --cache-pending-prefix-ttl-ms"
+        );
+        ensure!(
+            self.cache_pending_prefix_consult_below.is_none()
+                || self.cache_pending_prefix_ttl_ms.is_some(),
+            "--cache-pending-prefix-consult-below requires --cache-pending-prefix-ttl-ms"
+        );
+        ensure!(
+            self.cache_pending_prefix_consult_below
+                .is_none_or(|r| r > 0.0 && r <= 1.0),
+            "--cache-pending-prefix-consult-below must be above 0 and at most 1 (0 would never consult the tier; unset --cache-pending-prefix-ttl-ms to switch it off)"
+        );
         let cache_aware_uses_indexer = policy == PolicyKind::CacheAware
             && cache_prefix_provider == CachePrefixProvider::Indexer;
         if self.kv_indexer_endpoint.is_some() && !cache_aware_uses_indexer {
@@ -930,6 +972,8 @@ impl CacheArgs {
                 .unwrap_or(DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS),
             bootstrap_seed_required: self.kv_bootstrap_seed_required,
             pending_prefix_ttl_ms: self.cache_pending_prefix_ttl_ms.unwrap_or(0),
+            pending_prefix_max_followers: self.cache_pending_prefix_max_followers.unwrap_or(0),
+            pending_prefix_consult_below: self.cache_pending_prefix_consult_below,
         }))
     }
 }
@@ -1509,6 +1553,23 @@ mod tests {
         .unwrap();
         assert_eq!(c.model.id, "Qwen/Qwen3-0.6B");
         assert_eq!(c.model.tokenizer_path.as_deref(), Some("Qwen/Qwen3-0.6B"));
+        assert!(c.model.aliases.is_empty());
+    }
+
+    #[test]
+    fn model_alias_is_repeatable() {
+        let c = into_config(&[
+            "--model-id",
+            "org/repo",
+            "--model-alias",
+            "/weights-repo/snapshots/abc",
+            "--model-alias",
+            "repo",
+            "--worker-urls",
+            "http://x:30000",
+        ])
+        .unwrap();
+        assert_eq!(c.model.aliases, ["/weights-repo/snapshots/abc", "repo"]);
     }
 
     #[test]
@@ -1840,7 +1901,7 @@ mod tests {
     }
 
     /// Multiple `--selector` terms AND-join into one comma-separated
-    /// label selector (matches the Python router's space-separated form).
+    /// label selector.
     #[test]
     fn k8s_plain_selector_joins_multiple_terms() {
         let c = into_config_owned(with_model(&[
@@ -3006,6 +3067,66 @@ mod tests {
     }
 
     #[test]
+    fn pending_prefix_consult_below_defaults_and_validates() {
+        let cache = cfg_of("--policy cache_aware --cache-pending-prefix-ttl-ms 500")
+            .unwrap()
+            .model
+            .cache_aware
+            .unwrap();
+        assert_eq!(
+            cache.pending_prefix_consult_below, None,
+            "off unless asked for"
+        );
+        let cache = cfg_of(
+            "--policy cache_aware --cache-pending-prefix-ttl-ms 500 \
+             --cache-pending-prefix-consult-below 1",
+        )
+        .unwrap()
+        .model
+        .cache_aware
+        .unwrap();
+        assert_eq!(cache.pending_prefix_consult_below, Some(1.0));
+        for args in [
+            "--policy cache_aware --cache-pending-prefix-consult-below 0.5",
+            "--policy cache_aware --cache-pending-prefix-ttl-ms 500 --cache-pending-prefix-consult-below 1.5",
+            "--policy cache_aware --cache-pending-prefix-ttl-ms 500 --cache-pending-prefix-consult-below 0",
+            "--policy cache_aware --cache-pending-prefix-ttl-ms 500 --cache-pending-prefix-consult-below NaN",
+        ] {
+            let err = cfg_of(args).unwrap_err().to_string();
+            assert!(err.contains("--cache-pending-prefix-consult-below"), "{args}: {err}");
+        }
+    }
+
+    #[test]
+    fn pending_prefix_max_followers_rides_on_the_ttl() {
+        let cache = cfg_of(
+            "--policy cache_aware --cache-pending-prefix-ttl-ms 500 \
+             --cache-pending-prefix-max-followers 8",
+        )
+        .unwrap()
+        .model
+        .cache_aware
+        .unwrap();
+        assert_eq!(cache.pending_prefix_max_followers, 8);
+        let unset = cfg_of("--policy cache_aware --cache-pending-prefix-ttl-ms 500")
+            .unwrap()
+            .model
+            .cache_aware
+            .unwrap();
+        assert_eq!(
+            unset.pending_prefix_max_followers, 0,
+            "unbounded by default"
+        );
+        let err = cfg_of("--policy cache_aware --cache-pending-prefix-max-followers 8")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--cache-pending-prefix-max-followers"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn pending_prefix_ttl_needs_the_local_radix_tree() {
         let cache = cfg_of("--policy cache_aware --cache-pending-prefix-ttl-ms 500")
             .unwrap()
@@ -3036,6 +3157,25 @@ mod tests {
             legacy_config.model.decode_policy,
             DecodePolicyKind::LegacyHostAffinity
         );
+    }
+
+    #[test]
+    fn dp_rank_policy_requires_dp_aware_and_accepts_least_tokens() {
+        assert_eq!(
+            cfg_of("--policy power_of_two --dp-aware")
+                .unwrap()
+                .model
+                .dp_rank_policy,
+            DpRankPolicy::LeastInFlight
+        );
+        assert_eq!(
+            cfg_of("--policy power_of_two --dp-aware --dp-rank-policy least_tokens")
+                .unwrap()
+                .model
+                .dp_rank_policy,
+            DpRankPolicy::LeastTokens
+        );
+        assert!(cfg_of("--policy power_of_two --dp-rank-policy least_tokens").is_err());
     }
 
     #[test]

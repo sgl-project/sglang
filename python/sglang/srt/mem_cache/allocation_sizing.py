@@ -1,11 +1,22 @@
 from __future__ import annotations
 
+import functools
+import logging
+from typing import TYPE_CHECKING, List
+
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.capacity import tokens_fit
 from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_spec,
     max_speculative_num_draft_tokens,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+logger = logging.getLogger(__name__)
 
 
 def get_mamba_tracking_slots(
@@ -91,6 +102,58 @@ def page_aligned_decode_alloc_lens(
         nxt_kv_lens[i] = nxt
         num_needed_tokens += nxt - cur
     return cur_kv_lens, nxt_kv_lens, num_needed_tokens
+
+
+@functools.cache
+def _spec_decode_headroom_pages(hisparse: bool) -> int:
+    pages = envs.SGLANG_OPT_SPEC_DECODE_HEADROOM_PAGES.get()
+    if pages <= 0:
+        return 0
+    if hisparse:
+        if envs.SGLANG_OPT_SPEC_DECODE_HEADROOM_PAGES.is_set():
+            logger.warning(
+                "SGLANG_OPT_SPEC_DECODE_HEADROOM_PAGES is ignored under HiSparse."
+            )
+        return 0
+    return min(pages, 8)
+
+
+def add_spec_decode_headroom_pages(
+    batch: ScheduleBatch,
+    nxt_kv_lens: List[int],
+    num_needed_tokens: int,
+    *,
+    reserve: int,
+    page_size: int,
+) -> tuple[List[int], int]:
+    """On a step that allocates anyway, extend every request to the configured
+    pages beyond its page-aligned need in the same allocation."""
+    if num_needed_tokens == 0 or page_size == 1:
+        return nxt_kv_lens, num_needed_tokens
+    pages = _spec_decode_headroom_pages(batch.hisparse_coordinator is not None)
+    if pages == 0:
+        return nxt_kv_lens, num_needed_tokens
+    row_cap = batch.req_to_token_pool.req_to_token.shape[1] // page_size * page_size
+    lens = list(nxt_kv_lens)
+    extra = 0
+    for i, req in enumerate(batch.reqs):
+        need = req.kv.kv_committed_len + reserve
+        target = min(
+            row_cap,
+            (need + page_size - 1) // page_size * page_size + pages * page_size,
+        )
+        if target > lens[i]:
+            extra += target - lens[i]
+            lens[i] = target
+    if extra == 0:
+        return nxt_kv_lens, num_needed_tokens
+    # Paged extend evicts up to needed + bs pages; stay clear of that demand.
+    if not tokens_fit(
+        batch.token_to_kv_pool_allocator,
+        num_needed_tokens + len(lens) * page_size + 4 * extra,
+    ):
+        return nxt_kv_lens, num_needed_tokens
+    return lens, num_needed_tokens + extra
 
 
 def get_req_to_token_extra_context_len() -> int:

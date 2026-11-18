@@ -77,17 +77,8 @@ class _LoraEnvs:
         "SGLANG_OPT_LORA_PREFILL_ROUTING_REUSE", True
     )
 
-    # ---- correctness fixes: on by default when experimental ----
-    # Feed bf16 router logits straight to the JIT kimi gate (bitwise-identical).
-    SGLANG_OPT_KIMI_GATE_BF16_INPUT = _GatedBool(
-        "SGLANG_OPT_KIMI_GATE_BF16_INPUT", True
-    )
-
     # ---- non-shared: default False, set explicitly in the launch env ----
     # kimi (NVFP4):
-    SGLANG_OPT_USE_JIT_KERNEL_KIMI_GATE = _GatedBool(
-        "SGLANG_OPT_USE_JIT_KERNEL_KIMI_GATE", False
-    )
     SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN = _GatedBool(
         "SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN", False
     )

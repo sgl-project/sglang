@@ -402,9 +402,11 @@ def cosmos_unipc(
         stream_scheduler.set_timesteps(n_steps, device=device, shift=shift)
         # Ticks can repeat at high step counts; index by step, not by tick.
         stream_scheduler.set_begin_index(0)
-    for tick in next(iter(schedulers.values())).timesteps:
+    timesteps = next(iter(schedulers.values())).timesteps
+    # read the device ticks on the host once: float() of a tick syncs every step
+    for tick, tick_value in zip(timesteps, timesteps.cpu().tolist()):
         # The reference feeds float32(tick) / 1000 to the model.
-        t = torch.tensor(float(tick), dtype=torch.float32) / NUM_TRAIN_TIMESTEPS
+        t = torch.tensor(float(tick_value), dtype=torch.float32) / NUM_TRAIN_TIMESTEPS
         velocity = predict(samples, t.item())
         samples = {
             k: schedulers[k].step(velocity[k], tick, samples[k], return_dict=False)[0]

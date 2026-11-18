@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from sglang.multimodal_gen.configs.pipeline_configs.flux3_image import (
+    Flux3ImageSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.disaggregation.roles import (
@@ -20,6 +25,43 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (
 from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import build_layout
 from sglang.multimodal_gen.runtime.pipelines.qwen_image21 import QwenImage21Pipeline
 from sglang.multimodal_gen.runtime.pipelines_core import Req
+
+
+@pytest.mark.parametrize("edit", [False, True])
+@pytest.mark.parametrize("flow_map", [False, True])
+def test_flux3_encoding_survives_each_transfer_hop(edit, flow_map):
+    """Preserve nested embeddings, reference coordinates, crop, and sampling type."""
+    params = Flux3ImageSamplingParams(
+        flux3_mode="i2i" if edit else None, guidance_scale=1.0
+    )
+    params._explicit_fields = {"width"} if edit else set()
+    req = Req(request_id="flux3-transfer", prompt="test", sampling_params=params)
+    params.apply_request_extra(req)
+    text = [
+        (torch.randn(3, 8), torch.arange(12).reshape(3, 4))
+        for _ in range(1 if flow_map else 2)
+    ]
+    condition = (torch.randn(4, 8), torch.zeros(4, 4)) if edit else None
+    req.extra.update(
+        flux3_text=text,
+        flux3_condition=condition,
+        flux3_crop=(0, 0, 63, 61) if edit else None,
+    )
+    scheduler = SimpleNamespace(_disagg_sampling_params_cls=Flux3ImageSamplingParams)
+    for _ in range(3):
+        tensors, scalars = extract_transfer_fields(req)
+        metadata, buffers = pack_tensors(tensors, scalars)
+        received, scalars = unpack_tensors([metadata, *[w._view for w in buffers]])
+        req = SchedulerDisaggMixin._build_disagg_req(scheduler, scalars, received)
+        assert type(req.sampling_params) is Flux3ImageSamplingParams
+        assert req.flux3_mode == params.flux3_mode
+        assert req.guidance_scale == 1.0
+        assert req.sampling_params._explicit_fields == params._explicit_fields
+        torch.testing.assert_close(req.extra["flux3_text"], text, atol=0, rtol=0)
+        torch.testing.assert_close(
+            req.extra["flux3_condition"], condition, atol=0, rtol=0
+        )
+        assert req.extra["flux3_crop"] == ([0, 0, 63, 61] if edit else None)
 
 
 def test_task_type_survives_disagg_transfer():
