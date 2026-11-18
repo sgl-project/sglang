@@ -1930,4 +1930,1461 @@ run(tvm::ffi::TensorView x,
   }
 }
 
+// ---- shared by the decode kernels ----
+__device__ __forceinline__ void bulk_g2s(uint32_t dst, const void* src, int bytes, uint32_t bar, uint64_t pol) {
+  asm volatile(
+      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;" ::
+          "r"(dst),
+      "l"(src),
+      "r"(bytes),
+      "r"(bar),
+      "l"(pol)
+      : "memory");
+}
+__device__ __forceinline__ uint4 ld_cg4(const void* p) {
+  uint4 v;
+  asm volatile("ld.global.cg.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+  return v;
+}
+__device__ __forceinline__ int atom_add_acq_rel(int* p, int v) {
+  int o;
+  asm volatile("atom.add.acq_rel.gpu.global.s32 %0, [%1], %2;" : "=r"(o) : "l"(p), "r"(v) : "memory");
+  return o;
+}
+__device__ __forceinline__ uint32_t u4w(const uint4& v, int i) {
+  return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w;
+}
+// Natural intermediate column of gate row i (0 .. 63) of a 128-row half (pack.kperm_index).
+__device__ __forceinline__ int dec_kp(int i) {
+  return 16 * ((i >> 1) & 3) + 4 * (i >> 4) + 2 * ((i >> 3) & 1) + (i & 1);
+}
+__device__ __forceinline__ void
+tma_4d_h(uint32_t dst, const CUtensorMap* map, int c0, int c1, int c2, int c3, uint32_t bar, uint64_t pol) {
+  asm volatile(
+      "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1, {%2, %3, "
+      "%4, %5}], [%6], %7;" ::"r"(dst),
+      "l"(map),
+      "r"(c0),
+      "r"(c1),
+      "r"(c2),
+      "r"(c3),
+      "r"(bar),
+      "l"(pol)
+      : "memory");
+}
+
+// ---- decode, one launch (decf_k): both GEMMs in one persistent kernel, a tagged intermediate exchange ----
+// For one to a few tokens the call costs the touched experts' weight bytes. Every CTA computes the routing (slots:
+// experts with local routes in increasing id), owns rows over the full K (no K sum crosses CTAs) and streams its share
+// of each GEMM through a two-stage ring. GEMM2 needs intermediates that other CTAs write, and on H100 any global round
+// trip during the weight stream waits several us, so the exchange is built to need one:
+//   * GEMM1 writes the intermediate as 8-byte words, two BF16 values with this call's epoch above them, so a reader
+//     needs no counter and no fence: a word with this call's epoch holds this call's values. The epoch and the words
+//     live in one workspace that only grows (zeroed), so it is never newer than its epoch.
+//   * Every local route's intermediate row gets its own shared-memory row when they fit, fetched once for all of the
+//     CTA's GEMM2 pieces (otherwise slots rotate through as many buffers as fit). Three pairs of fetcher warps take
+//     16B-word chunks of those rows; a chunk starts once this CTA has written its GEMM1 items up to the round in which
+//     the chunk's last slot finishes (every CTA runs the same schedule) plus DF_FDLY_NS, and then reloads only the
+//     words whose epoch is still old.
+//   * Scales and top-k weights are staged in shared memory with the routing, before the stream starts, and every
+//     item is decoded once into shared memory: the hot paths stay short, because after an L2 flush each role's first
+//     pass through its code fetches instructions from HBM.
+//   * GEMM1 items are 32 gate and 32 up rows, or 16 and 16 when that lowers the busiest CTA's stages. A GEMM2 item is
+//     one slot, or up to 8 slots of one piece when a slot's weights are one small block: one ring stage and one
+//     hand-off for all of them.
+constexpr int DF_CW = 8;                                  // consumer warps
+constexpr int DF_NP = 3;                                  // fetcher warp pairs
+constexpr int DF_THREADS = (DF_CW + 2 + 2 * DF_NP) * 32;  // + producer, epilogue, fetchers
+constexpr int DF_STB = 36864;                             // bytes per ring stage
+constexpr int DF_NS = 2;                                  // ring stages: fewer bytes in flight, shorter round trips
+constexpr int DF_TMAX = 4;
+constexpr int DF_RMAX = 256;
+constexpr int DF_EMAX = 1024;
+constexpr int DF_RED = DF_CW * 64 * DF_TMAX * 4;  // bytes per hand-off buffer
+constexpr int DF_NBMAX = 16;                      // intermediate row buffers / fetch chunks
+constexpr int DF_NBAR = 2 * DF_NS + 1 + 2 * DF_NBMAX + 4;
+constexpr int DF_RL = 8;           // 16B loads per fetcher lane per chunk
+constexpr int DF_CH = 64 * DF_RL;  // 16B loads per chunk (a pair of warps)
+constexpr int DF_IMAX = 1024;      // items decoded into shared memory
+constexpr int DF_FDLY_NS = 1000;   // a chunk's first loads after its slot's writes
+constexpr int DF_WAIT_NS = 2048;   // suspend hint of the mbarrier waits
+constexpr int DF_FIXED =
+    ((2 * DF_RED + DF_NBAR * 8 + (9 * DF_RMAX + 3 * DF_EMAX + 16 + DF_IMAX) * 4) + 1023) / 1024 * 1024;
+constexpr int DF_SMEM = 232448;
+
+struct DFMaps {
+  CUtensorMap w13, w13h, w2;  // w13h: boxes of one 576B unit (16 rows) x nc chunks
+};
+struct DFArgs {
+  const __nv_bfloat16* x;
+  const int* ids;
+  const float* tw;  // null: y per route (zeros for other ranks' routes); else the weighted sum into out
+  const float* gs13;
+  const float* gs2;
+  int* state;                 // [0] CTAs done, [1] the last call's epoch
+  unsigned long long* inter;  // [routes][I / 2] tagged words
+  __nv_bfloat16* y;
+  __nv_bfloat16* out;
+  float scale;
+  int T, topk, E, H, I, RB1, RB2, C1, C2, nc1, nc1h, nc2, off_x;
+};
+// decf_k's clamp and workspace size, a kernel parameter of their own. With them inside DFArgs, ptxas emits 5,368
+// instead of 6,616 instructions for decf_k<false> and it runs about 1us slower (H100, Muse and DeepSeek EP8, 1 and 2
+// tokens), even unused.
+struct DFClamp {
+  const float* gsr;  // up / gate global scale per expert, for the clamp on up (CLAMP only)
+  int64_t nwords;    // tagged words in the workspace (all of them are zeroed when the epoch wraps)
+  float lim;         // the SwiGLU clamp (CLAMP only)
+};
+
+__device__ __forceinline__ void st_relaxed_u64(unsigned long long* p, unsigned long long v) {
+  asm volatile("st.relaxed.gpu.global.b64 [%0], %1;" ::"l"(p), "l"(v) : "memory");
+}
+// two 8-byte words, each single-copy atomic: a word's epoch and its two values are seen together
+__device__ __forceinline__ uint4 ld_relaxed_2u64(const unsigned long long* p) {
+  unsigned long long a, c;
+  asm volatile("ld.relaxed.gpu.global.v2.b64 {%0, %1}, [%2];" : "=l"(a), "=l"(c) : "l"(p) : "memory");
+  return make_uint4((uint32_t)a, (uint32_t)(a >> 32), (uint32_t)c, (uint32_t)(c >> 32));
+}
+__device__ __forceinline__ void df_wait(uint32_t bar, uint32_t parity) {
+  asm volatile(
+      "{\n .reg .pred p;\n W: mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1, %2;\n @!p bra W;\n}" ::"r"(bar),
+      "r"(parity),
+      "n"(DF_WAIT_NS)
+      : "memory");
+}
+__device__ __forceinline__ uint64_t df_time() {
+  uint64_t t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+
+// One stage for this consumer warp: chunks warp, warp + 8, ... (< nv), chunk stride cs, U units of 16 rows at uoff[u].
+template <int U>
+__device__ __forceinline__ void df_stage(
+    float (&acc)[4][4],
+    const uint8_t* sb,
+    const int (&uoff)[4],
+    int cs,
+    int nv,
+    const uint8_t* brow,
+    int k0,
+    int warp,
+    int lane) {
+  const int q = lane & 3;
+  for (int c = warp; c < nv; c += DF_CW) {
+    uint4 b0 = make_uint4(0, 0, 0, 0), b1 = b0;
+    if (brow != nullptr) {
+      const uint8_t* bp = brow + (k0 + c) * 128 + q * 32;
+      b0 = *reinterpret_cast<const uint4*>(bp);
+      b1 = *reinterpret_cast<const uint4*>(bp + 16);
+    }
+    const uint8_t* cb = sb + c * cs;
+#pragma unroll
+    for (int u = 0; u < U; u++) {
+      const uint8_t* up = cb + uoff[u];
+      const uint4 nb = *reinterpret_cast<const uint4*>(up + lane * 16);
+      const uint32_t Sc = sc_bf16(*reinterpret_cast<const uint16_t*>(up + 512 + lane * 2), 0x4140);
+#pragma unroll
+      for (int kk = 0; kk < 4; kk++) {
+        uint32_t o[4];
+        decode4(u4w(nb, kk), o);
+        const uint32_t a0 = bmulh(o[0], Sc, 0), a1 = bmulh(o[1], Sc, 1), a2 = bmulh(o[2], Sc, 0),
+                       a3 = bmulh(o[3], Sc, 1);
+        const uint4& bv = kk < 2 ? b0 : b1;
+        mma16816(acc[u], a0, a1, a2, a3, u4w(bv, 2 * (kk & 1)), u4w(bv, 2 * (kk & 1) + 1));
+      }
+    }
+  }
+}
+
+// CLAMP: SwiGLU clamps its inputs at C.lim exactly as grouped_k's copy_out does (gate from above, up on both sides at
+// lim / |gsr[e]|, since up carries the gate's global scale here and GEMM2's scale holds up / gate).
+template <bool CLAMP>
+__global__ void __launch_bounds__(DF_THREADS, 1)
+    decf_k(const __grid_constant__ DFMaps mp, const DFArgs A, const __grid_constant__ DFClamp C) {
+  extern __shared__ __align__(1024) uint8_t dsm[];
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, G = gridDim.x, b = blockIdx.x;
+  float* redb = reinterpret_cast<float*>(dsm);  // two hand-off buffers
+  uint64_t* bars = reinterpret_cast<uint64_t*>(dsm + 2 * DF_RED);
+  int* sids = reinterpret_cast<int*>(bars + DF_NBAR);
+  int* slot_e = sids + DF_RMAX;
+  int* slot_m = slot_e + DF_RMAX;
+  int* slot_r0 = slot_m + DF_RMAX;
+  int* routes = slot_r0 + DF_RMAX;                            // route indices by slot, increasing within a slot
+  float* sgs13 = reinterpret_cast<float*>(routes + DF_RMAX);  // per slot
+  float* sgs2 = sgs13 + DF_RMAX;
+  float* stw = sgs2 + DF_RMAX;                            // per route
+  float* egs = stw + DF_RMAX;                             // per expert: gs13 x 2^63, then gs2 x 2^63 at + DF_EMAX
+  int* scnt = reinterpret_cast<int*>(egs + 2 * DF_EMAX);  // per expert: route count, then slot
+  int* misc = scnt + DF_EMAX;  // [0] slots, [1] own GEMM1 items written, [2] row buffers (0: one row per route),
+                               // [3] ring offset, [4] rows offset, [5] rows per buffer, [6] 16-row GEMM1 items
+  int* itab = misc + 16;       // decoded items (see item)
+  const uint32_t bar0 = (uint32_t)__cvta_generic_to_shared(bars);
+  // barriers: stage full [DF_NS] / free [DF_NS], x rows, intermediate rows full [DF_NBMAX] / free [DF_NBMAX],
+  // hand-off full [2] / free [2]
+  const uint32_t bfull = bar0, bempty = bar0 + 8 * DF_NS, bx = bar0 + 16 * DF_NS, bif = bx + 8,
+                 bie = bif + 8 * DF_NBMAX, brf = bie + 8 * DF_NBMAX, bre = brf + 16;
+  const int R = A.T * A.topk, E = A.E;
+  uint32_t ep = (uint32_t)A.state[1] + 1u;
+  if (ep == 0) ep = 1;
+
+  if (tid == 0) {
+    for (int s = 0; s < DF_NS; s++) {
+      mbar_init(bfull + 8 * s, 1);
+      mbar_init(bempty + 8 * s, DF_CW);
+    }
+    mbar_init(bx, 1);
+    for (int s = 0; s < DF_NBMAX; s++) {
+      mbar_init(bif + 8 * s, 2);
+      mbar_init(bie + 8 * s, DF_CW);
+    }
+    for (int s = 0; s < 2; s++) {
+      mbar_init(brf + 8 * s, DF_CW);
+      mbar_init(bre + 8 * s, 1);
+    }
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  for (int i = tid; i < R; i += DF_THREADS) {
+    sids[i] = A.ids[i];
+    stw[i] = A.tw != nullptr ? A.tw[i] : 0.f;
+  }
+  for (int e = tid; e < E; e += DF_THREADS) {
+    scnt[e] = 0;
+    egs[e] = A.gs13[e] * 9.223372036854775808e18f;
+    egs[DF_EMAX + e] = A.gs2[e] * 9.223372036854775808e18f;
+  }
+  __syncthreads();
+  if (tid == DF_CW * 32) {  // every token's x row (padded by 16B); it needs no routing
+    mbar_expect(bx, A.T * 2 * A.H);
+    for (int t = 0; t < A.T; t++)
+      bulk_g2s(
+          (uint32_t)__cvta_generic_to_shared(dsm + A.off_x + t * (2 * A.H + 16)),
+          A.x + (int64_t)t * A.H,
+          2 * A.H,
+          bx,
+          pol_evict_first());
+  }
+  for (int i = tid; i < R; i += DF_THREADS)
+    if ((unsigned)sids[i] < (unsigned)E) atomicAdd(&scnt[sids[i]], 1);
+  __syncthreads();
+  if (warp == 0) {
+    int n = 0;
+    for (int e0 = 0; e0 < E; e0 += 32) {
+      const int e = e0 + lane, c = e < E ? scnt[e] : 0;
+      const uint32_t bal = __ballot_sync(0xffffffffu, c > 0);
+      if (c > 0) {
+        const int pos = n + __popc(bal & ((1u << lane) - 1));
+        slot_e[pos] = e;
+        slot_m[pos] = c;
+        scnt[e] = pos;
+      }
+      n += __popc(bal);
+    }
+    __syncwarp();
+    for (int s = lane; s < n; s += 32) {
+      sgs13[s] = egs[slot_e[s]];
+      sgs2[s] = egs[DF_EMAX + slot_e[s]];
+    }
+    if (lane == 0) {
+      int r0 = 0, mmax = 1;
+      for (int s = 0; s < n; s++) {
+        slot_r0[s] = r0;
+        r0 += slot_m[s];
+        mmax = max(mmax, slot_m[s]);
+      }
+      misc[0] = n;
+      misc[1] = 0;
+      // past the x rows: the ring, then the intermediate rows, one per local route when they fit
+      const int rowi = 2 * A.I + 16;
+      const int oring = (A.off_x + A.T * (2 * A.H + 16) + 1023) / 1024 * 1024;
+      const int avail = DF_SMEM - oring - DF_NS * DF_STB;
+      int nb = 0;
+      if (r0 * rowi > avail || (r0 * (A.I / 4) + DF_CH - 1) / DF_CH > DF_NBMAX)
+        nb = min(DF_NBMAX, avail / (mmax * rowi));
+      misc[2] = nb;
+      misc[3] = oring;
+      misc[4] = oring + DF_NS * DF_STB;
+      misc[5] = mmax;
+      // 16-row GEMM1 items when they lower this grid's most GEMM1 stages per CTA
+      const int k1 = (A.C1 + A.nc1 - 1) / A.nc1, k1h = (A.C1 + A.nc1h - 1) / A.nc1h;
+      const int N1 = n * A.RB1 * 4;
+      misc[6] = (2 * N1 + G - 1) / G * k1h < (N1 + G - 1) / G * k1;
+    }
+  }
+  __syncthreads();
+  for (int i = tid; i < R; i += DF_THREADS) {
+    const int e = sids[i];
+    if ((unsigned)e < (unsigned)E) {
+      int rank = 0;
+      for (int j = 0; j < i; j++)
+        rank += sids[j] == e;
+      routes[slot_r0[scnt[e]] + rank] = i;
+    }
+  }
+  __syncthreads();
+  const int n = misc[0], NB = misc[2], mmax = misc[5], g1h = misc[6];
+  uint8_t* const ring = dsm + misc[3];
+  uint8_t* const rows = dsm + misc[4];
+  const int per1 = A.RB1 * (g1h ? 8 : 4);
+  const int N1 = n * per1, P2 = A.RB2 * 8;
+  const int n1c = N1 > b ? (N1 - 1 - b) / G + 1 : 0, n2c = P2 > b ? (P2 - 1 - b) / G + 1 : 0;
+  const int nc1 = g1h ? A.nc1h : A.nc1;
+  const int k1 = (A.C1 + nc1 - 1) / nc1, k2 = (A.C2 + A.nc2 - 1) / A.nc2;
+  const int rowi = 2 * A.I + 16, rowx = 2 * A.H + 16;
+  // A GEMM2 item is G2 consecutive slots of one piece when a slot's weights are one small block (k2 == 1). The
+  // hand-off holds 8 routes, so G2 x (most routes of a slot) <= 8.
+  const int G2 = k2 == 1 && NB == 0 ? max(1, min(min(8, DF_STB / (1152 * A.nc2)), 8 / mmax)) : 1;
+  const int nG = (n + G2 - 1) / G2;
+  const int nitems = n1c + n2c * nG;
+  // item it: GEMM1 (it < n1c; slot s, row block rb, part hp) or GEMM2 (piece (it - n1c) / nG, slots [s, s + gsz)),
+  // decoded once here and read by every role as kind << 31 | slot << 20 | row block << 6 | (gsz - 1) << 3 | part
+  auto item_dec = [&](int it, int& kind, int& s, int& rb, int& hp, int& gsz) {
+    if (it < n1c) {
+      const int i = b + it * G;
+      kind = 0, s = i / per1, rb = (i % per1) / (per1 / A.RB1), hp = i % (per1 / A.RB1), gsz = 1;
+    } else {
+      const int j = b + ((it - n1c) / nG) * G;
+      kind = 1, s = ((it - n1c) % nG) * G2, rb = j >> 3, hp = j & 7, gsz = min(G2, n - s);
+    }
+  };
+  for (int it = tid; it < min(nitems, DF_IMAX); it += DF_THREADS) {
+    int kind, s, rb, hp, gsz;
+    item_dec(it, kind, s, rb, hp, gsz);
+    itab[it] = (int)(((uint32_t)kind << 31) | ((uint32_t)s << 20) | ((uint32_t)rb << 6) | ((uint32_t)(gsz - 1) << 3) |
+                     (uint32_t)hp);
+  }
+  __syncthreads();
+  auto item = [&](int it, int& kind, int& s, int& rb, int& hp, int& gsz) {
+    if (it < DF_IMAX) {
+      const uint32_t w = (uint32_t)itab[it];
+      kind = (int)(w >> 31), s = (int)((w >> 20) & 0x7ff), rb = (int)((w >> 6) & 0x3fff);
+      gsz = (int)((w >> 3) & 7) + 1, hp = (int)(w & 7);
+    } else {
+      item_dec(it, kind, s, rb, hp, gsz);
+    }
+  };
+  // GEMM2 item j2's rows of slot s: the slot's own rows (NB == 0) or buffer j2 % NB
+  auto rowbuf = [&](int j2, int s) { return NB == 0 ? rows + slot_r0[s] * rowi : rows + (j2 % NB) * mmax * rowi; };
+
+  if (warp == DF_CW) {  // producer
+    if (lane == 0) {
+      const uint64_t pol = pol_evict_first();
+      const uint32_t rs = (uint32_t)__cvta_generic_to_shared(ring);
+      int k = 0;
+      for (int it = 0; it < nitems; it++) {
+        int kind, s, rb, hp, gsz;
+        item(it, kind, s, rb, hp, gsz);
+        const int e = slot_e[s];
+        const int ks = kind ? k2 : k1;
+        for (int j = 0; j < ks; j++, k++) {
+          const int st = k % DF_NS;
+          if (k >= DF_NS) df_wait(bempty + 8 * st, ((k / DF_NS) + 1) & 1);
+          const uint32_t dst = rs + st * DF_STB, bar = bfull + 8 * st;
+          if (kind == 0 && g1h) {  // unit hp & 1 of gate group 4 (hp >> 2) + ((hp >> 1) & 1) and of its up group
+            const int h = hp >> 2, p = (hp >> 1) & 1, u = hp & 1, row = e * A.RB1 + rb;
+            mbar_expect(bar, 2 * 576 * nc1);
+            tma_4d_h(dst, &mp.w13h, 72 * u, 4 * h + p, j * nc1, row, bar, pol);
+            tma_4d_h(dst + 576 * nc1, &mp.w13h, 72 * u, 4 * h + 2 + p, j * nc1, row, bar, pol);
+          } else if (kind == 0) {
+            const int h = hp >> 1, p = hp & 1, row = e * A.RB1 + rb;
+            mbar_expect(bar, 2 * 1152 * nc1);
+            tma_4d_h(dst, &mp.w13, 0, 4 * h + p, j * nc1, row, bar, pol);
+            tma_4d_h(dst + 1152 * nc1, &mp.w13, 0, 4 * h + 2 + p, j * nc1, row, bar, pol);
+          } else {
+            mbar_expect(bar, gsz * 1152 * A.nc2);
+            for (int u = 0; u < gsz; u++)
+              tma_4d_h(dst + u * 1152 * A.nc2, &mp.w2, 0, hp, j * A.nc2, slot_e[s + u] * A.RB2 + rb, bar, pol);
+          }
+        }
+      }
+    }
+  } else if (warp >= DF_CW + 2) {  // fetchers: pair fp takes chunks fp, fp + DF_NP, ...
+    // A task is one chunk of DF_CH 16B loads: of every local route's row in slot order (one row per route; a chunk
+    // can span slots), or, when rotating, of one GEMM2 item's rows. A rotating task t refills buffer t % NB after a
+    // parity wait on its free barrier, which cannot tell phase c from c - 2, so no pair may reach a buffer two phases
+    // ahead of the consumers. With NB >= DF_NP a pair at task t has passed task t - DF_NP >= t - NB; with fewer
+    // buffers, pair b alone takes buffer b's tasks (pairs NB .. DF_NP - 1 idle), so it has passed t - NB.
+    const int fw = warp - DF_CW - 2, fp = fw >> 1, wi = fw & 1;
+    const int fstep = NB > 0 && NB < DF_NP ? NB : DF_NP;
+    const int per = A.I / 4;
+    const int nr = n > 0 ? slot_r0[n - 1] + slot_m[n - 1] : 0;
+    const int ntask = n2c > 0 ? (NB == 0 ? (nr * per + DF_CH - 1) / DF_CH : n2c * n) : 0;
+    for (int t = fp < fstep ? fp : ntask; t < ntask; t += fstep) {
+      int pos0, f0, f1, s;  // first route position, flat range [f0, f1) of 16B words from it, the last slot
+      uint8_t* bb;
+      if (NB == 0) {
+        f0 = t * DF_CH, f1 = min(nr * per, f0 + DF_CH), pos0 = 0, bb = rows;
+        const int lastpos = (f1 - 1) / per;
+        s = 0;
+        while (s + 1 < n && slot_r0[s + 1] <= lastpos)
+          s++;
+      } else {
+        s = t % n, pos0 = slot_r0[s], f0 = 0, f1 = slot_m[s] * per, bb = rowbuf(t, s);
+        if (t >= NB) df_wait(bie + 8 * (t % NB), ((t / NB) + 1) & 1);
+      }
+      const int need = min(n1c, ((s + 1) * per1 + G - 1) / G);
+      if (lane == 0) {
+        while (*reinterpret_cast<volatile int*>(misc + 1) < need)
+          __nanosleep(64);
+        const uint64_t t0 = df_time();
+        while (df_time() - t0 < (uint64_t)DF_FDLY_NS)
+          __nanosleep(64);
+      }
+      __syncwarp();
+      for (int c0 = f0; c0 < f1; c0 += DF_CH) {
+        // one division per chunk: a lane's words are 64 apart, so its (row, column) advance by 64 with a carry
+        uint4 v[DF_RL];
+        const unsigned long long* sp[DF_RL];
+        int doff[DF_RL];
+        uint32_t pend = 0;
+        {
+          const int i0 = c0 + wi * 32 + lane;
+          int row = i0 / per, col = i0 - row * per;
+#pragma unroll
+          for (int u = 0; u < DF_RL; u++) {
+            const bool ok = i0 + u * 64 < f1;
+            sp[u] = ok ? A.inter + (int64_t)routes[pos0 + row] * (A.I / 2) + col * 2 : A.inter;
+            doff[u] = row * rowi + col * 8;
+            pend |= (ok ? 1u : 0u) << u;
+            col += 64;
+            while (col >= per)
+              col -= per, row++;
+          }
+        }
+#pragma unroll
+        for (int u = 0; u < DF_RL; u++)
+          v[u] = ld_relaxed_2u64(sp[u]);
+        while (true) {
+#pragma unroll
+          for (int u = DF_RL - 1; u >= 0; u--) {
+            if (((pend >> u) & 1u) && v[u].y == ep && v[u].w == ep) {
+              *reinterpret_cast<uint2*>(bb + doff[u]) = make_uint2(v[u].x, v[u].z);
+              pend &= ~(1u << u);
+            }
+          }
+          if (!__any_sync(0xffffffffu, pend != 0)) break;
+#pragma unroll
+          for (int u = 0; u < DF_RL; u++)
+            if ((pend >> u) & 1u) v[u] = ld_relaxed_2u64(sp[u]);
+        }
+      }
+      __syncwarp();
+      if (lane == 0) mbar_arrive(bif + 8 * (NB == 0 ? t : t % NB));
+    }
+  } else if (warp == DF_CW + 1) {  // epilogue
+    float wsum[DF_TMAX];
+#pragma unroll
+    for (int t = 0; t < DF_TMAX; t++)
+      wsum[t] = 0.f;
+    for (int it = 0; it < nitems; it++) {
+      int kind, s, rb, hp, gsz;
+      item(it, kind, s, rb, hp, gsz);
+      const int hb = it & 1, m = slot_m[s], r0 = slot_r0[s];
+      df_wait(brf + 8 * hb, (it >> 1) & 1);
+      const float* red = redb + hb * (DF_RED / 4);
+      const int jr = lane;
+      if (kind == 0) {
+        const float sc = sgs13[s];
+        float ulim = 0.f;
+        if constexpr (CLAMP) ulim = C.lim / fabsf(__ldg(C.gsr + slot_e[s]));
+        // 32-row items: gate rows jr at red rows jr, up at 32 + jr; 16-row items: gate rows at jr, up at 16 + jr
+        // (lanes 16 .. 31 idle)
+        const int h = g1h ? hp >> 2 : hp >> 1, p = g1h ? (hp >> 1) & 1 : hp & 1;
+        const int gi = g1h ? 16 * (hp & 1) + (jr & 15) : jr, uo = g1h ? 16 : 32;
+        const int col = 128 * rb + 64 * h + dec_kp(32 * p + gi);
+        for (int r = 0; r < m; r++) {
+          float gt = 0.f, ut = 0.f;
+#pragma unroll
+          for (int w = 0; w < DF_CW; w++)
+            gt += red[(w * 64 + (jr & (uo - 1))) * DF_TMAX + r],
+                ut += red[(w * 64 + uo + (jr & (uo - 1))) * DF_TMAX + r];
+          gt *= sc;
+          float uv = ut * sc;
+          if constexpr (CLAMP) {  // as SGLang's clamped SiLU: gate from above, up on both sides
+            gt = gt > C.lim ? C.lim : gt;
+            uv = uv > ulim ? ulim : (uv < -ulim ? -ulim : uv);
+          }
+          // lanes 2c and 2c + 1 hold adjacent intermediate columns: one tagged word per pair
+          const uint32_t hv = __bfloat16_as_ushort(__float2bfloat16(gt / (1.f + __expf(-gt)) * uv));
+          const uint32_t hn = __shfl_down_sync(0xffffffffu, hv, 1);
+          if (!(lane & 1) && jr < uo)
+            st_relaxed_u64(
+                A.inter + (int64_t)routes[r0 + r] * (A.I / 2) + col / 2,
+                ((unsigned long long)ep << 32) | (hv | (hn << 16)));
+        }
+        __syncwarp();
+        if (lane == 0) {
+          mbar_arrive(bre + 8 * hb);
+          *reinterpret_cast<volatile int*>(misc + 1) = it + 1;
+        }
+      } else {
+        // the group's partial sums: [warp][32 rows][8 routes], its routes in slot order
+        const int row0 = 256 * rb + 32 * hp;
+        int cum = 0;
+        for (int sub = 0; sub < gsz; sub++) {
+          const int ss = s + sub, ms = slot_m[ss], rs = slot_r0[ss];
+          const float sc = sgs2[ss];
+          for (int r = 0; r < ms; r++) {
+            float v = 0.f;
+#pragma unroll
+            for (int w = 0; w < DF_CW; w++)
+              v += red[(w * 32 + jr) * 8 + cum + r];
+            const int route = routes[rs + r];
+            if (A.tw == nullptr) {
+              A.y[(int64_t)route * A.H + row0 + jr] = __float2bfloat16(v * sc);
+            } else {
+              const float c = stw[route] * (v * sc);
+              const int t = route / A.topk;
+#pragma unroll
+              for (int tt = 0; tt < DF_TMAX; tt++)
+                if (tt == t) wsum[tt] += c;
+            }
+          }
+          cum += ms;
+        }
+        __syncwarp();
+        if (lane == 0) mbar_arrive(bre + 8 * hb);
+        if (s + gsz == n) {  // the piece's last group: its rows of out (or the zeros of other ranks' routes in y)
+          if (A.tw != nullptr) {
+#pragma unroll
+            for (int t = 0; t < DF_TMAX; t++) {
+              if (t < A.T) A.out[(int64_t)t * A.H + row0 + jr] = __float2bfloat16(wsum[t] * A.scale);
+              wsum[t] = 0.f;
+            }
+          } else {
+            for (int r = 0; r < R; r++)
+              if ((unsigned)sids[r] >= (unsigned)E) A.y[(int64_t)r * A.H + row0 + jr] = __float2bfloat16(0.f);
+          }
+        }
+      }
+    }
+    if (n == 0) {  // no local route: this CTA's pieces are zeros
+      for (int it = 0; it < n2c; it++) {
+        const int j = b + it * G, row0 = 256 * (j >> 3) + 32 * (j & 7);
+        const int nr = A.tw != nullptr ? A.T : R;
+        __nv_bfloat16* dst = A.tw != nullptr ? A.out : A.y;
+        for (int r = 0; r < nr; r++)
+          dst[(int64_t)r * A.H + row0 + lane] = __float2bfloat16(0.f);
+      }
+    }
+  } else {  // consumers
+    const int g = lane >> 2, q = lane & 3;
+    int k = 0;
+    if (n1c > 0) df_wait(bx, 0);  // else after the items: the x copies must land before this CTA exits
+    for (int it = 0; it < nitems; it++) {
+      int kind, s, rb, hp, gsz;
+      item(it, kind, s, rb, hp, gsz);
+      const int hb = it & 1;
+      float acc[4][4];
+      if (kind == 1) {  // GEMM2: the group's slots one after another from one stage (k2 stages when gsz is 1)
+        const int j2 = it - n1c;
+        if (it >= 2) df_wait(bre + 8 * hb, ((it >> 1) + 1) & 1);
+        float* red = redb + hb * (DF_RED / 4);
+        int cum = 0;
+        for (int sub = 0; sub < gsz; sub++) {
+          const int ss = s + sub, ms = slot_m[ss], rs = slot_r0[ss];
+          if (NB == 0) {
+            const int per = A.I / 4;
+            for (int c = rs * per / DF_CH; c <= ((rs + ms) * per - 1) / DF_CH; c++)
+              df_wait(bif + 8 * c, 0);
+          } else {
+            df_wait(bif + 8 * (j2 % NB), (j2 / NB) & 1);
+          }
+          const uint8_t* brow = g < ms ? rowbuf(j2, ss) + g * rowi : nullptr;
+#pragma unroll
+          for (int u = 0; u < 4; u++)
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+              acc[u][i] = 0.f;
+          for (int j = 0; j < k2; j++) {
+            const int st = k % DF_NS;
+            if (sub == 0) df_wait(bfull + 8 * st, (k / DF_NS) & 1);
+            const int nv = min(A.nc2, A.C2 - j * A.nc2);
+            const int uo[4] = {0, 576, 0, 0};
+            df_stage<2>(acc, ring + st * DF_STB + sub * 1152 * A.nc2, uo, 1152, nv, brow, j * A.nc2, warp, lane);
+            if (sub == gsz - 1) {
+              __syncwarp();
+              if (lane == 0) mbar_arrive(bempty + 8 * st);
+              k++;
+            }
+          }
+          if (NB != 0) {
+            __syncwarp();
+            if (lane == 0) mbar_arrive(bie + 8 * (j2 % NB));
+          }
+#pragma unroll
+          for (int u = 0; u < 2; u++) {
+            float* rp = red + (warp * 32 + 16 * u + g) * 8 + cum;
+            if (2 * q < ms) rp[2 * q] = acc[u][0], rp[64 + 2 * q] = acc[u][2];
+            if (2 * q + 1 < ms) rp[2 * q + 1] = acc[u][1], rp[64 + 2 * q + 1] = acc[u][3];
+          }
+          cum += ms;
+        }
+        __syncwarp();
+        if (lane == 0) mbar_arrive(brf + 8 * hb);
+        continue;
+      }
+      // GEMM1
+      const int m = slot_m[s], r0 = slot_r0[s];
+      const uint8_t* brow = g < m ? dsm + A.off_x + (routes[r0 + g] / A.topk) * rowx : nullptr;
+#pragma unroll
+      for (int u = 0; u < 4; u++)
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+          acc[u][i] = 0.f;
+      for (int j = 0; j < k1; j++, k++) {
+        const int st = k % DF_NS;
+        df_wait(bfull + 8 * st, (k / DF_NS) & 1);
+        const uint8_t* sb = ring + st * DF_STB;
+        const int nv = min(nc1, A.C1 - j * nc1);
+        if (g1h) {
+          const int uo[4] = {0, 576 * nc1, 0, 0};
+          df_stage<2>(acc, sb, uo, 576, nv, brow, j * nc1, warp, lane);
+        } else {
+          const int uo[4] = {0, 576, 1152 * nc1, 1152 * nc1 + 576};
+          df_stage<4>(acc, sb, uo, 1152, nv, brow, j * nc1, warp, lane);
+        }
+        __syncwarp();
+        if (lane == 0) mbar_arrive(bempty + 8 * st);
+      }
+      if (it >= 2) df_wait(bre + 8 * hb, ((it >> 1) + 1) & 1);
+      float* red = redb + hb * (DF_RED / 4);
+      const int U = g1h ? 2 : 4;
+#pragma unroll
+      for (int u = 0; u < 4; u++) {
+        if (u < U) {
+          float* rp = red + (warp * 64 + 16 * u + g) * DF_TMAX;
+          if (2 * q < m) rp[2 * q] = acc[u][0], rp[8 * DF_TMAX + 2 * q] = acc[u][2];
+          if (2 * q + 1 < m) rp[2 * q + 1] = acc[u][1], rp[8 * DF_TMAX + 2 * q + 1] = acc[u][3];
+        }
+      }
+      __syncwarp();
+      if (lane == 0) mbar_arrive(brf + 8 * hb);
+    }
+    if (n1c == 0) df_wait(bx, 0);
+  }
+  __syncthreads();
+  // The last CTA to finish advances the epoch (the next call's reads of it are ordered by the kernel boundary). When
+  // the epoch would wrap, it zeroes every tagged word first and the next call starts again at epoch 1, so a word
+  // written 2^32 - 1 calls ago is never taken as current (one thread, once in 2^32 - 1 calls, so no other thread
+  // waits).
+  if (tid == 0) {
+    __threadfence();
+    if (atom_add_acq_rel(A.state, 1) == G - 1) {
+      if (ep == 0xFFFFFFFFu) {
+        for (int64_t i = 0; i < C.nwords; i++)
+          A.inter[i] = 0ull;
+        ep = 0;
+      }
+      A.state[1] = (int)ep;
+      A.state[0] = 0;
+    }
+  }
+}
+
+// The fused decode path: one decf_k launch (cooperative: every CTA must be resident), 1 to DF_TMAX tokens. ws (int64)
+// holds the done count and epoch (word 0), then the tagged intermediate (routes x I / 2 words); it must be zero before
+// its first call and is reused unchanged by later calls on the same stream.
+inline bool decode_fused_fits(int64_t t, int64_t h, int64_t i) {
+  const int64_t oring = (DF_FIXED + t * (2 * h + 16) + 1023) / 1024 * 1024;
+  return oring + DF_NS * DF_STB + 2 * t * (2 * i + 16) <= DF_SMEM;
+}
+inline void run_decode_fused(
+    tvm::ffi::TensorView x,
+    tvm::ffi::TensorView topk_ids,
+    tvm::ffi::TensorView w13,
+    tvm::ffi::TensorView w2,
+    tvm::ffi::TensorView gs13,
+    tvm::ffi::TensorView gs2,
+    tvm::ffi::TensorView gsr,
+    tvm::ffi::TensorView ws,
+    tvm::ffi::Optional<tvm::ffi::TensorView> y,
+    tvm::ffi::Optional<tvm::ffi::TensorView> topk_weights,
+    tvm::ffi::Optional<tvm::ffi::TensorView> out,
+    double scale,
+    double swiglu_limit,
+    int64_t ctas) {
+  using namespace host;
+  auto T = SymbolicSize{"tokens"};
+  auto H = SymbolicSize{"hidden"};
+  auto K = SymbolicSize{"top_k"};
+  auto R = SymbolicSize{"routes"};
+  auto E = SymbolicSize{"local_experts"};
+  auto device = SymbolicDevice{};
+  TensorMatcher({T, H}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).ensure_alignment(16).verify(x);
+  TensorMatcher({T, K}).with_dtype<int32_t>().with_device(device).verify(topk_ids);
+  TensorMatcher({E}).with_dtype<float>().with_device(device).verify(gs13);
+  TensorMatcher({E}).with_dtype<float>().with_device(device).verify(gs2);
+  TensorMatcher({E}).with_dtype<float>().with_device(device).verify(gsr);
+  if (y.has_value())
+    TensorMatcher({R, H}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(y.value());
+  TensorMatcher({-1}).with_dtype<int64_t>().with_device(device).ensure_alignment(16).verify(ws);
+  const int64_t t = T.unwrap(), h = H.unwrap(), topk = K.unwrap(), e = E.unwrap();
+  const int64_t r = y.has_value() ? R.unwrap() : t * topk;
+  RuntimeCheck(
+      w13.dim() == 3 && h >= 64 && w13.size(1) % (h / 64 * 8) == 0,
+      "nvfp4_w4a16_sm90: packed w13 must be [E, I / 64 * H / 64 * 8, 576]");
+  // The padded width; the decode kernels read whole 256-row GEMM1 blocks, so a half block (I % 128 == 64) is refused
+  // below and stays on the grouped kernels.
+  const int64_t i = w13.size(1) / (h / 64 * 8) * 64;
+  RuntimeCheck(r == t * topk, "nvfp4_w4a16_sm90: workspace rows ", r, " != tokens * top_k ", t * topk);
+  RuntimeCheck(
+      t >= 1 && t <= DF_TMAX && r <= DF_RMAX,
+      "nvfp4_w4a16_sm90 decode_fused: at most ",
+      DF_TMAX,
+      " tokens and ",
+      DF_RMAX,
+      " routes");
+  RuntimeCheck(h >= 256 && h % 256 == 0, "nvfp4_w4a16_sm90: hidden size must be a multiple of 256, got ", h);
+  RuntimeCheck(
+      i >= 128 && i % 128 == 0,
+      "nvfp4_w4a16_sm90 decode: padded intermediate size must be a multiple of 128 (no half block), got ",
+      i);
+  RuntimeCheck(swiglu_limit > 0, "nvfp4_w4a16_sm90: swiglu_limit must be positive (inf for none)");
+  RuntimeCheck(e >= 1 && e <= DF_EMAX, "nvfp4_w4a16_sm90: 1 to 1024 local experts, got ", e);
+  const int RB1 = (int)(2 * i / 256), RB2 = (int)(h / 256), C1 = (int)(h / 64), C2 = (int)(i / 64);
+  TensorMatcher({e, (int64_t)RB1 * C1 * 16, 576})
+      .with_dtype<uint8_t>()
+      .with_device(device)
+      .ensure_alignment(16)
+      .verify(w13);
+  TensorMatcher({e, RB2, C2, 16, 576}).with_dtype<uint8_t>().with_device(device).ensure_alignment(16).verify(w2);
+  RuntimeCheck(out.has_value() == topk_weights.has_value(), "nvfp4_w4a16_sm90: out and topk_weights go together");
+  RuntimeCheck(out.has_value() != y.has_value(), "nvfp4_w4a16_sm90 decode: y (per route) or out (weighted), not both");
+  if (out.has_value()) {
+    TensorMatcher({T, H}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(out.value());
+    TensorMatcher({T, K}).with_dtype<float>().with_device(device).verify(topk_weights.value());
+  }
+  const DLDevice dev = device.unwrap();
+  RuntimeCheck(runtime::get_sm_version(dev.device_id) == 90, "nvfp4_w4a16_sm90: needs an sm_90 (Hopper) GPU");
+  const int sms = (int)runtime::get_sm_count(dev.device_id);
+  RuntimeCheck(ws.size(0) >= 2 + r * i / 2, "nvfp4_w4a16_sm90 decode_fused: workspace too small");
+  RuntimeCheck(decode_fused_fits(t, h, i), "nvfp4_w4a16_sm90 decode_fused: tokens x width too large for shared memory");
+  const int nc1 = std::min(16, C1), nc1h = std::min(32, C1), nc2 = std::min(32, C2);
+  auto wmap = [&](void* base, int C, int64_t blocks, int nc, int box0) {
+    return host::tma::make_map(
+        base,
+        CU_TENSOR_MAP_DATA_TYPE_UINT64,
+        {144, 8, (cuuint64_t)C, (cuuint64_t)blocks},
+        {1152, 9216, (cuuint64_t)C * 9216},
+        {(cuuint32_t)box0, 1, (cuuint32_t)nc, 1},
+        {.l2_promotion = CU_TENSOR_MAP_L2_PROMOTION_L2_256B});
+  };
+  DFMaps mp;
+  mp.w13 = wmap(w13.data_ptr(), C1, e * RB1, nc1, 144);
+  mp.w13h = wmap(w13.data_ptr(), C1, e * RB1, nc1h, 72);
+  mp.w2 = wmap(w2.data_ptr(), C2, e * RB2, nc2, 144);
+  DFArgs A;
+  A.x = static_cast<const __nv_bfloat16*>(x.data_ptr());
+  A.ids = static_cast<const int*>(topk_ids.data_ptr());
+  A.tw = topk_weights.has_value() ? static_cast<const float*>(topk_weights.value().data_ptr()) : nullptr;
+  A.gs13 = static_cast<const float*>(gs13.data_ptr());
+  A.gs2 = static_cast<const float*>(gs2.data_ptr());
+  A.state = static_cast<int*>(ws.data_ptr());
+  A.inter = static_cast<unsigned long long*>(ws.data_ptr()) + 2;
+  A.y = y.has_value() ? static_cast<__nv_bfloat16*>(y.value().data_ptr()) : nullptr;
+  A.out = out.has_value() ? static_cast<__nv_bfloat16*>(out.value().data_ptr()) : nullptr;
+  A.scale = (float)scale;
+  A.T = (int)t, A.topk = (int)topk, A.E = (int)e, A.H = (int)h, A.I = (int)i;
+  A.RB1 = RB1, A.RB2 = RB2, A.C1 = C1, A.C2 = C2, A.nc1 = nc1, A.nc1h = nc1h, A.nc2 = nc2;
+  A.off_x = DF_FIXED;
+  const DFClamp C{static_cast<const float*>(gsr.data_ptr()), ws.size(0) - 2, (float)swiglu_limit};
+  const int grid = ctas > 0 ? (int)std::min<int64_t>(ctas, sms) : sms;
+  auto launch = [&](auto kernel) {
+    runtime::set_max_dynamic_smem_per_device<decltype(kernel)::value>(dev, DF_SMEM);
+    LaunchKernel(grid, DF_THREADS, dev, DF_SMEM).enable_cooperative(true)(decltype(kernel)::value, mp, A, C);
+  };
+  if (swiglu_limit < INFINITY)
+    launch(KernelC<decf_k<true>>{});
+  else
+    launch(KernelC<decf_k<false>>{});
+}
+
+// The id of the CUDA graph capture on x's device's current stream, 0 when it is not capturing: the op keys
+// decode_fused's workspace by it (see _fused_workspace).
+inline int64_t capture_id(tvm::ffi::TensorView x) {
+  using namespace host;
+  cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+  unsigned long long id = 0;
+  RuntimeDeviceCheck(cudaStreamGetCaptureInfo(LaunchKernel::resolve_device(x.device()), &st, &id));
+  return st == cudaStreamCaptureStatusActive ? (int64_t)id : 0;
+}
+
+// ---- decode, two launches (decp1_k, then decp2_k): no exchange between CTAs inside a launch ----
+// decp1_k computes GEMM1 and SwiGLU into the BF16 intermediate. decp2_k is its programmatic dependent: both fit on
+// one SM together (shared memory split between them, at most 2 x DP_THREADS x 88 registers), so decp2_k's CTAs start
+// while decp1_k streams and fill their ring with GEMM2 weights (they need no GEMM1 output). Only its row loader waits
+// for decp1_k to finish (griddepcontrol.wait), then reads every local route's intermediate row once, so the only
+// global round trip on the critical path runs while no weight copy is queued. Items own rows over the full K (no K
+// sum crosses CTAs), at 16 or 32 rows: GEMM1 picks per call the size that balances the slots' row groups over the CTAs,
+// GEMM2 the size that balances H's rows.
+constexpr int DP_CW = 8;
+constexpr int DP_THREADS = (DP_CW + 3) * 32;  // consumers + producer, row loader, epilogue
+constexpr int DP_TMAX = 4;
+constexpr int DP_RMAX = 256;
+constexpr int DP_EMAX = 1024;
+constexpr int DP_NSMAX = 48;          // ring stages at most
+constexpr int DP_SMEM_MAX = 232448;   // one CTA's dynamic shared memory at most on sm_90
+constexpr int DP_SMEM_PAIR = 231424;  // both kernels' dynamic shared memory on one SM (228KB less 1KB per CTA)
+
+struct DPMaps {
+  CUtensorMap w13[2], w2;  // w13: boxes of 576B (uh 1) and 1152B (uh 2) x nc1 chunks; w2: 576 uh2 B x nc2 chunks
+};
+struct DPArgs {
+  const __nv_bfloat16* x;
+  const int* ids;
+  const float* tw;  // null: y per route (zeros for other ranks' routes); else the weighted sum into out
+  const float* gs13;
+  const float* gs2;
+  __nv_bfloat16* inter;  // [routes][I]
+  __nv_bfloat16* y;
+  __nv_bfloat16* out;
+  float scale;
+  int T, topk, E, H, I, RB1, RB2, C1, C2;
+  int nc1a, nc1b, nc2, uh2;       // nc1a, nc1b: GEMM1 chunks per stage at uh 1, 2 (decp1_k picks uh per call)
+  int ns, stb, off_b, off_fixed;  // ring stages and bytes per stage; B rows (x or intermediate); the rest
+  const uint8_t* w2raw;           // the packed w2 (decp2_k reads small pieces of it with 16B copies)
+  int cpa;                        // decp2_k: 16B copies (stages under 9KB) instead of tensor copies
+  const float* gsr;               // up / gate global scale per expert, for the clamp on up (decp1_k with CLAMP only)
+  float lim;                      // SwiGLU clamp, read only when CLAMP
+};
+
+// Routing, the same in both kernels: slots are experts with local routes in increasing id, each slot's routes in route
+// order. rt holds sids[R], routes[R], slot_e, slot_m, slot_r0 [R each], scnt[E], misc[4]; returns the slot count.
+__device__ __forceinline__ int dp_route(const int* ids, int R, int E, int* rt) {
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  int *sids = rt, *routes = rt + R, *slot_e = rt + 2 * R, *slot_m = rt + 3 * R, *slot_r0 = rt + 4 * R,
+      *scnt = rt + 5 * R, *misc = scnt + E;
+  for (int i = tid; i < R; i += blockDim.x)
+    sids[i] = ids[i];
+  for (int e = tid; e < E; e += blockDim.x)
+    scnt[e] = 0;
+  __syncthreads();
+  for (int i = tid; i < R; i += blockDim.x)
+    if ((unsigned)sids[i] < (unsigned)E) atomicAdd(&scnt[sids[i]], 1);
+  __syncthreads();
+  if (warp == 0) {
+    int n = 0;
+    for (int e0 = 0; e0 < E; e0 += 32) {
+      const int e = e0 + lane, c = e < E ? scnt[e] : 0;
+      const uint32_t bal = __ballot_sync(0xffffffffu, c > 0);
+      if (c > 0) {
+        const int pos = n + __popc(bal & ((1u << lane) - 1));
+        slot_e[pos] = e;
+        slot_m[pos] = c;
+        scnt[e] = pos;
+      }
+      n += __popc(bal);
+    }
+    if (lane == 0) {
+      int r0 = 0;
+      for (int s = 0; s < n; s++) {
+        slot_r0[s] = r0;
+        r0 += slot_m[s];
+      }
+      misc[0] = n;
+    }
+  }
+  __syncthreads();
+  for (int i = tid; i < R; i += blockDim.x) {
+    const int e = sids[i];
+    if ((unsigned)e < (unsigned)E) {
+      int rank = 0;
+      for (int j = 0; j < i; j++)
+        rank += sids[j] == e;
+      routes[slot_r0[scnt[e]] + rank] = i;
+    }
+  }
+  __syncthreads();
+  return misc[0];
+}
+
+// 16B global -> shared copy through the load path (L2 only), and an arrive on bar once this thread's earlier ones land.
+// Bulk and tensor copies run about one at a time per SM (a 9KB copy and a 36KB copy each take about 1.2us under
+// load), so small pieces go this way.
+__device__ __forceinline__ void cp_async16(uint32_t dst, const void* src) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(src) : "memory");
+}
+__device__ __forceinline__ void cp_async_arrive(uint32_t bar) {
+  asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" ::"r"(bar) : "memory");
+}
+
+// One stage for this consumer warp: chunks c0, c0 + cstep, ... (< nv valid) of cs bytes each, nu units of 16 rows (576B
+// apart in a chunk) into accumulators ub .. ub + nu - 1; brow is this lane's B row.
+__device__ __forceinline__ void dp_stage(
+    float (&acc)[4][4],
+    const uint8_t* sb,
+    int ub,
+    int nu,
+    int cs,
+    int nv,
+    const uint8_t* brow,
+    int k0,
+    int c0,
+    int cstep,
+    int lane) {
+  const int q = lane & 3;
+  for (int c = c0; c < nv; c += cstep) {
+    uint4 b0 = make_uint4(0, 0, 0, 0), b1 = b0;
+    if (brow != nullptr) {
+      const uint8_t* bp = brow + (k0 + c) * 128 + q * 32;
+      b0 = *reinterpret_cast<const uint4*>(bp);
+      b1 = *reinterpret_cast<const uint4*>(bp + 16);
+    }
+    const uint8_t* cb = sb + c * cs;
+#pragma unroll
+    for (int u = 0; u < 4; u++) {
+      if (u < ub || u >= ub + nu) continue;
+      const uint8_t* up = cb + 576 * (u - ub);
+      const uint4 nb = *reinterpret_cast<const uint4*>(up + lane * 16);
+      const uint32_t Sc = sc_bf16(*reinterpret_cast<const uint16_t*>(up + 512 + lane * 2), 0x4140);
+#pragma unroll
+      for (int kk = 0; kk < 4; kk++) {
+        uint32_t o[4];
+        decode4(u4w(nb, kk), o);
+        const uint32_t a0 = bmulh(o[0], Sc, 0), a1 = bmulh(o[1], Sc, 1), a2 = bmulh(o[2], Sc, 0),
+                       a3 = bmulh(o[3], Sc, 1);
+        const uint4& bv = kk < 2 ? b0 : b1;
+        mma16816(acc[u], a0, a1, a2, a3, u4w(bv, 2 * (kk & 1)), u4w(bv, 2 * (kk & 1) + 1));
+      }
+    }
+  }
+}
+
+// This warp's K share of an item (nu units of 16 rows, m routes) into hand-off buffer red [warp][16 nu][T].
+__device__ __forceinline__ void
+dp_handoff(float* red, const float (&acc)[4][4], int nu, int m, int T, int warp, int lane) {
+  const int g = lane >> 2, q = lane & 3, RR = 16 * nu;
+#pragma unroll
+  for (int u = 0; u < 4; u++) {
+    if (u >= nu) break;
+    float* rp = red + (warp * RR + 16 * u + g) * T;
+    if (2 * q < m) rp[2 * q] = acc[u][0], rp[8 * T + 2 * q] = acc[u][2];
+    if (2 * q + 1 < m) rp[2 * q + 1] = acc[u][1], rp[8 * T + 2 * q + 1] = acc[u][3];
+  }
+}
+
+// GEMM1 row-group size for n slots: 32 rows (uh 2) unless 16-row items spread the work over the CTAs better.
+__device__ __forceinline__ int dp_uh1(int n, int RB1, int G) {
+  const int w2 = (n * RB1 * 4 + G - 1) / G * 2, w1 = (n * RB1 * 8 + G - 1) / G;
+  return w1 < w2 ? 1 : 2;
+}
+
+// CLAMP: SwiGLU clamps its inputs at A.lim, as in decf_k.
+template <bool CLAMP>
+__global__ void __launch_bounds__(DP_THREADS, 2) decp1_k(const __grid_constant__ DPMaps mp, const DPArgs A) {
+  extern __shared__ __align__(1024) uint8_t dsm[];
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, G = gridDim.x, b = blockIdx.x;
+  // decp2_k may start now: it reads no output of this grid before its griddepcontrol.wait
+  if (tid == 0) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  const int R = A.T * A.topk, E = A.E, NS = A.ns;
+  constexpr int RRMAX = 64;
+  const int redf = DP_CW * RRMAX * A.T;  // floats per hand-off buffer
+  float* redb = reinterpret_cast<float*>(dsm + A.off_fixed);
+  uint64_t* bars = reinterpret_cast<uint64_t*>(redb + 2 * redf);
+  int* rt = reinterpret_cast<int*>(bars + 2 * DP_NSMAX + 8);
+  const uint32_t ring = (uint32_t)__cvta_generic_to_shared(dsm);
+  const uint32_t bar0 = (uint32_t)__cvta_generic_to_shared(bars);
+  const uint32_t bfull = bar0, bempty = bar0 + 8 * DP_NSMAX, bx = bar0 + 16 * DP_NSMAX, brf = bx + 8, bre = bx + 24;
+  if (tid == 0) {
+    for (int s = 0; s < NS; s++) {
+      mbar_init(bfull + 8 * s, 1);
+      mbar_init(bempty + 8 * s, DP_CW);
+    }
+    mbar_init(bx, 1);
+    for (int s = 0; s < 2; s++) {
+      mbar_init(brf + 8 * s, DP_CW);
+      mbar_init(bre + 8 * s, 1);
+    }
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  __syncthreads();
+  if (tid == (DP_CW + 1) * 32) {  // every token's x row (padded by 16B); it needs no routing
+    mbar_expect(bx, A.T * 2 * A.H);
+    for (int t = 0; t < A.T; t++)
+      bulk_g2s(ring + A.off_b + t * (2 * A.H + 16), A.x + (int64_t)t * A.H, 2 * A.H, bx, pol_evict_first());
+  }
+  // every expert's global scale in shared memory, loaded with the ids (one round trip before the weight stream)
+  float* gsa = reinterpret_cast<float*>(rt + 5 * R + E + 4);
+  for (int e = tid; e < E; e += blockDim.x)
+    gsa[e] = A.gs13[e];
+  const int n = dp_route(A.ids, R, E, rt);
+  const int *routes = rt + R, *slot_e = rt + 2 * R, *slot_m = rt + 3 * R, *slot_r0 = rt + 4 * R;
+  const int uh = dp_uh1(n, A.RB1, G);
+  const int gpb = 8 / uh;  // items per 256-row block
+  const int per = A.RB1 * gpb, N1 = n * per;
+  const int n1c = N1 > b ? (N1 - 1 - b) / G + 1 : 0;
+  const int nc = uh == 1 ? A.nc1a : A.nc1b, cs = 576 * uh, ks = (A.C1 + nc - 1) / nc, RR = 32 * uh;
+  // item it: slot s, row block rb, half h, pair p, 16-row sub-unit u (uh 1)
+  auto item = [&](int it, int& s, int& rb, int& h, int& p, int& u) {
+    const int i = b + it * G, q = i % per, gq = q % gpb;
+    s = i / per, rb = q / gpb;
+    if (uh == 2)
+      h = gq >> 1, p = gq & 1, u = 0;
+    else
+      h = gq >> 2, p = (gq >> 1) & 1, u = gq & 1;
+  };
+
+  if (warp == DP_CW) {  // producer
+    if (lane == 0) {
+      const uint64_t pol = pol_evict_first();
+      const CUtensorMap* map = &mp.w13[uh - 1];
+      int k = 0;
+      for (int it = 0; it < n1c; it++) {
+        int s, rb, h, p, u;
+        item(it, s, rb, h, p, u);
+        const int row = slot_e[s] * A.RB1 + rb;
+        for (int j = 0; j < ks; j++, k++) {  // a stage: the gate rows, then the up rows, of nc chunks
+          const int st = k % NS;
+          if (k >= NS) mbar_wait(bempty + 8 * st, ((k / NS) + 1) & 1);
+          const uint32_t dst = ring + st * A.stb, bar = bfull + 8 * st;
+          mbar_expect(bar, 2 * cs * nc);
+          tma_4d_h(dst, map, 72 * u, 4 * h + p, j * nc, row, bar, pol);
+          tma_4d_h(dst + cs * nc, map, 72 * u, 4 * h + 2 + p, j * nc, row, bar, pol);
+        }
+      }
+    }
+  } else if (warp == DP_CW + 2) {  // epilogue: SwiGLU into the intermediate
+    for (int it = 0; it < n1c; it++) {
+      int s, rb, h, p, u;
+      item(it, s, rb, h, p, u);
+      const int hb = it & 1, e = slot_e[s], m = slot_m[s], r0 = slot_r0[s];
+      mbar_wait(brf + 8 * hb, (it >> 1) & 1);
+      const float* red = redb + hb * redf;
+      const int jr = lane, half = 16 * uh;
+      const float sc = gsa[e] * 9.223372036854775808e18f;
+      float ulim = 0.f;
+      if constexpr (CLAMP) ulim = A.lim / fabsf(__ldg(A.gsr + e));
+      const int col = 128 * rb + 64 * h + dec_kp(32 * p + 16 * u + (jr & (half - 1)));
+      for (int r = 0; r < m; r++) {
+        float gt = 0.f, ut = 0.f;
+        if (jr < half) {
+#pragma unroll
+          for (int w = 0; w < DP_CW; w++)
+            gt += red[(w * RR + jr) * A.T + r], ut += red[(w * RR + half + jr) * A.T + r];
+        }
+        gt *= sc;
+        float uv = ut * sc;
+        if constexpr (CLAMP) {
+          gt = gt > A.lim ? A.lim : gt;
+          uv = uv > ulim ? ulim : (uv < -ulim ? -ulim : uv);
+        }
+        const uint32_t hv = __bfloat16_as_ushort(__float2bfloat16(gt / (1.f + __expf(-gt)) * uv));
+        const uint32_t hn = __shfl_down_sync(0xffffffffu, hv, 1);
+        if (jr < half && !(jr & 1))
+          *reinterpret_cast<uint32_t*>(A.inter + (int64_t)routes[r0 + r] * A.I + col) = hv | (hn << 16);
+      }
+      __syncwarp();
+      if (lane == 0) mbar_arrive(bre + 8 * hb);
+    }
+  } else if (warp < DP_CW) {  // consumers
+    int k = 0;
+    const int rowx = 2 * A.H + 16, g = lane >> 2;
+    mbar_wait(bx, 0);  // always: the x copies are in flight even with no item
+    for (int it = 0; it < n1c; it++) {
+      int s, rb, h, p, u;
+      item(it, s, rb, h, p, u);
+      const int m = slot_m[s], r0 = slot_r0[s];
+      const uint8_t* brow = g < m ? dsm + A.off_b + (routes[r0 + g] / A.topk) * rowx : nullptr;
+      float acc[4][4];
+#pragma unroll
+      for (int a = 0; a < 4; a++)
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+          acc[a][i] = 0.f;
+      for (int j = 0; j < ks; j++, k++) {
+        const int st = k % NS;
+        mbar_wait(bfull + 8 * st, (k / NS) & 1);
+        const int nv = min(nc, A.C1 - j * nc);
+        const uint8_t* sb = dsm + st * A.stb;
+        dp_stage(acc, sb, 0, uh, cs, nv, brow, j * nc, warp, DP_CW, lane);
+        dp_stage(acc, sb + cs * nc, uh, uh, cs, nv, brow, j * nc, warp, DP_CW, lane);
+        __syncwarp();
+        if (lane == 0) mbar_arrive(bempty + 8 * st);
+      }
+      const int hb = it & 1;
+      if (it >= 2) mbar_wait(bre + 8 * hb, ((it >> 1) + 1) & 1);
+      dp_handoff(redb + hb * redf, acc, 2 * uh, m, A.T, warp, lane);
+      __syncwarp();
+      if (lane == 0) mbar_arrive(brf + 8 * hb);
+    }
+  }
+}
+
+__global__ void __launch_bounds__(DP_THREADS, 2) decp2_k(const __grid_constant__ DPMaps mp, const DPArgs A) {
+  // Work units are (piece of 16 uh output rows, slot), window by window, then piece, then slot. The eight consumer
+  // warps form 8 / F groups of F warps; group i takes every (8 / F)-th unit and its F warps split the unit's chunks.
+  // Each warp adds its share of route r's sum, times the slot's scale (and r's top-k weight), into wacc with shared
+  // atomics, so no warp waits on another until the end. Every unit's addresses are tabulated once, in parallel: the
+  // loops do no integer division (a runtime division is a chain of about 20 dependent instructions, and at these
+  // sizes the dependent chains, not the bytes, set the time).
+  extern __shared__ __align__(1024) uint8_t dsm[];
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, G = gridDim.x, b = blockIdx.x;
+  const int R = A.T * A.topk, E = A.E, NS = A.ns, uh = A.uh2, RR = 16 * uh;
+  const int ppb = 16 / uh, P2 = A.RB2 * ppb;  // pieces of 16 uh output rows
+  const int n2c = P2 > b ? (P2 - 1 - b) / G + 1 : 0, n2max = (P2 + G - 1) / G, UM = n2max * R;
+  const int W = A.tw != nullptr ? A.T : R;  // wacc columns: tokens (weighted sum) or routes (y per route)
+  // weighted sum: per consumer warp [piece][T][32], plain adds; y per route: [piece][R][32], shared atomics
+  const int WS = n2max * W * 32, NWS = A.tw != nullptr ? DP_THREADS / 32 : 1;
+  float* wacc = reinterpret_cast<float*>(dsm + A.off_fixed);
+  long long* usrc = reinterpret_cast<long long*>(wacc + max(DP_THREADS / 32 * n2max * A.T, n2max * R) * 32);
+  uint64_t* bars = reinterpret_cast<uint64_t*>(usrc + UM);
+  int* rt = reinterpret_cast<int*>(bars + 2 * DP_NSMAX + 2);
+  float* gsa = reinterpret_cast<float*>(rt + 5 * R + E + 4);  // per expert: gs2 x 2^63
+  float* rtw = gsa + E;                                       // per route: its top-k weight
+  int* rcol = reinterpret_cast<int*>(rtw + R);                // per route: its wacc column (token or route)
+  int* wins = rcol + R;                                       // window starts (slot index), [nw + 1]
+  int* woff = wins + DP_RMAX + 1;                             // window starts (unit index), [nw + 1]
+  int* urow = woff + DP_RMAX + 1;  // per unit: first row in the window's rows, routes, first route, piece, map coords
+  int* um = urow + UM;
+  int* ur0 = um + UM;
+  int* upi = ur0 + UM;
+  int* uc = upi + UM;   // 72 u | hp << 8
+  int* uerb = uc + UM;  // e RB2 + rb
+  float* usc = reinterpret_cast<float*>(uerb + UM);
+  const uint32_t ring = (uint32_t)__cvta_generic_to_shared(dsm);
+  const uint32_t bar0 = (uint32_t)__cvta_generic_to_shared(bars);
+  const uint32_t bfull = bar0, bempty = bar0 + 8 * DP_NSMAX;
+  for (int i = tid; i < NWS * WS; i += blockDim.x)
+    wacc[i] = 0.f;
+  for (int i = tid; i < R; i += blockDim.x)
+    rcol[i] = A.tw != nullptr ? i / A.topk : i;
+  // ids, topk weights and scales come from kernels that finished before decp1_k started, so they are read before the
+  // wait, all at once: one round trip before decp1_k's weight stream fills the memory queues
+  if (A.tw != nullptr)
+    for (int i = tid; i < R; i += blockDim.x)
+      rtw[i] = A.tw[i];
+  for (int e = tid; e < E; e += blockDim.x)
+    gsa[e] = A.gs2[e] * 9.223372036854775808e18f;
+  const int n = dp_route(A.ids, R, E, rt);
+  const int *routes = rt + R, *slot_e = rt + 2 * R, *slot_m = rt + 3 * R, *slot_r0 = rt + 4 * R;
+  // Windows: consecutive slots whose routes fit the rows region (one window unless the call has more local routes
+  // than the host sized for).
+  const int rowi = 2 * A.I + 16, rcap = (A.off_fixed - A.off_b) / rowi;
+  const int nc = A.nc2, cs = 576 * uh, ks = (A.C2 + nc - 1) / nc, U = n2c * n;
+  // F: warps per unit, the power of two that minimizes (units per group) x (chunks per warp); on ties the smallest,
+  // since each unit also costs a fixed chain of shared-memory reads per warp
+  // With the ring reused (not one shot), a group's next unit is (8 / F) ks stages on, so (8 / F) ks <= NS keeps every
+  // wait within one phase of its stage (a group a full ring ahead would read a stale phase's parity as done).
+  const bool fits = A.cpa && U * ks <= NS && (n == 0 || slot_r0[n - 1] + slot_m[n - 1] <= rcap);  // one shot
+  int F = 8;
+  for (int f = 4; f >= 1; f >>= 1)
+    if ((fits || (8 / f) * ks <= NS) &&
+        (U + 8 / f - 1) / (8 / f) * ((A.C2 + f - 1) / f) <= (U + 8 / F - 1) / (8 / F) * ((A.C2 + F - 1) / F))
+      F = f;
+  if (tid == 0) {
+    int nw = 0, r0 = 0;
+    wins[0] = 0;
+    for (int s = 0; s < n; s++)
+      if (slot_r0[s] + slot_m[s] - r0 > rcap) wins[++nw] = s, r0 = slot_r0[s];
+    wins[++nw] = n;
+    rt[5 * R + E + 1] = nw;
+    woff[0] = 0;
+    for (int w = 0; w < nw; w++)
+      woff[w + 1] = woff[w] + n2c * (wins[w + 1] - wins[w]);
+    for (int s = 0; s < NS; s++) {
+      mbar_init(bfull + 8 * s, A.cpa ? 32 : 1);
+      mbar_init(bempty + 8 * s, F);
+    }
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  __syncthreads();
+  const int nw = n > 0 ? rt[5 * R + E + 1] : 0;
+  for (int q = tid; q < U; q += blockDim.x) {
+    int w = 0;
+    while (q >= woff[w + 1])
+      w++;
+    const int l = q - woff[w], nsw = wins[w + 1] - wins[w], pi = l / nsw, s = wins[w] + l % nsw;
+    const int j = b + pi * G, rb = j / ppb, qq = j % ppb, hp = qq / (2 / uh), u = qq % (2 / uh), e = slot_e[s];
+    usrc[q] = ((long long)(e * A.RB2 + rb) * A.C2) * 9216 + hp * 1152 + u * 576;
+    urow[q] = slot_r0[s] - slot_r0[wins[w]];
+    um[q] = slot_m[s];
+    ur0[q] = slot_r0[s];
+    upi[q] = pi;
+    uc[q] = 72 * u | hp << 8;
+    uerb[q] = e * A.RB2 + rb;
+    usc[q] = gsa[e];
+  }
+  __syncthreads();
+  const int pc = cs / 16;  // 16B pieces per chunk
+
+  // 16B copies (small stages): every warp issues a share of the first NS stages now, a warp per stage (one warp
+  // issuing them all takes about 0.75us per stage). Later stages are issued by the warp that frees the slot when a
+  // unit has one warp (F == 1), else by the producer warp.
+  const bool multi = A.cpa && nw == 1, total_fit = U * ks <= NS, crefill = multi && F == 1;
+  // With no producer warp needed (16B copies, one warp per unit), every warp of the CTA consumes, as long as a group's
+  // next unit stays within one ring of its last (the same rule as for F above, now with 11 groups).
+  const int NCW = (crefill || (multi && total_fit && F == 1)) && (total_fit || (DP_THREADS / 32) * ks <= NS)
+                      ? DP_THREADS / 32
+                      : DP_CW;
+  // Stages in use. A reused ring is safe only when one group fills and consumes every slot: a group's parity wait on a
+  // slot then always follows its own wait on that slot's previous fill. Groups take units round robin, so that holds
+  // when the stages in use are a multiple of (groups x stages per unit). Otherwise a group can wait on a slot whose
+  // previous fill belongs to another group and is still in flight (copies complete out of order), read the parity of
+  // the fill two back as done, and free the slot early; the producer then arrives twice on one phase (a device
+  // exception, seen with another kernel holding most SMs).
+  const int gNc = NCW / F;
+  const int NU = total_fit || gNc == 1 ? NS : NS - NS % (gNc * ks);
+  auto issue_cp = [&](int k) {  // stage k into its slot by this warp's 32 lanes, then their arrives
+    const int q = k / ks, j = k - q * ks, nv = min(nc, A.C2 - j * nc);
+    const uint8_t* src = A.w2raw + usrc[q] + (long long)j * nc * 9216;
+    const uint32_t dst = ring + (k % NU) * A.stb;
+    for (int c = 0; c < nv; c++)
+      for (int o = lane; o < pc; o += 32)
+        cp_async16(dst + c * cs + o * 16, src + (long long)c * 9216 + o * 16);
+    cp_async_arrive(bfull + 8 * (k % NU));
+  };
+  if (multi)
+    for (int k = warp; k < min(NU, U * ks); k += DP_THREADS / 32)
+      issue_cp(k);
+  if (warp == DP_CW && !crefill && !(multi && total_fit)) {  // producer for the stages not issued above
+    const uint64_t pol = pol_evict_first();
+    for (int k = multi ? NU : 0; k < U * ks; k++) {
+      const int st = k % NU, q = k / ks, j = k - q * ks;
+      if (k >= NU) mbar_wait(bempty + 8 * st, ((k / NU) + 1) & 1);
+      if (A.cpa) {
+        issue_cp(k);
+      } else if (lane == 0) {
+        mbar_expect(bfull + 8 * st, cs * nc);
+        tma_4d_h(ring + st * A.stb, &mp.w2, uc[q] & 255, uc[q] >> 8, j * nc, uerb[q], bfull + 8 * st, pol);
+      }
+    }
+  }
+  if (warp < NCW) {  // consumers; they also load each window's intermediate rows once decp1_k has finished
+    const int g = lane >> 2, qd = lane & 3, gN = NCW / F, grp = warp / F, wg = warp % F;
+    GDC_WAIT();
+    for (int w = 0; w < nw && n2c > 0; w++) {
+      if (w > 0) asm volatile("bar.sync 1, %0;" ::"r"(NCW * 32) : "memory");  // every warp is done with the last rows
+      {
+        const int per = A.I / 8, wr0 = slot_r0[wins[w]];  // 16B per load
+        constexpr int L = 4;
+        const int nl = slot_r0[wins[w + 1] - 1] + slot_m[wins[w + 1] - 1] - wr0;
+        for (int i0 = 0; i0 < nl * per; i0 += NCW * 32 * L) {
+          uint4 v[L];
+#pragma unroll
+          for (int u = 0; u < L; u++) {
+            const int i = min(i0 + u * NCW * 32 + tid, nl * per - 1);
+            v[u] = ld_cg4(A.inter + (int64_t)routes[wr0 + i / per] * A.I + (i % per) * 8);
+          }
+#pragma unroll
+          for (int u = 0; u < L; u++) {
+            const int i = i0 + u * NCW * 32 + tid;
+            if (i < nl * per) *reinterpret_cast<uint4*>(dsm + A.off_b + (i / per) * rowi + (i % per) * 16) = v[u];
+          }
+        }
+      }
+      asm volatile("bar.sync 1, %0;" ::"r"(NCW * 32) : "memory");
+      const int q0 = woff[w] + ((grp - woff[w] % gN) + gN) % gN;
+      for (int q = q0; q < woff[w + 1]; q += gN) {
+        const int m = um[q];
+        const uint8_t* brow = g < m ? dsm + A.off_b + (urow[q] + g) * rowi : nullptr;
+        float acc[4][4];
+#pragma unroll
+        for (int a = 0; a < 4; a++)
+#pragma unroll
+          for (int i = 0; i < 4; i++)
+            acc[a][i] = 0.f;
+        for (int j = 0; j < ks; j++) {
+          const int k = q * ks + j, st = k % NU;
+          mbar_wait(bfull + 8 * st, (k / NU) & 1);
+          const int nv = min(nc, A.C2 - j * nc);
+          dp_stage(acc, dsm + st * A.stb, 0, uh, cs, nv, brow, j * nc, wg, F, lane);
+          __syncwarp();
+          if (crefill) {
+            if (k + NU < U * ks) issue_cp(k + NU);
+          } else if (lane == 0 && !(multi && total_fit)) {
+            mbar_arrive(bempty + 8 * st);
+          }
+        }
+        // this warp's share: rows 16 u + g (+ 8), routes 2 qd, 2 qd + 1 of the slot
+        const float sc = usc[q];
+        const int r0 = ur0[q], wbase = upi[q] * W;
+#pragma unroll
+        for (int u = 0; u < 2; u++) {
+          if (u >= uh) break;
+#pragma unroll
+          for (int c = 0; c < 2; c++) {
+            if (2 * qd + c >= m) continue;
+            const int route = routes[r0 + 2 * qd + c];
+            float* wp = wacc + (wbase + rcol[route]) * 32 + 16 * u + g;
+            if (A.tw != nullptr) {  // this warp's own sums: no other warp writes them
+              const float f = sc * rtw[route];
+              wp += warp * WS;
+              wp[0] += f * acc[u][c];
+              wp[8] += f * acc[u][2 + c];
+            } else {
+              atomicAdd(wp, sc * acc[u][c]);
+              atomicAdd(wp + 8, sc * acc[u][2 + c]);
+            }
+          }
+        }
+      }
+    }
+    asm volatile("bar.sync 1, %0;" ::"r"(NCW * 32) : "memory");
+    // each piece's rows of out, or of y for every route (zeros for other ranks' routes)
+    for (int i = tid; i < n2c * W * RR; i += NCW * 32) {
+      const int pi = i / (W * RR), c = (i / RR) % W, jr = i % RR;
+      const int j = b + pi * G, qq = j % ppb;
+      const int row = 256 * (j / ppb) + 32 * (qq / (2 / uh)) + 16 * (qq % (2 / uh)) + jr;
+      float v = 0.f;
+      for (int ww = 0; ww < NWS; ww++)
+        v += wacc[ww * WS + (pi * W + c) * 32 + jr];
+      if (A.tw != nullptr)
+        A.out[(int64_t)c * A.H + row] = __float2bfloat16(v * A.scale);
+      else
+        A.y[(int64_t)c * A.H + row] = __float2bfloat16(v);
+    }
+  }
+}
+
+struct DPCarveout {};
+// The two-launch decode path: decp1_k, then decp2_k as its programmatic dependent, 1 to DP_TMAX tokens. inter
+// ([routes][I] BF16) needs no initial value.
+inline void run_decode_pdl(
+    tvm::ffi::TensorView x,
+    tvm::ffi::TensorView topk_ids,
+    tvm::ffi::TensorView w13,
+    tvm::ffi::TensorView w2,
+    tvm::ffi::TensorView gs13,
+    tvm::ffi::TensorView gs2,
+    tvm::ffi::TensorView gsr,
+    tvm::ffi::TensorView inter,
+    tvm::ffi::Optional<tvm::ffi::TensorView> y,
+    tvm::ffi::Optional<tvm::ffi::TensorView> topk_weights,
+    tvm::ffi::Optional<tvm::ffi::TensorView> out,
+    double scale,
+    double swiglu_limit,
+    int64_t ctas) {
+  using namespace host;
+  auto T = SymbolicSize{"tokens"};
+  auto H = SymbolicSize{"hidden"};
+  auto K = SymbolicSize{"top_k"};
+  auto R = SymbolicSize{"routes"};
+  auto E = SymbolicSize{"local_experts"};
+  auto II = SymbolicSize{"intermediate"};
+  auto device = SymbolicDevice{};
+  TensorMatcher({T, H}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).ensure_alignment(16).verify(x);
+  TensorMatcher({T, K}).with_dtype<int32_t>().with_device(device).verify(topk_ids);
+  TensorMatcher({E}).with_dtype<float>().with_device(device).verify(gs13);
+  TensorMatcher({E}).with_dtype<float>().with_device(device).verify(gs2);
+  TensorMatcher({E}).with_dtype<float>().with_device(device).verify(gsr);
+  if (y.has_value())
+    TensorMatcher({R, H}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(y.value());
+  TensorMatcher({R, II}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(inter);
+  const int64_t t = T.unwrap(), h = H.unwrap(), topk = K.unwrap(), r = R.unwrap(), e = E.unwrap();
+  RuntimeCheck(
+      w13.dim() == 3 && h >= 64 && w13.size(1) % (h / 64 * 8) == 0,
+      "nvfp4_w4a16_sm90: packed w13 must be [E, I / 64 * H / 64 * 8, 576]");
+  // The padded width; the decode kernels read whole 256-row GEMM1 blocks, so a half block (I % 128 == 64) is refused
+  // below and stays on the grouped kernels.
+  const int64_t i = w13.size(1) / (h / 64 * 8) * 64;
+  RuntimeCheck(II.unwrap() == i, "nvfp4_w4a16_sm90 decode_pdl: intermediate width");
+  RuntimeCheck(r == t * topk, "nvfp4_w4a16_sm90: workspace rows ", r, " != tokens * top_k ", t * topk);
+  RuntimeCheck(
+      t >= 1 && t <= DP_TMAX && r <= DP_RMAX,
+      "nvfp4_w4a16_sm90 decode_pdl: at most ",
+      DP_TMAX,
+      " tokens and ",
+      DP_RMAX,
+      " routes");
+  RuntimeCheck(h >= 256 && h % 256 == 0, "nvfp4_w4a16_sm90: hidden size must be a multiple of 256, got ", h);
+  RuntimeCheck(
+      i >= 128 && i % 128 == 0,
+      "nvfp4_w4a16_sm90 decode: padded intermediate size must be a multiple of 128 (no half block), got ",
+      i);
+  RuntimeCheck(swiglu_limit > 0, "nvfp4_w4a16_sm90: swiglu_limit must be positive (inf for none)");
+  RuntimeCheck(e >= 1 && e <= DP_EMAX, "nvfp4_w4a16_sm90: 1 to 1024 local experts, got ", e);
+  const int RB1 = (int)(2 * i / 256), RB2 = (int)(h / 256), C1 = (int)(h / 64), C2 = (int)(i / 64);
+  TensorMatcher({e, (int64_t)RB1 * C1 * 16, 576})
+      .with_dtype<uint8_t>()
+      .with_device(device)
+      .ensure_alignment(16)
+      .verify(w13);
+  TensorMatcher({e, RB2, C2, 16, 576}).with_dtype<uint8_t>().with_device(device).ensure_alignment(16).verify(w2);
+  RuntimeCheck(out.has_value() == topk_weights.has_value(), "nvfp4_w4a16_sm90: out and topk_weights go together");
+  RuntimeCheck(out.has_value() != y.has_value(), "nvfp4_w4a16_sm90 decode: y (per route) or out (weighted), not both");
+  if (out.has_value()) {
+    TensorMatcher({T, H}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(out.value());
+    TensorMatcher({T, K}).with_dtype<float>().with_device(device).verify(topk_weights.value());
+  }
+  const DLDevice dev = device.unwrap();
+  RuntimeCheck(runtime::get_sm_version(dev.device_id) == 90, "nvfp4_w4a16_sm90: needs an sm_90 (Hopper) GPU");
+  const int sms = (int)runtime::get_sm_count(dev.device_id);
+  const int G = ctas > 0 ? (int)std::min<int64_t>(ctas, sms) : sms;
+  // GEMM2 piece size: 32 rows unless 16-row pieces balance H's rows over the CTAs better
+  const int P32 = (int)(h / 32);
+  const int uh2 = ((2 * P32 + G - 1) / G) < ((P32 + G - 1) / G) * 2 ? 1 : 2;
+  const int nc1a = (int)std::min<int64_t>(32, C1), nc1b = (int)std::min<int64_t>(16, C1);
+  const int nc2 = (int)std::min<int64_t>(64 / uh2, C2);
+  const int stba = 2 * 1152 * nc1b, stbb = 576 * uh2 * nc2;  // gate and up copies; nc1a at uh 1: the same bytes
+  auto rnd = [](int64_t v) { return (int)((v + 127) / 128 * 128); };
+  const int route_b = (int)(6 * r + 2 * e + 8) * 4, bars_b = (2 * DP_NSMAX + 8) * 8;
+  const int xrows = rnd(t * (2 * h + 16));
+  const int n2max = (int)((h / 16 / uh2 + G - 1) / G);
+  const int fixa = 2 * DP_CW * 64 * (int)t * 4 + bars_b + route_b;
+  const int fixb = (int)std::max<int64_t>(DP_THREADS / 32 * n2max * t, n2max * r) * 32 * 4 + (int)r * 4 +
+                   n2max * (int)r * (8 + 7 * 4) + (2 * DP_NSMAX + 2) * 8 + route_b + 2 * (DP_RMAX + 1) * 4;
+  const int nsa = 2;  // GEMM1 ring stages (more measured slower)
+  const int smem_a = nsa * stba + xrows + fixa;
+  // decp2_k's intermediate rows: room for rcap routes at once (more local routes run in windows of rcap). Default:
+  // all routes if three ring stages still fit, else as many as leave three stages, at least one slot's routes.
+  const int rowb = (int)(2 * i + 16), budget_b = DP_SMEM_PAIR - smem_a - fixb - 128;
+  const int rcap = (int)std::min<int64_t>(r, std::max<int64_t>(t, std::min<int64_t>(r, (budget_b - 3 * stbb) / rowb)));
+  RuntimeCheck(rcap >= t, "nvfp4_w4a16_sm90 decode_pdl: intermediate rows under one slot");
+  const int irows = rnd((int64_t)rcap * rowb);
+  const int nsb_fit = std::min<int>(DP_NSMAX, (budget_b + 128 - irows) / stbb);
+  RuntimeCheck(nsb_fit >= 2, "nvfp4_w4a16_sm90 decode_pdl: tokens x width too large for shared memory");
+  const int smem_b = nsb_fit * stbb + irows + fixb;
+  auto wmap = [&](void* base, int C, int64_t blocks, int nc, int uh) {
+    return host::tma::make_map(
+        base,
+        CU_TENSOR_MAP_DATA_TYPE_UINT64,
+        {144, 8, (cuuint64_t)C, (cuuint64_t)blocks},
+        {1152, 9216, (cuuint64_t)C * 9216},
+        {(cuuint32_t)(72 * uh), 1, (cuuint32_t)nc, 1},
+        {.l2_promotion = CU_TENSOR_MAP_L2_PROMOTION_L2_256B});
+  };
+  DPMaps mp;
+  mp.w13[0] = wmap(w13.data_ptr(), C1, e * RB1, nc1a, 1);
+  mp.w13[1] = wmap(w13.data_ptr(), C1, e * RB1, nc1b, 2);
+  mp.w2 = wmap(w2.data_ptr(), C2, e * RB2, nc2, uh2);
+  DPArgs A;
+  A.x = static_cast<const __nv_bfloat16*>(x.data_ptr());
+  A.ids = static_cast<const int*>(topk_ids.data_ptr());
+  A.tw = topk_weights.has_value() ? static_cast<const float*>(topk_weights.value().data_ptr()) : nullptr;
+  A.gs13 = static_cast<const float*>(gs13.data_ptr());
+  A.gs2 = static_cast<const float*>(gs2.data_ptr());
+  A.inter = static_cast<__nv_bfloat16*>(inter.data_ptr());
+  A.y = y.has_value() ? static_cast<__nv_bfloat16*>(y.value().data_ptr()) : nullptr;
+  A.out = out.has_value() ? static_cast<__nv_bfloat16*>(out.value().data_ptr()) : nullptr;
+  A.scale = (float)scale;
+  A.T = (int)t, A.topk = (int)topk, A.E = (int)e, A.H = (int)h, A.I = (int)i;
+  A.RB1 = RB1, A.RB2 = RB2, A.C1 = C1, A.C2 = C2;
+  A.nc1a = nc1a, A.nc1b = nc1b, A.nc2 = nc2, A.uh2 = uh2;
+  A.w2raw = static_cast<const uint8_t*>(w2.data_ptr());
+  A.cpa = stbb < 9216;
+  A.gsr = static_cast<const float*>(gsr.data_ptr());
+  A.lim = (float)swiglu_limit;
+  const bool clamp = swiglu_limit < INFINITY;
+  runtime::init_per_device<DPCarveout>(dev, [] {
+    RuntimeDeviceCheck(cudaFuncSetAttribute(decp1_k<false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    RuntimeDeviceCheck(cudaFuncSetAttribute(decp1_k<true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    RuntimeDeviceCheck(cudaFuncSetAttribute(decp2_k, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+  });
+  if (clamp)
+    runtime::set_max_dynamic_smem_per_device<decp1_k<true>>(dev, DP_SMEM_MAX);
+  else
+    runtime::set_max_dynamic_smem_per_device<decp1_k<false>>(dev, DP_SMEM_MAX);
+  runtime::set_max_dynamic_smem_per_device<decp2_k>(dev, DP_SMEM_MAX);
+  DPArgs B = A;
+  A.ns = nsa, A.stb = stba, A.off_b = nsa * stba, A.off_fixed = A.off_b + xrows;
+  B.ns = nsb_fit, B.stb = stbb, B.off_b = nsb_fit * stbb, B.off_fixed = B.off_b + irows;
+  if (clamp)
+    LaunchKernel(G, DP_THREADS, dev, smem_a)(decp1_k<true>, mp, A);
+  else
+    LaunchKernel(G, DP_THREADS, dev, smem_a)(decp1_k<false>, mp, A);
+  LaunchKernel(G, DP_THREADS, dev, smem_b).enable_pdl(true)(decp2_k, mp, B);
+}
+
 }  // namespace sglang::nvfp4_w4a16_sm90

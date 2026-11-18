@@ -74,6 +74,10 @@ SHAPES = {
     # Clamped SwiGLU layers (swiglu_limit 10): GLM-5.3-Flash at TP4 and TP8.
     "glm53f_tp4": (4096, 512, 36, 288, 8),
     "glm53f_tp8": (4096, 256, 36, 288, 8),
+    # Large experts where decode_fused rotates its intermediate rows through only 2 shared-memory buffers when one
+    # expert takes every token: Muse Spark (EP8) at 4 tokens, Phi-3.5-MoE at 3.
+    "muse": (4096, 4096, 32, 256, 8),
+    "phi35": (4096, 6400, 16, 16, 2),
 }
 SENTINEL = 7.0
 _LAYERS = {}
@@ -153,6 +157,8 @@ def _routing(T, topk, E, Eg, kind="skew", seed=0, remote="minus_one"):
         s[:, 1:E:2] = float("-inf")
     elif kind == "remote":
         s[:, :E] = float("-inf")
+    elif kind == "shared":  # every token routes to local expert 3
+        s[:, 3] = float("inf")
     ids = torch.topk(s, topk, dim=1).indices.to(torch.int32)
     if remote == "minus_one":
         ids = torch.where(ids < E, ids, -1)
@@ -611,11 +617,19 @@ void launch(torch::Tensor flag, torch::Tensor started, int64_t blocks) {
 """
 
 
-@pytest.mark.parametrize("variant", ["single", "pair"])
-def test_progress_while_another_kernel_holds_sms(variant):
+@pytest.mark.parametrize(
+    "variant,T,free",
+    [("single", 753, 16), ("pair", 753, 16)]
+    + [("decode_pdl", T, free) for T in (1, 2) for free in (16, 66, 92)],
+)
+def test_progress_while_another_kernel_holds_sms(variant, T, free):
     """Another stream's kernel holds all but 16 SMs (an overlapped side stream, MPS, a green context); the op must
     finish on the SMs it has. Fails on: a persistent kernel that gives CTA b tile b statically, so the resident CTAs
-    spin on GEMM2 tiles whose GEMM1 tiles belong to CTAs that are still queued."""
+    spin on GEMM2 tiles whose GEMM1 tiles belong to CTAs that are still queued. decode_fused is a cooperative launch
+    of one CTA per SM and only starts once every SM is free, so it is left out here (see _decode_variant). decode_pdl
+    runs with 16, 66 and 92 SMs free. Fails on (decode_pdl): GEMM2 consumer groups sharing ring slots, where a group
+    reads a slot's parity from two fills back while the previous fill is still in flight (at 1 token with 66 or 92 SMs
+    free it faulted with a device exception)."""
     from torch.utils.cpp_extension import load_inline
 
     spin = load_inline(
@@ -627,7 +641,6 @@ def test_progress_while_another_kernel_holds_sms(variant):
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     H, I, E, Eg, topk = SHAPES["deepseek_ep8"]
     ck, experts = _layer("deepseek_ep8")
-    T = 753
     x = torch.randn((T, H), device="cuda").bfloat16()
     ids = _routing(T, topk, E, Eg, seed=3)
     y = torch.empty((T * topk, H), dtype=torch.bfloat16, device="cuda")
@@ -641,11 +654,11 @@ def test_progress_while_another_kernel_holds_sms(variant):
     safety.start()
     try:
         with torch.cuda.stream(torch.cuda.Stream()):
-            spin.launch(flag, started, sms - 16)
+            spin.launch(flag, started, sms - free)
         t0 = time.time()
-        while int(started[0]) < sms - 16 and time.time() - t0 < 10:
+        while int(started[0]) < sms - free and time.time() - t0 < 10:
             time.sleep(0.01)
-        assert int(started[0]) == sms - 16, "the blocker did not become resident"
+        assert int(started[0]) == sms - free, "the blocker did not become resident"
         done = torch.cuda.Event()
         with torch.cuda.stream(torch.cuda.Stream()):
             nvfp4_w4a16_sm90_moe(x, ids, experts, out=y, variant=variant)
@@ -658,6 +671,453 @@ def test_progress_while_another_kernel_holds_sms(variant):
         flag.fill_(1)
         safety.cancel()
     torch.cuda.synchronize()
-    assert finished, "no progress on the 16 free SMs within 10s"
+    assert finished, f"no progress on the {free} free SMs within 10s"
     ref, local = _reference(ck, x, ids, E)
     _assert_close(y, ref, local)
+
+
+# ---- the decode kernels (1 to 4 tokens): one launch ("decode_fused") and two launches ("decode_pdl") ----
+
+
+def _whole_blocks(shape):
+    """The decode kernels take only padded widths of whole 128-column blocks (no half block)."""
+    return (SHAPES[shape][1] + 63) // 64 % 2 == 0
+
+
+def _fused_fits(shape, T):
+    """decode_fused's shared-memory bound (Phi-3.5-MoE's 6400-wide experts fit up to 3 tokens)."""
+    H, I = SHAPES[shape][:2]
+    return (43008 + T * (2 * H + 16) + 1023) // 1024 * 1024 + 2 * 36864 + 2 * T * (
+        2 * I + 16
+    ) <= 232448
+
+
+_DECODE_CASES = (
+    [
+        ("decode_fused", s, T)
+        for s in SHAPES
+        if _whole_blocks(s)
+        for T in (1, 2, 3, 4)
+        if _fused_fits(s, T)
+    ]
+    + [
+        ("decode_pdl", s, T)
+        for s in ("qwen3_30b", "qwen3_next_ep8")
+        for T in (1, 2, 3, 4)
+    ]
+    + [("decode_pdl", s, T) for s in ("deepseek_ep8", "eplb36") for T in (1, 2)]
+)
+
+
+@pytest.mark.parametrize("variant,shape,T", _DECODE_CASES)
+def test_decode_token_counts(variant, shape, T):
+    """Each decode kernel at every token count it serves, per-route outputs. Fails on: a tagged word written to the
+    wrong intermediate column (16-row GEMM1 items), a stale word taken as current, a slot's rows read from another
+    slot's shared-memory rows, a GEMM2 group whose slots share a stage but not a column offset, rotating row buffers
+    refilled before every consumer warp is done (DeepSeek at 4 tokens), a two-launch GEMM2 reading the intermediate
+    before its GEMM1 grid finished."""
+    _check(shape, T, variant=variant)
+
+
+@pytest.mark.parametrize("variant", ["decode_fused", "decode_pdl"])
+@pytest.mark.parametrize(
+    "kind,remote",
+    [
+        ("hot", "minus_one"),
+        ("empty", "minus_one"),
+        ("remote", "minus_one"),
+        ("skew", "global"),
+        ("remote", "global"),
+    ],
+)
+def test_decode_routing_kinds(variant, kind, remote):
+    """One expert taking most routes, empty experts, no local route at all. Fails on: a hang when no slot exists, a
+    slot with more than one route read with the wrong row stride."""
+    for T in (1, 2):
+        _check("qwen3_30b", T, kind=kind, remote=remote, variant=variant)
+
+
+@pytest.mark.parametrize("variant", ["decode_fused", "decode_pdl"])
+def test_decode_weighted_sum_repeat_and_graph(variant):
+    """The weighted sum against the reference, then a CUDA graph replayed with new routings: every result must match
+    the reference and an eager call bitwise. Eager calls, warm-up and capture share one stream, so the graph runs on
+    the eager calls' live epoch, which must advance by one per call, replays included. Fails on: an epoch that does
+    not advance (a later call takes an earlier call's words), weights or scales staged from the wrong route or slot, a
+    host-side routing decision."""
+    import sglang.kernels.ops.moe.nvfp4_w4a16_sm90 as op
+
+    H, I, E, Eg, topk = SHAPES["qwen3_30b"]
+    ck, experts = _layer("qwen3_30b")
+    s = torch.cuda.Stream()
+
+    def epoch():
+        ws = op._fused_ws[(torch.cuda.current_device(), s.cuda_stream)][0]
+        return int(ws[:1].view(torch.int32)[1])
+
+    for T in (1, 2):
+        x = torch.randn((T, H), device="cuda").bfloat16()
+        ids = _routing(T, topk, E, Eg, seed=5 + T)
+        w = torch.rand((T, topk), device="cuda")
+        out = torch.empty((T, H), dtype=torch.bfloat16, device="cuda")
+        with torch.cuda.stream(s):
+            for _ in range(
+                3
+            ):  # warm-up on the capture stream: the graph starts on a running epoch
+                nvfp4_w4a16_sm90_moe(
+                    x, ids, experts, topk_weights=w, out=out, scale=2.5, variant=variant
+                )
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=s):
+            nvfp4_w4a16_sm90_moe(
+                x, ids, experts, topk_weights=w, out=out, scale=2.5, variant=variant
+            )
+        torch.cuda.synchronize()
+        e0 = epoch() if variant == "decode_fused" else None
+        for rep in range(4):
+            x.copy_(torch.randn((T, H), device="cuda").bfloat16())
+            ids.copy_(
+                _routing(T, topk, E, Eg, kind=("skew", "hot")[rep % 2], seed=40 + rep)
+            )
+            torch.cuda.synchronize()
+            with torch.cuda.stream(s):
+                graph.replay()
+                eager = nvfp4_w4a16_sm90_moe(
+                    x, ids, experts, topk_weights=w, scale=2.5, variant=variant
+                )
+            torch.cuda.synchronize()
+            if e0 is not None:
+                assert e0 > 1 and epoch() == e0 + 2 * (rep + 1), (e0, epoch())
+            ref, local = _reference(ck, x, ids, E)
+            ref_sum = (
+                ref.view(T, topk, H) * (w * local.view(T, topk)).unsqueeze(-1)
+            ).sum(1) * 2.5
+            _assert_close(out, ref_sum, slice(None))
+            assert torch.equal(out, eager)
+
+
+def test_decode_dispatch():
+    """auto takes the one-launch kernel for large experts and the two-launch one for small ones, only up to
+    DECODE_MAX_TOKENS tokens, and gives the same result as the variant it picks. Fails on: a dispatch that sends a
+    shape to a kernel that refuses it, or past the token range."""
+    import sglang.kernels.ops.moe.nvfp4_w4a16_sm90 as op
+
+    assert op._decode_variant(1, 8, 32, 7168, 2048) == "decode_fused"
+    assert op._decode_variant(2, 16, 256, 6144, 256) == "decode_pdl"
+    assert op._decode_variant(3, 24, 32, 7168, 2048) == "auto"
+    for shape in ("deepseek_ep8", "qwen3_30b"):
+        H, I, E, Eg, topk = SHAPES[shape]
+        ck, experts = _layer(shape)
+        x = torch.randn((2, H), device="cuda").bfloat16()
+        ids = _routing(2, topk, E, Eg, seed=11)
+        w = torch.rand(
+            (2, topk), device="cuda"
+        )  # the weighted sum (decode_pdl's per-route sums use atomics)
+        a = nvfp4_w4a16_sm90_moe(x, ids, experts, topk_weights=w)
+        b = nvfp4_w4a16_sm90_moe(
+            x,
+            ids,
+            experts,
+            topk_weights=w,
+            variant=op._decode_variant(2, 2 * topk, E, H, I),
+        )
+        assert torch.equal(a, b)
+
+
+# ---- the decode kernels with swiglu_limit, and widths that end on a half block ----
+
+_DECODE_VARIANTS = ["decode_fused", "decode_pdl"]
+
+
+@pytest.mark.parametrize("variant", _DECODE_VARIANTS)
+@pytest.mark.parametrize("shape", ["glm53f_tp4", "glm53f_tp8"])
+@pytest.mark.parametrize("T", [1, 2, 3, 4])
+def test_decode_swiglu_limit(variant, shape, T):
+    """swiglu_limit 10 in both decode kernels on GLM-5.3-Flash's TP4 and TP8 shapes, gate and up loud enough that the
+    clamp binds on a large share of elements, against the clamped FP32 reference. Fails on: a decode kernel that
+    applies plain SwiGLU (the unclamped reference is checked to be far from the clamped one), up clamped on one side
+    only, the limit not reaching the kernel."""
+    ck, x, ids, ref, local, clamped = _check(
+        shape, T, case="loud", variant=variant, swiglu_limit=10.0
+    )
+    gate_share = sum(g for g, _ in clamped) / len(clamped)
+    up_share = sum(u for _, u in clamped) / len(clamped)
+    assert gate_share > 0.2 and up_share > 0.4, (gate_share, up_share)
+    unclamped, _ = _reference(ck, x, ids, SHAPES[shape][2])
+    assert float((unclamped[local] - ref[local]).norm() / ref[local].norm()) > 0.5
+
+
+@pytest.mark.parametrize("variant", _DECODE_VARIANTS)
+@pytest.mark.parametrize("T", [1, 2])
+def test_decode_swiglu_limit_where_the_clamp_shape_matters(variant, T):
+    """A limit of 1 on normal-sized gate and up in both decode kernels. Fails on: the gate clamped from below too, or
+    the clamp applied after SiLU (each moves the output by several percent here)."""
+    shape = "glm53f_tp8"
+    ck, x, ids, ref, local, clamped = _check(
+        shape, T, variant=variant, swiglu_limit=1.0
+    )
+    gate_share = sum(g for g, _ in clamped) / len(clamped)
+    up_share = sum(u for _, u in clamped) / len(clamped)
+    assert gate_share > 0.1 and up_share > 0.2, (gate_share, up_share)
+    rows = ref[local]
+    for wrong in ("both_sides", "after_silu"):
+        alt = _reference(ck, x, ids, SHAPES[shape][2], 1.0, variant=wrong)[0][local]
+        assert float((alt - rows).norm() / rows.norm()) > 0.03, wrong
+
+
+@pytest.mark.parametrize("variant", _DECODE_VARIANTS)
+@pytest.mark.parametrize("T", [1, 2])
+def test_decode_swiglu_limit_with_unequal_gate_and_up_scales(variant, T):
+    """Up carries the gate's global scale inside the decode kernels too (GEMM2's scale holds up / gate), so the up
+    clamp must bind at lim / |gsr|. Fails on: up clamped at the plain limit."""
+    _check("glm53f_tp8", T, case="loudgateup", variant=variant, swiglu_limit=10.0)
+
+
+@pytest.mark.parametrize("variant", _DECODE_VARIANTS)
+def test_decode_swiglu_limit_far_above_every_value_is_bitwise_the_plain_kernel(variant):
+    """With a limit no value reaches, the clamped decode kernels match the plain ones bitwise, on the weighted sum
+    (decode_pdl's per-route path adds partial sums with shared atomics, so its order and its last bit vary run to
+    run). Fails on: a clamp that changes the order or precision of the SwiGLU arithmetic."""
+    H, I, E, Eg, topk = SHAPES["glm53f_tp8"]
+    _, experts = _layer("glm53f_tp8")
+    for T in (1, 2):
+        x = torch.randn((T, H), device="cuda").bfloat16()
+        ids = _routing(T, topk, E, Eg, seed=T)
+        w = torch.rand((T, topk), device="cuda")
+        a = nvfp4_w4a16_sm90_moe(x, ids, experts, topk_weights=w, variant=variant)
+        b = nvfp4_w4a16_sm90_moe(
+            x, ids, experts, topk_weights=w, variant=variant, swiglu_limit=1e30
+        )
+        assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("variant", _DECODE_VARIANTS)
+def test_decode_clamped_weighted_sum_under_cuda_graph(variant):
+    """The clamped decode kernel captured in a CUDA graph with the weighted sum, replayed with new routings, against
+    the clamped reference and an eager call bitwise. Fails on: the clamp lost on replay."""
+    H, I, E, Eg, topk = SHAPES["glm53f_tp8"]
+    ck, experts = _layer("glm53f_tp8", "loud")
+    for T in (1, 2):
+        x = torch.randn((T, H), device="cuda").bfloat16()
+        ids = _routing(T, topk, E, Eg, seed=7 + T)
+        w = torch.rand((T, topk), device="cuda")
+        out = torch.empty((T, H), dtype=torch.bfloat16, device="cuda")
+
+        def run(o):
+            return nvfp4_w4a16_sm90_moe(
+                x,
+                ids,
+                experts,
+                topk_weights=w,
+                out=o,
+                variant=variant,
+                swiglu_limit=10.0,
+            )
+
+        run(out)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run(out)
+        for rep in range(3):
+            x.copy_(torch.randn((T, H), device="cuda").bfloat16())
+            ids.copy_(
+                _routing(T, topk, E, Eg, kind=("skew", "hot")[rep % 2], seed=50 + rep)
+            )
+            graph.replay()
+            eager = run(None)
+            torch.cuda.synchronize()
+            ref, local = _reference(ck, x, ids, E, 10.0)
+            ref_sum = (
+                ref.view(T, topk, H) * (w * local.view(T, topk)).unsqueeze(-1)
+            ).sum(1)
+            _assert_close(out, ref_sum, slice(None))
+            assert torch.equal(out, eager)
+
+
+@pytest.mark.parametrize("variant", _DECODE_VARIANTS)
+@pytest.mark.parametrize("shape", ["q38_tp2", "dsv41_tp8", "w64"])
+def test_decode_kernels_refuse_a_half_block(variant, shape):
+    """The decode kernels read whole 256-row GEMM1 blocks, so a layer whose padded width ends on a half block must
+    raise instead of reading past the expert's rows. Fails on: a width check that misses the half block."""
+    H, I, E, Eg, topk = SHAPES[shape]
+    _, experts = _layer(shape)
+    x = torch.randn((1, H), device="cuda").bfloat16()
+    ids = _routing(1, topk, E, Eg)
+    with pytest.raises(Exception, match="half block"):
+        nvfp4_w4a16_sm90_moe(x, ids, experts, variant=variant)
+
+
+@pytest.mark.parametrize(
+    "shape", ["q38_tp2", "q38_tp4", "dsv41_tp8", "q38_tp8", "glm53f_tp4", "glm53f_tp8"]
+)
+@pytest.mark.parametrize("T", [1, 2])
+def test_decode_dispatch_half_blocks_and_clamp(shape, T):
+    """auto at 1 and 2 tokens with swiglu_limit: half-block widths (Qwen3.8 TP2 and TP4, DeepSeek-V4.1-Flash TP8) stay
+    on the grouped kernels, whole-block ones (Qwen3.8 TP8 padded to 128, GLM-5.3-Flash TP4 and TP8) take decode_pdl,
+    and every result matches the clamped FP32 reference and the pinned kernel bitwise. Fails on: a half-block layer
+    dispatched to a decode kernel (it raises), a clamped layer that loses its clamp on the decode path."""
+    import sglang.kernels.ops.moe.nvfp4_w4a16_sm90 as op
+
+    H, I, E, Eg, topk = SHAPES[shape]
+    pick = op._decode_variant(T, T * topk, E, H, (I + 63) // 64 * 64)
+    assert pick == ("decode_pdl" if _whole_blocks(shape) else "auto"), pick
+    ck, x, ids, ref, local, clamped = _check(shape, T, swiglu_limit=1.0)
+    assert sum(g for g, _ in clamped) > 0, "the clamp never binds"
+    experts = _layer(shape)[1]
+    w = torch.rand(
+        (T, topk), device="cuda"
+    )  # the weighted sum: deterministic on every kernel
+    a = nvfp4_w4a16_sm90_moe(x, ids, experts, topk_weights=w, swiglu_limit=1.0)
+    b = nvfp4_w4a16_sm90_moe(
+        x,
+        ids,
+        experts,
+        topk_weights=w,
+        swiglu_limit=1.0,
+        variant="single" if pick == "auto" else pick,
+    )
+    assert torch.equal(a, b)
+
+
+# ---- decode_fused: two row buffers, the shared-memory bound, the workspace under graphs, the epoch wrap ----
+
+
+def _fused_row_buffers(T, H, I, routes, mmax):
+    """decf_k's choice of intermediate row buffers (0: one row per local route, no rotation)."""
+    rowi = 2 * I + 16
+    oring = (43008 + T * (2 * H + 16) + 1023) // 1024 * 1024
+    avail = 232448 - oring - 2 * 36864
+    if routes * rowi > avail or (routes * (I // 4) + 511) // 512 > 16:
+        return min(16, avail // (mmax * rowi))
+    return 0
+
+
+@pytest.mark.parametrize("shape,T", [("muse", 4), ("phi35", 3)])
+def test_decode_fused_with_two_row_buffers(shape, T):
+    """Every token routes to one expert, so decode_fused rotates its intermediate rows through 2 buffers, fewer than
+    its 3 fetcher pairs. Fails on: a pair that refills a buffer while the consumers still read it (a parity wait that
+    cannot tell phase c from c - 2 passes two phases early), seen as mixed rows in GEMM2."""
+    H, I, E, Eg, topk = SHAPES[shape]
+    ck, experts = _layer(shape)
+    for rep in range(12):
+        ids = _routing(T, topk, E, Eg, kind="shared", seed=60 + rep)
+        local = int(((ids >= 0) & (ids < E)).sum())
+        assert _fused_row_buffers(T, H, I, local, T) == 2, local
+        x = torch.randn((T, H), device="cuda").bfloat16()
+        y = torch.full((T * topk, H), SENTINEL, dtype=torch.bfloat16, device="cuda")
+        nvfp4_w4a16_sm90_moe(x, ids, experts, out=y, variant="decode_fused")
+        w = torch.rand((T, topk), device="cuda")
+        o = nvfp4_w4a16_sm90_moe(
+            x, ids, experts, topk_weights=w, variant="decode_fused"
+        )
+        ref, lm = _reference(ck, x, ids, E)
+        _assert_close(y, ref, lm)
+        ref_sum = (ref.view(T, topk, H) * (w * lm.view(T, topk)).unsqueeze(-1)).sum(1)
+        _assert_close(o, ref_sum, slice(None))
+
+
+def test_decode_dispatch_respects_decode_fused_shared_memory():
+    """auto takes decode_fused only where its shared memory fits, by the same bound the kernel checks. Mixtral-8x7B
+    at TP1 (I 14336) fits at 1 token and not at 2, where auto keeps the grouped kernels; widths 12160 and 12288 sit on
+    either side of the bound at 2 tokens. Fails on: auto sending a 2-token Mixtral call to decode_fused, which raises,
+    or the Python bound drifting from the kernel's."""
+    import sglang.kernels.ops.moe.nvfp4_w4a16_sm90 as op
+
+    H, E, topk = 4096, 8, 2
+    assert op._decode_variant(1, topk, E, H, 14336) == "decode_fused"
+    assert op._decode_variant(2, 2 * topk, E, H, 14336) == "auto"
+    for I in (12160, 12288, 14336):
+        ck = _checkpoint(E, H, I, "normal", seed=I)
+        experts = repack_modelopt_nvfp4_moe_for_sm90(**ck)
+        for T in (1, 2):
+            x = torch.randn((T, H), device="cuda").bfloat16()
+            ids = _routing(T, topk, E, E, seed=T)
+            ref, local = _reference(ck, x, ids, E)
+            _assert_close(nvfp4_w4a16_sm90_moe(x, ids, experts), ref, local)
+            fits = op._decode_fused_fits(T, H, I)
+            assert fits == (T == 1 or I == 12160), (I, T)
+            if fits:
+                _assert_close(
+                    nvfp4_w4a16_sm90_moe(x, ids, experts, variant="decode_fused"),
+                    ref,
+                    local,
+                )
+            else:
+                with pytest.raises(Exception, match="shared memory"):
+                    nvfp4_w4a16_sm90_moe(x, ids, experts, variant="decode_fused")
+        del ck, experts
+        torch.cuda.empty_cache()
+
+
+def test_decode_fused_graphs_captured_without_warm_up():
+    """Two graphs captured on a fresh stream with no eager call before, every cached workspace then filled with words
+    that carry the epoch the next call would use, and the second graph replayed first. Fails on: a workspace made
+    inside the first capture (zeroed only by that graph's replays) that the second graph reuses, so its first replay
+    takes stale words as current."""
+    import sglang.kernels.ops.moe.nvfp4_w4a16_sm90 as op
+
+    H, I, E, Eg, topk = SHAPES["deepseek_ep8"]
+    ck, experts = _layer("deepseek_ep8")
+    s = torch.cuda.Stream()
+    graphs = {}
+    for T in (
+        2,
+        1,
+    ):  # the larger first, so the second capture could reuse the first one's buffer
+        x = torch.randn((T, H), device="cuda").bfloat16()
+        ids = _routing(T, topk, E, Eg, seed=70 + T)
+        out = torch.empty((T * topk, H), dtype=torch.bfloat16, device="cuda")
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            nvfp4_w4a16_sm90_moe(x, ids, experts, out=out, variant="decode_fused")
+        graphs[T] = (g, x, ids, out)
+    torch.cuda.synchronize()
+    for chain in op._fused_ws.values():
+        while chain is not None:
+            ws = chain[0]
+            st = ws[:1].view(torch.int32)
+            k = int(st[1])
+            st[0], st[1] = 0, k
+            ws[2:] = (
+                (k + 1) << 32
+            ) | 0x3F803F80  # BF16 1.0 pairs tagged with the next epoch
+            chain = chain[1]
+    torch.cuda.synchronize()
+    for T in (1, 2):
+        g, x, ids, out = graphs[T]
+        with torch.cuda.stream(s):
+            g.replay()
+        torch.cuda.synchronize()
+        ref, local = _reference(ck, x, ids, E)
+        _assert_close(out, ref, local)
+
+
+def test_decode_fused_epoch_wrap():
+    """The call that takes the last 32-bit epoch zeroes every tagged word and the next call starts at epoch 1. The
+    words are filled with values tagged epoch 1 first, as a word last written 2^32 - 1 calls ago would be. Fails on: a
+    wrap that keeps those words, so the call after it takes them as current."""
+    import sglang.kernels.ops.moe.nvfp4_w4a16_sm90 as op
+
+    H, I, E, Eg, topk = SHAPES["deepseek_ep8"]
+    ck, experts = _layer("deepseek_ep8")
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        x = torch.randn((2, H), device="cuda").bfloat16()
+        ids = _routing(2, topk, E, Eg, seed=80)
+        nvfp4_w4a16_sm90_moe(x, ids, experts, variant="decode_fused")
+        torch.cuda.synchronize()
+        ws = op._fused_ws[(torch.cuda.current_device(), s.cuda_stream)][0]
+        st = ws[:1].view(torch.int32)
+        st[0], st[1] = 0, -2  # the last call took epoch 2^32 - 2
+        ws[2:] = (1 << 32) | 0x3F803F80
+        for rep, (want_epoch, zeroed) in enumerate(((0, True), (1, False))):
+            ids = _routing(2, topk, E, Eg, seed=81 + rep)
+            y = nvfp4_w4a16_sm90_moe(x, ids, experts, variant="decode_fused")
+            torch.cuda.synchronize()
+            ref, local = _reference(ck, x, ids, E)
+            _assert_close(y, ref, local)
+            assert int(st[1]) == want_epoch and int(st[0]) == 0, (
+                int(st[0]),
+                int(st[1]),
+            )
+            if zeroed:
+                assert bool((ws[2:] == 0).all()), "the wrap left tagged words"
