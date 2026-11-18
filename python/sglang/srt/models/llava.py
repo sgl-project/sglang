@@ -38,6 +38,7 @@ from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 # leave till last and symbol only in case circular import
 import sglang.srt.models as sgl_models
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.mm_utils import general_mm_embed_routine
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -50,7 +51,7 @@ from sglang.srt.multimodal.mm_utils import (
     unpad_image_shape,
 )
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.utils import add_prefix, flatten_nested_list, logger
+from sglang.srt.utils import flatten_nested_list, logger
 
 _KNOWN_BROKEN_AUTOMODEL_CONFIG = "VoxtralRealtimeTextConfig"
 _KNOWN_BROKEN_AUTOMODEL_ERROR = "Could not find VoxtralRealtimeTextModel"

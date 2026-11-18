@@ -14,7 +14,7 @@ from typing import Any, Dict, List, MutableMapping, Optional, Sequence, Tuple
 
 import torch
 
-from sglang.srt.utils import MultiprocessingSerializer
+from sglang.srt.utils import MultiprocessingSerializer, is_npu
 
 from .protocol import send_msg
 from .vmm_layout import pack_slot, plan_vmm_pack, validate_vmm_layout, view_from_entry
@@ -162,12 +162,39 @@ class WeightCacheTransportBackend(ABC):
         """Release what the backend mapped or exported. Idempotent."""
 
 
+def _check_npu_zero_copy(
+    state_tensors: MutableMapping[str, Tuple[torch.Tensor, bool]],
+) -> None:
+    # torch_npu must be imported before the first ForkingPickler dump of an
+    # NPU tensor so its reducer is registered; otherwise the tensor falls
+    # back to a CPU copy instead of zero-copy IPC. Probe once and warn (rather
+    # than error) if zero-copy is unavailable, so weight caching still works
+    # by copying the weights through the CPU.
+    import torch.multiprocessing.reductions as _reductions
+    import torch_npu  # noqa: F401
+
+    first = next(iter(state_tensors.values()), None)
+    if first is not None:
+        rebuild_fn, _ = _reductions.reduce_tensor(first[0].data)
+        if getattr(rebuild_fn, "__name__", None) != "rebuild_npu_tensor":
+            logger.warning(
+                "NPU weight-cache zero-copy IPC is unavailable: tensor "
+                "reduced to %r instead of torch_npu's rebuild_npu_tensor; "
+                "falling back to a CPU copy. Zero-copy requires Ascend HDK "
+                ">= 25.3.RC1 and CANN >= 8.3.RC1, and is unsupported on "
+                "Ascend 950DT.",
+                rebuild_fn,
+            )
+
+
 class TorchIpcTransportBackend(WeightCacheTransportBackend):
     name = TORCH_IPC_BACKEND
 
     def prepare_export(
         self, state_tensors: MutableMapping[str, Tuple[torch.Tensor, bool]]
     ) -> Dict[str, Dict[str, Any]]:
+        if is_npu():
+            _check_npu_zero_copy(state_tensors)
         entries: Dict[str, Dict[str, Any]] = {}
         for name, (tensor, is_param) in state_tensors.items():
             entries[name] = {
@@ -581,6 +608,11 @@ def create_daemon_transport_backend(
     name: str, device_id: int
 ) -> WeightCacheTransportBackend:
     if name == VMM_FD_BACKEND:
+        if is_npu():
+            raise RuntimeError(
+                "[weight_cache] The vmm_fd transport needs CUDA VMM and is not "
+                "available on NPU. Use --weight-cache-transport torch_ipc."
+            )
         backend = VmmFdTransportBackend.for_export(device_id)
     elif name == TORCH_IPC_BACKEND:
         backend = TorchIpcTransportBackend()

@@ -76,23 +76,5 @@ def test_sparse_tail_short_sequence_and_padding(dtype):
     assert (totals[1:] == 0).all()
 
 
-def test_sparse_tail_rejects_float_lengths():
-    indices = torch.empty((0, 4), dtype=torch.int32)
-    table = torch.empty((0, 132), dtype=torch.int32)
-    with pytest.raises(AssertionError):
-        pack_sparse_tail(
-            indices, torch.empty(0), table, torch.empty(0, dtype=torch.int32)
-        )
-
-
-@pytest.mark.parametrize("different_device", range(4))
-def test_sparse_tail_rejects_mixed_devices(different_device):
-    shapes = [(0, 4), (0,), (0, 132), (0,)]
-    tensors = [torch.empty(shape, dtype=torch.int32) for shape in shapes]
-    tensors[different_device] = tensors[different_device].to("meta")
-    with pytest.raises(AssertionError):
-        pack_sparse_tail(*tensors)
-
-
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

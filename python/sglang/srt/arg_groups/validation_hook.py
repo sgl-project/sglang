@@ -6,8 +6,13 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Collection, Dict, List, Optional
 
+from sglang.srt.arg_groups.arg_utils import (
+    _field_default,
+    _field_to_cli_name,
+    record_fields,
+)
 from sglang.srt.arg_groups.choices import BUILT_IN_SAMPLING_BACKENDS
 from sglang.srt.arg_groups.model_override_base import resolved_view, resolving_view
 from sglang.srt.arg_groups.overrides import (
@@ -20,7 +25,13 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
     parse_ib_device_config,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
+from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.runtime_context import (
+    attn_dp_enabled_of,
+    describe_kv_events_publisher,
+    get_platform,
+    num_dp_ranks_of,
+)
 from sglang.srt.sampling.watermarking.config import (
     MAX_WATERMARK_CONTEXT_WINDOW,
     parse_watermark_key,
@@ -105,6 +116,97 @@ def check_watermark_server_args(server_args: Any) -> None:
         raise ValueError("--enable-watermark is not supported with SGLANG_RUST_SERVER")
 
 
+# Server arguments Rust-server mode (SGLANG_RUST_SERVER=1) does not honor, or
+# honors only in part: the Rust server reads only what
+# `rust_server/config.py::_build_server_args` passes, and these act in the
+# Python frontend (with `--enable-trace`, its request spans; the scheduler's
+# own spans alone would be an incomplete trace).
+RUST_SERVER_UNSUPPORTED_ARGS = (
+    "ssl_keyfile",
+    "ssl_certfile",
+    "ssl_ca_certs",
+    "ssl_keyfile_password",
+    "enable_ssl_refresh",
+    "allowed_media_domains",
+    # The Rust media fetcher caps a download at this field's default, 64 MiB.
+    "media_url_max_file_size_mb",
+    "enable_trace",
+    "completion_template",
+    "hf_chat_template_name",
+    "enable_custom_logit_processor",
+    "enable_return_routed_experts",
+    "enable_lora",
+    "lora_paths",
+    "tokenizer_mode",
+    "tokenizer_backend",
+    "tokenizer_metrics_allowed_custom_labels",
+    # The Rust multimodal pipelines keep no preprocessing-artifact cache, and
+    # Python's changes the pad values of the items it serves. A model package
+    # whose Rust server caches honors it (`rust_server_unsupported_args`).
+    "mm_preprocess_cache_size_mb",
+    # The Rust server has no encoder dispatch.
+    "language_only",
+    # The Rust listener reports ready without waiting for weight updates.
+    "checkpoint_engine_wait_weights_before_ready",
+    "delete_ckpt_after_loading",
+    # Chat responses would lack the server-default sglext token ids.
+    "return_input_ids",
+    "return_output_ids",
+)
+
+
+def rust_server_unsupported_args(
+    server_args: Any, honored: Collection[str] = ()
+) -> List[str]:
+    """The CLI names of the ``RUST_SERVER_UNSUPPORTED_ARGS`` that are set,
+    except those a model package's Rust server ``honored`` itself.
+
+    An argument counts as set when it differs from its default; where the
+    default is off (``None``, ``False`` or empty), any falsy value is off too.
+    """
+    cfg = resolving_view(server_args)
+    defaults = {
+        field.name: _field_default(field) for field in record_fields(type(server_args))
+    }
+    offending = []
+    for name in RUST_SERVER_UNSUPPORTED_ARGS:
+        if name in honored:
+            continue
+        value, default = getattr(cfg, name), defaults[name]
+        if default is None or default is False or default == []:
+            is_set = bool(value)
+        else:
+            is_set = value != default
+        if is_set:
+            offending.append(_field_to_cli_name(name))
+    # The Rust chat route applies only each tool's own `strict`.
+    if envs.SGLANG_TOOL_STRICT_LEVEL.get() > 0:
+        offending.append("SGLANG_TOOL_STRICT_LEVEL")
+    return offending
+
+
+def rust_server_refusal(offending: List[str], separator: str = ", ") -> ValueError:
+    """The startup error refusing the ``offending`` settings in Rust-server
+    mode."""
+    many = len(offending) > 1
+    return ValueError(
+        "Rust-server mode (SGLANG_RUST_SERVER=1) does not support "
+        f"{separator.join(offending)}: the Rust server would silently ignore "
+        f"{'these settings' if many else 'this setting'}. "
+        f"Remove {'them' if many else 'it'} or unset SGLANG_RUST_SERVER."
+    )
+
+
+def validate_rust_server_unsupported_args(server_args: Any) -> None:
+    """Refuse, in Rust-server mode, every argument the Rust server would ignore
+    (``rust_server_unsupported_args``)."""
+    if not envs.SGLANG_RUST_SERVER.get():
+        return
+    offending = rust_server_unsupported_args(server_args)
+    if offending:
+        raise rust_server_refusal(offending)
+
+
 def validate_response_store(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.enable_response_store and cfg.disaggregation_mode != "null":
@@ -124,12 +226,14 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
     assert cfg.disable_overlap_schedule, (
         "Pipeline parallelism is not compatible with overlap schedule"
     )
-    if cfg.speculative_algorithm == "DSPARK":
+    if cfg.speculative_algorithm in ("DSPARK", "DFLASH"):
         assert cfg.disaggregation_mode == "prefill", (
-            "Pipeline parallel DSPARK requires disaggregation-mode=prefill"
+            f"Pipeline parallel {cfg.speculative_algorithm} requires "
+            "disaggregation-mode=prefill"
         )
         assert not envs.SGLANG_ENABLE_PP_SPEC.get(), (
-            "SGLANG_ENABLE_PP_SPEC does not support DSPARK PD prefill"
+            f"SGLANG_ENABLE_PP_SPEC does not support {cfg.speculative_algorithm} "
+            "PD prefill"
         )
     elif cfg.speculative_algorithm is not None:
         assert (
@@ -160,11 +264,22 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
                 "SGLANG_ENABLE_PP_SPEC is not compatible with attention DP "
                 "(--attn-dp-size)"
             )
+            assert not cfg.enable_return_routed_experts, (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with "
+                "--enable-return-routed-experts"
+            )
         else:
             assert cfg.disaggregation_mode == "prefill", (
                 "PP + speculative decoding (MTP) is only supported on prefill nodes "
                 "(disaggregation-mode=prefill)"
             )
+    # Stage 0 relays its received requests to the next stage every
+    # iteration, but later stages only receive on the iterations the recv
+    # skipper lets through, so the stages fall out of step.
+    assert cfg.scheduler_recv_interval <= 1, (
+        "--scheduler-recv-interval > 1 is not supported with pipeline "
+        "parallelism; use --scheduler-recv-interval 1"
+    )
     assert cfg.min_free_slots_delay is None, (
         "--min-free-slots-delay is not supported with pipeline "
         "parallelism: allocatable slots per microbatch are bounded by "
@@ -187,6 +302,30 @@ def check_server_args(server_args: Any):
         "pp_max_micro_batch_size must be a positive integer or None (for auto-compute). "
         f"Got: {cfg.pp_max_micro_batch_size}"
     )
+
+    if cfg.device == "npu":
+        from sglang.srt.hardware_backend.npu.compile_backend import (
+            validate_npugraph_ex_config,
+        )
+
+        # Local import: server_args imports this module at load time.
+        from sglang.srt.server_args import compute_world_size
+
+        # cuda_graph_config stays None until handle_cuda_graph_config runs, which
+        # the resolution pipeline skips for a "none"/"dummy" model path.
+        graph_cfg = cfg.cuda_graph_config
+
+        validate_npugraph_ex_config(
+            enable_compile=cfg.enable_torch_compile,
+            graph_enabled=(
+                graph_cfg is not None and graph_cfg.decode.backend != Backend.DISABLED
+            ),
+            world_size=compute_world_size(
+                dp_size=cfg.dp_size,
+                tp_size=cfg.tp_size,
+                pp_size=cfg.pp_size,
+            ),
+        )
 
     assert not (cfg.disable_cuda_graph_padding and cfg.enable_torch_compile), (
         "--disable-cuda-graph-padding is incompatible with --enable-torch-compile. "
@@ -279,6 +418,13 @@ def check_server_args(server_args: Any):
         ], (
             f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{cfg.schedule_policy}' is not supported."
         )
+        if cfg.enable_unified_memory and not cfg.disable_priority_preemption:
+            logger.warning(
+                "--enable-unified-memory turns priority preemption off: a "
+                "higher-priority request is admitted first but does not retract "
+                "running requests. Pass --disable-priority-preemption to silence "
+                "this warning."
+            )
         if cfg.default_priority_value is None:
             logger.warning(
                 "--default-priority-value is not set while --enable-priority-scheduling is enabled. "
@@ -360,10 +506,11 @@ def check_server_args(server_args: Any):
         raise ValueError("Communications quantization is only supported for NPU device")
 
     validate_device_sampling_backend(cfg.sampling_backend, cfg.device)
+    validate_device_lora_backend(cfg.lora_backend, cfg.device)
 
     # grpc_port is None for HTTP-only launches, so the == comparison is
     # already False there; no explicit None check needed.
-    if not (cfg.smg_grpc_mode or cfg.grpc_mode) and cfg.grpc_port == cfg.port:
+    if cfg.grpc_port == cfg.port:
         raise ValueError(
             f"--grpc-port ({cfg.grpc_port}) must differ from --port ({cfg.port})"
         )
@@ -377,6 +524,8 @@ def check_server_args(server_args: Any):
             raise ValueError(
                 "When setting gc_threshold, it must contain 1 to 3 integers."
             )
+    if cfg.gc_freeze_on_idle_secs < 0:
+        raise ValueError("--gc-freeze-on-idle-secs must be >= 0.")
 
     if cfg.kv_canary_sweep_interval > 0 and cfg.kv_canary == "none":
         raise ValueError(
@@ -386,6 +535,7 @@ def check_server_args(server_args: Any):
     check_watermark_server_args(server_args)
 
     check_load_publish_args(server_args)
+    warn_multi_node_kv_events(server_args)
 
 
 def validate_buckets_rule(arg_name: str, buckets_rule: List[str]):
@@ -481,6 +631,57 @@ def check_load_publish_args(server_args: Any):
         raise ValueError(reason)
 
 
+def warn_multi_node_kv_events(server_args: Any) -> None:
+    """Warn when /server_info's kv_events block cannot reach every
+    publishing rank: it advertises one host and one port base, while rank
+    ``r`` binds ``base + r`` on the node it runs on. Not an error, since
+    serving is unaffected; a subscriber just misses the remote ranks."""
+    descriptor = describe_kv_events_publisher(server_args)
+    if descriptor is None or descriptor["dp_size"] < 2:
+        return
+    cfg = resolving_view(server_args)
+    # Publishers are pp_rank 0 schedulers. PP stages take whole nodes first
+    # (`_calculate_rank_ranges` in engine.py), so pp_rank 0's TP group, and
+    # its attention-DP publishers with it, spans nnodes // pp_size nodes.
+    # Only the head node serves /server_info, so only its launcher warns.
+    if cfg.node_rank != 0 or cfg.nnodes // cfg.pp_size < 2:
+        return
+    from sglang.srt.disaggregation.kv_events import (
+        KVEventsConfig,
+        parse_bindable_tcp,
+    )
+
+    kv_config = KVEventsConfig.from_cli(cfg.kv_events_config)
+    # The publisher's own default: bind a wildcard host, connect to a
+    # concrete one. A connecting rank dials that host from any node.
+    kv_binds = kv_config.bind
+    if kv_binds is None:
+        kv_binds = parse_bindable_tcp(kv_config.endpoint) is not None
+    published = [
+        name
+        for name, binds in (
+            ("KV events", kv_binds),
+            # The load range always binds a wildcard host.
+            (
+                "load reports (--load-publish-endpoint)",
+                "load_endpoint_port_base" in descriptor,
+            ),
+        )
+        if binds
+    ]
+    if not published:
+        return
+    logger.warning(
+        f"{' and '.join(published)} are published per DP rank, and the "
+        f"{descriptor['dp_size']} publishing ranks span several of the "
+        f"{cfg.nnodes} nodes, but /server_info advertises one host and one "
+        f"port base for all of them. Only the ranks on the head node are "
+        f"reachable at the advertised address, so a router subscribing "
+        f"through /server_info (e.g. sgl-router's cache_aware policy) sees "
+        f"only part of the KV cache. Serving is unaffected."
+    )
+
+
 def validate_device_sampling_backend(
     sampling_backend: Optional[str], device: str
 ) -> None:
@@ -490,6 +691,15 @@ def validate_device_sampling_backend(
     if sampling_backend == "intel_xpu" and device != "xpu":
         raise ValueError(
             f"--sampling-backend intel_xpu requires --device xpu, got --device {device}"
+        )
+
+
+def validate_device_lora_backend(lora_backend: str, device: str) -> None:
+    # The intel_xpu LoRA kernels ship only in sgl-kernel-xpu; on another device the
+    # backend import fails late, inside LoRAManager init.
+    if lora_backend == "intel_xpu" and device != "xpu":
+        raise ValueError(
+            f"--lora-backend intel_xpu requires --device xpu, got --device {device}"
         )
 
 
@@ -582,10 +792,23 @@ def validate_experimental_sgl_marlin(server_args: Any):
     validate_experimental_sgl_marlin_server_args(server_args, view)
 
 
+# Multimodal architectures whose processor, encoder and decoder run on MPS.
+_MPS_MULTIMODAL_ARCHITECTURES = frozenset({"UnlimitedOCRV2ForCausalLM"})
+# Model-specific attention backends with an MPS implementation, by architecture.
+_MPS_MODEL_ATTENTION_BACKENDS = {"unlimited_ocr_v2": "UnlimitedOCRV2ForCausalLM"}
+
+
+def _model_architectures(model_config: Any) -> tuple:
+    return tuple(model_config.hf_config.architectures or ())
+
+
 def validate_mps_model_config(
     model_config: Any,
     *,
     lora_enabled: bool = False,
+    attention_backend: Optional[str] = None,
+    prefill_attention_backend: Optional[str] = None,
+    decode_attention_backend: Optional[str] = None,
 ) -> None:
     """Validate checkpoint-derived MPS constraints."""
     quantization = getattr(model_config, "quantization", None)
@@ -595,7 +818,21 @@ def validate_mps_model_config(
             "the resolved model configuration detected "
             f"quantization={quantization!r}"
         )
-    if bool(getattr(model_config, "is_multimodal", False)):
+    for backend in (
+        attention_backend,
+        prefill_attention_backend,
+        decode_attention_backend,
+    ):
+        if backend in _MPS_MODEL_ATTENTION_BACKENDS:
+            required = _MPS_MODEL_ATTENTION_BACKENDS[backend]
+            if required not in _model_architectures(model_config):
+                raise ValueError(
+                    f"The {backend} attention backend on Torch MPS serves "
+                    f"only {required}"
+                )
+    if bool(getattr(model_config, "is_multimodal", False)) and not (
+        _MPS_MULTIMODAL_ARCHITECTURES.intersection(_model_architectures(model_config))
+    ):
         raise ValueError(
             "Torch MPS multimodal serving does not yet have a model-specific "
             "end-to-end contract; use a text-only model until its encoder, "
@@ -625,7 +862,13 @@ def validate_standard_mps_server_args(server_args: Any):
     """Validate execution modes supported by the Torch MPS path."""
 
     cfg = resolving_view(server_args)
-    supported_attention_backends = {None, "torch_native"}
+    # Model-specific backends are checked against the architecture in
+    # validate_mps_model_config.
+    supported_attention_backends = {
+        None,
+        "torch_native",
+        *_MPS_MODEL_ATTENTION_BACKENDS,
+    }
     for field in (
         "attention_backend",
         "prefill_attention_backend",

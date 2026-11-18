@@ -41,12 +41,13 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_spec
 from sglang.srt.utils import (
     get_current_device_stream_fast,
     is_cpu,
     is_cuda,
     is_hip,
+    is_npu,
     print_info_once,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -60,6 +61,21 @@ _is_cpu = is_cpu()
 
 WeightsMapping = Mapping[str, Optional[str]]
 """If a key maps to a value of `None`, the corresponding weight is ignored."""
+
+
+def keeps_no_quant_config(hf_config, quant_config) -> None:
+    """``own_quant_config`` of a model class that keeps no ``quant_config``:
+    its layers may still take the loader's config, but its runner reads none
+    off the model, so an ``auto`` KV cache dtype resolves to the model dtype."""
+    return None
+
+
+def npu_draft_quant_config(hf_config, quant_config):
+    """``own_quant_config`` of a draft that runs unquantized on NPU unless a
+    draft quantization is named."""
+    if is_npu() and get_spec().speculative_draft_model_quantization is None:
+        return None
+    return quant_config
 
 
 @dataclass
@@ -396,21 +412,30 @@ def maybe_enable_silu_fp4_quant_fusion(mlp: torch.nn.Module) -> None:
 
     Replaces the separate act_and_mul and per-token FP4 quantize kernels with
     one FlashInfer kernel and feeds down_proj a prequantized (fp4, scale)
-    tuple. Kill switch: SGLANG_DISABLE_SILU_FP4_QUANT_FUSION=1.
+    tuple. For ModelOpt and compressed-tensors W4A4 NVFP4 projections.
+    Kill switch: SGLANG_DISABLE_SILU_FP4_QUANT_FUSION=1.
     """
     if envs.SGLANG_DISABLE_SILU_FP4_QUANT_FUSION.get():
         return
+    from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+        CompressedTensorsW4A4Fp4,
+    )
     from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
     from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
 
-    if not (
-        isinstance(mlp.gate_up_proj.quant_method, ModelOptFp4LinearMethod)
-        and mlp.gate_up_proj.quant_method.quant_mode == "w4a4"
-        and isinstance(mlp.down_proj.quant_method, ModelOptFp4LinearMethod)
+    gate_up, down = mlp.gate_up_proj, mlp.down_proj
+    if (
+        isinstance(gate_up.quant_method, ModelOptFp4LinearMethod)
+        and gate_up.quant_method.quant_mode == "w4a4"
+        and isinstance(down.quant_method, ModelOptFp4LinearMethod)
     ):
-        return
-    # The fused producer does not apply AWQ's per-input-channel scale.
-    if mlp.down_proj.quant_method.quant_config.is_awq:
+        # The fused producer does not apply AWQ's per-input-channel scale.
+        if down.quant_method.quant_config.is_awq:
+            return
+    elif not (
+        isinstance(gate_up.scheme, CompressedTensorsW4A4Fp4)
+        and isinstance(down.scheme, CompressedTensorsW4A4Fp4)
+    ):
         return
     # Marlin, the SM80-SM90 default, takes a floating-point input, not the tuple.
     if get_fp4_gemm_runner_backend().is_marlin():
@@ -434,8 +459,13 @@ def can_run_silu_fp4_quant_fusion(
     return (
         mlp._enable_silu_fp4_quant_fusion
         and not isinstance(gate_up, tuple)
+        and gate_up.dim() == 2
         and not get_forward().sp_active  # the SP g-bar matmul needs a tensor
         and not hasattr(mlp.down_proj, "base_layer")  # LoRA reads the activation
+        # down_proj outputs its params_dtype for the tuple, and gate_up's dtype
+        # for an activation; fuse only where the two agree. After the LoRA check:
+        # the LoRA wrapper has no params_dtype.
+        and gate_up.dtype == mlp.down_proj.params_dtype
     )
 
 
@@ -445,10 +475,20 @@ def silu_and_mul_fp4_quant(
     """SiLU(gate) * up of a dense MLP, quantized to NVFP4 for its down_proj."""
     from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize
 
-    # input_scale_inv only exists after weight loading, so derive it lazily;
+    from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+        CompressedTensorsW4A4Fp4,
+    )
+
+    # The global scale is final only after weight loading, so derive it lazily;
     # the fused kernel requires a 1-D global scale.
     if mlp._down_input_scale_inv_1d is None:
-        mlp._down_input_scale_inv_1d = mlp.down_proj.input_scale_inv.reshape(1)
+        down = mlp.down_proj
+        # The scale each format's own input quant multiplies by.
+        if isinstance(down.scheme, CompressedTensorsW4A4Fp4):
+            scale = down.input_global_scale
+        else:
+            scale = down.input_scale_inv
+        mlp._down_input_scale_inv_1d = scale.reshape(1)
     num_tokens = gate_up.shape[0]
     masked_m = mlp._masked_m_cache.get(num_tokens)
     if masked_m is None:
@@ -651,6 +691,114 @@ def apply_qk_norm(
     q = q_by_head.view(q.shape)
     k = k_by_head.view(k.shape)
     return q, k
+
+
+def can_use_jit_qk_norm_rope(
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    rotary_emb: torch.nn.Module,
+    head_dim: int,
+    dtype: torch.dtype,
+) -> bool:
+    """Whether ``apply_qk_norm_rope`` may fuse QK-norm and RoPE into the JIT
+    qknorm_rope kernel (ROCm only). Call it at init: it builds the kernel, which
+    must not happen for the first time inside CUDA graph capture."""
+    from sglang.srt.layers.layernorm import RMSNorm
+    from sglang.srt.layers.rotary_embedding import RotaryEmbedding
+
+    if not (
+        _is_hip
+        # None (unset) keeps it on; only --no-enable-fused-qk-norm-rope opts out.
+        and get_exec().kernel.enable_fused_qk_norm_rope is not False
+        and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+        and get_exec().deterministic.rl_on_policy_target is None
+        and get_exec().graph.cuda_graph_config.prefill.tc_compiler != "inductor"
+        and dtype in (torch.bfloat16, torch.float16)
+        # Scaled-RoPE subclasses (YaRN, Llama3, MRoPE, ...) stay on the unfused path.
+        and type(rotary_emb) is RotaryEmbedding
+        and not rotary_emb._force_native
+        and rotary_emb.head_size == head_dim
+        and rotary_emb.cos_sin_cache.dtype == torch.float32
+        and type(q_norm) is RMSNorm
+        and type(k_norm) is RMSNorm
+        and q_norm.variance_epsilon == k_norm.variance_epsilon
+    ):
+        return False
+    for norm in (q_norm, k_norm):
+        if (
+            not norm.has_weight
+            or norm.cast_x_before_out_mul
+            or norm.variance_size_override is not None
+            or norm.weight.dtype != dtype
+        ):
+            return False
+
+    from sglang.kernels.ops.diffusion.rope.qknorm_rope_jit import (
+        can_use_fused_inplace_qknorm_rope,
+    )
+
+    return can_use_fused_inplace_qknorm_rope(
+        head_dim,
+        rotary_emb.rotary_dim,
+        rotary_emb.is_neox_style,
+        dtype,
+        torch.float32,
+        round_norm_before_rope=True,
+    )
+
+
+def apply_qk_norm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    rotary_emb: torch.nn.Module,
+    positions: torch.Tensor,
+    head_dim: int,
+    alt_stream: Optional[torch.cuda.Stream] = None,
+    use_jit: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """QK-norm followed by RoPE. With ``use_jit`` (from ``can_use_jit_qk_norm_rope``)
+    both run in place as one kernel; otherwise ``apply_qk_norm`` then ``rotary_emb``."""
+    num_tokens = q.size(0)
+    if (
+        use_jit
+        and positions.dim() == 1
+        # A dtype other than the one checked at init would build a new kernel here.
+        and q.dtype == q_norm.weight.dtype
+    ):
+        if num_tokens == 0:
+            # HIP rejects a zero-size grid.
+            return q, k
+        from sglang.kernels.ops.diffusion.rope.qknorm_rope_jit import (
+            fused_inplace_qknorm_rope,
+        )
+
+        rotary_emb._match_cos_sin_cache_dtype(q)
+        fused_inplace_qknorm_rope(
+            q.view(num_tokens, -1, head_dim),
+            k.view(num_tokens, -1, head_dim),
+            q_norm.weight,
+            k_norm.weight,
+            rotary_emb.cos_sin_cache,
+            positions,
+            is_neox=rotary_emb.is_neox_style,
+            eps=q_norm.variance_epsilon,
+            head_dim=head_dim,
+            rope_dim=rotary_emb.rotary_dim,
+            round_norm_before_rope=True,
+        )
+        return q, k
+
+    q, k = apply_qk_norm(
+        q=q,
+        k=k,
+        q_norm=q_norm,
+        k_norm=k_norm,
+        head_dim=head_dim,
+        alt_stream=alt_stream,
+    )
+    return rotary_emb(positions, q, k)
 
 
 # ---------------------------------------------------------------------------
@@ -875,3 +1023,19 @@ def fused_qk_gemma_rmsnorm_with_gate(
 
 # Register the inplace op
 fused_inplace_qknorm = register_custom_op(fused_inplace_qknorm, mutates_args=["q", "k"])
+
+
+def is_non_idle_and_non_empty(forward_mode, hidden_states):
+    return (
+        (forward_mode is not None)
+        and not forward_mode.is_idle()
+        and hidden_states.shape[0] > 0
+    )
+
+
+def bind_or_assign(target, source):
+    if target is not None:
+        target.copy_(source)
+        return target
+    else:
+        return source

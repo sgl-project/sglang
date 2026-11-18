@@ -12,6 +12,7 @@ from sglang.srt.arg_groups.model_override_base import (
     is_attention_backend_not_set,
     resolving_view,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -179,13 +180,85 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
 @_register_for("KimiK31ForConditionalGeneration")
 def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
+    overrides = {}
     if cfg.dcp_size > 1:
-        raise ValueError(
-            f"Kimi-K3.1 does not support --dcp-size > 1 yet (got {cfg.dcp_size})."
-        )
-    if cfg.enable_unified_memory:
-        raise ValueError("Kimi-K3.1 does not support --enable-unified-memory yet.")
-    return {}
+        if cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH"):
+            raise ValueError(
+                "Kimi-K3.1 DCP supports only DSPARK and DFLASH speculative decoding."
+            )
+        if (
+            cfg.disaggregation_mode != "null"
+            and cfg.disaggregation_transfer_backend != "mooncake"
+        ):
+            raise ValueError("Kimi-K3.1 DCP supports PD only over Mooncake.")
+        if cfg.speculative_algorithm == "DSPARK":
+            from sglang.srt.speculative.ragged_verify import (
+                RaggedVerifyMode,
+                read_ragged_verify_mode,
+            )
+
+            if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+                raise ValueError(
+                    "Kimi-K3.1 DCP + DSPARK requires SGLANG_RAGGED_VERIFY_MODE=static."
+                )
+        if cfg.speculative_algorithm == "DFLASH":
+            if cfg.speculative_draft_attention_backend not in (None, "cutedsl_mla"):
+                raise ValueError(
+                    "Kimi-K3.1 DCP + DFLASH needs "
+                    "--speculative-draft-attention-backend cutedsl_mla."
+                )
+            overrides["speculative_draft_attention_backend"] = "cutedsl_mla"
+        if cfg.speculative_algorithm is not None:
+            # NOTE(yhyang201): DCP target verify runs the DSA decode path; each
+            # rank attends over its KV shard and the (o, lse) partials are merged.
+            overrides["speculative_attention_mode"] = "decode"
+        if (
+            cfg.dsa_topk_backend != "sgl-kernel"
+            or not envs.SGLANG_OPT_USE_TOPK_V2.get()
+            or not envs.SGLANG_DSA_FUSE_TOPK.get()
+        ):
+            raise ValueError(
+                "Kimi-K3.1 DCP needs the fused sgl-kernel v2 DSA top-k "
+                "(--dsa-topk-backend sgl-kernel, SGLANG_OPT_USE_TOPK_V2 and "
+                "SGLANG_DSA_FUSE_TOPK on)."
+            )
+        if cfg.enable_return_indexer_topk or envs.SGLANG_DSA_TOPK_BROADCAST.get():
+            # the sharded indexer returns only this rank's local KV slots
+            raise ValueError(
+                "Kimi-K3.1 DCP does not support --enable-return-indexer-topk "
+                "or SGLANG_DSA_TOPK_BROADCAST."
+            )
+        if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in (
+            "a2a",
+            "fi_a2a",
+        ):
+            logger.info("Kimi-K3.1 DCP enables replicated Q projection by default.")
+            overrides["dcp_replicate_q_proj"] = True
+    if cfg.enable_flashmla_prefill_token_packing is None:
+        logger.info("Kimi-K3.1 enables FlashMLA prefill token packing by default.")
+        overrides["enable_flashmla_prefill_token_packing"] = True
+    overrides["decode_state_free_radix_default"] = True
+    return overrides
+
+
+def _reject_flashinfer_mxfp4_cutlass_situ(hf_config: Any) -> None:
+    # On SM90/SM120 Mxfp4MoEMethod picks a CUTLASS runner, which computes
+    # GPT-OSS SwiGLU; only the SM100-family trtllm-gen runner has SiTU. Other
+    # arches have no flashinfer_mxfp4 kernel and fail in Mxfp4MoEMethod.
+    platform = get_platform()
+    if not (platform.is_sm90 or platform.is_sm120):
+        return
+    if not _is_mxfp4_pack_quantized(hf_config):
+        return
+    text_config = getattr(hf_config, "text_config", hf_config)
+    if getattr(text_config, "hidden_act", None) != "situ":
+        return
+    raise RuntimeError(
+        "Kimi-K3 with moe_runner_backend='flashinfer_mxfp4' on "
+        f"SM{platform.device_sm} would run the routed experts with GPT-OSS "
+        "SwiGLU instead of SiTU; only SM100-family GPUs have the SiTU kernels. "
+        "Use --moe-runner-backend marlin on this GPU."
+    )
 
 
 @_register_for("KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration")
@@ -196,6 +269,8 @@ def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     # SM107 uses the same packed-MXFP4 runner; leaving auto unresolved falls
     # back to BF16 weight materialization during model loading.
     cfg = resolving_view(server_args)
+    if cfg.moe_runner_backend == "flashinfer_mxfp4":
+        _reject_flashinfer_mxfp4_cutlass_situ(hf_config)
     if cfg.moe_runner_backend != "auto":
         return {}
     if not (get_platform().is_sm100 and get_platform().device_sm in (100, 103, 107)):

@@ -27,6 +27,12 @@ from sglang.srt.multimodal.encoder_preprocessing import (
     EncoderPreprocessOutput,
     invoke_encoder_preprocessor,
 )
+from sglang.srt.multimodal.media_io import (
+    CLIENT_MEDIA_EXCEPTIONS,
+    load_audio,
+    load_image,
+    load_video,
+)
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.glm4v import (
     _glm_effective_presize_budget,
@@ -49,12 +55,6 @@ from sglang.srt.runtime_context import (
     get_serving,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    CLIENT_MEDIA_EXCEPTIONS,
-    load_audio,
-    load_image,
-    load_video,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -72,9 +72,9 @@ def _convert(data):
         return data
     elif isinstance(data, np.ndarray):
         return torch.tensor(data)
-    elif isinstance(data, list) and isinstance(data[0], np.ndarray):
+    elif isinstance(data, list) and data and isinstance(data[0], np.ndarray):
         return torch.tensor(np.array(data))
-    elif isinstance(data, list) and isinstance(data[0], (int, float)):
+    elif isinstance(data, list) and data and isinstance(data[0], (int, float)):
         return torch.tensor(data)
     else:
         return data
@@ -371,9 +371,11 @@ class EncoderPreprocessor:
         except CLIENT_MEDIA_EXCEPTIONS as e:
             # Not ValueError: the DP envelope classifies by `.code`, which only
             # MMError carries.
-            raise BadRequestError(f"Error while loading data {data}: {e}") from e
+            raise BadRequestError(
+                f"Error while loading data {str(data)[:128]}: {e}"
+            ) from e
         except Exception as e:
-            raise RuntimeError(f"Error while loading data {data}: {e}")
+            raise RuntimeError(f"Error while loading data {str(data)[:128]}: {e}")
 
     def _submit_data_loading_tasks(self, items, modalities):
         futures = []
