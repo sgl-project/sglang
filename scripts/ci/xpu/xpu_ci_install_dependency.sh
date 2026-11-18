@@ -22,4 +22,9 @@ docker exec "${CONTAINER_NAME}" cp /sglang-checkout/python/pyproject_xpu.toml /s
 docker exec -w /sglang-checkout "${CONTAINER_NAME}" git fetch origin '+refs/tags/*:refs/tags/*' --force
 docker exec -w /sglang-checkout/python "${CONTAINER_NAME}" uv pip install --python "${PY}" --no-cache .
 docker exec "${CONTAINER_NAME}" uv pip install --python "${PY}" --no-cache --no-deps xgrammar==0.1.33
-docker exec "${CONTAINER_NAME}" /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
+# HF rate-limits /whoami-v2 hard; HF_TOKEN in the container env still authenticates downloads.
+for attempt in 1 2 3; do
+  docker exec "${CONTAINER_NAME}" /bin/bash -c '/opt/venv/bin/hf auth login --token "${HF_TOKEN}"' && break
+  echo "::warning::hf auth login failed (attempt ${attempt}/3)"
+  if [[ ${attempt} -lt 3 ]]; then sleep $(( 20 * attempt + RANDOM % 15 )); fi
+done
