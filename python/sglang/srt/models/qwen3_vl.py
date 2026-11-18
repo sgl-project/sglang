@@ -1384,6 +1384,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             self.num_deepstack_embeddings = 0
             self.use_deepstack = {}
 
+        # Set after the initial checkpoint load; later load_weights calls are updates.
+        self._initial_weights_loaded = False
+
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
@@ -1673,6 +1676,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        loaded_params = set()
         for name, loaded_weight in weights:
             check_not_image_generation_head(name)
             if "rotary_emb.inv_freq" in name:
@@ -1747,6 +1751,36 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+        self._check_vision_weights_loaded(loaded_params)
+
+    def _check_vision_weights_loaded(self, loaded_params: Iterable[str]) -> None:
+        """Refuse to serve a vision tower that the checkpoint has no weights for.
+
+        The tower is allocated uninitialized, so a text-only checkpoint whose config
+        still declares one serves an encoder full of garbage; the multimodal warmup
+        request runs it at startup (#26745). Only the initial load is checked:
+        later load_weights calls are partial updates (e.g. RL weight sync).
+        """
+        if self._initial_weights_loaded:
+            return
+        self._initial_weights_loaded = True
+        if self.visual is None or getattr(self.config, "language_only", False):
+            return
+        visual_params = {n for n, _ in self.visual.named_parameters(prefix="visual")}
+        if visual_params.isdisjoint(loaded_params):
+            raise ValueError(
+                "The checkpoint has no vision encoder weights (visual.*), but its "
+                "config declares a vision encoder, which would run uninitialized. "
+                "For a text-only checkpoint, set "
+                '"language_model_only": true in its config.json.'
+            )
+
+    def post_load_weights(self):
+        # Called by loaders that write weights without load_weights (dummy,
+        # sharded state, remote instance), so later load_weights calls are
+        # treated as updates.
+        self._initial_weights_loaded = True
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
