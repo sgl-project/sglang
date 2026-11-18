@@ -2794,29 +2794,28 @@ class TestV41PrefillCapability(unittest.TestCase):
         backend._dsv41_candidate_source_layer = -1
         return backend
 
-    def _patch(self, *, ready=True, arch35=True, cp=1, dcp=1, pp=1):
+    def _patch(self, *, breakable=True, arch35=True, cp=1, dcp=1, pp=1):
         return patch.multiple(
             dsv4_backend,
-            check_cuda_graph_backend=MagicMock(return_value=True),
+            check_cuda_graph_backend=MagicMock(return_value=breakable),
             get_parallel=MagicMock(
                 return_value=SimpleNamespace(
                     attn_cp_size=cp, attn_dcp_size=dcp, pp_size=pp
                 )
             ),
             is_npu_arch35=MagicMock(return_value=arch35),
-            _DSV41_PREFILL_GRAPH_CONTRACT_READY=ready,
         )
 
-    def test_disabled_contract_keeps_v41_on_the_eager_break_path(self):
-        with self._patch(ready=False):
+    def test_prefill_graph_off_keeps_v41_on_the_eager_break_path(self):
+        with self._patch(breakable=False):
             self.assertFalse(self._backend()._supports_dsv4_prefill_graph_capture())
 
-    def test_enabled_contract_accepts_v41(self):
-        with self._patch(ready=True):
+    def test_supported_v41_config_is_accepted(self):
+        with self._patch():
             self.assertTrue(self._backend()._supports_dsv4_prefill_graph_capture())
 
     def test_v4_path_is_unchanged(self):
-        with self._patch(ready=False):
+        with self._patch():
             self.assertTrue(
                 self._backend(low_ratio=False)._supports_dsv4_prefill_graph_capture()
             )

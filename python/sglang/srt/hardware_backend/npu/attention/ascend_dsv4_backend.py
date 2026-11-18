@@ -50,12 +50,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Single rollback switch for the DeepSeek-V4.1 prefill-graph contract.  It is
-# also the PR-0 safety gate: when False, `low_ratio_prefill_graph` stays False
-# and both the low-ratio sources and attention run at eager breaks, while the
-# rest of the breakable body keeps its existing capture.
-_DSV41_PREFILL_GRAPH_CONTRACT_READY = True
-
 
 # Ascend 950 kv-quant KV layout: nope is quantized in groups of 64 and the RoPE half is
 # stored unquantized, so the kernels need both dimensions spelled out.
@@ -3172,18 +3166,18 @@ class DeepseekV4AscendAttnBackend(
             logger.info(
                 "DSV4%s NPU breakable prefill graph: %s captured, "
                 "max %d request(s) per replay.",
-                ".1" if self._dsv4_has_low_ratio else "",
+                ".1" if self._dsv4_is_v41_model else "",
                 (
                     "low-ratio sources + attention"
-                    if self._dsv4_has_low_ratio
+                    if self._dsv4_is_v41_model
                     else "compressor/indexer"
                 ),
                 MAX_PREFILL_GRAPH_REQS,
             )
-        elif self._dsv4_has_low_ratio:
+        elif self._dsv4_is_v41_model:
             logger.info(
-                "DeepSeek-V4.1 NPU prefill graph contract disabled: low-ratio "
-                "sources and attention stay at eager breaks."
+                "DeepSeek-V4.1 NPU prefill graph not enabled: low-ratio sources "
+                "and attention stay at eager breaks."
             )
 
     def _supports_dsv4_prefill_graph_capture(self) -> bool:
@@ -3218,8 +3212,6 @@ class DeepseekV4AscendAttnBackend(
 
     def _supports_dsv41_prefill_graph_capture(self) -> bool:
         """V4.1: capture the low-ratio source and attention as one dataflow."""
-        if not _DSV41_PREFILL_GRAPH_CONTRACT_READY:
-            return False
         if not is_npu_arch35():
             raise ValueError(
                 "DeepSeek-V4.1 prefill graph needs arch35 (the fused ratio-2 "
