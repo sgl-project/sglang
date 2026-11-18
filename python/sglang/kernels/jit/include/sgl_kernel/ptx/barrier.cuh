@@ -34,24 +34,24 @@ SGL_DEVICE uint32_t to_shared(T* ptr) {
 // A consumer-first wait initialized to 1 skips the producer's first signal and
 // blocks forever on the second.
 SGL_DEVICE void mbar_init(uint64_t* bar, uint32_t count) {
-  asm volatile("mbarrier.init.shared.b64 [%0], %1;" ::"r"(to_shared(bar)), "r"(count));
+  asm volatile("mbarrier.init.shared.b64 [%0], %1;" ::"r"(to_shared(bar)), "r"(count) : "memory");
 }
 
 SGL_DEVICE uint64_t mbar_arrive(uint64_t* bar) {
   uint64_t state;
-  asm volatile("mbarrier.arrive.shared.b64 %0, [%1];" : "=l"(state) : "r"(to_shared(bar)));
+  asm volatile("mbarrier.arrive.shared.b64 %0, [%1];" : "=l"(state) : "r"(to_shared(bar)) : "memory");
   return state;
 }
 
 SGL_DEVICE uint64_t mbar_arrive_relaxed(uint64_t* bar) {
   uint64_t state;
-  asm volatile("mbarrier.arrive.relaxed.cta.shared::cta.b64 %0, [%1];" : "=l"(state) : "r"(to_shared(bar)));
+  asm volatile("mbarrier.arrive.relaxed.cta.shared::cta.b64 %0, [%1];" : "=l"(state) : "r"(to_shared(bar)) : "memory");
   return state;
 }
 
 // Combined arrive + set tx-count, for TMA-load completion.
 SGL_DEVICE void mbar_arrive_expect_tx(uint64_t* bar, uint32_t bytes) {
-  asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;" ::"r"(to_shared(bar)), "r"(bytes));
+  asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;" ::"r"(to_shared(bar)), "r"(bytes) : "memory");
 }
 
 // Sets the transaction count of the current phase without arriving (the arrivals come separately).
@@ -68,7 +68,8 @@ SGL_DEVICE void mbar_wait_parity(uint64_t* bar, uint32_t parity) {
       "{\n\t.reg .pred p;\n\t"
       "WAIT_%=: mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n\t"
       "@!p bra WAIT_%=;\n\t}\n" ::"r"(to_shared(bar)),
-      "r"(parity));
+      "r"(parity)
+      : "memory");
 }
 
 // The same wait with the PTX suspendTimeHint (nanoseconds): a thread that finds the phase incomplete may be suspended

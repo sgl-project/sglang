@@ -26,7 +26,7 @@ __all__ = [
     "TeaCacheMixin",
     # Spectrum (always available)
     "SpectrumMixin",
-    # cache-dit integration (lazy-loaded, requires cache-dit package)
+    # cache-dit integration (requires the cache-dit package)
     "CacheDitConfig",
     "enable_cache_on_transformer",
     "enable_cache_on_dual_transformer",

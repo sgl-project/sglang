@@ -89,7 +89,7 @@ const cfg = {
           disableReason: (s) => !BLACKWELL_HW.includes(s.hw)
             ? "M3.1 NVFP4 DFlash2 requires NVIDIA Blackwell (B300 / GB300 / B200 / GB200)."
             : cellMonokernel(s)
-              ? "The MonoKernel runs the DSpark draft and verify steps; DFlash2 is not supported with --monokernel-backend msa."
+              ? "The MonoKernel runs the DSpark draft and verify steps; DFlash2 is not supported with --enable-nvidia-megakernel."
               : "DFlash2 does not support DP attention, and this recipe runs --attn-dp-size "
                 + cellAttnDp(s) + ". Pick Balanced, or GB300 / GB200 High-Throughput." },
       ],
@@ -115,13 +115,13 @@ const cfg = {
 -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
 
   dockerImages: {
-    b300:  "lmsysorg/sglang:dev-minimax-m31-flash",
-    gb300: "lmsysorg/sglang:dev-minimax-m31-flash",
-    gb200: "lmsysorg/sglang:dev-minimax-m31-flash",
-    b200:  "lmsysorg/sglang:dev-minimax-m31-flash",
-    h200:  "lmsysorg/sglang:dev-minimax-m31-flash",
-    mi355x: "lmsysorg/sglang:dev-minimax-m31-flash-mi35x ",
-    mi350x: "lmsysorg/sglang:dev-minimax-m31-flash-mi35x ",
+    b300:  "lmsysorg/sglang:latest",
+    gb300: "lmsysorg/sglang:latest",
+    gb200: "lmsysorg/sglang:latest",
+    b200:  "lmsysorg/sglang:latest",
+    h200:  "lmsysorg/sglang:latest",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261113",
+    mi350x: "lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261113",
   },
 
   github: {
@@ -248,12 +248,12 @@ const cfg = {
       router: {
         port: 8000,
         command:
-`python3 -m sglang_router.launch_router \\
-  --pd-disaggregation \\
-  --prefill http://<prefill-host>:{{PREFILL_PORT}} 8998 \\
-  --decode http://<decode-host>:{{DECODE_PORT}} \\
-  --policy round_robin \\
-  --host 0.0.0.0 --port {{ROUTER_PORT}}`,
+`sgl-router \\
+  --model-id {{MODEL_NAME}} \\
+  --no-tokenizer \\
+  --worker-urls http://<prefill-host>:{{PREFILL_PORT}} http://<decode-host>:{{DECODE_PORT}} \\
+  --host 0.0.0.0 --port {{ROUTER_PORT}} \\
+  --policy round_robin`,
       },
     },
 
@@ -328,7 +328,7 @@ const cfg = {
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 8",
         "--speculative-dspark-block-size 7",
-        "--monokernel-backend msa",
+        "--enable-nvidia-megakernel",
         "--disable-attn-tp-gather",
         "--max-running-requests 8",
         "--mem-fraction-static 0.8",
@@ -411,7 +411,7 @@ const cfg = {
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 8",
         "--speculative-dspark-block-size 7",
-        "--monokernel-backend msa",
+        "--enable-nvidia-megakernel",
         "--disable-attn-tp-gather",
         "--max-running-requests 8",
         "--mem-fraction-static 0.8",
@@ -500,7 +500,7 @@ const cfg = {
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 8",
         "--speculative-dspark-block-size 7",
-        "--monokernel-backend msa",
+        "--enable-nvidia-megakernel",
         "--disable-attn-tp-gather",
         "--max-running-requests 8",
         "--mem-fraction-static 0.8",
@@ -589,7 +589,7 @@ const cfg = {
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 8",
         "--speculative-dspark-block-size 7",
-        "--monokernel-backend msa",
+        "--enable-nvidia-megakernel",
         "--disable-attn-tp-gather",
         "--max-running-requests 8",
         "--mem-fraction-static 0.8",
@@ -840,10 +840,10 @@ function cellAttnDp(s) {
   return flag ? parseInt(flag.split(/\s+/)[1], 10) : 1;
 }
 
-// Whether the showing cell runs the MSA-V1 MonoKernel (--monokernel-backend msa).
+// Whether the showing cell runs the MSA-V1 MonoKernel (--enable-nvidia-megakernel).
 function cellMonokernel(s) {
   const cell = cfg.cells.find((c) => Object.entries(c.match).every(([k, v]) => s[k] === v));
-  return !!cell && cell.flags.some((f) => f.startsWith("--monokernel-backend "));
+  return !!cell && cell.flags.some((f) => f === "--enable-nvidia-megakernel");
 }
 
 return cfg;

@@ -18,7 +18,8 @@ class TestTorchTP(CustomTestCase):
                 # This cannot run anymore with the new torch version.
                 # "--json-model-override-args",
                 # '{"architectures": ["TorchNativeLlamaForCausalLM"]}',
-                "--disable-cuda-graph",
+                "--disable-decode-cuda-graph",
+                "--disable-prefill-cuda-graph",
             ],
         )
 

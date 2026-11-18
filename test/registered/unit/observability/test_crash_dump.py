@@ -85,6 +85,7 @@ _SECRETS = {
     "api_key": "api-secret",
     "admin_api_key": "admin-secret",
     "ssl_keyfile_password": "ssl-secret",
+    "hicache_storage_backend_extra_config": '{"secret_key": "s3-secret"}',
     "watermark_key": "abcdef0123456789",
     "watermark_key_b": "0123456789abcdef",
 }
@@ -114,6 +115,13 @@ def _assert_secrets_redacted(test: CustomTestCase, path: str, dump: dict):
 
 
 class TestTokenizerManagerCrashDump(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # The TokenizerManager is the Python server's, and Rust-server mode
+        # refuses --ssl-keyfile-password at resolution, so pin the mode against
+        # an inherited SGLANG_RUST_SERVER=1.
+        self.enterContext(envs.SGLANG_RUST_SERVER.override(False))
+
     def test_file_name_and_contents(self):
         """The TokenizerManager's dump: one file per crash under the host's
         folder, holding the finished and unfinished requests with the launch
@@ -216,10 +224,18 @@ class TestTokenizerManagerCrashDump(CustomTestCase):
                 _server_args_for_dump=lambda: passed,
                 _dump_config_snapshot=server_args.resolved_dict,
             )
+            context = create_context(server_args, role="test")
+            # A runtime HiCache attach logs its config among the config updates.
+            context.override(
+                "tokenizer.attach_hicache",
+                hicache_storage_backend_extra_config=_SECRETS[
+                    "hicache_storage_backend_extra_config"
+                ],
+            )
             with (
                 self.subTest(type(passed).__name__),
                 tempfile.TemporaryDirectory() as folder,
-                use_context(create_context(server_args, role="test")),
+                use_context(context),
                 patch.object(sys, "argv", list(_SECRET_ARGV)),
                 envs.SGLANG_PYSPY_DUMP_BEFORE_CRASH.override(False),
                 envs.SGLANG_CUDA_COREDUMP_BEFORE_CRASH.override(False),
@@ -404,6 +420,10 @@ class TestRustServerCrashDump(CustomTestCase):
         """The dump carries no secret, as Python's does. Rust mode refuses
         `--enable-watermark`, but the Python API takes a server key without
         it and validation then skips the key."""
+        # Rust-server mode refuses --ssl-keyfile-password at resolution, and
+        # the dump path under test does not read the mode, so resolve the
+        # record against the Python mode.
+        self.enterContext(envs.SGLANG_RUST_SERVER.override(False))
         server_args = ServerArgs(model_path="dummy", **_SECRETS)
         server = _rust_server(_SNAPSHOT)
         server.server_args = server_args

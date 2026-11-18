@@ -17,7 +17,7 @@ from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="stage-a-test-cpu-intel")
+register_cpu_ci(est_time=6, suite="extra-test-cpu-intel")
 
 
 @pytest.fixture(autouse=True)

@@ -15,7 +15,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
-register_amd_ci(est_time=10, suite="jit-kernel-unit-test-amd")
+register_amd_ci(est_time=10, suite="base-a-jit-kernel-unit-test-amd")
 
 
 def block_topk_reference(
@@ -222,14 +222,6 @@ class TestBlockTopkTriton(CustomTestCase):
             rtol=0.0,
             atol=1e-7,
         )
-
-    def test_rejects_non_power_of_two_block_size(self):
-        logits = torch.zeros((6, 4), dtype=torch.float32, device="cuda")
-        bias = torch.zeros((4,), dtype=torch.float32, device="cuda")
-        for block_size in (3, True):
-            with self.subTest(block_size=block_size):
-                with self.assertRaisesRegex(ValueError, "positive power of two"):
-                    block_topk_triton(logits, bias, block_size, 2, 1)
 
     def test_empty_input_returns_fp32_weights(self):
         logits = torch.empty((0, 16), dtype=torch.bfloat16, device="cuda")

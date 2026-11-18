@@ -1040,6 +1040,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # fused_moe selects the preshuffle_on kernel family.
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
+            # K3 SiTU w13 is GU-interleaved; only gfx950's INTERLEAVE reads this layout
+            if is_gfx95_supported() and k3_situ and use_aiter_gu_interleave:
+                layer.situ_gate_up_interleaved = True
 
             layer.w13_weight_scale = torch.nn.Parameter(
                 shuffled_w13_scale, requires_grad=False
@@ -1433,6 +1436,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             "cutlass_sm120",
             "trtllm_sm100",
         ):
+            if (
+                self._fi_kernel != "trtllm_sm100"
+                and moe_runner_config.activation == "situ"
+            ):
+                # The CUTLASS runners read gemm1_alpha/gemm1_clamp_limit as
+                # GPT-OSS SwiGLU scalars; SiTU needs flashinfer-ai/flashinfer#4209.
+                raise NotImplementedError(
+                    f"moe_runner_backend=flashinfer_mxfp4 ({self._fi_kernel}) does "
+                    "not implement the SiTU activation; use "
+                    "--moe-runner-backend marlin."
+                )
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
             raise NotImplementedError(
@@ -1721,6 +1735,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             x_padded = torch.nn.functional.pad(
                 x, (0, self.hidden_pad), mode="constant", value=0.0
             )
+        fused_moe_kwargs = None
+        if getattr(layer, "situ_gate_up_interleaved", False):
+            from aiter.ops.flydsl.moe_common import GateMode
+
+            fused_moe_kwargs = {"gate_mode": GateMode.INTERLEAVE.value}
         quant_info = AiterMoeQuantInfo(
             w13_weight=w13_weight,
             w2_weight=w2_weight,
@@ -1733,6 +1752,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             doweight_stage1=self.moe_runner_config.apply_router_weight_on_input,
             hidden_pad=self.hidden_pad,
             intermediate_pad=self.intermediate_pad,
+            fused_moe_kwargs=fused_moe_kwargs,
             # Applies swiglu clamp for GPT-OSS-style activations. K3 SiTU
             # uses gemm1_clamp_limit as linear_beta, which is forwarded by
             # the AITER runner and must not be treated as swiglu_limit.

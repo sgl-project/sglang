@@ -1,9 +1,6 @@
 import itertools
-import math
-import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional, Tuple
 
-import numpy as np
 import torch
 import triton
 import triton.testing
@@ -67,9 +64,6 @@ def calculate_diff(batch_size: int, seq_len: int):
 
     vllm_out, vllm_scale = vllm_scaled_fp8_quant(x)
     sglang_out, sglang_scale = sglang_scaled_fp8_quant(x)
-
-    scale_diff = torch.abs(vllm_scale - sglang_scale).item()
-    output_diff = torch.abs(vllm_out.float() - sglang_out.float()).mean().item()
 
     if torch.allclose(
         vllm_out.to(torch.float32), sglang_out.to(torch.float32), rtol=1e-3, atol=1e-5

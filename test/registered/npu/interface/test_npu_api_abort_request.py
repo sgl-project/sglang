@@ -22,7 +22,7 @@ def send_requests(url, **kwargs):
     responses.append(response)
 
 
-register_npu_ci(est_time=400, suite="full-1-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="full-test-1-npu-a3", nightly=True)
 
 
 class TestNpuApi(CustomTestCase):

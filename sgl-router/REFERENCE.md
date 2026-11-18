@@ -213,8 +213,18 @@ client sent. The router picks the first of these that applies:
 1. A hash of the sticky routing key or session id, so a conversation keeps
    its rank and router replicas agree.
 2. The rank with the deepest cached prefix in the local KV tree.
-3. The rank with the fewest requests this router has in flight on it, or with
-   `--dp-rank-policy round_robin`, the worker's ranks in turn.
+3. The rank with the fewest requests this router has in flight on it; with
+   `--dp-rank-policy round_robin`, the worker's ranks in turn; or with
+   `--dp-rank-policy least_tokens`, the lighter of two ranks drawn at
+   random, by KV tokens committed, in use plus the prompts of requests still
+   queued, as the engine reports them on its `--load-publish-endpoint` feed,
+   which sees every router replica's traffic, plus the requests this router
+   has sent to the rank since that reading at the worker's mean KV per
+   request. Two random ranks rather than the lightest because every router
+   replica reads the same report, and all taking its minimum would send
+   their next requests to one rank until the next report. Ties, and a worker
+   without a fresh reading for every one of its ranks, fall back to the
+   in-flight count.
 
 In PD mode, decode is ranked by step 3 only. The decode request names the
 prefill rank in `disagg_prefill_dp_rank`, and the bootstrap room satisfies
@@ -586,6 +596,14 @@ the Messages API does, and a final assistant turn is sent as a prefill
 Every error uses the Anthropic error envelope; 5xx messages are replaced with a
 generic one, and a failed stream still closes its open block and ends with
 `message_stop`.
+
+A `system` turn inside `messages`, as Claude Code sends, stays in place only
+when every worker of the model reports `supports_inline_system` in
+`/server_info`: its chat template renders a system message after the first.
+Otherwise its text joins the leading system message, where the engine's own
+`/v1/messages` puts it, and the turns either side of it stay apart. An engine
+that predates the field counts as not supporting it, and a request that ends
+with a system turn is never a prefill.
 
 `/v1/messages/count_tokens` is answered by the router from the model's chat
 template, without calling an engine. Image tokens are not counted, and a model

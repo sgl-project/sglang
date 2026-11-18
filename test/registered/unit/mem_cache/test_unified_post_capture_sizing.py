@@ -1265,6 +1265,24 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
             for table in (sub.ids.virtual_to_physical, sub.ids.physical_to_virtual)
         ]
         table_ptrs = [table.data_ptr() for table in tables]
+        # The memory clip prices an empty pool of the reserved size, then of
+        # the final size: what it priced before the resize is not kept.
+        clip = dict(
+            token_capacity=10**7,
+            sliding_window_size=64,
+            chunk_size=None,
+            prefill_retire_lag=0,
+            eviction_interval=1,
+        )
+        prompts = (1000, 60000, 120000, 250000)
+
+        def clipped(allocator):
+            return [
+                allocator.max_new_tokens_for_memory(prompt, 100000, **clip)
+                for prompt in prompts
+            ]
+
+        reserved = clipped(allocator)
 
         config = _final_config(bundle)
         bundle.token_to_kv_pool.finalize_backing(config)
@@ -1283,6 +1301,9 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
         eager = _bundle(total_bytes=_FINAL_BYTES, post_capture_active=False)
         self.assertEqual(_capacities(bundle), _capacities(eager))
         self.assertEqual(allocator.verify_byte_accounting(), [])
+        final = clipped(allocator)
+        self.assertEqual(final, clipped(eager.token_to_kv_pool_allocator))
+        self.assertNotEqual(final, reserved)
 
         # The resized capacity is fully allocatable and accounted.
         n = largest_take(allocator)

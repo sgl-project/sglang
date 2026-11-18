@@ -44,6 +44,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod, Fp8Mo
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     apply_fp8_linear_bmm_flashinfer,
+    apply_fp8_linear_deterministic,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     flashinfer_per_tensor_fp8_supported,
@@ -68,7 +69,7 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
 from sglang.srt.layers.utils.common import set_weight_attrs
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import get_exec, get_platform
 from sglang.srt.utils.common import round_up
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.device import get_device_capability, is_cuda
@@ -654,6 +655,17 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 workspace=layer.workspace,
                 size_n=layer.output_size_per_partition,
                 size_k=layer.input_size_per_partition,
+                bias=bias,
+            )
+        if (
+            self.use_sm120_fp8
+            and get_exec().deterministic.enable_deterministic_inference
+        ):
+            return apply_fp8_linear_deterministic(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=layer.input_scale,
                 bias=bias,
             )
         if self.use_sm120_fp8:
@@ -2484,19 +2496,24 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # nvfp4_online overrides this for serialized FP8 source weights.
         return False
 
+    def _trtllm_hidden_alignment(self, layer) -> int:
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            trtllm_nvfp4_hidden_alignment,
+        )
+
+        return trtllm_nvfp4_hidden_alignment(
+            use_per_token_activation=self.quant_config.use_per_token_activation,
+            is_gated=layer.moe_runner_config.is_gated,
+        )
+
     def _align_fp4_moe_weights_for_flashinfer_trtllm(self, layer) -> None:
         """Align TRT-LLM weights, allowing model-specific storage layouts."""
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             align_fp4_moe_weights_for_flashinfer_trtllm,
-            trtllm_nvfp4_hidden_alignment,
         )
 
         align_fp4_moe_weights_for_flashinfer_trtllm(
-            layer,
-            hidden_alignment=trtllm_nvfp4_hidden_alignment(
-                use_per_token_activation=self.quant_config.use_per_token_activation,
-                is_gated=layer.moe_runner_config.is_gated,
-            ),
+            layer, hidden_alignment=self._trtllm_hidden_alignment(layer)
         )
 
     def create_weights(
@@ -2945,10 +2962,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 layer.w13_weight.device,
             )
 
+        # The TRT-LLM runner pads a misaligned hidden dim and so needs BF16
+        # activations; FP4 dispatch would quantize them at the unpadded size.
+        trtllm_pads_hidden = (
+            self.enable_flashinfer_trtllm_moe
+            and layer.hidden_size % self._trtllm_hidden_alignment(layer) != 0
+        )
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
         use_dispatch_fp4 = (
             not self.quant_config.use_per_token_activation
             and not use_w4a16
+            and not trtllm_pads_hidden
             and (
                 use_nvfp4_dispatch or should_use_flashinfer_cutlass_moe_fp4_allgather()
             )

@@ -3,13 +3,16 @@
 import contextlib
 import io
 import json
+import shlex
 import sys
 import unittest
 from importlib import resources
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from sglang.cli import interactive
 from sglang.cli.interactive import (
+    EDITOR_HEADER,
     NO_MODE_MESSAGE,
     NO_RECIPE_MESSAGE,
     command_argv,
@@ -687,6 +690,78 @@ class TestCliGuide(CustomTestCase):
             execvpe.call_args.args[1], _launch_argv(command_argv(recipe["command"]))
         )
 
+    def test_terminal_edits_the_whole_command_in_an_editor(self):
+        """What the user saves in $VISUAL launches, env lines included."""
+        recipe = _recipe(QWEN_NVFP4, "rtx6000", "low-latency")
+        argv = edit_flags(
+            argv=command_argv(recipe["command"]),
+            edits="--port 8000 !--reasoning-parser",
+        )
+        opened = []
+
+        def editor(args):
+            path = Path(args[-1])
+            opened.append((args[:-1], path.read_text()))
+            path.write_text(
+                "# Rewritten on one line, one env var dropped.\n"
+                f"PYTORCH_CUDA_ALLOC_CONF='a b' sglang serve {shlex.join(argv)}\n"
+            )
+            return 0
+
+        with (
+            patch.dict(interactive.os.environ, {"VISUAL": "code --wait"}),
+            patch.object(interactive.subprocess, "call", side_effect=editor),
+        ):
+            execvpe, stdout, _, _ = self._guide(
+                QWEN_NVFP4,
+                device="NVIDIA RTX PRO 6000 Blackwell Server Edition",
+                gpus=1,
+                answers=["", "e", ""],
+            )
+
+        original = format_command(
+            env=recipe["env"], argv=command_argv(recipe["command"])
+        )
+        self.assertEqual(
+            opened, [(["code", "--wait"], EDITOR_HEADER + original + "\n")]
+        )
+        _, launched, env = execvpe.call_args.args
+        self.assertEqual(launched, _launch_argv(argv))
+        self.assertEqual(env["PYTORCH_CUDA_ALLOC_CONF"], "a b")
+        self.assertNotIn("SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK", env)
+        edited = {"PYTORCH_CUDA_ALLOC_CONF": "a b"}
+        self.assertTrue(stdout.endswith(format_command(env=edited, argv=argv) + "\n"))
+
+    def test_failed_edit_keeps_the_command(self):
+        recipe = _recipe(QWEN, "h200", "low-latency")
+
+        def saves(text):
+            def editor(args):
+                Path(args[-1]).write_text(text)
+                return 0
+
+            return editor
+
+        for name, call, message in (
+            ("no editor", FileNotFoundError(2, "No such file"), "No such file"),
+            ("editor fails", lambda args: 1, "exited with code 1"),
+            ("no sglang serve", saves("python -m sglang.launch_server"), 'No "'),
+            ("not an env line", saves("export A=1 sglang serve"), "KEY=VALUE"),
+        ):
+            with (
+                self.subTest(name),
+                patch.object(interactive.subprocess, "call", side_effect=call),
+            ):
+                execvpe, _, stderr, _ = self._guide(
+                    QWEN, device=H200, gpus=4, answers=["", "e", ""]
+                )
+                self.assertIn(message, stderr)
+                self.assertIn("the command is unchanged", stderr)
+                self.assertEqual(
+                    execvpe.call_args.args[1],
+                    _launch_argv(command_argv(recipe["command"])),
+                )
+
     def test_eof_or_ctrl_c_cancels_without_launching(self):
         for error in (EOFError, KeyboardInterrupt):
             for answers in ([error()], ["", error()]):
@@ -697,6 +772,16 @@ class TestCliGuide(CustomTestCase):
                     execvpe.assert_not_called()
                     self.assertEqual(exit.code, 130)
                     self.assertIn("Cancelled", stderr)
+        with (
+            self.subTest("Ctrl-C in the editor"),
+            patch.object(interactive.subprocess, "call", side_effect=KeyboardInterrupt),
+        ):
+            execvpe, _, stderr, exit = self._guide(
+                QWEN, device=H200, gpus=4, answers=["", "e"]
+            )
+            execvpe.assert_not_called()
+            self.assertEqual(exit.code, 130)
+            self.assertIn("Cancelled", stderr)
 
     def test_model_without_modes_uses_the_default_command(self):
         recipe = dict(_recipe(QWEN, "h200", "low-latency"), mode=None)

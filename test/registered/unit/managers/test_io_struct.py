@@ -48,8 +48,8 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
-register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
+register_amd_ci(est_time=8, suite="base-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=6, suite="extra-test-cpu-intel")
 
 
 class TestTokenizedReqInputMsgpack(unittest.TestCase):
@@ -1367,25 +1367,12 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             )
             req.normalize_batch_and_arguments()
 
-    def test_data_parallel_rank_alias_maps_to_routed_dp_rank(self):
-        req = GenerateReqInput(text="Hello", sampling_params={}, data_parallel_rank=2)
-        req.normalize_batch_and_arguments()
-        self.assertEqual(req.routed_dp_rank, 2)
-        self.assertIsNone(req.data_parallel_rank)
-
-    def test_data_parallel_rank_alias_does_not_override_routed_dp_rank(self):
-        req = GenerateReqInput(
-            text="Hello", sampling_params={}, data_parallel_rank=2, routed_dp_rank=1
-        )
-        req.normalize_batch_and_arguments()
-        self.assertEqual(req.routed_dp_rank, 1)
-
-    def test_data_parallel_rank_alias_propagates_to_batch_items(self):
+    def test_routed_dp_rank_propagates_to_batch_items(self):
         req = GenerateReqInput(
             text=["Hello", "World"],
             sampling_params=[{}, {}],
             rid=["id1", "id2"],
-            data_parallel_rank=3,
+            routed_dp_rank=3,
         )
         req.normalize_batch_and_arguments()
         self.assertEqual(req[0].routed_dp_rank, 3)

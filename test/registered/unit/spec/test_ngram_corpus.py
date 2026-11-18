@@ -16,7 +16,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=19, suite="base-a-test-cpu")
 register_xpu_ci(
     est_time=20,
-    suite="stage-b-test-1-gpu-xpu",
+    suite="extra-test-1-gpu-xpu",
     disabled="XPU image lacks apache-tvm-ffi (NgramCorpus JIT dependency)",
 )
 

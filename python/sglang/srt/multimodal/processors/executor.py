@@ -2,7 +2,7 @@ import asyncio
 import concurrent.futures
 import copy
 import threading
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Optional, TypeVar
 
 T = TypeVar("T")
 
@@ -15,7 +15,13 @@ class _WorkerState(threading.local):
 class MultimodalProcessorExecutor:
     """Run processor calls on isolated, thread-local processor clones."""
 
-    def __init__(self, resolve_processor: Callable[[], Any], max_workers: int):
+    def __init__(
+        self,
+        resolve_processor: Callable[[], Any],
+        max_workers: int,
+        *,
+        initializer: Optional[Callable[[], None]] = None,
+    ):
         # Resolved per clone rather than captured here: a subclass keeps
         # customizing `_processor` after `super().__init__()` has already built
         # this pool, and a clone taken now would miss every one of those edits.
@@ -26,6 +32,7 @@ class MultimodalProcessorExecutor:
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="sglang-mm-processor",
+            initializer=initializer,
         )
         self._worker_state = _WorkerState()
         self._clone_lock = threading.Lock()

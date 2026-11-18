@@ -70,10 +70,10 @@ Do not mark the goal complete until the completion check at the end of this skil
 
 Known SGLang gates:
 
-- `pr-test.yml` requires the `run-ci` label for relevant PR changes. If its existing gate job failed because the label was absent, add `run-ci` when authorized and rerun failed jobs in that existing run; adding the label alone does not necessarily create a new `pr-test.yml` run.
-- `pr-test-extra.yml` requires both `run-ci` and `run-ci-nv-extra`; `pr-test-amd-extra.yml` requires `run-ci` and `run-ci-amd-extra`. These workflows do not trigger on label events. Use `/run-extra-ci nv` or `/run-extra-ci amd` to add the matching label and rerun the selected current-head workflow.
+- Every workflow that uses `pr-gate.yml` skips its tests on a draft PR or without the `run-ci` label; only `pr-test-finish` in `pr-test.yml` fails then. Add `run-ci` when authorized (`/tag-and-rerun-ci`), or use `/rerun-failed-ci` once it is there: both fully rerun the runs whose tests were skipped and can now run. Rerunning only failed jobs reruns just `pr-test-finish`. Adding the label alone does not create a new run.
+- `pr-test-extra.yml` and `pr-test-amd-extra.yml` require `run-ci` plus `run-ci-nv-extra` or `run-ci-amd-extra`; every other hardware workflow (`pr-test-<hw>.yml` for xeon, npu, xpu, musa, arm64, mlx, mlu, ppu) requires `run-ci` plus `run-ci-<hw>-extra`. Without the label such a run passes with its tests skipped, so it is green, not failed. These workflows do not trigger on label events. Use `/run-extra-ci <hw> [...]` (or `/run-ci <hw>` for hardware other than nv and amd) to add the labels and rerun the selected current-head workflows.
 - The shared `run-ci-extra` label is retired and does not pass updated gates. Older workflow runs retain their original revision; update the branch and push to create a fresh run before using the dedicated label. Verify the actual selected workflow file.
-- Treat draft, cooldown, maintenance, and missing-label failures as gate/infrastructure conditions, not code regressions. Fix only the safe gate condition in scope; wait for cooldown or maintenance windows rather than burning retries immediately.
+- Treat draft and missing-label skips, and cooldown and maintenance failures, as gate/infrastructure conditions, not code regressions. Fix only the safe gate condition in scope; wait for cooldown or maintenance windows rather than burning retries immediately.
 
 Adding the known CI opt-in labels is within scope. Do not add unrelated labels, mark the PR ready, alter reviewers, merge, or mutate other PR metadata.
 
@@ -86,7 +86,7 @@ For each selected workflow:
 1. Select the newest run associated with the current PR head SHA.
 2. Ignore runs for older head SHAs, including green runs made stale by a new push.
 3. Treat `queued`, `requested`, `waiting`, `pending`, and `in_progress` as active; keep monitoring.
-4. Treat a workflow as passing only when its current-head run concludes `success`.
+4. Treat a workflow as passing only when its current-head run concludes `success`. For a workflow that uses `pr-gate.yml`, `success` also requires that the gate's `Skip tests` step did not run: a run on a draft, or from before `run-ci` or the workflow's opt-in label, passes with every test job skipped. Rerun such a run with the commands under Known SGLang gates.
 5. If no current-head run exists, wait briefly for event delivery, then inspect the workflow's path filters, event triggers, and label gates.
 6. Trigger only through a mechanism explicitly supported by that workflow. Never invent `workflow_dispatch` inputs or dispatch a workflow against the default branch when the intent is to test the PR head.
 7. If a selected workflow cannot safely be triggered for the PR head, report the exact blocker and request direction.
@@ -165,7 +165,7 @@ If GitHub cannot rerun only the failed portion of the selected run, stop and ask
 Before completing the goal:
 
 1. Fetch the PR head SHA again.
-2. For every selected workflow, verify that its newest applicable run is for that exact SHA and concludes `success`.
+2. For every selected workflow, verify that its newest applicable run is for that exact SHA and concludes `success`, with test jobs that ran for an opt-in workflow.
 3. Verify no selected workflow is still pending and no success was invalidated by a newer push.
 4. Ignore all unselected workflows even if they are failing.
 5. Mark the goal complete only after all selected workflows satisfy these checks.

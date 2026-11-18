@@ -443,6 +443,12 @@
         "cooldown_interval_minutes": 0,
         "reason": "custom override"
     },
+    "akashpalla": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 30,
+        "reason": "custom override"
+    },
     "akhilg-nv": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -1235,6 +1241,12 @@
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,
         "reason": "top contributor"
+    },
+    "rumitdesai": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 30,
+        "reason": "custom override"
     },
     "rwang5203": {
         "can_tag_run_ci_label": true,

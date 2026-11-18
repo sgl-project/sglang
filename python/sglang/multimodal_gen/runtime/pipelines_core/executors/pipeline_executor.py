@@ -157,8 +157,7 @@ class PipelineExecutor(ABC):
         batch: Req,
         server_args: ServerArgs,
     ) -> OutputBatch:
-
-        with self.profile_execution(batch, dump_rank=0):
+        with self.profile_execution(batch, dump_rank=None):
             with current_platform.inference_mode():
                 batch = self.execute(stages, batch, server_args)
 

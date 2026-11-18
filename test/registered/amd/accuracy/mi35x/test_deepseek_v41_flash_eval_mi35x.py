@@ -21,7 +21,7 @@ the answer into `reasoning_content` and leave `message.content` empty. Scoring
 raw completions keeps this test measuring whether the ROCm kernels produce
 correct tokens.
 
-Registry: nightly-amd-4-gpu-mi35x-deepseek-v41-flash suite
+Registry: nightly-test-4-gpu-amd-mi35x-deepseek-v41-flash suite
 """
 
 import os
@@ -44,7 +44,7 @@ from sglang.test.test_utils import (
 # Register for AMD CI - DeepSeek-V4.1-Flash accuracy test on MI35x (~18 min in
 # run 36797490320: ~16 min of server startup, then 1319 GSM8K questions in ~1 min)
 register_amd_ci(
-    est_time=1200, suite="nightly-amd-4-gpu-mi35x-deepseek-v41-flash", nightly=True
+    est_time=1200, suite="nightly-test-4-gpu-amd-mi35x-deepseek-v41-flash", nightly=True
 )
 
 DEEPSEEK_V41_FLASH_MODEL_PATH = os.environ.get(

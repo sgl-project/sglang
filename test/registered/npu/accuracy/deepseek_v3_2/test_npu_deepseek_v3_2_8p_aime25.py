@@ -8,7 +8,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=4800,
-    suite="full-acc-16-npu-a3",
+    suite="full-acc-test-16-npu-a3",
     nightly=True,
 )
 
@@ -18,7 +18,8 @@ OTHER_ARGS = [
     "0.9",
     "--attention-backend",
     "ascend",
-    "--disable-cuda-graph",
+    "--disable-decode-cuda-graph",
+    "--disable-prefill-cuda-graph",
     "--tp-size",
     "16",
     "--quantization",

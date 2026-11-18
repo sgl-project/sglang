@@ -149,6 +149,11 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
+from sglang.srt.model_executor.model_interfaces import (
+    CPBoundedTailLogits,
+    CPLogitsInputs,
+    LanguageModelInputPreparation,
+)
 from sglang.srt.model_executor.runner import (
     compile_in_capture_mode,
     get_is_capture_mode,
@@ -935,7 +940,8 @@ def _low_ratio_sources_break(attn_backend, forward_batch) -> bool:
         forward_batch.forward_mode.is_extend()
         and is_in_breakable_cuda_graph()
         and (
-            not getattr(attn_backend, "low_ratio_prefill_graph", False)
+            is_cp_active(forward_batch)
+            or not getattr(attn_backend, "low_ratio_prefill_graph", False)
             or in_replay_tail_graph()
         )
     )
@@ -1158,7 +1164,7 @@ class MqaAttentionBase(nn.Module):
             # wo_a is quantized but never *applied* through its quant method:
             # the absorb GEMM in forward() reads .weight / .weight_scale_inv and
             # runs its own batched kernel (DeepGEMM fp8_einsum on CUDA, aiter
-            # mxscale BMM on gfx950), both of which want the plain row-major
+            # mxscale BMM on ROCm), both of which start from the plain row-major
             # [G, R, D] weight. Opt out of any backend-private weight layout the
             # linear method would otherwise install for its own GEMM -- on ROCm
             # that is aiter's B-preshuffle, which silently permutes the weight
@@ -2958,7 +2964,16 @@ class MQALayer(MqaAttentionBase):
                     # TRT-LLM returns BF16 even with FP8 queries.
                     dtype=x.dtype,
                 )
-                bcg_deepseek_v4_attention_with_output(
+                # NPU backends refresh capacity-sized metadata before each
+                # replay, so the attention can stay inside the captured
+                # segment.  Every other platform keeps ending the segment.
+                attention_with_output = (
+                    deepseek_v4_attention_with_output
+                    if _is_npu
+                    and attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
+                    else bcg_deepseek_v4_attention_with_output
+                )
+                attention_with_output(
                     attn_q,
                     attn_k,
                     o,
@@ -3085,7 +3100,7 @@ class MQALayer(MqaAttentionBase):
                     perm_y=(1, 0, 2),
                 )
             elif self.wo_a_fp8 and _wo_a_fp8_mxscale is not None:
-                # ROCm gfx950: same fp8 absorb GEMM as the DeepGEMM path below,
+                # ROCm gfx950/gfx1250: same fp8 absorb GEMM as the DeepGEMM path below,
                 # but through aiter's e8m0 block-scale batched GEMM. The
                 # activation is quantized per token-group inside the helper.
                 T, G, D = o.shape
@@ -4137,11 +4152,17 @@ class DeepseekV4Model(nn.Module):
         )
         if self.engram_hasher is not None:
             if cp_extend:
-                # n-gram hashing needs each token's predecessors: hash the whole prompt
+                # N-gram hashing needs each token's predecessors, so hash the
+                # whole prompt before selecting this CP rank's interleaved rows.
                 total = int(forward_batch.attn_cp_metadata.total_seq_lens)
-                hash_ids = self.engram_hasher(
-                    forward_batch.input_ids[:total], forward_batch
-                )
+                global_input_ids = forward_batch.input_ids[:total]
+                if is_in_breakable_cuda_graph():
+                    hash_ids = self.engram_hasher.new_hash_ids(global_input_ids)
+                    bcg_deepseek_v4_engram_hash_ids(
+                        self.engram_hasher, global_input_ids, hash_ids
+                    )
+                else:
+                    hash_ids = self.engram_hasher(global_input_ids, forward_batch)
                 parallel = get_parallel()
                 hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
                 pad_rows = hidden_states.shape[0] - hash_ids.shape[0]
@@ -4193,7 +4214,6 @@ class DeepseekV4Model(nn.Module):
                 forward_batch=forward_batch,
                 num_tokens=input_ids.shape[0],
                 tail_in_graph=tail_in_graph,
-                late_dp_counts=late_dp_counts,
             )
         saved_full = None
         # The HIP defer_post gate excludes residual readers. CUDA materializes
@@ -4789,7 +4809,14 @@ def _is_quark_checkpoint(config: DeepSeekV4Config) -> bool:
     return quantization_config.get("quant_method") == "quark"
 
 
-class DeepseekV4ForCausalLM(nn.Module):
+def _v41_vision_a2a_supported() -> bool:
+    backend = get_moe_a2a_backend()
+    return backend.is_none() or (_is_cuda and backend.is_megamoe())
+
+
+class DeepseekV4ForCausalLM(
+    nn.Module, LanguageModelInputPreparation, CPBoundedTailLogits
+):
     supports_cuda_vmm_feature_transport = True
 
     @classmethod
@@ -4841,15 +4868,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             and not getattr(config, "language_model_only", False)
         ):
             if (
-                get_parallel().attn_cp_size != 1
-                or get_parallel().pp_group.world_size != 1
-                or not (
-                    get_moe_a2a_backend().is_none()
-                    or (_is_cuda and get_moe_a2a_backend().is_megamoe())
-                )
+                get_parallel().pp_group.world_size != 1
+                or not _v41_vision_a2a_supported()
             ):
                 raise ValueError(
-                    "V4.1 vision supports TP/EP/DP without CP or PP; "
+                    "V4.1 vision supports TP/EP/DP and prefill CP without PP; "
                     "MoE A2A requires CUDA MegaMoE"
                 )
 
@@ -5056,6 +5079,25 @@ class DeepseekV4ForCausalLM(nn.Module):
         """Shared experts fused as routed slots when fusion is on."""
         return hf_config.n_shared_experts or 0
 
+    def prepare_cp_logits_inputs(
+        self, input_ids: torch.Tensor, forward_batch: ForwardBatch
+    ) -> CPLogitsInputs:
+        if not (
+            self.capture_aux_hidden_states
+            and self.model.late_layer_start is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return CPLogitsInputs(input_ids, forward_batch)
+
+        tail = get_attn_backend().tail_forward_metadata.late_layer_tail
+        if tail is None:
+            raise RuntimeError("CP bounded-tail logits require prepared tail metadata")
+        logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+        logits_metadata.extend_seq_lens = tail.extend_seq_lens
+        logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
+        logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
+        return CPLogitsInputs(tail.rows(input_ids), logits_metadata, tail.token_indices)
+
     def prepare_language_model_inputs(
         self,
         input_ids: torch.Tensor,
@@ -5228,10 +5270,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             if _wo_a_weight_scale_to_e8m0 is not None:
                 # ROCm: aiter's mxscale GEMM reads uint8 e8m0 block scales, and
                 # requantizes the weight when the checkpoint's scales are not
-                # already powers of two. It also needs the weight row-major, so
-                # check the linear method honoured keep_plain_weight_layout: a
-                # preshuffled weight has the same shape, dtype and strides and
-                # would only show up as garbage output.
+                # already powers of two. It starts from the row-major weight
+                # (and applies the layout its kernel reads itself), so check the
+                # linear method honoured keep_plain_weight_layout: a preshuffled
+                # weight has the same shape, dtype and strides and would only
+                # show up as garbage output.
                 assert not getattr(attn.wo_a, "aiter_bpreshuffled", False), (
                     "DSV4 wo_a was B-preshuffled by the fp8 linear method; the "
                     "aiter mxscale absorb GEMM needs the row-major weight"

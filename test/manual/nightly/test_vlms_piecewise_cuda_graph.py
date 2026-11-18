@@ -117,8 +117,6 @@ class TestVLMPiecewiseCudaGraph(CustomTestCase):
             process_env = os.environ.copy()
             if custom_env:
                 process_env.update(custom_env)
-            # if test vlm with cuda_ipc feature, open this env_var
-            process_env["SGLANG_USE_CUDA_IPC_TRANSPORT"] = "1"
 
             # Prepare stdout/stderr redirection if needed
             stdout_file = None
@@ -134,6 +132,8 @@ class TestVLMPiecewiseCudaGraph(CustomTestCase):
                 timeout=self.time_out,
                 api_key=self.api_key,
                 other_args=[
+                    "--mm-feature-transport",
+                    "cuda_ipc",
                     "--trust-remote-code",
                     "--cuda-graph-max-bs-prefill",
                     "8192",
