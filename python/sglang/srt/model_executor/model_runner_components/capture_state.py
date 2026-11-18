@@ -1,5 +1,5 @@
-"""State the first forward otherwise creates lazily, built once before graph capture;
-no capture then records (or is broken by) its creation."""
+"""State the first forward otherwise creates lazily, built before graph capture
+under CUDA graph persistence; no capture then records (or is broken by) its creation."""
 
 from __future__ import annotations
 
@@ -22,7 +22,9 @@ def prepare_capture_state(
     is_ep_scale_joiner: bool,
 ) -> None:
     """Build the MoE dispatchers' buffers / expert maps and the logits all-gather state;
-    natively the first warmup forward builds the same objects."""
+    without persistence the first warmup forward builds the same objects."""
+    if not get_foundry_adapter().enabled:
+        return
     # Lazy imports keep the runner package free of a layers import cycle.
     from sglang.srt.layers.logits_processor import prebuild_logits_gatherers
     from sglang.srt.layers.moe.token_dispatcher.base import prebuild_dispatchers
@@ -35,8 +37,7 @@ def prepare_capture_state(
     num_gatherers = (
         0 if is_draft_worker else prebuild_logits_gatherers(model, dtype=dtype)
     )
-    if get_foundry_adapter().enabled:
-        _probe_flashinfer_norm_cluster_size()
+    _probe_flashinfer_norm_cluster_size()
     if num_dispatchers or num_gatherers:
         log_info_on_rank0(
             logger,

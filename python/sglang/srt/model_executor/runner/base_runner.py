@@ -404,7 +404,7 @@ class BaseRunner(ABC):
         )
 
     def _prepare_capture_state(self):
-        """Build the comm state the first forward creates lazily, before CG capture."""
+        """With CUDA graph persistence, build the lazy comm state before CG capture."""
         mr = self.model_runner
         prepare_capture_state(
             model=mr.model,
