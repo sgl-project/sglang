@@ -45,7 +45,7 @@ class UnifiedRadixTreeTestMixin:
             num_questions=self.num_gsm8k_questions,
             max_new_tokens=16000,
             parallel=128,
-            host=f"http://{url.hostname}",
+            host=url.hostname,
             port=int(url.port),
         )
         metrics = run_few_shot_gsm8k(args)
@@ -160,7 +160,7 @@ class AccuracyTwoPassMixin:
             num_questions=self.num_gsm8k_questions,
             max_new_tokens=16000,
             parallel=self.gsm8k_parallel,
-            host=f"http://{url.hostname}",
+            host=url.hostname,
             port=int(url.port),
         )
         metrics = run_few_shot_gsm8k(args)

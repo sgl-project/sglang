@@ -141,15 +141,6 @@ class SwaDivergenceLog:
         return cls(**json.loads(match.group(1)))
 
     @classmethod
-    def find_last(cls, text: str) -> Optional[tuple[SwaDivergenceLog, str]]:
-        last_match: Optional[re.Match] = None
-        for match in _SWA_DIVERGENCE_LINE_RE.finditer(text):
-            last_match = match
-        if last_match is None:
-            return None
-        return cls(**json.loads(last_match.group(1))), last_match.group(0)
-
-    @classmethod
     def find_all(cls, text: str) -> list[tuple[SwaDivergenceLog, str]]:
         return [
             (cls(**json.loads(match.group(1))), match.group(0))

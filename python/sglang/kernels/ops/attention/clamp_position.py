@@ -6,11 +6,7 @@ import torch
 
 from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
-from sglang.kernels.spec import (
-    CapabilityRequirement,
-    FormatSignature,
-    KernelBackend,
-)
+from sglang.kernels.spec import CapabilityRequirement, KernelBackend
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -50,13 +46,6 @@ class ClampPositionOp(BaseFusedOp):
         KernelBackend.JIT: frozenset(
             {CapabilityRequirement.CUDA, CapabilityRequirement.HIP}
         )
-    }
-    format_signature = FormatSignature(
-        supported_dtypes=("int32", "int64"),
-        description="clamp(seq_lens - 1, min=0); returns int64 positions",
-    )
-    descriptions = {
-        KernelBackend.JIT: "Fused clamp-position kernel (sglang.kernels.jit).",
     }
 
     def forward_native(self, seq_lens: torch.Tensor) -> torch.Tensor:

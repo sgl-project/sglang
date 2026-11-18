@@ -16,13 +16,13 @@ from sglang.multimodal_gen.configs.models.encoders import (
 )
 from sglang.multimodal_gen.configs.models.vaes import HunyuanVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
     PipelineConfig,
     TextConditioningOutput,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 PROMPT_TEMPLATE_ENCODE_VIDEO = (
     "<|start_header_id|>system<|end_header_id|>\n\nDescribe the video by detailing the following aspects: "
@@ -169,3 +169,27 @@ class FastHunyuanConfig(HunyuanConfig):
             keep_resident_min_available_gb=60,
             keep_resident_components=("dit", "vae"),
         )
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.hunyuan import (
+        FastHunyuanSamplingParam,
+        HunyuanSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=HunyuanSamplingParams,
+        pipeline_config_cls=HunyuanConfig,
+        hf_model_paths=[
+            "hunyuanvideo-community/HunyuanVideo",
+        ],
+        model_detectors=[lambda hf_id: "hunyuanvideo" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=FastHunyuanSamplingParam,
+        pipeline_config_cls=FastHunyuanConfig,
+        hf_model_paths=[
+            "FastVideo/FastHunyuan-diffusers",
+        ],
+    )

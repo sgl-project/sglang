@@ -4,7 +4,7 @@ Shares the launch conventions of test_deepseek_v4_pro_fp4.py (same 1.6T model,
 same env, same long launch timeout) but enables prefill CP via
 ``--enable-prefill-cp --cp-strategy interleave`` over the unified_kv backend.
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-pro suite
+Registry: nightly-test-8-gpu-amd-mi35x-deepseek-v4-pro suite
 """
 
 import os
@@ -24,9 +24,8 @@ from sglang.test.test_utils import (
 
 register_amd_ci(
     est_time=5400,
-    suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro",
+    suite="nightly-test-8-gpu-amd-mi35x-deepseek-v4-pro",
     nightly=True,
-    disabled="Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon.",
 )
 
 DEEPSEEK_V4_PRO_FP4_MODEL_PATH = os.environ.get(
@@ -52,9 +51,6 @@ FP4_ENV_VARS = {
 }
 
 
-@unittest.skip(
-    "Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon."
-)
 class TestDeepseekV4ProFp4CPInterleave(CustomTestCase):
     """DeepSeek-V4-Pro FP4 unified_kv prefill CP, interleave (round-robin-split), tp=8."""
 

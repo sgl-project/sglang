@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.kernels.ops.kimi_k3 import kimi_k3_tiny_gemm
+from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm
 from sglang.srt.models.kimi_k3 import (
     KimiK3DeltaAttention,
     _merge_weights_as_views,
@@ -24,7 +24,7 @@ from sglang.srt.models.kimi_k3 import (
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=30, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 HIDDEN = 7168
 HEADS_TP = 12  # num_heads / tp8

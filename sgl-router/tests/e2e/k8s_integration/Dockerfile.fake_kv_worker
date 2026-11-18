@@ -1,0 +1,7 @@
+FROM python:3.12-slim
+WORKDIR /app
+# pyzmq for the PUB socket, msgspec for the engine's msgpack event encoding.
+RUN pip install --no-cache-dir fastapi uvicorn pyzmq msgspec
+COPY fake_kv_worker.py .
+EXPOSE 8000 5557
+CMD ["python", "fake_kv_worker.py"]

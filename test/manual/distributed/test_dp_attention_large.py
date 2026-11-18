@@ -7,7 +7,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.kits.ebnf_constrained_kit import EBNFConstrainedMixin
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
 from sglang.test.kits.regex_constrained_kit import RegexConstrainedMixin
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_IMAGE_URL,
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -42,8 +42,7 @@ class TestDPAttentionDP2TP4(
             other_args=[
                 "--trust-remote-code",
                 "--tp=4",
-                "--enable-dp-attention",
-                "--dp=2",
+                "--attn-dp-size=2",
             ],
         )
 
@@ -60,7 +59,7 @@ class TestDPAttentionDP2TP4(
             num_threads=1024,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.8)
 
@@ -89,8 +88,7 @@ class TestDPAttentionDP2TP2DeepseekV3MTP(
             "--speculative-draft-model-path",
             DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
             "--tp-size=4",
-            "--enable-dp-attention",
-            "--dp-size=2",
+            "--attn-dp-size=2",
         ]
         if not is_in_amd_ci():
             other_args += ["--mem-frac", "0.7"]
@@ -112,12 +110,11 @@ class TestDPAttentionDP2TP2DeepseekV3MTP(
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(metrics)
 
         self.assertGreater(metrics["score"], 0.60)
@@ -152,8 +149,7 @@ class TestDPAttentionDP2TP4VLM(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "2",
             ],
         )

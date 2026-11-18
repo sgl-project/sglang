@@ -34,7 +34,7 @@ from sglang.test.test_utils import (
     DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST,
 )
 
-register_cuda_ci(est_time=172, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=167, stage="extra-b", runner_config="4-gpu-h100")
 
 
 class TestInt8MambaCheckpointE2E(KLDivergenceMixin, DefaultServerBase):
@@ -83,7 +83,7 @@ class TestInt8MambaCheckpointE2E(KLDivergenceMixin, DefaultServerBase):
             num_questions=self.num_gsm8k_questions,
             max_new_tokens=512,
             parallel=self.parallel,
-            host=f"http://{url.hostname}",
+            host=url.hostname,
             port=int(url.port),
         )
         metrics = run_few_shot_gsm8k(args)

@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_amd_ci(est_time=900, suite="stage-b-test-large-8-gpu-mi35x-disaggregation-amd")
+register_amd_ci(est_time=900, suite="base-b-disaggregation-test-large-8-gpu-amd-mi35x")
 
 
 class NixlTransferEngineBase(PDDisaggregationServerBase):
@@ -198,7 +198,7 @@ class TestNixlTransferEngineAccuracy(NixlTransferEngineBase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host=f"http://{self.base_host}",
+            host=self.base_host,
             port=int(self.lb_port),
         )
         metrics = run_eval_few_shot_gsm8k(args)

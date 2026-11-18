@@ -10,24 +10,26 @@ This page focuses on optimal configuration and benchmark results for Kimi-K2.6 o
 On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
 </Note>
 
+The configurations on this page use the daily build image `quay.io/ascend/sglang:main-cann9.1.0-a3`.
+
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Kimi-K2.6 | Ascend A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 20ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-20ms) |
+| Kimi-K2.6 | A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 20ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-20ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Kimi-K2.6 | Ascend A3 Series Products | 16 | PD Mixed | 64k+1k | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-16p-in64k-out1k-100ms) |
-| Kimi-K2.6 | Ascend A3 Series Products | 16 | PD Disaggregation | 128k+1k | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-100ms) |
-| Kimi-K2.6 | Ascend A3 Series Products | 16 | PD Disaggregation | 128k+1k (90% prefix cache hit rate) | 100ms | 5s | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-prefix90-100ms) |
-| Kimi-K2.6 | Ascend A3 Series Products | 16 | PD Disaggregation | 64k+1.5k | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-100ms) |
-| Kimi-K2.6 | Ascend A3 Series Products | 16 | PD Disaggregation | 64k+1.5k (90% prefix cache hit rate) | 100ms | 3s | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-prefix90-100ms) |
-| Kimi-K2.6 | Ascend A3 Series Products | 8 | PD Mixed | 1024x1024 (30)+1024 | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1024x1024-30-out1024-50ms) |
-| Kimi-K2.6 | Ascend A3 Series Products | 8 | PD Mixed | 1080p_30+256 | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1080p-30-out256-50ms) |
-| Kimi-K2.6 | Ascend A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-50ms) |
+| Kimi-K2.6 | A3 Series Products | 16 | PD Mixed | 64k+1k | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-16p-in64k-out1k-100ms) |
+| Kimi-K2.6 | A3 Series Products | 16 | PD Disaggregation | 128k+1k | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-100ms) |
+| Kimi-K2.6 | A3 Series Products | 16 | PD Disaggregation | 128k+1k (90% prefix cache hit rate) | 100ms | 5s | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-prefix90-100ms) |
+| Kimi-K2.6 | A3 Series Products | 16 | PD Disaggregation | 64k+1.5k | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-100ms) |
+| Kimi-K2.6 | A3 Series Products | 16 | PD Disaggregation | 64k+1.5k (90% prefix cache hit rate) | 100ms | 3s | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-prefix90-100ms) |
+| Kimi-K2.6 | A3 Series Products | 8 | PD Mixed | 1024x1024 (30)+1024 | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1024x1024-30-out1024-50ms) |
+| Kimi-K2.6 | A3 Series Products | 8 | PD Mixed | 1080p_30+256 | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1080p-30-out256-50ms) |
+| Kimi-K2.6 | A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-50ms) |
 
 ## Optimal Configuration
 
@@ -37,7 +39,7 @@ On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; 
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -119,8 +121,7 @@ do
         --enable-multimodal \
         --mm-attention-backend ascend_attn \
         --sampling-backend ascend \
-        --enable-dp-attention \
-        --dp-size 32 \
+        --attn-dp-size 32 \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
         --cuda-graph-bs-decode 1 \
@@ -143,7 +144,7 @@ done
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -162,7 +163,7 @@ python -m sglang.bench_serving \
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -277,7 +278,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
@@ -296,8 +296,6 @@ do
         --tp-size 16 \
         --mem-fraction-static 0.82 \
         --max-running-requests 2 \
-        --enable-dp-attention \
-        --dp-size 1 \
         --enable-dp-lm-head \
         --disable-radix-cache \
         --enable-multimodal \
@@ -324,15 +322,17 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
 #   <your decode ip>: decode node IP address
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
-    --policy cache_aware
+    --request-timeout-secs 1800 \
+    --stale-request-timeout-secs 1800
 ```
 
 #### Benchmark
@@ -340,7 +340,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -358,7 +358,7 @@ python -m sglang.bench_serving \
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -476,7 +476,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
@@ -495,8 +494,6 @@ do
         --tp-size 16 \
         --mem-fraction-static 0.82 \
         --max-running-requests 2 \
-        --enable-dp-attention \
-        --dp-size 1 \
         --enable-dp-lm-head \
         --disable-radix-cache \
         --enable-multimodal \
@@ -523,15 +520,17 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
 #   <your decode ip>: decode node IP address
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
-    --policy cache_aware
+    --request-timeout-secs 1800 \
+    --stale-request-timeout-secs 1800
 ```
 
 #### Benchmark
@@ -542,7 +541,7 @@ We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
     --host 127.0.0.1 \
@@ -561,7 +560,7 @@ python -m sglang.bench_serving \
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -646,7 +645,7 @@ do
         --device npu \
         --tp-size 16 \
         --disable-radix-cache \
-        --disable-cuda-graph \
+        --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --mem-fraction-static 0.78 \
         --max-running-requests 1 \
         --moe-a2a-backend deepep \
@@ -674,7 +673,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
@@ -693,8 +691,6 @@ do
         --tp-size 16 \
         --mem-fraction-static 0.82 \
         --max-running-requests 16 \
-        --enable-dp-attention \
-        --dp-size 1 \
         --enable-dp-lm-head \
         --disable-radix-cache \
         --enable-multimodal \
@@ -721,15 +717,17 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
 #   <your decode ip>: decode node IP address
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
-    --policy cache_aware
+    --request-timeout-secs 1800 \
+    --stale-request-timeout-secs 1800
 ```
 
 #### Benchmark
@@ -737,7 +735,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -755,7 +753,7 @@ python -m sglang.bench_serving \
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -868,7 +866,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
@@ -887,8 +884,7 @@ do
         --tp-size 16 \
         --mem-fraction-static 0.82 \
         --max-running-requests 2 \
-        --enable-dp-attention \
-        --dp-size 2 \
+        --attn-dp-size 2 \
         --enable-dp-lm-head \
         --disable-radix-cache \
         --enable-multimodal \
@@ -915,15 +911,15 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
 #   <your decode ip>: decode node IP address
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip>:8001 \
     --host 127.0.0.1 \
-    --port 6688 \
-    --policy cache_aware
+    --port 6688
 ```
 
 #### Benchmark
@@ -934,7 +930,7 @@ We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
     --host 127.0.0.1 \
@@ -955,7 +951,7 @@ python -m sglang.bench_serving \
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 8
 
@@ -1001,7 +997,6 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=112
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_NPU_USE_MULTI_STREAM=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
@@ -1024,8 +1019,7 @@ python3 -m sglang.launch_server \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --sampling-backend ascend \
-    --enable-dp-attention \
-    --dp-size 16 \
+    --attn-dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
     --cuda-graph-bs-decode 1 2 4 8 9 10 11 \
@@ -1047,7 +1041,7 @@ python3 -m sglang.launch_server \
 We tested it based on the `IMAGE` dataset with 1024x1024 resolution.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name image \
     --backend sglang-oai-chat \
     --host 127.0.0.1 \
@@ -1068,7 +1062,7 @@ python -m sglang.bench_serving \
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 8
 
@@ -1112,7 +1106,6 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_NPU_USE_MULTI_STREAM=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
@@ -1135,8 +1128,7 @@ python3 -m sglang.launch_server \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --sampling-backend ascend \
-    --enable-dp-attention \
-    --dp-size 16 \
+    --attn-dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
     --cuda-graph-bs-decode 1 2 3 4 \
@@ -1158,7 +1150,7 @@ python3 -m sglang.launch_server \
 We tested it based on the `IMAGE` dataset with 1920x1080 resolution.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name image \
     --backend sglang-oai-chat \
     --host 127.0.0.1 \
@@ -1179,7 +1171,7 @@ python -m sglang.bench_serving \
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 8
 
@@ -1228,7 +1220,6 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=96
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_NPU_USE_MULTI_STREAM=1
 export SGLANG_SET_CPU_AFFINITY=1
@@ -1251,8 +1242,7 @@ python3 -m sglang.launch_server \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --sampling-backend ascend \
-    --enable-dp-attention \
-    --dp-size 16 \
+    --attn-dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
     --cuda-graph-bs-decode 1 2 3 4 5 \
@@ -1275,12 +1265,11 @@ python3 -m sglang.launch_server \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --max-attempts 5 \
     --max-concurrency 64 \
     --num-prompts 256 \
     --random-input-len 3500 \
@@ -1294,7 +1283,7 @@ python -m sglang.bench_serving \
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 8
 
@@ -1344,7 +1333,6 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=96
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -1365,8 +1353,7 @@ python3 -m sglang.launch_server \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --sampling-backend ascend \
-    --enable-dp-attention \
-    --dp-size 16 \
+    --attn-dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
     --cuda-graph-bs-decode 1 2 4 8 11 12 13 \
@@ -1389,7 +1376,7 @@ python3 -m sglang.launch_server \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \

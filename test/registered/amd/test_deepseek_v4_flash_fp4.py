@@ -6,7 +6,7 @@ Combined accuracy + performance test for DeepSeek-V4-Flash FP4 on MI35x ROCm 7.2
 
 Both tests share a single launched server.
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-flash suite
+Registry: nightly-test-8-gpu-amd-mi35x-deepseek-v4-flash suite
 """
 
 import json
@@ -27,7 +27,7 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=7200, suite="nightly-amd-8-gpu-mi35x-deepseek-v4-flash", nightly=True
+    est_time=7200, suite="nightly-test-8-gpu-amd-mi35x-deepseek-v4-flash", nightly=True
 )
 
 DEEPSEEK_V4_FP4_MODEL_PATH = os.environ.get(
@@ -105,7 +105,7 @@ class TestDeepseekV4Fp4(CustomTestCase):
             num_questions=1319,
             parallel=1319,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
@@ -132,7 +132,7 @@ class TestDeepseekV4Fp4(CustomTestCase):
         cmd = [
             "python3",
             "-m",
-            "sglang.bench_one_batch_server",
+            "sglang.benchmark.one_batch_server",
             "--model",
             "None",
             "--base-url",

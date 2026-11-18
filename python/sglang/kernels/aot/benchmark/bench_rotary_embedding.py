@@ -1,20 +1,16 @@
-import itertools
-import os
-
 import torch
 import triton
 from sgl_kernel.testing.rotary_embedding import (
     FlashInferRotaryEmbedding,
     FusedSetKVBufferArg,
     MHATokenToKVPool,
-    RotaryEmbedding,
     create_inputs,
 )
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.bench_utils import bench_kineto
-from sglang.utils import is_in_ci
 
-IS_CI = is_in_ci()
+IS_CI = envs.SGLANG_IS_IN_CI.get()
 
 # CI environment uses simplified parameters
 if IS_CI:
@@ -91,8 +87,6 @@ def benchmark(batch_size, seq_len, save_kv_cache, provider):
                 value=inputs["value"],
                 k_buffer=pool_flashinfer.k_buffer[0].view(-1, num_kv_heads * head_size),
                 v_buffer=pool_flashinfer.v_buffer[0].view(-1, num_kv_heads * head_size),
-                k_scale=None,
-                v_scale=None,
                 cache_loc=inputs["out_cache_loc"],
             )
             if save_kv_cache

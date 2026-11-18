@@ -31,6 +31,7 @@ AUDIO_BIRD_SONG_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-fi
 class TestOpenAIMLLMServerBase(CustomTestCase):
     model: str
     extra_args: list = []
+    extra_env: dict = {}
     fixed_args: list = ["--trust-remote-code", "--enable-multimodal"]
     trust_remote_code: bool = True
 
@@ -55,6 +56,7 @@ class TestOpenAIMLLMServerBase(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
             other_args=other_args,
+            env=cls.extra_env,
         )
         cls.base_url += "/v1"
 

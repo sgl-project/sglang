@@ -5,7 +5,7 @@ SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton. The test uses the full GSM8K set
 to catch regressions in unified-KV target-hidden injection, verify metadata, and
 DSpark acceptance.
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-pro-dspark suite
+Registry: nightly-test-8-gpu-amd-mi35x-deepseek-v4-pro-dspark suite
 """
 
 import os
@@ -17,7 +17,7 @@ import requests
 import torch
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import MAX_FUSED_ROWS
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+from sglang.kernels.ops.kvcache import dsv4_unified_kv_store
 from sglang.kernels.ops.speculative.dspark import dspark_verify_window
 from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
     DeepseekV4HipRadixBackend,
@@ -36,7 +36,9 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=7200, suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro-dspark", nightly=True
+    est_time=7200,
+    suite="nightly-test-8-gpu-amd-mi35x-deepseek-v4-pro-dspark",
+    nightly=True,
 )
 
 DEEPSEEK_V4_DSPARK_MODEL_PATH = os.environ.get(
@@ -121,7 +123,7 @@ class TestDSparkUnifiedKVKernelsAMD(CustomTestCase):
                     self.assertIs(result, eager_metadata)
                     backend.init_forward_metadata_target_verify_old.assert_called_once()
 
-    def test_build_unified_commit_inject_layout(self):
+    def test_build_ring_commit_inject_layout(self):
         stride, ring_stride = 7, 128
         req_pool_indices = torch.tensor([3, 0, 5, 1], device=DEVICE, dtype=torch.int32)
         prefix_lens = torch.tensor(
@@ -130,7 +132,7 @@ class TestDSparkUnifiedKVKernelsAMD(CustomTestCase):
         block_pos_offsets = torch.arange(stride, device=DEVICE, dtype=torch.int64)
         commit_lens = torch.tensor([0, 3, stride, 5], device=DEVICE, dtype=torch.int32)
 
-        got = dspark_verify_window.build_unified_commit_inject_layout(
+        got = dspark_verify_window.build_ring_commit_inject_layout(
             req_pool_indices=req_pool_indices,
             prefix_lens=prefix_lens,
             block_pos_offsets=block_pos_offsets,
@@ -163,11 +165,15 @@ class TestDSparkUnifiedKVKernelsAMD(CustomTestCase):
         keep = loc >= 0
         expected[loc[keep].long()] = kv[keep]
 
-        runtime.scatter_bf16_into_unified(kv=kv, loc=loc, unified_kv=unified)
+        dsv4_unified_kv_store.scatter_bf16_into_unified(
+            kv=kv, loc=loc, unified_kv=unified
+        )
         self.assertTrue(torch.equal(unified, expected))
 
         with self.assertRaises(AssertionError):
-            runtime.scatter_bf16_into_unified(kv=kv, loc=loc, unified_kv=unified.t())
+            dsv4_unified_kv_store.scatter_bf16_into_unified(
+                kv=kv, loc=loc, unified_kv=unified.t()
+            )
 
 
 class TestDeepseekV4DSparkUnifiedKVGSM8K(CustomTestCase):
@@ -183,9 +189,8 @@ class TestDeepseekV4DSparkUnifiedKVGSM8K(CustomTestCase):
             "--trust-remote-code",
             "--tp",
             "8",
-            "--dp",
+            "--attn-dp-size",
             "8",
-            "--enable-dp-attention",
             "--enable-dp-lm-head",
             "--enable-prefill-delayer",
             "--disable-radix-cache",
@@ -236,7 +241,7 @@ class TestDeepseekV4DSparkUnifiedKVGSM8K(CustomTestCase):
             num_questions=1319,
             parallel=512,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)

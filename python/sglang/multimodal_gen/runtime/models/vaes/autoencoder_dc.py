@@ -7,6 +7,7 @@ from diffusers.models.autoencoders.vae import DecoderOutput
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.vaes.sana import SanaVAEConfig
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_rank,
     get_decode_parallel_world_size,
@@ -67,6 +68,24 @@ class AutoencoderDC(nn.Module, LayerwiseOffloadableModuleMixin):
                 return arg.dtype
         return None
 
+    def _load_inner_state(self, state_dict: dict[str, torch.Tensor]) -> None:
+        missing, unexpected = self._inner_model.load_state_dict(
+            state_dict, strict=False
+        )
+        if missing:
+            logger.warning(
+                "AutoencoderDC missing keys when loading: %d keys", len(missing)
+            )
+            if len(missing) > 10:
+                logger.debug("First 10 missing keys: %s", list(missing)[:10])
+            else:
+                logger.debug("Missing keys: %s", list(missing))
+        if unexpected:
+            logger.debug(
+                "AutoencoderDC unexpected keys when loading: %d keys",
+                len(unexpected),
+            )
+
     def _ensure_inner_model(self, state_dict: dict[str, torch.Tensor] | None = None):
         if self._inner_model is not None:
             return
@@ -93,22 +112,7 @@ class AutoencoderDC(nn.Module, LayerwiseOffloadableModuleMixin):
         self._inner_model = DiffusersAutoencoderDC.from_config(hf_config)
 
         if state_to_load:
-            missing, unexpected = self._inner_model.load_state_dict(
-                state_to_load, strict=False
-            )
-            if missing:
-                logger.warning(
-                    "AutoencoderDC missing keys when loading: %d keys", len(missing)
-                )
-                if len(missing) > 10:
-                    logger.debug("First 10 missing keys: %s", list(missing)[:10])
-                else:
-                    logger.debug("Missing keys: %s", list(missing))
-            if unexpected:
-                logger.debug(
-                    "AutoencoderDC unexpected keys when loading: %d keys",
-                    len(unexpected),
-                )
+            self._load_inner_state(state_to_load)
             if state_dict is None:
                 self._loaded_state_dict.clear()
 
@@ -135,6 +139,27 @@ class AutoencoderDC(nn.Module, LayerwiseOffloadableModuleMixin):
             return next(self._inner_model.parameters()).device
         return torch.device("cpu")
 
+    def enable_tiling(self, *args, **kwargs):
+        # Proxy to the inner diffusers model, which already implements tiled
+        # decode; this wrapper just didn't forward the call before.
+        self._ensure_inner_model()
+        if self._spatial_parallel_decode_enabled:
+            # Tiling runs diffusers' tiled_decode independently inside each
+            # rank's height shard, which breaks the halo exchange of the
+            # spatially sharded decoder (mismatched collective rounds / wrong
+            # neighbours). Keep the two mutually exclusive.
+            logger.warning_once(
+                "AutoencoderDC: --vae-tiling is ignored because spatial-shard "
+                "parallel decode is enabled; the two cannot be combined."
+            )
+            return
+        self._inner_model.enable_tiling(*args, **kwargs)
+
+    def disable_tiling(self):
+        self._ensure_inner_model()
+        self._inner_model.disable_tiling()
+
+    @cached_vae_encode
     def encode(self, x: torch.Tensor, **kwargs):
         self._ensure_inner_model()
         return self._inner_model.encode(x, **kwargs)
@@ -188,7 +213,11 @@ class AutoencoderDC(nn.Module, LayerwiseOffloadableModuleMixin):
         assign: bool = False,
     ):
         """Intercept load_state_dict to route weights into the inner diffusers model."""
-        self._ensure_inner_model(state_dict=state_dict)
+        if self._inner_model is None:
+            self._ensure_inner_model(state_dict=state_dict)
+        else:
+            # The loader reads state_dict() first, which builds the inner model.
+            self._load_inner_state(state_dict)
 
     def state_dict(self, *args, **kwargs) -> dict[str, torch.Tensor]:
         self._ensure_inner_model()

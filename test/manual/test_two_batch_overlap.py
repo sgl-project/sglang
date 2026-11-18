@@ -8,9 +8,9 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
     compute_split_token_index,
 )
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST,
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -34,14 +34,14 @@ class TestTwoBatchOverlap(unittest.TestCase):
                     "--trust-remote-code",
                     "--tp",
                     "2",
-                    "--dp",
+                    "--attn-dp-size",
                     "2",
-                    "--enable-dp-attention",
                     "--moe-a2a-backend",
                     "deepep",
                     "--deepep-mode",
                     "normal",
-                    "--disable-cuda-graph",  # DeepEP normal does not support CUDA Graph
+                    "--disable-decode-cuda-graph",
+                    "--disable-prefill-cuda-graph",  # DeepEP normal does not support CUDA Graph
                     "--enable-two-batch-overlap",
                 ],
             )
@@ -71,7 +71,7 @@ class TestTwoBatchOverlap(unittest.TestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         self.assertGreater(metrics["score"], 0.5)
 
 
@@ -135,14 +135,14 @@ class TestQwen3TwoBatchOverlap(TestTwoBatchOverlap):
                     "--trust-remote-code",
                     "--tp",
                     "2",
-                    "--dp",
+                    "--attn-dp-size",
                     "2",
-                    "--enable-dp-attention",
                     "--moe-a2a-backend",
                     "deepep",
                     "--deepep-mode",
                     "normal",
-                    "--disable-cuda-graph",  # DeepEP normal does not support CUDA Graph
+                    "--disable-decode-cuda-graph",
+                    "--disable-prefill-cuda-graph",  # DeepEP normal does not support CUDA Graph
                     "--enable-two-batch-overlap",
                 ],
             )

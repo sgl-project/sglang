@@ -46,7 +46,7 @@ _LINEAR_ATTN_MODEL_REGISTRY: list[LinearAttnModelSpec] = []
 
 def register_linear_attn_model(spec: LinearAttnModelSpec) -> None:
     _LINEAR_ATTN_MODEL_REGISTRY.append(spec)
-    logger.info(
+    logger.debug(
         "Registered linear attn model: config=%s, backend=%s, archs=%s",
         spec.config_class.__name__,
         spec.backend_class_name.rsplit(".", 1)[-1],
@@ -69,6 +69,15 @@ def get_linear_attn_spec_by_arch(arch_name: str) -> Optional[LinearAttnModelSpec
         if arch_name in spec.arch_names:
             return spec
     return None
+
+
+def get_linear_attn_spec(hf_config: Any) -> Optional[LinearAttnModelSpec]:
+    """Spec for ``hf_config``: by architecture name, else by config class and predicate."""
+    spec = get_linear_attn_spec_by_arch(hf_config.architectures[0])
+    if spec is not None:
+        return spec
+    result = get_linear_attn_config(hf_config)
+    return result[0] if result is not None else None
 
 
 def import_backend_class(dotted_name: str) -> type:

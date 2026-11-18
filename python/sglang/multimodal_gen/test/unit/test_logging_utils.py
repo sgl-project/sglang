@@ -6,9 +6,19 @@ import unittest
 import weakref
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    _sanitize_for_logging,
     globally_suppress_loggers,
     init_logger,
 )
+from sglang.test.test_utils import CustomTestCase
+
+
+class TestInlineMediaLogging(CustomTestCase):
+    def test_uploaded_images_do_not_enter_logs(self):
+        inline = "data:image/png;base64,private-image-content"
+        result = _sanitize_for_logging([inline, "/data/reference.png"])
+        self.assertNotIn("private-image-content", str(result))
+        self.assertEqual(result[1], "/data/reference.png")
 
 
 class TestSuppressNoisyDependencyLogs(unittest.TestCase):
@@ -98,6 +108,31 @@ class TestLogOnceTakesFormatArgs(unittest.TestCase):
             logger.warning_once("idle ranks: %d", 1)
             logger.warning_once("idle ranks: %d", 2)  # different args, new line
         self.assertEqual(len(captured.output), 2, captured.output)
+
+
+class TestLateConfiguredLogLevel(unittest.TestCase):
+    def test_debug_root_level_set_after_logger_creation_logs_on_all_ranks(self):
+        """A DEBUG level set after logger creation must still log on every rank."""
+        import os
+        from unittest.mock import patch
+
+        root = logging.getLogger()
+        previous_level = root.level
+        root.setLevel(logging.WARNING)
+        logger = init_logger("sgl_diffusion_late_level_test")
+        records = []
+        handler = logging.Handler()
+        handler.emit = records.append
+        logger.addHandler(handler)
+        try:
+            root.setLevel(logging.DEBUG)
+            with patch.dict(os.environ, {"RANK": "1", "LOCAL_RANK": "1"}):
+                logger.info("from a non-main rank")
+        finally:
+            logger.removeHandler(handler)
+            root.setLevel(previous_level)
+
+        self.assertEqual(len(records), 1)
 
 
 if __name__ == "__main__":

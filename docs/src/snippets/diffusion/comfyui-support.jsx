@@ -1,48 +1,48 @@
 // ComfyUI support statement for a diffusion cookbook page.
 //
 // The per-model facts live here rather than in each page so they stay in sync
-// with the plugin. `integrated` must match a key in `executor_class_dict`
+// with the plugin. `integratedKey` must match a key in `executor_class_dict`
 // (python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion/core/generator.py);
 // a model absent from that dict has no integrated mode.
 
-const PLUGIN_PATH = "python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion";
-const PLUGIN_URL =
-  "https://github.com/sgl-project/sglang/tree/main/" + PLUGIN_PATH;
-
-const MODELS = {
-  flux: {
-    serverNode: "SGLDiffusion Generate Image",
-    integratedKey: "flux",
-    workflow: "flux_sgld_sp.json",
-  },
-  "z-image": {
-    serverNode: "SGLDiffusion Generate Image",
-    integratedKey: "lumina2",
-    workflow: "z-image_sgld.json",
-  },
-  "qwen-image": {
-    serverNode: "SGLDiffusion Generate Image",
-    integratedKey: "qwen_image",
-    workflow: "qwen_image_sgld.json",
-  },
-  "qwen-image-edit": {
-    serverNode: "SGLDiffusion Generate Image",
-    integratedKey: "qwen_image_edit",
-    note: "Image editing through the integrated path is experimental.",
-  },
-  "minimax-h3": {
-    serverNode: "SGLDiffusion Generate H3",
-    verified: true,
-    integratedBlockedBecause:
-      "H3 denoises a packed video-and-audio sequence in one pass and routes " +
-      "conditioning by task, while ComfyUI's KSampler drives a single latent " +
-      "tensor and has no audio branch",
-  },
-  image: { serverNode: "SGLDiffusion Generate Image" },
-  video: { serverNode: "SGLDiffusion Generate Video" },
-};
-
 export const ComfyUISupport = ({ model = "video", note }) => {
+  const PLUGIN_PATH = "python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion";
+  const PLUGIN_URL =
+    "https://github.com/sgl-project/sglang/tree/main/" + PLUGIN_PATH;
+
+  const MODELS = {
+    flux: {
+      serverNode: "SGLDiffusion Generate Image",
+      integratedKey: "flux",
+      workflow: "flux_sgld_sp.json",
+    },
+    "z-image": {
+      serverNode: "SGLDiffusion Generate Image",
+      integratedKey: "lumina2",
+      workflow: "z-image_sgld.json",
+    },
+    "qwen-image": {
+      serverNode: "SGLDiffusion Generate Image",
+      integratedKey: "qwen_image",
+      workflow: "qwen_image_sgld.json",
+    },
+    "qwen-image-edit": {
+      serverNode: "SGLDiffusion Generate Image",
+      integratedKey: "qwen_image_edit",
+      note: "Image editing through the integrated path is experimental.",
+    },
+    "minimax-h3": {
+      serverNode: "SGLDiffusion Generate MiniMax-H3",
+      integratedKey: "minimax_h3",
+      workflow: "minimax_h3_t2v_sgld.json",
+      verified: true,
+      note:
+        "Integrated T2V / I2VA / FL2VA need an fl2va checkpoint and R2V needs " +
+        "ref2va. FastH3 and VDN-H3 load through SGLDiffusion Native Model Loader.",
+    },
+    image: { serverNode: "SGLDiffusion Generate Image" },
+    video: { serverNode: "SGLDiffusion Generate Video" },
+  };
   const spec = MODELS[model] || MODELS.video;
   const extraNote = note || spec.note;
 

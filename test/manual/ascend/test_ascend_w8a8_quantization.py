@@ -40,7 +40,8 @@ class TestAscendW8A8(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
-                "--disable-cuda-graph",
+                "--disable-decode-cuda-graph",
+                "--disable-prefill-cuda-graph",
                 "--device",
                 "npu",
                 "--attention-backend",
@@ -61,7 +62,7 @@ class TestAscendW8A8(CustomTestCase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host=f"http://{url.hostname}",
+            host=url.hostname,
             port=int(url.port),
         )
         metrics = run_eval(args)

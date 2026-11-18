@@ -5,9 +5,10 @@ a group's compressed slot is any of its raw slots floor-divided by the compress 
 so per-row graph buffers are rebuilt from request lengths and ``req_to_token`` alone;
 accept-dependent speculative lengths never need the host.
 
-Both kernels run once eagerly at capture warmup,
-then are recorded into the main CUDA graph through ``init_forward_metadata_in_graph``;
-all inputs are stable-address runner buffers.
+Decode and target verify build row layout and compressed metadata in one kernel.
+Draft extend first builds its variable-length row layout, then derives metadata
+from those rows. Multi-step draft builds metadata for all steps in one launch.
+The launchers refresh graph buffers on device before replay.
 """
 
 from __future__ import annotations
@@ -30,36 +31,15 @@ def _qsa_graph_layout_kernel(
     bs,
     num_tokens,
     num_padding,
-    extend_len,  # uniform extend length (target verify); 0 -> extend_lens_ptr
-    MODE: tl.constexpr,  # 0 = decode, 1 = target verify, 2 = draft extend
 ):
     pid = tl.program_id(0)
-
-    if MODE == 0:
-        if pid < bs:
-            real = pid < bs - num_padding
-            seq_len = tl.load(seq_lens_ptr + pid).to(tl.int32)
-            req = tl.load(req_pool_ptr + pid).to(tl.int64)
-            # Padding rows alias request slot 0: it is never allocated, so
-            # its pending-ring rows are the inert dump for their state
-            # stores, and its req_to_token row reads stay in-bounds.
-            req = tl.where(real, req, 0)
-            seq_len = tl.where(real, seq_len, 1)
-            prefix = tl.maximum(seq_len - 1, 0)
-            tl.store(row_seq_lens_ptr + pid, seq_len)
-            tl.store(row_req_pool_ptr + pid, req.to(tl.int32))
-            tl.store(row_prefix_lens_ptr + pid, prefix)
-        return
 
     real_reqs = bs - num_padding
     if pid == bs:
         # Tail program: dummy rows for the static capacity past the real layout.
-        if MODE == 1:
-            row_start = real_reqs * extend_len
-        else:
-            row_start = 0
-            for j in range(real_reqs):
-                row_start += tl.load(extend_lens_ptr + j)
+        row_start = 0
+        for j in range(real_reqs):
+            row_start += tl.load(extend_lens_ptr + j)
         for row in range(row_start, num_tokens):
             tl.store(row_seq_lens_ptr + row, 1)
             tl.store(row_prefix_lens_ptr + row, 0)
@@ -68,24 +48,16 @@ def _qsa_graph_layout_kernel(
             tl.store(row_req_pool_ptr + row, 0)
         return
 
-    if MODE == 1:
-        eff = tl.where(pid < real_reqs, extend_len, 0)
-        offset = tl.minimum(pid, real_reqs) * extend_len
-    else:
-        eff = 0
-        offset = 0
-        for j in range(bs):
-            e_j = tl.where(j < real_reqs, tl.load(extend_lens_ptr + j), 0)
-            offset += tl.where(j < pid, e_j, 0)
-            eff = tl.where(j == pid, e_j, eff)
+    eff = 0
+    offset = 0
+    for j in range(bs):
+        e_j = tl.where(j < real_reqs, tl.load(extend_lens_ptr + j), 0)
+        offset += tl.where(j < pid, e_j, 0)
+        eff = tl.where(j == pid, e_j, eff)
     base = tl.load(seq_lens_ptr + pid).to(tl.int32)
     req = tl.load(req_pool_ptr + pid).to(tl.int64)
-    if MODE == 1:
-        prefix = base
-        limit = base + eff
-    else:
-        prefix = tl.maximum(base - eff, 0)
-        limit = base
+    prefix = tl.maximum(base - eff, 0)
+    limit = base
     for j in range(eff):
         row = offset + j
         seq_len = tl.minimum(prefix + 1 + j, limit)
@@ -113,30 +85,55 @@ def _qsa_graph_row_metadata_kernel(
     RATIO: tl.constexpr,
     FULL_PAGE: tl.constexpr,  # full-KV tokens per page
     PAGE_BLOCK: tl.constexpr,
+    seq_lens_ptr,
+    req_pool_ptr,
+    row_prefix_lens_ptr,
+    bs,
+    num_padding,
+    extend_len,
+    seq_offset,
+    MODE: tl.constexpr,
 ):
     row = tl.program_id(0)
-    seq_len = tl.load(row_seq_lens_ptr + row).to(tl.int32)
-    req = tl.load(row_req_pool_ptr + row).to(tl.int64)
+    if MODE == 0 or MODE == 1:
+        req_row = row if MODE == 0 else row // extend_len
+        real = req_row < bs - num_padding
+        base = tl.load(seq_lens_ptr + req_row, real, other=0).to(tl.int32)
+        req = tl.load(req_pool_ptr + req_row, real, other=0).to(tl.int64)
+        if MODE == 0:
+            seq_len = tl.where(real, base + seq_offset, 1)
+            prefix = tl.maximum(seq_len - 1, 0)
+        else:
+            seq_len = tl.where(real, base + row % extend_len + 1, 1)
+            prefix = tl.where(real, base, 0)
+        if tl.program_id(1) == 0:
+            tl.store(row_seq_lens_ptr + row, seq_len)
+            tl.store(row_req_pool_ptr + row, req.to(tl.int32))
+            tl.store(row_prefix_lens_ptr + row, prefix)
+    else:
+        seq_len = tl.load(row_seq_lens_ptr + row).to(tl.int32)
+        req = tl.load(row_req_pool_ptr + row).to(tl.int64)
     token_row = req * req_to_token_row_stride
-    current = tl.maximum(seq_len - 1, 0)
-    last_loc = tl.load(req_to_token_ptr + token_row + current).to(tl.int32)
+    if tl.program_id(1) == 0:
+        current = tl.maximum(seq_len - 1, 0)
+        last_loc = tl.load(req_to_token_ptr + token_row + current).to(tl.int32)
 
-    compressed = seq_len // RATIO
-    tl.store(compressed_lens_ptr + row, compressed)
+        compressed = seq_len // RATIO
+        tl.store(compressed_lens_ptr + row, compressed)
 
-    # The page-aligned allocator keeps each compression group inside one page,
-    # so last_loc // RATIO is the group's compressed slot; slot 0 is the padding slot.
-    boundary = (seq_len > 0) & (seq_len % RATIO == 0)
-    write_loc = tl.where(boundary, last_loc // RATIO, 0)
-    tl.store(write_locs_ptr + row, write_loc)
+        # The page-aligned allocator keeps each compression group inside one page,
+        # so last_loc // RATIO is the group's compressed slot; slot 0 is the padding slot.
+        boundary = (seq_len > 0) & (seq_len % RATIO == 0)
+        write_loc = tl.where(boundary, last_loc // RATIO, 0)
+        tl.store(write_locs_ptr + row, write_loc)
 
-    tl.store(logical_positions_ptr + row, current)
-    tl.store(state_slots_ptr + row, req * RATIO + (current % RATIO).to(tl.int64))
-    ring_base = row.to(tl.int64) * RATIO
-    for k in tl.static_range(RATIO):
-        member = tl.maximum(current - (RATIO - 1 - k), 0)
-        slot = req * RATIO + (member % RATIO).to(tl.int64)
-        tl.store(ring_locs_ptr + ring_base + k, slot.to(tl.int32))
+        tl.store(logical_positions_ptr + row, current)
+        tl.store(state_slots_ptr + row, req * RATIO + (current % RATIO).to(tl.int64))
+        ring_base = row.to(tl.int64) * RATIO
+        for k in tl.static_range(RATIO):
+            member = tl.maximum(current - (RATIO - 1 - k), 0)
+            slot = req * RATIO + (member % RATIO).to(tl.int64)
+            tl.store(ring_locs_ptr + ring_base + k, slot.to(tl.int32))
 
     # Page-table entries are the request's FULL-KV page ids, read from the
     # page-aligned req_to_token row; the scoring kernels turn them into
@@ -144,13 +141,10 @@ def _qsa_graph_row_metadata_kernel(
     table_row = page_table_ptr + row.to(tl.int64) * max_pages
     offs = tl.arange(0, PAGE_BLOCK)
     row_width_pages = req_to_token_row_stride // FULL_PAGE
-    for p0 in range(0, max_pages, PAGE_BLOCK):
-        idx = p0 + offs
-        valid = idx < tl.minimum(max_pages, row_width_pages)
-        loc = tl.load(
-            req_to_token_ptr + token_row + idx * FULL_PAGE, mask=valid, other=0
-        )
-        tl.store(table_row + idx, tl.maximum(loc // FULL_PAGE, 0), mask=valid)
+    idx = tl.program_id(1) * PAGE_BLOCK + offs
+    valid = idx < tl.minimum(max_pages, row_width_pages)
+    loc = tl.load(req_to_token_ptr + token_row + idx * FULL_PAGE, mask=valid, other=0)
+    tl.store(table_row + idx, tl.maximum(loc // FULL_PAGE, 0), mask=valid)
 
 
 def supports_graph_metadata_kernels(pool, device) -> bool:
@@ -174,6 +168,7 @@ def launch_graph_metadata(
     metadata,
     req_to_token,
     pool,
+    seq_offset=0,
 ) -> None:
 
     indexer = metadata.indexer_metadata
@@ -182,25 +177,24 @@ def launch_graph_metadata(
     row_req_pool = metadata.row_req_pool_indices
     row_prefix_lens = indexer.graph_prefix_lengths
 
-    _qsa_graph_layout_kernel[(bs + 1,)](
-        seq_lens,
-        req_pool_indices,
-        (
-            extend_lens
-            if extend_lens is not None
-            else row_seq_lens  # unused dummy pointer
-        ),
-        row_seq_lens,
-        row_prefix_lens,
-        row_req_pool,
-        bs,
-        num_rows,
-        num_padding,
-        extend_len,
-        MODE=mode,
-        num_warps=1,
-    )
-    _qsa_graph_row_metadata_kernel[(num_rows,)](
+    if mode == 2:
+        _qsa_graph_layout_kernel[(bs + 1,)](
+            seq_lens,
+            req_pool_indices,
+            (
+                extend_lens
+                if extend_lens is not None
+                else row_seq_lens  # unused dummy pointer
+            ),
+            row_seq_lens,
+            row_prefix_lens,
+            row_req_pool,
+            bs,
+            num_rows,
+            num_padding,
+            num_warps=1,
+        )
+    _qsa_graph_row_metadata_kernel[(num_rows, triton.cdiv(max_pages, 128))](
         row_seq_lens,
         row_req_pool,
         indexer.graph_compressed_lengths,
@@ -215,5 +209,99 @@ def launch_graph_metadata(
         RATIO=indexer.compress_ratio,
         FULL_PAGE=pool.qsa_compressed_page_size * indexer.compress_ratio,
         PAGE_BLOCK=128,
+        seq_lens_ptr=seq_lens,
+        req_pool_ptr=req_pool_indices,
+        row_prefix_lens_ptr=row_prefix_lens,
+        bs=bs,
+        num_padding=num_padding,
+        extend_len=extend_len,
+        seq_offset=seq_offset,
+        MODE=mode,
+        num_warps=1,
+    )
+
+
+@triton.jit
+def _qsa_draft_graph_metadata_kernel(
+    buffers,
+    seq_lens,
+    req_pool,
+    req_to_token,
+    row_stride,
+    bs,
+    num_padding,
+    MAX_PAGES: tl.constexpr,
+    RATIO: tl.constexpr,
+    FULL_PAGE: tl.constexpr,
+):
+    for step in tl.static_range(len(buffers)):
+        if tl.program_id(2) == step:
+            buf = buffers[step]
+            _qsa_graph_row_metadata_kernel(
+                buf[0],
+                buf[1],
+                buf[2],
+                buf[3],
+                buf[4],
+                buf[5],
+                buf[6],
+                buf[7],
+                req_to_token,
+                row_stride,
+                MAX_PAGES,
+                RATIO,
+                FULL_PAGE,
+                128,
+                seq_lens,
+                req_pool,
+                buf[8],
+                bs,
+                num_padding,
+                extend_len=0,
+                seq_offset=step + 1,
+                MODE=0,
+            )
+
+
+def prepare_draft_graph_metadata(metadata, req_to_token, pool):
+    buffers = tuple(
+        (
+            m.sequence_lengths,
+            m.row_req_pool_indices,
+            m.indexer_metadata.graph_compressed_lengths,
+            m.indexer_metadata.graph_write_locs,
+            m.indexer_metadata.graph_compressed_page_table,
+            m.indexer_metadata.decode_logical_positions,
+            m.indexer_metadata.pending_ring_slots,
+            m.indexer_metadata.graph_ring_group_locs,
+            m.indexer_metadata.graph_prefix_lengths,
+        )
+        for m in metadata
+    )
+    return (
+        buffers,
+        req_to_token,
+        req_to_token.stride(0),
+        metadata[0].indexer_metadata.graph_compressed_page_table.shape[1],
+        pool.qsa_compress_ratio,
+        pool.qsa_compressed_page_size * pool.qsa_compress_ratio,
+    )
+
+
+def launch_draft_graph_metadata(args, seq_lens, req_pool_indices, bs, num_padding):
+    buffers, req_to_token, row_stride, max_pages, ratio, full_page = args
+    if bs == 0:
+        return
+    _qsa_draft_graph_metadata_kernel[(bs, triton.cdiv(max_pages, 128), len(buffers))](
+        buffers,
+        seq_lens,
+        req_pool_indices,
+        req_to_token,
+        row_stride,
+        bs,
+        max(0, min(int(num_padding or 0), bs)),
+        max_pages,
+        ratio,
+        full_page,
         num_warps=1,
     )

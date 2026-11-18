@@ -4,9 +4,10 @@ from enum import Enum
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
+from torch import nn
 
+from sglang.srt.hf_transformers import AutoConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +79,7 @@ class LoRABatchInfo:
     seg_lens: Optional[torch.Tensor]
 
     # The logical (re)ordering of input rows (tokens), in shape (num_tokens,)
-    permutation: Optional[torch.Tensor]
+    permutation: Optional[torch.Tensor] = None
 
     # Total number of tokens this batch info expects (host-side int).
     # Used by lm_head LoRA to validate input shape without GPU sync.
@@ -87,6 +88,8 @@ class LoRABatchInfo:
     # CPU-side flag: True when at least one request uses a LoRA adapter.
     # Computed from Python lists in prepare_lora_batch to avoid GPU sync.
     has_active_lora: bool = False
+
+    is_prefill: bool = False
 
     # Per-request segment indptrs, shape (bs + 1,). Required by MoE virtual
     # experts which map tokens to requests regardless of the dense-LoRA
@@ -105,6 +108,39 @@ class LoRABatchInfo:
 class LoRAType(Enum):
     LORA_A = 0
     LORA_B = 1
+
+
+class Phase(str, Enum):
+    DECODE = "decode"
+    PREFILL = "prefill"
+
+
+# Smallest csgmv chunk size; --max-lora-chunk-size only changes the largest.
+MIN_CHUNK_SIZE = 16
+
+
+def csgmv_segment_grid_size(batch_info: LoRABatchInfo, num_tokens: int) -> int:
+    """Number of segment programs a csgmv launch over num_tokens rows needs.
+
+    Under a CUDA graph the grid must cover every batch that replays it, and a
+    smaller batch can use smaller chunks, so assume MIN_CHUNK_SIZE: at most
+    num_tokens // MIN_CHUNK_SIZE segments plus one partial per adapter slot.
+    """
+    if not batch_info.use_cuda_graph:
+        return batch_info.num_segments
+    return min(
+        batch_info.weight_indices.shape[0],
+        num_tokens // MIN_CHUNK_SIZE + batch_info.lora_ranks.shape[0],
+    )
+
+
+def architecture_for_capability(major: int) -> str:
+    """Plan-table name for compute capability major: sm90, sm100 (>= 10) or default."""
+    if major == 9:
+        return "sm90"
+    if major >= 10:
+        return "sm100"
+    return "default"
 
 
 def copy_weight_into_buffer(
@@ -182,6 +218,8 @@ def get_default_hidden_dim(
             o_head_dim * config.num_attention_heads,
             config.hidden_size,
         )
+    elif module_name == "self_attn.gate_proj":
+        return config.hidden_size, config.num_attention_heads * head_dim
     elif module_name == "gate_up_proj":
         inter = config.intermediate_size
         first_k = getattr(config, "first_k_dense_replace", None)
@@ -265,6 +303,9 @@ def get_normalized_target_modules(
     Mapping a list of target module name to names of the normalized LoRA weights.
     Handles both base module names (e.g., "gate_proj") and prefixed module names (e.g., "feed_forward.gate_proj").
 
+    The attention gate must be named "self_attn.gate_proj"; bare "gate_proj"
+    maps only to the MLP/MoE gate_up_proj.
+
     Also handles PEFT shorthand strings like "all-linear" or "all" by returning
     {"all"} as a sentinel value.  Callers that need a concrete module set
     should use :func:`auto_detect_lora_target_modules` to resolve the shorthand
@@ -305,6 +346,10 @@ def get_normalized_target_modules(
 
     result = set()
     for name in target_modules:
+        qualified_name = ".".join(name.split(".")[-2:])
+        if qualified_name in PRESERVED_LORA_TARGET_NAMES:
+            result.add(qualified_name)
+            continue
         base_name = name.split(".")[-1]
         normalized_name = params_mapping.get(base_name, base_name)
         result.add(normalized_name)
@@ -366,6 +411,8 @@ ROW_PARALLELISM_LINEAR_LORA_NAMES = [
 DSA_INDEXER_LORA_NAMES = frozenset(
     {"indexer.wq_b", "indexer.wk", "indexer.weights_proj"}
 )
+# Preserve the parent because the leaf alone names an MLP projection.
+PRESERVED_LORA_TARGET_NAMES = frozenset({"self_attn.gate_proj"})
 REPLICATED_LINEAR_LORA_NAMES = [
     "fused_qkv_a_proj_with_mqa",
     "fc1_latent_proj",
@@ -373,7 +420,7 @@ REPLICATED_LINEAR_LORA_NAMES = [
     *DSA_INDEXER_LORA_NAMES,
 ]
 # Attention-projection LoRA modules shard on the attention-TP group, which
-# under `--enable-dp-attention` is `attn_tp_size = tp_size // dp_size` rather
+# under attention DP is `attn_tp_size = tp_size // attn_dp_size` rather
 # than the outer TP size. in_proj / in_proj_qkvz (linear-attention hybrids)
 # belong here too: their layers are built on the attn-TP group (mamba.py and
 # qwen3_5.py take tp_size/tp_rank from attn_tp when dp attention is enabled).
@@ -388,6 +435,7 @@ ATTN_TP_LORA_MODULE_NAMES = frozenset(
         "wo_ud",
         "in_proj",
         "in_proj_qkvz",
+        "self_attn.gate_proj",
     }
 )
 
@@ -414,6 +462,7 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "kv_b_proj",
     }
     | DSA_INDEXER_LORA_NAMES
+    | PRESERVED_LORA_TARGET_NAMES
 )
 
 
@@ -448,7 +497,9 @@ def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
             parts = name.split(".")
             leaf_name = parts[-1]
             parent_qualified_name = ".".join(parts[-2:])
-            if parent_qualified_name in DSA_INDEXER_LORA_NAMES:
+            if parent_qualified_name in (
+                DSA_INDEXER_LORA_NAMES | PRESERVED_LORA_TARGET_NAMES
+            ):
                 raw_names.add(parent_qualified_name)
             elif leaf_name in dsa_indexer_leaf_names:
                 # Bare DSA indexer leaf names are ambiguous across model
@@ -492,6 +543,8 @@ def get_lm_head_lora_b_shard_size(output_dim: int, shard_indices=None) -> int:
 def get_batch_token_counts(forward_batch: ForwardBatch) -> Tuple[int, int]:
     """(total tokens, max tokens per request) for LoRA segment math."""
     mode = forward_batch.forward_mode
+    if mode.is_idle():
+        return 0, 0
     if mode.is_decode():
         return forward_batch.batch_size, 1
     if mode.is_target_verify():
@@ -508,7 +561,9 @@ def generate_sequence_lengths(
 
     device = torch.get_default_device() if device is None else device
     with torch.device(device):
-        if forward_batch.forward_mode.is_decode():
+        if forward_batch.forward_mode.is_idle():
+            seg_lens = torch.empty(0, dtype=torch.int32)
+        elif forward_batch.forward_mode.is_decode():
             seg_lens = torch.ones(forward_batch.batch_size, dtype=torch.int32)
         elif forward_batch.forward_mode.is_target_verify():
             seg_lens = torch.full(
@@ -655,3 +710,34 @@ def build_lm_head_pass_segments(
         result.append((seg_wi, seg_lens))
 
     return result
+
+
+def capturing_lora_graph() -> bool:
+    """Whether capture is active, excluding the decode "nolora" variant."""
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_capture_lora_variant,
+        get_is_capture_mode,
+    )
+
+    return get_is_capture_mode() and get_capture_lora_variant() != "nolora"
+
+
+def kv_b_lora_correction(attn_module) -> str | None:
+    """Select legacy or capture-aware v2 correction, or None."""
+    layer = getattr(attn_module, "kv_b_proj", None)
+    if not getattr(layer, "set_lora", False):
+        return None
+    if layer.lora_backend.name != "triton_v2":
+        return "legacy"
+    return "v2" if layer.lora_active else None
+
+
+# source: https://github.com/vllm-project/vllm/blob/93b38bea5dd03e1b140ca997dfaadef86f8f1855/vllm/lora/utils.py#L9
+def replace_submodule(
+    model: nn.Module, module_name: str, new_module: nn.Module
+) -> nn.Module:
+    """Replace a submodule in a model with a new module."""
+    parent = model.get_submodule(".".join(module_name.split(".")[:-1]))
+    target_name = module_name.split(".")[-1]
+    setattr(parent, target_name, new_module)
+    return new_module

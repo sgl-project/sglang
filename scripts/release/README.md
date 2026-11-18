@@ -89,7 +89,7 @@ python scripts/release/bump_sglang_version.py 0.5.3rc0
 - `python/sglang/version.py`
 
 ### `bump_docs_install_version.py`
-Bumps the release version pinned in the Mintlify install docs — both the `git clone -b v<version> ...sglang.git` "install from source" line and the version-pinned `lmsysorg/sglang:v<version>` Docker example. Mutable tags (`latest`, `dev`) are intentionally left untouched. Driven automatically on release-tag push by [`.github/workflows/bot-bump-docs-version.yml`](../../.github/workflows/bot-bump-docs-version.yml), which opens a PR with the change.
+Bumps the release version pinned in the Mintlify install docs' `git clone -b v<version> ...sglang.git` "install from source" line. Docker image tags (`latest`, and the historical last CUDA 12 tag) are intentionally left untouched. Driven automatically on release-tag push by [`.github/workflows/bot-bump-docs-version.yml`](../../.github/workflows/bot-bump-docs-version.yml), which opens a PR with the change.
 
 **Usage:**
 ```bash
@@ -97,8 +97,20 @@ python scripts/release/bump_docs_install_version.py 0.5.13
 ```
 
 **Files updated:**
-- `docs/docs/get-started/install.mdx` (Method 2: From source; Method 3: pinned Docker image)
+- `docs/docs/get-started/install.mdx` (Get the source)
 - `docs/docs/hardware-platforms/amd_gpu.mdx` (Install from Source)
+
+### `bump_sgl_amd_mono_version.py`
+Pins [`sgl-amd-mono`](https://github.com/sgl-project/sgl-amd-mono) at the head of its `main`, or at a given full commit SHA. Driven daily by [`.github/workflows/bot-bump-sgl-amd-mono-version.yml`](../../.github/workflows/bot-bump-sgl-amd-mono-version.yml), which opens a PR with the change.
+
+**Usage:**
+```bash
+python scripts/release/bump_sgl_amd_mono_version.py
+python scripts/release/bump_sgl_amd_mono_version.py <full-sha>
+```
+
+**Files updated:**
+- `python/pyproject_other.toml`
 
 ### `bump_kernel_version.py`
 Updates the `sglang-kernel` release version across all relevant files following the pattern from [PR #10732](https://github.com/sgl-project/sglang/pull/10732).

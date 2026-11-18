@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.kernels.kda_kernels import _cuda_source
 from sglang.srt.utils.custom_op import register_custom_op
@@ -14,13 +15,22 @@ if TYPE_CHECKING:
 
 @cache_once
 def _jit_ltx2_qknorm_split_rope_module(round_intermediates: bool = False) -> Module:
+    sm90 = current_arch().is_sm(9, 0)
+    namespace = "ltx2_qknorm_split_rope_kda" if sm90 else "ltx2_qknorm_split_rope"
     return load_jit(
         "diffusion_ltx2_qknorm_split_rope",
-        cuda_files=[_cuda_source("diffusion/ltx2_qknorm_split_rope.cuh")],
+        cuda_files=[
+            _cuda_source(
+                "diffusion/ltx2_qknorm_split_rope_sm90.cuh"
+                if sm90
+                else "diffusion/ltx2_qknorm_split_rope.cuh"
+            )
+        ],
+        extra_cuda_cflags=["-DKDA_SPLIT_THRESHOLD=1000000000"] if sm90 else [],
         cuda_wrappers=[
             (
                 "ltx2_qknorm_split_rope_pair",
-                "ltx2_qknorm_split_rope::LTX2QKNormSplitRopeKernel::run"
+                f"{namespace}::LTX2QKNormSplitRopeKernel::run"
                 f"<{str(round_intermediates).lower()}>",
             )
         ],
@@ -134,12 +144,7 @@ def _is_sm100_or_newer(x: torch.Tensor) -> bool:
 
 
 def _is_sm90(x: torch.Tensor) -> bool:
-    if not x.is_cuda or torch.version.hip is not None:
-        return False
-    try:
-        return torch.cuda.get_device_capability(x.device) == (9, 0)
-    except RuntimeError:
-        return False
+    return x.is_cuda and current_arch().is_sm(9, 0)
 
 
 def can_use_ltx2_qknorm_split_rope_cuda(

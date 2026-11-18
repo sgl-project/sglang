@@ -17,7 +17,7 @@ combination stays numerically equivalent to CP-only (>0.92 on GSM8K, same bar as
 test_deepseek_v4_pro_fp4_cp.py) and that neither the per-ubatch CP metadata setup
 nor the concurrent CP communicators deadlock or corrupt state.
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-pro suite
+Registry: nightly-test-8-gpu-amd-mi35x-deepseek-v4-pro suite
 """
 
 import os
@@ -37,9 +37,9 @@ from sglang.test.test_utils import (
 
 register_amd_ci(
     est_time=5400,
-    suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro",
+    suite="nightly-test-8-gpu-amd-mi35x-deepseek-v4-pro",
     nightly=True,
-    disabled="Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon.",
+    disabled="DeepSeek-V4 prefill CP on HIP does not support two-batch overlap yet.",
 )
 
 DEEPSEEK_V4_PRO_FP4_MODEL_PATH = os.environ.get(
@@ -66,9 +66,7 @@ FP4_ENV_VARS = {
 }
 
 
-@unittest.skip(
-    "Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon."
-)
+@unittest.skip("DeepSeek-V4 prefill CP on HIP does not support two-batch overlap yet.")
 class TestDeepseekV4ProFp4CPInterleaveTbo(CustomTestCase):
     """DeepSeek-V4-Pro FP4 unified_kv prefill CP (round-robin-split) + TBO, tp=8."""
 
