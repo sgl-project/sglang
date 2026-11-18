@@ -456,13 +456,19 @@ class AttnResidual:
         hidden_states: torch.Tensor,
         block_num: int,
         block_residual: Optional[torch.Tensor] = None,
+        *,
+        padded_rows: Optional[int] = None,
     ) -> None:
         num_tokens, hidden_size = hidden_states.shape
         # Frozen snapshot rows [T, NB, H]; raw tensor for PP transfer and the
         # legacy kernel path.
-        self.block_residual = hidden_states.new_empty(
-            (num_tokens, block_num, hidden_size)
+        self._storage = hidden_states.new_empty(
+            (num_tokens if padded_rows is None else padded_rows, block_num, hidden_size)
         )
+        self.block_residual = self._storage
+        if padded_rows is not None and padded_rows != num_tokens:
+            self._storage[num_tokens:].zero_()
+            self.block_residual = self._storage[:num_tokens]
         self.num_valid_blocks = 0
         # Whether a write snapshotted only this rank's slice of the rows, which
         # leaves the bank's other rows stale on this rank.
@@ -470,6 +476,9 @@ class AttnResidual:
         if block_residual is not None:  # inherited from the previous PP rank
             self.num_valid_blocks = block_residual.size(1)
             self.block_residual[:, : self.num_valid_blocks, :].copy_(block_residual)
+
+    def include_padding(self) -> None:
+        self.block_residual = self._storage
 
     def write(self, prefix_sum: torch.Tensor, rows: Optional[slice] = None) -> None:
         """Snapshot the pre-attention prefix into the next bank row.

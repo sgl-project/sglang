@@ -89,17 +89,34 @@ class TestK31PrefillSPTail(CustomTestCase):
         with envs.SGLANG_K31_PREFILL_SP_TAIL_MIN_TOKENS.override(2048):
             self.assertIsNotNone(self._begin(2048))
 
+    def test_prefill_comm_retries_failed_probe(self):
+        probe = k3_sp_collective.prefill_sp_comm
+        probe.cache_clear()
+        self.addCleanup(probe.cache_clear)
+        with (
+            patch.object(k3_sp_collective, "get_parallel", return_value=_parallel()),
+            patch(
+                "sglang.srt.utils.device.get_device_sm",
+                side_effect=[RuntimeError("probe failed"), 90],
+            ) as sm,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "probe failed"):
+                probe()
+            self.assertIsNone(probe())
+            self.assertIsNone(probe())
+            self.assertEqual(sm.call_count, 2)
+
     def test_nccl_fallback(self):
         group = _Group(world_size=8, rank=5)
         parallel = SimpleNamespace(tp_group=group)
-        x = torch.arange(16 * 6, dtype=torch.float32).view(16, 6)
-        residual = torch.ones(2, 6)
+        x = torch.arange(16 * 6, dtype=torch.float16).view(16, 6)
+        residual = x.new_ones(2, 6)
         with (
             patch.object(k3_sp_collective, "get_parallel", return_value=parallel),
-            patch.object(k3_sp_collective, "prefill_sp_comm", return_value=None),
+            patch.object(k3_sp_collective, "prefill_sp_comm", return_value=object()),
         ):
             out = k3_sp_collective.prefill_sp_reduce_scatter(
-                x, torch.empty(2, 6), residual, num_blocks=8
+                x, torch.empty_like(residual), residual, num_blocks=8
             )
             torch.testing.assert_close(out, x[10:12] * 8 + 1)
             local = torch.randn(2, 6)

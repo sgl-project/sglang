@@ -519,7 +519,6 @@ class _PrefillSP:
         "local",
         "rows",
         "first_layer",
-        "bank_storage",
         "entered",
     )
 
@@ -531,15 +530,12 @@ class _PrefillSP:
         start = group.rank_in_group * self.local
         self.rows = slice(start, start + self.local)
         self.first_layer = first_layer
-        self.bank_storage: Optional[torch.Tensor] = None
         self.entered = False
 
     def gather(self, x: torch.Tensor, *, owned: bool = False) -> torch.Tensor:
         full = k3_sp_collective.prefill_sp_all_gather(
-            x, num_blocks=_PREFILL_SP_AG_BLOCKS
+            x, num_blocks=_PREFILL_SP_AG_BLOCKS, owned=owned
         )
-        if owned:
-            return full[: self.num_tokens].clone()
         return full[: self.num_tokens]
 
     def reduce_scatter(
@@ -3435,15 +3431,12 @@ class KimiK3LinearModel(nn.Module):
                 if self.pp_group.is_first_rank
                 else pp_proxy_tensors["attn_res_bank"]
             )
-            if sp is not None and sp.padded != sp.num_tokens:
-                bank = self.attn_bank.open(
-                    hidden_states[:1].expand(sp.padded, -1), attn_res_block_num
-                )
-                sp.bank_storage = bank.block_residual
-                sp.bank_storage[sp.num_tokens :].zero_()
-                bank.block_residual = sp.bank_storage[: sp.num_tokens]
-            else:
-                self.attn_bank.open(hidden_states, attn_res_block_num, inherited)
+            self.attn_bank.open(
+                hidden_states,
+                attn_res_block_num,
+                inherited,
+                padded_rows=sp.padded if sp is not None else None,
+            )
 
         packs_aux = self.packs_aux_hidden_states
         aux_hidden_states: AuxHiddenStateAccumulator = (
@@ -3598,8 +3591,7 @@ class KimiK3LinearModel(nn.Module):
         stream = residual_batch.fold(hidden_states, forward_batch)
         residual_batch.clear(forward_batch)
         sp.entered = True
-        if sp.bank_storage is not None:
-            self.attn_bank.require().block_residual = sp.bank_storage
+        self.attn_bank.require().include_padding()
         start, stop = sp.rows.start, min(sp.rows.stop, sp.num_tokens)
         if stop - start == sp.local:
             return stream[sp.rows]
@@ -3611,18 +3603,8 @@ class KimiK3LinearModel(nn.Module):
     def _prefill_sp_capture_stream(
         self, layer_idx: int, stream: torch.Tensor, sp: _PrefillSP
     ) -> torch.Tensor:
-        if layer_idx + 1 < self.end_layer:
-            next_layer = self.layers[layer_idx + 1]
-            score_proj = next_layer.self_attention_res_proj
-            score_norm = next_layer.self_attention_res_norm
-            nvb = next_layer.prev_valid_blocks
-        else:
-            score_proj = self.output_attn_res_proj
-            score_norm = self.output_attn_res_norm
-            nvb = _cdiv(self.end_layer, self.config.attn_res_block_size)
-        bank = self.attn_bank.require()
-        mixed = aggregate_stream(
-            stream, bank.block_residual[sp.rows], nvb, score_proj, score_norm
+        mixed = self._capture_bank_rows(
+            layer_idx, stream, self.attn_bank.require().block_residual[sp.rows]
         )
         return sp.gather(mixed, owned=True)
 
@@ -3657,6 +3639,11 @@ class KimiK3LinearModel(nn.Module):
         output side for the last layer). The standard path captures at the
         next input instead."""
         hidden_states = residual_batch.snapshot(hidden_states, forward_batch)
+        return self._capture_bank_rows(
+            layer_idx, hidden_states, self.attn_bank.require().block_residual
+        )
+
+    def _capture_bank_rows(self, layer_idx, hidden_states, bank_rows):
         if layer_idx + 1 < self.end_layer:
             next_layer = self.layers[layer_idx + 1]
             score_proj = next_layer.self_attention_res_proj
@@ -3669,7 +3656,7 @@ class KimiK3LinearModel(nn.Module):
             nvb = _cdiv(self.end_layer, self.config.attn_res_block_size)
         return aggregate_stream(
             hidden_states,
-            self.attn_bank.require().block_residual,
+            bank_rows,
             nvb,
             score_proj,
             score_norm,

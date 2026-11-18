@@ -9,6 +9,7 @@ the checked-in GB200/GB300 tuning envelope.
 from __future__ import annotations
 
 import logging
+from functools import cache
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -463,19 +464,14 @@ def attn_res_all_gather(
 
 
 _PREFILL_SP_AG = "prefill_sp_all_gather"
-_PREFILL_SP_COMM = None
-_PREFILL_SP_COMM_INIT = False
 
 
+@cache
 def prefill_sp_comm():
-    global _PREFILL_SP_COMM, _PREFILL_SP_COMM_INIT
-    if _PREFILL_SP_COMM_INIT:
-        return _PREFILL_SP_COMM
-    _PREFILL_SP_COMM_INIT = True
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
         CustomAllReduceV2,
     )
-    from sglang.srt.utils.common import get_device_sm
+    from sglang.srt.utils.device import get_device_sm
 
     group = get_parallel().tp_group
     comm = group.ca_comm
@@ -485,7 +481,7 @@ def prefill_sp_comm():
         or not isinstance(comm, CustomAllReduceV2)
         or comm.disabled
         or not comm.has_multicast
-        or not getattr(comm, "pull_enabled", True)
+        or not comm.pull_enabled
         or not k3_ar_fusion.enabled()
     ):
         logger.info("K3.1 prefill SP tail: no multicast pull plane; using NCCL.")
@@ -493,7 +489,6 @@ def prefill_sp_comm():
     from sglang.kernels.ops.communication import sp_collective
 
     sp_collective.register_comm(comm.obj)
-    _PREFILL_SP_COMM = comm
     logger.info(
         "K3.1 prefill SP tail: pull RS / direct AG on the TP%d multicast plane",
         group.world_size,
@@ -504,10 +499,7 @@ def prefill_sp_comm():
 def _pull_tuning(comm, num_blocks: int, block_size: int):
     from sglang.kernels.ops.communication import sp_collective
 
-    try:
-        cap = int(comm.config.num_pull_blocks)
-    except Exception:
-        cap = num_blocks
+    cap = comm.config.num_pull_blocks
     return sp_collective.Tuning(max(1, min(num_blocks, cap)), block_size)
 
 
@@ -521,7 +513,11 @@ def prefill_sp_reduce_scatter(
 ) -> torch.Tensor:
     group = get_parallel().tp_group
     comm = prefill_sp_comm()
-    mc_ptr = k3_ar_fusion.find_mc_ptr(x) if comm is not None else None
+    mc_ptr = (
+        k3_ar_fusion.find_mc_ptr(x)
+        if comm is not None and x.dtype == torch.bfloat16
+        else None
+    )
     if comm is not None and mc_ptr is not None:
         from sglang.kernels.ops.communication import sp_collective
 
@@ -540,7 +536,7 @@ def prefill_sp_reduce_scatter(
 
 
 def prefill_sp_all_gather(
-    x: torch.Tensor, *, num_blocks: int, block_size: int = 1024
+    x: torch.Tensor, *, num_blocks: int, block_size: int = 1024, owned: bool = False
 ) -> torch.Tensor:
     group = get_parallel().tp_group
     rows = x.shape[0] * group.world_size
@@ -549,13 +545,14 @@ def prefill_sp_all_gather(
         from sglang.kernels.ops.communication import sp_collective
 
         out = k3_ar_fusion.symm_buffer(_PREFILL_SP_AG, rows, x.shape[1], x.dtype)
-        return sp_collective.all_gather_direct(
+        full = sp_collective.all_gather_direct(
             group.world_size,
             x,
             out,
             output_mc_ptr=k3_ar_fusion.get_mc_ptr(out),
             tuning=_pull_tuning(comm, num_blocks, block_size),
         )
+        return full.clone() if owned else full
     out = x.new_empty((rows, *x.shape[1:]))
     group.all_gather_into_tensor(out, x.contiguous())
     return out
