@@ -1,6 +1,7 @@
-"""Synthetic chunk profiling must stay within request bounds and release on failure."""
+"""Chunk profiling lifecycle and numerical stability of chunk-size prediction."""
 
 import unittest
+from decimal import Decimal, localcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -121,6 +122,76 @@ class TestDynamicChunkSizerProfiling(CustomTestCase):
         self._profile(
             context=8192, mapping=8196, prefill=16384, base=512, fail_forward=True
         )
+
+
+class TestChunkSizePredictor(CustomTestCase):
+    def _predictor(self, a, b):
+        predictor = module.ChunkSizePredictor()
+        predictor.quadratic_coeff_a = a
+        predictor.linear_coeff_b = b
+        predictor.set_target_latency(2048)
+        predictor.is_ready = True
+        return predictor
+
+    def _predict(self, predictor, history_len=0, **kwargs):
+        return predictor.predict_next_chunk_size(
+            history_len=history_len,
+            base_chunk_size=2048,
+            page_size=kwargs.get("page_size", 64),
+            context_len=kwargs.get("context_len", 32768),
+            max_chunk_size=kwargs.get("max_chunk_size"),
+        )
+
+    def test_zero_history_preserves_base_chunk_at_page_boundary(self):
+        for smooth_factor in (0.75, 1.0):
+            with module.envs.SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR.override(
+                smooth_factor
+            ):
+                for a, b in ((1e-8, 0.01), (1e-5, 0.1), (1e-4, 1.0)):
+                    with self.subTest(smooth_factor=smooth_factor, a=a, b=b):
+                        self.assertEqual(self._predict(self._predictor(a, b)), 2048)
+
+    def test_nearly_linear_model_keeps_positive_chunk(self):
+        with module.envs.SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR.override(1.0):
+            self.assertEqual(self._predict(self._predictor(1e-20, 1.0)), 2048)
+
+    def test_history_matches_high_precision_root(self):
+        with (
+            module.envs.SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR.override(1.0),
+            localcontext() as context,
+        ):
+            context.prec = 60
+            for a, b, history in (
+                (1e-8, 0.01, 8192),
+                (1e-5, 0.1, 16384),
+                (1e-4, 1.0, 4096),
+                (1e-4, 0.0, 512),
+            ):
+                with self.subTest(a=a, b=b, history=history):
+                    predictor = self._predictor(a, b)
+                    A = Decimal(str(a))
+                    B = 2 * A * history + Decimal(str(b))
+                    target = Decimal(str(predictor.target_latency))
+                    root = (B * B + 4 * A * target).sqrt()
+                    chunk = 2 * target / (B + root)
+                    expected = max(int(chunk), 2048 // 4) // 64 * 64
+                    self.assertEqual(self._predict(predictor, history), expected)
+
+    def test_existing_caps_and_page_alignment_are_preserved(self):
+        predictor = self._predictor(1e-8, 0.01)
+        for kwargs, expected in (
+            ({"max_chunk_size": 1000, "page_size": 128}, 896),
+            ({"context_len": 1100}, 960),
+            ({"context_len": 150}, None),
+        ):
+            with self.subTest(kwargs=kwargs):
+                self.assertEqual(self._predict(predictor, **kwargs), expected)
+
+    def test_unready_predictor_uses_static_fallback(self):
+        self.assertIsNone(self._predict(module.ChunkSizePredictor()))
+
+    def test_underflow_uses_static_fallback(self):
+        self.assertIsNone(self._predict(self._predictor(1e-200, 0.0)))
 
 
 if __name__ == "__main__":
