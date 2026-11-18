@@ -60,8 +60,8 @@ def resolve_aiter_mla_decode_backend(
     backend = value.lower()
     if backend not in ("auto", "asm", "gluon", "triton"):
         raise ValueError(
-            "SGLANG_AITER_MLA_DECODE_BACKEND must be 'auto', 'asm', 'gluon' or "
-            f"'triton', got {value!r}"
+            "SGLANG_AITER_MLA_DECODE_BACKEND must be 'auto', 'asm', 'asm_fp8q', "
+            f"'gluon' or 'triton', got {value!r}"
         )
     if backend in ("asm", "gluon"):
         return backend
