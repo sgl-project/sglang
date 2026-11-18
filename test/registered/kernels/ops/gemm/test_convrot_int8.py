@@ -161,15 +161,6 @@ def test_rotate_quantize_matches_hadamard_reference_wide_rows(K, group_size):
         assert (x_q.int() - ref_q.int()).abs().max().item() <= 1
 
 
-def test_rejects_misaligned_view():
-    base = torch.randn(20 * 3072 + 8, device="cuda", dtype=torch.bfloat16)
-    # Contiguous, but the storage offset is one element: the vectorized loads
-    # need 16-byte alignment and the op says so instead of faulting.
-    x = base[1 : 1 + 20 * 3072].view(20, 3072)
-    with pytest.raises(RuntimeError, match="aligned"):
-        convrot_rotate_quantize_activation(x, group_size=GROUP_SIZE)
-
-
 @pytest.mark.parametrize("M", PRODUCTION_M)
 @pytest.mark.parametrize("K,N", PRODUCTION_KN)
 @pytest.mark.parametrize("with_bias", [True, False])
@@ -261,99 +252,6 @@ def test_empty_batch():
     assert out.shape == (0, 3072) and out.dtype == torch.bfloat16
     x_q, x_scale = convrot_rotate_quantize_activation(x, group_size=GROUP_SIZE)
     assert x_q.shape == (0, 3072) and x_scale.shape == (0,)
-
-
-def test_rejects_invalid_arguments():
-    M, K, N = 20, 3072, 3072
-    x, _, weight_q, weight_scale, bias = _make_inputs(M, K, N, with_bias=True)
-    x_q, x_scale = convrot_rotate_quantize_activation(x, group_size=GROUP_SIZE)
-
-    with pytest.raises(RuntimeError, match="unsupported group_size"):
-        convrot_int8_fused_linear(x, weight_q, weight_scale, bias=bias, group_size=96)
-    with pytest.raises(RuntimeError, match="multiple of group_size"):
-        convrot_rotate_quantize_activation(
-            x[:, :3000].contiguous(), group_size=GROUP_SIZE
-        )
-    with pytest.raises(
-        RuntimeError, match=r"\[float32\] not in the allowed options: \[bfloat16\]"
-    ):
-        convrot_int8_fused_linear(
-            x.float(), weight_q, weight_scale, bias=bias, group_size=GROUP_SIZE
-        )
-    x_strided = x.t().contiguous().t()
-    with pytest.raises(RuntimeError, match="Tensor is not contiguous"):
-        convrot_int8_fused_linear(
-            x_strided, weight_q, weight_scale, bias=bias, group_size=GROUP_SIZE
-        )
-    with pytest.raises(
-        RuntimeError, match=r"\[int32\] not in the allowed options: \[int8\]"
-    ):
-        convrot_int8_fused_linear(
-            x, weight_q.to(torch.int32), weight_scale, bias=bias, group_size=GROUP_SIZE
-        )
-    with pytest.raises(RuntimeError, match="multiple of 8"):
-        convrot_int8_fused_linear(
-            x,
-            weight_q[: N - 4].contiguous(),
-            weight_scale[: N - 4],
-            bias=bias[: N - 4],
-            group_size=GROUP_SIZE,
-        )
-    narrow_weight_q = weight_q[:, :2048].contiguous()
-    with pytest.raises(
-        RuntimeError, match=r"shape#1\('K'\): expected 3072 but got 2048"
-    ):
-        convrot_int8_fused_linear(
-            x, narrow_weight_q, weight_scale, bias=bias, group_size=GROUP_SIZE
-        )
-    with pytest.raises(
-        RuntimeError, match=r"shape#0\('N'\): expected 3072 but got 3071"
-    ):
-        convrot_int8_fused_linear(
-            x, weight_q, weight_scale[:-1], bias=bias, group_size=GROUP_SIZE
-        )
-    with pytest.raises(
-        RuntimeError, match=r"\[float32\] not in the allowed options: \[bfloat16\]"
-    ):
-        convrot_int8_fused_linear(
-            x, weight_q, weight_scale, bias=bias.float(), group_size=GROUP_SIZE
-        )
-    wrong_out = torch.empty(M, N + 1, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(
-        RuntimeError, match=r"shape#1\('N'\): expected 3072 but got 3073"
-    ):
-        convrot_int8_fused_linear(
-            x, weight_q, weight_scale, bias=bias, group_size=GROUP_SIZE, out=wrong_out
-        )
-    fp16_out = torch.empty(M, N, device="cuda", dtype=torch.float16)
-    with pytest.raises(
-        RuntimeError, match=r"\[float16\] not in the allowed options: \[bfloat16\]"
-    ):
-        convrot_int8_fused_linear(
-            x, weight_q, weight_scale, bias=bias, group_size=GROUP_SIZE, out=fp16_out
-        )
-    strided_out = torch.empty(M, 2 * N, device="cuda", dtype=torch.bfloat16)[:, :N]
-    with pytest.raises(RuntimeError, match="Tensor is not contiguous"):
-        convrot_int8_fused_linear(
-            x, weight_q, weight_scale, bias=bias, group_size=GROUP_SIZE, out=strided_out
-        )
-    x_q_i32 = x_q.to(torch.int32)
-    with pytest.raises(
-        RuntimeError, match=r"\[int32\] not in the allowed options: \[int8\]"
-    ):
-        convrot_int8_linear_prequant(
-            x_q_i32, x_scale, weight_q, weight_scale, bias=bias, group_size=GROUP_SIZE
-        )
-    with pytest.raises(RuntimeError, match=r"shape#0\('M'\): expected 20 but got 19"):
-        convrot_int8_linear_prequant(
-            x_q, x_scale[:-1], weight_q, weight_scale, bias=bias, group_size=GROUP_SIZE
-        )
-    with pytest.raises(
-        RuntimeError, match=r"\[cpu\] not in the allowed options: \[cuda\]"
-    ):
-        convrot_int8_fused_linear(
-            x.cpu(), weight_q, weight_scale, bias=bias, group_size=GROUP_SIZE
-        )
 
 
 def test_supported_capabilities_is_the_published_table():

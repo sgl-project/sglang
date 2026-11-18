@@ -233,10 +233,12 @@ pub struct ServerArgs {
     /// `max_new_tokens` is clamped rather than rejected (Python
     /// `TokenizerManager._validate_one_request`).
     pub allow_auto_truncate: bool,
-    /// `return_hidden_states` is refused unless the server was launched with it:
-    /// the scheduler simply won't produce them, so the request would 200 with the
-    /// field silently missing.
+    /// The resolved `--enable-return-hidden-states`;
+    /// decides the mode only when `return_hidden_states_mode` is unset.
     pub enable_return_hidden_states: bool,
+    /// The resolved `--return-hidden-states-mode` (`None`, `"last"` or `"full"`):
+    /// the most a request's `return_hidden_states` may ask for.
+    pub return_hidden_states_mode: Option<String>,
     /// Output slots reserved per request on top of its input (eagle stores draft
     /// tokens there). Not a `server_args` field — `TokenizerManager` derives it and
     /// `RustServer._build_server_args` stamps it in, so both sides count alike.
@@ -329,6 +331,7 @@ impl ServerArgs {
         limit_mm_data_per_request,
         allow_auto_truncate,
         enable_return_hidden_states,
+        return_hidden_states_mode,
         num_reserved_tokens,
         tokenizer_model_max_length,
         version,
@@ -395,6 +398,7 @@ impl ServerArgs {
         limit_mm_data_per_request: Vec<(String, usize)>,
         allow_auto_truncate: bool,
         enable_return_hidden_states: bool,
+        return_hidden_states_mode: Option<String>,
         num_reserved_tokens: u64,
         tokenizer_model_max_length: i64,
         version: String,
@@ -459,6 +463,7 @@ impl ServerArgs {
             limit_mm_data_per_request,
             allow_auto_truncate,
             enable_return_hidden_states,
+            return_hidden_states_mode,
             num_reserved_tokens,
             tokenizer_model_max_length,
             version,
@@ -530,6 +535,7 @@ impl Default for ServerArgs {
             limit_mm_data_per_request: Vec::new(),
             allow_auto_truncate: false,
             enable_return_hidden_states: false,
+            return_hidden_states_mode: None,
             num_reserved_tokens: 0,
             tokenizer_model_max_length: -1,
             version: String::new(),
@@ -911,6 +917,15 @@ pub enum DisaggregationMode {
     Decode,
 }
 
+/// How much of the hidden states a request asks for or a server allows,
+/// ordered like Python's `CaptureHiddenMode`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HiddenStatesMode {
+    Null,
+    Last,
+    Full,
+}
+
 /// The slice of the resolved Python `ModelConfig` the rust server reads.
 #[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
 #[derive(Clone, Debug)]
@@ -1168,6 +1183,17 @@ impl ServerArgs {
             .map_err(|e| format!("invalid preferred_sampling_params: {e}"))?;
         }
         Ok(())
+    }
+
+    /// The most a request's `return_hidden_states` may ask for
+    /// (Python `get_server_return_hidden_states_mode`).
+    pub fn hidden_states_mode(&self) -> HiddenStatesMode {
+        match self.return_hidden_states_mode.as_deref() {
+            Some("last") => HiddenStatesMode::Last,
+            Some("full") => HiddenStatesMode::Full,
+            _ if self.enable_return_hidden_states => HiddenStatesMode::Full,
+            _ => HiddenStatesMode::Null,
+        }
     }
 
     /// True on a prefill or decode node — requests need bootstrap routing.

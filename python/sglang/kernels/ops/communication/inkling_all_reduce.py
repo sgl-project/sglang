@@ -194,6 +194,7 @@ def inkling_multimem_one_shot_fused(
     block_size: int = 0,
     per_block_barrier: bool = False,
     shared: torch.Tensor | None = None,
+    acc_f32: bool = False,
 ) -> None:
     """Single-launch multimem one-shot all-reduce (NVLink multicast ld_reduce/st).
 
@@ -208,6 +209,7 @@ def inkling_multimem_one_shot_fused(
         rank, world_size, num_items: as above.
         per_block_barrier: use per-block peer handshakes for both barriers (no
             grid funnel; capped at MAX_BARRIER_BLOCKS blocks).
+        acc_f32: accumulate the multicast reduction in FP32.
     """
     module = _jit_inkling_all_reduce_module(buffer.dtype, world_size)
     module.multimem_one_shot_fused(
@@ -221,6 +223,7 @@ def inkling_multimem_one_shot_fused(
         block_size,
         int(per_block_barrier),
         shared if shared is not None else empty_sentinel(buffer.device, buffer.dtype),
+        int(acc_f32),
     )
 
 

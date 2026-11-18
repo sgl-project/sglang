@@ -26,7 +26,7 @@ few-shot scorer that run_combined_tests routes gsm8k to, because GLM-5.3's
 chat template forces thinking on and the legacy scorer reads the last number
 in the response. See the MI35x file for the longer note.
 
-Registry: nightly-amd-accuracy-8-gpu-glm53 suite
+Registry: nightly-accuracy-test-8-gpu-amd-glm53 suite
 """
 
 import unittest
@@ -50,7 +50,7 @@ from sglang.test.test_utils import (
 # room for a slower download of the ~700 GB checkpoint.
 register_amd_ci(
     est_time=9000,
-    suite="nightly-amd-accuracy-8-gpu-glm53",
+    suite="nightly-accuracy-test-8-gpu-amd-glm53",
     nightly=True,
 )
 

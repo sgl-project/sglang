@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_npu_ci(est_time=3600, suite="nightly-acc-4-npu-a5", nightly=True)
+register_npu_ci(est_time=3600, suite="nightly-acc-test-4-npu-a5", nightly=True)
 
 SERVER_ENVS = {
     "SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8": (

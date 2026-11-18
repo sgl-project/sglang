@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
 
 # MoRI EP configs split out of test_moriep_small.py to keep the PR stage
 # short; this file runs nightly.
-register_amd_ci(est_time=3000, suite="nightly-amd-8-gpu", nightly=True)
+register_amd_ci(est_time=3000, suite="nightly-test-8-gpu-amd", nightly=True)
 
 
 class TestMTP(CustomTestCase):

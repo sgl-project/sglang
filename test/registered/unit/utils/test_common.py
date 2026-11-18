@@ -19,7 +19,7 @@ from sglang.srt.utils.device import (
     is_gfx1250_supported,
     is_hip,
 )
-from sglang.srt.utils.log_utils import freeze_gc
+from sglang.srt.utils.gc_utils import freeze_gc
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -29,7 +29,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=5, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(est_time=5, stage="base-b", runner_config="1-gpu-small-amd")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")

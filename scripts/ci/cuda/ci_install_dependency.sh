@@ -844,9 +844,9 @@ install_extra_deps() {
     fi
 
     if [ "$IS_BLACKWELL" != "1" ]; then
-        # pyarrow 26 needs NumPy 2 at import, but lmms_eval pins numpy 1.26.4;
-        # drop the cap once lmms_eval allows NumPy 2.
-        $PIP_CMD install "lmms_eval==0.5.0" "pyarrow<26" $PIP_INSTALL_SUFFIX
+        # pyarrow 26 and ml-dtypes 0.6 need NumPy 2 at import, but lmms_eval pins
+        # numpy 1.26.4; drop the caps once lmms_eval allows NumPy 2.
+        $PIP_CMD install "lmms_eval==0.5.0" "pyarrow<26" "ml-dtypes<0.6" $PIP_INSTALL_SUFFIX
         # lmms_eval 0.5.0 pulls antlr4-python3-runtime==4.7.2, clobbering the
         # 4.9.3 that sgl-eval's latex2sympy2_extended needs (4.7.2 ImportError
         # at sgl-eval import). Pin it back so the nightly sgl-eval path works.

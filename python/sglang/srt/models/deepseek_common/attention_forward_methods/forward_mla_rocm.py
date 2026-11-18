@@ -188,13 +188,16 @@ def _absorb_bmm_config(heads: int, m: int, n: int) -> Optional[dict]:
     while block_m < 64 and heads * cdiv(m, block_m) * n_tiles > 2 * num_cu:
         block_m *= 2
     workgroups = heads * cdiv(m, block_m) * n_tiles
+    # Four waves per EU aborts LLVM on gfx950 (#46829);
+    # more than two is also slower for most shapes on MI355X.
+    waves_per_eu = min(2, max(1, cdiv(workgroups, num_cu)))
     return {
         "BLOCK_SIZE_M": block_m,
         "BLOCK_SIZE_N": block_n,
         "GROUP_SIZE_M": 1,
         "num_warps": 4,
         "num_stages": 2,
-        "waves_per_eu": max(1, cdiv(workgroups, num_cu)),
+        "waves_per_eu": waves_per_eu,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg",
     }

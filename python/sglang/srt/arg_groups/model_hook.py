@@ -10,6 +10,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
+    decode_state_free_radix_of,
     mamba_extra_buffer_of,
     model_config_of,
     resolved_view,
@@ -76,7 +77,7 @@ def _validate_dsa_tbo_index_sharing(server_args: Any, hf_config: Any) -> None:
 
 
 def _rocm_fp8_wo_a_supported() -> bool:
-    """True when ROCm can run the DeepSeek-V4 fp8 wo_a GEMM (gfx950 + aiter)."""
+    """True when ROCm can run the DeepSeek-V4 fp8 wo_a GEMM (gfx950/gfx1250 + aiter)."""
     try:
         from sglang.srt.models.deepseek_common.amd.deepseek_v4_wo_a_fp8 import (
             is_wo_a_fp8_mxscale_supported,
@@ -1068,7 +1069,8 @@ def handle_mamba_radix_cache(server_args: Any, hf_config: Any):
             hf_config,
             mamba_cache_chunk_size_of=lambda: mamba_cache_chunk_size(server_args),
         )
-    else:
+    elif not decode_state_free_radix_of(view):
+        # A state-free decode tree caches no state, so no_buffer's limits do not apply.
         validate_mamba_no_buffer(view, hf_config.architectures[0])
 
 

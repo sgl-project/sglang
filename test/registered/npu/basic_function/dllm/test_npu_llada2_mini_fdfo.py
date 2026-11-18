@@ -7,8 +7,8 @@ from sglang.test.ascend.test_ascend_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-# Moved from nightly-2-npu-a3 to full-2-npu-a3: the model requires maintenance.
-register_npu_ci(est_time=400, suite="full-2-npu-a3", nightly=True)
+# Moved from nightly-test-2-npu-a3 to full-test-2-npu-a3: the model requires maintenance.
+register_npu_ci(est_time=400, suite="full-test-2-npu-a3", nightly=True)
 
 
 class TestLLaDA2MiniFDFO(CustomTestCase):

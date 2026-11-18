@@ -2,6 +2,7 @@
 from sglang.srt.utils.common import *
 from sglang.srt.utils.custom_op import *
 from sglang.srt.utils.device import *
+from sglang.srt.utils.gc_utils import *
 from sglang.srt.utils.log_utils import *
 from sglang.srt.utils.network import is_port_available  # noqa: F401
 from sglang.srt.utils.process import *

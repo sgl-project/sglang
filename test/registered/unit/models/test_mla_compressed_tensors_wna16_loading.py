@@ -314,7 +314,7 @@ class TestWNA16Dequantize(CustomTestCase):
 
         with mock.patch.object(
             compressed_tensors_wNa16,
-            "check_marlin_supports_shape",
+            "_check_marlin_supports_padded_shape",
             side_effect=_StopAfterMark,
         ):
             with self.assertRaises(_StopAfterMark):

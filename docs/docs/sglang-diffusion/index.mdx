@@ -1,16 +1,21 @@
 ---
 title: SGLang Diffusion
-description: Accelerated image and video generation with diffusion models.
+description: Accelerated image, video, audio, and action generation.
 ---
-SGLang Diffusion is SGLang's built-in inference engine for image and video generation. It ships in the same [repository](https://github.com/sgl-project/sglang) and `sglang` Python package, using the shared `sglang generate` and `sglang serve` commands.
 
-It provides native SGLang pipelines, diffusers backend support, an OpenAI-compatible server, and an optimized kernel stack built on both precompiled `sgl-kernel` operators and JIT kernels for key inference paths.
+import { DiffusionLogo } from '/src/snippets/diffusion/logo.jsx';
+
+<DiffusionLogo />
+
+SGLang Diffusion is SGLang's built-in inference engine for image, video, audio, and action generation. It ships in the same [repository](https://github.com/sgl-project/sglang) and `sglang` Python package, using the shared `sglang generate` and `sglang serve` commands.
+
+It provides native SGLang pipelines, diffusers backend support, a server with OpenAI-compatible media APIs and SGLang action APIs, and an optimized kernel stack built on both precompiled `sgl-kernel` operators and JIT kernels for key inference paths.
 
 ## Key Features
 
-- Broad model support across Wan, Hunyuan, Qwen-Image, FLUX, Z-Image, GLM-Image, and more
+- Broad model support across media generation and robot action policies, including Wan, Hunyuan, Qwen-Image, FLUX, Z-Image, GLM-Image, Cosmos3, Pi0.5, and Praxis-1
 - Fast inference with `sgl-kernel`, JIT kernels, scheduler improvements, and caching acceleration
-- Multiple interfaces: `sglang generate`, `sglang serve`, and an OpenAI-compatible API
+- Multiple interfaces: `sglang generate`, `sglang serve`, OpenAI-compatible media APIs, and action HTTP/WebSocket APIs
 - Multi-platform support for NVIDIA, AMD, Intel XPU, Ascend, Apple Silicon, and Moore Threads
 
 ## Quick Start
@@ -37,6 +42,8 @@ sglang serve --model-path Qwen/Qwen-Image --host 0.0.0.0 --port 30000
 - [Supported Models](/docs/sglang-diffusion/compatibility_matrix): browse supported model families, tasks, and public checkpoints
 - [CLI](/docs/sglang-diffusion/api/cli): run one-off generation jobs or launch a persistent server
 - [OpenAI-Compatible API](/docs/sglang-diffusion/api/openai_api): send image and video requests to the HTTP server
+- [Action Generation API](/docs/sglang-diffusion/api/openai_api#action-generation-sglang-extension): generate robot action chunks and discover policy metadata
+- [VLA Cookbook](/cookbook/vla/intro): deploy action policies with model-specific observation schemas and control-loop settings
 - [ComfyUI plugin](/docs/sglang-diffusion/comfyui): use SGLang from ComfyUI in server mode or as a per-step DiT backend
 - [Performance Overview](/docs/sglang-diffusion/performance-optimization): choose speed, memory, parallelism, caching, and quality-tradeoff levers
 - [Caching Acceleration](/docs/sglang-diffusion/caching-acceleration): use Cache-DiT, TeaCache, or Spectrum to reduce denoising cost

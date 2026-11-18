@@ -12,7 +12,7 @@ name: PR States
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review, converted_to_draft]
   workflow_run:
     workflows: ["PR Test Base", "PR Test Extra", "PR Test (AMD)"]
     types: [requested, completed]
@@ -171,17 +171,39 @@ jobs:
             // after a commit, because GHA doesn't retrigger on `labeled`.
             const isReal = (run) => run && run.conclusion !== 'skipped';
 
-            const missingCIText = ':x: **Missing `run-ci` label** -- add it to run CI tests.';
-            const peBlockedByCIText = ':x: **Blocked** -- `run-ci` is required first.';
-            const notNvExtraEnabledText = ':warning: **Not enabled** -- add `run-ci-nv-extra` label to opt in.';
+            // pr-gate.yml runs its "Skip tests" step when a draft, a missing
+            // `run-ci`, or a missing opt-in label skips the caller's tests, so
+            // such a run is green (or, for Base, red) with nothing tested.
+            async function skippedAtGate(run) {
+              // A skipped run ends failed (Base) or green; notify-pr-states
+              // refreshes this block when it does.
+              if (!isReal(run) || !['success', 'failure'].includes(run.conclusion)) return false;
+              const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: run.id,
+                filter: 'latest',
+                per_page: 100,
+              });
+              return jobs.some((job) => (job.steps || []).some(
+                (step) => step.name === 'Skip tests' && step.conclusion === 'success'));
+            }
+            const [ptSkipped, peSkipped, amdSkipped] = await Promise.all(
+              [ptRun, peRun, amdRun].map(skippedAtGate));
+            const tested = (run, skipped) => isReal(run) && !skipped;
+
+            // GitHub's "skipped" mark, for every row whose tests the gate skipped.
+            const skipMark = '\u2298 **Skipped**';
+            const missingCIText = `${skipMark} -- add the \`run-ci\` label to run CI tests.`;
             const stalePushText = ':warning: **Not run on latest push** -- push again to dispatch.';
+            const draftText = `${skipMark} -- the PR is a draft; mark it ready, then \`/rerun-failed-ci\`.`;
+            const noTestsText = (run) => `${skipMark} in [Run #${run.id}](${run.html_url}) -- it predates the labels or the PR leaving draft; \`/rerun-failed-ci\` reruns it.`;
             // A missing run usually means the paths filter excluded the PR,
             // but pull_request workflows can also be suppressed by GitHub
             // (for example, for merge conflicts or skip annotations).
             const amdNotTriggeredText = ':heavy_minus_sign: **No AMD PR run found for this commit**.';
 
-            // Status icon: body otherwise looks uniformly "dispatched" even
-            // for gate-failed runs (call-gate exits on missing label).
+            // Status icon: body otherwise looks uniformly "dispatched".
             function runIcon(run) {
               if (run.status !== 'completed') return ':hourglass_flowing_sand:';
               switch (run.conclusion) {
@@ -195,19 +217,20 @@ jobs:
               }
             }
             const runLink = (run) => `${runIcon(run)} [Run #${run.id}](${run.html_url})`;
-            const ptText = isReal(ptRun)
-              ? runLink(ptRun)
-              : (!hasCI ? missingCIText : '_Not run yet_');
-            const peText = isReal(peRun)
-              ? runLink(peRun)
-              : !hasCI
-                ? peBlockedByCIText
-                : !hasNvExtra
-                  ? notNvExtraEnabledText
-                  : stalePushText;
-            const amdText = isReal(amdRun)
-              ? runLink(amdRun)
-              : amdNotTriggeredText;
+            // A row without a tested run says why, in the order the gate checks.
+            function rowText(run, skipped, optInLabel, noRunText) {
+              if (tested(run, skipped)) return runLink(run);
+              if (pr.draft) return draftText;
+              if (!hasCI) return missingCIText;
+              if (optInLabel && !labels.includes(optInLabel)) {
+                return `${skipMark} -- add the \`${optInLabel}\` label to opt in.`;
+              }
+              return skipped ? noTestsText(run) : noRunText;
+            }
+            const ptText = rowText(ptRun, ptSkipped, null, '_Not run yet_');
+            const peText = rowText(peRun, peSkipped, 'run-ci-nv-extra', stalePushText);
+            // No AMD run usually means its paths filter excluded the PR, not a label.
+            const amdText = amdRun ? rowText(amdRun, amdSkipped, null, amdNotTriggeredText) : amdNotTriggeredText;
 
             const outerStart = '<!-- pr-states:start -->';
             const outerEnd   = '<!-- pr-states:end -->';

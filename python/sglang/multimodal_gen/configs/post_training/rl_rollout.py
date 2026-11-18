@@ -103,19 +103,3 @@ class RLRolloutArgs:
                 "(variance noise, mean, std, model output)."
             ),
         )
-
-    @classmethod
-    def from_dict(cls, kwargs: dict[str, Any]) -> RLRolloutArgs:
-        return cls(
-            rollout=bool(kwargs.get("rollout", cls.rollout)),
-            rollout_sde_type=str(kwargs.get("rollout_sde_type", cls.rollout_sde_type)),
-            rollout_noise_level=float(
-                kwargs.get("rollout_noise_level", cls.rollout_noise_level)
-            ),
-            rollout_log_prob_no_const=bool(
-                kwargs.get("rollout_log_prob_no_const", cls.rollout_log_prob_no_const)
-            ),
-            rollout_debug_mode=bool(
-                kwargs.get("rollout_debug_mode", cls.rollout_debug_mode)
-            ),
-        )

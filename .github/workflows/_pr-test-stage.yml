@@ -11,11 +11,11 @@ on:
   workflow_call:
     inputs:
       self_name:
-        description: 'Caller job key; used for partitions[suite] lookup.'
+        description: 'Caller job key, the suite {stage}-test-{runner_config}; used for partitions[suite] lookup.'
         type: string
         required: true
       runner_config:
-        description: 'Key in scripts/ci/runner_configs.yml. Resolves install script, artifact version, install timeout, runs-on label, and rdma_devices.'
+        description: 'Key in scripts/ci/runner_configs.yml. With the stage, resolves install script, artifact version, install timeout, runs-on label, and rdma_devices.'
         type: string
         required: true
       check_changes:
@@ -136,10 +136,19 @@ jobs:
 
       - name: Resolve runner_config
         id: rc
+        env:
+          SUITE: ${{ inputs.self_name }}
+          RUNNER_CONFIG: ${{ inputs.runner_config }}
         run: |
           python3 -c 'import yaml' 2>/dev/null ||
             python3 -m pip install --disable-pip-version-check pyyaml
-          python3 scripts/ci/runner_configs.py '${{ inputs.runner_config }}' >> "$GITHUB_OUTPUT"
+          # self_name is the suite, {stage}-test-{runner_config}.
+          stage="${SUITE%-test-"$RUNNER_CONFIG"}"
+          if [ "$stage" = "$SUITE" ]; then
+            echo "::error::self_name $SUITE does not end in -test-$RUNNER_CONFIG"
+            exit 1
+          fi
+          python3 scripts/ci/runner_configs.py "$RUNNER_CONFIG" "$stage" >> "$GITHUB_OUTPUT"
 
       - name: Export rdma_devices to job env
         run: echo "SGLANG_CI_RDMA_ALL_DEVICES=${{ steps.rc.outputs.rdma_devices || '' }}" >> "$GITHUB_ENV"

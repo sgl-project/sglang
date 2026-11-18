@@ -18,12 +18,12 @@ from sglang.test.test_utils import (
 
 register_xpu_ci(
     est_time=360,
-    suite="nightly-xpu-kernel-main-1-gpu",
+    suite="nightly-kernel-main-test-1-gpu-xpu",
     nightly=True,
 )
 register_xpu_ci(
     est_time=360,
-    suite="nightly-xpu-kernel-wheel-1-gpu",
+    suite="nightly-kernel-wheel-test-1-gpu-xpu",
     nightly=True,
 )
 

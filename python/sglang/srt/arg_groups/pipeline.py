@@ -24,6 +24,13 @@ def run_resolution_pipeline(server_args: Any) -> None:
     through ``run_hook`` so plugins can replace them without changing their order.
     """
 
+    from sglang.srt.kernel_plugins.nvidia.kimi_k31_gb_runtime_optimization import (
+        apply_k31_gb_runtime_optimization,
+    )
+
+    # Before any step reads the environment; spawned processes inherit it.
+    apply_k31_gb_runtime_optimization()
+
     # What the caller asked for, before any handler runs; this plus the
     # stash is the resolution result the projection reads.
     server_args._raw_input = {

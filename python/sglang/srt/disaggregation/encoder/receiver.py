@@ -1320,7 +1320,9 @@ class WaitingZmqRequestGrpc(WaitingZmqRequest):
                 if assigned_num == 0:
                     continue
                 encoder_url = self.encoder_urls[idx]
-                receive_url = f"{host_name}:{embedding_port}"
+                receive_url = NetworkAddress(
+                    host_name, embedding_port
+                ).to_host_port_str()
                 target_url = f"{encoder_url}/SchedulerReceiveUrl"
                 logger.info(f"Preparing to send to {target_url}")
                 tasks.append(
@@ -2431,7 +2433,10 @@ class MMReceiverBase(ABC):
             # Per-request sockets receive here; shared-socket requests use this
             # tick to retry pool staging after _drain_scheduler_embeddings().
             waiting_req._try_recv_mm_data()
-            if current_time - waiting_req.start_time > self.wait_timeout:
+            if (
+                waiting_req.status == WaitingMMRequestStatus.PENDING
+                and current_time - waiting_req.start_time > self.wait_timeout
+            ):
                 waiting_req.status = WaitingMMRequestStatus.TIMEOUT
                 waiting_req.release_resources()
                 waiting_req.close_recv_socket()

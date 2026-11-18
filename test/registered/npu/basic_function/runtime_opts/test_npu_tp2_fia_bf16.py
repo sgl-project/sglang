@@ -14,8 +14,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="base-b-test-2-npu-a3")
-register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="extra-b-test-2-npu-a3")
+register_npu_ci(est_time=400, suite="nightly-test-2-npu-a3", nightly=True)
 
 TEST_MODEL_MATRIX = {
     "/root/.cache/modelscope/hub/models/Qwen/Qwen2.5-7B-Instruct": {

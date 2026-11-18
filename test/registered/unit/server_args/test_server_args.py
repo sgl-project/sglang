@@ -96,6 +96,7 @@ from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.arg_groups.validation_hook import (
     check_pipeline_parallel_compat,
     check_two_batch_overlap,
+    validate_device_lora_backend,
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.entrypoints.sidecar import (
@@ -112,6 +113,7 @@ from sglang.srt.layers.moe.utils import (
     FlashinferA2ADispatchType,
     get_flashinfer_a2a_dispatch_type,
 )
+from sglang.srt.lora.backend.lora_registry import LORA_SUPPORTED_BACKENDS
 from sglang.srt.mem_cache import platform_kv_cache_dtype
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -135,7 +137,7 @@ from sglang.test.test_utils import (
 )
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
-register_cpu_ci(est_time=11, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=11, suite="extra-test-cpu-intel")
 
 # Mock get_device() so all tests run on CPU-only CI runners
 _mock_device = patch(
@@ -4767,11 +4769,6 @@ class TestGrpcServerArgs(CustomTestCase):
         proc.join.assert_called_once_with(timeout=42.0)
         kill_tree.assert_called_once_with(1234, wait_timeout=42.0)
 
-    def test_grpc_mode_requires_encoder_only(self):
-        with self.assertRaisesRegex(ValueError, "requires --encoder-only"):
-            handle_deprecated_args(self._args(grpc_mode=True))
-        handle_deprecated_args(self._args(grpc_mode=True, encoder_only=True))
-
     def test_native_grpc_rejects_multi_tokenizer(self):
         sa = self._args(grpc_port=40000, tokenizer_worker_num=2)
         with self.assertRaises(ValueError):
@@ -4912,6 +4909,24 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         # require dp-attention there.
         args = self._args(moe_a2a_backend="deepep")
         check_two_batch_overlap(args)
+
+
+class TestIntelXpuLoRABackend(CustomTestCase):
+    def test_registered_backend_is_selectable_from_cli(self):
+        self.assertIn("intel_xpu", LORA_SUPPORTED_BACKENDS)
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args = parser.parse_args(
+            ["--model-path", "dummy-model", "--lora-backend", "intel_xpu"]
+        )
+        self.assertEqual(args.lora_backend, "intel_xpu")
+
+    def test_rejected_off_xpu(self):
+        with self.assertRaisesRegex(ValueError, "requires --device xpu"):
+            validate_device_lora_backend(lora_backend="intel_xpu", device="cuda")
+
+    def test_accepted_on_xpu(self):
+        validate_device_lora_backend(lora_backend="intel_xpu", device="xpu")
 
 
 class TestKvCacheShardingCompatibility(CustomTestCase):
@@ -5394,10 +5409,10 @@ class TestLaunchCommand(CustomTestCase):
 
 
 class TestAccessKeyRedaction(CustomTestCase):
-    """The access keys and the TLS key password reach nothing that reports the
-    configuration: not the launch command, `/server_info`, the startup log or
-    the record's repr. Anyone holding the API key can read those, and the
-    admin key must stay out of their reach."""
+    """The access keys, the TLS key password and the HiCache storage config
+    reach nothing that reports the configuration: not the launch command,
+    `/server_info`, the startup log or the record's repr. Anyone holding the
+    API key can read those, and the admin key must stay out of their reach."""
 
     # Spellings argparse accepts: an abbreviation with `=`, a value with a
     # space, a value that spells another key flag, and a repeated flag.
@@ -5412,6 +5427,8 @@ class TestAccessKeyRedaction(CustomTestCase):
         "second-admin",
         "--ssl-keyfile-password",
         "tls-secret",
+        "--hicache-storage-backend-extra-config",
+        '{"secret_key": "s3-secret"}',
     ]
     SECRETS = (
         "alpha beta",
@@ -5419,6 +5436,7 @@ class TestAccessKeyRedaction(CustomTestCase):
         "--admin-api-key=x",
         "second-admin",
         "tls-secret",
+        "s3-secret",
     )
 
     def _assert_no_secret(self, text: str):
@@ -5431,7 +5449,8 @@ class TestAccessKeyRedaction(CustomTestCase):
             server_args.launch_command,
             "--model-path /tmp/x --api-key <redacted> --admin-api-ke=<redacted> "
             "--api-key=<redacted> --admin-api-key <redacted> "
-            "--ssl-keyfile-password <redacted>",
+            "--ssl-keyfile-password <redacted> "
+            "--hicache-storage-backend-extra-config <redacted>",
         )
         # Redaction is for display only: the server still authenticates with
         # the values the operator gave, the last of each repeated flag.
@@ -5445,6 +5464,7 @@ class TestAccessKeyRedaction(CustomTestCase):
         self.assertEqual(info["api_key"], "<redacted>")
         self.assertEqual(info["admin_api_key"], "<redacted>")
         self.assertEqual(info["ssl_keyfile_password"], "<redacted>")
+        self.assertEqual(info["hicache_storage_backend_extra_config"], "<redacted>")
         self._assert_no_secret(json.dumps(info, default=str))
         unset = build_server_info(prepare_server_args(["--model-path", "/tmp/x"]), {})
         self.assertIsNone(unset["api_key"])

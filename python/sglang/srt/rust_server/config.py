@@ -219,6 +219,7 @@ def _build_server_args(
         ),
         allow_auto_truncate=get_serving().allow_auto_truncate,
         enable_return_hidden_states=sa.enable_return_hidden_states,
+        return_hidden_states_mode=sa.return_hidden_states_mode,
         # Not a `server_args` field: `TokenizerManager` derives it, and the
         # rust ingress needs the same number for its total-token check.
         num_reserved_tokens=compute_num_reserved_tokens(),
