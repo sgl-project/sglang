@@ -41,6 +41,20 @@ class TestCpuTopologyOnMacos(CustomTestCase):
         ):
             self.assertEqual(get_physical_cpus_by_numa_or_block(), {0: {0}})
 
+    def test_linux_still_reads_lscpu_filtered_by_affinity(self):
+        """Off macOS the topology must still come from `lscpu`, restricted to
+        the CPUs the process may run on; the Darwin branch must not leak."""
+        lscpu = "# header\n0,0,0,0,0\n1,1,0,0,0\n2,2,0,1,0\n3,3,0,1,0\n"
+        with (
+            patch("sglang.srt.utils.device.platform.system", return_value="Linux"),
+            patch(
+                "sglang.srt.utils.device.subprocess.check_output", return_value=lscpu
+            ),
+            patch("sglang.srt.utils.device.psutil.Process") as process,
+        ):
+            process.return_value.cpu_affinity.return_value = [0, 1, 2]
+            self.assertEqual(get_physical_cpus_by_numa_or_block(), {0: {0, 1}, 1: {2}})
+
 
 if __name__ == "__main__":
     unittest.main()
