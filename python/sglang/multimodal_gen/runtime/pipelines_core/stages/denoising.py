@@ -120,6 +120,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
     is_layerwise_offloaded_module,
+    streams_layers_every_forward,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.component_loading import (
     load_transformer_if_needed,
@@ -2192,6 +2193,34 @@ class DenoisingStage(PipelineStage):
             return kwargs
         return {k: v for k, v in kwargs.items() if k in param_names}
 
+    def _should_batch_cfg(
+        self, current_model, cfg_policy, latent_model_input, server_args
+    ) -> bool:
+        # A streamed DiT is copied from host once per forward, so one batch-2
+        # forward halves the copies per step. With the DiT resident in eager mode
+        # one batch-2 forward was slightly slower than two serial ones.
+        return (
+            type(cfg_policy) is CFGPolicy
+            and len(cfg_policy.branches) == 2
+            and cfg_policy.branches[0].is_conditional
+            and not cfg_policy.branches[1].is_conditional
+            and isinstance(latent_model_input, torch.Tensor)
+            and latent_model_input.shape[0] == 1
+            and not server_args.enable_breakable_cuda_graph
+            and not self._cache_dit_enabled
+            and self._sp_world_size() <= 1
+            and self._dit_streams_when_serving(current_model)
+        )
+
+    def _dit_streams_when_serving(self, module) -> bool:
+        # A DiT offloaded only for the compile warmup is resident afterwards, so
+        # the warmup must trace the serial path that requests will run.
+        if not streams_layers_every_forward(module):
+            return False
+        return self._explicit_dit_layerwise_offload() or not any(
+            m is module for m in self._offloaded_dit_modules_for_compile
+        )
+
     def _predict_noise_with_cfg(
         self,
         current_model: nn.Module,
@@ -2235,6 +2264,40 @@ class DenoisingStage(PipelineStage):
                     server_args.pipeline_config.slice_noise_pred(pred_t[0], latents),
                 )
             return _unwrap(pred_t)
+
+        def predict_batched_fn(cond_branch, uncond_branch):
+            kwargs = server_args.pipeline_config.batch_cfg_branch_kwargs(
+                cond_branch.kwargs, uncond_branch.kwargs
+            )
+            if kwargs is None:
+                return None
+
+            def twice(x):
+                if isinstance(x, torch.Tensor) and x.dim() > 0 and x.shape[0] == 1:
+                    return torch.cat([x, x])
+                return x
+
+            cond_branch.configure_batch(batch)
+            with set_forward_context(
+                current_timestep=timestep_index,
+                attn_metadata=attn_metadata,
+                forward_batch=batch,
+                quality=batch.sampling_params.quality,
+            ):
+                raw = self._predict_noise(
+                    current_model=current_model,
+                    latent_model_input=twice(latent_model_input),
+                    timestep=twice(timestep),
+                    target_dtype=target_dtype,
+                    guidance=twice(guidance),
+                    **kwargs,
+                )
+            cond_t, uncond_t = zip(*(t.chunk(2) for t in _wrap(raw)))
+            if len(cond_t) == 1:
+                slice_pred = server_args.pipeline_config.slice_noise_pred
+                cond_t = (slice_pred(cond_t[0], latents),)
+                uncond_t = (slice_pred(uncond_t[0], latents),)
+            return [_unwrap(cond_t), _unwrap(uncond_t)]
 
         if (
             cfg_gate_state
@@ -2294,8 +2357,14 @@ class DenoisingStage(PipelineStage):
             # perform cfg branches in parallel, following the cfg policy
             predictions = run_cfg_parallel(cfg_policy, predict_fn)
         else:
-            # perform cfg branches one-by-one locally
-            predictions = [predict_fn(branch) for branch in cfg_policy.branches]
+            predictions = None
+            if self._should_batch_cfg(
+                current_model, cfg_policy, latent_model_input, server_args
+            ):
+                predictions = predict_batched_fn(*cfg_policy.branches)
+            if predictions is None:
+                # perform cfg branches one-by-one locally
+                predictions = [predict_fn(branch) for branch in cfg_policy.branches]
 
         return cfg_policy.combine(
             predictions,
