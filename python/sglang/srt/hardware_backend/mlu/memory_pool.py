@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.device import get_device_core_count
 from sglang.srt.utils.log_utils import print_warning_once
 
 if TYPE_CHECKING:
@@ -24,14 +25,16 @@ if TYPE_CHECKING:
 class MLUMHATokenToKVPool(MHATokenToKVPool):
     """MLU paged HND storage with shared allocation and slot movement."""
 
+    def __init__(self, *args, **kwargs):
+        if kwargs.get("kv_cache_layout") not in (None, "hnd") or (
+            envs.SGLANG_USE_HND_KVCACHE.is_set()
+            and not envs.SGLANG_USE_HND_KVCACHE.get()
+        ):
+            raise NotImplementedError("MLU MHA cache requires HND layout.")
+        kwargs["kv_cache_layout"] = "hnd"
+        super().__init__(*args, **kwargs)
+
     def _create_buffers(self) -> None:
-        if not self.use_hnd:
-            raise NotImplementedError(
-                "MLU MHA cache requires shared HND initialization, "
-                f"got kv_cache_layout={self.kv_cache_layout!r}. "
-                "Leave SGLANG_USE_HND_KVCACHE unset or set it to 1, "
-                "and remove any explicit KV cache layout override."
-            )
         if self.dtype not in (torch.float16, torch.bfloat16):
             raise NotImplementedError(
                 "MLU MHA cache currently supports only torch.float16 "
@@ -96,6 +99,13 @@ class MLUMHATokenToKVPool(MHATokenToKVPool):
 
 class MLUMLATokenToKVPool(MLATokenToKVPool):
     """Token-linear latent storage; TMO consumes a zero-copy paged view."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        device_index = torch.device(self.device).index
+        if device_index is None:
+            device_index = torch.mlu.current_device()
+        self.device_core_count = get_device_core_count(device_index)
 
     def _create_buffers(self) -> None:
         if self.dtype != torch.bfloat16 or self.use_dsa:
@@ -172,5 +182,11 @@ class MLUMLATokenToKVPool(MLATokenToKVPool):
                 dtype=dst_dtype,
                 device=kv_buffer.device,
             )
-        get_mla_kv_buffer_mlu(kv_buffer, loc, cache_k_nope, cache_k_rope)
+        get_mla_kv_buffer_mlu(
+            kv_buffer,
+            loc,
+            cache_k_nope,
+            cache_k_rope,
+            core_count=self.device_core_count,
+        )
         return cache_k_nope, cache_k_rope

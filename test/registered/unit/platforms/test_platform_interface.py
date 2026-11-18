@@ -703,9 +703,6 @@ class TestMluSRTPlatform(CustomTestCase):
                         for source, _ in args._resolved_overrides
                     )
                 )
-                self.assertEqual(
-                    envs.SGLANG_USE_HND_KVCACHE.get(), expected[1] == "mlu"
-                )
 
     def test_mixed_attention_backends_rejected(self):
         """Different phase backends cannot share the current MLU cache layout."""
@@ -752,10 +749,6 @@ class TestMluSRTPlatform(CustomTestCase):
                         ):
                             handle_mlu_backends(args)
                         self.assertEqual(envs.SGLANG_USE_HND_KVCACHE.get(), use_hnd)
-                        if not use_hnd:
-                            self.assertIsNone(
-                                MluSRTPlatform().get_kv_pool_cls(kind="mha")
-                            )
 
     def test_unsupported_runtime_settings_fail_during_resolution(self):
         """Reject unsupported runtime settings before model loading or execution."""

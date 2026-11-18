@@ -6,13 +6,13 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import (
     DeviceCapability,
     DeviceMixin,
     PlatformEnum,
 )
 from sglang.srt.platforms.interface import KVPoolKind, PlatformCapabilities, SRTPlatform
+from sglang.srt.runtime_context import attention_backends
 
 
 class MluDeviceMixin(DeviceMixin):
@@ -84,7 +84,8 @@ class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
 
     def get_kv_pool_cls(self, *, kind: KVPoolKind) -> Optional[type]:
         if kind == "mha":
-            if not envs.SGLANG_USE_HND_KVCACHE.get():
+            prefill_backend, _ = attention_backends()
+            if prefill_backend != "mlu":
                 return None
             from sglang.srt.hardware_backend.mlu.memory_pool import (
                 MLUMHATokenToKVPool,

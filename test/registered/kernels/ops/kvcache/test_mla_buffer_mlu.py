@@ -5,6 +5,7 @@ import unittest
 import torch
 
 from sglang.kernels.ops.kvcache.mla_buffer_mlu import get_mla_kv_buffer_mlu
+from sglang.srt.utils.device import get_device_core_count
 from sglang.test.ci.ci_register import register_mlu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -15,6 +16,7 @@ class TestMLABufferMLU(CustomTestCase):
     def setUp(self):
         super().setUp()
         torch.manual_seed(0)
+        self.device_core_count = get_device_core_count(torch.mlu.current_device())
 
     @staticmethod
     def _allocate_guarded_tensor(rows, dim, dtype, padded, device="mlu"):
@@ -67,7 +69,13 @@ class TestMLABufferMLU(CustomTestCase):
         else:
             rope, rope_storage = None, None
 
-        get_mla_kv_buffer_mlu(source, indices.to("mlu"), nope, rope)
+        get_mla_kv_buffer_mlu(
+            source,
+            indices.to("mlu"),
+            nope,
+            rope,
+            core_count=self.device_core_count,
+        )
         for output, storage, reference in (
             (nope, nope_storage, expected[..., :512]),
             (rope, rope_storage, expected[..., 512:]),

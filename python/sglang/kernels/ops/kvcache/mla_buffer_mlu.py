@@ -85,20 +85,15 @@ def get_mla_kv_buffer_mlu(
     loc: torch.Tensor,
     cache_k_nope: torch.Tensor,
     cache_k_rope: Optional[torch.Tensor] = None,
+    *,
+    core_count: int,
 ) -> None:
     """Gather MLA cache rows with a bounded persistent grid on MLU."""
     n_loc = loc.numel()
     if n_loc == 0:
         return
-    from triton.runtime import driver
-
-    device_index = loc.device.index
-    if device_index is None:
-        device_index = driver.active.get_current_device()
-    props = driver.active.utils.get_device_properties(device_index)
-    cores = props["cluster_num"] * props["core_num_per_cluster"]
     # Each program loops over row tiles, avoiding a token-count-sized grid.
-    grid = lambda meta: (min(triton.cdiv(n_loc, meta["BLOCK_M"]), cores),)
+    grid = lambda meta: (min(triton.cdiv(n_loc, meta["BLOCK_M"]), core_count),)
     _get_mla_kv_buffer_kernel[grid](
         kv_buffer,
         cache_k_nope,
@@ -110,5 +105,5 @@ def get_mla_kv_buffer_mlu(
         cache_k_nope.shape[-1],
         cache_k_rope.shape[-1] if cache_k_rope is not None else 0,
         n_loc,
-        cores,
+        core_count,
     )

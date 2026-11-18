@@ -12,7 +12,8 @@ from sglang.srt.hardware_backend.mlu.memory_pool import (
     MLUMLATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.platforms.mlu import MluSRTPlatform
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_mlu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -25,19 +26,20 @@ class TestMLUMHATokenToKVPool(CustomTestCase):
         stack = ExitStack()
         self.addCleanup(stack.close)
         # These tests construct MHA pools without platform configuration.
-        stack.enter_context(envs.SGLANG_USE_HND_KVCACHE.override(True))
+        stack.enter_context(envs.SGLANG_USE_HND_KVCACHE.override(None))
+        envs.SGLANG_USE_HND_KVCACHE.clear()
         torch.manual_seed(0)
 
-    def _create_pool(self, *, dtype=torch.bfloat16, layers=2, start=0, layout=None):
+    def _create_pool(self, *, dtype=torch.bfloat16, start=0, layout=None):
         pool = MLUMHATokenToKVPool(
             size=128,
             page_size=16,
             dtype=dtype,
             head_num=2,
             head_dim=128,
-            layer_num=layers,
+            layer_num=2,
             start_layer=start,
-            end_layer=start + layers - 1,
+            end_layer=start + 1,
             device="mlu",
             enable_memory_saver=False,
             kv_cache_layout=layout,
@@ -45,6 +47,19 @@ class TestMLUMHATokenToKVPool(CustomTestCase):
         for buf in pool.k_buffer + pool.v_buffer:
             buf.zero_()
         return pool
+
+    def test_backend_selects_mha_pool(self):
+        """Only the MLU backend should select the HND-specific pool."""
+        for backend, expected in (("mlu", MLUMHATokenToKVPool), ("triton", None)):
+            with (
+                self.subTest(backend=backend),
+                get_context().override_server_args(
+                    attention_backend="mlu",
+                    prefill_attention_backend=backend,
+                    decode_attention_backend=backend,
+                ),
+            ):
+                self.assertIs(MluSRTPlatform().get_kv_pool_cls(kind="mha"), expected)
 
     @staticmethod
     def _snapshot_cache_in_token_order(pool):
@@ -66,18 +81,10 @@ class TestMLUMHATokenToKVPool(CustomTestCase):
             for buffers in (pool.k_buffer, pool.v_buffer)
         )
 
-    def _assert_cache_matches(self, pool, expected):
-        """Compare all K/V slots across all layers against token-order references."""
-        for actual, reference in zip(
-            self._snapshot_cache_in_token_order(pool), expected
-        ):
-            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
-
     def test_write_overwrite_and_layer_override(self):
         """Writes cross pages, preserve other slots and honor scales/layer offsets."""
         # Create the pool and input tensors.
         pool = self._create_pool(start=5)
-        self.assertTrue(pool.use_hnd, "MLU KV cache should use HND layout by default.")
         loc = torch.tensor([143, 16, 31, 0, 32, 15])
         k = torch.randn(loc.numel(), pool.head_num, 128).to(pool.dtype)
         v = -k
@@ -101,7 +108,11 @@ class TestMLUMHATokenToKVPool(CustomTestCase):
         pool.set_kv_buffer(
             SimpleNamespace(layer_id=6), loc.to("mlu"), k.to("mlu"), v.to("mlu")
         )
-        actual = self._snapshot_cache_in_token_order(pool)
+        for actual, reference in zip(
+            self._snapshot_cache_in_token_order(pool), expected
+        ):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
         pool.set_kv_buffer(
             SimpleNamespace(layer_id=5),
             KVWriteLoc(loc=overwrite_loc.to("mlu")),
@@ -112,10 +123,10 @@ class TestMLUMHATokenToKVPool(CustomTestCase):
             layer_id_override=6,
         )
 
-        # Check the cache after each write against the CPU reference.
-        for buffer, reference in zip(actual, expected):
-            torch.testing.assert_close(buffer, reference, rtol=0, atol=0)
-        self._assert_cache_matches(pool, expected_overwrite)
+        for actual, reference in zip(
+            self._snapshot_cache_in_token_order(pool), expected_overwrite
+        ):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
     def test_invalid_configuration_is_rejected(self):
         with envs.SGLANG_USE_HND_KVCACHE.override(True):

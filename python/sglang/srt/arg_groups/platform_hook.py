@@ -81,9 +81,10 @@ def handle_mlu_backends(server_args: Any):
             "Use the same attention backend to ensure compatible layouts."
         )
     use_hnd = cfg.prefill_attention_backend == "mlu"
-    if not envs.SGLANG_USE_HND_KVCACHE.is_set():
-        envs.SGLANG_USE_HND_KVCACHE.set(use_hnd)
-    elif envs.SGLANG_USE_HND_KVCACHE.get() != use_hnd:
+    if (
+        envs.SGLANG_USE_HND_KVCACHE.is_set()
+        and envs.SGLANG_USE_HND_KVCACHE.get() != use_hnd
+    ):
         # MLA uses token-linear storage independently of the MHA layout.
         if not use_mla_backend(server_args):
             raise ValueError(
