@@ -4245,6 +4245,12 @@ class SchedulerDisaggregationDecodeMixin:
             else:
                 running_batch.merge_batch(last)
 
+        # Poll on the shared path so sustained tail batches cannot stall
+        # requests waiting to enter the decode preallocation queue.
+        if self.grammar_manager.has_waiting_grammars():
+            for req in self.grammar_manager.get_ready_grammar_requests():
+                self._add_request_to_queue(req)
+
         # Decode-tail reqs run a real extend first: they become ordinary
         # decode reqs through the standard result processor on this batch.
         tail_extend_batch = self._get_new_tail_extend_batch(running_batch)
@@ -4517,11 +4523,6 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
-        if self.grammar_manager.has_waiting_grammars():
-            ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
-            for req in ready_grammar_requests:
-                self._add_request_to_queue(req)
-
         if len(self.waiting_queue) == 0:
             return None
 

@@ -260,6 +260,32 @@ class PrepareForTailExtendTest(CustomTestCase):
         self.assertEqual(batch.seq_lens_cpu.tolist(), [64, 64])
 
 
+class TailSchedulingTest(CustomTestCase):
+    def test_ready_grammar_is_enqueued_before_tail_selection(self):
+        grammar_req = object()
+        tail_batch = object()
+        enqueued = []
+
+        def select_tail(running_batch):
+            self.assertEqual(enqueued, [grammar_req])
+            return tail_batch
+
+        scheduler = SimpleNamespace(
+            scheduler_stage_metrics=None,
+            last_batch=None,
+            grammar_manager=SimpleNamespace(
+                has_waiting_grammars=lambda: True,
+                get_ready_grammar_requests=lambda: [grammar_req],
+            ),
+            _add_request_to_queue=enqueued.append,
+            _get_new_tail_extend_batch=select_tail,
+        )
+        plan = decode_module.SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run(
+            scheduler, object()
+        )
+        self.assertIs(plan.batch_to_run, tail_batch)
+
+
 class StagingPrefetchTailBoundaryTest(CustomTestCase):
     """Staging reservations follow the shortened transfer, including zero."""
 

@@ -3,8 +3,8 @@
 SchedulerReqTimeStats.to_output_time_stats converts perf_counter stamps to
 wall-clock for the tokenizer. A field that was never stamped (0.0) must arrive
 as None, not as a converted value, or "was this stamped?" checks downstream
-fail. Concretely, a PD decode server never stamps prefill_finished_time
-locally; if the sentinel arrived as a real stamp, first-token bookkeeping would
+fail. A PD decode server using only prebuilt batches leaves prefill_finished_time
+unset. If the sentinel arrived as a real stamp, first-token bookkeeping would
 record ~node-uptime-sized garbage TTFT / inter-token-latency samples.
 
 The same "was this stamped?" rule governs the gen_ai.latency.* span attrs: the
@@ -58,6 +58,36 @@ class TestOutputTimeStatsKeepUnsetStamps(CustomTestCase):
         stats = rts.SchedulerReqTimeStats()
         stats.forward_entry_time = 123.456
         self.assertIsNone(stats.to_output_time_stats())
+
+
+class TestDisaggregatedDecodeTiming(CustomTestCase):
+    def test_first_decode_span_starts_at_local_prefill_completion(self):
+        for first_token_boundary in (
+            "set_prefill_finished_time",
+            "set_decode_prebuilt_finish_time",
+        ):
+            with self.subTest(first_token_boundary=first_token_boundary):
+                stats = rts.SchedulerReqTimeStats(
+                    disagg_mode=rts.DisaggregationMode.DECODE
+                )
+                stats.trace_ctx = mock.MagicMock(tracing_enable=True)
+                getattr(stats, first_token_boundary)(ts=1.25)
+
+                with mock.patch.object(stats, "trace_slice") as trace_slice:
+                    stats.set_last_decode_finish_time(ts=1.5)
+                    stats.set_last_decode_finish_time(ts=1.75)
+
+                self.assertEqual(
+                    trace_slice.call_args_list,
+                    [
+                        mock.call(
+                            rts.RequestStage.DECODE_LOOP, 1.25, 1.5, {"decode_ct": 0}
+                        ),
+                        mock.call(
+                            rts.RequestStage.DECODE_LOOP, 1.5, 1.75, {"decode_ct": 1}
+                        ),
+                    ],
+                )
 
 
 class TestOutputMetaInfo(CustomTestCase):
