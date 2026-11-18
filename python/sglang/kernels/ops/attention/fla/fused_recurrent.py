@@ -518,6 +518,21 @@ def fused_recurrent_kda_packed_decode_kernel(
     tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
 
+def _kda_packed_decode_value_tile(initial_state: torch.Tensor) -> int:
+    """V rows each program of the packed KDA decode updates."""
+    # With an FP32 state on SM90 and SM10x, 8-row tiles launch 4x the programs
+    # of BV = 32 and take 8-40% less kernel time on H20 and 1-25% on B300 at
+    # 8-64 heads, batch 1-256. Output and state are bit-identical to BV = 32.
+    # BF16 states keep BV = 32; not measured.
+    if (
+        is_cuda()
+        and initial_state.dtype == torch.float32
+        and torch.cuda.get_device_capability(initial_state.device)[0] in (9, 10)
+    ):
+        return 8
+    return 32
+
+
 def fused_recurrent_kda_packed_decode(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
@@ -677,7 +692,7 @@ def fused_recurrent_kda_packed_decode(
         raise ValueError(
             f"Packed decode kernel only supports NK=1 (got K={K}, BK={BK})."
         )
-    BV = min(triton.next_power_of_2(V), 32)
+    BV = min(triton.next_power_of_2(V), _kda_packed_decode_value_tile(initial_state))
     num_stages = 3
     num_warps = 1
 

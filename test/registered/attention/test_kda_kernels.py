@@ -5,6 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
+import sglang.kernels.ops.attention.fla.fused_recurrent as fused_recurrent
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_kda_packed_decode,
@@ -731,6 +732,44 @@ class TestKDAPackedDecode(unittest.TestCase):
             # Without the safe gate the same inputs reach the row kernel.
             with self.assertRaises(AssertionError):
                 self._run_packed(*inputs, 8, 128, 128)
+
+    @unittest.skipUnless(
+        torch.cuda.is_available()
+        and not torch.version.hip
+        and torch.cuda.get_device_capability()[0] in (9, 10),
+        "8-row value tiles run on SM90 and SM10x only",
+    )
+    def test_fp32_state_value_tile_matches_bv32(self):
+        """SM90 and SM10x decode an FP32 state with 8-row value tiles; output
+        and state must stay bit-identical to the BV = 32 launch."""
+        for B, H, lower_bound in ((1, 8, -5.0), (64, 64, -5.0), (4, 16, None)):
+            with self.subTest(B=B, H=H, lower_bound=lower_bound):
+                inputs = list(
+                    self._make_inputs(B, H, H, 128, 128, B + 4, torch.bfloat16, "cuda")
+                )
+                inputs[5] = inputs[5].float()
+                self.assertEqual(
+                    fused_recurrent._kda_packed_decode_value_tile(inputs[5]), 8
+                )
+                ref_states = inputs[5].clone()
+                with patch.object(
+                    fused_recurrent, "_kda_packed_decode_value_tile", return_value=32
+                ):
+                    ref = self._run_packed(
+                        *inputs[:5],
+                        ref_states,
+                        inputs[6],
+                        H,
+                        128,
+                        128,
+                        lower_bound=lower_bound,
+                    )
+                states = inputs[5].clone()
+                out = self._run_packed(
+                    *inputs[:5], states, inputs[6], H, 128, 128, lower_bound=lower_bound
+                )
+                self.assertTrue(torch.equal(out, ref))
+                self.assertTrue(torch.equal(states, ref_states))
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
