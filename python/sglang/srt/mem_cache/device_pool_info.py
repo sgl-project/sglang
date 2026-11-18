@@ -21,8 +21,7 @@ from sglang.srt.mem_cache.hicache_storage import PoolName
 
 
 def device_capacity_tokens(pool) -> int:
-    """Rows the host pool mirrors: unified views use their configured token cap,
-    other pools their whole buffer."""
+    # Unified views size host storage from their configured token cap, not the buffer.
     if pool.host_capacity_tokens is None:
         return pool.size
     return pool.host_capacity_tokens
@@ -73,8 +72,7 @@ class MambaStateBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
                 )
 
     def checkpoint_bytes_per_slot(self) -> int:
-        """Host bytes one checkpoint slot takes: every layer's conv and temporal
-        state, plus one row of each extra buffer."""
+        # conv and temporal are [layers, slots, ...]; extra buffers are [slots, ...].
         layer_bytes = sum(
             math.prod(buffer.shape[2:]) * buffer.element_size()
             for buffer in (*self.conv, self.temporal)
