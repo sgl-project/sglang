@@ -37,7 +37,7 @@ from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_xpu_ci(est_time=15, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=15, suite="extra-test-1-gpu-xpu")
 
 
 @triton.jit
