@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.environ import envs
 
@@ -60,14 +61,6 @@ def log_mla_gluon_capability(log: logging.Logger | None = None) -> None:
     )
 
 
-def _is_gfx950() -> bool:
-    # mla_gluon asserts this exact arch; is_gfx95_supported() also admits other gfx95x.
-    return (
-        torch.version.hip is not None
-        and torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] == "gfx950"
-    )
-
-
 def mla_gluon_dcp_unsupported_reason(
     *,
     gathered_num_head: int,
@@ -78,15 +71,18 @@ def mla_gluon_dcp_unsupported_reason(
 ) -> str | None:
     """Why aiter's Gluon MLA cannot run a DCP decode or verify here, or None if it can.
 
-    Mirrors mla_gluon's asserts for its bh16 regimes. Its bh64 regime (64 or 128
-    heads) also needs batch % 64 and a long min_kv_seq_len, which DCP cannot promise.
+    Mirrors mla_gluon's asserts for its bh16 regimes as of ROCm/aiter@285579b62
+    (aiter/ops/triton/gluon/mla_gluon.py); update it when aiter relaxes them. Its
+    bh64 regime (64 or 128 heads) also needs batch % 64 and a long min_kv_seq_len,
+    which DCP cannot promise.
     """
     mla_gluon = _gluon_fn()
     if mla_gluon is None:
         return "Gluon MLA is unavailable (see the 'aiter mla gluon' log)"
     if "return_lse" not in inspect.signature(mla_gluon).parameters:
         return "this aiter's mla_gluon cannot return the lse the DCP merge needs"
-    if not _is_gfx950():
+    hip = current_arch().hip
+    if hip is None or hip.gcn_arch != "gfx950":
         return "mla_gluon runs only on gfx950"
     if (kv_lora_rank, qk_rope_head_dim) != (512, 64):
         return (
