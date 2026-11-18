@@ -171,6 +171,7 @@ POSITIONAL_FIELD_ORDER = (
     "crash_dump_folder",
     "enable_metrics",
     "enable_mfu_metrics",
+    "enable_prefix_cache_hit_rate_window",
     "enable_metrics_for_all_schedulers",
     "load_snapshot_publish_interval",
     "tokenizer_metrics_custom_labels_header",
