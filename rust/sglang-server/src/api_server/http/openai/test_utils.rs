@@ -276,6 +276,81 @@ fn answering_app_state_built(
     })
 }
 
+#[tokio::test]
+async fn streaming_choices_are_all_submitted_before_first_output() {
+    for (path, body, count) in [
+        (
+            "/v1/completions",
+            json!({"model":"model", "prompt":"hi", "n":2, "stream":true}),
+            2,
+        ),
+        (
+            "/v1/completions",
+            json!({"model":"model", "prompt":["a","b"], "n":2, "stream":true}),
+            4,
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model":"model", "messages":[{"role":"user","content":"hi"}], "n":2, "stream":true}),
+            2,
+        ),
+    ] {
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let (abort_tx, _abort_rx) = flume::unbounded();
+        let core = CoreHandle::new(
+            intake_tx,
+            abort_tx,
+            crate::api_server::handlers::CoreConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: false,
+                is_disaggregation: false,
+                mm_limits: Default::default(),
+                multimodal: false,
+                peer_endpoints: Vec::new(),
+                metadata: crate::api_server::handlers::CoreMetadata::from(server_args().as_ref()),
+                metrics: None,
+                request_log: None,
+                generate_validator: None,
+                abort_hook: None,
+            },
+        );
+        let mut state = app_state(core);
+        Arc::get_mut(&mut state).unwrap().chat_formatter =
+            Some(sglang_processor::load_chat_formatter(None, None, None, Some("chatml")).unwrap());
+        let app = routes().with_state(state);
+        let response = tokio::spawn(post_json(app, path, body));
+        let mut requests = Vec::new();
+        for _ in 0..count {
+            let next =
+                tokio::time::timeout(std::time::Duration::from_secs(1), intake_rx.recv_async())
+                    .await;
+            if next.is_err() {
+                response.abort();
+                panic!("{path}: later choices were not submitted before first output");
+            }
+            let TmEvent::Intake { request, admission } = next.unwrap().unwrap() else {
+                panic!("unexpected intake")
+            };
+            assert!(admission.try_accept());
+            requests.push(request);
+        }
+        for request in &requests {
+            request
+                .sink
+                .try_send(chunk(request.rid.as_str(), "ok", true))
+                .unwrap();
+        }
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("[DONE]"), "{text}");
+    }
+}
+
 /// Serve one request through the full router (extractors, auth, routing).
 /// `with_state` consumes the state into a `Router<()>`, which is what
 /// implements `tower::Service`.
