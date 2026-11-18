@@ -35,7 +35,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=221, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=306, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=320, suite="extra-a-test-1-gpu-small-amd")
 
 _MAX_NEW_TOKENS = 4
@@ -826,6 +826,43 @@ class TestSamplingMaskPacking(CustomTestCase):
         )
         self.assertEqual(output.next_token_sampling_mask_idx, [None])
         self.assertEqual(output.next_token_sampling_logprobs, [None])
+
+    def test_only_requests_that_return_the_mask_can_overflow(self):
+        # Both rows have five positive weights against a cap of three; only row 0 returns the mask.
+        capture = _SamplingMaskCapture(
+            batch_rows=torch.tensor([0, 1]),
+            weights=torch.full((2, 5), 0.2),
+            token_ids=None,
+            selected_weight=torch.tensor([0.2, 0.2]),
+        )
+
+        sampling_output = self.sampler._build_sampling_mask_output(
+            torch.tensor([0, 1]), capture, support_capture_indices=None
+        )
+
+        output = LogitsProcessorOutput(
+            next_token_logits=None,
+            sampling_mask_output=sampling_output,
+        )
+        SchedulerBatchResultProcessor.materialize_sampling_mask_output(
+            [
+                SimpleNamespace(
+                    return_sampling_mask=returns_mask,
+                    return_sampling_logprobs=True,
+                    sampling_logprobs_mode="selected",
+                )
+                for returns_mask in (True, False)
+            ],
+            output,
+        )
+        self.assertEqual(
+            output.next_token_sampling_mask_status,
+            [SamplingMaskStatus.OVERFLOW, SamplingMaskStatus.OK],
+        )
+        self.assertEqual(len(output.next_token_sampling_mask_idx[1]), 0)
+        self.assertAlmostEqual(
+            float(output.next_token_sampling_logprobs[1][0]), math.log(0.2), places=6
+        )
 
 
 class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):
