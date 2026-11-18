@@ -16,6 +16,8 @@ from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import Mock, patch
 
+from transformers import PretrainedConfig
+
 from sglang.srt.arg_groups import model_override_base as base_module
 from sglang.srt.arg_groups import overrides as overrides_module
 from sglang.srt.arg_groups.arg_utils import A, Arg, resolvable_fields
@@ -136,9 +138,13 @@ class TestBoundaryParallelismResolution(CustomTestCase):
                     enable_prefill_cp=prefill,
                     cp_strategy="interleave" if prefill else None,
                 )
+                hf_config = PretrainedConfig(
+                    architectures=["TestModel"], model_type=model_type
+                )
                 model = SimpleNamespace(
-                    hf_config=SimpleNamespace(architectures=["TestModel"]),
-                    hf_text_config=SimpleNamespace(model_type=model_type),
+                    hf_config=hf_config,
+                    hf_text_config=hf_config,
+                    linear_attn_registry_result=None,
                 )
                 with (
                     patch("sglang.srt.arg_groups.parallel_hook.run_hook"),
@@ -206,6 +212,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "disable_overlap_schedule",
                     "disable_radix_cache",
                     "uses_mamba_radix_cache",
+                    "decode_state_free_radix_default",
                     "mamba_radix_cache_strategy",
                     "mamba_full_memory_ratio",
                     "ple_offload_embedding",
@@ -251,6 +258,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "mm_preprocess_cache_size_mb",
                     "mm_feature_transport",
                     "mm_enable_dp_encoder",
+                    "enable_flashmla_prefill_token_packing",
                 }
             ),
         )
