@@ -15,7 +15,6 @@ from sglang.srt.layers.attention.step5.compressor import compress_index_keys
 from sglang.srt.layers.attention.step5.metadata import (
     Step5IndexerMetadata,
     Step5SelectionWorkspace,
-    allocate_selection_workspace,
 )
 from sglang.srt.layers.attention.step5.norm import Step5RMSNorm
 from sglang.srt.layers.layernorm import LayerNorm
@@ -50,9 +49,7 @@ class Step5Indexer(nn.Module):
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
-        self.hidden_size = hidden_size
         self.index_head_dim = index_head_dim
-        self.provider_rank = tp_rank // (tp_size // index_tp_size)
         self.num_heads = num_index_heads // index_tp_size
         self.weight_scale = self.num_heads**-0.5
         self.sparse_indexer_q = ColumnParallelLinear(
@@ -131,26 +128,18 @@ class Step5Indexer(nn.Module):
             k_bias=self.sparse_indexer_k_norm.bias,
             cache=self.rotary_emb.cos_sin_cache_as(torch.bfloat16),
             positions=positions,
-            q_out=torch.empty(
-                index_q.shape, dtype=index_q.dtype, device=index_q.device
-            ),
-            k_out=torch.empty_like(index_key),
             eps=self.eps,
-            zero_centered=True,
         )
         state = metadata.layer_states[self.layer_id]
         # Read the old ring before publishing this forward's pending inputs.
         compress_index_keys(
-            batch=metadata,
+            metadata=metadata,
             compressed_index_keys=state.compressed_index_keys,
             index_key_ring=state.index_key_ring,
             compression_logits_ring=state.compression_logits_ring,
-            positions=state.index_positions,
+            ring_positions=state.index_positions,
             index_key=index_key,
             compression_logits=compression_logits,
-            assert_success=True,
-            enabled=metadata.compression_enabled,
-            success=metadata.compression_success,
         )
         return _topk_blocks(
             index_q=index_q,
@@ -159,7 +148,6 @@ class Step5Indexer(nn.Module):
             req_to_token=metadata.req_to_token,
             row_to_req=metadata.query_request_slots,
             positions=metadata.query_positions,
-            score_width=metadata.score_width,
             workspace=metadata.selection_workspace,
         )
 
@@ -172,55 +160,35 @@ def _topk_blocks(
     req_to_token: torch.Tensor,
     row_to_req: torch.Tensor,
     positions: torch.Tensor,
-    score_width: int,
-    workspace: Step5SelectionWorkspace | None = None,
+    workspace: Step5SelectionWorkspace,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return packed block IDs, counts and lengths without owning request state.
-
-    Index-key compression precedes this call. Every row sees the same completed
-    compressed_index_keys and causal position as the untiled path. Slicing only query rows
-    keeps request IDs, logical blocks and subsequent prefill groups unchanged.
-    Scratch is reused on the caller's stream; Graph loops depend on shapes only.
-    """
-    if workspace is None:
-        # Standalone kernel callers may allocate their own one-call workspace.
-        workspace = allocate_selection_workspace(
-            rows=index_q.shape[0],
-            score_width=score_width,
-            device=index_q.device,
-            row_to_req=row_to_req,
-            positions=positions,
-        )
     packed, counts, lengths = workspace.packed, workspace.counts, workspace.lengths
-    indexer_logits, ids = workspace.indexer_logits, workspace.ids
     for start, end in workspace.tiles:
-        tile_scores = indexer_logits[: end - start]
+        tile_scores = workspace.indexer_logits[: end - start]
+        tile_ids = workspace.ids[: end - start]
         step5_indexer_decode_logits(
-            index_q[start:end],
-            index_weights[start:end],
+            q=index_q[start:end],
+            weights=index_weights[start:end],
             compressed_index_keys=compressed_index_keys,
             req_to_token=req_to_token,
             row_to_req=row_to_req[start:end],
             positions=positions[start:end],
             out=tile_scores,
-            clear_future=True,
         )
         if workspace.use_deepselect:
             step5_topk_blocks_deepselect(
                 tile_scores,
-                positions[start:end],
-                row_to_req[start:end],
-                packed[start:end],
-                counts[start:end],
-                req_to_token=req_to_token,
-                causal_lengths=lengths[start:end],
+                positions=positions[start:end],
+                row_to_req=row_to_req[start:end],
                 history_lengths=workspace.topk_lengths[start:end],
+                req_to_token=req_to_token,
                 topk_ids=workspace.topk_ids[: end - start],
-                block_indices=ids[: end - start],
-                history_ready=workspace.topk_lengths_ready,
+                block_indices=tile_ids,
+                counts=counts[start:end],
+                packed=packed[start:end],
+                causal_lengths=lengths[start:end],
             )
         else:
-            tile_ids = ids[: end - start]
             step5_topk_blocks(
                 tile_scores,
                 positions=positions[start:end],

@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Step5 index normalization, compression, scoring and block selection."""
 
-import dataclasses
-import math
-
 import torch
 import triton
 import triton.language as tl
@@ -71,31 +68,6 @@ def _indexer_norm_rope(
         tl.store(KOut + token * 256 + channel, result, real_row)
 
 
-def _check_tensor(value, *, shape, dtype, device, name, contiguous=True):
-    if (
-        value.layout != torch.strided
-        or tuple(value.shape) != shape
-        or value.dtype != dtype
-        or value.device != device
-        or (contiguous and not value.is_contiguous())
-    ):
-        raise ValueError(f"Step5 indexer {name} requires {shape}/{dtype} on {device}")
-
-
-def _overlaps(a, b):
-    # Check addressed intervals, allowing disjoint views of a caller workspace.
-    if not a.numel() or not b.numel():
-        return False
-
-    def interval(t):
-        end = sum((n - 1) * s for n, s in zip(t.shape, t.stride())) + 1
-        return t.data_ptr(), t.data_ptr() + end * t.element_size()
-
-    a0, a1 = interval(a)
-    b0, b1 = interval(b)
-    return max(a0, b0) < min(a1, b1)
-
-
 def step5_indexer_norm_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -105,89 +77,20 @@ def step5_indexer_norm_rope(
     k_bias: torch.Tensor,
     cache: torch.Tensor,
     positions: torch.Tensor,
-    q_out: torch.Tensor,
-    k_out: torch.Tensor,
     eps: float,
-    zero_centered: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Normalize Q/K then rotate channels 0..31; outputs are caller-owned.
+    """Zero-centered RMSNorm on index Q, LayerNorm on index K, then RoPE on dims 0-31.
 
-    Q[T,H,256] and K[T,1,256] may have padded row strides; other tensors must
-    be contiguous. H is 2 or 4. Parameters/cache are BF16, statistics are FP32,
-    normalized Q/K round to BF16 before FP32 rotation and BF16 output.
-    Positions[T] must lie in [0, cache.shape[0]); the serving owner validates
-    this bound. Inputs must be finite and output storage disjoint from inputs.
-    Warm up before Graph capture. No allocation or host tensor-value reads.
+    Q is BF16 [T, 2 or 4, 256] and K is BF16 [T, 1, 256]; rows may be padded.
     """
-    if q.device.type != "cuda" or torch.version.hip is not None:
-        raise ValueError("Step5 indexer requires NVIDIA CUDA")
-    if q.ndim != 3 or q.shape[1] not in (2, 4) or q.shape[2] != 256:
-        raise ValueError("Step5 index Q requires [tokens, 2 or 4, 256]")
-    if not math.isfinite(eps) or eps <= 0 or not isinstance(zero_centered, bool):
-        raise ValueError(
-            "Step5 indexer requires positive finite eps and bool zero_centered"
-        )
+    assert q.ndim == 3 and q.shape[1] in (2, 4) and q.shape[2] == 256
     tokens, heads, _ = q.shape
-    for name, value, shape in (
-        ("q", q, (tokens, heads, 256)),
-        ("k", k, (tokens, 1, 256)),
-    ):
-        _check_tensor(
-            value,
-            shape=shape,
-            dtype=torch.bfloat16,
-            device=q.device,
-            name=name,
-            contiguous=False,
-        )
-        if (
-            value.stride(2) != 1
-            or value.stride(1) != 256
-            or value.stride(0) < shape[1] * 256
-        ):
-            raise ValueError(
-                "Step5 indexer requires contiguous heads and nonoverlapping rows"
-            )
-    for name, value in (
-        ("q_weight", q_weight),
-        ("k_weight", k_weight),
-        ("k_bias", k_bias),
-    ):
-        _check_tensor(
-            value, shape=(256,), dtype=torch.bfloat16, device=q.device, name=name
-        )
-    if cache.ndim != 2 or cache.shape[1] != 32 or cache.shape[0] < 1:
-        raise ValueError("Step5 indexer cache requires [positions, 32]")
-    _check_tensor(
-        cache,
-        shape=tuple(cache.shape),
-        dtype=torch.bfloat16,
-        device=q.device,
-        name="cache",
-    )
-    if positions.dtype not in (torch.int32, torch.int64):
-        raise ValueError("Step5 indexer positions must be int32 or int64")
-    _check_tensor(
-        positions,
-        shape=(tokens,),
-        dtype=positions.dtype,
-        device=q.device,
-        name="positions",
-    )
-    for name, out, shape in (
-        ("q_out", q_out, tuple(q.shape)),
-        ("k_out", k_out, tuple(k.shape)),
-    ):
-        _check_tensor(
-            out, shape=shape, dtype=torch.bfloat16, device=q.device, name=name
-        )
-        if any(
-            _overlaps(out, x)
-            for x in (q, k, q_weight, k_weight, k_bias, cache, positions)
-        ):
-            raise ValueError("Step5 indexer outputs must not alias inputs")
-    if _overlaps(q_out, k_out):
-        raise ValueError("Step5 indexer outputs must not alias each other")
+    assert k.shape == (tokens, 1, 256)
+    assert q.dtype == torch.bfloat16 and k.dtype == torch.bfloat16
+    assert q.stride(1) == 256 and q.stride(2) == 1 and k.stride(2) == 1
+    assert cache.shape[1] == 32 and cache.is_contiguous()
+    q_out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+    k_out = torch.empty(k.shape, dtype=torch.bfloat16, device=k.device)
     if tokens:
         _indexer_norm_rope[(tokens, heads + 1)](
             q,
@@ -204,7 +107,7 @@ def step5_indexer_norm_rope(
             k.stride(0),
             heads,
             eps,
-            int(zero_centered),
+            1,
             num_warps=4,
             enable_fp_fusion=False,
         )
@@ -234,9 +137,6 @@ def _build_request_metadata(
     Live,
     Mapping,
     Uses,
-    NativePositions,
-    SeqLens,
-    OutLoc,
     SafeSlots,
     Starts,
     Sources,
@@ -247,8 +147,6 @@ def _build_request_metadata(
     Writes,
     QuerySlots,
     QueryPositions,
-    QueryCount,
-    NativeValid,
     ROWS: tl.constexpr,
     CAP: tl.constexpr,
     TOKENS: tl.constexpr,
@@ -257,7 +155,6 @@ def _build_request_metadata(
     PHYSICAL_LIMIT: tl.constexpr,
     CONTEXT: tl.constexpr,
     WIDTH: tl.constexpr,
-    NATIVE: tl.constexpr,
     QBLOCK: tl.constexpr,
     RBLOCK: tl.constexpr,
     BLOCKS: tl.constexpr,
@@ -279,9 +176,8 @@ def _build_request_metadata(
         & (current >= 64)
         & (current < PHYSICAL_LIMIT)
     )
-    # Validate each completed R8 group once, rather than loading its eight
-    # physical mappings for every query. Current-token mappings above remain
-    # per query: native FULL pages need not be physically adjacent.
+    # Validate each completed R8 group once; current-token mappings above stay
+    # per query because native FULL pages need not be physically adjacent.
     block_idx = tl.arange(0, RBLOCK)
     closing_depth = 7 - (base % 8 + 8) % 8 + block_idx * 8
     closing_pos = tl.minimum(
@@ -315,11 +211,9 @@ def _build_request_metadata(
     tl.store(Admitted + row, admitted)
     if row == 0:
         tl.store(CountValid, count_ok)
-        tl.store(QueryCount, live * WIDTH)
 
-    # Store destinations directly in [completed-block, request] order.
-    # A trailing, incomplete block is never consumed; match the last query's
-    # mapping there so every output cell is deterministic across graph replays.
+    # Destinations are stored in [completed-block, request] order. An incomplete
+    # block is never consumed but still gets a deterministic value for graph replay.
     tl.store(
         Writes + block_idx * ROWS + row,
         (first - (first % 8 + 8) % 8) // 8,
@@ -329,136 +223,74 @@ def _build_request_metadata(
     query_pos = safe_pos
     tl.store(QueryPositions + row * WIDTH + depth, query_pos, depth < WIDTH)
     tl.store(QuerySlots + row * WIDTH + depth, tl.where(active, raw, 0), depth < WIDTH)
-    native_ok = True
-    if NATIVE:
-        native_pos = tl.load(
-            NativePositions + row * WIDTH + depth, depth < WIDTH, other=0
-        )
-        out = tl.load(OutLoc + row * WIDTH + depth, depth < WIDTH, other=0)
-        seq = tl.load(SeqLens + row).to(tl.int64)
-        length_ok = (base == seq - 1) & (base < CONTEXT)
-        native_ok = ~active | (
-            length_ok
-            & tl.min(
-                tl.where(
-                    depth < WIDTH, (native_pos == query_pos) & (out == current), True
-                ).to(tl.int32),
-                0,
-            )
-        )
-    tl.store(NativeValid + row, native_ok)
 
 
 def build_compression_metadata(
     *,
-    request_slots,
-    positions,
-    valid_rows,
-    req_to_token,
-    compressed_index_key_pages,
-    native_positions=None,
-    seq_lens=None,
-    out_cache_loc=None,
-    context_len=None,
-):
-    """Build decode request admission, query layout and final block write addresses.
+    request_slots: torch.Tensor,
+    positions: torch.Tensor,
+    valid_rows: torch.Tensor,
+    req_to_token: torch.Tensor,
+    compressed_index_key_pages: int,
+    context_len: int,
+) -> tuple[dict, torch.Tensor, torch.Tensor]:
+    """Build the decode compression plan (one input token per request).
 
-    ``positions`` names current-token positions. Native input validation is
-    folded into mapping loads when the backend supplies positions/lengths/write
-    locations. No CPU reads of dynamic values or mapping dtype conversions occur here.
+    Returns the plan fields plus int32 per-query request slots and positions.
     """
-    token_width = 1
     device = req_to_token.device
     rows = request_slots.numel()
-    if (
-        device.type != "cuda"
-        or req_to_token.ndim != 2
-        or req_to_token.dtype not in (torch.int32, torch.int64)
-        or req_to_token.shape[0] < 1
-        or req_to_token.shape[1] < 8
-        or compressed_index_key_pages < 2
-    ):
-        raise ValueError("CSA requires native CUDA request/FULL mapping")
-    native = native_positions is not None
-    values = [(request_slots, (rows,)), (positions, (rows,)), (valid_rows, (1,))]
-    if native:
-        values += [
-            (native_positions, (rows * token_width,)),
-            (seq_lens, (rows,)),
-            (out_cache_loc, (rows * token_width,)),
-        ]
-    for value, shape in values:
-        if (
-            value is None
-            or value.device != device
-            or value.shape != shape
-            or value.dtype not in (torch.int32, torch.int64)
-            or not value.is_contiguous()
-        ):
-            raise ValueError("CSA requires contiguous device integer metadata")
-
-    def alloc(shape, dtype):
-        return torch.empty(shape, dtype=dtype, device=device)
-
+    num_slots, token_capacity = req_to_token.shape
+    token_width = 1
     num_blocks = (7 + token_width) // 8
     result = dict(
-        request_slots=alloc(rows, torch.int64),
-        input_start_positions=alloc(rows, torch.int64),
-        input_start_rows=alloc(rows, torch.int64),
-        input_lengths=alloc(rows, torch.int64),
-        request_active=alloc(rows, torch.bool),
-        request_mapping_valid=alloc(rows, torch.bool),
-        request_count_valid=alloc(1, torch.bool),
-        compressed_key_write_indices=alloc((num_blocks, rows), torch.int64),
+        request_slots=torch.empty(rows, dtype=torch.int64, device=device),
+        input_start_positions=torch.empty(rows, dtype=torch.int64, device=device),
+        input_start_rows=torch.empty(rows, dtype=torch.int64, device=device),
+        input_lengths=torch.empty(rows, dtype=torch.int64, device=device),
+        request_active=torch.empty(rows, dtype=torch.bool, device=device),
+        request_mapping_valid=torch.empty(rows, dtype=torch.bool, device=device),
+        request_count_valid=torch.empty(1, dtype=torch.bool, device=device),
+        compressed_key_write_indices=torch.empty(
+            (num_blocks, rows), dtype=torch.int64, device=device
+        ),
         num_input_tokens=rows * token_width,
     )
-    query_slots = alloc(rows * token_width, torch.int32)
-    query_positions = alloc(rows * token_width, torch.int32)
-    query_count = alloc(1, torch.int32)
-    native_valid = alloc(rows, torch.bool)
-    uses = torch.zeros(req_to_token.shape[0], dtype=torch.int32, device=device)
-    if rows:
-        _count_request_owners[(triton.cdiv(rows, 128),)](
-            request_slots, valid_rows, uses, rows, req_to_token.shape[0], 128
-        )
-        _build_request_metadata[(rows,)](
-            request_slots,
-            positions,
-            valid_rows,
-            req_to_token,
-            uses,
-            native_positions if native else positions,
-            seq_lens if native else positions,
-            out_cache_loc if native else positions,
-            result["request_slots"],
-            result["input_start_positions"],
-            result["input_start_rows"],
-            result["input_lengths"],
-            result["request_active"],
-            result["request_mapping_valid"],
-            result["request_count_valid"],
-            result["compressed_key_write_indices"],
-            query_slots,
-            query_positions,
-            query_count,
-            native_valid,
-            rows,
-            req_to_token.shape[0],
-            req_to_token.shape[1],
-            *req_to_token.stride(),
-            compressed_index_key_pages * 64,
-            context_len or req_to_token.shape[1],
-            token_width,
-            native,
-            triton.next_power_of_2(token_width),
-            triton.next_power_of_2(num_blocks),
-            num_blocks,
-            num_warps=4,
-        )
-    else:
-        result["request_count_valid"].copy_((valid_rows == 0))
-        query_count.zero_()
-    return result, query_slots, query_positions, query_count, native_valid
+    query_slots = torch.empty(rows * token_width, dtype=torch.int32, device=device)
+    query_positions = torch.empty(rows * token_width, dtype=torch.int32, device=device)
+    uses = torch.zeros(num_slots, dtype=torch.int32, device=device)
+    _count_request_owners[(triton.cdiv(rows, 128),)](
+        request_slots, valid_rows, uses, rows, num_slots, 128
+    )
+    _build_request_metadata[(rows,)](
+        request_slots,
+        positions,
+        valid_rows,
+        req_to_token,
+        uses,
+        result["request_slots"],
+        result["input_start_positions"],
+        result["input_start_rows"],
+        result["input_lengths"],
+        result["request_active"],
+        result["request_mapping_valid"],
+        result["request_count_valid"],
+        result["compressed_key_write_indices"],
+        query_slots,
+        query_positions,
+        rows,
+        num_slots,
+        token_capacity,
+        *req_to_token.stride(),
+        compressed_index_key_pages * 64,
+        context_len,
+        token_width,
+        triton.next_power_of_2(token_width),
+        triton.next_power_of_2(num_blocks),
+        num_blocks,
+        num_warps=4,
+    )
+    return result, query_slots, query_positions
 
 
 @triton.jit
@@ -606,9 +438,8 @@ def _compress(
 ):
     block_offset, row = tl.program_id(0), tl.program_id(1)
     if ADMIT:
-        # Exactly one CTA per request: admission and compression share its
-        # register result. Multi-block prefill admits and writes in
-        # separate launches instead of racing/repeating them per block.
+        # Single-block launches admit in the same CTA; multi-block prefill admits
+        # in a separate launch instead of repeating admission per block.
         ok = _admit_row(
             row,
             slots,
@@ -762,113 +593,89 @@ def _write(
     )
 
 
-@dataclasses.dataclass(frozen=True)
-class AppendRingPlan:
-    """Execution plan for one batched append: one row per request span."""
-
-    slots: torch.Tensor
-    bases: torch.Tensor
-    sources: torch.Tensor
-    lengths: torch.Tensor
-    active: torch.Tensor
-    admitted: torch.Tensor
-    count_valid: torch.Tensor
-    physical_blocks: torch.Tensor
-    max_blocks: int
-    enabled: torch.Tensor
-    success: torch.Tensor
-
-
 def append_ring(
     *,
-    plan: AppendRingPlan,
-    index_key,
-    compression_logits,
-    index_key_ring,
-    compression_logits_ring,
-    positions,
-    compressed_index_keys,
-    assert_success=False,
-):
-    slots, bases, sources, lengths = (
-        plan.slots,
-        plan.bases,
-        plan.sources,
-        plan.lengths,
-    )
-    active, admitted, count_valid = plan.active, plan.admitted, plan.count_valid
-    physical_blocks, max_blocks = plan.physical_blocks, plan.max_blocks
-    enabled, success = plan.enabled, plan.success
-    """Read history/current inputs before overwriting ring cells.
-
-    The native page64 prefix cache resumes fresh requests at an R8 boundary;
-    later chunks/verify read only [floor(base/8)*8, base). With C >= 7 + W,
-    a candidate at p <= base + W - 1 overwrites p-C < floor(base/8)*8.
-    Thus any legal accepted prefix retains every historical input it can need.
-    Slot reuse is ordered by the scheduler's forward stream / WAR barrier;
-    position tags diagnose missing inputs, not a second request identity.
-    """
+    slots: torch.Tensor,
+    bases: torch.Tensor,
+    sources: torch.Tensor,
+    lengths: torch.Tensor,
+    active: torch.Tensor,
+    admitted: torch.Tensor,
+    count_valid: torch.Tensor,
+    physical_blocks: torch.Tensor,
+    enabled: torch.Tensor,
+    success: torch.Tensor,
+    index_key: torch.Tensor,
+    compression_logits: torch.Tensor,
+    index_key_ring: torch.Tensor,
+    compression_logits_ring: torch.Tensor,
+    ring_positions: torch.Tensor,
+    compressed_index_keys: torch.Tensor,
+) -> None:
+    """Compress completed R8 blocks into the SW128 FP8 index-key pages, then keep
+    each request's newest K/Z inputs in its ring for the next forward."""
+    assert index_key.is_contiguous() and compression_logits.stride(-1) == 1
     rows = slots.numel()
+    max_blocks = physical_blocks.shape[0]
     capacity = index_key_ring.shape[1]
-    if rows:
-        if max_blocks != 1:
-            _admit[(rows,)](
-                slots,
-                bases,
-                active,
-                admitted,
-                count_valid,
-                positions,
-                enabled,
-                success,
-                capacity,
-                assert_success,
-                debug=True,
-            )
-        if max_blocks:
-            _compress[(max_blocks, rows)](
-                index_key,
-                compression_logits,
-                slots,
-                bases,
-                sources,
-                lengths,
-                physical_blocks,
-                enabled,
-                index_key_ring,
-                compression_logits_ring,
-                compressed_index_keys,
-                active,
-                admitted,
-                count_valid,
-                positions,
-                success,
-                max_blocks == 1,
-                assert_success,
-                capacity,
-                rows,
-                compression_logits.stride(0),
-                num_warps=8,
-                enable_fp_fusion=True,
-                debug=True,
-            )
-        _write[(rows,)](
+    # Ring history is read by _compress before _write overwrites it.
+    if max_blocks != 1:
+        _admit[(rows,)](
+            slots,
+            bases,
+            active,
+            admitted,
+            count_valid,
+            ring_positions,
+            enabled,
+            success,
+            capacity,
+            True,
+            debug=True,
+        )
+    if max_blocks:
+        _compress[(max_blocks, rows)](
             index_key,
             compression_logits,
             slots,
             bases,
             sources,
             lengths,
+            physical_blocks,
             enabled,
             index_key_ring,
             compression_logits_ring,
-            positions,
+            compressed_index_keys,
+            active,
+            admitted,
+            count_valid,
+            ring_positions,
+            success,
+            max_blocks == 1,
+            True,
             capacity,
-            triton.next_power_of_2(capacity),
+            rows,
             compression_logits.stride(0),
             num_warps=8,
+            enable_fp_fusion=True,
+            debug=True,
         )
-    return success
+    _write[(rows,)](
+        index_key,
+        compression_logits,
+        slots,
+        bases,
+        sources,
+        lengths,
+        enabled,
+        index_key_ring,
+        compression_logits_ring,
+        ring_positions,
+        capacity,
+        triton.next_power_of_2(capacity),
+        compression_logits.stride(0),
+        num_warps=8,
+    )
 
 
 # Indexer logits.
@@ -891,7 +698,6 @@ def _score_blocks(
     BLOCKS,
     BLOCK_R: tl.constexpr,
     GRID_TILES: tl.constexpr,
-    CLEAR_FUTURE: tl.constexpr,
     WEIGHT_SCALE: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
@@ -911,17 +717,7 @@ def _score_blocks(
         )
         * WEIGHT_SCALE
     )
-    # A 1M graph capture has 4096 capacity tiles while a 60K request has about
-    # 235 live tiles. The SM10x selector consumes positions directly, so its
-    # path can stop at live history. The portable FlashInfer fallback still
-    # overwrites future tiles to make a full-width top-k replay safe.
     last_tile = tl.cdiv(BLOCKS, BLOCK_R)
-    if not CLEAR_FUTURE:
-        live_blocks = tl.maximum(position // 8, 0)
-        last_tile = tl.minimum(tl.cdiv(live_blocks, BLOCK_R), last_tile)
-        # Selecting every historical block does not consume indexer_logits.
-        last_tile = tl.where(live_blocks <= 512, 0, last_tile)
-        last_tile = tl.where(request > 0, last_tile, 0)
     for tile in range(first_tile, last_tile, GRID_TILES):
         num_blocks = tile * BLOCK_R + tl.arange(0, BLOCK_R)
         if (request > 0) & (tile * BLOCK_R < position // 8):
@@ -951,54 +747,6 @@ def _score_blocks(
         tl.store(Out + row * BLOCKS + num_blocks, score, num_blocks < BLOCKS)
 
 
-def _launch_triton_scores(
-    q,
-    weights,
-    compressed_index_keys,
-    req_to_token,
-    row_to_req,
-    positions,
-    out,
-    *,
-    clear_future,
-    weight_scale=1.0,
-):
-    # D256 gathers already consume substantial registers. A 32-block tile
-    # reduces that pressure and gives small batches more independent CTAs.
-    blocks_per_tile = 32
-    grid_tiles = min(triton.cdiv(out.shape[1], blocks_per_tile), 128)
-    _score_blocks[(q.shape[0], grid_tiles)](
-        q,
-        weights,
-        compressed_index_keys,
-        req_to_token,
-        row_to_req,
-        positions,
-        out,
-        q.shape[1],
-        req_to_token.stride(0),
-        out.shape[1],
-        blocks_per_tile,
-        grid_tiles,
-        clear_future,
-        weight_scale,
-        num_warps=4,
-    )
-
-
-def _check(value, *, shape, dtype, device, name):
-    if (
-        value.layout != torch.strided
-        or tuple(value.shape) != shape
-        or value.dtype != dtype
-        or value.device != device
-        or not value.is_contiguous()
-    ):
-        raise ValueError(
-            f"Step5 scoring {name} requires contiguous {shape}/{dtype} on {device}"
-        )
-
-
 def step5_indexer_decode_logits(
     q: torch.Tensor,
     weights: torch.Tensor,
@@ -1008,110 +756,39 @@ def step5_indexer_decode_logits(
     row_to_req: torch.Tensor,
     positions: torch.Tensor,
     out: torch.Tensor,
-    clear_future: bool = True,
-) -> torch.Tensor:
-    """Score completed historical blocks for flattened ragged query rows.
+) -> None:
+    """Score each query row against its completed history blocks into FP32 ``out``.
 
-    Q is BF16 or prequantized unscaled E4M3. FP32 weights are already scaled by the
-    index head count (``weight_scale=1``). BF16 weights are the unscaled GEMM
-    output and use ``weight_scale=0.5`` (exact: ``4**-0.5``). CompressedIndexKeys is
-    the existing SW128 byte backing.
-    Request slot zero is padding. Valid slots/positions and compressed_index_keys
-    publication are the backend's responsibility. Each valid req_to_token entry
-    at logical offset 8*r must be an aligned physical start of a complete block.
-    Native 64-token pages retain their contiguous logical offsets.
-    Output width must cover all positions//8, including Graph replay inputs.
-    With ``clear_future=True``, invalid/future output columns are always -inf.
-    The SM10x live-length selector may set it false because it never reads those
-    columns. Inputs are immutable; output must not share storage with them.
-    Warm up before Graph capture.
+    Q is BF16 [T, 2 or 4, 256] and weights are FP32 [T, heads], already scaled;
+    future and padding columns of ``out`` are written as -inf.
     """
-    if q.device.type != "cuda" or torch.version.hip is not None:
-        raise ValueError("Step5 scoring requires NVIDIA CUDA")
-    if type(clear_future) is not bool:
-        raise ValueError("Step5 scoring clear_future must be a bool")
-    if q.ndim != 3 or q.shape[1] not in (2, 4) or q.shape[2] != 256:
-        raise ValueError("Step5 scoring Q requires [tokens, 2 or 4, 256]")
+    assert q.ndim == 3 and q.shape[1] in (2, 4) and q.shape[2] == 256
     tokens, heads, _ = q.shape
-    if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
-        raise ValueError("Step5 scoring Q must be BF16 or E4M3")
-    _check(q, shape=tuple(q.shape), dtype=q.dtype, device=q.device, name="q")
-    if weights.dtype not in (torch.bfloat16, torch.float32):
-        raise ValueError("Step5 scoring weights must be BF16 or FP32")
-    weight_scale = 0.5 if weights.dtype == torch.bfloat16 else 1.0
-    _check(
+    assert q.is_contiguous() and weights.is_contiguous()
+    assert weights.shape == (tokens, heads) and weights.dtype == torch.float32
+    assert compressed_index_keys.shape[1:] == (8, 1, 256)
+    assert compressed_index_keys.dtype == torch.uint8
+    assert out.shape[0] == tokens and out.dtype == torch.float32
+    assert out.is_contiguous()
+    # D256 gathers are register-heavy; 32-block tiles also give small batches more CTAs.
+    blocks_per_tile = 32
+    grid_tiles = min(triton.cdiv(out.shape[1], blocks_per_tile), 128)
+    _score_blocks[(tokens, grid_tiles)](
+        q.to(torch.float8_e4m3fn),
         weights,
-        shape=(tokens, heads),
-        dtype=weights.dtype,
-        device=q.device,
-        name="weights",
-    )
-    if (
-        compressed_index_keys.ndim != 4
-        or compressed_index_keys.shape[1:] != (8, 1, 256)
-        or compressed_index_keys.shape[0] < 1
-    ):
-        raise ValueError(
-            "Step5 compressed_index_keys requires SW128 [pages, 8, 1, 256]"
-        )
-    _check(
         compressed_index_keys,
-        shape=tuple(compressed_index_keys.shape),
-        dtype=torch.uint8,
-        device=q.device,
-        name="compressed_index_keys",
-    )
-    if req_to_token.ndim != 2 or req_to_token.shape[0] < 1:
-        raise ValueError("Step5 request map requires [request slots, token capacity]")
-    for name, value, shape in (
-        ("req_to_token", req_to_token, tuple(req_to_token.shape)),
-        ("row_to_req", row_to_req, (tokens,)),
-        ("positions", positions, (tokens,)),
-    ):
-        if value.dtype not in (torch.int32, torch.int64):
-            raise ValueError(f"Step5 scoring {name} must be int32 or int64")
-        _check(value, shape=shape, dtype=value.dtype, device=q.device, name=name)
-    if (
-        out.ndim != 2
-        or not 1 <= out.shape[1] < 2**31
-        or out.shape[1] > (req_to_token.shape[1] // 8 + 255) // 256 * 256
-    ):
-        raise ValueError(
-            "Step5 score width must fit native request capacity and int32 indexing"
-        )
-    _check(
+        req_to_token,
+        row_to_req,
+        positions,
         out,
-        shape=(tokens, out.shape[1]),
-        dtype=torch.float32,
-        device=q.device,
-        name="out",
+        heads,
+        req_to_token.stride(0),
+        out.shape[1],
+        blocks_per_tile,
+        grid_tiles,
+        1.0,
+        num_warps=4,
     )
-    if out.numel():
-        a, b = out.data_ptr(), out.data_ptr() + out.numel() * out.element_size()
-        for value in (
-            q,
-            weights,
-            compressed_index_keys,
-            req_to_token,
-            row_to_req,
-            positions,
-        ):
-            lo = value.data_ptr()
-            if max(a, lo) < min(b, lo + value.numel() * value.element_size()):
-                raise ValueError("Step5 scoring output must not alias inputs")
-    if tokens:
-        _launch_triton_scores(
-            q.to(torch.float8_e4m3fn),
-            weights,
-            compressed_index_keys,
-            req_to_token,
-            row_to_req,
-            positions,
-            out,
-            clear_future=clear_future,
-            weight_scale=weight_scale,
-        )
-    return out
 
 
 # Block top-k and packed attention addresses.
@@ -1125,11 +802,6 @@ def _canonicalize_zero(Scores, Out, N: tl.constexpr, BLOCK: tl.constexpr):
     # bits, including subnormals, so numerical ties prefer the smaller block ID.
     bits = tl.where((bits & 0x7FFFFFFF) == 0, 0, bits)
     tl.store(Out + offset, bits.to(tl.float32, bitcast=True), offset < N)
-
-
-def canonicalize_zero(scores, out):
-    size = scores.numel()
-    _canonicalize_zero[(triton.cdiv(size, 1024),)](scores, out, size, 1024, num_warps=4)
 
 
 @triton.jit
@@ -1193,22 +865,23 @@ def _pack_blocks(
 
 
 def _launch_block_pack(
+    *,
     indices,
     positions,
-    requests,
-    out,
+    row_to_req,
+    block_indices,
     counts,
-    *,
     selected_k,
     req_to_token=None,
     packed=None,
     causal_lengths=None,
 ):
-    _pack_blocks[(out.shape[0],)](
+    rows = block_indices.shape[0]
+    _pack_blocks[(rows,)](
         indices,
         positions,
-        requests,
-        out,
+        row_to_req,
+        block_indices,
         counts,
         req_to_token,
         packed,
@@ -1216,21 +889,13 @@ def _launch_block_pack(
         selected_k,
         req_to_token.stride(0) if packed is not None else 0,
         packed.shape[1] if packed is not None else 0,
-        num_warps=1 if packed is not None and out.shape[0] >= 512 else 4,
+        num_warps=1 if packed is not None and rows >= 512 else 4,
     )
 
 
 STEP5_HISTORY_BLOCKS = 512
 # Preserve the score workspace layout while sharing the public top-k kernel.
 _SCORE_STRIDE_ALIGNMENT = 256
-
-
-@triton.jit
-def _prepare_history_lengths(Positions, Requests, Lengths, ROWS: tl.constexpr):
-    row = tl.program_id(0) * 128 + tl.arange(0, 128)
-    position = tl.load(Positions + row, row < ROWS, other=0)
-    request = tl.load(Requests + row, row < ROWS, other=0)
-    tl.store(Lengths + row, tl.where(request > 0, position // 8, 0), row < ROWS)
 
 
 def can_use_step5_topk_deepselect(device: torch.device) -> bool:
@@ -1248,22 +913,21 @@ def deepselect_score_width(score_width: int) -> int:
 
 def step5_topk_blocks_deepselect(
     scores: torch.Tensor,
+    *,
     positions: torch.Tensor,
     row_to_req: torch.Tensor,
-    packed: torch.Tensor,
-    counts: torch.Tensor,
-    *,
-    req_to_token: torch.Tensor,
-    causal_lengths: torch.Tensor,
     history_lengths: torch.Tensor,
+    req_to_token: torch.Tensor,
     topk_ids: torch.Tensor,
     block_indices: torch.Tensor,
-    history_ready: bool = False,
+    counts: torch.Tensor,
+    packed: torch.Tensor,
+    causal_lengths: torch.Tensor,
 ) -> None:
-    if not history_ready:
-        _prepare_history_lengths[(triton.cdiv(positions.numel(), 128),)](
-            positions, row_to_req, history_lengths, positions.numel(), num_warps=4
-        )
+    """SM10x ``step5_topk_blocks`` that also writes the packed attention addresses.
+
+    ``history_lengths`` is int32 positions // 8 per row, zero for padding rows.
+    """
     topk(
         scores,
         STEP5_HISTORY_BLOCKS,
@@ -1272,11 +936,11 @@ def step5_topk_blocks_deepselect(
         idx_oob_fill_value=-1,
     )
     _launch_block_pack(
-        topk_ids,
-        positions,
-        row_to_req,
-        block_indices,
-        counts,
+        indices=topk_ids,
+        positions=positions,
+        row_to_req=row_to_req,
+        block_indices=block_indices,
+        counts=counts,
         selected_k=STEP5_HISTORY_BLOCKS,
         req_to_token=req_to_token,
         packed=packed,
@@ -1291,60 +955,17 @@ def step5_topk_blocks(
     row_to_req: torch.Tensor,
     block_indices: torch.Tensor,
     counts: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Select <=512 historical blocks, sort IDs, then append current exactly once.
+) -> None:
+    """Select up to 512 history blocks per row, sorted, then append the current block.
 
-    Inputs follow step5_indexer_decode_logits: finite history and -inf future scores.
-    Width covers positions//8. Slot zero is padding. Output IDs are logical,
-    ascending, int32 [T,513], padded with -1; counts are int32 [T]. Caller must
-    keep outputs disjoint from inputs and each other. Warm FlashInfer outside
-    capture and use its shared device scratch on the sequential forward stream.
+    ``block_indices`` is int32 [T, 513] of logical block IDs padded with -1;
+    ``counts`` is int32 [T] and includes the current block.
     """
-    if scores.device.type != "cuda" or torch.version.hip is not None:
-        raise ValueError("Step5 selection requires NVIDIA CUDA")
-    if (
-        scores.ndim != 2
-        or scores.dtype != torch.float32
-        or not scores.is_contiguous()
-        or not 1 <= scores.shape[1] < 2**31
-    ):
-        raise ValueError(
-            "Step5 selection requires contiguous FP32 scores [T,R], 1<=R<2**31"
-        )
+    assert scores.ndim == 2 and scores.dtype == torch.float32
+    assert scores.is_contiguous()
     rows, width = scores.shape
-    for name, value, shape in (
-        ("positions", positions, (rows,)),
-        ("row_to_req", row_to_req, (rows,)),
-        ("block_indices", block_indices, (rows, 513)),
-        ("counts", counts, (rows,)),
-    ):
-        dtype_ok = (
-            value.dtype in (torch.int32, torch.int64)
-            if name in ("positions", "row_to_req")
-            else value.dtype == torch.int32
-        )
-        if (
-            value.device != scores.device
-            or value.layout != torch.strided
-            or tuple(value.shape) != shape
-            or not value.is_contiguous()
-            or not dtype_ok
-        ):
-            raise ValueError(f"Step5 selection invalid {name} metadata")
-    if rows == 0:
-        return block_indices, counts
-    for out, others in (
-        (block_indices, (scores, positions, row_to_req, counts)),
-        (counts, (scores, positions, row_to_req)),
-    ):
-        a = out.data_ptr()
-        b = a + out.numel() * out.element_size()
-        for value in others:
-            lo = value.data_ptr()
-            if max(a, lo) < min(b, lo + value.numel() * value.element_size()):
-                raise ValueError(
-                    "Step5 selection outputs must not alias inputs or each other"
-                )
+    assert block_indices.shape == (rows, 513) and block_indices.dtype == torch.int32
+    assert counts.shape == (rows,) and counts.dtype == torch.int32
     selected_k = 0
     indices = block_indices
     if width > 512:
@@ -1353,7 +974,10 @@ def step5_topk_blocks(
         # Numerical equality includes +0/-0; the library's radix key does not.
         # Keep the caller's scores intact, including during graph replay.
         ordered_scores = torch.empty_like(scores)
-        canonicalize_zero(scores, ordered_scores)
+        size = scores.numel()
+        _canonicalize_zero[(triton.cdiv(size, 1024),)](
+            scores, ordered_scores, size, 1024, num_warps=4
+        )
         _, indices = flashinfer.top_k(
             ordered_scores,
             512,
@@ -1365,9 +989,13 @@ def step5_topk_blocks(
         selected_k = 512
 
     _launch_block_pack(
-        indices, positions, row_to_req, block_indices, counts, selected_k=selected_k
+        indices=indices,
+        positions=positions,
+        row_to_req=row_to_req,
+        block_indices=block_indices,
+        counts=counts,
+        selected_k=selected_k,
     )
-    return block_indices, counts
 
 
 @triton.jit
@@ -1411,66 +1039,25 @@ def step5_pack_decode_blocks(
     packed_blocks: torch.Tensor,
     causal_lengths: torch.Tensor,
 ) -> None:
-    """Pack physical block and logical token start without copying raw K/V.
+    """Map selected logical blocks to packed int64 attention addresses.
 
-    Selection supplies sorted int32 IDs [T,513] and counts [T], including current.
-    Request slot zero is padding and must have count zero. The native FULL pool
-    uses page64; req_to_token[request, 8*block] is the aligned physical start.
-    Its page16 view uses the same physical token numbering. Each int64 output
-    stores physical_start/8 in its high word and logical_start in its low word.
-
-    The caller owns disjoint output buffers and keeps all inputs alive until
-    consumption. Output widths 513/514/516 support the source split policies.
-    Slots beyond count become -1; padded rows get causal length zero. Logical
-    IDs, live request slots, aligned mappings, and positions below the model's
-    context limit are producer contracts, as in step5_indexer_decode_logits. No tensor
-    data is read by Python, so changed-input Graph replay remains supported.
+    Each output holds physical_start // 8 in the high word and logical_start in the
+    low word; slots past ``counts`` are -1 and padding rows get causal length 0.
     """
-    if block_indices.device.type != "cuda" or torch.version.hip is not None:
-        raise ValueError("Step5 sparse metadata requires NVIDIA CUDA")
-    if block_indices.ndim != 2 or block_indices.shape[1] != 513:
-        raise ValueError("Step5 block_indices must have shape [T,513]")
     rows = block_indices.shape[0]
-    for name, tensor, shape, dtypes in (
-        ("block_indices", block_indices, (rows, 513), (torch.int32,)),
-        ("counts", counts, (rows,), (torch.int32,)),
-        ("row_to_req", row_to_req, (rows,), (torch.int32, torch.int64)),
-        ("positions", positions, (rows,), (torch.int32, torch.int64)),
-        ("causal_lengths", causal_lengths, (rows,), (torch.int32,)),
-    ):
-        if (
-            tensor.device != block_indices.device
-            or tensor.dtype not in dtypes
-            or tuple(tensor.shape) != shape
-            or not tensor.is_contiguous()
-        ):
-            raise ValueError(f"Step5 sparse metadata invalid {name}")
-    if (
-        req_to_token.device != block_indices.device
-        or req_to_token.dtype not in (torch.int32, torch.int64)
-        or req_to_token.ndim != 2
-        or req_to_token.stride(1) != 1
-    ):
-        raise ValueError("Step5 req_to_token requires CUDA integer [requests, context]")
-    if (
-        packed_blocks.device != block_indices.device
-        or packed_blocks.dtype != torch.int64
-        or packed_blocks.ndim != 2
-        or packed_blocks.shape[0] != rows
-        or packed_blocks.shape[1] not in (513, 514, 516)
-        or not packed_blocks.is_contiguous()
-    ):
-        raise ValueError("Step5 packed_blocks requires int64 [T,513/514/516]")
-    if rows:
-        _pack_decode_blocks[(rows,)](
-            block_indices,
-            counts,
-            req_to_token,
-            row_to_req,
-            positions,
-            packed_blocks,
-            causal_lengths,
-            req_to_token.stride(0),
-            packed_blocks.shape[1],
-            num_warps=4,
-        )
+    assert block_indices.shape == (rows, 513) and block_indices.dtype == torch.int32
+    assert packed_blocks.shape[0] == rows and packed_blocks.shape[1] in (513, 514, 516)
+    assert packed_blocks.dtype == torch.int64 and packed_blocks.is_contiguous()
+    assert req_to_token.stride(1) == 1
+    _pack_decode_blocks[(rows,)](
+        block_indices,
+        counts,
+        req_to_token,
+        row_to_req,
+        positions,
+        packed_blocks,
+        causal_lengths,
+        req_to_token.stride(0),
+        packed_blocks.shape[1],
+        num_warps=4,
+    )

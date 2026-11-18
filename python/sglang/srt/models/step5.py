@@ -14,9 +14,8 @@ import torch.nn.functional as F
 from safetensors import safe_open
 from torch import nn
 
-from sglang.kernels.ops.attention.step5.sparse_attention import (
-    step5_head_gate,
-    step5_qknorm_rope,
+from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
+    fused_qk_gemma_rmsnorm_rope_gate,
 )
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.configs.step5 import Step5Config, parse_step5_attention_profile
@@ -197,6 +196,9 @@ class Step5Attention(nn.Module):
             quant_config=None,
             prefix=add_prefix("qkv_proj", prefix),
         )
+        self.num_kv_heads = self.qkv_proj.num_kv_heads
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
         self.g_proj = ColumnParallelLinear(
             profile.hidden_size,
             profile.num_heads,
@@ -257,14 +259,24 @@ class Step5Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         gate, _ = self.g_proj(hidden_states)
-        q, k, v = step5_qknorm_rope(
-            qkv,
-            self.q_norm.weight,
-            self.k_norm.weight,
-            positions,
-            self.rotary_emb.cos_sin_cache_as(torch.bfloat16),
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k, _ = fused_qk_gemma_rmsnorm_rope_gate(
+            q,
+            k,
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
+            cos_sin_cache=self.rotary_emb.cos_sin_cache_as(torch.bfloat16),
+            positions=positions,
             eps=self.eps,
+            num_q_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            rotary_dim=self.rotary_emb.rotary_dim,
+            has_gate=False,
         )
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.contiguous().view(-1, self.num_kv_heads, self.head_dim)
         if is_in_breakable_cuda_graph():
             output = q.new_empty((q.shape[0], self.num_heads * self.head_dim))
             _breakable_step5_attention_core(
@@ -277,12 +289,9 @@ class Step5Attention(nn.Module):
             )
         else:
             output = self.attn(q, k, v, forward_batch)
-        output = step5_head_gate(
-            output.reshape(-1, self.num_heads * self.head_dim),
-            gate,
-            head_dim=self.head_dim,
-        )
-        output, _ = self.o_proj(output)
+        output = output.view(-1, self.num_heads, self.head_dim)
+        output = output * gate.sigmoid().unsqueeze(-1)
+        output, _ = self.o_proj(output.flatten(1))
         return output
 
 

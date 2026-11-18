@@ -4,49 +4,28 @@ from __future__ import annotations
 
 import torch
 
-from sglang.kernels.ops.attention.step5.indexer import (
-    AppendRingPlan,
-    append_ring,
-)
+from sglang.kernels.ops.attention.step5.indexer import append_ring
 from sglang.srt.layers.attention.step5.metadata import Step5IndexerMetadata
 from sglang.srt.utils.device import async_h2d
 
 
 def build_prefill_compression_inputs(
     *,
-    request_slots,
-    prefix_lengths,
-    append_lengths,
-    req_to_token,
-    compressed_index_key_pages,
+    request_slots: torch.Tensor,
+    prefix_lengths: list[int],
+    append_lengths: list[int],
+    req_to_token: torch.Tensor,
+    compressed_index_key_pages: int,
 ) -> dict:
-    """Build a batched prefill plan once, shared by every DSA layer.
+    """Build the prefill compression plan shared by every DSA layer.
 
-    CPU spans are native scheduler metadata. All FULL mapping checks are batched
-    on device. A request with any invalid completed block is disabled in full.
-    Padding consumes source rows but never owns ring cells or destinations.
+    A request with any invalid completed block is disabled in full; padding rows
+    consume input rows but never own ring cells or destinations.
     """
-    if (
-        req_to_token.device.type != "cuda"
-        or req_to_token.ndim != 2
-        or req_to_token.dtype not in (torch.int32, torch.int64)
-        or compressed_index_key_pages < 2
-    ):
-        raise ValueError("CSA append requires native CUDA request/FULL mapping")
-    if any(len(v) != len(request_slots) for v in (prefix_lengths, append_lengths)):
-        raise ValueError("CSA append batch lengths differ")
     rows, source = [], 0
     for base, length in zip(prefix_lengths, append_lengths):
-        if (
-            length < 0
-            or base < 0
-            or base + length > min(1048576, req_to_token.shape[1])
-        ):
-            raise ValueError("CSA append invalid logical span")
         rows.append((base, source, length))
         source += length
-    if source > 2**31 - 1:
-        raise ValueError("CSA append packed input exceeds int32")
     device = req_to_token.device
     raw_slots = torch.as_tensor(request_slots, dtype=torch.int64, device=device)
     slots = raw_slots.clamp(0, req_to_token.shape[0] - 1)
@@ -87,60 +66,29 @@ def build_prefill_compression_inputs(
 
 def compress_index_keys(
     *,
-    batch: Step5IndexerMetadata,
-    compressed_index_keys,
-    index_key_ring,
-    compression_logits_ring,
-    positions,
-    index_key,
-    compression_logits,
-    enabled,
-    success,
-    assert_success=False,
-):
-    """Compress history/current inputs, then retain inputs for the next forward.
-
-    One batched launch sequence serves prefill and decode. Indexer logits
-    enforces query causality.
-    """
-    # K is packed; Z may be a row-padded view of the combined projection.
-    # No forward-mode flag reaches the kernels.
-    for value in (index_key, compression_logits):
-        if (
-            value.shape != (batch.num_input_tokens, 1, 256)
-            or value.dtype != torch.bfloat16
-            or value.device != batch.request_slots.device
-            or value.stride(2) != 1
-            or value.stride(0) < 256
-        ):
-            raise ValueError(
-                "Step5 compression requires BF16 index K/Z rows: "
-                f"expected shape={(batch.num_input_tokens, 1, 256)}, "
-                f"got shape={tuple(value.shape)}, dtype={value.dtype}, "
-                f"device={value.device}, strides={value.stride()}"
-            )
-    if not index_key.is_contiguous():
-        raise ValueError("Step5 compression requires packed BF16 index K")
-    plan = AppendRingPlan(
-        slots=batch.request_slots,
-        bases=batch.input_start_positions,
-        sources=batch.input_start_rows,
-        lengths=batch.input_lengths,
-        active=batch.request_active,
-        admitted=batch.request_mapping_valid,
-        count_valid=batch.request_count_valid,
-        physical_blocks=batch.compressed_key_write_indices,
-        max_blocks=batch.compressed_key_write_indices.shape[0],
-        enabled=enabled,
-        success=success,
-    )
-    return append_ring(
-        plan=plan,
+    metadata: Step5IndexerMetadata,
+    compressed_index_keys: torch.Tensor,
+    index_key_ring: torch.Tensor,
+    compression_logits_ring: torch.Tensor,
+    ring_positions: torch.Tensor,
+    index_key: torch.Tensor,
+    compression_logits: torch.Tensor,
+) -> None:
+    append_ring(
+        slots=metadata.request_slots,
+        bases=metadata.input_start_positions,
+        sources=metadata.input_start_rows,
+        lengths=metadata.input_lengths,
+        active=metadata.request_active,
+        admitted=metadata.request_mapping_valid,
+        count_valid=metadata.request_count_valid,
+        physical_blocks=metadata.compressed_key_write_indices,
+        enabled=metadata.compression_enabled,
+        success=metadata.compression_success,
         index_key=index_key,
         compression_logits=compression_logits,
         index_key_ring=index_key_ring,
         compression_logits_ring=compression_logits_ring,
-        positions=positions,
+        ring_positions=ring_positions,
         compressed_index_keys=compressed_index_keys,
-        assert_success=assert_success,
     )
