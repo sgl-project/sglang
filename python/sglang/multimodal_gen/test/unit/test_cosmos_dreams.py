@@ -701,9 +701,6 @@ class TestCosmosDreamsSdeSeeding(unittest.TestCase):
         self.assertEqual(len(seeds), 800)
 
     def test_schedule_built_once_steps_like_one_rebuilt_for_every_chunk(self):
-        """Pointing the scheduler back at a prepared schedule must leave it where
-        ``set_timesteps`` and the first step's index lookup would, also when the
-        rollout alternates between the sigma lists of its profile."""
         device = torch.device("cpu")
         kept, rebuilt = (
             FlowMatchEulerDiscreteScheduler(stochastic_sampling=True) for _ in range(2)
@@ -756,8 +753,6 @@ def _text_kv(layers: int = 2, text_tokens: int = 3) -> list:
 
 
 def _commit_labelled(history, label: float, tokens: int, *, tail_tokens=None) -> list:
-    """Write ``tokens`` K/V tokens labelled ``label`` as a forward would, commit
-    them, and return the labels attention read during that forward."""
     slots = history.slots(tokens)
     for slot in slots:
         slot.chunk_keys.fill_(label)
@@ -800,8 +795,6 @@ class TestCosmosDreamsKVHistory(unittest.TestCase):
         self.assertEqual(archive.committed(0)[0][0, :, 0, 0].tolist(), [0.0, 1.0, 2.0])
 
     def test_clean_pass_writes_every_layers_kv_and_skips_the_last_attention(self):
-        """A commit pass leaves K/V behind in every layer; the last layer gets
-        the hidden state of the one before it and never runs its attention."""
         calls = []
 
         class Layer:
@@ -837,11 +830,6 @@ class TestCosmosDreamsKVHistory(unittest.TestCase):
         )
 
     def test_history_matches_sink_plus_tail_through_slides_moves_and_growth(self):
-        """The block attention reads is always ``[text | first sink | latest tail |
-        chunk]`` in order, whatever the buffers did underneath: the span drifts on
-        every eviction, moves back to the front when the spare room runs out, and
-        the buffers of an open-ended session double. Tails alternate like the
-        control/RGB commits of a transfer rollout."""
         tokens, sink_frames, window_frames = 2, 2, 5
         text_kv = _text_kv()
         for rollout_frames in (None, 60):
@@ -856,6 +844,7 @@ class TestCosmosDreamsKVHistory(unittest.TestCase):
             kept: list[float] = []
             for frame in range(60):
                 chunk_frames = 1 + frame % 3
+                # Tails alternate like a transfer rollout's control and RGB commits.
                 tail_frames = window_frames - frame % 2
                 label = float(frame)
                 read = _commit_labelled(
@@ -1386,9 +1375,6 @@ class TestCosmosDreamsRolloutStreams(unittest.TestCase):
 
 class TestCosmosDreamsStreamedOutput(unittest.TestCase):
     def test_decoding_stage_gets_a_path_frames_or_nothing(self):
-        """A rollout that encoded the MP4 hands over its path and nothing is decoded
-        again; one whose encoder failed hands over nothing, so the decoding stage
-        decodes the latents itself; one without an encoder hands over its frames."""
         stage = object.__new__(CosmosDreamsRolloutStage)
 
         def hand_over(encoder, frames="frames"):

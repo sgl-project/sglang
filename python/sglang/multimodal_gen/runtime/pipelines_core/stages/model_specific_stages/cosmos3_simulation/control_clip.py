@@ -15,17 +15,17 @@ from sglang.multimodal_gen.runtime.utils.vision import (
     rgb_hwc_uint8,
 )
 
-# Most buffer the decode reserves before it knows how long the clip is; a longer
-# clip doubles it. Arbitrary: host memory is only committed once written, so
-# room a shorter clip leaves unused costs nothing.
+# Most buffer the decode reserves before it knows how long the clip is, and a
+# longer clip doubles it. Arbitrary: host pages are committed only when the
+# decode first writes them.
 INITIAL_BUFFER_BYTES = 1 << 30
 
 
 class ControlClipDecode:
     """A control clip decoding on a thread into one ``uint8 [T, H, W, 3]`` buffer.
 
-    Frames become final in order; ``frames`` may be asked for any of the frames
-    ``wait`` has reported.
+    Frames become final in order, and ``frames`` may read any frame that ``wait``
+    has reported, also after ``close``.
     """
 
     def __init__(self, path: str, *, max_frames: int) -> None:
@@ -60,19 +60,16 @@ class ControlClipDecode:
 
     @property
     def source_hw(self) -> tuple[int, int]:
-        """``(height, width)`` of the clip, known once its first frame is final."""
         if self.wait(1) == 0:
             raise ValueError(f"No frames decoded from control video {self.path!r}.")
         frame = self.frames(0, 1)
         return int(frame.shape[2]), int(frame.shape[3])
 
     def frames(self, start: int, stop: int) -> torch.Tensor:
-        """``uint8 [3, stop - start, H, W]`` view of final frames ``[start, stop)``."""
         with self._changed:
             return self._buffer[start:stop].permute(3, 0, 1, 2)
 
     def close(self) -> None:
-        """Stop decoding; frames already final stay readable."""
         with self._changed:
             self._closed = True
         self._thread.join()
@@ -100,7 +97,7 @@ class ControlClipDecode:
     def _buffer_with_room(
         self, index: int, frame_shape: tuple[int, ...]
     ) -> torch.Tensor:
-        """The buffer, grown if frame ``index`` does not fit; called by the decode thread."""
+        # Read unlocked: this runs on the decode thread, the only writer of ``_buffer``.
         buffer = self._buffer
         if buffer is not None and index < buffer.shape[0]:
             return buffer

@@ -224,11 +224,8 @@ def _pack_kernel_applies(
     kv_slot: CosmosDreamsKVSlot,
     cos_sin_cache: torch.Tensor,
 ) -> bool:
-    """Whether the kernel that norms and rotates Q/K can also write K/V into the slot.
-
-    Same arithmetic as the in-place kernel ``_apply_qwen3_qk_norm_rope`` picks, so
-    this only saves the two copies into the slot.
-    """
+    """Same arithmetic as the in-place kernel ``_apply_qwen3_qk_norm_rope`` picks,
+    so the packing kernel only saves the two copies into the slot."""
     return (
         envs.SGLANG_ENABLE_FUSED_QKNORM_ROPE
         and q.device.type == "cuda"
@@ -256,8 +253,8 @@ def _write_chunk_kv(
     rope_positions: torch.Tensor,
     null_token_slices: list[slice],
 ) -> torch.Tensor:
-    """Write the chunk's K (post-norm, post-RoPE) and V (null-action slots zeroed)
-    into ``kv_slot``, which is exactly what history must store; returns its Q."""
+    """``kv_slot`` gets what history must store: post-norm, post-RoPE K and V
+    with null-action slots zeroed."""
     batch_size, seq_len = hidden.shape[:2]
     num_q_heads = attention.local_num_attention_heads
     num_kv_heads = attention.local_num_key_value_heads
@@ -311,7 +308,6 @@ def _joint_attention(
     kv_slot: CosmosDreamsKVSlot,
     **write_kwargs: Any,
 ) -> torch.Tensor:
-    """One softmax over ``[text | history | current chunk]``, read in place."""
     batch_size, seq_len = hidden.shape[:2]
     q = _write_chunk_kv(attention, hidden, kv_slot=kv_slot, **write_kwargs)
     out = attention.attn(q, kv_slot.keys, kv_slot.values)
@@ -360,7 +356,6 @@ class CosmosDreamsGenDecoderLayer(Cosmos3GenDecoderLayer):
         return hidden + self.mlp(self.post_attention_layernorm(hidden))
 
     def write_kv(self, hidden: torch.Tensor, **write_kwargs: Any) -> None:
-        """Write this layer's K/V for ``hidden`` and stop before its attention."""
         _write_chunk_kv(
             self.cross_attention, self.input_layernorm(hidden), **write_kwargs
         )
@@ -574,13 +569,7 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
         action_domain_ids: torch.Tensor | None = None,
         null_action_frame_indexes: Sequence[int] = (),
     ) -> None:
-        """Clean-refresh one chunk: write its K/V into ``kv_slots`` and nothing else.
-
-        Takes what :meth:`forward` takes, without a timestep: the chunk enters
-        with no time embedding, so the K/V are clean history, and a control clip
-        is committed exactly like a clean frame. The last layer stops once its
-        K/V are written, since nothing reads what it would compute after them.
-        """
+        """Clean-refresh one chunk into ``kv_slots``, a control clip exactly like a clean frame."""
         hidden, layer_kwargs = self._prepare_chunk(
             hidden_states,
             None,
@@ -618,8 +607,7 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
         action_domain_ids: torch.Tensor | None,
         null_action_frame_indexes: Sequence[int],
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Embed one chunk (``timestep`` None: clean, no time embedding) and build
-        what every layer takes besides its slot."""
+        """``timestep`` None embeds the chunk as clean history, with no time embedding."""
         self._validate_chunk_inputs(hidden_states, kv_slots=kv_slots)
         self._validate_action_inputs(
             action_latents, action_domain_ids, null_action_frame_indexes

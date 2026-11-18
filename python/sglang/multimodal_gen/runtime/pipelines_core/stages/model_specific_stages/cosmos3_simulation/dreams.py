@@ -1180,9 +1180,7 @@ class FixedStepSchedules:
     """The scheduler's state for each sigma list of a rollout, built once.
 
     ``set_timesteps`` uploads the sigmas with a blocking copy, and the first
-    ``step`` after it searches the device for its index and reads it back. Each
-    of those stops the host until the GPU has drained, once per chunk, although a
-    rollout only ever uses the few sigma lists of its profile.
+    ``step`` after it searches the device for its index and reads it back.
     """
 
     def __init__(self, scheduler: FlowMatchEulerDiscreteScheduler) -> None:
@@ -1194,8 +1192,6 @@ class FixedStepSchedules:
     def begin_chunk(
         self, t_list: Sequence[float], device: torch.device
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
-        """Point the scheduler at the first step of ``t_list``; returns the
-        ``(scalar, [1])`` timestep of every step."""
         scheduler = self.scheduler
         key = (tuple(float(sigma) for sigma in t_list), device)
         prepared = self._prepared.get(key)
@@ -1449,7 +1445,6 @@ class CosmosDreamsRolloutStage(PipelineStage):
         )
 
     def _streamed_encoder(self, batch: Req) -> EncodeWhileDecoding | None:
-        """An MP4 encoder for the decode queue to feed, when the frames only go to the saved file."""
         save_file_path = streamed_video_output_path(batch, self.server_args, 1)
         if save_file_path is None:
             return None
@@ -1642,7 +1637,6 @@ class CosmosDreamsRolloutStage(PipelineStage):
         rows: torch.Tensor | None,
         commit: bool,
     ) -> torch.Tensor:
-        """Latent frame 0 from the conditioning image, committed as clean history."""
         latent = batch.image_latent.to(device=context.device, dtype=context.dtype)
         if commit:
             action, null_indexes = self._actions(
@@ -1760,8 +1754,6 @@ class CosmosDreamsRolloutStage(PipelineStage):
 
 
 class CosmosDreamsDecodingStage(Cosmos3DecodingStage):
-    """Cosmos3 decoding that returns the MP4 the rollout already encoded, if any."""
-
     def forward(self, batch: Req, server_args: ServerArgs):
         output_file_paths = batch.extra.get(EXTRA_STREAMED_OUTPUT_PATHS)
         if output_file_paths is None:

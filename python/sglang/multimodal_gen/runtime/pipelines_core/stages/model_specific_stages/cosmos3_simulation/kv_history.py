@@ -24,18 +24,16 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
 # Arbitrary: small enough that a short session stays cheap.
 OPEN_ENDED_INITIAL_FRAMES = 16
 # Most spare frames a sliding history drifts through before it moves back to the
-# front. Arbitrary: one move per 16 evictions already makes the moves a few
-# percent of the copies the eviction used to cost.
+# front. Arbitrary.
 MAX_SPARE_FRAMES = 16
 
 
 class CosmosDreamsKVHistory:
     """Per-layer ``[text | committed history | current chunk]`` K/V buffers.
 
-    ``commit`` keeps the first ``sink_tokens`` and the latest ``tail_tokens`` of
-    the history. The kept tail stays where it is and ``[text | sink]`` is
-    rewritten just in front of it, so the block attention reads drifts forward
-    through the spare room and moves back to the front when that runs out.
+    The kept tail stays where it is and ``[text | sink]`` is rewritten just in
+    front of it, so the block attention reads drifts forward through the spare
+    room and moves back to the front when that runs out.
     """
 
     def __init__(
@@ -47,8 +45,7 @@ class CosmosDreamsKVHistory:
         spare_tokens: int = 0,
         initial_tokens: int | None = None,
     ) -> None:
-        """``live_tokens`` bounds committed history plus one chunk; ``initial_tokens``
-        allocates less than that first and doubles on demand."""
+        """``live_tokens`` bounds committed history plus one chunk."""
         if not text_kv:
             raise ValueError("Cosmos-Dreams K/V history needs at least one layer.")
         if sink_tokens < 0 or live_tokens <= 0 or spare_tokens < 0:
@@ -88,17 +85,14 @@ class CosmosDreamsKVHistory:
             self._kv.append(buffer)
 
     def committed_kv(self, layer_idx: int) -> torch.Tensor:
-        """One layer's committed history without the text, ``[2, 1, S, H_kv, D]``."""
         start = self._offset + self.text_tokens
         return self._kv[layer_idx][:, :, start : start + self.committed_tokens]
 
     def committed(self, layer_idx: int) -> KVPair:
-        """One layer's committed history, without the text."""
         keys, values = self.committed_kv(layer_idx)
         return keys, values
 
     def clear(self) -> None:
-        """Forget the committed history; the text stays."""
         if self._offset:
             raise ValueError(
                 "A Cosmos-Dreams K/V history that evicted cannot be cleared."
@@ -106,7 +100,6 @@ class CosmosDreamsKVHistory:
         self.committed_tokens = 0
 
     def slots(self, chunk_tokens: int) -> list[CosmosDreamsKVSlot]:
-        """Per-layer views for one forward over a chunk of ``chunk_tokens``."""
         if chunk_tokens <= 0:
             raise ValueError(
                 f"Cosmos-Dreams K/V chunk must be positive, got {chunk_tokens}."
@@ -131,8 +124,8 @@ class CosmosDreamsKVHistory:
         return slots
 
     def commit(self, chunk_tokens: int, *, tail_tokens: int | None = None) -> None:
-        """Keep the chunk the last forward wrote; ``tail_tokens`` bounds what stays
-        behind the sink (None keeps everything)."""
+        """Keep the chunk the last forward wrote. ``tail_tokens`` bounds what stays
+        behind the sink, and None keeps everything."""
         total = self.committed_tokens + chunk_tokens
         if (
             chunk_tokens <= 0
@@ -192,9 +185,8 @@ class CosmosDreamsKVHistory:
 class SelectedKVHistory:
     """``[text | selected archive frames | current chunk]`` buffers for frustum retrieval.
 
-    ``select`` gathers the chosen frames once per chunk; the chunk's forwards
-    then read and write these buffers, and ``commit`` also appends the chunk to
-    the archive so later chunks can retrieve it.
+    ``select`` gathers the chosen frames once per chunk, and ``commit`` also
+    appends the chunk to the archive so later chunks can retrieve it.
     """
 
     def __init__(
@@ -213,7 +205,8 @@ class SelectedKVHistory:
     def select(
         self, frame_ids: Sequence[int], *, tokens_per_frame: int
     ) -> SelectedKVHistory:
-        """Read ``frame_ids`` of the archive, in order, until the next ``select``."""
+        """The selected frames, and the chunks committed after them, stay readable
+        until the next ``select``."""
         stored = self._archive.committed_tokens // tokens_per_frame
         ids = list(frame_ids)
         if ids != sorted(set(ids)) or (ids and (ids[0] < 0 or ids[-1] >= stored)):
@@ -247,7 +240,6 @@ class SelectedKVHistory:
         return self._read.slots(chunk_tokens)
 
     def commit(self, chunk_tokens: int, *, tail_tokens: int | None = None) -> None:
-        """Append the chunk to the archive and keep it readable for this selection."""
         written = self._read.slots(chunk_tokens)
         for source, target in zip(
             written, self._archive.slots(chunk_tokens), strict=True
@@ -266,13 +258,8 @@ def new_kv_history(
     chunk_frames: int,
     rollout_frames: int | None,
 ) -> CosmosDreamsKVHistory:
-    """Size a history for a rollout that keeps ``sink_frames`` plus the latest
-    ``window_frames`` (None: everything).
-
-    ``rollout_frames`` is every frame the rollout writes, None for an open-ended
-    session. A rollout that fits its window gets exactly its own length; one that
-    evicts gets the window, one chunk and the spare room it drifts through.
-    """
+    """``rollout_frames`` is every frame the rollout writes, None for an open-ended
+    session. ``window_frames`` None keeps every frame."""
     bound = None if window_frames is None else sink_frames + window_frames
     if rollout_frames is not None and (bound is None or rollout_frames <= bound):
         return CosmosDreamsKVHistory(
