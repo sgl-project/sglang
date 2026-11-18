@@ -17,7 +17,7 @@ on:
         description: 'NPU image used by the prefill/decode pods.'
         required: false
         type: string
-        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B031'
+        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B031'
       use_image_sglang:
         description: "If 'true' (default), pods import sglang from the image's site-packages. Set 'false' to use the PR checkout's sglang."
         required: false
@@ -113,7 +113,7 @@ jobs:
       decode_size: ${{ matrix.decode_size }}
       router_size: ${{ matrix.router_size }}
       test_case: ${{ matrix.test_case }}
-      image: ${{ inputs.image || 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B031' }}
+      image: ${{ inputs.image || 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B031' }}
       prefill_decode_deployment: ${{ matrix.prefill_decode_deployment }}
       container_patches: ${{ matrix.container_patches || '' }}
       run_start_metadata: ${{ needs.metadata.outputs.run_start_metadata }}
@@ -216,14 +216,35 @@ jobs:
                   )
               return rows
 
-          def performance_rows(case):
-              if not case["metrics"]:
-                  return [f"| {case['test_case']} | {case['status']} | - | - | - |"]
-              return [
-                  f"| {case['test_case']} | {case['status']} | {name} | "
-                  f"{case['metrics'][name]} | {case['baselines'].get(name, '-')} |"
-                  for name in sorted(case["metrics"])
+          def performance_table(cases):
+              """One row per case; columns are the union of the case metrics."""
+              metric_names = sorted(
+                  {name for case in cases for name in case["metrics"]}
+              )
+              header = ["Test case", "Status"]
+              for name in metric_names:
+                  baselines = {
+                      str(case["baselines"][name])
+                      for case in cases
+                      if name in case["baselines"]
+                  }
+                  # A baseline shared by every case goes into the header so the
+                  # row stays compact; diverging baselines keep the bare name.
+                  label = name
+                  if len(baselines) == 1:
+                      label = f"{name} (baseline {baselines.pop()})"
+                  header.append(label)
+              rows = [
+                  "| " + " | ".join(header) + " |",
+                  "| " + " | ".join(["---"] * len(header)) + " |",
               ]
+              for case in cases:
+                  values = [case["test_case"], case["status"]]
+                  values += [
+                      str(case["metrics"].get(name, "-")) for name in metric_names
+                  ]
+                  rows.append("| " + " | ".join(values) + " |")
+              return rows
 
           accuracy_cases = [case for case in ordered if case["test_type"] == "accuracy"]
           performance_cases = [
@@ -245,14 +266,8 @@ jobs:
                       lines += accuracy_rows(case)
                   lines.append("")
               if performance_cases:
-                  lines += [
-                      "## Performance",
-                      "",
-                      "| Test case | Status | Metric | Value | Baseline |",
-                      "| --- | --- | --- | --- | --- |",
-                  ]
-                  for case in performance_cases:
-                      lines += performance_rows(case)
+                  lines += ["## Performance", ""]
+                  lines += performance_table(performance_cases)
                   lines.append("")
           markdown = "\n".join(lines) + "\n"
           with open(os.environ["OUTPUT_MARKDOWN"], "w", encoding="utf-8") as f:
