@@ -1650,6 +1650,8 @@ class Envs:
     # The [M*top_k, hidden] HBM round trip pays only at small M; 0 disables.
     # GLM-5.2 (H=6144): neutral at 192 on B300 TP8, crossover 192-223 on GB300 TP4.
     SGLANG_MOE_DEFERRED_FINALIZE_MAX_TOKENS = EnvInt(192)
+    # Root holding configs/triton_*/ fused MoE Triton tile JSONs; unset uses the packaged one.
+    SGLANG_MOE_CONFIG_DIR = EnvStr(None)
     # Let the CuTe DSL fused MoE finalize consume expert-parallel handoffs.
     # Unset follows the NVIDIA runtime master; an explicit value wins.
     SGLANG_OPT_CUTEDSL_EP_DEFERRED_FINALIZE = EnvBool(
