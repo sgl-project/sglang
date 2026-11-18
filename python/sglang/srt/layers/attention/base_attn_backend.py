@@ -109,6 +109,10 @@ class AttentionBackend(ABC):
     # attention takes the padded queries rather than only the real rows.
     plans_padded_extend_rows: bool = False
 
+    # Whether forward_mha reads the MLA prefix latent in bf16 and hands the
+    # projected prefix K/V to pack_prefix_chunk_kv(k_nope, k_pe, v).
+    supports_prefix_chunk_kv_pack: bool = False
+
     # Resolved per-mode backend names, stamped by ModelRunner.init_attention_backend
     prefill_attention_backend_str: Optional[str] = None
     decode_attention_backend_str: Optional[str] = None

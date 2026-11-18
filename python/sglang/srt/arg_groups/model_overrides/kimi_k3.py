@@ -282,3 +282,19 @@ def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
         "(FlashInfer SiTU kernels)."
     )
     return {"moe_runner_backend": "flashinfer_mxfp4"}
+
+
+@_register_for(
+    "KimiK3ForConditionalGeneration",
+    "KimiK31ForConditionalGeneration",
+    "KimiK3LinearForCausalLM",
+)
+def _kimi_k3_mla_fp8_prefill_overrides(server_args: Any, hf_config: Any) -> dict:
+    # The aiter asm fp8 MLA prefill paths (native AITER head counts, fp8 zero-padding,
+    # prefix chunks with keyless requests, fp8 prefix K/V packing) were measured on
+    # Kimi-K3 in sgl-project/sglang#47035; K3.1 (DSA layers) was not.
+    from sglang.srt.configs.model_config import is_kimi_k31
+
+    if is_kimi_k31(hf_config):
+        return {}
+    return {"mla_fp8_prefill_extended": True}

@@ -258,9 +258,34 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "mm_feature_transport",
                     "mm_enable_dp_encoder",
                     "enable_flashmla_prefill_token_packing",
+                    "mla_fp8_prefill_extended",
                 }
             ),
         )
+
+
+class TestKimiK3MlaFp8PrefillDeclaration(CustomTestCase):
+    def test_declared_for_kimi_k3_but_not_k31(self):
+        """The aiter backend reads mla_fp8_prefill_extended instead of the model identity,
+        so the Kimi-K3 declaration must not reach Kimi-K3.1 (DSA layers) or other models."""
+        from sglang.srt.arg_groups.model_overrides import kimi_k3 as kimi_k3_module
+
+        provider = kimi_k3_module._kimi_k3_mla_fp8_prefill_overrides
+        for arch in (
+            "KimiK3ForConditionalGeneration",
+            "KimiK31ForConditionalGeneration",
+            "KimiK3LinearForCausalLM",
+        ):
+            self.assertIn(provider, base_module._MODEL_OVERRIDE_FNS[arch])
+            k3 = SimpleNamespace(architectures=[arch])
+            self.assertEqual(provider(None, k3), {"mla_fp8_prefill_extended": True})
+        for arch in ("KimiK31ForConditionalGeneration", "KimiK3LinearForCausalLM"):
+            k31 = SimpleNamespace(architectures=[arch], index_topk=2048)
+            self.assertEqual(provider(None, k31), {})
+        self.assertNotIn(
+            provider, base_module._MODEL_OVERRIDE_FNS.get("DeepseekV3ForCausalLM", [])
+        )
+        self.assertFalse(_declared_default("mla_fp8_prefill_extended"))
 
 
 class TestBoundaryReductionDefaults(CustomTestCase):

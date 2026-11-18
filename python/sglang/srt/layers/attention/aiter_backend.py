@@ -165,7 +165,7 @@ from sglang.kernels.ops.kvcache.shuffle_5d_cache import (
     launch_gather_shuffle_5d_to_linear,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, scaled_fp8_quant
-from sglang.srt.configs.model_config import AttentionArch, is_kimi_k3, is_kimi_k31
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.aiter_mla_gluon import (
     log_mla_gluon_capability,
@@ -246,7 +246,7 @@ def _asm_cprr_kernel_heads(gathered_heads: int, q_len: int) -> int:
 # aiter/csrc/kernels/mla/reduce.cu. See https://github.com/ROCm/aiter/blob/7915f53a4225b3f9cb632a97a23369dbebcf1be0/csrc/kernels/mla/reduce.cu#L923
 _MLA_REDUCE_V1_HEADS = {
     64: frozenset({64}),
-    128: frozenset({1, 2, 4, 8, 10, 16, 32, 40, 48, 64, 96, 128}),
+    128: frozenset({1, 2, 4, 8, 10, 16, 32, 40, 64, 128}),
     512: frozenset({8, 16, 32, 48, 64, 80, 96, 112, 128}),
 }
 
@@ -254,20 +254,16 @@ _MLA_REDUCE_V1_HEADS = {
 @functools.lru_cache(maxsize=None)
 def _aiter_has_mla_reduce_v1_instance(*, num_head: int, head_dim: int) -> bool:
     # mla_reduce_v1 aborts the process on a shape it has no instance for,
-    # so ask the compiled AITER, as its own planner does (nh12_hd128 is ROCm/aiter#7087);
-    # an AITER without the query (ROCm/aiter#6107), or whose .so predates it, pads instead.
+    # so ask the compiled AITER, as its own planner does (nh12_hd128 is ROCm/aiter#7087).
+    # A False only costs the padding _MLA_REDUCE_V1_HEADS already gives: an AITER without
+    # the query (ROCm/aiter#6107), or whose compiled module predates it, pads instead.
+    # Asked only for a model that declares mla_fp8_prefill_extended.
     try:
         from aiter.ops.attention import mla_reduce_v1_supports
 
         return mla_reduce_v1_supports(num_heads=num_head, head_dim=head_dim)
     except (ImportError, AttributeError):
         return False
-
-
-def _fp8_prefill_runs_keyless_prefix_chunks(hf_config) -> bool:
-    # Running keyless prefix chunks on the asm fp8 prefill instead of bf16 varlen,
-    # and packing prefix K/V straight to saturating fp8, are validated on Kimi-K3 only.
-    return is_kimi_k3(hf_config) and not is_kimi_k31(hf_config)
 
 
 # Persist
@@ -879,15 +875,28 @@ class AiterAttnBackend(AttentionBackend):
                 -1
             ]
 
+        # A model override declares mla_fp8_prefill_extended for the paths validated
+        # on it (Kimi-K3, #47035): native head counts the compiled AITER reports,
+        # zero-padding straight into fp8, prefix chunks that include requests without
+        # keys, and prefix K/V packed straight to fp8. It describes the target model,
+        # so a draft worker's backend keeps the default paths.
+        self.mla_fp8_prefill_extended = (
+            self.use_mla
+            and _use_fp8_prefill_attn
+            and get_exec().kernel.mla_fp8_prefill_extended
+            and not model_runner.is_draft_worker
+        )
         # The asm fp8 prefill reduces through mla_reduce_v1, which only has
-        # instantiations for the head shapes in _MLA_REDUCE_V1_HEADS or the ones the
-        # compiled AITER reports; anything else is zero-padded up to one it does carry,
-        # or falls back to flash_attn_varlen_func when the table has nothing to reach.
+        # instantiations for the head shapes in _MLA_REDUCE_V1_HEADS (or, on the
+        # extended paths, the ones the compiled AITER reports); anything else is
+        # padded up to one it does carry, or falls back to flash_attn_varlen_func
+        # when the table has nothing to reach.
         self.fp8_prefill_num_head = (
             self.check_fp8_prefill_num_head(
                 num_head=self.num_head,
                 num_kv_head=self.num_kv_head,
                 v_head_dim=self.v_head_dim,
+                ask_aiter=self.mla_fp8_prefill_extended,
             )
             if self.use_mla and _use_fp8_prefill_attn
             else None
@@ -898,19 +907,13 @@ class AiterAttnBackend(AttentionBackend):
         self.fp8_prefill_num_kv_head = self.num_kv_head + (
             (self.fp8_prefill_num_head or self.num_head) - self.num_head
         )
-        self.use_fp8_prefill_keyless_prefix_chunks = (
-            self.use_fp8_prefill_attn
-            and _fp8_prefill_runs_keyless_prefix_chunks(
-                model_runner.model_config.hf_config
-            )
-        )
-        # forward_mha reads the prefix latent in bf16 whenever this hook exists;
-        # keep it only where every prefix chunk runs the asm fp8 prefill on a bf16 model.
-        if not (
-            self.use_fp8_prefill_keyless_prefix_chunks
+        # forward_mha reads the prefix latent in bf16 when the backend packs prefix K/V;
+        # do so only where every prefix chunk runs the asm fp8 prefill on a bf16 model.
+        self.supports_prefix_chunk_kv_pack = (
+            self.mla_fp8_prefill_extended
+            and self.use_fp8_prefill_attn
             and self.input_dtype == torch.bfloat16
-        ):
-            self.pack_prefix_chunk_kv = None
+        )
         if self.use_fp8_prefill_attn and self.fp8_prefill_num_head != self.num_head:
             logger.info(
                 f"aiter asm fp8 MLA prefill pads {self.num_head} query heads to "
@@ -1328,15 +1331,18 @@ class AiterAttnBackend(AttentionBackend):
         return x.repeat(1, reps, 1)[:, :padded, :].contiguous()
 
     def check_fp8_prefill_num_head(
-        self, *, num_head: int, num_kv_head: int, v_head_dim: int
+        self, *, num_head: int, num_kv_head: int, v_head_dim: int, ask_aiter: bool
     ) -> Optional[int]:
-        """Check _MLA_REDUCE_V1_HEADS to get head count to run the asm fp8
-        mla prefill, return None if it is invalid so we will fall it back to
-        aiter fa implementation.
+        """Check _MLA_REDUCE_V1_HEADS (and, with ask_aiter, the compiled AITER)
+        to get head count to run the asm fp8 mla prefill, return None if it is
+        invalid so we will fall it back to aiter fa implementation.
         """
         supported = _MLA_REDUCE_V1_HEADS.get(v_head_dim, frozenset())
-        if num_head in supported or _aiter_has_mla_reduce_v1_instance(
-            num_head=num_head, head_dim=v_head_dim
+        if num_head in supported or (
+            ask_aiter
+            and _aiter_has_mla_reduce_v1_instance(
+                num_head=num_head, head_dim=v_head_dim
+            )
         ):
             return num_head
         if num_head != num_kv_head:
@@ -2810,13 +2816,20 @@ class AiterAttnBackend(AttentionBackend):
         nhead = layer.tp_q_head_num
         v_head_dim = layer.v_head_dim
         # mla_reduce_v1 dispatches on the head count, so a model it has no
-        # instantiation for runs on the next one up, with zero heads sliced back off.
+        # instantiation for runs on the next one up, with the extra output columns
+        # sliced back off. The extended paths pad with zero heads straight into fp8;
+        # the others tile the query heads to fill.
         head_pad = self.fp8_prefill_num_head - nhead
-        if head_pad:
+        if head_pad and self.mla_fp8_prefill_extended:
             nhead = self.fp8_prefill_num_head
             q = _zero_pad_heads(q, num_heads=nhead, dtype=fp8_dtype)
             k = _zero_pad_heads(k, num_heads=nhead, dtype=fp8_dtype)
             v = _zero_pad_heads(v, num_heads=nhead, dtype=fp8_dtype)
+        elif head_pad:
+            q = self.pad_heads(q, self.fp8_prefill_num_head)
+            k = self.pad_heads(k, self.fp8_prefill_num_head)
+            v = self.pad_heads(v, self.fp8_prefill_num_head)
+            nhead = self.fp8_prefill_num_head
 
         if q.dtype != fp8_dtype:
             q = q.to(fp8_dtype)
@@ -4579,17 +4592,15 @@ class AiterAttnBackend(AttentionBackend):
         metadatas: list[Optional[MlaPrefillPsMetadata]] = []
         for i in range(forward_batch.num_prefix_chunks):
             chunk_lens_cpu = forward_batch.prefix_chunk_seq_lens_cpu[i].to(torch.int32)
-            # num_prefix_chunks is ceil(max prefix / chunk len),
-            # so the longest prefix has keys in every chunk.
-            assert chunk_lens_cpu.any(), f"prefix chunk {i} has no keys"
             if forward_batch.prefix_chunk_has_zero_kv[i]:
-                # None leaves the chunk to bf16 varlen in _forward_extend_prefix_chunk.
+                # None leaves the chunk to bf16 varlen in _forward_extend_prefix_chunk;
+                # the extended paths plan the requests that have keys instead.
                 metadatas.append(
                     self._build_active_prefix_chunk_ps_metadata(
                         chunk_lens_cpu=chunk_lens_cpu,
                         extend_lens_cpu=extend_lens_cpu,
                     )
-                    if self.use_fp8_prefill_keyless_prefix_chunks
+                    if self.mla_fp8_prefill_extended and chunk_lens_cpu.any()
                     else None
                 )
                 continue

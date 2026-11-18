@@ -276,6 +276,20 @@ class ExecKernel(msgspec.Struct):
             resolvable=True,
         ),
     ] = "auto"
+    mla_fp8_prefill_extended: A[
+        bool,
+        Arg(
+            help=(
+                "Resolved by a model override for the target model. On the aiter "
+                "asm fp8 MLA prefill: run head counts the compiled AITER "
+                "mla_reduce_v1 reports natively, zero-pad the rest straight into "
+                "fp8, plan prefix chunks that include requests without keys, and "
+                "pack prefix K/V straight to fp8. Kimi-K3 declares it."
+            ),
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = False
     sampling_backend: A[
         Optional[str],
         Arg(

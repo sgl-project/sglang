@@ -317,6 +317,8 @@ class CuteDslMLAPrefillBackend(TRTLLMMLABackend):
     them without the per-tensor casts of the BF16 path.
     """
 
+    supports_prefix_chunk_kv_pack = True
+
     @staticmethod
     def _fused_rope_fp8_quantize(
         q_nope: torch.Tensor,

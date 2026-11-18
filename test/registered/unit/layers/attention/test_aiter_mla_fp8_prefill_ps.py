@@ -19,7 +19,6 @@ if _RUNNABLE:
         AiterAttnBackend,
         ForwardMetadata,
         _aiter_has_mla_reduce_v1_instance,
-        _fp8_prefill_runs_keyless_prefix_chunks,
     )
     from sglang.srt.layers.attention.merge_state import merge_state
     from sglang.srt.utils import is_gfx95_supported
@@ -32,15 +31,16 @@ SCALE = (QK_NOPE + QK_ROPE) ** -0.5
 KIMI_K3_TP8_HEADS = 12
 
 
-def _backend(num_heads, q_lens, keyless_prefix_chunks=True):
+def _backend(num_heads, q_lens, extended=True):
+    """The backend with mla_fp8_prefill_extended as a model override declares it."""
     backend = object.__new__(AiterAttnBackend)
     backend.device = torch.device("cuda")
     backend.input_dtype = torch.bfloat16
     backend._arange_buf = None
     backend.use_fp8_prefill_attn = True
-    backend.use_fp8_prefill_keyless_prefix_chunks = keyless_prefix_chunks
+    backend.mla_fp8_prefill_extended = extended
     backend.fp8_prefill_num_head = backend.check_fp8_prefill_num_head(
-        num_head=num_heads, num_kv_head=num_heads, v_head_dim=V_HEAD
+        num_head=num_heads, num_kv_head=num_heads, v_head_dim=V_HEAD, ask_aiter=extended
     )
     backend.fp8_prefill_num_kv_head = backend.fp8_prefill_num_head
     qo_indptr = torch.zeros(len(q_lens) + 1, dtype=torch.int32)
@@ -56,7 +56,7 @@ def _backend(num_heads, q_lens, keyless_prefix_chunks=True):
     return backend
 
 
-def _backend_without_reduce_instance(num_heads, q_lens):
+def _backend_without_reduce_instance(num_heads, q_lens, extended=True):
     """The backend as built against an AITER whose compiled mla_reduce_v1 lacks num_heads."""
     _aiter_has_mla_reduce_v1_instance.cache_clear()
     try:
@@ -65,7 +65,7 @@ def _backend_without_reduce_instance(num_heads, q_lens):
             return_value=False,
             create=True,
         ):
-            return _backend(num_heads, q_lens)
+            return _backend(num_heads, q_lens, extended=extended)
     finally:
         _aiter_has_mla_reduce_v1_instance.cache_clear()
 
@@ -120,22 +120,26 @@ class TestAiterMlaFp8PrefillPs(CustomTestCase):
         """Heads without an mla_reduce_v1 instance pad up to one;
         padding must not perturb the real heads' output or LSE, nor reach a missing instance."""
         q_lens, kv_lens = [300, 77], [517, 1200]
-        # Which 12-head path runs depends on the installed AITER, so also force the padded one;
-        # 48 and 96 (Kimi-K3 at TP2 and TP1) run natively from the static table.
-        for num_heads, pad in (
-            (KIMI_K3_TP8_HEADS, False),
-            (KIMI_K3_TP8_HEADS, True),
-            (16, False),
-            (48, False),
-            (96, False),
+        # Which 12/48/96-head (Kimi-K3 at TP8/TP2/TP1) path runs on the extended paths
+        # depends on the installed AITER, so also force the padded one. Without the
+        # extension the table alone decides and repeat-padding fills (other models).
+        for num_heads, pad, extended in (
+            (KIMI_K3_TP8_HEADS, False, True),
+            (KIMI_K3_TP8_HEADS, True, True),
+            (KIMI_K3_TP8_HEADS, True, False),
+            (16, False, True),
+            (48, False, True),
+            (96, False, True),
         ):
-            with self.subTest(num_heads=num_heads, pad=pad):
+            with self.subTest(num_heads=num_heads, pad=pad, extended=extended):
                 if pad:
-                    backend = _backend_without_reduce_instance(num_heads, q_lens)
+                    backend = _backend_without_reduce_instance(
+                        num_heads, q_lens, extended=extended
+                    )
                     self.assertEqual(backend.fp8_prefill_num_head, 16)
                 else:
                     backend = _backend(num_heads, q_lens)
-                    self.assertEqual(backend.fp8_prefill_num_head, num_heads)
+                    self.assertGreaterEqual(backend.fp8_prefill_num_head, num_heads)
                 kv_indptr = torch.zeros(len(kv_lens) + 1, dtype=torch.int32)
                 kv_indptr[1:] = torch.tensor(kv_lens).cumsum(0)
                 ps = backend._build_prefill_ps_metadata(
@@ -209,21 +213,12 @@ class TestAiterMlaFp8PrefillPs(CustomTestCase):
                 self.assertFalse(merged.isnan().any())
                 torch.testing.assert_close(merged[keyless], other_out[keyless])
 
-    def test_keyless_prefix_chunk_stays_bf16_off_kimi_k3(self):
-        """Keyless prefix chunks run on the asm fp8 prefill only for Kimi-K3;
-        every other MLA model keeps such a chunk on bf16 varlen, at bf16 accuracy."""
-        self.assertTrue(
-            _fp8_prefill_runs_keyless_prefix_chunks(
-                SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"])
-            )
-        )
-        for arch in ("DeepseekV3ForCausalLM", "KimiK31ForConditionalGeneration"):
-            config = SimpleNamespace(architectures=[arch], index_topk=2048)
-            self.assertFalse(_fp8_prefill_runs_keyless_prefix_chunks(config))
-
+    def test_keyless_prefix_chunk_stays_bf16_without_the_extension(self):
+        """Keyless prefix chunks run on the asm fp8 prefill only where a model declares
+        mla_fp8_prefill_extended; every other MLA model keeps such a chunk on bf16 varlen."""
         q_lens, chunk_lens = [130, 40, 260], [700, 0, 333]
         num_heads = 16
-        backend = _backend(num_heads, q_lens, keyless_prefix_chunks=False)
+        backend = _backend(num_heads, q_lens, extended=False)
         chunk_lens_t = torch.tensor([chunk_lens], dtype=torch.int32)
         cu = torch.zeros(1, len(chunk_lens) + 1, dtype=torch.int32)
         cu[:, 1:] = chunk_lens_t.cumsum(1)

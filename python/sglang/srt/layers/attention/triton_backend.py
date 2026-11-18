@@ -316,12 +316,13 @@ class TritonAttnBackend(AttentionBackend):
             and mla_config.v_head_dim == 128
             and mla_config.kv_lora_rank == 512
         )
-        # forward_mha discovers these hooks dynamically. Hiding them when the
-        # exact Kimi-K3 FP8 configuration is absent keeps all other models on
-        # their existing code paths.
+        # forward_mha packs prefix K/V here only when supports_prefix_chunk_kv_pack
+        # says so, and discovers prepare_chunked_prefill_qkv dynamically. Both stay
+        # off when the exact Kimi-K3 FP8 configuration is absent, which keeps all
+        # other models on their existing code paths.
+        self.supports_prefix_chunk_kv_pack = self.use_dense_fp8_chunked_prefill
         if not self.use_dense_fp8_chunked_prefill:
             self.prepare_chunked_prefill_qkv = None
-            self.pack_prefix_chunk_kv = None
         # One read rail per window sub-pool the window layers read.
         self.window_lengths = self._window_lengths(model_runner)
         # The decode kernel's "// Lv" stride trick requires attn_logits.shape[-1]
