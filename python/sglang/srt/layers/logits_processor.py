@@ -1621,7 +1621,8 @@ class LogitsProcessor(nn.Module):
         Compute logprobs for multi-item scoring using pre-computed delimiter indices.
 
         Sequence format: Query<delimiter>Item1<delimiter>Item2<delimiter>...
-        Scoring positions: Extracts logprobs at positions before each <delimiter>
+        Scoring positions: Extracts logprobs before each <delimiter>. Empty items
+        with a nonempty query reuse the query's final-token readout.
 
         Args:
             input_ids: Input token IDs. Shape: [total_sequence_length].
@@ -1634,20 +1635,23 @@ class LogitsProcessor(nn.Module):
         # Build offset-adjusted indices on CPU, then do a single CPU→GPU transfer.
         device = input_ids.device
         all_tensors = []
-        if logits_metadata.extend_seq_lens_cpu is not None:
-            offset = 0
-            for req_seq_len, indices_tensor in zip(
-                logits_metadata.extend_seq_lens_cpu, multi_item_delimiter_indices
-            ):
-                if len(indices_tensor) > 0:
-                    # Note: if the first delimiter is at position 0 (empty query),
-                    # indices - 1 wraps to -1. This is harmless — the first
-                    # delimiter entry is always discarded by
-                    # _process_multi_item_scoring_results.
-                    all_tensors.append(indices_tensor + (offset - 1))
-                offset += req_seq_len
-        else:
-            all_tensors.append(multi_item_delimiter_indices[0] - 1)
+        seq_lens = logits_metadata.extend_seq_lens_cpu
+        if seq_lens is None:
+            seq_lens = [hidden_states.shape[0]]
+        offset = 0
+        for req_seq_len, indices_tensor in zip(seq_lens, multi_item_delimiter_indices):
+            if len(indices_tensor) > 0:
+                readout_indices = indices_tensor - 1
+                if indices_tensor[0] > 0:
+                    # Empty items predict after the query, not after a delimiter.
+                    empty_items = indices_tensor[1:] == indices_tensor[:-1] + 1
+                    readout_indices[1:] = torch.where(
+                        empty_items, readout_indices[0], readout_indices[1:]
+                    )
+                # With an empty query, the unused first row still wraps to -1
+                # and is discarded by _process_multi_item_scoring_results.
+                all_tensors.append(readout_indices + offset)
+            offset += req_seq_len
         multi_item_indices = torch.cat(all_tensors).to(device, non_blocking=True)
 
         # Extract hidden states at delimiter positions for multi-item scoring
