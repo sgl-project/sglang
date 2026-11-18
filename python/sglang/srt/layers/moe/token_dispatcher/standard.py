@@ -58,6 +58,13 @@ except ImportError:
     nvfp4_block_scale_interleave_flashinfer = None
 
 
+class GatheredMxfp8Scale(NamedTuple):
+    """pre_quant_input whose ``hidden_states`` are already MXFP8 (fp8) rows: their
+    group-32 e8m0 scales, carried as ``hidden_states_scale``."""
+
+    scale: torch.Tensor
+
+
 class StandardDispatchOutput(NamedTuple):
     """Standard dispatch output."""
 

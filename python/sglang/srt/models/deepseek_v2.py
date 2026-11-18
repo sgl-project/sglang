@@ -1087,6 +1087,12 @@ class DeepseekV2MoE(nn.Module):
         )
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
+        routed = self.__dict__.pop("_routed_prequant", None)
+        if routed is not None:
+            return self._forward_routed_prequant(
+                routed, return_moe_output, leave_output_sum
+            )
+
         num_token_non_padded = (
             forward_batch.moe_num_token_non_padded()
             if forward_batch is not None
@@ -1170,6 +1176,30 @@ class DeepseekV2MoE(nn.Module):
             return self.forward_deepep(
                 hidden_states, forward_batch, input_ids_global=input_ids_global
             )
+
+    def _forward_routed_prequant(
+        self, routed, return_moe_output: bool, leave_output_sum: bool
+    ) -> Union[torch.Tensor, MoEOutput]:
+        """Routed experts on rows routed and MXFP8-quantized before the DP gather
+        (SGLANG_HIP_DP_ROUTED_MXFP8_GATHER); the shared expert ran on the local rows."""
+        from sglang.srt.layers.moe.token_dispatcher.standard import GatheredMxfp8Scale
+
+        final_hidden_states = self.experts(
+            routed.hidden_q,
+            routed.topk_output,
+            pre_quant_input=GatheredMxfp8Scale(routed.scale),
+        )
+        if not (_use_aiter and self.routed_scaling_factor_fused_in_topk):
+            final_hidden_states *= self.routed_scaling_factor
+        if return_moe_output or leave_output_sum:
+            return MoEOutput(
+                routed=final_hidden_states,
+                shared=None,
+                experts=self.experts,
+                routed_scaling_factor=self.routed_scaling_factor,
+                shared_is_replicated=self._shared_expert_tp1,
+            )
+        return self._finalize_normal_output(final_hidden_states, None)
 
     def forward_normal_dual_stream(
         self,

@@ -1113,6 +1113,13 @@ class Envs:
     # before the gather) to an expert this rank masks off, so the MoE sort drops them
     # instead of piling them (bias-only router logits) onto the same few local experts.
     SGLANG_HIP_DP_MASK_PAD_TOPK = EnvBool(False)
+    # MAX_LEN DP decode on HIP with SGLANG_DP_SHARED_EXPERT_LOCAL: route and MXFP8-quantize
+    # the local rows before the gather, which then carries [fp8 | e8m0 | topk ids | topk
+    # weights] instead of bf16; aiter fused_moe takes the pre-quantized activations.
+    SGLANG_HIP_DP_ROUTED_MXFP8_GATHER = EnvBool(False)
+    # The same routed MXFP8 gather for SUM_LEN (prefill / extend) steps on the variable-length
+    # gatherv path (SGLANG_DP_USE_GATHERV); replaces SGLANG_ENABLE_DP_GATHER_FP8 for routed MoE layers.
+    SGLANG_HIP_DP_ROUTED_MXFP8_GATHER_PREFILL = EnvBool(False)
     # The gfx950 TP4 JIT quick all-reduce (quick_all_reduce_hip) runs an INT4 request below this
     # many MiB in INT8, which is as fast at decode sizes with about 1/16 of INT4's error; 0 runs
     # INT4 at every size.

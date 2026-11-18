@@ -34,6 +34,11 @@ from sglang.srt.layers.moe import (
     get_moe_ascend_ops_config,
     should_use_dp_reduce_scatterv,
 )
+from sglang.srt.models.deepseek_common.amd.routed_mxfp8_gather import (
+    gather_routed_mxfp8,
+    gather_routed_mxfp8_varlen,
+    routed_mxfp8_gather_applies,
+)
 from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip
 
@@ -186,11 +191,26 @@ class MoeRowTransport(ComputeTransport):
             )
             if do_shared_local and local_hidden_states.shape[0] > 0:
                 _shared_local = moe._forward_shared_experts(local_hidden_states)
+            if routed_mxfp8_gather_applies(
+                moe,
+                local_hidden_states,
+                forward_batch,
+                hidden_states.shape[0],
+                do_shared_local,
+            ):
+                gather = (
+                    gather_routed_mxfp8
+                    if forward_batch.dp_padding_mode.is_max_len()
+                    else gather_routed_mxfp8_varlen
+                )
+                routed = gather(moe, local_hidden_states, forward_batch, input_ids)
+                hidden_states = routed.hidden_q
+                moe._routed_prequant = routed
             # Pad rows are not refreshed during graph replay. Stale bf16-max
             # values can overflow the MoE and contaminate the combine output.
             # self_attn has already reduced across attention TP, so these hidden
             # states are replicated and must not be summed by a partial gather.
-            if not (
+            elif not (
                 _is_hip
                 and dp_gather_replicate_zero_pad(
                     hidden_states, local_hidden_states, forward_batch
