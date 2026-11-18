@@ -1253,28 +1253,24 @@ class ModelRunner:
     def prewarm_sampling(self) -> SamplingPrewarmResult:
         """Warm sampling, penalty, and logprob kernels after graph initialization."""
         self.sampling_prewarm_result = SamplingPrewarmResult()
-        vocab_size = getattr(getattr(self, "model_config", None), "vocab_size", 0)
-        device_str = str(getattr(self, "device", ""))
+        vocab = getattr(getattr(self, "model_config", None), "vocab_size", 0)
+        dev_str = str(getattr(self, "device", ""))
+        warmups = getattr(getattr(self, "server_args", None), "warmups", None) or ""
         if (
-            not getattr(self, "is_generation", False)
+            "all" not in {w.strip() for w in warmups.split(",")}
+            or not getattr(self, "is_generation", False)
             or getattr(self, "is_draft_worker", False)
             or getattr(self, "sampler", None) is None
             or get_exec().dllm.dllm_algorithm is not None
-            or not device_str.startswith("cuda")
+            or not dev_str.startswith("cuda")
             or not torch.cuda.is_available()
-            or not isinstance(vocab_size, int)
-            or vocab_size <= 0
+            or not isinstance(vocab, int)
+            or vocab <= 0
         ):
             return self.sampling_prewarm_result
 
-        raw_warmups = getattr(getattr(self, "server_args", None), "warmups", None) or ""
-        if "all" not in {w.strip() for w in raw_warmups.split(",")}:
-            return self.sampling_prewarm_result
-
-        tic = time.perf_counter()
-        device = torch.device(self.device)
-        enable_det = get_exec().deterministic.enable_deterministic_inference
-
+        tic, dev = time.perf_counter(), torch.device(self.device)
+        det = get_exec().deterministic.enable_deterministic_inference
         try:
             from sglang.srt.layers.logsumexp import (
                 FUSED_TOPK_MAX_K,
@@ -1288,97 +1284,72 @@ class ModelRunner:
             def _sample(
                 bs: int,
                 temp: float,
-                *,
                 top_p: float = 1.0,
-                top_k: int = vocab_size,
+                top_k: int = vocab,
                 min_p: float = 0.0,
-                logprob: bool = False,
+                lp: bool = False,
             ) -> None:
-                greedy = temp == 0.0
-                k_lp = min(5, vocab_size) if logprob else 0
+                g = temp == 0.0
                 info = SamplingBatchInfo(
                     temperatures=torch.full(
-                        (bs, 1), temp, dtype=torch.float32, device=device
+                        (bs, 1), temp, dtype=torch.float32, device=dev
                     ),
-                    top_ps=torch.full((bs,), top_p, dtype=torch.float32, device=device),
-                    top_ks=torch.full((bs,), top_k, dtype=torch.int32, device=device),
-                    min_ps=torch.full((bs,), min_p, dtype=torch.float32, device=device),
-                    is_all_greedy=greedy,
-                    is_any_greedy=greedy,
-                    need_top_p_sampling=not greedy and top_p < 1.0,
-                    need_top_k_sampling=not greedy and top_k < vocab_size,
-                    need_min_p_sampling=not greedy and min_p > 0.0,
-                    vocab_size=vocab_size,
-                    sampling_seed=(
-                        torch.zeros(bs, dtype=torch.int64, device=device)
-                        if enable_det
-                        else None
-                    ),
+                    top_ps=torch.full((bs,), top_p, dtype=torch.float32, device=dev),
+                    top_ks=torch.full((bs,), top_k, dtype=torch.int32, device=dev),
+                    min_ps=torch.full((bs,), min_p, dtype=torch.float32, device=dev),
+                    is_all_greedy=g,
+                    is_any_greedy=g,
+                    need_top_p_sampling=not g and top_p < 1.0,
+                    need_top_k_sampling=not g and top_k < vocab,
+                    need_min_p_sampling=not g and min_p > 0.0,
+                    vocab_size=vocab,
+                    sampling_seed=torch.zeros(bs, dtype=torch.int64, device=dev)
+                    if det
+                    else None,
                     max_top_k=top_k,
-                    device=device_str,
+                    device=dev_str,
                 )
+                logits = torch.zeros((bs, vocab), dtype=torch.float32, device=dev)
+                pos = torch.zeros(bs, dtype=torch.int64, device=dev)
                 self.sampler(
-                    LogitsProcessorOutput(
-                        next_token_logits=torch.zeros(
-                            (bs, vocab_size), dtype=torch.float32, device=device
-                        )
-                    ),
+                    LogitsProcessorOutput(next_token_logits=logits),
                     info,
-                    logprob,
-                    [k_lp] * bs,
+                    lp,
+                    [min(5, vocab) if lp else 0] * bs,
                     [None] * bs,
-                    torch.zeros(bs, dtype=torch.int64, device=device),
+                    pos,
                 )
 
-            with (
-                torch.no_grad(),
-                envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(False),
-            ):
+            with torch.no_grad(), envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(False):
                 for bs in (1, 2):
-                    _sample(bs, 0.0, logprob=True)
-                    _sample(
-                        bs, 0.6, top_p=0.95, top_k=min(20, vocab_size), logprob=True
-                    )
-                    _sample(bs, 0.7, top_p=0.95, top_k=min(50, vocab_size), min_p=0.05)
+                    _sample(bs, 0.0, lp=True)
+                    _sample(bs, 0.6, 0.95, min(20, vocab), lp=True)
+                    _sample(bs, 0.7, 0.95, min(50, vocab), 0.05)
                     apply_scaling_penalties(
-                        torch.zeros(
-                            (bs, vocab_size), dtype=torch.float32, device=device
-                        ),
-                        torch.ones(
-                            (bs, vocab_size), dtype=torch.float32, device=device
-                        ),
+                        torch.zeros((bs, vocab), dtype=torch.float32, device=dev),
+                        torch.ones((bs, vocab), dtype=torch.float32, device=dev),
                     )
-
                 dtypes = [torch.float32] + (
                     [self.dtype]
                     if getattr(self, "dtype", None) in (torch.bfloat16, torch.float16)
                     else []
                 )
-                ks = sorted(
-                    {
-                        k
-                        for k in (1, 2, 5)
-                        if 1 <= k <= min(FUSED_TOPK_MAX_K, vocab_size)
-                    }
-                )
+                ks = [k for k in (1, 2, 5) if k <= min(FUSED_TOPK_MAX_K, vocab)]
                 for dt in dtypes:
-                    lse_in = torch.zeros((2, vocab_size), dtype=dt, device=device)
-                    row_logsumexp(lse_in)
-                    for k_lse in ks:
-                        row_logsumexp_topk(lse_in, k_lse)
+                    x = torch.zeros((2, vocab), dtype=dt, device=dev)
+                    row_logsumexp(x)
+                    for k in ks:
+                        row_logsumexp_topk(x, k)
 
-            torch.cuda.synchronize(device)
+            torch.cuda.synchronize(dev)
             if get_parallel().tp_rank == 0:
                 logger.info(
-                    "Prewarmed sampling, penalty, and logprob kernels in %.2f s.",
-                    time.perf_counter() - tic,
+                    "Prewarmed sampling kernels in %.2f s.", time.perf_counter() - tic
                 )
         except Exception:
             logger.warning(
-                "Sampling kernel prewarm encountered an error; continuing startup.",
-                exc_info=True,
+                "Sampling kernel prewarm failed; continuing startup.", exc_info=True
             )
-
         return self.sampling_prewarm_result
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):

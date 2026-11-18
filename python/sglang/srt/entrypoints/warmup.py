@@ -56,8 +56,8 @@ async def execute_warmups(
 ):
     token = _current_app_state.set(app_state)
     try:
-        for raw_name in warmup_names:
-            warmup_name = raw_name.strip() if raw_name else ""
+        for raw in warmup_names:
+            warmup_name = raw.strip() if raw else ""
             if not warmup_name:
                 continue
             if warmup_name not in _warmup_registry:
@@ -69,56 +69,47 @@ async def execute_warmups(
         _current_app_state.reset(token)
 
 
-def _multi_worker_info(tokenizer_manager: Any) -> Optional[tuple[str, int, int]]:
-    parent_pid = getattr(multiprocessing.current_process(), "_parent_pid", None)
-    server_args = getattr(tokenizer_manager, "server_args", None)
-    worker_num = getattr(server_args, "tokenizer_worker_num", 1)
-    if parent_pid is None or not isinstance(worker_num, int) or worker_num <= 1:
+def _multi_worker_info(tm: Any) -> Optional[tuple[str, int, int]]:
+    ppid = getattr(multiprocessing.current_process(), "_parent_pid", None)
+    args = getattr(tm, "server_args", None)
+    n = getattr(args, "tokenizer_worker_num", 1)
+    if ppid is None or not isinstance(n, int) or n <= 1:
         return None
-    port = getattr(server_args, "port", 0)
-    startup = getattr(tokenizer_manager, "startup_time", None)
-    tag = hashlib.sha256(f"{parent_pid}:{port}:{startup!r}".encode()).hexdigest()[:12]
-    prefix = os.path.join(
-        tempfile.gettempdir(), f"sglang_warmup_{parent_pid}_{port}_{tag}"
+    port = getattr(args, "port", 0)
+    tag = hashlib.sha256(
+        f"{ppid}:{port}:{getattr(tm, 'startup_time', None)!r}".encode()
+    ).hexdigest()[:12]
+    return (
+        os.path.join(tempfile.gettempdir(), f"sglang_warmup_{ppid}_{port}_{tag}"),
+        ppid,
+        n,
     )
-    return prefix, parent_pid, worker_num
 
 
-def sync_multi_worker_ready_barrier(
-    tokenizer_manager: Any, timeout_s: float = 0
-) -> bool:
-    """Wait until all multi-tokenizer HTTP workers finish warmup; returns True for the leader."""
-    info = _multi_worker_info(tokenizer_manager)
+def sync_multi_worker_ready_barrier(tm: Any, timeout_s: float = 0) -> bool:
+    info = _multi_worker_info(tm)
     if info is None:
         return True
     prefix, main_pid, num_workers = info
-    barrier_dir = f"{prefix}_ready"
-    os.makedirs(barrier_dir, exist_ok=True)
-    my_pid = os.getpid()
-    open(os.path.join(barrier_dir, str(my_pid)), "w").close()
-
-    deadline = time.monotonic() + (timeout_s if timeout_s > 0 else 600)
-    live = [my_pid]
+    bdir, my_pid = f"{prefix}_ready", os.getpid()
+    os.makedirs(bdir, exist_ok=True)
+    open(os.path.join(bdir, str(my_pid)), "w").close()
+    deadline, live = time.monotonic() + (timeout_s if timeout_s > 0 else 600), [my_pid]
     while time.monotonic() < deadline:
         try:
             live = [
                 int(e)
-                for e in os.listdir(barrier_dir)
+                for e in os.listdir(bdir)
                 if e.isdigit() and psutil.pid_exists(int(e))
             ]
         except OSError:
             live = []
-        if len(live) >= num_workers:
-            break
-        if not psutil.pid_exists(main_pid):
-            return False
+        if len(live) >= num_workers or not psutil.pid_exists(main_pid):
+            return psutil.pid_exists(main_pid) and bool(live) and my_pid == min(live)
         time.sleep(0.05)
-    else:
-        logger.warning(
-            "Timed out waiting for %d tokenizer workers (%d ready); proceeding.",
-            num_workers,
-            len(live),
-        )
+    logger.warning(
+        "Timed out waiting for %d tokenizer workers (%d ready).", num_workers, len(live)
+    )
     return bool(live) and my_pid == min(live)
 
 
@@ -126,16 +117,7 @@ def sync_multi_worker_ready_barrier(
 async def whisper_autodetect(
     disaggregation_mode: str, tokenizer_manager: TokenizerManager
 ):
-    """Pre-compile the xgrammar FSM for both Whisper auto-detect regexes.
-
-    The first request that uses each structured-generation regex incurs a
-    ~15-20s compilation cost. xgrammar caches compiled grammars by the
-    exact regex string, so we warm both the notimestamps and timestamps
-    variants here — otherwise the first ``language=None +
-    timestamp_granularities`` request would still pay the full spike.
-    """
-    # A short silent audio encoded as base64 WAV (0.1s, 16kHz, mono) —
-    # soundfile produces the WAV header + PCM data from a list of floats.
+    """Pre-compile the xgrammar FSM for both Whisper auto-detect regexes."""
     import base64
     import io
 
@@ -151,8 +133,9 @@ async def whisper_autodetect(
     n = int(sr * dur)
     buf = io.BytesIO()
     sf.write(buf, [0.0] * n, sr, format="WAV")
-    audio_b64 = base64.b64encode(buf.getvalue()).decode()
-    audio_data_uri = f"data:audio/wav;base64,{audio_b64}"
+    audio_data_uri = (
+        f"data:audio/wav;base64,{base64.b64encode(buf.getvalue()).decode()}"
+    )
 
     for variant_name, regex in (
         ("notimestamps", WHISPER_AUTODETECT_REGEX),
@@ -175,15 +158,9 @@ async def whisper_autodetect(
             },
             modalities=["audio"],
         )
-        # PD prefill servers assert req.bootstrap_room is not None in the
-        # default follow_bootstrap_room scheduler; the fake values match
-        # what the voice_chat warmup uses for the same reason.
         if disaggregation_mode != "null":
             req.bootstrap_room = 0
             req.bootstrap_host = FAKE_BOOTSTRAP_HOST
-        # Drain the generator so the FSM is fully installed and any
-        # downstream exception surfaces instead of being swallowed after
-        # the first yield.
         async for _ in tokenizer_manager.generate_request(req, None):
             pass
     logger.info("Whisper auto-detect regex FSMs compiled.")
@@ -191,8 +168,6 @@ async def whisper_autodetect(
 
 @warmup("voice_chat", rust_server=True)
 async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
-    # this warms up the fused_moe triton kernels and caches them
-    # if we don't do this we break real time inference for voice chat
     for i in tqdm.trange(1, 512):
         size = i * 4
         generate_req_input = GenerateReqInput(
@@ -207,56 +182,38 @@ async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManag
         if disaggregation_mode != "null":
             generate_req_input.bootstrap_room = 0
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
-
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
 
 
-def _max_warmup_input_len(
-    tokenizer_manager: Any, max_new_tokens: int = 1
-) -> Optional[int]:
-    """Return the strictest safe prompt length for a warmup request, honoring
-    model ``context_len``, ``num_reserved_tokens``, scheduler ``max_req_input_len``,
-    and unchunked ``max_prefill_tokens``."""
-    server_args = getattr(tokenizer_manager, "server_args", None)
-    model_cfg = getattr(tokenizer_manager, "model_config", None)
-    reserved = max(0, int(getattr(tokenizer_manager, "num_reserved_tokens", 0) or 0))
-    need_out = max(1, int(max_new_tokens or 1))
-
-    limits: List[int] = []
-    for ctx in (
-        getattr(tokenizer_manager, "context_len", None),
-        getattr(model_cfg, "context_len", None),
-        getattr(server_args, "context_length", None),
-    ):
-        if isinstance(ctx, int) and ctx > 0:
-            # TokenizerManager enforces: input_len + reserved < ctx
-            # and input_len + reserved + max_new_tokens <= ctx.
-            limits.append(ctx - reserved - need_out)
-
-    max_req = getattr(tokenizer_manager, "max_req_input_len", None)
-    if isinstance(max_req, int) and max_req > 0:
-        # Scheduler enforces: input_len < max_req_input_len (max_req_len - 5).
-        limits.append(min(max_req - 1, max_req + 5 - reserved - need_out))
-
-    chunked_size = getattr(server_args, "chunked_prefill_size", None)
-    max_prefill = getattr(server_args, "max_prefill_tokens", None)
-    if (
-        isinstance(chunked_size, int)
-        and chunked_size <= 0
-        and isinstance(max_prefill, int)
-        and max_prefill > 0
-    ):
-        limits.append(max_prefill)
-
-    return max(0, min(limits)) if limits else None
+def _max_warmup_input_len(tm: Any, max_new: int = 1) -> Optional[int]:
+    args, cfg = getattr(tm, "server_args", None), getattr(tm, "model_config", None)
+    res = max(0, int(getattr(tm, "num_reserved_tokens", 0) or 0))
+    out = max(1, int(max_new or 1))
+    lims = [
+        ctx - res - out
+        for ctx in (
+            getattr(tm, "context_len", None),
+            getattr(cfg, "context_len", None),
+            getattr(args, "context_length", None),
+        )
+        if isinstance(ctx, int) and ctx > 0
+    ]
+    if isinstance(mr := getattr(tm, "max_req_input_len", None), int) and mr > 0:
+        lims.append(min(mr - 1, mr + 5 - res - out))
+    cs, mp = (
+        getattr(args, "chunked_prefill_size", None),
+        getattr(args, "max_prefill_tokens", None),
+    )
+    if isinstance(cs, int) and cs <= 0 and isinstance(mp, int) and mp > 0:
+        lims.append(mp)
+    return max(0, min(lims)) if lims else None
 
 
 def _prefill_shape_sizes(max_size: int = 32768) -> List[int]:
-    page_size, sizes, base = 64, set(), 64
+    sizes, base = set(), 64
     while base <= max_size:
         sizes.add(base)
-        mid = (base * 3 // 2 + page_size - 1) // page_size * page_size
-        if mid <= max_size:
+        if (mid := (base * 3 // 2 + 63) // 64 * 64) <= max_size:
             sizes.add(mid)
         base *= 2
     return sorted(sizes)
@@ -264,77 +221,64 @@ def _prefill_shape_sizes(max_size: int = 32768) -> List[int]:
 
 @warmup("prefill_shapes", rust_server=True)
 async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
-    """Warmup Triton kernels across a wide range of prefill seq_lens (up to 32K).
-
-    Uses power-of-2 sizes plus intermediate points to cover the shape space
-    that fused_moe, attention extend, and other Triton kernels may encounter.
-    """
-    max_input = _max_warmup_input_len(tokenizer_manager, max_new_tokens=1)
-    max_size = min(32768, max_input) if max_input is not None else 32768
+    cap = _max_warmup_input_len(tokenizer_manager, 1)
+    max_size = min(32768, cap) if cap is not None else 32768
     for size in tqdm.tqdm(
-        _prefill_shape_sizes(max_size),
-        desc=f"Warmup prefill shapes (up to {max_size})",
+        _prefill_shape_sizes(max_size), desc=f"Warmup prefill shapes (up to {max_size})"
     ):
-        generate_req_input = GenerateReqInput(
+        req = GenerateReqInput(
             input_ids=(np.random.randint(2**16, size=[size])).tolist(),
-            sampling_params={
-                "max_new_tokens": 1,
-                "temperature": 0.0,
-            },
+            sampling_params={"max_new_tokens": 1, "temperature": 0.0},
         )
         if disaggregation_mode != "null":
-            generate_req_input.bootstrap_room = 0
-            generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
-
-        await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+            req.bootstrap_room, req.bootstrap_host = 0, FAKE_BOOTSTRAP_HOST
+        await tokenizer_manager.generate_request(req, None).__anext__()
 
 
 async def _send(
-    disaggregation_mode: str,
-    tokenizer_manager: TokenizerManager,
-    input_ids: List[int],
-    sampling_params: Dict[str, Any],
-    *,
-    room_id: int = 0,
-    **kwargs: Any,
+    mode: str,
+    tm: TokenizerManager,
+    ids: List[int],
+    params: Dict[str, Any],
+    room: int = 0,
+    **kw: Any,
 ) -> None:
-    params = dict(sampling_params)
-    max_new = max(1, int(params.get("max_new_tokens", 1) or 1))
-    budget_min = _max_warmup_input_len(tokenizer_manager, max_new_tokens=1)
-    if budget_min is not None:
-        if budget_min < 1:
+    params = dict(params)
+    b1 = _max_warmup_input_len(tm, 1)
+    if b1 is not None:
+        if b1 < 1:
             return
-        limit = _max_warmup_input_len(tokenizer_manager, max_new_tokens=max_new)
-        if (limit is None or limit < 4) and max_new > 1:
-            max_new = max(1, min(max_new, (budget_min + 1) // 2))
-            params["max_new_tokens"] = max_new
-            limit = _max_warmup_input_len(tokenizer_manager, max_new_tokens=max_new)
-        if limit is None or limit < 1:
+        max_new = max(1, int(params.get("max_new_tokens", 1) or 1))
+        lim = _max_warmup_input_len(tm, max_new) or 0
+        if lim < 4 and max_new > 1:
+            params["max_new_tokens"] = max_new = max(1, min(max_new, (b1 + 1) // 2))
+            lim = _max_warmup_input_len(tm, max_new) or 0
+        if lim < 1:
             return
-        if len(input_ids) > limit:
-            input_ids = input_ids[:limit]
-    if kwargs.get("logprob_start_len", -1) >= len(input_ids):
-        kwargs["logprob_start_len"] = max(0, len(input_ids) - 1)
-
-    req = GenerateReqInput(input_ids=input_ids, sampling_params=params, **kwargs)
-    if disaggregation_mode != "null":
-        req.bootstrap_room = room_id
-        req.bootstrap_host = FAKE_BOOTSTRAP_HOST
-    async for _ in tokenizer_manager.generate_request(req, None):
+        ids = ids[:lim]
+    if kw.get("logprob_start_len", -1) >= len(ids):
+        kw["logprob_start_len"] = max(0, len(ids) - 1)
+    req = GenerateReqInput(input_ids=ids, sampling_params=params, **kw)
+    if mode != "null":
+        req.bootstrap_room, req.bootstrap_host = room, FAKE_BOOTSTRAP_HOST
+    async for _ in tm.generate_request(req, None):
         pass
 
 
-async def _run_all_gpu_warmups(
-    disaggregation_mode: str, tokenizer_manager: TokenizerManager
-) -> None:
-    vocab = getattr(getattr(tokenizer_manager, "model_config", None), "vocab_size", 0)
+async def _run_all_gpu_warmups(mode: str, tm: TokenizerManager) -> None:
+    vocab = getattr(getattr(tm, "model_config", None), "vocab_size", 0)
     high = (
         max(32, min(vocab - 16, 2**15))
         if isinstance(vocab, int) and vocab > 32
         else 1024
     )
     rng = np.random.default_rng(42)
-    rand_ids = lambda n: [int(x) for x in rng.integers(16, high, size=n)]
+
+    def rids(n: int) -> List[int]:
+        return [int(x) for x in rng.integers(16, high, size=n)]
+
+    def send(ids: List[int], p: Dict[str, Any], room: int = 0, **kw: Any):
+        return _send(mode, tm, ids, p, room, **kw)
 
     greedy = {"max_new_tokens": 4, "temperature": 0.0, "ignore_eos": True}
     sampled = {
@@ -350,12 +294,9 @@ async def _run_all_gpu_warmups(
         "frequency_penalty": 0.1,
         "presence_penalty": 0.1,
     }
+    max_in = _max_warmup_input_len(tm, 1)
 
-    max_input = _max_warmup_input_len(tokenizer_manager, max_new_tokens=1)
-    can_batch_2 = max_input is None or max_input >= 64
-
-    # 1. Sampling & penalties (bs=1 + concurrent mixed/dynamic bs=2 when capacity allows)
-    for size, params in (
+    for n, p in (
         (16, greedy),
         (21, {**sampled, "max_new_tokens": 16}),
         (
@@ -365,120 +306,68 @@ async def _run_all_gpu_warmups(
         (24, {**sampled, "temperature": 0.7, "top_k": 50, "min_p": 0.05}),
         (21, penalty),
     ):
-        await _send(disaggregation_mode, tokenizer_manager, rand_ids(size), params)
-    if can_batch_2:
-        await asyncio.gather(
-            _send(
-                disaggregation_mode, tokenizer_manager, rand_ids(17), greedy, room_id=0
-            ),
-            _send(
-                disaggregation_mode, tokenizer_manager, rand_ids(23), sampled, room_id=1
-            ),
-        )
-        await asyncio.gather(
-            _send(
-                disaggregation_mode,
-                tokenizer_manager,
-                rand_ids(19),
-                dict(penalty),
-                room_id=0,
-            ),
-            _send(
-                disaggregation_mode,
-                tokenizer_manager,
-                rand_ids(27),
-                dict(penalty),
-                room_id=1,
-            ),
-        )
+        await send(rids(n), p)
+    if max_in is None or max_in >= 64:
+        await asyncio.gather(send(rids(17), greedy, 0), send(rids(23), sampled, 1))
+        await asyncio.gather(send(rids(19), penalty, 0), send(rids(27), penalty, 1))
 
-    # 2. Output & prompt logprobs
-    if getattr(tokenizer_manager, "is_generation", True):
-        lp_kw = {
+    if getattr(tm, "is_generation", True):
+        lp = {
             "return_logprob": True,
             "top_logprobs_num": 5,
             "return_text_in_logprobs": True,
             "log_metrics": False,
         }
-        await _send(
-            disaggregation_mode, tokenizer_manager, rand_ids(16), greedy, **lp_kw
-        )
-        await _send(
-            disaggregation_mode, tokenizer_manager, rand_ids(21), sampled, **lp_kw
-        )
-        if disaggregation_mode != "decode":
-            await _send(
-                disaggregation_mode,
-                tokenizer_manager,
-                rand_ids(25),
+        await send(rids(16), greedy, **lp)
+        await send(rids(21), sampled, **lp)
+        if mode != "decode":
+            await send(
+                rids(25),
                 {"max_new_tokens": 1, "temperature": 0.0},
                 logprob_start_len=0,
-                **lp_kw,
+                **lp,
             )
 
-    # 3. Structured output (FSM compiler + token bitmask kernel)
     if (
-        not getattr(tokenizer_manager, "skip_tokenizer_init", False)
-        and getattr(
-            getattr(tokenizer_manager, "server_args", None), "grammar_backend", None
-        )
-        != "none"
+        not getattr(tm, "skip_tokenizer_init", False)
+        and getattr(getattr(tm, "server_args", None), "grammar_backend", None) != "none"
     ):
         schema = '{"type":"object","properties":{"safe":{"type":"boolean"}},"required":["safe"]}'
-        await _send(
-            disaggregation_mode,
-            tokenizer_manager,
-            rand_ids(16),
-            {"max_new_tokens": 8, "temperature": 0.0, "json_schema": schema},
+        await send(
+            rids(16), {"max_new_tokens": 8, "temperature": 0.0, "json_schema": schema}
         )
-        await _send(
-            disaggregation_mode,
-            tokenizer_manager,
-            rand_ids(16),
+        await send(
+            rids(16),
             {"max_new_tokens": 4, "temperature": 0.0, "regex": r"(safe|unsafe)"},
         )
 
-    # 4. RadixCache prefix-hit extend (tile buckets + odd KV-slot alignments) & prefill shapes
     env_val = os.environ.get("SGLANG_WARMUP_MAX_PREFILL_SIZE")
     max_size = int(env_val) if env_val and env_val.isdigit() else 32768
-    if max_input is not None:
-        safe_cap = max_input - 15 if max_input > 80 else max_input
-        max_size = min(max_size, safe_cap)
+    if max_in is not None:
+        max_size = min(max_size, max_in - 15 if max_in > 80 else max_in)
 
-    ext_cap = _max_warmup_input_len(tokenizer_manager, max_new_tokens=2)
+    ext_cap = _max_warmup_input_len(tm, 2)
     ext_max = min(max_size, ext_cap) if ext_cap is not None else max_size
-    prefix_len = min(64, max(0, ext_max - 2))
-    prefix = rand_ids(prefix_len) if prefix_len >= 4 else []
-    if prefix:
-        ext_params = {**sampled, "max_new_tokens": 2}
-        for tail in (7, 2, 7, 21, 96):
-            if prefix_len + tail <= ext_max:
-                await _send(
-                    disaggregation_mode,
-                    tokenizer_manager,
-                    prefix + rand_ids(tail),
-                    ext_params,
-                )
+    plen = min(64, max(0, ext_max - 2))
+    prefix = rids(plen) if plen >= 4 else []
+    for tail in (7, 2, 7, 21, 96) if prefix else ():
+        if plen + tail <= ext_max:
+            await send(prefix + rids(tail), {**sampled, "max_new_tokens": 2})
 
-    shape_seqs = [rand_ids(s) for s in (3, 7, 21, 48) if s <= max_size]
-    shape_seqs += [
-        list(prefix) if (s == prefix_len and prefix) else rand_ids(s)
+    seqs = [rids(s) for s in (3, 7, 21, 48) if s <= max_size]
+    seqs += [
+        list(prefix) if (s == plen and prefix) else rids(s)
         for s in _prefill_shape_sizes(max_size)
     ]
-    if shape_seqs:
-        shape_params = {"max_new_tokens": 1, "temperature": 0.0, "ignore_eos": True}
-        for ids in tqdm.tqdm(
-            shape_seqs, desc=f"Warmup prefill shapes (up to {max_size})"
-        ):
-            await _send(disaggregation_mode, tokenizer_manager, ids, shape_params)
-
-    # Flush synthetic warmup KV / Mamba cache before serving traffic
-    flush_fn = getattr(tokenizer_manager, "flush_cache", None)
-    if (
-        disaggregation_mode == "null"
-        and getattr(tokenizer_manager, "is_generation", True)
-        and callable(flush_fn)
+    for ids in (
+        tqdm.tqdm(seqs, desc=f"Warmup prefill shapes (up to {max_size})")
+        if seqs
+        else ()
     ):
+        await send(ids, {"max_new_tokens": 1, "temperature": 0.0, "ignore_eos": True})
+
+    flush_fn = getattr(tm, "flush_cache", None)
+    if mode == "null" and getattr(tm, "is_generation", True) and callable(flush_fn):
         try:
             res = flush_fn()
             if asyncio.iscoroutine(res):
@@ -487,39 +376,36 @@ async def _run_all_gpu_warmups(
             logger.debug("Post-warmup flush_cache skipped", exc_info=True)
 
 
-async def _warm_local_worker(tokenizer_manager: Any, app_state: Optional[Any]) -> None:
-    if getattr(tokenizer_manager, "skip_tokenizer_init", False):
+async def _warm_local_worker(tm: Any, app_state: Optional[Any]) -> None:
+    if getattr(tm, "skip_tokenizer_init", False):
         return
-
-    dyn_tok = getattr(tokenizer_manager, "dynamic_batch_tokenizer", None)
-    tok = getattr(tokenizer_manager, "tokenizer", None)
+    dyn_tok, tok = (
+        getattr(tm, "dynamic_batch_tokenizer", None),
+        getattr(tm, "tokenizer", None),
+    )
     try:
         if dyn_tok is not None:
             await dyn_tok.encode("Warmup dynamic batch tokenizer.")
         elif tok is not None and hasattr(tok, "encode"):
             await asyncio.to_thread(tok.encode, "Warmup tokenizer.")
     except Exception:
-        logger.debug("Tokenizer encode warmup skipped", exc_info=True)
-
+        logger.debug("Tokenizer warmup skipped", exc_info=True)
     if tok is not None:
         try:
             from sglang.srt.entrypoints.openai.utils import token_id_to_bytes
 
             await asyncio.to_thread(token_id_to_bytes, tok, 0)
         except Exception:
-            logger.debug("Tokenizer byte-level cache warmup skipped", exc_info=True)
-
-    serving_chat = (
-        getattr(app_state, "openai_serving_chat", None) if app_state else None
-    )
-    if serving_chat is not None and getattr(tokenizer_manager, "is_generation", True):
+            logger.debug("Byte-level cache warmup skipped", exc_info=True)
+    chat = getattr(app_state, "openai_serving_chat", None) if app_state else None
+    if chat is not None and getattr(tm, "is_generation", True):
         try:
             from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
-            chat_req = ChatCompletionRequest(
+            req = ChatCompletionRequest(
                 messages=[
-                    {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": "Warmup chat template."},
+                    {"role": "system", "content": "Assistant."},
+                    {"role": "user", "content": "Hi."},
                 ],
                 max_tokens=2,
                 temperature=0.6,
@@ -527,31 +413,22 @@ async def _warm_local_worker(tokenizer_manager: Any, app_state: Optional[Any]) -
                 logprobs=True,
                 top_logprobs=2,
             )
-            await asyncio.to_thread(
-                serving_chat._convert_to_internal_request, chat_req, None
-            )
+            await asyncio.to_thread(chat._convert_to_internal_request, req, None)
         except Exception:
-            logger.debug("OpenAIServingChat template warmup skipped", exc_info=True)
+            logger.debug("Chat template warmup skipped", exc_info=True)
 
 
 @warmup("all")
 async def warmup_all(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
-    """Comprehensive warmup covering sampling, penalties, logprobs, structured
-    output, RadixCache prefix hits, prefill shapes, and per-worker tokenizers."""
     info = _multi_worker_info(tokenizer_manager) if fcntl is not None else None
     if info is None:
         await _run_all_gpu_warmups(disaggregation_mode, tokenizer_manager)
     else:
-        prefix, _, _ = info
-        with open(f"{prefix}_all.lock", "a+", encoding="utf-8") as f:
+        with open(f"{info[0]}_all.lock", "a+", encoding="utf-8") as f:
             await asyncio.to_thread(fcntl.flock, f.fileno(), fcntl.LOCK_EX)
             f.seek(0)
             if not f.read():
                 await _run_all_gpu_warmups(disaggregation_mode, tokenizer_manager)
                 f.write("1")
                 f.flush()
-            else:
-                logger.info(
-                    "Skipping GPU warmup in worker %d (completed by peer)", os.getpid()
-                )
     await _warm_local_worker(tokenizer_manager, _current_app_state.get())

@@ -2522,7 +2522,6 @@ def _execute_server_warmup(server_args: ServerArgs):
 
     # Send a warmup request
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
-    defer_ready = _is_multi_tokenizer_worker()
     try:
         if get_disagg().disaggregation_mode == "null":
             res = session.post(
@@ -2533,8 +2532,6 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
-            if not defer_ready:
-                _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
@@ -2559,10 +2556,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                     get_disagg().disaggregation_mode,
                     failed_status_codes,
                 )
-            if failed_status_codes:
                 _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
-            elif not defer_ready:
-                _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
     except Exception:
         last_traceback = traceback.format_exc()
@@ -2571,14 +2565,6 @@ def _execute_server_warmup(server_args: ServerArgs):
         return False
 
     return success
-
-
-def _is_multi_tokenizer_worker() -> bool:
-    return (
-        not getattr(app, "is_single_tokenizer_mode", False)
-        and get_main_process_id() is not None
-        and get_serving().tokenizer_worker_num > 1
-    )
 
 
 def _tokenizer_worker_gc_callback(worker_id: int, gc_threshold) -> Callable[[], None]:
@@ -2637,8 +2623,7 @@ def _wait_and_warmup(
 
     is_leader_worker = True
     if _global_state.tokenizer_manager.server_status != ServerStatus.UnHealthy:
-        if _is_multi_tokenizer_worker():
-            _global_state.tokenizer_manager.server_status = ServerStatus.Starting
+        if not getattr(app, "is_single_tokenizer_mode", False):
             is_leader_worker = sync_multi_worker_ready_barrier(
                 _global_state.tokenizer_manager, envs.SGLANG_WARMUP_TIMEOUT.get()
             )
