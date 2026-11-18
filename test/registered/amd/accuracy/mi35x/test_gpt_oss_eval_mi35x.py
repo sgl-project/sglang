@@ -5,7 +5,7 @@ few-shot completion benchmark on MI35x.
 
 Note: MI35x uses openai/* paths, not lmsys/* paths like MI300X.
 
-Registry: nightly-amd-8-gpu-mi35x suite
+Registry: nightly-test-8-gpu-amd-mi35x suite
 """
 
 import ast
@@ -30,7 +30,7 @@ from sglang.test.test_utils import (
 from sglang.utils import download_and_cache_file, read_jsonl
 
 # Register for AMD CI - MI35x GPT-OSS accuracy tests (~30 min)
-register_amd_ci(est_time=1800, suite="nightly-amd-8-gpu-mi35x", nightly=True)
+register_amd_ci(est_time=1800, suite="nightly-test-8-gpu-amd-mi35x", nightly=True)
 
 INVALID = -9999999
 
