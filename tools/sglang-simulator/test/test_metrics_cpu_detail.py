@@ -111,7 +111,7 @@ def test_source_and_policy_guards_survive(public_adapter, monkeypatch, detail):
         SimOpusNativeCostAdapter.from_sdk(
             database, "deepseek-ai/DeepSeek-V4.1-Flash", **bad
         )
-    from simopus.sdk.operations.compute.region.query import SOURCE_WORK_POLICY
+    SOURCE_WORK_POLICY = "native_region_golden351_decode_work_v1"
 
     with pytest.raises(PredictorError):
         SimOpusNativeCostAdapter.from_sdk(

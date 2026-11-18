@@ -39,7 +39,7 @@ def public_adapter(request, monkeypatch):
             reason="install the current SimOpus SDK for native public integration controls",
         )
     from simopus.sdk import DatabaseMode, DatabaseProvenance, DecodeExecutionProfile
-    from simopus.sdk.models.umd import umd_static
+    from simopus.sdk import DatabaseProvenance
 
     root = (
         Path(__file__).parent / "fixtures/simopus-native-source" / f"tp{request.param}"
@@ -53,7 +53,7 @@ def public_adapter(request, monkeypatch):
         cache_key=lambda: ("CPU-source-fixture", request.param),
     )
     monkeypatch.setattr(
-        umd_static.DatabaseProvenance,
+        DatabaseProvenance,
         "from_database",
         lambda db: DatabaseProvenance(
             "mi355x",
@@ -158,7 +158,7 @@ def step_for(adapter, mode="DECODE", batch=2):
 @pytest.fixture
 def leaves(monkeypatch):
     from simopus.sdk import PerformanceResult
-    from simopus.sdk.operations.compute.region.cost import DSV41NativeSegment
+    from simopus.sdk.estimator.operations.compute.region.cost import DSV41NativeSegment
 
     calls = []
 
@@ -321,7 +321,7 @@ def test_public_source_policy_cannot_be_enabled_without_golden_originals(
     public_adapter,
 ):
     _adapter, database, options = public_adapter
-    from simopus.sdk.operations.compute.region.query import SOURCE_WORK_POLICY
+    SOURCE_WORK_POLICY = "native_region_golden351_decode_work_v1"
 
     with pytest.raises(PredictorError):
         SimOpusNativeCostAdapter.from_sdk(
