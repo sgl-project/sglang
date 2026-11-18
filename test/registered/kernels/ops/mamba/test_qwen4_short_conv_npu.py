@@ -12,7 +12,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models import qwen4_exp as model
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=30, suite="base-b-test-1-npu-a3")
+register_npu_ci(est_time=30, suite="extra-b-test-1-npu-a3")
 pytestmark = pytest.mark.skipif(not model._is_npu, reason="NPU is required")
 
 

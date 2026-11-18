@@ -58,7 +58,16 @@ header).
 
 ## Quick start
 
-Build:
+Pull the container image (multi-arch, amd64 and arm64; see
+[Releases and versions](#releases-and-versions)):
+
+```bash
+docker pull lmsysorg/sgl-router:latest            # latest release
+docker pull lmsysorg/sgl-router:nightly           # built from main every night
+docker run --rm -p 30000:30000 lmsysorg/sgl-router:latest --help
+```
+
+Or build from source:
 
 ```bash
 cd sgl-router
@@ -345,9 +354,11 @@ unset fields inherit the CLI flags. See
   consecutive failures; `--disable-circuit-breaker` turns this off; see
   [circuit breaker](REFERENCE.md#circuit-breaker).
 - **DP-rank routing**: `--dp-aware` also picks the DP rank inside multi-rank
-  engines, and `--dp-rank-policy round_robin` cycles ranks that no routing key
-  or cached prefix decides; in PD mode, `--decode-dispatch-limit N` picks the
-  decode rank shortly before the KV arrives; see
+  engines; for ranks that no routing key or cached prefix decides,
+  `--dp-rank-policy round_robin` cycles them and `least_tokens` keeps the
+  lighter of two random ranks by engine-reported KV tokens; in PD mode,
+  `--decode-dispatch-limit N` picks the decode rank shortly before the KV
+  arrives; see
   [DP-rank routing](REFERENCE.md#dp-rank-routing).
 - **PD version groups**: `--pd-version-group-label <key>` pairs prefill and
   decode only within the same engine version; see
@@ -395,6 +406,37 @@ docker build -f docker/sgl-router.Dockerfile --build-arg CARGO_FEATURES=fips .
   `--no-tokenizer` for load-only policies.
 - On macOS, the FIPS module links as a shared library; set
   `DYLD_LIBRARY_PATH` to its build output directory to run a native build.
+
+## Releases and versions
+
+`sgl-router` is versioned on its own semver track, independent of SGLang
+releases. Each release ships as:
+
+- a container image, `lmsysorg/sgl-router` tagged `v<version>` and `latest`
+  (the newest release);
+- a PyPI package, `pip install sgl-router`, whose wheel (linux x86_64 and
+  aarch64) puts the `sgl-router` binary on `PATH`.
+
+`lmsysorg/sgl-router:nightly` is built from main every night, and the SGLang
+images build the router from their own source. The crate itself is not
+published to crates.io.
+`sgl-router --version` prints the version a binary was built from.
+
+Releases are made manually:
+
+1. Bump `version` in `Cargo.toml` and run `cargo check` once so `Cargo.lock`
+   records it (CI builds with `--locked`): the minor version for new routing
+   behavior, flags, or protocol changes; the patch version for fixes only.
+   Open a PR with the bump and the release notes.
+2. Once the bump is on main, a maintainer tags that commit
+   `router-v<version>` and pushes the tag. That tag starts
+   `release-sgl-router.yml`, which refuses a tag that differs from the
+   `Cargo.toml` version, builds the image and the wheels for amd64 and arm64,
+   pushes `lmsysorg/sgl-router:v<version>` and `:latest`, and uploads the
+   wheels to PyPI.
+
+Do not tag a router release `v<version>`: SGLang's own PyPI and Docker release
+workflows run on every `v*` tag.
 
 ## License
 
