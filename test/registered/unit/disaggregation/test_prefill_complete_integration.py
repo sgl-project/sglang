@@ -1118,6 +1118,35 @@ class TestAllocationIntegration(CustomTestCase):
             mgr._staging_outstanding[1] -= 1
             self.assertEqual(mgr.request_status.get(1), KVPoll.Success)
 
+    def test_abort_after_deferred_chunk_drains_keeps_success(self):
+        mgr = self.manager("prefill", 1)
+        mgr.defer_decode_allocation = False
+        mgr.deferred_bootstrap = None
+        mgr._staging_outstanding = defaultdict(int)
+        with get_context().override_server_args(
+            disaggregation_decode_allocation_policy="early"
+        ):
+            sender = MooncakeKVSender(mgr, "prefill:8998", 1)
+            mgr.update_status(1, KVPoll.WaitingForInput)
+            # Chunk A was deferred and re-enqueued behind the last chunk B, so
+            # both are outstanding when B concludes.
+            mgr._staging_outstanding[1] += 1
+            mgr._staging_outstanding[1] += 1
+            self.conclude_like_worker(mgr)
+            # transfer_worker, after B's uncount: A is still outstanding.
+            mgr._staging_outstanding[1] -= 1
+            mgr.settle_provisional_success(1)
+            with self.subTest("Success is provisional while A is outstanding"):
+                self.assertIn(1, mgr._provisional_success)
+            # Chunk A's retry succeeds; transfer_worker uncounts it.
+            mgr._staging_outstanding[1] -= 1
+            mgr.settle_provisional_success(1)
+            with self.subTest("the final drain retires the marker"):
+                self.assertNotIn(1, mgr._provisional_success)
+            sender.abort()
+            with self.subTest("table keeps Success"):
+                self.assertEqual(mgr.request_status.get(1), KVPoll.Success)
+
 
 if __name__ == "__main__":
     unittest.main()

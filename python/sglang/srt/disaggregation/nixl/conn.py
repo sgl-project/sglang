@@ -1989,6 +1989,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # flag, so a raise after this point must not uncount twice.
                 kv_chunk.staging_counted = False
                 self._staging_outstanding[room] -= 1
+                # Success path only: a failed chunk takes the except branch.
+                self.settle_provisional_success(room)
                 if self.enable_deferred_decode_kv_release:
                     # Handles all DONE => this room's writes landed; ack if it
                     # was aborted and nothing else is outstanding.

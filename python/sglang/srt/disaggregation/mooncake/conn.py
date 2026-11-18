@@ -3213,6 +3213,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # counts it: the decrement and the report find nothing.
                 if kv_chunk.room in self._staging_outstanding:
                     self._staging_outstanding[kv_chunk.room] -= 1
+                # A failed chunk concluded Failed above, before this point.
+                self.settle_provisional_success(kv_chunk.room)
                 self.note_send_finished(kv_chunk.room, kv_chunk.send_record)
                 if self.enable_deferred_decode_kv_release:
                     # In-flight write finished; if aborted and nothing outstanding,

@@ -577,6 +577,10 @@ class MoriKVManager(CommonKVManager):
 
             if is_quiescent:
                 self._mark_transfer_quiescent(kv_chunk)
+                # _process_transfer_chunk concluded any failure before it
+                # returned. The submission failure and drainer paths uncount
+                # before or without that, so they leave the marker in place.
+                self.settle_provisional_success(kv_chunk.room)
 
     def _handle_submission_failure(
         self, kv_chunk: TransferKVChunk, exc: _MoriTransferSubmissionError

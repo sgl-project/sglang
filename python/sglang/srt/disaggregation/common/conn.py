@@ -866,6 +866,21 @@ class CommonKVManager(BaseKVManager):
         if current is not None and (record is None or record is current):
             current.finished += 1
 
+    def settle_provisional_success(self, bootstrap_room: int) -> None:
+        """A staging chunk has been uncounted (worker thread). Once no chunk of
+        the room is outstanding, a Success written while one was is final.
+
+        Call only where a failed chunk has already written Failed: Failed is
+        terminal, so retiring the marker then changes nothing. Retiring it
+        before a failure is reported would let Success swallow that failure.
+        """
+        if (
+            self._provisional_success
+            and self._staging_outstanding.get(bootstrap_room, 0) <= 0
+        ):
+            with self._status_lock:
+                self._provisional_success.discard(bootstrap_room)
+
     def send_counts(self, bootstrap_room: int) -> Tuple[int, int]:
         """The room's sends queued and finished so far, in queue order."""
         record = (self._send_records or {}).get(bootstrap_room)
