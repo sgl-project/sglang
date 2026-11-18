@@ -479,41 +479,20 @@ void biased_grouped_topk_kernel_impl(
         topk_weights[i * topk + j] = scores[index];
       }
 
-#if defined(CPU_CAPABILITY_AVX512)
       if (renormalize || apply_scaling_factor) {
-        __mmask16 mask_sum = (1ULL << routed_count) - 1;
-        __mmask16 mask_all = (1ULL << topk) - 1;
-        __m512 x_all = _mm512_maskz_loadu_ps(mask_all, topk_weights + i * topk);
+        float scale = scaling_factor_value;
         if (renormalize) {
-          __m512 x_sum = _mm512_maskz_loadu_ps(mask_sum, topk_weights + i * topk);
-          float sum = _mm512_reduce_add_ps(x_sum);
-          __m512 vscale = _mm512_set1_ps(scaling_factor_value / sum);
-          __m512 y = _mm512_mul_ps(x_all, vscale);
-          _mm512_mask_storeu_ps(topk_weights + i * topk, mask_all, y);
-        } else {
-          __m512 vscale = _mm512_set1_ps(scaling_factor_value);
-          __m512 y = _mm512_mul_ps(x_all, vscale);
-          _mm512_mask_storeu_ps(topk_weights + i * topk, mask_all, y);
+          float sum = at::vec::reduce_all<float>(
+              [](const Vec& lhs, const Vec& rhs) { return lhs + rhs; }, topk_weights + i * topk, routed_count);
+          scale /= sum;
         }
+        const Vec scale_vec(scale);
+        at::vec::map<float>(
+            [scale_vec](Vec weights) { return weights * scale_vec; },
+            topk_weights + i * topk,
+            topk_weights + i * topk,
+            topk);
       }
-#else
-      if (renormalize || apply_scaling_factor){
-        if (renormalize) {
-          float sum = 0.f;
-          for (int64_t j = 0; j < routed_count; ++j) {
-            sum += topk_weights[i * topk + j];
-          }
-          float scale = scaling_factor_value / sum;
-          for (int64_t j = 0; j < topk; ++j) {
-            topk_weights[i * topk + j] *= scale;
-          }
-        }else{
-          for (int64_t j = 0; j < topk; ++j) {
-            topk_weights[i * topk + j] *= scaling_factor_value;
-          }
-        }
-      }
-#endif
       if (num_fused_shared_experts > 0) {
         const int64_t shared_pos = i * topk + topk - 1;
         topk_ids[shared_pos] = static_cast<int32_t>(NUM_EXPERTS);

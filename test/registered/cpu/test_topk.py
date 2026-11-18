@@ -225,6 +225,71 @@ class TestBiasedGroupedTopKFusedSharedExpert(CustomTestCase):
                                 apply_routed_scaling_factor_on_output,
                             )
 
+    def test_topk_vector_boundaries(self):
+        """Normalize and scale every routed weight across vector boundaries."""
+        hidden_states = torch.zeros(3, 4, dtype=torch.bfloat16)
+        scaling_factor = 2.5
+        for (
+            topk,
+            shared,
+            renormalize,
+            apply_scale,
+            equal_weights,
+            dtype,
+        ) in itertools.product(
+            [15, 16, 17, 32, 33, 64, 65],
+            [0, 1],
+            [False, True],
+            [False, True],
+            [False, True],
+            [torch.float32, torch.bfloat16],
+        ):
+            with self.subTest(
+                topk=topk,
+                shared=shared,
+                renormalize=renormalize,
+                apply_scale=apply_scale,
+                equal_weights=equal_weights,
+                dtype=dtype,
+            ):
+                logits = (
+                    torch.zeros(128) if equal_weights else torch.linspace(-3, 3, 128)
+                )
+                gating_output = logits.repeat(3, 1).to(dtype)
+                bias = (
+                    torch.zeros(128)
+                    if equal_weights
+                    else torch.linspace(-0.1, 0.1, 128)
+                )
+                weights, ids = biased_grouped_topk_cpu(
+                    hidden_states=hidden_states,
+                    gating_output=gating_output,
+                    correction_bias=bias,
+                    topk=topk,
+                    renormalize=renormalize,
+                    num_expert_group=8,
+                    topk_group=8,
+                    num_fused_shared_experts=shared,
+                    routed_scaling_factor=scaling_factor,
+                    apply_routed_scaling_factor_on_output=apply_scale,
+                )
+                scores = gating_output.float().sigmoid()
+                expected_ids = torch.topk(scores + bias, k=topk, dim=-1).indices
+                expected = scores.gather(1, expected_ids)
+                routed_count = topk - shared
+                if renormalize:
+                    expected /= expected[:, :routed_count].sum(dim=-1, keepdim=True)
+                if apply_scale:
+                    expected *= scaling_factor
+                if shared:
+                    expected[:, -1] = 1.0 if apply_scale else 1.0 / scaling_factor
+                    self.assertTrue((ids[:, -1] == 128).all())
+                if not equal_weights:
+                    torch.testing.assert_close(
+                        ids[:, :routed_count].long(), expected_ids[:, :routed_count]
+                    )
+                torch.testing.assert_close(weights, expected, atol=1e-4, rtol=1e-4)
+
 
 class TestBiasedTopK(CustomTestCase):
     def test_biased_topk_returns_logical_ids_with_eplb_info(self):
