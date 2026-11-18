@@ -181,7 +181,21 @@ def test_public_config_load_and_roundtrip(tmp_path, release_config):
     assert reloaded.mtp_config == release_config["mtp_config"]
 
 
-@pytest.mark.parametrize("hub_stub", [None, "NVFP4", "MXFP8"])
+@pytest.mark.parametrize(
+    "hub_stub",
+    [
+        None,
+        dict(quant_method="modelopt", quant_algo="NVFP4"),
+        dict(
+            quant_method="fp8",
+            activation_scheme="dynamic",
+            weight_block_size=[1, 32],
+            scale_fmt="ue8m0",
+            modules_to_not_convert=["model.llm.unembed", "model.visual"],
+        ),
+    ],
+    ids=["none", "nvfp4", "mxfp8"],
+)
 def test_precision_file_is_detected_without_launch_flag(
     tmp_path, release_config, hub_stub
 ):
@@ -198,10 +212,8 @@ def test_precision_file_is_detected_without_launch_flag(
         ),
     )
     if hub_stub:
-        # The published checkpoints add this stub so the Hub counts parameters.
-        release_config["quantization_config"] = dict(
-            quant_method="modelopt", quant_algo=hub_stub
-        )
+        # The published checkpoints add these stubs so the Hub counts parameters.
+        release_config["quantization_config"] = hub_stub
     (tmp_path / "config.json").write_text(json.dumps(release_config))
     (tmp_path / "hf_quant_config.json").write_text(json.dumps(precision))
     config = ModelConfig(str(tmp_path), trust_remote_code=False)
