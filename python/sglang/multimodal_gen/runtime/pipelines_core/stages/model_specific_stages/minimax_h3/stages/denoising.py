@@ -140,14 +140,26 @@ def _image_rollout(
     *, batch: Req, positive: PackedBranchInputs, device: torch.device
 ) -> MiniMaxH3ImageRollout:
     """Rollout state of an image request: its noise generator, and the conditioning the trainer replays."""
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.image_noise import (
+        MINIMAX_H3_IMAGE_NOISE_EXTRA_KEY,
+    )
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
         MiniMaxH3ImageRollout,
     )
 
+    request_generator = batch.extra[MINIMAX_H3_IMAGE_NOISE_EXTRA_KEY].generator
+    # The request's next draw: a generator seeded like the request's would
+    # repeat the initial noise as the first noisy step's noise.
+    step_noise_seed = torch.randint(
+        2**63 - 1,
+        (1,),
+        generator=request_generator,
+        device=request_generator.device,
+    )
     return MiniMaxH3ImageRollout(
         batch=batch,
         sigmas=[float(sigma) for sigma in batch.sigmas],
-        generator=torch.Generator(device=device).manual_seed(int(batch.seed)),
+        generator=torch.Generator(device=device).manual_seed(int(step_noise_seed)),
         pos_cond_kwargs={
             "encoder_hidden_states": positive.text_embeddings.detach().cpu(),
             "h3_packed_layout": {

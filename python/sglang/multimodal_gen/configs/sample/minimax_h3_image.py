@@ -26,7 +26,8 @@ class MiniMaxH3ImageSamplingParams(SamplingParams):
     step: ``negative_prompt`` is rejected and ``guidance_scale`` /
     ``true_cfg_scale`` accept only 1 (no guidance). A no-prompt instance is a
     defaults template for the shared sampling factory. All noise comes from one
-    generator per request seeded with ``seed`` on ``generator_device`` (see
+    generator per request seeded with ``seed`` on ``generator_device``, a
+    rollout's step noise through a seed drawn from it (see
     minimax_h3/image_noise.py). A request below ``min_generation_area`` pixels
     is generated on a larger canvas and resized back to width x height (see
     minimax_h3/image_canvas.py).

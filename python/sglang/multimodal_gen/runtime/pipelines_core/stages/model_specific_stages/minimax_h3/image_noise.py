@@ -13,7 +13,9 @@ the request seed) and consumed in this order:
    patchified; the denoise loop restores references to
    ``t * clean + (1 - t) * noise`` with ``t = MINIMAX_H3_IMGVID_COND_TIMESTEP``;
 3. per edit reference, in condition order: the VAE posterior sample inside
-   ``video_vae.encode_images(..., generator=...)``.
+   ``video_vae.encode_images(..., generator=...)``;
+4. for a training rollout (t2i only, so right after draw 1): the seed of the
+   denoise-device generator that draws each noisy step's transition noise.
 
 Draws 1 and 2 depend only on the request geometry, so every rank of a replica
 and every dedup sibling (``n > 1``) performs them with an identical result;

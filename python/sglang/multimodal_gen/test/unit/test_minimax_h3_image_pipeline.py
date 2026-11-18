@@ -231,6 +231,22 @@ def test_rollout_request_returns_its_trajectory_and_conditioning(server):
     assert conditioning["encoder_hidden_states"].shape == (3, 5120)
 
 
+def test_rollout_step_noise_is_not_the_initial_noise_again(server):
+    """A step generator seeded like the request's replays the initial latent's draw as exploration noise."""
+    trajectory = _rollout_through_the_stages(
+        server, rollout_sde_step_indices=[0], rollout_debug_mode=True
+    )
+
+    initial_noise = trajectory.dit_trajectory.latents[0, 0]
+    step_noise = trajectory.rollout_debug_tensors.rollout_variance_noises[0, 0]
+    # Patchifying reorders the draw, so compare the values, not their places.
+    assert not torch.allclose(
+        step_noise.flatten().sort().values,
+        initial_noise.flatten().sort().values,
+        atol=1e-3,
+    )
+
+
 def _pattern(latent_h, latent_w):
     generator = torch.Generator().manual_seed(3)
     return torch.rand((1, 3, latent_h * 16, latent_w * 16), generator=generator)
