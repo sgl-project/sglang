@@ -28,6 +28,7 @@ from sglang.kernels.ops.diffusion import (
     fuse_layernorm_scale_shift_gate_select01_kernel,
     fuse_residual_layernorm_scale_shift_gate_select01_kernel,
     fuse_scale_shift_kernel,
+    ltx2_ada_values9,
 )
 from sglang.kernels.ops.diffusion.layout.ulysses_qkv_triton import (
     pack_qkv_destination_major,
@@ -123,6 +124,11 @@ def _temb_table_slices(seq_len):
     fused_temb_table_slices(table, temb)
 
 
+def _ltx2_ada_values9(seq_len):
+    table = torch.randn(9, HIDDEN, device=DEVICE, dtype=torch.float32)
+    ltx2_ada_values9(table, _bf16(1, seq_len, 9 * HIDDEN))
+
+
 def _pack_qkv(seq_len):
     q = _bf16(seq_len, 4, 128)
     pack_qkv_destination_major(q, torch.randn_like(q), torch.randn_like(q), 2)
@@ -178,6 +184,7 @@ LAUNCHES = {
     "layernorm_modulate": _layernorm_modulate,
     "qk_head_layernorm": _qk_head_layernorm,
     "temb_table_slices": _temb_table_slices,
+    "ltx2_ada_values9": _ltx2_ada_values9,
     "pack_qkv": _pack_qkv,
     "wan_cat_pad": _wan_cat_pad,
     "wan_cat_pad_channels_first": _wan_cat_pad_channels_first,
