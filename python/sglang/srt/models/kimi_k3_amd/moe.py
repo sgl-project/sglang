@@ -1,7 +1,8 @@
 """Kimi-K3's latent MoE on ROCm.
 
 Shared helpers are imported inside methods to avoid a cycle with ``kimi_k3``,
-which imports this module. ROCm keeps the multicast all-reduce fusion disabled.
+which imports this module on gfx950. ROCm keeps the multicast all-reduce fusion
+disabled.
 """
 
 from __future__ import annotations

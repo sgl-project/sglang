@@ -127,12 +127,6 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
-from sglang.srt.models.kimi_k3_amd.moe import (
-    KimiK3MoEHip,
-    link_hip_paths,
-    prepare_hip_paths,
-    row_shard_bank_hooks_hip,
-)
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3MultiModalProjector,
     KimiK3VisionTower,
@@ -180,6 +174,12 @@ if _is_gfx95:
         k3_bf16_gemm_hip,
         kda_f_b_gemm_hip,
         mono_output_gate_hip,
+    )
+    from sglang.srt.models.kimi_k3_amd.moe import (
+        KimiK3MoEHip,
+        link_hip_paths,
+        prepare_hip_paths,
+        row_shard_bank_hooks_hip,
     )
 
 # (n, k) -> ((m_lo, m_hi, tactic), ...); tactic None = the ladder pick.
