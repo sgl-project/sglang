@@ -26,6 +26,7 @@ from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
 )
+from sglang.srt.layers.dcp.layout import is_mla_dcp_lse_base_on_e
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -59,7 +60,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
     _select_local_dcp_heads_for_autotune,
-    is_mla_dcp_lse_base_on_e,
 )
 from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
@@ -188,13 +188,16 @@ def _absorb_bmm_config(heads: int, m: int, n: int) -> Optional[dict]:
     while block_m < 64 and heads * cdiv(m, block_m) * n_tiles > 2 * num_cu:
         block_m *= 2
     workgroups = heads * cdiv(m, block_m) * n_tiles
+    # Four waves per EU aborts LLVM on gfx950 (#46829);
+    # more than two is also slower for most shapes on MI355X.
+    waves_per_eu = min(2, max(1, cdiv(workgroups, num_cu)))
     return {
         "BLOCK_SIZE_M": block_m,
         "BLOCK_SIZE_N": block_n,
         "GROUP_SIZE_M": 1,
         "num_warps": 4,
         "num_stages": 2,
-        "waves_per_eu": max(1, cdiv(workgroups, num_cu)),
+        "waves_per_eu": waves_per_eu,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg",
     }
@@ -1220,7 +1223,7 @@ class DeepseekMLARocmForwardMixin:
         q, and it casts q to the KV dtype on load anyway: casting before the
         wire halves the bytes without changing a single dot-product input.
         """
-        if not (self.use_dsa and self.current_attention_backend in ("dsa", "nsa")):
+        if not (self.use_dsa and self.current_attention_backend == "dsa"):
             return None
         kernel = get_exec().kernel
         if (
@@ -1261,7 +1264,7 @@ class DeepseekMLARocmForwardMixin:
         return (
             _use_aiter_gfx95
             and self.dcp_size == 1
-            and self.current_attention_backend in ("dsa", "nsa")
+            and self.current_attention_backend == "dsa"
             and (
                 get_exec().kernel.dsa_decode_backend in ("tilelang", "triton")
                 or get_exec().kernel.dsa_prefill_backend in ("tilelang", "triton")

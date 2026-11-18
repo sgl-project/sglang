@@ -62,7 +62,7 @@ def _swa_decode_uses_min_seq_len_rule(case: "DenseAttentionCase") -> bool:
     raise ValueError(
         f"Unknown SWA decode rule for backend {case.backend!r}. Add it to "
         f"either `_SWA_DECODE_MIN_SEQ_LEN_WINDOW` or `_SWA_DECODE_EXTEND_WINDOW` "
-        f"in common/attention_methods/dense_attention.py, depending on what its "
+        f"in attention_methods/dense_attention.py, depending on what its "
         f"`init_forward_metadata_decode` metadata builder produces."
     )
 
@@ -408,6 +408,7 @@ class MockModelRunner(ModelRunner):
             get_kvcache=lambda: self.token_to_kv_pool,
             hands_out_virtual_ids=False,
             state_id_spaces=lambda: {},
+            request_id_spaces=lambda: {},
         )
         self.init_runner_ids()
         self.attention_chunk_size = None

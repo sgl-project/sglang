@@ -19,7 +19,8 @@ def handle_mamba_backend(server_args: Any):
     if cfg.mamba_cache_philox_rounds < 0:
         raise ValueError("--mamba-cache-philox-rounds must be non-negative.")
 
-    if cfg.mamba_max_states_per_path == 0 or cfg.mamba_max_states_per_path < -1:
+    cap = cfg.mamba_max_states_per_path
+    if cap is not None and (cap == 0 or cap < -1):
         raise ValueError(
             "--mamba-max-states-per-path must be -1 (unlimited) or a positive "
             f"integer, got {cfg.mamba_max_states_per_path}."
@@ -126,8 +127,8 @@ def validate_mamba_extra_buffer(view, hf_config: Any, *, mamba_cache_chunk_size_
     )
     if view.mamba_radix_cache_strategy == "extra_buffer_lazy":
         # The PD-disagg decode pool is not wired for lazy slots.
-        assert view.disaggregation_mode == "null", (
-            "extra_buffer_lazy unsupported under PD disaggregation; use "
+        assert view.disaggregation_mode != "decode", (
+            "extra_buffer_lazy unsupported on a PD decode worker; use "
             "--mamba-radix-cache-strategy extra_buffer."
         )
         # eagle/ngram/dspark/dflash all verify through
