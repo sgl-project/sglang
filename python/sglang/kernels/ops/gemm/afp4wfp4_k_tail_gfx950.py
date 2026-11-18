@@ -37,7 +37,7 @@ def k_tail_safe_tiling(
     """Widest BLOCK_SIZE_K, then most num_stages, that keep the K tail out of an unfilled LDS stage."""
     # gemm_afp4wfp4 shrinks a block wider than K to K's next power of two, then raises it to the minimum.
     block_k = max(min(block_k, 1 << (k - 1).bit_length()), _MIN_BLOCK_K)
-    while k_tail_in_unfilled_stage(block_k, k, num_stages):
+    while k_tail_in_unfilled_stage(block_k=block_k, k=k, num_stages=num_stages):
         if block_k > _MIN_BLOCK_K:
             block_k //= 2
             continue
@@ -48,7 +48,7 @@ def k_tail_safe_tiling(
     return block_k, num_stages
 
 
-def _aiter_get_config(m: int, n: int, k_packed: int) -> tuple[dict, bool]:
+def _aiter_get_config(*, m: int, n: int, k_packed: int) -> tuple[dict, bool]:
     # The private config getter gemm_afp4wfp4 itself calls when given no config; it takes packed K.
     from aiter.ops.triton.gemm_afp4wfp4 import _get_config
 
@@ -73,7 +73,7 @@ def k_tail_safe_config(m: int, n: int, k_packed: int) -> Optional[dict]:
     if hip is None or hip.gcn_arch != "gfx950":
         return None
     try:
-        config, _ = _aiter_get_config(m, n, k_packed)
+        config, _ = _aiter_get_config(m=m, n=n, k_packed=k_packed)
     except (KeyError, AssertionError):
         # aiter's get_gemm_config: no M bucket (KeyError) or no DEFAULT.json (AssertionError).
         return None

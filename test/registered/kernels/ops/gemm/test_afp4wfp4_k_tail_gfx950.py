@@ -89,11 +89,13 @@ class TestQuarkAfp4wfp4KTail(CustomTestCase):
 
         for (k, m), (x_q, x_s, w_q, w_s, ref) in self.inputs.items():
             with self.subTest(k=k, m=m):
-                aiter_config, _ = _aiter_get_config(m, N, k // 2)
+                aiter_config, _ = _aiter_get_config(m=m, n=N, k_packed=k // 2)
                 # Guard the premise: once AITER tunes this shape off the stale-LDS path, pick another.
                 self.assertTrue(
                     k_tail_in_unfilled_stage(
-                        aiter_config["BLOCK_SIZE_K"], k, aiter_config["num_stages"]
+                        block_k=aiter_config["BLOCK_SIZE_K"],
+                        k=k,
+                        num_stages=aiter_config["num_stages"],
                     )
                 )
                 y = torch.zeros((m, N), dtype=torch.bfloat16, device="cuda")

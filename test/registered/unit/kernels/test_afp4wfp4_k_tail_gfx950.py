@@ -81,7 +81,7 @@ class TestKTailSafeConfig(CustomTestCase):
         config = self._config(get_config, k_packed=768)
 
         # gemm_afp4wfp4's _get_config takes packed K, as gemm_afp4wfp4 passes it.
-        get_config.assert_called_once_with(16, 7168, 768)
+        get_config.assert_called_once_with(m=16, n=7168, k_packed=768)
         self.assertEqual(config, {**self._DECODE_CONFIG, "BLOCK_SIZE_K": 512})
 
     def test_other_archs_keep_aiters_config(self):
