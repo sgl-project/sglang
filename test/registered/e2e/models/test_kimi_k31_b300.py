@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=1800, stage="extra-b", runner_config="8-gpu-b300")
+register_cuda_ci(est_time=3600, stage="extra-b", runner_config="8-gpu-b300")
 
 MODEL_PATH = "moonshotai/Kimi-K3.1-Pro"
 DFLASH_DRAFT_MODEL = "RadixArk/Kimi-K3.1-Dflash2-Preview"
@@ -35,6 +35,49 @@ class TestKimiK31B300(GSM8KMixin, CustomTestCase):
     gsm8k_top_p = 0.95
     gsm8k_max_tokens = 32768
 
+    server_args = [
+        "--trust-remote-code",
+        "--tp-size",
+        "8",
+        "--dcp-size",
+        "8",
+        "--dcp-comm-backend",
+        "fi_a2a",
+        "--ep-size",
+        "2",
+        "--mem-fraction-static",
+        "0.85",
+        "--max-running-requests",
+        "64",
+        "--weight-loader-prefetch-checkpoints",
+        "--model-loader-extra-config",
+        MODEL_LOADER_EXTRA_CONFIG,
+        "--reasoning-parser",
+        "kimi_k3",
+        "--tool-call-parser",
+        "kimi_k3",
+        "--mamba-full-memory-ratio",
+        "3.63",
+        "--speculative-algorithm",
+        "DFLASH",
+        "--speculative-draft-model-path",
+        DFLASH_DRAFT_MODEL,
+        "--speculative-dflash-block-size",
+        "8",
+        "--speculative-draft-kv-cache-dtype",
+        "fp8_e4m3",
+        "--speculative-draft-attention-backend",
+        "cutedsl_mla",
+        "--enable-linear-replayssm-spec",
+        "--enable-hierarchical-cache",
+        "--hicache-io-backend",
+        "direct",
+        "--hicache-mem-layout",
+        "page_first_direct",
+        "--mamba-max-states-per-path",
+        "1",
+    ]
+
     @classmethod
     def setUpClass(cls):
         cls.model = MODEL_PATH
@@ -43,48 +86,7 @@ class TestKimiK31B300(GSM8KMixin, CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=SERVER_LAUNCH_TIMEOUT,
-            other_args=[
-                "--trust-remote-code",
-                "--tp-size",
-                "8",
-                "--dcp-size",
-                "8",
-                "--dcp-comm-backend",
-                "fi_a2a",
-                "--ep-size",
-                "2",
-                "--mem-fraction-static",
-                "0.85",
-                "--max-running-requests",
-                "64",
-                "--weight-loader-prefetch-checkpoints",
-                "--model-loader-extra-config",
-                MODEL_LOADER_EXTRA_CONFIG,
-                "--reasoning-parser",
-                "kimi_k3",
-                "--tool-call-parser",
-                "kimi_k3",
-                "--mamba-full-memory-ratio",
-                "3.63",
-                "--speculative-algorithm",
-                "DFLASH",
-                "--speculative-draft-model-path",
-                DFLASH_DRAFT_MODEL,
-                "--speculative-dflash-block-size",
-                "8",
-                "--speculative-draft-kv-cache-dtype",
-                "fp8_e4m3",
-                "--speculative-draft-attention-backend",
-                "cutedsl_mla",
-                "--enable-linear-replayssm-spec",
-                "--enable-hierarchical-cache",
-                "--hicache-io-backend",
-                "direct",
-                "--hicache-mem-layout",
-                "page_first_direct",
-                "--mamba-max-states-per-path",
-                "1",
-            ],
+            other_args=cls.server_args,
             env=SERVER_ENV,
         )
 
@@ -93,6 +95,19 @@ class TestKimiK31B300(GSM8KMixin, CustomTestCase):
         if hasattr(cls, "process") and cls.process:
             terminate_and_kill_process_tree(cls.process)
             _wait_for_gpu_idle_in_ci(timeout=GPU_IDLE_TIMEOUT)
+
+
+class TestKimiK31B300PrimsTs(TestKimiK31B300):
+    """The same recipe on the Prims-TS DSA backend, which InferenceX serves with:
+    under DCP its decode reads the sharded indexer's local KV slots through a path
+    the default FlashMLA backend does not share."""
+
+    server_args = TestKimiK31B300.server_args + [
+        "--dsa-prefill-backend",
+        "prims_ts",
+        "--dsa-decode-backend",
+        "prims_ts",
+    ]
 
 
 if __name__ == "__main__":
