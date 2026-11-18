@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 # flight on two streams must not share it.
 _SORT_WS: dict[tuple[torch.device, int], torch.Tensor] = {}
 
+
 def supported_hardware() -> bool:
     hip = current_arch().hip
     return hip is not None and hip.gcn_arch in ("gfx942", "gfx950")

@@ -142,15 +142,21 @@ SGL_DEVICE int expert_of(int lane, int q) {
 /// [kGlmTopK] row to LDS and to the output tensors.
 template <bool kWriteThrough>
 SGL_DEVICE void route_token(
-    const GlmRouteSortParams& p, const float (&x)[4], const float (&bias)[4], int token, bool padded,
-    int32_t* s_ids, float* s_w) {
+    const GlmRouteSortParams& p,
+    const float (&x)[4],
+    const float (&bias)[4],
+    int token,
+    bool padded,
+    int32_t* s_ids,
+    float* s_w) {
   const int lane = threadIdx.x & (kGlmWave - 1);
   // Lane L owns experts 2L, 2L + 1, 128 + 2L, 129 + 2L, as aiter's EPL=4 kernel does.
   uint32_t key[4];
   float sig[4];
 #pragma unroll
   for (int q = 0; q < 4; ++q) {
-    const float s = __builtin_amdgcn_rcpf(1.0f + exp2f(static_cast<float>(-kGlmSigmoidLog2E * static_cast<double>(x[q]))));
+    const float s =
+        __builtin_amdgcn_rcpf(1.0f + exp2f(static_cast<float>(-kGlmSigmoidLog2E * static_cast<double>(x[q]))));
     sig[q] = s;
     key[q] = ordered_bits(s + bias[q]);
   }
@@ -443,8 +449,7 @@ struct GlmRouteSortKernel {
         "local routed experts must be a range of the 256");
     RuntimeCheck(block_m >= 1, "block_m must be positive");
     RuntimeCheck(
-        tokens_per_block >= 1 && tokens_per_block <= kGlmWaves * kGlmTokensPerWave,
-        "a block routes 1 to 64 tokens");
+        tokens_per_block >= 1 && tokens_per_block <= kGlmWaves * kGlmTokensPerWave, "a block routes 1 to 64 tokens");
     // aiter's moe_sorting allocation for the 257 global experts.
     const int64_t global_experts = kGlmExperts + 1;
     const int64_t padded_rows = M * kGlmTopK + global_experts * block_m - kGlmTopK;
