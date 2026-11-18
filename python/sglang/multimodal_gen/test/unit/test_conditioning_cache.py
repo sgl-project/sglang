@@ -5,15 +5,18 @@ from contextlib import nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
+from PIL import Image
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.runtime.cache.conditioning import (
+    _DIGEST_CHUNK_BYTES,
     ConditioningCache,
     cached_conditioning,
     cached_encoder_call,
@@ -167,6 +170,75 @@ def test_lru_budget_and_oversized_outputs():
     assert cache.evictions == 2
     assert cache.bytes == before == 32
     assert cache.bypasses == 1
+
+
+@torch.no_grad()
+def test_partial_edit_of_request_with_more_than_128_entries_reuses_the_rest():
+    """Editing a few of a request's 148 small entries (tiled VAE references) must
+    recompute only those; a 128-entry LRU evicted all of them between requests."""
+    cache = ConditioningCache(1 << 20)
+    model = Encoder().eval()
+    tiles = [torch.full((4,), float(value)) for value in range(148)]
+    edited = list(tiles)
+    for index in (3, 70, 140):  # a local edit touches a few tiles
+        edited[index] = tiles[index] + 1000
+    with cache.scope():
+        for x in tiles:
+            model(x)
+        for x in edited:
+            model(x)
+    assert (model.calls, cache.hits, cache.evictions) == (151, 145, 0)
+
+
+@torch.no_grad()
+def test_group_tier_keeps_a_stage_with_more_than_128_private_entries():
+    """A grouped stage must reuse every private snapshot within the entry limit;
+    a fixed 128-entry group tier dropped the rest of a large tiled reference."""
+    cache = ConditioningCache(0)  # cross-request tier off, so only group hits count
+    model = Encoder().eval()
+    tiles = [torch.full((4,), float(value)) for value in range(148)]
+    with cache.scope(), cache.group_scope():
+        for _ in range(2):
+            for x in tiles:
+                model(x)
+    assert (model.calls, cache.group_hits) == (148, 148)
+
+
+@torch.no_grad()
+def test_entry_limit_evicts_lru_and_keeps_preferred_entries():
+    model = Encoder().eval()
+
+    def encode(value, *, preferred=False):
+        with prefer_conditioning_cache() if preferred else nullcontext():
+            model(torch.full((4,), float(value)))
+
+    lru = ConditioningCache(1 << 20, max_entries=2)
+    with lru.scope():
+        encode(1)
+        encode(2)
+        encode(1)  # hit: 2 becomes least recent
+        encode(3)  # evicts 2, not 1
+        encode(1)
+        assert lru.hits == 2
+        encode(2)
+        assert lru.hits == 2
+
+    protected = ConditioningCache(1 << 20, max_entries=2)
+    with protected.scope():
+        encode(10, preferred=True)
+        encode(11)
+        encode(12)  # a normal store evicts 11, never the older preferred 10
+        encode(10, preferred=True)
+        encode(12)
+        assert protected.hits == 2
+
+    full = ConditioningCache(1 << 20, max_entries=1)
+    with full.scope():
+        encode(20, preferred=True)
+        encode(21)  # only a preferred entry could make room: bypass
+        assert full.stats()["entries"] == 1 and full.bypasses == 1
+        encode(22, preferred=True)  # a preferred store may evict it
+        assert full.stats()["entries"] == 1 and full.evictions == 1
 
 
 @torch.no_grad()
@@ -372,6 +444,41 @@ def test_cuda_snapshot_waits_for_producing_stream_before_restore():
         restored.hidden_states, (expected, expected.T, expected[::2, ::2]), strict=True
     ):
         torch.testing.assert_close(actual.cpu(), reference, rtol=0, atol=0)
+
+
+@torch.no_grad()
+def test_chunked_input_digest_covers_every_byte():
+    # inputs larger than one digest chunk hash chunk by chunk on threads
+    cache = ConditioningCache(256 * 1024 * 1024)
+    vae = VAE().eval()
+    # three float32 chunks and a partial one
+    x = torch.rand(1, 2, 3 * _DIGEST_CHUNK_BYTES // 8 + 1)
+    with cache.scope():
+        vae.encode(x)
+        vae.encode(x.clone())
+        for index in (0, _DIGEST_CHUNK_BYTES // 4, x.numel() - 1):
+            changed = x.clone()
+            changed.view(-1)[index] += 1
+            vae.encode(changed)
+        vae.encode(x[..., :-1])
+    assert vae.calls == 5
+    assert cache.hits == 1
+
+    model = Encoder().eval()
+    pixels = np.random.default_rng(0).integers(0, 256, (513, 1024, 4), dtype=np.uint8)
+    changed = pixels.copy()
+    changed[-1, -1, -1] ^= 1
+    calls = []
+    with cache.scope():
+        for array in (pixels, pixels.copy(), changed):
+            cache.run(
+                model,
+                "image",
+                (Image.fromarray(array),),
+                {},
+                lambda: calls.append(1) or torch.ones(1),
+            )
+    assert len(calls) == 2
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA transfers")

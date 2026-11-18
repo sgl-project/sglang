@@ -293,7 +293,7 @@ class Hf3fsMetadataServer:
         data = await self._read_json(request)
         namespace = data.get("namespace", "kv")
         metadata = self.get_rank_metadata(rank, namespace)
-        count = metadata.delete_keys(data["keys"])
+        metadata.delete_keys(data["keys"])
         return Response(status_code=204)
 
     async def clear(self, rank: int, request: Request):
