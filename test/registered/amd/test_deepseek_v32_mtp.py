@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
 
 register_amd_ci(
     est_time=3600,
-    suite="stage-c-test-large-8-gpu-amd-mi35x",
+    suite="base-c-test-large-8-gpu-amd-mi35x",
     disabled="move to nightly for saving time",
 )
 
