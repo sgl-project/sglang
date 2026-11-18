@@ -2167,7 +2167,13 @@ class AiterAttnBackend(AttentionBackend):
             and (fp8_q_asm_call or max_q_len > _MLA_ASM_PS_MAX_QLEN)
             and q.dtype != fp8_dtype
         ):
-            q, kwargs["q_scale"] = self._quantize_q_fp8(q)
+            if fp8_q_asm_call:
+                # Every opt-in decode step reads an fp8 query; saturate instead of NaN.
+                q, kwargs["q_scale"] = self._quantize_q_fp8(q)
+            else:
+                q_flat = q.reshape(q.shape[0], -1).to(fp8_dtype)
+                kwargs["q_scale"] = torch.ones((), dtype=torch.float32, device=q.device)
+                q = q_flat.view(q.shape)
         if self.head_pad_mode == "repeat" or (
             self.head_pad_mode == "none" and self.num_head_padded != self.num_head
         ):
