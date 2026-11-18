@@ -1147,7 +1147,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         block_size_q = self._choose_block_size_q(max_seqlen)
 
         # Score-path qblock mappings (layer-invariant), built once per forward.
-        from sgl_kernel_npu.operators.indexer.qblock_mappings import (
+        from sgl_kernel_npu.operators.indexer.indexer_utils import (
             build_qblock_mappings,
         )
 
