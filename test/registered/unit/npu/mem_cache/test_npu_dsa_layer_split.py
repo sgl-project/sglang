@@ -270,7 +270,6 @@ class TestKvSetDecisionMatrix(CustomTestCase):
         pool.pending_remote_kv_broadcast = False
         pool.pending_remote_kv_layer_id = None
         pool.pending_kv_works = []
-        pool._registered_via_patch = False
         pool.stores = []
 
         def store(layer, loc_info, cache_k, cache_v):
@@ -291,7 +290,6 @@ class TestKvSetDecisionMatrix(CustomTestCase):
         )
         self.assertEqual(self.parent_calls, [4])
         self.assertEqual(pool.remote_kv_layer_id, 4)
-        self.assertTrue(pool._registered_via_patch)
 
     def test_non_owner_full_gather_stores_remote_copy(self):
         pool = self._pool(7)
@@ -301,7 +299,6 @@ class TestKvSetDecisionMatrix(CustomTestCase):
         self.assertEqual(pool.stores, [7])
         self.assertEqual(self.parent_calls, [])
         self.assertEqual(pool.remote_kv_layer_id, 7)
-        self.assertTrue(pool._registered_via_patch)
 
     def test_chunk_write_with_pending_prefix_broadcast_registers(self):
         pool = self._pool(7)
@@ -494,7 +491,6 @@ class TestFinalizeAndPrefetchKv(CustomTestCase):
         pool.pending_remote_kv_broadcast = False
         pool.pending_remote_kv_layer_id = None
         pool.pending_kv_works = []
-        pool._registered_via_patch = False
         pool.kicks = []
         pool._broadcast_kv_from_owner = lambda layer_id, bound=None: (
             pool.kicks.append((layer_id, bound)) or []

@@ -230,7 +230,6 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         # prefix broadcasts.
         self.pending_kv_works: list = []
         self.pending_index_works: list = []
-        self._registered_via_patch = False
         # Row-space bound of the current kick's broadcast: rows [0, bound)
         # below the batch's patch-write region.
         self._kv_used_bound = 0
@@ -432,7 +431,6 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         for _w in self._broadcast_kv_from_owner(layer_id, None):
             _w.wait()
         self.remote_kv_layer_id = layer_id
-        self._registered_via_patch = False
 
     def _ensure_remote_index_layer(self, layer_id: int) -> None:
         """Materialize ``layer_id``'s indexer rows on every rank (paired broadcast)."""
@@ -516,10 +514,8 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
             if self._is_layer_owned(layer_id):
                 super().set_kv_buffer(layer, loc_info, cache_k, cache_v)
                 self.remote_kv_layer_id = layer_id
-                self._registered_via_patch = True
             else:
                 self._store_remote_copy(layer, loc_info, cache_k, cache_v)
-                self._registered_via_patch = True
             return
         if not self._is_layer_owned(layer_id):
             return
