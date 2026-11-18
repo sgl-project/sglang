@@ -1597,8 +1597,10 @@ class PrefillAdder:
             # No progress this pass: wait rather than run an empty chunk.
             return req
         if truncated and truncation_align_size is not None:
-            # Same absolute grid as the first chunk; a continuation too short to
-            # reach it keeps its length so the request still makes progress.
+            # Same absolute grid as the first chunk. A chunk that cannot reach the
+            # next grid point would start the following chunk off the grid, so it
+            # waits when only memory or a cap held it back this pass; only a chunk
+            # size below one grid step keeps its length, to make progress.
             aligned_end = (
                 (req.prefix_len + new_len)
                 // truncation_align_size
@@ -1606,6 +1608,10 @@ class PrefillAdder:
             )
             if aligned_end > req.prefix_len:
                 new_len = aligned_end - req.prefix_len
+            elif self.rem_chunk_tokens >= truncation_align_size - (
+                req.prefix_len % truncation_align_size
+            ):
+                return req
         request_slot_reserve = self._request_slot_reserve_for_req(
             req, extend_input_len=new_len
         )

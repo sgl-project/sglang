@@ -441,6 +441,35 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(adder.add_chunked_req(req, truncation_align_size=64), req)
         self.assertEqual(req.prefix_len + req.extend_len, 5056)
 
+    def test_continuation_waits_rather_than_end_off_the_alignment_grid(self):
+        # A continuation that cannot reach the next grid point would start the
+        # following chunk off the grid: it waits when memory held it back, and
+        # only a chunk size below one grid step runs short to make progress.
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        cases = [
+            # (free tokens, chunk tokens, prefix, expected end; None waits)
+            (1000, 4096, 1024, 1984),
+            (40, 4096, 1024, None),
+            (20, 4096, 1000, None),
+            (1000, 32, 1024, 1056),
+        ]
+        for available, chunk, prefix, expected in cases:
+            with self.subTest(available=available, chunk=chunk, prefix=prefix):
+                self.mock_token_allocator.available_size.return_value = available
+                adder = self.create_adder(
+                    self.create_running_batch(), page_size=1, rem_chunk_tokens=chunk
+                )
+                req = self.create_shared_req("continuation")
+                req.full_untruncated_fill_ids = list(range(8192))
+                req.prefix_len = prefix
+                self.assertIs(adder.add_chunked_req(req, truncation_align_size=64), req)
+                if expected is None:
+                    self.assertEqual(adder.can_run_list, [])
+                    self.assertIsNone(req.extend_end)
+                else:
+                    self.assertEqual(req.prefix_len + req.extend_len, expected)
+
     def test_new_request_chunk_ends_on_the_alignment_grid(self):
         # A cached prefix can end off the alignment grid; the first chunk must
         # still end on it (aligning only the chunk length would end at 292).
