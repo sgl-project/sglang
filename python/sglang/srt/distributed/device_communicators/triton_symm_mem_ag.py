@@ -22,7 +22,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_gfx95_supported
 
 logger = logging.getLogger(__name__)
 
@@ -471,6 +471,9 @@ class MultimemAllGatherer:
         if not get_platform().is_cuda:
             # Multimem symmetric-memory all-gather is an NVLink/CUDA feature;
             # other platforms (e.g. NPU) always take the standard gather path.
+            self._state = None
+        elif is_gfx95_supported():
+            # gfx950 has no multicast; the build's symm-mem rendezvous hung MI355X start.
             self._state = None
         else:
             self._state = self._UNINIT if enabled else None
