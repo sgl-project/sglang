@@ -920,7 +920,6 @@ class TestRolloutStopStepUnit(unittest.TestCase):
             finalize(len(batch.scheduler.timesteps))
         finalize(len(timesteps))
         self.assertEqual(batch.rollout_trajectory_data.rollout_log_probs.shape, (1, 3))
-        self.assertEqual(batch.rollout_controllers, {})
 
     def _run_minimax_h3(
         self, stop_step_index: int | None

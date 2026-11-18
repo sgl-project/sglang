@@ -11,6 +11,7 @@ Every hook is a no-op for serving requests.
 from __future__ import annotations
 
 import functools
+from contextlib import contextmanager
 from typing import Any, Callable
 
 import torch
@@ -33,6 +34,28 @@ from sglang.multimodal_gen.runtime.post_training.sp_utils import (
 
 # Key of the image/video latent stream in ``Req.rollout_controllers``.
 VISUAL_STREAM = "visual"
+
+
+def _drop_rollout_working_state(batch: Req) -> None:
+    batch.rollout_controllers = {}
+    batch._rollout_denoising_env_state = None
+
+
+@contextmanager
+def rollout_scope(batch: Req):
+    """Reset rollout state on entry; drop the controllers and env snapshot on exit."""
+    if not batch.rollout:
+        yield
+        return
+    _drop_rollout_working_state(batch)
+    batch.rollout_trajectory_data = None
+    try:
+        yield
+    except BaseException:
+        batch.rollout_trajectory_data = None
+        raise
+    finally:
+        _drop_rollout_working_state(batch)
 
 
 def _kwargs_to_cpu(d: Any) -> Any:
@@ -247,6 +270,3 @@ def finalize_rollout_if_enabled(
                 )
             )
         batch.rollout_trajectory_data.denoising_env = env
-
-    batch._rollout_denoising_env_state = None
-    batch.rollout_controllers = {}

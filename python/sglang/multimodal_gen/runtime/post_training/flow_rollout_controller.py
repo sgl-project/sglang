@@ -33,8 +33,7 @@ def truncate_rollout_sigmas(
 class FlowRolloutController:
     """Rollout controller of one latent stream of one request, shared by every
     flow-matching model: the schedule the loop runs, its SDE/CPS/ODE transition
-    and the per-step log-probs. The denoising stage creates it in
-    ``batch.rollout_controllers`` and clears that dict when the loop ends.
+    and the per-step log-probs.
     """
 
     def __init__(
