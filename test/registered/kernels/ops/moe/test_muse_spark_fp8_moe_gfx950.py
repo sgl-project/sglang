@@ -25,6 +25,7 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.kernels.muse_spark_fp8_moe import (
     U_BF16,
+    exceeds,
     finalize_bound,
     finalize_reference,
     gemm_row_bounds,
@@ -150,9 +151,12 @@ class TestMuseSparkFp8MoE(CustomTestCase):
         for e in experts.unique().tolist():
             sel = experts == e
             b = w[e].double() * w_scale[e].double().unsqueeze(-1)
+            self.assertTrue(
+                bool(torch.isfinite(out[sel]).all()), f"{what} expert {e} not finite"
+            )
             bounds = gemm_row_bounds(out[sel], a[rows[sel]], b)
             for key in ("deterministic", "statistical"):
-                bad = bounds["err"] > bounds[key]
+                bad = exceeds(bounds["err"], bounds[key])
                 if bad.any():
                     i = int(bad.nonzero()[0])
                     failures.append(
@@ -169,9 +173,10 @@ class TestMuseSparkFp8MoE(CustomTestCase):
         )
         has_local = torch.zeros(m, dtype=torch.bool, device="cuda")
         has_local[slots // TOP_K] = True
+        self.assertTrue(bool(torch.isfinite(out).all()), "finalize output not finite")
         err = (out.double() - ref).norm(dim=-1)
         bound = finalize_bound(ref, cancellation, HIDDEN)
-        bad = has_local & (err > bound)
+        bad = has_local & exceeds(err, bound)
         self.assertFalse(
             bool(bad.any()),
             f"finalize: rows {bad.nonzero().squeeze(1).tolist()[:4]} err {err[bad][:4].tolist()} "

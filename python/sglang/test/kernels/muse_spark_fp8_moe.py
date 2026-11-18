@@ -13,8 +13,14 @@ FP32 unit roundoff u32 = 2^-24:
   gamma_K = K*u32 / (1 - K*u32)); this holds for any summation order.
 * the statistical variant replaces gamma_K by ``lam*sqrt(K)*u32``: it assumes
   the accumulation rounding errors are independent and zero-mean, so the error
-  of a K-term sum grows like sqrt(K); with lam = 6 a row exceeds it with
-  probability of order 1e-9. It is an engineering check, not a hardware bound.
+  of a K-term sum grows like sqrt(K) times the size of the summands; lam = 6 is a
+  six-standard-deviation margin under that assumption, not a guaranteed tail
+  probability, and a test applies it to every row at once. It is an engineering
+  check, not a hardware bound: summation orders that correlate the rounding
+  errors break the assumption, and only the deterministic bound then holds.
+
+``exceeds`` is the comparison to use with every bound: a NaN error, reference or
+bound counts as exceeding it (``NaN > bound`` alone is False).
 """
 
 import math
@@ -26,6 +32,11 @@ FP8_MAX = torch.finfo(FP8).max
 U_BF16 = 2.0**-8
 U_FP32 = 2.0**-24
 STAT_LAMBDA = 6.0
+
+
+def exceeds(err: torch.Tensor, bound: torch.Tensor) -> torch.Tensor:
+    """Elementwise ``err > bound``, with any NaN on either side counted as exceeding."""
+    return ~(err <= bound)
 
 
 def quantize_rows(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

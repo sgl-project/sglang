@@ -18,6 +18,7 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.kernels.muse_spark_fp8_moe import (
     FP8,
+    exceeds,
     gemm_row_bounds,
     quantize_rows,
     quantizer_report,
@@ -124,9 +125,10 @@ class TestMuseSparkQuarkPtpcLinear(CustomTestCase):
                 self.assertEqual(out.shape, (m, codes.shape[0]))
                 self.assertEqual(out.dtype, torch.bfloat16)
                 xq, xs = per_token_group_quant_fp8(x, group_size=x.shape[1])
+                self.assertTrue(bool(torch.isfinite(out).all()), "output not finite")
                 bounds = gemm_row_bounds(out, xq.double() * xs.double(), weight)
                 for key in ("deterministic", "statistical"):
-                    bad = bounds["err"] > bounds[key]
+                    bad = exceeds(bounds["err"], bounds[key])
                     self.assertFalse(
                         bool(bad.any()),
                         f"{key}: err {bounds['err'][bad][:4].tolist()} bound {bounds[key][bad][:4].tolist()}",
