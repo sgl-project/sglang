@@ -68,7 +68,7 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
-from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.layers.utils.common import copy_into_param_storage, set_weight_attrs
 from sglang.srt.runtime_context import get_exec, get_platform
 from sglang.srt.utils.common import round_up
 from sglang.srt.utils.custom_op import register_custom_op
@@ -580,6 +580,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
         layer.orig_dtype = params_dtype
+        layer.fp8_weights_processed = False
 
         # Register weight
         layer.register_parameter(
@@ -615,15 +616,20 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Requantizes weights after loading using the maximum scale."""
+        if layer.fp8_weights_processed:
+            return
         max_w_scale, quantized_weight = requantize_with_max_scale(
             layer.weight, layer.weight_scale, layer.logical_widths
         )
-        layer.weight = Parameter(quantized_weight.t(), requires_grad=False)
+        # The weight, its scales and the input scale keep their Parameters and
+        # storage, so a weight update loads through their weight_loaders and
+        # CUDA graphs captured before it stay valid.
+        layer.weight.data = quantized_weight.t()
         layer.use_flashinfer_bmm = self._can_use_flashinfer_bmm(layer)
         if self.cutlass_fp8_supported and not layer.use_flashinfer_bmm:
             max_w_scale = convert_to_channelwise(max_w_scale, layer.logical_widths)
-        layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
-        layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
+        copy_into_param_storage(layer.weight_scale, max_w_scale)
+        copy_into_param_storage(layer.input_scale, layer.input_scale.max())
         if (
             self.use_sm120_fp8
             and layer.weight_scale.numel() == 1
@@ -639,6 +645,27 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             prepare_fp8_layer_for_marlin(layer)
             # Marlin uses FP8 weights with unquantized activations.
             del layer.input_scale
+            return
+        layer.fp8_weights_processed = True
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        """Put the weight and scales back in checkpoint form, in place.
+
+        Every shard gets the served max scale, which the next processing
+        requantizes to the same bytes, so a weight a load does not rewrite is
+        served unchanged.
+        """
+        if not layer.fp8_weights_processed:
+            return
+        num_shards = len(layer.logical_widths)
+        layer.weight.data = layer.weight.data.t()
+        copy_into_param_storage(
+            layer.weight_scale, layer.weight_scale.max().repeat(num_shards)
+        )
+        copy_into_param_storage(
+            layer.input_scale, layer.input_scale.reshape(1).repeat(num_shards)
+        )
+        layer.fp8_weights_processed = False
 
     def apply(
         self,
@@ -1236,15 +1263,58 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter("w13_input_scale", w13_input_scale)
             layer.register_parameter("w2_input_scale", w2_input_scale)
+        layer.fp8_weights_processed = False
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        """Give the scales back their checkpoint shapes, in place.
+
+        Both w13 shards of an expert get its served max scale, which the next
+        processing requantizes to the same bytes.
+        """
+        if not layer.fp8_weights_processed:
+            return
+        if not layer.fp8_weights_reloadable:
+            # Raise before the load writes into the served layout.
+            raise NotImplementedError(
+                "Online weight updates of ModelOpt FP8 MoE are not supported on "
+                f"{self._moe_runner_backend} or with padded experts."
+            )
+        num_shards = 2 if layer.moe_runner_config.is_gated else 1
+        num_experts = layer.w13_weight.shape[0]
+        copy_into_param_storage(
+            layer.w13_weight_scale,
+            layer.w13_weight_scale.reshape(num_experts, 1).repeat(1, num_shards),
+        )
+        for name in ("w13_input_scale", "w2_input_scale"):
+            param = getattr(layer, name)
+            copy_into_param_storage(param, param.reshape(1).repeat(num_experts))
+        layer.fp8_weights_processed = False
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process FP8 MoE weights after loading from serialized checkpoint.
 
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
-
-        layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
-        layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
+        if layer.fp8_weights_processed:
+            return
+        # Triton and CUTLASS keep every Parameter and its storage, so a weight
+        # update loads through the same weight_loaders and addresses.
+        layer.fp8_weights_reloadable = (
+            self.quant_config.is_checkpoint_fp8_serialized
+            and not self._moe_runner_backend.is_flashinfer_trtllm()
+        )
+        if not layer.fp8_weights_reloadable:
+            for name in (
+                "w13_weight",
+                "w2_weight",
+                "w13_weight_scale",
+                "w2_weight_scale",
+                "w13_input_scale",
+                "w2_input_scale",
+            ):
+                param = getattr(layer, name, None)
+                if param is not None:
+                    setattr(layer, name, Parameter(param.data, requires_grad=False))
 
         # Handle scale parameters
         if hasattr(layer, "w13_weight_scale") and layer.w13_weight_scale is not None:
@@ -1282,24 +1352,12 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                         start += intermediate_size_per_partition
 
                 # Update the scale parameter to be per-expert instead of per-shard
-                layer.w13_weight_scale = Parameter(max_w13_scales, requires_grad=False)
-            else:
-                layer.w13_weight_scale = Parameter(
-                    layer.w13_weight_scale.data, requires_grad=False
-                )
+                copy_into_param_storage(layer.w13_weight_scale, max_w13_scales)
 
-        if hasattr(layer, "w2_weight_scale") and layer.w2_weight_scale is not None:
-            layer.w2_weight_scale = Parameter(
-                layer.w2_weight_scale.data, requires_grad=False
-            )
         if hasattr(layer, "w13_input_scale") and layer.w13_input_scale is not None:
-            layer.w13_input_scale = Parameter(
-                layer.w13_input_scale.max(), requires_grad=False
-            )
+            copy_into_param_storage(layer.w13_input_scale, layer.w13_input_scale.max())
         if hasattr(layer, "w2_input_scale") and layer.w2_input_scale is not None:
-            layer.w2_input_scale = Parameter(
-                layer.w2_input_scale.max(), requires_grad=False
-            )
+            copy_into_param_storage(layer.w2_input_scale, layer.w2_input_scale.max())
 
         # Align FP8 weights to FlashInfer per-tensor kernel layout if enabled
         if self._moe_runner_backend.is_flashinfer_trtllm():
@@ -1327,16 +1385,12 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             w13_weight_scale = layer.w13_weight_scale.to(torch.float32)
             w2_weight_scale = layer.w2_weight_scale.to(torch.float32)
 
-            layer.fc1_dequant = Parameter(
-                w13_weight_scale * input_scale, requires_grad=False
+            copy_or_rebind_param(layer, "fc1_dequant", w13_weight_scale * input_scale)
+            copy_or_rebind_param(layer, "fc2_quant", activation_scale.reciprocal())
+            copy_or_rebind_param(
+                layer, "fc2_dequant", activation_scale * w2_weight_scale
             )
-            layer.fc2_quant = Parameter(
-                activation_scale.reciprocal(), requires_grad=False
-            )
-            layer.fc2_dequant = Parameter(
-                activation_scale * w2_weight_scale, requires_grad=False
-            )
-            layer.fc1_input_dequant = Parameter(input_scale, requires_grad=False)
+            copy_or_rebind_param(layer, "fc1_input_dequant", input_scale.clone())
 
             # flashinfer_cutlass kernel requires intermediate_size to be a
             # multiple of 16.  Pad weight tensors with zeros after loading.
@@ -1346,6 +1400,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             num_shards = 2 if layer.moe_runner_config.is_gated else 1
             isp = layer.w13_weight.shape[1] // num_shards
             if isp % 16 != 0:
+                layer.fp8_weights_reloadable = False
                 pad_amount = round_up(isp, 16) - isp
                 w13_data = layer.w13_weight.data
                 if num_shards == 2:
@@ -1380,11 +1435,15 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 materialize_swiglu_params_for_cutlass,
             )
 
-            layer._cutlass_swiglu_params = materialize_swiglu_params_for_cutlass(
-                layer.moe_runner_config,
-                int(layer.num_local_experts),
-                layer.w13_weight.device,
-            )
+            # The values depend only on the runner config, so a reload keeps
+            # the tensors captured CUDA graphs read.
+            if not hasattr(layer, "_cutlass_swiglu_params"):
+                layer._cutlass_swiglu_params = materialize_swiglu_params_for_cutlass(
+                    layer.moe_runner_config,
+                    int(layer.num_local_experts),
+                    layer.w13_weight.device,
+                )
+        layer.fp8_weights_processed = True
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
