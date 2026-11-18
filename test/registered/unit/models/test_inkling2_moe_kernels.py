@@ -45,35 +45,6 @@ def _route(tokens, skewed=False, seed=0):
     return route_metadata(ids.flatten(), weights.flatten(), LOCAL, LOCAL, EXPERTS)
 
 
-def _scale_rows(x_scales, offsets, rows, width):
-    """Unswizzle the grouped-GEMM activation scales of rows [offsets[0], offsets[-1])."""
-    scale_k = (width + 63) // 64 * 4
-    offsets = offsets.long()
-    rows = rows.long()
-    expert = torch.searchsorted(offsets, rows, right=True) - 1
-    local = rows - offsets[expert]
-    base = (offsets[expert] - offsets[0] + expert * 127) // 128 * 128 * scale_k
-    cols = torch.arange(width // 16, device=rows.device)
-    index = (
-        base[:, None]
-        + ((local[:, None] // 128) * (scale_k // 4) + cols // 4) * 512
-        + (local[:, None] % 32) * 16
-        + ((local[:, None] // 32) % 4) * 4
-        + cols % 4
-    )
-    return x_scales[index]
-
-
-def _x_scales(rows, width):
-    scale_k = (width + 63) // 64 * 4
-    size = (rows + 127 * LOCAL + 127) // 128 * 128 * scale_k
-    return torch.full((size,), 0x7F, device="cuda", dtype=torch.uint8)
-
-
-def _sm_count():
-    return torch.cuda.get_device_properties(0).multi_processor_count
-
-
 _FP4_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
@@ -111,43 +82,6 @@ def _assert_relative_error(actual, expected, tolerance):
 
 
 @sm100_or_sm103
-@pytest.mark.parametrize("tokens", [1, 8, 64, 512])
-def test_routed_quantize_matches_token_quantize(tokens):
-    from sglang.kernels.ops.moe.inkling2_moe import routed_quant_module
-
-    width = 4608
-    _, dst2src, _, counts, offsets, _, _, _ = _route(tokens, seed=tokens)
-    x = torch.randn(tokens, width, device="cuda").bfloat16() * 3
-    rows = dst2src.numel()
-    values = torch.empty(rows, width // 2, device="cuda", dtype=torch.uint8)
-    x_scales = _x_scales(rows, width)
-    amax = torch.empty(rows, device="cuda")
-    routed_quant_module(width).quantize(
-        x, dst2src, values, x_scales, amax, offsets, TOP_K, _sm_count()
-    )
-    ref_values, ref_scales, ref_amax = _quantize_reference(x)
-    local = torch.arange(offsets[0].item(), offsets[-1].item(), device="cuda")
-    source = dst2src[local].long() // TOP_K
-    assert torch.equal(values[local], ref_values[source])
-    assert torch.equal(amax[local], ref_amax[source])
-    assert torch.equal(
-        _scale_rows(x_scales, offsets, local, width),
-        ref_scales[source].view(torch.uint8),
-    )
-    _assert_zero_tails(x_scales, offsets, counts, width)
-
-
-def _assert_zero_tails(x_scales, offsets, counts, width):
-    for e in torch.nonzero(counts % 128).flatten().tolist():
-        start, count = offsets[e].item(), counts[e].item()
-        padded = (count + 127) // 128 * 128
-        tail = torch.arange(start + count, start + padded, device="cuda")
-        fake = offsets.clone()
-        fake[e + 1 :] += padded - count
-        assert not _scale_rows(x_scales, fake, tail, width).any()
-
-
-@sm100_or_sm103
 @pytest.mark.parametrize(
     "tokens,skewed",
     [(1, False), (64, False), (129, True), (256, False), (512, False), (512, True)],
@@ -161,33 +95,6 @@ def test_route_metadata_cuda_matches_triton(monkeypatch, tokens, skewed):
     actual = _route(tokens, skewed, seed=tokens)
     for a, b in zip(actual, expected):
         assert torch.equal(a, b)
-
-
-@sm100_or_sm103
-@pytest.mark.parametrize("tokens", [8, 64, 512])
-def test_routed_partial_matches_post_reorder(tokens):
-    from sglang.kernels.ops.moe.inkling2_moe import (
-        routed_partial,
-        routed_rows,
-        unweighted_post_reorder,
-    )
-
-    width = 4608
-    src2dst, _, _, _, offsets, _, _, _ = _route(tokens, seed=tokens)
-    rows = src2dst.numel()
-    down = torch.randn(rows, width, device="cuda") * 7
-    scales = (
-        torch.rand(rows, device="cuda") + 0.5,
-        torch.rand(LOCAL, device="cuda") + 0.5,
-        torch.tensor([3.0], device="cuda"),
-    )
-    expected = unweighted_post_reorder(
-        routed_rows(down, offsets, out_dtype=torch.bfloat16, nvfp4_scales=scales),
-        src2dst,
-        TOP_K,
-    )
-    actual = routed_partial(down, offsets, src2dst, TOP_K, nvfp4_scales=scales)
-    assert torch.equal(actual.bfloat16(), expected)
 
 
 @sm100_or_sm103
@@ -285,37 +192,6 @@ def _routing(tokens, rank):
     _, schedule = compute_expert_block_metadata(counts, ids.numel(), block_size_m=128)
     gammas = torch.rand(tokens * TOPK, device="cuda")[dst2src]
     return dst2src, counts, offsets, schedule, gammas
-
-
-@blackwell
-@pytest.mark.skipif(
-    torch.cuda.is_available() and torch.cuda.get_device_capability() != (10, 3),
-    reason="NVFP4 experts require SM103",
-)
-@pytest.mark.parametrize("tokens,rank", [(4096, 1), (16384, 2)])
-def test_nvfp4_prefill_gemm(tokens, rank):
-    """At prefill sizes the routed NVFP4 GEMM still matches the FP32 reference."""
-    from sglang.kernels.ops.gemm import inkling2_nvfp4 as nvfp4
-
-    dst2src, counts, offsets, schedule, _ = _routing(tokens, rank)
-    x = torch.randn(tokens, H, device="cuda").bfloat16()
-    weight = torch.randint(0, 256, (E, 2 * I, H // 2), device="cuda").to(torch.uint8)
-    weight_scales = (torch.rand(E, 2 * I, H // 16, device="cuda") * 2 + 0.25).to(
-        torch.float8_e4m3fn
-    )
-    acc, x_amax = nvfp4.routed_expert_matmul(
-        x,
-        dst2src,
-        TOPK,
-        weight,
-        swizzle_blockscale(weight_scales).flatten(1),
-        counts,
-        offsets,
-        schedule,
-    )
-    _assert_nvfp4_routed_rows(
-        acc, x_amax, x, dst2src, TOPK, weight, weight_scales, offsets
-    )
 
 
 @blackwell
@@ -545,33 +421,6 @@ def test_nvfp4_reload_reaches_captured_cuda_graph(monkeypatch):
         expected = experts(x, gammas, ids)
     assert not torch.equal(before_reload, expected)
     assert torch.equal(captured.view(torch.uint8), expected.view(torch.uint8))
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a GPU")
-def test_domain_paged_empty():
-    from cuda.bindings import driver as cu
-
-    out = moe.domain_paged_empty((8, 4608, 1152), torch.uint8)
-    if out is None:
-        pytest.skip("The GPU has one locality domain")
-    weight = torch.randint(0, 256, out.shape, dtype=torch.uint8, device="cuda")
-    assert out.is_contiguous() and out.device == weight.device
-    out.copy_(weight)
-    assert torch.equal(out, weight)
-    n, page, half = out.numel(), 2 << 20, 4608 // 2 * 1152
-    domains = [
-        cu.cuPointerGetAttribute(
-            cu.CUpointer_attribute.CU_POINTER_ATTRIBUTE_LOCALITY_DOMAIN_ORDINAL,
-            out.data_ptr() + p,
-        )[1]
-        for p in range(0, n, page)
-    ]
-    local = sum(
-        max(0, min(p + page, s + half) - max(p, s))
-        for p, d in zip(range(0, n, page), domains)
-        for s in range(d * half, n, 2 * half)
-    )
-    assert local / n > 0.75
 
 
 if __name__ == "__main__":

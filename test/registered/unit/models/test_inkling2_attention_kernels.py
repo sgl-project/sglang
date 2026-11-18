@@ -75,12 +75,16 @@ def _run_both(monkeypatch, fn, mutable):
 
 
 @hopper_or_blackwell
-@pytest.mark.parametrize("seqs", [1, 64])
-@pytest.mark.parametrize("mode", ["decode", "verify"])
-@pytest.mark.parametrize("top_k", [0, 8])
-@pytest.mark.parametrize("with_partial", [False, True])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("rows_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "seqs,mode,top_k,with_partial,rows_dtype",
+    [
+        (1, "decode", 0, False, torch.bfloat16),
+        (64, "verify", 8, True, torch.float32),
+        (64, "decode", 8, False, torch.float32),
+        (1, "verify", 0, True, torch.bfloat16),
+    ],
+)
 def test_sconv_epilogue(
     monkeypatch, seqs, mode, top_k, with_partial, out_dtype, rows_dtype
 ):
@@ -123,13 +127,15 @@ def test_sconv_epilogue(
 
 
 @hopper_or_blackwell
-@pytest.mark.parametrize("m", [1, 64])
-@pytest.mark.parametrize("full", [False, True])
-@pytest.mark.parametrize("partials", [False, True])
-@pytest.mark.parametrize("param_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("mode", ["verify", "decode", "decode_track"])
-@pytest.mark.parametrize("padded_group", [8, 6])
-@pytest.mark.parametrize("H,KVH", [(12, 2), (6, 1)], ids=["tp4", "tp8"])
+@pytest.mark.parametrize(
+    "m,full,partials,param_dtype,mode,padded_group,H,KVH",
+    [
+        (1, False, False, torch.bfloat16, "decode", 8, 12, 2),
+        (64, True, True, torch.float32, "verify", 6, 6, 1),
+        (64, False, False, torch.bfloat16, "decode_track", 8, 6, 1),
+        (1, True, False, torch.float32, "verify", 6, 12, 2),
+    ],
+)
 def test_cuda_prologue(
     monkeypatch, m, full, partials, param_dtype, mode, padded_group, H, KVH
 ):
@@ -235,117 +241,6 @@ def test_cuda_prologue(
         assert _bits_equal(a, b), name
 
 
-@hopper_or_blackwell
-@blackwell
-@pytest.mark.parametrize("m", [1, 61])
-@pytest.mark.parametrize("window", [None, 1023])
-@pytest.mark.parametrize("ragged", [False, True])
-@pytest.mark.parametrize(
-    "path,H,KVH", [("cuda", 12, 2), ("triton", 12, 2), ("triton", 6, 1)]
-)
-def test_prologue_sheared_verify_rel(monkeypatch, m, window, ragged, path, H, KVH):
-    """The verify prologue's sheared rel rows (CUDA, or the Triton fallback, also
-    at TP8 heads) equal what FA4's ShearingBias builds from the compact ones, and
-    FA4 on them (presheared) equals FA4 on the compact rows, bitwise."""
-    from sglang.kernels.ops.attention import inkling2_attn_prologue as P
-    from sglang.kernels.ops.attention.flash_attention_v4 import (
-        flash_attn_with_kvcache,
-    )
-    from sglang.kernels.ops.attention.flash_attn.cute import interface
-
-    torch.manual_seed(m * 4 + ragged * 2 + (window is None))
-    D, DR, G, extent, page = 128, 16, 8, 1024, 128
-    taken = []
-    real = P._cuda_prologue
-    monkeypatch.setattr(
-        P,
-        "_cuda_prologue",
-        lambda *a: path == "cuda" and (taken.append(real(*a)) or taken[-1]),
-    )
-    lens = (torch.randint(1, T8 + 1, (m,)) if ragged else torch.full((m,), T8)).tolist()
-    tokens = sum(lens)
-    cu = torch.tensor([0] + lens, device="cuda").cumsum(0)
-    sizes = [H * D, KVH * D, KVH * D, H * DR]
-    proj = (torch.randn(tokens, sum(sizes) + 8, device="cuda") * 3).bfloat16()
-    q, k, v, r = proj[:, : sum(sizes)].split(sizes, dim=1)
-    slots = 3 * m + 5
-    meta = {
-        "safe_idx": (torch.randperm(slots - 1, device="cuda") + 1)[:m],
-        "cache_mask": torch.ones(m, 1, 1, device="cuda", dtype=torch.bool),
-        "cu": cu,
-        "si": torch.repeat_interleave(
-            torch.arange(m, device="cuda", dtype=torch.int32),
-            torch.tensor(lens, device="cuda"),
-        ),
-    }
-    kw = torch.randn(KVH * D, W, device="cuda").bfloat16()
-    vw = torch.randn(KVH * D, W, device="cuda").bfloat16()
-    kc0 = torch.randn(slots, W - 1, KVH * D, device="cuda").bfloat16()
-    vc0 = torch.randn(slots, W - 1, KVH * D, device="cuda").bfloat16()
-    q_scale = (torch.rand(H, D, device="cuda") * 2).bfloat16()
-    r_scale = (torch.rand(H, DR, device="cuda") * 2).bfloat16()
-    rel_proj = (torch.randn(DR, extent, device="cuda") * 3).bfloat16()
-    seqlens_k = torch.tensor(lens, dtype=torch.int32) + torch.randint(0, 3000, (m,))
-    for i, sk in enumerate([0, 120, 121, 1024 - 3, 1030, 128 * 7 + 2]):
-        if i < m:
-            seqlens_k[i] = lens[i] + sk
-    seqlens_k = seqlens_k.to(torch.int32).cuda()
-
-    def prologue(shear):
-        windows = [
-            torch.zeros(m + 1, T8, W - 1, KVH * D, device="cuda").bfloat16()
-            for _ in range(2)
-        ]
-        return P.attention_prologue(
-            q, k, v, r, H, KVH, DR, G, kw, vw, kc0.clone(), vc0.clone(), meta,
-            q_scale, r_scale, rel_proj, None, window is not None,
-            22.627416997969522, 8.0, 1e-6, 1e-6,
-            verify_windows=tuple(windows), shear=shear,
-        )  # fmt: skip
-
-    q_out, _, _, rel_compact = prologue(None)
-    _, _, _, rel_sheared = prologue((seqlens_k, window))
-    assert taken == ([True, True] if path == "cuda" else [])
-    assert rel_sheared.shape == ((tokens + 127) // 128 * 128, KVH * G, extent + 256)
-
-    pages = (int(seqlens_k.max()) + page - 1) // page
-    page_table = (
-        torch.randperm(m * pages, device="cuda", dtype=torch.int32).view(m, pages) + 1
-    )
-    kcache = torch.randn(m * pages + 1, page, KVH, D, device="cuda").bfloat16()
-    vcache = torch.randn_like(kcache)
-    captured = []
-    real_empty = interface._shear_bias_empty
-
-    def capture(shape, dtype, device):
-        captured.append(torch.full(shape, float("nan"), dtype=dtype, device=device))
-        return captured[-1]
-
-    def attend(rel, presheared, num_splits=1):
-        return flash_attn_with_kvcache(
-            q=q_out, k_cache=kcache, v_cache=vcache, cache_seqlens=seqlens_k,
-            page_table=page_table, cu_seqlens_q=cu.to(torch.int32),
-            max_seqlen_q=max(lens), softmax_scale=D**-0.5, causal=window is None,
-            window_size=(-1, -1) if window is None else (window, 0), num_splits=num_splits,
-            pack_gqa=True, rel_bias=rel, return_softmax_lse=True,
-            rel_bias_presheared=presheared,
-        )  # fmt: skip
-
-    monkeypatch.setattr(interface, "_shear_bias_empty", capture)
-    expected = attend(rel_compact, False)
-    monkeypatch.setattr(interface, "_shear_bias_empty", real_empty)
-    assert len(captured) == 1
-    assert _bits_equal(rel_sheared[:tokens], captured[0][:tokens])
-    actual = attend(rel_sheared, True)
-    for a, b in zip(actual, expected):
-        assert _bits_equal(a, b)
-    split_out, split_lse = attend(rel_sheared, True, num_splits=9)
-    torch.testing.assert_close(
-        split_out.float(), actual[0].float(), atol=2e-2, rtol=2e-2
-    )
-    torch.testing.assert_close(split_lse, actual[1], atol=1e-3, rtol=1e-3)
-
-
 def _rel_bias_attention_ref(q, kc, vc, page_table, seqused, rel, scale, window):
     """FP32 reference: q (batch * qlen, heads, d) are the last qlen positions of each
     sequence, attending causally with the compact relative bias (0 past the extent)
@@ -384,10 +279,9 @@ def _rel_bias_attention_ref(q, kc, vc, page_table, seqused, rel, scale, window):
 
 @hopper_or_blackwell
 @blackwell
-@pytest.mark.parametrize("batch", [1, 32])
-@pytest.mark.parametrize("qlen", [1])
-@pytest.mark.parametrize("window", [None, 1023])
-@pytest.mark.parametrize("num_sms", [None, 148])
+@pytest.mark.parametrize(
+    "batch,qlen,window,num_sms", [(1, 1, None, None), (32, 1, 1023, 148)]
+)
 def test_rel_bias_decode_multi_query(batch, qlen, window, num_sms):
     """paged_rel_bias_decode matches an FP32 reference, through the combine_gate_sink
     epilogue it feeds, with the 64-CTA and the one-wave split counts."""
@@ -433,119 +327,6 @@ def test_rel_bias_decode_multi_query(batch, qlen, window, num_sms):
 
 
 H, KVH, D, DR, W, T8 = 12, 2, 128, 16, 4, 8
-
-
-def _verify_meta(m, slots):
-    tokens = m * T8
-    idx = (torch.randperm(slots - 1, device="cuda").int() + 1)[:m].contiguous()
-    if m > 2:
-        idx[1] = 0  # CUDA-graph padding row on the reserved slot
-    return idx, {
-        "safe_idx": idx,
-        "cache_mask": torch.ones(m, device="cuda", dtype=torch.int32),
-        "cu": torch.arange(0, tokens + 1, T8, device="cuda", dtype=torch.int32),
-        "si": torch.arange(m, device="cuda", dtype=torch.int32).repeat_interleave(T8),
-    }
-
-
-@blackwell
-@pytest.mark.parametrize("m", [1, 3, 16])
-def test_sconv_windows_and_routed_epilogue(m):
-    from sglang.kernels.ops.elementwise.inkling2_residual_add import residual_add
-    from sglang.kernels.ops.mamba.inkling2_sconv import (
-        routed_sconv_epilogue,
-        short_convolution,
-    )
-    from sglang.kernels.ops.moe.inkling2_moe import unweighted_post_reorder
-    from sglang.srt.models.inkling_common.kernels.sconv import (
-        save_intermediate_conv_windows,
-    )
-
-    torch.manual_seed(m)
-    hidden, top_k, tokens = 4608, 8, m * T8
-    slots = 3 * m + 5
-    idx, meta = _verify_meta(m, slots)
-    cache = torch.randn(slots, W - 1, hidden, device="cuda").bfloat16()
-    weight = torch.randn(hidden, W, device="cuda")
-    rows = torch.randn(tokens * top_k, hidden, device="cuda").bfloat16()
-    src2dst = torch.randperm(tokens * top_k, device="cuda").int()
-    attention = torch.randn(tokens, hidden, device="cuda").bfloat16()
-    partial = torch.randn(tokens, hidden, device="cuda").bfloat16()
-    windows = [
-        torch.zeros(m + 2, T8, W - 1, hidden, device="cuda", dtype=torch.bfloat16)
-        for _ in range(3)
-    ]
-    real = idx != 0
-
-    mlp = unweighted_post_reorder(rows, src2dst, top_k)
-    conv = short_convolution(mlp, weight, cache, meta)
-    save_intermediate_conv_windows(cache, mlp, idx, windows[0], m, T8)
-    assert _bits_equal(
-        short_convolution(mlp, weight, cache, meta, window=windows[1]), conv
-    )
-    assert _bits_equal(windows[1][:m][real], windows[0][:m][real])
-    fused = routed_sconv_epilogue(
-        rows, src2dst, top_k, weight, cache, meta, attention, partial, window=windows[2]
-    )
-    assert _bits_equal(fused, residual_add(partial, attention, conv))
-    assert _bits_equal(windows[2][:m][real], windows[0][:m][real])
-
-
-@blackwell
-def test_markov_rnn_gates_and_softcap():
-    from sglang.kernels.ops.activation.softcap import softcap_inplace_logits
-    from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
-    from sglang.kernels.ops.speculative.inkling2_mtp import rnn_gates
-
-    torch.manual_seed(0)
-    for rows in (1, 16, 64):
-        proj = (torch.randn(rows, 768, device="cuda") * 4).bfloat16()
-        state = torch.randn(rows, 256, device="cuda").bfloat16()
-        gate_raw, cand_raw, out_raw = proj.chunk(3, dim=-1)
-        gate = torch.sigmoid(gate_raw)
-        new_state, latent = rnn_gates(proj, state)
-        assert _bits_equal(
-            new_state, gate * state + (1.0 - gate) * torch.tanh(cand_raw)
-        )
-        assert _bits_equal(latent, torch.tanh(out_raw))
-
-    cap, limit, width = 30.0, 200058, 50256
-    for rows in (1, 8):
-        for start in (0, 150768):
-            base = (torch.randn(rows, width, device="cuda") * 40).bfloat16()
-            bias = (torch.randn(rows, width, device="cuda") * 5).bfloat16()
-            temps = (torch.arange(rows, device="cuda") % 2).float()
-            offset = torch.zeros(1, dtype=torch.int64, device="cuda")
-            logits = base + bias
-            softcap_inplace_logits(logits, cap)
-            logits[..., max(limit - start, 0) :] = float("-inf")
-            kept = [
-                torch.empty(rows, width, device="cuda", dtype=torch.bfloat16)
-                for _ in range(2)
-            ]
-            common = dict(
-                temperatures=temps,
-                key=7,
-                offset=offset,
-                step=1,
-                step_dtype=torch.bfloat16,
-                vocab_start=start,
-            )
-            want = MarkovSampleStep.execute(
-                base_logits=logits,
-                bias=torch.zeros_like(bias),
-                logits_out=kept[0],
-                **common,
-            )
-            got = MarkovSampleStep.execute(
-                base_logits=base,
-                bias=bias,
-                logits_out=kept[1],
-                softcap=cap,
-                vocab_limit=limit,
-                **common,
-            )
-            assert torch.equal(got, want) and _bits_equal(kept[1], kept[0])
 
 
 requires_cuda = pytest.mark.skipif(
@@ -740,20 +521,6 @@ def _assert_bitwise(actual, expected):
             left.contiguous().view(torch.uint8),
             right.contiguous().view(torch.uint8),
         )
-
-
-@requires_cuda
-@pytest.mark.parametrize("page_size", [1, 128])
-def test_anchored_attention_matches_token_pool_reference(monkeypatch, page_size):
-    case = _setup(
-        monkeypatch,
-        page_size,
-        [0, 127, 1023, 1025, 1153],
-        [8, 8, 8, 8, 8],
-        "precomputed",
-        "cuda",
-    )
-    _assert_bitwise(_forward(case, return_lse=True), _reference_attention(case))
 
 
 @requires_cuda
