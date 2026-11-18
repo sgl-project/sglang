@@ -80,8 +80,9 @@ requests, and breakable prefill graphs run the paged MoE layers as eager breaks.
   Other quantization methods and MoE runners are rejected at startup.
 - **Parallelism:** TP is currently validated for unquantized BF16 experts with the triton
   runner. Each TP rank holds its native expert shards in pinned host memory and its own K-slot
-  GPU table; TP1 also supports the other formats above. Expert, pipeline, data and attention
-  data parallelism require `--ep-size`, `--pp-size`, `--dp-size` and `--attn-dp-size` to be 1.
+  GPU table; TP1 also supports the other formats above. Expert, pipeline, data, attention
+  data and attention context parallelism require `--ep-size`, `--pp-size`, `--dp-size`,
+  `--attn-dp-size` and `--attn-cp-size` to be 1.
   Under `auto`, K uses the minimum free memory across TP ranks. An explicit
   `--paged-experts-num-resident K` must fit on the rank with the least free memory.
   Startup checks that the final K and decode capture sizes agree across TP ranks.
@@ -100,8 +101,11 @@ requests, and breakable prefill graphs run the paged MoE layers as eager breaks.
   the host must be able to pin that much memory, or the disk tier holds the rest. TP ranks
   on one host share its RAM: their expert shards together occupy the full store for that host.
   `--paged-experts-host-memory-gb` caps their combined stores, not each rank independently;
-  on multiple hosts each host has its own budget. Under WSL2, the pinned-memory cap of about
-  half of system RAM applies to this shared total: set `--paged-experts-host-memory-gb` below it.
+  on multiple hosts each host has its own budget. A multi-node launch with this flag
+  requires the host kernel's `/proc/sys/kernel/random/boot_id` to be readable on every rank.
+  Ranks on the same kernel share the budget across container IPC namespaces. Under WSL2,
+  the pinned-memory cap of about half of system RAM applies to this shared total: set
+  `--paged-experts-host-memory-gb` below it.
 - **Disk tier** ([below](#disk-tier); R is the experts per layer in host memory): x86-64 hosts
   only for now. The first start writes every layer's file once, about the size of the expert
   weights, and keeps 8 GiB of the disk free; the space is checked at startup. The checkpoint must

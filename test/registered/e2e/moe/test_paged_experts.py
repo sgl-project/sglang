@@ -73,6 +73,7 @@ class _PagedMatchesUnpaged:
     #: Extra arguments for both servers.
     server_args = ()
     paged_extra_args = ()
+    paged_log = None
 
     @classmethod
     def setUpClass(cls):
@@ -84,6 +85,7 @@ class _PagedMatchesUnpaged:
                 cls.model,
                 PAGED_URL,
                 [*cls.server_args, *cls.paged_extra_args, *PAGED_ARGS],
+                log=cls.paged_log,
                 prompts=cls.prompts,
             )
             cls.reference, cls.paged = reference.result(), paged.result()
@@ -95,6 +97,8 @@ class _PagedMatchesUnpaged:
         self._assert_match(self.reference["batch"], self.paged["batch"])
 
     def _assert_match(self, reference, paged):
+        self.assertEqual(len(reference), len(self.prompts))
+        self.assertEqual(len(paged), len(self.prompts))
         decode_compared = decode_total = 0
         for prompt, ref, got in zip(self.prompts, reference, paged):
             with self.subTest(prompt=prompt[:30]):

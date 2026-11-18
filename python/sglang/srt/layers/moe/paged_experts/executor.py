@@ -9,6 +9,7 @@ decode up to ``K // top_k`` requests. Both finish through the same contract.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import torch
@@ -25,6 +26,8 @@ from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class EagerExecutor:
@@ -83,6 +86,13 @@ class EagerExecutor:
                 distinct=distinct,
                 in_host_rows=self.store.in_host_rows(),
             )
+            if len(waves) > 1:
+                logger.debug(
+                    "Paged experts: host-planned %d waves for %d tokens (%d experts)",
+                    len(waves),
+                    topk_ids.shape[0],
+                    len(distinct),
+                )
             merged = self._run_waves(layer, dispatch_output, waves, routed, topk_ids)
         return StandardCombineInput(
             hidden_states=self.contract.finish(
