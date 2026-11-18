@@ -73,6 +73,7 @@ def forward_triton_dcp_partial(
         return_lse=True,
         lengths=topk_length,
         expected_topk=expected_topk,
+        natural_lse=True,
     )
     return o.squeeze(0), lse
 
