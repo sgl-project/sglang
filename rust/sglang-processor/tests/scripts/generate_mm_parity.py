@@ -190,7 +190,6 @@ class PythonPath:
             mm_feature_transport="cpu",
             mm_enable_dp_encoder=False,
             image_processor_backend=backend,
-            disable_fast_image_processor=False,
             skip_tokenizer_init=False,
             mm_preprocess_cache_size_mb=0,
             trust_mm_content_hashes=False,
