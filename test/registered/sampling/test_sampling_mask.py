@@ -979,6 +979,10 @@ class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):
         ):
             self.assertAlmostEqual(sampling_logprob, logprob, delta=1e-4)
 
+    def test_selected_mode_without_new_tokens_is_not_aborted(self):
+        output = self._post_selected_without_mask({"max_new_tokens": 0})
+        self.assertEqual(output["meta_info"]["completion_tokens"], 0)
+
 
 class TestSamplingMaskRlOnPolicy(SamplingMaskTestMixin, CustomTestCase):
     @classmethod

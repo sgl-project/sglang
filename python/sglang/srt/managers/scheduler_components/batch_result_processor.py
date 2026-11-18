@@ -422,10 +422,13 @@ class SchedulerBatchResultProcessor:
                 discard_finish_reason = (
                     req.discard_output_reason if should_commit_output else None
                 )
+                has_sampling_output = (
+                    req.return_sampling_logprobs and not req.is_prefill_only
+                )
                 if (
                     should_commit_output
                     and discard_finish_reason is None
-                    and req.return_sampling_logprobs
+                    and has_sampling_output
                 ):
                     assert logits_output is not None
                     statuses = logits_output.next_token_sampling_mask_status
@@ -544,7 +547,7 @@ class SchedulerBatchResultProcessor:
                     if discard_finish_reason is not None:
                         continue
 
-                    if req.return_sampling_logprobs:
+                    if has_sampling_output:
                         self.add_sampling_mask_return_values(i, req, logits_output)
 
                     if req.grammar is not None:

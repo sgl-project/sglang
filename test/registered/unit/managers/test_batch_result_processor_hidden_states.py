@@ -250,6 +250,7 @@ class _PrefillReq(FakeReq):
         self.return_logprob = False
         self.return_sampling_mask = False
         self.return_sampling_logprobs = False
+        self.is_prefill_only = False
         self.grammar = None
         self.require_reasoning = False
         self.customized_info = None
