@@ -8,14 +8,14 @@ from sglang.kernels.ops.gemm import latent_mxfp4_aiter_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=120, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=120, stage="base-b", runner_config="1-gpu-small-amd-mi35x")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "no GPU")
 class TestKimiK3LatentMXFP4(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        if not latent_mxfp4_aiter_hip.supported():
+        if not latent_mxfp4_aiter_hip.available():
             raise unittest.SkipTest("Kimi-K3 latent MXFP4 needs AITER on gfx950")
         torch.manual_seed(0)
         cls.device = torch.device("cuda", 0)
@@ -87,6 +87,10 @@ class TestKimiK3LatentMXFP4(CustomTestCase):
                 weight = torch.empty(shape, dtype=torch.bfloat16, device=self.device)
                 with self.assertRaisesRegex(ValueError, "aligned to 256"):
                     latent_mxfp4_aiter_hip.pack(weight=weight)
+        with self.assertRaisesRegex(ValueError, "GPU weight"):
+            latent_mxfp4_aiter_hip.pack(
+                weight=torch.empty((3584, 7168), dtype=torch.bfloat16)
+            )
 
     def test_rejects_incompatible_activations(self):
         _, packed, scale = self.projections[0]

@@ -958,6 +958,16 @@ class ExecMoe(msgspec.Struct):
         "mxf4xmxf4 MMA type. Use with "
         "--moe-a2a-backend megamoe.",
     ] = False
+    enable_kimi_k3_latent_mxfp4: A[
+        bool,
+        "Kimi-K3 on gfx950 with SGLANG_USE_AITER=1: keep MXFP4 copies of the BF16 "
+        "latent MoE down/up projections and run them with AITER gemm_a4w4 for "
+        "batches of 2048 tokens or more (lossy weight and activation quantization). "
+        "The copies take about 2.34 GiB per GPU out of the KV cache budget, so "
+        "recheck the token capacity and --mem-fraction-static. Raises with "
+        "quantized latent projections, --moe-a2a-backend or "
+        "--enable-deterministic-inference.",
+    ] = False
     deepep_v2_mode: A[
         Literal["direct", "hybrid"],
         "DeepEP v2 ElasticBuffer communication topology, fixed at server init: "

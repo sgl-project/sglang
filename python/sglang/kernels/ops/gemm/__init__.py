@@ -26,15 +26,6 @@ _SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
 _SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))})
 _KDA_PACKAGE = "sglang.kernels.kda_kernels"
 
-register_kernel(
-    KernelSpec(
-        op="gemm.kimi_k3_latent_mxfp4",
-        backend=KernelBackend.AITER,
-        target="sglang.kernels.ops.gemm.latent_mxfp4_aiter_hip:run",
-        capabilities=frozenset({CapabilityRequirement.HIP}),
-    )
-)
-
 for _name, _backend in (
     ("linear_bf16_quack", KernelBackend.CUTE_DSL),
     ("linear_bf16_cublaslt", KernelBackend.FLASHINFER),
@@ -618,6 +609,15 @@ for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
         )
     )
 del _mod, _fn, _desc
+# Kimi-K3 latent MoE projections on gfx950 (AITER gemm_a4w4); available() bounds the arch.
+register_kernel(
+    KernelSpec(
+        op="gemm.kimi_k3_latent_mxfp4",
+        backend=KernelBackend.AITER,
+        target="sglang.kernels.ops.gemm.latent_mxfp4_aiter_hip:run",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
 register_kernel(
     KernelSpec(
         op="gemm.project_active_codebook_logits",

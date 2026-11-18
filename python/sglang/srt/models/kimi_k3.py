@@ -127,6 +127,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
+from sglang.srt.models.kimi_k3_rocm_mxfp4 import build_latent_mxfp4_projections
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3MultiModalProjector,
     KimiK3VisionTower,
@@ -765,18 +766,12 @@ class KimiK3MoE(nn.Module):
                 quant_config=latent_quant_config,
                 prefix=f"{prefix}.routed_expert_up_proj",
             )
-            # MXFP4 copies are made from the BF16 latent weights only.
-            if (
-                _is_hip
-                and latent_quant_config is None
-                and get_moe_a2a_backend().is_none()
-                and envs.SGLANG_OPT_HIP_K3_MOE_LATENT_MXFP4.get()
-            ):
-                from sglang.srt.models.kimi_k3_rocm_mxfp4 import (
-                    build_latent_mxfp4_projections,
+            if get_exec().moe.enable_kimi_k3_latent_mxfp4:
+                self._latent_mxfp4 = build_latent_mxfp4_projections(
+                    latent_quantized=latent_quant_config is not None,
+                    moe_a2a=not get_moe_a2a_backend().is_none(),
+                    deterministic=get_exec().deterministic.enable_deterministic_inference,
                 )
-
-                self._latent_mxfp4 = build_latent_mxfp4_projections()
         else:
             self.routed_expert_down_proj = None
             self.routed_expert_norm = None

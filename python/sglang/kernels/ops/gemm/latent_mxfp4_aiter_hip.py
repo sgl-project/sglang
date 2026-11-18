@@ -1,4 +1,8 @@
-"""AITER gfx950 MXFP4 GEMMs for Kimi-K3 latent projections."""
+"""AITER gfx950 MXFP4 GEMMs for Kimi-K3 latent projections.
+
+available() bounds them to gfx950 with AITER's MXFP4 ops; pack() and run() raise
+ValueError on inputs outside their contract.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +10,8 @@ import functools
 from collections.abc import Callable
 
 import torch
+
+from sglang.kernels.arch import current_arch
 
 _PRESHUFFLE_LAYOUT = (16, 16)
 _Ops = tuple[
@@ -27,22 +33,13 @@ def _ops() -> _Ops | None:
     return get_hip_quant(QuantType.per_1x32), shuffle_weight, gemm_a4w4, dtypes.fp4x2
 
 
-def supported(*, device: torch.device | None = None) -> bool:
+@functools.cache
+def available() -> bool:
+    """Whether pack() and run() can launch here: gfx950 and AITER's MXFP4 ops."""
     if torch.version.hip is None or not torch.cuda.is_available():
         return False
-    if device is not None and device.type != "cuda":
-        return False
-    arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
-    return arch == "gfx950" and _ops() is not None
-
-
-def _require_ops(*, device: torch.device) -> _Ops:
-    if not supported(device=device):
-        raise RuntimeError("latent MXFP4 GEMM requires AITER on gfx950")
-    ops = _ops()
-    if ops is None:
-        raise RuntimeError("AITER MXFP4 GEMM operators are unavailable")
-    return ops
+    hip = current_arch().hip
+    return hip is not None and hip.gcn_arch == "gfx950" and _ops() is not None
 
 
 def pack(*, weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -55,13 +52,16 @@ def pack(*, weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         or weight.shape[0] % 256 != 0
         or weight.shape[1] == 0
         or weight.shape[1] % 256 != 0
+        or weight.device.type != "cuda"
     ):
         raise ValueError(
-            "MXFP4 needs a nonempty 2D BF16 weight with output/input dimensions "
-            "aligned to 256, got "
-            f"{weight.dtype} {tuple(weight.shape)}"
+            "MXFP4 needs a nonempty 2D BF16 GPU weight with output/input "
+            "dimensions aligned to 256, got "
+            f"{weight.dtype} {tuple(weight.shape)} on {weight.device}"
         )
-    quant, shuffle, _, fp4x2 = _require_ops(device=weight.device)
+    if not available():
+        raise RuntimeError("latent MXFP4 GEMM requires AITER on gfx950")
+    quant, shuffle, _, fp4x2 = _ops()
     q, scale = quant(weight.contiguous(), quant_dtype=fp4x2, shuffle=True)
     return shuffle(q, layout=_PRESHUFFLE_LAYOUT), scale
 
@@ -80,7 +80,7 @@ def run(*, x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.
         or not scale.is_contiguous()
     ):
         raise ValueError("latent MXFP4 weight and scales must match the activations")
-    # pack() already checked the device, so skip the per-call device query.
+    # pack() already checked available(), so skip it per call.
     ops = _ops()
     if ops is None or weight.dtype != ops[3]:
         raise ValueError("latent MXFP4 GEMM needs packed FP4 weights from pack()")

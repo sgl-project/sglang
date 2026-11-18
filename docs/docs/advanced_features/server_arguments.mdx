@@ -1889,6 +1889,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>deep_gemm</code>, <code>triton</code>, <code>flashinfer_trtllm</code>, <code>experimental_sgl_trtllm</code>, <code>flashinfer_trtllm_routed</code>, <code>flashinfer_cutlass</code>, <code>flashinfer_mxfp4</code>, <code>flashinfer_cutedsl</code>, <code>cutlass</code>, <code>aiter</code>, <code>marlin</code></td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-kimi-k3-latent-mxfp4`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi-K3 on gfx950 with `SGLANG_USE_AITER=1`: keep MXFP4 copies of the BF16 latent MoE down/up projections and run them with AITER `gemm_a4w4` for batches of 2048 tokens or more (lossy weight and activation quantization). The copies take about 2.34 GiB per GPU out of the KV cache budget, so recheck the token capacity and `--mem-fraction-static`. Raises with quantized latent projections, `--moe-a2a-backend` or `--enable-deterministic-inference`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--flashinfer-mxfp4-moe-precision`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Choose the computation precision of flashinfer mxfp4 moe. On SM90, `fp8` selects the Humming-style MXFP4-weight x FP8-activation path introduced by FlashInfer #3738 and requires FlashInfer &gt;= 0.6.18.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`default`</td>
