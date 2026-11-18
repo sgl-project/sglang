@@ -19,8 +19,10 @@ consume-once stash instead of new signatures:
     Mxfp4MoEMethod.apply (situ)     take(x) skips the quant and the pack
 
 The ROCm radix-4 router's fused AITER MoE sort (aiter_presort) is requested
-through the same stash: stage_aiter_presort() before self.topk, and
-take_aiter_presort() in biased_grouped_topk_gpu's radix-4 branch.
+through the same stash: stage_aiter_presort(gate) before self.topk,
+take_aiter_presort() in biased_grouped_topk_gpu's radix-4 branch, and
+staged_aiter_presort() in the AITER runner, which shows the gate its fused_moe
+arguments.
 
 Every step is fallback-safe: if the routing dispatch never consumes the staged
 request (different model, uncovered shape, triton fallback) or the runner's
@@ -46,8 +48,9 @@ class _Handoff(msgspec.Struct):
     fused_routing_ok: bool = False
     padded_rows_masked: bool = False
     # staged by the model layer: let the ROCm radix-4 router also write AITER's
-    # MoE sort (aiter_presort)
-    aiter_presort: bool = False
+    # MoE sort on the batch sizes this aiter_presort.PresortGate takes
+    aiter_presort: Optional[Any] = None
+    aiter_presort_taken: bool = False
     # published by the routing dispatch, keyed by the staged activations
     produced_x: Optional[torch.Tensor] = None
     packed: Optional[torch.Tensor] = None
@@ -74,28 +77,38 @@ def clear() -> None:
     _handoff = _Handoff()
 
 
-def stage_aiter_presort() -> None:
-    """Ask the next radix-4 routing call to also write AITER's MoE sort. Caller
-    pairs this with clear() (try/finally)."""
-    _handoff.aiter_presort = True
+def stage_aiter_presort(gate: Any) -> None:
+    """Ask the next radix-4 routing call to also write AITER's MoE sort where
+    gate (aiter_presort.PresortGate) takes the batch. Caller pairs this with
+    clear() (try/finally)."""
+    _handoff.aiter_presort = gate
+    _handoff.aiter_presort_taken = False
 
 
 def bind_select_experts(
     num_token_non_padded: Optional[torch.Tensor], fused_routing_ok: bool
 ) -> None:
-    if _handoff.request_x is None and not _handoff.aiter_presort:
+    if _handoff.request_x is None and _handoff.aiter_presort is None:
         return
     _handoff.num_token_non_padded = num_token_non_padded
     _handoff.fused_routing_ok = fused_routing_ok
 
 
-def take_aiter_presort() -> Tuple[bool, Optional[torch.Tensor]]:
-    """Consume a staged presort request: whether select_experts leaves the
-    router's ids and weights as they are, which a sort of them needs, and the
-    padding row count it bound."""
-    requested = _handoff.aiter_presort and _handoff.fused_routing_ok
-    _handoff.aiter_presort = False
-    return requested, _handoff.num_token_non_padded
+def take_aiter_presort() -> Tuple[Optional[Any], Optional[torch.Tensor]]:
+    """Consume a staged presort request: its gate if select_experts leaves the
+    router's ids and weights as they are, which a sort of them needs (else
+    None), and the padding row count it bound."""
+    gate = None
+    if not _handoff.aiter_presort_taken and _handoff.fused_routing_ok:
+        gate = _handoff.aiter_presort
+    _handoff.aiter_presort_taken = True
+    return gate, _handoff.num_token_non_padded
+
+
+def staged_aiter_presort() -> Optional[Any]:
+    """The staged presort gate, until clear(), for the runner to show it the
+    layer's fused_moe arguments."""
+    return _handoff.aiter_presort
 
 
 def take_padded_rows_masked() -> bool:

@@ -656,15 +656,19 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             self.experts.runner_backend,
             routing_method_type=self.experts.routing_method_type,
         )
-        # Ask the radix-4 router for AITER fused_moe's sort only where it is
-        # consumed: AITER drops it under an expert mask (EP), and other runners
-        # never see it.
+        # Ask the radix-4 router for AITER fused_moe's sort only where it can be
+        # consumed: AITER drops it under an expert mask (EP), other runners never
+        # see it, and the gate checks AITER's block_m per batch size.
         self._aiter_presort = (
-            envs.SGLANG_K3_RADIX4_TOPK.get()
-            and self.experts.runner_backend is not None
-            and self.experts.runner_backend.is_aiter()
-            and self.experts.moe_ep_size == 1
-            and aiter_presort.available()
+            aiter_presort.PresortGate()
+            if (
+                envs.SGLANG_K3_RADIX4_TOPK.get()
+                and self.experts.runner_backend is not None
+                and self.experts.runner_backend.is_aiter()
+                and self.experts.moe_ep_size == 1
+                and aiter_presort.available()
+            )
+            else None
         )
 
         # MegaMoE (deep_gemm fused a2a+GEMM over the EP symm buffer) replaces
@@ -1830,8 +1834,8 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             # the FFN read already ran the front on this rank's rows (shard_front)
             return self._forward_row_front(prefix_sum)
         hidden_states = hidden_states.view(-1, hidden_size)
-        if self._aiter_presort:
-            aiter_presort.stage()
+        if self._aiter_presort is not None:
+            aiter_presort.stage(self._aiter_presort)
         try:
             if cp_shard_rows:
                 return self._forward_cp_shard_rows(hidden_states)
@@ -1848,7 +1852,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         finally:
             # A presort that no fused_moe consumed must not outlive this layer
             # (AITER's contract).
-            if self._aiter_presort:
+            if self._aiter_presort is not None:
                 aiter_presort.clear()
         return out.view(num_tokens, hidden_size)
 

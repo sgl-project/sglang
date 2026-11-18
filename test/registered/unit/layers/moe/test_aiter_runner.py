@@ -7,6 +7,7 @@ import torch
 import sglang.srt.layers.moe.moe_runner.aiter as aiter_runner
 from sglang.srt.environ import envs
 from sglang.srt.layers import zero_copy_context
+from sglang.srt.layers.moe import route_quant_handoff
 from sglang.srt.layers.moe.moe_runner.aiter import (
     AiterMoeQuantInfo,
     AiterQuantType,
@@ -88,6 +89,27 @@ def test_aiter_runner_forwards_no_combine_and_extra_fused_moe_kwargs(monkeypatch
     assert captured["quant_type"] == "per_1x32"
     assert captured["no_combine"] is True
     assert captured["custom_fused_moe_kwarg"] == "enabled"
+
+
+def test_aiter_runner_shows_a_staged_presort_gate_its_fused_moe_call(monkeypatch):
+    """The radix-4 router's presort gate asks AITER for the config of exactly
+    the call fused_moe gets."""
+    captured = {}
+
+    def fused_moe(**kwargs):
+        captured.update(kwargs)
+        return kwargs["hidden_states"]
+
+    _install_fake_aiter(monkeypatch, fused_moe)
+    gate = SimpleNamespace(calls=[])
+    gate.observe = gate.calls.append
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu"))
+    route_quant_handoff.stage_aiter_presort(gate)
+    try:
+        runner.run(_runner_input(), _quant_info(), {})
+    finally:
+        route_quant_handoff.clear()
+    assert gate.calls == [captured]
 
 
 def test_aiter_runner_rejects_no_combine_when_fused_moe_does_not_support_it(

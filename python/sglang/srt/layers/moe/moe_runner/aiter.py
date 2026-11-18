@@ -12,6 +12,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers import zero_copy_context
+from sglang.srt.layers.moe import route_quant_handoff
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -332,7 +333,7 @@ class AiterRunnerCore(MoeRunnerCore):
         if activation is None:
             activation = _aiter_activation(self.config)
 
-        output = fused_moe(
+        fused_moe_args = dict(
             hidden_states=runner_input.hidden_states,
             w1=quant_info.w13_weight,
             w2=quant_info.w2_weight,
@@ -352,6 +353,10 @@ class AiterRunnerCore(MoeRunnerCore):
             intermediate_pad=quant_info.intermediate_pad,
             **extra,
         )
+        presort_gate = route_quant_handoff.staged_aiter_presort()
+        if presort_gate is not None:
+            presort_gate.observe(fused_moe_args)
+        output = fused_moe(**fused_moe_args)
         return AiterRunnerOutput(hidden_states=output)
 
     @property

@@ -11,8 +11,11 @@ included; anything less and a token's routing would depend on the batch size.
 Run:  SGLANG_USE_AITER=1 pytest test/registered/kernels/ops/moe/test_moe_route_radix4.py -v
 """
 
+import inspect
 import sys
 from collections import defaultdict
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -278,8 +281,6 @@ def test_select_experts_sorts_only_for_a_staged_layer(staged):
     """Only an AITER fused_moe without an expert mask takes the router's sort;
     for any other consumer (EP, another runner) the fused sort is pure overhead,
     so the router emits and registers it only when the layer staged a request."""
-    from unittest.mock import patch
-
     from sglang.srt.environ import envs
     from sglang.srt.layers.moe import aiter_presort
     from sglang.srt.layers.moe import topk as topk_module
@@ -307,7 +308,7 @@ def test_select_experts_sorts_only_for_a_staged_layer(staged):
         patch.object(aiter_presort, "_registrar", return_value=registrations.append),
     ):
         if staged:
-            aiter_presort.stage()
+            aiter_presort.stage(SimpleNamespace(takes_presort=lambda m: True))
         try:
             _, ids, _ = select_experts(
                 torch.zeros((m, 8), device="cuda"), scores, config
@@ -708,6 +709,158 @@ def test_aiter_ignores_fused_sort_for_another_moe_call():
         )
         is None
     )
+
+
+# The K3 activation modes AITER's SiTUv2 MoE runs (aiter.fused_moe's
+# resolve_activation_dtype reads these at every call).
+_SITU_MODES = {
+    "a16w4": {},
+    "a8w4": {"AITER_SITUV2_A8W4": "1"},
+    "a4w4": {"AITER_SITUV2_A4W4": "1"},
+}
+
+
+def _requires_presort_aiter():
+    from sglang.srt.layers.moe import aiter_presort
+
+    if not aiter_presort.available():
+        pytest.skip("AITER without register_presorted_moe (ROCm/aiter#6484)")
+    return aiter_presort
+
+
+def _k3_fused_moe_call(m, mode, device, num_experts, model_dim, inter_dim):
+    """The fused_moe keyword arguments the AITER runner passes a K3 layer:
+    preshuffled MXFP4 weights, SiTUv2, gate/up interleaved for A8W4."""
+    from aiter import ActivationType, QuantType, dtypes
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    w1 = torch.empty(
+        (num_experts, 2 * inter_dim, model_dim // 2), dtype=dtypes.fp4x2, device=device
+    )
+    w2 = torch.empty(
+        (num_experts, model_dim, inter_dim // 2), dtype=dtypes.fp4x2, device=device
+    )
+    w1.is_shuffled = w2.is_shuffled = True
+    gate_mode = GateMode.SEPARATED
+    if mode == "a8w4":
+        w1.gate_up_interleave = True
+        gate_mode = GateMode.INTERLEAVE
+    return dict(
+        hidden_states=torch.zeros((m, model_dim), dtype=torch.bfloat16, device=device),
+        w1=w1,
+        w2=w2,
+        topk_weight=torch.zeros((m, TOPK), dtype=torch.float32, device=device),
+        topk_ids=torch.zeros((m, TOPK), dtype=torch.int32, device=device),
+        quant_type=QuantType.per_1x32,
+        activation=ActivationType.Situv2,
+        w1_scale=None,
+        w2_scale=None,
+        a1_scale=None,
+        a2_scale=None,
+        bias1=None,
+        bias2=None,
+        expert_mask=None,
+        doweight_stage1=False,
+        hidden_pad=0,
+        intermediate_pad=0,
+        gate_mode=gate_mode.value,
+        moe_sorting_dispatch_policy=0,
+    )
+
+
+class _LookupReached(Exception):
+    pass
+
+
+@pytest.mark.parametrize("mode", list(_SITU_MODES))
+@pytest.mark.parametrize("m", [1, 100, 512])
+def test_presort_gate_asks_aiter_what_fused_moe_asks(mode, m, monkeypatch):
+    """The gate mirrors how _fused_moe_impl derives its get_2stage_cfgs call, so
+    the call fused_moe itself makes is the reference: any drift on AITER's side
+    fails here instead of silently registering sorts AITER drops."""
+    aiter_presort = _requires_presort_aiter()
+    import aiter.fused_moe as aiter_fused_moe
+
+    for name, value in _SITU_MODES[mode].items():
+        monkeypatch.setenv(name, value)
+    call = _k3_fused_moe_call(
+        m, mode, "cuda", num_experts=8, model_dim=256, inter_dim=256
+    )
+    signature = inspect.signature(aiter_fused_moe.get_2stage_cfgs)
+    seen = []
+
+    def lookup(*args, **kwargs):
+        seen.append(signature.bind(*args, **kwargs))
+        raise _LookupReached
+
+    with patch.object(aiter_fused_moe, "get_2stage_cfgs", lookup):
+        with pytest.raises(_LookupReached):
+            aiter_fused_moe.fused_moe(**call)
+    gate = aiter_presort.PresortGate()
+    gate.observe(call)
+    ours = signature.bind(**gate.cfg_args(m))
+    seen[0].apply_defaults()
+    ours.apply_defaults()
+    assert ours.arguments == seen[0].arguments
+
+
+@pytest.mark.parametrize("mode", list(_SITU_MODES))
+def test_select_experts_sorts_only_where_aiter_takes_it(mode, monkeypatch):
+    """On AITER's own tables for the K3 MoE shapes (TP8, non-EP), the router
+    registers its sort exactly on the batch sizes whose config is the BM=16
+    aux-sort pipeline; elsewhere (e.g. stock A4W4's BM=32 rows at 65-256
+    tokens) AITER would sort again, so the router skips it."""
+    aiter_presort = _requires_presort_aiter()
+    from aiter.fused_moe import get_2stage_cfgs
+
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe import topk as topk_module
+    from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+    from sglang.srt.runtime_context import get_context
+
+    if not topk_module._use_aiter:
+        pytest.skip("Requires SGLANG_USE_AITER=1 before importing the router.")
+    for name, value in _SITU_MODES[mode].items():
+        monkeypatch.setenv(name, value)
+    gate = aiter_presort.PresortGate()
+    # The lookup needs the weights' shapes and tags only.
+    gate.observe(
+        _k3_fused_moe_call(
+            1, mode, "meta", num_experts=NUM_EXPERTS, model_dim=MODEL_DIM, inter_dim=384
+        )
+    )
+    config = TopKConfig(
+        top_k=TOPK,
+        use_grouped_topk=True,
+        num_expert_group=1,
+        topk_group=1,
+        correction_bias=torch.zeros(NUM_EXPERTS, dtype=torch.float32, device="cuda"),
+        routed_scaling_factor=2.5,
+    )
+    sizes = [1, 16, 64, 65, 128, 256, 512]
+    expected = {}
+    for m in sizes:
+        metadata = get_2stage_cfgs(**gate.cfg_args(m))
+        expected[m] = bool(metadata.output_aux) and int(metadata.block_m) == BM
+    registered = {}
+    for m in sizes:
+        registrations = []
+        scores = torch.randn((m, NUM_EXPERTS), dtype=torch.bfloat16, device="cuda")
+        with (
+            get_context().override_server_args(),
+            envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.override(False),
+            envs.SGLANG_K3_RADIX4_TOPK.override(True),
+            patch.object(
+                aiter_presort, "_registrar", return_value=registrations.append
+            ),
+        ):
+            aiter_presort.stage(gate)
+            try:
+                select_experts(torch.zeros((m, 8), device="cuda"), scores, config)
+            finally:
+                aiter_presort.clear()
+        registered[m] = len(registrations) == 2
+    assert registered == expected
 
 
 if __name__ == "__main__":

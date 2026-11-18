@@ -3,6 +3,7 @@ K3 MoE layer leaves no routing state behind for the next one."""
 
 import unittest
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import patch
 
 import torch
@@ -59,7 +60,9 @@ class TestKimiK3ExpertPlacement(CustomTestCase):
                     KimiK3MoE(config)
 
 
-def _unfused_moe(*, aiter_presort: bool, registrations: list) -> SimpleNamespace:
+def _unfused_moe(
+    *, presort_gate: Optional[aiter_presort.PresortGate], registrations: list
+) -> SimpleNamespace:
     def route_without_fused_moe(hidden_states, *, prefix_sum, valid_token_count):
         registrations.append({"M": hidden_states.shape[0]})
         return hidden_states
@@ -68,7 +71,7 @@ def _unfused_moe(*, aiter_presort: bool, registrations: list) -> SimpleNamespace
         _row_front_out=None,
         _eligible_for_fused_front=False,
         _forward_unfused=route_without_fused_moe,
-        _aiter_presort=aiter_presort,
+        _aiter_presort=presort_gate,
     )
 
 
@@ -77,31 +80,35 @@ class TestKimiK3MoEPresortLifetime(CustomTestCase):
         """AITER matches a registered presort by topk tensor address, so one that no
         fused_moe consumed must not outlive the layer, whichever path routed it."""
         registrations = []
-        moe = _unfused_moe(aiter_presort=True, registrations=registrations)
+        moe = _unfused_moe(
+            presort_gate=aiter_presort.PresortGate(), registrations=registrations
+        )
         with patch.object(
             aiter_presort, "_registrar", return_value=registrations.append
         ):
             KimiK3MoE.forward(moe, torch.zeros(2, 4))
         self.assertIsNone(registrations[-1])
         # The request no routing call consumed is dropped with it.
-        self.assertEqual(route_quant_handoff.take_aiter_presort(), (False, None))
+        self.assertEqual(route_quant_handoff.take_aiter_presort(), (None, None))
 
     def test_presort_request_needs_unrewritten_routing(self):
         """AITER matches the sort to the router's own topk tensors, so a request is
         dropped when select_experts rewrites them (EPLB remap, simulated routing,
         shared slots), and otherwise carries its padding row count."""
         non_padded = torch.tensor(3)
+        gate = aiter_presort.PresortGate()
         try:
-            route_quant_handoff.stage_aiter_presort()
+            route_quant_handoff.stage_aiter_presort(gate)
             route_quant_handoff.bind_select_experts(non_padded, fused_routing_ok=False)
-            self.assertFalse(route_quant_handoff.take_aiter_presort()[0])
-            route_quant_handoff.stage_aiter_presort()
+            self.assertIsNone(route_quant_handoff.take_aiter_presort()[0])
+            route_quant_handoff.stage_aiter_presort(gate)
             route_quant_handoff.bind_select_experts(non_padded, fused_routing_ok=True)
             self.assertEqual(
-                route_quant_handoff.take_aiter_presort(), (True, non_padded)
+                route_quant_handoff.take_aiter_presort(), (gate, non_padded)
             )
-            # Consumed once.
-            self.assertFalse(route_quant_handoff.take_aiter_presort()[0])
+            # Consumed once; the runner still sees the gate until clear().
+            self.assertIsNone(route_quant_handoff.take_aiter_presort()[0])
+            self.assertIs(route_quant_handoff.staged_aiter_presort(), gate)
         finally:
             route_quant_handoff.clear()
 
@@ -109,7 +116,7 @@ class TestKimiK3MoEPresortLifetime(CustomTestCase):
         """CUDA, non-AITER runners and EP layers cannot register a presort, so
         they skip the cleanup and never import AITER."""
         registrations = []
-        moe = _unfused_moe(aiter_presort=False, registrations=registrations)
+        moe = _unfused_moe(presort_gate=None, registrations=registrations)
         with patch.object(aiter_presort, "_registrar") as registrar:
             KimiK3MoE.forward(moe, torch.zeros(2, 4))
         registrar.assert_not_called()
