@@ -250,9 +250,9 @@ def moe_finalize_all_reduce(
     num_tokens = expert_weights.shape[0]
     assert expert_weights.dtype in (torch.bfloat16, torch.float32)
     assert expert_weights.shape[1] == top_k, (expert_weights.shape, top_k)
-    assert (norm_weight is None) == (
-        norm_eps is None
-    ), "norm_weight and norm_eps must be given together"
+    assert (norm_weight is None) == (norm_eps is None), (
+        "norm_weight and norm_eps must be given together"
+    )
     out = torch.empty(
         num_tokens, hidden_dim, dtype=torch.bfloat16, device=gemm2_out.device
     )
