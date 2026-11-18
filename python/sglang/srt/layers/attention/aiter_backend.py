@@ -904,10 +904,10 @@ class AiterAttnBackend(AttentionBackend):
             self.use_triton_unified_attention or self.kv_cache_is_vectorized_5d
         )
 
-        # When topk == 1 the EAGLE draft chain is linear, so target_verify's
-        # mask reduces to pure causal and can go through unified_attention
-        # instead of the legacy triton extend_attention_fwd. Gated on non-MLA
-        # (MLA has its own verify path) and env var for opt-out.
+        # When topk == 1 the draft chain is linear, so target_verify needs only the
+        # causal mask (or none, for ENCODER_ONLY drafts) and can go through
+        # unified_attention instead of the legacy triton extend_attention_fwd.
+        # Gated on non-MLA (MLA has its own verify path) and env var for opt-out.
         self._use_unified_verify = (
             self.use_triton_unified_attention
             and not self.use_mla
@@ -4967,9 +4967,9 @@ class AiterAttnBackend(AttentionBackend):
                 else:
                     o = torch.empty_like(q)
 
-                # target_verify goes through unified_attention when topk == 1
-                # (the linear draft chain gives a pure causal mask). MLA and
-                # draft_extend still use the legacy extend_attention_fwd path.
+                # target_verify goes through unified_attention when topk == 1: a
+                # linear draft chain needs only the causal mask (none for ENCODER_ONLY).
+                # MLA and draft_extend still use the legacy extend_attention_fwd path.
                 if (
                     self._use_unified_verify
                     and forward_batch.forward_mode.is_target_verify()
@@ -4987,6 +4987,12 @@ class AiterAttnBackend(AttentionBackend):
                         window_size = (layer.sliding_window_size - 1, 0)
                         if self.forward_metadata.swa_page_table is not None:
                             page_table = self.forward_metadata.swa_page_table
+                    is_bidirectional = layer.attn_type == AttentionType.ENCODER_ONLY
+                    if is_bidirectional and window_size != (-1, -1):
+                        raise ValueError(
+                            "aiter unified_attention takes no sliding window with "
+                            "causal=False (an ENCODER_ONLY layer)."
+                        )
 
                     q_unified = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
                     k_unified = k_cache.view(
@@ -5009,7 +5015,7 @@ class AiterAttnBackend(AttentionBackend):
                     use_unified_attention_3d_mtp = (
                         is_gfx95_supported()
                         # this kernel is causal-only
-                        and layer.attn_type != AttentionType.ENCODER_ONLY
+                        and not is_bidirectional
                         and 1 < self.forward_metadata.max_q_len <= 4
                         and max_kv_len > 512
                         and (
@@ -5071,6 +5077,8 @@ class AiterAttnBackend(AttentionBackend):
                         )
                     if (
                         self.muse_verify_kernels
+                        # the Muse verify kernels are causal-only
+                        and not is_bidirectional
                         and not layer.is_cross_attention
                         and layer.qk_head_dim == layer.v_head_dim == 64
                         and _muse_verify_attention(
@@ -5113,7 +5121,7 @@ class AiterAttnBackend(AttentionBackend):
                         max_seqlen_q=self.forward_metadata.max_q_len,
                         max_seqlen_k=max_kv_len,
                         softmax_scale=layer.scaling,
-                        causal=layer.attn_type != AttentionType.ENCODER_ONLY,
+                        causal=not is_bidirectional,
                         window_size=window_size,
                         block_table=page_table,
                         softcap=layer.logit_cap,
