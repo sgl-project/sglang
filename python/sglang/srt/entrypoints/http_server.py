@@ -2378,35 +2378,6 @@ async def _send_disaggregation_warmup_requests(
         )
 
 
-def _wait_for_model_info(
-    server_args: ServerArgs, *, deadline_s: Optional[float] = None
-) -> dict:
-    # Polls once a second; after 120 tries or deadline_s seconds, raises with the
-    # last failure.
-    headers = {}
-    if get_serving().api_key:
-        headers["Authorization"] = f"Bearer {get_serving().api_key}"
-    last_traceback = ""
-    end = None if deadline_s is None else time.monotonic() + deadline_s
-    for _ in range(120):
-        time.sleep(1)
-        timeout = 5 if end is None else min(5, end - time.monotonic())
-        if timeout <= 0:
-            break
-        try:
-            res = requests.get(
-                server_args.url() + "/model_info",
-                timeout=timeout,
-                headers=headers,
-                verify=ssl_verify_of(server_args),
-            )
-            assert res.status_code == 200, f"{res=}, {res.text=}"
-            return res.json()
-        except (AssertionError, requests.exceptions.RequestException):
-            last_traceback = traceback.format_exc()
-    raise TimeoutError(last_traceback)
-
-
 def _execute_server_warmup(server_args: ServerArgs):
     headers = {}
     url = server_args.url()
@@ -2415,12 +2386,27 @@ def _execute_server_warmup(server_args: ServerArgs):
 
     ssl_verify = ssl_verify_of(server_args)
 
-    try:
-        model_info = _wait_for_model_info(server_args)
-    except TimeoutError as error:
-        logger.error(f"Initialization failed. warmup error: {error}")
+    # Wait until the server is launched
+    success = False
+    for _ in range(120):
+        time.sleep(1)
+        try:
+            res = requests.get(
+                url + "/model_info", timeout=5, headers=headers, verify=ssl_verify
+            )
+            assert res.status_code == 200, f"{res=}, {res.text=}"
+            success = True
+            break
+        except (AssertionError, requests.exceptions.RequestException):
+            last_traceback = traceback.format_exc()
+            pass
+
+    if not success:
+        logger.error(f"Initialization failed. warmup error: {last_traceback}")
         kill_process_tree(os.getpid())
-        return False
+        return success
+
+    model_info = res.json()
 
     # Construct a warmup request (MLX: text warmup for VLM-advertising models; TODO: enable image warmup).
     # A language-only worker may advertise VLM capability for encoder
@@ -2569,7 +2555,7 @@ def _execute_server_warmup(server_args: ServerArgs):
         kill_process_tree(os.getpid())
         return False
 
-    return True
+    return success
 
 
 def _tokenizer_worker_gc_callback(worker_id: int, gc_threshold) -> Callable[[], None]:
@@ -2583,25 +2569,6 @@ def _multi_tokenizer_warmup_kwargs(server_args: ServerArgs, worker_id: int):
             worker_id, server_args.gc_threshold
         ),
     )
-
-
-# Arbitrary: a server listens within seconds, and one that cannot reach its own
-# URL (a common reason to skip warmup) should not hold /health back for minutes.
-_SKIPPED_WARMUP_WAIT_S = 20
-
-
-def _wait_for_server_before_gc_freeze(server_args: ServerArgs) -> bool:
-    # The freeze is a request to this server, and with warmup skipped nothing
-    # else waits for it to listen; a refused freeze is only logged, never retried.
-    try:
-        _wait_for_model_info(server_args, deadline_s=_SKIPPED_WARMUP_WAIT_S)
-    except TimeoutError as error:
-        logger.warning(
-            f"No answer from the server within {_SKIPPED_WARMUP_WAIT_S} s; "
-            f"skipping the GC freeze: {error}"
-        )
-        return False
-    return True
 
 
 def _freeze_gc_after_server_warmup(server_args: ServerArgs):
@@ -2640,22 +2607,15 @@ def _wait_and_warmup(
             get_exec().moe.ep_join_mode,
         )
 
-    skip_warmup = get_serving().skip_server_warmup and not skip_elastic_joiner_warmup
-    server_answered = True
-    if skip_elastic_joiner_warmup:
+    if not get_serving().skip_server_warmup and not skip_elastic_joiner_warmup:
+        if not execute_warmup_func(server_args):
+            return
+    else:
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
-    elif skip_warmup:
-        server_answered = _wait_for_server_before_gc_freeze(server_args)
-    elif not execute_warmup_func(server_args):
-        return
 
     if post_warmup_callback is not None:
         post_warmup_callback()
-    if server_answered:
-        _freeze_gc_after_server_warmup(server_args)
-    if skip_warmup:
-        # Up after the freeze, so no request waits on it walking the startup heap.
-        _global_state.tokenizer_manager.server_status = ServerStatus.Up
+    _freeze_gc_after_server_warmup(server_args)
 
     # The server is ready for requests
     logger.info("The server is fired up and ready to roll!")
