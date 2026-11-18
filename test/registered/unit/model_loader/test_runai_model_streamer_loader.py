@@ -85,6 +85,21 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
                     load_group=_DEFAULT_LOAD_GROUP,
                 )
 
+    def test_local_directory_wildcard_rejected(self):
+        """A directory wildcard must fail loudly on local paths too, not match nothing."""
+        loader = loader_mod.RunaiModelStreamerLoader(
+            LoadConfig(load_format=LoadFormat.RUNAI_STREAMER)
+        )
+        with (
+            tempfile.TemporaryDirectory() as model_path,
+            patch.object(loader_mod, "get_server_args", return_value=None),
+            patch.object(runai_utils, "list_safetensors", return_value=[]),
+            self.assertRaisesRegex(ValueError, "directory wildcards"),
+        ):
+            loader._prepare_weights(
+                model_path, None, allow_patterns_overrides=["*/model.safetensors"]
+            )
+
     def test_remote_checkpoint_index(self):
         for scheme in ("s3", "gs", "az"):
             for relative_cache in (False, True):
