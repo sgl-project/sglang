@@ -546,8 +546,8 @@ class TestPrepareServerArgs(CustomTestCase):
                         weight_cache_mode=mode,
                         speculative_algorithm=algorithm,
                     )
-                    if mode != "off" and algorithm in ("DFLASH", "DSPARK"):
-                        with self.assertRaisesRegex(ValueError, "EAGLE and EAGLE3"):
+                    if mode != "off" and algorithm == "DFLASH":
+                        with self.assertRaisesRegex(ValueError, "EAGLE3 and DSPARK"):
                             handle_load_format(args)
                     else:
                         handle_load_format(args)
