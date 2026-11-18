@@ -31,7 +31,7 @@ from sglang.srt.constants import (
 )
 from sglang.test.ci.ci_register import register_xpu_ci
 
-register_xpu_ci(est_time=60, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=60, suite="extra-test-1-gpu-xpu")
 
 
 def _xpu_saver_available():
