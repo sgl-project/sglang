@@ -224,16 +224,6 @@ class MambaPoolHost(HostKVCache):
         self.lock = threading.RLock()
         self.clear()
 
-    @staticmethod
-    def _as_npu_transfer_view5(tensor):
-        """Collapse [A, B, *S] to [A, P, 1, 1, W] as a pure view, or None
-        when the trailing dims are not mergeable. `view` never copies, unlike
-        `reshape`, which could silently duplicate the whole buffer."""
-        try:
-            return tensor.view(tensor.shape[0], tensor.shape[1], 1, 1, -1)
-        except RuntimeError:
-            return None
-
     def _init_npu_state_transfer(self) -> None:
         """Pre-build the per-component views the kernel_ascend path submits.
 
@@ -242,6 +232,7 @@ class MambaPoolHost(HostKVCache):
         already failed at import time.
         """
         self._npu_state_transfer_views = ()
+        self._npu_h2d_transfer_views = {}
         if not _is_npu:
             return
         if not ascendc_io_enabled():
@@ -254,50 +245,27 @@ class MambaPoolHost(HostKVCache):
         # one slot per page, trailing state shape collapsed to width W.
         views = []
 
-        def add(name, key, dev, host):
-            if dev is None or host is None:
-                raise RuntimeError(
-                    f"NPU kernel_ascend Mamba transfers cannot address "
-                    f"component {name!r} in place: its per-slot payload is "
-                    f"not contiguous."
-                )
-            views.append((name, key, dev, host))
-
         if self.temporal_state_elem_size > 0:
-            add(
-                "temporal",
-                None,
-                self._as_npu_transfer_view5(self.buffer_info.temporal),
-                self._as_npu_transfer_view5(self.temporal_buffer),
+            views.append(
+                ("temporal", None, self.buffer_info.temporal, self.temporal_buffer)
             )
         for i in range(len(self.conv_state_shapes)):
-            add(
-                f"conv_{i}",
-                None,
-                self._as_npu_transfer_view5(self.buffer_info.conv[i]),
-                self._as_npu_transfer_view5(self.conv_buffer[i]),
+            views.append(
+                (f"conv_{i}", None, self.buffer_info.conv[i], self.conv_buffer[i])
             )
         # Draft layers: separate single-layer device allocations targeting the
         # draft layer range of the shared host pool.
         n_main = self.buffer_info.temporal.shape[0]
-        temporal_host_v = self._as_npu_transfer_view5(self.temporal_buffer)
-        conv_host_vs = [self._as_npu_transfer_view5(buf) for buf in self.conv_buffer]
         for depth, draft_info in enumerate(self.mtp_draft_buffer_infos):
             host_layer = n_main + depth
             if draft_info.temporal.numel():
-                add(
-                    "temporal_draft",
-                    depth,
-                    self._as_npu_transfer_view5(draft_info.temporal),
-                    temporal_host_v.narrow(1, host_layer, 1),
-                )
+                host_state = self.temporal_buffer.narrow(1, host_layer, 1)
+                views.append(("temporal_draft", depth, draft_info.temporal, host_state))
             for i in range(len(self.conv_state_shapes)):
                 if draft_info.conv[i].numel():
-                    add(
-                        f"conv_{i}_draft",
-                        depth,
-                        self._as_npu_transfer_view5(draft_info.conv[i]),
-                        conv_host_vs[i].narrow(1, host_layer, 1),
+                    host_state = self.conv_buffer[i].narrow(1, host_layer, 1)
+                    views.append(
+                        (f"conv_{i}_draft", depth, draft_info.conv[i], host_state)
                     )
         # Side states: no layer axis, so a single-layer component covers them.
         # unsqueeze is a pure view op, so the payload checks stay meaningful.
@@ -306,28 +274,32 @@ class MambaPoolHost(HostKVCache):
         ):
             if not state.numel() or not buf.numel():
                 continue
-            add(
-                f"side_{i}",
-                None,
-                self._as_npu_transfer_view5(state.unsqueeze(0)),
-                self._as_npu_transfer_view5(buf.unsqueeze(1)),
-            )
+            views.append((f"side_{i}", None, state.unsqueeze(0), buf.unsqueeze(1)))
 
-        self._npu_state_transfer_views = tuple(views)
+        transfer_views = []
+        for name, key, dev, host in views:
+            dev = dev.view(dev.shape[0], dev.shape[1], 1, 1, -1)
+            host = host.view(host.shape[0], host.shape[1], 1, 1, -1)
+            transfer_views.append((name, key, dev, host))
+        self._npu_state_transfer_views = tuple(transfer_views)
+
+        h2d_views = {}
+        for name, key, dev, host in transfer_views:
+            if key is not None:
+                h2d_views.setdefault(n_main + key, []).append((dev, host, 0))
+            elif name.startswith("side_"):
+                h2d_views.setdefault(0, []).append((dev, host, 0))
+            else:
+                for layer_id in range(n_main):
+                    h2d_views.setdefault(layer_id, []).append((dev, host, layer_id))
+        self._npu_h2d_transfer_views = {
+            layer_id: tuple(components) for layer_id, components in h2d_views.items()
+        }
         logger.info(
             "NPU HiCache Mamba state transfer mode: "
             "npu_state_transfer (kv_exchange, %d components).",
             len(views),
         )
-
-    def _npu_transfer_indices(self, host_indices, device_indices):
-        di = device_indices.reshape(-1).to(
-            dtype=torch.int64, device=self._buffer_device
-        )
-        hi = host_indices.reshape(-1).to(
-            dtype=torch.int64, device=self._buffer_device
-        )
-        return di, hi
 
     def _load_to_device_npu_state(self, host_indices, device_indices, layer_id) -> None:
         """H2D via kv_exchange, one submission per state component.
@@ -336,60 +308,34 @@ class MambaPoolHost(HostKVCache):
         layer 0, the side states; draft layers ride their own single-layer
         component on the matching pool layer id.
         """
-        di, hi = self._npu_transfer_indices(host_indices, device_indices)
-        if di.numel() == 0:
-            return
-        n_main = self.buffer_info.temporal.shape[0]
-        empty_dev = torch.empty(0, device=self._buffer_device)
-        empty_host = torch.empty(0)
-        for name, key, dev, host in self._npu_state_transfer_views:
-            if name.endswith("_draft"):
-                # Draft components submit once, on their own layer call. Their
-                # host view is pre-narrowed to that single layer, so the layer
-                # offset is already folded into the view and both operands
-                # address layer 0.
-                if layer_id != n_main + key:
-                    continue
-                device_layer_id = host_layer_id = 0
-            else:
-                if name.startswith("side_"):
-                    if layer_id != 0:
-                        continue
-                    device_layer_id, host_layer_id = 0, 0
-                elif layer_id >= n_main:
-                    continue
-                else:
-                    device_layer_id = host_layer_id = layer_id
+        for dev, host, component_layer_id in self._npu_h2d_transfer_views.get(
+            layer_id, ()
+        ):
             transfer_kv_per_layer_kv_split_pf_lf(
-                device_indices=di,
-                host_indices=hi,
+                device_indices=device_indices,
+                host_indices=host_indices,
                 device_k=dev,
                 host_k=host,
-                device_v=empty_dev,
-                host_v=empty_host,
+                device_v=torch.empty(0, device=self._buffer_device),
+                host_v=torch.empty(0),
                 page_size=1,
-                device_layer_id=device_layer_id,
-                host_layer_id=host_layer_id,
+                device_layer_id=component_layer_id,
+                host_layer_id=component_layer_id,
             )
 
     def _backup_from_device_npu_state(self, host_indices, device_indices) -> None:
         """D2H via kv_exchange: one all-layer call per state component."""
-        di, hi = self._npu_transfer_indices(host_indices, device_indices)
-        if di.numel() == 0:
-            return
-        empty_dev = torch.empty(0, device=self._buffer_device)
-        empty_host = torch.empty(0)
         for _, _, dev, host in self._npu_state_transfer_views:
             # Main views keep the full layer axis and fill host layers from 0;
             # draft/side host views are pre-narrowed to one layer, so they too
             # start at host layer 0.
             transfer_kv_all_layer_kv_split_lf_pf(
-                device_indices=di,
-                host_indices=hi,
+                device_indices=device_indices,
+                host_indices=host_indices,
                 device_k=dev,
                 host_k=host,
-                device_v=empty_dev,
-                host_v=empty_host,
+                device_v=torch.empty(0, device=self._buffer_device),
+                host_v=torch.empty(0),
                 page_size=1,
                 host_layer_start=0,
             )
