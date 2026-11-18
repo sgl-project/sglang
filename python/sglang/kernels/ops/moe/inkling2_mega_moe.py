@@ -2,7 +2,8 @@
 
 Coverage: SM100 / SM103, NVFP4 (packed `uint8`) or MXFP8 (`float8_e4m3fn`) expert weights, SiTU with
 caps (4, 25), experts split over the EP `group`. Every rank passes the same tokens, at most
-`max_num_tokens_per_rank * group.size()`, and gets the output of all experts for all of them.
+`max_num_tokens_per_rank * group.size()`, or only the slice it dispatches, and gets the output of
+all experts for all of them.
 
 Reads the same tensors as `Inkling2FlashInferMoE` (`weight_layout="up_gate_block16"`): w13 rows from
 `up_gate_block16_rows_`, w2 rows plain, block scales from `swizzle_blockscale`.
@@ -114,21 +115,37 @@ class Inkling2MegaMoE:
                 l2_act_scales=torch.full_like(w2_alpha, act_scale),
             )
 
+    def token_slice(self, num_tokens: int) -> tuple[int, int]:
+        """`(start, count)` of the tokens this rank dispatches out of `num_tokens`."""
+        per_rank = -(-num_tokens // self.num_ranks)
+        start = min(self.rank * per_rank, num_tokens)
+        return start, min(num_tokens - start, per_rank)
+
     def __call__(
-        self, x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor
+        self,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        num_tokens: int | None = None,
     ) -> torch.Tensor:
         """`x` `[T, H]` bf16, `topk_weights` / `topk_ids` `[T, top_k]` (global expert ids), the
-        same on every rank. Returns `[T, H]` bf16, a view into the symmetric buffer that the next
-        call on a layer of the same shape overwrites."""
-        tokens = x.shape[0]
-        per_rank = -(-tokens // self.num_ranks)
-        start = min(self.rank * per_rank, tokens)
-        local = min(tokens - start, per_rank)
+        same on every rank. With `num_tokens`, the inputs hold only this rank's
+        `token_slice(num_tokens)` rows instead. Returns `[num_tokens or T, H]` bf16, a view into
+        the symmetric buffer that the next call on a layer of the same shape overwrites."""
+        if num_tokens is None:
+            num_tokens = x.shape[0]
+            start, local = self.token_slice(num_tokens)
+            rows = slice(start, start + local)
+            x, topk_weights, topk_ids = x[rows], topk_weights[rows], topk_ids[rows]
+        else:
+            local = self.token_slice(num_tokens)[1]
+            assert x.shape[0] == topk_ids.shape[0] == local
+        per_rank = -(-num_tokens // self.num_ranks)
         buf = self.buffer
         deep_gemm.mega_moe_pre_dispatch(
-            x[start : start + local],
-            topk_ids[start : start + local].int(),
-            topk_weights[start : start + local].float(),
+            x,
+            topk_ids.int(),
+            topk_weights.float(),
             buf.x,
             buf.x_sf,
             buf.topk_idx,
@@ -142,4 +159,4 @@ class Inkling2MegaMoE:
             buf.topk_idx[local:per_rank].fill_(-1)
         y = buf.gathered_y[: per_rank * self.num_ranks]
         deep_gemm.fp8_fp4_mega_moe(y, self.l1, self.l2, buf, **self.kwargs)
-        return y[:tokens]
+        return y[:num_tokens]
