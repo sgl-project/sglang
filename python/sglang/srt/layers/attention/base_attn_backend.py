@@ -302,12 +302,6 @@ class AttentionBackend(ABC):
             return self._snapshot_prefill_shared_reads(forward_batch)
         return self.shared_read_ends(forward_batch.forward_mode)
 
-    def resolve_eager_shared_read_ends(
-        self, forward_batch: ForwardBatch
-    ) -> SharedReadEnds:
-        """Declare audited eager reads ending after final metadata preparation."""
-        return SharedReadEnds.UNKNOWN
-
     def _snapshot_prefill_shared_reads(
         self, forward_batch: ForwardBatch
     ) -> SharedReadEnds:

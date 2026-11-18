@@ -58,10 +58,12 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import has_forward_context
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_disagg,
     get_flags,
+    get_memory,
     get_parallel,
     get_schedule,
     get_spec,
@@ -575,6 +577,7 @@ class AscendAttnBackend(AttentionBackend):
             )
 
             self.shared_read_enabled = get_npu_shared_read_event_api() is not None
+        self._shared_read_runner = model_runner
 
     def _supports_shared_read(self, model_runner: ModelRunner) -> bool:
         if (
@@ -616,18 +619,34 @@ class AscendAttnBackend(AttentionBackend):
             )
         return SharedReadEnds.UNKNOWN
 
-    def resolve_eager_shared_read_ends(
-        self, forward_batch: ForwardBatch
-    ) -> SharedReadEnds:
-        if not self.shared_read_enabled:
-            return SharedReadEnds.UNKNOWN
+    def _publish_eager_shared_read_done(self, forward_batch: ForwardBatch) -> None:
+        # The final eager preparation replaces any earlier phase's event.
+        runner = self._shared_read_runner
+        runner.shared_read_done_event = None
+        if envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
+            return
         mode = forward_batch.forward_mode
-        if mode.is_decode() or mode.is_target_verify() or mode.is_draft_extend_v2():
-            return SharedReadEnds.PRE_REPLAY
-        # NextN prefill ends with this draft's EXTEND, after the target's reads.
-        if mode == ForwardMode.EXTEND and self.is_draft_worker:
-            return SharedReadEnds.PRE_REPLAY
-        return SharedReadEnds.UNKNOWN
+        if mode.is_draft_extend_v2() and not has_forward_context():
+            # NPU always re-plans draft extend after padding on the forward
+            # stream; its plan-stream preparation is not the publication point.
+            return
+        if mode == ForwardMode.EXTEND:
+            # Ordinary target prefill uses the existing runner publisher. NextN's
+            # last reader is the draft; Scheduler already fences HiCache copies
+            # on the forward stream shared by target and draft.
+            if (
+                not self.is_draft_worker
+                or not envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get()
+                or get_memory().enable_lmcache
+            ):
+                return
+        elif not (
+            mode.is_decode() or mode.is_target_verify() or mode.is_draft_extend_v2()
+        ):
+            return
+        event = torch.get_device_module(self.device).Event()
+        event.record()
+        runner.shared_read_done_event = event
 
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
         return (
@@ -1094,6 +1113,9 @@ class AscendAttnBackend(AttentionBackend):
                 self.forward_metadata, forward_batch.seq_lens
             )
         self.graph_mode = False
+
+        if self.shared_read_enabled:
+            self._publish_eager_shared_read_done(forward_batch)
 
     def _prepare_quant_flash_attn_metadata(
         self,
