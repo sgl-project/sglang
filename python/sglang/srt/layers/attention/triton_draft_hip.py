@@ -114,7 +114,7 @@ class MlaDcpWindowVerify:
                 dcp_size=backend.dcp_size,
                 dcp_rank=backend.dcp_rank,
                 page_size=backend.page_size,
-                v2p=None if ring else backend.kv_index_translator.full_v2p_table,
+                v2p=None if ring else backend.runner_ids.full_v2p_table,
                 ring_rows_per_req=ring.rows_per_req if ring else 0,
                 min_pos=ring.min_pos if ring else None,
             )
