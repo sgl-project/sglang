@@ -351,7 +351,6 @@ jobs:
 #            test_type: 'perf'
 #            prefill_decode_deployment: 'separation'
           # deepseek_v4_flash accuracy tests
-          # There is a conflict among dspark, dp and cp; temporarily use deepseek_v4_flash accuracy off_cp&off_dspark tests
           - name: deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa
             prefill_size: 1
             decode_size: 1
