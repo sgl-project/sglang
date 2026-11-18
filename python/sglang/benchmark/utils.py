@@ -138,7 +138,14 @@ def is_file_valid_json(path):
 
     # TODO can fuse into the real file open later
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
+            if str(path).endswith(".jsonl"):
+                found = False
+                for line in f:
+                    if line.strip():
+                        json.loads(line)
+                        found = True
+                return found
             json.load(f)
         return True
     except JSONDecodeError as e:
