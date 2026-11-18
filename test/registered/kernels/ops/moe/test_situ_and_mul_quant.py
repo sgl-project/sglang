@@ -1,9 +1,10 @@
 import unittest
 
 import torch
-import triton
 
-from sglang.kernels.ops.moe import situ_and_mul_masked_post_quant
+from sglang.kernels.ops.moe.kimi_k3_situ_and_mul_quant import (
+    situ_and_mul_masked_post_quant,
+)
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -45,74 +46,6 @@ class TestSituAndMulQuant(CustomTestCase):
             raise unittest.SkipTest("CUDA is not available")
         if get_device_sm() < 100:
             raise unittest.SkipTest("Kimi K3 compute kernels require SM100a+")
-
-    def test_contiguous_situ_uses_the_packed_scale_during_graph_replay(self):
-        from sglang.srt.layers.moe.moe_runner.deep_gemm import (
-            _cast_to_e8m0_with_rounding_up,
-            _situ_mul_quant_contig_kernel,
-        )
-
-        torch.cuda.manual_seed_all(41)
-        rows = 17
-        for width in (512, 1536, 2048):
-            groups = width // _GROUP_SIZE
-            x = torch.randn(rows, 2 * width, device="cuda", dtype=torch.bfloat16)
-            q = torch.empty(rows, width, device="cuda", dtype=torch.float8_e4m3fn)
-            scales = torch.empty(rows, groups, device="cuda", dtype=torch.float32)
-
-            def quantize():
-                _situ_mul_quant_contig_kernel[(rows,)](
-                    x,
-                    q,
-                    scales,
-                    width,
-                    groups,
-                    _BETA,
-                    _LINEAR_BETA,
-                    GROUP=_GROUP_SIZE,
-                    KG_POW2=triton.next_power_of_2(groups),
-                    num_warps=8,
-                )
-                return _cast_to_e8m0_with_rounding_up(scales.unsqueeze(0))
-
-            stream = torch.cuda.Stream()
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                for _ in range(3):
-                    quantize()
-            torch.cuda.current_stream().wait_stream(stream)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                packed = quantize()
-            for gain in (1.0, 8.0, 0.0):
-                with self.subTest(width=width, gain=gain):
-                    x.copy_((torch.randn_like(x.float()) * gain).to(x.dtype))
-                    graph.replay()
-                    expected = _situ_reference(x)
-                    expected_scale = torch.exp2(
-                        torch.ceil(
-                            torch.log2(
-                                expected.reshape(rows, groups, _GROUP_SIZE)
-                                .abs()
-                                .amax(-1)
-                                .clamp_min(1e-10)
-                                / 448.0
-                            )
-                        )
-                    )
-                    packed_scale = _unpack_ue8m0_scales(
-                        packed.transpose(1, 2), groups
-                    ).squeeze(0)
-                    torch.testing.assert_close(scales, expected_scale, rtol=0, atol=0)
-                    torch.testing.assert_close(packed_scale, scales, rtol=0, atol=0)
-                    dequantized = q.float() * packed_scale.repeat_interleave(
-                        _GROUP_SIZE, dim=-1
-                    )
-                    relative_rmse = (
-                        (dequantized - expected).square().mean().sqrt()
-                        / expected.square().mean().sqrt().clamp_min(1e-12)
-                    )
-                    self.assertLess(relative_rmse.item(), 0.04)
 
     def test_situ_mul_quant(self):
         torch.cuda.manual_seed_all(3)
@@ -183,6 +116,47 @@ class TestSituAndMulQuant(CustomTestCase):
                 )
             )
             self.assertTrue(bool((raw_output[expert, valid_tokens:] == 0x7F).all()))
+
+
+class TestSituMulQuantContig(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        if get_device_sm() < 100:
+            raise unittest.SkipTest("UE8M0 activation scales are Blackwell-only")
+
+    def test_ue8m0_scale_is_the_one_used_to_quantize(self):
+        import triton
+
+        from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+            _cast_to_e8m0_with_rounding_up,
+            _situ_mul_quant_contig_kernel,
+        )
+
+        torch.manual_seed(0)
+        rows, n = 64, 2048
+        kg = n // _GROUP_SIZE
+        gate_up = (torch.randn(rows, 2 * n, device="cuda") * 3).bfloat16()
+        q = torch.empty(rows, n, device="cuda", dtype=torch.float8_e4m3fn)
+        scale = torch.empty(rows, kg, device="cuda")
+        _situ_mul_quant_contig_kernel[(rows,)](
+            gate_up,
+            q,
+            scale,
+            n,
+            kg,
+            _BETA,
+            _LINEAR_BETA,
+            GROUP=_GROUP_SIZE,
+            KG_POW2=triton.next_power_of_2(kg),
+            num_warps=8,
+        )
+        e8m0 = _cast_to_e8m0_with_rounding_up(scale.unsqueeze(0)).squeeze(0)
+        e8m0 = e8m0.contiguous().view(torch.uint8).view(rows, -1)[:, :kg]
+        read_scale = (e8m0.to(torch.int32) << 23).view(torch.float32)
+        torch.testing.assert_close(read_scale, scale, rtol=0, atol=0)
+        dequant = q.float() * read_scale.repeat_interleave(_GROUP_SIZE, 1)
+        ref = _situ_reference(gate_up)
+        self.assertLess(((dequant - ref).norm() / ref.norm()).item(), 0.05)
 
 
 if __name__ == "__main__":

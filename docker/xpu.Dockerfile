@@ -77,8 +77,8 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 WORKDIR /sgl-workspace
 
-RUN pip install --no-cache-dir torch==2.14.0+xpu torchvision==0.29.0+xpu torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu && \
-    pip install --no-cache-dir msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate --root-user-action=ignore
+RUN uv pip install --no-cache torch==2.14.0+xpu torchvision==0.29.0+xpu torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu && \
+    uv pip install --no-cache msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate
 
 # SG_LANG_KERNEL_SOURCE=source points the sglang-kernel-xpu dependency at the kernel repo.
 RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
@@ -220,8 +220,11 @@ RUN export PKG_CONFIG_PATH=${ABSEIL_PREFIX}/lib/pkgconfig:${UCX_INSTALL_DIR}/lib
     cd / && rm -rf /tmp/nixl /tmp/nixl-build-only.txt
 RUN python -c "import nixl; nixl.nixl_agent('agent1')"
 
-# The PD tests launch a sglang-router between the prefill and decode servers.
-ARG SGLANG_ROUTER_VERSION=0.3.2
-RUN pip install --no-cache-dir sglang-router==${SGLANG_ROUTER_VERSION}
+# The PD tests launch sgl-router between the prefill and decode servers, built
+# from the same clone as the sglang install above.
+RUN cd /sgl-workspace/sglang/sgl-router && \
+    CARGO_TARGET_DIR=/tmp/sgl-router-target cargo build --locked --release --bin sgl-router && \
+    install -m 0755 /tmp/sgl-router-target/release/sgl-router /usr/local/bin/sgl-router && \
+    rm -rf /tmp/sgl-router-target
 
 CMD ["bash"]

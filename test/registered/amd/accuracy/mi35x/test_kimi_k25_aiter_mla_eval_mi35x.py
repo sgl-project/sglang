@@ -14,7 +14,7 @@ heads_per_gpu % 16 == 0. With tp_size=4: 64/4 = 16 heads, which
 satisfies the constraint. (DeepSeek-R1/V3 has 128 heads so TP=8
 yields 128/8 = 16 heads and works fine.)
 
-Registry: nightly-amd-8-gpu-mi35x-kimi-k25-aiter-mla suite
+Registry: nightly-test-8-gpu-amd-mi35x-kimi-k25-aiter-mla suite
 """
 
 import os
@@ -33,7 +33,10 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=7200, suite="nightly-amd-8-gpu-mi35x-kimi-k25-aiter-mla", nightly=True
+    est_time=7200,
+    suite="nightly-test-8-gpu-amd-mi35x-kimi-k25-aiter-mla",
+    nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 
