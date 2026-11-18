@@ -324,7 +324,7 @@ class MiniCPMVImagePreprocessArtifact:
     def has_feature(self) -> bool:
         return True
 
-    def cache_value(self) -> "MiniCPMVImagePreprocessArtifact":
+    def cache_value(self) -> MiniCPMVImagePreprocessArtifact:
         return self
 
     def cache_size_items(self):
