@@ -48,17 +48,16 @@ def test_muse_target_layer_id_mapping(target_model_type, draft_architecture, exp
 
 
 @pytest.mark.parametrize(
-    "enable_dp_attention,dp_size,attn_cp_size,local_kv_heads,draft_dtype,element_bytes",
+    "attn_dp_size,attn_cp_size,local_kv_heads,draft_dtype,element_bytes",
     [
-        (False, 1, 1, 1, "bf16", 2),
-        (True, 2, 1, 1, "bf16", 2),
-        (True, 8, 1, 4, "fp8_e4m3", 1),
-        (True, 2, 2, 2, "bf16", 2),
+        (1, 1, 1, "bf16", 2),
+        (2, 1, 1, "bf16", 2),
+        (8, 1, 4, "fp8_e4m3", 1),
+        (2, 2, 2, "bf16", 2),
     ],
 )
 def test_draft_kv_budget_matches_attention_sharding(
-    enable_dp_attention,
-    dp_size,
+    attn_dp_size,
     attn_cp_size,
     local_kv_heads,
     draft_dtype,
@@ -72,9 +71,8 @@ def test_draft_kv_budget_matches_attention_sharding(
     draft.head_dim = draft.v_head_dim = 128
     with published_topology(
         tp_size=8,
-        dp_size=dp_size,
+        attn_dp_size=attn_dp_size,
         attn_cp_size=attn_cp_size,
-        enable_dp_attention=enable_dp_attention,
         kv_cache_dtype="nvfp4",
         speculative_draft_kv_cache_dtype=draft_dtype,
         speculative_draft_attention_backend="trtllm_mha",

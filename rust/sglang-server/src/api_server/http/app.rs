@@ -9,8 +9,8 @@ use axum::Router;
 
 use super::generate_hook::GenerateHook;
 use super::{
-    auth, connections, dp_relay, hicache, info, loads, metrics, native_api, openai, pre_generate,
-    request_decompression,
+    anthropic, auth, connections, corpus, dp_relay, hicache, info, loads, metrics, native_api,
+    ollama, openai, parsers, pre_generate, request_decompression, weights, wrappers,
 };
 use crate::HttpLayer;
 use crate::api_server::core::{DrainEnd, FLUSH_INTERVAL};
@@ -156,9 +156,14 @@ pub async fn serve(
     // Each endpoint module registers its own routes and merges here.
     let mut router = Router::new()
         .merge(info::routes())
+        .merge(weights::routes())
+        .merge(parsers::routes())
+        .merge(corpus::routes())
         .merge(loads::routes())
         .merge(native_api::routes())
-        .merge(openai::routes());
+        .merge(openai::routes())
+        .merge(ollama::routes())
+        .merge(anthropic::routes());
     if server_args.metrics.is_some() && metrics_listener {
         router = router.merge(metrics::routes());
     }
@@ -203,6 +208,10 @@ pub async fn serve(
     };
     // Outside the embedding package's layers, so they read decompressed bodies.
     app = request_decompression::apply(app, &server_args);
+    // Python's generation wrappers (`/vertex_generate`, `/invocations`)
+    // rewrite the request and send it back through everything above, so a
+    // wrapped generate is relayed and parsed like a direct one.
+    app = wrappers::apply(app);
     // Outside the extension layer, so its routes are keyed too. The bootstrap
     // registry below stays open, as Python serves it on its own server. Auth
     // runs before decompression, so an unauthenticated body is never inflated.
