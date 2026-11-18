@@ -1,21 +1,7 @@
-"""P0 NPU tests: the device-idle contract around pause/resume.
-
-``release_memory_occupation`` must not return before the device is idle: an RL
-caller starts copying weights as soon as it returns. The unit cases assert the
-ordering directly; the e2e case repeats pause -> update -> continue to catch a
-race that only shows up over rounds.
-"""
+"""P0 NPU tests for DP draining and pause/update/continue lifecycle rounds."""
 
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
 
-from sglang.srt.managers.scheduler_components import (
-    weight_updater as weight_updater_module,
-)
-from sglang.srt.managers.scheduler_components.weight_updater import (
-    SchedulerWeightUpdaterManager,
-)
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
 from sglang.test.ascend.test_npu_rl_utils import (
     begin_weight_update,
@@ -62,88 +48,7 @@ DP_ARGS = SERVER_ARGS + (
 NORM_WEIGHT = "model.norm.weight"
 
 
-def _make_manager(events):
-    with patch.object(
-        weight_updater_module,
-        "get_parallel",
-        lambda: SimpleNamespace(tp_group=SimpleNamespace(cpu_group=object())),
-    ):
-        return SchedulerWeightUpdaterManager(
-            tp_worker=SimpleNamespace(model_runner=SimpleNamespace(model=object())),
-            draft_worker=None,
-            memory_saver_adapter=SimpleNamespace(
-                pause=lambda tag: events.append(("pause", tag)),
-                resume=lambda tag: events.append(("resume", tag)),
-            ),
-            flush_cache=lambda **kwargs: events.append(("flush", None)) or True,
-            is_fully_idle=lambda **kwargs: True,
-        )
-
-
 class TestNpuDeviceBarrier(CustomTestCase):
-    def test_release_synchronizes_before_return(self):
-        events = []
-        manager = _make_manager(events)
-
-        with (
-            patch.object(
-                weight_updater_module,
-                "_export_static_state",
-                lambda model: events.append(("export", None)),
-            ),
-            patch.object(
-                weight_updater_module,
-                "get_model",
-                lambda: SimpleNamespace(weight_cache_mode="off"),
-            ),
-            patch(
-                "torch.distributed.barrier",
-                lambda *args, **kwargs: events.append(("barrier", None)),
-            ),
-            patch(
-                "torch.npu.synchronize",
-                lambda: events.append(("sync", None)),
-            ),
-            # release_memory_occupation gates on the TP ranks being idle.
-            patch("torch.distributed.all_reduce", lambda *args, **kwargs: None),
-        ):
-            manager.release_memory_occupation(SimpleNamespace(tags=["weights"]))
-
-        self.assertEqual(
-            [kind for kind, _ in events],
-            ["export", "barrier", "pause", "sync", "barrier"],
-        )
-
-    def test_resume_orders_restore_after_barrier(self):
-        events = []
-        manager = _make_manager(events)
-        manager.offload_tags = {"weights"}
-
-        with (
-            patch.object(
-                weight_updater_module,
-                "_import_static_state",
-                lambda model, state: events.append(("import", None)),
-            ),
-            patch.object(
-                weight_updater_module,
-                "get_model",
-                lambda: SimpleNamespace(weight_cache_mode="off"),
-            ),
-            patch(
-                "torch.distributed.barrier",
-                lambda *args, **kwargs: events.append(("barrier", None)),
-            ),
-        ):
-            manager.resume_memory_occupation(SimpleNamespace(tags=["weights"]))
-
-        self.assertEqual(
-            [kind for kind, _ in events],
-            ["resume", "barrier", "import"],
-        )
-        # resume_memory_occupation has no device-wide synchronize today; this
-        # test locks the barrier/restore ordering that the current code provides.
-
     def test_02_dp_pause_returns_after_all_ranks_drain(self):
         with npu_server(MODEL, extra_args=DP_ARGS, env=npu_rl_env()) as base_url:
             requests_ = [

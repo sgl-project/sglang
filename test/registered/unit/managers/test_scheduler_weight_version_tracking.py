@@ -12,6 +12,7 @@ from sglang.srt.managers.io_struct import (
     PluginWeightUpdateReqInput,
     PluginWeightUpdateReqOutput,
     ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -716,6 +717,127 @@ class TestPluginWeightUpdate(_WeightUpdaterManagerTestBase):
         self.assertFalse(unknown.success)
         self.assertIn("nccl", unknown.message)
         self.assertEqual(called, [])
+
+
+class TestMemoryOccupationLifecycle(_WeightUpdaterManagerTestBase):
+    def _offloaded_manager(self, events):
+        manager = self._manager(Mock(), session=False)
+        manager.memory_saver_adapter = Mock()
+        manager.memory_saver_adapter.resume.side_effect = lambda tag: events.append(
+            ("resume", tag)
+        )
+        manager.offload_tags = {"weights"}
+        manager.stashed_model_static_state = {"buffers": []}
+        return manager
+
+    def test_release_synchronizes_before_return(self):
+        """Release must finish device work before the control request returns."""
+        events = []
+        manager = self._manager(Mock(), session=False)
+        manager.scheduler = None
+        manager.memory_saver_adapter = Mock()
+        manager.memory_saver_adapter.pause.side_effect = lambda tag: events.append(
+            ("pause", tag)
+        )
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.weight_updater._export_static_state",
+                side_effect=lambda model: events.append(("export", None)),
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.weight_updater.get_model",
+                return_value=SimpleNamespace(weight_cache_mode="off"),
+            ),
+            patch(
+                "torch.distributed.barrier",
+                side_effect=lambda *args, **kwargs: events.append(("barrier", None)),
+            ),
+            patch(
+                "torch.distributed.all_reduce", side_effect=lambda *args, **kwargs: None
+            ),
+            patch(
+                "torch.get_device_module",
+                return_value=SimpleNamespace(
+                    synchronize=lambda: events.append(("sync", None))
+                ),
+            ),
+        ):
+            manager.release_memory_occupation(
+                ReleaseMemoryOccupationReqInput(tags=["weights"])
+            )
+
+        self.assertEqual(
+            [kind for kind, _ in events],
+            ["export", "barrier", "pause", "sync", "barrier"],
+        )
+
+    def test_resume_deduplicates_tags_and_skip(self):
+        """Repeated or duplicate resume requests must not fail or resume twice."""
+        events = []
+        manager = self._offloaded_manager(events)
+        manager.scheduler = None
+        manager.offload_tags = {"weights", "kv_cache"}
+        import_state = Mock()
+        barrier = Mock()
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.weight_updater.get_model",
+                return_value=SimpleNamespace(weight_cache_mode="off"),
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.weight_updater._import_static_state",
+                import_state,
+            ),
+            patch("torch.distributed.barrier", barrier),
+        ):
+            manager.resume_memory_occupation(
+                ResumeMemoryOccupationReqInput(tags=["weights", "weights", "kv_cache"])
+            )
+            manager.resume_memory_occupation(
+                ResumeMemoryOccupationReqInput(tags=["weights"])
+            )
+
+        self.assertEqual(
+            events,
+            [
+                ("resume", "weights"),
+                ("barrier", None),
+                ("import", None),
+                ("resume", "kv_cache"),
+            ],
+        )
+        self.assertEqual(manager.offload_tags, set())
+        import_state.assert_called_once()
+        self.assertEqual(barrier.call_count, 1)
+
+    def test_resume_orders_restore_after_barrier(self):
+        events = []
+        manager = self._offloaded_manager(events)
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.weight_updater.get_model",
+                return_value=SimpleNamespace(weight_cache_mode="off"),
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.weight_updater._import_static_state",
+                side_effect=lambda model, state: events.append(("import", None)),
+            ),
+            patch(
+                "torch.distributed.barrier",
+                side_effect=lambda *args, **kwargs: events.append(("barrier", None)),
+            ),
+        ):
+            manager.resume_memory_occupation(
+                ResumeMemoryOccupationReqInput(tags=["weights"])
+            )
+
+        self.assertEqual(
+            [kind for kind, _ in events],
+            ["resume", "barrier", "import"],
+        )
 
 
 class TestReleaseMemoryRefusal(_WeightUpdaterManagerTestBase):
