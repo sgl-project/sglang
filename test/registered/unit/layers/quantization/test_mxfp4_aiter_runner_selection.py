@@ -47,11 +47,10 @@ _CASES = {
 
 
 class TestMxfp4AiterRunnerSelection(CustomTestCase):
-    def _build(self, stack: ExitStack, case: str):
+    def _build(self, stack: ExitStack, case: str, align_128: bool = False):
         runner_backend, use_aiter, a2a_backend, expect_aiter = _CASES[case]
         for name, value in (
             ("_use_aiter", use_aiter),
-            ("_aiter_k3_opt", False),
             ("_is_cpu", False),
             ("_is_xpu", False),
         ):
@@ -77,6 +76,7 @@ class TestMxfp4AiterRunnerSelection(CustomTestCase):
         layer.hidden_size = _HIDDEN
         layer.intermediate_size_per_partition = _INTERMEDIATE
         layer.num_local_experts = _EXPERTS
+        layer.aiter_mxfp4_intermediate_align_128 = align_128
         method.create_weights(
             layer,
             num_experts=_EXPERTS,
@@ -100,6 +100,20 @@ class TestMxfp4AiterRunnerSelection(CustomTestCase):
                 )
                 shapes = (tuple(layer.w13_weight.shape), tuple(layer.w2_weight.shape))
                 self.assertEqual(shapes, expected)
+
+    def test_declared_128_alignment_narrows_only_the_aiter_intermediate(self):
+        """A layer declaring aiter_mxfp4_intermediate_align_128 (Kimi-K3) pads the
+        AITER intermediate to 128, not 256; layers that declare nothing keep 256,
+        and the Triton runner never pads."""
+        for case in ("aiter-aiter_env", "triton-aiter_env"):
+            for align_128 in (False, True):
+                with self.subTest(case=case, align_128=align_128), ExitStack() as stack:
+                    _, layer, expect_aiter = self._build(stack, case, align_128)
+                    if not expect_aiter:
+                        inter = _INTERMEDIATE
+                    else:
+                        inter = 128 if align_128 else _AITER_ALIGN
+                    self.assertEqual(layer.w2_weight.shape[-1], inter // 2)
 
     def test_apply_dispatch_matches_runner(self):
         for case in _CASES:
