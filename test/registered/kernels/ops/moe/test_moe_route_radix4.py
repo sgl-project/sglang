@@ -536,8 +536,8 @@ def test_fused_sort_routes_padded_rows_like_the_mask(m, n_real):
 
 @pytest.mark.parametrize("m", [65, 300])
 def test_fused_sort_tail_is_stable(m):
-    """Past 64 tokens each expert's routes come out in token order, which is the
-    layout AITER's own sort writes from there on, and the same on every launch."""
+    """Past 64 tokens each expert's routes come out in token order, as AITER's
+    default moe_sorting writes them, and the same on every launch."""
     generator = torch.Generator(device="cuda").manual_seed(m)
     scores = torch.randn(
         (m, NUM_EXPERTS), dtype=torch.bfloat16, device="cuda", generator=generator

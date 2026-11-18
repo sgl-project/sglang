@@ -1,9 +1,12 @@
 /// BM=16 MoE sort used by the fused radix4+sort kernel.
 ///
 /// Mirrors aiter's `moe_sort_quant.cuh` sort-only path (count, padded
-/// prefix, place, pad) so GEMM1/GEMM2 metadata matches the two-kernel
-/// decode path bit for bit. Kept in this TU so the SGLang JIT does not
-/// include AITER headers.
+/// prefix, place, pad), so GEMM1/GEMM2 get the layout of AITER's BM=16 aux
+/// sort, pad rows carrying token id M. It is not byte-equal to every AITER
+/// sort: moe_sorting(output_aux=False) pads with (topk << 24) | M, and the order
+/// of one expert's routes can differ (the leader sort places them in LDS-atomic
+/// order), which only changes GEMM2's atomic accumulation order. Kept in this
+/// TU so the SGLang JIT does not include AITER headers.
 ///
 /// The phases are split by what they depend on rather than by aiter's order.
 /// Padding a slot does not depend on the routing result: the pad token, the pad
@@ -329,8 +332,9 @@ SGL_DEVICE void sort_subkernel(
 /// every route into LDS -- tokens before its chunk into s_before, the rest into
 /// s_rest -- and sets one bit per chunk token in s_mask[expert], so a route's
 /// slot is cumsum[e] + s_before[e] + popcount(the mask bits of earlier chunk
-/// tokens). That puts every expert's routes in token order, the layout AITER's
-/// own sort writes, with no global atomics and the same result on every run.
+/// tokens). That puts every expert's routes in token order, the order AITER's
+/// default moe_sorting writes (its aux sort's differs), with no global atomics
+/// and the same result on every run.
 /// Every helper rebuilds the full prefix itself, which costs less than handing
 /// one around.
 ///

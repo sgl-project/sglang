@@ -36,7 +36,9 @@ _MAX_TOKENS = 1024
 logger = logging.getLogger(__name__)
 
 # Per (device, stream): the sort's arrival counters, which launches in flight on
-# two streams must not share. Four int32 (see RouteRadix4Params::sort_ws).
+# two streams must not share. Four int32 (see RouteRadix4Params::sort_ws). A
+# captured graph keeps its capture stream's counters, so it must not replay
+# alongside eager launches on that stream.
 _SORT_WS: dict[tuple[torch.device, int], torch.Tensor] = {}
 
 

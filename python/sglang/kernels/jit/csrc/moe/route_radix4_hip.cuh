@@ -803,6 +803,7 @@ struct RouteRadix4SortKernel {
         .routed_scaling_factor = static_cast<fp32_t>(routed_scaling_factor),
         .renormalize = renormalize,
         .sort_ws = static_cast<int32_t*>(sort_ws.data_ptr()),
+        .tail_ctas = static_cast<int32_t>(std::min((M + kRadix4TailChunk - 1) / kRadix4TailChunk, kRadix4MaxTailCtas)),
         .sorted_token_ids = static_cast<int32_t*>(sorted_token_ids.data_ptr()),
         .sorted_expert_ids = static_cast<int32_t*>(sorted_expert_ids.data_ptr()),
         .sorted_weights = static_cast<fp32_t*>(sorted_weights.data_ptr()),
@@ -813,7 +814,6 @@ struct RouteRadix4SortKernel {
         .moe_dim = moe_dim,
         .sorted_capacity = static_cast<uint32_t>(S_.unwrap()),
         .num_non_padded = non_padded_ptr,
-        .tail_ctas = static_cast<int32_t>(std::min((M + kRadix4TailChunk - 1) / kRadix4TailChunk, kRadix4MaxTailCtas)),
     };
 
     constexpr auto kExperts = static_cast<int>(kRadix4NumExperts);
