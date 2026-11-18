@@ -61,6 +61,16 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
             loader.target_device_str = "cpu"
             with (
                 patch.object(loader_mod, "get_server_args", return_value=None),
+                # The runai package is optional; list the local directory instead.
+                patch.object(
+                    runai_utils,
+                    "list_safetensors",
+                    side_effect=lambda path: sorted(
+                        os.path.join(path, name)
+                        for name in os.listdir(path)
+                        if name.endswith(".safetensors")
+                    ),
+                ),
                 patch.object(
                     weight_utils,
                     "runai_safetensors_weights_iterator",
