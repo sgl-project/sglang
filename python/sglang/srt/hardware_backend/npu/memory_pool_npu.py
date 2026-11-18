@@ -278,6 +278,13 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         """
         if tgt_loc.numel() == 0:
             return
+        if self._hicache_k_buffer.dtype in (torch.float16, torch.bfloat16):
+            from sgl_kernel_npu.mem_cache.kv_cache_move import move_kv_cache_rows
+
+            move_kv_cache_rows(
+                self._hicache_k_buffer, self._hicache_v_buffer, tgt_loc, src_loc
+            )
+            return
         keys = self._hicache_k_buffer.flatten(1, 2)
         values = self._hicache_v_buffer.flatten(1, 2)
         keys.index_copy_(1, tgt_loc, keys.index_select(1, src_loc))
