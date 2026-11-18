@@ -41,7 +41,12 @@ def _model_path():
 def _server_args(parser):
     args = ["--tool-call-parser", parser]
     if is_npu():
-        args[:0] = ["--attention-backend", "ascend", "--disable-cuda-graph"]
+        args[:0] = [
+            "--attention-backend",
+            "ascend",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
+        ]
     return args
 
 
@@ -1009,7 +1014,7 @@ class TestOpenAIPythonicFunctionCallingWithRust(TestOpenAIPythonicFunctionCallin
 #             other_args=[
 #                 # If your server needs extra parameters to test function calling, please add them here.
 #                 "--tool-call-parser",
-#                 "glm45",
+#                 "glm",
 #                 "--reasoning-parser",
 #                 "glm45",
 #                 "--tp-size",

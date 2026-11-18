@@ -92,6 +92,7 @@ from sglang.srt.speculative.dflash_draft_l2_prefetch import (
 )
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
+    draft_kv_ring_is_paged,
     draft_kv_ring_rows_per_req_from_config,
 )
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -168,13 +169,21 @@ from sglang.srt.speculative.spec_utils import (
     sample_simulated_acc_len,
     simulated_acc_len_generator,
 )
-from sglang.srt.utils import async_h2d, is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import (
+    async_h2d,
+    is_cuda,
+    is_gfx95_supported,
+    is_hip,
+    is_npu,
+    is_xpu,
+)
 
 _is_npu = is_npu()
 
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.dflash_mla_ctx import MlaContextKV
 
 logger = logging.getLogger(__name__)
 
@@ -386,6 +395,7 @@ class _SelectorDraftSampler:
         self.block_size = int(block_size)
         self.sampling_enabled = sampling_enabled
         max_bs, gamma, top_k = int(max_bs), self.block_size - 1, self.selector.top_k
+        self.max_bs = max_bs
         self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
         # Written by the host before replay, or read after it; the addresses are
         # baked into the captured graph.
@@ -460,6 +470,8 @@ class _MegakernelSelectorDraftSampler:
     def __init__(self, *, head, out, candidate_out, q_out, sampling_enabled):
         self.out, self.candidate_out, self.q_out = out, candidate_out, q_out
         self.sampling_enabled = sampling_enabled
+        # Staging goes to the megakernel head's own buffers, not ones sized here.
+        self.max_bs = None
         self._head = head
         self._staged_greedy = False
 
@@ -1129,7 +1141,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             window_left=get_dflash_attention_sliding_window_size(draft_hf_config),
             dcp_rank=parallel.attn_dcp_rank,
             pool=pool,
+            page_size=(
+                pool.page_size if draft_kv_ring_is_paged(draft_hf_config) else None
+            ),
         )
+        self.draft_kv_ring.warm_block_locs(req_to_token_rows, self.block_size)
         if parallel.tp_rank == 0:
             logger.info(
                 "DFLASH draft KV ring: %d rows per request per rank (%d positions), "
@@ -1206,7 +1222,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         "Disable DFLASH draft cuda graph because dp attention "
                         "is enabled (draft runs eager)."
                     )
-            if is_cuda() and capture_decode_cuda_graph:
+            if (is_cuda() or is_gfx95_supported()) and capture_decode_cuda_graph:
                 available_mem = self._tp_sync.available_memory_gb(
                     SpecTpSyncSite.DFLASH_MEM,
                     self.device,
@@ -1290,9 +1306,10 @@ class DFlashWorkerV2(BaseSpecWorker):
     def prewarm_sampling(self) -> SamplingPrewarmResult:
         """Rehearse the non-greedy verify path so an undersized graph-pool
         borrow surfaces at startup rather than under traffic."""
+        # gfx950 prewarms the sampler without graph-pool borrowing; KV is sized before capture.
         if (
             not self._hosts_draft
-            or not is_cuda()
+            or not (is_cuda() or is_gfx95_supported())
             or not is_dflash_sampling_verify_available()
         ):
             return self.model_runner.prewarm_sampling()
@@ -1375,6 +1392,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             result.sampling_headroom_bytes,
         )
         return result
+
+    def _stage_draft_sampler(self, *, bs: int, sampling_info) -> None:
+        # A batch past the sampler's static buffers has no captured bucket,
+        # so its draft runs eager and the eager head reads none of them.
+        sampler = self._draft_sampler
+        if sampler is None:
+            return
+        if sampler.max_bs is None or bs <= sampler.max_bs:
+            sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
 
     def _maybe_attach_megakernel_head(self, lm_head):
         head = megakernel_draft_selector_head(self.draft_model)
@@ -2458,6 +2484,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         physical ids for a fused draft, the virtual ids for a private one."""
         return plan.write_ids(self.draft_model_runner.runner_ids, kind=kind)
 
+    def _mla_context_kv(self) -> Optional["MlaContextKV"]:
+        """The ROCm monokernel's stacked context-KV writer, or None."""
+        if "_mla_ctx" not in self.__dict__:
+            from sglang.srt.speculative.dflash_mla_ctx import MlaContextKV
+
+            self._mla_ctx = MlaContextKV.for_worker(self)
+        return self._mla_ctx
+
     def _append_target_hidden_to_draft_kv_by_loc(
         self,
         *,
@@ -2620,6 +2654,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                         self._use_fused_kv_materialize = False
                         self._fused_kv_helper = None
 
+                if is_gfx95_supported() and (ctx := self._mla_context_kv()) is not None:
+                    pool = self.draft_model_runner.token_to_kv_pool
+                    ctx.write(pool, positions, ctx_hidden, cache_loc_2d, commit_lens)
+                    return
                 for layer in self.draft_model.layers:
                     attn = layer.self_attn
                     layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
@@ -4075,11 +4113,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self.selector is not None or self.lilicorr is not None:
             self._selector_sample = None
             self._draft_feature = self._draft_confidence = None
-            if self._draft_sampler is not None:
-                # Consumed by the in-graph sample; must be staged before the replay.
-                self._draft_sampler.stage_sampling_params(
-                    bs=bs, sampling_info=batch.sampling_info
-                )
+            # Consumed by the in-graph sample; must be staged before the replay.
+            self._stage_draft_sampler(bs=bs, sampling_info=batch.sampling_info)
 
         self._join_aux()
         with (

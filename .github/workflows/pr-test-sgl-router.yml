@@ -44,7 +44,6 @@ jobs:
               - '.github/workflows/pr-test-sgl-router.yml'
               - '.github/workflows/_pr-test-sgl-router-build.yml'
               - '.github/actions/download-sgl-router/**'
-              - 'scripts/ci/utils/build_sgl_router.sh'
               - 'scripts/ci/utils/prepare_sgl_router.sh'
               - 'docker/sgl-router.Dockerfile'
               - 'scripts/ci/cuda/ci_install_dependency.sh'
