@@ -171,7 +171,6 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "ring_degree": server_args.ring_degree,
             "sp_degree": server_args.sp_degree,
             "tp_size": server_args.tp_size,
-            "transformer_weights_path": server_args.transformer_weights_path,
             "ulysses_degree": server_args.ulysses_degree,
             "use_fsdp_inference": server_args.use_fsdp_inference,
         }
@@ -196,7 +195,6 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "ring_degree": 1,
             "sp_degree": 4,
             "tp_size": 1,
-            "transformer_weights_path": None,
             "ulysses_degree": 4,
             "use_fsdp_inference": False,
         }
@@ -256,13 +254,13 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                     "pass --enable-torch-compile false"
                 )
         selected_backend = self.resolve_transformer_attention_backend(server_args)
-        if (
-            int(server_args.ring_degree or 1) > 1
-            and selected_backend is not AttentionBackendEnum.FA
+        if int(server_args.ring_degree or 1) > 1 and selected_backend not in (
+            AttentionBackendEnum.FA,
+            AttentionBackendEnum.AITER,
         ):
             raise ValueError(
-                "MiniMax-H3 ring parallelism requires the FlashAttention "
-                "backend for the transformer"
+                "MiniMax-H3 ring parallelism requires the FlashAttention or "
+                "aiter backend for the transformer"
             )
         if selected_backend is None:
             return

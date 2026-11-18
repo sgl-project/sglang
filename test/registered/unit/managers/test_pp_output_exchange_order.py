@@ -15,6 +15,7 @@ import unittest
 from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest import mock
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -26,6 +27,7 @@ from sglang.test.test_utils import (
 maybe_stub_sgl_kernel()
 
 from sglang.srt.environ import envs  # noqa: E402
+from sglang.srt.managers import scheduler_pp_mixin as pp_mod  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
 from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 
@@ -126,6 +128,32 @@ class TestPPOutputExchangeOrder(CustomTestCase):
                         pp_rank, spec_relay, "relay", "output", **server_args
                     )
                     self.assertNotIn(("wait", "own-forward"), ops)
+
+
+class TestPPOutputSkipWhileCapturingRoutedExperts(CustomTestCase):
+    def test_middle_prefill_chunks_keep_their_output_message(self):
+        """The output message carries a chunk's routed experts to the first
+        stage; skipping it returns zeros for that chunk's tokens."""
+        middle_chunk = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            reqs=[object()],
+            contains_last_prefill_chunk=False,
+            return_logprob=False,
+        )
+        with envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.override(True):
+            for capturing in (False, True):
+                features = SimpleNamespace(enable_return_routed_experts=capturing)
+                with (
+                    self.subTest(capturing=capturing),
+                    mock.patch.object(
+                        pp_mod,
+                        "get_exec",
+                        return_value=SimpleNamespace(features=features),
+                    ),
+                ):
+                    self.assertEqual(
+                        pp_mod._pp_can_skip_output_comm(middle_chunk), not capturing
+                    )
 
 
 if __name__ == "__main__":

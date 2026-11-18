@@ -91,6 +91,15 @@ def verify_reduce_norm_gate(state, out_shape, out_dtype, gate, eps, weight=None)
     """Merged, RMS-normalized (``weight`` optional) and sigmoid-gated attention output ``out_shape``
     (``[T, H * 64]``) from the deferred verify ``state``; ``gate`` is ``None`` or the grouped
     ``[T, groups, heads_per_group * 64]`` gate view."""
+    if len(state) == 5:
+        # segmented partials of the length-balanced FlyDSL verify
+        from sglang.kernels.ops.attention.muse_verify_balanced import (
+            segmented_reduce_norm_gate,
+        )
+
+        return segmented_reduce_norm_gate(
+            state, out_shape, out_dtype, gate, eps, weight
+        )
     partial, maximum, denom, v_scale = state
     tokens, heads, splits = maximum.shape
     n = tokens * heads
@@ -101,7 +110,10 @@ def verify_reduce_norm_gate(state, out_shape, out_dtype, gate, eps, weight=None)
     else:
         heads_per_group = gate.shape[-1] // HEAD_DIM
         stride_g0, stride_g1 = gate.stride(0), gate.stride(1)
-    block_m = 8
+    # Single-wave programs of 2 rows up to 4096 (token, head) rows, 8 rows beyond; 4 waves when the merge has fewer
+    # than 4 splits per row at the wide batches (gfx1250).
+    block_m = 2 if n <= 4096 else 8
+    num_warps = 4 if n > 4096 and splits < 4 else 1
     _reduce_norm_gate[(triton.cdiv(n, block_m),)](
         partial,
         maximum,
@@ -120,6 +132,6 @@ def verify_reduce_norm_gate(state, out_shape, out_dtype, gate, eps, weight=None)
         block_m,
         weight is not None,
         gate is not None,
-        num_warps=4,
+        num_warps=num_warps,
     )
     return y
