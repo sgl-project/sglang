@@ -153,7 +153,6 @@ def test_reduce_d_chunk_is_bitwise_identical(active_splits):
             lse,
             acc,
             out,
-            lse,  # lse_out_ptr, unread without STORE_LSE
             H=heads,
             D_V=value_dim,
             KV_SPLITS=active_splits,

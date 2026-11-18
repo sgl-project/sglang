@@ -383,7 +383,6 @@ def _sparse_mla_fwd_split_dim_kernel(
     kv_ptr,  # [num_pages, 1, DIM] fp8/bf16
     idx_ptr,  # [seq, topk]      int32
     o_ptr,  # [seq, H, D_V]    bf16
-    lse_ptr,  # [seq, H]         fp32, natural log; written when STORE_LSE
     qk_scale,  # sm_scale * LOG2E (prescaled for exp2)
     fp8_max,
     topk,
@@ -398,9 +397,10 @@ def _sparse_mla_fwd_split_dim_kernel(
     STRIDE_QR_H,
     USE_FP8_DOT: tl.constexpr,
     KV_SCALED: tl.constexpr,
-    STORE_LSE: tl.constexpr,
     SEQ_BUCKET: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    lse_out_ptr=None,
+    STORE_LSE: tl.constexpr = False,
 ):
     s_i = tl.program_id(0).to(tl.int64)
 
@@ -496,7 +496,7 @@ def _sparse_mla_fwd_split_dim_kernel(
     if STORE_LSE:
         # A row whose keys are all masked keeps m_i at the -3.4e38 sentinel.
         lse = tl.where(m_i > -1.0e38, (m_i + tl.log2(l_safe)) * _LN2, float("-inf"))
-        tl.store(lse_ptr + s_i * H + h, lse)
+        tl.store(lse_out_ptr + s_i * H + h, lse)
     acc0 = acc0 * inv_l[:, None]
     if NUM_GROUPS >= 2:
         acc1 = acc1 * inv_l[:, None]
@@ -583,10 +583,10 @@ def _triton_sparse_mla_fwd_single(
         out_pad = torch.empty(
             seq, H_pad, d_v, device=q_nope.device, dtype=torch.bfloat16
         )
-        lse = torch.empty(
-            (seq, H_pad) if return_lse else (0,),
-            device=q_nope.device,
-            dtype=torch.float32,
+        lse = (
+            torch.empty(seq, H_pad, device=q_nope.device, dtype=torch.float32)
+            if return_lse
+            else None
         )
         _sparse_mla_fwd_split_dim_kernel[(seq,)](
             q_nope_pad,
@@ -594,7 +594,6 @@ def _triton_sparse_mla_fwd_single(
             kv,
             idx_flat,
             out_pad,
-            lse,
             qk_scale,
             _FP8_MAX,
             topk,
@@ -609,15 +608,18 @@ def _triton_sparse_mla_fwd_single(
             STRIDE_QR_H=stride_qr_h,
             USE_FP8_DOT=use_fp8_dot,
             KV_SCALED=kv_scaled,
-            STORE_LSE=return_lse,
             SEQ_BUCKET=seq_bucket,
+            lse_out_ptr=lse,
+            STORE_LSE=return_lse,
         )
         out = out_pad[:, :H, :].contiguous()
         if return_lse:
             lse = lse[:, :H].contiguous()
     else:
-        lse = torch.empty(
-            (seq, H) if return_lse else (0,), device=q_nope.device, dtype=torch.float32
+        lse = (
+            torch.empty(seq, H, device=q_nope.device, dtype=torch.float32)
+            if return_lse
+            else None
         )
         _sparse_mla_fwd_split_dim_kernel[(seq,)](
             q_nope,
@@ -625,7 +627,6 @@ def _triton_sparse_mla_fwd_single(
             kv,
             idx_flat,
             out,
-            lse,
             qk_scale,
             _FP8_MAX,
             topk,
@@ -640,8 +641,9 @@ def _triton_sparse_mla_fwd_single(
             STRIDE_QR_H=stride_qr_h,
             USE_FP8_DOT=use_fp8_dot,
             KV_SCALED=kv_scaled,
-            STORE_LSE=return_lse,
             SEQ_BUCKET=seq_bucket,
+            lse_out_ptr=lse,
+            STORE_LSE=return_lse,
         )
     return (out.unsqueeze(0), lse) if return_lse else out.unsqueeze(0)
 
@@ -678,7 +680,6 @@ def _sparse_mla_fused_kernel(
     idx_ptr,
     topk_length_ptr,
     out_ptr,
-    lse_ptr,
     qk_scale,
     fp8_max,
     topk: tl.constexpr,
@@ -692,13 +693,19 @@ def _sparse_mla_fused_kernel(
     STRIDE_QR_T,
     STRIDE_QR_H,
     USE_FP8_DOT: tl.constexpr,
-    KV_SCALED: tl.constexpr,
-    STORE_LSE: tl.constexpr,
     USE_TOPK_LENGTH: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
     USE_I64_PAGE: tl.constexpr = True,
     PIPE_STAGES: tl.constexpr = 3,
+    lse_out_ptr=None,
+    STORE_LSE: tl.constexpr = False,
+    # Set only when 0 <= topk_length <= topk and every index past it is -1,
+    # as transform_index_page_table_dcp writes the DCP-localized table: the
+    # tile count skips the clamp and the index load masks on the constexpr
+    # topk, leaving the -1 tail to slot >= 0.
+    TOPK_TAIL_INVALID: tl.constexpr = False,
+    KV_SCALED: tl.constexpr = False,
 ):
     """Single-pass with head-block splitting. grid=(seq, head_blocks)."""
     t = tl.program_id(0).to(tl.int64)
@@ -752,12 +759,14 @@ def _sparse_mla_fused_kernel(
     if NUM_GROUPS >= 4:
         acc3 = tl.zeros((BLOCK_H, _G), dtype=tl.float32)
 
-    valid_topk = topk
-    if USE_TOPK_LENGTH:
-        valid_topk = tl.minimum(tl.maximum(tl.load(topk_length_ptr + t), 0), topk)
-
     k_offs = tl.arange(0, BLOCK_K)
-    num_tiles = tl.cdiv(valid_topk, BLOCK_K)
+    valid_topk = topk
+    if TOPK_TAIL_INVALID:
+        num_tiles = tl.cdiv(tl.load(topk_length_ptr + t), BLOCK_K)
+    else:
+        if USE_TOPK_LENGTH:
+            valid_topk = tl.minimum(tl.maximum(tl.load(topk_length_ptr + t), 0), topk)
+        num_tiles = tl.cdiv(valid_topk, BLOCK_K)
 
     for j in tl.range(0, num_tiles, num_stages=PIPE_STAGES):
         k_start = j * BLOCK_K
@@ -820,10 +829,6 @@ def _sparse_mla_fused_kernel(
 
     denom = tl.maximum(l_i, 1.0e-30)
     inv_denom = 1.0 / denom
-    if STORE_LSE:
-        # A row whose keys are all masked keeps m_i at the -3.4e38 sentinel.
-        lse = tl.where(m_i > -1.0e38, (m_i + tl.log2(denom)) * _LN2, float("-inf"))
-        tl.store(lse_ptr + t * H + h_offs, lse, mask=h_mask)
     acc0 = tl.where(l_i[:, None] > 0.0, acc0 * inv_denom[:, None], 0.0)
     if NUM_GROUPS >= 2:
         acc1 = tl.where(l_i[:, None] > 0.0, acc1 * inv_denom[:, None], 0.0)
@@ -831,6 +836,11 @@ def _sparse_mla_fused_kernel(
         acc2 = tl.where(l_i[:, None] > 0.0, acc2 * inv_denom[:, None], 0.0)
     if NUM_GROUPS >= 4:
         acc3 = tl.where(l_i[:, None] > 0.0, acc3 * inv_denom[:, None], 0.0)
+
+    if STORE_LSE:
+        # A row whose keys are all masked keeps m_i at the -3.4e38 sentinel.
+        lse = tl.where(m_i > -1.0e38, (m_i + tl.log2(denom)) * _LN2, float("-inf"))
+        tl.store(lse_out_ptr + t * H + h_offs, lse, mask=h_mask)
 
     o_base = out_ptr + t * H * D_V
     tl.store(
@@ -879,18 +889,14 @@ def _sparse_mla_split_k_kernel(
     STRIDE_QR_T,
     STRIDE_QR_H,
     USE_FP8_DOT: tl.constexpr,
-    KV_SCALED: tl.constexpr,
     KV_SPLITS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
     topk_length_ptr=None,
     USE_TOPK_LENGTH: tl.constexpr = False,
+    KV_SCALED: tl.constexpr = False,
 ):
-    """Split-K partial kernel. grid=(seq, head_blocks, kv_splits).
-
-    USE_TOPK_LENGTH: row t's keys are indices [0, topk_length[t]); its tiles are
-    spread over all KV_SPLITS on device, and a split left without tiles still
-    stores the empty partial the reduce expects."""
+    """Split-K partial kernel. grid=(seq, head_blocks, kv_splits)."""
     t = tl.program_id(0).to(tl.int64)
     pid_h = tl.program_id(1)
     pid_k = tl.program_id(2)
@@ -933,13 +939,14 @@ def _sparse_mla_split_k_kernel(
     ).to(input_type)
 
     if USE_TOPK_LENGTH:
-        row_len = tl.minimum(tl.maximum(tl.load(topk_length_ptr + t), 0), topk)
-        num_tiles = tl.cdiv(row_len, BLOCK_K)
+        # The reduce reads all KV_SPLITS partials, so a split left with no tiles
+        # must fall through and store an empty one rather than return early.
+        valid_topk = tl.minimum(tl.maximum(tl.load(topk_length_ptr + t), 0), topk)
+        num_tiles = tl.cdiv(valid_topk, BLOCK_K)
         tiles_per_segment = tl.cdiv(num_tiles, KV_SPLITS)
-        tile_start = tl.minimum(pid_k * tiles_per_segment, num_tiles)
+        tile_start = pid_k * tiles_per_segment
         tile_end = tl.minimum(tile_start + tiles_per_segment, num_tiles)
     else:
-        row_len = topk
         tiles_per_segment = tl.cdiv(topk, KV_SPLITS * BLOCK_K)
         if pid_k * tiles_per_segment * BLOCK_K >= topk:
             return
@@ -962,7 +969,7 @@ def _sparse_mla_split_k_kernel(
     for j in tl.range(tile_start, tile_end, num_stages=3):
         k_start = j * BLOCK_K
         k_pos = k_start + k_offs
-        valid = k_pos < row_len
+        valid = k_pos < topk
 
         slot = tl.load(idx_ptr + t * topk + k_pos, mask=valid, other=0)
         valid = valid & (slot >= 0)
@@ -1066,7 +1073,6 @@ def _sparse_mla_reduce_kernel(
     lse_partial_ptr,
     acc_partial_ptr,
     out_ptr,
-    lse_out_ptr,
     H: tl.constexpr,
     D_V: tl.constexpr,
     KV_SPLITS: tl.constexpr,
@@ -1074,6 +1080,7 @@ def _sparse_mla_reduce_kernel(
     ACTIVE_SPLITS_POW2: tl.constexpr,
     D_CHUNK: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    lse_out_ptr=None,
     STORE_LSE: tl.constexpr = False,
 ):
     """Reduce split-K partials via log-space combine. grid=(seq, H, d_v_chunks)."""
@@ -1113,6 +1120,13 @@ def _sparse_mla_reduce_kernel(
     weights = tl.exp2(lse_p - lse_max)
     w_sum = tl.sum(weights, axis=0)
     scale = tl.exp2(lse_p - lse_max - tl.log2(tl.maximum(w_sum, 1.0e-30)))
+    out = tl.sum(a_p * scale[:, None], axis=0)
+
+    tl.store(
+        out_ptr + t * H * D_V + h * D_V + d_offs,
+        out.to(tl.bfloat16),
+        mask=d_mask,
+    )
     if STORE_LSE:
         if dc == 0:
             # Every split empty leaves lse_max at the -3.4e38 sentinel.
@@ -1122,13 +1136,6 @@ def _sparse_mla_reduce_kernel(
                 float("-inf"),
             )
             tl.store(lse_out_ptr + t * H + h, lse)
-    out = tl.sum(a_p * scale[:, None], axis=0)
-
-    tl.store(
-        out_ptr + t * H * D_V + h * D_V + d_offs,
-        out.to(tl.bfloat16),
-        mask=d_mask,
-    )
 
 
 def _triton_sparse_mla_fwd_splitk(
@@ -1189,8 +1196,10 @@ def _triton_sparse_mla_fwd_splitk(
         kv_splits = 1
 
     out = torch.empty(seq, H, d_v, device=q_nope.device, dtype=torch.bfloat16)
-    lse = torch.empty(
-        (seq, H) if return_lse else (0,), device=q_nope.device, dtype=torch.float32
+    lse = (
+        torch.empty(seq, H, device=q_nope.device, dtype=torch.float32)
+        if return_lse
+        else None
     )
 
     if kv_splits == 1:
@@ -1208,7 +1217,6 @@ def _triton_sparse_mla_fwd_splitk(
             idx_flat,
             topk_length_ptr,
             out,
-            lse,
             qk_scale,
             _FP8_MAX,
             topk=topk,
@@ -1222,13 +1230,14 @@ def _triton_sparse_mla_fwd_splitk(
             STRIDE_QR_T=stride_qr_t,
             STRIDE_QR_H=stride_qr_h,
             USE_FP8_DOT=use_fp8_dot,
-            KV_SCALED=kv_scaled,
-            STORE_LSE=return_lse,
             USE_TOPK_LENGTH=use_topk_length,
             BLOCK_H=BLOCK_H,
             BLOCK_K=BLOCK_K,
             USE_I64_PAGE=not (i32_page_safe and i32_page_tuned),
             PIPE_STAGES=1 if use_topk_length else 3,
+            KV_SCALED=kv_scaled,
+            lse_out_ptr=lse,
+            STORE_LSE=return_lse,
             num_warps=fused_num_warps,
             num_stages=2,
         )
@@ -1271,10 +1280,10 @@ def _triton_sparse_mla_fwd_splitk(
             STRIDE_QR_T=stride_qr_t,
             STRIDE_QR_H=stride_qr_h,
             USE_FP8_DOT=use_fp8_dot,
-            KV_SCALED=kv_scaled,
             KV_SPLITS=kv_splits,
             BLOCK_H=BLOCK_H,
             BLOCK_K=BLOCK_K,
+            KV_SCALED=kv_scaled,
             num_warps=split_num_warps,
             num_stages=2,
         )
@@ -1284,7 +1293,6 @@ def _triton_sparse_mla_fwd_splitk(
             lse_partial,
             acc_partial,
             out,
-            lse,
             H=H,
             D_V=d_v,
             KV_SPLITS=kv_splits,
@@ -1292,6 +1300,7 @@ def _triton_sparse_mla_fwd_splitk(
             ACTIVE_SPLITS_POW2=_next_pow2(active_splits),
             D_CHUNK=D_CHUNK,
             BLOCK_K=BLOCK_K,
+            lse_out_ptr=lse,
             STORE_LSE=return_lse,
             num_warps=4,
         )
