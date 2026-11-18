@@ -446,11 +446,13 @@ SGLang supports two grammar backends:
   - XGrammar currently uses the [GGML BNF format](https://github.com/ggml-org/llama.cpp/blob/master/grammars/README.md).
 - [Outlines](https://github.com/dottxt-ai/outlines): Supports JSON schema and regular expression constraints.
 
-If instead you want to initialize the Outlines backend, you can use `--grammar-backend outlines` flag:
+To use Outlines, pass `--grammar-backend outlines`.
+
+Start a server with XGrammar to run the JSON schema, regular expression, and EBNF examples below.
 
 ```bash Command
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
---port 30000 --host 0.0.0.0 --grammar-backend [xgrammar|outlines] # xgrammar or outlines (default: xgrammar)
+  --port 30000 --host 0.0.0.0 --grammar-backend xgrammar
 ```
 
 ```python Example
@@ -466,7 +468,7 @@ json_schema = json.dumps({
     "required": ["name", "population"],
 })
 
-# JSON (works with both Outlines and XGrammar)
+# JSON schema
 response = requests.post(
     "http://localhost:30000/generate",
     json={
@@ -480,7 +482,7 @@ response = requests.post(
 )
 print(response.json())
 
-# Regular expression (Outlines backend only)
+# Regular expression
 response = requests.post(
     "http://localhost:30000/generate",
     json={
@@ -494,7 +496,7 @@ response = requests.post(
 )
 print(response.json())
 
-# EBNF (XGrammar backend only)
+# EBNF
 response = requests.post(
     "http://localhost:30000/generate",
     json={
