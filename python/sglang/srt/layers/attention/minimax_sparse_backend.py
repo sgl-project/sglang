@@ -1147,11 +1147,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         block_size_q = self._choose_block_size_q(max_seqlen)
 
         # Score-path qblock mappings (layer-invariant), built once per forward.
-        from sgl_kernel_npu.implementation.triton.indexer.flash_prefill_bnsd_score import (
-            _build_qblock_mappings as _build_score_qblock_mappings,
+        from sgl_kernel_npu.operators.indexer.qblock_mappings import (
+            build_qblock_mappings,
         )
 
-        qblock_mappings = _build_score_qblock_mappings(
+        qblock_mappings = build_qblock_mappings(
             cu_seqlens,
             seq_lens,
             self.req_to_token,
