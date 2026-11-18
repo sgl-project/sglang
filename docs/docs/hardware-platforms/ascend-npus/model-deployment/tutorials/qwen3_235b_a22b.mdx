@@ -310,15 +310,15 @@ python3 -m sglang.launch_server \
     --dist-init-addr <PREFILL_HOST_IP>:6688
 ```
 
-    Key parameters for PCP:
+Key parameters for PCP:
 
-    | Parameter | Value | Description |
-    |-----------|-------|-------------|
-    | `--enable-prefill-cp` | flag | Enable PCP feature |
-    | `--cp-strategy` | zigzag | Context sharding layout (required with `--enable-prefill-cp`) |
-    | `--attn-cp-size` | 2 | Split context across 2 CP ranks (each rank handles half the sequence) |
-    | `--moe-dp-size` | 2 | MoE DP size, should match `--attn-cp-size` |
-    | `--max-running-requests` | 1 | Required by PCP (batch_size=1 constraint) |
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `--enable-prefill-cp` | flag | Enable PCP feature |
+| `--cp-strategy` | zigzag | Context sharding layout (required with `--enable-prefill-cp`) |
+| `--attn-cp-size` | 2 | Split context across 2 CP ranks (each rank handles half the sequence) |
+| `--moe-dp-size` | 2 | MoE DP size, should match `--attn-cp-size` |
+| `--max-running-requests` | 1 | Required by PCP (batch_size=1 constraint) |
 
 2. Run on the **decode node**:
 
