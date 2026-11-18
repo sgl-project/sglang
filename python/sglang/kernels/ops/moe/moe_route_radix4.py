@@ -197,7 +197,8 @@ def route_radix4_with_sort(
     """route_radix4 plus AITER's BM=16 sort of its routes, in one launch.
 
     Returns (weights, ids, aux), where aux is the dict AITER's
-    register_presorted_moe takes. A given moe_buf ([M, D] packed bf16, D a
+    register_presorted_moe takes; it keeps weights, ids and moe_buf alive for as
+    long as it is registered. A given moe_buf ([M, D] packed bf16, D a
     multiple of 8) is zeroed in the same launch, and aux records it. Rows at or
     past num_token_non_padded come out as expert 0 with weight 0, which is what
     select_experts masks CUDA-graph padding rows to on HIP.
@@ -252,5 +253,10 @@ def route_radix4_with_sort(
         "reverse_sorted": reverse_sorted,
         "moe_buf_zeroed": moe_buf is not None,
         "moe_buf_ptr": moe_buf.data_ptr() if moe_buf is not None else 0,
+        # AITER matches on the *_ptr keys above; holding the tensors keeps the
+        # allocator from handing those addresses to another tensor meanwhile.
+        "topk_ids": out_i,
+        "topk_weights": out_w,
+        "moe_buf": moe_buf,
     }
     return out_w, out_i, aux

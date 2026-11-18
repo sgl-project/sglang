@@ -584,6 +584,27 @@ def test_fused_sort_rejects_a_moe_buf_it_cannot_zero():
         )
 
 
+def test_fused_sort_aux_pins_the_addresses_it_matches_on():
+    """AITER pairs a registered sort with fused_moe by the topk and output
+    addresses, so while aux lives no other tensor may be handed those addresses;
+    otherwise a later topk_ids reusing one would be served this stale sort."""
+    m = 12
+    scores = torch.randn((m, NUM_EXPERTS), dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn(NUM_EXPERTS, dtype=torch.bfloat16, device="cuda")
+    moe_buf = torch.ones((m, MODEL_DIM), dtype=torch.bfloat16, device="cuda")
+    w, ids, aux = moe_route_radix4.route_radix4_with_sort(
+        scores, bias, TOPK, True, 2.5, moe_buf=moe_buf
+    )
+    del w, ids, moe_buf
+    later = [
+        torch.empty((m, TOPK), dtype=torch.int32, device="cuda"),
+        torch.empty((m, TOPK), dtype=torch.float32, device="cuda"),
+        torch.empty((m, MODEL_DIM), dtype=torch.bfloat16, device="cuda"),
+    ]
+    pinned = {aux["topk_ids_ptr"], aux["topk_weights_ptr"], aux["moe_buf_ptr"]}
+    assert pinned.isdisjoint(t.data_ptr() for t in later)
+
+
 @pytest.mark.parametrize("m", [1, 12, 64, 80, 512])
 def test_aiter_accepts_fused_sort(m):
     """AITER drops a registered sort whose aux lacks a key it matches on, such as
