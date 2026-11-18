@@ -160,6 +160,13 @@ def compute_dynamic_image_size(
         target_pw = max(ds, int(math.floor(target_pw * down / ds)) * ds)
         target_ph = max(ds, int(math.floor(target_ph * down / ds)) * ds)
 
+        # A minimum-sized short side can prevent uniform scaling from fitting.
+        if target_pw * target_ph > max_num_patches:
+            if target_pw >= target_ph:
+                target_pw = max(ds, (max_num_patches // target_ph // ds) * ds)
+            else:
+                target_ph = max(ds, (max_num_patches // target_pw // ds) * ds)
+
     target_w = target_pw * patch_size
     target_h = target_ph * patch_size
     num_tokens = (target_pw * target_ph) // (ds * ds)
