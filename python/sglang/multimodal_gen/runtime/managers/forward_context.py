@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
+
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.attention import AttentionMetadata
     from sglang.multimodal_gen.runtime.pipelines_core import Req
@@ -26,6 +28,7 @@ class ForwardContext:
         tuple[int, int, int, int],
         tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     ] = field(default_factory=dict)
+    quality: str = field(default="exact", kw_only=True)
 
     @torch.compiler.disable
     def get_trtllm_gen_sequence_metadata(
@@ -67,9 +70,23 @@ def get_forward_context_or_none() -> "ForwardContext | None":
     return _forward_context
 
 
+def request_allows_lossless() -> bool:
+    """Whether the request of this forward pass allows ``lossless`` fast paths."""
+    # only a request that allows it: many stages set the forward context
+    # without forward_batch, and an exact request must still get exact bytes
+    forward_batch = None if _forward_context is None else _forward_context.forward_batch
+    sampling_params = getattr(forward_batch, "sampling_params", None)
+    quality = getattr(sampling_params, "quality", None)
+    return quality is not None and quality_allows(quality, "lossless")
+
+
 @contextmanager
 def set_forward_context(
-    current_timestep, attn_metadata, forward_batch: Optional["Req"] = None
+    current_timestep,
+    attn_metadata,
+    forward_batch: Optional["Req"] = None,
+    *,
+    quality: str = "exact",
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -81,6 +98,7 @@ def set_forward_context(
         current_timestep=current_timestep,
         attn_metadata=attn_metadata,
         forward_batch=forward_batch,
+        quality=quality,
     )
 
     try:

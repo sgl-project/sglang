@@ -54,7 +54,8 @@ class BaseLayerWithLoRA(nn.Module):
         self.lora_backend: BaseLoRABackend = lora_backend
         if hasattr(self.base_layer, "weight"):
             self.weight = self.base_layer.weight
-        if hasattr(self.base_layer, "bias") and self.base_layer.bias is not None:
+        # Mirror a None bias too: callers read `layer.bias is None`.
+        if hasattr(self.base_layer, "bias"):
             self.bias = self.base_layer.bias
         # Forward reduce_results so model code that inspects it on the module
         # (e.g. DeepseekV2AttentionMLA's `assert not self.o_proj.reduce_results`
@@ -934,7 +935,6 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
                 dtype=torch.int32,
                 device=B_buffer.device,
             )
-            self._output_offset_cpu = self._output_offset.cpu()
             self._max_out_dim = max(first_dim, second_dim)
         else:
             # Single-projection path: csgmv backend requires an explicit
@@ -944,6 +944,7 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
                 dtype=torch.int32,
                 device=B_buffer.device,
             )
+        self._output_offset_cpu = self._output_offset.cpu()
         self.lora_a, self.lora_b = A_buffer, B_buffer
         self.lora_offsets = tuple(self._output_offset.tolist())
 
@@ -957,6 +958,7 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
                 x=lora_a_output,
                 weights=self.B_buffer,
                 output_offset=self._output_offset,
+                output_offset_cpu=self._output_offset_cpu,
                 base_output=base_output,
             )
             return lora_output
@@ -1044,6 +1046,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.should_fuse_routed_scaling_factor_in_topk = (
             base_layer.should_fuse_routed_scaling_factor_in_topk
         )
+        # The LoRA forward has no deferred-finalize variant.
+        self.supports_deferred_finalize = False
+        self.supports_routed_deferred_finalize = False
 
         self.tp_size = base_layer.moe_tp_size
         self.tp_rank = base_layer.moe_tp_rank

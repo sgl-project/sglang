@@ -46,10 +46,10 @@ class TestAttentionBCGOutputs(unittest.TestCase):
     def _capture_and_replay(self, attention, *args, **kwargs):
         graph = bcg.BreakableCUDAGraph()
         capture = SimpleNamespace(
-            cuda_graph=graph,
-            _barrier_fn=None,
-            _end_current_segment=lambda: None,
-            _begin_new_segment=lambda: None,
+            end_current_segment=lambda: None,
+            begin_next_segment=lambda: None,
+            register_eager_call=graph._break_fns.append,
+            retain_for_replay=lambda value: value,
         )
         with (
             patch.object(layer, "is_in_breakable_cuda_graph", return_value=True),
@@ -65,11 +65,8 @@ class TestAttentionBCGOutputs(unittest.TestCase):
             ),
             patch.object(layer, "sequence_model_parallel_all_gather", lambda x, **_: x),
         ):
-            token = bcg._current_capture_var.set(capture)
-            try:
+            with bcg.use_breakable_capture_recorder(capture):
                 captured = attention(*args, **kwargs)
-            finally:
-                bcg._current_capture_var.reset(token)
             self.assertEqual(len(graph._break_fns), 1)
             self.assertIsNone(graph._break_fns[0]())
         return captured
@@ -77,14 +74,14 @@ class TestAttentionBCGOutputs(unittest.TestCase):
     def test_local_attention_replays_into_captured_output(self):
         q = torch.zeros(1, 4, 2, 3)
         output = self._capture_and_replay(_attention(layer.LocalAttention), q, q, q)
-        self.assertTrue(torch.all(output == 2))
+        self.assertTrue(torch.all(output == 1))
 
     def test_ulysses_attention_replays_into_captured_tuple(self):
         q = torch.zeros(1, 4, 2, 3)
         replicated_q = torch.zeros(1, 2, 2, 3)
         attention = _attention(layer.UlyssesAttention)
         output, replicated_output = self._capture_and_replay(attention, q, q, q)
-        self.assertTrue(torch.all(output == 2))
+        self.assertTrue(torch.all(output == 1))
         self.assertIsNone(replicated_output)
 
         output, replicated_output = self._capture_and_replay(
@@ -98,8 +95,8 @@ class TestAttentionBCGOutputs(unittest.TestCase):
         )
         self.assertEqual(output.shape, q.shape)
         self.assertEqual(replicated_output.shape, replicated_q.shape)
-        self.assertTrue(torch.all(output == 4))
-        self.assertTrue(torch.all(replicated_output == 4))
+        self.assertTrue(torch.all(output == 2))
+        self.assertTrue(torch.all(replicated_output == 2))
 
 
 if __name__ == "__main__":

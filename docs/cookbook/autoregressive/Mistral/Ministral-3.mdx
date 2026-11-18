@@ -105,7 +105,7 @@ sglang serve \
 #####  Low Concurrency
 - Benchmark Command:
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model mistralai/Ministral-3-14B-Instruct-2512 \
   --dataset-name random \
@@ -159,7 +159,7 @@ Max ITL (ms):                            8.45
 ##### Medium Concurrency
 - Benchmark Command:
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model mistralai/Ministral-3-14B-Instruct-2512 \
   --dataset-name random \
@@ -212,7 +212,7 @@ Max ITL (ms):                            888.63
 ##### High Concurrency
 - Benchmark Command:
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model mistralai/Ministral-3-14B-Instruct-2512 \
   --dataset-name random \

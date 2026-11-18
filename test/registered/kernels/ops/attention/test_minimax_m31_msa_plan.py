@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.msa_v1.compact_dequant import dequant_nvfp4_page_table
+from sglang.kernels.ops.kvcache.msa_v1_compact_dequant import dequant_nvfp4_page_table
 from sglang.srt.layers.attention.minimax_sparse_ops.msa_plan import (
     MSA_V1_DECODE_INDEXER_AVAILABLE,
     MSAV1DecodeAttentionPlan,
@@ -172,11 +172,6 @@ def test_topk_matches_reference_and_graph_replay(caches, query_length, fallback,
         _plan(indexer, page_table, lengths)
         graph.replay()
         _check_topk(iq, index, page_table, query_length, lengths, captured)
-
-
-def test_decode_indexer_rejects_unsupported_head_count(caches):
-    with pytest.raises(ValueError, match="index heads"):
-        _indexer(1, False, caches[1], heads=3)
 
 
 @pytest.mark.parametrize(

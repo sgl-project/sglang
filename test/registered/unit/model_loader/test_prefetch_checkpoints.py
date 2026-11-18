@@ -73,6 +73,12 @@ def _wait_all(fs, return_when):
 class TestPrefetchCheckpoints(CustomTestCase):
     """Verify coordinated checkpoint prefetch behavior."""
 
+    def setUp(self):
+        # The fastsafetensors iterator asks for the current CUDA device; keep CPU runners off CUDA.
+        current_device = patch("torch.cuda.current_device", return_value=0)
+        current_device.start()
+        self.addCleanup(current_device.stop)
+
     def _create_safetensors_files(self, tmpdir, num_shards=3):
         """Create real safetensors files with known tensor content."""
         paths = []
@@ -336,6 +342,47 @@ class TestPrefetchCheckpoints(CustomTestCase):
 
         torch.testing.assert_close(loaded[0][1], torch.tensor([1.0]))
         self.assertEqual(events, ["close", "drop:model.safetensors"])
+
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_fastsafetensors_uses_local_device_not_group_rank(self, _):
+        """On multi-node TP the group rank exceeds the node's GPU count;
+        the loader must copy to this process's current device, not cuda:{rank}."""
+        devices = []
+
+        class FakeGroup:
+            def rank(self):
+                return 3
+
+            def size(self):
+                return 1
+
+        class FakeBuffer:
+            key_to_rank_lidx = {}
+
+        class FakeLoader:
+            def __init__(self, group, device, nogds):
+                devices.append(device)
+
+            def add_filenames(self, rank_file_map):
+                pass
+
+            def copy_files_to_device(self):
+                return FakeBuffer()
+
+            def close(self):
+                pass
+
+        with (
+            patch("sglang.srt.model_loader.weight_utils.SingleGroup", FakeGroup),
+            patch(
+                "sglang.srt.model_loader.weight_utils.SafeTensorsFileLoader",
+                FakeLoader,
+            ),
+            patch("torch.cuda.current_device", return_value=1),
+        ):
+            list(fastsafetensors_weights_iterator(["model.safetensors"]))
+
+        self.assertEqual(devices, [torch.device("cuda", 1)])
 
 
 class TestPrefetchDispatch(CustomTestCase):

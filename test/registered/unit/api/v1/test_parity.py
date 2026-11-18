@@ -51,7 +51,6 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
     {
         "background",
         "conversation_id",
-        "data_parallel_rank",
         "encoder_urls",
         "external_trace_header",
         "http_worker_ipc",
@@ -63,6 +62,7 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "min_dynamic_patch",
         "mm_content_hashes",
         "mm_processor_kwargs",
+        "mm_routing_labels",
         "multi_item_delimiter_indices",
         "need_wait_for_mm_inputs",
         "no_logs",
@@ -74,6 +74,8 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "return_flat_raw_output_top_logprobs",
         "return_flat_raw_top_logprobs",
         "return_flat_raw_top_logprobs_b64",
+        "return_flat_raw_sampling_mask",
+        "return_flat_raw_sampling_mask_b64",
         "return_indexer_topk",
         "return_routed_experts",
         "sampling_logprobs_mode",
@@ -237,7 +239,9 @@ class TestResponseParity(CustomTestCase):
                 "completion_tokens": 2,
                 "cached_tokens": 1,
                 "spec_accept_rate": 0.5,
+                "cached_tokens_details": {"device": 1, "host": 0},
                 "e2e_latency": 0.25,
+                "dp_rank": None,
             },
         }
         frame = GenerateResponse.from_json_value(python_frame)
@@ -253,10 +257,15 @@ class TestResponseParity(CustomTestCase):
                 "cached_tokens",
                 "reasoning_tokens",
                 "weight_version",
+                "cached_tokens_details",
+                "dp_rank",
             ],
         )
         self.assertEqual(
             back["meta_info"]["finish_reason"], {"type": "stop", "matched": 2}
+        )
+        self.assertEqual(
+            back["meta_info"]["cached_tokens_details"], {"device": 1, "host": 0}
         )
         self.assertNotIn("output_ids", back)
 
@@ -291,6 +300,8 @@ class TestResponseParity(CustomTestCase):
                 "image_tokens",
                 "audio_tokens",
                 "video_tokens",
+                "cached_tokens_details",
+                "dp_rank",
             ],
         )
 
