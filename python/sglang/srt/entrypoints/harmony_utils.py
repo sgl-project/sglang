@@ -234,6 +234,22 @@ def parse_response_input(
         msg = msg.with_channel("commentary")
         msg = msg.with_recipient(f"functions.{response_msg['name']}")
         msg = msg.with_content_type("json")
+    elif response_msg["type"] == "tool_search_call":
+        # Client-executed tool search, replayed to the built-in
+        # "tool_search" pseudo-tool.
+        arguments = response_msg.get("arguments") or "{}"
+        if isinstance(arguments, dict):
+            arguments = orjson.dumps(arguments).decode()
+        msg = Message.from_role_and_content(Role.ASSISTANT, arguments)
+        msg = msg.with_channel("commentary")
+        msg = msg.with_recipient("functions.tool_search")
+        msg = msg.with_content_type("json")
+    elif response_msg["type"] == "tool_search_output":
+        tools = response_msg.get("tools") or []
+        msg = Message.from_author_and_content(
+            Author.new(Role.TOOL, "functions.tool_search"),
+            orjson.dumps(tools).decode(),
+        )
     else:
         raise ValueError(f"Unknown input type: {response_msg['type']}")
     return msg

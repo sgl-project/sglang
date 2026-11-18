@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import functools
+import json
 import sys
 import unittest
 from contextlib import asynccontextmanager
@@ -1146,6 +1147,88 @@ class InputItemNormalizationTestCase(CustomTestCase):
         self.assertEqual(
             normalized,
             {"role": "tool", "tool_call_id": "call_abc", "content": "42"},
+        )
+
+    def test_tool_search_call_becomes_assistant_tool_call(self):
+        # Regression: tool_search_call input items used to raise "Unsupported
+        # Responses API input item type", breaking tool-search replay loops.
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "tool_search_call",
+                "call_id": "call_ts_1",
+                "status": "completed",
+                "execution": "client",
+                "arguments": {"query": "calendar", "limit": 5},
+            }
+        )
+        self.assertEqual(
+            normalized,
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_ts_1",
+                        "type": "function",
+                        "function": {
+                            "name": "tool_search",
+                            "arguments": '{"query":"calendar","limit":5}',
+                        },
+                    }
+                ],
+            },
+        )
+
+    def test_tool_search_output_becomes_tool_message(self):
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "tool_search_output",
+                "call_id": "call_ts_1",
+                "status": "completed",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "create_event",
+                        "description": "Create a calendar event",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"title": {"type": "string"}},
+                            "required": ["title"],
+                        },
+                    }
+                ],
+            }
+        )
+        self.assertEqual(normalized["role"], "tool")
+        self.assertEqual(normalized["tool_call_id"], "call_ts_1")
+        tools = json.loads(normalized["content"])
+        self.assertEqual(tools[0]["name"], "create_event")
+
+    def test_harmony_tool_search_input_replays(self):
+        from sglang.srt.entrypoints.harmony_utils import parse_response_input
+
+        call_msg = parse_response_input(
+            {
+                "type": "tool_search_call",
+                "call_id": "call_ts_1",
+                "arguments": {"query": "calendar"},
+            },
+            [],
+        )
+        self.assertEqual(call_msg.recipient, "functions.tool_search")
+        self.assertEqual(call_msg.channel, "commentary")
+
+        output_msg = parse_response_input(
+            {
+                "type": "tool_search_output",
+                "call_id": "call_ts_1",
+                "tools": [{"type": "function", "name": "create_event"}],
+            },
+            [],
+        )
+        self.assertEqual(output_msg.author.name, "functions.tool_search")
+        self.assertEqual(output_msg.author.role, "tool")
+        self.assertEqual(
+            json.loads(output_msg.content[0].text)[0]["name"], "create_event"
         )
 
     def test_unknown_input_item_type_raises(self):

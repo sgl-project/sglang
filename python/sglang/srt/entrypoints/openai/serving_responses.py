@@ -1403,6 +1403,43 @@ class OpenAIServingResponses(OpenAIServingChat):
     def _response_tools_to_chat_tools(self, request: ResponsesRequest) -> list[Tool]:
         # ``function`` and ``custom`` tools flow to chat; built-ins go through
         # harmony. A custom tool is shimmed into a single-string function tool.
+        chat_tools = self._static_chat_tools(request)
+        # Tools discovered by client-side tool_search become callable for this
+        # turn even though they were never listed in ``request.tools``.
+        for tool in self._tool_search_output_tools(request):
+            chat_tools.append(
+                Tool(
+                    type="function",
+                    function=Function(
+                        name=tool["name"],
+                        description=tool.get("description"),
+                        parameters=tool.get("parameters"),
+                        strict=tool.get("strict", False),
+                    ),
+                )
+            )
+        return chat_tools
+
+    def _tool_search_output_tools(self, request: ResponsesRequest) -> list[dict]:
+        """Function tools from ``tool_search_output`` input items, deduped by
+        name; earlier items win over later ones."""
+        found: dict[str, dict] = {}
+        for item in self._response_input_history(request):
+            if hasattr(item, "model_dump"):
+                item = item.model_dump(exclude_none=True)
+            if not isinstance(item, dict) or item.get("type") != "tool_search_output":
+                continue
+            for tool in item.get("tools") or []:
+                if (
+                    isinstance(tool, dict)
+                    and tool.get("type", "function") == "function"
+                    and tool.get("name")
+                    and tool["name"] not in found
+                ):
+                    found[tool["name"]] = tool
+        return list(found.values())
+
+    def _static_chat_tools(self, request: ResponsesRequest) -> list[Tool]:
         chat_tools = []
         is_muse = self.tool_call_parser == "muse"
         for tool in request.tools:
@@ -1600,6 +1637,18 @@ class OpenAIServingResponses(OpenAIServingChat):
                 message.get("name"),
                 encode_custom_tool_input(message.get("input") or ""),
             )
+        if msg_type == "tool_search_call":
+            # Client-executed tool search; replay as an assistant tool_call to
+            # the built-in "tool_search" pseudo-tool, matched later by call_id.
+            raw = message.get("arguments")
+            raw = orjson.dumps(raw).decode("utf-8") if isinstance(raw, dict) else "{}"
+            return cls._chat_tool_call_message(message, "tool_search", raw)
+        if msg_type == "tool_search_output":
+            return {
+                "role": "tool",
+                "tool_call_id": message.get("call_id"),
+                "content": orjson.dumps(message.get("tools") or []).decode("utf-8"),
+            }
         if msg_type in ("function_call_output", "custom_tool_call_output"):
             return {
                 "role": "tool",
