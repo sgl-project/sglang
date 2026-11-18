@@ -8,7 +8,6 @@ import string
 import subprocess
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
 
 import psutil
 import yaml
@@ -680,11 +679,6 @@ def run_npu_e2e_test_case(
         test_method (str): single unittest method ("Class.method") injected into
             pods as NPU_TEST_METHOD; empty runs every test in test_case.
     """
-    # Select once per launcher run so every pod uses the same variant across midnight.
-    beijing_day = datetime.now(timezone(timedelta(hours=8))).day
-    accuracy_variant = "dcp" if beijing_day % 2 else "pcp"
-    logger.info(f"[accuracy-variant] Beijing day={beijing_day}: {accuracy_variant}")
-
     random_str = get_unique_random_string(16, True)
 
     kube_config_map = f"sglang-configmap-{random_str}"
@@ -762,7 +756,6 @@ def run_npu_e2e_test_case(
                 "run_label": run_label,
                 "run_id": run_id,
                 "accuracy_dataset": accuracy_dataset,
-                "accuracy_variant": accuracy_variant,
                 "use_image_sglang": use_image_sglang,
                 "test_method": test_method,
                 "container_patches": container_patches,
@@ -796,7 +789,6 @@ def run_npu_e2e_test_case(
                 "run_label": run_label,
                 "run_id": run_id,
                 "accuracy_dataset": accuracy_dataset,
-                "accuracy_variant": accuracy_variant,
                 "use_image_sglang": use_image_sglang,
                 "test_method": test_method,
             }
