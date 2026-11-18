@@ -1,9 +1,11 @@
 """Security tests for client-supplied remote multimodal media URLs."""
 
 import http.server
+import os
+import socket
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import requests
 
@@ -92,6 +94,11 @@ class TestMediaURLSecurity(unittest.TestCase):
         cls.thread.join()
 
     def setUp(self):
+        self.private_media_opt_in = patch.dict(
+            os.environ, {"SGLANG_ALLOW_PRIVATE_MEDIA_URLS": "1"}
+        )
+        self.private_media_opt_in.start()
+        self.addCleanup(self.private_media_opt_in.stop)
         self.server.redirect_target_reached = False
         configure_media_url_security([], max_file_size_mb=64)
 
@@ -177,6 +184,132 @@ class TestMediaURLSecurity(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "not allowed"):
                         loader("https://blocked.example/media")
             self.assertEqual(download.call_count, 3)
+
+
+class TestMediaURLAddresses(unittest.TestCase):
+    def setUp(self):
+        configure_media_url_security([])
+        self.env = patch.dict(os.environ, {"SGLANG_ALLOW_PRIVATE_MEDIA_URLS": "0"})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.session = MagicMock()
+        self.session_patch = patch(
+            "sglang.srt.multimodal.media_io.get_mm_http_session",
+            return_value=self.session,
+        )
+        self.session_patch.start()
+        self.addCleanup(self.session_patch.stop)
+        self.response = self.session.get.return_value.__enter__.return_value
+        self.response.status_code = 200
+        self.response.headers = {}
+        self.response.iter_content.return_value = [b"media"]
+
+    @staticmethod
+    def _addresses(*addresses):
+        return [
+            (
+                socket.AF_INET6 if ":" in ip else socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                (ip, 80),
+            )
+            for ip in addresses
+        ]
+
+    def test_non_global_destinations_are_rejected_before_fetch(self):
+        for host, address in [
+            ("127.0.0.1", "127.0.0.1"),
+            ("localhost", "127.0.0.1"),
+            ("media.example", "127.0.0.1"),
+            ("2130706433", "127.0.0.1"),
+            ("metadata.example", "169.254.169.254"),
+            ("private.example", "10.0.0.1"),
+            ("private.example", "172.16.0.1"),
+            ("private.example", "192.168.0.1"),
+            ("cgnat.example", "100.64.0.1"),
+            ("unspecified.example", "0.0.0.0"),
+            ("[::1]", "::1"),
+            ("[::]", "::"),
+            ("[fc00::1]", "fc00::1"),
+            ("[fe80::1]", "fe80::1"),
+            ("[::ffff:127.0.0.1]", "::ffff:127.0.0.1"),
+            ("[::127.0.0.1]", "::127.0.0.1"),
+            ("nat64.example", "64:ff9b::7f00:1"),
+            ("nat64.example", "64:ff9b::a00:1"),
+            ("multicast.example", "239.1.1.1"),
+            ("multicast.example", "ff0e::1"),
+        ]:
+            with (
+                self.subTest(host=host, address=address),
+                patch(
+                    "sglang.srt.multimodal.media_io.socket.getaddrinfo",
+                    return_value=self._addresses(address),
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "local or private"):
+                    download_remote_media(f"http://{host}/media", timeout=5)
+                self.session.get.assert_not_called()
+
+    def test_public_destinations_are_allowed(self):
+        with patch(
+            "sglang.srt.multimodal.media_io.socket.getaddrinfo",
+            return_value=self._addresses(
+                "8.8.8.8", "2001:4860:4860::8888", "64:ff9b::808:808"
+            ),
+        ):
+            self.assertEqual(
+                download_remote_media("https://media.example/media", timeout=5),
+                b"media",
+            )
+        self.session.get.assert_called_once()
+
+    def test_any_private_dns_answer_is_rejected(self):
+        with patch(
+            "sglang.srt.multimodal.media_io.socket.getaddrinfo",
+            return_value=self._addresses("8.8.8.8", "127.0.0.1"),
+        ):
+            with self.assertRaisesRegex(ValueError, "local or private"):
+                download_remote_media("https://media.example/media", timeout=5)
+        self.session.get.assert_not_called()
+
+    def test_redirect_to_private_destination_is_rejected_before_fetch(self):
+        self.response.status_code = 302
+        self.response.headers = {"Location": "http://127.0.0.1/media"}
+        self.response.url = "https://media.example/media"
+        with patch(
+            "sglang.srt.multimodal.media_io.socket.getaddrinfo",
+            side_effect=[self._addresses("8.8.8.8"), self._addresses("127.0.0.1")],
+        ):
+            with self.assertRaisesRegex(ValueError, "local or private"):
+                download_remote_media(self.response.url, timeout=5)
+        self.session.get.assert_called_once()
+
+    def test_failed_or_empty_dns_answer_is_rejected(self):
+        for kwargs in [{"return_value": []}, {"side_effect": socket.gaierror("DNS")}]:
+            with (
+                self.subTest(kwargs=kwargs),
+                patch("sglang.srt.multimodal.media_io.socket.getaddrinfo", **kwargs),
+            ):
+                with self.assertRaisesRegex(ValueError, "could not be resolved"):
+                    download_remote_media("https://media.example/media", timeout=5)
+                self.session.get.assert_not_called()
+
+    def test_direct_decoders_share_the_policy(self):
+        from sglang.srt.multimodal.audio_from_video import decode_audio_container
+        from sglang.srt.utils.video_decoder import VideoDecoderWrapper
+
+        with patch(
+            "sglang.srt.multimodal.media_io.socket.getaddrinfo",
+            return_value=self._addresses("127.0.0.1"),
+        ):
+            with self.assertRaisesRegex(ValueError, "local or private"):
+                VideoDecoderWrapper("http://localhost/media")
+            with self.assertRaisesRegex(ValueError, "local or private"):
+                decode_audio_container(
+                    "http://localhost/media", target_sr=16000, mono=True
+                )
+        self.session.get.assert_not_called()
 
 
 if __name__ == "__main__":

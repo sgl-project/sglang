@@ -20,6 +20,7 @@ import ipaddress
 import logging
 import math
 import os
+import socket
 import stat
 import threading
 import time
@@ -145,7 +146,10 @@ def media_url_security_config() -> tuple:
     )
 
 
-def _assert_media_url_allowed(url: str) -> None:
+_NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
+
+
+def assert_media_url_allowed(url: str) -> None:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
         raise ValueError(f"Invalid media URL: {url!r}")
@@ -157,6 +161,29 @@ def _assert_media_url_allowed(url: str) -> None:
             f"Allowed domains: {sorted(_allowed_media_domains)}; "
             f"input domain: {hostname}"
         )
+    # Local media servers require an explicit operator opt-in.
+    if os.getenv("SGLANG_ALLOW_PRIVATE_MEDIA_URLS") == "1":
+        return
+    try:
+        addresses = socket.getaddrinfo(
+            hostname,
+            parsed.port or (443 if parsed.scheme == "https" else 80),
+            type=socket.SOCK_STREAM,
+        )
+    except OSError as error:
+        raise ValueError("Media URL hostname could not be resolved") from error
+    if not addresses:
+        raise ValueError("Media URL hostname could not be resolved")
+    for _, _, _, _, address in addresses:
+        ip = ipaddress.ip_address(address[0])
+        if isinstance(ip, ipaddress.IPv6Address):
+            embedded = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+            if ip.ipv4_mapped or int(ip) >> 32 == 0:
+                ip = embedded
+            elif ip in _NAT64_PREFIX and not embedded.is_global:
+                ip = embedded
+        if not ip.is_global or ip.is_multicast:
+            raise ValueError("Media URL must not point to a local or private address")
 
 
 def media_url_timeout(default: float) -> float:
@@ -188,7 +215,7 @@ def download_remote_media(url: str, timeout: float) -> bytes:
         prepared_url = requests.Request("GET", current_url).prepare().url
         if prepared_url is None:
             raise ValueError(f"Invalid media URL: {current_url!r}")
-        _assert_media_url_allowed(prepared_url)
+        assert_media_url_allowed(prepared_url)
 
         remaining = deadline - time.monotonic()
         if remaining <= 0:
