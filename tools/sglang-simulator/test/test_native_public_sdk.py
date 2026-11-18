@@ -39,7 +39,6 @@ def public_adapter(request, monkeypatch):
             reason="install the current SimOpus SDK for native public integration controls",
         )
     from simopus.sdk import DatabaseMode, DatabaseProvenance, DecodeExecutionProfile
-    from simopus.sdk import DatabaseProvenance
 
     root = (
         Path(__file__).parent / "fixtures/simopus-native-source" / f"tp{request.param}"
