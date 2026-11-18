@@ -92,6 +92,45 @@ def selective_state_update_ref(
     return out
 
 
+@pytest.mark.parametrize("capacity", [4, 8])
+@pytest.mark.parametrize("tree", [False, True])
+def test_verify_intermediate_state_row_stride(capacity, tree):
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    batch, steps, heads, dim, dstate = 2, 4, 1, 4, 4
+    state = torch.zeros(batch, heads, dim, dstate, device=device)
+    rows = torch.arange(batch, device=device, dtype=torch.int32)
+    x = (rows + 1).float().view(batch, 1, 1, 1).expand(batch, steps, heads, dim)
+    B = torch.ones(batch, steps, 1, dstate, device=device)
+    zeros = state.new_zeros((heads, dim))
+    cache = state.new_full((batch, capacity, heads, dim, dstate), -1)
+    parents = torch.tensor([[-1, 0, 0, 1]], device=device).expand(batch, -1)
+    selective_state_update(
+        state,
+        x,
+        torch.ones_like(x),
+        torch.zeros_like(state[0]),
+        B,
+        B,
+        D=zeros,
+        dt_bias=zeros,
+        out=torch.empty_like(x),
+        state_batch_indices=rows,
+        disable_state_update=True,
+        intermediate_states_buffer=cache,
+        cache_steps=steps,
+        retrieve_parent_token=parents if tree else None,
+    )
+
+    # Each step adds x to its parent's state.
+    depth = torch.tensor([1, 2, 2, 3] if tree else [1, 2, 3, 4], device=device)
+    expected = (x * depth.view(1, steps, 1, 1)).unsqueeze(-1)
+    torch.testing.assert_close(cache[:, :steps], expected.expand_as(cache[:, :steps]))
+    assert (cache[:, steps:] == -1).all()
+
+
 @pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("has_z", [False, True])
 @pytest.mark.parametrize("dstate", [16, 32, 64])
