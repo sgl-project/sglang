@@ -1,8 +1,12 @@
-"""Inkling2 FlashInfer CuTe DSL MoE: the w13 row reorder matches FlashInfer's own preparation, and
-the experts (local slice of a larger EP expert set) match a dequantized fp32 SiTU reference."""
+"""Inkling2 FlashInfer CuTe DSL MoE and DeepGEMM MegaMoE: the w13 row reorder matches FlashInfer's
+own preparation, and both ops, reading the same prepared tensors, match a dequantized fp32 SiTU
+reference."""
+
+import socket
 
 import pytest
 import torch
+import torch.distributed as dist
 from flashinfer import block_scale_interleave
 from flashinfer.fused_moe import interleave_cute_dsl_moe_weights
 
@@ -11,6 +15,7 @@ from sglang.kernels.ops.moe.inkling2_flashinfer_moe import (
     Inkling2FlashInferMoE,
     up_gate_block16_rows_,
 )
+from sglang.kernels.ops.moe.inkling2_mega_moe import Inkling2MegaMoE
 from sglang.srt.layers.quantization.utils import swizzle_blockscale
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -82,11 +87,13 @@ def _experts(nvfp4, rows, k, g):
     return w, s, values * scale
 
 
-def _reference(x, w13, w2, topk_weights, topk_ids, swap_gate_up=False):
+def _reference(
+    x, w13, w2, topk_weights, topk_ids, swap_gate_up=False, offset=NUM_EXPERTS - LOCAL
+):
     out = torch.zeros(x.shape[0], HIDDEN, device="cuda")
     for t in range(x.shape[0]):
         for k in range(TOP_K):
-            e = int(topk_ids[t, k]) - (NUM_EXPERTS - LOCAL)
+            e = int(topk_ids[t, k]) - offset
             if e < 0:
                 continue
             h = w13[e] @ x[t].float()
@@ -135,6 +142,60 @@ def test_matches_reference(nvfp4):
         out = moe(x, weights, ids).float()
         ref = _reference(x, ref13, ref2, weights, ids)
         swapped = _reference(x, ref13, ref2, weights, ids, swap_gate_up=True)
+        rel = ((out - ref).norm() / ref.norm()).item()
+        control = ((out - swapped).norm() / swapped.norm()).item()
+        bound = 0.25 if nvfp4 else 0.08
+        assert rel < bound and control > 2 * bound, (
+            f"{tokens} tokens: {rel=:.4f} {control=:.4f}"
+        )
+
+
+@pytest.fixture(scope="module")
+def single_rank_group():
+    if not dist.is_initialized():
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        dist.init_process_group(
+            "nccl", init_method=f"tcp://127.0.0.1:{port}", rank=0, world_size=1
+        )
+    return dist.group.WORLD
+
+
+@pytest.mark.parametrize("nvfp4", [True, False], ids=["nvfp4", "mxfp8"])
+def test_mega_moe_matches_reference(nvfp4, single_rank_group):
+    g = torch.Generator(device="cuda").manual_seed(3)
+    w13, s13, ref13 = _experts(nvfp4, 2 * INTERMEDIATE, HIDDEN, g)
+    w2, s2, ref2 = _experts(nvfp4, HIDDEN, INTERMEDIATE, g)
+    alpha = torch.full((LOCAL,), 1.0 / 64.0, device="cuda") if nvfp4 else None
+    if nvfp4:
+        ref13, ref2 = ref13 * alpha[0], ref2 * alpha[0]
+    up_gate_block16_rows_(w13)
+    up_gate_block16_rows_(s13)
+    moe = Inkling2MegaMoE(
+        w13,
+        swizzle_blockscale(s13),
+        w2,
+        swizzle_blockscale(s2),
+        group=single_rank_group,
+        num_experts=LOCAL,
+        top_k=TOP_K,
+        max_num_tokens_per_rank=64,
+        w13_alpha=alpha,
+        w2_alpha=alpha,
+    )
+    for tokens in (1, 7, 64):
+        x = torch.randn(tokens, HIDDEN, device="cuda", generator=g).bfloat16()
+        ids = torch.stack(
+            [
+                torch.randperm(LOCAL, device="cuda", generator=g)[:TOP_K]
+                for _ in range(tokens)
+            ]
+        )
+        weights = torch.rand(tokens, TOP_K, device="cuda", generator=g)
+        out = moe(x, weights, ids).float()
+        ref = _reference(x, ref13, ref2, weights, ids, offset=0)
+        swapped = _reference(x, ref13, ref2, weights, ids, swap_gate_up=True, offset=0)
         rel = ((out - ref).norm() / ref.norm()).item()
         control = ((out - swapped).norm() / swapped.norm()).item()
         bound = 0.25 if nvfp4 else 0.08
