@@ -12,7 +12,7 @@ chmod +x "${binary}" 2>/dev/null || true
 if ! "${binary}" --help >/dev/null 2>&1; then
     rm -f "${binary}"
     bash "${workspace}/scripts/ci/utils/install_rustup.sh"
-    bash "${workspace}/scripts/ci/utils/build_sgl_router.sh" "${workspace}/sgl-router-bin"
+    bash "${workspace}/sgl-router/scripts/build.sh" "${binary}"
     "${binary}" --help >/dev/null
 fi
 echo "SGLANG_TEST_PD_ROUTER_BINARY=${binary}" >> "${GITHUB_ENV}"

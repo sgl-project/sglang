@@ -2913,10 +2913,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     and staging_buffer is not None
                 ):
                     staging_strategy = self._try_create_staging_strategy(staging_buffer)
-                reqs_to_be_processed = (
-                    self.transfer_infos[kv_chunk.room].values()
-                    if kv_chunk.room in self.transfer_infos
-                    else []
+                reqs_to_be_processed = list(
+                    self.transfer_infos.get(kv_chunk.room, {}).values()
                 )
                 polls = []
                 dst_ranks_infos = []
@@ -3176,6 +3174,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 else 0
                             )
                             if ret != 0:
+                                with self.session_lock:
+                                    self.session_failures[req.mooncake_session_id] += 1
+                                    self.failed_sessions.add(req.mooncake_session_id)
+                                    logger.error(
+                                        f"Session {req.mooncake_session_id} failed."
+                                    )
                                 # The aux write targets decode's metadata
                                 # slot, which the deferred release also frees.
                                 self._poison_unsettled_send(req.room)

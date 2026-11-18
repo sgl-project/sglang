@@ -10,8 +10,9 @@
 //   Prefill / Decode  -> "W4A8 1P1D 32P IN16K OUT1K 50ms" (4 A3 nodes, 2 per role).
 // Transcribed from the 2026-10-15 revision of that page (CANN 9.1.0 update, #44432).
 // Deviations from the best-practice scripts, all forced by current main:
-//   - --disable-cuda-graph -> --cuda-graph-backend-{decode,prefill} disabled,
-//     --moe-dense-tp -> --moe-dense-tp-size (deprecated / abbreviated spellings).
+//   - --disable-decode-cuda-graph --disable-prefill-cuda-graph ->
+//     --cuda-graph-backend-{decode,prefill} disabled, and the abbreviated
+//     --moe-dense-tp -> --moe-dense-tp-size.
 //   - SGLANG_ENABLE_SPEC_V2 and SGLANG_SPEC_ENABLE_OVERLAP_REFLOW are dropped:
 //     main no longer reads either (spec decoding always runs the V2 worker).
 //   - --served-model-name glm-5 is dropped so requests use the checkpoint name.
@@ -75,12 +76,9 @@ export const config = {
   --seed 1 --flush-cache`,
   },
 
-  // Pinned CANN 9.1.0 release image for Atlas 800I A3. v0.5.22 is the first
-  // release that carries both features these recipes need: NPU prefill CP
-  // (#39427) and --attn-dp-size (#41818). The rolling main-cann9.1.0-a3 tag
-  // works too but moves; re-pin here if a verification run uses another build.
+  // Daily build for Atlas 800I A3.
   dockerImages: {
-    a3: "quay.io/ascend/sglang:v0.5.22-cann9.1.0-a3",
+    a3: "quay.io/ascend/sglang:main-cann9.1.0-a3",
   },
 
   // This page renders the deployment matrix only; the GPU Playground is not wired up here.
