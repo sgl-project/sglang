@@ -4,11 +4,13 @@ parsing, chunk-partition alignment, prompt formatting, vision-only position
 ids, and registry wiring."""
 
 import copy
+import functools
 import json
 import os
 import tempfile
 import threading
 import unittest
+from concurrent.futures import Future
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
@@ -124,6 +126,23 @@ MANIFEST = parse_cosmos_dreams_manifest(TRANSFER_ARTIFACT)
 
 def _artifact() -> dict:
     return copy.deepcopy(TRANSFER_ARTIFACT)
+
+
+def _fails_if_hung(test):
+    @functools.wraps(test)
+    def bounded(self):
+        outcome = Future()
+
+        def run():
+            try:
+                outcome.set_result(test(self))
+            except BaseException as exc:
+                outcome.set_exception(exc)
+
+        threading.Thread(target=run, daemon=True).start()
+        outcome.result(timeout=60)
+
+    return bounded
 
 
 class _FakeTokenizer:
@@ -362,6 +381,7 @@ class TestTransferFramesAndHistory(unittest.TestCase):
         with self.assertRaises(ValueError):
             synthetic_control_frames(num_frames=0, height=480, width=832)
 
+    @_fails_if_hung
     def test_control_frames_stay_readable_while_the_clip_decodes_and_grows(self):
         """A reader gets a frame as soon as it is final, well before the clip
         ends, and the frames it holds survive the buffer growing behind them."""
@@ -390,6 +410,7 @@ class TestTransferFramesAndHistory(unittest.TestCase):
         self.assertTrue(torch.equal(early, expected[:, :3]))
         self.assertTrue(torch.equal(decode.frames(0, 7), expected))
 
+    @_fails_if_hung
     def test_decode_failure_reaches_the_reader(self):
         def frames(path, max_frames):
             yield torch.zeros((4, 6, 3), dtype=torch.uint8).numpy()
@@ -413,6 +434,7 @@ class TestTransferFramesAndHistory(unittest.TestCase):
         vae.use_feature_cache = False
         self.assertFalse(can_encode_while_decoding(vae))
 
+    @_fails_if_hung
     def test_encode_of_a_decoding_clip_matches_the_finished_clip(self):
         """Encoding a clip group by group as it decodes gives the latent of the
         finished clip, covers exactly the frames the rollout uses, and fitting
