@@ -14,7 +14,7 @@ import os
 import tempfile
 import threading
 import unittest
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
@@ -2165,6 +2165,46 @@ class TestInputLoading(unittest.TestCase):
             self.assertEqual(second_released_by_third, [True])
             control.result()
         self.assertEqual(started, ["a.mp4", "b.mp4", "c.mp4"])
+
+    def test_closing_a_rig_skips_the_loads_that_have_not_started(self):
+        views = [
+            MultiviewViewInput(camera_key=path, control=path, vision=None, prompt="x")
+            for path in ("a.mp4", "b.mp4")
+        ]
+        stage = _stage(
+            Cosmos3MultiviewInputStage,
+            parse_multiview_deployment_config(_transformer_config()),
+        )
+        started = []
+        first_started = threading.Event()
+        release_first = threading.Event()
+
+        def decode(path, max_frames=None):
+            started.append(path)
+            first_started.set()
+            release_first.wait(timeout=10)
+            return iter(np.zeros((2, 4, 6, 3), dtype=np.uint8)[:max_frames])
+
+        with (
+            mock.patch.object(multiview_stage, "iter_video_frames", decode),
+            torch.inference_mode(),
+        ):
+            control, _ = stage._start_pixel_loads(
+                views,
+                height=4,
+                width=6,
+                num_frames=2,
+                vision_keep_first=False,
+                completion=False,
+            )
+            try:
+                self.assertTrue(first_started.wait(timeout=10))
+                control.close()
+            finally:
+                release_first.set()
+            with self.assertRaises(CancelledError):
+                control.result()
+        self.assertEqual(started, ["a.mp4"])
 
     def test_anchor_encode_reads_only_the_frames_its_latents_depend_on(self):
         vae = _tiny_wan_vae(load_decoder=False)

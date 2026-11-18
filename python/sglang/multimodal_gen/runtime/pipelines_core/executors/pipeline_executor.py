@@ -25,7 +25,11 @@ from sglang.multimodal_gen.runtime.managers.request_cancel import raise_if_cance
 from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
     RequestCancelledError,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+    OutputBatch,
+    Req,
+    close_request_resources,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -107,6 +111,9 @@ class PipelineExecutor(ABC):
                 refresh=self._is_warmup_payload(payload),
             ):
                 yield
+        except BaseException:
+            close_request_resources(requests)
+            raise
         finally:
             self.finish_component_residency_request()
 

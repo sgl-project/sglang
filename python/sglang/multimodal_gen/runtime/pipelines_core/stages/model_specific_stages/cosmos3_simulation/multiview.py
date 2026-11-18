@@ -19,7 +19,7 @@ import math
 import os
 import threading
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from itertools import chain, islice
 from typing import Any
@@ -67,6 +67,7 @@ from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fas
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
+    RequestResource,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -430,6 +431,7 @@ class CameraLoadGate:
         self._next = 0
         self._running = 0
         self._limit = 1
+        self._cancelled = False
 
     def ticket(self) -> int:
         # Tickets are issued from one thread, so this needs no lock.
@@ -441,8 +443,13 @@ class CameraLoadGate:
     def turn(self, ticket: int) -> Iterator[None]:
         with self._changed:
             self._changed.wait_for(
-                lambda: ticket == self._next and self._running < self._limit
+                lambda: (
+                    self._cancelled
+                    or (ticket == self._next and self._running < self._limit)
+                )
             )
+            if self._cancelled:
+                raise CancelledError
             self._next += 1
             self._running += 1
             self._changed.notify_all()
@@ -461,8 +468,13 @@ class CameraLoadGate:
             self._limit += 1
             self._changed.notify_all()
 
+    def cancel(self) -> None:
+        with self._changed:
+            self._cancelled = True
+            self._changed.notify_all()
 
-class PendingCameraMajorPixels:
+
+class PendingCameraMajorPixels(RequestResource):
     """A camera-major ``uint8 [1, 3, V*F, H, W]`` rig whose cameras are still loading.
 
     A failed load is raised by the call that waits for its camera.
@@ -498,6 +510,10 @@ class PendingCameraMajorPixels:
         for load in self._loads:
             load.result()
         return self._rig
+
+    def close(self) -> None:
+        """Skip the camera loads that have not started. One already running finishes."""
+        self._gate.cancel()
 
 
 def _is_camera_major_pixels(value: Any) -> bool:

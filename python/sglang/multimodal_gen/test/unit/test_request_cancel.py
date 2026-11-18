@@ -52,6 +52,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation import (
+    control_clip,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -323,19 +326,36 @@ def test_executor_cancellation_skips_later_stages_and_unwinds(
     cancel_state, terminal, grouped
 ):
     executor, args = _checkpoint_executor(SyncExecutor)
-    requests = [_req()]
+    requests = [_req(), _req()] if grouped else [_req()]
     payload = requests if grouped else requests[0]
     stages = [_Stage()] if terminal else [_Stage(), _Stage()]
     executed = []
+    reader_closed = threading.Event()
+
+    def frames(path, max_frames):
+        try:
+            while True:
+                yield torch.zeros((1, 1, 3), dtype=torch.uint8).numpy()
+        finally:
+            reader_closed.set()
+
+    with patch.object(control_clip, "iter_video_frames", frames):
+        decode = control_clip.ControlClipDecode("clip.mp4", max_frames=1 << 20)
+        decode.wait(1)
 
     def run_stage(stage, batch):
         executed.append(stage)
+        requests[-1].extra["control_decode"] = decode
         cancel_state("job")
         # the terminal stage need not return Req: keep the original cancel identity
         return OutputBatch() if terminal else batch
 
-    with pytest.raises(RequestCancelledError):
-        executor._run_profile_all_stages(stages, payload, args, run_stage)
+    try:
+        with pytest.raises(RequestCancelledError):
+            executor._run_profile_all_stages(stages, payload, args, run_stage)
+        assert reader_closed.is_set()
+    finally:
+        decode.close()
     assert executed == stages[:1]
     executor.component_residency_manager.end_stage.assert_called_once()
     executor.component_residency_manager.finish_request.assert_called_once()

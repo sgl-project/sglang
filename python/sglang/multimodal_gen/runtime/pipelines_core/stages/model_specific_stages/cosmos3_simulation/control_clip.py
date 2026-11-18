@@ -10,6 +10,7 @@ from contextlib import closing
 
 import torch
 
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import RequestResource
 from sglang.multimodal_gen.runtime.utils.vision import (
     iter_video_frames,
     rgb_hwc_uint8,
@@ -21,7 +22,7 @@ from sglang.multimodal_gen.runtime.utils.vision import (
 INITIAL_BUFFER_BYTES = 1 << 30
 
 
-class ControlClipDecode:
+class ControlClipDecode(RequestResource):
     """A control clip decoding on a thread into one ``uint8 [T, H, W, 3]`` buffer.
 
     Frames become final in order, and ``frames`` may read any frame that ``wait``
