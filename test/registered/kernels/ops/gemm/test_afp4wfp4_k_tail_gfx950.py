@@ -1,15 +1,16 @@
-"""Quark W4A4 MXFP4 dense GEMM on gfx950 when K is not a whole number of AITER's BLOCK_SIZE_K:
+"""aiter's MXFP4 dense GEMM on gfx950 when K is not a whole number of AITER's BLOCK_SIZE_K:
 outputs must match a dequantized reference whatever the previous kernel left in LDS."""
 
 import unittest
 
 import torch
 
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.kernels.arch import current_arch
+from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=30, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=30, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 # Untuned at ROCm/aiter@285579b62, so DEFAULT.json picks BLOCK_SIZE_K=1024 for 8 < M <= 32;
 # an M that is a multiple of 16 takes the stale-LDS path. No power of two >= 128 divides K=2880,
@@ -43,7 +44,14 @@ def _make_lds_fill():
     return lds_fill
 
 
-@unittest.skipUnless(is_hip() and is_gfx95_supported(), "gfx950 MXFP4 GEMM")
+def _is_gfx950() -> bool:
+    if not (is_hip() and torch.cuda.is_available()):
+        return False
+    hip = current_arch().hip
+    return hip is not None and hip.gcn_arch == "gfx950"
+
+
+@unittest.skipUnless(_is_gfx950(), "gfx950 MXFP4 GEMM")
 class TestQuarkAfp4wfp4KTail(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -73,25 +81,25 @@ class TestQuarkAfp4wfp4KTail(CustomTestCase):
         cls.lds_fill = staticmethod(_make_lds_fill())
 
     def _assert_matches_reference(self):
-        from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
-            _afp4wfp4_k_tail_in_unfilled_stage,
-            _aiter_afp4wfp4_get_config,
-            gemm_afp4wfp4,
+        from sglang.kernels.ops.gemm.afp4wfp4_k_tail_gfx950 import (
+            _aiter_get_config,
+            gemm_afp4wfp4_k_tail_safe,
+            k_tail_in_unfilled_stage,
         )
 
         for (k, m), (x_q, x_s, w_q, w_s, ref) in self.inputs.items():
             with self.subTest(k=k, m=m):
-                aiter_config, _ = _aiter_afp4wfp4_get_config(m, N, k // 2)
+                aiter_config, _ = _aiter_get_config(m, N, k // 2)
                 # Guard the premise: once AITER tunes this shape off the stale-LDS path, pick another.
                 self.assertTrue(
-                    _afp4wfp4_k_tail_in_unfilled_stage(
+                    k_tail_in_unfilled_stage(
                         aiter_config["BLOCK_SIZE_K"], k, aiter_config["num_stages"]
                     )
                 )
                 y = torch.zeros((m, N), dtype=torch.bfloat16, device="cuda")
                 # 0xFF is a NaN E8M0 scale; a K-tail that reads stale LDS turns it into NaN.
                 self.lds_fill(0xFF)
-                gemm_afp4wfp4(x_q, w_q, x_s, w_s, torch.bfloat16, y)
+                gemm_afp4wfp4_k_tail_safe(x_q, w_q, x_s, w_s, y)
                 err = (y.float() - ref).abs().nan_to_num(float("inf"))
                 self.assertLessEqual(err.max().item(), 0.02 * ref.abs().max().item())
 
