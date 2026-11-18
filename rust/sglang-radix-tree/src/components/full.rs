@@ -263,15 +263,18 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
             return;
         }
         if tree_core.full_evict_host_heap.is_none() {
-            let arena = &tree_core.arena;
-            let strategy = &tree_core.eviction_strategy;
-            tree_core.full_evict_host_heap = Some(
-                tree_core
-                    .evictable_host_leaves
-                    .iter()
-                    .map(|id| Reverse((strategy.get_priority(arena.node(id)), id)))
-                    .collect(),
-            );
+            // Marked (host evict-first) leaves rank ahead of the policy's order.
+            let heap = tree_core
+                .evictable_host_leaves
+                .iter()
+                .map(|id| {
+                    Reverse((
+                        tree_core.host_eviction_priority_(tree_core.arena.node(id)),
+                        id,
+                    ))
+                })
+                .collect();
+            tree_core.full_evict_host_heap = Some(heap);
         }
         while tracker[&ct] < num_tokens {
             let Some(Reverse((_, x))) = tree_core
@@ -283,6 +286,10 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
             };
             if !tree_core.evictable_host_leaves.contains(x) {
                 continue;
+            }
+            if tree_core.is_host_evict_first_(tree_core.arena.node(x)) {
+                let tokens = tree_core.arena.host_value_len(x, FULL);
+                tree_core.note_host_evict_first_eviction_(FULL, tokens);
             }
             tree_core.evict_host_leaf_(x, tracker, device_frees, host_frees, cache_actions);
         }
