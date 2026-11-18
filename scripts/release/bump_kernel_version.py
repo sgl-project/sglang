@@ -23,6 +23,7 @@ def main():
         Path("python/sglang/kernels/aot/pyproject_cpu.toml"),
         Path("python/sglang/kernels/aot/pyproject_rocm.toml"),
         Path("python/sglang/kernels/aot/pyproject_musa.toml"),
+        Path("python/sglang/kernels/aot/pyproject_sail.toml"),
         Path("python/sglang/kernels/aot/python/sgl_kernel/version.py"),
     ]
 

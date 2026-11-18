@@ -1,0 +1,252 @@
+name: Release SGLang SAIL Kernel
+
+# Publishes the SAIL (PPU) sgl-kernel wheel to the sgl-project/whl release page
+# and to the `sail` wheel index, mirroring how release-whl-kernel.yml publishes
+# cuXXX / ROCm / MUSA and release-whl-kernel-xpu.yml publishes XPU:
+#
+#   release:      https://github.com/sgl-project/whl/releases/tag/v<ver>+sail
+#   wheel index:  https://sgl-project.github.io/whl/sail/sglang-kernel/index.html
+#   install:      pip install "sglang-kernel==<ver>+sail" \
+#                     --extra-index-url https://docs.sglang.io/whl/sail/
+#
+# Manual only on purpose: the wheel is built from this SAIL fork, whose
+# python/sgl_kernel/version.py is not bumped by the upstream release bot, so a
+# `push` trigger would either fire on every upstream merge or never.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Version to publish (e.g. 0.4.10); must match python/sglang/kernels/aot/python/sgl_kernel/version.py, which is the default"
+        type: string
+        required: false
+      ref:
+        description: "Git ref to build (branch, tag, SHA, or refs/pull/<n>/head); defaults to the dispatched ref"
+        type: string
+        required: false
+      container_image:
+        description: "PPU build image; must ship a cuda-free SAIL Torch build and PPU_SDK"
+        type: string
+        required: false
+        default: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-hggcrt3-py312-20261005
+      max_jobs:
+        description: "Parallel compilation jobs for the native build"
+        type: number
+        required: false
+        default: 8
+      publish:
+        description: "Publish to sgl-project/whl; uncheck to only build and verify the wheel"
+        type: boolean
+        required: false
+        default: true
+
+concurrency:
+  group: release-sglang-sail-kernel
+  # A cancelled run can leave the release created but the index uncommitted, so
+  # an in-flight publish is allowed to finish instead of being replaced.
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  GIT_CONFIG_NOSYSTEM: "1"
+
+jobs:
+  build-sail:
+    name: build-sail
+    runs-on: ubuntu-24.04
+    # Hosted runners cap a job at 6h; the native kernel build is the long pole.
+    timeout-minutes: 350
+    permissions:
+      contents: read
+    container:
+      image: ${{ inputs.container_image }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      wheel-name: ${{ steps.wheel.outputs.wheel_name }}
+    steps:
+      # build_and_test.sh insists on a private wheel/artifact directory and on
+      # a checkout whose HEAD is PPU_CI_SOURCE_SHA, exactly like pr-test-ppu.
+      - name: Initialize private build directories and Git configuration
+        run: |
+          work="$(mktemp -d "${RUNNER_TEMP}/sail-release.XXXXXX")"
+          touch "$work/gitconfig"
+          mkdir "$work/wheels" "$work/artifacts"
+          {
+            printf 'GIT_CONFIG_GLOBAL=%s\n' "$work/gitconfig"
+            printf 'PPU_CI_WHEEL_DIR=%s\n' "$work/wheels"
+            printf 'PPU_CI_ARTIFACT_DIR=%s\n' "$work/artifacts"
+          } >> "$GITHUB_ENV"
+
+      - name: Checkout the source revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      - name: Pin the source revision
+        run: printf 'PPU_CI_SOURCE_SHA=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Resolve the kernel version
+        id: version
+        env:
+          REQUESTED: ${{ inputs.tag_name }}
+        run: |
+          set -euo pipefail
+          declared=$(cut -d'"' -f2 python/sglang/kernels/aot/python/sgl_kernel/version.py)
+          requested="${REQUESTED#v}"
+          if [[ -n "$requested" && "$requested" != "$declared" ]]; then
+            printf '::error::tag_name=%s does not match python/sglang/kernels/aot/python/sgl_kernel/version.py=%s; bump the kernel version with scripts/release/bump_kernel_version.py instead of overriding the tag\n' \
+              "$requested" "$declared" >&2
+            exit 1
+          fi
+          printf 'version=%s\n' "$declared" >> "$GITHUB_OUTPUT"
+          printf 'Building sglang-kernel %s+sail from %s\n' "$declared" "$(git rev-parse HEAD)"
+
+      # Same recipe pr-test-ppu validates: it builds both wheels from a
+      # `git archive` of the pinned SHA and records the dependency snapshot.
+      - name: Build the native SAIL wheels
+        env:
+          MAX_JOBS: ${{ inputs.max_jobs }}
+          SGL_KERNEL_COMPILE_THREADS: ${{ inputs.max_jobs }}
+        run: bash scripts/ci/ppu/build_and_test.sh build
+
+      # setup_sail.py bakes the `+sail` local version into the wheel, so this
+      # check is also the guard against a pyproject_sail.toml that lags behind
+      # python/sgl_kernel/version.py.
+      - name: Verify the artifact to be published
+        id: wheel
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=("$PPU_CI_WHEEL_DIR"/sglang_kernel-*.whl)
+          if [[ ${#wheels[@]} -ne 1 ]]; then
+            printf '::error::Expected exactly one sglang_kernel wheel, found %d\n' \
+              "${#wheels[@]}" >&2
+            exit 1
+          fi
+          name=$(basename "${wheels[0]}")
+          expected="sglang_kernel-${VERSION}+sail-"
+          if [[ "$name" != "$expected"* ]]; then
+            printf '::error::%s is not a %s* wheel; sync python/sglang/kernels/aot/pyproject_sail.toml with python/sgl_kernel/version.py (scripts/release/bump_kernel_version.py)\n' \
+              "$name" "$expected" >&2
+            exit 1
+          fi
+          printf 'wheel_name=%s\n' "$name" >> "$GITHUB_OUTPUT"
+          ls -lh "$PPU_CI_WHEEL_DIR"
+
+      - name: Upload the SAIL kernel wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: sglang-kernel-sail-${{ steps.version.outputs.version }}
+          path: ${{ env.PPU_CI_WHEEL_DIR }}/sglang_kernel-*.whl
+          if-no-files-found: error
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sail-build-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.PPU_CI_ARTIFACT_DIR }}
+          if-no-files-found: warn
+
+  publish-sail:
+    name: publish-sail
+    needs: build-sail
+    if: needs.build-sail.result == 'success' && inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.build-sail.outputs.version }}
+      WHEEL_NAME: ${{ needs.build-sail.outputs.wheel-name }}
+      RELEASE_TAG: v${{ needs.build-sail.outputs.version }}+sail
+    steps:
+      # Needed for scripts/update_kernel_whl_index.py --sail.
+      - name: Checkout the source revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Download the SAIL kernel wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: sglang-kernel-sail-${{ needs.build-sail.outputs.version }}
+          path: python/sglang/kernels/aot/dist/
+
+      # A published wheel must stay immutable: re-running the workflow for an
+      # already published version is a version bump, not an asset overwrite.
+      - name: Refuse to republish an existing asset
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+        run: |
+          set -euo pipefail
+          # Without the token, `gh api` below fails with the same exit code as a
+          # missing release, so fail here instead of half way through the push.
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            printf '::error::GH_PAT_FOR_WHL_RELEASE is not configured for this repository\n' >&2
+            exit 1
+          fi
+          ls -lh python/sglang/kernels/aot/dist/
+          if [[ ! -f "python/sglang/kernels/aot/dist/${WHEEL_NAME}" ]]; then
+            printf '::error::%s is missing from the downloaded artifact\n' "$WHEEL_NAME" >&2
+            exit 1
+          fi
+          if gh api "repos/sgl-project/whl/releases/tags/${RELEASE_TAG}" \
+            > "$RUNNER_TEMP/release.json" 2>/dev/null; then
+            if jq -e --arg name "$WHEEL_NAME" 'any(.assets[]; .name == $name)' \
+              "$RUNNER_TEMP/release.json" > /dev/null; then
+              printf '::error::Release %s already carries %s; bump the kernel version instead of overwriting it\n' \
+                "$RELEASE_TAG" "$WHEEL_NAME" >&2
+              exit 1
+            fi
+            printf 'Release %s exists without %s; adding the asset to it\n' \
+              "$RELEASE_TAG" "$WHEEL_NAME"
+          fi
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          repository: sgl-project/whl
+          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+          fail_on_unmatched_files: true
+          files: |
+            python/sglang/kernels/aot/dist/sglang_kernel-*.whl
+
+      - name: Clone wheel index
+        run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
+        env:
+          WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+
+      - name: Update wheel index
+        run: python3 scripts/update_kernel_whl_index.py --sail
+
+      - name: Push wheel index
+        run: |
+          set -euo pipefail
+          cd sgl-whl
+          git config --local user.name "sglang-bot"
+          git config --local user.email "sglangbot@gmail.com"
+          git add -A
+          if git diff --cached --quiet; then
+            printf 'Wheel index already lists %s\n' "$WHEEL_NAME"
+          else
+            git commit -m "update whl index (sail ${VERSION})"
+            git push
+          fi
+
+      - name: Summarize the release
+        run: |
+          {
+            printf '### sglang-kernel %s+sail\n\n' "$VERSION"
+            printf -- '- wheel: `%s`\n' "$WHEEL_NAME"
+            printf -- '- release: https://github.com/sgl-project/whl/releases/tag/%s\n' "$RELEASE_TAG"
+            printf -- '- index: https://sgl-project.github.io/whl/sail/sglang-kernel/index.html\n'
+            printf -- '- install: `pip install %s --extra-index-url https://docs.sglang.io/whl/sail/`\n' \
+              "sglang-kernel==${VERSION}+sail"
+          } >> "$GITHUB_STEP_SUMMARY"
