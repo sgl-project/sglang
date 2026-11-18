@@ -1468,7 +1468,7 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
             mamba_track_grid(batch.tree_cache.page_size),
             max_speculative_num_draft_tokens(),
         )
-    if batch.spec_algorithm.is_dflash_family():
+    if batch.spec_algorithm.uses_block_verify():
         batch.spec_info.prepare_for_decode(batch)
     elif batch.spec_algorithm.is_uno():
         from sglang.srt.speculative.uno_info import UnoDraftInput

@@ -215,6 +215,7 @@ def is_deepseek_dsa(config) -> bool:
             "Dots3NoteForCausalLMNextN",
             "HYV4ForCausalLM",
             "HYV4ForCausalLMNextN",
+            "HYV4FlashForConditionalGeneration",
             "Ernie5_5_MoeForCausalLM",
             "Ernie5_5_MoeForCausalLMNextN",
         )
@@ -1548,6 +1549,7 @@ class ModelConfig:
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "HYV4ForCausalLM" in self.hf_config.architectures
             or "HYV4ForCausalLMNextN" in self.hf_config.architectures
+            or "HYV4FlashForConditionalGeneration" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
             or "Dots3NoteForCausalLM" in self.hf_config.architectures
             or "Dots3NoteForCausalLMNextN" in self.hf_config.architectures
@@ -2599,6 +2601,7 @@ multimodal_model_archs = [
     "GlmOcrForConditionalGeneration",
     "GlmAsrForConditionalGeneration",
     "GlmImageForConditionalGeneration",
+    "HYV4FlashForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "LlavaLlamaForCausalLM",

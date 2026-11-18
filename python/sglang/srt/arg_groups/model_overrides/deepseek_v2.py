@@ -53,6 +53,7 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
     "Glm5NextForConditionalGeneration",
     "HYV4ForCausalLM",
     "HYV4ForCausalLMNextN",
+    "HYV4FlashForConditionalGeneration",
     "LongcatFlashForCausalLM",
     "LongcatFlashForCausalLMNextN",
     "Dots3NoteForCausalLM",
@@ -70,7 +71,11 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     )
 
     model_arch = (getattr(hf_config, "architectures", None) or [None])[0]
-    if model_arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN"):
+    if model_arch in (
+        "HYV4ForCausalLM",
+        "HYV4ForCausalLMNextN",
+        "HYV4FlashForConditionalGeneration",
+    ):
         if cfg.enable_prefill_cp:
             raise ValueError(
                 "--enable-prefill-cp is not supported for HYV4 because its "

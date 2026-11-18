@@ -3507,8 +3507,12 @@ class Scheduler(
             )
             return
 
-        if self.spec_algorithm.is_dflash_family():
-            error_msg = validate_dflash_request(req, self.enable_overlap)
+        if self.spec_algorithm.uses_block_verify():
+            error_msg = validate_dflash_request(
+                req,
+                self.enable_overlap,
+                supports_grammar=not self.spec_algorithm.is_dfly(),
+            )
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
