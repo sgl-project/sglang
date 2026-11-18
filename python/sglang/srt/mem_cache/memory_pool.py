@@ -1546,7 +1546,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
         from sglang.srt.layers.communication import kda_tp
 
-        if kda_tp.state_shard_width() > 1:
+        if kda_tp.enabled():
             # KDA TP: global slot ids; this DP rank allocates its 1/W of them.
             first_slot, per_rank = kda_tp.slot_partition(mamba_size)
             self.mamba_allocator = MambaSlotAllocator(

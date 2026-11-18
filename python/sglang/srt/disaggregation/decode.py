@@ -381,7 +381,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         from sglang.srt.layers.communication.kda_tp.staging import KdaTpStaging
 
         # KDA TP: a head-sharded pool holds every DP rank's slots and verify rows.
-        kda_tp_width = kda_tp.state_shard_width()
+        kda_tp_width = kda_tp.width()
         # Lazy slots: requests in their handoff hold staging slots, not state slots.
         handoff = (
             0 if kda_tp.lazy_mamba_slot(enable_mamba_extra_buffer) else pre_alloc_size
@@ -440,7 +440,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
 def _kda_tp_pd_staging(req_to_token_pool):
     from sglang.srt.layers.communication import kda_tp
 
-    if kda_tp.state_shard_width() <= 1:
+    if not kda_tp.enabled():
         return None
     return req_to_token_pool.mamba_pool.pd_staging
 

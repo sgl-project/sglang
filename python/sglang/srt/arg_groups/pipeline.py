@@ -326,7 +326,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_a2a_moe, server_args)
     run_hook(handle_shared_experts_tp, server_args)
     run_hook(handle_kda_dwdp, server_args)
-    run_hook(handle_kda_tp, server_args)
     run_hook(handle_eplb_and_dispatch, server_args)
     run_hook(handle_expert_distribution_metrics, server_args)
     run_hook(handle_elastic_ep, server_args)
@@ -405,5 +404,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Validate after all batch-size declarations are visible.
     run_hook(validate_deepep_v2_speculative_draft, server_args)
     run_hook(validate_deepep_v2_dispatch_token_budget, server_args)
+
+    # Validation only; needs the final cache, graph and speculative settings.
+    run_hook(handle_kda_tp, server_args)
 
     server_args._resolution_finished = True

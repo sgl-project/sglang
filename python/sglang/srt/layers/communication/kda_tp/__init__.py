@@ -21,114 +21,13 @@ from sglang.srt.runtime_context import get_flags, get_parallel
 logger = logging.getLogger(__name__)
 
 
-def _is_kimi_k3() -> bool:
-    from sglang.srt.configs.model_config import is_kimi_k3
-    from sglang.srt.runtime_context import process_model_config
-
-    return is_kimi_k3(process_model_config().hf_config)
-
-
-def _applies() -> bool:
-    return get_flags().dp.kda_tp and _is_kimi_k3()
-
-
 def enabled() -> bool:
-    if not _applies():
-        return False
-    _check_supported()
-    return True
-
-
-def _check_supported() -> None:
-    # Every collective here must run on every DP rank.
-    from sglang.srt.model_executor.cuda_graph_config import (
-        Backend,
-        Phase,
-        check_cuda_graph_backend,
-    )
-    from sglang.srt.runtime_context import get_disagg, get_exec, get_memory
-
-    mamba = get_exec().mamba
-    mem = get_memory()
-    disagg = get_disagg()
-    problems = []
-    if mamba.enable_linear_replayssm_spec or mamba.enable_linear_replayssm:
-        problems.append("ReplaySSM rings (per-slot cursors)")
-    if mem.enable_hierarchical_cache:
-        problems.append("HiCache (host copies of rank-local head shards)")
-    if mem.enable_unified_memory:
-        problems.append("--enable-unified-memory (state slots are global ids)")
-    if disagg.disaggregation_mode != "decode":
-        problems.append(
-            f"disaggregation mode {disagg.disaggregation_mode!r}: KDA TP serves the PD "
-            "decode role only (a PD prefill would send head shards)"
-        )
-    if (
-        disagg.disaggregation_mode == "decode"
-        and envs.SGLANG_K3_KDA_TP_LATE_STAGE.get()
-        and disagg.disaggregation_transfer_backend != "nixl"
-    ):
-        problems.append(
-            "SGLANG_K3_KDA_TP_LATE_STAGE with transfer backend "
-            f"{disagg.disaggregation_transfer_backend} (the stage negotiation is "
-            "implemented for nixl)"
-        )
-    if (
-        disagg.disaggregation_mode == "decode"
-        and disagg.disaggregation_decode_enable_radix_cache
-    ):
-        problems.append(
-            "the PD decode radix cache (rank-local state copies on prefix match)"
-        )
-    if not mem.disable_radix_cache and not mamba.enable_mamba_extra_buffer:
-        problems.append(
-            "the no_buffer mamba radix strategy (eager slot copies on insert)"
-        )
-    if check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
-        problems.append(
-            "breakable prefill CUDA graphs (replay skips the per-forward KDA TP "
-            "metadata exchange)"
-        )
-    from sglang.srt.runtime_context import get_spec
-
-    algo = get_spec().speculative_algorithm
-    if algo is not None and str(algo).upper().split(".")[-1] not in (
-        "EAGLE",
-        "EAGLE3",
-        "NEXTN",
-    ):
-        problems.append(
-            f"speculative algorithm {algo} (its verify state commit is not the "
-            "collective one)"
-        )
-    topk = get_spec().speculative_eagle_topk
-    if topk not in (None, 1):
-        problems.append(
-            f"--speculative-eagle-topk {topk} (the gathered verify metadata keeps each "
-            "rank's own draft-tree fields)"
-        )
-    if envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get():
-        problems.append(
-            "SGLANG_SCHEDULER_SKIP_ALL_GATHER (the state imports and forward kinds "
-            "come from the scheduler's DP all-gather)"
-        )
-    if envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get():
-        problems.append(
-            "SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH (the state commit is a "
-            "collective that idle DP ranks must join)"
-        )
-    if problems:
-        raise NotImplementedError(
-            "--enable-kda-tp does not support: " + "; ".join(problems) + "."
-        )
-
-
-def state_shard_width() -> int:
-    return get_parallel().tp_size if _applies() else 1
+    return get_flags().dp.kda_tp
 
 
 def width() -> int:
-    return get_parallel().tp_size
+    """KDA heads and state are sharded this many ways (1 without --enable-kda-tp)."""
+    return get_parallel().tp_size if enabled() else 1
 
 
 def group():
@@ -271,14 +170,14 @@ def _static(name: str, numel: int, dtype: torch.dtype) -> torch.Tensor:
 def lazy_mamba_slot(enable_mamba_extra_buffer: bool) -> bool:
     # Not with ping-pong tracking slots, which are allocated with the main slot.
     return (
-        state_shard_width() > 1
+        enabled()
         and not enable_mamba_extra_buffer
         and envs.SGLANG_K3_KDA_TP_LAZY_MAMBA_SLOT.get()
     )
 
 
 def late_stage() -> bool:
-    return state_shard_width() > 1 and envs.SGLANG_K3_KDA_TP_LATE_STAGE.get()
+    return enabled() and envs.SGLANG_K3_KDA_TP_LATE_STAGE.get()
 
 
 # State destination a late-staged request advertises until its stage is bound.

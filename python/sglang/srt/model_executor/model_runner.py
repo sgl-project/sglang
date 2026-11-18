@@ -691,7 +691,7 @@ class ModelRunner:
     ):
         from sglang.srt.layers.communication import kda_tp
 
-        if kda_tp.state_shard_width() > 1 and built_megakernel(self.model) is not None:
+        if kda_tp.enabled() and built_megakernel(self.model) is not None:
             # Lazy-slot admission and the state mirrors bypass the megakernel's resets and commit.
             raise NotImplementedError(
                 "--enable-kda-tp does not support an installed megakernel"
@@ -2053,7 +2053,7 @@ class ModelRunner:
                 mirror_deferred_state_ops,
             )
 
-            if kda_tp.state_shard_width() > 1:
+            if kda_tp.enabled():
                 # Head-sharded KDA state: every rank applies every DP rank's ops.
                 mirror_deferred_state_ops(self, forward_batch)
                 return

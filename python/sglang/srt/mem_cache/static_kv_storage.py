@@ -729,7 +729,7 @@ class StaticKVStorage:
             from sglang.srt.layers.communication import kda_tp
 
             capacity = allocator.state.pool.size
-            if kda_tp.state_shard_width() > 1:
+            if kda_tp.enabled():
                 from sglang.srt.mem_cache.allocator.mamba import mamba_slot_capacity
 
                 # KDA TP: this DP rank allocates only its range of the shared pool.

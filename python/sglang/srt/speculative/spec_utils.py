@@ -1246,7 +1246,7 @@ def commit_mamba_states_after_verify(
     from sglang.srt.layers.communication import kda_tp
     from sglang.srt.layers.communication.kda_tp.staging import commit_after_verify
 
-    if kda_tp.state_shard_width() > 1:
+    if kda_tp.enabled():
         # Head-sharded KDA state: a collective that idle ranks join with no requests.
         last_correct_step_indices = mamba_steps_to_track = None
         if not batch.forward_mode.is_idle() and accept_index.numel() > 0:

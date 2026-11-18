@@ -543,10 +543,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # Per-request row index into the speculative `intermediate_ssm` scratch,
         # used by the MTP / target_verify path (mirrors GDNAttnBackend). Sized
         # past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
-        from sglang.srt.layers.communication.kda_tp import state_shard_width
+        from sglang.srt.layers.communication import kda_tp
 
         # --enable-kda-tp: a verify covers every DP rank's requests.
-        self._kda_tp_width = state_shard_width()
+        self._kda_tp_width = kda_tp.width()
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(
                 self.req_to_token_pool.size * self._kda_tp_width,

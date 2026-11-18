@@ -295,7 +295,7 @@ def retraction_needs_rebootstrap(
     return (
         isinstance(token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator)
         or isinstance(token_to_kv_pool_allocator.get_kvcache(), DeepSeekV4TokenToKVPool)
-        or kda_tp.state_shard_width() > 1
+        or kda_tp.enabled()
     )
 
 

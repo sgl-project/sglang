@@ -215,11 +215,11 @@ class KimiLinearConfig(PretrainedConfig):
     @property
     def mamba2_cache_params(self) -> KimiLinearCacheParams:
 
-        from sglang.srt.layers.communication.kda_tp import state_shard_width
+        from sglang.srt.layers.communication import kda_tp
 
         # --enable-kda-tp: head-sharded over the TP group, across DP ranks.
         shape = KimiLinearStateShape.create(
-            tp_world_size=linear_attn_tp_size() * state_shard_width(),
+            tp_world_size=linear_attn_tp_size() * kda_tp.width(),
             num_heads=self.linear_attn_config["num_heads"],
             head_dim=self.linear_attn_config["head_dim"],
             conv_kernel_size=self.linear_attn_config["short_conv_kernel_size"],

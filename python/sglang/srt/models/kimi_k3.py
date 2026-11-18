@@ -3535,8 +3535,6 @@ class KimiK3LinearModel(nn.Module):
         else:
             self.norm = PPMissingLayer()
         self._kda_tp = kda_tp.enabled()
-        if self._kda_tp and self.pp_group.world_size > 1:
-            raise ValueError("--enable-kda-tp does not support pipeline parallelism")
         if self._kda_tp:
             # Collective workspace request: every rank, before graph capture.
             k3_sp_collective.tp_group_state()

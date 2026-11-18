@@ -11,6 +11,7 @@ from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
     resolve_cp_tp_group_sharing,
 )
 from sglang.srt.arg_groups.model_override_base import (
+    mamba_extra_buffer_of,
     model_config_of,
     resolved_view,
     resolving_view,
@@ -366,6 +367,73 @@ def handle_kda_tp(server_args: Any):
         raise ValueError(
             "--enable-kda-tp is only supported for Kimi-K3 "
             f"(got {hf_config.architectures[0]})."
+        )
+    _check_kda_tp_supported(cfg)
+
+
+def _check_kda_tp_supported(cfg) -> None:
+    # Every KDA TP collective must run on every DP rank.
+    problems = []
+    if cfg.enable_linear_replayssm_spec or cfg.enable_linear_replayssm:
+        problems.append("ReplaySSM rings (per-slot cursors)")
+    if cfg.enable_hierarchical_cache:
+        problems.append("HiCache (host copies of rank-local head shards)")
+    if cfg.enable_unified_memory:
+        problems.append("--enable-unified-memory (state slots are global ids)")
+    if (
+        envs.SGLANG_K3_KDA_TP_LATE_STAGE.get()
+        and cfg.disaggregation_transfer_backend != "nixl"
+    ):
+        problems.append(
+            "SGLANG_K3_KDA_TP_LATE_STAGE with transfer backend "
+            f"{cfg.disaggregation_transfer_backend} (the stage negotiation is "
+            "implemented for nixl)"
+        )
+    if cfg.disaggregation_decode_enable_radix_cache:
+        problems.append(
+            "the PD decode radix cache (rank-local state copies on prefix match)"
+        )
+    if not cfg.disable_radix_cache and not mamba_extra_buffer_of(cfg):
+        problems.append(
+            "the no_buffer mamba radix strategy (eager slot copies on insert)"
+        )
+    if (
+        cfg.cuda_graph_config is not None
+        and cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+    ):
+        problems.append(
+            "breakable prefill CUDA graphs (replay skips the per-forward KDA TP "
+            "metadata exchange)"
+        )
+    algo = cfg.speculative_algorithm
+    if algo is not None and str(algo).upper().split(".")[-1] not in (
+        "EAGLE",
+        "EAGLE3",
+        "NEXTN",
+    ):
+        problems.append(
+            f"speculative algorithm {algo} (its verify state commit is not the "
+            "collective one)"
+        )
+    topk = cfg.speculative_eagle_topk
+    if topk not in (None, 1):
+        problems.append(
+            f"--speculative-eagle-topk {topk} (the gathered verify metadata keeps each "
+            "rank's own draft-tree fields)"
+        )
+    if envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get():
+        problems.append(
+            "SGLANG_SCHEDULER_SKIP_ALL_GATHER (the state imports and forward kinds "
+            "come from the scheduler's DP all-gather)"
+        )
+    if envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get():
+        problems.append(
+            "SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH (the state commit is a "
+            "collective that idle DP ranks must join)"
+        )
+    if problems:
+        raise ValueError(
+            "--enable-kda-tp does not support: " + "; ".join(problems) + "."
         )
 
 
