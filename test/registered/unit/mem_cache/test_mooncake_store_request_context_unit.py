@@ -14,6 +14,8 @@ Usage:
 import unittest
 from types import SimpleNamespace
 
+import numpy as np
+
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolName,
@@ -609,6 +611,18 @@ class TestMooncakeStoreReceiptValidation(unittest.TestCase):
         # One requested length per receipt, always.
         with self.assertRaises(ValueError):
             validate_receipts([4096, 4096], [4096])
+        # Integral numpy counts pass, while bool and string inputs fail closed.
+        self.assertEqual(
+            validate_receipts(
+                [np.int64(4096), np.int64(8192)],
+                [np.int64(4096), [np.int64(4096), np.int64(4096)]],
+            ),
+            [True, True],
+        )
+        self.assertEqual(
+            validate_receipts([True, 1, 16, 16], [1, True, "16", [True, 15]]),
+            [False, False, False, False],
+        )
 
     def test_f1_all_keys_short_read_group_miss_without_exception(self):
         # Every page half served: positive receipts, wrong byte counts.

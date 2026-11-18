@@ -2,6 +2,7 @@ import contextlib
 import ctypes
 import json
 import logging
+import numbers
 import os
 import time
 import uuid
@@ -38,6 +39,10 @@ DEFAULT_TENANT_ID = "default"
 logger = logging.getLogger(__name__)
 
 
+def _is_non_bool_integral(value: Any) -> bool:
+    return isinstance(value, numbers.Integral) and not isinstance(value, bool)
+
+
 def validate_receipts(receipts: List[int], requested_lengths: List[Any]) -> List[bool]:
     """Validate per-key byte receipts of zero-copy get transfers, fail-closed.
 
@@ -56,11 +61,21 @@ def validate_receipts(receipts: List[int], requested_lengths: List[Any]) -> List
         )
     validated = []
     for receipt, requested in zip(receipts, requested_lengths):
-        if isinstance(requested, Sequence):
-            expected = sum(requested)
+        if isinstance(requested, Sequence) and not isinstance(requested, (str, bytes)):
+            if not all(_is_non_bool_integral(part) for part in requested):
+                validated.append(False)
+                continue
+            expected = sum(int(part) for part in requested)
+        elif _is_non_bool_integral(requested):
+            expected = int(requested)
         else:
-            expected = requested
-        validated.append(receipt > 0 and receipt == expected)
+            validated.append(False)
+            continue
+        validated.append(
+            _is_non_bool_integral(receipt)
+            and int(receipt) > 0
+            and int(receipt) == expected
+        )
     return validated
 
 
