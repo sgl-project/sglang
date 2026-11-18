@@ -231,6 +231,31 @@ def test_rollout_request_returns_its_trajectory_and_conditioning(server):
     assert conditioning["encoder_hidden_states"].shape == (3, 5120)
 
 
+def test_returned_latents_are_a_subset_while_steps_stay_indexed_by_step(server):
+    """miles asks back the noisy steps' latents only, then indexes log-probs and debug tensors by step number."""
+    trajectory = _rollout_through_the_stages(
+        server,
+        rollout_sde_step_indices=[1, 2],
+        rollout_return_step_indices=[1, 2, 3],
+        rollout_debug_mode=True,
+    )
+
+    assert trajectory.dit_trajectory.latents.shape == (1, 3, 2, 96)
+    assert trajectory.dit_trajectory.latent_step_indices.tolist() == [1, 2, 3]
+    assert trajectory.rollout_log_probs.shape == (1, 6)
+    debug = trajectory.rollout_debug_tensors
+    assert debug.rollout_model_outputs.shape == (1, 6, 2, 96)
+    assert debug.rollout_noise_std_devs.shape == (1, 6, 1)
+    assert (debug.rollout_noise_std_devs[0, :, 0] != 0).tolist() == [
+        False,
+        True,
+        True,
+        False,
+        False,
+        False,
+    ]
+
+
 def test_rollout_step_noise_is_not_the_initial_noise_again(server):
     """A step generator seeded like the request's replays the initial latent's draw as exploration noise."""
     trajectory = _rollout_through_the_stages(
