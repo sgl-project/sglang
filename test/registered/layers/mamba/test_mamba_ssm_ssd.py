@@ -185,7 +185,9 @@ def generate_continuous_batched_examples(
         dt2, X2, B2, C2 = get_continuous_batch(spec)
 
         # get the metadata
-        cu_seqlens = torch.tensor((0,) + spec, device=device).cumsum(dim=0)
+        cu_seqlens = torch.tensor((0,) + spec, device=device).cumsum(
+            dim=0, dtype=torch.int32
+        )
         seq_idx = torch.zeros(
             cu_seqlens[-1], dtype=torch.int32, device=cu_seqlens.device
         )
