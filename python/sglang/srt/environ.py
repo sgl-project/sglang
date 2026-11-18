@@ -1078,7 +1078,8 @@ class Envs:
     # serving FP8, drop --quantization fp8.
     SGLANG_DISABLE_GFX1250_FP8_GEMM = EnvBool(False)
     # Kill-switch for the gfx115x kernels (Quark int4 W4A16 GEMMs and row pad, target-verify
-    # attention, GDN prefill); each also falls back to the generic path where it does not apply.
+    # attention, GDN prefill, block-FP8 matmul);
+    # each also falls back to the generic path where it does not apply.
     SGLANG_DISABLE_GFX115_KERNELS = EnvBool(False)
     # In-tree rows for aiter's GEMM and fused-MoE tuned tables (utils/aiter_tuned_tables.py)
     # and DeepSeek-V4's in-tree Triton GEMM configs. 0 = use aiter as is.

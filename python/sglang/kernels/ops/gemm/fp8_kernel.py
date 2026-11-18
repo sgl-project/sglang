@@ -15,11 +15,13 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx1250_supported,
     log_info_on_rank0,
+    use_gfx115_kernels,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
 _is_gfx1250 = is_gfx1250_supported()
+_is_gfx115 = use_gfx115_kernels()
 logger = logging.getLogger(__name__)
 
 
@@ -300,7 +302,7 @@ def _w8a8_block_fp8_matmul_gfx1250(
     needs_masking: tl.constexpr,
 ):
     """
-    gfx1250 (RDNA4) block-fp8 matmul.
+    gfx1250 (RDNA4) block-fp8 matmul, also launched on gfx115x (RDNA3.5).
     The shared ``_w8a8_block_fp8_matmul`` is unusable on gfx1250.
       1. fp8 ``tl.dot`` faults at runtime
       2. software pipelining (``num_stages`` > 1) miscompiles and yields NaN.
@@ -433,6 +435,49 @@ def get_w8a8_block_fp8_configs(
         config_file_path,
     )
     return None
+
+
+def _default_block_fp8_config(
+    *, num_rows: int, block_size: List[int]
+) -> Dict[str, int]:
+    # Block-wise quant: BLOCK_SIZE_K must be divisible by block_size[1]
+    config = {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": block_size[0],
+        "BLOCK_SIZE_K": block_size[1],
+        "GROUP_SIZE_M": 32,
+        "num_warps": 4,
+        "num_stages": 3,
+    }
+    if _is_gfx115:
+        # Measured on gfx1151 at Qwen3.8-27B-FP8 shapes, 1 to 64 and 1,024 rows.
+        if num_rows <= 16:
+            tile = {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64}
+        elif num_rows <= 32:
+            tile = {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64}
+        else:
+            tile = {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 32}
+        config.update(tile, GROUP_SIZE_M=1)
+    return config
+
+
+def _select_block_fp8_kernel(
+    config: Dict[str, Any],
+) -> Tuple[Any, Dict[str, Any], bool]:
+    # Returns (kernel, launch config, hopper_tuned).
+    # Split-K accumulates K in SPLIT_K separate fp32 partials, so its results
+    # do not match the single-accumulator kernels bit-for-bit.
+    hopper_tuned = get_platform().is_sm90 and (
+        config.get("SWAP_AB", False) or config.get("SPLIT_K", 1) > 1
+    )
+    if hopper_tuned:
+        return _w8a8_block_fp8_matmul_hopper, config, True
+    if _is_gfx1250 or _is_gfx115:
+        # gfx115x: for speed, on gfx1151 the shared kernel is slower at the same tile.
+        # The upcast decodes the two fp8 NaN codes as +-480.
+        # num_stages > 1 miscompiles on gfx1250 and is not measured on gfx115x.
+        return _w8a8_block_fp8_matmul_gfx1250, {**config, "num_stages": 1}, False
+    return _w8a8_block_fp8_matmul, config, False
 
 
 @functools.lru_cache
@@ -631,29 +676,9 @@ def w8a8_block_fp8_matmul_triton(
                 if key not in ("SPLIT_K", "SWAP_AB")
             }
     else:
-        # Default config
-        # Block-wise quant: BLOCK_SIZE_K must be divisible by block_size[1]
-        config = {
-            "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": block_size[0],
-            "BLOCK_SIZE_K": block_size[1],
-            "GROUP_SIZE_M": 32,
-            "num_warps": 4,
-            "num_stages": 3,
-        }
+        config = _default_block_fp8_config(num_rows=M, block_size=block_size)
 
-    # Split-K accumulates K in SPLIT_K separate fp32 partials, so its results
-    # do not match the single-accumulator kernels bit-for-bit.
-    hopper_tuned = get_platform().is_sm90 and (
-        config.get("SWAP_AB", False) or config.get("SPLIT_K", 1) > 1
-    )
-    if hopper_tuned:
-        kernel = _w8a8_block_fp8_matmul_hopper
-    elif _is_gfx1250:
-        config = {**config, "num_stages": 1}
-        kernel = _w8a8_block_fp8_matmul_gfx1250
-    else:
-        kernel = _w8a8_block_fp8_matmul
+    kernel, config, hopper_tuned = _select_block_fp8_kernel(config)
 
     split_k = config.get("SPLIT_K", 1) if hopper_tuned else 1
     if split_k > 1:
