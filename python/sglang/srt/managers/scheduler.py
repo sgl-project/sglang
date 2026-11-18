@@ -1518,7 +1518,18 @@ class Scheduler(
         ).finalize(actual_prefill_bs=0)
 
     def _arm_prefill_decode_interval(self, batch: Optional[ScheduleBatch]) -> None:
-        if self.prefill_decode_interval == 0 or batch is None:
+        if batch is None:
+            return
+        if self.prefill_delayer is not None and self.prefill_delayer.coalesce:
+            is_extend = (
+                batch.is_extend_in_batch
+                if self.require_mlp_sync
+                else batch.forward_mode.is_extend()
+            )
+            if is_extend:
+                self.prefill_delayer.arm_decode_interval()
+            return
+        if self.prefill_decode_interval == 0:
             return
 
         # DP attention synchronizes this flag across ranks. This keeps every
@@ -1577,7 +1588,15 @@ class Scheduler(
                     max_delay_passes=get_schedule().prefill_delayer_max_delay_passes,
                     token_usage_low_watermark=get_schedule().prefill_delayer_token_usage_low_watermark,
                     debug_log_enabled=get_parallel().attn_tp_rank == 0,
+                    chunk_tokens=self.chunked_prefill_size or self.max_prefill_tokens,
+                    decode_interval=self.prefill_decode_interval,
                 )
+                if self.prefill_delayer.coalesce:
+                    # The delayer counts the interval from the DP-synchronized
+                    # prefill flag; the scheduler-side deferral would skip its
+                    # per-pass gather on some passes.
+                    self.prefill_decode_interval = 0
+                    self._prefill_decode_interval_remaining = 0
 
         # NOTE: preemption is enabled by default for priority scheduling.
         # TODO(ch-wan): a unified pool admits by pricing demands, and preemption
@@ -4462,7 +4481,10 @@ class Scheduler(
                 self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
             )
             prefill_delayer_single_pass = PrefillDelayerSinglePassExecutor(
-                self.prefill_delayer, token_usage=max_pool_usage
+                self.prefill_delayer,
+                token_usage=max_pool_usage,
+                running_batch=running_batch.batch_size(),
+                waiting_queue_len=len(self.waiting_queue),
             )
 
         ret, running_batch = self._get_new_batch_prefill_raw(
@@ -4533,6 +4555,18 @@ class Scheduler(
             kv_storage_of(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             ).release_state_slot(req)
+
+    def _coalesce_pending_tokens(self) -> int:
+        budget = self.prefill_delayer._coalesce_params.chunk
+        pending = 0
+        if self.chunked_req is not None:
+            req = self.chunked_req
+            pending = len(req.full_untruncated_fill_ids) - req.prefix_len
+        for req in self.waiting_queue:
+            if pending >= budget:
+                break
+            pending += SchedulePolicy._shortest_prefill_work(req)
+        return min(pending, budget)
 
     def _get_new_batch_prefill_raw(
         self,
@@ -4616,6 +4650,16 @@ class Scheduler(
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
             # in the waiting queue.
             return None, running_batch
+
+        if prefill_delayer_single_pass is not None and self.prefill_delayer.coalesce:
+            # After the ranking above, num_matched_prefix_tokens is fresh.
+            if not prefill_delayer_single_pass.negotiate_coalesce(
+                local_prefillable=True,
+                pending_tokens=self._coalesce_pending_tokens(),
+                partial=self.chunked_req is not None,
+            ):
+                return None, running_batch
+            prefill_delayer_single_pass = None
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size

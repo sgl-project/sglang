@@ -3,7 +3,7 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, NamedTuple, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
@@ -73,6 +73,114 @@ class _NegotiateOutput(NamedTuple):
     wait_seconds: float = 0.0
 
 
+COALESCE_REASONS = frozenset(
+    {
+        "interval",
+        "no_decode",
+        "kv_high",
+        "ttft",
+        "partial",
+        "stall_unaligned",
+        "align",
+        "fill",
+        "stall",
+        "fill_wait",
+    }
+)
+
+
+@dataclass(frozen=True)
+class CoalesceParams:
+    dp_size: int
+    chunk: int
+    interval: int
+    fill_ratio: float = 0.9
+    stall_ticks: int = 10
+    ttft_ticks: int = 200
+
+    @property
+    def partial_ticks(self) -> int:
+        return max(self.ttft_ticks // 2, 1)
+
+
+@dataclass(frozen=True)
+class CoalesceState:
+    interval_remaining: int = 0
+    hold_ticks: int = 0
+    stall: int = 0
+    prev_pending: int = 0
+    prev_num_prefillable: int = 0
+    prev_queue: int = 0
+
+
+def decide_coalesce(
+    state: CoalesceState,
+    params: CoalesceParams,
+    *,
+    armed: bool,
+    prefillable: Sequence[int],
+    running: Sequence[int],
+    pending: Sequence[int],
+    queue: Sequence[int],
+    partial: Sequence[int],
+    kv_high: Sequence[int],
+) -> Tuple[CoalesceState, bool, str]:
+    """One coalesce tick from the DP-gathered per-rank state; identical on every rank.
+
+    Decode interval, then must-fire bounds, then the alignment gate, then the fill goal
+    (ATOM's prefill_delayer decision table without its cost gate).
+    """
+    remaining = params.interval if armed else state.interval_remaining
+    num_prefillable = sum(1 for p in prefillable if p)
+    running_decode = sum(running)
+    group_pending = sum(min(p, params.chunk) for p, f in zip(pending, prefillable) if f)
+    group_queue = sum(queue)
+    work_changed = (
+        group_pending > state.prev_pending
+        or num_prefillable != state.prev_num_prefillable
+        or group_queue > state.prev_queue
+    )
+    stall = 0 if work_changed else state.stall + 1
+    base = dataclasses.replace(
+        state,
+        interval_remaining=max(remaining - 1, 0),
+        stall=stall,
+        prev_pending=group_pending,
+        prev_num_prefillable=num_prefillable,
+        prev_queue=group_queue,
+    )
+
+    def fire(reason: str):
+        return dataclasses.replace(base, hold_ticks=0, stall=0), True, reason
+
+    def hold(reason: str, count: bool = True):
+        ticks = state.hold_ticks + 1 if count else state.hold_ticks
+        return dataclasses.replace(base, hold_ticks=ticks), False, reason
+
+    if num_prefillable == 0:
+        return fire("")
+    if remaining > 0 and running_decode > 0:
+        return hold("interval", count=False)
+    if running_decode == 0:
+        return fire("no_decode")
+    if any(k and f for k, f in zip(kv_high, prefillable)):
+        return fire("kv_high")
+    if state.hold_ticks >= params.ttft_ticks:
+        return fire("ttft")
+    if any(partial) and state.hold_ticks >= params.partial_ticks:
+        return fire("partial")
+    if num_prefillable < params.dp_size:
+        unreachable = sum(1 for f, r in zip(prefillable, running) if not f and r == 0)
+        if unreachable > 0 and stall >= params.stall_ticks:
+            return fire("stall_unaligned")
+        return hold("align")
+    if group_pending >= params.fill_ratio * params.chunk * num_prefillable:
+        return fire("fill")
+    if stall >= params.stall_ticks:
+        return fire("stall")
+    return hold("fill_wait")
+
+
 class PrefillDelayer:
     def __init__(
         self,
@@ -80,6 +188,8 @@ class PrefillDelayer:
         token_usage_low_watermark: Optional[float],
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
         debug_log_enabled: bool = True,
+        chunk_tokens: Optional[int] = None,
+        decode_interval: int = 0,
     ):
         self._max_delay_passes = max_delay_passes
         self._token_usage_low_watermark = token_usage_low_watermark
@@ -136,6 +246,31 @@ class PrefillDelayer:
 
         self._curr_state: Optional[_State] = None
         self.skip_first_delayer = True
+
+        schedule = get_schedule()
+        self.coalesce = schedule.prefill_delayer_mode == "coalesce"
+        if self.coalesce:
+            assert chunk_tokens is not None and chunk_tokens > 0, (
+                "--prefill-delayer-mode coalesce needs a chunked prefill size"
+            )
+            self._coalesce_params = CoalesceParams(
+                dp_size=dp_size_dim,
+                chunk=chunk_tokens,
+                interval=decode_interval,
+                fill_ratio=schedule.prefill_delayer_fill_ratio,
+                stall_ticks=schedule.prefill_delayer_stall_ticks,
+                ttft_ticks=schedule.prefill_delayer_ttft_ticks,
+            )
+            self._kv_high_watermark = schedule.prefill_delayer_kv_high_watermark
+            self._coalesce_state = CoalesceState()
+            self._coalesce_armed = False
+            # Per rank: prefillable, running, pending tokens, waiting queue, partial, kv_high.
+            self._coalesce_buffer = torch.empty(
+                (dp_size_dim, parallel.attn_cp_size * parallel.attn_tp_size, 6),
+                dtype=torch.int64,
+                device=self._gather_device,
+            )
+            logger.info(f"PrefillDelayer coalesce mode: {self._coalesce_params}")
 
         assert not get_schedule().disable_overlap_schedule, (
             "To use PrefillDelayer, disable_overlap_schedule must be False."
@@ -380,11 +515,72 @@ class PrefillDelayer:
         tp0_info = self._global_info_buffer[:, 0, :]
         return tp0_info
 
+    def arm_decode_interval(self) -> None:
+        """A prefill ran on some DP rank this pass (the flag is DP-synchronized)."""
+        self._coalesce_armed = True
+
+    def negotiate_coalesce(
+        self,
+        *,
+        local_prefillable: bool,
+        running_batch: int,
+        pending_tokens: int,
+        waiting_queue_len: int,
+        partial: bool,
+        token_usage: float,
+    ) -> _NegotiateOutput:
+        local_info = torch.tensor(
+            [
+                int(local_prefillable),
+                running_batch,
+                min(pending_tokens, self._coalesce_params.chunk),
+                waiting_queue_len,
+                int(partial),
+                int(token_usage >= self._kv_high_watermark),
+            ],
+            device=self._gather_device,
+            dtype=torch.int64,
+        )
+        all_gather_single(
+            self._coalesce_buffer.flatten(), local_info, group=self._gather_group
+        )
+        cols = self._coalesce_buffer[:, 0, :].T.tolist()
+        prev = self._coalesce_state
+        self._coalesce_state, allow, reason = decide_coalesce(
+            prev,
+            self._coalesce_params,
+            armed=self._coalesce_armed,
+            prefillable=cols[0],
+            running=cols[1],
+            pending=cols[2],
+            queue=cols[3],
+            partial=cols[4],
+            kv_high=cols[5],
+        )
+        self._coalesce_armed = False
+        return _NegotiateOutput(
+            next_state=None,
+            input_estimation="coalesce",
+            output_allow=allow,
+            output_reason=reason,
+            num_prefillable=sum(1 for p in cols[0] if p),
+            num_token_watermark_force_allow=0,
+            wait_forward_passes=prev.hold_ticks if allow else 0,
+        )
+
 
 class PrefillDelayerSinglePassExecutor:
-    def __init__(self, prefill_delayer: PrefillDelayer, token_usage: float):
+    def __init__(
+        self,
+        prefill_delayer: PrefillDelayer,
+        token_usage: float,
+        running_batch: int = 0,
+        waiting_queue_len: int = 0,
+    ):
         self._prefill_delayer = prefill_delayer
         self._token_usage = token_usage
+        self._running_batch = running_batch
+        self._waiting_queue_len = waiting_queue_len
         self._result: Optional[_NegotiateOutput] = None
         self._attempted_prefill_bs = 0
 
@@ -392,9 +588,29 @@ class PrefillDelayerSinglePassExecutor:
     def _called(self) -> bool:
         return self._result is not None
 
+    def negotiate_coalesce(
+        self, *, local_prefillable: bool, pending_tokens: int, partial: bool
+    ) -> bool:
+        """Coalesce mode: the single negotiation of this pass (every DP rank calls it once)."""
+        assert self._prefill_delayer.coalesce and not self._called
+        self._result = self._prefill_delayer.negotiate_coalesce(
+            local_prefillable=local_prefillable,
+            running_batch=self._running_batch,
+            pending_tokens=pending_tokens,
+            waiting_queue_len=self._waiting_queue_len,
+            partial=partial,
+            token_usage=self._token_usage,
+        )
+        return self._result.output_allow
+
     def finalize(self, *, actual_prefill_bs: int) -> int:
         if not self._called:
-            self.negotiate_should_allow_prefill(local_prefillable=False)
+            if self._prefill_delayer.coalesce:
+                self.negotiate_coalesce(
+                    local_prefillable=False, pending_tokens=0, partial=False
+                )
+            else:
+                self.negotiate_should_allow_prefill(local_prefillable=False)
 
         _record_single_pass_result(
             actual_execution=actual_prefill_bs > 0,
@@ -444,6 +660,9 @@ class PrefillDelayerSinglePassExecutor:
                 ),
             )
         if not self._called:
+            assert not self._prefill_delayer.coalesce, (
+                "coalesce mode negotiates once a pass via negotiate_coalesce"
+            )
             self._result = self._prefill_delayer._negotiate_should_allow_prefill(
                 local_prefillable=local_prefillable,
                 token_usage=self._token_usage,
@@ -482,6 +701,7 @@ def _record_single_pass_result(
                 "wait_success",
                 "no_wait",
                 "delay",
+                *COALESCE_REASONS,
             }
 
     if metrics_collector is not None:
