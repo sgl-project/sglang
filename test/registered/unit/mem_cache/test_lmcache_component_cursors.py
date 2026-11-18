@@ -178,7 +178,10 @@ def test_external_slots_on_a_shared_memory_reclaim_the_load_demand(
     )
 
 
-def test_external_slots_on_independent_full_pool_reclaim_for_allocation(cache_class):
+@pytest.mark.parametrize("available", [0, 3840, 4095, 4096, 4097])
+def test_external_slots_on_independent_full_pool_reclaim_for_allocation(
+    cache_class, available
+):
     from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
     cache = cache_class.__new__(cache_class)
@@ -186,12 +189,34 @@ def test_external_slots_on_independent_full_pool_reclaim_for_allocation(cache_cl
     cache.is_swa_enabled = False
     cache.evict_for_alloc = mock.Mock()
     allocator = mock.Mock(pools_share_memory=False)
+    allocator.available_size.return_value = available
+    cache.token_to_kv_pool_allocator = allocator
+
+    assert cache._allocate_external_slots(4096) is allocator.alloc.return_value
+    if available < 4096:
+        cache.evict_for_alloc.assert_called_once_with(KVDemand(full_tokens=4096))
+    else:
+        cache.evict_for_alloc.assert_not_called()
+    allocator.alloc.assert_called_once_with(4096)
+
+
+def test_external_slots_on_independent_full_mamba_pool_keep_component_eviction(
+    cache_class,
+):
+    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+    cache = cache_class.__new__(cache_class)
+    cache.tree_components = (ComponentType.FULL, ComponentType.MAMBA)
+    cache.is_swa_enabled = False
+    cache.evict = mock.Mock()
+    cache.evict_for_alloc = mock.Mock()
+    allocator = mock.Mock(pools_share_memory=False)
     allocator.available_size.return_value = 3840
     cache.token_to_kv_pool_allocator = allocator
 
     assert cache._allocate_external_slots(4096) is allocator.alloc.return_value
-    cache.evict_for_alloc.assert_called_once_with(KVDemand(full_tokens=4096))
-    allocator.alloc.assert_called_once_with(4096)
+    cache.evict.assert_called_once_with(EvictParams(num_tokens=4096))
+    cache.evict_for_alloc.assert_not_called()
 
 
 if __name__ == "__main__":
