@@ -65,8 +65,12 @@ class BatchedPenalizerOrchestrator:
                 applied directly.
         """
         if repeat is None:
+            # Match overlap and speculative sampling: additive penalties precede
+            # repetition scaling, regardless of the constructor set's order.
+            self.accumulate_additive_penalties(logits)
             for penalizer in self.penalizers.values():
-                penalizer.apply(logits)
+                if penalizer.is_multiplicative:
+                    penalizer.apply(logits)
         else:
             # Additive: capture into zeros, expand, add
             bs = logits.shape[0] // repeat
