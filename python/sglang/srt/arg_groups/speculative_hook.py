@@ -174,7 +174,8 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     if (
         cfg.disaggregation_mode == "decode"
         and cfg.disaggregation_decode_enable_radix_cache
-        and cfg.speculative_algorithm not in (None, "DSPARK", "EAGLE", "EAGLE3")
+        and cfg.speculative_algorithm
+        not in (None, "DFLASH", "DSPARK", "EAGLE", "EAGLE3")
     ):
         raise ValueError(
             "--disaggregation-decode-enable-radix-cache is incompatible "
@@ -339,9 +340,10 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 "SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION=0."
             )
 
-    if cfg.pp_size != 1:
+    if cfg.pp_size != 1 and cfg.disaggregation_mode != "prefill":
         raise ValueError(
-            "Currently DFLASH speculative decoding only supports pp_size == 1."
+            "DFLASH pipeline parallelism requires PD prefill; decode and "
+            "non-disaggregated serving require pp_size == 1."
         )
 
     if cfg.speculative_draft_model_path is None:
@@ -449,7 +451,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             )
 
     _resolve_dflash_draft_attention_backend(server_args)
-    _reject_dflash_sliding_mla_draft_window(server_args)
+    _resolve_dflash_mla_draft_window(server_args)
     _resolve_dflash_draft_kv_ring(server_args)
 
     if cfg.max_running_requests is None:
@@ -728,7 +730,8 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                     "DSpark DP MoE or prefill coordination requires "
                     "SGLANG_RAGGED_VERIFY_MODE=static."
                 )
-        if cfg.attn_cp_size > 1:
+
+        if not _is_npu and cfg.attn_cp_size > 1:
             raise ValueError(
                 "DSpark with dp attention does not support context parallel "
                 f"(attn_cp_size={cfg.attn_cp_size})."
@@ -1091,28 +1094,41 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     )
 
 
-def _reject_dflash_sliding_mla_draft_window(server_args: ServerArgs) -> None:
+def _resolve_dflash_mla_draft_window(server_args: ServerArgs) -> None:
+    """Runs after the draft backend is final, which it reads."""
     from sglang.srt.speculative.dflash_utils import (
-        get_dflash_layer_types,
         parse_dflash_draft_config,
+        resolve_mla_draft_compact_window,
     )
 
     cfg = resolving_view(server_args)
-    draft_backend = cfg.speculative_draft_attention_backend
-    if (
-        cfg.speculative_draft_window_size is None
-        or draft_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS
-    ):
+    window_size = cfg.speculative_draft_window_size
+    if window_size is None:
+        return
+    if cfg.speculative_draft_attention_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
         return
     draft_hf_config = _load_draft_hf_config(cfg)
     if not parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla:
         return
-    layer_types = get_dflash_layer_types(draft_hf_config)
-    if layer_types and "sliding_attention" in layer_types:
-        raise ValueError(
-            "--speculative-draft-window-size is not supported for an MLA draft "
-            f"with sliding-window layers on {draft_backend}: the backend applies "
-            "the draft's own window."
+    kept = resolve_mla_draft_compact_window(
+        draft_hf_config,
+        window_size=window_size,
+        dcp_size=cfg.dcp_size,
+        page_size=cfg.page_size,
+        megakernel=bool(cfg.enable_nvidia_megakernel),
+    )
+    if kept is None:
+        logger.warning(
+            "DFLASH: --speculative-draft-window-size %d is dropped on %s: every "
+            "draft layer is sliding_attention and the backend applies that window "
+            "itself over the full request table.",
+            window_size,
+            cfg.speculative_draft_attention_backend,
+        )
+        declare_resolution(
+            server_args,
+            "_resolve_dflash_mla_draft_window",
+            speculative_draft_window_size=None,
         )
 
 
@@ -1137,6 +1153,10 @@ def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
         ),
         enable_unified_memory=cfg.enable_unified_memory,
         dcp_size=cfg.dcp_size,
+        attn_cp_size=cfg.attn_cp_size,
+        enable_dp_attention=attn_dp_enabled_of(cfg),
+        draft_window_size=cfg.speculative_draft_window_size,
+        is_cuda=current_platform.is_cuda(),
     )
     if reason is not None:
         if switch.is_set():

@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from sglang.kernels.ops.moe.moe_mps import fused_experts_mps
 from sglang.test.ci.ci_register import register_mps_ci
 
-register_mps_ci(est_time=20, suite="stage-a-unit-test-mps")
+register_mps_ci(est_time=20, suite="extra-unit-test-mps")
 
 pytestmark = pytest.mark.skipif(
     not torch.backends.mps.is_available(), reason="requires Apple MPS"

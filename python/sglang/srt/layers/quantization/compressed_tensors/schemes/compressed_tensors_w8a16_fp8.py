@@ -7,6 +7,7 @@ from typing import Callable, List, Optional
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
 
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
@@ -19,11 +20,17 @@ from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     apply_fp8_marlin_linear,
     prepare_fp8_layer_for_marlin,
 )
-from sglang.srt.layers.quantization.utils import convert_to_channelwise
+from sglang.srt.layers.quantization.utils import (
+    convert_to_channelwise,
+    requantize_with_max_scale,
+)
+from sglang.srt.utils import cpu_has_amx_support, is_cpu
 
 __all__ = ["CompressedTensorsW8A16Fp8"]
 
 SUPPORTED_STRATEGIES = [QuantizationStrategy.CHANNEL, QuantizationStrategy.TENSOR]
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 
 class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
@@ -40,6 +47,31 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
     # So if we have a fused module (QKV, MLP) with per tensor scales,
     # we expand each scale to its shard's channels.
     def process_weights_after_loading(self, layer) -> None:
+        if _is_cpu:
+            assert _is_cpu_amx_available, (
+                "CPU compressed-tensors W8A16 FP8 requires AMX support."
+            )
+            if self.strategy != QuantizationStrategy.TENSOR:
+                raise NotImplementedError(
+                    "CPU compressed-tensors W8A16 FP8 currently supports only per-tensor weight scales."
+                )
+            # The CPU GEMM takes a single scale, so fused shards are requantized to the max scale.
+            max_w_scale, weight = requantize_with_max_scale(
+                layer.weight.data, layer.weight_scale.data, layer.logical_widths
+            )
+            layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+            layer.weight_scale = torch.nn.Parameter(
+                max_w_scale.reshape(()), requires_grad=False
+            )
+            # Packs the weight into the AMX layout and converts the bias to fp32.
+            _amx_process_weight_after_loading(layer, ["weight"])
+            if not layer.use_intel_amx_backend:
+                raise NotImplementedError(
+                    "CPU compressed-tensors W8A16 FP8 requires an AMX-packable weight "
+                    "(output dim divisible by 16, input dim divisible by 32)."
+                )
+            return
+
         if self.strategy == QuantizationStrategy.TENSOR:
             ws_channelwise = convert_to_channelwise(
                 layer.weight_scale, layer.logical_widths
@@ -125,6 +157,16 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if _is_cpu:
+            return torch.ops.sgl_kernel.fp8_per_tensor_scaled_mm_cpu(
+                x,
+                layer.weight,
+                layer.weight_scale,
+                bias,
+                x.dtype,
+                True,  # is_vnni: weight was packed at load time
+            )
+
         return apply_fp8_marlin_linear(
             input=x,
             weight=layer.weight,
