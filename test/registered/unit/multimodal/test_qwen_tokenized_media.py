@@ -416,7 +416,7 @@ class TestQwenTokenizedMedia(CustomTestCase):
             model_path="dummy",
             mm_process_config={},
             enable_token_space_processor=True,
-            disable_fast_image_processor=True,
+            image_processor_backend="pil",
             mm_processor_worker_num=1,
         )
         publish(args, role="test")
