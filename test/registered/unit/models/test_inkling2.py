@@ -393,7 +393,8 @@ def test_logits_preserve_padding_for_normalization(
     processor = Inkling2LogitsProcessor(config)
     generator = torch.Generator().manual_seed(7)
     hidden = torch.randn(2, 4, generator=generator).to(device)
-    head = torch.nn.Linear(4, padded, bias=False, device=device)
+    # Served weights never require grad; out= matmuls reject ones that do.
+    head = torch.nn.Linear(4, padded, bias=False, device=device).requires_grad_(False)
     head.weight.data.copy_(torch.randn(padded, 4, generator=generator).to(device))
     buffer = torch.empty(2, padded, device=device) if buffered else None
     metadata = LogitsMetadata(
