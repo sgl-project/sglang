@@ -10,7 +10,7 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=30, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(est_time=30, suite="base-b-test-1-gpu-small-amd")
 
 D, NOPE, ROPE = 512, 448, 64
 DATA_BYTES, SCALE_BYTES = 576, 8
