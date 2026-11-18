@@ -64,7 +64,10 @@ class TorchMemorySaverAdapter(ABC):
     def region(self, tag: str, enable_cpu_backup: bool = False):
         raise NotImplementedError
 
-    def cuda_graph(self, **kwargs):
+    def cuda_graph(self, *args, **kwargs):
+        # Graph capture is called as cuda_graph(graph, pool=..., stream=..., ...) on
+        # backends that pass the graph object positionally (e.g. the NPU NPUGraph
+        # path), so the graph handle must be forwarded positionally as well.
         raise NotImplementedError
 
     def disable(self):
@@ -100,7 +103,7 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
     def region(self, tag: str, enable_cpu_backup: bool = False):
         return _memory_saver.region(tag=tag, enable_cpu_backup=enable_cpu_backup)
 
-    def cuda_graph(self, **kwargs):
+    def cuda_graph(self, *args, **kwargs):
         if is_xpu():
             # Upstream gates pauseable graph capture on hook_mode="preload" while XPU
             # requires hook_mode="torch", so the two are mutually exclusive. Unreachable
@@ -116,7 +119,7 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
                     "release_memory_occupation(tags=['cuda_graph'])."
                 )
             return self._noop_context()
-        return _memory_saver.cuda_graph(**kwargs)
+        return _memory_saver.cuda_graph(*args, **kwargs)
 
     @contextmanager
     def _noop_context(self, **kwargs):
@@ -146,7 +149,7 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
         yield
 
     @contextmanager
-    def cuda_graph(self, **kwargs):
+    def cuda_graph(self, *args, **kwargs):
         yield
 
     @contextmanager
