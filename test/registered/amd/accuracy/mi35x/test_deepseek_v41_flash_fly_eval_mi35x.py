@@ -11,7 +11,7 @@ grading) on all 1319 questions through run_sgl_eval, at temperature 1.0 and top_
 1.0: the server's defaults for this checkpoint, which take the vocab-shard sampling
 accept that FLy rewrites. The seed pins the sampling.
 
-Registry: nightly-amd-4-gpu-mi35x-deepseek-v41-flash suite
+Registry: nightly-test-4-gpu-amd-mi35x-deepseek-v41-flash suite
 """
 
 import os
@@ -33,7 +33,7 @@ from sglang.test.test_utils import (
 
 # Server startup dominates, as in test_deepseek_v41_flash_eval_mi35x.py.
 register_amd_ci(
-    est_time=1200, suite="nightly-amd-4-gpu-mi35x-deepseek-v41-flash", nightly=True
+    est_time=1200, suite="nightly-test-4-gpu-amd-mi35x-deepseek-v41-flash", nightly=True
 )
 
 DEEPSEEK_V41_FLASH_MODEL_PATH = os.environ.get(
