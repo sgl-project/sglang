@@ -89,6 +89,7 @@ PY
     cd "$work/source/python/sglang/kernels/aot"
     cp pyproject_sail.toml pyproject.toml
     python3 setup_sail.py bdist_wheel --dist-dir "$wheel_dir"
+    python3 "$checker" collect-dev-sail "$wheel_dir"
     cd "$wheel_dir"
     printf '%s\n' "$PPU_CI_SOURCE_SHA" > source-sha.txt
     sha256sum source-sha.txt ./*.whl ./runtime-deps/*.whl > SHA256SUMS
@@ -113,13 +114,15 @@ export UMD_ENABLE_COREDUMP_ON_EXCEPTION=1 UMD_ENABLE_LIGHTWEIGHT_COREDUMP=1
 mkdir -p "$artifacts/eval-results"
 ln -s "$artifacts/eval-results" "$HOME/.sgl_eval"
 python3 "$checker" snapshot "$artifacts/dependencies-before.json"
+additions="$artifacts/dependency-additions.json"
+printf '{}\n' > "$additions"
 finalize() {
     code=$?
     trap - EXIT
     set +e
     if ! python3 "$checker" snapshot "$artifacts/dependencies-after.json"; then
         code=1
-    elif ! python3 "$checker" check "$artifacts/dependencies-before.json" "$artifacts/dependencies-after.json"; then
+    elif ! python3 "$checker" check "$artifacts/dependencies-before.json" "$artifacts/dependencies-after.json" --additions "$additions"; then
         code=1
     fi
     if ! verify_wheels; then
@@ -136,13 +139,13 @@ python3 "$repo/scripts/ci/ppu/check_ppu_environment.py"
 python3 -c 'import torch; print("Runtime Torch:", torch.__version__, "SAIL build marker:", getattr(torch.version, "sail", None)); assert torch.cuda.device_count() == 1'
 python3 -m pip uninstall -y sgl-kernel
 python3 -m pip install --no-deps --no-index --force-reinstall "$wheel_dir/"*.whl
-missing_wheels=$(python3 "$checker" missing-wheels "$wheel_dir/runtime-deps")
+missing_wheels=$(python3 "$checker" missing-dev-sail "$wheel_dir" "$additions")
 if [[ -n "$missing_wheels" ]]; then
     mapfile -t runtime_wheels <<< "$missing_wheels"
-    python3 -m pip install --no-deps --no-index "${runtime_wheels[@]}"
+    python3 -m pip install --upgrade --no-deps --no-index "${runtime_wheels[@]}"
 fi
 python3 "$checker" snapshot "$artifacts/dependencies-installed.json"
-python3 "$checker" check "$artifacts/dependencies-before.json" "$artifacts/dependencies-installed.json"
+python3 "$checker" check "$artifacts/dependencies-before.json" "$artifacts/dependencies-installed.json" --additions "$additions"
 python3 - <<'PY'
 from sailify.sailify_python import sailify_extra_files_recursive
 import sgl_kernel
