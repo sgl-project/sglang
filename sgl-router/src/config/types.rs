@@ -169,6 +169,12 @@ pub enum DpRankPolicy {
     /// The worker's ranks in turn.
     #[value(name = "round_robin")]
     RoundRobin,
+    /// Of two ranks drawn at random, the one with fewer engine-reported KV
+    /// tokens, in use plus queued, from the engine's `--load-publish-endpoint`
+    /// feed; two candidates compare directly. Ties, and a worker without a
+    /// fresh reading for every rank, fall back to `least_in_flight`.
+    #[value(name = "least_tokens")]
+    LeastTokens,
 }
 
 /// Role served by a static bucket.
@@ -586,8 +592,9 @@ pub const MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS: u64 = 30_000;
 /// Duration` can overflow and panic.
 pub const MAX_KV_BOOTSTRAP_TIMEOUT_MS: u64 = 3_600_000;
 
-/// Default request header for sticky routing.
-pub const DEFAULT_STICKY_HEADER: &str = "x-sgl-routing-key";
+/// Default request header for sticky routing: the one the engine reads its
+/// routing key from.
+pub const DEFAULT_STICKY_HEADER: &str = sglang_processor::openai::ROUTING_KEY_HEADER;
 
 /// Default request header for session-aware routing.
 pub const DEFAULT_SESSION_ID_HEADER: &str = "x-session-id";

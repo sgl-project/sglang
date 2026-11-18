@@ -46,6 +46,9 @@ bytemuck = "1"
 sglang-processor = { path = "../sglang-processor", features = ["openai"] }
 flume = "0.12.0"
 http = "1.5.0"
+# The HTTP listener's connections (`api_server::http::connections`): HTTP/1.1,
+# and h2c beside it with `--enable-http2`. Already in the tree via axum.
+hyper-util = { version = "0.1.20", features = ["http1", "http2", "server-auto", "server-graceful", "service", "tokio"] }
 itertools = "0.14"
 # Already in the tree via axum; the `/generate` body's content-type check.
 mime = "0.3"
@@ -71,6 +74,7 @@ sha2 = "0.10"
 # naturally while the crate keeps its own artifact name in the shared target/.
 sglang_mm = { package = "sglang-mm", path = "../sglang-mm", default-features = false }
 tonic = { workspace = true }
+tower = { workspace = true }
 tokio-stream = { workspace = true }
 # Request bodies tagged `x-body-compressed: zstd`
 # (`SGLANG_ENABLE_REQUEST_DECOMPRESSION`).
@@ -83,7 +87,7 @@ sglang_api_types = { package = "sglang-api-types", path = "../sglang-api-types" 
 sha2 = { version = "0.10", features = ["asm"] }
 
 [dev-dependencies]
-# `Router::oneshot` for handler-level router tests.
-tower = { version = "0.5", features = ["util"] }
+# An HTTP/2 client that can reset its streams, for the h2c listener's tests.
+h2 = "0.4"
 # Paused virtual time for deadline tests.
 tokio = { workspace = true, features = ["test-util"] }
