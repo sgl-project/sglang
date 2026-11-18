@@ -221,3 +221,49 @@ def update_trtllm_mha_graph_metadata(
         BS_BLOCK=triton.next_power_of_2(bs),
         SKIP_PAGE_TABLE=1 if skip_page_table else 0,
     )
+
+
+@triton.jit
+def _draft_step_seqlens_kernel(
+    seq_lens_ptr,  # [bs] int
+    cache_seqlens_ptr,  # [steps, cache_seqlens_stride] int32
+    cu_seqlens_k_ptr,  # [steps, cu_seqlens_k_stride] int32
+    bs,
+    first_offset,
+    cache_seqlens_stride,
+    cu_seqlens_k_stride,
+    BS_BLOCK: tl.constexpr,
+):
+    # One program per draft step s: cache_seqlens = seq_lens + first_offset + s, and its
+    # cu_seqlens_k cumsum (cu_seqlens_k[s, 0] stays the preset 0).
+    s = tl.program_id(axis=0)
+    offs = tl.arange(0, BS_BLOCK)
+    mask = offs < bs
+    seqlens = tl.load(seq_lens_ptr + offs, mask=mask, other=0).to(tl.int32)
+    seqlens = tl.where(mask, seqlens + first_offset + s, 0)
+    tl.store(cache_seqlens_ptr + s * cache_seqlens_stride + offs, seqlens, mask=mask)
+    tl.store(
+        cu_seqlens_k_ptr + s * cu_seqlens_k_stride + 1 + offs,
+        tl.cumsum(seqlens, axis=0),
+        mask=mask,
+    )
+
+
+def update_draft_step_seqlens(
+    *, seq_lens, cache_seqlens, cu_seqlens_k, bs: int, steps: int, first_offset: int
+):
+    """The cache_seqlens / cu_seqlens_k rows of ``steps`` draft decode steps in one launch:
+    row s holds what ``update_trtllm_mha_graph_metadata`` writes at
+    ``seqlen_offset = first_offset + s``."""
+    if bs == 0 or steps == 0:
+        return
+    _draft_step_seqlens_kernel[(steps,)](
+        seq_lens,
+        cache_seqlens,
+        cu_seqlens_k,
+        bs,
+        first_offset,
+        cache_seqlens.stride(0),
+        cu_seqlens_k.stride(0),
+        BS_BLOCK=triton.next_power_of_2(bs),
+    )

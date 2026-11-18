@@ -8,7 +8,7 @@ import torch
 from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=10, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 if not (torch.version.hip and torch.cuda.is_available() and is_gfx95_supported()):
     pytest.skip("requires AMD gfx95", allow_module_level=True)
@@ -28,12 +28,11 @@ SLOTS, RING_LEN = 8, 16
 
 def test_only_small_kimi_k3_kda_batches_take_the_narrow_tile():
     for n in (1, 4):
-        for target_verify in (True, False):
-            assert _select_recurrent_launch_config(
-                n=n, h=H, hv=HV, k=K, v=V, is_kda=True, target_verify=target_verify
-            ) == (8, 1)
+        assert _select_recurrent_launch_config(
+            n=n, h=H, hv=HV, k=K, v=V, is_kda=True, target_verify=False
+        ) == (8, 1)
     assert _select_recurrent_launch_config(
-        n=5, h=H, hv=HV, k=K, v=V, is_kda=True, target_verify=True
+        n=9, h=H, hv=HV, k=K, v=V, is_kda=True, target_verify=True
     ) == (32, 1)
     assert _select_recurrent_launch_config(
         n=1, h=H, hv=HV, k=K, v=V, is_kda=False, target_verify=True

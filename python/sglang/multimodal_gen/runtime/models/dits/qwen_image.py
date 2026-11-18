@@ -75,6 +75,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
     UnquantizedLinearMethod,
+    apply_amx_packed_linear,
     apply_unquantized_linear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
@@ -93,8 +94,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_jit import (
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4LinearMethod,
-    ModelOptFp8LinearMethod,
     apply_nvfp4_gemm_prequantized,
+    shared_modelopt_fp8_scale,
+    valid_modelopt_fp8_linear,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
@@ -112,6 +114,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.utils import use_intel_amx_backend
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 _QWEN_NORM_OUT = BitExactFusionGate("Qwen-Image fused norm_out", per_signature=True)
@@ -213,6 +216,9 @@ def _split_unquantized_merged_linear(
     sizes = linear.output_partition_sizes
     if len(sizes) != 3:
         raise ValueError(f"Expected three packed projection shards, got {sizes}")
+    if use_intel_amx_backend(linear):
+        merged = apply_amx_packed_linear(x=x, weight=linear.weight, bias=linear.bias)
+        return tuple(merged.split(sizes, dim=-1))
     weights = linear.weight.split(sizes, dim=0)
     biases = (
         linear.bias.split(sizes, dim=0)
@@ -950,6 +956,7 @@ class QwenImageCrossAttention(nn.Module):
                 AttentionBackendEnum.AITER_SAGE,
                 AttentionBackendEnum.AITER_QUANT,
                 AttentionBackendEnum.TORCH_SDPA,
+                AttentionBackendEnum.AMX_ATTN,
                 AttentionBackendEnum.SAGE_ATTN,
                 AttentionBackendEnum.SAGE_ATTN_3,
                 AttentionBackendEnum.SPARGE_ATTN,
@@ -1542,27 +1549,6 @@ class QwenImageTransformerBlock(nn.Module):
         self._fp8_img_mlp_norm_quant = False
         self._fp8_txt_mlp_norm_quant = False
 
-    @staticmethod
-    def _valid_modelopt_fp8_linear(linear: nn.Module) -> bool:
-        input_scale = getattr(linear, "input_scale", None)
-        return (
-            isinstance(getattr(linear, "quant_method", None), ModelOptFp8LinearMethod)
-            and isinstance(input_scale, torch.Tensor)
-            and input_scale.is_cuda
-            and input_scale.dtype == torch.float32
-            and input_scale.numel() == 1
-            and input_scale.is_contiguous()
-            and bool(torch.isfinite(input_scale).all().item())
-            and bool((input_scale > 0).all().item())
-        )
-
-    @classmethod
-    def _shared_modelopt_fp8_scale(cls, linears: list[nn.Module]) -> bool:
-        if not all(cls._valid_modelopt_fp8_linear(linear) for linear in linears):
-            return False
-        reference = linears[0].input_scale
-        return all(torch.equal(reference, linear.input_scale) for linear in linears[1:])
-
     def configure_fp8_norm_quant(self) -> None:
         """Enable exact norm+quant paths after checkpoint scales are materialized."""
         if not torch.cuda.is_available():
@@ -1571,28 +1557,26 @@ class QwenImageTransformerBlock(nn.Module):
         if self.dim != 3072 or capability[0] < 10 or self.zero_cond_t:
             return
         if self.attn.use_fused_qkv:
-            self._fp8_img_attn_norm_quant = self._valid_modelopt_fp8_linear(
-                self.attn.to_qkv
-            )
+            self._fp8_img_attn_norm_quant = valid_modelopt_fp8_linear(self.attn.to_qkv)
         else:
-            self._fp8_img_attn_norm_quant = self._shared_modelopt_fp8_scale(
+            self._fp8_img_attn_norm_quant = shared_modelopt_fp8_scale(
                 [self.attn.to_q, self.attn.to_k, self.attn.to_v]
             )
         if self.attn.added_kv_proj_dim is not None:
             if self.attn.use_fused_added_qkv:
-                self._fp8_txt_attn_norm_quant = self._valid_modelopt_fp8_linear(
+                self._fp8_txt_attn_norm_quant = valid_modelopt_fp8_linear(
                     self.attn.to_added_qkv
                 )
             else:
-                self._fp8_txt_attn_norm_quant = self._shared_modelopt_fp8_scale(
+                self._fp8_txt_attn_norm_quant = shared_modelopt_fp8_scale(
                     [self.attn.add_q_proj, self.attn.add_k_proj, self.attn.add_v_proj]
                 )
         if isinstance(self.img_mlp, QwenImageFeedForward):
-            self._fp8_img_mlp_norm_quant = self._valid_modelopt_fp8_linear(
+            self._fp8_img_mlp_norm_quant = valid_modelopt_fp8_linear(
                 self.img_mlp.net[0].proj
             )
         if isinstance(self.txt_mlp, QwenImageFeedForward):
-            self._fp8_txt_mlp_norm_quant = self._valid_modelopt_fp8_linear(
+            self._fp8_txt_mlp_norm_quant = valid_modelopt_fp8_linear(
                 self.txt_mlp.net[0].proj
             )
 

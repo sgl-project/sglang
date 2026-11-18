@@ -1,7 +1,6 @@
 ---
 title: Hy4 preview
 description: "Deploy Tencent Hy4 preview with SGLang — launch recipes for the 770B-parameter Mixture-of-Experts model with MLA, DeepSeek Sparse Attention (DSA), and MTP speculative decoding, in BF16 on H200/B200/B300/GB300 and MXFP8 on Blackwell GPUs."
-tag: NEW
 ---
 
 ## Deployment
@@ -147,7 +146,7 @@ On H200 (BF16, TP16 → ~95GB of weights per rank) the per-rank pool holds rough
 
 **MXFP8 kernel stack.** The MXFP8 checkpoint self-describes via its ModelOpt `hf_quant_config` (dynamic activations, UE8M0 group-32 weight scales) — no `--quantization` flag needed; the recipes pin `--moe-runner-backend deep_gemm --fp8-gemm-backend deep_gemm`, the validated HYV4 MXFP8 path (the runtime also defaults both to `deep_gemm` for HYV4 when the flags are left unset). The MXFP8 kernel path requires SM100+ (Blackwell); H200 (SM90) cannot serve the MXFP8 checkpoint — use BF16 there.
 
-**CUDA graph decode vs eager.** Decode CUDA-graph capture is on by default; long-duration soak validation of the graph path on Hy4 is still in progress. If you hit instability under long mixed agentic workloads, pass `--disable-cuda-graph` to fall back to eager decode (a restart recovers cleanly either way).
+**CUDA graph decode vs eager.** Decode CUDA-graph capture is on by default; long-duration soak validation of the graph path on Hy4 is still in progress. If you hit instability under long mixed agentic workloads, pass `--disable-decode-cuda-graph --disable-prefill-cuda-graph` to fall back to eager decode (a restart recovers cleanly either way).
 
 **MTP (NextN) speculative decoding.** Both checkpoints ship one draft layer; the preset is `--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-num-draft-tokens 4` (top-k 1). Speculative decoding reserves 4 draft-token slots per request, so the effective request budget is `prompt_tokens + max_tokens + 4 ≤ context length` — requests at the exact context boundary are rejected with the reservation accounted for.
 

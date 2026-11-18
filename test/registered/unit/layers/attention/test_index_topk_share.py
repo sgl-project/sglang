@@ -176,6 +176,8 @@ def _capture(
     )
     # Exercise the real seed export method without initializing GPU resources.
     backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+    backend.dsa_shards_index_k = False
+    backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
     backend.use_fused_topk = fused
     backend.get_topk_transform_method = Mock(
         return_value=TopkTransformMethod.RAGGED if ragged else TopkTransformMethod.PAGED
@@ -200,7 +202,6 @@ def _capture(
                 q_lora=None,
                 positions=None,
                 forward_batch=batch,
-                layer_id=0,
             )
             assert indexer.call_args.kwargs["return_indices"]
         else:
