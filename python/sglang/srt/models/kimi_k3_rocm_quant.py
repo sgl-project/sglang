@@ -200,7 +200,9 @@ def k3_kda_inproj_fp8_tail_rows(
     return rows + (-(wide_rows + rows)) % 64
 
 
-def k3_kda_inproj_fp8_f_b(f_a: torch.Tensor, f_b_weight: torch.Tensor) -> torch.Tensor:
+def k3_kda_inproj_fp8_f_b(
+    *, f_a: torch.Tensor, f_b_weight: torch.Tensor
+) -> torch.Tensor:
     """f_b on f_a, a row slice of the merged Quark FP8 in-proj output: AITER's tuned
     GEMM reads it in place on gfx95x, the tiny GEMM runs it elsewhere."""
     if _is_gfx95:

@@ -2505,7 +2505,9 @@ class KimiK3DeltaAttention(nn.Module):
                     # Restored from an already-processed state: no BF16 f_b cache.
                     forget_gate = self.f_b_proj(f_a.contiguous())[0]
                 else:
-                    forget_gate = k3_kda_inproj_fp8_f_b(f_a, self._bfa_f_b_w)
+                    forget_gate = k3_kda_inproj_fp8_f_b(
+                        f_a=f_a, f_b_weight=self._bfa_f_b_w
+                    )
                 return qkv, beta, forget_gate, g_proj_states
 
             if self._bfa_w is not None:
