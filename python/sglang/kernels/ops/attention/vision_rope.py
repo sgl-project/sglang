@@ -8,6 +8,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
+
 PreparedInplaceComplexRoPE = Tuple[torch.Tensor, torch.Tensor]
 
 
@@ -79,17 +81,19 @@ def can_use_fused_qk_complex_rope(
     device: torch.device,
     freqs_cis: torch.Tensor,
 ) -> bool:
-    """Select the fused path before projecting the vision Q/K tensors."""
+    """Select the fused path before projecting the vision Q/K tensors.
+
+    ``freqs_cis`` sharing the activations' device is the kernel's contract,
+    which :func:`apply_fused_qk_complex_rope` asserts, not a dispatch choice.
+    """
     if not (
         device.type == "cuda"
-        and freqs_cis.is_cuda
-        and device == freqs_cis.device
         and dtype in (torch.bfloat16, torch.float16)
         and freqs_cis.dtype == torch.complex64
     ):
         return False
-    major, _ = torch.cuda.get_device_capability(device)
-    return major >= 9
+    # props.major is the gfx major on ROCm, which also selects the fused path.
+    return current_arch().props.major >= 9
 
 
 def apply_fused_qk_complex_rope(
@@ -115,7 +119,7 @@ def apply_fused_qk_complex_rope(
             f"freqs={freqs_cis.shape}/{freqs_cis.dtype}/{freqs_cis.device}"
         )
 
-    assert q.device == k.device and q.dtype == k.dtype
+    assert q.device == k.device == freqs_cis.device and q.dtype == k.dtype
     assert q.shape == k.shape and q.ndim >= 3
     assert q.shape[-1] % 2 == 0
     assert freqs_cis.shape == q.shape[:-2] + (q.shape[-1] // 2,)

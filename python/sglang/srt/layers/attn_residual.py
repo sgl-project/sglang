@@ -24,9 +24,11 @@ import triton.language as tl
 
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.models.utils import bind_or_assign
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
+_SCORE_MAX_BLOCK_H: int = 8192  # one _score_kernel block spans H up to this
 _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
 
 _FAST_SUPPORTED = None
@@ -67,6 +69,8 @@ def get_cw(
     proj: ReplicatedLinear,
     norm: RMSNorm,
     dtype: torch.dtype = torch.float32,
+    *,
+    refresh: bool = False,
 ) -> torch.Tensor:
     """Cached product norm_weight ⊙ proj_weight (both [H]) in `dtype`.
 
@@ -77,9 +81,10 @@ def get_cw(
         cache = {}
         proj._attn_res_cw_cache = cache
     cw = cache.get(dtype)
-    if cw is None:
-        cw = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
-        cw = cache[dtype] = cw.to(dtype)
+    if cw is None or refresh:
+        # Refresh in place: captured graphs retain the original cache storage.
+        updated = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
+        cw = cache[dtype] = bind_or_assign(cw, updated.to(dtype))
     return cw
 
 
@@ -133,7 +138,7 @@ def _score_kernel(
     BLOCK_H: tl.constexpr,
 ):
     """One CTA per (token, row): scan H, output one scalar score."""
-    pid_t = tl.program_id(0)
+    pid_t = tl.program_id(0).to(tl.int64)  # pid_t * stride_bm overflows int32
     j = tl.program_id(1)
     if j > NVB:
         return
@@ -142,12 +147,16 @@ def _score_kernel(
     for h0 in tl.static_range(0, H, BLOCK_H):
         offs_h = h0 + tl.arange(0, BLOCK_H)
         if j < NVB:
-            v = tl.load(bank_ptr + pid_t * stride_bm + j * stride_bb + offs_h).to(
-                tl.float32
-            )
+            v = tl.load(
+                bank_ptr + pid_t * stride_bm + j * stride_bb + offs_h,
+                mask=offs_h < H,
+                other=0,
+            ).to(tl.float32)
         else:
-            v = tl.load(prefix_ptr + pid_t * stride_pm + offs_h).to(tl.float32)
-        cw = tl.load(cw_ptr + offs_h)
+            v = tl.load(
+                prefix_ptr + pid_t * stride_pm + offs_h, mask=offs_h < H, other=0
+            ).to(tl.float32)
+        cw = tl.load(cw_ptr + offs_h, mask=offs_h < H, other=0)
         sumsq += tl.sum(v * v)
         dotv += tl.sum(v * cw)
     rrms = 1.0 / tl.sqrt(sumsq / H + eps)
@@ -160,7 +169,7 @@ def _combine_kernel(
     bank_ptr,
     scores_ptr,  # [T, MAX_ROWS] fp32
     out_ptr,  # [T, H]
-    NVB,
+    NVB: tl.constexpr,
     stride_pm,
     stride_bm,
     stride_bb,
@@ -174,7 +183,7 @@ def _combine_kernel(
     Softmax is redundantly computed by each H-chunk CTA (≤16 elements, trivial).
     This gives full H-parallelism: 7 CTAs for H=7168/1024.
     """
-    pid_t = tl.program_id(0)
+    pid_t = tl.program_id(0).to(tl.int64)  # pid_t * stride_bm overflows int32
     pid_h = tl.program_id(1)
     h0 = pid_h * BLOCK_H
 
@@ -191,7 +200,7 @@ def _combine_kernel(
     # Weighted sum for this H chunk
     offs_h = h0 + tl.arange(0, BLOCK_H)
     acc = tl.zeros([BLOCK_H], tl.float32)
-    for j in range(0, NVB + 1):
+    for j in tl.static_range(0, NVB + 1):
         if j < NVB:
             v = tl.load(bank_ptr + pid_t * stride_bm + j * stride_bb + offs_h).to(
                 tl.float32
@@ -244,7 +253,7 @@ def _mix_fused(
         bank.stride(1),
         scores.stride(0),
         H=H,
-        BLOCK_H=_BLOCK_H,
+        BLOCK_H=min(triton.next_power_of_2(H), _SCORE_MAX_BLOCK_H),
         num_warps=8,
     )
 

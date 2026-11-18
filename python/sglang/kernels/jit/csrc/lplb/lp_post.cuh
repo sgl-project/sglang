@@ -86,11 +86,11 @@ void lp_post(
   using namespace host;
 
   SymbolicDevice device_;
-  TensorMatcher({NUM_LOGICAL, MAX_COPIES}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(log2phy_prob);
-  TensorMatcher({NUM_SINGLE}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(t1);
-  TensorMatcher({NUM_SINGLE}).with_dtype<int64_t>().with_device<kDLCUDA>(device_).verify(phy_single);
-  TensorMatcher({NUM_RED_PHY}).with_dtype<int64_t>().with_device<kDLCUDA>(device_).verify(phy_replicated);
-  TensorMatcher({NUM_LOGICAL, MAX_COPIES}).with_dtype<int64_t>().with_device<kDLCUDA>(device_).verify(log2phy);
+  TensorMatcher({NUM_LOGICAL, MAX_COPIES}).with_dtype<float>().with_device<kDLGPU>(device_).verify(log2phy_prob);
+  TensorMatcher({NUM_SINGLE}).with_dtype<float>().with_device<kDLGPU>(device_).verify(t1);
+  TensorMatcher({NUM_SINGLE}).with_dtype<int64_t>().with_device<kDLGPU>(device_).verify(phy_single);
+  TensorMatcher({NUM_RED_PHY}).with_dtype<int64_t>().with_device<kDLGPU>(device_).verify(phy_replicated);
+  TensorMatcher({NUM_LOGICAL, MAX_COPIES}).with_dtype<int64_t>().with_device<kDLGPU>(device_).verify(log2phy);
   // x has shape (NV,) which we don't constrain at this layer.
 
   constexpr int PHY_PROB_SIZE = NUM_SINGLE + NUM_RED_PHY + 1;

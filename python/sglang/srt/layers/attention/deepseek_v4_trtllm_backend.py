@@ -18,6 +18,9 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     DeepseekV4MultiStepBackend,
 )
+from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
+    DeepseekV4MegaAttnBackend,
+)
 from sglang.srt.runtime_context import (
     get_buffer,
     get_exec,
@@ -28,8 +31,11 @@ from sglang.srt.runtime_context import (
 )
 
 try:
-    import flashinfer.mla._core as _fi_core
     from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
+    from flashinfer.utils import (
+        get_device_sm_count,
+        get_trtllm_gen_multi_ctas_kv_counter_bytes,
+    )
 except ImportError as exc:
     _flashinfer_import_error = exc
 else:
@@ -58,7 +64,6 @@ def _get_trtllm_workspace_buffer(device: torch.device) -> torch.Tensor:
     )
 
 
-_trtllm_semaphore_installed = False
 # Capacity is in query rows: requests x draft tokens for decode, sum_q for prefill.
 _trtllm_semaphore_rows: int = 0
 
@@ -84,44 +89,42 @@ def _trtllm_query_row_capacity(model_runner: ModelRunner) -> int:
     return max(rows, 1)
 
 
-def _install_persistent_trtllm_semaphores(capacity_rows: int) -> None:
-    """Install a persistent counter buffer sized by query rows.
-
-    FlashInfer sizes this private buffer by request count, while the DSV4
-    VarSeq kernel indexes it by query row. Remove this workaround once
-    FlashInfer accepts a caller-owned buffer.
-    """
-    global _trtllm_semaphore_installed, _trtllm_semaphore_rows
+def _reserve_trtllm_query_rows(capacity_rows: int) -> None:
+    """Grow the query-row capacity the shared counter buffer is sized for."""
+    global _trtllm_semaphore_rows
     if _flashinfer_import_error is not None:
         raise ImportError(
             "--dsv4-attn-backend trtllm requires FlashInfer sparse MLA support"
         ) from _flashinfer_import_error
     _trtllm_semaphore_rows = max(_trtllm_semaphore_rows, capacity_rows)
-    if _trtllm_semaphore_installed:
-        return
-    _orig = _fi_core._get_trtllm_gen_multi_ctas_kv_counter_buffer
-    # Allocate once outside graph capture. Stream ordering and the kernel's
-    # counter reset make one shared buffer safe across launches.
-    state: dict = {}
 
-    def _patched(batch_size, num_qo_heads, sm_count, device):
-        buf = state.get("buf")
-        if buf is None or buf.device != device:
-            assert not torch.cuda.is_current_stream_capturing(), (
-                "persistent trtllm semaphore buffer must be created outside "
-                "graph capture (first call is expected during eager warmup)"
-            )
-            buf = _orig(_trtllm_semaphore_rows, num_qo_heads, sm_count, device)
-            state["buf"] = buf
-        return buf
 
-    _fi_core._get_trtllm_gen_multi_ctas_kv_counter_buffer = _patched
-    _trtllm_semaphore_installed = True
-    logger.info(
-        "trtllm-gen multi-CTA semaphores: single persistent buffer sized for "
-        "%d query rows, shared across launches (flashinfer sizing WAR).",
-        _trtllm_semaphore_rows,
-    )
+def _get_trtllm_kv_counter_buffer(num_heads: int, device: torch.device) -> torch.Tensor:
+    """Return the shared multi-CTA KV counter buffer, sized by query rows.
+
+    FlashInfer sizes its default buffer by request count, while the DSV4
+    VarSeq kernel indexes it by query row, so pass a caller-owned buffer.
+    The kernel resets its counters at the end of every launch, so one zeroed
+    buffer is safe to share across launches and layers.
+    """
+
+    def _alloc() -> torch.Tensor:
+        assert not torch.cuda.is_current_stream_capturing(), (
+            "persistent trtllm semaphore buffer must be created outside "
+            "graph capture (first call is expected during eager warmup)"
+        )
+        num_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            _trtllm_semaphore_rows, num_heads, get_device_sm_count(device)
+        )
+        logger.info(
+            "trtllm-gen multi-CTA semaphores: one persistent buffer sized for "
+            "%d query rows x %d heads, shared across launches.",
+            _trtllm_semaphore_rows,
+            num_heads,
+        )
+        return torch.zeros(num_bytes, dtype=torch.uint8, device=device)
+
+    return get_buffer(f"trtllm_dsv4_multi_ctas_kv_counter_h{num_heads}", _alloc)
 
 
 def _check_trtllm_query_rows(num_rows: int) -> None:
@@ -149,7 +152,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         topk=0,
         speculative_num_steps=0,
     ):
-        _install_persistent_trtllm_semaphores(_trtllm_query_row_capacity(model_runner))
+        _reserve_trtllm_query_rows(_trtllm_query_row_capacity(model_runner))
         super().__init__(
             model_runner,
             skip_prefill=skip_prefill,
@@ -364,6 +367,9 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             sinks=attn_sink,
             kv_layout="HND",
             backend="trtllm-gen",
+            multi_ctas_kv_counter_buffer=_get_trtllm_kv_counter_buffer(
+                num_heads, q.device
+            ),
         )
         if out_pad_tail is not None:
             out_pad_tail[:bs] = out.view(bs, num_heads, 512)
@@ -382,11 +388,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         extra_indices: Optional[torch.Tensor],
         extra_topk_lengths: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Drive the decode kernel as varlen prefill with one table row per token.
-
-        ``seq_lens`` includes cached prefixes; the kernel derives causal SWA
-        validity from it. This path runs eagerly.
-        """
+        """Run varlen prefill eagerly, including at BCG breaks."""
 
         assert q.ndim == 3, f"{q.shape=}"
         num_qo_padded, num_heads, head_dim = q.shape
@@ -395,7 +397,12 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         # Build VarSeq metadata from the same extend lengths as the sparse tables.
         core = self.forward_metadata.core_attn_metadata
         if core.trtllm_prefill_qmeta is None:
-            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+            tail = self.forward_metadata.late_layer_tail
+            extend_seq_lens_cpu = (
+                tail.extend_seq_lens_cpu
+                if tail is not None
+                else forward_batch.extend_seq_lens_cpu
+            )
             assert extend_seq_lens_cpu is not None and len(extend_seq_lens_cpu) > 0
             batch_size = len(extend_seq_lens_cpu)
             cum_lens = [0] * (batch_size + 1)
@@ -404,7 +411,11 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             sum_q = cum_lens[-1]
             max_q_len = max(int(x) for x in extend_seq_lens_cpu)
             assert 0 < sum_q <= num_qo_padded, f"{sum_q=} {num_qo_padded=}"
-            seq_lens_i32 = forward_batch.seq_lens.to(torch.int32)
+            # SWA masking uses causal lengths, not -1 sentinels: make them
+            # tail-relative while keeping compressed KV indices full-context.
+            seq_lens_i32 = (
+                tail.extend_seq_lens if tail is not None else forward_batch.seq_lens
+            ).to(torch.int32)
             assert seq_lens_i32.shape == (batch_size,), f"{seq_lens_i32.shape=}"
             core.trtllm_prefill_qmeta = (
                 self._move_to_device(cum_lens),
@@ -506,6 +517,9 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             backend="trtllm-gen",
             cum_seq_lens_q=cum_seq_lens_q,
             max_q_len=max_q_len,
+            multi_ctas_kv_counter_buffer=_get_trtllm_kv_counter_buffer(
+                num_heads, q.device
+            ),
         )
         return out_padded if out_padded is not None else out
 
@@ -530,15 +544,20 @@ def is_dsv4_trtllm_attn_enabled() -> bool:
     return get_exec().kernel.dsv4_attn_backend == "trtllm"
 
 
+def is_dsv4_mega_attn_enabled() -> bool:
+    return get_exec().kernel.dsv4_attn_backend == "flashmla_mega"
+
+
 def create_deepseek_v4_attn_backend(
     model_runner: ModelRunner, **kwargs
 ) -> DeepseekV4AttnBackend:
     """Construct the DSV4 backend matching --dsv4-attn-backend."""
-    cls = (
-        DeepseekV4TrtllmAttnBackend
-        if is_dsv4_trtllm_attn_enabled()
-        else DeepseekV4AttnBackend
-    )
+    if is_dsv4_trtllm_attn_enabled():
+        cls = DeepseekV4TrtllmAttnBackend
+    elif is_dsv4_mega_attn_enabled():
+        cls = DeepseekV4MegaAttnBackend
+    else:
+        cls = DeepseekV4AttnBackend
     return cls(model_runner, **kwargs)
 
 

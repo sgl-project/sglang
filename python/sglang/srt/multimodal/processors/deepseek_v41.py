@@ -7,11 +7,7 @@ from functools import partial
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 from sglang.srt.multimodal.deepseek_v41_image_processing import (
     GPU_PLAN_KEY,
@@ -20,6 +16,7 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
     patchify_image_rust,
     prepare_image_gpu,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -40,7 +37,7 @@ class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
         self.preprocess_backend = "cpu"
         self.cpu_patchify = patchify_image
         backend = get_mm().image_processor_backend
-        if backend == "pil" or get_mm().disable_fast_image_processor:
+        if backend == "pil":
             self.preprocess_backend = "cpu"
         elif envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get():
             self.preprocess_backend = "gpu"

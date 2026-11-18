@@ -24,14 +24,14 @@ import torch
 import sglang.srt.layers.attention.deepseek_v4_backend_hip_radix as backend_mod
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DSV4_FP8_NOPE_ROW_BYTES
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
 # the store is a plain row move, but the two-pool layout it pins is gfx95-only, so
 # run it where the feature lives rather than on the default mi300 runner
-register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=15, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 DEVICE = torch.device("cuda")
 

@@ -77,8 +77,8 @@ def _apply_weight_only_fp8_linear(
     enable_fused_w8a8: bool,
 ) -> torch.Tensor:
     if weight.dtype != FP8_WEIGHT_DTYPE:
-        # Weight was dequantized to the compute dtype once at load time
-        # (see dequantize_weight_only_fp8_linears_at_load).
+        # The weight was dequantized to the compute dtype once on its first
+        # device-resident forward (see _maybe_promote_fp8_weight).
         bias = bias.to(weight.dtype) if bias is not None else None
         return F.linear(x.to(weight.dtype), weight, bias)
     x = x.to(compute_dtype)
@@ -490,24 +490,3 @@ def _maybe_promote_fp8_weight(module: nn.Module, x_dtype: torch.dtype) -> None:
             "FP8-resident)."
         )
         _dequant_cache_logged = True
-
-
-def swap_linears_to_weight_only_fp8(module: nn.Module) -> None:
-    """Recursively replace nn.Linear with WeightOnlyFP8Linear.
-
-    Ideogram FP8 checkpoints provide ``<linear>.weight_scale`` for every
-    quantized linear. Swapping before load lets strict state-dict checks verify
-    both the FP8 weight and its row-wise scale.
-    """
-
-    for name, child in list(module.named_children()):
-        if isinstance(child, nn.Linear):
-            replacement = WeightOnlyFP8Linear(
-                child.in_features,
-                child.out_features,
-                bias=child.bias is not None,
-                compute_dtype=child.weight.dtype,
-            )
-            setattr(module, name, replacement)
-        else:
-            swap_linears_to_weight_only_fp8(child)

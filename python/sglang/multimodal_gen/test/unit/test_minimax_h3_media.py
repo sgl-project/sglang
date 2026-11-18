@@ -14,12 +14,169 @@ import numpy as np
 import pytest
 import torch
 
+from sglang.multimodal_gen.configs.sample.minimax_h3 import (
+    FastH3OmniSamplingParams,
+    MiniMaxH3SamplingParams,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
     keyframe_encoding,
     material_io,
     reference_encoding,
 )
+
+
+@pytest.mark.parametrize(
+    ("mode", "source_size", "canvas_size", "expected_size", "policy_version"),
+    [
+        (
+            "match",
+            (1920, 1080),
+            (960, 544),
+            (960, 544),
+            "reference_image_match_v1",
+        ),
+        (
+            "match",
+            (512, 512),
+            (960, 544),
+            (512, 512),
+            "reference_image_match_v1",
+        ),
+        (
+            "max",
+            (5000, 2500),
+            (960, 544),
+            (4096, 2048),
+            "reference_image_max_v1",
+        ),
+        (
+            "max",
+            (1920, 1080),
+            (960, 544),
+            (1920, 1088),
+            "reference_image_max_v1",
+        ),
+        (
+            "diffusers",
+            (512, 512),
+            (960, 544),
+            (2048, 2048),
+            "reference_image_short_edge_v1",
+        ),
+    ],
+)
+def test_reference_image_resize_modes(
+    mode, source_size, canvas_size, expected_size, policy_version
+):
+    resolved = reference_encoding.minimax_h3_resolve_reference_image_shape(
+        width=source_size[0],
+        height=source_size[1],
+        canvas_width=canvas_size[0],
+        canvas_height=canvas_size[1],
+        mode=mode,
+    )
+
+    assert (resolved["width"], resolved["height"]) == expected_size
+    assert resolved["shape_policy_version"] == policy_version
+    assert resolved["reference_resize_mode"] == mode
+    assert resolved["allow_upscale"] is (mode == "diffusers")
+
+
+@pytest.mark.parametrize(
+    ("source_size", "expected_size"),
+    [
+        ((512, 512), (512, 512)),
+        ((585, 1024), (576, 1024)),
+        ((5000, 2500), (4096, 2048)),
+    ],
+    ids=["small-square", "portrait-reference", "large-reference"],
+)
+def test_reference_image_resize_default_does_not_upscale(source_size, expected_size):
+    resolved = reference_encoding.minimax_h3_resolve_reference_image_shape(
+        width=source_size[0],
+        height=source_size[1],
+        canvas_width=960,
+        canvas_height=544,
+    )
+
+    assert (resolved["width"], resolved["height"]) == expected_size
+    assert resolved["reference_resize_mode"] == "max"
+    assert resolved["shape_policy_version"] == "reference_image_max_v1"
+    assert resolved["allow_upscale"] is False
+
+
+@pytest.mark.parametrize(
+    ("sampling_params_class", "expected_size"),
+    [
+        (MiniMaxH3SamplingParams, (576, 1024)),
+        (FastH3OmniSamplingParams, (2048, 3584)),
+    ],
+    ids=["native-h3", "fasth3-omni"],
+)
+def test_checkpoint_resize_defaults_produce_expected_reference_geometry(
+    sampling_params_class, expected_size
+):
+    sampling_params = sampling_params_class()
+    reference_shape = reference_encoding.minimax_h3_resolve_reference_image_shape(
+        width=585,
+        height=1024,
+        canvas_width=1344,
+        canvas_height=768,
+        mode=sampling_params.reference_resize_mode,
+    )
+    assert (reference_shape["width"], reference_shape["height"]) == expected_size
+
+
+def test_explicit_diffusers_resize_preserves_legacy_geometry():
+    resolved = reference_encoding.minimax_h3_resolve_reference_image_shape(
+        width=585,
+        height=1024,
+        canvas_width=1344,
+        canvas_height=768,
+        mode="diffusers",
+    )
+    assert (resolved["width"], resolved["height"]) == (2048, 3584)
+    assert resolved["allow_upscale"] is True
+
+
+def test_reference_image_resize_normalizes_mode():
+    resolved = reference_encoding.minimax_h3_resolve_reference_image_shape(
+        width=1920,
+        height=1080,
+        canvas_width=960,
+        canvas_height=544,
+        mode=" MATCH ",
+    )
+
+    assert resolved["reference_resize_mode"] == "match"
+    assert (resolved["width"], resolved["height"]) == (960, 544)
+
+
+def test_reference_image_resize_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="reference_resize_mode"):
+        reference_encoding.minimax_h3_resolve_reference_image_shape(
+            width=1920,
+            height=1080,
+            canvas_width=960,
+            canvas_height=544,
+            mode="unknown",
+        )
+
+
+@pytest.mark.parametrize(
+    ("canvas_width", "canvas_height"),
+    [(0, 544), (960, 0), (-960, 544), (float("nan"), 544)],
+)
+def test_reference_image_resize_rejects_invalid_canvas(canvas_width, canvas_height):
+    with pytest.raises(ValueError, match="target canvas"):
+        reference_encoding.minimax_h3_resolve_reference_image_shape(
+            width=1920,
+            height=1080,
+            canvas_width=canvas_width,
+            canvas_height=canvas_height,
+            mode="match",
+        )
 
 
 def test_keyframe_rng_supports_cpu_and_default_device():

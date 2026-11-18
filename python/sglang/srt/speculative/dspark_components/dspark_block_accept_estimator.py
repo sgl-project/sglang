@@ -13,6 +13,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.runner.future_tensor import DelayedDeviceHostHandler
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.utils.device import is_pin_memory_available
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,7 @@ def block_accept_skip_reason(
             "probabilities would be state-dependent"
         )
     if corrected_logits is None:
-        return "corrected_logits unavailable (folded draft path)"
+        return "corrected_logits unavailable (greedy draft or vocab-sharded)"
     return None
 
 
@@ -762,7 +763,10 @@ class BlockAcceptEstimateRecorder:
     def _host_to_device_async(
         self, values: List[int], *, device: torch.device
     ) -> torch.Tensor:
-        host = torch.tensor(values, dtype=torch.long, pin_memory=device.type == "cuda")
+        # Pin so the non_blocking H2D is stream-ordered
+        host = torch.tensor(
+            values, dtype=torch.long, pin_memory=is_pin_memory_available(device)
+        )
         self._retained_h2d.append(host)
         return host.to(device=device, non_blocking=True)
 
@@ -816,20 +820,22 @@ class BlockAcceptEstimateRecorder:
         warn_once(self._warned_skip_reasons, reason=reason)
 
 
+def block_accept_estimate_enabled() -> bool:
+    return (
+        bool(envs.SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH.get())
+        or envs.SGLANG_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL.get() > 0
+    )
+
+
 def create_block_accept_estimate_recorder(
     *, gamma: int, device: Union[str, torch.device], tp_rank: int
 ) -> Optional[BlockAcceptEstimateRecorder]:
-    if tp_rank != 0:
-        return None
-
-    path = envs.SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH.get()
-    online_log_interval = envs.SGLANG_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL.get()
-    if not path and online_log_interval <= 0:
+    if tp_rank != 0 or not block_accept_estimate_enabled():
         return None
 
     return BlockAcceptEstimateRecorder(
-        path=path,
+        path=envs.SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH.get(),
         gamma=gamma,
         device=device,
-        online_log_interval=online_log_interval,
+        online_log_interval=envs.SGLANG_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL.get(),
     )

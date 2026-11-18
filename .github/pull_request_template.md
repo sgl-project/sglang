@@ -1,5 +1,8 @@
 <!-- Thank you for your contribution! Please follow these guidelines to enhance your pull request. If anything is unclear, submit your PR and reach out to maintainers for assistance. Join our Slack community at https://slack.sglang.io to discuss further. -->
 
+<!-- PR title: [Type] scope: title, or [Type] [Hardware] scope: title, e.g. [Fix] attention: Fix KV cache indexing.
+The allowed types and the scope and hardware rules: https://docs.sglang.io/docs/developer_guide/contribution_guide#pull-request-titles -->
+
 ## Motivation
 
 <!-- Describe the purpose and goals of this pull request. -->

@@ -11,7 +11,7 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=25, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=25, stage="base-b", runner_config="1-gpu-small-amd-mi35x")
 
 
 NOPE, ROPE, D = 448, 64, 512
@@ -382,8 +382,8 @@ def _model_inverse_rope(x, freqs_real, positions):
     """The model's standalone inverse RoPE of the attention output:
     fused_rope_inplace(..., inverse=True) with the batched flat kernel
     (set_batched_rope(True))."""
-    from sglang.kernels.ops.attention.deepseek_v4_rope import set_batched_rope
-    from sglang.kernels.ops.attention.dsv4.elementwise import fused_rope_inplace
+    from sglang.kernels.ops.attention.dsv4.norm_rope import fused_rope_inplace
+    from sglang.kernels.ops.attention.dsv4.rope import set_batched_rope
 
     set_batched_rope(True)
     freqs_cis = torch.view_as_complex(freqs_real.view(freqs_real.shape[0], -1, 2))

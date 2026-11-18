@@ -11,9 +11,6 @@ from sglang.multimodal_gen.runtime.cache.conditioning import (
     invalidate_conditioning_caches,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3video import Cosmos3LanguageModel
-from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
-    NEOChatModel,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.text_encoding import (
     RealtimeTextEncodingStage,
@@ -61,32 +58,6 @@ def test_cosmos_understanding_cache_restores_private_kv():
         model(ids, mask, positions + 1)
         model(ids, mask * 0, positions)
         assert layer.calls == 3
-
-
-class Vision(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.calls = 0
-
-    def forward(self, pixel_values, **kwargs):
-        self.calls += 1
-        return SimpleNamespace(last_hidden_state=pixel_values * 2)
-
-
-@torch.no_grad()
-def test_sensenova_caches_references_but_runs_noisy_vision_each_step():
-    model = NEOChatModel.__new__(NEOChatModel)
-    torch.nn.Module.__init__(model)
-    model.vision_model = Vision()
-    model.fm_modules = torch.nn.ModuleDict({"vision_model_mot_gen": Vision()})
-    model.eval()
-    pixels = torch.ones(2, 4)
-    with ConditioningCache(4096).scope():
-        for _ in range(2):
-            model.extract_feature(pixels)
-            model.extract_feature(pixels, gen_model=True)
-    assert model.vision_model.calls == 1
-    assert model.fm_modules["vision_model_mot_gen"].calls == 2
 
 
 @pytest.mark.parametrize("disabled, capacity", [(False, 512), (True, 512), (False, 0)])

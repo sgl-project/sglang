@@ -24,13 +24,14 @@ def _moe_align_small_numel_kernel(
     topk_ids_ptr,  # [numel] int, flattened (token, slot) expert ids, -1 = filtered
     sorted_token_ids_ptr,  # [max_num_tokens_padded] int32
     expert_ids_ptr,  # [max_num_m_blocks] int32
-    num_tokens_post_pad_ptr,  # [1] int32
+    num_tokens_post_pad_ptr,  # [1] or [2] int32
     num_experts,  # E + 1 (the "+1 offset" convention's bucket count)
     block_size,
     numel,
     NP: tl.constexpr,  # power-of-2 >= numel
     NB: tl.constexpr,  # power-of-2 >= max blocks used
     USE_GDC: tl.constexpr = False,
+    WRITE_INACTIVE_PREFIX_COUNT: tl.constexpr = False,
 ):
     """Single-CTA moe_align for tiny batches with MANY experts.
 
@@ -77,6 +78,11 @@ def _moe_align_small_numel_kernel(
 
     total = tl.sum(tl.where(is_rep, padded_cnt, 0), axis=0)
     tl.store(num_tokens_post_pad_ptr, total.to(tl.int32))
+    if WRITE_INACTIVE_PREFIX_COUNT:
+        inactive_blocks = tl.sum(
+            tl.where(is_rep & (bucket == 0), padded_cnt // block_size, 0), axis=0
+        )
+        tl.store(num_tokens_post_pad_ptr + 1, inactive_blocks.to(tl.int32))
 
     # expert_ids per used block: representative r owns blocks
     # [excl[r], excl[r] + padded_cnt[r]); the written id is bucket - 1
@@ -118,6 +124,8 @@ def moe_align_small_numel(
     sorted_token_ids: torch.Tensor,
     expert_ids: torch.Tensor,
     num_tokens_post_pad: torch.Tensor,
+    *,
+    write_inactive_prefix_count: bool = False,
 ) -> None:
     """Align and sort expert token ids into block-padded buffers, in one launch.
 
@@ -130,6 +138,12 @@ def moe_align_small_numel(
     correct above it, but its pairwise tensors spill and it stops being faster
     than the two-kernel path.
     """
+    if write_inactive_prefix_count:
+        assert num_tokens_post_pad.shape == (2,)
+        assert num_tokens_post_pad.dtype == torch.int32
+        assert num_tokens_post_pad.device == topk_ids.device
+        assert num_tokens_post_pad.is_contiguous()
+        assert num_tokens_post_pad.data_ptr() % 8 == 0
     numel = topk_ids.numel()
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
     _moe_align_small_numel_kernel[(1,)](
@@ -142,6 +156,7 @@ def moe_align_small_numel(
         numel,
         NP=triton.next_power_of_2(max(numel, 2)),
         NB=triton.next_power_of_2(max(expert_ids.numel(), 2)),
+        WRITE_INACTIVE_PREFIX_COUNT=write_inactive_prefix_count,
         num_warps=4,
         **pdl_kwargs,
     )

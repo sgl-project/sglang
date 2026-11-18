@@ -155,7 +155,10 @@ class SchedulerStageMetricsRecorder:
             overlap = FORWARD_OVERLAP_PARTIAL
         else:
             overlap = FORWARD_OVERLAP_NONE
-        self._wall_ns[self._current_stage, overlap] += wall_ns - self._last_wall_ns
+        # CRIU restore without a time namespace can move the monotonic clock
+        # backwards. Drop that span so drained totals stay non-negative.
+        if wall_ns >= self._last_wall_ns:
+            self._wall_ns[self._current_stage, overlap] += wall_ns - self._last_wall_ns
         self._last_wall_ns = wall_ns
         self._last_forward_active = forward_active
 
