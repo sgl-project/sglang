@@ -1974,7 +1974,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_MLA_Q_CACHE_FUSION</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi-K3 on ROCm: write the absorbed MLA decode and target-verify query and the latent KV cache in one launch, with AITER on gfx950 and the AITER Triton kernel elsewhere. Applies to AITER MLA decode and target-verify and to Triton MLA decode, without DCP and with a unit KV-cache scale; everything else keeps the split rope/concat/cache chain.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi-K3 on ROCm: write the absorbed MLA decode and target-verify query and the latent KV cache in one launch, with AITER on gfx950 and the AITER Triton kernel elsewhere (not gfx1250). Applies to AITER MLA decode and target-verify and to Triton MLA decode, without DCP and with a unit KV-cache scale; everything else, including inputs outside both kernels' contracts, keeps the split rope/concat/cache chain. Because DCP turns it off, it has no effect on the cookbook MI35x TP8/DCP8 recipe.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
