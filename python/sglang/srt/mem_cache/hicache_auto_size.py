@@ -99,28 +99,28 @@ def _estimate_hicache_bytes(
     return total + sum(_draft_bytes(pool, draft) for draft in drafts)
 
 
-def _world_cpu_group():
-    """None when this process has no sglang world group to synchronize with."""
-    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
-        return None
-    try:
-        return get_parallel().world_group.cpu_group
-    except (RuntimeError, ValueError):
-        return None
+def _host_allocator_and_device(params: CacheInitParams):
+    """The allocator class and KV device the host pools will map memory with."""
+    return (
+        get_allocator_class_from_storage(get_allocator_type()),
+        params.token_to_kv_pool_allocator.get_kvcache().device,
+    )
 
 
 @contextmanager
 def _explicit_size_budget(params: CacheInitParams):
-    """Book explicitly sized host pools against a snapshot taken before any rank
-    allocates; re-sampling per pool charges a late rank for its peers' pools."""
-    kvcache_device = getattr(
-        params.token_to_kv_pool_allocator.get_kvcache(), "device", None
-    )
-    allocator = get_allocator_class_from_storage(get_allocator_type())
-    budget = host_memory_budget_plain_hugetlb(allocator, kvcache_device)
-    group = _world_cpu_group()
-    if group is not None:
-        torch.distributed.barrier(group=group)
+    """Book explicitly sized host pools against one snapshot of host memory.
+
+    Sampling per pool charges a rank that builds late for its peers' pools.
+    """
+    budget = host_memory_budget_plain_hugetlb(*_host_allocator_and_device(params))
+    if ranks_per_host() > 1:
+        # Ranks on one host draw on the same free memory. The barrier makes every
+        # rank sample before any rank pins a pool; without it a late rank's share
+        # already lacks its peers' pools. ranks_per_host() is the same on every
+        # rank, so all ranks enter or skip it together. Auto-sizing needs none:
+        # its all_reduce already orders the samples before the pools.
+        torch.distributed.barrier(group=get_parallel().world_group.cpu_group)
     with host_memory_budget_scope(budget):
         yield
 
@@ -144,10 +144,7 @@ def auto_size_hicache(
         return
     requested = get_memory().hicache_ratio
     device_bytes = _estimate_hicache_bytes(params, draft_plan)
-    kvcache_device = getattr(
-        params.token_to_kv_pool_allocator.get_kvcache(), "device", None
-    )
-    allocator = get_allocator_class_from_storage(get_allocator_type())
+    allocator, kvcache_device = _host_allocator_and_device(params)
     plain_budget, hugetlb_budget = host_memory_budget_plain_hugetlb(
         allocator, kvcache_device, auto_size=True
     )
@@ -160,11 +157,12 @@ def auto_size_hicache(
     ratio = min(requested, budget * (1 - _ALLOCATION_SLACK_FRACTION) / device_bytes)
     # One collective before any pool is built: PP stages own different pool
     # counts, so a per-pool collective could deadlock.
-    group = _world_cpu_group()
-    if group is not None:
+    if torch.distributed.is_initialized():
         value = torch.tensor([ratio], dtype=torch.float64)
         torch.distributed.all_reduce(
-            value, op=torch.distributed.ReduceOp.MIN, group=group
+            value,
+            op=torch.distributed.ReduceOp.MIN,
+            group=get_parallel().world_group.cpu_group,
         )
         ratio = value.item()
     if ratio <= 0:

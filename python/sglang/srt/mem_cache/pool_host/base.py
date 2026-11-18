@@ -288,16 +288,7 @@ def host_memory_preflight(
     """
     available = _host_memory_budget.get()
     if available is not None:
-        booked_plain_rem, pool_rem = available
-        # Pinned memory that books nothing (staging buffers, another engine)
-        # still counts: the plain allowance never exceeds what the host has
-        # free now. Booking subtracts from the snapshot, not from this cap.
-        plain_rem = min(
-            booked_plain_rem,
-            available_host_memory_bytes(allow_cgroup_fallback=True)
-            - HICACHE_HOST_MEMORY_RESERVE_BYTES,
-        )
-        available = (plain_rem, pool_rem)
+        plain_rem, pool_rem = available
         page_size_and_mode = _hugetlb_page_size_and_mode(allocator, device)
         plain_part, pool_part = _host_memory_allocation_bytes(
             mapping_lengths,
@@ -313,9 +304,7 @@ def host_memory_preflight(
             if book:
                 if plain_fallback:
                     pool_rem = 0  # a plain fallback drains the live pool's rest
-                _host_memory_budget.set(
-                    (booked_plain_rem - plain_part, pool_rem - pool_part)
-                )
+                _host_memory_budget.set((plain_rem - plain_part, pool_rem - pool_part))
             # available_bytes predates the booking (and the pool-bucket close).
             if plain_fallback:
                 # An all-plain charge is measured unaligned, as outside a scope.

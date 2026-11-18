@@ -47,7 +47,6 @@ def _windowed(pool):
     return pool
 
 
-
 def _cpu_params():
     return SimpleNamespace(
         token_to_kv_pool_allocator=SimpleNamespace(
@@ -248,16 +247,22 @@ class TestHiCacheAutoSize(CustomTestCase):
         pool_bytes = 79 * 2 * 64
         rank_budget = 12_000
         host_free = {"bytes": base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 4 * rank_budget}
+        free_now = Mock(side_effect=lambda **_: host_free["bytes"])
         with (
             get_context().override_server_args(
                 enable_hierarchical_cache=True, hicache_host_memory_fraction=None
             ),
             patch.object(base, "ranks_per_host", return_value=4),
+            patch.object(sizing, "ranks_per_host", return_value=4),
+            patch.object(torch.distributed, "barrier"),
             patch.object(
-                base,
-                "available_host_memory_bytes",
-                side_effect=lambda **_: host_free["bytes"],
+                sizing,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    world_group=SimpleNamespace(cpu_group="cpu")
+                ),
             ),
+            patch.object(base, "available_host_memory_bytes", free_now),
             sizing.auto_size_hicache(_cpu_params(), None, enabled=True),
         ):
             # Three peers on this host pin their pools before this rank builds its own.
@@ -278,52 +283,42 @@ class TestHiCacheAutoSize(CustomTestCase):
             self.assertEqual(host.size * host.size_per_token, pool_bytes)
             self.assertEqual(_plain_left(), rank_budget - pool_bytes)
         self.assertIsNone(base._host_memory_budget.get())
+        # One snapshot per rank: building the pool books it, never re-samples.
+        free_now.assert_called_once()
 
     def test_explicit_size_samples_host_memory_before_the_rank_barrier(self):
-        calls = Mock()
-        calls.free.return_value = base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 1000
-        with (
-            get_context().override_server_args(
-                enable_hierarchical_cache=True, hicache_host_memory_fraction=None
-            ),
-            patch.object(base, "ranks_per_host", return_value=1),
-            patch.object(base, "available_host_memory_bytes", calls.free),
-            patch.object(torch.distributed, "is_initialized", return_value=True),
-            patch.object(torch.distributed, "barrier", calls.barrier),
-            patch.object(
-                sizing,
-                "get_parallel",
-                return_value=SimpleNamespace(
-                    world_group=SimpleNamespace(cpu_group="cpu")
+        """Ranks sharing a host sample before any of them allocates; a rank alone
+        on its host takes no collective."""
+        for local_ranks in (1, 2):
+            calls = Mock()
+            calls.free.return_value = (
+                base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 1000 * local_ranks
+            )
+            with (
+                self.subTest(local_ranks=local_ranks),
+                get_context().override_server_args(
+                    enable_hierarchical_cache=True, hicache_host_memory_fraction=None
                 ),
-            ),
-            sizing.auto_size_hicache(_cpu_params(), None, enabled=True),
-        ):
-            self.assertEqual(_plain_left(), 1000)
-        names = [name for name, _, _ in calls.mock_calls]
-        self.assertEqual(names[:2], ["free", "barrier"])
-        calls.barrier.assert_called_once_with(group="cpu")
-
-    def test_explicit_size_books_the_snapshot_without_an_sglang_world_group(self):
-        """A process can initialize torch.distributed without building the sglang
-        world group; an explicit size must still book its snapshot, not raise."""
-        with (
-            get_context().override_server_args(
-                enable_hierarchical_cache=True, hicache_host_memory_fraction=None
-            ),
-            patch.object(base, "ranks_per_host", return_value=1),
-            patch.object(
-                base,
-                "available_host_memory_bytes",
-                return_value=base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 1000,
-            ),
-            patch.object(torch.distributed, "is_initialized", return_value=True),
-            patch.object(
-                sizing, "get_parallel", side_effect=RuntimeError("no world group")
-            ),
-            sizing.auto_size_hicache(_cpu_params(), None, enabled=True),
-        ):
-            self.assertEqual(_plain_left(), 1000)
+                patch.object(base, "ranks_per_host", return_value=local_ranks),
+                patch.object(sizing, "ranks_per_host", return_value=local_ranks),
+                patch.object(base, "available_host_memory_bytes", calls.free),
+                patch.object(torch.distributed, "barrier", calls.barrier),
+                patch.object(
+                    sizing,
+                    "get_parallel",
+                    return_value=SimpleNamespace(
+                        world_group=SimpleNamespace(cpu_group="cpu")
+                    ),
+                ),
+                sizing.auto_size_hicache(_cpu_params(), None, enabled=True),
+            ):
+                self.assertEqual(_plain_left(), 1000)
+            names = [name for name, _, _ in calls.mock_calls]
+            if local_ranks == 1:
+                self.assertEqual(names, ["free"])
+            else:
+                self.assertEqual(names, ["free", "barrier"])
+                calls.barrier.assert_called_once_with(group="cpu")
 
     def test_deepseek_v4_host_pools_book_the_snapshot(self):
         alloc = Mock(return_value=torch.empty(1, dtype=torch.uint8))
@@ -337,12 +332,6 @@ class TestHiCacheAutoSize(CustomTestCase):
         ]
         with (
             patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}),
-            # Host memory free now caps the snapshot; pin it so it never binds.
-            patch.object(
-                base,
-                "available_host_memory_bytes",
-                return_value=base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 1000,
-            ),
             base.host_memory_budget_scope(1000),
         ):
             # 3 layers x 4 pages x 11 bytes
@@ -364,18 +353,6 @@ class TestHiCacheAutoSize(CustomTestCase):
                 _plain_left(),
                 1000 - 132 - state.layer_num * 4 * state.state_page_bytes,
             )
-
-    def test_snapshot_budget_never_exceeds_host_memory_free_now(self):
-        """Pinned memory that books nothing (staging buffers, another engine)
-        still caps the allowance."""
-        free_now = base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 300
-        with (
-            patch.object(base, "available_host_memory_bytes", return_value=free_now),
-            base.host_memory_budget_scope(1000),
-        ):
-            self.assertEqual(base.host_memory_preflight([500]).available_bytes, 300)
-            self.assertEqual(base.host_memory_preflight([200]).available_bytes, 300)
-            self.assertEqual(base._host_memory_budget.get(), (800, 0))
 
 
 if __name__ == "__main__":
