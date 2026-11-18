@@ -18,7 +18,7 @@ from typing import Optional
 import requests
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.perf_bench_kit import at_most, check_perf, reported
+from sglang.test.kits.perf_bench_kit import check_perf, reported
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -206,13 +206,6 @@ class TestFoundryGraphPersistence(CustomTestCase):
     # Batched outputs are compared with native unless a subclass opts out;
     # DP attention composes batches per rank, which differs run to run natively.
     compare_batched = True
-    # MoE dispatchers SAVE and LOAD prebuild; the logits gatherer count is not pinned,
-    # it follows the runner's multicast support.
-    prebuilt_dispatchers = 0
-    # LOAD upper bounds in CI, seconds, about twice what the H100 runners measure;
-    # all graph sets' capture loops (restore + per-shape prep), the scheduler init.
-    load_graph_s = 4.0
-    load_scheduler_s = 20.0
     # Skip, not fail, a layout whose native engine cannot start on this machine,
     # such as DeepEP without a usable NVSHMEM transport.
     native_failure_skips = False
@@ -434,12 +427,9 @@ class TestFoundryGraphPersistence(CustomTestCase):
         or built on one of SAVE / LOAD only; one layout's outputs can miss both."""
         # Without persistence the first forward builds it, so native prints no line.
         self.assertEqual(_PREBUILT_STATE.findall(self.runs["native"]["log"]), [])
+        # What is prebuilt follows the layout and the machine (multicast), not a constant.
         save = _PREBUILT_STATE.findall(self.runs["save"]["log"])
         self.assertEqual(_PREBUILT_STATE.findall(self.runs["load"]["log"]), save)
-        # A prebuild moved past the capture finds nothing pending and prints no line.
-        self.assertEqual(
-            sum(int(dispatchers) for dispatchers, _ in save), self.prebuilt_dispatchers
-        )
         for engine in ("save", "load"):
             log = self.runs[engine]["log"]
             with self.subTest(engine=engine):
@@ -458,18 +448,22 @@ class TestFoundryGraphPersistence(CustomTestCase):
         self.assertIsNotNone(native, "no startup-timings line in the native log")
         self.assertIsNotNone(load, "no startup-timings line in the LOAD log")
         # Not persistence's time; drop once these kernels are cached on disk.
-        gdn_prewarm_s = sum(map(float, _GDN_PREWARM.findall(self.runs["load"]["log"])))
-        load_init_s = load[0] - gdn_prewarm_s
+        native_init_s, load_init_s = (
+            times[0] - sum(map(float, _GDN_PREWARM.findall(self.runs[engine]["log"])))
+            for engine, times in (("native", native), ("load", load))
+        )
         check_perf(
             self,
-            at_most("load_cuda_graph", load[1], self.load_graph_s, unit="s"),
-            at_most("load_scheduler_e2e", load_init_s, self.load_scheduler_s, unit="s"),
+            reported("load_cuda_graph", load[1], unit="s"),
+            reported("load_scheduler_e2e", load_init_s, unit="s"),
             reported("native_cuda_graph", native[1], unit="s"),
-            reported("native_scheduler_e2e", native[0], unit="s"),
+            reported("native_scheduler_e2e", native_init_s, unit="s"),
             suffix=f"_{type(self).__name__}",
         )
-        # On any machine: native warms every shape up twice and captures it once.
+        # The same run's native engine is the reference, whatever the machine:
+        # it warms every shape up twice and captures it once.
         self.assertLess(load[1], 0.5 * native[1])
+        self.assertLess(load_init_s, native_init_s)
 
     def test_greedy_output_matches_native(self):
         for engine in ("save", "load"):
@@ -506,9 +500,6 @@ class TestFoundryGraphPersistenceSpecPrefill(TestFoundryGraphPersistence):
         "--load-format",
         "dummy",
     ]
-    # Four graph sets instead of one, and a draft model to initialize.
-    load_graph_s = 12.0
-    load_scheduler_s = 28.0
 
 
 if __name__ == "__main__":

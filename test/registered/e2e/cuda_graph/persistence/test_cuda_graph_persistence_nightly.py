@@ -17,8 +17,6 @@ class TestFoundryGraphPersistenceSpecPrefillNoPins(
 ):
     # Measured: the pins cut per-shape prep by a quarter to 40 % on FlashInfer.
     engine_env = {}
-    # Without the pinned-buffer registration the per-shape prep is slower.
-    load_graph_s = 14.0
 
 
 if __name__ == "__main__":
