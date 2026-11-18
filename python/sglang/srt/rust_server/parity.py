@@ -145,7 +145,7 @@ RUST_SERVER_KNOWN_GAPS: Dict[str, str] = {
     "SGLANG_PYSPY_DUMP_BEFORE_CRASH": "No crash diagnostics when a scheduler crashes.",
     "SGLANG_CUDA_COREDUMP_BEFORE_CRASH": "No crash diagnostics when a scheduler crashes.",
     "SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS": "No crash diagnostics when a scheduler crashes.",
-    "speculative_num_draft_tokens": "No per-request speculative-decoding stats in meta_info (also behind the speculative_algorithm read, honored by name).",
+    "speculative_num_draft_tokens": "Native /generate gets the scheduler's per-request speculative-decoding stats (SchedulerOutputStreamer.get_request_stats), but the OpenAI routes drop sglext.spec_tokens_details, and under adaptive speculative decoding the proposed-draft count follows the scheduler's active draft width where Python uses the launch value (also behind the speculative_algorithm read, honored by name).",
     "SGLANG_ENABLE_COLOCATED_BATCH_GEN": "Unverified: whether a batch's items are scheduled together.",
     "enable_encoder_swa_bounded_replay": "Unverified: Python refuses image requests off CUDA and warms up with text.",
     "SGLANG_INKLING_DEFAULT_REASONING_EFFORT": "Chat: the Rust chat route has no Inkling renderer.",
