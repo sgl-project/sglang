@@ -149,7 +149,9 @@ class GigaChat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
         self.pp_group = get_parallel().pp_group
         self.num_fused_shared_experts = 0
         self.draft_model_idx = draft_model_idx or 0
-        quant_config = self._resolve_nextn_quant_config(quant_config)
+        quant_config = self.own_quant_config(
+            config, quant_config, draft_model_idx=self.draft_model_idx
+        )
         self.quant_config = quant_config
 
         self.model = GigaChat35ModelNextN(
@@ -211,7 +213,8 @@ class GigaChat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
             nextn_spec_weight_names=["shared_head.norm", "eh_proj", "enorm", "hnorm"],
         )
 
-    def _resolve_nextn_quant_config(self, quant_config):
+    @staticmethod
+    def own_quant_config(hf_config, quant_config, *, draft_model_idx: int = 0):
         if (
             quant_config is None
             or quant_config.get_name() not in ("fp8", "mxfp8")
@@ -219,10 +222,14 @@ class GigaChat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
         ):
             return quant_config
 
-        nextn_conf = self._initialize_nextn_conf(is_nextn=True)
+        nextn_layer_id = (
+            0
+            if hf_config.num_hidden_layers == 1
+            else hf_config.num_hidden_layers + draft_model_idx
+        )
         prefixes = (
-            nextn_conf.nextn_layer_prefix,
-            nextn_conf.nextn_layer_prefix.removeprefix("model."),
+            f"model.layers.{nextn_layer_id}",
+            f"layers.{nextn_layer_id}",
         )
         nextn_roots = ("shared_head", "eh_proj", "enorm", "hnorm")
         runtime_roots = ["model.decoder", *(f"model.{root}" for root in nextn_roots)]
@@ -242,7 +249,7 @@ class GigaChat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
                     return ["model.decoder." + suffix]
             return [name]
 
-        # Each MTP head has its own checkpoint layer but the same runtime prefix.
+        # Head-specific exclusions preserve the quant/KV dtype predicted before build.
         quant_config = copy.copy(quant_config)
         quant_config.ignored_layers = list(
             dict.fromkeys(

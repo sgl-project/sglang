@@ -79,7 +79,9 @@ class GigaChat4ForCausalLMNextN(GigaChat35ForCausalLMNextN):
         self.pp_group = get_parallel().pp_group
         self.num_fused_shared_experts = 0
         self.draft_model_idx = draft_model_idx or 0
-        quant_config = self._resolve_nextn_quant_config(quant_config)
+        quant_config = self.own_quant_config(
+            config, quant_config, draft_model_idx=self.draft_model_idx
+        )
         self.quant_config = quant_config
 
         self.model = GigaChat4ModelNextN(
