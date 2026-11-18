@@ -122,8 +122,8 @@ class TestRegisteredNPUHostAllocation(unittest.TestCase):
         )
         exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
         for npu, source, expected in (
-            (True, "page_first_kv_split", "page_first"),
-            (True, "layer_first_kv_split", "layer_first"),
+            (True, "page_first_kv_split", "page_first_direct"),
+            (True, "layer_first_kv_split", "page_first_direct"),
             (False, "page_first_kv_split", "page_first_direct"),
             (False, "layer_first_kv_split", "page_first_direct"),
         ):
@@ -164,8 +164,7 @@ class TestRegisteredNPUHostAllocation(unittest.TestCase):
             namespace,
         )
         for layout, expected_dims in (
-            ("page_first", (2, 8, 3, 128, 2, 64)),
-            ("layer_first", (2, 3, 1024, 2, 64)),
+            ("page_first_direct", (2, 8, 3, 128, 2, 64)),
         ):
             with self.subTest(layout=layout):
                 calls.clear()
@@ -742,11 +741,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
                             else "page_first_kv_split"
                         )
                     else:
-                        expected = (
-                            "layer_first"
-                            if layout == "layer_first"
-                            else "page_first"
-                        )
+                        expected = "page_first_direct"
                     self.assertEqual(resolved["hicache_mem_layout"], expected)
                     self.assertEqual(resolved["hicache_io_backend"], "kernel_ascend")
 

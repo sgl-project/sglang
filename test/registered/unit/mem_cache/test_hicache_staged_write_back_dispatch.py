@@ -736,7 +736,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             2,
             0,
             16,
-            "page_first",
+            "page_first_direct",
             pin_memory=False,
             device_capacity_tokens=32,
             start_layer=0,
@@ -772,9 +772,6 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                     device_buffer[:, 1].copy_(host_buffer[0])
 
         with (
-            mock.patch.object(
-                host, "_npu_split_view", side_effect=AssertionError("late NPU view")
-            ),
             mock.patch(
                 f"{MHA_POOL_HOST_MODULE}.transfer_kv_all_layer_kv_split_lf_pf",
                 side_effect=lambda **kw: transfer(direction="D2H", **kw),
@@ -805,71 +802,12 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         for before, after in zip(expected, actual, strict=True):
             self.assertTrue(torch.equal(before, after))
 
-    def test_npu_mha_layer_first_split_roundtrip(self):
-        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
-
-        pool = NPUMHATokenToKVPool(
-            size=32,
-            page_size=16,
-            dtype=torch.float16,
-            head_num=2,
-            head_dim=4,
-            layer_num=2,
-            device="cpu",
-            enable_memory_saver=False,
-            enable_alt_stream=False,
-        )
-        info = pool.get_device_pool_infos()[0].buffer_info
-        npu_patch = mock.patch(f"{MHA_POOL_HOST_MODULE}._is_npu", True)
-        npu_patch.start()
-        self.addCleanup(npu_patch.stop)
-        host = MHATokenToKVPoolHost(
-            info,
-            2,
-            0,
-            16,
-            "layer_first",
-            pin_memory=False,
-            device_capacity_tokens=32,
-            start_layer=0,
-            end_layer=2,
-        )
-        self.addCleanup(host.destroy)
-        expected = []
-        for buffer in info.transfer_buffers():
-            buffer.copy_(torch.arange(buffer.numel()).reshape(buffer.shape))
-            expected.append(buffer[:, 1].clone())
-
-        def transfer(*, device_k, device_v, host_k, host_v, direction, **kwargs):
-            for device_buffer, host_buffer in ((device_k, host_k), (device_v, host_v)):
-                if direction == "D2H":
-                    host_buffer[:, 0].copy_(device_buffer[:, 1])
-                else:
-                    device_buffer[:, 1].copy_(host_buffer[:, 0])
-
-        with (
-            mock.patch(
-                f"{MHA_POOL_HOST_MODULE}.transfer_kv_all_layer_kv_split",
-                side_effect=lambda **kw: transfer(direction="D2H", **kw),
-            ) as backup,
-            mock.patch(
-                f"{MHA_POOL_HOST_MODULE}.transfer_kv_per_layer_kv_split",
-                side_effect=lambda **kw: transfer(direction="H2D", **kw),
-            ) as load,
-        ):
-            host.backup_from_device_all_layer(
-                pool, _indices(0, 16), _indices(16, 32), "kernel_ascend"
-            )
-            for buffer in info.transfer_buffers():
-                buffer.zero_()
-            for layer_id in range(2):
-                host.load_to_device_per_layer(
-                    pool, _indices(0, 16), _indices(16, 32), layer_id, "kernel_ascend"
-                )
-        self.assertEqual(backup.call_count, 1)
-        self.assertEqual(load.call_count, 2)
-        for before, buffer in zip(expected, info.transfer_buffers(), strict=True):
-            self.assertTrue(torch.equal(before, buffer[:, 1]))
+    def test_npu_mha_rejects_layer_first(self):
+        host = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        host._transfer_device = SimpleNamespace(type="npu")
+        host.layout = "layer_first"
+        with self.assertRaisesRegex(ValueError, "does not support layer_first"):
+            host.init_kv_buffer()
 
     def test_mla_backup_then_load_roundtrip_uses_staged(self):
         layer_num = 2

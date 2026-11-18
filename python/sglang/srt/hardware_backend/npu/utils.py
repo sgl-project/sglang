@@ -219,11 +219,7 @@ def set_default_server_args(args: "ServerArgs"):
             declare_resolution(
                 args,
                 "set_default_server_args",
-                hicache_mem_layout=(
-                    "layer_first"
-                    if cfg.hicache_mem_layout == "layer_first"
-                    else "page_first"
-                ),
+                hicache_mem_layout="page_first_direct",
             )
         else:
             declare_resolution(
