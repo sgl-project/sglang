@@ -48,6 +48,7 @@ from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.kvcache.mla_buffer import (
     get_mla_kv_buffer_triton,
+    set_mla_kv_buffer_cast_triton,
     set_mla_kv_buffer_dcp_sharded_triton,
     set_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton_fp8_quant,
@@ -85,7 +86,7 @@ from sglang.srt.mem_cache.layout.token_major import (
 )
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_flags, get_parallel, get_platform
+from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_platform
 from sglang.srt.utils import (
     ceil_align,
     cpu_has_amx_support,
@@ -864,13 +865,13 @@ class MambaPool:
                             raise ValueError(
                                 f"spec-verify ring length must be a power of two, got {L}"
                             )
-                        if (
-                            speculative_num_draft_tokens is not None
-                            and L < 2 * speculative_num_draft_tokens
-                        ):
+                        # Fold-every-commit restarts at offset zero, so needs one window.
+                        min_ring_len = (speculative_num_draft_tokens or 0) * (
+                            1 if self.replayssm_spec_fold else 2
+                        )
+                        if L < min_ring_len:
                             raise ValueError(
-                                f"spec-verify ring too small: {L} < "
-                                f"2 * {speculative_num_draft_tokens} (early-flush margin)"
+                                f"spec-verify ring too small: {L} < {min_ring_len}"
                             )
                     replayssm_rawv = torch.zeros(
                         size=(num_mamba_layers, num_slots, hv, record_len, v_dim),
@@ -4278,6 +4279,7 @@ class HybridLinearKVPool(KVCache):
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
         kv_scale_ue8m0: bool = False,
+        fp8_cast_on_write: bool = False,
         start_layer: Optional[int] = None,
         full_kv_pool_class: Optional[type] = None,
         quant_method=None,
@@ -4366,6 +4368,7 @@ class HybridLinearKVPool(KVCache):
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
                 kv_scale_ue8m0=kv_scale_ue8m0,
+                fp8_cast_on_write=fp8_cast_on_write,
                 **hisparse_kwargs,
                 use_fp4_indexer=use_fp4_indexer,
             )
@@ -4746,6 +4749,13 @@ class HybridLinearKVPool(KVCache):
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_index_k_with_scale_buffer(layer_id)
 
+    def get_index_k_fp4_buffers(
+        self, layer_id: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_index_k_fp4_buffers(layer_id)
+
     def get_broadcastable_index_k_with_scale_buffer(
         self, layer_id: int
     ) -> torch.Tensor:
@@ -4858,6 +4868,7 @@ def _prefix_valid_mla_write_loc(loc_2d, commit_lens, cache_k_nope):
 class MLATokenToKVPool(KVCache, MLAKVView):
     # fp8_ds_mla tile scales rounded up to powers of two (Kimi-K3.1)
     kv_scale_ue8m0 = False
+    fp8_cast_on_write = False
 
     def __init__(
         self,
@@ -5150,6 +5161,23 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             # NoPE bytes are [FP8 values | one FP32 scale per 128 values].
             # RoPE bytes contain the raw BF16 tail and may have zero width.
             self._scatter_mla_rows(dst_buffer, loc, cache_k_nope_fp8, cache_k_rope_fp8)
+        elif (
+            self.fp8_cast_on_write
+            and cache_k_nope.dtype == torch.bfloat16
+            and cache_k_rope is not None
+            and cache_k_rope.dtype == torch.bfloat16
+            and cache_k_rope.numel() > 0
+        ):
+            world = self._write_loc_dcp_span
+            rank = get_parallel().attn_dcp_rank if world > 1 else 0
+            set_mla_kv_buffer_cast_triton(
+                dst_buffer.view(self.dtype),
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                dcp_world_size=world,
+                dcp_rank=rank,
+            )
         else:
             if cache_k_nope.dtype != self.dtype:
                 cache_k_nope = cache_k_nope.to(self.dtype)
@@ -5452,6 +5480,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
     # The fp8 index-K layout; __init__ sets the instance value.
     use_fp4_indexer = False
+    index_k_fp4 = False
 
     @staticmethod
     def index_bytes_per_token_for(
@@ -5490,6 +5519,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         skip_topk_layers: Optional[List[bool]] = None,
         dcp_replicated: bool = False,
         kv_scale_ue8m0: bool = False,
+        fp8_cast_on_write: bool = False,
         use_fp4_indexer: bool = False,
     ):
         override_dim = (
@@ -5512,6 +5542,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
             dcp_replicated=dcp_replicated,
         )
         self.kv_scale_ue8m0 = kv_scale_ue8m0
+        # Only the raw fp8 layout (no fp8_ds_mla tiles) casts on write.
+        self.fp8_cast_on_write = (
+            fp8_cast_on_write
+            and _is_cuda
+            and dtype == torch.float8_e4m3fn
+            and not self.dsa_kv_cache_store_fp8
+        )
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
         self.index_head_dim = index_head_dim
@@ -5549,6 +5586,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
         assert len(self.skip_topk_layers) == layer_num
 
         physical_page_size = self.index_page_size
+        self.index_k_fp4 = (
+            _is_gfx95_supported and get_exec().kernel.enable_dsa_fp4_indexer
+        )
+        if self.index_k_fp4:
+            from sglang.kernels.ops.attention.dsa.fp4_index_hip import check_pool
+
+            check_pool(dcp_replicated, index_kpool, physical_page_size)
         if _is_hip:
             if aiter_can_use_preshuffle_paged_mqa():
                 assert physical_page_size % 16 == 0, (
@@ -5581,6 +5625,10 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self._finalize_allocation_log(size)
 
     def _create_index_key_cache(self) -> IndexKeyCache:
+        if self.index_k_fp4:
+            from sglang.srt.mem_cache.index_key_cache_hip import Fp4IndexKeyCache
+
+            return Fp4IndexKeyCache(self, self.index_buf_size)
         return IndexKeyCache(self, self.index_buf_size)
 
     def _should_allocate_index_layer(self, local_layer_idx: int) -> bool:
@@ -5623,12 +5671,21 @@ class DSATokenToKVPool(MLATokenToKVPool):
                     self.index_key_cache.buffer[i] for i in index_buffer_layer_ids
                 ),
                 key_layout=(
-                    IndexKeyLayout.PAGED_FP4_KEYS_WITH_SCALES
+                    IndexKeyLayout.PAGED_FP4_KEYS
+                    if self.index_k_fp4
+                    else IndexKeyLayout.PAGED_FP4_KEYS_WITH_SCALES
                     if self.use_fp4_indexer
                     else IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES
                 ),
             ),
         )
+        if self.index_k_fp4:
+            from sglang.kernels.ops.attention.dsa.fp4_index_hip import scale_pool_info
+
+            scales = [
+                self.index_key_cache.scale_buffer[i] for i in index_buffer_layer_ids
+            ]
+            return (*kv_infos, index_info, scale_pool_info(index_info, scales))
         return (*kv_infos, index_info)
 
     @property
@@ -5789,6 +5846,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         return self.index_key_cache.get_local_buffer(layer_id)
 
+    def get_index_k_fp4_buffers(
+        self, layer_id: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.index_key_cache.get_fp4_buffers(layer_id)
+
     def get_index_k_scale_buffer(
         self,
         layer_id: int,
@@ -5899,6 +5961,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
         kv_size_bytes = super().get_kv_size_bytes()
         for index_k_cache in self.index_k_with_scale_buffer:
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
+        if self.index_k_fp4:  # the FP4 keys' exponents
+            for scales in self.index_key_cache.scale_buffer:
+                kv_size_bytes += get_tensor_size_bytes(scales)
         return kv_size_bytes
 
 
