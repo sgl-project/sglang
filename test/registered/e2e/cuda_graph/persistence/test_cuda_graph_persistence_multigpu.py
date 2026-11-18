@@ -50,7 +50,7 @@ class TestFoundryGraphPersistenceEP2(e2e.TestFoundryGraphPersistence):
     model = _MODEL
     compare_batched = False
     native_failure_skips = True
-    prebuilt_state = [("1", "0")]
+    prebuilt_dispatchers = 1
     extra_env = _EP_ENV
     extra_server_args = (
         [
@@ -72,7 +72,7 @@ class TestFoundryGraphPersistenceEP2(e2e.TestFoundryGraphPersistence):
 class TestFoundryGraphPersistenceTP2EP2(e2e.TestFoundryGraphPersistence):
     model = _MODEL
     native_failure_skips = True
-    prebuilt_state = [("1", "0")]
+    prebuilt_dispatchers = 1
     extra_env = _EP_ENV
     extra_server_args = (
         ["--tp-size", "2", "--ep-size", "2", "--load-format", "dummy"]

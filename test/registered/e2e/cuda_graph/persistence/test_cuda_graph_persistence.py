@@ -206,9 +206,9 @@ class TestFoundryGraphPersistence(CustomTestCase):
     # Batched outputs are compared with native unless a subclass opts out;
     # DP attention composes batches per rank, which differs run to run natively.
     compare_batched = True
-    # SAVE's and LOAD's Prebuilt capture state counts (dispatchers, gatherers);
-    # empty = none pending.
-    prebuilt_state = []
+    # MoE dispatchers SAVE and LOAD prebuild; the logits gatherer count is not pinned,
+    # it follows the runner's multicast support.
+    prebuilt_dispatchers = 0
     # LOAD upper bounds in CI, seconds, about twice what the H100 runners measure;
     # all graph sets' capture loops (restore + per-shape prep), the scheduler init.
     load_graph_s = 4.0
@@ -434,11 +434,15 @@ class TestFoundryGraphPersistence(CustomTestCase):
         or built on one of SAVE / LOAD only; one layout's outputs can miss both."""
         # Without persistence the first forward builds it, so native prints no line.
         self.assertEqual(_PREBUILT_STATE.findall(self.runs["native"]["log"]), [])
+        save = _PREBUILT_STATE.findall(self.runs["save"]["log"])
+        self.assertEqual(_PREBUILT_STATE.findall(self.runs["load"]["log"]), save)
+        # A prebuild moved past the capture finds nothing pending and prints no line.
+        self.assertEqual(
+            sum(int(dispatchers) for dispatchers, _ in save), self.prebuilt_dispatchers
+        )
         for engine in ("save", "load"):
             log = self.runs[engine]["log"]
             with self.subTest(engine=engine):
-                # A prebuild moved past the capture finds nothing pending and prints no line.
-                self.assertEqual(_PREBUILT_STATE.findall(log), self.prebuilt_state)
                 prebuilt = _PREBUILT_STATE.search(log)
                 if prebuilt is not None:
                     capture = _CAPTURE_BEGIN.search(log)
