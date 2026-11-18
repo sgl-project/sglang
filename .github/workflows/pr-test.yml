@@ -77,7 +77,7 @@ jobs:
     with:
       git_ref: ${{ inputs.git_ref || '' }}
       run_all_tests: ${{ inputs.run_all_tests == true }}
-      force_continue_on_error: ${{ inputs.force_continue_on_error == true }}
+      force_continue_on_error: true  # [CI trial] run every test; revert before merge
     secrets: inherit
 
   call-pr-test-extra:
