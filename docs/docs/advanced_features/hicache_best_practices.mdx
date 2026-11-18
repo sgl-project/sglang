@@ -136,7 +136,7 @@ python3 -m sglang.launch_server \
   --hicache-write-policy write_through \
   --hicache-storage-backend hf3fs \
   --hicache-storage-prefetch-policy wait_complete \
-  --disaggregation-decode-enable-offload-kvcache \  # Enable async KV cache offloading in decode node
+  --disaggregation-decode-enable-offload-kvcache \
   --disaggregation-ib-device mlx5_0 \
   --disaggregation-mode decode \
   --disaggregation-transfer-backend mooncake
