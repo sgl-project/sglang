@@ -15,6 +15,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
+from sglang.srt.hardware_backend.npu.disaggregation import NPUPDLayoutMixin
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import get_local_ip_auto
 
@@ -33,7 +34,7 @@ class AscendStateType(str, enum.Enum):
 _DSV4_KVCACHE_STATE_TYPES = tuple(AscendStateType)
 
 
-class AscendKVManager(MooncakeKVManager):
+class AscendKVManager(NPUPDLayoutMixin, MooncakeKVManager):
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
         return (
             super()._requires_exact_state_index_match(st)

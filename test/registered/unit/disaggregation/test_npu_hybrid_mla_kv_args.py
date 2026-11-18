@@ -144,7 +144,33 @@ class TestNpuHybridMlaKvArgs(CustomTestCase):
             [-1, 0, -1, 1, -1, 2, -1, 3],
         )
         self._assert_target_registered(kv_args)
-        self.assertEqual(kv_args.dcp_num_replicated_entries, 2)
+        self.assertFalse(hasattr(kv_args, "dcp_num_replicated_entries"))
+        self.assertTrue(callable(kv_args.npu_prepare_dcp_token_item_lens))
+
+    def test_dsa_indexer_registers_as_state_with_draft_layer_ids(self):
+        def dsa_pool(layers, draft=False):
+            return NPUMLATokenToKVPool(
+                **_MLA,
+                kv_lora_rank=16,
+                qk_rope_head_dim=8,
+                layer_num=layers,
+                index_head_dim=128,
+                enable_memory_saver=False,
+                is_draft_worker=draft,
+            )
+
+        target, draft = dsa_pool(2), dsa_pool(1, draft=True)
+        args = _register(target, draft)
+        self.assertEqual(args.state_types, [StateType.DSA])
+        self.assertEqual(args.state_layer_ids, [[0, 1, _TARGET_LAYERS]])
+        self.assertEqual(
+            args.state_data_ptrs[0],
+            target.get_state_buf_infos()[0] + draft.get_state_buf_infos()[0],
+        )
+        self.assertEqual(len(target.get_contiguous_buf_infos()[0]), 4)
+        self.assertEqual(args.num_draft_entries, 2)
+        self.assertEqual(args.kv_buf_groups, 2)
+        self.assertEqual(args.kv_layer_ids, [0, 1, 0, 1, 6, 6])
 
     def test_plain_mla_writes_use_token_interleaving_by_default(self):
         with (

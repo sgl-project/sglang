@@ -476,12 +476,7 @@ class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
         pool.index_k_scale_buffer = [torch.empty(4, 8, 1)]
 
         ptrs, lens, item_lens = pool.get_contiguous_buf_infos()
-        buffers = (
-            pool.k_buffer
-            + pool.v_buffer
-            + pool.index_k_buffer
-            + pool.index_k_scale_buffer
-        )
+        buffers = pool.k_buffer + pool.v_buffer
 
         self.assertEqual(ptrs, [buffer.data_ptr() for buffer in buffers])
         self.assertEqual(lens, [buffer.nbytes for buffer in buffers])
@@ -490,9 +485,13 @@ class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
             [
                 pool.k_buffer[0][0].nbytes,
                 pool.v_buffer[0][0].nbytes,
-                pool.index_k_buffer[0][0].nbytes * pool.dcp_size,
-                pool.index_k_scale_buffer[0][0].nbytes * pool.dcp_size,
             ],
+        )
+        state_ptrs, _, state_item_lens = pool.get_state_buf_infos()
+        state_buffers = pool.index_k_buffer + pool.index_k_scale_buffer
+        self.assertEqual(state_ptrs, [buffer.data_ptr() for buffer in state_buffers])
+        self.assertEqual(
+            state_item_lens, [buffer[0].nbytes for buffer in state_buffers]
         )
 
     def test_lse_merge_world_size_one_is_identity(self):

@@ -1213,10 +1213,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         entries = [(buffer, global_kv) for buffer in self.k_buffer]
         if not getattr(self, "dsa_kv_cache_store_fp8", False):
             entries += [(buffer, global_kv) for buffer in self.v_buffer]
-        if self.index_head_dim is not None:
-            entries += [(buffer, True) for buffer in self.index_k_buffer]
-            if self.index_k_scale_buffer is not None:
-                entries += [(buffer, True) for buffer in self.index_k_scale_buffer]
         return entries
 
     # for disagg
@@ -1231,20 +1227,26 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             ],
         )
 
-    def configure_pd_dcp(self, kv_args):
+    def configure_pd_dcp(self, kv_args, draft_pool=None, total_kv_layers=None):
         if self.is_draft_worker:
             return
         if self.use_fia_nz and self.dcp_size > 1:
             raise ValueError(
                 "NPU token-interleaved PD requires a row-contiguous KV pool."
             )
-        # Index-K and its scales precede the appended draft entries. All
-        # entries in this suffix keep allocator-global slots on Decode.
-        kv_args.dcp_num_replicated_entries = (
-            sum(global_slots for _, global_slots in self._get_disagg_buffer_entries())
-            + kv_args.num_draft_entries
-        )
-        kv_args.dcp_prepare_token_item_lens = self._prepare_pd_dcp_token_item_lens
+        kv_args.kv_buf_groups = self._pd_kv_buffer_groups
+        if not getattr(kv_args, "kv_layer_ids", None):
+            from sglang.srt.disaggregation.utils import remap_draft_layer_ids
+
+            # Plain NPU pools also split latent/RoPE into separate groups.
+            # Publish their layer ids so shared senders can pair PP stages.
+            kv_args.kv_layer_ids = self.get_kv_layer_ids()
+            if draft_pool is not None:
+                draft_pool = draft_pool.layer_router.wrapped_view() or draft_pool
+                kv_args.kv_layer_ids += remap_draft_layer_ids(
+                    draft_pool.get_kv_layer_ids(), total_kv_layers
+                )
+        kv_args.npu_prepare_dcp_token_item_lens = self._prepare_pd_dcp_token_item_lens
 
     def _prepare_pd_dcp_token_item_lens(self, kv_args, peer) -> list[int]:
         from sglang.srt.disaggregation.utils import resolve_dcp_dst_entry_indices
@@ -1261,7 +1263,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             len(kv_args.kv_data_ptrs),
             len(peer.dst_kv_ptrs),
         )
-        num_target = len(kv_args.kv_item_lens) - kv_args.dcp_num_replicated_entries
+        num_target = len(kv_args.kv_item_lens) - kv_args.num_draft_entries
         widths = []
         for i, (src_bytes, dst_entry) in enumerate(
             zip(kv_args.kv_item_lens, dst_entries, strict=True)
@@ -1279,11 +1281,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             widths.append(width)
         return widths
 
+    @property
+    def _pd_kv_buffer_groups(self):
+        packed = self.use_combined_kv_buffer or getattr(
+            self, "dsa_kv_cache_store_fp8", False
+        )
+        return 1 if packed else 2
+
     def get_kv_layer_ids(self):
         return (
             list(range(self.start_layer, self.start_layer + self.layer_num))
-            * (1 if self.use_combined_kv_buffer else 2)
-            + self.get_state_layer_ids()
+            * self._pd_kv_buffer_groups
         )
 
     def get_state_layer_ids(self):
