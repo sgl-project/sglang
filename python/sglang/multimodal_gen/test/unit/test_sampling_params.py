@@ -639,6 +639,7 @@ _PER_SIDE_16 = {
     "zero": (0, 512, True),
     "negative": (-16, 512, True),
 }
+_PER_SIDE_32 = {**_PER_SIDE_16, "below_multiple": (32, 992, True)}
 
 
 def _size_alignment_models():
@@ -660,6 +661,9 @@ def _size_alignment_models():
     from sglang.multimodal_gen.configs.pipeline_configs.moss_image import (
         MOSSImagePipelineConfig,
     )
+    from sglang.multimodal_gen.configs.pipeline_configs.qwen_image21 import (
+        QwenImage21PipelineConfig,
+    )
     from sglang.multimodal_gen.configs.pipeline_configs.zimage import (
         ZImagePipelineConfig,
     )
@@ -667,6 +671,9 @@ def _size_alignment_models():
     from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
     from sglang.multimodal_gen.configs.sample.moss_image import (
         MOSSImageSamplingParams,
+    )
+    from sglang.multimodal_gen.configs.sample.qwenimage21 import (
+        QwenImage21SamplingParams,
     )
     from sglang.multimodal_gen.configs.sample.zimage import ZImageSamplingParams
 
@@ -727,6 +734,23 @@ def _size_alignment_models():
             Cosmos3SamplingParams,
             Cosmos3MultiviewConfig(),
             unchanged,
+        ),
+        # Qwen-Image 2.1 aligns at construction and warmup on every backend, not in _adjust.
+        (
+            "qwen21",
+            "Qwen-Image 2.1",
+            32,
+            QwenImage21SamplingParams,
+            QwenImage21PipelineConfig(),
+            {"adjust": _UNCHANGED, "warmup": _PER_SIDE_32, "init": _PER_SIDE_32},
+        ),
+        (
+            "qwen21-diffusers",
+            "Qwen-Image 2.1",
+            32,
+            QwenImage21SamplingParams,
+            diffusers,
+            {"adjust": _UNCHANGED, "warmup": _PER_SIDE_32, "init": _PER_SIDE_32},
         ),
         (
             "flux3",
