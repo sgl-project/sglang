@@ -363,18 +363,20 @@ def maybe_init_shared_mooncake_transfer_engine(*, gpu_id: int) -> None:
     """
     Need MooncakeTransferEngine when:
     1) PD disaggregation uses mooncake for KV transfer (prefill/decode)
-    2) HiCache uses mooncake storage backend
-    3) Encoder disaggregation uses mooncake
+    2) Encoder disaggregation uses mooncake
+    3) Elastic EP or expert backup uses mooncake
+    HiCache's mooncake storage backend only reuses the engine when it exists
+    (SGLANG_HICACHE_MOONCAKE_REUSE_TE); otherwise MooncakeStore starts its own.
     """
-    use_mooncake_te = (
+    hicache_reuses_te = (
+        get_memory().enable_hierarchical_cache
+        and get_memory().hicache_storage_backend == "mooncake"
+        and envs.SGLANG_HICACHE_MOONCAKE_REUSE_TE.get()
+    )
+    needs_mooncake_te = (
         (
             get_disagg().disaggregation_mode != "null"
             and get_disagg().disaggregation_transfer_backend == "mooncake"
-        )
-        or (
-            get_memory().enable_hierarchical_cache
-            and get_memory().hicache_storage_backend == "mooncake"
-            and envs.SGLANG_HICACHE_MOONCAKE_REUSE_TE.get()
         )
         or (
             get_disagg().encoder_only
@@ -390,17 +392,19 @@ def maybe_init_shared_mooncake_transfer_engine(*, gpu_id: int) -> None:
         )
         or get_exec().moe.elastic_ep_backend == "mooncake"
     )
+    if not (needs_mooncake_te or hicache_reuses_te):
+        return
 
-    if use_mooncake_te:
-        if envs.SGLANG_MOONCAKE_TRANSFER_ENGINE.get() == "tent" and (
-            get_exec().moe.enable_elastic_expert_backup
-            or get_exec().moe.elastic_ep_backend is not None
-        ):
-            raise ValueError(
-                "SGLANG_MOONCAKE_TRANSFER_ENGINE=tent supports PD and encoder "
-                "disaggregation only; elastic EP and expert backup drive the "
-                "classic mooncake.engine object directly."
-            )
+    if envs.SGLANG_MOONCAKE_TRANSFER_ENGINE.get() == "tent" and (
+        get_exec().moe.enable_elastic_expert_backup
+        or get_exec().moe.elastic_ep_backend is not None
+    ):
+        raise ValueError(
+            "SGLANG_MOONCAKE_TRANSFER_ENGINE=tent supports PD and encoder "
+            "disaggregation only; elastic EP and expert backup drive the "
+            "classic mooncake.engine object directly."
+        )
+    try:
         init_mooncake_transfer_engine(
             hostname=get_local_ip_auto(),
             gpu_id=gpu_id,
@@ -409,14 +413,25 @@ def maybe_init_shared_mooncake_transfer_engine(*, gpu_id: int) -> None:
                 or get_exec().moe.mooncake_ib_device
             ),
         )
+    except RuntimeError:
+        if needs_mooncake_te:
+            raise
+        # E.g. RDMA NICs that cannot open without GPUDirect (DGX Spark): the
+        # storage backend still works through its own engine and protocol.
+        logger.warning(
+            "Shared Mooncake transfer engine failed to start; the HiCache "
+            "mooncake storage backend will start its own.",
+            exc_info=True,
+        )
+        return
 
-        if get_exec().moe.elastic_ep_backend == "mooncake":
-            try:
-                from mooncake.pg import set_transfer_engine
-            except ImportError as e:
-                raise ImportError(
-                    "Failed to import 'set_transfer_engine' from 'mooncake.pg'. "
-                    "Please upgrade your 'mooncake-transfer-engine' "
-                    "installation to 0.3.11 or above."
-                ) from e
-            set_transfer_engine(_mooncake_transfer_engine.engine)
+    if get_exec().moe.elastic_ep_backend == "mooncake":
+        try:
+            from mooncake.pg import set_transfer_engine
+        except ImportError as e:
+            raise ImportError(
+                "Failed to import 'set_transfer_engine' from 'mooncake.pg'. "
+                "Please upgrade your 'mooncake-transfer-engine' "
+                "installation to 0.3.11 or above."
+            ) from e
+        set_transfer_engine(_mooncake_transfer_engine.engine)
