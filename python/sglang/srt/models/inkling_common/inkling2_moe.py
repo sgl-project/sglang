@@ -1,6 +1,5 @@
 import math
 from functools import partial
-from importlib.metadata import version
 from itertools import groupby
 from types import SimpleNamespace
 from typing import NamedTuple
@@ -345,8 +344,9 @@ class Inkling2Experts(nn.Module):
                 current.copy_(swizzled)
 
     def prepare_mega_moe(self):
-        """DeepGEMM MegaMoE over the loaded expert tensors in place (`inkling2`
-        layout); runs after the NVFP4 scale swizzle and the MXFP8 CUTLASS scales."""
+        """DeepGEMM MegaMoE over the loaded expert tensors in place
+        (`gate_up_interleaved` layout); runs after the NVFP4 scale swizzle and the
+        MXFP8 CUTLASS scales."""
         if not (
             get_moe_a2a_backend().is_megamoe()
             and self.ep_size > 1
@@ -356,11 +356,6 @@ class Inkling2Experts(nn.Module):
             return
         if (self.gate_cap, self.up_cap) != (4.0, 25.0):
             raise ValueError("MegaMoE SiTU needs MLP softcaps (4, 25)")
-        if version("sgl-deep-gemm") != MEGA_MOE_DEEP_GEMM_VERSION:
-            raise RuntimeError(
-                f"Inkling2 MegaMoE needs sgl-deep-gemm {MEGA_MOE_DEEP_GEMM_VERSION} "
-                "(docker/inkling2/apply_deep_gemm_patches.sh)"
-            )
         import deep_gemm
 
         from sglang.srt.layers.moe.mega_moe import (
@@ -370,7 +365,10 @@ class Inkling2Experts(nn.Module):
         max_tokens = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
 
         nvfp4 = self.w13_weight.dtype == torch.uint8
-        kwargs = {"recipe": (1, 1, 16 if nvfp4 else 32), "weight_layout": "inkling2"}
+        kwargs = {
+            "recipe": (1, 1, 16 if nvfp4 else 32),
+            "weight_layout": "gate_up_interleaved",
+        }
         if nvfp4:
             l1 = (self.w13_weight.view(torch.int8), self.w13_scale.view(torch.int32))
             l2 = (self.w2_weight.view(torch.int8), self.w2_scale.view(torch.int32))
@@ -806,7 +804,6 @@ class Inkling2Experts(nn.Module):
 
 PREFILL_EXCHANGE_MAX_TOKENS = 32768
 PARTIAL_COMBINE_MIN_TOKENS = 16
-MEGA_MOE_DEEP_GEMM_VERSION = "0.2.6+inkling2.0f96f72.1"
 
 _MEGA_MOE_BUFFERS = {}
 _MEGA_MOE_MMA_TYPES = ("nvfp4xnvfp4", "fp8xfp8")
