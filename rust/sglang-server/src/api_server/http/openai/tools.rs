@@ -341,7 +341,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(text, "Before <|python_");
         assert_eq!(
-            choice(&items[1]).finish_reason,
+            choice(items.last().expect("terminal chunk")).finish_reason,
             Some(OpenAIFinishReason::Stop)
         );
     }
