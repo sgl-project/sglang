@@ -1904,7 +1904,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_AITER_FLYDSL_QUICK_REDUCE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>ROCM_QUICK_REDUCE_QUANTIZATION=INT4</code> on gfx950, run QuickReduce with the AITER FlyDSL INT4 kernel instead of the HIP INT4 kernel. Only contiguous, 16-byte-aligned bf16 payloads use it.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>ROCM_QUICK_REDUCE_QUANTIZATION=INT4</code> on gfx950, run QuickReduce through AITER's QuickAllReduce dispatcher instead of SGLang's HIP INT4 kernel. The dispatcher serves each payload with its FlyDSL INT4 kernels where its policy covers it, and with AITER's HIP INT4 kernel otherwise. Without the dispatcher in the installed AITER, QuickReduce keeps the HIP kernel.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>

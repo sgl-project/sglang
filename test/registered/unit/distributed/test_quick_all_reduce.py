@@ -1,6 +1,7 @@
 """Unit tests for srt/distributed/device_communicators/quick_all_reduce.py"""
 
 import logging
+import os
 import sys
 import types
 import unittest
@@ -22,29 +23,58 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _QR_MODULE = "sglang.srt.distributed.device_communicators.quick_all_reduce"
+_AITER_QR_MODULE = "aiter.dist.device_communicators.quick_all_reduce"
+_AITER_ENV = (
+    "AITER_QUICK_REDUCE_QUANTIZATION",
+    "AITER_QUICK_REDUCE_CAST_BF16_TO_FP16",
+    "AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB",
+    "AITER_FLY_AR",
+)
 
 
-class _FakeFlyDSLInt4:
-    def __init__(self, **kwargs):
+class _FakeAiterQuickAllReduce:
+    """Stands in for aiter's QuickAllReduce dispatcher."""
+
+    disabled = False
+
+    def __init__(self, group=None, device=None):
+        self.env_at_init = {key: os.environ.get(key) for key in _AITER_ENV}
+        self.qr_max_size = 1024 * MB
+        self.accepts = True
         self.calls = 0
         self.closed = False
-        self.compiled = []
 
-    def allreduce(self, inp, out):
+    def should_quick_allreduce(self, inp):
+        return self.accepts
+
+    def quick_all_reduce(self, inp, *, out=None):
         self.calls += 1
+        if out is None:
+            out = torch.empty_like(inp)
         out.copy_(inp)
-
-    def compile(self, inp, out):
-        self.compiled.append((inp, out))
+        return out
 
     def close(self):
         self.closed = True
 
 
-def _make_flydsl_quick_reduce(fake: _FakeFlyDSLInt4) -> QuickAllReduce:
+class _DisabledAiterQuickAllReduce(_FakeAiterQuickAllReduce):
+    disabled = True
+
+
+def _aiter_module(cls=None) -> types.ModuleType:
+    module = types.ModuleType(_AITER_QR_MODULE)
+    if cls is not None:
+        module.QuickAllReduce = cls
+    return module
+
+
+def _make_dispatcher_quick_reduce(
+    dispatcher: _FakeAiterQuickAllReduce,
+) -> QuickAllReduce:
     quick_reduce = QuickAllReduce.__new__(QuickAllReduce)
     quick_reduce.disabled = False
-    quick_reduce._flydsl_int4 = fake
+    quick_reduce._flydsl_int4 = dispatcher
     quick_reduce.world_size = 4
     quick_reduce.qr_quant_level = QuickReduceRegime.INT4
     quick_reduce.use_fp16_kernels = 1
@@ -65,51 +95,72 @@ def _make_uninitialized_quick_reduce() -> QuickAllReduce:
     return quick_reduce
 
 
-class TestQuickAllReduceFlyDSLInt4(CustomTestCase):
-    def test_flydsl_int4_takes_only_contiguous_aligned_bf16(self):
-        """Input the FlyDSL INT4 kernel cannot take must not reach it."""
+class TestQuickAllReduceAiterDispatcher(CustomTestCase):
+    def test_sglang_size_window_applies_before_the_dispatcher(self):
+        """SGLang's INT4 size window still gates; aiter decides inside it."""
         numel = MB  # 2 MiB of 16-bit data, the INT4 minimum size at TP4
-        fake = _FakeFlyDSLInt4()
-        quick_reduce = _make_flydsl_quick_reduce(fake)
+        dispatcher = _FakeAiterQuickAllReduce()
+        quick_reduce = _make_dispatcher_quick_reduce(dispatcher)
 
-        inp = torch.ones(numel, dtype=torch.bfloat16)
-        self.assertTrue(quick_reduce.should_quick_allreduce(inp))
+        for dtype in (torch.bfloat16, torch.float16):
+            with self.subTest(dtype=dtype):
+                self.assertTrue(
+                    quick_reduce.should_quick_allreduce(torch.empty(numel, dtype=dtype))
+                )
+        self.assertFalse(
+            quick_reduce.should_quick_allreduce(
+                torch.empty(numel // 2, dtype=torch.bfloat16)
+            )
+        )
+        dispatcher.accepts = False
+        self.assertFalse(
+            quick_reduce.should_quick_allreduce(
+                torch.empty(numel, dtype=torch.bfloat16)
+            )
+        )
+
+    def test_quick_all_reduce_goes_through_the_dispatcher(self):
+        dispatcher = _FakeAiterQuickAllReduce()
+        quick_reduce = _make_dispatcher_quick_reduce(dispatcher)
+
+        inp = torch.ones(MB, dtype=torch.bfloat16)
         out = quick_reduce.quick_all_reduce(inp)
-        self.assertEqual(fake.calls, 1)
+
+        self.assertEqual(dispatcher.calls, 1)
         self.assertTrue(torch.equal(out, inp))
 
-        unaligned = torch.empty(numel + 4, dtype=torch.bfloat16)[4:]
-        self.assertEqual(unaligned.data_ptr() % 16, 8)
-        rejected = {
-            "fp16": torch.empty(numel, dtype=torch.float16),
-            "weakly_contiguous": torch.empty(2, numel // 2, dtype=torch.bfloat16).t(),
-            "8_byte_offset": unaligned,
-        }
-        for name, tensor in rejected.items():
-            with self.subTest(name):
-                self.assertFalse(quick_reduce.should_quick_allreduce(tensor))
-
-    def test_init_compiles_on_an_admitted_payload(self):
-        """The FlyDSL kernels are built at init, on a payload this communicator admits."""
-        fake_module = types.ModuleType("aiter.ops.flydsl")
-        fake_module.QuickAllReduceInt4 = _FakeFlyDSLInt4
+    def test_init_sets_aiter_env_only_while_building_the_dispatcher(self):
+        """AITER_FLY_AR also switches aiter's custom all-reduce, so it must not leak."""
         quick_reduce = _make_uninitialized_quick_reduce()
         with (
-            patch.dict(sys.modules, {"aiter.ops.flydsl": fake_module}),
+            temp_set_env(**{key: None for key in _AITER_ENV}),
+            patch.dict(
+                sys.modules, {_AITER_QR_MODULE: _aiter_module(_FakeAiterQuickAllReduce)}
+            ),
             self.assertLogs(level="INFO") as logs,
         ):
-            self.assertTrue(quick_reduce._init_flydsl_int4(2048 * MB))
+            self.assertTrue(quick_reduce._init_flydsl_int4(512 * MB))
+            leaked = {key: os.environ.get(key) for key in _AITER_ENV}
 
-        ((compile_inp, _),) = quick_reduce._flydsl_int4.compiled
-        self.assertTrue(quick_reduce.should_quick_allreduce(compile_inp))
-        self.assertIn("compiled at init", "\n".join(logs.output))
+        self.assertEqual(
+            quick_reduce._flydsl_int4.env_at_init,
+            {
+                "AITER_QUICK_REDUCE_QUANTIZATION": "INT4",
+                "AITER_QUICK_REDUCE_CAST_BF16_TO_FP16": "1",
+                "AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB": "512",
+                "AITER_FLY_AR": "1",
+            },
+        )
+        self.assertEqual(leaked, {key: None for key in _AITER_ENV})
+        self.assertEqual(quick_reduce.qr_max_size, 1024 * MB)
+        self.assertFalse(quick_reduce.disabled)
+        self.assertIn("QuickAllReduce dispatcher", "\n".join(logs.output))
 
-    def test_missing_flydsl_class_falls_back_to_hip_visibly(self):
-        """Without QuickAllReduceInt4, QuickReduce stays on the HIP kernel, warns once and says so."""
-        fake_module = types.ModuleType("aiter.ops.flydsl")
+    def test_missing_dispatcher_falls_back_to_hip_visibly(self):
+        """Without aiter's dispatcher, QuickReduce stays on the HIP kernel, warns once and says so."""
         print_warning_once.cache_clear()
         with (
-            patch.dict(sys.modules, {"aiter.ops.flydsl": fake_module}),
+            patch.dict(sys.modules, {_AITER_QR_MODULE: _aiter_module()}),
             envs.SGLANG_USE_AITER_FLYDSL_QUICK_REDUCE.override(True),
             temp_set_env(ROCM_QUICK_REDUCE_QUANTIZATION="INT4"),
             patch(f"{_QR_MODULE}.is_gfx95_supported", return_value=True),
@@ -136,35 +187,27 @@ class TestQuickAllReduceFlyDSLInt4(CustomTestCase):
         ]
         self.assertEqual(len(activation), 2)
 
-    def test_flydsl_class_without_compile_falls_back_to_hip(self):
-        """A newer aiter's QuickAllReduceInt4 (preload(), no compile()) is not built."""
-
-        class _PreloadOnly:
-            def __init__(self, **kwargs):
-                raise AssertionError("must not be constructed")
-
-            def preload(self, *, payload_range=None):
-                pass
-
-        fake_module = types.ModuleType("aiter.ops.flydsl")
-        fake_module.QuickAllReduceInt4 = _PreloadOnly
+    def test_disabled_dispatcher_falls_back_to_hip(self):
         print_warning_once.cache_clear()
         quick_reduce = _make_uninitialized_quick_reduce()
         with (
-            patch.dict(sys.modules, {"aiter.ops.flydsl": fake_module}),
+            patch.dict(
+                sys.modules,
+                {_AITER_QR_MODULE: _aiter_module(_DisabledAiterQuickAllReduce)},
+            ),
             self.assertLogs(level="WARNING") as logs,
         ):
-            self.assertFalse(quick_reduce._init_flydsl_int4(2048 * MB))
+            self.assertFalse(quick_reduce._init_flydsl_int4(0))
         self.assertIsNone(quick_reduce._flydsl_int4)
-        self.assertIn("has no compile()", "\n".join(logs.output))
+        self.assertIn("dispatcher is disabled", "\n".join(logs.output))
 
-    def test_close_releases_flydsl_int4(self):
-        fake = _FakeFlyDSLInt4()
-        quick_reduce = _make_flydsl_quick_reduce(fake)
+    def test_close_releases_the_dispatcher(self):
+        dispatcher = _FakeAiterQuickAllReduce()
+        quick_reduce = _make_dispatcher_quick_reduce(dispatcher)
 
         quick_reduce.close()
 
-        self.assertTrue(fake.closed)
+        self.assertTrue(dispatcher.closed)
         self.assertIsNone(quick_reduce._flydsl_int4)
         self.assertTrue(quick_reduce.disabled)
 

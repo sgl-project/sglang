@@ -17,7 +17,13 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip, print_warning_once
+from sglang.srt.utils import (
+    is_cuda,
+    is_gfx95_supported,
+    is_hip,
+    print_warning_once,
+    temp_set_env,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -224,46 +230,44 @@ class QuickAllReduce:
         )
 
     def _init_flydsl_int4(self, qr_max_size: int) -> bool:
-        # FlyDSL owns its IPC buffers, so the HIP QuickReduce is not created.
-        try:
-            from aiter.ops.flydsl import QuickAllReduceInt4
-        except ImportError as e:
+        # Go through aiter's QuickAllReduce dispatcher, its stable entry point; the
+        # FlyDSL kernel classes behind it get renamed and reworked. The dispatcher
+        # builds the FlyDSL engines, agrees on them across ranks, preloads them
+        # before graph capture, and serves each payload with FlyDSL or with its own
+        # HIP INT4 kernel. It reads AITER_* variables, the quantization already at
+        # import, and AITER_FLY_AR also switches aiter's custom all-reduce, so they
+        # are set only while the dispatcher is imported and built.
+        with temp_set_env(
+            AITER_QUICK_REDUCE_QUANTIZATION=self.qr_quant_level.name,
+            AITER_QUICK_REDUCE_CAST_BF16_TO_FP16=self.use_fp16_kernels,
+            AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB=qr_max_size // MB,
+            AITER_FLY_AR=1,
+        ):
+            try:
+                from aiter.dist.device_communicators.quick_all_reduce import (
+                    QuickAllReduce as AiterQuickAllReduce,
+                )
+            except ImportError as e:
+                print_warning_once(
+                    "SGLANG_USE_AITER_FLYDSL_QUICK_REDUCE is set, but aiter has no "
+                    f"QuickAllReduce dispatcher ({e}); QuickReduce INT4 uses the HIP kernel."
+                )
+                return False
+            dispatcher = AiterQuickAllReduce(group=self.group, device=self.device)
+        if dispatcher.disabled:
+            dispatcher.close()
             print_warning_once(
-                "SGLANG_USE_AITER_FLYDSL_QUICK_REDUCE is set, but aiter has no FlyDSL "
-                f"QuickAllReduceInt4 ({e}); QuickReduce INT4 uses the HIP kernel."
-            )
-            return False
-        # Since ROCm/aiter#5555 this name is the multi-codec FlyQuickAllReduce,
-        # which has preload() instead of compile().
-        if not hasattr(QuickAllReduceInt4, "compile"):
-            print_warning_once(
-                "SGLANG_USE_AITER_FLYDSL_QUICK_REDUCE is set, but aiter's FlyDSL "
-                "QuickAllReduceInt4 has no compile(); QuickReduce INT4 uses the HIP kernel."
+                "SGLANG_USE_AITER_FLYDSL_QUICK_REDUCE is set, but aiter's QuickAllReduce "
+                "dispatcher is disabled; QuickReduce INT4 uses the HIP kernel."
             )
             return False
 
-        self._flydsl_int4 = QuickAllReduceInt4(
-            group=self.group,
-            device=self.device,
-            rank=self.rank,
-            world_size=self.world_size,
-        )
-        # The FlyDSL binaries take the payload size at run time, so the smallest
-        # payload this communicator admits builds every one of them.
-        compile_inp = torch.zeros(
-            self._min_size(torch.bfloat16) // 2,
-            dtype=torch.bfloat16,
-            device=self.device,
-        )
-        self._flydsl_int4.compile(compile_inp, torch.empty_like(compile_inp))
-        # QuickAllReduceInt4 rejects payloads above its 4 GiB window.
-        self.qr_max_size = min(
-            qr_max_size if qr_max_size > 0 else ops.qr_max_size(), 0xFFFFFFFF
-        )
+        self._flydsl_int4 = dispatcher
+        self.qr_max_size = dispatcher.qr_max_size
         self.disabled = False
         logger.info(
-            "QuickReduce INT4 uses aiter FlyDSL QuickAllReduceInt4 "
-            "(max %d MiB, compiled at init)",
+            "QuickReduce INT4 uses aiter's QuickAllReduce dispatcher: FlyDSL where "
+            "its policy serves the payload, its HIP INT4 kernel otherwise (max %d MiB)",
             self.qr_max_size // MB,
         )
         return True
@@ -285,13 +289,6 @@ class QuickAllReduce:
         """
         if self.disabled:
             return False
-        # The FlyDSL INT4 kernel takes only contiguous, 16-byte-aligned bf16 input.
-        if self._flydsl_int4 is not None and (
-            inp.dtype != torch.bfloat16
-            or not inp.is_contiguous()
-            or inp.data_ptr() % 16 != 0
-        ):
-            return False
         if inp.dtype not in self._SUPPORTED_DTYPES:
             return False
         # the JIT build behind SGLANG_ROCM_QUICK_ALL_REDUCE_JIT reduces bf16 only
@@ -304,7 +301,11 @@ class QuickAllReduce:
             return False
         if not is_weak_contiguous(inp):
             return False
-        return self._min_size(inp.dtype) <= inp_size <= self.qr_max_size
+        if not self._min_size(inp.dtype) <= inp_size <= self.qr_max_size:
+            return False
+        return self._flydsl_int4 is None or self._flydsl_int4.should_quick_allreduce(
+            inp
+        )
 
     def _min_size(self, dtype: torch.dtype) -> int:
         if self.use_fp16_kernels:
@@ -318,8 +319,7 @@ class QuickAllReduce:
         if out is None:
             out = torch.empty_like(inp)
         if self._flydsl_int4 is not None:
-            self._flydsl_int4.allreduce(inp, out)
-            return out
+            return self._flydsl_int4.quick_all_reduce(inp, out=out)
         ops.qr_all_reduce(
             self._ptr, inp, out, self.qr_quant_level.value, self.use_fp16_kernels
         )
