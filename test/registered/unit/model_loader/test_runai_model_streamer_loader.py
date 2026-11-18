@@ -79,7 +79,10 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
             ):
                 list(loader._get_all_weights(config, model))
                 streamer.assert_called_once_with(
-                    [os.path.join(model_path, "mtp.safetensors")], False, "cpu"
+                    [os.path.join(model_path, "mtp.safetensors")],
+                    False,
+                    "cpu",
+                    load_group=_DEFAULT_LOAD_GROUP,
                 )
 
     def test_remote_checkpoint_index(self):
@@ -173,7 +176,9 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
                         )
                         list(loader._get_all_weights(config, model))
                         list_safetensors.assert_called_with(path=model_path)
-                        streamer.assert_called_once_with([files[1]], True, "cpu")
+                        streamer.assert_called_once_with(
+                            [files[1]], True, "cpu", load_group=_DEFAULT_LOAD_GROUP
+                        )
                         download.assert_not_called()
                         download_index.assert_not_called()
 
