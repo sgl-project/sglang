@@ -47,10 +47,12 @@ The DSA indexer K cache stays BF16 by default; add
 recipe's own restrictions (no HiCache). The record is the one `fp8_e4m3`
 stores on arch35, so `int8` supports what that path supports, including a
 speculative draft model, prefill context parallelism and HiCache.
+With `SGLANG_NPU_USE_MLAPO`, MLAProlog writes the record during decode; this
+needs dynamic INT8 QKV-A and Q-B projection weights, so a draft model with BF16
+weights needs `--speculative-draft-kv-cache-dtype bf16`.
 
 `--kv-cache-dtype int8` is rejected at startup on other platforms, for non-DSA
-models, on arch35 NPUs (use `fp8_e4m3` there), and with `SGLANG_NPU_USE_MLAPO`,
-whose MLAProlog writes the packed record only on arch35. It is also rejected
+models and on arch35 NPUs (use `fp8_e4m3` there). It is also rejected
 with `--dcp-size` above 1 (the DCP read of the packed record is wired for
 `fp8_e4m3` on arch35 only) and, like `fp8_e4m3` on arch35, with sparse KV
 offload, which has no packed-record path.

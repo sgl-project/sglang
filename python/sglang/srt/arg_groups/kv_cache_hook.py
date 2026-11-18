@@ -174,17 +174,9 @@ def handle_int8_kv_cache_compatibility(server_args: Any) -> None:
             f"{hf_config.architectures[0]} is not a DSA model. Use "
             "--kv-cache-dtype bf16 or auto."
         )
-    from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
-        is_mla_preprocess_enabled,
-    )
-
-    # Off arch35, MLAProlog writes only a BF16 cache; the packed write needs
-    # arch35 and MXFP8 weights.
-    if is_mla_preprocess_enabled():
-        raise ValueError(
-            "--kv-cache-dtype int8 is not supported with SGLANG_NPU_USE_MLAPO. "
-            "Unset it or use --kv-cache-dtype bf16."
-        )
+    # SGLANG_NPU_USE_MLAPO needs no check here: MLAProlog writes the INT8
+    # record from dynamic INT8 projections, and NPUFusedMLAPreprocess rejects
+    # other projection weights once they are loaded, as it does for FP8.
 
 
 def handle_kv4_compatibility(server_args: Any) -> None:
