@@ -323,6 +323,9 @@ class MlxModelRunnerStub(ModelRunner):
             kvcache=dummy_kv,
             need_sort=False,
         )
+        if isinstance(self.req_to_token_pool, MlxAuxiliaryStateReqToTokenPool):
+            # The radix cache's state component reaches the slots here.
+            self.token_to_kv_pool_allocator.state = self.req_to_token_pool.state
 
         # No CUDA graphs, no attention backend
         self.decode_cuda_graph_runner = None
@@ -337,7 +340,7 @@ class MlxModelRunnerStub(ModelRunner):
             f"zero GPU KV cache allocation)"
         )
 
-    def alloc_memory_pool(self, memory_pool_config=None):
+    def alloc_memory_pool(self, memory_pool_config=None, *, draft_parallel_layout=None):
         """No-op: MLX manages its own KV cache."""
         pass
 

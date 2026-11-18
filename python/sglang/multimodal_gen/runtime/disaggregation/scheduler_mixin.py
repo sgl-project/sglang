@@ -60,10 +60,12 @@ from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
     detach_cuda_tensors,
 )
 from sglang.multimodal_gen.runtime.distributed.utils import broadcast_pyobj
-from sglang.multimodal_gen.runtime.entrypoints.utils import expand_request_outputs
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     clone_scheduler_runtime,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    expand_request_outputs,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
@@ -540,7 +542,7 @@ class SchedulerDisaggMixin:
         self._preallocated_slots: dict[int, object] = {}
         preallocated_slot_info = []
         if self._disagg_role.is_transfer_receiver:
-            capacity = getattr(sa, "disagg_prealloc_slots", 2)
+            capacity = 2
             typical_size = 64 * 1024 * 1024  # 64 MiB per slot
             for i in range(capacity):
                 slot = buffer.allocate(typical_size, f"prealloc_{i}")
@@ -1569,7 +1571,9 @@ class SchedulerDisaggMixin:
         self: Scheduler, req: Req, request_id: str
     ) -> None:
         """Run local preparation, DiT, and VAE, then return decoded pixels."""
+        # the head owns image encoding and persistence; this hop carries tensors
         req.save_output = False
+        req.return_file_paths_only = False
         start_time = time.monotonic()
         with self._disagg_trace_dispatch(req):
             if (
@@ -1619,7 +1623,7 @@ class SchedulerDisaggMixin:
         """Run decoder compute in transfer mode, send result to DS.
 
         Decoder result is sent as raw ZMQ multipart frames (same format as
-        relay mode) so DiffusionServer handles it via _handle_decoder_result_frames
+        relay mode) so DiffusionServer uses its decoder result handler
         without hex/JSON overhead.
         """
 
@@ -1646,7 +1650,7 @@ class SchedulerDisaggMixin:
         duration_s = time.monotonic() - start_time
 
         # Send result as raw ZMQ frames (no TRANSFER_MAGIC prefix).
-        # DiffusionServer will route it through _handle_decoder_result_frames,
+        # DiffusionServer will route it through its decoder result handler,
         # the same path as relay mode.
         tensor_fields = {}
         scalar_fields = {"request_id": request_id}

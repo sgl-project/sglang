@@ -91,7 +91,7 @@ def warmup(nc: int, nv: int, num_iters: int = 5, device: str = "cuda") -> None:
     _init_fused_backend()
     if not _FUSED_AVAILABLE:
         raise RuntimeError(f"LPLB fused solver unavailable: {_unavailable_reason()}")
-    _FUSED_ASSERT_FITS(nc, nv, gpu="h100")
+    _FUSED_ASSERT_FITS(nc, nv)
     _FUSED_WARMUP(nc, nv, num_iters=num_iters, device=device)
 
 

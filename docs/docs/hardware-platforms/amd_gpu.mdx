@@ -45,7 +45,7 @@ You can install SGLang using one of the methods below.
 
 ```bash Command
 # Use the last release branch
-git clone -b v0.5.21 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.23 https://github.com/sgl-project/sglang.git
 cd sglang
 
 # Compile sgl-kernel
@@ -105,7 +105,7 @@ The steps below show how to build and use an image.
 
    ```bash Command
    drun sglang_image \
-       python3 -m sglang.bench_serving \
+       python3 -m sglang.benchmark.serving \
        --backend sglang \
        --dataset-name random \
        --num-prompts 4000 \

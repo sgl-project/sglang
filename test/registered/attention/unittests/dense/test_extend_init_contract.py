@@ -27,7 +27,7 @@ import unittest
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
@@ -36,7 +36,9 @@ from sglang.test.kits.attention_unittest.attention_methods.dense_attention impor
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=11, stage="base-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-a", runner_config="1-gpu-small")
+# The FA3 cases skip on SM100+; the 5090 above is SM120.
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
 
 _EXTEND_CASE = DenseAttentionCase(
     name="extend_no_prefix_smoke",

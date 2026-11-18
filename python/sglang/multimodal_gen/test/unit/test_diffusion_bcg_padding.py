@@ -1,7 +1,7 @@
 import dataclasses
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -19,10 +19,12 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     DynamicVarlenMaskMeta,
     build_varlen_mask_meta,
 )
+from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.models.dits.flux3_image import Packed
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     _attn_mask_meta_local_pad,
 )
+from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     denoising as denoising_module,
 )
@@ -896,6 +898,65 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         )
 
         self.assertIsNone(runner._capture_limit_reason(entry))
+
+
+class TestBCGWeightChangeAfterCapture(unittest.TestCase):
+    """Graphs replay capture-time weights and LoRA branches, so a later change drops them."""
+
+    def setUp(self):
+        self.eager_calls = 0
+
+        def eager(**kwargs):
+            self.eager_calls += 1
+            return "eager"
+
+        self.runner = object.__new__(DiffusionBreakableCudaGraphRunner)
+        self.runner.transformer = eager
+        self.runner.device_module = SimpleNamespace(empty_cache=lambda: None)
+        self.runner._blocked = set()
+        self.runner._disabled_reason = None
+        self.kwargs = {"hidden_states": torch.zeros(2)}
+        self.runner.entries = {
+            _signature_kwargs(self.kwargs): _CaptureEntry(
+                graph=SimpleNamespace(_break_fns=[], _segments=[object()]),
+                static_kwargs={},
+                static_leaves=[],
+                output=None,
+                num_segments=1,
+            )
+        }
+        stage = DenoisingStage.__new__(DenoisingStage)
+        stage._bcg_runners = {(id(eager), "lossless"): self.runner}
+        self.worker = GPUWorker.__new__(GPUWorker)
+        self.worker.metrics = None
+        self.worker.pipeline = MagicMock(spec=LoRAPipeline)
+        self.worker.pipeline.stages = [stage]
+
+    def _assert_runs_eager(self):
+        self.assertEqual(self.runner.entries, {})
+        self.assertEqual(self.runner(**self.kwargs), "eager")
+        self.assertEqual(self.eager_calls, 1)
+
+    def test_set_lora_drops_captured_graphs(self):
+        self.worker.set_lora("style", "/loras/style.safetensors")
+        self.worker.pipeline.set_lora.assert_called_once()
+        self._assert_runs_eager()
+
+    def test_merge_and_unmerge_drop_captured_graphs(self):
+        changes = {
+            "merge": lambda worker: worker.merge_lora_weights(),
+            "unmerge": lambda worker: worker.unmerge_lora_weights(),
+        }
+        for name, change in changes.items():
+            with self.subTest(name):
+                self.setUp()
+                change(self.worker)
+                self._assert_runs_eager()
+
+    def test_resume_memory_occupation_drops_captured_graphs(self):
+        self.worker.memory_occupation = MagicMock()
+        self.worker.resume_memory_occupation()
+        self._assert_runs_eager()
 
 
 if __name__ == "__main__":

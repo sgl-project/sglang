@@ -71,6 +71,14 @@ class TestSelection:
         with patch(THRESHOLD_PATH, 1024):
             assert _host_resident_tables(model) == []
 
+    def test_a_table_tied_to_an_output_head_is_left_alone(self):
+        # a tied head would keep a host weight and fail its device matmul
+        model = _Declared()
+        model.head = torch.nn.Linear(64, 4096, bias=False)
+        model.head.weight = model.embed.weight
+        with patch(THRESHOLD_PATH, 1024):
+            assert _host_resident_tables(model) == []
+
 
 class TestDetachAndRestore:
     def test_the_weight_survives_a_move_that_skips_it(self):

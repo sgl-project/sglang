@@ -7,7 +7,7 @@ from sglang.test.glm53_flash_common import COMMON_SERVER_ARGS, _GLM53FlashH200Ba
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
 
-register_cuda_ci(est_time=1200, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=521, stage="extra-b", runner_config="8-gpu-h200")
 
 
 class TestGLM53FlashH200LowLatency(

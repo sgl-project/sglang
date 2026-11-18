@@ -10,7 +10,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention import deepseek_v4_backend as dsv4
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -100,7 +100,7 @@ class TestRunnerGluesTheTargetVerify(CustomTestCase):
         runner.buffers = SimpleNamespace(out_cache_loc=torch.arange(16))
         view = SimpleNamespace(out_cache_loc=torch.arange(100, 106))
         runner._draft_metadata_glue, runner._target_metadata_glue = False, True
-        runner._glue_draft_inputs(view)
+        runner._glue_draft_inputs(view, 6)
         self.assertEqual(
             view.out_cache_loc.data_ptr(), runner.buffers.out_cache_loc.data_ptr()
         )

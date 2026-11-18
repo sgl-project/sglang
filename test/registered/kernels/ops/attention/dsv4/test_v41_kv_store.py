@@ -37,7 +37,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 # backend-specific: the gfx950 builds of the V4.1 row quantizers, the dequant NaN
 # canonicalization and the query rope in the K launch exist only on HIP
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=60, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 V41_LAYOUTS = (
     KVLayout.V41,
@@ -309,8 +309,9 @@ class TestV41KVStore(CustomTestCase):
         fused_store_cache: exact-norm rows bitwise against the torch quantizer, and
         general rows bitwise against the unfused kernel chain."""
 
-        # 300 tokens take the block-per-token kernel, 4096 the warp-per-token one.
-        for n, num_pages in ((300, 3), (4096, 20)):
+        # 300 tokens take the block-per-token kernel, 4097 the warp-per-token one; an odd
+        # count leaves half of the last wave64 idle on HIP.
+        for n, num_pages in ((300, 3), (4097, 20)):
             with self.subTest(tokens=n):
                 self._check_fused_k_norm_rope_store(n, num_pages)
 

@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4StateBufferInfo
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -79,27 +80,6 @@ class KVAndScore:
             )
 
         return KVAndScore(torch.cat([v.kv_score for v in tensors], dim=dim))
-
-
-def c4_state_transfer_indices(
-    req_pool_idx: int,
-    seq_len: int,
-    *,
-    ring_size: int,
-) -> np.ndarray:
-    """PD transfer rows of the overlap C4 state: the live tail of the request's ring."""
-    # Prefill and decode can have different ring sizes (8 or 16 with EAGLE/MTP);
-    # pair the overlap compressor's live rows by logical token position.
-    if ring_size < 8 or ring_size % 4 != 0:
-        raise ValueError(
-            f"C4 ring_size must be a multiple of 4 and at least 8, got {ring_size}"
-        )
-
-    seq_len = max(0, int(seq_len))
-    state_len = seq_len % 4 + 4
-    positions = np.arange(max(0, seq_len - state_len), seq_len, dtype=np.int64)
-    rows = int(req_pool_idx) * int(ring_size) + positions % int(ring_size)
-    return rows.astype(np.int32)
 
 
 def request_scoped_state_transfer_indices(
@@ -188,6 +168,24 @@ class CompressStatePool:
                 self.kv_score_buffer.clear()
             else:
                 self.kv_score_buffer[-1].clear()
+
+    def checkpoint_buffer_info(self) -> DSV4StateBufferInfo:
+        """Expose whole page-owned rings without copying their backing storage."""
+        if self.request_scoped:
+            raise ValueError("Request-scoped compressor state is not checkpointed")
+        state = self.kv_score_buffer.kv_score
+        if not state.is_contiguous():
+            raise ValueError("Compressor checkpoint state must be contiguous")
+        page_bytes = self.ring_size * state[0].nbytes
+        usable_slots = state.shape[0] // self.ring_size * self.ring_size
+        pages = (
+            state.view(torch.uint8)
+            .reshape(state.shape[0], -1)[:usable_slots]
+            .reshape(-1, page_bytes)
+        )
+        return DSV4StateBufferInfo(
+            pages=pages, ring_size=self.ring_size, dtype=state.dtype
+        )
 
     def transfer_indices(self, req_pool_idx: int, seq_len: int) -> np.ndarray:
         """PD transfer indices of this pool's state for one request."""

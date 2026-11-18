@@ -8,7 +8,8 @@ import sglang.kernels.ops.layernorm.mhc as mhc
 from sglang.kernels.ops.layernorm.mhc import mhc_fused_post_pre, mhc_post, mhc_pre
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
 
 
 @pytest.fixture
@@ -236,6 +237,30 @@ def _hopper_mhc_layer(norm, w, scale, base):
     return layer
 
 
+def _mhc_mix_inputs(num_tokens):
+    torch.manual_seed(192 + num_tokens)
+    x = torch.randn(num_tokens, 4, 5120, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(24, 20480, device="cuda") * 0.01
+    scale = torch.tensor([0.5, 0.25, 0.25], device="cuda")
+    base = torch.randn(24, device="cuda")
+    return x, w, scale, base
+
+
+def _mhc_mix_reference(x, w, scale, base):
+    xd = x.flatten(1).double()
+    z = (xd @ w.double().T) * torch.rsqrt(xd.square().mean(-1, keepdim=True) + 1e-6)
+    pre = torch.sigmoid(z[:, :4] * scale[0] + base[:4]) + 1e-6
+    post = 2 * torch.sigmoid(z[:, 4:8] * scale[1] + base[4:8])
+    comb = (z[:, 8:] * scale[2] + base[8:]).reshape(-1, 4, 4)
+    comb = (comb - comb.amax(-1, keepdim=True)).exp()
+    comb = comb / comb.sum(-1, keepdim=True) + 1e-6
+    comb = comb / (comb.sum(-2, keepdim=True) + 1e-6)
+    for _ in range(19):
+        comb = comb / (comb.sum(-1, keepdim=True) + 1e-6)
+        comb = comb / (comb.sum(-2, keepdim=True) + 1e-6)
+    return pre, post, comb
+
+
 @pytest.mark.parametrize("num_tokens", [32, 33, 64, 128, 257, 4096, 4097, 8192])
 def test_hopper_compensated_mhc(num_tokens):
     from sglang.srt.environ import envs
@@ -245,11 +270,7 @@ def test_hopper_compensated_mhc(num_tokens):
 
     if not is_sm90_supported():
         pytest.skip("Hopper compensated mHC dispatch")
-    torch.manual_seed(192 + num_tokens)
-    x = torch.randn(num_tokens, 4, 5120, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(24, 20480, device="cuda") * 0.01
-    scale = torch.tensor([0.5, 0.25, 0.25], device="cuda")
-    base = torch.randn(24, device="cuda")
+    x, w, scale, base = _mhc_mix_inputs(num_tokens)
     norm = SimpleNamespace(weight=torch.ones(5120, device="cuda", dtype=torch.bfloat16))
     layer = _hopper_mhc_layer(norm, w, scale, base)
     with envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(True):
@@ -257,25 +278,70 @@ def test_hopper_compensated_mhc(num_tokens):
         assert layer._hc_attn_bf16_parts is not None
         assert layer._hc_attn_tf32_parts is None
         actual = model_mhc.mix_stats(layer.attn_hc, x)
-    xd = x.flatten(1).double()
-    z = (xd @ w.double().T) * torch.rsqrt(xd.square().mean(-1, keepdim=True) + 1e-6)
-    expected_pre = torch.sigmoid(z[:, :4] * scale[0] + base[:4]) + 1e-6
-    expected_post = 2 * torch.sigmoid(z[:, 4:8] * scale[1] + base[4:8])
-    comb = (z[:, 8:] * scale[2] + base[8:]).reshape(-1, 4, 4)
-    comb = (comb - comb.amax(-1, keepdim=True)).exp()
-    comb = comb / comb.sum(-1, keepdim=True) + 1e-6
-    comb = comb / (comb.sum(-2, keepdim=True) + 1e-6)
-    for _ in range(19):
-        comb = comb / (comb.sum(-1, keepdim=True) + 1e-6)
-        comb = comb / (comb.sum(-2, keepdim=True) + 1e-6)
-    for result, expected in zip(actual, (expected_pre, expected_post, comb)):
+    reference = _mhc_mix_reference(x, w, scale, base)
+    for result, expected in zip(actual, reference):
         torch.testing.assert_close(result.double(), expected, rtol=1e-5, atol=2e-6)
     with envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(False):
         fallback = model_mhc.mix_stats(layer.attn_hc, x)
-        for result, expected in zip(fallback, (expected_pre, expected_post, comb)):
+        for result, expected in zip(fallback, reference):
             torch.testing.assert_close(result.double(), expected, rtol=1e-5, atol=2e-6)
         DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache(layer)
         assert layer._hc_attn_bf16_parts is None
+
+
+@pytest.mark.parametrize("num_tokens", [32, 100, 256, 512, 1024])
+def test_deepgemm_prenorm_dual_matches_two_calls(num_tokens):
+    from unittest.mock import patch
+
+    if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10):
+        pytest.skip("SM10x only")
+    torch.manual_seed(7 + num_tokens)
+    x = torch.randn(num_tokens, 20480, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(24, 20480, device="cuda") * 0.01
+    high = w.bfloat16().float()
+    low = (w - high).contiguous()
+    scale = torch.tensor([0.5, 0.25, 0.25], device="cuda")
+    base = torch.randn(24, device="cuda")
+    args = (x, (high, low), scale, base, 20, 1e-6, 1e-6)
+    dual = mhc.hc_mix_stats_sinkhorn_deepgemm(*args)
+    not_sm10 = SimpleNamespace(
+        is_sm=lambda _: False, num_sms=mhc.current_arch().num_sms
+    )
+    with patch.object(mhc, "current_arch", return_value=not_sm10):
+        two_calls = mhc.hc_mix_stats_sinkhorn_deepgemm(*args)
+    for a, b in zip(dual, two_calls):
+        assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("num_tokens", [32, 33, 256, 257, 4095, 4096])
+def test_blackwell_compensated_mhc(num_tokens):
+    """Blackwell takes the BF16x3 projection up to 256 rows (not on SM107) and
+    for 4096-65536 rows, and the DeepGEMM projection in between."""
+    from unittest.mock import patch
+
+    from sglang.srt.environ import envs
+    from sglang.srt.models import deepseek_v4_mhc as model_mhc
+    from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
+    from sglang.srt.utils import get_device_sm, is_sm100_supported
+
+    if not is_sm100_supported():
+        pytest.skip("Blackwell compensated mHC dispatch")
+    bf16x3 = num_tokens >= 4096 or (num_tokens <= 256 and get_device_sm() != 107)
+    unused = (
+        "hc_mix_stats_sinkhorn_deepgemm" if bf16x3 else "hc_mix_stats_sinkhorn_bf16x3"
+    )
+    x, w, scale, base = _mhc_mix_inputs(num_tokens)
+    norm = SimpleNamespace(weight=torch.ones(5120, device="cuda", dtype=torch.bfloat16))
+    layer = _hopper_mhc_layer(norm, w, scale, base)
+    with envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(True):
+        DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache(layer)
+        if layer._hc_attn_bf16_parts is None:
+            pytest.skip("DeepGEMM tf32_hc_prenorm_gemm is unavailable")
+        with patch.object(mhc, unused, side_effect=AssertionError(unused)):
+            actual = model_mhc.mix_stats(layer.attn_hc, x)
+    if bf16x3:
+        for result, expected in zip(actual, _mhc_mix_reference(x, w, scale, base)):
+            torch.testing.assert_close(result.double(), expected, rtol=1e-5, atol=2e-6)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 4, 64, 4096])
@@ -305,7 +371,7 @@ def test_hopper_combine_norm(num_tokens):
 @pytest.mark.parametrize("num_tokens", [1, 4, 16, 64])
 def test_hopper_mhc_stats_stream_graph(num_tokens):
     from sglang.srt.layers.layernorm import RMSNorm
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
     from sglang.srt.models import deepseek_v4_mhc as model_mhc
     from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
     from sglang.srt.utils import is_sm90_supported
@@ -424,6 +490,144 @@ def test_moe_post_reduces_before_adding_replicated_shared(
     assert len(reduced_inputs) == 1
     torch.testing.assert_close(reduced_inputs[0], partial)
     torch.testing.assert_close(actual, torch.full((2, 3), expected))
+
+
+_EPS = 1e-6
+_SINKHORN_ITERS = 20
+_POST_MULT = 2.0
+
+
+@pytest.fixture
+def single_process(monkeypatch, stated_tp_group):
+    monkeypatch.setattr(mhc, "use_symmetric_memory", lambda *a, **kw: nullcontext())
+    monkeypatch.setattr(mhc, "is_allocation_symmetric", lambda: False)
+    yield
+
+
+def _mhc_pre_reference(residual, fn, hc_scale, hc_base, *, eps_outside_sqrt):
+    hc_mult = residual.shape[1]
+    x = residual.flatten(1).float()
+    mixes = x @ fn.t()
+    mean_sq = x.pow(2).mean(-1, keepdim=True)
+    if eps_outside_sqrt:
+        rms = 1.0 / (mean_sq.sqrt() + _EPS)
+    else:
+        rms = torch.rsqrt(mean_sq + _EPS)
+    mixes = mixes * rms
+    pre = torch.sigmoid(mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]) + _EPS
+    post = _POST_MULT * torch.sigmoid(
+        mixes[:, hc_mult : 2 * hc_mult] * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult]
+    )
+    comb = (mixes[:, 2 * hc_mult :] * hc_scale[2] + hc_base[2 * hc_mult :]).view(
+        -1, hc_mult, hc_mult
+    )
+    comb = torch.exp(comb - comb.amax(-1, keepdim=True))
+    comb = comb / comb.sum(-1, keepdim=True) + _EPS
+    comb = comb / (comb.sum(-2, keepdim=True) + _EPS)
+    for _ in range(_SINKHORN_ITERS - 1):
+        comb = comb / (comb.sum(-1, keepdim=True) + _EPS)
+        comb = comb / (comb.sum(-2, keepdim=True) + _EPS)
+    layer_input = (pre.unsqueeze(-1) * residual.float()).sum(1)
+    return post, comb, layer_input
+
+
+def _eps_outside_sqrt_inputs(num_tokens, hc_mult=4, hidden=4096):
+    torch.manual_seed(0)
+    mix = hc_mult * (2 + hc_mult)
+    # A small residual puts mean_sq near eps, where the two eps placements differ.
+    residual = (
+        torch.randn(num_tokens, hc_mult, hidden, device="cuda") * 1e-3
+    ).bfloat16()
+    fn = torch.randn(mix, hc_mult * hidden, device="cuda") * 0.01
+    hc_scale = torch.rand(3, device="cuda")
+    hc_base = torch.randn(mix, device="cuda") * 0.1
+    return residual, fn, hc_scale, hc_base
+
+
+def _run_mhc_pre_eps_outside_sqrt(residual, fn, hc_scale, hc_base, **norm):
+    return mhc_pre(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps=_EPS,
+        hc_pre_eps=_EPS,
+        hc_sinkhorn_eps=_EPS,
+        hc_post_mult_value=_POST_MULT,
+        sinkhorn_repeat=_SINKHORN_ITERS,
+        eps_outside_sqrt=True,
+        **norm,
+    )
+
+
+def _assert_post_uses_eps_outside_sqrt(post, inputs):
+    ref_post, _, _ = _mhc_pre_reference(*inputs, eps_outside_sqrt=True)
+    dsv4_post, _, _ = _mhc_pre_reference(*inputs, eps_outside_sqrt=False)
+    # Tolerance covers the kernel's split-K fp32 GEMM order.
+    torch.testing.assert_close(post.squeeze(-1), ref_post, rtol=2e-3, atol=2e-3)
+    assert (post.squeeze(-1) - dsv4_post).abs().max() > 1e-2
+
+
+@pytest.mark.parametrize("num_tokens", [7, 300, 3000])
+def test_mhc_pre_eps_outside_sqrt(num_tokens, single_process):
+    inputs = _eps_outside_sqrt_inputs(num_tokens)
+    post, comb, layer_input = _run_mhc_pre_eps_outside_sqrt(*inputs)
+    _, ref_comb, ref_input = _mhc_pre_reference(*inputs, eps_outside_sqrt=True)
+    _assert_post_uses_eps_outside_sqrt(post, inputs)
+    torch.testing.assert_close(comb, ref_comb, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(layer_input.float(), ref_input, rtol=2e-2, atol=1e-4)
+
+
+@pytest.mark.parametrize("num_tokens", [7, 300])
+def test_mhc_pre_eps_outside_sqrt_fused_norm(num_tokens, single_process):
+    inputs = _eps_outside_sqrt_inputs(num_tokens)
+    hidden = inputs[0].shape[-1]
+    norm_weight = (1 + 0.1 * torch.randn(hidden, device="cuda")).bfloat16()
+    post, _, layer_input = _run_mhc_pre_eps_outside_sqrt(
+        *inputs, norm_weight=norm_weight, norm_eps=_EPS
+    )
+    _assert_post_uses_eps_outside_sqrt(post, inputs)
+    _, _, ref_input = _mhc_pre_reference(*inputs, eps_outside_sqrt=True)
+    ref = torch.nn.functional.rms_norm(ref_input, (hidden,), norm_weight.float(), _EPS)
+    # The reference norms the fp32 layer input; the kernel scales a bf16 stash.
+    torch.testing.assert_close(layer_input.float(), ref, rtol=2e-2, atol=2e-2)
+
+
+def _hc_head_reference(x, fn, scale, base, norm_eps, hc_eps, eps_outside_sqrt):
+    flat = x.flatten(1).float()
+    mean_sq = flat.square().mean(-1, keepdim=True)
+    if eps_outside_sqrt:
+        rsqrt = 1.0 / (mean_sq.sqrt() + norm_eps)
+    else:
+        rsqrt = torch.rsqrt(mean_sq + norm_eps)
+    pre = torch.sigmoid(torch.nn.functional.linear(flat, fn) * rsqrt * scale + base)
+    return torch.sum((pre + hc_eps).unsqueeze(-1) * x.float(), dim=1).to(x.dtype)
+
+
+@pytest.mark.parametrize("eps_outside_sqrt", [False, True])
+def test_fused_hc_head(eps_outside_sqrt):
+    from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
+
+    torch.manual_seed(0)
+    num_tokens, hc, hidden = 33, 4, 4096
+    x = torch.randn(num_tokens, hc, hidden, device="cuda").bfloat16()
+    fn = torch.randn(hc, hc * hidden, device="cuda") * 0.1
+    scale = torch.ones(1, device="cuda")
+    base = torch.randn(hc, device="cuda") * 0.1
+    # A large eps puts a quarter or more of the outputs of the two formulas
+    # outside the tolerance of each other.
+    norm_eps = 0.5
+    out = fused_hc_head(
+        x,
+        fn,
+        scale,
+        base,
+        norm_eps=norm_eps,
+        hc_eps=1e-6,
+        eps_outside_sqrt=eps_outside_sqrt,
+    )
+    ref = _hc_head_reference(x, fn, scale, base, norm_eps, 1e-6, eps_outside_sqrt)
+    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
 
 
 if __name__ == "__main__":

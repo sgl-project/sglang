@@ -10,17 +10,31 @@ draft pool exists.
 import unittest
 
 from sglang.srt.disaggregation.utils import build_staging_slot_metadata
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _Pool(MHATokenToKVPool):
     def __init__(self, tag, layer_ids):
         self.k_buffer = [f"{tag}K{i}" for i in layer_ids]
         self.v_buffer = [f"{tag}V{i}" for i in layer_ids]
+        self.start_layer = 0
+        self.layer_num = len(layer_ids)
+
+
+class _NoBuffers:
+    """A pool of another layout: one sub-pool, its own view, no K/V tensors."""
+
+    start_layer = 0
+    layer_num = 0
+
+    def __init__(self):
+        self.layer_router = PlainPoolRouter(self, IdSpaceKind.FULL)
 
 
 def _kv_layer_ids(target_ids, draft_ids):
@@ -32,9 +46,6 @@ class TestStagingDraftKvSlots(CustomTestCase):
     def test_undescribable_draft_still_yields_target_buffers(self):
         # Returning nothing here left the caller skipping set_kv_buffer_tensors
         # entirely, and staging then came up with no buffers at all.
-        class _NoBuffers:
-            pass
-
         k_buffers, v_buffers, slot_ids = build_staging_slot_metadata(
             kv_layer_ids=_kv_layer_ids([87], [92]),
             num_draft_entries=2,
@@ -48,9 +59,6 @@ class TestStagingDraftKvSlots(CustomTestCase):
     def test_pool_without_contiguous_tensors_is_declined(self):
         # MLA pools have no k_buffer/v_buffer to stage; the caller relies on None
         # to skip the registration rather than register empty lists.
-        class _NoBuffers:
-            pass
-
         self.assertIsNone(
             build_staging_slot_metadata(
                 kv_layer_ids=[],
