@@ -107,7 +107,6 @@ if _use_aiter:
 
     from sglang.srt.layers.quantization.unquant_hip import (
         a16w16_into,
-        a16w16_is_tuned,
         prefer_hipblaslt,
     )
 
@@ -1054,16 +1053,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 and flydsl_gemm_applies(x, layer.weight, x.dtype)
             ):
                 return flydsl_gemm(x, layer.weight)
-            if (
-                _rowmajor_ok
-                and _prefer_triton_a16w16(x, layer.weight)
-                and not (
-                    _is_gfx95
-                    and a16w16_is_tuned(
-                        x.shape[0], layer.weight.shape[0], x.shape[1], bias is not None
-                    )
-                )
-            ):
+            if _rowmajor_ok and _prefer_triton_a16w16(x, layer.weight):
                 return _aiter_triton_a16w16(x, layer.weight, bias, dtype=x.dtype)
             if (
                 _is_gfx1250
