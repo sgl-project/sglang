@@ -327,11 +327,13 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     shuffle_weight(layer.w13_weight.data, (16, 16)),
                     requires_grad=False,
                 )
+                layer.w13_weight.is_shuffled = True
                 torch.cuda.empty_cache()
                 layer.w2_weight = torch.nn.Parameter(
                     shuffle_weight(layer.w2_weight.data, (16, 16)),
                     requires_grad=False,
                 )
+                layer.w2_weight.is_shuffled = True
                 torch.cuda.empty_cache()
 
         if (

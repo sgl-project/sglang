@@ -152,14 +152,14 @@ def _cached_finalize_launch(
     weight_dtype: str,
     split_k: int = 1,
 ):
-    from aiter.ops.flydsl.muse_moe_finalize import build_finalize
+    from sglang.kernels.ops.moe.muse_moe_finalize import build_finalize
 
     return build_finalize(H, topk, has_norm, has_scale, weight_dtype, split_k)
 
 
 @functools.lru_cache(maxsize=16)
 def _cached_splitk_silu_launch(I: int, split_k: int):
-    from aiter.ops.flydsl.muse_moe_finalize import build_splitk_silu
+    from sglang.kernels.ops.moe.muse_moe_finalize import build_splitk_silu
 
     return build_splitk_silu(I, split_k)
 
@@ -182,7 +182,7 @@ def _launch_gemm(
     cfg,
     split_k=1,
 ):
-    from aiter.ops.flydsl.muse_moe_gemm import launch_muse_moe_gemm
+    from sglang.kernels.ops.moe.muse_moe_gemm import launch_muse_moe_gemm
 
     # Gate/up carries twice as many accumulator fragments as down projection,
     # so one tile is not generally optimal for both stages.  Preserve the

@@ -1,8 +1,7 @@
-"""Qwen3.5-9B GSM8K accuracy on Intel XPU (TP=4).
+"""Qwen3.5-9B GSM8K accuracy on Intel XPU (TP=1).
 
-Scored by sgl-eval ``gsm8k`` with thinking disabled. Covers both the opt-in
-fused GDN SYCL kernel path (``--linear-attn-backend intel_xpu``) and the default
-Triton GDN path (``triton``, unchanged from other platforms).
+Scored by sgl-eval ``gsm8k`` with thinking disabled. Covers standalone SYCL GDN
+(``--linear-attn-backend intel_xpu``) and Triton GDN. Both use SYCL conv1d.
 """
 
 import unittest
@@ -13,7 +12,7 @@ from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.xpu.simple_eval_gsm8k_xpu_mixin import SimpleEvalGSM8KXPUMixin
 
-register_xpu_ci(est_time=900, suite="nightly-xpu-kernel-main-4-gpu", nightly=True)
+register_xpu_ci(est_time=900, suite="nightly-kernel-main-test-4-gpu-xpu", nightly=True)
 
 
 @unittest.skipUnless(
@@ -43,16 +42,11 @@ class Qwen3_5_9BXPUBase(SimpleEvalGSM8KXPUMixin, CustomTestCase):
 
 
 class TestQwen3_5_9BXPUDefault(Qwen3_5_9BXPUBase):
-    """Default path: Triton GDN kernels (unchanged from other platforms)."""
+    """Default Triton GDN recurrence with SYCL conv1d."""
 
 
-class TestQwen3_5_9BXPUFusedGDN(Qwen3_5_9BXPUBase):
-    """Opt-in fused SYCL GDN kernel path (``--linear-attn-backend intel_xpu``).
-
-    Small ``num_examples`` since this is a smoke check of the fused-kernel
-    dispatch, not a full accuracy regression test (already covered by the
-    default Triton path above); accuracy threshold is left at 0 accordingly.
-    """
+class TestQwen3_5_9BXPUStandaloneGDN(Qwen3_5_9BXPUBase):
+    """Standalone SYCL GDN recurrence (``--linear-attn-backend intel_xpu``)."""
 
     other_args = Qwen3_5_9BXPUBase.other_args + [
         "--linear-attn-backend",

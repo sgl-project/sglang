@@ -349,6 +349,7 @@ def _page_guard_action(
     try:
         max_page_tokens = int(params.get("max_page_tokens") or 0)
         page_token_id = _optional_int(params.get("page_token_id"))
+        lookahead = int(params.get(KEY_LOOKAHEAD) or 0)
     except (TypeError, ValueError):
         return None
     if (
@@ -364,7 +365,7 @@ def _page_guard_action(
         max_page_tokens=max_page_tokens,
         eos_id=eos_id,
         stop_only=bool(params.get("page_stop_only")),
-        lookahead=int(params.get(KEY_LOOKAHEAD) or 0),
+        lookahead=lookahead,
     )
 
 
@@ -494,6 +495,8 @@ class _RowEdits:
         )
         if logits.is_cuda:
             index = index.pin_memory().to(logits.device, non_blocking=True)
+        else:
+            index = index.to(logits.device)
         rows, cols = index[0], index[1]
         if n_forced:
             logits.index_fill_(0, rows[:n_forced], -float("inf"))
