@@ -80,6 +80,7 @@ from sglang.srt.layers.attention.graph_utils import (
     real_rows_scope,
 )
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
+from sglang.srt.layers.cp.cp_decode_attn_dp import cp_decode_query_layout
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
 from sglang.srt.layers.cp.utils import (
@@ -1019,6 +1020,7 @@ class MqaAttentionBase(nn.Module):
     wo_a_fp8: bool = False
     wo_a_fp8_block128: bool = False
     use_mega_attention: bool = False
+    use_cp_decode_attn_dp: bool = False
 
     def __init__(
         self,
@@ -1038,6 +1040,10 @@ class MqaAttentionBase(nn.Module):
         self.is_dsv41 = getattr(config, "model_type", None) == "deepseek_v41"
         self.attn_tp_rank: int = get_parallel().attn_tp_rank
         self.attn_tp_size: int = get_parallel().attn_tp_size
+        self.use_cp_decode_attn_dp = (
+            isinstance(self, MQALayer)
+            and getattr(get_parallel(), "cp_decode_attn_mode", None) == "dp"
+        )
 
         self.layer_id = layer_id
         self.dim = config.hidden_size
@@ -1352,9 +1358,10 @@ class MqaAttentionBase(nn.Module):
 
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
-        from sglang.srt.layers.cp.cp_decode_attn_dp import use_cp_decode_attn_dp
-
-        if isinstance(self, MQALayer) and use_cp_decode_attn_dp(forward_batch):
+        if self.use_cp_decode_attn_dp and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
             yield
             return
         ctx = get_cp_decode_attn_tp_ctx()
@@ -2718,9 +2725,11 @@ class MQALayer(MqaAttentionBase):
             return x
 
         attn_backend = get_attn_backend()
-        from sglang.srt.layers.cp.cp_decode_attn_dp import cp_decode_query_layout
-
-        decode_dp = cp_decode_query_layout(forward_batch, x.shape[0])
+        decode_dp = (
+            cp_decode_query_layout(forward_batch, x.shape[0])
+            if self.use_cp_decode_attn_dp
+            else None
+        )
         query_rows = decode_dp.local_rows if decode_dp is not None else x.shape[0]
         if TYPE_CHECKING:
             assert isinstance(

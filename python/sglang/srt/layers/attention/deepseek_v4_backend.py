@@ -110,6 +110,7 @@ from sglang.srt.layers.attention.verify_mask import (
     VerifyMask,
     maybe_create_verify_mask,
 )
+from sglang.srt.layers.cp.cp_decode_attn_dp import cp_decode_query_layout
 from sglang.srt.layers.cp.interleave import (
     InterleaveContextParallelMetadata,
     interleave_rows_per_request,
@@ -1182,8 +1183,6 @@ class DSV4Metadata:
     q_pad_buffer: Optional[torch.Tensor] = None
     # Set once a CUDA graph captures q_pad_buffer; it may not grow after that.
     q_pad_captured: bool = False
-    # Full-query and query-DP shapes must never share FlashMLA schedules.
-    decode_dp_flashmla_metadata: dict = field(default_factory=dict, repr=False)
 
     # What the candidate-source layer published for the index-source layers after
     # it, in the implementation's own type; never copied from the host.
@@ -1207,7 +1206,6 @@ class DSV4Metadata:
         return self.core_attn_metadata
 
     def copy_(self, other: DSV4Metadata):
-        self.decode_dp_flashmla_metadata.clear()
         self.core_attn_metadata.copy_(other.core_attn_metadata)
         maybe_copy_inplace(self.indexer_metadata, src=other.indexer_metadata)
         maybe_copy_inplace(self.c1_indexer_metadata, src=other.c1_indexer_metadata)
@@ -1219,7 +1217,6 @@ class DSV4Metadata:
         self.sparse_prefill_cache = None
 
     def refresh_for_breakable_cuda_graph_replay_(self, static_metadata: DSV4Metadata):
-        self.decode_dp_flashmla_metadata.clear()
         self.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
             static_metadata.core_attn_metadata
         )
@@ -1249,6 +1246,20 @@ class DSV4Metadata:
                 src=static_metadata.c128_compress_metadata,
             )
         self.sparse_prefill_cache = None
+
+
+@dataclass
+class DSV4DecodeDPMetadata(DSV4Metadata):
+    # Full-query and query-DP shapes must never share FlashMLA schedules.
+    decode_dp_flashmla_metadata: dict = field(default_factory=dict, repr=False)
+
+    def copy_(self, other: DSV4Metadata):
+        self.decode_dp_flashmla_metadata.clear()
+        super().copy_(other)
+
+    def refresh_for_breakable_cuda_graph_replay_(self, static_metadata: DSV4Metadata):
+        self.decode_dp_flashmla_metadata.clear()
+        super().refresh_for_breakable_cuda_graph_replay_(static_metadata)
 
 
 @dataclass
@@ -1334,6 +1345,8 @@ class DeepseekV4AttnBackend(
     needs_cpu_seq_lens: bool = False
     trtllm_attn: bool = False
     mega_attn: bool = False
+    use_cp_decode_attn_dp: bool = False
+    metadata_type = DSV4Metadata
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Breakable-graph verify rereads shared state across segments.
@@ -1355,6 +1368,12 @@ class DeepseekV4AttnBackend(
     ):
         super().__init__()
         self.model_runner = model_runner
+        self.use_cp_decode_attn_dp = (
+            not model_runner.is_draft_worker
+            and getattr(get_parallel(), "cp_decode_attn_mode", None) == "dp"
+        )
+        if self.use_cp_decode_attn_dp:
+            self.metadata_type = DSV4DecodeDPMetadata
         # Run at every KV store-location read; the DSpark deferred draft KV store
         # joins its forked write there (SGLANG_DSPARK_DEFER_CONTEXT_KV).
         self.pre_kv_store_hook: Optional[Callable[[], None]] = None
@@ -1834,7 +1853,7 @@ class DeepseekV4AttnBackend(
                     online_state_slot_offset=online_c128_state_slot_offset,
                 )
 
-        metadata = DSV4Metadata(
+        metadata = self.metadata_type(
             core_attn_metadata,
             indexer_metadata,
             c4_compress_metadata=create(compress_ratio=4) if self.has_c4 else None,
@@ -2465,7 +2484,7 @@ class DeepseekV4AttnBackend(
             c128_compress_metadata = create(compress_ratio=128)
         low = core_attn_metadata.low_ratios
         rows_per_request = 1 if is_ragged else num_draft_tokens
-        return DSV4Metadata(
+        return self.metadata_type(
             core_attn_metadata,
             indexer_metadata,
             c1_indexer_metadata=(
@@ -2535,7 +2554,7 @@ class DeepseekV4AttnBackend(
             seq_lens=seq_lens,
         )
 
-        return DSV4Metadata(
+        return self.metadata_type(
             core_attn_metadata,
             indexer_metadata,
             c1_indexer_metadata=c1_indexer_metadata,
@@ -2596,7 +2615,7 @@ class DeepseekV4AttnBackend(
             # Captures store_cache's cached path instead of a per-layer
             # in-graph mapping translate.
             core_attn_metadata.swa_out_cache_loc = swa_out_cache_loc
-        return DSV4Metadata(
+        return self.metadata_type(
             core_attn_metadata=core_attn_metadata,
             indexer_metadata=None,
         )
@@ -3577,7 +3596,8 @@ class DeepseekV4AttnBackend(
         if isinstance(metadata, DSV4Metadata) and isinstance(
             metadata.core_attn_metadata, DSV4AttnMetadata
         ):
-            metadata.decode_dp_flashmla_metadata.clear()
+            if self.use_cp_decode_attn_dp:
+                metadata.decode_dp_flashmla_metadata.clear()
             core = metadata.core_attn_metadata
             core.c0_flashmla_metadata = _create_flashmla_metadata()
             if core.has_c4:
@@ -3698,9 +3718,11 @@ class DeepseekV4AttnBackend(
         if run_compressor and layer.compressor is not None:
             self._low_ratio_compress(layer, x, req, pos, forward_batch)
         if run_indexer and layer.indexer is not None:
-            from sglang.srt.layers.cp.cp_decode_attn_dp import cp_decode_query_layout
-
-            layout = cp_decode_query_layout(forward_batch, x.shape[0])
+            layout = (
+                cp_decode_query_layout(forward_batch, x.shape[0])
+                if self.use_cp_decode_attn_dp
+                else None
+            )
             if layout is None:
                 self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
             elif layout.actual_rows:
