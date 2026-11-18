@@ -2406,6 +2406,22 @@ class TestNonIntrusiveTags(_NonIntrusiveTestBase):
         assert captured[f"{P}draft_layer.output"]["meta"]["runner"] == "draft"
         assert captured[f"{P}target_layer.output"]["meta"]["runner"] == "target"
 
+    def test_tags_are_filterable(self, tmp_path):
+        d = self._make_dumper(tmp_path, filter='runner == "draft"')
+        draft = self._build_model("draft_layer")
+        target = self._build_model("target_layer")
+        d.register_non_intrusive_dumper(draft, tags={"runner": "draft"})
+        d.register_non_intrusive_dumper(target, tags={"runner": "target"})
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            draft(x)
+            target(x)
+
+        P = self._PREFIX
+        assert f"{P}draft_layer.output" in captured
+        assert f"{P}target_layer.output" not in captured
+
     def test_tags_attached_to_core_fields(self, tmp_path):
         d = _make_test_dumper(tmp_path, non_intrusive_mode="core")
 

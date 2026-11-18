@@ -420,6 +420,19 @@ class _Dumper:
         *,
         tags: Optional[dict[str, Any]] = None,
     ) -> Optional["_NonIntrusiveDumper"]:
+        """Hook ``model`` so its forwards are dumped without editing model code.
+
+        ``tags`` is attached to every dump these hooks emit, so it appears in the
+        dump filename (``...___runner=draft___...pt``) and can be used in
+        ``filter`` (for example ``runner == "draft"``). It is bound here, so two
+        models registered in one process keep their own tags even when their
+        forwards interleave. Under speculative decoding ``ModelRunner`` passes
+        ``{"runner": "draft"}`` or ``{"runner": "target"}``, because the draft
+        and target forwards can share a ``ForwardMode`` (DSPARK's draft block
+        runs as ``TARGET_VERIFY``). With ``tags=None`` dump names are unchanged.
+
+        Returns None when ``non_intrusive_mode`` is ``off``.
+        """
         self._http_manager  # noqa: B018
         mode = self._config.non_intrusive_mode
         if mode == "off":
