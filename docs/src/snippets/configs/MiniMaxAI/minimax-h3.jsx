@@ -218,7 +218,7 @@ return {
     { id: "rtx5070", label: "RTX 5070", vram: "12GB", vendor: "consumer" },
     { id: "rtx4070", label: "RTX 4070", vram: "12GB", vendor: "consumer" },
     { id: "rtx3060", label: "RTX 3060", vram: "12GB", vendor: "consumer" },
-    { id: "b70", label: "Arc Pro B70", vram: "32GB", vendor: "consumer" },
+    { id: "b70", label: "Arc Pro B70", vram: "32GB", vendor: "intel" },
   ],
   groupHardware: false,
 
@@ -414,8 +414,8 @@ return {
           id: "sage",
           label: "SageAttention",
           flags: ["--attention-backend sage_attn"],
-          disabled: (s) => ["mi300x", "mi355x"].includes(s.hw),
-          disableReason: "SageAttention is not exposed for the AMD recipes.",
+          disabled: (s) => ["mi300x", "mi355x", "b70"].includes(s.hw),
+          disableReason: "SageAttention is not exposed for the AMD recipes, and the XPU backend does not implement it (see Attention Backends support matrix).",
           description: "Approximate attention math. Install its packed-varlen dependency and inspect video and audio quality.",
         },
       ],
@@ -653,7 +653,7 @@ return {
         { id: "rtx5070-offload-1", hw: "rtx5070", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
         { id: "rtx3060-offload-1", hw: "rtx3060", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
         { id: "rtx4070-offload-1", hw: "rtx4070", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
-        { id: "b70-offload-4", hw: "b70", nodes: 1, gpus_per_node: 4, placement: "offload", tp_size: 1, ulysses_degree: 4, ring_degree: 1, encoder: "auto", default: true },
+        { id: "b70-offload-4", hw: "b70", nodes: 1, gpus_per_node: 4, placement: "offload", tp_size: 4, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
         { id: "b70-offload-8", hw: "b70", nodes: 1, gpus_per_node: 8, placement: "offload", tp_size: 4, ulysses_degree: 2, ring_degree: 1, encoder: "auto", default: true, extraFlags: ["--sp-degree 2"] },
       ],
       autoTopology: (s) => {
@@ -1077,6 +1077,7 @@ return {
     b300: "lmsysorg/sglang:dev",
     h200: "lmsysorg/sglang:dev",
     h100: "lmsysorg/sglang:dev",
+    b70: "lmsysorg/sglang:v0.5.23-xpu",
   },
 
   showPlaygroundLink: false,
