@@ -497,9 +497,7 @@ class Inkling2Attention(nn.Module):
                 q_descale=quantized_q.scale.view(torch.float8_e8m0fnu),
             )
         else:
-            attention_kwargs = dict(
-                rel_bias=rel_bias, rel_bias_scale_after_add=True, **bias_kwargs
-            )
+            attention_kwargs = dict(rel_bias=rel_bias, **bias_kwargs)
         if compact:
             output = self.attn(
                 q,

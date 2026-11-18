@@ -1603,7 +1603,6 @@ class FlashAttentionBackend(AttentionBackend):
         rel_bias=None,
         rel_bias_event=None,
         return_lse: bool = False,
-        rel_bias_scale_after_add: bool = False,
         rel_bias_compact_decode: bool = False,
         rel_bias_decode_epilogue=None,
         rel_bias_presheared: bool = False,
@@ -1766,7 +1765,6 @@ class FlashAttentionBackend(AttentionBackend):
                 # it -- so rel_logits_proj overlaps the KV-write above.
                 rel_bias_event.wait()
             kwargs["rel_bias"] = rel_bias
-            kwargs["rel_bias_scale_after_add"] = rel_bias_scale_after_add
             if rel_bias_presheared:
                 kwargs["rel_bias_presheared"] = True
             if metadata is self.full_cg_prefill_metadata:
@@ -2311,7 +2309,6 @@ class FlashAttentionBackend(AttentionBackend):
         rel_bias=None,
         rel_bias_event=None,
         return_lse: bool = False,
-        rel_bias_scale_after_add: bool = False,
         rel_bias_compact_decode: bool = False,
         rel_bias_decode_epilogue=None,
     ) -> torch.Tensor:
@@ -2403,7 +2400,6 @@ class FlashAttentionBackend(AttentionBackend):
                 # it -- so rel_logits_proj overlaps the KV-write above.
                 rel_bias_event.wait()
             kwargs["rel_bias"] = rel_bias
-            kwargs["rel_bias_scale_after_add"] = rel_bias_scale_after_add
             if metadata is self.full_cg_prefill_metadata:
                 # Full-CG reuses the cu_seqlens pointer with new values each replay.
                 # Disable its pointer-keyed schedule cache so the graph refreshes it.

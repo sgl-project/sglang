@@ -328,7 +328,7 @@ def test_prologue_sheared_verify_rel(monkeypatch, m, window, ragged, path, H, KV
             max_seqlen_q=max(lens), softmax_scale=D**-0.5, causal=window is None,
             window_size=(-1, -1) if window is None else (window, 0), num_splits=num_splits,
             pack_gqa=True, rel_bias=rel, return_softmax_lse=True,
-            rel_bias_scale_after_add=True, rel_bias_presheared=presheared,
+            rel_bias_presheared=presheared,
         )  # fmt: skip
 
     monkeypatch.setattr(interface, "_shear_bias_empty", capture)

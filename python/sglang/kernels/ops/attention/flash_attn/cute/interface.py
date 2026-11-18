@@ -417,7 +417,6 @@ def _flash_attn_fwd(
     qk_sf_vec_size: Optional[int] = None,
     v_sf_vec_size: Optional[int] = None,
     rel_bias_prep_cache: Optional[dict] = None,
-    rel_bias_scale_after_add: bool = False,
     rel_bias_presheared: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
@@ -437,13 +436,6 @@ def _flash_attn_fwd(
     fake_mode = is_fake_mode()
     arch = _get_device_arch() if _arch is None else _arch
     arch_forward_host = get_forward_host(arch)
-    if rel_bias_scale_after_add and rel_bias is not None:
-        assert arch // 10 in (9, 10, 11), (
-            "Scale-after-add relative bias requires SM90/SM100/SM110"
-        )
-        assert score_mod is None and softcap in (None, 0.0), (
-            "Scale-after-add relative bias cannot combine with score_mod or softcap"
-        )
     requested_num_splits = num_splits
     if (
         not fake_mode
@@ -1024,10 +1016,6 @@ def _flash_attn_fwd(
         arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     )
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
-    if rel_bias_scale_after_add and rel_bias is not None:
-        assert not use_dedicated_hd256_kernel, (
-            "Scale-after-add bias does not support head_dim=256"
-        )
 
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
@@ -1379,7 +1367,6 @@ def _flash_attn_fwd(
     compile_key = (
         dtype,
         out_torch_dtype,
-        rel_bias_scale_after_add,
         head_dim,
         head_dim_v,
         qhead_per_kvhead,
@@ -1663,7 +1650,6 @@ def _flash_attn_fwd(
                         {}
                         if use_dedicated_hd256_kernel
                         else dict(
-                            rel_bias_scale_after_add=rel_bias_scale_after_add,
                             qk_blockscaled=qk_blockscaled,
                             v_dequant=v_blockscaled,
                             q_sf_interleaved=q_sf_interleaved,
@@ -2130,7 +2116,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         rel_bias_prep_cache: Optional[dict] = None,
         return_lse: bool = False,
         out: Optional[torch.Tensor] = None,
-        rel_bias_scale_after_add: bool = False,
         rel_bias_presheared: bool = False,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
@@ -2173,7 +2158,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
             rel_bias=rel_bias,
-            rel_bias_scale_after_add=rel_bias_scale_after_add,
             rel_bias_presheared=rel_bias_presheared,
             sfq=sfq,
             sfk=sfk,
@@ -2300,7 +2284,6 @@ def flash_attn_varlen_func(
     rel_bias_prep_cache: Optional[dict] = None,
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
-    rel_bias_scale_after_add: bool = False,
     rel_bias_presheared: bool = False,
 ):
     """
@@ -2437,7 +2420,6 @@ def flash_attn_varlen_func(
         rel_bias_prep_cache,
         return_lse,
         out,
-        rel_bias_scale_after_add,
         rel_bias_presheared,
     )
     needs_autograd = False
