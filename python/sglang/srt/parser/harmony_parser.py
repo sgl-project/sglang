@@ -315,7 +315,12 @@ class CanonicalStrategy:
 
         # Each channel type has specific valid end tokens
         if channel_type == "final":
-            while end_pos < len(tokens) and tokens[end_pos].type != "RETURN":
+            # A final message closes with <|return|> when the turn ends, and with
+            # <|end|> when another message follows; both terminate the block.
+            while end_pos < len(tokens) and tokens[end_pos].type not in (
+                "RETURN",
+                "END",
+            ):
                 end_pos += 1
         elif channel_type == "analysis":
             while end_pos < len(tokens) and tokens[end_pos].type not in ("END", "CALL"):

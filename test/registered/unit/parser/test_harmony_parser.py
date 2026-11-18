@@ -183,6 +183,25 @@ class TestCanonicalStrategy(CustomTestCase):
         self.assertEqual(events[0].content, "")
         self.assertEqual(remaining, "")
 
+    def test_parse_final_block_closed_by_end_token(self):
+        """A final block closed by <|end|> keeps the token out of its content.
+
+        Only <|return|> closed a final block, so a final message ending in <|end|>
+        found no terminator, ran to the end of the input, and carried the marker
+        into the answer served to the client.
+        """
+        text = (
+            "<|start|><|channel|>analysis<|message|>reasoning<|end|>"
+            "<|start|><|channel|>final<|message|>answer<|end|>"
+        )
+        events, remaining = self.strategy.parse(text)
+
+        self.assertEqual(
+            [(e.event_type, e.content) for e in events],
+            [("reasoning", "reasoning"), ("normal", "answer")],
+        )
+        self.assertEqual(remaining, "")
+
 
 class TestTextStrategy(CustomTestCase):
     def setUp(self):
