@@ -2983,6 +2983,15 @@ class KVCacheConfigurator:
                 )
 
                 return NPUMLATokenToKVPool
+            if _is_npu:
+                # The in-tree DSA leaf stores fp8+scale index keys in a uint8
+                # facade sized for 64-token pages; the Ascend indexer kernels
+                # need the NPU DSA buffer layout instead.
+                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                    NPUDSATokenToKVPool,
+                )
+
+                return NPUDSATokenToKVPool
             return dsa_pool_class
         if _is_npu:
             self._reject_registered_kv_cache_dtype(pool="the NPU KV pool")

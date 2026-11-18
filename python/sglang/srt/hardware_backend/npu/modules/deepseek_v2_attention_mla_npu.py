@@ -443,6 +443,8 @@ def forward_dsa_prepare_npu(
         )
     else:
         fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+        # NoPE layers (skip_rope=True, rotary_emb=None; Kimi K2/K3, GLM-5.3
+        # Flash) take the unfused split path, like the MLA prepare does.
         if m.rotary_emb is None or m.rotary_emb.is_neox_style:
             q, latent_cache = fused_qkv_a_proj_out.split(
                 [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
@@ -513,6 +515,8 @@ def forward_dsa_prepare_npu(
             perm_y=(1, 0, 2),
         )
 
+        # NoPE layers (skip_rope=True, rotary_emb=None) skip rope entirely,
+        # mirroring the None guard in forward_mla_prepare_npu.
         if (
             is_mla_preprocess_enabled()
             and m.rotary_emb is not None
