@@ -1081,6 +1081,10 @@ class Envs:
     # gfx950 ROCm Muse Spark: FP32 MoE router logits outside the shared router + pooler front run the vendored
     # tlx.ops.router_gemm (plain Triton) on an [E, K] copy of each router weight, 8 MiB per MoE layer.
     SGLANG_USE_TLX_ROUTER_GEMM = EnvBool(False)
+    # gfx950 ROCm Muse Spark: the QK norm / RoPE / FP8 KV-cache store at decode and target verify runs fbtriton's
+    # tlx.ops.qk_norm_rope_kv_cache (plain Triton, vendored in sglang.kernels.tlx_ops) instead of the Triton
+    # qk_norm_rope_cache, at any row count (SGLANG_ROCM_MUSE_QK_ROPE_CACHE_MAX_ROWS does not apply).
+    SGLANG_USE_TLX_QK_NORM_ROPE = EnvBool(False)
     # Set by someone bisecting a numerical or performance regression to an
     # online-FP8 linear on gfx1250, to take the Triton tile out of the picture
     # without rebuilding. The tile is on by default because hipBLASLt ships no

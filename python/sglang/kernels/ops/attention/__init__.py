@@ -708,6 +708,15 @@ for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
         )
     )
 del _mod, _fn, _desc
+# Vendored tlx.ops.qk_norm_rope_kv_cache (gfx950); plain Triton, no TLX runtime needed.
+register_kernel(
+    KernelSpec(
+        op="attention.tlx_qk_norm_rope_kv_cache",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.tlx:qk_norm_rope_kv_cache",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
 
 # Muse Spark on gfx950 (MI355X): FlyDSL kernels of the same backends.
 _MUSE_SPARK_GFX950_FLYDSL_KERNELS = [
