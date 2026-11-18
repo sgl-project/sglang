@@ -1371,53 +1371,61 @@ mod tests {
 
     #[tokio::test]
     async fn management_requires_admin_credentials_before_any_control_intake() {
-        let h = Harness::new(1, false, Duration::from_secs(1));
-        for bearers in [
-            &[][..],
-            &["Bearer wrong"][..],
-            &["Basic sk-admin"][..],
-            &["Bearer sk-admin", "Bearer sk-admin"][..],
-        ] {
-            let attach = h
-                .service
-                .attach_hi_cache_storage(bearer_request(
-                    api::AttachHiCacheStorageRequest::default(),
-                    bearers,
-                ))
-                .await
-                .unwrap_err();
-            let detach = h
-                .service
-                .detach_hi_cache_storage(bearer_request(
-                    api::DetachHiCacheStorageRequest {},
-                    bearers,
-                ))
-                .await
-                .unwrap_err();
-            let clear = h
-                .service
-                .clear_hi_cache_storage(bearer_request(api::ClearHiCacheStorageRequest {}, bearers))
-                .await
-                .unwrap_err();
-            let abort = h
-                .service
-                .abort(bearer_request(
-                    api::AbortRequest {
-                        rid: String::new(),
-                        abort_all: true,
-                    },
-                    bearers,
-                ))
-                .await
-                .unwrap_err();
-            for error in [attach, detach, clear, abort] {
-                assert_eq!(error.code(), Code::Unauthenticated);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let h = Harness::new(1, false, Duration::from_secs(1));
+            for bearers in [
+                &[][..],
+                &["Bearer wrong"][..],
+                &["Basic sk-admin"][..],
+                &["Bearer sk-admin", "Bearer sk-admin"][..],
+            ] {
+                let attach = h
+                    .service
+                    .attach_hi_cache_storage(bearer_request(
+                        api::AttachHiCacheStorageRequest::default(),
+                        bearers,
+                    ))
+                    .await
+                    .unwrap_err();
+                assert_eq!(attach.code(), Code::Unauthenticated);
+                let detach = h
+                    .service
+                    .detach_hi_cache_storage(bearer_request(
+                        api::DetachHiCacheStorageRequest {},
+                        bearers,
+                    ))
+                    .await
+                    .unwrap_err();
+                assert_eq!(detach.code(), Code::Unauthenticated);
+                let clear = h
+                    .service
+                    .clear_hi_cache_storage(bearer_request(
+                        api::ClearHiCacheStorageRequest {},
+                        bearers,
+                    ))
+                    .await
+                    .unwrap_err();
+                assert_eq!(clear.code(), Code::Unauthenticated);
+                let abort = h
+                    .service
+                    .abort(bearer_request(
+                        api::AbortRequest {
+                            rid: String::new(),
+                            abort_all: true,
+                        },
+                        bearers,
+                    ))
+                    .await
+                    .unwrap_err();
+                assert_eq!(abort.code(), Code::Unauthenticated);
+                // No request reaches the shared core, hence no local or peer
+                // control target can observe an unauthenticated mutation.
+                assert!(h.intake_rx.is_empty());
+                assert!(h.abort_rx.is_empty());
             }
-            // No request reaches the shared core, hence no local or peer
-            // control target can observe an unauthenticated mutation.
-            assert!(h.intake_rx.is_empty());
-            assert!(h.abort_rx.is_empty());
-        }
+        })
+        .await
+        .expect("management authentication must reject before waiting on control intake");
     }
 
     /// Check gRPC validation, scheduler results, and the configuration returned by GET.
