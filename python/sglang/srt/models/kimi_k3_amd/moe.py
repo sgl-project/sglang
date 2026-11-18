@@ -1,7 +1,7 @@
 """Kimi-K3's latent MoE on ROCm.
 
 Shared helpers are imported inside methods to avoid a cycle with ``kimi_k3``,
-which imports this mixin. ROCm keeps the multicast all-reduce fusion disabled.
+which imports this module. ROCm keeps the multicast all-reduce fusion disabled.
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ from sglang.srt.utils.common import cdiv, get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.communication.k3_ll_comm_hip import LLComm
+    from sglang.srt.models.kimi_k3 import KimiK3MoE
 
 _is_gfx95 = is_gfx95_supported()
 _use_aiter = is_hip() and get_bool_env_var("SGLANG_USE_AITER")
@@ -111,68 +112,74 @@ def _vector_aligned(t: torch.Tensor) -> bool:
     )
 
 
-class KimiK3MoEHipMixin:
-    """KimiK3MoE's ROCm paths."""
+class KimiK3MoEHip:
+    """KimiK3MoE's ROCm paths; the layer builds one on gfx950 as ``_hip``."""
 
-    # Set post-load by _prepare_hip_paths; the defaults keep every path off.
-    # This rank's columns of the replicated routed up_proj, used for batches of at
-    # least _UP_PROJ_COLUMN_SPLIT_MIN_TOKENS tokens.
-    _prefill_up_proj_cols: Optional[slice] = None
-    _defer_routed_cast_eligible = False
-    _fused_latent_tail_eligible = False
-    # Set by link_column_tails_hip when the next layer's attention read can ride
-    # the column-parallel tail's all-gather.
-    next_attn_read: Optional[NextAttnRead] = None
-    # Whether shard_front runs this layer's front on row shards, and what
-    # shard_front gathered for the forward after it.
-    _row_front_on = False
-    _row_front_out: Optional[tuple] = None
-    # Set by link_row_sharded_stream_hip when every later layer reads a stream
-    # left on row shards (SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM, PP1).
-    _row_stream = False
+    def __init__(self, moe: KimiK3MoE) -> None:
+        self.moe = moe
+        # Set post-load by prepare_paths; the defaults keep every path off.
+        # This rank's columns of the replicated routed up_proj, used for batches of at
+        # least _UP_PROJ_COLUMN_SPLIT_MIN_TOKENS tokens.
+        self._prefill_up_proj_cols: Optional[slice] = None
+        self._defer_routed_cast_eligible = False
+        self._fused_latent_tail_eligible = False
+        # Set by link_column_tails_hip when the next layer's attention read can ride
+        # the column-parallel tail's all-gather.
+        self.next_attn_read: Optional[NextAttnRead] = None
+        # Whether shard_front runs this layer's front on row shards, and what
+        # shard_front gathered for the forward after it.
+        self._row_front_on = False
+        self.row_front_out: Optional[tuple] = None
+        # Set by link_row_sharded_stream_hip when every later layer reads a stream
+        # left on row shards (SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM, PP1).
+        self.row_stream = False
 
-    def _prepare_hip_paths(self) -> None:
-        """Post-load, after _merge_front_weights: the ROCm paths this layer takes."""
+    def prepare_paths(self) -> None:
+        """Post-load, after KimiK3MoE._merge_front_weights: the ROCm paths this
+        layer takes."""
+        moe = self.moe
         self._select_prefill_up_proj_columns()
         self._build_row_sharded_front()
         # fp32 front with a SiTU shared expert: the routed input's bf16 cast can
         # ride the shared activation's launch instead of its own.
-        shared = self.shared_experts
+        shared = moe.shared_experts
         self._defer_routed_cast_eligible = (
-            self._front_fp32
+            moe._front_fp32
             and shared is not None
             and isinstance(shared.act_fn, SituAndMul)
         )
         self._fused_latent_tail_eligible = (
             _is_gfx95
-            and self.routed_expert_norm is not None
-            and self.routed_expert_up_proj is not None
-            and self.routed_expert_up_proj.weight.dtype == torch.bfloat16
+            and moe.routed_expert_norm is not None
+            and moe.routed_expert_up_proj is not None
+            and moe.routed_expert_up_proj.weight.dtype == torch.bfloat16
         )
 
     def _select_prefill_up_proj_columns(self) -> None:
         """Prefill-sized batches compute only this rank's 1/tp columns of the
         routed up_proj; the shared-expert all-reduce carries them."""
-        weight = self.routed_expert_up_proj.weight if self.use_latent_moe else None
+        moe = self.moe
+        weight = moe.routed_expert_up_proj.weight if moe.use_latent_moe else None
         if not (
-            self.tp_size > 1
-            and self._eligible_for_fused_front
+            moe.tp_size > 1
+            and moe._eligible_for_fused_front
             and isinstance(weight, torch.Tensor)
             and weight.dtype == torch.bfloat16
-            and weight.shape[0] % self.tp_size == 0
+            and weight.shape[0] % moe.tp_size == 0
         ):
             return
-        rows = weight.shape[0] // self.tp_size
+        rows = weight.shape[0] // moe.tp_size
         rank = get_parallel().tp_rank
         self._prefill_up_proj_cols = slice(rank * rows, (rank + 1) * rows)
 
-    def _forward_fused_hip(
+    def forward_fused(
         self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor]
     ) -> torch.Tensor:
         """KimiK3MoE._forward_fused on ROCm: the merged front, both TP-partial sums
         in one flat [latent | shared] buffer, then the tail the batch takes."""
         from sglang.srt.models.kimi_k3 import _add3
 
+        moe = self.moe
         num_tokens, hidden_size = hidden_states.shape
         # The row-sharded tail also shards the up_proj (by rows), so it replaces the
         # column split where both apply.
@@ -187,7 +194,7 @@ class KimiK3MoEHipMixin:
         # fp32 front, single-collective tail: the shared SiTU launch also casts the
         # routed input to bf16 (one launch a MoE layer fewer)
         defer_cast = self._defer_routed_cast_eligible and up_proj_cols is None
-        gate_up, router_logits, routed_input = self._fused_front(
+        gate_up, router_logits, routed_input = moe._fused_front(
             hidden_states, cast_routed=not defer_cast
         )
         if defer_cast and not _vector_aligned(routed_input):
@@ -197,19 +204,19 @@ class KimiK3MoEHipMixin:
         # The row-sharded tail pads the rows to a multiple of TP for equal
         # reduce-scatter shards.
         rows = (
-            cdiv(num_tokens, self.tp_size) * self.tp_size if row_sharded else num_tokens
+            cdiv(num_tokens, moe.tp_size) * moe.tp_size if row_sharded else num_tokens
         )
         if row_sharded:
-            buf = hidden_states.new_empty(rows * (self.moe_hidden_size + hidden_size))
+            buf = hidden_states.new_empty(rows * (moe.moe_hidden_size + hidden_size))
         else:
             with use_symmetric_memory(
                 get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):
                 buf = hidden_states.new_empty(
-                    rows * (self.moe_hidden_size + hidden_size)
+                    rows * (moe.moe_hidden_size + hidden_size)
                 )
-        latent_numel = rows * self.moe_hidden_size
-        latent_rows = buf[:latent_numel].view(rows, self.moe_hidden_size)
+        latent_numel = rows * moe.moe_hidden_size
+        latent_rows = buf[:latent_numel].view(rows, moe.moe_hidden_size)
         shared_rows = buf[latent_numel:].view(rows, hidden_size)
         latent, shared_output = latent_rows[:num_tokens], shared_rows[:num_tokens]
 
@@ -219,8 +226,8 @@ class KimiK3MoEHipMixin:
             side_stream = _hip_moe_side_stream(current_stream.device)
             side_stream.wait_stream(current_stream)
             with torch.cuda.stream(side_stream):
-                self._forward_shared(gate_up, shared_output)
-            self._forward_routed(hidden_states, router_logits, routed_input, latent)
+                moe._forward_shared(gate_up, shared_output)
+            moe._forward_routed(hidden_states, router_logits, routed_input, latent)
             current_stream.wait_stream(side_stream)
             return self._column_split_tail(
                 latent, shared_output, prefix_sum, cols=up_proj_cols
@@ -230,15 +237,15 @@ class KimiK3MoEHipMixin:
                 gate_up, shared_output, routed_input
             )
         else:
-            self._forward_shared(gate_up, shared_output)
-        self._forward_routed(hidden_states, router_logits, routed_input, latent)
+            moe._forward_shared(gate_up, shared_output)
+        moe._forward_routed(hidden_states, router_logits, routed_input, latent)
         if row_sharded:
             return self._row_sharded_tail(
                 latent_rows, shared_rows, num_tokens, prefix_sum
             )
-        buf = self._reduce_latent_and_shared(buf)
+        buf = moe._reduce_latent_and_shared(buf)
 
-        latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
+        latent = buf[:latent_numel].view(num_tokens, moe.moe_hidden_size)
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
         if self.next_attn_read is not None:
             stream = self._column_tail_and_next_read(latent, shared_output, prefix_sum)
@@ -248,20 +255,20 @@ class KimiK3MoEHipMixin:
             self._fused_latent_tail_eligible
             and kimi_k3_latent_tail_hip.supports_latent_tail(
                 latent,
-                self.routed_expert_up_proj.weight,
+                moe.routed_expert_up_proj.weight,
                 shared_output,
                 prefix_sum,
             )
         ):
             return kimi_k3_latent_tail_hip.k3_latent_tail(
                 latent,
-                self.routed_expert_norm.weight,
-                self.routed_expert_norm.variance_epsilon,
-                self.routed_expert_up_proj.weight,
+                moe.routed_expert_norm.weight,
+                moe.routed_expert_norm.variance_epsilon,
+                moe.routed_expert_up_proj.weight,
                 shared_output,
                 prefix_sum,
             )
-        out, _ = self.routed_expert_up_proj(self._latent_norm(latent))
+        out, _ = moe.routed_expert_up_proj(moe._latent_norm(latent))
 
         return _add3(out, shared_output, prefix_sum, prefetch_bc=True)
 
@@ -279,7 +286,7 @@ class KimiK3MoEHipMixin:
         routed_bf16 = torch.empty(
             routed_input.shape, dtype=shared_output.dtype, device=routed_input.device
         )
-        shared = self.shared_experts
+        shared = self.moe.shared_experts
         act = situ_and_mul(
             gate_up,
             None,
@@ -301,9 +308,10 @@ class KimiK3MoEHipMixin:
         columns of the TP-partial shared sum, then one all-reduce carries both."""
         from sglang.srt.models.kimi_k3 import _k3_bf16_gemm
 
-        latent = self._latent_norm(tensor_model_parallel_all_reduce(latent))
+        moe = self.moe
+        latent = moe._latent_norm(tensor_model_parallel_all_reduce(latent))
         shared_output[:, cols] += _k3_bf16_gemm(
-            latent, self.routed_expert_up_proj.weight[cols]
+            latent, moe.routed_expert_up_proj.weight[cols]
         )
         out = tensor_model_parallel_all_reduce(shared_output)
         return out if prefix_sum is None else out + prefix_sum
@@ -311,19 +319,20 @@ class KimiK3MoEHipMixin:
     def _row_sharded_tail_eligible(self, num_tokens: int, has_prefix: bool) -> bool:
         """Whether the tail runs on this rank's 1/TP of the rows (gfx950 prefill
         batches; see _row_sharded_tail)."""
+        moe = self.moe
         return (
             _is_gfx95
             and num_tokens >= _ROW_SHARDED_TAIL_MIN_TOKENS
-            and self.tp_size > 1
+            and moe.tp_size > 1
             and has_prefix
             and not k3_ar_fusion.enabled()
-            and self.routed_expert_up_proj is not None
+            and moe.routed_expert_up_proj is not None
         )
 
     def takes_row_sharded_tail(self, num_tokens: int) -> bool:
         """Whether a batch of num_tokens runs _row_sharded_tail, which then
         also takes the written residual on this rank's padded rows."""
-        return self._eligible_for_fused_front and self._row_sharded_tail_eligible(
+        return self.moe._eligible_for_fused_front and self._row_sharded_tail_eligible(
             num_tokens, True
         )
 
@@ -341,7 +350,7 @@ class KimiK3MoEHipMixin:
         on every row or already on this rank's padded rows."""
         tp_group = get_parallel().tp_group
         padded_rows, hidden_size = shared_rows.shape
-        rows = padded_rows // self.tp_size
+        rows = padded_rows // self.moe.tp_size
         if padded_rows > num_tokens:
             latent_rows[num_tokens:].zero_()
             shared_rows[num_tokens:].zero_()
@@ -363,8 +372,9 @@ class KimiK3MoEHipMixin:
         of the stream, or the stream left on this rank's rows."""
         from sglang.srt.models.kimi_k3 import _add3
 
+        moe = self.moe
         rows, hidden_size = shared.shape
-        padded_rows = rows * self.tp_size
+        padded_rows = rows * moe.tp_size
         tp_rank = get_parallel().tp_rank
         start = tp_rank * rows
         if prefix_sum.shape[0] == num_tokens:
@@ -376,11 +386,11 @@ class KimiK3MoEHipMixin:
             prefix = torch.cat(
                 [prefix, prefix.new_zeros(rows - prefix.shape[0], hidden_size)]
             )
-        out, _ = self.routed_expert_up_proj(self._latent_norm(latent))
+        out, _ = moe.routed_expert_up_proj(moe._latent_norm(latent))
         stream_rows = _add3(out, shared, prefix)
-        if self._row_stream:
+        if self.row_stream:
             # the next read takes this rank's rows (attn_bank._bank_rows)
-            return stream_rows[: row_shard(num_tokens, self.tp_size, tp_rank)[1]]
+            return stream_rows[: row_shard(num_tokens, moe.tp_size, tp_rank)[1]]
         stream = stream_rows.new_empty(padded_rows, hidden_size)
         get_parallel().tp_group.all_gather_into_tensor(stream, stream_rows)
         return stream[:num_tokens]
@@ -390,13 +400,14 @@ class KimiK3MoEHipMixin:
         top-k, latent down-proj) on this rank's rows on top of the row-sharded tail,
         the shared experts TP-sharded on the all-gathered normed input
         (SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT)."""
+        moe = self.moe
         if not (
             envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT.get()
             and _is_gfx95
-            and self.tp_size > 1
-            and self._eligible_for_fused_front
+            and moe.tp_size > 1
+            and moe._eligible_for_fused_front
             # the merged front is [gate_up | router | latent] (not the EP pair)
-            and len(self._front_sizes) == 3
+            and len(moe._front_sizes) == 3
         ):
             return
         self._row_front_on = True
@@ -411,6 +422,7 @@ class KimiK3MoEHipMixin:
         from sglang.kernels.ops.moe.k3_a8w4_gfx950 import quant_mxfp8
         from sglang.srt.models.kimi_k3 import _k3_bf16_gemm
 
+        moe = self.moe
         min_tokens = self._a8w4_moe_min_tokens
         if (
             not self._row_front_on
@@ -423,16 +435,16 @@ class KimiK3MoEHipMixin:
         tp_group = get_parallel().tp_group
         side_stream = _eager_side_stream()
         # the TP-sharded shared experts read every row; gathered under the front GEMM
-        normed_all = normed.new_empty(self.tp_size * normed.shape[0], normed.shape[1])
+        normed_all = normed.new_empty(moe.tp_size * normed.shape[0], normed.shape[1])
         _run_on_side_stream(
             side_stream,
             lambda: tp_group.all_gather_into_tensor(normed_all, normed.contiguous()),
         )
         fused = _k3_bf16_gemm(
-            normed, self._front_w[self._front_sizes[0] :], out_dtype=torch.float32
+            normed, moe._front_w[moe._front_sizes[0] :], out_dtype=torch.float32
         )
-        router_logits, routed_input = torch.split(fused, self._front_sizes[1:], dim=-1)
-        topk_output = self.topk(normed, router_logits)
+        router_logits, routed_input = torch.split(fused, moe._front_sizes[1:], dim=-1)
+        topk_output = moe.topk(normed, router_logits)
         top_k = topk_output.topk_ids.shape[1]
         # ids ride bit-cast beside the weights
         topk = torch.cat(
@@ -448,7 +460,7 @@ class KimiK3MoEHipMixin:
         topk_bytes = topk.view(torch.uint8)
         widths = (a.shape[1], a_scale.shape[1], topk_bytes.shape[1])
         packed = torch.cat([a, a_scale, topk_bytes], dim=-1)
-        packed_all = packed.new_empty(self.tp_size * packed.shape[0], packed.shape[1])
+        packed_all = packed.new_empty(moe.tp_size * packed.shape[0], packed.shape[1])
         # behind the normed gather on the side stream
         _run_on_side_stream(
             side_stream,
@@ -460,7 +472,7 @@ class KimiK3MoEHipMixin:
             torch.cuda.current_stream().wait_stream(side_stream)
         a_all, scale_all, topk_all = packed_all[:num_tokens].split(widths, dim=-1)
         topk_all = topk_all.contiguous().view(torch.float32)
-        self._row_front_out = (
+        self.row_front_out = (
             (a_all.contiguous(), scale_all.contiguous()),
             topk_all[:, :top_k].contiguous().view(torch.int32),
             topk_all[:, top_k:].contiguous(),
@@ -469,15 +481,16 @@ class KimiK3MoEHipMixin:
         )
         return True
 
-    def _forward_row_front(self, prefix_sum: torch.Tensor) -> torch.Tensor:
+    def forward_row_front(self, prefix_sum: torch.Tensor) -> torch.Tensor:
         """The routed experts on what shard_front gathered and the latent
         reduce-scatter (on the side stream in eager batches), then the row-sharded
         tail. The shared experts run TP-sharded on every gathered row first, their
         reduce-scatter on the side stream under the routed experts."""
         from sglang.srt.models.kimi_k3 import _k3_bf16_gemm
 
-        a_mx, topk_ids, topk_weights, normed, normed_all = self._row_front_out
-        self._row_front_out = None
+        moe = self.moe
+        a_mx, topk_ids, topk_weights, normed, normed_all = self.row_front_out
+        self.row_front_out = None
         num_tokens = a_mx[0].shape[0]
         rows = normed.shape[0]
         tp_group = get_parallel().tp_group
@@ -485,25 +498,25 @@ class KimiK3MoEHipMixin:
         # fp32 gate_up into the SiTU, as the fused front feeds it
         gate_up = _k3_bf16_gemm(
             normed_all,
-            self.shared_experts.gate_up_proj.weight,
+            moe.shared_experts.gate_up_proj.weight,
             out_dtype=torch.float32,
         )
         shared_rows = _k3_bf16_gemm(
-            self.shared_experts.act_fn(gate_up),
-            self.shared_experts.down_proj.weight,
+            moe.shared_experts.act_fn(gate_up),
+            moe.shared_experts.down_proj.weight,
         )
         shared = shared_rows.new_empty(rows, shared_rows.shape[1])
         _run_on_side_stream(
             side_stream, lambda: tp_group.reduce_scatter_tensor(shared, shared_rows)
         )
-        latent_rows = normed.new_empty(rows * self.tp_size, self.moe_hidden_size)
+        latent_rows = normed.new_empty(rows * moe.tp_size, moe.moe_hidden_size)
         # bf16 rows of the latent's shape; the experts read a_mx instead
-        latent_shape = normed.new_empty(1, 1).expand(num_tokens, self.moe_hidden_size)
+        latent_shape = normed.new_empty(1, 1).expand(num_tokens, moe.moe_hidden_size)
         self._run_a8w4(
             latent_shape, topk_ids, topk_weights, latent_rows[:num_tokens], a_mx=a_mx
         )
         latent_rows[num_tokens:].zero_()
-        latent = latent_rows.new_empty(rows, self.moe_hidden_size)
+        latent = latent_rows.new_empty(rows, moe.moe_hidden_size)
         _run_on_side_stream(
             side_stream, lambda: tp_group.reduce_scatter_tensor(latent, latent_rows)
         )
@@ -521,10 +534,11 @@ class KimiK3MoEHipMixin:
         of the replicated weight), finished by the all-gather of the stream,
         which also stages the next layer's attention read. None, before
         anything runs, when the kernels do not take the batch."""
+        moe = self.moe
         read = self.next_attn_read
         assert read is not None
         num_tokens = latent.shape[0]
-        slice_width = shared_output.shape[1] // self.tp_size
+        slice_width = shared_output.shape[1] // moe.tp_size
         bank = read.bank.require()
         if not (
             self._fused_latent_tail_eligible
@@ -538,27 +552,27 @@ class KimiK3MoEHipMixin:
         ):
             return None
         rank = get_parallel().tp_rank
-        up_weight = self.routed_expert_up_proj.weight[
+        up_weight = moe.routed_expert_up_proj.weight[
             rank * slice_width : (rank + 1) * slice_width
         ]
         if num_tokens <= _COLUMN_TAIL_PARTIALS_MAX_TOKENS:
             part, sq = kimi_k3_latent_tail_hip.k3_latent_tail_partials(
                 latent,
-                self.routed_expert_norm.weight,
+                moe.routed_expert_norm.weight,
                 up_weight,
             )
         else:
             # the replicated tail's up_proj GEMM on this rank's columns
             from sglang.srt.models.kimi_k3 import _k3_bf16_gemm
 
-            part, sq = _k3_bf16_gemm(self._latent_norm(latent), up_weight), None
+            part, sq = _k3_bf16_gemm(moe._latent_norm(latent), up_weight), None
         return attn_residual_hip.gather_tail_read(
             bank,
             part,
             sq,
             shared_output,
             prefix_sum,
-            self.routed_expert_norm.variance_epsilon,
+            moe.routed_expert_norm.variance_epsilon,
             read.score_proj,
             read.score_norm,
             read.norm,
@@ -577,7 +591,8 @@ class KimiK3MoEHipMixin:
             _aiter_situ_uses_a8w4,
         )
 
-        experts = self.experts
+        moe = self.moe
+        experts = moe.experts
         method = experts.quant_method
         if not (
             _aiter_situ_uses_a8w4()
@@ -587,10 +602,10 @@ class KimiK3MoEHipMixin:
             and experts.num_local_experts == experts.num_experts
             and method.hidden_pad == 0
             and method.intermediate_pad == 0
-            and self.routed_scaling_factor == 1.0
+            and moe.routed_scaling_factor == 1.0
             # [gate | up] rows: the down kernel is built for intermediate sizes 384 and 512
             and experts.w13_weight.shape[1] in (768, 1024)
-            and self.topk.topk_config.top_k == 16
+            and moe.topk.topk_config.top_k == 16
             and experts.num_experts <= 1024
             and experts.moe_runner_config.gemm1_clamp_limit is not None
         ):
@@ -604,11 +619,11 @@ class KimiK3MoEHipMixin:
     def _a8w4_moe_max_tokens(self) -> int:
         """The down GEMM's output holds up to T * top_k + E * block_m sorted rows and
         must stay under 4 GB."""
-        experts = self.experts
+        experts = self.moe.experts
         max_rows = ((1 << 32) - 1) // (2 * experts.w2_weight.shape[1])
         return (max_rows - experts.num_experts * 64) // 16
 
-    def _forward_routed_a8w4(
+    def forward_routed_a8w4(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
@@ -625,7 +640,7 @@ class KimiK3MoEHipMixin:
             and routed_input.is_contiguous()
         ):
             return False
-        topk_output = self.topk(hidden_states, router_logits)
+        topk_output = self.moe.topk(hidden_states, router_logits)
         assert TopKOutputChecker.format_is_standard(topk_output), topk_output.format
         self._run_a8w4(
             routed_input,
@@ -647,7 +662,7 @@ class KimiK3MoEHipMixin:
         already through quant_mxfp8."""
         from sglang.kernels.ops.moe.k3_a8w4_gfx950 import k3_a8w4_moe
 
-        experts = self.experts
+        experts = self.moe.experts
         k3_a8w4_moe(
             routed_input,
             topk_ids,
@@ -663,21 +678,25 @@ class KimiK3MoEHipMixin:
         )
 
 
+def _moe_hip(layer) -> Optional[KimiK3MoEHip]:
+    """A KimiK3DecoderLayer's latent-MoE ROCm paths; None for a dense MLP."""
+    from sglang.srt.models.kimi_k3 import KimiK3MoE
+
+    return layer.mlp._hip if isinstance(layer.mlp, KimiK3MoE) else None
+
+
 def ffn_row_shards_hip(layer) -> Optional[Callable[[int], bool]]:
     """gfx950: the batch-size predicate under which a KimiK3DecoderLayer's FFN read
     completes the attention output's sum on this rank's rows and leaves the written
     residual there for the row-sharded latent-MoE tail, or None."""
     if layer._sp_moe or layer.all_reduce_fusion:
         return None
-    if not (
-        _is_gfx95
-        and layer._ffn_writes_stream
-        and isinstance(layer.mlp, KimiK3MoEHipMixin)
-    ):
+    moe_hip = _moe_hip(layer)
+    if not (_is_gfx95 and layer._ffn_writes_stream and moe_hip is not None):
         return None
     if get_parallel().attn_tp_size != get_parallel().tp_size:
         return None
-    return layer.mlp.takes_row_sharded_tail
+    return moe_hip.takes_row_sharded_tail
 
 
 def _row_sharded_switch_on() -> bool:
@@ -723,15 +742,15 @@ def row_shard_bank_hooks_hip(layer) -> dict:
             o_proj, tp_size=get_parallel().attn_tp_size, row_shards=row_shards
         )
     return dict(
-        ffn_row_shard=RowShardRead(row_shards, shard_front=layer.mlp.shard_front)
+        ffn_row_shard=RowShardRead(row_shards, shard_front=layer.mlp._hip.shard_front)
     )
 
 
 def prepare_hip_paths(layer) -> None:
     """Post-load, after _merge_front_weights: a MoE KimiK3DecoderLayer's ROCm
     paths and the fp32 next-layer norm weight its column tail reads."""
-    layer.mlp._prepare_hip_paths()
-    if (read := layer.mlp.next_attn_read) is not None:
+    layer.mlp._hip.prepare_paths()
+    if (read := layer.mlp._hip.next_attn_read) is not None:
         from sglang.srt.layers.attn_residual_hip import get_fp32_norm_weight
 
         # a reload rewrites that norm in place; the tail reads only this copy
@@ -750,8 +769,8 @@ def link_row_sharded_stream_hip(model) -> None:
     later_on_shards = True
     for i in reversed(range(model.start_layer, model.end_layer)):
         layer = model.layers[i]
-        if isinstance(layer.mlp, KimiK3MoEHipMixin):
-            layer.mlp._row_stream = later_on_shards
+        if (moe_hip := _moe_hip(layer)) is not None:
+            moe_hip.row_stream = later_on_shards
         # set by row_shard_bank_hooks_hip, which a layer without a bank skips
         row_shards = getattr(layer, "_row_shards", None)
         later_on_shards = later_on_shards and row_shards is not None
@@ -796,7 +815,7 @@ def link_column_tails_hip(model) -> None:
     pairs = [
         (layers[i], layers[i + 1])
         for i in range(model.start_layer, model.end_layer - 1)
-        if isinstance(layers[i].mlp, KimiK3MoEHipMixin)
+        if _moe_hip(layers[i]) is not None
         and layers[i]._ffn_writes_stream
         and not layers[i]._sp_moe
         and not layers[i + 1]._sp_moe
@@ -813,7 +832,7 @@ def link_column_tails_hip(model) -> None:
         else _COLUMN_TAIL_PARTIALS_MAX_TOKENS
     )
     for layer, next_layer in pairs:
-        layer.mlp.next_attn_read = NextAttnRead(
+        layer.mlp._hip.next_attn_read = NextAttnRead(
             bank=model.attn_bank,
             score_proj=next_layer.self_attention_res_proj,
             score_norm=next_layer.self_attention_res_norm,

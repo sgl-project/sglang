@@ -128,7 +128,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
 from sglang.srt.models.kimi_k3_amd.moe import (
-    KimiK3MoEHipMixin,
+    KimiK3MoEHip,
     link_hip_paths,
     prepare_hip_paths,
     row_shard_bank_hooks_hip,
@@ -535,7 +535,7 @@ def _uses_ep_a2a() -> bool:
     )
 
 
-class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
+class KimiK3MoE(nn.Module):
     """K3 MoE with Latent MoE (experts run in moe_hidden_size space)."""
 
     def __init__(
@@ -807,6 +807,8 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             and self.routed_expert_up_proj.weight.dtype == torch.bfloat16
             and self.routed_expert_up_proj.weight.is_contiguous()
         )
+        # gfx950's paths, switched on post-load by prepare_hip_paths
+        self._hip = KimiK3MoEHip(self) if _is_gfx95 else None
 
     def _merge_front_weights(self) -> None:
         """Merge shared gate_up + router gate + latent down_proj weights.
@@ -1530,7 +1532,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         )
 
     def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
-        if _is_gfx95 and self._forward_routed_a8w4(
+        if _is_gfx95 and self._hip.forward_routed_a8w4(
             hidden_states, router_logits, routed_input, latent
         ):
             return
@@ -1814,15 +1816,15 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         cp_shard_rows: the rows are gathered rank-major over the attention-CP
         group, and only this rank's CP rows of the output are returned."""
         num_tokens, hidden_size = hidden_states.shape
-        if _is_gfx95 and self._row_front_out is not None:
+        if _is_gfx95 and self._hip.row_front_out is not None:
             # the FFN read already ran the front on this rank's rows (shard_front)
-            return self._forward_row_front(prefix_sum)
+            return self._hip.forward_row_front(prefix_sum)
         hidden_states = hidden_states.view(-1, hidden_size)
         if cp_shard_rows:
             return self._forward_cp_shard_rows(hidden_states)
         if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
             if _is_gfx95:  # its row-sharded tail may return this rank's rows
-                return self._forward_fused_hip(hidden_states, prefix_sum=prefix_sum)
+                return self._hip.forward_fused(hidden_states, prefix_sum=prefix_sum)
             out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
         else:
             out = self._forward_unfused(
