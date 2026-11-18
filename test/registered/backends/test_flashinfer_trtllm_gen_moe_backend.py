@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -12,7 +13,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=1770, stage="weekly", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=2300, stage="weekly", runner_config="4-gpu-b200")
 
 
 class FlashinferTrtllmGenMoeBackendFP8Base:
@@ -252,6 +253,7 @@ class FlashinferTrtllmGenMoeBackendNVFP4Base:
     backend = None
     model = "nvidia/Qwen3-30B-A3B-NVFP4"
     extra_env = {}
+    extra_args = []
     gsm8k_threshold = 0.89
 
     @classmethod
@@ -271,6 +273,7 @@ class FlashinferTrtllmGenMoeBackendNVFP4Base:
                 "4",
                 "--mem-fraction-static",
                 "0.7",
+                *cls.extra_args,
             ],
         )
 
@@ -345,6 +348,35 @@ class TestFlashinferTrtllmGenMoeBackendNvFp4PerTokenActivationRelu2(
     extra_env = {"SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "1"}
     backend = "flashinfer_trtllm"
     gsm8k_threshold = 0.93
+
+
+class TestFlashinferTrtllmGenMoeBackendNVFP4NemotronNano(
+    FlashinferTrtllmGenMoeBackendNVFP4Base, CustomTestCase
+):
+    """Static NVFP4 at hidden size 2688, a multiple of 128 but not of 256: the
+    kernels return wrong outputs unless the hidden size is padded to 256."""
+
+    model = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
+    backend = "flashinfer_trtllm"
+    extra_args = ["--reasoning-parser", "nemotron_3"]
+    # Padded scores 0.925 here; unpadded (wrong outputs) scores 0.405.
+    gsm8k_threshold = 0.80
+
+    def test_gsm8k(self):
+        # Model card instruct mode: thinking off, greedy.
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            num_examples=200,
+            num_threads=128,
+            temperature=0.0,
+            max_tokens=1024,
+            chat_template_kwargs={"enable_thinking": False},
+        )
+        metrics = run_sgl_eval(args)
+        print(f"{metrics=}")
+        self.assertGreater(metrics["score"], self.gsm8k_threshold)
 
 
 if __name__ == "__main__":
