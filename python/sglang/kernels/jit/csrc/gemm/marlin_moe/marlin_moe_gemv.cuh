@@ -7,6 +7,7 @@
 // summed in split order through distributed shared memory.
 
 #include <sgl_kernel/tensor.h>
+
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 
