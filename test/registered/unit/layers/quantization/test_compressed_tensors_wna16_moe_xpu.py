@@ -18,7 +18,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=30, suite="extra-test-1-gpu-xpu")
 
 EXPERTS, HIDDEN, INTERMEDIATE, TOP_K = 8, 512, 256, 2
 
@@ -134,7 +134,7 @@ class TestXPUNativeWNA16MoE(CustomTestCase):
         self.assertLess(float(error), 2e-2)
 
     def test_matches_the_dequantized_reference(self):
-        for group_size in (32, 128):
+        for group_size in (32, 64, 128, 256):
             with self.subTest(group_size=group_size):
                 self._run(group_size)
 
