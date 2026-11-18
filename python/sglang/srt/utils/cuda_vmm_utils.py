@@ -512,6 +512,10 @@ class BumpArenaStub:
         return int(self._fn_freed())
 
 
+class VmmAllocationOutOfMemory(RuntimeError):
+    """A local physical cuMemCreate allocation failed for lack of memory."""
+
+
 class VmmReservation:
     """Own a VA reservation, its mappings, and their teardown order."""
 
@@ -561,7 +565,10 @@ class VmmReservation:
 
         drv = _get_cuda_driver()
         address = self.base + offset
-        handle = check_drv(drv.cuMemCreate(size, self._prop, 0), "cuMemCreate(local)")
+        create_result = drv.cuMemCreate(size, self._prop, 0)
+        if create_result[0] == drv.CUresult.CUDA_ERROR_OUT_OF_MEMORY:
+            raise VmmAllocationOutOfMemory(f"cuMemCreate(local): {create_result[0]}")
+        handle = check_drv(create_result, "cuMemCreate(local)")
         mapped = False
         try:
             check_drv(
