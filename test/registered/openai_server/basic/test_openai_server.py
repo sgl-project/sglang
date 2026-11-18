@@ -17,7 +17,6 @@ import requests
 
 from sglang.srt.hf_transformers import get_tokenizer
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.anthropic_messages_kit import AnthropicMessagesMixin
 from sglang.test.runners import TEST_RERANK_QUERY_DOCS
@@ -29,6 +28,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_rust_server_built,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=294, stage="base-b", runner_config="1-gpu-small")
@@ -36,6 +36,8 @@ register_amd_ci(est_time=224, suite="base-b-test-1-gpu-small-amd")
 
 
 class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):
+    process = None
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -53,7 +55,8 @@ class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if cls.process is not None:
+            terminate_and_kill_process_tree(cls.process)
 
     def test_ignore_eos(self):
         """ignore_eos=True must keep generating past EOS up to max_tokens."""
@@ -964,6 +967,8 @@ The SmartHome Mini is a compact smart home assistant available in black or white
 class TestOpenAICompletionWithRust(CustomTestCase):
     """Run the existing Completion matrix unchanged through the Rust frontend."""
 
+    process = None
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -981,7 +986,8 @@ class TestOpenAICompletionWithRust(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if cls.process is not None:
+            terminate_and_kill_process_tree(cls.process)
 
     # Reuse the reference test methods directly so Python and Rust coverage
     # cannot drift into separate matrices.
@@ -1009,6 +1015,8 @@ class TestOpenAIChatWithRust(TestOpenAICompletionWithRust):
 
 
 class TestOpenAIV1Rerank(CustomTestCase):
+    process = None
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME_FOR_TEST
@@ -1037,7 +1045,8 @@ class TestOpenAIV1Rerank(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if cls.process is not None:
+            terminate_and_kill_process_tree(cls.process)
 
     def run_rerank(self, query, docs):
         response = requests.post(
@@ -1080,6 +1089,8 @@ class TestOpenAIV1Rerank(CustomTestCase):
 
 
 class TestOpenAIServerCustomLogitProcessor(CustomTestCase):
+    process = None
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -1097,7 +1108,8 @@ class TestOpenAIServerCustomLogitProcessor(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
-        kill_process_tree(cls.process.pid)
+        if cls.process is not None:
+            terminate_and_kill_process_tree(cls.process)
 
     def run_custom_logit_processor(self, target_token_id: Optional[int] = None) -> None:
         """
