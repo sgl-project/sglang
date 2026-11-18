@@ -572,9 +572,14 @@ class NonCudaDSparkMixin(NonCudaDecoderMixin):
         forward_batch: ForwardBatch,
         prev_pre: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # The draft stages run the plain four steps: no fused post, no seams, so
-        # they need nothing from `bind_next` and never hand anything forward.
+        # The draft stages run the plain four steps, or Mega-mHC within the stage:
+        # no fused post across stages, so they need nothing from `bind_next` and
+        # never hand anything forward.
         assert self.attn_hc is not None and self.ffn_hc is not None
+        if mhc.mega_draft_enabled(self.attn_hc, self.ffn_hc, hidden_states):
+            return self._forward_hc_mega(
+                positions, hidden_states, forward_batch, prev_pre
+            )
         stats_stream = None
         if mhc.use_stats_stream(self.hc_cfg, forward_batch, hidden_states):
             stats_stream = self.hc_stats_stream
@@ -601,6 +606,25 @@ class NonCudaDSparkMixin(NonCudaDecoderMixin):
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)
         hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
+        return hidden_states, ffn_pre
+
+    def _forward_hc_mega(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        prev_pre: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Mega-mHC takes the attention seam's combine, norm and triplet in one
+        # launch, and the attention post with the FFN's in another; the FFN post
+        # stays plain, so the stage hands forward what the plain path does.
+        opened = mhc.mega_draft_open(self.attn_hc, hidden_states, prev_pre)
+        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            x = self.self_attn(positions, opened.input.rows, forward_batch)
+        ffn = mhc.mega_draft_post(x, opened, self.ffn_hc)
+        x = self._run_ffn(ffn.input.rows, forward_batch)
+        ffn_pre, ffn_post, ffn_comb = ffn.stats
+        hidden_states = self.hc_post(x, ffn.residual, ffn_post, ffn_comb)
         return hidden_states, ffn_pre
 
     def _run_ffn(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
