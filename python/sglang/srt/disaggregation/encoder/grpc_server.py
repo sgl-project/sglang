@@ -164,14 +164,22 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                     await self.encoder.release_request(request.req_id)
                 return encoder_pb2.EncodeResponse()
             elif get_disagg().encoder_transfer_backend == "zmq_to_tokenizer":
-                embedding_port = (
-                    request.embedding_port[0] if request.embedding_port else 0
-                )
-                await self.encoder.send(
+                if not request.embedding_port:
+                    await self.encoder.release_request(request.req_id)
+                    context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                    context.set_details("embedding_port is required")
+                    return encoder_pb2.EncodeResponse()
+                sent = await self.encoder.send(
                     req_id=request.req_id,
                     prefill_host=request.prefill_host,
-                    embedding_port=embedding_port,
+                    embedding_port=request.embedding_port[0],
                 )
+                if not sent:
+                    context.set_code(grpc.StatusCode.INTERNAL)
+                    context.set_details(
+                        f"no staged embedding for req_id={request.req_id}"
+                    )
+                    return encoder_pb2.EncodeResponse()
                 await self.encoder.release_request(request.req_id)
                 return encoder_pb2.EncodeResponse()
 
@@ -197,7 +205,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
         self, request: encoder_pb2.SendRequest, context
     ) -> encoder_pb2.SendResponse:
         try:
-            await self.encoder.send(
+            sent = await self.encoder.send(
                 req_id=request.req_id,
                 prefill_host=request.prefill_host,
                 embedding_port=request.embedding_port,
@@ -206,6 +214,10 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                     request.buffer_address if request.buffer_address else None
                 ),
             )
+            if not sent:
+                context.set_code(grpc.StatusCode.INTERNAL)
+                context.set_details(f"no staged embedding for req_id={request.req_id}")
+                return encoder_pb2.SendResponse()
             await self.encoder.release_request(request.req_id)
             return encoder_pb2.SendResponse()
 
