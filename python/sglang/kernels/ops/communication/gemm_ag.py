@@ -86,9 +86,8 @@ def gemm_ag_up_proj(
 ) -> torch.Tensor:
     """``out = x @ weight.T (allgathered) + b (+ c)``, all bf16.
 
-    ``x`` is [M, 3584] with M in [1, GEMV_MAX_TOKENS]; ``weight`` is the FULL
-    replicated [7168, 3584] up_proj weight (each rank reads only its own
-    row block); ``b`` / ``c`` / ``out`` are [M, 7168] (``out`` is
+    ``x`` is [M, 3584] with M in [1, GEMV_MAX_TOKENS]; ``weight`` is replicated
+    [7168, 3584] or a contiguous local [7168 / world_size, 3584] shard; ``b`` / ``c`` / ``out`` are [M, 7168] (``out`` is
     output-only)."""
     _gemm_ag_op(world_size, x, weight, b, c, out)
     return out

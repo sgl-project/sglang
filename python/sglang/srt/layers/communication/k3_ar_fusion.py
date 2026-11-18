@@ -424,16 +424,21 @@ def gemm_ag_up_proj(
     c: Optional[torch.Tensor],
 ) -> torch.Tensor:
     """``up_proj(x) + b (+ c)`` with the up_proj sharded by output column over
-    TP. ``weight`` is the FULL replicated up_proj. Caller checked
+    TP. ``weight`` is replicated or this rank's output-column shard. Caller checked
     :func:`gemm_ag_up_fits`."""
     from sglang.kernels.ops.communication import gemm_ag as mod
 
     state = _get_state()
     assert state is not None
     if x.shape[0] > mod.GEMV_MAX_TOKENS:
-        rows = weight.shape[0] // state.world_size
-        rank = state.rank
-        local = slice_gemm(x, weight[rank * rows : (rank + 1) * rows])
+        rows = mod.N // state.world_size
+        # Physically sharded weights already contain this rank's rows.
+        local_weight = (
+            weight[state.rank * rows : (state.rank + 1) * rows]
+            if weight.shape[0] == mod.N
+            else weight
+        )
+        local = slice_gemm(x, local_weight)
         return mod.gather_add3(state.world_size, local, b, c, torch.empty_like(b))
     return mod.gemm_ag_up_proj(
         state.world_size,

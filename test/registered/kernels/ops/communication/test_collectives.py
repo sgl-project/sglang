@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import atexit
 import os
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -248,6 +250,12 @@ def test_gemm_all_gather(num_tokens, with_c):
             output, expected.to(torch.bfloat16), rtol=3e-2, atol=3e-2
         )
 
+        # The physically sharded entry must preserve the replicated GEMV.
+        shard = weight.chunk(world_size)[dist.get_rank()].clone()
+        sharded_output = torch.empty_like(output)
+        gemm_ag.gemm_ag_up_proj(world_size, x, shard, b, c, sharded_output)
+        torch.testing.assert_close(sharded_output, output, rtol=0, atol=0)
+
     # Slice GEMM + gather: exact against the slices gathered by NCCL, with the
     # replicated tail's bf16(bf16(up_proj + b) + c) rounding.
     rows = gemm_ag.N // world_size
@@ -265,6 +273,85 @@ def test_gemm_all_gather(num_tokens, with_c):
         gemm_ag.gather_add3(world_size, local, b, c, output)
         torch.cuda.synchronize()
         torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+    if num_tokens > gemm_ag.GEMV_MAX_TOKENS:
+        from sglang.srt.layers.communication import k3_ar_fusion
+
+        # The communication workspace is real; only select the already
+        # initialized rank/world state without constructing a full model.
+        with patch.object(
+            k3_ar_fusion,
+            "_get_state",
+            return_value=SimpleNamespace(world_size=world_size, rank=rank),
+        ):
+            full = k3_ar_fusion.gemm_ag_up_proj(x, weight, b, c)
+            shard = weight[rank * rows : (rank + 1) * rows].clone()
+            sliced = k3_ar_fusion.gemm_ag_up_proj(x, shard, b, c)
+        torch.testing.assert_close(sliced, full, rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_kimi_latent_up_projection():
+    _require_sm100()
+    if int(os.environ["WORLD_SIZE"]) != 8:
+        pytest.skip("Kimi K3 latent-up sharding is enabled for TP8")
+    _init_world()
+    from sglang.srt.models.kimi_k3 import KimiK3LatentUpProjection
+
+    group = get_parallel().world_group
+    generator = torch.Generator(device=_device()).manual_seed(31)
+    weight = (
+        torch.randn(
+            gemm_ag.N,
+            gemm_ag.K,
+            generator=generator,
+            device=_device(),
+            dtype=torch.bfloat16,
+        )
+        * 0.02
+    )
+    with get_parallel().override(tp_group=group, tp_size=8, nnodes=1), _device():
+        layer = KimiK3LatentUpProjection(
+            gemm_ag.K,
+            gemm_ag.N,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            parallel_group="tp",
+        )
+        layer.weight.weight_loader(layer.weight, weight)
+        torch.testing.assert_close(
+            layer.weight, weight.chunk(8)[group.rank_in_group], rtol=0, atol=0
+        )
+        assert layer.weight.untyped_storage().nbytes() == weight.numel() * 2 // 8
+        # Include zero rows, the GEMV boundary, odd/strided input, the multicast
+        # limit and the larger-prefill fallback. Consume scratch before reuse.
+        for rows in (0, 1, 12, 13, 219, 267, 512, 513):
+            storage = torch.randn(
+                rows,
+                gemm_ag.K + 8,
+                generator=generator,
+                device=_device(),
+                dtype=torch.bfloat16,
+            )
+            x = storage[:, : gemm_ag.K]
+
+            def run():
+                return layer(x)[0].clone()
+
+            for _ in range(3):
+                output = run()
+            expected = torch.nn.functional.linear(x, weight)
+            torch.testing.assert_close(output, expected, rtol=1e-2, atol=2e-2)
+            graph = torch.cuda.CUDAGraph()
+            dist.barrier()
+            with torch.cuda.graph(graph):
+                output = run()
+            for _ in range(5):
+                storage.normal_(generator=generator)
+                graph.replay()
+                torch.cuda.synchronize()
+                expected = torch.nn.functional.linear(x, weight)
+                torch.testing.assert_close(output, expected, rtol=1e-2, atol=2e-2)
 
 
 @torch.inference_mode()
