@@ -165,7 +165,7 @@ SGL_DEVICE f32x4 mfma_a8w4(u32x4 w, u32x4 a_lo, u32x4 a_hi, f32x4 c, u32 scale_w
 }
 
 // ---------------------------------------------------------------------------------------------
-// Numerics shared with AITER's A8W4 SiTUv2 path (sgl-amd-mono's situ_aiter matches it).
+// Numerics shared with AITER's A8W4 SiTUv2 path.
 // ---------------------------------------------------------------------------------------------
 constexpr float kLog2e = 1.4426950408889634f;
 constexpr float kFp8Max = 448.0f;
