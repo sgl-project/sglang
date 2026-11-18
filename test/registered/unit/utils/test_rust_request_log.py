@@ -1,21 +1,9 @@
-"""The Rust server renders `--log-requests` lines from what Python hands it
-(`rust_server.config.request_log_settings`): the request class's fields with
-their defaults, and the logger's rules for the level and format. The Rust
-tests (rust/sglang-server/src/api_server/core/request_log/tests.rs) render the
-cases below from rust/sglang-server/testdata/request_log.json, which holds
-those settings and the lines Python's own `RequestLogger` logs, in both
-formats.
-
-The fixture pins the logger's format, not the request classes' field sets:
-it keeps only the fields in `_GENERATE_FIELDS` and `_OPENAI_REQUESTS`, and
-each case logs the request projected onto them. Adding, removing or moving
-any other field of `GenerateReqInput` or an OpenAI request model leaves it
-unchanged; at runtime the Rust server gets the full field list from Python.
-When the format changes, regenerate the fixture with
-
-    python test/registered/unit/utils/test_rust_request_log.py --write-fixture
-
-and make the Rust renderer render it."""
+"""The Rust tests (rust/sglang-server/src/api_server/core/request_log/tests.rs)
+render the cases below from rust/sglang-server/testdata/request_log.json: the
+settings Python hands the Rust server and the lines Python's `RequestLogger`
+logs. The fixture keeps only the fields in `_GENERATE_FIELDS` and
+`_OPENAI_REQUESTS`, so it pins the log format, not the request classes' fields;
+the Rust server gets the full field list from Python at runtime."""
 
 import dataclasses
 import datetime
@@ -58,10 +46,7 @@ RUST_REQUEST_LOG_FIXTURE = os.path.join(
     "rust/sglang-server/testdata/request_log.json",
 )
 
-# The `GenerateReqInput` fields the fixture keeps, in the order its lines
-# print them: every field a case sets or normalization fills in, every skip
-# name, a field a batch item leaves at its default, and plain defaults of a
-# few types.
+# The `GenerateReqInput` fields the fixture keeps, in the order its lines print.
 _GENERATE_FIELDS = (
     "rid",
     "session_id",  # shared by a batch's items
@@ -95,8 +80,7 @@ _GENERATE_FIELDS = (
     "cache_salt",
 )
 
-# Each OpenAI request: its model, its fields' key in the settings, and the
-# fields the fixture keeps, in the order its lines print them.
+# Per OpenAI request: its model, its settings key, and its kept fields in order.
 _OPENAI_REQUESTS = {
     "chat": (
         ChatCompletionRequest,
@@ -135,8 +119,6 @@ _OPENAI_REQUESTS = {
     ),
 }
 
-# The request object the fixture's lines print: `GenerateReqInput` with only
-# the kept fields.
 _ProjectedGenerateReqInput = dataclasses.make_dataclass(
     GenerateReqInput.__name__, _GENERATE_FIELDS
 )
@@ -478,9 +460,7 @@ class _FixedDatetime(datetime.datetime):
 
 
 def build_rust_request_log_fixture() -> dict:
-    """Every case at every level in both formats, on the kept fields only: the
-    settings Python hands the Rust server and the lines Python's
-    `RequestLogger` logs."""
+    """Every case at every level in both formats, on the kept fields only."""
     # The defaults, whatever this shell or an earlier test in the process sets.
     with (
         use_context(RuntimeContext(parallel=ParallelContext())),
@@ -516,22 +496,19 @@ def _logger(level: int, log_format: str, lines: list) -> RequestLogger:
 
 
 def _kept_settings(level: int, log_format: str) -> dict:
-    """`request_log_settings` with the request fields cut to the kept ones,
-    in their order, and without the OpenAI models' fields (the fixture holds
-    those once, in `openai_fields`)."""
     settings = request_log_settings(level, GenerateReqInput, log_format)
     defaults = dict(settings["fields"])
     settings["fields"] = [(name, defaults[name]) for name in _GENERATE_FIELDS]
     for key in ("batch_item_fields", "batch_shared_fields"):
         names = set(settings[key])
         settings[key] = [name for name in _GENERATE_FIELDS if name in names]
+    # The fixture holds these once, in `openai_fields`.
     for _, key, _ in _OPENAI_REQUESTS.values():
         del settings[key]
     return settings
 
 
 def _project(obj: GenerateReqInput) -> _ProjectedGenerateReqInput:
-    """`obj` as the fixture's lines print it: its kept fields."""
     projected = _ProjectedGenerateReqInput(
         **{name: getattr(obj, name) for name in _GENERATE_FIELDS}
     )
@@ -541,9 +518,8 @@ def _project(obj: GenerateReqInput) -> _ProjectedGenerateReqInput:
 
 
 def _project_openai(kind: str, body: dict) -> dict:
-    """The request's `model_dump(exclude_none=True)`, which the logger logs,
-    cut to the kept fields."""
     model, _, names = _OPENAI_REQUESTS[kind]
+    # What `log_openai_received_request` logs for a request model.
     dump = model(**json.loads(json.dumps(body))).model_dump(exclude_none=True)
     return {name: dump[name] for name in names if name in dump}
 
@@ -639,8 +615,7 @@ _WRITE_FIXTURE = (
 
 
 def _first_difference(old, new, path: str = "fixture"):
-    """The first place `new` differs from `old`: its path and both values
-    there; `None` when they are equal."""
+    """`(path, old value, new value)` where `new` first differs, or None."""
     if isinstance(old, dict) and isinstance(new, dict):
         for key in [*old, *(key for key in new if key not in old)]:
             at = f"{path}[{key!r}]"
@@ -697,8 +672,6 @@ class TestRustRequestLogFixture(CustomTestCase):
         )
 
     def test_kept_fields_exist(self):
-        """Every field the fixture keeps is still on its request class, and the
-        fixture keeps every field a case sets and every name a level skips."""
         fields = {field.name for field in dataclasses.fields(GenerateReqInput)}
         self.assertEqual(
             [name for name in _GENERATE_FIELDS if name not in fields],
