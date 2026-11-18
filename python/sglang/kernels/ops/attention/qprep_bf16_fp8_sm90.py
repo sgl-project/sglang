@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 
@@ -27,7 +28,7 @@ ROPE_DIM = 64  # qk_rope_head_dim
 
 @cache_once
 def _jit_qprep_bf16_fp8_module() -> Module:
-    if torch.cuda.get_device_capability()[0] != 9:
+    if not current_arch().is_sm(9):
         raise RuntimeError("qprep_bf16_fp8_sm90 requires an SM90 (Hopper) GPU")
     return load_jit(
         "qprep_bf16_fp8_sm90",

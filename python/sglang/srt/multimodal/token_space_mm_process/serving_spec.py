@@ -1,7 +1,7 @@
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import MultimodalDataItem
+    from sglang.srt.managers.req_types import MultimodalDataItem
 
 
 class TokenSpaceServingSpec:

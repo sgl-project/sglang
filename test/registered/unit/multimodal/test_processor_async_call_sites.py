@@ -102,7 +102,7 @@ def test_every_call_site_can_await():
 
 @pytest.mark.parametrize("media_source", ["arguments", "request"])
 def test_sglang_entry_forwards_the_request_to_its_core(media_source):
-    from sglang.srt.multimodal.token_space_mm_process.sglang import (
+    from sglang.srt.multimodal.token_space_mm_process.serving_processor import (
         TokenSpaceSGLangProcessor,
     )
 
@@ -210,6 +210,8 @@ _NO_WORKER_POOL_ROUTE = {
     "deepseek_v41.py",
     "dots_note_omni.py",
     "inkling.py",
+    # Expands audio placeholders and extracts per-clip features in io_executor.
+    "lfm3_audio.py",
     "lightonocr.py",
     "llava.py",
     "mimo_v2.py",

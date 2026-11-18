@@ -19,13 +19,14 @@ from sglang.srt.multimodal.token_space_mm_process.registry import (
     register_token_space_models,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _MODELS = "sglang.srt.multimodal.token_space_mm_process.models"
 
 
-class TestStrategyRegistry(unittest.TestCase):
+class TestStrategyRegistry(CustomTestCase):
     def test_importing_the_manager_leaves_strategy_modules_unloaded(self):
         """Every server imports the manager; only a multimodal one loads strategies."""
         loaded = subprocess.run(

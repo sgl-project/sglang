@@ -2,7 +2,7 @@
 //
 // Only the RTX 5090 row carries numbers. They were measured on a single
 // RTX 5090 32GB (`zijiexia-5090-1gpu`, `lmsysorg/sglang:dev` @ 30705c004c) with
-// `python3 -m sglang.bench_serving`, random 1024/1024, against the exact cell
+// `python3 -m sglang.benchmark.serving`, random 1024/1024, against the exact cell
 // command on this page — including `--mem-fraction-static 0.75
 // --cuda-graph-max-bs-decode 128`, which is what keeps concurrency 64 and 128
 // graph-backed (see the model page's Configuration Tips).

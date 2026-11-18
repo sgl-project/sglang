@@ -29,11 +29,11 @@ from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale,
     view_aiter_fused_rms_transposed_fp8_scale,
 )
-from sglang.srt.utils.common import is_gfx95_supported, is_hip
+from sglang.srt.utils.device import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=60, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 _GROUP_SIZE = 128
 

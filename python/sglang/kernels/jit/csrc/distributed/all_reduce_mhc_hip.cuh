@@ -89,7 +89,7 @@ struct AllReduceMhcPostKernel {
     using namespace host;
     auto M = SymbolicSize{"num_rows"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({M, kHidden}).with_dtype<bf16_t>().with_device(device).verify(input);
     TensorMatcher({M, kHc, kHidden}).with_dtype<bf16_t>().with_device(device).verify(residual).verify(output);

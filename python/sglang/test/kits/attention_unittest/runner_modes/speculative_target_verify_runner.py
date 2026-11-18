@@ -1,10 +1,9 @@
-from dataclasses import replace
 from typing import Literal
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPVerifyInput
@@ -260,29 +259,6 @@ def _make_custom_masks(
     return masks_by_req, torch.cat(flattened_masks, dim=0)
 
 
-def _make_flashinfer_dflash_swa_builtin_masks(
-    case,
-    *,
-    device: str,
-) -> list[torch.Tensor]:
-    """Mirror FlashInfer DFLASH verify's production no-custom-mask path."""
-    draft_token_num = _check_target_verify_case(case)
-    window = int(case.sliding_window_size)
-    masks_by_req = []
-    q_idx = torch.arange(
-        draft_token_num,
-        dtype=torch.int32,
-        device=device,
-    ).unsqueeze(1)
-    for prefix_len in case.prefix_lens:
-        seq_len = prefix_len + draft_token_num
-        prefix_start = max(0, int(prefix_len) - window)
-        k_idx = torch.arange(seq_len, dtype=torch.int32, device=device).unsqueeze(0)
-        masks_by_req.append((k_idx >= prefix_start) & (k_idx <= prefix_len + q_idx))
-
-    return masks_by_req
-
-
 def _expected_case_and_masks_for_spec_verify(
     case,
     *,
@@ -290,16 +266,6 @@ def _expected_case_and_masks_for_spec_verify(
     spec_kind: SpecVerifyKind,
     device: str,
 ):
-    if (
-        spec_kind == "dflash"
-        and case.backend == "flashinfer"
-        and getattr(case, "sliding_window_size", None) is not None
-    ):
-        reference_case = replace(case, sliding_window_size=None)
-        return reference_case, _make_flashinfer_dflash_swa_builtin_masks(
-            case, device=device
-        )
-
     masks_by_req, _ = _make_custom_masks(case, topk=topk, device=device)
     return case, masks_by_req
 
@@ -349,8 +315,8 @@ def _make_spec_verify_input(
             and getattr(case, "sliding_window_size", None) is not None
         ):
             # Production DFLASH disables custom verify masks for FlashInfer
-            # backends. SWA metadata clips the cached prefix; the backend causal
-            # path handles the draft block.
+            # backends. The window read clips the cached prefix; the kernel's
+            # causal window masks each query to its own window.
             custom_mask = None
         return DFlashVerifyInput(
             draft_token=batch.input_ids,

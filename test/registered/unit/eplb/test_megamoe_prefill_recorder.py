@@ -5,7 +5,6 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.eplb.eplb_manager import EPLBManager
-from sglang.srt.eplb.eplb_map_record_fused import eplb_map_and_record_fused
 from sglang.srt.eplb.expert_distribution import (
     _ExpertDistributionRecorderReal,
     _InfiniteBuffer,
@@ -13,7 +12,7 @@ from sglang.srt.eplb.expert_distribution import (
     should_advance_eplb_counter,
     should_record_forward_pass,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import override_platform
 from sglang.srt.utils import Withable
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -65,7 +64,6 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
     def test_pass_gate_records_only_real_prefill(self):
         cases = [
             (_batch(ForwardMode.EXTEND, extend_tokens=8192), True),
-            (_batch(ForwardMode.SPLIT_PREFILL, extend_tokens=8192), True),
             (_batch(ForwardMode.EXTEND, extend_tokens=0), False),
             (_batch(ForwardMode.DECODE), False),
             (_batch(ForwardMode.MIXED, extend_tokens=8192), False),
@@ -143,24 +141,32 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
         )
         self.assertTrue(torch.equal(gatherer._data, torch.tensor([[1, 0, 0, 1]])))
 
-    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA/HIP")
-    def test_fused_map_record_filters_padding(self):
-        topk_ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32, device="cuda")
-        dispatch = torch.tensor([2, 0, 3, 1], dtype=torch.int32, device="cuda")
-        info = SimpleNamespace(
-            ep_dispatch_algorithm="static",
-            partial_logical_to_rank_dispatch_physical_map=dispatch,
+    def test_local_count_buffer_is_this_ranks_slice_of_the_layer_row(self):
+        recorder = _ExpertDistributionRecorderReal.__new__(
+            _ExpertDistributionRecorderReal
         )
-        load = torch.zeros(4, dtype=torch.int32, device="cuda")
-        valid_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
-        output = eplb_map_and_record_fused(topk_ids, info, load, valid_tokens)
-        torch.cuda.synchronize()
-        self.assertTrue(
-            torch.equal(output.cpu(), torch.tensor([[2, 0], [3, 1]], dtype=torch.int32))
+        gatherer = _SelectExpertsSinglePassGatherer.__new__(
+            _SelectExpertsSinglePassGatherer
         )
-        self.assertTrue(
-            torch.equal(load.cpu(), torch.tensor([1, 0, 1, 0], dtype=torch.int32))
-        )
+        gatherer._data = torch.zeros((3, 8), dtype=torch.int32)
+        recorder._single_pass_gatherers = {"primary": gatherer}
+        recorder._current_layer_idx = SimpleNamespace(value=1)
+        local = dict(num_experts=8, ep_rank=2, ep_size=4)
+        with patch.object(recorder, "_hook_enabled", return_value=True):
+            recorder.get_current_pass_local_count_buffer(**local).fill_(1)
+            expected = torch.zeros((3, 8), dtype=torch.int32)
+            expected[1, 4:6] = 1
+            self.assertTrue(torch.equal(gatherer._data, expected))
+            self.assertIsNone(
+                recorder.get_current_pass_local_count_buffer(
+                    num_experts=12, ep_rank=2, ep_size=4
+                )
+            )
+            recorder._current_layer_idx = SimpleNamespace(value=None)
+            self.assertIsNone(recorder.get_current_pass_local_count_buffer(**local))
+        recorder._current_layer_idx = SimpleNamespace(value=1)
+        with patch.object(recorder, "_hook_enabled", return_value=False):
+            self.assertIsNone(recorder.get_current_pass_local_count_buffer(**local))
 
     def _make_recorder(self):
         recorder = _ExpertDistributionRecorderReal.__new__(

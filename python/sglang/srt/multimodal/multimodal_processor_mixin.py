@@ -5,17 +5,17 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
-from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
-from sglang.srt.utils import (
+from sglang.srt.multimodal.media_io import (
     CLIENT_MEDIA_EXCEPTIONS,
     configure_media_url_security,
     load_audio,
     load_image,
     load_video,
-    logger,
     smart_to_rgb,
 )
+from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
+from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
+from sglang.srt.utils import logger
 
 
 def _tokenizer_of(processor):
@@ -33,6 +33,7 @@ class MultimodalProcessorMixin:
     """Share media loading and preprocessing resources across training and serving."""
 
     gpu_image_decode = True  # Enable GPU decoding by default
+    gpu_video_decode = True
     smart_rgb_conversion = False
     auto_mm_io_worker_num = 4
     # Processors opt out only when their preprocessing is not thread-safe. The
@@ -56,11 +57,11 @@ class MultimodalProcessorMixin:
         configure_media_url_security(
             processor_config.allowed_media_domains,
             processor_config.media_url_max_file_size_mb,
+            processor_config.media_url_timeout,
+            processor_config.allow_local_media_files,
         )
 
         self.image_processor_backend = processor_config.image_processor_backend
-        if processor_config.disable_fast_image_processor:
-            self.image_processor_backend = "pil"
         self.disable_fast_image_processor = self.image_processor_backend == "pil"
 
         mm_process_config = processor_config.mm_process_config
@@ -229,7 +230,9 @@ class MultimodalProcessorMixin:
             elif modality == Modality.VIDEO:
                 if video_decode_device is None:
                     video_decode_device = cls.video_preprocessing_device
-                return load_video(data, use_gpu=video_decode_device != "cpu")
+                return load_video(
+                    data, use_gpu=cls.gpu_video_decode and video_decode_device != "cpu"
+                )
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 

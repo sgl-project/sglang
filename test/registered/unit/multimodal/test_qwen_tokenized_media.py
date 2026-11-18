@@ -69,8 +69,9 @@ from sglang.srt.managers.multimodal_processor import (
     PROCESSOR_MAPPING,
     get_mm_processor,
 )
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 from sglang.srt.multimodal.processors.qwen_vl import (
     QwenVLImageProcessor,
@@ -93,14 +94,16 @@ from sglang.srt.multimodal.token_space_mm_process.processor import (
     TokenSpaceProcessor,
 )
 from sglang.srt.multimodal.token_space_mm_process.registry import (
+    TOKEN_SPACE_SERVING_SPEC_MAPPING,
     TOKEN_SPACE_STRATEGY_MAPPING,
 )
-from sglang.srt.multimodal.token_space_mm_process.sglang import (
+from sglang.srt.multimodal.token_space_mm_process.serving_processor import (
     TokenSpaceSGLangProcessor,
 )
 from sglang.srt.multimodal.transport.feature_transport import (
     MultimodalFeatureTransport,
 )
+from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
@@ -297,6 +300,7 @@ def _make_processor(model_type="qwen3_vl"):
         ),
     )
     processor._disable_fast_image_processor = True
+    processor._processor_fingerprint = "sha256:" + "0" * 64
     processor._serving_spec = processor._serving_spec_class(processor.hf_config)
     _attach_core(
         processor,
@@ -435,7 +439,7 @@ class TestQwenTokenizedMedia(CustomTestCase):
             model_path="dummy",
             mm_process_config={},
             enable_token_space_processor=True,
-            disable_fast_image_processor=True,
+            image_processor_backend="pil",
             mm_processor_worker_num=1,
         )
         publish(args, role="test")
@@ -484,6 +488,11 @@ class TestQwenTokenizedMedia(CustomTestCase):
             patch.dict(
                 TOKEN_SPACE_STRATEGY_MAPPING,
                 {"Qwen3VLForConditionalGeneration": QwenTokenSpaceProcessStrategy},
+                clear=True,
+            ),
+            patch.dict(
+                TOKEN_SPACE_SERVING_SPEC_MAPPING,
+                {"Qwen3VLForConditionalGeneration": QwenTokenSpaceServingSpec},
                 clear=True,
             ),
         ):
@@ -1046,6 +1055,163 @@ class TestQwenTokenizedMedia(CustomTestCase):
                 )
 
     @patch("sglang.srt.multimodal.qwen_vl_media_processing.is_cpu", return_value=True)
+    def test_video_url_options_of_other_models_do_not_reach_hf(self, _is_cpu):
+        video_data = []
+        process_content_for_template_format(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video_url",
+                        "video_url": {
+                            "url": "video.mp4",
+                            "max_frames": 4,
+                            "max_dynamic_patch": 2,
+                            "max_tokens_per_frame": 64,
+                            "max_image_tokens": 128,
+                        },
+                    }
+                ],
+            },
+            "openai",
+            [],
+            video_data,
+            [],
+            [],
+        )
+        frames = (
+            torch.arange(8 * 64 * 64 * 3)
+            .remainder(251)
+            .to(torch.uint8)
+            .reshape(8, 64, 64, 3)
+        )
+        for processor_class, patch_size, model_type in (
+            (Qwen2_5_VLProcessor, 14, "qwen2_5_vl"),
+            (Qwen3VLProcessor, 16, "qwen3_vl"),
+        ):
+            with self.subTest(model_type=model_type):
+                processor = _make_hf_processor(
+                    processor_class, patch_size, model_type=model_type
+                )
+                processor._core.strategy.video_config = {"fps": 8.0}
+                decoder = _VideoDecoder(frames, fps=8)
+                from_request = _process_media(
+                    processor,
+                    videos=[decoder],
+                    preprocess_kwargs={"videos": [video_data[0].preprocess_kwargs]},
+                )
+                qwen_options_only = _process_media(
+                    processor,
+                    videos=[_VideoDecoder(frames, fps=8)],
+                    preprocess_kwargs={"videos": [{"max_frames": 4}]},
+                )
+                self.assertEqual(len(decoder.decode_requests[0]), 4)
+                for key in ("pixel_values_videos", "video_grid_thw"):
+                    self.assert_tensor_bytes_equal(
+                        from_request[key], qwen_options_only[key]
+                    )
+
+    @patch("sglang.srt.multimodal.qwen_vl_media_processing.is_cpu", return_value=True)
+    def test_item_video_options_cannot_change_the_processor_layout(self, _is_cpu):
+        frames = (
+            torch.arange(8 * 64 * 64 * 3)
+            .remainder(251)
+            .to(torch.uint8)
+            .reshape(8, 64, 64, 3)
+        )
+        layout_options = {
+            "video_metadata": {"fps": 8, "total_num_frames": 8},
+            "patch_size": 8,
+            "merge_size": 4,
+            "temporal_patch_size": 4,
+            "return_tensors": "np",
+        }
+        for processor_class, patch_size, model_type in (
+            (Qwen2_5_VLProcessor, 14, "qwen2_5_vl"),
+            (Qwen3VLProcessor, 16, "qwen3_vl"),
+        ):
+            with self.subTest(model_type=model_type):
+                processor = _make_hf_processor(
+                    processor_class, patch_size, model_type=model_type
+                )
+                processor._core.strategy.video_config = {"fps": 8.0}
+                with_layout = _process_media(
+                    processor,
+                    videos=[_VideoDecoder(frames, fps=8)],
+                    preprocess_kwargs={"videos": [{"max_frames": 4, **layout_options}]},
+                )
+                without_layout = _process_media(
+                    processor,
+                    videos=[_VideoDecoder(frames, fps=8)],
+                    preprocess_kwargs={"videos": [{"max_frames": 4}]},
+                )
+                for key in ("pixel_values_videos", "video_grid_thw"):
+                    self.assert_tensor_bytes_equal(
+                        with_layout[key], without_layout[key]
+                    )
+
+    def test_frame_tensor_items_keep_their_own_qwen_options(self):
+        for processor_class, patch_size, model_type, frames, item_options in (
+            (
+                Qwen2_5_VLProcessor,
+                14,
+                "qwen2_5_vl",
+                torch.full((4, 3, 112, 112), 127, dtype=torch.uint8),
+                {"max_pixels": 56 * 56},
+            ),
+            (
+                Qwen3VLProcessor,
+                16,
+                "qwen3_vl",
+                torch.full((16, 3, 64, 64), 127, dtype=torch.uint8),
+                {"fps": 12.0},
+            ),
+        ):
+            with self.subTest(model_type=model_type):
+                processor = _make_hf_processor(
+                    processor_class, patch_size, model_type=model_type
+                )
+                strategy = processor._core.strategy
+                strategy.video_config = {}
+                default = _process_media(processor, videos=[frames])
+                per_item = _process_media(
+                    processor,
+                    videos=[frames],
+                    preprocess_kwargs={"videos": [item_options]},
+                )
+                strategy.video_config = dict(item_options)
+                configured = _process_media(processor, videos=[frames])
+                for key in ("pixel_values_videos", "video_grid_thw"):
+                    self.assert_tensor_bytes_equal(per_item[key], configured[key])
+                self.assertNotEqual(
+                    per_item["video_grid_thw"].tolist(),
+                    default["video_grid_thw"].tolist(),
+                )
+
+    def test_scheduler_mrope_fallback_rebuilds_omni_audio_lengths(self):
+        processor = _make_hf_processor(
+            Qwen3OmniMoeProcessor, 16, model_type="qwen3_omni_moe"
+        )
+        strategy = processor._core.strategy
+        strategy.audio_config = {"return_attention_mask": True, "truncation": False}
+        audios = [np.zeros(3200, dtype=np.float32), np.zeros(19200, dtype=np.float32)]
+        with _ban_text_processing(processor):
+            media = _process_media(processor, audios=audios)
+            expanded = expand_token_placeholders(
+                [AUDIO, EOS, AUDIO], _expansion_spec(processor, media)
+            )
+        with patch.object(
+            strategy, "compute_mrope_positions", return_value=(None, None)
+        ) as compute_mrope_positions:
+            serving = _post_process(processor, expanded, media)
+            processor.compute_mrope_positions(expanded, serving.mm_items)
+        rebuilt = compute_mrope_positions.call_args.args[0]
+        self.assertNotIn("input_features", rebuilt)
+        self.assert_tensor_bytes_equal(
+            rebuilt["feature_attention_mask"], media["feature_attention_mask"]
+        )
+
+    @patch("sglang.srt.multimodal.qwen_vl_media_processing.is_cpu", return_value=True)
     def test_omni_seconds_per_grid_follow_the_item_fps(self, _is_cpu):
         """A video_url fps sets both the frames sampled and the M-RoPE seconds per grid.
 
@@ -1110,6 +1276,13 @@ class TestQwenTokenizedMedia(CustomTestCase):
         processor._core.strategy.video_config = {"use_audio_in_video": True}
         with self.assertRaisesRegex(ValueError, "use_audio_in_video"):
             _process_media(processor, videos=[object()])
+        processor._core.strategy.video_config = {}
+        with self.assertRaisesRegex(ValueError, "use_audio_in_video"):
+            _process_media(
+                processor,
+                videos=[object()],
+                preprocess_kwargs={"videos": [{"use_audio_in_video": True}]},
+            )
 
     def test_video_preprocess_kwargs_cannot_raise_configured_limits(self):
         strategy = _make_hf_processor(Qwen3VLProcessor, 16)._core.strategy

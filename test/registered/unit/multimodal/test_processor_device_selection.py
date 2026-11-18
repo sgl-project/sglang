@@ -22,11 +22,11 @@ from sglang.srt.multimodal.token_space_mm_process.process_strategy import (
 from sglang.srt.multimodal.token_space_mm_process.processor import (
     TokenSpaceProcessor,
 )
+from sglang.srt.multimodal.token_space_mm_process.serving_processor import (
+    TokenSpaceSGLangProcessor,
+)
 from sglang.srt.multimodal.token_space_mm_process.serving_spec import (
     TokenSpaceServingSpec,
-)
-from sglang.srt.multimodal.token_space_mm_process.sglang import (
-    TokenSpaceSGLangProcessor,
 )
 from sglang.srt.multimodal.transport.feature_transport import (
     MultimodalFeatureTransport,
@@ -185,7 +185,7 @@ class TestTokenSpaceDevices(CustomTestCase):
         )
         publish(server_args, role="test")
         with patch(
-            "sglang.srt.multimodal.token_space_mm_process.sglang.is_cuda_alike",
+            "sglang.srt.multimodal.token_space_mm_process.serving_processor.is_cuda_alike",
             return_value=True,
         ):
             wrapper = TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
