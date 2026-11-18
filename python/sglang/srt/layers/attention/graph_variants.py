@@ -144,11 +144,6 @@ class Dsv41CandidateGraphVariants:
     verify_extra_tokens: int = 0
 
     def select(self, forward_batch: ForwardBatch) -> str:
-        # Decode only: a DSpark target verify stages its metadata for the variant of
-        # its own committed lengths (select_for_max_seq_len) before the replay.
-        dp_max_seq_len = dp_decode_max_seq_len(forward_batch)
-        if dp_max_seq_len is not None:
-            return self.select_for_max_seq_len(dp_max_seq_len)
         lengths = getattr(forward_batch, "seq_lens_cpu", None)
         max_seq_len = None
         if lengths is not None and lengths.device.type == "cpu" and lengths.numel() > 0:

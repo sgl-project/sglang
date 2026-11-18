@@ -122,35 +122,6 @@ class TestLengthKeyedVariantsUnderDP(CustomTestCase):
         self.assertEqual(variants.select(_batch(ForwardMode.IDLE, 0)), "p1")
         self.assertEqual(variants.select(_batch(decode, None, torch.tensor([7]))), "p1")
 
-    def test_dsv41_candidates_follow_the_bound_in_decode_only(self):
-        variants = gv.Dsv41CandidateGraphVariants(
-            graph_limits=(
-                ("candidate_all", 2048),
-                (gv.DSV41_CANDIDATE_UNFILTERED, 16384),
-            ),
-            capture_labels=(
-                "candidate_all",
-                gv.DSV41_CANDIDATE_UNFILTERED,
-                gv.DSV41_CANDIDATE_FILTERED,
-            ),
-        )
-        decode = ForwardMode.DECODE
-        self.assertEqual(
-            variants.select(_batch(decode, 2000, torch.tensor([30000]))),
-            "candidate_all",
-        )
-        self.assertEqual(
-            variants.select(_batch(decode, 20000, torch.tensor([7]))),
-            gv.DSV41_CANDIDATE_FILTERED,
-        )
-        # A verify replay keeps the variant its early-staged metadata was built for.
-        self.assertEqual(
-            variants.select(
-                _batch(ForwardMode.TARGET_VERIFY, 2000, torch.tensor([30000]))
-            ),
-            gv.DSV41_CANDIDATE_FILTERED,
-        )
-
 
 class TestMLPSyncDecodeBound(CustomTestCase):
     def _info(self, bound):
