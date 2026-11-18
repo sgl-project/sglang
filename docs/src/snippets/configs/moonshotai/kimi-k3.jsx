@@ -1288,7 +1288,7 @@ export const config = {
       verificationStatus: "in-progress",
       env: [
         "SGLANG_USE_AITER=1",
-        "SGLANG_OPT_HIP_K3_AITER=1",
+        "SGLANG_AITER_K3_OPT=1",
         "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
       ],
@@ -1318,7 +1318,7 @@ export const config = {
       verificationStatus: "in-progress",
       env: [
         "SGLANG_USE_AITER=1",
-        "SGLANG_OPT_HIP_K3_AITER=1",
+        "SGLANG_AITER_K3_OPT=1",
         "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
       ],
@@ -2062,7 +2062,7 @@ export const config = {
       verificationStatus: "in-progress",
       env: [
         "SGLANG_USE_AITER=1",
-        "SGLANG_OPT_HIP_K3_AITER=1",
+        "SGLANG_AITER_K3_OPT=1",
         "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
       ],
@@ -2090,7 +2090,7 @@ export const config = {
       verificationStatus: "in-progress",
       env: [
         "SGLANG_USE_AITER=1",
-        "SGLANG_OPT_HIP_K3_AITER=1",
+        "SGLANG_AITER_K3_OPT=1",
         "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
       ],
