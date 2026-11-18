@@ -201,7 +201,15 @@ class TargetVerifyExecutor:
         if folded_accept:
             return self.verify_epilogue.read_accept(bs)
 
-        correct_len, bonus, cap_trim_lens = accept_draft_tokens(
+        # A simulated top-k / top-p bonus draws from the distribution the accept
+        # just built; keep it instead of rebuilding the simulated row's.
+        reuse_target_probs = (
+            self._simulated_correct_len is not None
+            and simulate_bonus_sampling_info is not None
+            and simulate_bonus_sampling_info is sampling_info
+            and (sampling_info.need_top_k_sampling or sampling_info.need_top_p_sampling)
+        )
+        accepted = accept_draft_tokens(
             candidates=verify_ids_2d,
             target_logits=target_logits,
             draft_block=draft_block,
@@ -212,7 +220,13 @@ class TargetVerifyExecutor:
             cutoff_layout=layout,
             block_verification=self._block_verification,
             rejection_noise=self._rejection_noise,
+            return_target_probs=reuse_target_probs,
         )
+        target_probs = None
+        if reuse_target_probs:
+            correct_len, bonus, cap_trim_lens, target_probs = accepted
+        else:
+            correct_len, bonus, cap_trim_lens = accepted
         greedy_bonus = simulate_bonus_sampling_info is None and (
             sampling_info is None or sampling_info.is_all_greedy
         )
@@ -235,6 +249,7 @@ class TargetVerifyExecutor:
             target_logits=target_logits,
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             simulated_bonus_seed=self._simulated_bonus_seed,
+            simulated_bonus_target_probs=target_probs,
         )
 
     def begin_simulated_step(self) -> None:
@@ -1139,12 +1154,15 @@ def build_accept_outs(
     target_logits: Optional[torch.Tensor] = None,
     simulate_bonus_sampling_info=None,
     simulated_bonus_seed: Optional[int] = None,
+    simulated_bonus_target_probs: Optional[torch.Tensor] = None,
     out: Optional[AcceptOuts] = None,
     block_accept_lens_out: Optional[torch.Tensor] = None,
 ) -> AcceptOuts:
     """``out``: static buffers (the in-graph accept's) to copy the results into;
     ``block_accept_lens_out`` (with ``out``) gets commit_lens + cap_trim_lens.
-    ``simulated_bonus_seed`` (with ``simulate_bonus_sampling_info``) seeds the bonus."""
+    ``simulated_bonus_seed`` (with ``simulate_bonus_sampling_info``) seeds the bonus;
+    ``simulated_bonus_target_probs`` is the accept's own top-k / top-p target
+    distribution, which the bonus then reuses."""
     bs = correct_len.shape[0]
     if simulated_correct_len is not None:
         # The accept runs as served; only its length is replaced.
@@ -1159,6 +1177,7 @@ def build_accept_outs(
                 bs=bs,
                 verify_num_draft_tokens=verify_num_draft_tokens,
                 seed=simulated_bonus_seed,
+                target_probs=simulated_bonus_target_probs,
             )
         elif target_logits is not None:
             # The accept's bonus is the real-length row's; take the simulated row's argmax.
@@ -1218,10 +1237,29 @@ def sample_simulated_bonus(
     bs: int,
     verify_num_draft_tokens: int,
     seed: int,
+    target_probs: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """The bonus token at the (simulated) correct_len row, drawn from the target
-    distribution the sampling accept uses: temperature, then top-k / top-p."""
-    if sampling_info.need_top_k_sampling or sampling_info.need_top_p_sampling:
+    distribution the sampling accept uses: temperature, then top-k / top-p.
+
+    ``target_probs`` ([bs, verify_num_draft_tokens, vocab]) is that distribution as
+    the accept built it; given, the bonus reads its simulated row instead of
+    rebuilding it (index_select, softmax, renorm) and sampling with multinomial."""
+    if (
+        sampling_info.need_top_k_sampling or sampling_info.need_top_p_sampling
+    ) and target_probs is not None:
+        rows = target_probs.view(bs, verify_num_draft_tokens, -1)[
+            torch.arange(bs, device=target_probs.device), correct_len.view(-1).long()
+        ]
+        # Exponential race: argmax p_i / E_i with E_i ~ Exp(1) picks i with
+        # probability p_i, without multinomial's input checks.
+        noise = (
+            torch.empty_like(rows)
+            .exponential_()
+            .clamp_min_(torch.finfo(rows.dtype).tiny)
+        )
+        bonus = (rows / noise).argmax(dim=-1)
+    elif sampling_info.need_top_k_sampling or sampling_info.need_top_p_sampling:
         probs = build_speculative_verify_target_probs(
             next_token_logits=target_logits.index_select(
                 0, _simulated_rows(correct_len, verify_num_draft_tokens)
@@ -1334,16 +1372,27 @@ def accept_draft_tokens(
     cutoff_layout: Optional[RaggedVerifyLayout] = None,
     block_verification: bool = False,
     rejection_noise: Optional[RejectionNoise] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_target_probs: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    """(correct_len, bonus, cap_trim_lens); with ``return_target_probs``, also the
+    [bs, rows, vocab] target probabilities the sampling accept used, or None on a
+    path that never materializes them (greedy, sharded, block-wise rejection)."""
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
     all_greedy = sampling_info is None or sampling_info.is_all_greedy
+    target_probs = None
+
+    def done(result):
+        return (*result, target_probs) if return_target_probs else result
+
     if all_greedy:
-        return AcceptGreedy.execute(
-            candidates=candidates,
-            target_logits=target_logits,
-            verify_num_draft_tokens=verify_num_draft_tokens,
-            cutoff_verify_lens=cutoff_verify_lens,
+        return done(
+            AcceptGreedy.execute(
+                candidates=candidates,
+                target_logits=target_logits,
+                verify_num_draft_tokens=verify_num_draft_tokens,
+                cutoff_verify_lens=cutoff_verify_lens,
+            )
         )
     if _accepts_on_shards(draft_block, sampling_info, block_verification):
         # Block-wise rejection scans the whole draft vocab. This kernel is the
@@ -1391,9 +1440,12 @@ def accept_draft_tokens(
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
             block_verification=block_verification,
+            return_target_probs=return_target_probs,
         )
+        if return_target_probs:
+            *sampled, target_probs = sampled
     if not sampling_info.is_any_greedy:
-        return sampled
+        return done(sampled)
     greedy_len, greedy_bonus, greedy_trim = AcceptGreedy.execute(
         candidates=candidates,
         target_logits=target_logits,
@@ -1410,4 +1462,4 @@ def accept_draft_tokens(
         sampling_bonus=sampling_bonus,
         sampling_trim=sampling_trim,
     )
-    return selected.correct_len, selected.bonus, selected.cap_trim_lens
+    return done((selected.correct_len, selected.bonus, selected.cap_trim_lens))

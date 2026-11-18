@@ -12,11 +12,11 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="base-b-test-1-gpu-small-amd")
 
 
-def _info(temps):
+def _info(temps, need_top_p_sampling=False):
     return types.SimpleNamespace(
         temperatures=torch.tensor(temps, device="cuda"),
         need_top_k_sampling=False,
-        need_top_p_sampling=False,
+        need_top_p_sampling=need_top_p_sampling,
     )
 
 
@@ -80,6 +80,46 @@ class TestSimulatedBonus(unittest.TestCase):
         )
         freq = torch.bincount(out, minlength=vocab).float() / n
         want = torch.softmax(base / 0.7, dim=-1)
+        self.assertLess((freq - want).abs().max().item(), 5e-3)
+
+    def test_reused_target_probs_reads_the_simulated_row(self):
+        # One-hot rows: the bonus must be the hot token of the row at correct_len.
+        bs, rows, vocab = 4, 6, 1000
+        hot = torch.randint(0, vocab, (bs, rows), device="cuda")
+        target_probs = torch.zeros(bs, rows, vocab, device="cuda")
+        target_probs.scatter_(-1, hot.unsqueeze(-1), 1.0)
+        correct_len = torch.tensor([0, 5, 2, 3], device="cuda", dtype=torch.int32)
+        out = sample_simulated_bonus(
+            target_logits=torch.randn(bs * rows, vocab, device="cuda"),
+            correct_len=correct_len,
+            greedy_bonus=torch.zeros(bs, dtype=torch.int64, device="cuda"),
+            sampling_info=_info([1.0] * bs, need_top_p_sampling=True),
+            bs=bs,
+            verify_num_draft_tokens=rows,
+            seed=0,
+            target_probs=target_probs,
+        )
+        self.assertEqual(out.dtype, torch.int64)
+        self.assertTrue(torch.equal(out, hot[torch.arange(bs), correct_len.long()]))
+
+    def test_reused_target_probs_matches_their_distribution(self):
+        # A top-p-truncated distribution (zeros past the nucleus) is sampled as given.
+        torch.manual_seed(3)
+        vocab, n = 8, 200_000
+        want = torch.tensor([0.4, 0.3, 0.2, 0.1, 0.0, 0.0, 0.0, 0.0], device="cuda")
+        target_probs = want.repeat(n, 1).view(n, 1, vocab)
+        out = sample_simulated_bonus(
+            target_logits=torch.zeros(n, vocab, device="cuda"),
+            correct_len=torch.zeros(n, dtype=torch.int32, device="cuda"),
+            greedy_bonus=torch.zeros(n, dtype=torch.int64, device="cuda"),
+            sampling_info=_info([1.0] * n, need_top_p_sampling=True),
+            bs=n,
+            verify_num_draft_tokens=1,
+            seed=3,
+            target_probs=target_probs,
+        )
+        freq = torch.bincount(out, minlength=vocab).float() / n
+        self.assertEqual(freq[4:].sum().item(), 0.0)
         self.assertLess((freq - want).abs().max().item(), 5e-3)
 
 
