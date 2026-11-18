@@ -92,6 +92,7 @@ class TcPiecewiseCudaGraphBackend(BaseGraphBackend):
     """
 
     def __init__(self, cuda_graph_runner: BaseCudaGraphRunner) -> None:
+        self._cuda_graph_runner = cuda_graph_runner
         model_runner = cuda_graph_runner.model_runner
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
@@ -237,10 +238,23 @@ class TcPiecewiseCudaGraphBackend(BaseGraphBackend):
     ) -> None:
         # Call 1 warms FX state; call 2 captures the cuda graph inside capture_session.
         # See cuda_piecewise_backend.py for the FX backend that drives the capture.
+        # The per-shape schedule waits 2 steps and records the next one. This
+        # backend only runs two forwards, so step once before the loop. The
+        # recorded call is the capture, and the last step closes that trace.
+        runner = self._cuda_graph_runner
+        profiler = (
+            getattr(runner, "_profiler", None)
+            if getattr(runner, "enable_profile_cuda_graph", False)
+            else None
+        )
+        if profiler is not None:
+            profiler.step()
         for _ in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
             forward_fn()
+            if profiler is not None:
+                profiler.step()
             if post_warmup_hook is not None:
                 post_warmup_hook()
 

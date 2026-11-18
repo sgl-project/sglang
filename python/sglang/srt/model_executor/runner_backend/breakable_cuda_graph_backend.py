@@ -134,12 +134,23 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseBreakableGraphBackend
         capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
+        # Step the per-shape profiler past the two warmups and after capture
+        # (same as FullCudaGraphBackend). _profiler is None unless
+        # SGLANG_GRAPH_BATCH_CAPTURE is set.
+        runner = self._cuda_graph_runner
+        profiler = (
+            getattr(runner, "_profiler", None)
+            if getattr(runner, "enable_profile_cuda_graph", False)
+            else None
+        )
         warmup_out = None
         for _ in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
             with self._precarve.measure():
                 warmup_out = forward_fn()
+            if profiler is not None:
+                profiler.step()
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
@@ -185,6 +196,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseBreakableGraphBackend
                 out = forward_fn()
                 out_rows = self._output_rows(out, size)
                 self._copy_output_to_buffer(out, buffer, out_rows)
+
+        if profiler is not None:
+            profiler.step()
 
         stored = self._slice_output(buffer, out_rows)
         self._graphs[shape_key] = graph
