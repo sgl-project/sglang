@@ -197,6 +197,8 @@ class TestFoundryGraphPersistence(CustomTestCase):
     # Batched outputs are compared with native unless a subclass opts out;
     # DP attention composes batches per rank, which differs run to run natively.
     compare_batched = True
+    # Native's Prebuilt capture state counts (dispatchers, gatherers); empty = none pending.
+    prebuilt_state = []
     # LOAD upper bounds in CI, seconds, about twice what the H100 runners measure;
     # all graph sets' capture loops (restore + per-shape prep), the scheduler init.
     load_graph_s = 4.0
@@ -418,6 +420,8 @@ class TestFoundryGraphPersistence(CustomTestCase):
         """Catches the lazy comm state built after the first capture began,
         or built on one of native / SAVE / LOAD only; one layout's outputs can miss both."""
         native = _PREBUILT_STATE.findall(self.runs["native"]["log"])
+        # A prebuild moved past the capture finds nothing pending and prints no line.
+        self.assertEqual(native, self.prebuilt_state)
         for engine in ("native", "save", "load"):
             log = self.runs[engine]["log"]
             with self.subTest(engine=engine):
