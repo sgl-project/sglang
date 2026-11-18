@@ -15,9 +15,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
 import threading
+import time
+import uuid
 from typing import Callable, List, Optional
 
 import ray
@@ -25,15 +28,19 @@ from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from sglang.srt.arg_groups.overrides import declare_resolution
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.engine import (
     Engine,
     SchedulerInitResult,
     _calculate_rank_ranges,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.mem_cache.hicache_storage import merge_scheduler_info_layouts
 from sglang.srt.ray.scheduler_actor import SchedulerActor
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_parallel,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
@@ -42,6 +49,10 @@ logger = logging.getLogger(__name__)
 
 # Bounds how long a stopped scheduler monitor keeps its thread alive; arbitrary.
 _SCHEDULER_MONITOR_POLL_S = 5.0
+# Same default as /health_generate's SGLANG_HEALTH_CHECK_TIMEOUT.
+_HEALTH_PROBE_TIMEOUT_S = 20.0
+# Arbitrary; sets how fast check_health returns once a scheduler answers.
+_HEALTH_PROBE_POLL_S = 0.1
 
 
 @dataclasses.dataclass
@@ -262,14 +273,57 @@ class RayEngine(Engine):
             target=self._monitor_schedulers, daemon=True, name="ray_scheduler_monitor"
         ).start()
 
-    def check_health(self) -> None:
-        """Raise if a scheduler actor died or its event loop exited.
+    async def check_health(self, timeout_s: float = _HEALTH_PROBE_TIMEOUT_S) -> None:
+        """Raise if a scheduler exited or the schedulers stop answering.
 
-        Non-blocking; callers such as a serving framework's health probe use it
-        to replace the engine.
+        Sends a one-token probe as /health_generate does: an idle scheduler runs
+        it, a busy one acknowledges it from its event loop, and any scheduler
+        output within ``timeout_s`` counts as an answer. A host such as a serving
+        framework calls this to decide whether to replace the engine.
         """
         if self._scheduler_exit_error is not None:
             raise self._scheduler_exit_error
+        tokenizer_manager = self.tokenizer_manager
+        rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
+        sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
+        if tokenizer_manager.is_generation:
+            probe = GenerateReqInput(
+                rid=rid,
+                input_ids=[0],
+                sampling_params=sampling_params,
+                log_metrics=False,
+            )
+            if get_disagg().disaggregation_mode != DisaggregationMode.NULL.value:
+                probe.bootstrap_host = FAKE_BOOTSTRAP_HOST
+                probe.bootstrap_room = 0
+        else:
+            probe = EmbeddingReqInput(
+                rid=rid,
+                input_ids=[0],
+                sampling_params=sampling_params,
+                log_metrics=False,
+            )
+        sent_at = time.time()
+        deadline = time.monotonic() + timeout_s
+
+        async def send_probe():
+            async for _ in tokenizer_manager.generate_request(probe):
+                break
+
+        task = asyncio.create_task(send_probe())
+        try:
+            # Compared against real_time(), which is time.time().
+            while tokenizer_manager.last_receive_tstamp <= sent_at:
+                if task.done() and task.exception() is not None:
+                    raise task.exception()
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"SGLang schedulers did not answer a health probe in {timeout_s} s"
+                    )
+                await asyncio.sleep(_HEALTH_PROBE_POLL_S)
+        finally:
+            task.cancel()
+            tokenizer_manager.rid_to_state.pop(probe.rid, None)
 
     def _monitor_schedulers(self) -> None:
         """Report the first scheduler event loop to end, unless shutdown() ended it."""

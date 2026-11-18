@@ -1,8 +1,8 @@
-"""Tests for RayEngine's scheduler-exit monitor (requires Ray, no GPU).
+"""Tests for RayEngine's scheduler-exit monitor and health probe (requires Ray, no GPU).
 
 Stand-in actors replace the scheduler actors: ``run_event_loop`` blocks, like
 the real one, until the test ends it or kills the actor. A stand-in tokenizer
-manager records what the engine forwards to it.
+manager records what the engine forwards to it and answers, or ignores, probes.
 
 Usage:
     python -m pytest test/manual/test_ray_engine_scheduler_exit.py -v
@@ -10,14 +10,17 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import queue
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 
 import ray
 
 from sglang.srt.ray.engine import RayEngine
+from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
 
 _EXIT_TIMEOUT_S = 30
@@ -72,12 +75,11 @@ class TestRayEngineSchedulerExit(CustomTestCase):
         message = messages.get(timeout=_EXIT_TIMEOUT_S)
         self.assertIn(expected, message)
         with self.assertRaisesRegex(RuntimeError, expected):
-            engine.check_health()
+            asyncio.run(engine.check_health())
 
     def test_one_killed_actor_is_reported_while_others_run(self):
         """A dead TP rank must be reported even though the other ranks keep running."""
         actors, engine, _, messages = self._start()
-        engine.check_health()
         ray.kill(actors[0])
         self._assert_reported(engine, messages, "scheduler actor died")
 
@@ -99,7 +101,49 @@ class TestRayEngineSchedulerExit(CustomTestCase):
         monitor.join(timeout=_EXIT_TIMEOUT_S)
         self.assertFalse(monitor.is_alive())
         self.assertTrue(messages.empty())
-        engine.check_health()
+        self.assertIsNone(engine._scheduler_exit_error)
+
+
+class _ProbeTokenizerManager:
+    """Answers a probe like a live scheduler, or never answers like a hung one."""
+
+    is_generation = True
+
+    def __init__(self, *, answers: bool):
+        self.answers = answers
+        self.last_receive_tstamp = time.time()
+        self.rid_to_state = {}
+
+    async def generate_request(self, obj):
+        self.rid_to_state[obj.rid] = obj
+        if self.answers:
+            await asyncio.sleep(0.05)
+            self.last_receive_tstamp = time.time()
+            yield {}
+        await asyncio.Event().wait()
+
+
+class TestRayEngineHealthProbe(CustomTestCase):
+    def _engine(self, *, answers: bool) -> RayEngine:
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+        engine = RayEngine.__new__(RayEngine)
+        engine._scheduler_exit_error = None
+        engine.tokenizer_manager = _ProbeTokenizerManager(answers=answers)
+        return engine
+
+    def test_answered_probe_passes(self):
+        engine = self._engine(answers=True)
+        asyncio.run(engine.check_health(timeout_s=5))
+        self.assertEqual(engine.tokenizer_manager.rid_to_state, {})
+
+    def test_hung_scheduler_fails_probe(self):
+        """A scheduler that is alive but stuck never answers; check_health must raise."""
+        engine = self._engine(answers=False)
+        with self.assertRaisesRegex(RuntimeError, "did not answer a health probe"):
+            asyncio.run(engine.check_health(timeout_s=0.3))
+        self.assertEqual(engine.tokenizer_manager.rid_to_state, {})
 
 
 if __name__ == "__main__":
