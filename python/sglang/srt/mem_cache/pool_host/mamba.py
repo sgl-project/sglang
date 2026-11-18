@@ -209,6 +209,12 @@ class MambaPoolHost(HostKVCache):
             self.allocator,
             self._buffer_device,
         )
+        from sglang.srt.mem_cache.pool_host.rocm_budget import clamp_mamba_pool
+
+        # gfx950 shrinks a ratio-sized pool to fit the pinnable budget; no-op elsewhere
+        allocation_bytes, available_bytes = clamp_mamba_pool(
+            self, host_size, allocation_bytes, available_bytes
+        )
         if allocation_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
