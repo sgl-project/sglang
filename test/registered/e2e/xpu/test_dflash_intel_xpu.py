@@ -129,7 +129,10 @@ class TestDFlashIntelXPUBackendNoCudaGraph(_dflash_base.TestDFlashServerNoCudaGr
 
     max_running_requests = 8
     attention_backend = "intel_xpu"
-    other_launch_args = _XPU_LAUNCH_ARGS + ["--disable-cuda-graph"]
+    other_launch_args = _XPU_LAUNCH_ARGS + [
+        "--disable-decode-cuda-graph",
+        "--disable-prefill-cuda-graph",
+    ]
 
 
 @unittest.skipUnless(is_xpu(), "Intel XPU not available")
