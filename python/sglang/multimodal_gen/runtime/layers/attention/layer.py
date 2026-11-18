@@ -805,6 +805,34 @@ class LocalAttention(nn.Module):
                 "is_causal": False,
                 "scale": self.softmax_scale,
             }
+            # Experimental, opt-in NPU path for binary additive masks.
+            # Keep SDPA for non-sentinel values and fully masked rows.
+            # Do not cache this decision on a mutable tensor.
+            if (
+                os.environ.get("SGLANG_EXPERIMENTAL_NPU_FIA_MASKED_ATTENTION") == "1"
+                and q_.device.type == "npu"
+                and mask.ndim == 4
+                and torch.is_floating_point(mask)
+                and hasattr(torch.ops.npu, "npu_fused_infer_attention_score")
+            ):
+                threshold = torch.finfo(mask.dtype).min / 2
+                allowed = mask == 0
+                blocked = mask <= threshold
+                if bool(torch.all(allowed | blocked)) and bool(
+                    torch.all(torch.any(allowed, dim=-1))
+                ):
+                    output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+                        q_,
+                        k_,
+                        v_,
+                        atten_mask=blocked,
+                        num_heads=q_.shape[1],
+                        num_key_value_heads=k_.shape[1],
+                        scale=self.softmax_scale,
+                        input_layout="BNSD",
+                    )
+                    return output.transpose(1, 2)
+
             with sdpa_context:
                 return torch.nn.functional.scaled_dot_product_attention(
                     q_,
