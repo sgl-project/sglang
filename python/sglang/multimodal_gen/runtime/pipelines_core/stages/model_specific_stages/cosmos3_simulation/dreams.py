@@ -55,6 +55,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
     EncodeWhileDecoding,
+    finish_streamed_encode,
     streamed_video_output_path,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
@@ -1526,14 +1527,16 @@ class CosmosDreamsRolloutStage(PipelineStage):
     def _hand_over_decode(self, batch: Req, decode_queue: "CausalDecodeQueue") -> None:
         """Tell the decoding stage what the rollout already produced."""
         self.log_info("Decoded %d chunks during the rollout", decode_queue.submitted)
-        if decode_queue.encoder is None:
-            batch.extra[EXTRA_DECODED_OUTPUT] = decode_queue.finish()
+        output_file_paths, encode_failed = finish_streamed_encode(decode_queue.encoder)
+        if encode_failed:
+            # A failed encode leaves nothing behind, so the decoding stage decodes
+            # the latents itself and the worker saves the frames. Ranks without
+            # the encoder keep their frames back too, to take part in that decode.
             return
-        # A failed encode leaves nothing behind, so the decoding stage decodes
-        # the latents itself and the worker saves the frames.
-        output_file_paths = decode_queue.encoder.finish()
         if output_file_paths is not None:
             batch.extra[EXTRA_STREAMED_OUTPUT_PATHS] = output_file_paths
+        else:
+            batch.extra[EXTRA_DECODED_OUTPUT] = decode_queue.finish()
 
     def _rollout_chunks(
         self,

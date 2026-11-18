@@ -142,3 +142,20 @@ class EncodeWhileDecoding:
             "decode instead. Enable debug logging for exception details."
         )
         logger.debug("Streamed video encode failure", exc_info=True)
+
+
+def finish_streamed_encode(
+    stream: EncodeWhileDecoding | None,
+) -> tuple[list[str] | None, bool]:
+    """Close this rank's encoder: (its saved path, whether the output rank's encode failed)."""
+    output_file_paths = None if stream is None else stream.finish()
+    failed = stream is not None and output_file_paths is None
+    if model_parallel_is_initialized():
+        group = get_replica_group()
+        if group.world_size > 1:
+            # Only the output rank has an encoder. A fallback that decodes again
+            # must run on every rank, since the VAE decode is shared across them.
+            failed = group.broadcast_object(
+                failed if group.rank_in_group == 0 else None, src=0
+            )
+    return output_file_paths, failed

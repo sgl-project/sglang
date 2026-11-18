@@ -74,6 +74,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
     EncodeWhileDecoding,
+    finish_streamed_encode,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
@@ -1739,7 +1740,6 @@ class Cosmos3MultiviewDecodingStage(Cosmos3DecodingStage):
         batch.raw_latent_shape = tuple(latents.shape)
         # Frames reach the encoder camera by camera, the order of the clip.
         stream = self._encode_while_decoding(batch, server_args)
-        output_file_paths = None
         with self.use_declared_component(component_name="vae", module=self.vae):
             with (
                 torch.no_grad(),
@@ -1754,14 +1754,15 @@ class Cosmos3MultiviewDecodingStage(Cosmos3DecodingStage):
                         latent_frames_per_view=latent_frames_per_view,
                         on_frames=stream,
                     )
-                    if stream is not None:
-                        output_file_paths = stream.finish()
+                    output_file_paths, encode_failed = finish_streamed_encode(stream)
                 except BaseException:
                     if stream is not None:
                         stream.abort()
                     raise
-                if stream is not None and output_file_paths is None:
-                    # The streamed encode failed, so the worker saves the clip.
+                if encode_failed:
+                    # The worker saves the clip instead. Ranks without the encoder
+                    # drop the clip they kept and repeat the decode with the output rank.
+                    del decoded
                     decoded = self._decode_views(
                         latents,
                         num_views=num_views,
