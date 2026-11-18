@@ -611,6 +611,24 @@ class TestHunyuanDetectorStreaming(CustomTestCase):
         args = json.loads(collected[0]["parameters"])
         self.assertEqual(args["city"], "San Francisco")
 
+    def test_streaming_string_arg_control_characters_match_one_shot(self):
+        """Streamed string args with control characters must be the one-shot JSON."""
+        value = 'a\x00b\x08c\x0cd\x1fe"f\\g\nh'
+        text = (
+            "<tool_calls><tool_call>get_weather<tool_sep>"
+            f"<arg_key>city</arg_key><arg_value>{value}</arg_value>"
+            "</tool_call></tool_calls>"
+        )
+        expected = self._new_detector().detect_and_parse(text, self.tools)
+        detector = self._new_detector()
+        all_calls = []
+        for ch in text:
+            all_calls.extend(detector.parse_streaming_increment(ch, self.tools).calls)
+
+        collected = _collect_streamed_tool_calls(all_calls)
+        self.assertEqual(collected[0]["parameters"], expected.calls[0].parameters)
+        self.assertEqual(json.loads(collected[0]["parameters"]), {"city": value})
+
     def test_streaming_all_in_one_delta(self):
         """Entire tool call arriving in a single delta."""
         detector = self._new_detector()
