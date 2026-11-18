@@ -1253,30 +1253,22 @@ class ModelRunner:
     def prewarm_sampling(self) -> SamplingPrewarmResult:
         """Warm sampling, penalty, and logprob kernels after graph initialization."""
         self.sampling_prewarm_result = SamplingPrewarmResult()
+        vocab_size = getattr(getattr(self, "model_config", None), "vocab_size", 0)
+        device_str = str(getattr(self, "device", ""))
         if (
             not getattr(self, "is_generation", False)
             or getattr(self, "is_draft_worker", False)
             or getattr(self, "sampler", None) is None
             or get_exec().dllm.dllm_algorithm is not None
+            or not device_str.startswith("cuda")
+            or not torch.cuda.is_available()
+            or not isinstance(vocab_size, int)
+            or vocab_size <= 0
         ):
             return self.sampling_prewarm_result
 
-        device_str = str(getattr(self, "device", ""))
-        if not device_str.startswith("cuda") or not torch.cuda.is_available():
-            return self.sampling_prewarm_result
-
-        vocab_size = getattr(getattr(self, "model_config", None), "vocab_size", 0)
-        if not isinstance(vocab_size, int) or vocab_size <= 0:
-            return self.sampling_prewarm_result
-
-        raw_warmups = getattr(getattr(self, "server_args", None), "warmups", None)
-        requested_warmups = {
-            w.strip() for w in (raw_warmups or "").split(",") if w.strip()
-        }
-        warm_sampling = bool(requested_warmups & {"all", "sampling"})
-        warm_penalties = bool(requested_warmups & {"all", "penalties"})
-        warm_logprobs = bool(requested_warmups & {"all", "logprobs"})
-        if not (warm_sampling or warm_penalties or warm_logprobs):
+        raw_warmups = getattr(getattr(self, "server_args", None), "warmups", None) or ""
+        if "all" not in {w.strip() for w in raw_warmups.split(",")}:
             return self.sampling_prewarm_result
 
         tic = time.perf_counter()
@@ -1293,154 +1285,87 @@ class ModelRunner:
                 apply_scaling_penalties,
             )
 
-            # Run outside graph-pool borrow so persistent FlashInfer JIT / Triton /
-            # TorchInductor workspaces allocate in regular storage before KV sizing.
-            logits = pen_logits = scaling_penalties = lse_input = None
+            def _sample(
+                bs: int,
+                temp: float,
+                *,
+                top_p: float = 1.0,
+                top_k: int = vocab_size,
+                min_p: float = 0.0,
+                logprob: bool = False,
+            ) -> None:
+                greedy = temp == 0.0
+                k_lp = min(5, vocab_size) if logprob else 0
+                info = SamplingBatchInfo(
+                    temperatures=torch.full(
+                        (bs, 1), temp, dtype=torch.float32, device=device
+                    ),
+                    top_ps=torch.full((bs,), top_p, dtype=torch.float32, device=device),
+                    top_ks=torch.full((bs,), top_k, dtype=torch.int32, device=device),
+                    min_ps=torch.full((bs,), min_p, dtype=torch.float32, device=device),
+                    is_all_greedy=greedy,
+                    is_any_greedy=greedy,
+                    need_top_p_sampling=not greedy and top_p < 1.0,
+                    need_top_k_sampling=not greedy and top_k < vocab_size,
+                    need_min_p_sampling=not greedy and min_p > 0.0,
+                    vocab_size=vocab_size,
+                    sampling_seed=(
+                        torch.zeros(bs, dtype=torch.int64, device=device)
+                        if enable_det
+                        else None
+                    ),
+                    max_top_k=top_k,
+                    device=device_str,
+                )
+                self.sampler(
+                    LogitsProcessorOutput(
+                        next_token_logits=torch.zeros(
+                            (bs, vocab_size), dtype=torch.float32, device=device
+                        )
+                    ),
+                    info,
+                    logprob,
+                    [k_lp] * bs,
+                    [None] * bs,
+                    torch.zeros(bs, dtype=torch.int64, device=device),
+                )
+
             with (
                 torch.no_grad(),
                 envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(False),
             ):
                 for bs in (1, 2):
-                    positions = torch.zeros(bs, dtype=torch.int64, device=device)
-                    seed = (
-                        torch.zeros(bs, dtype=torch.int64, device=device)
-                        if enable_det
-                        else None
+                    _sample(bs, 0.0, logprob=True)
+                    _sample(
+                        bs, 0.6, top_p=0.95, top_k=min(20, vocab_size), logprob=True
                     )
-                    top_k_logprob = min(5, vocab_size)
-
-                    if warm_sampling or warm_logprobs:
-                        # 1. Greedy + output top-logprobs
-                        logits = torch.zeros(
+                    _sample(bs, 0.7, top_p=0.95, top_k=min(50, vocab_size), min_p=0.05)
+                    apply_scaling_penalties(
+                        torch.zeros(
                             (bs, vocab_size), dtype=torch.float32, device=device
-                        )
-                        greedy_info = SamplingBatchInfo(
-                            temperatures=torch.zeros(
-                                (bs, 1), dtype=torch.float32, device=device
-                            ),
-                            top_ps=torch.ones(bs, dtype=torch.float32, device=device),
-                            top_ks=torch.full(
-                                (bs,), vocab_size, dtype=torch.int32, device=device
-                            ),
-                            min_ps=torch.zeros(bs, dtype=torch.float32, device=device),
-                            is_all_greedy=True,
-                            is_any_greedy=True,
-                            need_top_p_sampling=False,
-                            need_top_k_sampling=False,
-                            need_min_p_sampling=False,
-                            vocab_size=vocab_size,
-                            sampling_seed=seed,
-                            device=device_str,
-                        )
-                        self.sampler(
-                            LogitsProcessorOutput(next_token_logits=logits),
-                            greedy_info,
-                            True,
-                            [top_k_logprob] * bs,
-                            [None] * bs,
-                            positions,
-                        )
-
-                    if warm_sampling:
-                        # 2. Non-greedy top-k + top-p + output top-logprobs
-                        #    Triggers LazyImport("flashinfer.sampling") + JIT compile of sampling.so
-                        k_val = min(20, vocab_size)
-                        logits = torch.zeros(
+                        ),
+                        torch.ones(
                             (bs, vocab_size), dtype=torch.float32, device=device
-                        )
-                        topk_topp_info = SamplingBatchInfo(
-                            temperatures=torch.full(
-                                (bs, 1), 0.6, dtype=torch.float32, device=device
-                            ),
-                            top_ps=torch.full(
-                                (bs,), 0.95, dtype=torch.float32, device=device
-                            ),
-                            top_ks=torch.full(
-                                (bs,), k_val, dtype=torch.int32, device=device
-                            ),
-                            min_ps=torch.zeros(bs, dtype=torch.float32, device=device),
-                            is_all_greedy=False,
-                            is_any_greedy=False,
-                            need_top_p_sampling=True,
-                            need_top_k_sampling=True,
-                            need_min_p_sampling=False,
-                            vocab_size=vocab_size,
-                            sampling_seed=seed,
-                            max_top_k=k_val,
-                            device=device_str,
-                        )
-                        self.sampler(
-                            LogitsProcessorOutput(next_token_logits=logits),
-                            topk_topp_info,
-                            True,
-                            [top_k_logprob] * bs,
-                            [None] * bs,
-                            positions,
-                        )
+                        ),
+                    )
 
-                        # 3. Non-greedy min-p + renorm (top_p_renorm_prob, top_k_renorm_prob, min_p_sampling_from_probs)
-                        k_minp = min(50, vocab_size)
-                        logits = torch.zeros(
-                            (bs, vocab_size), dtype=torch.float32, device=device
-                        )
-                        minp_info = SamplingBatchInfo(
-                            temperatures=torch.full(
-                                (bs, 1), 0.7, dtype=torch.float32, device=device
-                            ),
-                            top_ps=torch.full(
-                                (bs,), 0.95, dtype=torch.float32, device=device
-                            ),
-                            top_ks=torch.full(
-                                (bs,), k_minp, dtype=torch.int32, device=device
-                            ),
-                            min_ps=torch.full(
-                                (bs,), 0.05, dtype=torch.float32, device=device
-                            ),
-                            is_all_greedy=False,
-                            is_any_greedy=False,
-                            need_top_p_sampling=True,
-                            need_top_k_sampling=True,
-                            need_min_p_sampling=True,
-                            vocab_size=vocab_size,
-                            sampling_seed=seed,
-                            max_top_k=k_minp,
-                            device=device_str,
-                        )
-                        self.sampler(
-                            LogitsProcessorOutput(next_token_logits=logits),
-                            minp_info,
-                            False,
-                            [0] * bs,
-                            [None] * bs,
-                            positions,
-                        )
-
-                    if warm_penalties:
-                        # 4. @torch.compile(dynamic=True) repetition penalty (bs=1 static & bs=2 dynamic)
-                        pen_logits = torch.zeros(
-                            (bs, vocab_size), dtype=torch.float32, device=device
-                        )
-                        scaling_penalties = torch.ones(
-                            (bs, vocab_size), dtype=torch.float32, device=device
-                        )
-                        apply_scaling_penalties(pen_logits, scaling_penalties)
-
-                if warm_logprobs:
-                    # 5. Triton row_logsumexp & row_logsumexp_topk (prompt logprobs / scoring)
-                    lse_dtypes = [torch.float32]
-                    if getattr(self, "dtype", None) in (torch.bfloat16, torch.float16):
-                        lse_dtypes.append(self.dtype)
-                    max_fused_k = min(FUSED_TOPK_MAX_K, vocab_size)
-                    lse_ks = sorted({k for k in (1, 2, 5) if 1 <= k <= max_fused_k})
-                    for dt in lse_dtypes:
-                        lse_input = torch.zeros(
-                            (2, vocab_size), dtype=dt, device=device
-                        )
-                        row_logsumexp(lse_input)
-                        for k_lse in lse_ks:
-                            row_logsumexp_topk(lse_input, k_lse)
-
-                del logits, pen_logits, scaling_penalties, lse_input
+                dtypes = [torch.float32] + (
+                    [self.dtype]
+                    if getattr(self, "dtype", None) in (torch.bfloat16, torch.float16)
+                    else []
+                )
+                ks = sorted(
+                    {
+                        k
+                        for k in (1, 2, 5)
+                        if 1 <= k <= min(FUSED_TOPK_MAX_K, vocab_size)
+                    }
+                )
+                for dt in dtypes:
+                    lse_in = torch.zeros((2, vocab_size), dtype=dt, device=device)
+                    row_logsumexp(lse_in)
+                    for k_lse in ks:
+                        row_logsumexp_topk(lse_in, k_lse)
 
             torch.cuda.synchronize(device)
             if get_parallel().tp_rank == 0:

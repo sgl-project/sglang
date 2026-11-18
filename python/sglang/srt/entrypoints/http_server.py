@@ -134,7 +134,10 @@ from sglang.srt.entrypoints.server_utils import (
 from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
-from sglang.srt.entrypoints.warmup import execute_warmups
+from sglang.srt.entrypoints.warmup import (
+    execute_warmups,
+    sync_multi_worker_ready_barrier,
+)
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
@@ -2571,76 +2574,11 @@ def _execute_server_warmup(server_args: ServerArgs):
 
 
 def _is_multi_tokenizer_worker() -> bool:
-    """True when running inside a spawned multi-tokenizer HTTP worker process."""
-    if getattr(app, "is_single_tokenizer_mode", False):
-        return False
-    if get_main_process_id() is None:
-        return False
-    return get_serving().tokenizer_worker_num > 1
-
-
-def _sync_multi_worker_ready_barrier() -> bool:
-    """Wait until all multi-tokenizer HTTP workers finish startup warmup.
-
-    Returns True for the single leader worker responsible for cluster-wide
-    post-warmup actions (such as ``/freeze_gc`` on scheduler/detokenizer).
-    """
-    if not _is_multi_tokenizer_worker():
-        return True
-
-    main_pid = get_main_process_id()
-    num_workers = get_serving().tokenizer_worker_num
-    port = get_serving().port
-    startup_time = getattr(_global_state.tokenizer_manager, "startup_time", None)
-    import hashlib
-
-    token = hashlib.sha256(
-        f"{main_pid}:{port}:{startup_time!r}".encode("utf-8")
-    ).hexdigest()[:12]
-    barrier_dir = os.path.join(
-        tempfile.gettempdir(), f"sglang_ready_{main_pid}_{port}_{token}"
+    return (
+        not getattr(app, "is_single_tokenizer_mode", False)
+        and get_main_process_id() is not None
+        and get_serving().tokenizer_worker_num > 1
     )
-    os.makedirs(barrier_dir, exist_ok=True)
-    my_pid = os.getpid()
-    marker_path = os.path.join(barrier_dir, str(my_pid))
-    with open(marker_path, "w", encoding="utf-8") as f:
-        f.write("ok")
-
-    warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
-    deadline = time.monotonic() + (warmup_timeout if warmup_timeout > 0 else 600)
-    live_pids: List[int] = [my_pid]
-    while time.monotonic() < deadline:
-        live_pids = []
-        try:
-            entries = os.listdir(barrier_dir)
-        except OSError:
-            entries = []
-        for entry in entries:
-            if not entry.isdigit():
-                continue
-            pid = int(entry)
-            try:
-                os.kill(pid, 0)
-                live_pids.append(pid)
-            except OSError:
-                pass
-        if len(live_pids) >= num_workers:
-            break
-        if main_pid is not None:
-            try:
-                os.kill(main_pid, 0)
-            except OSError:
-                return False
-        time.sleep(0.05)
-    else:
-        logger.warning(
-            "Timed out waiting for all %d tokenizer workers to finish warmup "
-            "(%d ready); proceeding.",
-            num_workers,
-            len(live_pids),
-        )
-
-    return bool(live_pids) and my_pid == min(live_pids)
 
 
 def _tokenizer_worker_gc_callback(worker_id: int, gc_threshold) -> Callable[[], None]:
@@ -2701,7 +2639,9 @@ def _wait_and_warmup(
     if _global_state.tokenizer_manager.server_status != ServerStatus.UnHealthy:
         if _is_multi_tokenizer_worker():
             _global_state.tokenizer_manager.server_status = ServerStatus.Starting
-            is_leader_worker = _sync_multi_worker_ready_barrier()
+            is_leader_worker = sync_multi_worker_ready_barrier(
+                _global_state.tokenizer_manager, envs.SGLANG_WARMUP_TIMEOUT.get()
+            )
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
     if post_warmup_callback is not None:
