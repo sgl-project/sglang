@@ -52,6 +52,7 @@ class TokenizerManagerScoreMixin:
         temperature: float = 1.0,
         return_token_logprobs: bool = False,
         image_data: Optional[List[List[ImageData]]] = None,
+        lora_path: Optional[str] = None,
     ) -> ScoreResult:
         """
         Score probabilities of specified token IDs after each *full prompt*.
@@ -59,6 +60,7 @@ class TokenizerManagerScoreMixin:
         This is a thin wrapper over `score_request` that treats `prompts` as
         already-composed inputs (i.e., no query/item concatenation needed).
         """
+        adapter = {"lora_path": lora_path} if lora_path is not None else {}
         # Text prompts
         if isinstance(prompts, str) or (
             isinstance(prompts, list) and (not prompts or isinstance(prompts[0], str))
@@ -73,6 +75,7 @@ class TokenizerManagerScoreMixin:
                 temperature=temperature,
                 return_token_logprobs=return_token_logprobs,
                 image_data=image_data,
+                **adapter,
             )
 
         # Tokenized prompts
@@ -87,6 +90,7 @@ class TokenizerManagerScoreMixin:
                 temperature=temperature,
                 return_token_logprobs=return_token_logprobs,
                 image_data=image_data,
+                **adapter,
             )
 
         raise ValueError("Invalid prompts type for score_prompts.")
@@ -885,6 +889,7 @@ class TokenizerManagerScoreMixin:
         return_token_logprobs: bool = False,
         image_data: Optional[List[List[ImageData]]] = None,
         rid: Optional[str] = None,
+        lora_path: Optional[str] = None,
     ) -> ScoreResult:
         """
         Score the probability of specified token IDs appearing after the given (query + item) pair.
@@ -1187,6 +1192,7 @@ class TokenizerManagerScoreMixin:
                 multi_item_delimiter_indices=mis_delimiter_indices,
                 token_indices_to_pool=token_indices_to_pool,
                 rid=sub_rids,
+                lora_path=lora_path,
             )
         else:
             batch_request = EmbeddingReqInput(
@@ -1197,6 +1203,7 @@ class TokenizerManagerScoreMixin:
                 multi_item_delimiter_indices=mis_delimiter_indices,
                 token_indices_to_pool=token_indices_to_pool,
                 rid=sub_rids,
+                lora_path=lora_path,
             )
 
         results = await self.generate_request(batch_request, request).__anext__()

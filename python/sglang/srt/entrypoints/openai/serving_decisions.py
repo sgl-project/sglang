@@ -192,7 +192,7 @@ class OpenAIServingDecisions(OpenAIServingBase):
                 "served with --dllm-algorithm"
             )
         _, adapter = self._parse_model_parameter(model)
-        if adapter is not None:
+        if adapter is not None and self.question_encoder is None:
             return (
                 f"model names the LoRA adapter {adapter!r}, which {route} "
                 "does not support"
@@ -411,9 +411,11 @@ class OpenAIServingDecisions(OpenAIServingBase):
         adapted_request: Iterator[EncodedQuestion],
         raw_request: Request,
         temperature: float = 1.0,
+        lora_path: Optional[str] = None,
     ):
         """Encode every question, then score them all in one call."""
         prompts, label_token_ids, image_data = await _encode_all(adapted_request)
+        adapter = {"lora_path": lora_path} if lora_path is not None else {}
         result = await self.tokenizer_manager.score_prompts(
             prompts=prompts,
             label_token_ids=label_token_ids,
@@ -422,6 +424,7 @@ class OpenAIServingDecisions(OpenAIServingBase):
             temperature=temperature,
             return_token_logprobs=True,
             image_data=image_data if any(image_data) else None,
+            **adapter,
         )
         return prompts, label_token_ids, result
 

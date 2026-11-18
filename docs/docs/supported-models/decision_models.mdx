@@ -73,6 +73,12 @@ packing, speculative decoding and multi-token generation are unsupported.
 `/v1/decisions` keeps its generic prompt and directs this checkpoint to
 `/v1/systemone` instead.
 
+To use a LoRA adapter, add `--lora-paths task=/path/to/adapter` to the launch
+command and set `"model": "decision-test:task"` in the request. The server infers
+the adapter rank and target modules from its config. Base and adapter requests
+can share the same server. Other decision models keep their existing adapter
+restrictions.
+
 ## Launch command
 
 ```bash Command

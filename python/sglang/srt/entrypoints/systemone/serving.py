@@ -446,6 +446,11 @@ class SystemOneServing(OpenAIServingDecisions):
             return await self._answer_pointer(
                 adapted_request, request, views, raw_request
             )
+        adapter = (
+            self._resolve_lora_path(request.model, None)
+            if self.question_encoder is not None
+            else None
+        )
         _, _, result = await self._score(
             adapted_request=adapted_request,
             raw_request=raw_request,
@@ -454,6 +459,7 @@ class SystemOneServing(OpenAIServingDecisions):
                 if self.decision_config is None
                 else self.decision_config["temperature"]
             ),
+            **({"lora_path": adapter} if adapter is not None else {}),
         )
         answers = {}
         for i, question_id in enumerate(request.questions):

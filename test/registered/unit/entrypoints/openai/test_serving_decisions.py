@@ -1,6 +1,7 @@
 """Unit tests for /v1/decisions and /v1/systemone: request limits, prompt text, answer labels, and scoring."""
 
 import asyncio
+import copy
 import json
 import math
 import re
@@ -184,6 +185,7 @@ class ScoringManager(TokenizerManagerScoreMixin):
         logits = torch.randn(len(tokenizer), generator=generator, dtype=torch.float64)
         self.logprobs = torch.log_softmax(logits * 4, dim=0)
         self.requests = []
+        self.adapter_logprobs = {}
         self.served_model_name = "served-model"
 
     def config_value(self, name):
@@ -192,9 +194,23 @@ class ScoringManager(TokenizerManagerScoreMixin):
     async def generate_request(self, request, raw_request):
         self.requests.append(request)
         request.normalize_batch_and_arguments()
+        input_ids = request.input_ids
+        if input_ids is None:
+            input_ids = [
+                self.tokenizer.encode(text, add_special_tokens=False)
+                for text in request.text
+            ]
         results = []
-        for ids, labels in zip(request.input_ids, request.token_ids_logprob):
-            logprobs = [(self.logprobs[token].item(), token, None) for token in labels]
+        for index, (ids, labels) in enumerate(
+            zip(input_ids, request.token_ids_logprob)
+        ):
+            adapter = (
+                request.lora_path[index] if request.lora_path is not None else None
+            )
+            values = (
+                self.logprobs if adapter is None else self.adapter_logprobs[adapter]
+            )
+            logprobs = [(values[token].item(), token, None) for token in labels]
             meta = {"prompt_tokens": len(ids), "output_token_ids_logprobs": [logprobs]}
             results.append({"meta_info": meta})
         yield results
@@ -232,6 +248,30 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         self.addCleanup(restore_context, snapshot_context())
+
+    async def test_text_scoring_uses_adapter_weights(self):
+        manager = ScoringManager(self.tokenizer)
+        labels = self.tokenizer.convert_tokens_to_ids(["A", "B"])
+        manager.logprobs[labels] = torch.tensor(
+            [math.log(0.25), math.log(0.75)], dtype=manager.logprobs.dtype
+        )
+        manager.logprobs = manager.logprobs.log_softmax(0)
+        manager.adapter_logprobs["task"] = manager.logprobs.clone()
+        manager.adapter_logprobs["task"][labels] = manager.logprobs[labels].flip(0)
+        prompts = ["Which city?", "Which team should handle this billing ticket?"]
+        for adapter, expected in ((None, [0.25, 0.75]), ("task", [0.75, 0.25])):
+            with self.subTest(adapter=adapter):
+                result = await manager.score_prompts(
+                    prompts=prompts,
+                    label_token_ids=labels,
+                    apply_softmax=True,
+                    lora_path=adapter,
+                )
+                self.assertEqual(len(result.scores), len(prompts))
+                for row in result.scores:
+                    self.assertEqual(len(row), len(expected))
+                    for actual, probability in zip(row, expected):
+                        self.assertAlmostEqual(actual, probability)
 
     def test_request_limits_follow_the_label_alphabets(self):
         options = {name: None for name in string.ascii_lowercase}
@@ -995,6 +1035,69 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
             serving_class=SystemOneServing,
             **kwargs,
         )
+
+    async def test_nemotron_adapter_requests_do_not_silently_read_the_base_model(self):
+        tokenizer = copy.deepcopy(self.tokenizer)
+        tokenizer.add_special_tokens({"additional_special_tokens": ["<SPECIAL_100>"]})
+        manager = ScoringManager(tokenizer)
+        manager.model_config.hf_config = SimpleNamespace(
+            architectures=["NemotronForDecision"],
+            model_type="ministral3",
+            mask_token_id=tokenizer.convert_tokens_to_ids("<SPECIAL_100>"),
+        )
+        manager.model_config.nemotron_decision_config = {
+            "labels": {"choice": ["A", "B"], "score": ["A", "B"], "noul": ["A", "B"]},
+            "temperature": {},
+            "max_questions": 512,
+            "max_input_tokens": 4096,
+            "max_candidates_per_read": 2,
+            "chat_template": "{{ decision_content }}<SPECIAL_100>",
+        }
+        manager.adapter_logprobs = {
+            "first": manager.logprobs.roll(1),
+            "second": manager.logprobs.roll(2),
+        }
+        serving = self._serving(manager)
+        question = {
+            "q": {
+                "type": "choice",
+                "instructions": "Choose?",
+                "criteria": {"a": "First", "b": "Second"},
+            }
+        }
+        requests_ = [
+            _systemone_request(question).model_copy(
+                update={
+                    "model": "served-model"
+                    if adapter is None
+                    else f"served-model:{adapter}"
+                }
+            )
+            for adapter in (None, "first", "second")
+        ]
+        responses = await asyncio.gather(
+            *(serving.handle_request(request, None) for request in requests_)
+        )
+        self.assertEqual(len(manager.requests), 3)
+        actual = []
+        for adapter, response, scored in zip(
+            (None, "first", "second"), responses, manager.requests
+        ):
+            self.assertEqual(response.status_code, 200, response.body)
+            values = (
+                manager.logprobs
+                if adapter is None
+                else manager.adapter_logprobs[adapter]
+            )
+            expected = values[scored.token_ids_logprob[0]].softmax(0).tolist()
+            probabilities = json.loads(response.body)["answers"]["q"]["probabilities"]
+            actual.append(list(probabilities.values()))
+            for probability, expected_probability in zip(
+                probabilities.values(), expected
+            ):
+                self.assertAlmostEqual(probability, expected_probability)
+        self.assertNotEqual(actual[0], actual[1])
+        self.assertNotEqual(actual[1], actual[2])
 
     async def test_decision_checkpoints_answer_with_their_trained_prompt(self):
         """The prompt literal is decision_messages of perplexity-ai/pplx-decider-v1-27b."""
