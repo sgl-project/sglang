@@ -264,6 +264,9 @@ def handle_load_format(server_args: Any):
     if cfg.remote_instance_weight_loader_start_seed_via_nixl:
         _assert_nixl_seed_usable(cfg)
 
+    if cfg.remote_instance_weight_loader_start_seed_via_mori:
+        _assert_mori_seed_usable(cfg)
+
     # "ipc_cache" is an internal-only load format: ModelRunner sets it
     # automatically when the weight cache is enabled, and it is not a public
     # --load-format choice. Setting it directly is always wrong (no daemon is
@@ -308,6 +311,30 @@ def validate_transfer_engine(server_args: Any):
         return False
     else:
         return True
+
+
+def _assert_mori_seed_usable(cfg: Any) -> None:
+    flag = "--remote-instance-weight-loader-start-seed-via-mori"
+    if (
+        cfg.remote_instance_weight_loader_start_seed_via_transfer_engine
+        or cfg.remote_instance_weight_loader_start_seed_via_nixl
+    ):
+        raise ValueError(
+            f"{flag} publishes the weights for MoRI only; set one seed transport"
+        )
+    backend = cfg.remote_instance_weight_loader_backend
+    if cfg.load_format == "remote_instance" and backend in (
+        "transfer_engine",
+        "modelexpress",
+    ):
+        # the loader registers and publishes the weights over its own transport
+        raise ValueError(f"{flag} cannot seed weights loaded over {backend}")
+    if importlib.util.find_spec("mori") is None:
+        raise ValueError(f"{flag} needs the mori package")
+    if cfg.enable_memory_saver:
+        raise ValueError(
+            f"{flag} cannot run with --enable-memory-saver: it releases the registered weights"
+        )
 
 
 def _assert_nixl_seed_usable(cfg: Any) -> None:
