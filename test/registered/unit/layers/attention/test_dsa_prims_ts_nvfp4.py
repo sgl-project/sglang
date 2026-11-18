@@ -1,10 +1,10 @@
 """prims_ts over the 352 B/token NVFP4 DSA pool, on CPU: the shared Prims-TS
-launcher's plan and run arguments (FlashInfer stubbed), the per-forward lengths and
+launcher's plan and run arguments (FlashInfer stubbed), the per-row lengths and
 causal indices of the NVFP4 route, its dispatch, and the pool/argument checks."""
 
 import sys
 import unittest
-from types import MethodType, ModuleType, SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -169,54 +169,12 @@ class TestPrimsTSCausalIndices(unittest.TestCase):
 
 
 def _nvfp4_backend():
-    backend = SimpleNamespace(
-        device="cpu",
-        is_dsa_prims_nvfp4=True,
-        _prims_ts_live_rows=0,
-        _prims_ts_lengths={},
-        _prims_ts_graph_rows=set(),
-    )
-    backend._prims_ts_nvfp4_lengths = MethodType(
-        DeepseekSparseAttnBackend._prims_ts_nvfp4_lengths, backend
-    )
-    return backend
-
-
-class TestPrimsTSNvfp4Lengths(_NoCapture):
-    def test_live_rows_get_full_width_and_padding_rows_zero(self):
-        backend = _nvfp4_backend()
-        lengths = backend._prims_ts_nvfp4_lengths(4, 3, for_graph=True)
-        self.assertEqual(lengths.tolist(), [2048, 2048, 2048, 0])
-
-    def test_unchanged_live_count_does_not_rewrite_and_keeps_the_address(self):
-        backend = _nvfp4_backend()
-        lengths = backend._prims_ts_nvfp4_lengths(4, 3, for_graph=True)
-        lengths[0] = 7  # a rewrite would restore 2048
-        again = backend._prims_ts_nvfp4_lengths(4, 3)
-        self.assertIs(again, lengths)
-        self.assertEqual(again[0].item(), 7)
-        # A new live count (graph replay with more padding) updates in place.
-        self.assertIs(backend._prims_ts_nvfp4_lengths(4, 1), lengths)
-        self.assertEqual(lengths.tolist(), [2048, 0, 0, 0])
-
-    def test_eager_shapes_are_evicted_but_graph_shapes_kept(self):
-        backend = _nvfp4_backend()
-        graph = backend._prims_ts_nvfp4_lengths(8, 8, for_graph=True)
-        backend._prims_ts_nvfp4_lengths(300, 300)
-        backend._prims_ts_nvfp4_lengths(500, 499)
-        self.assertEqual(set(backend._prims_ts_lengths), {8, 500})
-        self.assertIs(backend._prims_ts_lengths[8][0], graph)
-
-    def test_rejects_invalid_live_count(self):
-        backend = _nvfp4_backend()
-        with self.assertRaises(ValueError):
-            backend._prims_ts_nvfp4_lengths(4, 5)
+    return SimpleNamespace(device="cpu", is_dsa_prims_nvfp4=True)
 
 
 class TestPrimsTSNvfp4Forward(_NoCapture):
     def test_casts_q_and_hands_the_pool_ids_and_lengths_to_the_launcher(self):
         backend = _nvfp4_backend()
-        backend._prims_ts_live_rows = 2
         cache = torch.zeros((64, 1, 352), dtype=torch.uint8)
         casts = []
 
@@ -240,15 +198,20 @@ class TestPrimsTSNvfp4Forward(_NoCapture):
         q_nope = torch.zeros((3, 4, 512), dtype=torch.bfloat16)
         q_rope = torch.zeros((3, 4, 64), dtype=torch.bfloat16)
         ids = torch.zeros((3, 2048), dtype=torch.int32)
+        # Per-row min(seq_len, 2048); the DP padding row is 0 and an extra
+        # padded entry beyond the Q rows is dropped.
+        seqlens = torch.tensor([5, 2048, 0, 0], dtype=torch.int32)
+        metadata = SimpleNamespace(dsa_cache_seqlens_int32=seqlens)
         out = DeepseekSparseAttnBackend._forward_prims_ts_nvfp4(
-            backend, q_nope, q_rope, layer, cache, ids
+            backend, q_nope, q_rope, layer, cache, ids, metadata
         )
 
         self.assertEqual(out.shape, (3, 4, 512))
         (call,) = calls
         self.assertIs(call["indices"], ids)
         self.assertIs(call["kv_cache"], cache)
-        self.assertEqual(call["lengths"].tolist(), [2048, 2048, 0])
+        self.assertEqual(call["lengths"].tolist(), [5, 2048, 0])
+        self.assertEqual(call["lengths"].data_ptr(), seqlens.data_ptr())  # a view
         self.assertEqual((call["sm_scale"], call["kv_scale"]), (0.25, 1.0))
         self.assertEqual(call["q"].dtype, torch.float8_e4m3fn)
         (cast,) = casts
@@ -258,27 +221,16 @@ class TestPrimsTSNvfp4Forward(_NoCapture):
 
 
 class TestPrimsTSNvfp4Metadata(_NoCapture):
-    def test_metadata_glue_graph_is_refused(self):
-        # A glue-graph replay would skip the host-side lengths refill.
-        backend = SimpleNamespace(
-            is_dsa_prims_nvfp4=True,
-            init_kernel_metadata=MethodType(
-                DeepseekSparseAttnBackend.init_kernel_metadata, object()
-            ),
+    def test_rejects_fewer_lengths_than_rows(self):
+        layer = SimpleNamespace(v_head_dim=512, head_dim=576, tp_q_head_num=4)
+        metadata = SimpleNamespace(
+            dsa_cache_seqlens_int32=torch.ones(2, dtype=torch.int32)
         )
-        prop = DeepseekSparseAttnBackend.requires_eager_metadata
-        self.assertTrue(prop.fget(backend))
-        backend.is_dsa_prims_nvfp4 = False
-        self.assertFalse(prop.fget(backend))
-
-    def test_graph_metadata_rejects_prefill(self):
-        backend = _nvfp4_backend()
-        batch = SimpleNamespace(
-            forward_mode=SimpleNamespace(is_decode_or_idle=lambda: False),
-            batch_size=4,
-        )
-        with self.assertRaisesRegex(RuntimeError, "graph metadata"):
-            DeepseekSparseAttnBackend.init_forward_metadata_out_graph(backend, batch)
+        q = torch.zeros((3, 4, 512), dtype=torch.bfloat16)
+        with self.assertRaisesRegex(RuntimeError, "top-k lengths"):
+            DeepseekSparseAttnBackend._forward_prims_ts_nvfp4(
+                _nvfp4_backend(), q, q[..., :64], layer, None, None, metadata
+            )
 
 
 class TestPrimsTSNvfp4Pool(unittest.TestCase):

@@ -1060,12 +1060,8 @@ class DeepseekSparseAttnBackend(
             self.dsa_prefill_impl,
         )
 
-        # prims_ts NVFP4: per-forward live row count, graph-stable lengths
-        # buffers (rows -> [lengths, live rows written]), and the causal
-        # indices of a prefill without top-k, shared by all its layers.
-        self._prims_ts_live_rows = 0
-        self._prims_ts_lengths: dict[int, list] = {}
-        self._prims_ts_graph_rows: set[int] = set()
+        # prims_ts NVFP4: the causal indices of a prefill without top-k,
+        # shared by all its layers.
         self._prims_ts_causal = None
         if self.is_dsa_prims_nvfp4:
             if (
@@ -1593,19 +1589,6 @@ class DeepseekSparseAttnBackend(
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        if self.is_dsa_prims_nvfp4:
-            mode = forward_batch.forward_mode
-            if not mode.is_decode_or_idle():
-                # One row per request holds only for decode; prefill graphs are
-                # rejected at init.
-                raise RuntimeError(f"prims_ts NVFP4 graph metadata for {mode}")
-            rows = forward_batch.batch_size
-            actual_mode = getattr(forward_batch, "actual_forward_mode", None)
-            active_rows = rows - getattr(forward_batch, "num_padding", 0)
-            if (actual_mode or forward_batch.forward_mode).is_idle():
-                active_rows = 0
-            self._prims_ts_live_rows = active_rows
-            self._prims_ts_nvfp4_lengths(rows, active_rows, for_graph=True)
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
@@ -1624,9 +1607,7 @@ class DeepseekSparseAttnBackend(
 
     @property
     def requires_eager_metadata(self) -> bool:
-        # prims_ts NVFP4 rewrites its lengths buffer on the host when the live row
-        # count changes, which a metadata glue graph replay would skip.
-        return self.is_dsa_prims_nvfp4 or (
+        return (
             getattr(self.init_kernel_metadata, "__func__", None)
             is not DeepseekSparseAttnBackend.init_kernel_metadata
         )
@@ -1994,19 +1975,6 @@ class DeepseekSparseAttnBackend(
         )
         self.forward_metadata = metadata
         self.init_kernel_metadata(forward_batch)
-        if self.is_dsa_prims_nvfp4:
-            rows = forward_batch.input_ids.shape[0]
-            if forward_batch.forward_mode.is_idle():
-                live = 0
-            elif forward_batch._original_num_tokens is not None:
-                # DP attention padded the batch; the padded rows are not live.
-                live = forward_batch._original_num_tokens
-            elif forward_batch.forward_mode.is_decode_or_idle():
-                live = batch_size
-            else:
-                live = sum(extend_seq_lens_cpu)
-            self._prims_ts_live_rows = min(live, rows)
-            self._prims_ts_nvfp4_lengths(rows, self._prims_ts_live_rows)
 
     def _cal_indexer_k_start_end(
         self,
@@ -2919,7 +2887,7 @@ class DeepseekSparseAttnBackend(
                 )
                 self._prims_ts_causal = cached
             return self._forward_prims_ts_nvfp4(
-                q_nope, q_rope, layer, kv_cache, cached[1]
+                q_nope, q_rope, layer, kv_cache, cached[1], metadata
             )
         # q8 is only wired on the RAGGED route; PAGED would run the bf16 kernel.
         if (
@@ -2993,7 +2961,7 @@ class DeepseekSparseAttnBackend(
             if topk_transform_method != TopkTransformMethod.PAGED:
                 raise NotImplementedError("prims_ts NVFP4 prefill needs PAGED top-k")
             return self._forward_prims_ts_nvfp4(
-                q_nope, q_rope, layer, kv_cache, page_table_1
+                q_nope, q_rope, layer, kv_cache, page_table_1, metadata
             )
         if dsa_impl == "tilelang":
             if q_rope is not None:
@@ -3340,7 +3308,7 @@ class DeepseekSparseAttnBackend(
 
         if self.is_dsa_prims_nvfp4:
             return self._forward_prims_ts_nvfp4(
-                q_nope, q_rope, layer, kv_cache, page_table_1
+                q_nope, q_rope, layer, kv_cache, page_table_1, metadata
             )
         if dsa_impl == "flashmla_sparse":
             if q_rope is not None:
@@ -3459,54 +3427,24 @@ class DeepseekSparseAttnBackend(
         else:
             assert False, f"Unsupported {dsa_impl = }"
 
-    def _prims_ts_nvfp4_lengths(
-        self, rows: int, live: int, *, for_graph: bool = False
-    ) -> torch.Tensor:
-        """Top-k lengths for the NVFP4 route: 2048 for live rows, 0 for padding.
-
-        Live rows use the full width because the indexer pads its selection
-        with -1 holes, which the kernel masks; a zero length disables a padding
-        row, whose stale indices are never read. Written only when the live row
-        count changes, outside graph capture, so layers launch nothing for it.
-        Graph shapes keep their buffer address; only the latest eager shape is
-        kept besides them.
-        """
-        if not 0 <= live <= rows:
-            raise ValueError(f"invalid prims_ts live row count {live} of {rows}")
-        entry = self._prims_ts_lengths.get(rows)
-        capturing = torch.cuda.is_current_stream_capturing()
-        if entry is None:
-            if capturing:
-                raise RuntimeError(
-                    f"prims_ts has no lengths for {rows} rows; set them before capture"
-                )
-            for old in list(self._prims_ts_lengths):
-                if old not in self._prims_ts_graph_rows:
-                    del self._prims_ts_lengths[old]
-            entry = [torch.empty(rows, dtype=torch.int32, device=self.device), -1]
-            self._prims_ts_lengths[rows] = entry
-        if for_graph:
-            self._prims_ts_graph_rows.add(rows)
-        if entry[1] != live:
-            if capturing:
-                raise RuntimeError("prims_ts lengths must not change during capture")
-            entry[0].fill_(PRIMS_TS_TOPK)
-            if live < rows:
-                entry[0][live:].fill_(0)
-            entry[1] = live
-        return entry[0]
-
-    def _forward_prims_ts_nvfp4(self, q_nope, q_rope, layer, kv_cache, indices):
+    def _forward_prims_ts_nvfp4(
+        self, q_nope, q_rope, layer, kv_cache, indices, metadata: DSAMetadata
+    ):
         """prims_ts over the 352 B NVFP4 pool; indices hold physical slots."""
         if layer.v_head_dim != 512 or layer.head_dim != 576:
             raise ValueError("prims_ts needs absorbed MLA 512+64, never unabsorbed MHA")
         rows = q_nope.shape[0]
         if rows == 0:
             return q_nope.new_empty((0, layer.tp_q_head_num, 512))
-        # Eager DP padding can widen Q after init_forward_metadata; that shape
-        # gets its own lengths. Captured forwards only read the buffer, which
-        # the out-of-graph replay hook keeps current.
-        lengths = self._prims_ts_nvfp4_lengths(rows, self._prims_ts_live_rows)
+        # Per-row top-k lengths, min(seq_len, 2048), as the other DSA kernels
+        # use: the selected keys fill the first slots of each row, and DP
+        # padding rows have length 0. k-pool is 1, so lengths fit the width.
+        lengths = metadata.dsa_cache_seqlens_int32
+        if lengths.shape[0] < rows:
+            raise RuntimeError(
+                f"prims_ts NVFP4 has {lengths.shape[0]} top-k lengths for {rows} rows"
+            )
+        lengths = lengths[:rows]
         # The FP8 route's fused concat + E4M3 cast; Prims-TS needs no head padding.
         q8 = self._trtllm_q_fp8(q_nope, q_rope, layer.tp_q_head_num, pad_heads=False)
         out, _ = self._prims_ts.forward(
