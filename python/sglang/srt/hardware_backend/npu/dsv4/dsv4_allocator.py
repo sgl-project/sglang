@@ -114,6 +114,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         device: str,
         kvcache,
         need_sort: bool,
+        req_to_token_pool=None,
     ):
         super().__init__(
             size=size,
@@ -123,6 +124,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             device=device,
             kvcache=kvcache,
             need_sort=need_sort,
+            req_to_token_pool=req_to_token_pool,
         )
 
         def mk(pool_size, pool):
@@ -438,6 +440,8 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         # loc to swa, then add the c4/c128 KV pools into a DSV4OutCacheLoc.
         if out_full_loc is None:
             return None
+        if self._swa_req_ring:
+            self._map_swa_ring(out_full_loc, prefix_lens, seq_lens, req_pool_indices)
         out_swa_loc = self.translate_loc_from_full_to_swa(out_full_loc)
         assert out_swa_loc is not None, (
             "translate_loc_from_full_to_swa returned None — "
@@ -453,6 +457,19 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             loc_dtype,
             req_pool_indices,
         )
+
+    def _map_swa_ring(self, full_loc, prefix_lens, seq_lens, req_pool_indices):
+        from sglang.srt.hardware_backend.npu.dsv4.swa_ring import npu_swa_ring_locations
+
+        assert req_pool_indices is not None
+        loc = npu_swa_ring_locations(
+            req_pool_indices,
+            prefix_lens,
+            seq_lens,
+            full_loc.numel(),
+            self.get_kvcache().swa_req_ring_size,
+        )
+        self.set_full_to_swa_mapping(full_loc, loc)
 
     def alloc_decode(
         self,
@@ -472,6 +489,8 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         if out_full_loc is None:
             return None
 
+        if self._swa_req_ring:
+            self._map_swa_ring(out_full_loc, seq_lens - 1, seq_lens, req_pool_indices)
         out_swa_loc = self.translate_loc_from_full_to_swa(out_full_loc)
         # One new token per req. Model as an extend from (seq_len-1)//ratio to
         # seq_len//ratio so _alloc_c_extend anchors on the real c-pool last_loc.
@@ -531,6 +550,23 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             last_loc.dtype,
             req_pool_indices,
         )
+
+    def free_full(self, free_index: torch.Tensor):
+        if self._swa_req_ring:
+            # Ring rows stay owned by the request, but released full IDs must
+            # no longer point at them before the full allocator can reuse them.
+            self.clear_full_to_swa_mapping(free_index)
+        super().free_full(free_index)
+
+    def free_full_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        if self._swa_req_ring:
+            self.clear_full_to_swa_mapping(free_index)
+        super().free_full_segment(free_index, start_pos=start_pos)
+
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        if self._swa_req_ring:
+            self.clear_full_to_swa_mapping(free_index)
+        super().free_segment(free_index, start_pos=start_pos)
 
     def free(
         self,
