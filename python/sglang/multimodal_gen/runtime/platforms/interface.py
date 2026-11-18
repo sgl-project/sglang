@@ -27,6 +27,7 @@ logger = init_logger(__name__)
 
 class AttentionBackendEnum(enum.Enum):
     FA2 = enum.auto()
+    FLASHINFER_FA2 = enum.auto()
     FA = enum.auto()
     SLIDING_TILE_ATTN = enum.auto()
     TORCH_SDPA = enum.auto()
@@ -53,6 +54,7 @@ class AttentionBackendEnum(enum.Enum):
     CUBE_SPARSE_ATTN = enum.auto()
     FP8_FA_SM120 = enum.auto()
     NO_ATTENTION = enum.auto()
+    AMX_ATTN = enum.auto()
 
     def __str__(self):
         return self.name.lower()

@@ -6,14 +6,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
 import pytest
-import torch
 
 from sglang.multimodal_gen.runtime.managers import gpu_worker as gpu_worker_module
 from sglang.multimodal_gen.runtime.managers import scheduler as scheduler_module
-from sglang.multimodal_gen.runtime.managers.gpu_worker import (
-    GPUWorker,
-    _is_unrecoverable_device_error,
-)
+from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 
 # the two errors reported in #38167, verbatim
 _DRIVER_ERROR = "CUDA driver error: device not ready"
@@ -21,41 +17,6 @@ _ALLOCATOR_ASSERT = (
     '!handles_.at(i) INTERNAL ASSERT FAILED at "/__w/pytorch/pytorch/c10/cuda/'
     'CUDACachingAllocator.cpp":467, please report a bug to PyTorch.'
 )
-
-
-def _wrapped(message: str) -> Exception:
-    try:
-        try:
-            raise RuntimeError(message)
-        except RuntimeError as cause:
-            raise ValueError("stage failed") from cause
-    except ValueError as error:
-        return error
-
-
-@pytest.mark.parametrize(
-    "error",
-    [
-        RuntimeError(_DRIVER_ERROR),
-        RuntimeError(_ALLOCATOR_ASSERT),
-        RuntimeError("CUDA error: an illegal memory access was encountered"),
-        _wrapped(_DRIVER_ERROR),
-    ],
-)
-def test_device_breaking_errors_are_unrecoverable(error):
-    assert _is_unrecoverable_device_error(error)
-
-
-@pytest.mark.parametrize(
-    "error",
-    [
-        torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB"),
-        RuntimeError("CUDA error: out of memory"),
-        ValueError("height must be divisible by 16"),
-    ],
-)
-def test_oom_and_request_errors_stay_recoverable(error):
-    assert not _is_unrecoverable_device_error(error)
 
 
 @pytest.fixture

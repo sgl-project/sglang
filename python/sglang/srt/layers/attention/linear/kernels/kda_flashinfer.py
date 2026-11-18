@@ -1,7 +1,7 @@
 """FlashInfer KDA decode/verify wrapper.
 
-Wraps ``flashinfer.kda_decode.recurrent_kda`` (SM100+). KDA prefill uses a
-separate SM100/SM103-only adapter in ``kda_flashinfer_prefill``.
+Wraps ``flashinfer.recurrent_kda`` (SM100+). KDA prefill uses a separate
+SM100/SM103-only adapter in ``kda_flashinfer_prefill``.
 
 Contract with the Triton KDA reference:
   - raw per-K gate ``a`` is activated in-kernel as
@@ -41,7 +41,7 @@ def _get_flashinfer_kda_kernel():
         try:
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
 
-            from flashinfer.kda_decode import recurrent_kda
+            from flashinfer import recurrent_kda
 
             _flashinfer_recurrent_kda = recurrent_kda
             # SM100/SM103 get frozen fast paths; the generic CuTe DSL path

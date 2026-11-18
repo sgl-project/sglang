@@ -96,7 +96,7 @@ def _tokenizer_load_snapshot_owner_caller() -> str:
     """The caller that plays the tokenizer-side zmq owner role.
 
     In multi-tokenizer mode (``tokenizer_worker_num > 1``) there are N
-    independent ``TokenizerWorker`` processes that would all try to bind the
+    independent tokenizer worker processes that would all try to bind the
     same zmq PULL endpoint.  Instead, the single ``MultiTokenizerRouter``
     process owns the socket (polls zmq -> SHM) and every worker reads SHM.
     """
@@ -350,7 +350,7 @@ class ShmLoadSnapshotWriter:
                 HEADER_STRUCT.pack_into(
                     self.mmap, 0, MAGIC, VERSION, dp_size, self.slot_size
                 )
-                self._write_payload(LoadSnapshot(dp_rank=dp_rank))
+                self._copy_payload(self._encode_payload(LoadSnapshot(dp_rank=dp_rank)))
         except Exception:
             if self.fd >= 0:
                 os.close(self.fd)
@@ -362,10 +362,12 @@ class ShmLoadSnapshotWriter:
                 f"snapshot dp_rank={snapshot.dp_rank} does not match writer dp_rank={self.dp_rank}"
             )
 
+        # Encode before taking the lock so readers wait only for the copy.
+        payload = self._encode_payload(snapshot)
         with file_lock(self.fd, fcntl.LOCK_EX):
-            self._write_payload(snapshot)
+            self._copy_payload(payload)
 
-    def _write_payload(self, snapshot: LoadSnapshot) -> None:
+    def _encode_payload(self, snapshot: LoadSnapshot) -> bytes:
         payload = snapshot_encoder.encode(snapshot)
         max_payload_size = self.slot_size - SLOT_LEN_STRUCT.size
         if len(payload) > max_payload_size:
@@ -373,7 +375,9 @@ class ShmLoadSnapshotWriter:
                 f"load snapshot payload size {len(payload)} exceeds slot payload "
                 f"capacity {max_payload_size}"
             )
+        return payload
 
+    def _copy_payload(self, payload: bytes) -> None:
         offset = slot_offset(self.dp_rank, self.slot_size)
         payload_start = offset + SLOT_LEN_STRUCT.size
         payload_end = payload_start + len(payload)

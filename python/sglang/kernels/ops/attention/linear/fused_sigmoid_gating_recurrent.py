@@ -1,3 +1,4 @@
+import functools
 from typing import Optional
 
 import torch
@@ -5,6 +6,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_device_sm,
     is_cuda,
@@ -15,6 +17,8 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 _is_gfx95 = is_gfx95_supported()
+# The narrow-tile PTX add below has no AMDGCN form.
+_PTX_NARROW_KDA_ADD = tl.constexpr(not _is_hip)
 _is_sm90 = is_sm90_supported()
 _is_sm103 = is_cuda() and get_device_sm() == 103
 _is_sm107 = is_cuda() and get_device_sm() == 107
@@ -44,6 +48,30 @@ def _select_recurrent_launch_config(
     ):
         return (8, 4) if n == 1 else (16, 2)
     if (
+        _is_gfx95
+        and is_kda
+        and target_verify
+        and 0 < n <= 8
+        and h == hv == 12
+        and k == 128
+        and v == 128
+    ):
+        # Measured on MI350X (K3.1 TP8 8-token verify), bit-identical across widths;
+        # past 8 requests the BV=32 default applies (it wins from 16).
+        return (4 if n <= 2 else 8 if n <= 4 else 16), 1
+    if (
+        _is_hip
+        and _is_gfx95
+        and is_kda
+        and 0 < n <= 4
+        and h == hv == 12
+        and k == 128
+        and v == 128
+    ):
+        # Kimi-K3 TP8 (12 heads) gets 48 CTAs at BV=32; tuned on MI355X at n=1 and n=4,
+        # where BV=8 is 15.2 vs 19.9 us at n=1, T=8. One warp matches BV=32 bit for bit.
+        return 8, 1
+    if (
         target_verify
         and not _is_hip
         and not is_kda
@@ -71,6 +99,22 @@ def _select_recurrent_launch_config(
         # over 8x the CTAs with identical output (6.99 vs 13.66 us isolated).
         return 4, 1
     return min(triton.next_power_of_2(v), 32), 1
+
+
+@functools.lru_cache(maxsize=8)
+def _sm_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _select_bv(v_size: int, programs_per_split: int, device: torch.device) -> int:
+    # V tiles are independent; splitting them fills otherwise idle SMs at small N.
+    v_pow2 = triton.next_power_of_2(v_size)
+    bv_max = min(v_pow2, 32)
+    bv_min = min(16, bv_max)
+    wanted = max(1, _sm_count(device.index) // max(1, programs_per_split))
+    splits = 1 << (wanted.bit_length() - 1)
+    splits = max(1, min(splits, v_pow2 // bv_min))
+    return max(bv_min, min(bv_max, v_pow2 // splits))
 
 
 _EX2_APPROX_FTZ_F32 = tl.constexpr("ex2.approx.ftz.f32 $0, $1;")
@@ -487,7 +531,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Update hidden state: h += k[:, None] * v[None, :]
         if MATCH_CUTEDSL_DECODE:
             b_h = tl.fma(b_k[:, None], b_v[None, :], b_h)
-        elif IS_KDA and (V == 128 and BV == 4):
+        elif IS_KDA and V == 128 and BV == 4 and _PTX_NARROW_KDA_ADD:
             # The narrow KDA tile keeps the separate FP32 multiply/add rounding.
             b_h = tl.inline_asm_elementwise(
                 "add.rn.f32 $0, $1, $2;",
@@ -642,6 +686,8 @@ def fused_sigmoid_gating_delta_rule_update(
         target_verify=target_verify,
         cache_steps=cache_steps,
     )
+    if is_kda and _is_sm90 and envs.SGLANG_ENABLE_FP8_BLOCK_GEMV.get():
+        BV = _select_bv(V, N * HV, v.device)
     BK = triton.next_power_of_2(K)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"

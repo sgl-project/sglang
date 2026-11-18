@@ -28,7 +28,7 @@ activation address.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import msgspec
 import torch
@@ -37,9 +37,16 @@ import torch
 class _Handoff(msgspec.Struct):
     # staged by the model layer: the activation rows the runner will quantize
     request_x: Optional[torch.Tensor] = None
+    request_layer: Optional[Any] = None
+    num_token_non_padded: Optional[torch.Tensor] = None
+    fused_routing_ok: bool = False
+    padded_rows_masked: bool = False
     # published by the routing dispatch, keyed by the staged activations
     produced_x: Optional[torch.Tensor] = None
     packed: Optional[torch.Tensor] = None
+    prepared_ids: Optional[torch.Tensor] = None
+    routing_metadata: Optional[Any] = None
+    da_body: Optional[Any] = None
     x_q: Optional[torch.Tensor] = None
     x_s: Optional[torch.Tensor] = None
 
@@ -47,19 +54,32 @@ class _Handoff(msgspec.Struct):
 _handoff = _Handoff()
 
 
-def stage(x: torch.Tensor) -> None:
+def stage(x: torch.Tensor, layer: Optional[Any] = None) -> None:
     """Publish the routed activations for the upcoming topk call. Caller pairs
     this with clear() after the experts call (try/finally)."""
+    clear()
     _handoff.request_x = x
-    _handoff.produced_x = None
+    _handoff.request_layer = layer
 
 
 def clear() -> None:
-    _handoff.request_x = None
-    _handoff.produced_x = None
-    _handoff.packed = None
-    _handoff.x_q = None
-    _handoff.x_s = None
+    global _handoff
+    _handoff = _Handoff()
+
+
+def bind_select_experts(
+    num_token_non_padded: Optional[torch.Tensor], fused_routing_ok: bool
+) -> None:
+    if _handoff.request_x is None:
+        return
+    _handoff.num_token_non_padded = num_token_non_padded
+    _handoff.fused_routing_ok = fused_routing_ok
+
+
+def take_padded_rows_masked() -> bool:
+    masked = _handoff.padded_rows_masked
+    _handoff.padded_rows_masked = False
+    return masked
 
 
 def try_route_quant_fused(
@@ -78,8 +98,46 @@ def try_route_quant_fused(
     x = _handoff.request_x
     if x is None or num_fused_shared_experts != 0:
         return None
+    if routed_scaling_factor is None:
+        routed_scaling_factor = 1.0
 
-    from sglang.kernels.ops.moe import moe_route_quant_fused
+    from sglang.kernels.ops.moe import kimi_k3_fused_routing, moe_route_quant_fused
+
+    layer = _handoff.request_layer
+    if (
+        layer is not None
+        and _handoff.fused_routing_ok
+        and kimi_k3_fused_routing.covered(gating_output, correction_bias, topk, x)
+        and kimi_k3_fused_routing.available()
+    ):
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            select_trtllm_routed_body,
+        )
+
+        weights_dtype = kimi_k3_fused_routing.expert_weights_dtype(x.shape[0])
+        body = select_trtllm_routed_body(layer, x, topk, weights_dtype)
+        if body is not None:
+            routed = kimi_k3_fused_routing.fused_routing(
+                gating_output,
+                correction_bias,
+                x,
+                topk,
+                renormalize=renormalize,
+                routed_scaling_factor=routed_scaling_factor,
+                apply_scale=apply_routed_scaling_factor_on_output,
+                num_token_non_padded=_handoff.num_token_non_padded,
+                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                num_local_experts=layer.num_local_experts,
+                tile_tokens=body.tile_n,
+                weights_dtype=weights_dtype,
+            )
+            _handoff.padded_rows_masked = True
+            _handoff.prepared_ids = routed.ids
+            _handoff.routing_metadata = routed.metadata
+            _handoff.da_body = body
+            return _publish(
+                x, routed.weights, routed.ids, routed.ids, routed.x_q, routed.x_s
+            )
 
     if (
         not moe_route_quant_fused.covered(gating_output, correction_bias, topk, x)
@@ -93,17 +151,29 @@ def try_route_quant_fused(
         x,
         topk,
         renormalize=renormalize,
-        routed_scaling_factor=(
-            routed_scaling_factor if routed_scaling_factor is not None else 1.0
-        ),
+        routed_scaling_factor=routed_scaling_factor,
         apply_scale=apply_routed_scaling_factor_on_output,
     )
+    return _publish(x, weights, ids, packed, x_q, x_s)
+
+
+def _publish(x, weights, ids, packed, x_q, x_s):
     _handoff.request_x = None
     _handoff.produced_x = x
     _handoff.packed = packed
     _handoff.x_q = x_q
     _handoff.x_s = x_s
     return weights, ids
+
+
+def take_prepared_routing(ids: torch.Tensor) -> Optional[Tuple[Any, Any]]:
+    if _handoff.prepared_ids is not ids:
+        return None
+    out = (_handoff.routing_metadata, _handoff.da_body)
+    _handoff.prepared_ids = None
+    _handoff.routing_metadata = None
+    _handoff.da_body = None
+    return out
 
 
 def take(
