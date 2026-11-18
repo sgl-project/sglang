@@ -3,7 +3,7 @@
 Tests GPT-OSS models (lmsys/gpt-oss-20b-bf16, lmsys/gpt-oss-120b-bf16) using
 few-shot completion benchmark on MI300X.
 
-Registry: nightly-amd-8-gpu suite
+Registry: nightly-test-8-gpu-amd suite
 """
 
 import ast
@@ -28,7 +28,9 @@ from sglang.test.test_utils import (
 from sglang.utils import download_and_cache_file, read_jsonl
 
 # Register for AMD CI - GPT-OSS accuracy tests (~30 min)
-register_amd_ci(est_time=1800, suite="nightly-amd-accuracy-8-gpu-gpt-oss", nightly=True)
+register_amd_ci(
+    est_time=1800, suite="nightly-accuracy-test-8-gpu-amd-gpt-oss", nightly=True
+)
 
 INVALID = -9999999
 

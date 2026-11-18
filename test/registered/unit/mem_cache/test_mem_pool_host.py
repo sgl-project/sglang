@@ -1481,14 +1481,18 @@ class TestMLAKvSplitMappingLengths(CustomTestCase):
     """page_first_kv_split books K, V and the indexer mirrors as own mappings."""
 
     @staticmethod
-    def _pool(packed_fp8=False, indexer=True):
+    def _pool(packed_fp8=False, indexer=True, index_page_size=16):
         layer_num = 3
         info = MLABufferInfo(
             buffers=MLASplitBuffers(
                 k=torch.empty((0, 1, 640), dtype=torch.bfloat16),
                 v=torch.empty((0, 1, 64), dtype=torch.bfloat16),
-                index_k=torch.empty((2, 0)) if indexer else None,
-                index_scales=torch.empty((2, 0)) if indexer else None,
+                index_k=torch.empty((2, 0, index_page_size, 1, 128))
+                if indexer
+                else None,
+                index_scales=torch.empty((2, 0, index_page_size, 1))
+                if indexer
+                else None,
                 index_layer_indices=(0, 1) if indexer else (),
                 k_width=640,
                 v_width=64,
@@ -1542,6 +1546,21 @@ class TestMLAKvSplitMappingLengths(CustomTestCase):
             self.addCleanup(pool.destroy)
             self.assertEqual(
                 pool.get_mapping_lengths(), [rows * 3 * 512 * 2, rows * 3 * 64 * 2]
+            )
+
+        with self.subTest("compressed indexer mirrors"):
+            compressed = self._pool(index_page_size=4)
+            self.addCleanup(compressed.destroy)
+            compressed_lengths = compressed.get_mapping_lengths()[-2:]
+            self.assertEqual(
+                compressed_lengths,
+                [
+                    buf.numel() * buf.element_size()
+                    for buf in (
+                        compressed.index_k_buffer,
+                        compressed.index_k_scale_buffer,
+                    )
+                ],
             )
 
     def test_storage_buffers_cover_every_page_segment(self):

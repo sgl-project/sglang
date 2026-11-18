@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
 
 register_npu_ci(
     est_time=400,
-    suite="full-4-npu-a3",
+    suite="full-test-4-npu-a3",
     nightly=True,
 )
 
