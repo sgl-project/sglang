@@ -3,12 +3,14 @@ import io
 import sys
 import unittest
 from array import array
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
 from PIL import Image
 
 from sglang.srt.multimodal.media_io import _load_image
+from sglang.srt.utils import gc_utils
 from sglang.srt.utils.common import flatten_arrays_to_int64_tensor
 from sglang.srt.utils.device import (
     _get_device_sm_via_nvml,
@@ -304,6 +306,37 @@ class TestFreezeGc(CustomTestCase):
     def test_applies_configured_threshold(self):
         freeze_gc("test", [700, 10, 1000])
         self.assertEqual(gc.get_threshold(), (700, 10, 1000))
+
+
+class TestConfigureGcLogging(CustomTestCase):
+    def test_long_gc_warning_does_not_walk_the_heap(self):
+        clock = iter([0.0, 5.0])
+        with (
+            mock.patch.object(
+                gc_utils,
+                "envs",
+                SimpleNamespace(SGLANG_LOG_GC=SimpleNamespace(get=lambda: False)),
+            ),
+            mock.patch.object(
+                gc_utils,
+                "get_observability",
+                return_value=SimpleNamespace(gc_warning_threshold_secs=1.0),
+            ),
+        ):
+            gc_utils.configure_gc_logging("test")
+        callback = gc.callbacks.pop()
+
+        with (
+            mock.patch.object(
+                gc_utils, "time", SimpleNamespace(perf_counter=lambda: next(clock))
+            ),
+            mock.patch.object(gc, "get_objects", side_effect=AssertionError),
+            self.assertLogs(gc_utils.logger, "WARNING") as logs,
+        ):
+            callback("start", {"generation": 2})
+            callback("stop", {"generation": 2, "collected": 3, "uncollectable": 0})
+        self.assertIn("LONG GARBAGE COLLECTION DETECTED", logs.output[0])
+        self.assertIn("Collected: 3", logs.output[0])
 
 
 if __name__ == "__main__":

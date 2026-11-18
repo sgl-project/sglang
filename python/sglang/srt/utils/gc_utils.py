@@ -1,6 +1,8 @@
 import collections
 import gc
 import logging
+import os
+import threading
 import time
 import types
 from typing import Optional, Sequence
@@ -46,10 +48,15 @@ def configure_gc_logging(process_name: str) -> None:
                 f"{' (LONG GC)' if duration > 0.1 else ''}"
             )
         if 0 < warning_threshold_secs < duration:
-            g0, g1, g2 = gc_object_counts()
+            # Runs while the interpreter is still paused for this collection, so
+            # only O(1) stats here: gc_object_counts() would walk the whole heap.
+            g0, g1, g2 = gc.get_count()
+            cpu = os.sched_getcpu() if hasattr(os, "sched_getcpu") else -1
             logger.warning(
                 f"LONG GARBAGE COLLECTION DETECTED | {process_name} | Generation {gen} | "
-                f"Duration: {duration:.4f}s | # Objects: gen0={g0}, gen1={g1}, gen2={g2} | "
+                f"Duration: {duration:.4f}s | Collected: {info['collected']} | "
+                f"Counts: gen0={g0}, gen1={g1}, gen2={g2} | "
+                f"Thread: {threading.current_thread().name} | CPU: {cpu} | "
                 f"This may cause latency jitter. Long-lived objects keep each full pass slow; "
                 f"in the scheduler, --gc-freeze-on-idle-secs freezes them."
             )
