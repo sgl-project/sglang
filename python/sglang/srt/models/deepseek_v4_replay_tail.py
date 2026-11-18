@@ -683,6 +683,13 @@ class DecoderReplayTail:
 
         model = self._model
         aux: List[torch.Tensor] = []
+        fused_step = False
+        if is_hip():
+            from sglang.srt.models.deepseek_common.amd.deepseek_v4_hip import (
+                fused_boundary_this_step,
+            )
+
+            fused_step = fused_boundary_this_step(forward_batch)
         for i in self._layer_ids:
             layer = model.layers[i]
             assert layer.engram is None
@@ -696,7 +703,7 @@ class DecoderReplayTail:
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
-                if layer.hc_boundary_fused:
+                if fused_step and layer.hc_boundary_fused:
                     state = forward_layer_fused_boundary(
                         model,
                         i,
