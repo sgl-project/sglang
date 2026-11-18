@@ -25,6 +25,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.runtime_context import (
     get_buffer,
     get_exec,
+    get_memory,
     get_parallel,
     get_platform,
     get_spec,
@@ -840,6 +841,13 @@ class DeepseekSparseAttnBackend(
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self._kv_shard_pool = get_kv_shard_pool(self.token_to_kv_pool)
         self.hisparse_coordinator = model_runner.hisparse_coordinator
+        self.hisparse_hicache_buffer = (
+            model_runner.hisparse_hicache_buffer
+            if (get_memory().hisparse_backend == "hicache")
+            else None
+        )
+        if self.hisparse_hicache_buffer is not None:
+            self.hisparse_coordinator = self.hisparse_hicache_buffer
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         # Translates the ids `req_to_token` holds into the physical ids the
         # page tables carry (`_read_v2p`); identity on a static pool.
@@ -1520,6 +1528,35 @@ class DeepseekSparseAttnBackend(
         )
         return page_table[:, strided_indices] // page_size
 
+    def _build_hisparse_hicache_indexer_page_table(
+        self,
+        *,
+        forward_mode: ForwardMode,
+        req_pool_indices: torch.Tensor,
+        max_seqlen_k: int,
+    ) -> Optional[torch.Tensor]:
+        if self.hisparse_hicache_buffer is None or not forward_mode.is_decode_or_idle():
+            return None
+        table = self.hisparse_hicache_buffer.indexer_page_table(
+            req_pool_indices=req_pool_indices,
+            num_pages=(max_seqlen_k + self.physical_page_size - 1)
+            // self.physical_page_size,
+        )
+        return table
+
+    def _refresh_hisparse_hicache_indexer_page_table(
+        self, metadata, *, forward_mode, req_pool_indices
+    ):
+        if metadata.indexer_page_table is None:
+            return
+        table = self._build_hisparse_hicache_indexer_page_table(
+            forward_mode=forward_mode,
+            req_pool_indices=req_pool_indices,
+            max_seqlen_k=self._graph_page_table_width(metadata),
+        )
+        assert table is not None
+        metadata.indexer_page_table.copy_(table)
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -1872,6 +1909,11 @@ class DeepseekSparseAttnBackend(
             dsa_seqlens_expanded=seqlens_expanded,
             dsa_extend_seq_lens_list=extend_seq_lens_cpu,
             real_page_table=self._transform_table_1_to_real(page_table),
+            indexer_page_table=self._build_hisparse_hicache_indexer_page_table(
+                forward_mode=forward_batch.forward_mode,
+                req_pool_indices=forward_batch.req_pool_indices,
+                max_seqlen_k=max_seqlen_k,
+            ),
             dsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,
             dcp_local_kv_rows=(
@@ -2261,6 +2303,11 @@ class DeepseekSparseAttnBackend(
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             dsa_seqlens_expanded=seqlens_expanded,
             real_page_table=real_page_table,
+            indexer_page_table=self._build_hisparse_hicache_indexer_page_table(
+                forward_mode=forward_mode,
+                req_pool_indices=req_pool_indices,
+                max_seqlen_k=max_seqlen_k,
+            ),
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
             dcp_topk_length=self._dcp_topk_length_buffer(
@@ -2578,6 +2625,10 @@ class DeepseekSparseAttnBackend(
         else:
             assert metadata.real_page_table is metadata.page_table_1
 
+        self._refresh_hisparse_hicache_indexer_page_table(
+            metadata, forward_mode=forward_mode, req_pool_indices=req_pool_indices
+        )
+
         effective_n_per_batch = None
         if forward_mode.is_draft_extend_v2() and spec_info is not None:
             effective_n_per_batch = getattr(spec_info, "num_accept_tokens", None)
@@ -2624,6 +2675,11 @@ class DeepseekSparseAttnBackend(
         metadata = self.decode_cuda_graph_metadata[bs]
 
         self._copy_base_replay_buffers(bs, metadata, precomputed, forward_mode)
+        self._refresh_hisparse_hicache_indexer_page_table(
+            metadata,
+            forward_mode=forward_mode,
+            req_pool_indices=precomputed.req_pool_indices,
+        )
 
         # Refresh the schedule because stale shape decomposition can deadlock
         # DeepGEMM paged MQA.
@@ -2817,7 +2873,10 @@ class DeepseekSparseAttnBackend(
                 )
 
         # todo hisparse: to cover more backends
-        if self.hisparse_coordinator is not None:
+        if (
+            self.hisparse_coordinator is not None
+            and self.hisparse_hicache_buffer is None
+        ):
             if forward_batch.forward_mode.is_target_verify():
                 num_reqs = forward_batch.req_pool_indices.shape[0]
                 num_steps = self.speculative_num_draft_tokens

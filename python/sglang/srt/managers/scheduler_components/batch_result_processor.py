@@ -57,7 +57,10 @@ if TYPE_CHECKING:
         DecodeKVCacheOffloadManager,
     )
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
-    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+    from sglang.srt.managers.hisparse_coordinator import (
+        HiSparseCoordinator,
+        HiSparseHiCacheBackend,
+    )
     from sglang.srt.managers.scheduler_components.logprob_result_processor import (
         SchedulerLogprobResultProcessor,
     )
@@ -138,6 +141,7 @@ class SchedulerBatchResultProcessor:
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     tree_cache: BasePrefixCache
     hisparse_coordinator: Optional[HiSparseCoordinator]
+    hisparse_hicache_backend: Optional[HiSparseHiCacheBackend] = None
     req_to_token_pool: ReqToTokenPool
     kv_weight_version_tracker: Optional[KvWeightVersionTracker]
     decode_offload_manager: Optional[DecodeKVCacheOffloadManager]
@@ -518,6 +522,12 @@ class SchedulerBatchResultProcessor:
                             partial(checkpoint_kv_cache, req, self.tree_cache)
                         )
                         checkpoint_reqs.append(req)
+                        if self.hisparse_hicache_backend is not None:
+                            kv_ops.append(
+                                partial(
+                                    self.hisparse_hicache_backend.admit_request, req
+                                )
+                            )
                         if get_memory().enable_hisparse:
                             kv_ops.append(
                                 partial(

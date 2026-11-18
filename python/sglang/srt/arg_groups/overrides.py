@@ -721,7 +721,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         )
         return declared
 
-    if view.enable_hisparse:
+    if view.enable_hisparse or (view.hisparse_backend == "hicache"):
         from sglang.srt.arg_groups.hisparse_hook import _hisparse_default_backend
 
         backend = _hisparse_default_backend(kv_cache_dtype)

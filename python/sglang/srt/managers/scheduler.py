@@ -1383,6 +1383,14 @@ class Scheduler(
 
     def init_hisparse_coordinator(self) -> None:
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+        self.hisparse_hicache_backend = None
+        if get_memory().hisparse_backend == "hicache":
+            self.hisparse_hicache_backend = (
+                self.tp_worker.model_runner.hisparse_hicache_backend
+            )
+            self.hisparse_hicache_backend.attach_tree(self.tree_cache)
+            self.hisparse_hicache_backend.forward_stream = self.forward_stream
+            return
         if not self.enable_hisparse:
             return
 
@@ -2115,6 +2123,8 @@ class Scheduler(
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
+        if self.hisparse_hicache_backend is not None:
+            self.hisparse_hicache_backend.destroy()
         self.tree_cache.release_host_resources()
         if self.decode_offload_manager is not None:
             self.decode_offload_manager.release_host_resources()
@@ -3006,6 +3016,7 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
+            hisparse_hicache_backend=self.hisparse_hicache_backend,
             req_to_token_pool=self.req_to_token_pool,
             kv_weight_version_tracker=self.kv_weight_version_tracker,
             decode_offload_manager=self.decode_offload_manager,
@@ -4545,8 +4556,13 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_priority_preemption or self.is_hybrid_swa:
-            # Reset batch_is_full to try preemption with a prefill adder.
+        if (
+            self.enable_priority_preemption
+            or self.is_hybrid_swa
+            or self.hisparse_hicache_backend is not None
+        ):
+            # Preemption, window movement and HiSparse demotion can free capacity
+            # without a running request finishing.
             running_batch.batch_is_full = False
         if running_batch.is_empty():
             # An empty batch has no request left to leave, and only a leaving
@@ -4652,6 +4668,7 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
             request_retirer=self.request_retirer,
             kv_awaiting_transfer=bool(self.disagg_prefill_transfer_queue),
+            hisparse_hicache_backend=self.hisparse_hicache_backend,
         )
 
         # The request between two chunks: in chunked_reqs, not in waiting_queue.

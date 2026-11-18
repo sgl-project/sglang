@@ -42,6 +42,7 @@ from sglang.srt.arg_groups.hisparse_hook import (
     _hisparse_default_backend,
     validate_hisparse,
     validate_hisparse_dsa_backend,
+    validate_hisparse_hicache,
     validate_hisparse_kv_cache_dtype,
 )
 from sglang.srt.arg_groups.kv_cache_hook import (
@@ -2098,6 +2099,82 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
     def test_hisparse_rejects_unvalidated_speculation(self):
         with self.assertRaisesRegex(ValueError, "has not validated"):
             self._validate_hisparse_with_spec("NGRAM")
+
+
+class TestHiSparseHiCachePolicy(CustomTestCase):
+    @staticmethod
+    def _args(**overrides):
+        values = dict(
+            model_path="dummy",
+            device="cuda",
+            hisparse_backend="hicache",
+            enable_hierarchical_cache=True,
+            page_size=64,
+            hicache_ratio=2,
+            hicache_write_policy="write_back",
+            hicache_mem_layout="page_first",
+            kv_cache_dtype="bfloat16",
+            dsa_prefill_backend="flashmla_sparse",
+            dsa_decode_backend="flashmla_sparse",
+        )
+        values.update(overrides)
+        args = ServerArgs(**values)
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["DeepseekV32ForCausalLM"],
+                index_topk=2048,
+            )
+        )
+        return args
+
+    @override_platform(is_hip=False)
+    def test_backend_selection_routes_hicache_validation(self):
+        validate_hisparse(self._args())
+        with self.assertRaisesRegex(ValueError, "enable-hierarchical-cache"):
+            validate_hisparse(self._args(enable_hierarchical_cache=False))
+        validate_hisparse(
+            self._args(hisparse_backend="private", enable_hierarchical_cache=False)
+        )
+
+    @override_platform(is_hip=False)
+    def test_shared_host_mode_requires_compatible_ownership(self):
+        validate_hisparse_hicache(self._args())
+        for overrides in (
+            {"enable_hisparse": True},
+            {"enable_hierarchical_cache": False},
+            {"disable_radix_cache": True},
+            {"hicache_write_policy": "write_through"},
+            {"hicache_host_memory_mode": "buffer_only"},
+            {"enable_streaming_session": True},
+            {"disaggregation_mode": "decode"},
+            {"attn_cp_size": 2},
+        ):
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                validate_hisparse_hicache(self._args(**overrides))
+
+    @override_platform(is_hip=False)
+    def test_rejects_inconsistent_index_or_swap_capacity(self):
+        for config in (
+            {"top_k": 1024},
+            {"device_buffer_size": 2049},
+            {"device_buffer_size": True},
+            {"expansion_ratio": 0},
+            {"expansion_ratio": float("nan")},
+            {"swap_in_block_size": 1025},
+        ):
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                validate_hisparse_hicache(
+                    self._args(hisparse_config=json.dumps(config))
+                )
+
+    @override_platform(is_hip=False)
+    def test_rejects_speculative_decoding(self):
+        for algorithm in ("EAGLE", "EAGLE3", "DFLASH", "NGRAM"):
+            with (
+                self.subTest(algorithm=algorithm),
+                self.assertRaisesRegex(ValueError, "speculative decoding"),
+            ):
+                validate_hisparse_hicache(self._args(speculative_algorithm=algorithm))
 
 
 class TestFa4PageSizeAutoForce(CustomTestCase):

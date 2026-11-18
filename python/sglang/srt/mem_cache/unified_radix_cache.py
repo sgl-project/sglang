@@ -242,6 +242,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.init_metrics_collector()
         self._enable_metrics_flag = params.enable_metrics
         self.enable_storage_metrics = False
+        self.hisparse_hicache_backend = None
         self.storage_metrics_collector: Optional[StorageMetricsCollector] = None
         self.extra_metric_labels = None
 
@@ -505,6 +506,8 @@ class UnifiedRadixCache(BasePrefixCache):
         """Full reset: destroy entire tree and all state."""
         # In-flight restores still read their host slots; finish them first.
         self._discard_restore_backups()
+        if self.hisparse_hicache_backend is not None:
+            self.hisparse_hicache_backend.reset()
         self.tree_core.reset()
         self.session_refs.reset()
 
@@ -1570,6 +1573,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid", "checkpointed"])
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        if self.hisparse_hicache_backend is not None:
+            self.hisparse_hicache_backend.request_finished(req)
         if checkpointed:
             return
         for comp in self._components_tuple:
@@ -1582,6 +1587,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid", "up_to"])
     def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
+        if self.hisparse_hicache_backend is not None and req.hisparse_hicache_active:
+            return
         if self.session.try_checkpoint(req, up_to=up_to, **kwargs):
             return
         self.checkpoint_into_tree(req, up_to=up_to, **kwargs)

@@ -303,6 +303,13 @@ class Memory(msgspec.Struct):
     # Hierarchical sparse attention
     # -------------------------------------------------------------------------
     enable_hisparse: A[bool, "Enable hierarchical sparse attention"] = False
+    hisparse_backend: A[
+        str,
+        Arg(
+            help="HiSparse host backend. hicache enables shared HiCache storage; private uses --enable-hisparse.",
+            choices=["private", "hicache"],
+        ),
+    ] = "private"
     hisparse_config: A[
         Optional[str],
         Arg(

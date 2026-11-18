@@ -215,6 +215,8 @@ def create_unified_radix_cache(
         }
 
     params.tree_slots = tuple(tree_slots)
+    if get_memory().hisparse_backend == "hicache":
+        params.tree_core_backend = "python"
     if use_mlx() and ctx.is_hybrid_ssm:
         from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
             MlxAuxiliaryStateComponent,

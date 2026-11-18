@@ -501,6 +501,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.is_eagle = params.is_eagle and TREE_STATE not in self._family_slot_ids
         self.enable_hicache = False
         self.is_host_memory_buffer_only = False
+        self.hisparse_hicache_backend = None
         self.enable_storage = False
         self.enable_external_cache_linker = False
         self.write_through_threshold = 256
@@ -1669,6 +1670,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         for component in self.components:
             component.redistribute_on_node_split(new_parent=new_node, child=child)
         new_node.parent.children[key.child_key(self.page_size)] = new_node
+        if self.hisparse_hicache_backend is not None:
+            self.hisparse_hicache_backend.on_node_split(
+                new_parent=new_node, child=child
+            )
 
         # Buffer-mode dependencies are tracked by the cache, without an ack here.
         action: Optional[CacheAction | ComponentAction] = None
@@ -2121,6 +2126,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # A failed backup never issues the D->H copy, so the subtree root has
         # no host state and no in-flight DMA reading its device slots.
         assert not node.backuped and node.write_through_pending_id is None
+        if (
+            self.hisparse_hicache_backend is not None
+            and self.hisparse_hicache_backend.node_is_active(node)
+        ):
+            return result
         if node.load_back_pending_id is not None or any(
             cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in node.component_data
         ):
@@ -2392,6 +2402,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if node.write_back_queued:
             node.write_back_queued = False
             self._write_back_queued_count -= 1
+        if self.hisparse_hicache_backend is not None:
+            self.hisparse_hicache_backend.on_node_evicted(node)
         trigger = self.components_by_type[BASE_COMPONENT_TYPE]
         self._evict_component_and_detach_lru(
             node,

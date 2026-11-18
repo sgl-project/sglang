@@ -46,6 +46,8 @@ else:
         SPEC_SWAP_MAX_STEPS,
     )
 
+import msgspec
+
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
@@ -59,6 +61,8 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseHiCacheBuffer
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     MiniMaxSparseKVPool,
@@ -67,6 +71,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mha import HiSparseMHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
@@ -1659,3 +1664,247 @@ class HiSparseCoordinator:
                         self.prefetch_stream
                     )
         return anchor_locs
+
+
+class _RequestState(msgspec.Struct, kw_only=True):
+    prefix_len: int
+    temp: torch.Tensor
+    nodes: list
+    host_locks: dict = {}
+
+
+class _PrefillReservation(msgspec.Struct, frozen=True):
+    temp: torch.Tensor
+    prefix_len: int
+
+
+class HiSparseHiCacheBackend:
+    def __init__(self, *, cache: HiSparseHiCacheBuffer, allocator):
+        self.cache = cache
+        self.allocator = allocator
+        self.tree_cache = None
+        self.forward_stream = None
+        self.requests: dict[int, _RequestState] = {}
+        self.pending: dict[str, _PrefillReservation] = {}
+        self._admit_count = 0
+
+    def attach_tree(self, tree_cache) -> None:
+        from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
+
+        if not isinstance(tree_cache.tree_core, UnifiedTreeCore):
+            raise ValueError(
+                "HiSparse HiCache backend requires the Python unified tree core"
+            )
+        self.tree_cache = tree_cache
+        host_pool = tree_cache.host_pool_group.get_pool(PoolName.KV)
+        self.cache.attach_host_pool(host_pool)
+        tree_cache.hisparse_hicache_backend = self
+        tree_cache.tree_core.hisparse_hicache_backend = self
+
+    def _wait_for_forward(self) -> None:
+        if self.forward_stream is not None:
+            torch.cuda.current_stream().wait_stream(self.forward_stream)
+
+    def _prefix_nodes(self, req) -> list:
+        node = self.tree_cache.tree_core.node_by_id(req.last_node)
+        nodes = []
+        while node.parent is not None:
+            nodes.append(node)
+            node = node.parent
+        return nodes
+
+    def temp_tokens_required(self, req, *, max_new_tokens: int) -> int:
+        if req.rid in self.pending:
+            return 0
+        prefix_len = len(req.full_untruncated_fill_ids)
+        if prefix_len < self.cache.reserved_buffer_tokens or (
+            prefix_len
+            + self.cache.reserved_buffer_tokens
+            + max_new_tokens
+            + self.cache.page_size
+            >= self.cache.pool.size
+        ):
+            return 0
+        return self.cache.reserved_buffer_tokens
+
+    def reserve_prefill(self, req, *, max_new_tokens: int) -> bool:
+        needed = self.temp_tokens_required(req, max_new_tokens=max_new_tokens)
+        if not needed:
+            return True
+        prefix_len = (
+            len(req.full_untruncated_fill_ids)
+            // self.cache.page_size
+            * self.cache.page_size
+        )
+        pending_tokens = sum(p.prefix_len for p in self.pending.values())
+        claimed = {
+            node.id: len(node.key)
+            for state in self.requests.values()
+            for node in state.nodes
+        }
+        # Keep room for decode growth and fragmentation while allowing each
+        # active prefix one home across the device and host tiers.
+        capacity = self.cache.host_pool.size + int(self.cache.pool.size * 0.95)
+        used = sum(claimed.values()) + pending_tokens + self.reserved_temp_tokens()
+        if prefix_len + needed > capacity - used:
+            return False
+        from sglang.srt.mem_cache.common import evict_from_tree_cache
+
+        evict_from_tree_cache(self.tree_cache, needed)
+        temp = self.allocator.alloc(needed)
+        if temp is None:
+            return False
+        self.pending[req.rid] = _PrefillReservation(temp, prefix_len)
+        return True
+
+    def admit_request(self, req) -> bool:
+        req_id = req.kv.req_pool_idx
+        if req_id in self.requests:
+            raise RuntimeError("HiSparse HiCache backend request admitted twice")
+        prefix_len = req.kv.cache_protected_len
+        reservation = self.pending.pop(req.rid, None)
+        if prefix_len < self.cache.reserved_buffer_tokens:
+            if reservation is not None:
+                self.allocator.free(reservation.temp)
+            return False
+        if prefix_len % self.cache.page_size:
+            raise RuntimeError(
+                "HiSparse HiCache backend tree prefix is not page-aligned"
+            )
+        self._wait_for_forward()
+        temp = (
+            reservation.temp
+            if reservation is not None
+            else self.allocator.alloc(self.cache.reserved_buffer_tokens)
+        )
+        if temp is None:
+            logger.debug(
+                "HiSparse HiCache backend keeps request %s resident: no swap slots",
+                req.rid,
+            )
+            return False
+        self.cache.assign_temp_locations(req_id, temp)
+        self.cache.protected_lens[req_id] = prefix_len
+        self.requests[req_id] = _RequestState(
+            prefix_len=prefix_len, temp=temp, nodes=self._prefix_nodes(req)
+        )
+        req.hisparse_hicache_active = True
+        self.tree_cache.unlock(req.lock)
+        req.lock = None
+        self._admit_count += 1
+        if self._admit_count == 1 or self._admit_count % 64 == 0:
+            logger.info(
+                "HiSparse HiCache backend: admitted request #%d (%d prefix tokens, %d active)",
+                self._admit_count,
+                prefix_len,
+                len(self.requests),
+            )
+        return True
+
+    def node_is_active(self, node) -> bool:
+        return any(
+            any(prefix_node.id == node.id for prefix_node in state.nodes)
+            for state in self.requests.values()
+        )
+
+    def on_node_split(self, *, new_parent, child) -> None:
+        for state in self.requests.values():
+            if any(node.id == child.id for node in state.nodes):
+                state.nodes.append(new_parent)
+        # FullComponent moves the receipt boundary on split, so existing host
+        # receipts already cover both fragments and need no new acquisition.
+
+    def on_node_evicted(self, node) -> None:
+        if not self.requests:
+            return
+        component = node.component_data[ComponentType.FULL]
+        if component.value is None:
+            return
+        affected = [
+            (req_id, state)
+            for req_id, state in self.requests.items()
+            if any(prefix_node.id == node.id for prefix_node in state.nodes)
+        ]
+        if not affected:
+            return
+        if component.host_value is None:
+            raise RuntimeError(
+                "HiSparse HiCache backend cannot discard an active prefix without backup"
+            )
+        self._wait_for_forward()
+        device_rows, order = component.value.to(self.cache.device).long().sort()
+        host_rows = component.host_value.to(self.cache.device).long()[order]
+        for _, state in affected:
+            if node.id not in state.host_locks:
+                state.host_locks[node.id] = self.tree_cache.inc_host_lock_ref(
+                    node.id
+                ).to_dec_params()
+        self.cache.preserve_index(device_rows, host_rows)
+        for req_id, state in affected:
+            row = self.cache.req_to_token[req_id, : state.prefix_len]
+            lookup = torch.searchsorted(device_rows, row.long()).clamp(
+                max=device_rows.numel() - 1
+            )
+            positions = ((row >= 0) & (device_rows[lookup] == row)).nonzero().flatten()
+            if not positions.numel():
+                continue
+            # Publish both maps before the allocator can hand these rows to another request.
+            self.cache.host_locs[req_id, positions] = host_rows[lookup[positions]]
+            row[positions] = -1
+
+    def request_finished(self, req) -> None:
+        reservation = self.pending.pop(req.rid, None)
+        if reservation is not None:
+            self.allocator.free(reservation.temp)
+        state = self.requests.pop(req.kv.req_pool_idx, None)
+        if state is None:
+            return
+        self._wait_for_forward()
+        for node_id, receipt in state.host_locks.items():
+            self.tree_cache.dec_host_lock_ref(node_id, receipt)
+        self.cache.release(req.kv.req_pool_idx)
+        self.allocator.free(state.temp)
+        req.hisparse_hicache_active = False
+
+    def reserved_temp_tokens(self) -> int:
+        return (
+            len(self.requests) + len(self.pending)
+        ) * self.cache.reserved_buffer_tokens
+
+    def reset(self) -> None:
+        if self.requests or self.pending:
+            raise RuntimeError(
+                "HiSparse HiCache backend cache reset requires all requests to finish"
+            )
+
+    def destroy(self) -> None:
+        self._wait_for_forward()
+        self.cache.host_bindings.zero_()
+        torch.cuda.current_stream().synchronize()
+
+
+def build_hisparse_hicache_buffer(
+    *, req_to_token_pool, token_to_kv_pool, model_config, device
+):
+    from sglang.srt.configs.model_config import get_dsa_index_kpool
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+    from sglang.srt.mem_cache.sparsity.factory import (
+        parse_hisparse_hicache_config,
+    )
+
+    if (
+        not isinstance(token_to_kv_pool, DSATokenToKVPool)
+        or get_dsa_index_kpool(model_config.hf_text_config) != 1
+    ):
+        raise ValueError("HiSparse HiCache backend requires an unpooled DSA KV pool")
+    config = parse_hisparse_hicache_config(
+        model_top_k=model_config.hf_text_config.index_topk
+    )
+    return HiSparseHiCacheBuffer(
+        req_to_token_pool=req_to_token_pool,
+        token_to_kv_pool=token_to_kv_pool,
+        top_k=config.top_k,
+        buffer_tokens=config.buffer_tokens,
+        block_size=config.block_size,
+        device=device,
+    )

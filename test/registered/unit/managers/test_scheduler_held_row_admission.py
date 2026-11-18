@@ -79,10 +79,12 @@ class TestHeldRowAdmission(CustomTestCase):
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.enable_priority_preemption = False
         s.is_hybrid_swa = False
+        s.hisparse_hicache_backend = None
         s.waiting_queue = IndexedReqList(ListKind.WAITING)
         move(waiting, s.waiting_queue)
         s.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
-        move([final_chunk], s.chunked_reqs)
+        if final_chunk is not None:
+            move([final_chunk], s.chunked_reqs)
         s.min_free_slots_delayer = None
         s.invariant_checker = Mock()
         s.policy = Mock(
@@ -126,7 +128,9 @@ class TestHeldRowAdmission(CustomTestCase):
         s.spec_algorithm = None
         # The final chunk and the running requests hold rows; one row is free.
         s.req_to_token_pool = SimpleNamespace(
-            available_size=lambda: NUM_ROWS - len(running) - 1
+            available_size=lambda: (
+                NUM_ROWS - len(running) - int(final_chunk is not None)
+            )
         )
         s.beam_coordinator = SimpleNamespace(
             pending_member_rows=lambda batch: 0, pending_member_rows_of=lambda reqs: 0
@@ -167,6 +171,24 @@ class TestHeldRowAdmission(CustomTestCase):
                 can_run_list, batch_is_full, final_chunk, waiting = self._admitted(mode)
                 self.assertEqual(can_run_list, [final_chunk, waiting])
                 self.assertFalse(batch_is_full)
+
+    def test_hisparse_demotion_reopens_admission(self):
+        """Device demotion permits admission while decoding requests still run."""
+        running = [_Req(holds_row=True)]
+        s = self._scheduler(
+            DisaggregationMode.NULL, running, None, [_Req(holds_row=False)]
+        )
+        s.hisparse_hicache_backend = object()
+        s.policy.calc_priority = Mock(side_effect=_BatchBuilt)
+        batch = ScheduleBatch(reqs=running, batch_is_full=True)
+        with (
+            get_context().override_server_args(pp_max_micro_batch_size=NUM_ROWS),
+            self.assertRaises(_BatchBuilt),
+        ):
+            s._get_new_batch_prefill_raw(
+                prefill_delayer_single_pass=None, running_batch=batch
+            )
+        self.assertFalse(batch.batch_is_full)
 
     def test_parked_chunk_admits_no_waiting_request(self):
         running = [_Req(holds_row=True)]
