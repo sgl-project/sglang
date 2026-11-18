@@ -1,3 +1,4 @@
+import importlib.util
 import unittest
 from pathlib import Path
 
@@ -19,8 +20,7 @@ register_npu_ci(
     nightly=True,
 )
 
-# MOONCAKE_INSTALLED = importlib.util.find_spec("mooncake") is not None
-MOONCAKE_INSTALLED = False
+MOONCAKE_INSTALLED = importlib.util.find_spec("mooncake") is not None
 DISAGGREGATION_TRANSFER_BACKEND = "mooncake" if MOONCAKE_INSTALLED else "ascend"
 
 # Mooncake + TENT + MemFabric, only used when the Mooncake package is present.
@@ -55,7 +55,6 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_COMMON_ENVS = {
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "USE_NPU_MOE_GATING_TOP_K": "1",
     "SGLANG_RAGGED_VERIFY_MODE": "static",
-    "SGLANG_DSPARK_FAST_SAMPLING": "0",
     "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
     "SGLANG_DSPARK_QUANT_AUDIT": "1",
     "SGLANG_DSPARK_QUANT_AUDIT_STRICT": "0",
@@ -140,7 +139,6 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     70000,
     "--max-running-requests",
     256,
-    "--enable-dp-attention",
     "--tokenizer-worker-num",
     16,
     "--moe-a2a-backend",
@@ -152,7 +150,8 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     "--enable-dp-lm-head",
     "--kv-cache-dtype",
     "bfloat16",
-    "--disable-cuda-graph",
+    "--disable-decode-cuda-graph",
+    "--disable-prefill-cuda-graph",
     "--load-balance-method",
     "round_robin",
     "--enable-metrics",
@@ -165,7 +164,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     "dynamic",
     "--ep-num-redundant-experts",
     16,
-    "--dp-size",
+    "--attn-dp-size",
     16,
     "--optimistic-prefill-attempts",
     1,
@@ -199,9 +198,8 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ARGS = [
     DISAGGREGATION_TRANSFER_BACKEND,
     "--max-running-requests",
     256,
-    "--dp-size",
+    "--attn-dp-size",
     16,
-    "--enable-dp-attention",
     "--moe-a2a-backend",
     "deepep",
     "--deepep-mode",

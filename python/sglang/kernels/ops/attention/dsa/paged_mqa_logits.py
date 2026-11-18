@@ -102,6 +102,7 @@ def aiter_paged_mqa_logits(
     *,
     preshuffle: bool,
     kv_block_size: int,
+    persistent_schedule: torch.Tensor | None = None,
 ) -> torch.Tensor:
     from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
@@ -122,6 +123,65 @@ def aiter_paged_mqa_logits(
         max_seq_len,
         Preshuffle=preshuffle,
         KVBlockSize=kv_block_size,
+        # older aiter pins (the gfx1151 image's) have no PersistentSchedule
+        **(
+            {}
+            if persistent_schedule is None
+            else {"PersistentSchedule": persistent_schedule}
+        ),
+    )
+    return logits
+
+
+def aiter_paged_mqa_logits_persistent_schedule(
+    seq_lens: torch.Tensor, max_seq_len: int
+) -> torch.Tensor:
+    """Work table that splits every row's chunks evenly over the grid by its real length
+    (one query row per entry of seq_lens); built on the device, so graph-safe."""
+    from aiter.ops.triton.pa_mqa_logits import (
+        deepgemm_fp8_paged_mqa_logits_persistent_schedule,
+    )
+
+    return deepgemm_fp8_paged_mqa_logits_persistent_schedule(
+        seq_lens.shape[0], 1, seq_lens, max_seq_len
+    )
+
+
+def aiter_paged_mqa_logits_verify(
+    q_fp8: torch.Tensor,
+    kv_cache_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    request_lens: torch.Tensor,
+    request_block_tables: torch.Tensor,
+    max_seq_len: int,
+    *,
+    q_offset: int,
+    B: int,
+    next_n: int,
+    kv_block_size: int,
+) -> torch.Tensor:
+    """Target-verify logits with Q as [B, next_n] rows, so a request's draft rows share
+    one pass over its index-K pages.
+
+    Row n of a request scores keys up to its last row's length - next_n + n; the top-k
+    bounds every row by its own length."""
+    from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+
+    logits = torch.empty(
+        (q_offset, max_seq_len), device=q_fp8.device, dtype=torch.float32
+    )
+    deepgemm_fp8_paged_mqa_logits(
+        q_fp8[:q_offset].view(B, next_n, q_fp8.shape[1], q_fp8.shape[2]),
+        kv_cache_fp8,
+        weights[:q_offset],
+        logits,
+        request_lens,
+        request_block_tables,
+        max_seq_len,
+        Preshuffle=True,
+        KVBlockSize=kv_block_size,
+        # 4 waves/EU beat the default 2 on MI350X verify; the kernel fits 128 VGPRs
+        WavePerEU=4,
     )
     return logits
 

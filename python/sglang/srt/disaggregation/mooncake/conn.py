@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.mooncake.utils import (
     _validate_efa_allocator_compatibility,
     check_mooncake_custom_mem_pool_enabled,
 )
+from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
     align_window_tails,
     build_dsa_tail_transfer_blocks,
@@ -549,6 +550,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.deregister_buffer_to_engine()
         except Exception:
             logger.exception("Failed to deregister buffers during teardown")
+
+        if isinstance(self.request_status, PPConsensusStore):
+            self.request_status.close()
 
         logger.info(
             "MooncakeKVManager torn down (was role=%s)",
@@ -1144,6 +1148,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     f"decode={registration_info.dst_attn_tp_size}"
                 )
         state_types = getattr(self.kv_args, "state_types", [])
+        if (
+            StateType.DRAFT_RING in state_types
+            and self.kv_args.draft_kv_ring_paged
+            and registration_info.dst_attn_tp_size != self.attn_tp_size
+        ):
+            # An MHA draft's ring rows hold this rank's head shard, sent unsliced.
+            return False, (
+                "A DFLASH MHA draft KV ring needs the same attention TP size: "
+                f"prefill={self.attn_tp_size}, "
+                f"decode={registration_info.dst_attn_tp_size}"
+            )
         fully_checked = True
         for i, st in enumerate(state_types):
             if not self._is_generic_kvcache_state_type(st):
@@ -2902,10 +2917,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     and staging_buffer is not None
                 ):
                     staging_strategy = self._try_create_staging_strategy(staging_buffer)
-                reqs_to_be_processed = (
-                    self.transfer_infos[kv_chunk.room].values()
-                    if kv_chunk.room in self.transfer_infos
-                    else []
+                reqs_to_be_processed = list(
+                    self.transfer_infos.get(kv_chunk.room, {}).values()
                 )
                 polls = []
                 dst_ranks_infos = []
@@ -3165,6 +3178,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 else 0
                             )
                             if ret != 0:
+                                with self.session_lock:
+                                    self.session_failures[req.mooncake_session_id] += 1
+                                    self.failed_sessions.add(req.mooncake_session_id)
+                                    logger.error(
+                                        f"Session {req.mooncake_session_id} failed."
+                                    )
                                 # The aux write targets decode's metadata
                                 # slot, which the deferred release also frees.
                                 self._poison_unsettled_send(req.room)
