@@ -139,7 +139,7 @@ class _FakeReq(FakeReq):
 
 def _accumulator(
     current_weight_version="default",
-    return_sampling_mask=False,
+    return_sampling_logprobs=False,
     request_level_keys=frozenset(),
     output_sink=OutputSink.DETOKENIZER,
 ):
@@ -148,7 +148,7 @@ def _accumulator(
         return_hidden_states=False,
         return_routed_experts=False,
         return_indexer_topk=False,
-        return_sampling_mask=return_sampling_mask,
+        return_sampling_logprobs=return_sampling_logprobs,
         spec_algorithm=SpeculativeAlgorithm.NONE,
         disaggregation_mode=DisaggregationMode.NULL,
         default_stream_interval=1,
@@ -999,7 +999,7 @@ class TestOutputStreamerSamplingMasks(unittest.TestCase):
                 support = _FakeReq(
                     "support", array("q", [9, 6]), sampling_mask_rows=support_rows
                 )
-                accumulator = _accumulator(return_sampling_mask=True)
+                accumulator = _accumulator(return_sampling_logprobs=True)
                 for req in (selected, _FakeReq("plain", array("q", [1])), support):
                     accumulator.accept(req=req)
                 payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
@@ -1024,7 +1024,7 @@ class TestOutputStreamerSamplingMasks(unittest.TestCase):
                     ),
                     ([[5, 3], [7]], [-0.5, 0.0]),
                 )
-                accumulator = _accumulator(return_sampling_mask=True)
+                accumulator = _accumulator(return_sampling_logprobs=True)
                 accumulator.accept(req=selected)
                 masks = round_trip(
                     accumulator.to_payload(dp_rank=0, is_idle_batch=False)
@@ -1093,7 +1093,7 @@ class TestOutputStreamerSamplingMasks(unittest.TestCase):
                         else:
                             expected[i][1].append(float(selected[row]))
                     if step in (0, 1, 5, 6, 11):
-                        accumulator = _accumulator(return_sampling_mask=True)
+                        accumulator = _accumulator(return_sampling_logprobs=True)
                         for req in reqs:
                             accumulator.accept(req=req)
                         chunks = round_trip(
