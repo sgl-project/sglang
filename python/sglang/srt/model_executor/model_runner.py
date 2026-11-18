@@ -2169,8 +2169,13 @@ class ModelRunner:
                     and not self.is_draft_worker
                 ):
                     mamba_pool = self.req_to_token_pool.mamba_pool
-                    # KDA TP PD decode: import received states before anything reads them.
-                    mamba_pool.pd_staging.run_imports(mamba_pool, forward_batch)
+                    if mamba_pool.pd_staging is not None:
+                        # KDA TP PD decode: import received states before anything reads them.
+                        mamba_pool.pd_staging.run_imports(mamba_pool, forward_batch)
+                    elif any(forward_batch.dp_kda_tp_state_imports):
+                        raise RuntimeError(
+                            "KDA TP: state imports advertised without PD staging"
+                        )
 
             # Replay cuda graph if applicable
             if can_run_graph:
