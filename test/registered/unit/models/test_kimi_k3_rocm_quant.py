@@ -5,7 +5,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import unittest
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -21,7 +21,12 @@ from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
 from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
 from sglang.srt.models import kimi_k3, kimi_k3_rocm_quant
 from sglang.srt.models.kimi_k3 import KimiK3DeltaAttention, _is_unquantized_mergeable
-from sglang.srt.models.kimi_k3_rocm_kda_verify import KimiK3HipFusedVerify
+from sglang.srt.models.kimi_k3_amd import kda as kimi_k3_kda_hip
+from sglang.srt.models.kimi_k3_amd.kda import (
+    KimiK3HipFusedVerify,
+    build_fused_verify_hip,
+    prepare_fused_kda_hip,
+)
 from sglang.srt.models.kimi_k3_rocm_quant import (
     _k3_channel_fp8_to_bf16,
     k3_fused_decode_f_b_weight,
@@ -167,7 +172,7 @@ def _armable_hip_attention() -> SimpleNamespace:
     """A stand-in KDA attention whose static inputs fit the fused decode kernel."""
     heads, dim = 12, 128
     f_b_weight = torch.zeros(heads * dim, dim, dtype=torch.bfloat16)
-    attention = SimpleNamespace(
+    return SimpleNamespace(
         attn=SimpleNamespace(
             conv_weights=torch.zeros(3 * heads * dim, 4),
             A_log=torch.zeros(heads),
@@ -184,14 +189,10 @@ def _armable_hip_attention() -> SimpleNamespace:
             )
         ),
     )
-    attention._prepare_fused_verify_hip = MethodType(
-        KimiK3DeltaAttention._prepare_fused_verify_hip, attention
-    )
-    return attention
 
 
 class TestHipFusedDecodeArming(CustomTestCase):
-    """_prepare_fused_decode_hip on a stand-in attention module."""
+    """prepare_fused_kda_hip on a stand-in attention module."""
 
     def test_failed_rearm_drops_the_previous_arming(self):
         """A re-run that cannot arm (here the backend reports unavailable) must not
@@ -207,7 +208,6 @@ class TestHipFusedDecodeArming(CustomTestCase):
         attention = SimpleNamespace(
             attn=layer,
             _kda_hip_fused_decode_ready=True,
-            _kda_hip_fused_verify_ready=True,
             f_b_proj=SimpleNamespace(weight=torch.empty(12 * 128, 128)),
             config=SimpleNamespace(
                 mamba2_cache_params=SimpleNamespace(
@@ -223,10 +223,9 @@ class TestHipFusedDecodeArming(CustomTestCase):
                 kda_fused_decode_aiter_hip, "available", return_value=False
             ),
         ):
-            KimiK3DeltaAttention._prepare_fused_decode_hip(attention)
+            prepare_fused_kda_hip(attention)
 
         self.assertFalse(attention._kda_hip_fused_decode_ready)
-        self.assertFalse(attention._kda_hip_fused_verify_ready)
         self.assertIsNone(layer._k3_hip_fused_decode_args)
         self.assertIsNone(layer._k3_hip_fused_decode_ops)
         self.assertIsNone(layer.kda_fused_verify)
@@ -248,9 +247,6 @@ class TestHipFusedDecodeArming(CustomTestCase):
                 _k3_hip_fused_decode_args=decode_args,
                 kda_fused_verify=None,
             )
-            attention = SimpleNamespace(
-                attn=layer, use_full_rank_gate=True, _kda_hip_fused_verify_ready=False
-            )
             with (
                 self.subTest(topk=topk, host_only=host_only),
                 get_context().override_server_args(
@@ -264,16 +260,14 @@ class TestHipFusedDecodeArming(CustomTestCase):
                     kda_fused_verify_aiter_hip, "available", return_value=True
                 ) as available,
                 mock.patch.object(kda_fused_verify_aiter_hip, "warmup") as warmup,
-                mock.patch.object(kimi_k3, "print_warning_once") as warn,
+                mock.patch.object(kimi_k3_kda_hip, "print_warning_once") as warn,
             ):
-                KimiK3DeltaAttention._prepare_fused_verify_hip(
-                    attention, state_dtype=torch.bfloat16
+                hook = build_fused_verify_hip(
+                    layer=layer, use_full_rank_gate=True, state_dtype=torch.bfloat16
                 )
-                self.assertEqual(attention._kda_hip_fused_verify_ready, armed)
                 self.assertEqual(available.called, armed)
                 self.assertEqual(warmup.called, armed)
                 self.assertEqual(warn.called, not armed)
-                hook = layer.kda_fused_verify
                 self.assertEqual(hook is not None, armed)
                 if armed:
                     self.assertIsInstance(hook, KimiK3HipFusedVerify)
@@ -305,12 +299,12 @@ class TestHipFusedDecodeArming(CustomTestCase):
                         wraps=attention._fused_decode_f_b_weight,
                     ) as f_b_weight,
                     mock.patch.object(fused_ops, "warmup") as warmup,
-                    mock.patch.object(kimi_k3, "print_warning_once") as warn,
+                    mock.patch.object(kimi_k3_kda_hip, "print_warning_once") as warn,
                 ):
-                    KimiK3DeltaAttention._prepare_fused_decode_hip(attention)
+                    prepare_fused_kda_hip(attention)
 
                     self.assertEqual(attention._kda_hip_fused_decode_ready, armed)
-                    self.assertFalse(attention._kda_hip_fused_verify_ready)
+                    self.assertIsNone(attention.attn.kda_fused_verify)
                     self.assertEqual(
                         attention.attn._k3_hip_fused_decode_args is not None, armed
                     )
@@ -352,12 +346,11 @@ class TestHipFusedDecodeArming(CustomTestCase):
                 mock.patch.object(
                     kda_fused_verify_aiter_hip, "warmup"
                 ) as verify_warmup,
-                mock.patch.object(kimi_k3, "print_warning_once"),
+                mock.patch.object(kimi_k3_kda_hip, "print_warning_once"),
             ):
-                KimiK3DeltaAttention._prepare_fused_decode_hip(attention)
+                prepare_fused_kda_hip(attention)
 
                 self.assertFalse(attention._kda_hip_fused_decode_ready)
-                self.assertTrue(attention._kda_hip_fused_verify_ready)
                 self.assertIsNotNone(attention.attn._k3_hip_fused_decode_args)
                 self.assertIsNone(attention.attn._k3_hip_fused_decode_ops)
                 self.assertEqual(attention.attn.kda_fused_verify.num_draft_tokens, 5)

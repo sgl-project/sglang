@@ -467,12 +467,12 @@ def handle_linear_attn_backend(server_args: Any):
                 "EAGLE tree verify. Got "
                 f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
             )
-        # KDA's aiter verify (Kimi-K3's fused kernel, triton otherwise) writes
-        # the ring; GDN's does not.
-        kda_aiter_verify = verify == "aiter" and uses_kda_attention(
+        # A KDA model's aiter verify runs the KDA chain (Kimi-K3's fused kernel,
+        # triton otherwise), which writes the ring; GDN's does not.
+        kda_chain_verify = verify == "aiter" and uses_kda_attention(
             model_config_of(server_args).hf_config
         )
-        if verify == "aiter" and not kda_aiter_verify:
+        if verify == "aiter" and not kda_chain_verify:
             raise ValueError(
                 "--enable-linear-replayssm-spec verifies through its own "
                 "ReplaySSM kernels and cannot use "
@@ -500,7 +500,7 @@ def handle_linear_attn_backend(server_args: Any):
             _algo = (cfg.speculative_algorithm or "").upper()
             verify = cfg.linear_attn_verify_backend
             ring_writing = ("triton", "nv_cutedsl") + (
-                ("aiter",) if kda_aiter_verify else ()
+                ("aiter",) if kda_chain_verify else ()
             )
             if _algo not in ("DSPARK", "DFLASH") or verify not in ring_writing:
                 raise ValueError(

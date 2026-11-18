@@ -94,6 +94,20 @@ class KDAFusedVerify(Protocol):
         ...
 
 
+# The kernel a model's KDAFusedVerify runs under --linear-attn-verify-backend aiter.
+_FUSED_VERIFY_HOOK_OP = "attention.kda_fused_verify_aiter_hip"
+
+
+def _kernel_runs_here(op: str) -> bool:
+    """Whether a registered implementation of ``op`` declares this device."""
+    from sglang.kernels import PlatformInfo, capabilities_satisfied, registry
+
+    platform = PlatformInfo.detect()
+    return any(
+        capabilities_satisfied(spec.capabilities, platform) for spec in registry.get(op)
+    )
+
+
 def _validate_flashinfer_kda_prefill(
     *,
     chunk_size: int,
@@ -225,7 +239,7 @@ class KDAKernelDispatcher:
         elif verify_backend.is_aiter():
             # A model's KDAFusedVerify hook runs the batches it covers; the rest
             # take the Triton chain.
-            if not is_hip():
+            if not _kernel_runs_here(_FUSED_VERIFY_HOOK_OP):
                 raise ValueError("KDA aiter verify backend requires ROCm")
             self.verify_kernel = triton_kernel
         elif verify_backend.is_custom():

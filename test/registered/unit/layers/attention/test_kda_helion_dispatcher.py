@@ -213,6 +213,36 @@ class TestHelionKDADispatcher(unittest.TestCase):
                         with self.assertRaisesRegex(ValueError, error):
                             handle_linear_attn_backend(args)
 
+    def test_aiter_verify_asks_its_kernels_declared_devices(self):
+        """--linear-attn-verify-backend aiter takes the Triton chain behind the
+        model's fused-verify hook on a device the hook's registered kernel declares,
+        and is rejected elsewhere; the check reads the KernelSpec, not is_hip()."""
+        from sglang.kernels import PlatformInfo
+
+        for device_type, accepted in (("hip", True), ("cuda", False), ("cpu", False)):
+            with (
+                self.subTest(device_type=device_type),
+                patch.object(
+                    PlatformInfo,
+                    "detect",
+                    return_value=PlatformInfo(device_type=device_type),
+                ),
+            ):
+                if accepted:
+                    dispatcher, _, _ = self._make_dispatcher(
+                        LinearAttnKernelBackend.TRITON,
+                        LinearAttnKernelBackend.TRITON,
+                        LinearAttnKernelBackend.AITER,
+                    )
+                    self.assertIsInstance(dispatcher.verify_kernel, TritonKDAKernel)
+                else:
+                    with self.assertRaisesRegex(ValueError, "requires ROCm"):
+                        self._make_dispatcher(
+                            LinearAttnKernelBackend.TRITON,
+                            LinearAttnKernelBackend.TRITON,
+                            LinearAttnKernelBackend.AITER,
+                        )
+
     def test_explicit_base_backend_is_not_replaced_by_flashinfer(self):
         args = ServerArgs(
             model_path="dummy",

@@ -786,7 +786,7 @@ def test_aiter_fused_verify_matches_unfused_backend(ring: bool) -> None:
     from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
     from sglang.srt.mem_cache.memory_pool import MambaPool
     from sglang.srt.model_executor.forward_mode import ForwardMode
-    from sglang.srt.models.kimi_k3_rocm_kda_verify import KimiK3HipFusedVerify
+    from sglang.srt.models.kimi_k3_amd.kda import KimiK3HipFusedVerify
 
     torch.manual_seed(20261104)
     batch, steps, num_slots, ring_len = 3, 5, 7, 8
