@@ -528,6 +528,23 @@ class TestAbortOutputPayload(CustomTestCase):
                 self.assertEqual(out["output_ids"], expected)
                 self.assertEqual(out["meta_info"]["completion_tokens"], 3)
 
+    def test_abort_coalesces_only_the_pending_text_delta(self):
+        """Incremental abort output must not repeat text already sent."""
+        tm = _make_tokenizer_manager(self)
+        tm.incremental_streaming_output = True
+        rid = "abort_pending_text_rid"
+        state = _make_req_state(rid)
+        state.obj.stream = True
+        state.output_ids = [5, 6, 7]
+        state.text = "already sent"
+        state.text_chunks.append("pending")
+        tm.rid_to_state[rid] = state
+
+        tm._handle_abort_req(_make_abort_req(rid))
+
+        self.assertEqual(state.out_list[0]["text"], "")
+        self.assertEqual(state.get_text(), "already sentpending")
+
 
 class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
     """Test that _handle_batch_output removes rid from rid_to_state on completion."""

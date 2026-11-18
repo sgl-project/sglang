@@ -43,6 +43,35 @@ class _Tokenizer:
         return [self.decode(ids, **kwargs) for ids in ids_list]
 
 
+class _StopTokenizer:
+    is_fast = True
+    _pieces = {
+        1: "S",
+        2: "<special>",
+        3: "T",
+        4: ".",
+        5: "ST",
+        6: "S.T",
+        7: "X",
+    }
+
+    def decode(
+        self,
+        ids,
+        skip_special_tokens=False,
+        spaces_between_special_tokens=True,
+    ):
+        return "".join(
+            piece
+            for token_id in ids
+            for piece in [self._pieces[token_id]]
+            if not (skip_special_tokens and token_id in (2, 5))
+        )
+
+    def batch_decode(self, ids_list, **kwargs):
+        return [self.decode(ids, **kwargs) for ids in ids_list]
+
+
 def _header(prompt_tail_ids, *, skip_special_tokens=True, ipc="worker-a"):
     return DetokenizeHeader(
         prompt_tail_ids=array("q", prompt_tail_ids),
@@ -102,9 +131,9 @@ def _output(sent, rows, *, ipc="worker-a"):
     )
 
 
-def _detokenizer(capacity=16):
+def _detokenizer(capacity=16, tokenizer=None):
     detok = DetokenizerManager.__new__(DetokenizerManager)
-    detok.tokenizer = _Tokenizer()
+    detok.tokenizer = tokenizer or _Tokenizer()
     detok.vocab_size = None
     detok.detokenize_state_table = DetokenizeStateTable(capacity=capacity)
     detok.disable_tokenizer_batch_decode = False
@@ -178,7 +207,7 @@ class TestDetokenizeState(CustomTestCase):
             texts += out.output_strs
 
         self.assertEqual(texts, ["3.", f"<{SPECIAL}>4.", "5."])
-        self.assertIsNone(detok.detokenize_state_table.get("r"))
+        self.assertIsNone(detok.detokenize_state_table.get("r", "worker-a"))
 
     def test_new_header_replaces_the_state_of_a_reused_rid(self):
         detok = _detokenizer()
@@ -193,7 +222,10 @@ class TestDetokenizeState(CustomTestCase):
 
         self.assertEqual(out.output_strs, ["7."])
         self.assertEqual(out.http_worker_ipcs, ["worker-b"])
-        self.assertEqual(list(detok.detokenize_state_table.get("r").decode_ids), [6, 7])
+        self.assertEqual(
+            list(detok.detokenize_state_table.get("r", "worker-b").decode_ids),
+            [6, 7],
+        )
 
     def test_a_row_without_state_drops_only_its_text(self):
         """A row still in flight when its request was released (overlap scheduling)
@@ -211,8 +243,10 @@ class TestDetokenizeState(CustomTestCase):
         )
 
         detok.init_request_dispatcher()
-        detok._request_dispatcher(DetokenizeReleaseReq(rid="gone"))
-        self.assertIsNone(detok.detokenize_state_table.get("gone"))
+        detok._request_dispatcher(
+            DetokenizeReleaseReq(rid="gone", http_worker_ipc="worker-a")
+        )
+        self.assertIsNone(detok.detokenize_state_table.get("gone", "worker-a"))
         with self.assertLogs(
             "sglang.srt.managers.detokenizer_manager", level="WARNING"
         ) as logs:
@@ -284,6 +318,67 @@ class TestDetokenizeState(CustomTestCase):
         s = table.start(rid="r", header=_header([-101, 3, 12]), vocab_size=10)
 
         self.assertEqual(s.decode_ids, [0, 3, 0])
+
+    def test_capacity_does_not_evict_an_active_stream(self):
+        table = DetokenizeStateTable(capacity=1)
+        active = table.start(rid="active", header=_header([1]), vocab_size=None)
+
+        self.assertIsNotNone(active)
+        self.assertIsNone(table.start(rid="new", header=_header([2]), vocab_size=None))
+        self.assertIs(table.get("active", "worker-a"), active)
+
+        table.release("active", "worker-a")
+        self.assertIsNotNone(
+            table.start(rid="new", header=_header([2]), vocab_size=None)
+        )
+
+    def test_same_rid_on_two_workers_has_independent_state(self):
+        table = DetokenizeStateTable(capacity=2)
+        worker_a = table.start(
+            rid="r", header=_header([1], ipc="worker-a"), vocab_size=None
+        )
+        worker_b = table.start(
+            rid="r", header=_header([2], ipc="worker-b"), vocab_size=None
+        )
+
+        self.assertIsNot(worker_a, worker_b)
+        self.assertEqual(worker_a.decode_ids, [1])
+        self.assertEqual(worker_b.decode_ids, [2])
+        table.release("r", "worker-a")
+        self.assertIsNone(table.get("r", "worker-a"))
+        self.assertIs(table.get("r", "worker-b"), worker_b)
+
+    def test_skipped_special_token_does_not_move_terminal_stop(self):
+        for terminal_ids in ([2, 3], [5]):
+            with self.subTest(terminal_ids=terminal_ids):
+                detok = _detokenizer(tokenizer=_StopTokenizer())
+                sent = {}
+                first = detok.handle_batch_token_id_out(
+                    _output(
+                        sent,
+                        [("r", [1], _header([], ipc="worker-a"), False)],
+                    )
+                )
+                terminal = detok.handle_batch_token_id_out(
+                    _output(sent, [("r", terminal_ids, None, True)])
+                )
+
+                self.assertEqual(first.output_strs, ["S"])
+                self.assertEqual(terminal.output_strs, [""])
+                self.assertEqual(terminal.http_worker_ipcs, ["worker-a"])
+
+    def test_regex_like_stop_does_not_trim_an_earlier_literal(self):
+        detok = _detokenizer(tokenizer=_StopTokenizer())
+        sent = {}
+        first = detok.handle_batch_token_id_out(
+            _output(sent, [("r", [6], _header([], ipc="worker-a"), False)])
+        )
+        terminal = detok.handle_batch_token_id_out(
+            _output(sent, [("r", [1, 7, 3], None, True)])
+        )
+
+        self.assertEqual(first.output_strs, ["S.T"])
+        self.assertEqual(terminal.output_strs, ["SXT"])
 
     def test_a_row_that_does_not_continue_the_received_ids_raises_an_alarm(self):
         """A break warns (raises in CI) and still decodes; beam rows are exempt."""

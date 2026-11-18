@@ -66,7 +66,7 @@ RUST_SERVER_IGNORED_BY_DESIGN: Dict[str, str] = {
     "rl_on_policy_target": "Puts Python's fast image processor on CPU and caps its workers; the Rust resize runs on CPU.",
     "SGLANG_USE_IPC_POOL_HANDLE_CACHE": "Python's CUDA IPC feature transport; Rust pipelines pick their own.",
     "mm_feature_transport": "Python's feature transport; Rust pipelines pick their own.",
-    "SGLANG_DETOKENIZER_MAX_STATES": "Bounds Python's detokenizer state LRU; Rust keeps a request's state for its life.",
+    "SGLANG_DETOKENIZER_MAX_STATES": "Bounds Python's detokenizer states; Rust keeps a request's state for its life.",
     "disable_tokenizer_batch_decode": "Python detokenizer batching.",
     "enable_tokenizer_batch_encode": "Python tokenizer batching.",
     "enable_dynamic_batch_tokenizer": "Python tokenizer batching.",
