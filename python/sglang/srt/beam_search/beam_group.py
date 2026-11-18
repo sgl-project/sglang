@@ -23,9 +23,8 @@ split documented in coordinator.py.
 
 from __future__ import annotations
 
-from collections import deque
-
 import enum
+from collections import deque
 from typing import List, Optional, Sequence
 
 import msgspec
