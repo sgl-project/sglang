@@ -53,6 +53,12 @@ def _uniform_indptr(num_tokens: int, width: int, device: str) -> torch.Tensor:
     return indptr
 
 
+def hip_kv_layout_interleaved() -> bool:
+    """Whether the HIP DeepSeek-V4 caches use the token-interleaved V4.1 layouts
+    (SGLANG_DSV4_KV_LAYOUT=v41_new), which only the opus attention reads."""
+    return is_hip() and envs.SGLANG_DSV4_KV_LAYOUT.get().lower() == "v41_new"
+
+
 def aiter_sparse_decode_fwd(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -64,11 +70,35 @@ def aiter_sparse_decode_fwd(
     inv_rope: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    csr_cache: Optional[dict] = None,
     **_,
 ):
     """aiter's gfx950 gluon sparse decode kernel (pa_decode_sparse) behind the
     flash_mla_with_kvcache shapes. Only -1 entries are skipped, so callers fold
     topk_length into the index lists; inv_rope folds the model's inverse RoPE into the output."""
+    if hip_kv_layout_interleaved():
+        from sglang.kernels.ops.attention.dsv4.opus_v41_attention_hip import (
+            opus_v41_sparse_attention,
+        )
+
+        b, s, h, d = q.shape
+        out = opus_v41_sparse_attention(
+            q.reshape(b * s, h, d),
+            k_cache,
+            indices,
+            topk_length,
+            attn_sink,
+            softmax_scale,
+            extra_k_cache=extra_k_cache,
+            extra_indices=extra_indices_in_kvcache,
+            extra_topk_length=(
+                extra_topk_length if extra_k_cache is not None else None
+            ),
+            csr_cache=csr_cache,
+        )
+        if inv_rope is not None:
+            _apply_inverse_rope(out, inv_rope)
+        return out.view(b, s, h, d), None
     if k_cache.shape[-1] in (
         KVLayout.V41.bytes_per_token,
         KVLayout.V41_FP4.bytes_per_token,
