@@ -528,7 +528,8 @@ fn _server(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod shm_buffer_tests {
     use super::ShmBuffer;
-    use crate::utils::shm::{ShmSegment, shm_exists, unique_name};
+    use crate::utils::platform::shm_exists;
+    use crate::utils::shm::{ShmSegment, unique_name};
 
     fn buffer() -> (ShmBuffer, String) {
         let name = unique_name("test");

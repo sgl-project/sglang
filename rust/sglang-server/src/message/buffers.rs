@@ -231,7 +231,8 @@ pub fn find<'a>(buffers: &'a [Buffer], name: &str) -> Option<&'a Buffer> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::shm::{shm_exists, shm_read, unique_name};
+    use crate::utils::platform::{shm_exists, shm_read};
+    use crate::utils::shm::unique_name;
 
     /// An inline buffer keeps its typed vector; a shm buffer holds the same
     /// bytes in a segment that lives exactly as long as the buffer.

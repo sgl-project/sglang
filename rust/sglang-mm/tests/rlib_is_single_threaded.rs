@@ -35,22 +35,24 @@ fn threads() -> (usize, Vec<String>) {
     }
     #[cfg(target_os = "macos")]
     {
-        let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::uninit();
+        // SAFETY: proc_taskinfo is plain data, so all-zero is a valid value;
+        // libproc overwrites at most `size` bytes of it.
+        let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
-        // SAFETY: libproc fills `size` bytes of a plain-data struct we own and
-        // reports how many it wrote; the value is read only after that check.
         let written = unsafe {
             libc::proc_pidinfo(
                 std::process::id() as libc::c_int,
                 libc::PROC_PIDTASKINFO,
                 0,
-                info.as_mut_ptr().cast(),
+                (&mut info as *mut libc::proc_taskinfo).cast(),
                 size,
             )
         };
         assert_eq!(written, size, "proc_pidinfo(PROC_PIDTASKINFO)");
-        let info = unsafe { info.assume_init() };
-        (usize::try_from(info.pti_threadnum).unwrap_or(0), Vec::new())
+        (
+            usize::try_from(info.pti_threadnum).expect("thread count"),
+            Vec::new(),
+        )
     }
 }
 

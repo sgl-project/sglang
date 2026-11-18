@@ -23,7 +23,7 @@ use crate::HttpLayer;
 use crate::message::config::RuntimeConfig;
 use crate::message::detok::DetokMsg;
 
-use super::threads::{frontend_cpu_set, join_all_with_timeout, pin_current, spawn_pool};
+use super::threads::{frontend_cpu_set, join_all_with_timeout, spawn_pool};
 use crate::tokenizer_manager::channel::{
     FromSchedulerRx, FromSchedulerTx, ToSchedulerRx, ToSchedulerTx, from_scheduler, to_scheduler,
 };
@@ -573,12 +573,12 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             .spawn(move || {
                 // This thread runs `block_on` (the listeners' accept loops);
                 // the runtime's worker and blocking threads pin on start.
-                pin_current(cpus.as_ref());
+                super::platform::pin_current(cpus.as_ref());
                 let mut builder = tokio::runtime::Builder::new_multi_thread();
                 builder
                     .worker_threads(cfg.rust_server_args.http_api_worker_num)
                     .enable_all()
-                    .on_thread_start(move || pin_current(cpus.as_ref()));
+                    .on_thread_start(move || super::platform::pin_current(cpus.as_ref()));
                 let rt = builder.build().expect("build api runtime");
                 rt.block_on(async move {
                     let http = api_server::http::app::serve(
@@ -965,6 +965,7 @@ mod tests {
     /// drain signal's byte counts, as a wakeup fd carries every caught signal.
     /// Once the listeners have closed, the scheduler's parked wait ends and
     /// the launching process gets its datagram.
+    #[cfg(target_os = "linux")]
     #[test]
     fn drain_signal_fd_begins_the_drain_and_reports_its_end() {
         use std::io::Write;
@@ -1012,6 +1013,7 @@ mod tests {
     /// the drain completes, and the launching process hears of it, only on
     /// the release. A release before any drain began is ignored, and the
     /// hold cannot be taken once a drain began.
+    #[cfg(target_os = "linux")]
     #[test]
     fn held_drain_end_waits_for_the_release() {
         let name = format!("sglang-drain-hold-test-{}", std::process::id());

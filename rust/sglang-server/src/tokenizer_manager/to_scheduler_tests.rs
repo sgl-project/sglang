@@ -9,7 +9,8 @@ use crate::message::sampling::SamplingParams;
 use crate::multi_modality::worker::MediaError;
 use crate::tokenizer_manager::channel::{ToSchedulerRx, to_scheduler};
 use crate::utils::fsm::{AfterTokenize, RequestState};
-use crate::utils::shm::{shm_exists, unique_name};
+use crate::utils::platform::shm_exists;
+use crate::utils::shm::unique_name;
 use tokio::sync::mpsc;
 
 /// An `Intake` plus its detok-shard receiver, to_scheduler channel consumer (keep alive —
