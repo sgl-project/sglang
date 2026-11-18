@@ -1889,8 +1889,13 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_AITER_UNIFIED_ATTN</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use the AITER unified attention kernel. <code>1</code>/<code>true</code> turns it on and <code>0</code>/<code>false</code> off for every runner, a DSpark draft included; unset, only a DSpark MHA draft on the aiter backend uses it. Any other value, empty included, warns and counts as unset.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use the AITER unified attention kernel. <code>1</code>/<code>true</code> turns it on for every runner and also lets a DSpark draft that inherits <code>--attention-backend aiter</code> run on aiter; <code>0</code>/<code>false</code> turns it off for every runner and keeps a DSpark draft off aiter. Unset, only a DSpark MHA draft whose draft backend is named aiter (<code>--speculative-draft-attention-backend aiter</code>, or the Kimi-K3 default on ROCm) uses it; any other DSpark draft on aiter falls back to triton, as does every DSpark draft when the installed AITER <code>unified_attention</code> lacks <code>causal=False</code>. <code>yes</code>/<code>y</code> and <code>no</code>/<code>n</code> also parse; any other value, empty included, warns and counts as unset.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>unset</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AITER_UNIFIED_VERIFY</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With unified attention on, run topk=1 non-MLA target verify through AITER <code>unified_attention</code>; <code>0</code>/<code>false</code> keeps the triton extend kernel and keeps a DSpark draft off aiter. <code>yes</code>/<code>y</code> and <code>no</code>/<code>n</code> also parse; any other value, empty or <code>off</code> included, warns and keeps the default.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_AITER_FP8_PER_TOKEN</code></td>

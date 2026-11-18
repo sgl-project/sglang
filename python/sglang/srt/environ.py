@@ -1097,7 +1097,8 @@ class Envs:
     # input anyway, but router/shared-expert reads see rounded values, so this
     # stays accuracy-gated and default OFF.
     SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(False)
-    # None (unset): only a DSpark MHA draft takes unified_attention; set, it decides for all.
+    # None (unset): only a DSpark MHA draft named onto aiter takes unified_attention;
+    # set, it decides for all, and True also lets a DSpark draft inherit aiter.
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(None)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated

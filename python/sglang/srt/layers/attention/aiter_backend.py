@@ -52,6 +52,7 @@ from sglang.srt.utils import (
     is_gfx1250_supported,
     print_info_once,
 )
+from sglang.srt.utils.aiter import aiter_unified_attention_supports_non_causal
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -855,6 +856,19 @@ class AiterAttnBackend(AttentionBackend):
                     use_mla=self.use_mla,
                     kv_cache_is_vectorized_5d=self.kv_cache_is_vectorized_5d,
                 )
+            )
+        # A DSpark draft's layers are ENCODER_ONLY: its unified verify takes causal=False.
+        if (
+            self.use_triton_unified_attention
+            and not self.use_mla
+            and model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_dspark()
+            and not aiter_unified_attention_supports_non_causal()
+        ):
+            raise ValueError(
+                "The DSpark draft runs aiter unified_attention with causal=False, "
+                "which the installed AITER lacks (ROCm/aiter#7244). Use "
+                "--speculative-draft-attention-backend triton for the draft."
             )
         # Deterministic mode allows aiter decode only for the paged_attention_ragged
         # path and aiter prefill only for the batch prefill path; the unified-attention

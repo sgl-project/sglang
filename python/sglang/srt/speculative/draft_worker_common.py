@@ -47,21 +47,35 @@ def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) 
     otherwise the process's prefill backend. Both are resolution's answers, so
     they come from the bags. A backend the draft worker does not support falls
     back to the platform default, with a warning when ``algo_label`` names the
-    caller.
+    caller. aiter serves only a DSpark draft, and an inherited aiter only when
+    ``SGLANG_USE_AITER_UNIFIED_ATTN=1``.
     """
     # FlashInfer is CUDA-only; fall back to triton on XPU and ROCm.
     platform_fallback = (
         "triton" if (get_platform().is_xpu or torch.version.hip) else "flashinfer"
     )
-    draft_backend = get_spec().speculative_draft_attention_backend
+    named_backend = get_spec().speculative_draft_attention_backend
+    draft_backend = named_backend
     if draft_backend is None:
         draft_backend, _ = attention_backends()
     if draft_backend is None:
         return platform_fallback
     if algo_label == "DFLASH" and draft_backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
         return draft_backend
-    if draft_backend == "aiter" and _aiter_serves_draft():
-        return draft_backend
+    if draft_backend == "aiter" and _is_dspark():
+        reject_reason = _aiter_dspark_draft_reject_reason(
+            is_named=named_backend == "aiter"
+        )
+        if reject_reason is None:
+            return draft_backend
+        if algo_label is not None:
+            logger.warning(
+                "%s draft worker cannot run on 'aiter' (%s). Falling back to '%s'.",
+                algo_label,
+                reject_reason,
+                platform_fallback,
+            )
+        return platform_fallback
     if draft_backend not in DRAFT_ATTENTION_BACKEND_CHOICES:
         fallback = platform_fallback
         if algo_label is not None:
@@ -77,30 +91,50 @@ def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) 
     return draft_backend
 
 
-def _aiter_serves_draft() -> bool:
-    # A DSpark draft verifies its block bidirectionally: only AITER unified_attention
-    # with causal=False serves that, and it takes no MLA, sliding window, 5D or unified-memory pool.
-    # Deterministic mode rejects unified_attention, so the draft stays on the fallback there.
+def _is_dspark() -> bool:
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    return SpeculativeAlgorithm.from_string(
+        get_spec().speculative_algorithm
+    ).is_dspark()
+
+
+def _aiter_dspark_draft_reject_reason(*, is_named: bool) -> Optional[str]:
+    """Why the aiter backend cannot serve this DSpark draft, or None when it can."""
     from sglang.srt.environ import envs
     from sglang.srt.speculative.dspark_components.dspark_config import (
         draft_has_sliding_window,
         draft_is_mla,
     )
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
     from sglang.srt.utils.aiter import aiter_unified_attention_supports_non_causal
 
-    spec_algo = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
-    return (
-        spec_algo.is_dspark()
-        and envs.SGLANG_USE_AITER_UNIFIED_ATTN.get() is not False
-        and envs.SGLANG_AITER_UNIFIED_VERIFY.get()
-        and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "nhd"
-        and not get_memory().enable_unified_memory
-        and not get_exec().deterministic.enable_deterministic_inference
-        and aiter_unified_attention_supports_non_causal()
-        and not draft_is_mla()
-        and not draft_has_sliding_window()
-    )
+    unified_attn_env = envs.SGLANG_USE_AITER_UNIFIED_ATTN.get()
+    if unified_attn_env is False:
+        return "SGLANG_USE_AITER_UNIFIED_ATTN=0"
+    # Validated per model: a model hook (or the operator) names aiter for the draft;
+    # an aiter inherited from --attention-backend needs SGLANG_USE_AITER_UNIFIED_ATTN=1.
+    if not is_named and not unified_attn_env:
+        return (
+            "no model hook named it for this draft; pass "
+            "--speculative-draft-attention-backend aiter to opt in"
+        )
+    if not envs.SGLANG_AITER_UNIFIED_VERIFY.get():
+        return "SGLANG_AITER_UNIFIED_VERIFY=0"
+    if envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() != "nhd":
+        return "SGLANG_AITER_KV_CACHE_LAYOUT is not nhd"
+    if get_memory().enable_unified_memory:
+        return "unified memory"
+    # Deterministic mode rejects unified_attention.
+    if get_exec().deterministic.enable_deterministic_inference:
+        return "deterministic inference"
+    # The draft verifies its block bidirectionally, which needs causal=False.
+    if not aiter_unified_attention_supports_non_causal():
+        return "the installed AITER unified_attention has no causal=False"
+    if draft_is_mla():
+        return "MLA draft"
+    if draft_has_sliding_window():
+        return "sliding-window draft"
+    return None
 
 
 def build_draft_tp_worker(

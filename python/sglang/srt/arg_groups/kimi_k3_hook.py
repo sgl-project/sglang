@@ -3,7 +3,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    resolved_view,
+    resolving_view,
+)
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.runtime_context import get_platform
 
@@ -50,6 +54,24 @@ def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
         logger.info(
             "Kimi hybrid DSPARK: defaulting "
             "--speculative-draft-attention-backend to trtllm_mha."
+        )
+
+    # Validated on the Kimi-K3 DSpark draft (8 Q / 2 KV heads, head dim 64) on gfx950;
+    # the draft worker still falls back to triton when AITER lacks causal=False.
+    if (
+        cfg.speculative_algorithm == "DSPARK"
+        and cfg.speculative_draft_attention_backend is None
+        and get_platform().is_hip
+        and attention_backends_of(resolved_view(server_args))[0] == "aiter"
+    ):
+        declare_resolution(
+            server_args,
+            "apply_kimi_k3_spec_backend_defaults",
+            speculative_draft_attention_backend="aiter",
+        )
+        logger.info(
+            "Kimi hybrid DSPARK on ROCm: defaulting "
+            "--speculative-draft-attention-backend to aiter."
         )
 
 

@@ -212,7 +212,7 @@ Speculation: DSPARK holds block size + 1 (= 8) intermediate states per request �
 
 **Context length.** `--context-length` bounds the longest accepted request plus some context-scaled buffers; it does not size the KV pool. For long context the lever that adds capacity is `fp8_e4m3` KV.
 
-**DSPARK.** Adds `--speculative-algorithm DSPARK` plus the draft checkpoint on top of the showing strategy. Leave `--speculative-draft-attention-backend` unset. The published B300 DSPARK numbers pin the acceptance length with `SGLANG_SIMULATE_ACC_LEN`, so no measured acceptance rate exists for a real workload yet — measure against the same recipe running NOSPEC before adopting.
+**DSPARK.** Adds `--speculative-algorithm DSPARK` plus the draft checkpoint on top of the showing strategy. Leave `--speculative-draft-attention-backend` unset. On MI350X/MI355X with AITER attention the draft then defaults to `aiter`, which runs its bidirectional verify on AITER's non-causal `unified_attention` when the installed AITER has it ([ROCm/aiter#7244](https://github.com/ROCm/aiter/pull/7244)) and falls back to `triton` otherwise. The published B300 DSPARK numbers pin the acceptance length with `SGLANG_SIMULATE_ACC_LEN`, so no measured acceptance rate exists for a real workload yet — measure against the same recipe running NOSPEC before adopting.
 
 **Per-platform notes:**
 
