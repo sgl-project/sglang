@@ -72,6 +72,17 @@ POST /v1/classify
   - `completion_tokens`: Number of completion tokens (always 0 for classification)
   - `prompt_tokens_details`: Additional token details (optional)
 
+### Multi-label classification
+
+When the model's `config.json` sets `"problem_type": "multi_label_classification"`,
+`probs` contains an independent sigmoid probability for each class. These
+probabilities do not need to sum to one. For example, logits `[2.0, 2.0]` produce
+approximately `[0.880797, 0.880797]`, so both classes can be positive.
+
+`label` remains the top-scoring class for response compatibility. Apply your
+chosen thresholds to the complete `probs` vector to select multiple labels.
+Models with another or unspecified `problem_type` continue to use softmax.
+
 ## Example Usage
 
 ### Using curl
