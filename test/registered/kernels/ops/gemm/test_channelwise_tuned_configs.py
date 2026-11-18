@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from unittest import mock
 
 import pytest
@@ -210,3 +211,7 @@ def test_tuned_tile_matches_fp32_reference(rtx_pro_5000, N, K):
     error = (out.float() - reference).pow(2).mean().sqrt()
     relative = (error / reference.pow(2).mean().sqrt()).item()
     assert relative < 2e-2, f"N={N}, K={K}, M={M}: relative RMS {relative:.4f}"
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
