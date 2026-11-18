@@ -9,7 +9,7 @@ use crate::message::sampling::SamplingParams;
 use crate::multi_modality::worker::MediaError;
 use crate::tokenizer_manager::channel::{ToSchedulerRx, to_scheduler};
 use crate::utils::fsm::{AfterTokenize, RequestState};
-use crate::utils::shm::{shm_path, unique_name};
+use crate::utils::shm::{shm_exists, unique_name};
 use tokio::sync::mpsc;
 
 /// An `Intake` plus its detok-shard receiver, to_scheduler channel consumer (keep alive —
@@ -1389,10 +1389,7 @@ fn abort_while_in_mm_pool_drops_on_return() {
     encode_like_worker(&mut req, vec![5, 6], buffers);
     intake.drive(req);
     assert!(consumer.drain(16).is_empty(), "cancelled: never submitted");
-    assert!(
-        !shm_path(&segment).exists(),
-        "dropped result released its shm"
-    );
+    assert!(!shm_exists(&segment), "dropped result released its shm");
     assert!(rx.try_recv().is_err(), "no frame for a client that left");
     assert!(detok_rx.try_recv().is_err(), "deregistered exactly once");
 }

@@ -7,21 +7,18 @@
 
 use std::os::fd::{AsFd, BorrowedFd};
 
-use rustix::fs::{FallocateFlags, Mode, fallocate, ftruncate};
+use rustix::fs::{Mode, ftruncate};
 use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
 use rustix::shm::{OFlags, open, unlink};
 
-/// Reserve `len` bytes of backing pages for a fresh segment, so a full
-/// `/dev/shm` surfaces here as `ENOSPC` instead of as a `SIGBUS` on the first
-/// write into the mapping. `ftruncate` only sets the length; tmpfs allocates
-/// pages lazily at write time. Mirrors Python's `posix_fallocate` in
-/// `ShmPointerMMData`. Injectable so tests can stand in for an exhausted tmpfs.
+/// Reserve the backing pages of a fresh segment (see
+/// [`platform::reserve_shm_pages`](super::platform::reserve_shm_pages)); mirrors
+/// Python's `posix_fallocate` in `ShmPointerMMData`. Injectable so tests can
+/// stand in for an exhausted tmpfs.
 pub type Reserve = fn(BorrowedFd<'_>, u64) -> rustix::io::Result<()>;
 
 /// The real reservation.
-pub fn reserve_pages(fd: BorrowedFd<'_>, len: u64) -> rustix::io::Result<()> {
-    fallocate(fd, FallocateFlags::empty(), 0, len)
-}
+pub use super::platform::reserve_shm_pages as reserve_pages;
 
 /// A named POSIX shared-memory segment owning its name: dropped -> unlinked.
 ///
@@ -114,11 +111,9 @@ pub fn unique_name(tag: &str) -> String {
     format!("sgl-{tag}-{}-{n}", std::process::id())
 }
 
-/// Test helper: where Linux exposes the segment as a file.
+/// Test helpers: look at a segment the way the platform allows.
 #[cfg(test)]
-pub fn shm_path(name: &str) -> std::path::PathBuf {
-    std::path::Path::new("/dev/shm").join(name)
-}
+pub use super::platform::{shm_exists, shm_read};
 
 #[cfg(test)]
 mod tests {
@@ -136,9 +131,9 @@ mod tests {
         let payload: Vec<u8> = (0..255u8).collect();
         let segment = ShmSegment::create(name.clone(), &payload).unwrap();
         assert_eq!(segment.name(), name);
-        assert_eq!(std::fs::read(shm_path(&name)).unwrap(), payload);
+        assert_eq!(shm_read(&name, payload.len()).unwrap(), payload);
         drop(segment);
-        assert!(!shm_path(&name).exists(), "drop must unlink");
+        assert!(!shm_exists(&name), "drop must unlink");
     }
 
     /// An empty payload is refused before the segment exists: nothing to
@@ -148,7 +143,7 @@ mod tests {
         let name = test_name();
         let err = ShmSegment::create(name.clone(), &[]).unwrap_err();
         assert!(err.contains("empty payload"), "{err}");
-        assert!(!shm_path(&name).exists(), "no segment may be created");
+        assert!(!shm_exists(&name), "no segment may be created");
     }
 
     /// `into_name` transfers the unlink duty to the caller (Python's
@@ -157,7 +152,7 @@ mod tests {
     fn into_name_disarms_the_unlink() {
         let segment = ShmSegment::create(test_name(), &[1, 2, 3]).unwrap();
         let name = segment.into_name();
-        assert!(shm_path(&name).exists(), "handoff must not unlink");
+        assert!(shm_exists(&name), "handoff must not unlink");
         unlink(format!("/{name}")).unwrap(); // manual cleanup for the test
     }
 
@@ -173,20 +168,19 @@ mod tests {
         let err = ShmSegment::create_with(name.clone(), &[1, 2, 3], no_space).unwrap_err();
         assert!(err.starts_with("fallocate("), "{err}");
         assert!(err.contains("No space left"), "{err}");
-        assert!(
-            !shm_path(&name).exists(),
-            "partial segment must be unlinked"
-        );
+        assert!(!shm_exists(&name), "partial segment must be unlinked");
     }
 
     /// The real reservation is what `create` runs: a segment it made is fully
-    /// backed, so a later write cannot fault.
+    /// backed, so a later write cannot fault. Linux only: the reservation is
+    /// the tmpfs `fallocate`, read back through the segment's `/dev/shm` file.
+    #[cfg(target_os = "linux")]
     #[test]
     fn create_reserves_backing_pages() {
         let name = test_name();
         let payload = vec![7u8; 4096 * 3];
         let segment = ShmSegment::create(name.clone(), &payload).unwrap();
-        let meta = std::fs::metadata(shm_path(&name)).unwrap();
+        let meta = std::fs::metadata(std::path::Path::new("/dev/shm").join(&name)).unwrap();
         use std::os::unix::fs::MetadataExt;
         assert!(
             meta.blocks() * 512 >= payload.len() as u64,

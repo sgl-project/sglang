@@ -54,3 +54,8 @@ dynamo-tokenizers = { version = "3.1.0", optional = true }
 
 [dev-dependencies]
 sha2 = "0.10"
+
+# `mm_single_thread` counts the process's threads: Linux reads procfs, macOS
+# asks libproc.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+libc = "0.2"
