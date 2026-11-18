@@ -137,7 +137,7 @@ from sglang.kernels.ops.kvcache.shuffle_5d_cache import (
     launch_gather_shuffle_5d_to_linear,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, scaled_fp8_quant
-from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.configs.model_config import AttentionArch, is_kimi_k3, is_kimi_k31
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.aiter_mla_gluon import (
     log_mla_gluon_capability,
@@ -220,6 +220,12 @@ def _aiter_has_mla_reduce_v1_instance(*, num_head: int, head_dim: int) -> bool:
         return mla_reduce_v1_supports(num_heads=num_head, head_dim=head_dim)
     except (ImportError, AttributeError):
         return False
+
+
+def _fp8_prefill_runs_keyless_prefix_chunks(hf_config) -> bool:
+    # Running keyless prefix chunks on the asm fp8 prefill instead of bf16 varlen,
+    # and packing prefix K/V straight to saturating fp8, are validated on Kimi-K3 only.
+    return is_kimi_k3(hf_config) and not is_kimi_k31(hf_config)
 
 
 # Persist
@@ -475,7 +481,7 @@ class ForwardMetadata:
     paged_kv_view: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
     prefill_ps_metadata: Optional[MlaPrefillPsMetadata] = None
     chunked_skip_prefix_ps_metadata: Optional[MlaPrefillPsMetadata] = None
-    chunked_prefix_ps_metadatas: Optional[list[MlaPrefillPsMetadata]] = None
+    chunked_prefix_ps_metadatas: Optional[list[Optional[MlaPrefillPsMetadata]]] = None
     # cprr
     global_kv_indptr: Optional[torch.Tensor] = None
     use_asm_cprr_verify: bool = False
@@ -760,9 +766,18 @@ class AiterAttnBackend(AttentionBackend):
         self.fp8_prefill_num_kv_head = self.num_kv_head + (
             (self.fp8_prefill_num_head or self.num_head) - self.num_head
         )
+        self.use_fp8_prefill_keyless_prefix_chunks = (
+            self.use_fp8_prefill_attn
+            and _fp8_prefill_runs_keyless_prefix_chunks(
+                model_runner.model_config.hf_config
+            )
+        )
         # forward_mha reads the prefix latent in bf16 whenever this hook exists;
-        # keep it only where the asm fp8 prefill runs a bf16 model.
-        if not (self.use_fp8_prefill_attn and self.input_dtype == torch.bfloat16):
+        # keep it only where every prefix chunk runs the asm fp8 prefill on a bf16 model.
+        if not (
+            self.use_fp8_prefill_keyless_prefix_chunks
+            and self.input_dtype == torch.bfloat16
+        ):
             self.pack_prefix_chunk_kv = None
         if self.use_fp8_prefill_attn and self.fp8_prefill_num_head != self.num_head:
             logger.info(
@@ -4277,7 +4292,7 @@ class AiterAttnBackend(AttentionBackend):
                 )
             )
 
-        metadatas: list[MlaPrefillPsMetadata] = []
+        metadatas: list[Optional[MlaPrefillPsMetadata]] = []
         for i in range(forward_batch.num_prefix_chunks):
             chunk_lens_cpu = forward_batch.prefix_chunk_seq_lens_cpu[i].to(torch.int32)
             if not chunk_lens_cpu.any():
@@ -4285,11 +4300,14 @@ class AiterAttnBackend(AttentionBackend):
                 # leaving the list unset keeps every chunk in bf16 on varlen.
                 return
             if forward_batch.prefix_chunk_has_zero_kv[i]:
+                # None leaves the chunk to bf16 varlen in _forward_extend_prefix_chunk.
                 metadatas.append(
                     self._build_active_prefix_chunk_ps_metadata(
                         chunk_lens_cpu=chunk_lens_cpu,
                         extend_lens_cpu=extend_lens_cpu,
                     )
+                    if self.use_fp8_prefill_keyless_prefix_chunks
+                    else None
                 )
                 continue
             chunk_indptr_cpu = torch.zeros(len(chunk_lens_cpu) + 1, dtype=torch.int32)
@@ -4454,8 +4472,8 @@ class AiterAttnBackend(AttentionBackend):
     ):
         idx = forward_batch.prefix_chunk_idx
         ps_metadatas = self.forward_metadata.chunked_prefix_ps_metadatas
-        if ps_metadatas is not None:
-            ps = ps_metadatas[idx]
+        ps = ps_metadatas[idx] if ps_metadatas is not None else None
+        if ps is not None:
             rows = ps.active_q_rows
             if rows is None:
                 return self._mla_fp8_prefill_attn_ps(q, k, v, layer, ps)

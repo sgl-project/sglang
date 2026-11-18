@@ -19,6 +19,7 @@ if _RUNNABLE:
         AiterAttnBackend,
         ForwardMetadata,
         _aiter_has_mla_reduce_v1_instance,
+        _fp8_prefill_runs_keyless_prefix_chunks,
     )
     from sglang.srt.layers.attention.merge_state import merge_state
     from sglang.srt.utils import is_gfx95_supported
@@ -31,12 +32,13 @@ SCALE = (QK_NOPE + QK_ROPE) ** -0.5
 KIMI_K3_TP8_HEADS = 12
 
 
-def _backend(num_heads, q_lens):
+def _backend(num_heads, q_lens, keyless_prefix_chunks=True):
     backend = object.__new__(AiterAttnBackend)
     backend.device = torch.device("cuda")
     backend.input_dtype = torch.bfloat16
     backend._arange_buf = None
     backend.use_fp8_prefill_attn = True
+    backend.use_fp8_prefill_keyless_prefix_chunks = keyless_prefix_chunks
     backend.fp8_prefill_num_head = backend.check_fp8_prefill_num_head(
         num_head=num_heads, num_kv_head=num_heads, v_head_dim=V_HEAD
     )
@@ -84,9 +86,10 @@ def _cat_k(k_nope, k_pe):
     return torch.cat([k_nope, k_pe.expand(-1, k_nope.shape[1], -1)], dim=-1)
 
 
-def _reference(q, k, v, q_lens, kv_lens):
-    """fp32 non-causal attention per request over the fp8-rounded inputs."""
-    q, k, v = (t.to(fp8_dtype).float() for t in (q, k, v))
+def _reference(q, k, v, q_lens, kv_lens, fp8_inputs=True):
+    """fp32 non-causal attention per request over the (fp8-rounded) inputs."""
+    in_dtype = fp8_dtype if fp8_inputs else q.dtype
+    q, k, v = (t.to(in_dtype).float() for t in (q, k, v))
     out = torch.zeros(q.shape[0], q.shape[1], V_HEAD, device=q.device)
     lse = torch.full(q.shape[:2], float("-inf"), device=q.device)
     q_off = kv_off = 0
@@ -107,9 +110,9 @@ class TestAiterMlaFp8PrefillPs(CustomTestCase):
     def setUp(self):
         torch.manual_seed(0)
 
-    def _assert_matches(self, out, lse, ref_out, ref_lse, rows):
+    def _assert_matches(self, out, lse, ref_out, ref_lse, rows, rtol=0.03):
         err = (out[rows].float() - ref_out[rows]).abs().max().item()
-        self.assertLess(err, 0.03 * ref_out[rows].abs().max().item())
+        self.assertLess(err, rtol * ref_out[rows].abs().max().item())
         lse_err = (lse[rows] - ref_lse[rows]).abs().max().item()
         self.assertLess(lse_err, 1e-2)
 
@@ -235,6 +238,48 @@ class TestAiterMlaFp8PrefillPs(CustomTestCase):
         other_lse = torch.randn_like(lse)
         merged, _ = merge_state(out, lse, other_out, other_lse)
         torch.testing.assert_close(merged, other_out)
+
+    def test_keyless_prefix_chunk_stays_bf16_off_kimi_k3(self):
+        """Keyless prefix chunks run on the asm fp8 prefill only for Kimi-K3;
+        every other MLA model keeps such a chunk on bf16 varlen, at bf16 accuracy."""
+        self.assertTrue(
+            _fp8_prefill_runs_keyless_prefix_chunks(
+                SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"])
+            )
+        )
+        for arch in ("DeepseekV3ForCausalLM", "KimiK31ForConditionalGeneration"):
+            config = SimpleNamespace(architectures=[arch], index_topk=2048)
+            self.assertFalse(_fp8_prefill_runs_keyless_prefix_chunks(config))
+
+        q_lens, chunk_lens = [130, 40, 260], [700, 0, 333]
+        num_heads = 16
+        backend = _backend(num_heads, q_lens, keyless_prefix_chunks=False)
+        chunk_lens_t = torch.tensor([chunk_lens], dtype=torch.int32)
+        cu = torch.zeros(1, len(chunk_lens) + 1, dtype=torch.int32)
+        cu[:, 1:] = chunk_lens_t.cumsum(1)
+        batch = SimpleNamespace(
+            extend_seq_lens_cpu=q_lens,
+            num_prefix_chunks=1,
+            prefix_chunk_idx=0,
+            prefix_chunk_seq_lens_cpu=chunk_lens_t,
+            prefix_chunk_has_zero_kv=[True],
+            prefix_chunk_cu_seq_lens=cu.cuda(),
+            prefix_chunk_max_seq_lens=[max(chunk_lens)],
+        )
+        backend.init_mha_chunk_metadata(batch, disable_flashinfer_ragged=True)
+        self.assertEqual(backend.forward_metadata.chunked_prefix_ps_metadatas, [None])
+
+        q, k_nope, k_pe, v = _qkv(num_heads, q_lens, chunk_lens)
+        k = _cat_k(k_nope, k_pe)
+        out, lse = backend._forward_extend_prefix_chunk(
+            q, k, v, _layer(num_heads), batch
+        )
+        ref_out, ref_lse = _reference(q, k, v, q_lens, chunk_lens, fp8_inputs=False)
+        keyless = torch.repeat_interleave(
+            torch.tensor([n == 0 for n in chunk_lens]), torch.tensor(q_lens)
+        ).cuda()
+        # fp8 inputs miss this bound by several times on random normal inputs.
+        self._assert_matches(out, lse, ref_out, ref_lse, ~keyless, rtol=0.01)
 
 
 if __name__ == "__main__":
