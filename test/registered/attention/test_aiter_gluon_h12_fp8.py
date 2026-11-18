@@ -12,7 +12,7 @@ import torch
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention import aiter_mla_gluon as mod
-from sglang.srt.runtime_context import get_context, override_platform
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -511,21 +511,21 @@ class TestZeroPaddedH12Fp8Shape(CustomTestCase):
                 self.assertFalse(mod.is_zero_padded_h12_fp8_mla(**kwargs))
 
 
-class TestIsGfx950Supported(CustomTestCase):
+class TestIsGfx950(CustomTestCase):
     """The fp8-Q ASM route is gfx950 only: an exact arch match, not a gfx95 prefix."""
 
     def _is_gfx950(self, hip):
-        from sglang.srt.utils import device
+        from sglang.srt.layers.attention import aiter_backend
 
-        device.is_gfx950_supported.cache_clear()
+        aiter_backend._is_gfx950.cache_clear()
         try:
             with mock.patch(
                 "sglang.kernels.arch.current_arch",
                 return_value=mock.Mock(hip=hip),
             ):
-                return device.is_gfx950_supported()
+                return aiter_backend._is_gfx950()
         finally:
-            device.is_gfx950_supported.cache_clear()
+            aiter_backend._is_gfx950.cache_clear()
 
     def test_exact_arch(self):
         self.assertTrue(self._is_gfx950(mock.Mock(gcn_arch="gfx950")))
@@ -586,7 +586,7 @@ class TestFp8QAsmPersistScope(CustomTestCase):
                 speculative_num_steps=1,
                 speculative_attention_mode="decode",
             ),
-            override_platform(is_gfx950=gfx950),
+            mock.patch.object(aiter_backend, "_is_gfx950", return_value=gfx950),
             mock.patch.object(aiter_backend, "is_gfx95_supported", return_value=True),
             mock.patch.object(
                 aiter_backend, "prefer_mla_gluon_decode", return_value=True

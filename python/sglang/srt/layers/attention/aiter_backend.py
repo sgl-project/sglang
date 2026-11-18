@@ -1,12 +1,6 @@
 from __future__ import annotations
 
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_parallel,
-    get_platform,
-    get_schedule,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
 
 """
 end to end attention solution with aiter kernels
@@ -229,6 +223,16 @@ _MLA_FP8_Q_ASM_DECODE_BACKEND = "asm_fp8q"
 # which on MI355X beats Gluon only from about 128K tokens of context; that
 # crossover is why the route is an explicit backend choice, not a default.
 _MLA_FP8_Q_ASM_QLENS = frozenset((1, *range(5, 8 + 1)))
+
+
+@functools.cache
+def _is_gfx950() -> bool:
+    """Exactly gfx950 (MI350X/MI355X), not any gfx95x: the fp8-Q ASM MLA route's
+    only arch. False off HIP."""
+    from sglang.kernels.arch import current_arch
+
+    hip = current_arch().hip
+    return hip is not None and hip.gcn_arch == "gfx950"
 
 
 def _fp8_q_asm_mla_skip_reason(
@@ -1306,7 +1310,7 @@ class AiterAttnBackend(AttentionBackend):
 
             if fp8_q_asm_requested:
                 skip_reason = _fp8_q_asm_mla_skip_reason(
-                    gfx950=get_platform().is_gfx950,
+                    gfx950=_is_gfx950(),
                     zero_padded_h12_fp8=is_zero_padded_h12_fp8_mla(
                         head_pad_mode=self.head_pad_mode,
                         num_head=self.num_head,
