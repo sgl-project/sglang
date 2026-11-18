@@ -101,3 +101,111 @@ wait
 Then, you can test the server by sending requests following other [documents](../../basic_usage/openai_api_completions).
 
 Thanks for [aflah02](https://github.com/aflah02) for providing the example, based on his [blog post](https://aflah02.substack.com/p/multi-node-llm-inference-with-sglang).
+
+## Run a Slurm job with Apptainer
+
+Use [Apptainer](https://apptainer.org/docs/user/latest/) when your cluster runs containers without Docker. This example serves `Qwen/Qwen3-0.6B` on one NVIDIA GPU with tensor parallelism set to `1`. It uses Linux, a Slurm GPU partition, and Apptainer's `--nv` support. The host NVIDIA driver must support the CUDA version in your chosen [SGLang image](/docs/get-started/install#install-sglang).
+
+### Prepare the image and model cache
+
+Load your cluster's Apptainer module, if required. Choose an absolute shared directory accessible from the login and compute nodes, and replace `/shared` below with your site's storage path. Use paths without commas or colons, which delimit Apptainer bind specifications.
+
+Run these commands once on a machine where downloads and container conversion are allowed. The example uses the public model above and does not need a Hugging Face token. For reproducibility, replace `latest` with a specific release tag from [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang/tags).
+
+```bash
+export WORK_DIR="/shared/$USER/sglang"
+mkdir -p "$WORK_DIR"/{images,hf-cache,jit-cache,logs}
+
+apptainer pull "$WORK_DIR/images/sglang.sif" docker://lmsysorg/sglang:latest
+
+apptainer exec --cleanenv \
+  --bind "$WORK_DIR/hf-cache:/cache/huggingface" \
+  --env HF_HOME=/cache/huggingface \
+  "$WORK_DIR/images/sglang.sif" \
+  hf download Qwen/Qwen3-0.6B
+```
+
+The model cache is downloaded before the job starts, so compute nodes do not need access to Hugging Face. The separate writable `jit-cache` directory stores SGLang compilation artifacts outside the read-only SIF image. Use a cache owned by your user, and a separate directory when changing image versions or GPU architectures.
+
+### Submit the server job
+
+Save the following as `slurm-apptainer.sh`. Adjust the CPU, memory, GPU, and time requests for your cluster. If Apptainer requires an environment module, load it in this script before `srun`.
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=sglang-apptainer
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --gres=gpu:1
+#SBATCH --mem=32G
+#SBATCH --time=01:00:00
+
+set -euo pipefail
+: "${WORK_DIR:?Export WORK_DIR before submitting the job}"
+export WORK_DIR
+export PORT=30000
+
+echo "Server node: $(hostname)"
+echo "Server port: $PORT"
+
+srun --ntasks=1 bash -c '
+  set -euo pipefail
+  # Preserve the GPU selection from this Slurm task despite --cleanenv.
+  export APPTAINERENV_CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:?Slurm must assign a GPU to this task}"
+
+  exec apptainer exec --nv --cleanenv \
+    --bind "$WORK_DIR/hf-cache:/cache/huggingface" \
+    --bind "$WORK_DIR/jit-cache:/cache/sglang" \
+    --env HF_HOME=/cache/huggingface \
+    --env HF_HUB_OFFLINE=1 \
+    --env SGLANG_CACHE_DIR=/cache/sglang \
+    "$WORK_DIR/images/sglang.sif" \
+    python3 -m sglang.launch_server \
+      --model-path Qwen/Qwen3-0.6B \
+      --served-model-name slurm-example \
+      --tensor-parallel-size 1 \
+      --host 0.0.0.0 \
+      --port "$PORT"
+'
+```
+
+`--cleanenv` avoids inheriting a host Python or Conda environment. The GPU variable is passed explicitly using [Apptainer's GPU selection mechanism](https://apptainer.org/docs/user/latest/gpu.html#multiple-gpus). Set it **inside** the `srun` task, where Slurm establishes the task's GPU visibility; do not replace it with a hard-coded GPU index. Apptainer uses the host network by default, so no Docker-style port mapping is needed.
+
+Submit from the shell where you exported `WORK_DIR`, replacing `YOUR_GPU_PARTITION` and adding your site's account or QoS options if required. The log directory must exist before submission because Slurm opens the output file before running the script.
+
+```bash
+JOB_ID=$(sbatch --parsable \
+  --partition=YOUR_GPU_PARTITION \
+  --output="$WORK_DIR/logs/%x-%j.out" \
+  slurm-apptainer.sh)
+JOB_ID=${JOB_ID%%;*}
+squeue --jobs "$JOB_ID"
+```
+
+The foreground `srun` keeps the allocation alive for the server's lifetime and propagates a server startup failure to the batch job. Stop the server and release the allocation with `scancel "$JOB_ID"`.
+
+### Check readiness and send a request
+
+Once the job is running, read the node name from its log and replace `COMPUTE_NODE` below. Run the commands from a machine permitted to reach that node on port `30000`. The readiness check retries connection failures while the model loads and returns a nonzero exit status if retries are exhausted.
+
+```bash
+HOST=COMPUTE_NODE
+PORT=30000
+curl --fail --show-error --silent \
+  --retry 60 --retry-delay 5 --retry-connrefused --max-time 5 \
+  "http://$HOST:$PORT/health"
+
+curl --fail --show-error "http://$HOST:$PORT/v1/chat/completions" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"slurm-example","messages":[{"role":"user","content":"Say hello in one sentence."}],"max_tokens":64}'
+```
+
+Use your cluster's supported tunnel or proxy if compute nodes are not directly reachable. The example binds to all interfaces on the compute node; configure [API authentication](/docs/advanced_features/server_arguments#api-related) before making it available to untrusted clients. Choose another `PORT` if it is already in use on a shared node.
+
+### Troubleshoot the container job
+
+- **No GPU visible:** check the Slurm GPU allocation and that the task sets `CUDA_VISIBLE_DEVICES`. Verify that your site supports `apptainer exec --nv`; this flag uses the host driver and does not install one.
+- **Model files missing in offline mode:** repeat the download using the same image, model ID, and `hf-cache` bind mount. `HF_HUB_OFFLINE=1` intentionally prevents a compute-node download.
+- **Permission or cache errors:** check that your user can read the SIF and write both cache directories on the compute node. The [Apptainer bind guide](https://apptainer.org/docs/user/latest/bind_paths_and_mounts.html) describes site restrictions on user bind mounts.
+- **Job exits before readiness:** inspect `"$WORK_DIR/logs/sglang-apptainer-$JOB_ID.out"` for container, CUDA compatibility, out-of-memory, or port-binding errors before resubmitting.
