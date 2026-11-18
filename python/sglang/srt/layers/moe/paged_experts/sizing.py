@@ -29,10 +29,10 @@ _GIB = 1 << 30
 
 def check_tp_sizing(model) -> None:
     """Fail on every TP rank before graph capture if the final slot/capture plans differ."""
-    from sglang.srt.distributed import get_tp_group
     from sglang.srt.layers.moe.paged_experts.method import PagedExpertsMoEMethod
 
-    if get_parallel().tp_size == 1:
+    parallel = get_parallel()
+    if parallel.tp_size == 1:
         return
     ks = [
         m.quant_method.num_resident
@@ -43,7 +43,7 @@ def check_tp_sizing(model) -> None:
     plan = (ks, list(decode.bs or ()), decode.max_bs)
     # Object gather also detects different layer/capture counts, without a collective
     # over tensors of different lengths. This runs once at startup, never per step.
-    plans = get_tp_group().all_gather_object(plan)
+    plans = parallel.tp_group.all_gather_object(plan)
     if any(other != plans[0] for other in plans[1:]):
         raise RuntimeError(
             "Paged experts: K or decode CUDA graph capture sizes differ across TP ranks "
@@ -95,12 +95,11 @@ def static_budget_bytes(kv_configurator, pre_model_load_memory: float) -> int:
     """What is left of the static budget (``--mem-fraction-static``): free memory less the
     non-static slack and the multimodal reserve, as the KV configurator measures it (its other
     terms are for multi-GPU and post-capture KV sizing, which paged experts do not run)."""
-    from sglang.srt.distributed import get_tp_group
     from sglang.srt.mem_cache.kv_cache_configurator import mm_runtime_reservation_gb
     from sglang.srt.utils.device import get_available_gpu_memory
 
     gc.collect()
-    tp_group = get_tp_group()
+    tp_group = get_parallel().tp_group
     free_gb = get_available_gpu_memory(
         device=kv_configurator.device,
         gpu_id=kv_configurator.gpu_id,

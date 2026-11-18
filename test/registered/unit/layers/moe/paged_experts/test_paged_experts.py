@@ -65,6 +65,7 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import freeze_gc
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     breakable_cuda_graph,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -1471,7 +1472,7 @@ class TestSizing(CustomTestCase):
                 self._SIZING + "get_mm",
                 return_value=SimpleNamespace(mm_feature_transport=None),
             ),
-            patch("sglang.srt.distributed.get_tp_group", return_value=tp_group),
+            get_parallel().override(tp_group=tp_group),
             patch(
                 "sglang.srt.utils.device.get_available_gpu_memory",
                 side_effect=free_memory,
@@ -1581,10 +1582,7 @@ class TestSizing(CustomTestCase):
                 group = SimpleNamespace(all_gather_object=gather)
                 with (
                     self.subTest(peer=peer, rank=rank),
-                    patch(
-                        self._SIZING + "get_parallel",
-                        return_value=SimpleNamespace(tp_size=2),
-                    ),
+                    get_parallel().override(tp_size=2, tp_group=group),
                     patch(
                         self._SIZING + "get_exec",
                         return_value=SimpleNamespace(
@@ -1593,7 +1591,6 @@ class TestSizing(CustomTestCase):
                             )
                         ),
                     ),
-                    patch("sglang.srt.distributed.get_tp_group", return_value=group),
                 ):
                     if peer == plans[0]:
                         sizing.check_tp_sizing(model)
@@ -2761,15 +2758,11 @@ class TestTpHostBudget(CustomTestCase):
             patch.object(disk_tier, "_MODEL", disk_tier.ModelContext()),
             patch.object(method_module, "get_exec", return_value=exec_ctx),
             patch("sglang.srt.runtime_context.get_exec", return_value=exec_ctx),
-            patch(
-                "sglang.srt.runtime_context.get_parallel",
-                return_value=SimpleNamespace(tp_size=len(hosts)),
-            ),
+            get_parallel().override(tp_size=len(hosts), tp_group=group),
             patch(
                 "sglang.srt.runtime_context.process_model_config",
                 return_value=SimpleNamespace(num_hidden_layers=2),
             ),
-            patch("sglang.srt.distributed.get_tp_group", return_value=group),
             patch(
                 "sglang.srt.distributed.parallel_state.in_the_same_node_as",
                 side_effect=lambda pg, source_rank: [
