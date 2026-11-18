@@ -124,7 +124,7 @@ class AWQAscendLinearKernel:
                 scales_exp = layer.scales.data
 
             weight_float = (weight_u8.float() - zeros_exp.float()) * scales_exp.float()
-            weight_float = weight_float.t().contiguous().to(torch.bfloat16)
+            weight_float = weight_float.t().contiguous().to(layer.scales.dtype)
 
             layer.register_parameter(
                 "weight", torch.nn.Parameter(weight_float, requires_grad=False)
