@@ -1703,7 +1703,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             # under DCP (gfx950), block_tables cover only this rank's index-K shard
             row_lens = seqlens_32_2d.view(-1) if dcp_size > 1 else seqlens_32
             schedule = None
-            if _use_aiter_preshuffle and envs.SGLANG_DSA_MQA_PERSISTENT_SCHEDULE.get():
+            # gfx950: balance the grid over each row's real length, not a fixed split
+            if _use_aiter_preshuffle and _is_gfx95_supported:
                 schedule = dsa_indexer_hip.paged_logits_persistent_schedule(
                     forward_batch, layer_id, row_lens, max_seq_len
                 )
