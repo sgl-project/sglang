@@ -13,12 +13,25 @@ from sglang.kernels.ops.speculative.dflash import (
     compute_dflash_correct_drafts_and_bonus,
 )
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.srt.environ import envs
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     build_speculative_verify_target_probs,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_hip, is_npu
+
+try:
+    from sglang.kernels.ops.speculative.dspark.dspark_accept_split import (
+        chain_speculative_sampling_split,
+    )
+except ImportError:  # pragma: no cover - a tree without the split kernels
+    chain_speculative_sampling_split = None
+_SPLIT_ACCEPT = (
+    is_hip()
+    and chain_speculative_sampling_split is not None
+    and envs.SGLANG_ROCM_DSPARK_SPLIT_ACCEPT.get()
+)
 
 _is_npu = is_npu()
 
@@ -106,7 +119,53 @@ def _accept_sampling_core(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
-    if not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling:
+    plain = (
+        not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling
+    )
+    if (
+        _SPLIT_ACCEPT
+        and plain
+        and not block_verification
+        and not _is_npu
+        and target_logits.is_cuda
+    ):
+        # the vocabulary split over CTAs (one CTA a request walks 202k twice otherwise:
+        # ~340 us a step at any batch size); the softmax is folded in
+        (
+            retrieve_index,
+            _retrieve_next_token,
+            _retrieve_next_sibling,
+            predicts,
+            accept_index,
+            accept_token_num,
+        ) = _get_or_create_chain_verify_buffers(
+            bs=bs,
+            draft_token_num=verify_num_draft_tokens,
+            device=device,
+        )
+        chain_speculative_sampling_split(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            retrive_index=retrieve_index,
+            uniform_samples=torch.rand((bs, gamma), dtype=torch.float32, device=device),
+            uniform_samples_for_final_sampling=torch.rand(
+                (bs,), dtype=torch.float32, device=device
+            ),
+            target_logits=target_logits,
+            temperatures=sampling_info.temperatures,
+            draft_probs=draft_probs,
+        )
+        correct_len = accept_token_num
+        if cutoff_verify_lens is not None:
+            correct_len, cap_trim_lens = CapCorrectLen.execute(
+                correct_len=correct_len, verify_lens=cutoff_verify_lens
+            )
+        else:
+            cap_trim_lens = torch.zeros_like(correct_len)
+        return correct_len, cap_trim_lens, accept_index, predicts
+    if plain:
         target_probs = SoftmaxTemp.execute(
             logits=target_logits,
             temperatures=sampling_info.temperatures,
@@ -388,6 +447,83 @@ def _softmax_temp_kernel(
         tl.store(out_base + offs, e / sum_exp, mask=vmask)
 
 
+@triton.jit
+def _softmax_temp_stats_kernel(
+    logits_ptr,
+    temp_ptr,
+    stats_ptr,
+    vocab,
+    chunk,
+    rows_per_request,
+    logits_row_stride,
+    num_splits,
+    BLOCK_V: tl.constexpr,
+):
+    # Online max / sum-exp over one vocab chunk of a row; lanes that saw only -inf keep a zero sum.
+    row = tl.program_id(0)
+    split = tl.program_id(1)
+    temp = tl.load(temp_ptr + row // rows_per_request).to(tl.float32)
+    base = logits_ptr + row.to(tl.int64) * logits_row_stride
+    start = split * chunk
+    end = tl.minimum(start + chunk, vocab)
+    m = tl.full([BLOCK_V], -float("inf"), tl.float32)
+    acc = tl.zeros([BLOCK_V], tl.float32)
+    for v0 in range(start, end, BLOCK_V):
+        offs = v0 + tl.arange(0, BLOCK_V)
+        x = tl.load(base + offs, mask=offs < end, other=-float("inf")).to(tl.float32)
+        x = x / temp
+        m_new = tl.maximum(m, x)
+        live = m_new > -float("inf")
+        acc = tl.where(live, acc * tl.exp(m - m_new) + tl.exp(x - m_new), 0.0)
+        m = m_new
+    row_max = tl.max(m, axis=0)
+    sum_exp = tl.sum(
+        tl.where(m > -float("inf"), acc * tl.exp(m - row_max), 0.0), axis=0
+    )
+    out = stats_ptr + (row * num_splits + split) * 2
+    tl.store(out, row_max)
+    tl.store(out + 1, sum_exp)
+
+
+@triton.jit
+def _softmax_temp_write_kernel(
+    logits_ptr,
+    temp_ptr,
+    stats_ptr,
+    out_ptr,
+    vocab,
+    chunk,
+    rows_per_request,
+    logits_row_stride,
+    num_splits,
+    BLOCK_V: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    row = tl.program_id(0)
+    split = tl.program_id(1)
+    temp = tl.load(temp_ptr + row // rows_per_request).to(tl.float32)
+    s = tl.arange(0, BLOCK_S)
+    smask = s < num_splits
+    stats = stats_ptr + (row * num_splits + s) * 2
+    part_max = tl.load(stats, mask=smask, other=-float("inf"))
+    part_sum = tl.load(stats + 1, mask=smask, other=0.0)
+    row_max = tl.max(part_max, axis=0)
+    sum_exp = tl.sum(
+        tl.where(part_max > -float("inf"), part_sum * tl.exp(part_max - row_max), 0.0),
+        axis=0,
+    )
+    base = logits_ptr + row.to(tl.int64) * logits_row_stride
+    out_base = out_ptr + row.to(tl.int64) * vocab
+    start = split * chunk
+    end = tl.minimum(start + chunk, vocab)
+    for v0 in range(start, end, BLOCK_V):
+        offs = v0 + tl.arange(0, BLOCK_V)
+        vmask = offs < end
+        x = tl.load(base + offs, mask=vmask, other=-float("inf")).to(tl.float32)
+        x = x / temp
+        tl.store(out_base + offs, tl.exp(x - row_max) / sum_exp, mask=vmask)
+
+
 def softmax_temp_triton(
     *,
     logits: torch.Tensor,
@@ -401,15 +537,52 @@ def softmax_temp_triton(
     )
     temperatures = temperatures.reshape(bs).to(torch.float32).contiguous()
     out = torch.empty((num_rows, vocab), dtype=torch.float32, device=logits.device)
-    BLOCK_V = 4096
-    _softmax_temp_kernel[(num_rows,)](
+    if num_rows == 0:
+        return out
+    if not is_hip():
+        _softmax_temp_kernel[(num_rows,)](
+            logits,
+            temperatures,
+            out,
+            vocab,
+            rows_per_request,
+            logits.stride(0),
+            BLOCK_V=4096,
+        )
+        return out
+    # A verify has only bs x block rows: split each row over enough programs to fill the GPU. One pass writes
+    # per-chunk max / sum-exp, the second combines them and writes its normalized chunk.
+    BLOCK_V = 2048
+    num_splits = max(1, min(64, triton.cdiv(1024, num_rows)))
+    chunk = triton.cdiv(triton.cdiv(vocab, num_splits), BLOCK_V) * BLOCK_V
+    num_splits = triton.cdiv(vocab, chunk)
+    stats = torch.empty(
+        (num_rows, num_splits, 2), dtype=torch.float32, device=logits.device
+    )
+    grid = (num_rows, num_splits)
+    _softmax_temp_stats_kernel[grid](
         logits,
         temperatures,
-        out,
+        stats,
         vocab,
+        chunk,
         rows_per_request,
         logits.stride(0),
+        num_splits,
         BLOCK_V=BLOCK_V,
+    )
+    _softmax_temp_write_kernel[grid](
+        logits,
+        temperatures,
+        stats,
+        out,
+        vocab,
+        chunk,
+        rows_per_request,
+        logits.stride(0),
+        num_splits,
+        BLOCK_V=BLOCK_V,
+        BLOCK_S=triton.next_power_of_2(num_splits),
     )
     return out
 
@@ -602,12 +775,14 @@ class AcceptGreedy:
         target_logits: torch.Tensor,
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
+        target_predict: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_greedy(
             candidates=candidates,
             target_logits=target_logits,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
+            target_predict=target_predict,
         )
 
     @classmethod
@@ -618,12 +793,14 @@ class AcceptGreedy:
         target_logits: torch.Tensor,
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
+        target_predict: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_greedy_triton(
             candidates=candidates,
             target_logits=target_logits,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
+            target_predict=target_predict,
         )
 
 
@@ -633,9 +810,13 @@ def accept_greedy(
     target_logits: torch.Tensor,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
+    target_predict: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
-    target_predict = sampling_argmax(target_logits).view(bs, verify_num_draft_tokens)
+    # target_predict: the per-row argmax already resolved (e.g. across vocab shards).
+    if target_predict is None:
+        target_predict = sampling_argmax(target_logits)
+    target_predict = target_predict.view(bs, verify_num_draft_tokens)
     correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
         candidates=candidates,
         target_predict=target_predict,
@@ -683,9 +864,12 @@ def accept_greedy_triton(
     target_logits: torch.Tensor,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
+    target_predict: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
-    target_predict = sampling_argmax(target_logits).view(bs, verify_num_draft_tokens)
+    if target_predict is None:
+        target_predict = sampling_argmax(target_logits)
+    target_predict = target_predict.view(bs, verify_num_draft_tokens)
     correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
         candidates=candidates,
         target_predict=target_predict,
@@ -845,7 +1029,8 @@ def cap_correct_len(
     verify_lens: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     ell_r = (verify_lens.to(device=correct_len.device) - 1).to(correct_len.dtype)
-    capped = torch.minimum(correct_len, ell_r)
+    # verify_lens==0 (padded) rows would yield -1, an out-of-bounds index downstream.
+    capped = torch.clamp(torch.minimum(correct_len, ell_r), min=0)
     cap_trim_lens = correct_len - capped
     return capped, cap_trim_lens
 
@@ -865,7 +1050,8 @@ def _cap_correct_len_kernel(
     cl = tl.load(correct_len_ptr + offs, mask=mask, other=0).to(tl.int64)
     vl = tl.load(verify_lens_ptr + offs, mask=mask, other=0).to(tl.int64)
     ell = vl - 1
-    capped = tl.minimum(cl, ell)
+    # verify_lens==0 (padded) rows would yield -1, an out-of-bounds index downstream.
+    capped = tl.maximum(tl.minimum(cl, ell), 0)
     trim = cl - capped
     tl.store(capped_ptr + offs, capped, mask=mask)
     tl.store(trim_ptr + offs, trim, mask=mask)

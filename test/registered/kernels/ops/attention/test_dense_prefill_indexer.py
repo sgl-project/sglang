@@ -17,12 +17,13 @@ from sglang.kernels.ops.quantization.fp4_fake_quant import fake_quant_fp4
 from sglang.kernels.ops.quantization.fp4_indexer_quant import (
     quantize_fp4_indexer_tensor,
 )
+from sglang.kernels.ops.quantization.fp4_to_fp8 import widen_fp4_to_fp8
 from sglang.srt.layers.attention.dsv4.v41_indexer import dense_blocks, scoring
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 def make_inputs(request_lengths, ratio=1, zero_queries=False, seed=17):
@@ -62,10 +63,8 @@ def make_inputs(request_lengths, ratio=1, zero_queries=False, seed=17):
     )
 
 
-def run_dense(inputs, *, publish_candidates, candidates):
-    """The plain top-k, or the CP source's own top-k plus its candidate blocks
-    (`publish_candidates`), or a CP consumer's top-k among `candidates`."""
-    data = scoring.DeepGEMMPrefillData(
+def prefill_data(inputs):
+    return scoring.DeepGEMMPrefillData(
         k_slots=torch.arange(inputs["kv"][0].shape[0], device="cuda"),
         request_starts=inputs["starts"],
         lens_per_request=[n for _, n in inputs["request_lengths"]],
@@ -75,6 +74,12 @@ def run_dense(inputs, *, publish_candidates, candidates):
         q_sf=inputs["q"][1],
         weights=inputs["weights"],
     )
+
+
+def run_dense(inputs, *, publish_candidates, candidates):
+    """The plain top-k, or the CP source's own top-k plus its candidate blocks
+    (`publish_candidates`), or a CP consumer's top-k among `candidates`."""
+    data = prefill_data(inputs)
     if publish_candidates:
         selected, blocks = dense_blocks._publish_prefill_blocks(
             data=data,
@@ -120,8 +125,12 @@ def request_blocks(inputs, candidates):
     return out
 
 
+def is_hopper():
+    return torch.cuda.get_device_capability()[0] == 9
+
+
 def dense_scores(inputs):
-    from deep_gemm import fp8_fp4_mqa_logits
+    from deep_gemm import fp8_fp4_mqa_logits, fp8_mqa_logits
 
     from sglang.kernels.ops.attention.dsv4.index_logits import (
         index_logits_dtype,
@@ -129,26 +138,90 @@ def dense_scores(inputs):
     )
 
     width = (max(n for _, n in inputs["request_lengths"]) + 3) // 4 * 4
-    # Score in the dtypes the indexer uses on this GPU, so the reference matches.
-    scores = fp8_fp4_mqa_logits(
-        inputs["q"],
-        inputs["kv"],
-        inputs["weights"].to(index_weights_dtype()),
-        inputs["starts"],
-        inputs["starts"] + inputs["lengths"],
-        False,
-        width,
-        logits_dtype=index_logits_dtype(),
-    ).float()
+    ends = inputs["starts"] + inputs["lengths"]
+    if is_hopper():
+        q, q_scale = widen_fp4_to_fp8(*inputs["q"])
+        kv = widen_fp4_to_fp8(*inputs["kv"])
+        scores = fp8_mqa_logits(
+            q, kv, inputs["weights"] * q_scale, inputs["starts"], ends, False, width
+        )
+    else:
+        # Score in the dtypes the indexer uses on this GPU, so the reference matches.
+        scores = fp8_fp4_mqa_logits(
+            inputs["q"],
+            inputs["kv"],
+            inputs["weights"].to(index_weights_dtype()),
+            inputs["starts"],
+            ends,
+            False,
+            width,
+            logits_dtype=index_logits_dtype(),
+        ).float()
     return scores.masked_fill_(
         torch.arange(width, device="cuda")[None, :] >= inputs["lengths"][:, None],
         -torch.inf,
     )
 
 
+def dequant_fp4(payload, scales):
+    from sglang.srt.layers.quantization.fp8 import DSV4_DEQUANT_FP4_TABLE
+
+    u = payload.view(torch.uint8)
+    codes = torch.stack([u & 15, u >> 4], dim=-1).flatten(-2).long()
+    exponents = scales.unsqueeze(-1).view(torch.uint8).double() - 127
+    table = DSV4_DEQUANT_FP4_TABLE.to(payload.device).double()
+    return table[codes] * torch.exp2(exponents).repeat_interleave(32, dim=-1)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestFp4ToFp8(CustomTestCase):
+    def test_exact_within_14_binades_of_the_largest_block(self):
+        # e4m3 holds every fp4 value scaled into [2**-9, 384]: a vector whose
+        # blocks span 15 binades loses its smallest nonzero codes.
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        payload = torch.randint(
+            -128, 128, (512, 64), dtype=torch.int8, device="cuda", generator=gen
+        )
+        for spread in (0, 1, 7, 14, 15, 19, 40):
+            with self.subTest(spread=spread):
+                top = torch.randint(100, 140, (512, 1), device="cuda", generator=gen)
+                offsets = torch.randint(
+                    0, spread + 1, (512, 4), device="cuda", generator=gen
+                )
+                offsets[:, 0], offsets[:, 1] = 0, spread
+                scales = (top - offsets).to(torch.uint8).view(torch.int32)[:, 0]
+                fp8, scale = widen_fp4_to_fp8(payload, scales)
+                widened = fp8.double() * scale.double()[:, None]
+                expected = dequant_fp4(payload, scales)
+                self.assertEqual(torch.equal(widened, expected), spread <= 14)
+                torch.testing.assert_close(
+                    widened, expected, rtol=0, atol=expected.abs().max().item() * 2**-17
+                )
+
+    def test_exact_at_the_smallest_and_largest_block_exponents(self):
+        # Exponent bytes down to 1, the smallest the format holds (the quantizers
+        # floor block amax well above that), so the fp32 scale 2**(top - 133) is
+        # subnormal below top = 7.
+        gen = torch.Generator(device="cuda").manual_seed(1)
+        payload = torch.randint(
+            -128, 128, (64, 64), dtype=torch.int8, device="cuda", generator=gen
+        )
+        for top in (1, 2, 5, 6, 7, 8, 30, 254):
+            with self.subTest(top=top):
+                scales = torch.full((64, 4), top, dtype=torch.uint8, device="cuda")
+                scales = scales.view(torch.int32)[:, 0]
+                fp8, scale = widen_fp4_to_fp8(payload, scales)
+                self.assertTrue(
+                    torch.equal(
+                        fp8.double() * scale.double()[:, None],
+                        dequant_fp4(payload, scales),
+                    )
+                )
+
+
 @unittest.skipUnless(
-    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10,
-    "requires SM100",
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] in (9, 10),
+    "requires SM90 or SM100",
 )
 class TestDensePrefillIndexer(CustomTestCase):
     def assert_topk(self, inputs, selected, scores):
@@ -321,8 +394,38 @@ class TestDensePrefillIndexer(CustomTestCase):
                 )
                 self.assertEqual(tuple(candidates.blocks.shape), block_shape)
 
+    @unittest.skipUnless(torch.cuda.is_available() and is_hopper(), "Hopper scores")
+    def test_hopper_scores_match_the_fp4_operands(self):
+        # Exact fp4 products with fp32 sums, about 1e-7 of the row's largest score
+        # on H200; the torch path rounds each head's score to bf16.
+        inputs = make_inputs([(33, 511), (257, 4097)])
+        q = dequant_fp4(*inputs["q"])
+        k = dequant_fp4(*inputs["kv"])
+        expected = (
+            (torch.einsum("rhd,nd->rhn", q, k).relu() * inputs["weights"][..., None])
+            .sum(1)
+            .float()
+        )
+        visible = (
+            torch.arange(k.shape[0], device="cuda")[None, :] - inputs["starts"][:, None]
+        )
+        visible = (visible >= 0) & (visible < inputs["lengths"][:, None])
+        tiles = scoring.score_tiles(prefill_data(inputs), inputs["kv"])
+        scores = torch.cat([logits for _, logits in tiles])
+        for row in range(q.shape[0]):
+            n = inputs["lengths"][row].item()
+            torch.testing.assert_close(
+                scores[row, :n],
+                expected[row, visible[row]],
+                rtol=0,
+                atol=expected[row].abs().max().item() * 2**-18,
+            )
+
     def test_score_budget_includes_allocation_padding(self):
-        from deep_gemm import fp8_fp4_mqa_logits
+        import deep_gemm
+
+        name = "fp8_mqa_logits" if is_hopper() else "fp8_fp4_mqa_logits"
+        kernel = getattr(deep_gemm, name)
 
         inputs = make_inputs([(13, 257)])
         expected = dense_scores(inputs)
@@ -332,13 +435,13 @@ class TestDensePrefillIndexer(CustomTestCase):
 
                 def checked_logits(*args, **kwargs):
                     before = torch.cuda.memory_allocated()
-                    logits = fp8_fp4_mqa_logits(*args, **kwargs)
+                    logits = kernel(*args, **kwargs)
                     allocations.append(torch.cuda.memory_allocated() - before)
                     return logits
 
                 with (
                     patch.object(scoring, "_DEEP_GEMM_SCORE_BUDGET_BYTES", budget),
-                    patch("deep_gemm.fp8_fp4_mqa_logits", new=checked_logits),
+                    patch(f"deep_gemm.{name}", new=checked_logits),
                 ):
                     selected, _ = run_dense(
                         inputs, publish_candidates=True, candidates=None
