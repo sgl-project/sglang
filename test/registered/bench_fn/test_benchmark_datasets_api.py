@@ -408,7 +408,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             },
             {
                 "messages": [{"role": "user", "content": "What is 2+2?"}],
-                "max_tokens": 8,
+                "max_completion_tokens": 8,
                 "tools": [{"type": "function", "function": {"name": "tool_a"}}],
             },
         ]
@@ -550,6 +550,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
 
     def test_openai_sampler(self):
+        """Honor both recorded output-limit field names when replaying requests."""
         dataset_path = self._write_openai_jsonl()
         rows = sample_openai_requests(
             dataset_path=dataset_path,
@@ -557,6 +558,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             tokenizer=self.tokenizer,
         )
         self.assertEqual(len(rows), 2)
+        self.assertEqual([row.output_len for row in rows], [7, 8])
         self.assertIn("temperature", rows[0].extra_request_body)
         self.assertIn("tools", rows[1].extra_request_body)
 
