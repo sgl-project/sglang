@@ -49,6 +49,10 @@ class TestNPUIndexerLayerLayout(CustomTestCase):
                 "get_parallel",
                 return_value=SimpleNamespace(attn_dcp_size=2),
             ),
+            patch(
+                "sglang.srt.layers.cp.utils.get_parallel",
+                return_value=SimpleNamespace(enable_dsa_cache_layer_split=False),
+            ),
             patch.object(
                 kcc,
                 "get_schedule",
