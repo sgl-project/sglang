@@ -269,6 +269,57 @@ def test_untile_kernel_compiles_once_per_mode(monkeypatch) -> None:
     assert len(cache) == 2
 
 
+@requires_cuda
+def test_pack_tiles_kernel_compiles_once_per_mode(monkeypatch) -> None:
+    """The tile count follows the prompt length; each divisibility class must
+    reuse one variant per mode and give the bytes of the length-specialized
+    kernel."""
+    kernel = vsa_h3_kernels._pack_tiles_kernel
+    cache = _fresh_compile_cache(monkeypatch, kernel)
+    specialized = triton.jit(kernel.fn)
+    block = vsa_h3_kernels.VSA_H3_KERNEL_BLOCK
+    for n_tiles in (32, 33):  # divisible by 16 or not
+        # one empty tile past n_tiles, as the workspace may hold
+        seq_pad, used = (n_tiles + 1) * block, n_tiles * block - 37
+        # q / k / v as slices of one fused [rows, heads, 3 * D] projection
+        q, k, v = (
+            torch.randn(used, 7, 3 * HEAD_DIM, device="cuda")
+            .to(torch.bfloat16)
+            .split(HEAD_DIM, dim=-1)
+        )
+        gate = torch.randn(used, 7, HEAD_DIM, device="cuda").to(torch.bfloat16)
+        src_index = torch.full((seq_pad,), -1, dtype=torch.int32, device="cuda")
+        slots = torch.randperm(n_tiles * block, device="cuda")[:used]
+        src_index[slots] = torch.arange(used, dtype=torch.int32, device="cuda")
+        sizes = (src_index[: n_tiles * block].view(n_tiles, block) >= 0).sum(1).int()
+        for has_gate in (True, False):
+            results = []
+            for jit in (kernel, specialized):
+                tiled = torch.zeros(
+                    3 + has_gate,
+                    7,
+                    seq_pad,
+                    HEAD_DIM,
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                )
+                pooled = torch.zeros(3, 7, n_tiles, HEAD_DIM, device="cuda")
+                with mock.patch.object(vsa_h3_kernels, "_pack_tiles_kernel", jit):
+                    vsa_h3_kernels.vsa_h3_pack_tiles(
+                        q,
+                        k,
+                        v,
+                        gate if has_gate else None,
+                        src_index,
+                        sizes,
+                        tiled,
+                        pooled,
+                    )
+                results.append((tiled, pooled))
+            assert all(_same_bytes(*pair) for pair in zip(*results))
+    assert len(cache) == 2
+
+
 def _masked_dense_reference(meta, used, q, k, v, gate, sparsity):
     """fp32 reference over the padded tile layout with the top-k tile mask."""
     n_tiles = meta.num_tiles

@@ -302,7 +302,11 @@ def vsa_h3_block_sparse_attn_forward(
     return out
 
 
-@triton.jit
+# N_TILES follows the prompt length; specializing on its divisibility compiled
+# a new variant on the request path. It only offsets the pooled rows, which are
+# HEAD_DIM-aligned either way, so the vector accesses are unchanged. S_PAD is a
+# whole number of tiles, so its specialization never changes.
+@triton.jit(do_not_specialize=["N_TILES"])
 def _pack_tiles_kernel(
     Q,
     K,
