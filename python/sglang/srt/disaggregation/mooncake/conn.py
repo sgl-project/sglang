@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.mooncake.utils import (
     _validate_efa_allocator_compatibility,
     check_mooncake_custom_mem_pool_enabled,
 )
+from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
     align_window_tails,
     build_dsa_tail_transfer_blocks,
@@ -549,6 +550,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.deregister_buffer_to_engine()
         except Exception:
             logger.exception("Failed to deregister buffers during teardown")
+
+        if isinstance(self.request_status, PPConsensusStore):
+            self.request_status.close()
 
         logger.info(
             "MooncakeKVManager torn down (was role=%s)",
