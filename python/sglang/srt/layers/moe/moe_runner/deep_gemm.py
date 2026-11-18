@@ -236,6 +236,13 @@ def _should_use_masked_standard_layout(
         )
     if mode != "auto":
         return mode == "masked"
+    if get_exec().deterministic.enable_deterministic_inference:
+        # Masked layout fuses post-GEMM1 SiLU*mul and FP8 quantization in FP32,
+        # whereas compact layout rounds SiLU*mul to BF16 before quantizing.
+        # Under auto mode, switching from masked (small-M / CUDA graph) to
+        # compact (large-M prefill exceeding the memory budget) breaks batch
+        # invariance; compact layout is CUDA-graph-safe and scales to any M.
+        return False
 
     global _masked_standard_layout_memory_budget_bytes
     if _masked_standard_layout_memory_budget_bytes is None:
