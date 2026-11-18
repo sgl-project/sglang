@@ -1296,6 +1296,7 @@ class AiterAttnBackend(AttentionBackend):
                 and is_gfx95_supported()
                 and self.dcp_world_size <= 1
                 and self.kv_cache_dtype == fp8_dtype
+                and self.input_dtype == torch.bfloat16
                 and self.num_draft_tokens == 8
                 and getattr(self, "num_head", None) == 12
                 and prefer_mla_gluon_decode(
@@ -5594,6 +5595,7 @@ class AiterAttnBackend(AttentionBackend):
                 and layer.qk_head_dim == layer.v_head_dim == 128
                 and layer.tp_k_head_num == layer.tp_v_head_num
                 and self.kv_cache_dtype == fp8_dtype
+                and self.input_dtype == torch.bfloat16
                 and q.dtype == torch.bfloat16
                 and _aiter_fp8_asm_supports_gqa(
                     layer.tp_q_head_num, layer.tp_k_head_num
@@ -5660,6 +5662,7 @@ class AiterAttnBackend(AttentionBackend):
                 and layer.qk_head_dim == 256
                 and layer.v_head_dim == 256
                 and self.kv_cache_dtype == fp8_dtype
+                and self.input_dtype == torch.bfloat16
                 and _aiter_fp8_asm_supports_gqa(
                     layer.tp_q_head_num, layer.tp_k_head_num
                 )
@@ -5720,6 +5723,7 @@ class AiterAttnBackend(AttentionBackend):
                 and layer.qk_head_dim == 256
                 and layer.v_head_dim == 256
                 and self.kv_cache_dtype == fp8_dtype
+                and self.input_dtype == torch.bfloat16
                 and _aiter_fp8_asm_supports_gqa(
                     layer.tp_q_head_num, layer.tp_k_head_num
                 )
@@ -5823,6 +5827,7 @@ class AiterAttnBackend(AttentionBackend):
                 and layer.qk_head_dim == 256
                 and layer.v_head_dim == 256
                 and self.kv_cache_dtype == fp8_dtype
+                and self.input_dtype == torch.bfloat16
             ):
                 # These must match aiter's asm guard: there is no CK arm for 4D
                 # LINEAR page-64 fp8 hd256, so a shape the guard rejects raises
