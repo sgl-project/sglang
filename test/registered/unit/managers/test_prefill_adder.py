@@ -189,6 +189,7 @@ class TestPrefillAdder(CustomTestCase):
         req.fulfilled_storage_hit_len.return_value = 0
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
+        req.beam_group = None
         req.last_node = MagicMock()
         return req
 

@@ -152,8 +152,7 @@ export const DeepSeekV31Deployment = () => {
         cmd += ` \\\n  --attn-dp-size 8`;
       }
       else{
-        cmd += ` \\\n  --dp 6`;
-        cmd += ` \\\n  --enable-dp-attention`;
+        cmd += ` \\\n  --attn-dp-size 6`;
       }
 
     }
