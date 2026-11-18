@@ -1,0 +1,155 @@
+name: Cleanup ccache
+
+on:
+  workflow_dispatch:
+
+jobs:
+  cleanup-ccache:
+    name: Cleanup ccache
+    strategy:
+      matrix:
+        runner:
+          - x64-kernel-build-node
+          - arm-kernel-build-node
+      fail-fast: false
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Display ccache stats before cleanup
+        id: before-stats
+        continue-on-error: true
+        run: |
+          echo "==================================="
+          echo "ccache Statistics BEFORE Cleanup"
+          echo "==================================="
+
+          CCACHE_DIR="${HOME}/.cache/sgl-kernel/ccache"
+
+          if [ -d "$CCACHE_DIR" ]; then
+            echo "ccache directory exists at: $CCACHE_DIR"
+
+            # Check disk usage before cleanup
+            echo ""
+            echo "Disk usage:"
+            du -sh "$CCACHE_DIR" 2>/dev/null || echo "Unable to calculate directory size"
+
+            # Try to show ccache stats if ccache is installed
+            if command -v ccache &> /dev/null; then
+              export CCACHE_DIR="$CCACHE_DIR"
+              ccache -s 2>/dev/null || echo "ccache installed but unable to show stats"
+            else
+              echo "ccache not installed on this runner"
+            fi
+          else
+            echo "ccache directory does not exist at: $CCACHE_DIR"
+          fi
+
+          echo ""
+
+      - name: Display CMake cache stats before cleanup
+        continue-on-error: true
+        run: |
+          echo "==================================="
+          echo "CMake Cache BEFORE Cleanup"
+          echo "==================================="
+
+          CMAKE_CACHE_DIR="${HOME}/.cache/sgl-kernel/cmake-downloads"
+
+          if [ -d "$CMAKE_CACHE_DIR" ]; then
+            echo "CMake cache directory exists at: $CMAKE_CACHE_DIR"
+            echo ""
+            echo "Disk usage:"
+            du -sh "$CMAKE_CACHE_DIR" 2>/dev/null || echo "Unable to calculate directory size"
+            echo ""
+            echo "Files in cache:"
+            ls -lh "$CMAKE_CACHE_DIR" 2>/dev/null || echo "Unable to list files"
+          else
+            echo "CMake cache directory does not exist at: $CMAKE_CACHE_DIR"
+          fi
+
+          echo ""
+
+      - name: Force cleanup ccache
+        run: |
+          echo "==================================="
+          echo "Performing ccache Cleanup"
+          echo "==================================="
+
+          CCACHE_DIR="${HOME}/.cache/sgl-kernel/ccache"
+
+          if [ -d "$CCACHE_DIR" ]; then
+            echo "Removing ccache directory: $CCACHE_DIR"
+            rm -rf "$CCACHE_DIR"
+
+            if [ ! -d "$CCACHE_DIR" ]; then
+              echo "✅ ccache directory successfully removed"
+            else
+              echo "❌ Failed to remove ccache directory"
+              exit 1
+            fi
+          else
+            echo "⚠️  ccache directory does not exist, nothing to clean"
+          fi
+
+          echo ""
+
+      - name: Force cleanup CMake cache
+        run: |
+          echo "==================================="
+          echo "Performing CMake Cache Cleanup"
+          echo "==================================="
+
+          CMAKE_CACHE_DIR="${HOME}/.cache/sgl-kernel/cmake-downloads"
+
+          if [ -d "$CMAKE_CACHE_DIR" ]; then
+            echo "Removing CMake cache directory: $CMAKE_CACHE_DIR"
+            rm -rf "$CMAKE_CACHE_DIR"
+
+            if [ ! -d "$CMAKE_CACHE_DIR" ]; then
+              echo "✅ CMake cache directory successfully removed"
+            else
+              echo "❌ Failed to remove CMake cache directory"
+              exit 1
+            fi
+          else
+            echo "⚠️  CMake cache directory does not exist, nothing to clean"
+          fi
+
+          echo ""
+
+      - name: Verify cleanup
+        run: |
+          echo "==================================="
+          echo "Cleanup Verification"
+          echo "==================================="
+
+          CACHE_BASE_DIR="${HOME}/.cache/sgl-kernel"
+
+          if [ -d "$CACHE_BASE_DIR" ]; then
+            echo "Base cache directory still exists at: $CACHE_BASE_DIR"
+            echo ""
+            echo "Remaining contents:"
+            ls -la "$CACHE_BASE_DIR" 2>/dev/null || echo "Directory is empty or inaccessible"
+          else
+            echo "✅ Entire sgl-kernel cache directory has been removed"
+          fi
+
+          echo ""
+          echo "==================================="
+          echo "Cleanup Complete"
+          echo "==================================="
+
+      - name: Display cleanup summary
+        if: always()
+        run: |
+          echo ""
+          echo "╔════════════════════════════════════════╗"
+          echo "║   ccache Cleanup Summary               ║"
+          echo "╚════════════════════════════════════════╝"
+          echo ""
+          echo "Runner: ${{ matrix.runner }}"
+          echo "Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo ""
+          echo "Cleaned directories:"
+          echo "  - ${HOME}/.cache/sgl-kernel/ccache"
+          echo "  - ${HOME}/.cache/sgl-kernel/cmake-downloads"
+          echo ""
