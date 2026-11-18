@@ -82,6 +82,10 @@ _CAPTURE_BEGIN = re.compile(r"Capture [\w ]*CUDA graph begin\.")
 # SGLang's own startup timers (the launcher prints them once the schedulers are up).
 _STARTUP_TIMINGS = re.compile(r"Engine startup timings \(s\): (.*)")
 _STARTUP_FIELDS = re.compile(r"scheduler_e2e=([0-9.]+), cuda_graph=\{([^}]*)\}")
+# Hybrid GDN models compile their prefill kernels in process on every start, LOAD included.
+_GDN_PREWARM = re.compile(
+    r"Prewarmed FlashInfer GDN prefill with \d+ runs in ([0-9.]+) s\."
+)
 _PREFILL_PASSES = re.compile(
     r'^sglang:cuda_graph_passes_total\{[^}]*mode="prefill_cuda_graph"[^}]*\}'
     r"\s+([0-9.eE+-]+)$",
@@ -441,10 +445,13 @@ class TestFoundryGraphPersistence(CustomTestCase):
         )
         self.assertIsNotNone(native, "no startup-timings line in the native log")
         self.assertIsNotNone(load, "no startup-timings line in the LOAD log")
+        # Not persistence's time; drop once these kernels are cached on disk.
+        gdn_prewarm_s = sum(map(float, _GDN_PREWARM.findall(self.runs["load"]["log"])))
+        load_init_s = load[0] - gdn_prewarm_s
         check_perf(
             self,
             at_most("load_cuda_graph", load[1], self.load_graph_s, unit="s"),
-            at_most("load_scheduler_e2e", load[0], self.load_scheduler_s, unit="s"),
+            at_most("load_scheduler_e2e", load_init_s, self.load_scheduler_s, unit="s"),
             reported("native_cuda_graph", native[1], unit="s"),
             reported("native_scheduler_e2e", native[0], unit="s"),
             suffix=f"_{type(self).__name__}",
