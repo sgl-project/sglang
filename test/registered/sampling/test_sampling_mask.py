@@ -369,6 +369,25 @@ class SamplingMaskTestMixin:
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
+    def _post_selected_without_mask(self, sampling_params, return_logprob=False):
+        payload = {
+            "text": "The capital of France is",
+            "sampling_params": {
+                "temperature": 1.0,
+                "max_new_tokens": _MAX_NEW_TOKENS,
+                "ignore_eos": True,
+                "sampling_seed": _SAMPLING_SEED,
+                **sampling_params,
+            },
+            "sampling_logprobs_mode": "selected",
+            "return_logprob": return_logprob,
+        }
+        response = requests.post(self.base_url + "/generate", json=payload, timeout=60)
+        self.assertEqual(response.status_code, 200, response.text)
+        output = response.json()
+        self.assertNotIn("output_token_sampling_mask", output["meta_info"])
+        return output
+
     def _post_generate(
         self,
         sampling_params,
@@ -890,25 +909,6 @@ class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):
         ):
             self.assertEqual(streamed["meta_info"][key], support["meta_info"][key])
 
-    def _post_selected_without_mask(self, sampling_params, return_logprob=False):
-        payload = {
-            "text": "The capital of France is",
-            "sampling_params": {
-                "temperature": 1.0,
-                "max_new_tokens": _MAX_NEW_TOKENS,
-                "ignore_eos": True,
-                "sampling_seed": _SAMPLING_SEED,
-                **sampling_params,
-            },
-            "sampling_logprobs_mode": "selected",
-            "return_logprob": return_logprob,
-        }
-        response = requests.post(self.base_url + "/generate", json=payload, timeout=60)
-        self.assertEqual(response.status_code, 200, response.text)
-        output = response.json()
-        self.assertNotIn("output_token_sampling_mask", output["meta_info"])
-        return output
-
     def test_selected_mode_without_mask_matches_mask_request(self):
         sampling_params = {
             "top_k": _TOP_K,
@@ -941,6 +941,28 @@ class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):
             strict=True,
         ):
             self.assertAlmostEqual(sampling_logprob, logprob, delta=1e-4)
+
+
+class TestSamplingMaskRlOnPolicy(SamplingMaskTestMixin, CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._launch_server(
+            ("--rl-on-policy-target", "fsdp", "--attention-backend", "triton")
+        )
+
+    def test_unfiltered_selected_mode_without_mask_returns_the_sampler_logprobs(self):
+        output = self._post_selected_without_mask(
+            {"top_k": -1, "top_p": 1.0}, return_logprob=True
+        )
+        meta_info = output["meta_info"]
+        self.assertEqual(len(output["output_ids"]), _MAX_NEW_TOKENS)
+        # The sampler normalizes its bf16 log-softmax weights; the output logprob is not normalized.
+        for sampling_logprob, (logprob, *_) in zip(
+            meta_info["output_token_sampling_logprobs"],
+            meta_info["output_token_logprobs"],
+            strict=True,
+        ):
+            self.assertAlmostEqual(sampling_logprob, logprob, delta=1e-2)
 
 
 class TestSamplingMaskPytorch(TestSamplingMask):

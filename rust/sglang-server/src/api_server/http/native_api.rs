@@ -789,11 +789,10 @@ pub(super) fn generate_requests(
         tracing::warn!(error = %e, "rejected request");
         (StatusCode::BAD_REQUEST, e.to_string(), stream)
     })?;
-    // Python refuses a mode without `return_sampling_mask=true`, and
-    // `into_requests` refused the mask.
+    // The Rust server returns no sampling logprobs; `into_requests` refused the mask.
     let batch = is_batch.then_some(requests.len());
     if sampling_logprobs_mode.is_some_and(|mode| sampling_logprobs_mode_set(&mode, batch)) {
-        let message = "sampling_logprobs_mode can only be set when return_sampling_mask=true.";
+        let message = "sampling_logprobs_mode is not supported by the Rust server";
         tracing::warn!(error = %message, "rejected request");
         return Err((StatusCode::BAD_REQUEST, message.into(), stream));
     }
@@ -1607,15 +1606,15 @@ mod tests {
             ),
             (
                 serde_json::json!({"text": "hi", "sampling_logprobs_mode": "support"}),
-                "sampling_logprobs_mode can only be set when return_sampling_mask=true.",
+                "sampling_logprobs_mode is not supported by the Rust server",
             ),
             (
                 serde_json::json!({"text": "hi", "sampling_logprobs_mode": [null]}),
-                "sampling_logprobs_mode can only be set when return_sampling_mask=true.",
+                "sampling_logprobs_mode is not supported by the Rust server",
             ),
             (
                 serde_json::json!({"text": ["a", "b"], "sampling_logprobs_mode": [null, "support"]}),
-                "sampling_logprobs_mode can only be set when return_sampling_mask=true.",
+                "sampling_logprobs_mode is not supported by the Rust server",
             ),
             (
                 serde_json::json!({
