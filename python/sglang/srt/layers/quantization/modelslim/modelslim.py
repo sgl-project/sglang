@@ -221,6 +221,14 @@ class ModelSlimConfig(QuantizationConfig):
             candidates.append(prefix.replace(".mlp.", ".block_sparse_moe."))
 
         for candidate in list(candidates):
+            if candidate.startswith("model.language_model."):
+                candidates.append(
+                    "model." + candidate.removeprefix("model.language_model.")
+                )
+            elif candidate.startswith("model."):
+                candidates.append(
+                    "model.language_model." + candidate.removeprefix("model.")
+                )
             if candidate.startswith("language_model."):
                 candidates.append(candidate.removeprefix("language_model."))
             else:

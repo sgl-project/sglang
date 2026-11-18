@@ -2,6 +2,7 @@ import importlib.util
 import sys
 import unittest
 from contextlib import ExitStack
+from itertools import product
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -517,13 +518,21 @@ class TestAscendTPOptimizations(CustomTestCase):
             ModelSlimFusedMoEMethod,
         )
 
-        for w13, w2 in (
-            ("FLOAT", "W8A8_DYNAMIC"),
-            ("W8A8_DYNAMIC", "FLOAT"),
-            ("W4A4_DYNAMIC", "W8A8_DYNAMIC"),
+        for checkpoint_prefix, (w13, w2) in product(
+            (
+                "model.language_model.layers.0",
+                "model.layers.0",
+                "language_model.model.layers.0",
+            ),
+            (
+                ("FLOAT", "FLOAT"),
+                ("FLOAT", "W8A8_DYNAMIC"),
+                ("W8A8_DYNAMIC", "FLOAT"),
+                ("W4A4_DYNAMIC", "W8A8_DYNAMIC"),
+            ),
         ):
             description = {
-                f"model.layers.0.mlp.experts.0.{proj}.weight": scheme
+                f"{checkpoint_prefix}.mlp.experts.0.{proj}.weight": scheme
                 for proj, scheme in (
                     ("gate_proj", w13),
                     ("up_proj", w13),
