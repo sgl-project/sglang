@@ -47,6 +47,7 @@
 #include <cstdlib>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <limits>
 
 // Local PTX primitives (cp.async / mbarrier / async-proxy fence)
 
@@ -311,11 +312,12 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
     float scale,                      // query scale applied after L2-normalization
     float onorm_eps,                  // onorm RMSNorm epsilon
     int64_t x_row_stride,             // element stride between consecutive tokens' rows in x_q/x_k/x_v (>= 3*H*128)
-    int64_t g_row_stride,             // element stride between consecutive tokens' rows in g (>= HV*128)
-    int64_t beta_row_stride,          // element stride between consecutive tokens' rows in beta (>= HV)
-    int64_t onormg_row_stride,        // element stride between consecutive tokens' rows in onorm_g (>= HV*128)
-    int64_t cs_slot_stride,           // element stride between consecutive slots in cs_q/cs_k/cs_v
-    int64_t cs_w_stride,              // element stride between shift-register taps (w=0..2) within a slot
+    // 32-bit like their offsets below (the host bounds them): int64 here costs ~1.5% at mid batch.
+    int32_t g_row_stride,         // element stride between consecutive tokens' rows in g (>= HV*128)
+    int32_t beta_row_stride,      // element stride between consecutive tokens' rows in beta (>= HV)
+    int32_t onormg_row_stride,    // element stride between consecutive tokens' rows in onorm_g (>= HV*128)
+    int64_t cs_slot_stride,       // element stride between consecutive slots in cs_q/cs_k/cs_v
+    int64_t cs_w_stride,          // element stride between shift-register taps (w=0..2) within a slot
     int64_t state_slot_stride) {  // element stride between consecutive slots in state (dense HV*128*128, or larger for
                                   // shared pools)
   device::PDLWaitPrimary<kUsePDL>();
@@ -451,7 +453,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
     cs_v[cs_base + 2 * cs_w_stride] = v_new;
     s_v[v] = device::activation::silu(v_acc);
 
-    const int64_t onorm_idx = i_n * onormg_row_stride + i_hv * kDimV + v;
+    const int onorm_idx = i_n * onormg_row_stride + i_hv * kDimV + v;
     pre_onorm_gate = device::activation::sigmoid(__bfloat162float(onorm_g[onorm_idx]));
     pre_onorm_weight = onorm_weight[v];
   }
@@ -703,6 +705,11 @@ struct KdaFusedDecodeKernel {
     // pools. Threaded into every ssm-state read/write; int64 avoids the
     // envelope-pitch overflow.
     const int64_t state_slot_stride = state.stride(0);
+    const auto fits_int32 = [B](int64_t row_stride, int64_t row_width) {
+      return (B - 1) * row_stride + row_width <= std::numeric_limits<int32_t>::max();
+    };
+    CHECK_HOST(fits_int32(a.stride(0), kSeg) && fits_int32(b.stride(0), kH) && fits_int32(onorm_g.stride(0), kSeg))
+        << "kda_fused_decode: g / beta / onorm_g offsets must fit in int32";
     // Full-state staging (4 stages, 64KB, sync-free) wins while the grid is small
     // enough that occupancy isn't the limiter; past that the 48KB 3-stage variant
     // (one sync for the single stage reuse) benches fastest.
@@ -745,9 +752,9 @@ struct KdaFusedDecodeKernel {
             static_cast<float>(scale),
             static_cast<float>(onorm_eps),
             mixed_qkv.stride(0),
-            a.stride(0),
-            b.stride(0),
-            onorm_g.stride(0),
+            static_cast<int32_t>(a.stride(0)),
+            static_cast<int32_t>(b.stride(0)),
+            static_cast<int32_t>(onorm_g.stride(0)),
             conv_states.stride(0),
             conv_states.stride(1),
             state_slot_stride);
