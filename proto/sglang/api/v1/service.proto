@@ -11,6 +11,7 @@ package sglang.api.v1;
 import "sglang/api/v1/control.proto";
 import "sglang/api/v1/generate.proto";
 import "sglang/api/v1/hicache.proto";
+import "sglang/api/v1/weights.proto";
 import "sglang/json/v1/options.proto";
 
 service SglangService {
@@ -69,6 +70,37 @@ service SglangService {
   // `/release_memory_occupation`, `/resume_memory_occupation`.
   rpc ReleaseMemoryOccupation(ReleaseMemoryOccupationRequest) returns (MemoryOccupationResponse);
   rpc ResumeMemoryOccupation(ResumeMemoryOccupationRequest) returns (MemoryOccupationResponse);
+
+  // `/get_weights_by_name`: one parameter per DP rank.
+  rpc GetWeightsByName(GetWeightsByNameRequest) returns (GetWeightsByNameResponse);
+
+  // Weight-update process groups and remote-instance sends. Single-DP-rank
+  // deployments only, as in Python.
+  rpc InitWeightsUpdateGroup(InitWeightsUpdateGroupRequest) returns (WeightGroupResponse);
+  rpc DestroyWeightsUpdateGroup(DestroyWeightsUpdateGroupRequest) returns (WeightGroupResponse);
+  rpc InitWeightsSendGroupForRemoteInstance(InitWeightsSendGroupForRemoteInstanceRequest) returns (WeightGroupResponse);
+  rpc SendWeightsToRemoteInstance(SendWeightsToRemoteInstanceRequest) returns (WeightGroupResponse);
+
+  // The weight updates, each under the frontend's update lock on every
+  // listener. Distributed, tensor and plugin updates run inside a
+  // `BeginWeightUpdate` / `EndWeightUpdate` session and on single-DP-rank
+  // deployments only, as in Python.
+  rpc UpdateWeightsFromDisk(UpdateWeightsFromDiskRequest) returns (UpdateWeightsFromDiskResponse);
+  rpc UpdateWeightsFromDistributed(UpdateWeightsFromDistributedRequest) returns (WeightUpdateResponse);
+  rpc UpdateWeightsFromTensor(UpdateWeightsFromTensorRequest) returns (WeightUpdateResponse);
+  rpc UpdateWeightsFromIpc(UpdateWeightsFromIpcRequest) returns (WeightUpdateResponse);
+  rpc BeginWeightUpdate(BeginWeightUpdateRequest) returns (WeightUpdateResponse);
+  rpc EndWeightUpdate(EndWeightUpdateRequest) returns (WeightUpdateResponse);
+  rpc PluginWeightUpdate(PluginWeightUpdateRequest) returns (PluginWeightUpdateResponse);
+
+  // LoRA adapters; refused as "LoRA is not enabled" (see weights.proto).
+  rpc LoadLoraAdapter(LoadLoraAdapterRequest) returns (LoraUpdateResponse);
+  rpc LoadLoraAdapterFromTensors(LoadLoraAdapterFromTensorsRequest) returns (LoraUpdateResponse);
+  rpc UnloadLoraAdapter(UnloadLoraAdapterRequest) returns (LoraUpdateResponse);
+
+  // `/remote_instance_transfer_engine_info`: proxied from the engine-info
+  // bootstrap server.
+  rpc GetRemoteInstanceTransferEngineInfo(RemoteInstanceTransferEngineInfoRequest) returns (RemoteInstanceTransferEngineInfoResponse);
 
   // `/freeze_gc`, `/pause_generation`, `/continue_generation`,
   // `/pd_role_switch`, `/update_weight_version`.
