@@ -53,7 +53,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_replay_scope,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_xpu
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_npu, is_xpu
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -109,11 +109,11 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseBreakableGraphBackend
             self._memory_saver_adapter is not None
             and self._memory_saver_adapter.enabled
         ):
-            if is_xpu():
-                # The memory saver cannot capture pauseable graphs on XPU.
+            if is_xpu() or is_npu():
+                # The memory saver's pauseable capture wraps torch.cuda.graph only.
                 raise NotImplementedError(
                     "Breakable CUDA graph is not compatible with memory saver "
-                    "mode on XPU"
+                    "mode on XPU or NPU"
                 )
             self._segment_capture = partial(
                 self._memory_saver_adapter.cuda_graph,
