@@ -2145,6 +2145,19 @@ mod tests {
         assert_eq!(c.model.policy, PolicyKind::LoadBased);
     }
 
+    /// `--policy shape_aware` parses to the shape-aware selector.
+    #[test]
+    fn parses_shape_aware_policy() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--policy",
+            "shape_aware",
+        ]))
+        .unwrap();
+        assert_eq!(c.model.policy, PolicyKind::ShapeAware);
+    }
+
     /// clap rejects `--cb-threshold 0` because the field is `NonZeroU32`.
     #[test]
     fn rejects_zero_cb_threshold() {

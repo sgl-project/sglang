@@ -57,6 +57,8 @@ pub(crate) struct PrefillSelectionInputs<'a> {
     pub routing_key: Option<&'a str>,
     pub session_id: Option<&'a str>,
     pub request_input_tokens: u64,
+    /// `max_tokens`; `None` when the request sets no cap.
+    pub request_output_tokens: Option<u64>,
     /// The longest single prompt, which bucket limits bound; below
     /// `request_input_tokens` only for a batch.
     pub request_sequence_tokens: u64,
@@ -410,6 +412,7 @@ impl<'a> Selector<'a> {
             .with_session_id(inputs.session_id)
             .with_candidate_range_id(candidate_range_id)
             .with_input_tokens(inputs.request_input_tokens)
+            .with_output_tokens(inputs.request_output_tokens)
             .with_request_tokens(inputs.request_tokens)
             .with_cache_namespace(inputs.cache_namespace)
             .with_external_prefix(inputs.external_prefix)
@@ -983,6 +986,7 @@ mod tests {
             routing_key: None,
             session_id: None,
             request_input_tokens,
+            request_output_tokens: None,
             request_sequence_tokens: request_input_tokens,
             request_tokens: None,
             cache_namespace: crate::state::kv_events::CacheNamespace::NONE,

@@ -630,6 +630,7 @@ fn pick_prefill_worker(
         routing_key: routing.routing_key,
         session_id: routing.session_id,
         request_input_tokens: request.input_token_count as u64,
+        request_output_tokens: request.output_tokens,
         request_sequence_tokens: request.sequence_token_count as u64,
         request_tokens: request.tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
         cache_namespace: &request.cache_namespace,
