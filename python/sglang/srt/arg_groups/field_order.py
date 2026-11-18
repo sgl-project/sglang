@@ -572,5 +572,7 @@ POSITIONAL_FIELD_ORDER = (
     "gc_freeze_on_idle_secs",
     "elastic_ep_retiree_lifecycle",
     "elastic_ep_reuse_cuda_graph",
+    "enable_dsa_fp4_indexer",
+    "kda_dwdp_size",
 )
 # fmt: on

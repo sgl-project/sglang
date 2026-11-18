@@ -2051,6 +2051,11 @@ class ModelRunner:
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
         if isinstance(output.logits_output, LogitsProcessorOutput):
             output.logits_output.own_customized_info()
+        if (
+            not self.is_draft_worker
+            and (placement := getattr(self.model, "expert_placement", None)) is not None
+        ):
+            placement.on_forward_end(forward_batch)
 
         no_copy_to_cpu = not get_schedule().disable_overlap_schedule
         if (
