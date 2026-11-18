@@ -17,7 +17,9 @@ import unittest
 from array import array
 from types import SimpleNamespace
 from typing import Optional
+from unittest import mock
 
+import test_write_back_eviction_parity as write_back_parity
 import torch
 from numpy import float64
 
@@ -41,8 +43,12 @@ from sglang.srt.mem_cache.unified_cache.components.full import (
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import _LazyLeafHeap
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
+from sglang.test import hicache_write_back_fixtures
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.tree_slots import tree_slots_of
+from sglang.test.unified_allocator_fixtures import build_window_chain
 
 POLICIES = ("lru", "lfu", "fifo", "mru", "filo", "priority", "slru")
 
@@ -51,7 +57,26 @@ POLICIES = ("lru", "lfu", "fifo", "mru", "filo", "priority", "slru")
 # Legacy oracle: the Full component as it was before the persistent heap.
 # ---------------------------------------------------------------------------
 class LegacyFullComponent(FullComponent):
-    """Verbatim pre-change eviction drivers (rebuild the heap every call)."""
+    """Verbatim pre-change eviction drivers (rebuild the heap every walk)."""
+
+    def __init__(self, cache, params, slot):
+        super().__init__(cache, params, slot)
+        self.session_ref_eviction_strategy = (
+            self._session_ref_eviction_strategy
+            if cache.enable_session_radix_cache
+            else None
+        )
+        self._host_eviction_heap: Optional[list] = None
+
+    def _ensure_eviction_strategy(self) -> None:
+        if self.session_ref_eviction_strategy is None:
+            self.session_ref_eviction_strategy = (
+                self.tree_core.eviction_strategy.get_priority
+            )
+
+    def _session_ref_eviction_strategy(self, node):
+        ref = self.session_ref(node)
+        return ref > 0, ref, self.tree_core.eviction_strategy.get_priority(node)
 
     def _evict_device_start(self, request_cnt: int) -> None:
         self._ensure_eviction_strategy()
@@ -87,32 +112,43 @@ class LegacyFullComponent(FullComponent):
     def _evict_device_end(self) -> None:
         self._evict_device_heap = []
         self._evict_device_last_node = None
+        self._host_eviction_heap = None
+
+    def on_host_leaf_added(self, node) -> None:
+        if self._host_eviction_heap is not None:
+            heapq.heappush(
+                self._host_eviction_heap,
+                (self.session_ref_eviction_strategy(node), node),
+            )
 
     def drive_host_eviction(
         self, num_tokens, tracker, device_frees, host_frees, cache_actions
     ):
         self._ensure_eviction_strategy()
-        heap = [
-            (self.session_ref_eviction_strategy(n), n)
-            for n in self.tree_core.evictable_host_leaves
-        ]
-        heapq.heapify(heap)
+        if tracker[self.component_type] >= num_tokens:
+            return
+        if self._host_eviction_heap is None:
+            self._host_eviction_heap = [
+                (self.session_ref_eviction_strategy(n), n)
+                for n in self.tree_core.evictable_host_leaves
+            ]
+            heapq.heapify(self._host_eviction_heap)
+        heap = self._host_eviction_heap
         ct = self.component_type
-        while tracker[ct] < num_tokens and heap:
-            _, x = heapq.heappop(heap)
-            if x not in self.tree_core.evictable_host_leaves:
-                continue
-            self.tree_core._evict_host_leaf(
-                x, tracker, device_frees, host_frees, cache_actions=cache_actions
-            )
-            if (
-                x.parent is not None
-                and x.parent in self.tree_core.evictable_host_leaves
-            ):
-                heapq.heappush(
-                    heap,
-                    (self.session_ref_eviction_strategy(x.parent), x.parent),
+        try:
+            while tracker[ct] < num_tokens and heap:
+                _, x = heapq.heappop(heap)
+                if x not in self.tree_core.evictable_host_leaves:
+                    continue
+                self.tree_core._evict_host_leaf(
+                    x, tracker, device_frees, host_frees, cache_actions=cache_actions
                 )
+        finally:
+            if not (
+                self.is_evict_device_ongoing
+                and not self.tree_core.enable_session_radix_cache
+            ):
+                self._host_eviction_heap = None
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +183,7 @@ def make_cache(
     # The heap lives in the Python TreeCore; pin it so the suite does not pick
     # up the process-wide backend default.
     with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("python"):
-        return UnifiedRadixCache(
+        cache = UnifiedRadixCache(
             params=CacheInitParams(
                 disable=False,
                 req_to_token_pool=req_pool,
@@ -162,6 +198,33 @@ def make_cache(
                 ),
             )
         )
+    if legacy:
+        forward_host_leaf_adds(cache)
+    return cache
+
+
+class _HostLeafAddForwarder:
+    """Stands in for the tree core's host heap on the legacy side: the legacy
+    drivers never read it, but they need the host-leaf-added notification the
+    tree core used to send to the component."""
+
+    def __init__(self, heap, component):
+        self._heap = heap
+        self._component = component
+
+    def add(self, node) -> None:
+        self._heap.add(node)
+        self._component.on_host_leaf_added(node)
+
+    def __getattr__(self, name):
+        return getattr(self._heap, name)
+
+
+def forward_host_leaf_adds(cache) -> None:
+    core = cache.tree_core
+    core.full_host_heap = _HostLeafAddForwarder(
+        core.full_host_heap, core.components_by_type[ComponentType.FULL]
+    )
 
 
 def node_path(core, node) -> tuple:
@@ -314,46 +377,24 @@ def replay_pair(
     seed: int,
     session: bool,
     page_size: int = 1,
-    kill_switch=False,
     policy_config: Optional[dict] = None,
 ):
     ops = gen_ops(seed, 320, page_size, session)
-    reset_time_counter()
-    # Pin the lazy side explicitly: the env var is read at UnifiedTreeCore
-    # construction, so an exported kill switch would otherwise flip both sides.
-    with envs.SGLANG_UNIFIED_RADIX_LAZY_EVICTION_HEAP.override(True):
-        new = Replay(
+    pair = []
+    for legacy in (False, True):
+        reset_time_counter()
+        replay = Replay(
             make_cache(
                 policy=policy,
                 enable_session=session,
                 page_size=page_size,
+                legacy=legacy,
                 policy_config=policy_config,
             )
         )
-    new.run(ops)
-    reset_time_counter()
-    if kill_switch:
-        with envs.SGLANG_UNIFIED_RADIX_LAZY_EVICTION_HEAP.override(False):
-            ref = Replay(
-                make_cache(
-                    policy=policy,
-                    enable_session=session,
-                    page_size=page_size,
-                    policy_config=policy_config,
-                )
-            )
-    else:
-        ref = Replay(
-            make_cache(
-                policy=policy,
-                enable_session=session,
-                page_size=page_size,
-                legacy=True,
-                policy_config=policy_config,
-            )
-        )
-    ref.run(ops)
-    return new, ref
+        replay.run(ops)
+        pair.append(replay)
+    return pair
 
 
 # ---------------------------------------------------------------------------
@@ -374,49 +415,107 @@ class _Node:
         return f"N{self.id}"
 
 
+def _drain(heap) -> list:
+    heap.begin_walk()
+    out = []
+    while True:
+        n = heap.pop_next()
+        if n is None:
+            break
+        out.append(n)
+    heap.end_walk()
+    return out
+
+
 class TestLazyLeafHeapUnit(CustomTestCase):
-    def _heap(self, nodes, **kw):
+    def _heap(self, nodes, hide_entrants=True):
         members = set(nodes)
-        heap = _LazyLeafHeap(members, lambda: lambda n: n.key, **kw)
+        heap = _LazyLeafHeap(members, lambda n: n.key, hide_entrants=hide_entrants)
         for n in nodes:
-            heap.refresh(n)
+            heap.add(n)
         return members, heap
 
-    def _drain(self, heap):
-        heap.begin_walk()
-        out = []
-        while True:
-            n = heap.pop_next()
-            if n is None:
-                break
-            out.append(n)
-        heap.end_walk()
-        return out
+    def _assert_invariants(self, heap):
+        errors = []
+        heap.check_invariants(errors.append, "t", lambda n: True)
+        self.assertEqual(errors, [])
 
-    def test_pop_order_and_key_updates(self):
+    def test_pop_order_and_key_drop(self):
         nodes = [_Node(i, k) for i, k in enumerate([5, 3, 9, 1])]
         members, heap = self._heap(nodes)
-        errors = []
-        heap.check_invariants(errors.append, "t")
-        self.assertEqual(errors, [])
-        nodes[2].key = 0  # 9 -> 0: must come first after a touch
-        heap.touch(nodes[2])
-        self.assertEqual(self._drain(heap), [nodes[2], nodes[3], nodes[1], nodes[0]])
-        # a full walk yields every member exactly once, then they are all live again
-        errors = []
-        heap.check_invariants(errors.append, "t")
-        self.assertEqual(errors, [])
+        self._assert_invariants(heap)
+        nodes[2].key = 0  # 9 -> 0: must come first once reported
+        heap.lowered(nodes[2])
+        self.assertEqual(_drain(heap), [nodes[2], nodes[3], nodes[1], nodes[0]])
+        # a full walk yields every member exactly once, then they all have an entry again
+        self.assertEqual(set(heap._entry), members)
+        self._assert_invariants(heap)
 
-    def test_touch_ignores_non_members_and_forget_removes(self):
+    def test_key_raise_needs_no_hook(self):
+        nodes = [_Node(i, k) for i, k in enumerate([1, 2, 3, 4])]
+        members, heap = self._heap(nodes)
+        before = heap.num_heap_entries()
+        nodes[0].key = 10  # like an LRU touch: no call at all
+        nodes[1].key = 7
+        self.assertEqual(heap.num_heap_entries(), before)
+        self._assert_invariants(heap)
+        self.assertEqual(_drain(heap), [nodes[2], nodes[3], nodes[1], nodes[0]])
+        self._assert_invariants(heap)
+
+    def test_leaving_and_reentering_pushes_nothing(self):
         nodes = [_Node(i, i) for i in range(4)]
         members, heap = self._heap(nodes)
+        before = heap.num_heap_entries()
+        for t in range(1000):  # lock / unlock churn with LRU-style touches
+            members.discard(nodes[0])
+            nodes[0].key = 10 + t
+            members.add(nodes[0])
+            heap.add(nodes[0])
+        self.assertEqual(heap.num_heap_entries(), before)
+        self.assertEqual(_drain(heap), [nodes[1], nodes[2], nodes[3], nodes[0]])
+
+    def test_non_member_entry_is_dropped_on_pop(self):
+        nodes = [_Node(i, i) for i in range(4)]
+        members, heap = self._heap(nodes)
+        members.discard(nodes[0])  # left the set: no heap call
+        self.assertEqual(_drain(heap), nodes[1:])
+        self.assertNotIn(nodes[0], heap._entry)
+        nodes[0].key = -1
+        members.add(nodes[0])
+        heap.add(nodes[0])
+        self.assertEqual(_drain(heap), nodes)
+
+    def test_key_drop_outside_the_set_drops_the_entry(self):
+        nodes = [_Node(i, i + 1) for i in range(3)]
+        members, heap = self._heap(nodes)
+        members.discard(nodes[2])
+        before = heap.num_heap_entries()
+        for key in (0, -1, -2):  # e.g. MRU stamps on an interior node
+            nodes[2].key = key
+            heap.lowered(nodes[2])
+        self.assertEqual(heap.num_heap_entries(), before)  # nothing pushed
+        self.assertNotIn(nodes[2], heap._entry)
+        members.add(nodes[2])
+        heap.add(nodes[2])  # keyed again on the way back in
+        self._assert_invariants(heap)
+        self.assertEqual(_drain(heap), [nodes[2], nodes[0], nodes[1]])
+
+    def test_lowered_ignores_nodes_without_an_entry(self):
+        nodes = [_Node(i, i) for i in range(3)]
+        members, heap = self._heap(nodes)
         outsider = _Node(99, -1)
-        heap.touch(outsider)
-        heap.refresh(outsider)
-        self.assertEqual(len(heap), 4)
+        heap.lowered(outsider)
+        self.assertEqual(len(heap), 3)
+        self.assertEqual(_drain(heap), nodes)
+
+    def test_forget_drops_a_deleted_node(self):
+        nodes = [_Node(i, i) for i in range(4)]
+        members, heap = self._heap(nodes)
         members.discard(nodes[0])
         heap.forget(nodes[0])
-        self.assertEqual(self._drain(heap), nodes[1:])
+        self.assertEqual(len(heap), 3)
+        self.assertEqual(_drain(heap), nodes[1:])
+        self._assert_invariants(heap)
 
     def test_walk_snapshot_entrants_and_promote(self):
         nodes = [_Node(i, i) for i in range(3)]
@@ -426,51 +525,117 @@ class TestLazyLeafHeapUnit(CustomTestCase):
         self.assertIs(first, nodes[0])
         entrant = _Node(10, -5)  # smallest key, enters mid-walk
         members.add(entrant)
-        heap.refresh(entrant)
+        heap.add(entrant)
         self.assertIs(heap.pop_next(), nodes[1])  # invisible without promote
         heap.promote(entrant)
         self.assertIs(heap.pop_next(), entrant)  # visible right after promote
         self.assertIs(heap.pop_next(), nodes[2])
         self.assertIsNone(heap.pop_next())
         heap.end_walk()
-        # every member (including the yielded ones) is live again
-        self.assertEqual(set(heap._live), members)
-        errors = []
-        heap.check_invariants(errors.append, "t")
-        self.assertEqual(errors, [])
+        # every member (including the yielded ones) has an entry again
+        self.assertEqual(set(heap._entry), members)
+        self._assert_invariants(heap)
 
-    def test_admitted_non_member_lives_for_one_walk(self):
+    def test_hidden_entrant_with_an_old_entry_stays_hidden(self):
+        nodes = [_Node(i, i) for i in range(3)]
+        members, heap = self._heap(nodes)
+        members.discard(nodes[0])  # leaves before the walk, entry lingers
+        heap.begin_walk()
+        members.add(nodes[0])
+        heap.add(nodes[0])  # re-enters mid-walk
+        self.assertIs(heap.pop_next(), nodes[1])
+        self.assertIs(heap.pop_next(), nodes[2])
+        self.assertIsNone(heap.pop_next())
+        heap.end_walk()
+        self._assert_invariants(heap)
+        self.assertEqual(_drain(heap), nodes)
+
+    def test_host_walk_sees_entrants_at_once(self):
+        nodes = [_Node(i, i) for i in range(3)]
+        members, heap = self._heap(nodes, hide_entrants=False)
+        heap.begin_walk()
+        self.assertIs(heap.pop_next(), nodes[0])
+        entrant = _Node(10, -5)
+        members.add(entrant)
+        heap.add(entrant)
+        self.assertIs(heap.pop_next(), entrant)
+        self.assertIs(heap.pop_next(), nodes[1])
+        heap.end_walk()
+        self._assert_invariants(heap)
+
+    def test_promoted_non_member_lives_for_one_walk(self):
         # write_back: the walk may take a parent whose device children are all
         # queued although it is not in the leaf set.
         nodes = [_Node(i, i) for i in range(3)]
         members, heap = self._heap(nodes)
         parent = _Node(10, -1)
-        heap.promote(parent)  # not a member, not admitted: ignored
         heap.begin_walk()
         self.assertIs(heap.pop_next(), nodes[0])
-        heap.promote(parent, admit=True)
-        heap.forget(parent)  # a leaf-set update must not drop it mid-walk
+        heap.promote(parent)
         self.assertIs(heap.pop_next(), parent)
         self.assertIs(heap.pop_next(), nodes[1])
         other = _Node(11, -2)
-        heap.promote(other, admit=True)  # admitted but never popped
+        heap.promote(other)  # promoted but never popped
         heap.end_walk()
-        self.assertEqual(set(heap._live), members)
-        errors = []
-        heap.check_invariants(errors.append, "t")
-        self.assertEqual(errors, [])
-        self.assertEqual(self._drain(heap), nodes)
+        self.assertEqual(set(heap._entry), members)
+        self._assert_invariants(heap)
+        self.assertEqual(_drain(heap), nodes)
 
-    def test_mid_walk_touch_is_deferred_to_end_walk(self):
+    def test_promoted_node_stays_visible_when_it_joins_the_set(self):
+        # write_back with a full host pool: the queued batch is demoted in the
+        # middle of the walk and the promoted parent becomes a real leaf.
+        child, other, parent = _Node(0, 1), _Node(1, 2), _Node(2, 3)
+        members, heap = self._heap([child, other])
+        heap.begin_walk()
+        self.assertIs(heap.pop_next(), child)
+        heap.promote(parent)
+        self.assertIs(heap.pop_next(), other)
+        members.discard(child)
+        members.add(parent)
+        heap.add(parent)
+        self.assertIs(heap.pop_next(), parent)
+        heap.end_walk()
+        self._assert_invariants(heap)
+
+    def test_mid_walk_key_drop_keeps_the_walk_start_order(self):
+        # A nested host eviction can lower a session_ref during the walk; the
+        # heap rebuilt at walk start would not have seen it.
+        x, y = _Node(0, 5), _Node(1, 8)
+        members, heap = self._heap([x, y])
+        x.key = 10  # raised before the walk, no hook: the entry is stale-low
+        heap.begin_walk()
+        heap.pin(x)
+        x.key = 7
+        heap.lowered(x)
+        self.assertEqual([heap.pop_next(), heap.pop_next()], [y, x])
+        heap.end_walk()
+        self._assert_invariants(heap)
+        self.assertEqual(_drain(heap), [x, y])  # the drop counts from now on
+
+    def test_mid_walk_key_drop_is_applied_at_end_walk(self):
         nodes = [_Node(i, i) for i in range(3)]
         members, heap = self._heap(nodes)
         heap.begin_walk()
+        heap.pin(nodes[2])
         nodes[2].key = -100
-        heap.touch(nodes[2])  # key frozen for this walk
+        heap.lowered(nodes[2])
         self.assertIs(heap.pop_next(), nodes[0])
         heap.end_walk()
-        # after the walk the fresh key is honoured; the yielded node is live again
-        self.assertEqual(self._drain(heap), [nodes[2], nodes[0], nodes[1]])
+        self._assert_invariants(heap)
+        self.assertEqual(_drain(heap), [nodes[2], nodes[0], nodes[1]])
+
+    def test_host_walk_takes_an_entrant_at_its_current_key(self):
+        a, b, p = _Node(0, 5), _Node(1, 8), _Node(2, 10)
+        members, heap = self._heap([a, b, p], hide_entrants=False)
+        members.discard(p)  # gained a host child: the entry lingers
+        heap.begin_walk()
+        heap.pin(p)
+        p.key = 6  # the walk evicts that child and a session recedes
+        heap.lowered(p)
+        members.add(p)
+        heap.add(p)
+        self.assertEqual([heap.pop_next() for _ in range(3)], [a, p, b])
+        heap.end_walk()
 
     def test_nested_walk_is_rejected(self):
         members, heap = self._heap([_Node(0, 0)])
@@ -479,38 +644,156 @@ class TestLazyLeafHeapUnit(CustomTestCase):
             heap.begin_walk()
         heap.end_walk()
 
-    def test_compaction_bound(self):
-        nodes = [_Node(i, i) for i in range(8)]
+    def test_stale_entries_are_bounded_with_bounded_work_per_call(self):
+        nodes = [_Node(i, 0) for i in range(8)]
         members, heap = self._heap(nodes)
+        steps = _LazyLeafHeap._DRAIN_STEPS
+        limit = 2 * len(nodes) + 64
+        retired = 0
         for t in range(5000):
-            nodes[t % 8].key = 1000 + t
-            heap.touch(nodes[t % 8])
-        self.assertLessEqual(len(heap._heap), 2 * len(heap._live) + 64)
-        errors = []
-        heap.check_invariants(errors.append, "t")
-        self.assertEqual(errors, [])
-        self.assertEqual(self._drain(heap), sorted(nodes, key=lambda n: n.key))
+            node = nodes[t % 8]
+            node.key = -t  # every call lowers a key: one stale entry each
+            old_before = len(heap._old)
+            heap.lowered(node)
+            if old_before:
+                # a retired heap is only ever drained a few entries at a time
+                self.assertLessEqual(old_before - len(heap._old), steps)
+            elif heap._old:
+                retired += 1
+            self.assertLessEqual(heap.num_heap_entries(), limit + limit // steps + 2)
+        self.assertGreater(retired, 10)
+        self._assert_invariants(heap)
+        self.assertEqual(_drain(heap), sorted(nodes, key=lambda n: n.key))
 
-    def test_rebuild_each_walk_matches(self):
-        nodes = [_Node(i, k) for i, k in enumerate([4, 2, 8, 6])]
-        _, lazy = self._heap(nodes)
-        _, eager = self._heap(nodes, rebuild_each_walk=True)
-        nodes[0].key = 1  # key change without any hook: only the rebuild sees it
-        self.assertEqual(self._drain(eager)[0], nodes[0])
-        self.assertEqual(self._drain(lazy)[0], nodes[1])
+    def test_walk_pops_across_a_retired_heap(self):
+        nodes = [_Node(i, 1000 + i) for i in range(40)]
+        members, heap = self._heap(nodes)
+        t = 0
+        while not heap._old:  # lower keys until the heap is retired
+            t += 1
+            nodes[t % 40].key = -t
+            heap.lowered(nodes[t % 40])
+        for _ in range(3):  # leave valid entries on both sides
+            t += 1
+            nodes[t % 40].key = -t
+            heap.lowered(nodes[t % 40])
+        self.assertTrue(heap._old)
+        self.assertTrue(heap._heap)
+        self._assert_invariants(heap)
+        self.assertEqual(_drain(heap), sorted(nodes, key=lambda n: n.key))
+        self._assert_invariants(heap)
 
     def test_check_invariants_reports_divergence(self):
         nodes = [_Node(i, i) for i in range(3)]
         members, heap = self._heap(nodes)
-        members.discard(nodes[1])  # membership removed without forget()
+        stray = _Node(7, 7)
+        members.add(stray)  # joined the set without add()
         errors = []
-        heap.check_invariants(errors.append, "t")
-        self.assertTrue(any("live but not member" in e for e in errors))
-        members.add(nodes[1])
-        nodes[2].key = 42  # key changed without touch()
+        heap.check_invariants(errors.append, "t", lambda n: True)
+        self.assertTrue(any("member without entry" in e for e in errors))
+        members.discard(stray)
+        members.discard(nodes[2])
+        nodes[2].key = -42  # key dropped without lowered(), outside the set
         errors = []
-        heap.check_invariants(errors.append, "t")
-        self.assertTrue(any("out of date" in e for e in errors))
+        heap.check_invariants(errors.append, "t", lambda n: True)
+        self.assertTrue(any("missed key-drop hook" in e for e in errors))
+        errors = []  # deleted without forget()
+        heap.check_invariants(errors.append, "t", lambda n: n is not nodes[1])
+        self.assertTrue(any("deleted node" in e for e in errors))
+
+    def test_random_walks_match_the_per_walk_rebuild(self):
+        # Model check on plain nodes: the persistent heap against a heap that
+        # is rebuilt for every walk, under both walk flavours.
+        for hide_entrants in (True, False):
+            for seed in range(30):
+                with self.subTest(hide_entrants=hide_entrants, seed=seed):
+                    self._random_walks(random.Random(seed), hide_entrants)
+
+    def _random_walks(self, rng, hide_entrants):
+        next_id = [0]
+
+        def new_node():
+            next_id[0] += 1
+            return _Node(next_id[0], rng.randint(0, 50))
+
+        pool = [new_node() for _ in range(30)]
+        members = set(pool[:20])
+        heap = _LazyLeafHeap(members, lambda n: n.key, hide_entrants=hide_entrants)
+        for n in members:
+            heap.add(n)
+        for _ in range(40):
+            for _ in range(rng.randint(0, 25)):  # between walks
+                n = rng.choice(pool)
+                r = rng.random()
+                if r < 0.35:
+                    n.key += rng.randint(0, 9)  # raise: no call
+                elif r < 0.55:
+                    n.key -= rng.randint(0, 9)
+                    heap.lowered(n)
+                elif r < 0.75:
+                    members.discard(n)  # leave: no call
+                elif r < 0.95:
+                    if n not in members:
+                        members.add(n)
+                        heap.add(n)
+                else:
+                    members.discard(n)
+                    heap.forget(n)  # deleted; may come back as a new node
+            self._assert_invariants(heap)
+            legacy = [(n.key, n) for n in members]
+            heapq.heapify(legacy)
+            # nodes the per-walk rebuild may yield although they are not in
+            # the set (the device walk's explicit pushes)
+            pushed = set()
+            want, got = [], []
+            heap.begin_walk()
+            for _ in range(rng.randint(1, 12)):
+                x = None
+                while legacy:
+                    _, cand = heapq.heappop(legacy)
+                    if cand in members or cand in pushed:
+                        x = cand
+                        break
+                y = heap.pop_next()
+                want.append(x)
+                got.append(y)
+                if x is None or y is not x:
+                    break
+                pushed.discard(x)
+                if rng.random() < 0.8:
+                    members.discard(x)  # evicted; otherwise declined
+                r = rng.random()
+                if r < 0.3:
+                    e = new_node()  # enters the set mid-walk
+                    pool.append(e)
+                    members.add(e)
+                    heap.add(e)
+                    if not hide_entrants:
+                        heapq.heappush(legacy, (e.key, e))
+                    elif rng.random() < 0.7:
+                        heapq.heappush(legacy, (e.key, e))
+                        heap.promote(e)
+                elif r < 0.45 and hide_entrants:
+                    e = new_node()  # pushed while outside the set ...
+                    pool.append(e)
+                    heapq.heappush(legacy, (e.key, e))
+                    heap.promote(e)
+                    pushed.add(e)
+                    if rng.random() < 0.5:  # ... and joins it later in the walk
+                        members.add(e)
+                        heap.add(e)
+                for _ in range(rng.randint(0, 2)):  # a key drops mid-walk
+                    n = rng.choice(pool)
+                    heap.pin(n)
+                    n.key -= rng.randint(1, 9)
+                    heap.lowered(n)
+                    if not hide_entrants and n not in members and rng.random() < 0.5:
+                        members.add(n)  # and it becomes a host leaf again
+                        heap.add(n)
+                        heapq.heappush(legacy, (n.key, n))
+            heap.end_walk()
+            self.assertEqual(got, want)
+        self._assert_invariants(heap)
 
 
 # ---------------------------------------------------------------------------
@@ -576,19 +859,180 @@ class TestEvictionOrderParity(CustomTestCase):
                     new, ref = replay_pair(policy, seed, False, page_size=4)
                     self._assert_parity(new, ref, label)
 
-    def test_kill_switch_parity(self):
-        for policy in ("lru", "slru"):
-            label = f"kill-switch policy={policy}"
-            with self.subTest(label):
-                new, ref = replay_pair(policy, 7, True, kill_switch=True)
-                self._assert_parity(new, ref, label)
-                self.assertTrue(ref.core.full_device_heap.rebuild_each_walk)
-                self.assertFalse(new.core.full_device_heap.rebuild_each_walk)
+    def test_parity_joint_lru_split_restores_the_suffix_time(self):
+        # Under joint_lru a split keeps the suffix's older access time, which
+        # lowers its key right after the insert touched it. With compaction
+        # blocked the eviction is the Full walk.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        orders = []
+        for legacy in (False, True):
+            reset_time_counter()
+            cache, allocator = make_joint_lru_cache(legacy=legacy)
+            for tokens in (list(range(1, 11)), [20, 21], list(range(1, 9)) + [50]):
+                value = allocator.alloc(len(tokens))
+                cache.insert(
+                    InsertParams(key=RadixKey(array("q", tokens)), value=value)
+                )
+            cache.sanity_check()
+            core = cache.tree_core
+            orig = core.evict_device_leaf
+            victims = []
+
+            def recording(node_id, is_write_back, core=core, orig=orig, out=victims):
+                out.append(node_path(core, core.node_by_id(node_id)))
+                return orig(node_id, is_write_back)
+
+            core.evict_device_leaf = recording
+            cache.evict(EvictParams(num_tokens=2))
+            cache.sanity_check()
+            orders.append(victims)
+        new, ref = orders
+        self.assertEqual(new, ref)
+        # The split-off suffix [9, 10] is older than [20, 21].
+        self.assertEqual([path[-1] for path in new], [(9, 10)])
+
+
+# ---------------------------------------------------------------------------
+# Order parity with a host tier (HiCache write_back)
+# ---------------------------------------------------------------------------
+def write_back_victims(
+    policy: str, session: bool, host_tokens: int, seed: int, legacy: bool
+) -> list[tuple]:
+    """Device and host victims, in order, of the multi-session write_back
+    workload of test_write_back_eviction_parity (match, load back, allocate
+    with eviction, insert, lock for a step) under ``policy``. A small host pool
+    makes device walks evict host leaves and demote queued batches mid-walk.
+    With ``session`` every insert registers a session on the leaf and on a
+    shorter prefix, and sessions are released now and then."""
+    real_params = hicache_write_back_fixtures.CacheInitParams
+
+    def params(**kwargs):
+        return real_params(
+            eviction_policy=policy,
+            enable_session_radix_cache=session,
+            component_registry_override=(
+                {TREE_TOKEN: LegacyFullComponent} if legacy else None
+            ),
+            **kwargs,
+        )
+
+    reset_time_counter()
+    with (
+        mock.patch.object(hicache_write_back_fixtures, "CacheInitParams", params),
+        mock.patch.object(write_back_parity, "HOST_TOKENS", host_tokens),
+        mock.patch.object(write_back_parity, "STEPS", 150),
+    ):
+        workload = write_back_parity._Workload("python", seed, batched=True, swa=False)
+        cache = workload.cache
+        core = cache.tree_core
+        if legacy:
+            forward_host_leaf_adds(cache)
+        victims = []
+        evict_device_leaf, evict_host_leaf = (
+            core.evict_device_leaf,
+            core._evict_host_leaf,
+        )
+
+        def record_device(node_id, is_write_back):
+            victims.append(("device", node_path(core, core.node_by_id(node_id))))
+            return evict_device_leaf(node_id, is_write_back)
+
+        def record_host(node, *args, **kwargs):
+            victims.append(("host", node_path(core, node)))
+            return evict_host_leaf(node, *args, **kwargs)
+
+        core.evict_device_leaf = record_device
+        core._evict_host_leaf = record_host
+        if session:
+            insert = workload._insert
+
+            def insert_and_register(admitted, new_indices, step):
+                insert(admitted, new_indices, step)
+                key = admitted[1]
+                page = hicache_write_back_fixtures.PAGE
+                sid = f"s{admitted[0].sid % 4}"
+                for cut in (len(key), max(page, len(key) // 2 // page * page)):
+                    res = cache.match_prefix(MatchPrefixParams(key=key[:cut]))
+                    if res.last_device_node == cache.root_node_handle():
+                        continue
+                    cache.session_refs.register_session_ref(
+                        SimpleNamespace(
+                            session_id=sid,
+                            session_generation=cache.ensure_session_generation(sid),
+                            session=None,
+                            last_node=res.last_device_node,
+                            origin_input_ids=array("q", key.token_ids[:cut]),
+                            output_ids=array("q"),
+                            extra_key=None,
+                        ),
+                        leaf=res.last_device_node,
+                    )
+                if step % 37 == 0:
+                    cache.release_radix_session(f"s{step // 37 % 4}")
+
+            workload._insert = insert_and_register
+        workload.run()
+    return victims
+
+
+class TestWriteBackHostTierParity(CustomTestCase):
+    def test_parity_write_back_host_tier(self):
+        for policy in ("lru", "mru", "filo"):
+            for session in (False, True):
+                for host_tokens in (32, 128):
+                    for seed in range(2):
+                        label = (
+                            f"write_back policy={policy} session={session} "
+                            f"host_tokens={host_tokens} seed={seed}"
+                        )
+                        with self.subTest(label):
+                            new, ref = (
+                                write_back_victims(
+                                    policy, session, host_tokens, seed, legacy
+                                )
+                                for legacy in (False, True)
+                            )
+                            self.assertEqual(new, ref, label)
+                            kinds = {kind for kind, _ in new}
+                            self.assertEqual(kinds, {"device", "host"}, label)
 
 
 # ---------------------------------------------------------------------------
 # Targeted behaviours on a real cache
 # ---------------------------------------------------------------------------
+def make_joint_lru_cache(legacy: bool):
+    """A Full + SWA tree on the two-ended allocator that keeps the joint LRU,
+    with compaction blocked so that eviction takes the Full walk."""
+    _, allocator, _ = build_window_chain(
+        n_full_slots=48, n_swa_slots=48, full_layer_num=2, swa_layer_num=6
+    )
+    cache = UnifiedRadixCache(
+        CacheInitParams(
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            disable=False,
+            sliding_window_size=4,
+            tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.SWA), window=4),
+            tree_core_backend="python",
+            eviction_policy="joint_lru",
+            component_registry_override=(
+                {TREE_TOKEN: LegacyFullComponent} if legacy else None
+            ),
+        )
+    )
+    assert cache.tree_core.joint_lru is not None
+    if legacy:
+        forward_host_leaf_adds(cache)
+    allocator.lazy_compaction = True
+    for sub_pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
+        sub_pool.lazy_compaction = True
+        sub_pool.fix_pages("blocked", [sub_pool.min_page_index])
+    return cache, allocator
+
+
 def _insert(cache, tokens):
     v = cache.token_to_kv_pool_allocator.alloc(len(tokens))
     cache.insert(
@@ -722,28 +1166,36 @@ class TestHeapOnRealCache(CustomTestCase):
         self.assertEqual(_match_len(cache, [1, 2, 3]) + _match_len(cache, [7, 8, 9]), 0)
         cache.sanity_check()
 
-    def test_eviction_walk_keeps_heap_compact(self):
-        """Regression: a walk must not leave one stale entry per evicted leaf."""
+    def test_lru_matches_and_lock_churn_push_nothing(self):
+        cache = make_cache(policy="lru")
+        _insert(cache, [1, 2, 3])
+        _insert(cache, [7, 8, 9])
+        heap = cache.tree_core.full_device_heap
+        before = heap.num_heap_entries()
+        for _ in range(2000):
+            _match_len(cache, [1, 2, 3])
+            res = cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", [7, 8, 9])))
+            )
+            lock = cache.inc_lock_ref(res.last_device_node).to_dec_params()
+            cache.dec_lock_ref(res.last_device_node, lock)
+        self.assertEqual(heap.num_heap_entries(), before)
+        cache.sanity_check()
+
+    def test_mru_matches_keep_stale_entries_bounded(self):
         cache = make_cache(policy="mru")
         seqs = [[1000 + i * 3 + j for j in range(3)] for i in range(30)]
         for s in seqs:
             _insert(cache, s)
-        for _ in range(3):
+        heap = cache.tree_core.full_device_heap
+        for _ in range(40):
             for s in seqs:
                 _match_len(cache, s)
+            self.assertLessEqual(heap.num_heap_entries(), 3 * len(heap) + 64)
+        cache.sanity_check()
         cache.evict(EvictParams(num_tokens=45))
-        heap = cache.tree_core.full_device_heap
-        self.assertLessEqual(len(heap._heap), 2 * len(heap._live) + 64)
         cache.sanity_check()
-
-    def test_many_matches_keep_heap_compact(self):
-        cache = make_cache(policy="lru")
-        _insert(cache, [1, 2, 3])
-        for _ in range(5000):
-            _match_len(cache, [1, 2, 3])
-        heap = cache.tree_core.full_device_heap
-        self.assertLessEqual(len(heap._heap), 2 * len(heap._live) + 64)
-        cache.sanity_check()
+        self.assertLessEqual(heap.num_heap_entries(), 3 * len(heap) + 64)
 
 
 if __name__ == "__main__":

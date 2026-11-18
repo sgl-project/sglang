@@ -6,7 +6,6 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
-    EvictParams,
     IncLockRefResult,
     InsertResult,
     MatchPrefixParams,
@@ -17,6 +16,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.plan import TREE_TOKEN
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
@@ -51,24 +51,13 @@ class FullComponent(TreeComponent):
         super().__init__(cache, params, slot)
         # HiCache state: set to host KV pool when HiCache enabled
         self._full_kv_pool_host = None
-        # Lazy bind eviction strategy since tree core is initialized after component init.
-        self.session_ref_eviction_strategy = (
-            self._session_ref_eviction_strategy
-            if cache.enable_session_radix_cache
-            else None
-        )
-
-    def _ensure_eviction_strategy(self) -> None:
-        if self.session_ref_eviction_strategy is None:
-            self.session_ref_eviction_strategy = (
-                self.tree_core.eviction_strategy.get_priority
-            )
 
     def _dec_session_coverage(self, session_id: str, leaf: UnifiedTreeNode) -> None:
         node = leaf
         while node is not None and node is not self.tree_core.root_node:
             cd = node.component_data[self.component_type]
             assert cd.session_ref > 0
+            self.tree_core._pin_full_eviction_key(node)
             cd.session_ref -= 1
             self.tree_core._touch_full_eviction_key(node)
             node = node.parent
@@ -87,7 +76,6 @@ class FullComponent(TreeComponent):
             and node is not self.tree_core.root_node
         ):
             node.component_data[self.component_type].session_ref += 1
-            self.tree_core._touch_full_eviction_key(node)
             node = node.parent
 
     def _recede_session_coverage(
@@ -105,6 +93,7 @@ class FullComponent(TreeComponent):
         ):
             cd = node.component_data[self.component_type]
             assert cd.session_ref > 0
+            self.tree_core._pin_full_eviction_key(node)
             cd.session_ref -= 1
             self.tree_core._touch_full_eviction_key(node)
             node = node.parent
@@ -204,10 +193,6 @@ class FullComponent(TreeComponent):
     def eviction_priority(self, is_leaf: bool) -> int:
         return 0 if is_leaf else 2
 
-    def _session_ref_eviction_strategy(self, node: UnifiedTreeNode):
-        ref = self.session_ref(node)
-        return ref > 0, ref, self.tree_core.eviction_strategy.get_priority(node)
-
     def _evict_device_start(self, request_cnt: int) -> None:
         self._evict_device_request_cnt = request_cnt
         self._evict_device_last_node = None
@@ -221,24 +206,20 @@ class FullComponent(TreeComponent):
         cache_actions: list[CacheAction | ComponentAction],
     ) -> Optional[NodeId]:
         ct = self.component_type
-        tree_core = self.tree_core
-        heap = tree_core.full_device_heap
+        heap = self.tree_core.full_device_heap
         lv = self._evict_device_last_node
         if (
             lv is not None
             and lv.parent is not None
-            and tree_core._is_device_walk_candidate(lv.parent)
+            and self.tree_core._is_device_walk_candidate(lv.parent)
         ):
-            # The evicted leaf's parent may have become a device leaf, or under
-            # write_back a parent whose device children are all queued: admit
-            # it to the current walk, keyed now (the legacy explicit push).
-            heap.promote(lv.parent, admit=True)
+            heap.promote(lv.parent)
         self._evict_device_last_node = None
         while tracker[ct] < self._evict_device_request_cnt:
             x = heap.pop_next()
             if x is None:
                 break
-            if not tree_core._is_device_walk_candidate(x):
+            if not self.tree_core._is_device_walk_candidate(x):
                 continue
             self._evict_device_last_node = x
             return x.id
@@ -257,8 +238,10 @@ class FullComponent(TreeComponent):
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Evict host leaves to free KV host pool space."""
-        ct = self.component_type
+        if tracker[self.component_type] >= num_tokens:
+            return
         heap = self.tree_core.full_host_heap
+        ct = self.component_type
         heap.begin_walk()
         try:
             while tracker[ct] < num_tokens:
@@ -268,8 +251,6 @@ class FullComponent(TreeComponent):
                 self.tree_core._evict_host_leaf(
                     x, tracker, device_frees, host_frees, cache_actions=cache_actions
                 )
-                if x.parent is not None:
-                    heap.promote(x.parent)
         finally:
             heap.end_walk()
 
@@ -306,9 +287,6 @@ class FullComponent(TreeComponent):
 
         # Lock the device-on segment up to root
         delta = 0
-        tree_core = self.tree_core
-        evictable_device_leaves = tree_core.evictable_device_leaves
-        device_live = tree_core._full_device_live
         while cur is not root:
             cd = cur.component_data[ct]
             assert cd.value is not None, (
@@ -316,13 +294,11 @@ class FullComponent(TreeComponent):
             )
             if cd.lock_ref == 0:
                 key_len = self.reclaimable_value_len(cur)
-                tree_core.component_evictable_size_[ct] -= key_len
-                tree_core.component_protected_size_[ct] += key_len
+                self.tree_core.component_evictable_size_[ct] -= key_len
+                self.tree_core.component_protected_size_[ct] += key_len
                 delta += key_len
             cd.lock_ref += 1
-            evictable_device_leaves.discard(cur)
-            if cur in device_live:
-                tree_core.full_device_heap.forget(cur)
+            self.tree_core.evictable_device_leaves.discard(cur)
             cur = cur.parent
         result.delta = delta
         return result
@@ -503,9 +479,8 @@ class FullComponent(TreeComponent):
         if phase == LinkerTransferPhase.LOAD:
             storage, sub_pool = self.storage_and_sub_pool()
             num_tokens = len(keys) * self.cache.page_size
-            shortfall = max(0, num_tokens - storage.available_units(sub_pool))
-            if shortfall:
-                self.cache.evict(EvictParams(num_tokens=shortfall))
+            if not storage.units_fit(sub_pool, num_tokens):
+                self.cache.evict_for_alloc(KVDemand(full_tokens=num_tokens))
             slots = storage.take_units(sub_pool, num_tokens)
             if slots is None:
                 return None

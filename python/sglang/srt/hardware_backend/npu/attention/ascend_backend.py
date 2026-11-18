@@ -34,7 +34,13 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
 )
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+    dsa_token_shard_cumulative_query_lens,
+    dsa_token_shard_key_lens,
+    get_dsa_token_shard_plan,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
@@ -43,7 +49,7 @@ from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_dcp
 from sglang.srt.layers.dcp.layout import get_dcp_chain_spec_lens, get_dcp_lens
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -114,13 +120,19 @@ class ForwardMetadata:
     cu_seqlens_q: Optional[torch.Tensor] = None  # Query offsets, including leading 0.
     actual_seq_lengths_q: Optional[torch.Tensor] = None
     actual_seq_lengths_q_pa: Optional[torch.Tensor] = None
-    # CPU mirror of actual_seq_lengths_q_pa for the host metadata op
-    # (torch.ops.npu.sparse_attn_sharedkv_metadata_host reads CPU int32 inputs).
+    # CPU mirror of actual_seq_lengths_q_pa for host-side padding trims.
     actual_seq_lengths_q_pa_cpu: Optional[torch.Tensor] = None
     actual_seq_lengths_kv: Optional[torch.Tensor] = None
     seqused_q: Optional[torch.Tensor] = None  # Valid query counts; padding is 0.
     flash_mla_metadata: Optional[torch.Tensor] = None
     dcp_mtp_attn_mask: Optional[torch.Tensor] = None
+
+    # Per-request Q length for uniform batches; None for variable-length prefill.
+    uniform_query_len: Optional[int] = None
+    # Flash attention scheduling plan.
+    fa_metadata: Optional[torch.Tensor] = None
+    # Q-scale layout shared by the scheduling plan and query quantization.
+    fa_layout_q_descale: str = "TND"
 
     # DCP per-request lengths and decode inputs
     dcp_seq_lens_cpu_int: Optional[torch.Tensor] = None
@@ -284,7 +296,7 @@ class AscendAttnMaskBuilder:
 
 
 def _cp_allgather_and_save_kv_npu(
-    forward_batch, layer, k, v, cp_size, token_to_kv_pool, swa_loc=None
+    forward_batch, layer, k, v, cp_size, token_to_kv_pool, window_locs=None
 ):
     """NPU-compatible CP KV all-gather with merged K/V communication.
 
@@ -297,8 +309,9 @@ def _cp_allgather_and_save_kv_npu(
     Equivalent to cp_allgather_and_save_kv_cache() in cp_utils.py, but uses
     a single all-gather for both K and V.
 
-    swa_loc is the pre-translated full->SWA write target for hybrid SWA pools
-    (None for non-SWA pools); set_kv_buffer never translates internally.
+    window_locs holds the pre-translated window write targets, by sub-pool, for
+    hybrid SWA pools (None for non-SWA pools); set_kv_buffer never translates
+    internally.
     """
     cache_loc = (
         forward_batch.out_cache_loc
@@ -312,7 +325,7 @@ def _cp_allgather_and_save_kv_npu(
     if cp_strategy is None or cp_strategy.cp_size <= 1:
         token_to_kv_pool.set_kv_buffer(
             layer,
-            KVWriteLoc(cache_loc, swa_loc),
+            KVWriteLoc(cache_loc, window_locs=window_locs),
             k,
             v,
         )
@@ -323,7 +336,7 @@ def _cp_allgather_and_save_kv_npu(
         layer,
         k,
         v,
-        swa_loc=swa_loc,
+        window_locs=window_locs,
     )
 
 
@@ -341,6 +354,35 @@ class AscendAttnBackend(AttentionBackend):
         self.model_dtype = model_runner.model_config.dtype
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        modelslim_cache_layout = (
+            model_runner.kv_cache_configurator.modelslim_cache_layout
+        )
+        self.use_quant_flash_attn = (
+            modelslim_cache_layout is not None
+            and modelslim_cache_layout.layout == "gqa_mxfp8"
+        )
+        if self.use_quant_flash_attn:
+            from sgl_kernel_npu.operators.attention import (
+                quant_flash_attn,
+                quant_flash_attn_metadata,
+            )
+
+            from sglang.srt.layers.quantization.modelslim.schemes.modelslim_qk_mxfp8_dynamic_v_mxfp8_per_channel import (
+                init_mxfp8_kv_scales,
+            )
+
+            self.needs_cpu_seq_lens = False
+            self.quant_flash_attn = quant_flash_attn
+            self.quant_flash_attn_metadata = quant_flash_attn_metadata
+            self.modelslim_cache_layout = modelslim_cache_layout
+            self.fa_num_heads = model_runner.model_config.get_num_attention_heads(
+                get_parallel().attn_tp_size
+            )
+            init_mxfp8_kv_scales(
+                model_runner.model,
+                model_runner.token_to_kv_pool,
+                modelslim_cache_layout,
+            )
         # Only DSA models (GLM-5.2, DeepSeek-V3-DSA, ...) consume the per-token DSA
         # CP metadata built by prepare_dsa_cp_metadata; V4 keeps its own variant.
         self.use_dsa = is_deepseek_dsa(model_runner.model_config.hf_config)
@@ -353,9 +395,6 @@ class AscendAttnBackend(AttentionBackend):
         self.dsa_dcp_target = self.use_dsa and self.dcp_size > 1
         if self.use_mla:
             self.nope_padding_dtype = self.model_dtype or torch.bfloat16
-            modelslim_cache_layout = (
-                model_runner.kv_cache_configurator.modelslim_cache_layout
-            )
             if (
                 modelslim_cache_layout is not None
                 and modelslim_cache_layout.layout == "mla_fp8"
@@ -388,6 +427,17 @@ class AscendAttnBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.dcp_fp8_sparse_attention = None
+        if self.dsa_dcp_target and self.kv_cache_dtype == torch.float8_e4m3fn:
+            if not self.token_to_kv_pool.dsa_kv_cache_store_fp8:
+                raise ValueError(
+                    "Ascend DSA DCP with FP8 KV requires the A5 packed KV pool."
+                )
+            from sgl_kernel_npu.operators.attention import (
+                kv_quant_sparse_flash_attention,
+            )
+
+            self.dcp_fp8_sparse_attention = kv_quant_sparse_flash_attention
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.enable_sparsity_driven_kv_offload = is_sparsity_driven_kv_offload_enabled(
@@ -476,7 +526,9 @@ class AscendAttnBackend(AttentionBackend):
         if not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get():
             # FIA host IntArrays consume the CPU mirror; keep it on instead of
             # crashing later. Hybrid SWA is allowed through for dsv4 experiments.
-            if self.use_fia and not (self.use_flash_mla or self.use_paged_mtp):
+            if self.use_fia and not (
+                self.use_quant_flash_attn or self.use_flash_mla or self.use_paged_mtp
+            ):
                 logger.warning(
                     "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is ignored: "
                     "host-bound attention paths present; keeping the mirror."
@@ -603,7 +655,7 @@ class AscendAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
-        self.forward_metadata = ForwardMetadata()
+        self.forward_metadata = self._create_forward_metadata()
         dense_mla_dcp_partial = self.dense_mla_dcp_target and (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
@@ -612,7 +664,12 @@ class AscendAttnBackend(AttentionBackend):
         # Data-driven branch: take the CPU-mirror path whenever the mirror is
         # present, instead of statically gating on needs_cpu_seq_lens. When the
         # mirror is absent (true mirrorless), fall through to the else branch.
-        if forward_batch.seq_lens_cpu is not None and not dense_mla_dcp_partial:
+        # QFA uses device lengths even when the hybrid linear backend needs a CPU mirror.
+        if (
+            forward_batch.seq_lens_cpu is not None
+            and not dense_mla_dcp_partial
+            and not self.use_quant_flash_attn
+        ):
             seq_lens_max = forward_batch.seq_lens.max()
             if forward_batch.forward_mode.is_target_verify():
                 if (
@@ -666,6 +723,26 @@ class AscendAttnBackend(AttentionBackend):
                 ]
                 // self.page_size
             )
+        if self.use_quant_flash_attn:
+            metadata = self.forward_metadata
+            # Match QFA's query extent before DP padding; skip FIA's host metadata.
+            seq_lens = forward_batch.seq_lens[: forward_batch._original_batch_size]
+            metadata.block_tables = metadata.block_tables[: seq_lens.shape[0]]
+            if forward_batch.forward_mode.is_decode_or_idle():
+                metadata.uniform_query_len = 1
+            elif forward_batch.forward_mode.is_target_verify():
+                metadata.uniform_query_len = int(
+                    forward_batch.spec_info.draft_token_num
+                )
+            self.graph_mode = False
+            self._prepare_quant_flash_attn_metadata(
+                metadata,
+                seq_lens,
+                forward_batch.forward_mode,
+                spec_info=forward_batch.spec_info,
+                extend_seq_lens=forward_batch.extend_seq_lens,
+            )
+            return
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
             self.forward_metadata.extend_seq_lens_cpu_int = (
@@ -880,6 +957,78 @@ class AscendAttnBackend(AttentionBackend):
             )
         self.graph_mode = False
 
+    def _create_forward_metadata(self) -> ForwardMetadata:
+        """Create the metadata object for one forward pass."""
+        return ForwardMetadata()
+
+    def _prepare_quant_flash_attn_metadata(
+        self,
+        metadata: ForwardMetadata,
+        seq_lens: torch.Tensor,
+        forward_mode: ForwardMode,
+        *,
+        spec_info: Optional[SpecInput] = None,
+        extend_seq_lens: Optional[torch.Tensor] = None,
+    ):
+        """Prepare QFA on device outside capture, preserving graph-bound addresses."""
+        bs = seq_lens.shape[0]
+        if metadata.seq_lens is None:
+            metadata.seq_lens = torch.empty_like(seq_lens, dtype=torch.int32)
+        query_len = metadata.uniform_query_len
+        if metadata.cu_seqlens_q is None:
+            groups = self.fa_num_heads // self.modelslim_cache_layout.local_kv_heads
+            metadata.fa_layout_q_descale = (
+                "N2TGD" if query_len is not None and groups * query_len <= 80 else "TND"
+            )
+            if query_len is None:
+                metadata.cu_seqlens_q = torch.zeros(
+                    bs + 1, dtype=torch.int32, device=self.device
+                )
+            else:
+                metadata.cu_seqlens_q = torch.arange(
+                    0,
+                    (bs + 1) * query_len,
+                    query_len,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+        if bs == 0:
+            return
+        offset = 0
+        if forward_mode.is_target_verify():
+            offset = query_len
+        elif forward_mode.is_decode_or_idle() and spec_info is not None:
+            offset = self.speculative_step_id + 1
+        # Each step owns its lengths; never offset the shared runner inputs.
+        torch.add(seq_lens, offset, out=metadata.seq_lens)
+        if self.graph_mode and offset:
+            metadata.seq_lens.masked_fill_(seq_lens == 0, 0)
+        if query_len is None:
+            torch.cumsum(
+                extend_seq_lens[:bs],
+                dim=0,
+                dtype=torch.int32,
+                out=metadata.cu_seqlens_q[1:],
+            )
+        schedule = self.quant_flash_attn_metadata(
+            self.fa_num_heads,
+            self.modelslim_cache_layout.local_kv_heads,
+            self.modelslim_cache_layout.key_head_dim,
+            1,
+            cu_seqlens_q=metadata.cu_seqlens_q,
+            seqused_kv=metadata.seq_lens,
+            max_seqlen_q=query_len or -1,
+            mask_mode=0 if forward_mode.is_decode_or_idle() else 3,
+            layout_q="TND",
+            layout_q_descale=metadata.fa_layout_q_descale,
+            layout_kv="PA_BBND",
+            layout_out="TND",
+        )
+        # Like FlashMLA, replay consumes the buffers bound during capture.
+        if metadata.fa_metadata is None:
+            metadata.fa_metadata = torch.empty_like(schedule)
+        metadata.fa_metadata.copy_(schedule)
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         total_context_len = self.max_context_len + self.page_size - 1
         if self.speculative_num_draft_tokens is not None:
@@ -987,7 +1136,7 @@ class AscendAttnBackend(AttentionBackend):
         out_cache_loc: Optional[torch.Tensor] = None,
     ) -> ForwardMetadata:
         """Create and store the per-bs ForwardMetadata for CUDA graph capture."""
-        metadata = ForwardMetadata()
+        metadata = self._create_forward_metadata()
         if self.enable_sparsity_driven_kv_offload:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_callback import (
                 register_npu_host_callback_stream,
@@ -1023,9 +1172,17 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             num_tokens = out_cache_loc.shape[0]
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
+        if self.use_quant_flash_attn:
+            # Fix the query width from capture, not the live replay token count.
+            if forward_mode.is_draft_extend_v2():
+                metadata.uniform_query_len = out_cache_loc.shape[0] // bs
+            elif forward_mode.is_target_verify():
+                metadata.uniform_query_len = self.speculative_num_draft_tokens
+            else:
+                metadata.uniform_query_len = 1
         if self.needs_cpu_seq_lens and not self.dense_mla_dcp_target:
             metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
-        if self.use_flash_mla or self.use_paged_mtp:
+        if self.use_flash_mla or self.use_paged_mtp or self.use_quant_flash_attn:
             metadata.seq_lens = torch.empty_like(seq_lens, dtype=torch.int32)
         else:
             metadata.seq_lens = seq_lens
@@ -1265,13 +1422,17 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.dcp_block_tables[:bs, dcp_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
 
-        if self.use_flash_mla or self.use_paged_mtp:
-            if self.use_flash_mla:
+        if self.use_flash_mla or self.use_paged_mtp or self.use_quant_flash_attn:
+            self.graph_mode = True
+            if self.use_quant_flash_attn:
+                self._prepare_quant_flash_attn_metadata(
+                    metadata, seq_lens[:bs], forward_mode, spec_info=spec_info
+                )
+            elif self.use_flash_mla:
                 self._prepare_flash_mla_metadata(metadata, seq_lens[:bs])
             else:
                 self._prepare_paged_mtp_metadata(metadata, seq_lens[:bs])
             self.forward_metadata = metadata
-            self.graph_mode = True
             return
 
         # Device-derived KV lengths drive query visibility independently of the
@@ -1730,6 +1891,16 @@ class AscendAttnBackend(AttentionBackend):
         # V2: Q is already sharded to local by the strategy; single sparse-attn
         # call against the full (gathered) KV, no prev/next balance split.
         topk_indices = _expand_dsa_sparse_indices(topk_indices)
+        if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
+            return self._forward_fp8_sparse(
+                q_nope,
+                q_pe,
+                k_nope,
+                topk_indices,
+                layer,
+                actual_seq_qlen,
+                actual_seq_lengths_kv,
+            )
         attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
             query=q_nope,
             key=k_nope,
@@ -1753,6 +1924,45 @@ class AscendAttnBackend(AttentionBackend):
             return_softmax_lse=False,
         )
         return attn_out
+
+    def _forward_fp8_sparse(
+        self,
+        q_nope,
+        q_pe,
+        packed_kv,
+        topk_indices,
+        layer,
+        actual_seq_qlen,
+        actual_seq_lengths_kv,
+    ):
+        assert q_nope.dtype == q_pe.dtype == torch.bfloat16
+        packed = packed_kv.view(torch.float8_e4m3fn)
+        return torch_npu.npu_kv_quant_sparse_flash_attention(
+            query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
+            key=packed,
+            value=packed,
+            sparse_indices=topk_indices,
+            scale_value=layer.scaling,
+            key_quant_mode=2,
+            value_quant_mode=2,
+            key_dequant_scale=None,
+            value_dequant_scale=None,
+            actual_seq_lengths_query=actual_seq_qlen.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            actual_seq_lengths_kv=actual_seq_lengths_kv.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            block_table=self.forward_metadata.block_tables,
+            sparse_block_size=1,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            sparse_mode=3,
+            attention_mode=2,
+            quant_scale_repo_mode=1,
+            tile_size=128,
+            rope_head_dim=self.qk_rope_head_dim,
+        )
 
     def do_cp_attn_fia(
         self,
@@ -1837,15 +2047,42 @@ class AscendAttnBackend(AttentionBackend):
 
         if save_kv_cache:
             k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
-            k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
+            k_rope = k_rope.reshape(
+                k_rope.shape[0], layer.tp_k_head_num, self.qk_rope_head_dim
+            )
             self.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
+        # SFA's MLA interface requires a fixed 64-dimensional query_rope even
+        # for models without RoPE.
+        if self.qk_rope_head_dim == 0 and is_npu_arch35():
+            k_pe = self._a5_zero_rope(k_nope, (*k_nope.shape[:-1], 64))
+            q_pe = self._a5_zero_rope(q_nope, (q.shape[0], layer.tp_q_head_num, 64))
+        elif self.qk_rope_head_dim == 0:
+            k_pe = k_nope.new_zeros((*k_nope.shape[:-1], 64))
+            q_pe = q_nope.new_zeros(
+                (
+                    q.shape[0],
+                    layer.tp_q_head_num,
+                    64,
+                )
+            )
+
+        # The token shard replaces the query lengths, built once per forward.
+        dsa_token_shard_plan = get_dsa_token_shard_plan(forward_batch)
+        dsa_token_shard_qlen = None
+        if dsa_token_shard_plan is not None:
+            dsa_token_shard_qlen = dsa_token_shard_cumulative_query_lens(
+                forward_batch, dsa_token_shard_plan, q.device
+            )
+
         if is_prefill:
-            if self.forward_metadata.actual_seq_lengths_q is not None:
+            if dsa_token_shard_qlen is not None:
+                actual_seq_qlen = dsa_token_shard_qlen
+            elif self.forward_metadata.actual_seq_lengths_q is not None:
                 actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
             else:
                 actual_seq_qlen = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
@@ -1879,6 +2116,12 @@ class AscendAttnBackend(AttentionBackend):
         else:
             actual_seq_lengths_kv = self.forward_metadata.seq_lens
 
+        # The plan is refused under prefill CP, so this never meets its layout.
+        if dsa_token_shard_plan is not None and is_prefill:
+            actual_seq_lengths_kv = dsa_token_shard_key_lens(
+                forward_batch, dsa_token_shard_plan, q.device
+            )
+
         if (
             is_prefill
             and is_dsa_enable_prefill_cp()
@@ -1910,35 +2153,17 @@ class AscendAttnBackend(AttentionBackend):
                     forward_batch=forward_batch,
                     speculative_num_draft_tokens=self.speculative_num_draft_tokens,
                     scaling=layer.scaling,
+                    fp8_attention=self.dcp_fp8_sparse_attention,
                 )
             if self.kv_cache_dtype == torch.float8_e4m3fn:
-                assert q_nope.dtype == q_pe.dtype == torch.bfloat16
-                packed = k_nope.view(torch.float8_e4m3fn)
-                attn_out = torch_npu.npu_kv_quant_sparse_flash_attention(
-                    query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
-                    key=packed,
-                    value=packed,
-                    sparse_indices=topk_indices,
-                    scale_value=layer.scaling,
-                    key_quant_mode=2,
-                    value_quant_mode=2,
-                    key_dequant_scale=None,
-                    value_dequant_scale=None,
-                    actual_seq_lengths_query=actual_seq_qlen.to(
-                        device=q_nope.device, dtype=torch.int32
-                    ),
-                    actual_seq_lengths_kv=actual_seq_lengths_kv.to(
-                        device=q_nope.device, dtype=torch.int32
-                    ),
-                    block_table=self.forward_metadata.block_tables,
-                    sparse_block_size=1,
-                    layout_query="TND",
-                    layout_kv="PA_BSND",
-                    sparse_mode=3,
-                    attention_mode=2,
-                    quant_scale_repo_mode=1,
-                    tile_size=128,
-                    rope_head_dim=self.qk_rope_head_dim,
+                attn_out = self._forward_fp8_sparse(
+                    q_nope,
+                    q_pe,
+                    k_nope,
+                    topk_indices,
+                    layer,
+                    actual_seq_qlen,
+                    actual_seq_lengths_kv,
                 )
             else:
                 attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
@@ -1965,6 +2190,15 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
         return attn_out
+
+    def _a5_zero_rope(self, reference, shape):
+        # Cache the large pool-shaped dummy across graph captures/layers.
+        if not hasattr(self, "_a5_zero_rope_cache"):
+            self._a5_zero_rope_cache = {}
+        key = (tuple(shape), reference.dtype, reference.device)
+        if key not in self._a5_zero_rope_cache:
+            self._a5_zero_rope_cache[key] = reference.new_zeros(shape)
+        return self._a5_zero_rope_cache[key]
 
     def _load_mla_prefix_cache(
         self,
@@ -2096,7 +2330,9 @@ class AscendAttnBackend(AttentionBackend):
                         v,
                         self.attn_cp_size,
                         self.token_to_kv_pool,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        window_locs=window_write_locs(
+                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                        ),
                     )
                 else:
                     # support cross attention
@@ -2105,17 +2341,76 @@ class AscendAttnBackend(AttentionBackend):
                         if not layer.is_cross_attention
                         else forward_batch.encoder_out_cache_loc
                     )
-                    swa_loc = (
-                        self.forward_metadata.swa_out_cache_loc
+                    window_locs = (
+                        window_write_locs(
+                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                        )
                         if not layer.is_cross_attention
                         else None
                     )
                     self.token_to_kv_pool.set_kv_buffer(
-                        layer, KVWriteLoc(cache_loc, swa_loc), k, v
+                        layer, KVWriteLoc(cache_loc, window_locs=window_locs), k, v
                     )
 
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+            if self.use_quant_flash_attn:
+                num_token_padding = q.shape[0]
+                query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                query = query[: forward_batch.global_num_token_non_padded_cpu]
+                if query.shape[0] == 0:
+                    attn_output = query.new_empty(
+                        (0, layer.tp_q_head_num, layer.v_head_dim), dtype=torch.bfloat16
+                    )
+                else:
+                    query, q_scale = layer.scheme.prepare_query(
+                        query, self.forward_metadata.fa_layout_q_descale
+                    )
+                    k_scale, v_scale = self.token_to_kv_pool.get_kv_scale_buffer(
+                        layer.layer_id
+                    )
+                    attn_output, _ = self.quant_flash_attn(
+                        query,
+                        k_cache.view(
+                            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                        ),
+                        v_cache.view(
+                            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                        ),
+                        q_scale.view(torch.float8_e8m0fnu),
+                        k_scale.view(torch.float8_e8m0fnu),
+                        v_scale.view(torch.float8_e8m0fnu),
+                        1,
+                        block_table=self.forward_metadata.block_tables,
+                        cu_seqlens_q=self.forward_metadata.cu_seqlens_q,
+                        seqused_kv=self.forward_metadata.seq_lens,
+                        metadata=self.forward_metadata.fa_metadata,
+                        attn_mask=self.mix_mask,
+                        mask_mode=3,
+                        softmax_scale=layer.scaling,
+                        p_scale=layer.scheme.p_scale,
+                        max_seqlen_q=self.forward_metadata.uniform_query_len or -1,
+                        layout_q="TND",
+                        layout_q_descale=self.forward_metadata.fa_layout_q_descale,
+                        layout_kv="PA_BBND",
+                        layout_out="TND",
+                    )
+                attn_output = attn_output.view(
+                    -1, layer.tp_q_head_num * layer.v_head_dim
+                )
+                if attn_output.shape[0] != num_token_padding:
+                    attn_output = torch.cat(
+                        [
+                            attn_output,
+                            attn_output.new_zeros(
+                                num_token_padding - attn_output.shape[0],
+                                *attn_output.shape[1:],
+                            ),
+                        ],
+                        dim=0,
+                    )
+                return attn_output
 
             if sinks is not None or (self._is_swa_layer(layer) and self.use_fia):
                 # Use SWA block tables if hybrid SWA is enabled for this layer
@@ -2773,7 +3068,9 @@ class AscendAttnBackend(AttentionBackend):
                 layer,
                 KVWriteLoc(
                     forward_batch.out_cache_loc,
-                    self.forward_metadata.swa_out_cache_loc,
+                    window_locs=window_write_locs(
+                        self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                    ),
                 ),
                 k,
                 v,
@@ -2968,7 +3265,9 @@ class AscendAttnBackend(AttentionBackend):
                     layer,
                     KVWriteLoc(
                         forward_batch.out_cache_loc,
-                        self.forward_metadata.swa_out_cache_loc,
+                        window_locs=window_write_locs(
+                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                        ),
                     ),
                     k,
                     v,
@@ -2986,6 +3285,66 @@ class AscendAttnBackend(AttentionBackend):
         )
 
         if not self.use_mla:
+            if self.use_quant_flash_attn:
+                k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+                num_token_padding = q.shape[0]
+                query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                if not self.graph_mode:
+                    query = query[: forward_batch.global_num_token_non_padded_cpu]
+                if query.shape[0] == 0:
+                    attn_output = query.new_empty(
+                        (0, layer.tp_q_head_num, layer.v_head_dim), dtype=torch.bfloat16
+                    )
+                else:
+                    query, q_scale = layer.scheme.prepare_query(
+                        query, self.forward_metadata.fa_layout_q_descale
+                    )
+                    k_scale, v_scale = self.token_to_kv_pool.get_kv_scale_buffer(
+                        layer.layer_id
+                    )
+                    attn_output, _ = self.quant_flash_attn(
+                        query,
+                        k_cache.view(
+                            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                        ),
+                        v_cache.view(
+                            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                        ),
+                        q_scale.view(torch.float8_e8m0fnu),
+                        k_scale.view(torch.float8_e8m0fnu),
+                        v_scale.view(torch.float8_e8m0fnu),
+                        1,
+                        block_table=self.forward_metadata.block_tables,
+                        cu_seqlens_q=self.forward_metadata.cu_seqlens_q,
+                        seqused_kv=self.forward_metadata.seq_lens,
+                        metadata=self.forward_metadata.fa_metadata,
+                        attn_mask=self.mix_mask,
+                        mask_mode=3,
+                        softmax_scale=layer.scaling,
+                        p_scale=layer.scheme.p_scale,
+                        max_seqlen_q=self.forward_metadata.uniform_query_len or -1,
+                        layout_q="TND",
+                        layout_q_descale=self.forward_metadata.fa_layout_q_descale,
+                        layout_kv="PA_BBND",
+                        layout_out="TND",
+                    )
+                attn_output = attn_output.view(
+                    -1, layer.tp_q_head_num * layer.v_head_dim
+                )
+                if attn_output.shape[0] != num_token_padding:
+                    attn_output = torch.cat(
+                        [
+                            attn_output,
+                            attn_output.new_zeros(
+                                num_token_padding - attn_output.shape[0],
+                                *attn_output.shape[1:],
+                            ),
+                        ],
+                        dim=0,
+                    )
+                return attn_output
+
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
                 -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
             )
@@ -3447,11 +3806,48 @@ class AscendAttnBackend(AttentionBackend):
                     layer,
                     KVWriteLoc(
                         forward_batch.out_cache_loc,
-                        self.forward_metadata.swa_out_cache_loc,
+                        window_locs=window_write_locs(
+                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                        ),
                     ),
                     k,
                     v,
                 )
+
+        if self.use_quant_flash_attn:
+            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+            query, q_scale = layer.scheme.prepare_query(
+                query, self.forward_metadata.fa_layout_q_descale
+            )
+            k_scale, v_scale = self.token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
+            attn_output, _ = self.quant_flash_attn(
+                query,
+                k_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                ),
+                v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.v_head_dim),
+                q_scale.view(torch.float8_e8m0fnu),
+                k_scale.view(torch.float8_e8m0fnu),
+                v_scale.view(torch.float8_e8m0fnu),
+                1,
+                block_table=self.forward_metadata.block_tables,
+                cu_seqlens_q=self.forward_metadata.cu_seqlens_q,
+                seqused_kv=self.forward_metadata.seq_lens,
+                metadata=self.forward_metadata.fa_metadata,
+                attn_mask=None,
+                mask_mode=0,
+                softmax_scale=layer.scaling,
+                p_scale=layer.scheme.p_scale,
+                max_seqlen_q=self.forward_metadata.uniform_query_len or -1,
+                layout_q="TND",
+                layout_q_descale=self.forward_metadata.fa_layout_q_descale,
+                layout_kv="PA_BBND",
+                layout_out="TND",
+            )
+            attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            return attn_output
 
         if sinks is not None or self.is_hybrid_swa:
             # Use SWA block tables if hybrid SWA is enabled for this layer
@@ -3809,17 +4205,76 @@ class AscendAttnBackend(AttentionBackend):
                 # swa_out_cache_loc is the full->SWA write target, derived from
                 # out_cache_loc; it must not be applied to cross-attention writes
                 # (which target encoder_out_cache_loc) and is None for non-SWA pools.
-                swa_loc = (
-                    self.forward_metadata.swa_out_cache_loc
+                window_locs = (
+                    window_write_locs(
+                        self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                    )
                     if not layer.is_cross_attention
                     else None
                 )
                 self.token_to_kv_pool.set_kv_buffer(
-                    layer, KVWriteLoc(cache_loc, swa_loc), k, v
+                    layer, KVWriteLoc(cache_loc, window_locs=window_locs), k, v
                 )
             num_tokens = q.shape[0]
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+            if self.use_quant_flash_attn:
+                num_token_padding = q.shape[0]
+                query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                query = query[: self.forward_metadata.block_tables.shape[0]]
+                if query.shape[0] == 0:
+                    attn_output = query.new_empty(
+                        (0, layer.tp_q_head_num, layer.v_head_dim), dtype=torch.bfloat16
+                    )
+                else:
+                    query, q_scale = layer.scheme.prepare_query(
+                        query, self.forward_metadata.fa_layout_q_descale
+                    )
+                    k_scale, v_scale = self.token_to_kv_pool.get_kv_scale_buffer(
+                        layer.layer_id
+                    )
+                    attn_output, _ = self.quant_flash_attn(
+                        query,
+                        k_cache.view(
+                            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                        ),
+                        v_cache.view(
+                            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                        ),
+                        q_scale.view(torch.float8_e8m0fnu),
+                        k_scale.view(torch.float8_e8m0fnu),
+                        v_scale.view(torch.float8_e8m0fnu),
+                        1,
+                        block_table=self.forward_metadata.block_tables,
+                        cu_seqlens_q=self.forward_metadata.cu_seqlens_q,
+                        seqused_kv=self.forward_metadata.seq_lens,
+                        metadata=self.forward_metadata.fa_metadata,
+                        attn_mask=None,
+                        mask_mode=0,
+                        softmax_scale=layer.scaling,
+                        p_scale=layer.scheme.p_scale,
+                        max_seqlen_q=self.forward_metadata.uniform_query_len or -1,
+                        layout_q="TND",
+                        layout_q_descale=self.forward_metadata.fa_layout_q_descale,
+                        layout_kv="PA_BBND",
+                        layout_out="TND",
+                    )
+                attn_output = attn_output.view(
+                    -1, layer.tp_q_head_num * layer.v_head_dim
+                )
+                if attn_output.shape[0] != num_token_padding:
+                    attn_output = torch.cat(
+                        [
+                            attn_output,
+                            attn_output.new_zeros(
+                                num_token_padding - attn_output.shape[0],
+                                *attn_output.shape[1:],
+                            ),
+                        ],
+                        dim=0,
+                    )
+                return attn_output
 
             if sinks is not None or (self._is_swa_layer(layer) and self.use_fia):
                 # Use SWA block tables if hybrid SWA is enabled for this layer
@@ -4121,10 +4576,6 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ):
-        if self.use_mla and topk_indices is None:
-            raise NotImplementedError(
-                "The 'enable-mixed-chunk' feature is currently unsupported when using the MLA backend (without DSA sparse attention) on Ascend NPU devices."
-            )
         # A mixed batch is a varlen extend batch (decode rows are 1-token
         # extends), so reuse the extend path
         return self.forward_extend(
@@ -4147,6 +4598,8 @@ class AscendAttnMultiStepDraftBackend:
     draft decoding steps
     """
 
+    backend_cls = AscendAttnBackend
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -4159,7 +4612,7 @@ class AscendAttnMultiStepDraftBackend:
         self.attn_backends = []
         for step_id in range(self.speculative_num_steps):
             self.attn_backends.append(
-                AscendAttnBackend(model_runner, speculative_step_id=step_id)
+                self.backend_cls(model_runner, speculative_step_id=step_id)
             )
         self.needs_cpu_seq_lens = any(b.needs_cpu_seq_lens for b in self.attn_backends)
 
