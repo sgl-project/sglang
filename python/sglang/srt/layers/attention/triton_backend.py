@@ -654,14 +654,14 @@ class TritonAttnBackend(AttentionBackend):
         kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
         if kv_indices is None:
             return kv_indptr
-        # ROCm: one program per request crawls its whole row, so tile the gather
+        # gfx950: one program per request crawls its whole row, so tile the gather
         self.runner_ids.pack_read_stream(
             plan,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens[:bs],
             indptr=kv_indptr,
             out=kv_indices,
-            num_token_blocks=None if _is_hip else 1,
+            num_token_blocks=None if is_gfx95_supported() else 1,
         )
         return kv_indptr
 
