@@ -60,13 +60,24 @@ def log_mla_gluon_capability(log: logging.Logger | None = None) -> None:
     )
 
 
+def is_zero_padded_h12_fp8_mla(
+    *, head_pad_mode: str, num_head: int, kv_cache_dtype: torch.dtype
+) -> bool:
+    """12 query heads zero-padded to aiter's 16-head kernels over an fp8 KV cache
+    (e.g. Kimi K3 at TP8): the shape mla_gluon and the persistent fp8-query ASM
+    MLA kernel serve without repeating heads."""
+    return head_pad_mode == "zero" and num_head == 12 and kv_cache_dtype == fp8_dtype
+
+
 def prefer_mla_gluon_decode(
     *, head_pad_mode: str, num_head: int, kv_cache_dtype: torch.dtype
 ) -> bool:
     return (
-        head_pad_mode == "zero"
-        and num_head == 12
-        and kv_cache_dtype == fp8_dtype
+        is_zero_padded_h12_fp8_mla(
+            head_pad_mode=head_pad_mode,
+            num_head=num_head,
+            kv_cache_dtype=kv_cache_dtype,
+        )
         and _gluon_fn() is not None
     )
 

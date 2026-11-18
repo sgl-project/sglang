@@ -12,7 +12,7 @@ import torch
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention import aiter_mla_gluon as mod
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -448,89 +448,100 @@ class TestMlaDcpAsmDecode(CustomTestCase):
 
 
 class TestFp8QAsmSelection(CustomTestCase):
-    def _selected(self, **overrides):
+    def _skip_reason(self, **overrides):
         from sglang.srt.layers.attention.aiter_backend import (
-            _fp8_q_asm_mla_selected,
+            _fp8_q_asm_mla_skip_reason,
         )
 
         kwargs = dict(
-            enabled=True,
-            num_head=12,
-            head_pad_mode="zero",
-            kv_cache_dtype=fp8_dtype,
-            decode_backend="asm",
+            gfx950=True,
+            zero_padded_h12_fp8=True,
             verify_backend="asm",
             dcp_world_size=1,
             is_draft_worker=False,
             verify_qlen=1,
-            gfx95=True,
         )
         kwargs.update(overrides)
-        return _fp8_q_asm_mla_selected(**kwargs)
+        return _fp8_q_asm_mla_skip_reason(**kwargs)
 
-    def test_off_by_default(self):
-        self.assertFalse(envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM.default)
-        self.assertFalse(self._selected(enabled=False))
-
-    def test_verify_window_bound(self):
-        self.assertTrue(self._selected(verify_qlen=1))
-        for qlen in (0, 5, 8):
+    def test_decode_and_folded_windows_are_selected(self):
+        for qlen in (1, 5, 6, 7, 8):
             with self.subTest(qlen=qlen):
-                self.assertFalse(self._selected(verify_qlen=qlen))
+                self.assertIsNone(self._skip_reason(verify_qlen=qlen))
 
     def test_refuses_broken_2_to_4_token_windows(self):
-        for max_qlen in (4, 8):
-            for qlen in (2, 3, 4):
-                with self.subTest(qlen=qlen, max_qlen=max_qlen):
-                    self.assertFalse(
-                        self._selected(verify_qlen=qlen, max_verify_qlen=max_qlen)
-                    )
-
-    def test_folded_window_is_opt_in(self):
-        self.assertEqual(envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM_MAX_QLEN.default, 4)
-        for qlen in (5, 8):
+        for qlen in (2, 3, 4):
             with self.subTest(qlen=qlen):
-                self.assertTrue(self._selected(verify_qlen=qlen, max_verify_qlen=8))
-        self.assertFalse(self._selected(verify_qlen=8, max_verify_qlen=7))
+                self.assertIn("ROCm/aiter#7007", self._skip_reason(verify_qlen=qlen))
 
-    def test_rejects_window_beyond_the_fold(self):
-        for max_qlen in (0, 9):
-            with self.subTest(max_qlen=max_qlen):
-                with self.assertRaises(ValueError):
-                    self._selected(max_verify_qlen=max_qlen)
-
-    def test_disabled_ignores_max_window(self):
-        for max_qlen in (0, 9):
-            with self.subTest(max_qlen=max_qlen):
-                self.assertFalse(
-                    self._selected(enabled=False, max_verify_qlen=max_qlen)
-                )
+    def test_refuses_windows_beyond_the_fold(self):
+        for qlen in (0, 9, 16):
+            with self.subTest(qlen=qlen):
+                self.assertIsNotNone(self._skip_reason(verify_qlen=qlen))
 
     def test_requires_gfx950_h12_zero_pad_fp8(self):
-        for override in (
-            dict(gfx95=False),
-            dict(num_head=8),
-            dict(num_head=16),
-            dict(head_pad_mode="repeat"),
-            dict(head_pad_mode="none"),
-            dict(kv_cache_dtype=torch.bfloat16),
-        ):
-            with self.subTest(**override):
-                self.assertFalse(self._selected(**override))
+        self.assertIsNotNone(self._skip_reason(gfx950=False))
+        self.assertIsNotNone(self._skip_reason(zero_padded_h12_fp8=False))
 
-    def test_requires_asm_for_decode_and_verify(self):
-        self.assertFalse(self._selected(decode_backend="gluon"))
-        self.assertFalse(self._selected(verify_backend="gluon"))
+    def test_requires_asm_verify(self):
+        self.assertIsNotNone(self._skip_reason(verify_backend="gluon"))
 
     def test_dcp_keeps_its_own_route(self):
-        self.assertFalse(self._selected(dcp_world_size=2))
+        self.assertIsNotNone(self._skip_reason(dcp_world_size=2))
+
+    def test_draft_worker_keeps_the_module_route(self):
+        self.assertIsNotNone(self._skip_reason(is_draft_worker=True))
+
+
+class TestZeroPaddedH12Fp8Shape(CustomTestCase):
+    def test_only_twelve_zero_padded_heads_over_fp8(self):
+        self.assertTrue(
+            mod.is_zero_padded_h12_fp8_mla(
+                head_pad_mode="zero", num_head=12, kv_cache_dtype=fp8_dtype
+            )
+        )
+        for kwargs in (
+            dict(head_pad_mode="zero", num_head=8, kv_cache_dtype=fp8_dtype),
+            dict(head_pad_mode="zero", num_head=16, kv_cache_dtype=fp8_dtype),
+            dict(head_pad_mode="repeat", num_head=12, kv_cache_dtype=fp8_dtype),
+            dict(head_pad_mode="none", num_head=12, kv_cache_dtype=fp8_dtype),
+            dict(head_pad_mode="zero", num_head=12, kv_cache_dtype=torch.bfloat16),
+        ):
+            with self.subTest(**kwargs):
+                self.assertFalse(mod.is_zero_padded_h12_fp8_mla(**kwargs))
+
+
+class TestIsGfx950Supported(CustomTestCase):
+    """The fp8-Q ASM route is gfx950 only: an exact arch match, not a gfx95 prefix."""
+
+    def _is_gfx950(self, hip):
+        from sglang.srt.utils import device
+
+        device.is_gfx950_supported.cache_clear()
+        try:
+            with mock.patch(
+                "sglang.kernels.arch.current_arch",
+                return_value=mock.Mock(hip=hip),
+            ):
+                return device.is_gfx950_supported()
+        finally:
+            device.is_gfx950_supported.cache_clear()
+
+    def test_exact_arch(self):
+        self.assertTrue(self._is_gfx950(mock.Mock(gcn_arch="gfx950")))
+        for arch in ("gfx942", "gfx951", "gfx9500", "gfx1250"):
+            with self.subTest(arch=arch):
+                self.assertFalse(self._is_gfx950(mock.Mock(gcn_arch=arch)))
+
+    def test_false_off_hip(self):
+        self.assertFalse(self._is_gfx950(None))
 
 
 class TestFp8QAsmPersistScope(CustomTestCase):
-    """SGLANG_OPT_HIP_MLA_FP8_Q_ASM must not turn persistence on for the process.
+    """SGLANG_AITER_MLA_DECODE_BACKEND=asm_fp8q must not turn persistence on for the process.
     Under SGLANG_AITER_MLA_PERSIST=0, other backends and the module defaults stay off."""
 
-    def _build(self, *, num_draft_tokens, is_draft_worker=False):
+    def _build(self, *, num_draft_tokens, is_draft_worker=False, gfx950=True):
         from types import SimpleNamespace
 
         from sglang.srt.configs.model_config import AttentionArch
@@ -575,6 +586,7 @@ class TestFp8QAsmPersistScope(CustomTestCase):
                 speculative_num_steps=1,
                 speculative_attention_mode="decode",
             ),
+            override_platform(is_gfx950=gfx950),
             mock.patch.object(aiter_backend, "is_gfx95_supported", return_value=True),
             mock.patch.object(
                 aiter_backend, "prefer_mla_gluon_decode", return_value=True
@@ -587,9 +599,7 @@ class TestFp8QAsmPersistScope(CustomTestCase):
         from sglang.srt.layers.attention import aiter_backend
 
         with (
-            envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM.override(True),
-            envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM_MAX_QLEN.override(8),
-            envs.SGLANG_AITER_MLA_DECODE_BACKEND.override("asm"),
+            envs.SGLANG_AITER_MLA_DECODE_BACKEND.override("asm_fp8q"),
             envs.SGLANG_AITER_MLA_VERIFY_BACKEND.override("asm"),
             envs.SGLANG_AITER_MLA_AUTO_KV_SPLITS.override(False),
             mock.patch.object(aiter_backend, "_use_mla_ps_kernel", False),
@@ -617,15 +627,34 @@ class TestFp8QAsmPersistScope(CustomTestCase):
             self.assertFalse(draft.use_mla_fp8_q_asm)
             self.assertFalse(draft._use_mla_decode_persist_metadata())
 
+    def test_route_needs_asm_fp8q_on_gfx950(self):
+        from sglang.srt.layers.attention import aiter_backend
+
+        with (
+            envs.SGLANG_AITER_MLA_VERIFY_BACKEND.override("asm"),
+            envs.SGLANG_AITER_MLA_AUTO_KV_SPLITS.override(False),
+            mock.patch.object(aiter_backend, "_use_mla_ps_kernel", False),
+            mock.patch.object(aiter_backend, "fast_mode", False),
+            mock.patch.object(aiter_backend, "intra_batch_mode", False),
+        ):
+            with envs.SGLANG_AITER_MLA_DECODE_BACKEND.override("asm"):
+                plain_asm = self._build(num_draft_tokens=8)
+            with envs.SGLANG_AITER_MLA_DECODE_BACKEND.override("asm_fp8q"):
+                other_arch = self._build(num_draft_tokens=8, gfx950=False)
+
+            self.assertFalse(plain_asm.use_mla_fp8_q_asm)
+            self.assertFalse(other_arch.use_mla_fp8_q_asm)
+            # asm_fp8q that does not take the route behaves as asm.
+            self.assertEqual(other_arch.mla_decode_backend, "asm")
+            self.assertFalse(other_arch._use_mla_decode_persist_metadata())
+
     def test_persist_auto_splits_still_set_the_module_modes(self):
         """Under PERSIST=1 with auto KV splits, draft extend reads the module modes with a
         split cap of -1, so the opt-in must not keep them on the non-auto schedule."""
         from sglang.srt.layers.attention import aiter_backend
 
         with (
-            envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM.override(True),
-            envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM_MAX_QLEN.override(8),
-            envs.SGLANG_AITER_MLA_DECODE_BACKEND.override("asm"),
+            envs.SGLANG_AITER_MLA_DECODE_BACKEND.override("asm_fp8q"),
             envs.SGLANG_AITER_MLA_VERIFY_BACKEND.override("asm"),
             envs.SGLANG_AITER_MLA_AUTO_KV_SPLITS.override(True),
             mock.patch.object(aiter_backend, "_use_mla_ps_kernel", True),

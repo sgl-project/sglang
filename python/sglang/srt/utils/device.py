@@ -112,6 +112,7 @@ __all__ = [
     "get_compiler_backend",
     "set_cuda_arch",
     "is_gfx95_supported",
+    "is_gfx950_supported",
     "is_gfx942_supported",
     "is_gfx115_supported",
     "use_gfx115_kernels",
@@ -1314,6 +1315,18 @@ def is_gfx95_supported():
         return any(gfx in gcn_arch for gfx in ["gfx95"])
     else:
         return False
+
+
+@lru_cache(maxsize=1)
+def is_gfx950_supported():
+    """Whether the device is exactly gfx950 (MI350X/MI355X), not any gfx95x.
+
+    False on every non-HIP build, so callers do not need their own is_hip().
+    """
+    from sglang.kernels.arch import current_arch
+
+    hip = current_arch().hip
+    return hip is not None and hip.gcn_arch == "gfx950"
 
 
 @lru_cache(maxsize=1)

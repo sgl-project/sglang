@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_platform,
+    get_schedule,
+    get_spec,
+)
 
 """
 end to end attention solution with aiter kernels
@@ -170,6 +176,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, scaled_fp8_qua
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.aiter_mla_gluon import (
+    is_zero_padded_h12_fp8_mla,
     log_mla_gluon_capability,
     mla_gluon_decode,
     prefer_mla_gluon_decode,
@@ -214,48 +221,43 @@ _use_fp8_prefill_attn = (
 
 # Max qlen limitation of the asm ps kernels to handle q with bf16 dtype
 _MLA_ASM_PS_MAX_QLEN = 4
-# 16 padded heads times the window must fit aiter's 128-row fold.
-_MLA_FP8_Q_ASM_FOLD_MAX_QLEN = 8
-# The fp8-Q kernels return wrong output for these verify windows (ROCm/aiter#7007).
-_MLA_FP8_Q_ASM_BROKEN_QLENS = frozenset(range(2, 4 + 1))
+# SGLANG_AITER_MLA_DECODE_BACKEND value that runs decode and target verify on
+# aiter's persistent fp8-query ASM MLA kernel where _fp8_q_asm_mla_skip_reason allows.
+_MLA_FP8_Q_ASM_DECODE_BACKEND = "asm_fp8q"
+# Windows the fp8-query ASM kernel runs correctly at 16 padded heads. 2-4 return
+# wrong output (ROCm/aiter#7007). 5-8 fold onto aiter's 128-row qlen-4 kernel,
+# which on MI355X beats Gluon only from about 128K tokens of context; that
+# crossover is why the route is an explicit backend choice, not a default.
+_MLA_FP8_Q_ASM_QLENS = frozenset((1, *range(5, 8 + 1)))
 
 
-def _fp8_q_asm_mla_selected(
+def _fp8_q_asm_mla_skip_reason(
     *,
-    enabled: bool,
-    num_head: int,
-    head_pad_mode: str,
-    kv_cache_dtype: torch.dtype,
-    decode_backend: str,
+    gfx950: bool,
+    zero_padded_h12_fp8: bool,
     verify_backend: str,
     dcp_world_size: int,
     is_draft_worker: bool,
     verify_qlen: int,
-    gfx95: bool,
-    max_verify_qlen: int = _MLA_ASM_PS_MAX_QLEN,
-) -> bool:
-    # The native 16-head fp8-Q kernel covers up to _MLA_ASM_PS_MAX_QLEN tokens;
-    # a wider window folds onto the 32-head kernel, which wins only at long context.
-    if not enabled:
-        return False
-    if not 1 <= max_verify_qlen <= _MLA_FP8_Q_ASM_FOLD_MAX_QLEN:
-        raise ValueError(
-            f"fp8-Q asm MLA max verify qlen must be in "
-            f"[1, {_MLA_FP8_Q_ASM_FOLD_MAX_QLEN}], got {max_verify_qlen}"
-        )
-    return (
-        num_head == 12
-        and head_pad_mode == "zero"
-        and kv_cache_dtype == fp8_dtype
-        and decode_backend == "asm"
-        and verify_backend == "asm"
-        and dcp_world_size <= 1
+) -> Optional[str]:
+    """Why the fp8-query ASM MLA route does not apply here, or None when it does."""
+    if not gfx950:
+        return "the kernel is gfx950 only"
+    if not zero_padded_h12_fp8:
+        return "it needs 12 zero-padded query heads over an fp8 KV cache"
+    if verify_backend != "asm":
+        return "SGLANG_AITER_MLA_VERIFY_BACKEND is not asm"
+    if dcp_world_size > 1:
+        return "DCP is on"
+    if is_draft_worker:
         # A draft backend also runs draft extend, which plans with the module modes.
-        and not is_draft_worker
-        and gfx95
-        and 1 <= verify_qlen <= max_verify_qlen
-        and verify_qlen not in _MLA_FP8_Q_ASM_BROKEN_QLENS
-    )
+        return "this is a draft worker"
+    if verify_qlen not in _MLA_FP8_Q_ASM_QLENS:
+        return (
+            f"a {verify_qlen}-token verify window is not 1 or 5-8 (2-4 are wrong "
+            "on current aiter, ROCm/aiter#7007; wider ones do not fold)"
+        )
+    return None
 
 
 # (query head count -> query lengths) at which aiter's scheduler treats the
@@ -849,8 +851,13 @@ class AiterAttnBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
 
         self.dcp_world_size = get_parallel().attn_dcp_size
+        mla_decode_backend_choice = envs.SGLANG_AITER_MLA_DECODE_BACKEND.get()
+        # asm_fp8q is asm wherever its fp8-query route does not apply.
+        fp8_q_asm_requested = (
+            mla_decode_backend_choice.lower() == _MLA_FP8_Q_ASM_DECODE_BACKEND
+        )
         self.mla_decode_backend = resolve_aiter_mla_decode_backend(
-            envs.SGLANG_AITER_MLA_DECODE_BACKEND.get(),
+            "asm" if fp8_q_asm_requested else mla_decode_backend_choice,
             use_mla=self.use_mla,
             input_dtype=self.input_dtype,
             dcp_world_size=self.dcp_world_size,
@@ -1297,26 +1304,32 @@ class AiterAttnBackend(AttentionBackend):
                     intra_batch_mode = False
                 log_mla_gluon_capability(logger)
 
-            self.use_mla_fp8_q_asm = _fp8_q_asm_mla_selected(
-                enabled=envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM.get(),
-                num_head=self.num_head,
-                head_pad_mode=self.head_pad_mode,
-                kv_cache_dtype=self.kv_cache_dtype,
-                decode_backend=self.mla_decode_backend,
-                verify_backend=self.mla_verify_backend,
-                dcp_world_size=self.dcp_world_size,
-                is_draft_worker=model_runner.is_draft_worker,
-                verify_qlen=self.num_draft_tokens or 1,
-                gfx95=is_gfx95_supported(),
-                max_verify_qlen=envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM_MAX_QLEN.get(),
-            )
-            if self.use_mla_fp8_q_asm:
+            if fp8_q_asm_requested:
+                skip_reason = _fp8_q_asm_mla_skip_reason(
+                    gfx950=get_platform().is_gfx950,
+                    zero_padded_h12_fp8=is_zero_padded_h12_fp8_mla(
+                        head_pad_mode=self.head_pad_mode,
+                        num_head=self.num_head,
+                        kv_cache_dtype=self.kv_cache_dtype,
+                    ),
+                    verify_backend=self.mla_verify_backend,
+                    dcp_world_size=self.dcp_world_size,
+                    is_draft_worker=model_runner.is_draft_worker,
+                    verify_qlen=self.num_draft_tokens or 1,
+                )
+                self.use_mla_fp8_q_asm = skip_reason is None
                 logger.info(
-                    "aiter MLA: decode/verify use the FP8-Q ASM kernel (qlen<=%s)",
-                    envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM_MAX_QLEN.get(),
+                    "aiter MLA: SGLANG_AITER_MLA_DECODE_BACKEND=asm_fp8q %s",
+                    (
+                        "runs decode and verify on the fp8-query ASM kernel"
+                        if self.use_mla_fp8_q_asm
+                        else f"falls back to asm: {skip_reason}"
+                    ),
                 )
 
-            use_any_mla_persist = self._mla_ps_kernel_enabled() or self.use_mla_dcp_asm
+            # Persistence the module modes (and so draft extend) are planned with.
+            use_module_mla_persist = _use_mla_ps_kernel or self.use_mla_dcp_asm
+            use_any_mla_persist = use_module_mla_persist or self.use_mla_fp8_q_asm
             self.max_split_per_batch = 32 if use_any_mla_persist else None
 
             if self.num_draft_tokens is None and use_any_mla_persist:
@@ -1341,7 +1354,7 @@ class AiterAttnBackend(AttentionBackend):
                 )
                 # Draft extend reads the module modes; the fp8-Q opt-in alone must not
                 # flip them, it takes its own from _mla_decode_metadata_modes.
-                if _use_mla_ps_kernel or self.use_mla_dcp_asm:
+                if use_module_mla_persist:
                     fast_mode = True
                     intra_batch_mode = False
                 self.max_split_per_batch = -1
