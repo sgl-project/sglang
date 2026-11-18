@@ -444,10 +444,10 @@ def check_pool(dcp_replicated: bool, index_kpool: int, page_size: int) -> None:
         aiter_can_use_preshuffle_paged_mqa,
     )
     from sglang.srt.layers.dcp.layout import dsa_shards_index_k
-    from sglang.srt.utils import is_hip
+    from sglang.srt.utils import is_gfx95_supported
 
     if not (
-        is_hip()
+        is_gfx95_supported()
         and aiter_can_use_preshuffle_paged_mqa()
         and dsa_shards_index_k()
         and not dcp_replicated
