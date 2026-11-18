@@ -12,10 +12,7 @@ score(h,i,t) = q_nope[i,h] · c_KV[t]  +  q_pe[i,h] · k_pe[t]      # 512 dot + 
 out(h,i)     = Σ_t softmax_t · c_KV[t]                            # V = c_KV
 
 ``verify_mla_draft_fwd`` (``DraftVerifyMLA``) runs the same kernel bodies for the
-gfx950 monokernel's DFLASH MLA draft, with constexpr options the other callers'
-launches leave off: BF16 prefix dots over an FP8 cache, a sliding window trimmed
-from the front of each rail, empty prefixes, and a combine over blocks of splits
-and row tiles.
+gfx950 monokernel's DFLASH MLA draft, with constexpr options the other launches leave off.
 """
 
 import torch
@@ -159,8 +156,6 @@ def _verify_mla_prefix_stage1_body(
             (cur_q_start + offs_l)[None, :] * stride_qbs + offs_h[:, None] * stride_qh,
             (R,),
         )
-        # q, the probabilities and the dots run in the cache dtype (FP8 dots over
-        # an FP8 cache), or with BF16_DOT in q's dtype, upcasting K/V instead.
         dot_dtype = Q.dtype.element_ty if BF16_DOT else K_Buffer.dtype.element_ty
         q_nope = tl.load(
             Q + q_row[:, None] + offs_dn[None, :],
@@ -836,8 +831,7 @@ class DraftVerifyMLA(VerifyMLA):
 
     It serves empty prefixes and a window trimmed from each rail. On the MLA shape
     it also splits further, combines blocks of splits over row tiles, and compiles
-    stage 1 spill-free. Its partials are flat, sized for the largest bs x splits a
-    launch needs.
+    stage 1 spill-free.
     """
 
     max_splits = MAX_N_SPLITS

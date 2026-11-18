@@ -14,7 +14,7 @@
 # limitations under the License.
 
 """Non-greedy tree verify on ROCm: Triton port of the CUDA
-``tree_speculative_sampling_target_only`` (sgl_kernel speculative/sampling.cuh)."""
+``tree_speculative_sampling_target_only`` (jit/include/sgl_kernel/speculative/sampling.cuh)."""
 
 import torch
 import triton
@@ -206,11 +206,9 @@ def tree_speculative_sampling_target_only_triton(
     threshold_acc: float = 1.0,
     deterministic: bool = True,  # not used: Triton reductions are deterministic
 ) -> None:
-    """Triton port of the CUDA ``tree_speculative_sampling_target_only``
-    (``jit/include/sgl_kernel/speculative/sampling.cuh``) with the same operand
-    contract and results; only fp32 summation order differs. It launches one
-    program per request and neither allocates nor syncs, so CUDA graphs can
-    capture it."""
+    """The CUDA kernel's operand contract and results; only fp32 summation order
+    differs. One program per request, with no allocation or sync, so CUDA graphs
+    can capture it."""
     bs, num_draft_tokens = candidates.shape
     num_spec_tokens = accept_index.shape[-1]
     vocab_size = target_probs.shape[-1]
