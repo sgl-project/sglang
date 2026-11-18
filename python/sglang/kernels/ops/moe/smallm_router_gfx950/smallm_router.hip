@@ -37,8 +37,14 @@ __device__ __forceinline__ float dot8(u32x4 w, u32x4 x, float acc) {
     for (int q = 0; q < 4; ++q) {
         // bit_cast of a vector-element lvalue reads element 0; go through scalars
         const unsigned wq = w[q], xq = x[q];
+#if defined(__gfx950__)
         acc = __builtin_amdgcn_fdot2_f32_bf16(__builtin_bit_cast(bf16x2, wq), __builtin_bit_cast(bf16x2, xq), acc,
                                               false);
+#else
+        // gfx942 has no v_dot2_f32_bf16 (dot12-insts): widen each bf16 half to fp32 and FMA, low half first
+        acc = __builtin_fmaf(__uint_as_float(wq << 16), __uint_as_float(xq << 16), acc);
+        acc = __builtin_fmaf(__uint_as_float(wq & 0xffff0000u), __uint_as_float(xq & 0xffff0000u), acc);
+#endif
     }
     return acc;
 }
@@ -201,9 +207,16 @@ __device__ __forceinline__ uint32_t order_key(float v) {
 }
 
 __device__ __forceinline__ float dot_u32(const uint32_t* w, const uint32_t* x, int n, float acc) {
-    for (int q = 0; q < n; ++q)
+    for (int q = 0; q < n; ++q) {
+#if defined(__gfx950__)
         acc = __builtin_amdgcn_fdot2_f32_bf16(__builtin_bit_cast(bf16x2, w[q]), __builtin_bit_cast(bf16x2, x[q]), acc,
                                               false);
+#else
+        // gfx942 only builds this (the GLM router runs on gfx950): same FMA fallback as dot8
+        acc = __builtin_fmaf(__uint_as_float(w[q] << 16), __uint_as_float(x[q] << 16), acc);
+        acc = __builtin_fmaf(__uint_as_float(w[q] & 0xffff0000u), __uint_as_float(x[q] & 0xffff0000u), acc);
+#endif
+    }
     return acc;
 }
 

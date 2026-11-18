@@ -49,3 +49,15 @@ class GetDisaggStatsReq(msgspec.Struct):
     """Request to get disagg pipeline metrics from the scheduler."""
 
     pass
+
+
+class StartProfileReq(msgspec.Struct):
+    output_dir: str | None = None
+    profile_id: str | None = None
+    activities: list[str] | None = None
+    with_stack: bool | None = None
+    record_shapes: bool | None = None
+
+
+class StopProfileReq(msgspec.Struct):
+    export_trace: bool = True

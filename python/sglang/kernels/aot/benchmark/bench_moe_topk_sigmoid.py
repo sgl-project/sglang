@@ -1,7 +1,5 @@
 import itertools
-import os
 
-import pytest
 import torch
 import triton
 from sgl_kernel import topk_sigmoid
@@ -195,7 +193,7 @@ if MUSA_AVAILABLE:
 def benchmark(num_tokens, num_experts, topk, provider):
     gating_output, correction_bias = get_topk_sigmoid_input(num_tokens, num_experts)
 
-    if provider == "torch" or provider == "torch1":
+    if provider == "torch":
 
         def fn():
             return torch_topk_sigmoid_native(
@@ -205,12 +203,12 @@ def benchmark(num_tokens, num_experts, topk, provider):
                 correction_bias,
             )
 
-    elif provider == "sglang" or provider == "sglang1":
+    elif provider == "sglang":
 
         def fn():
             return sglang_topk_sigmoid(gating_output, topk, True, correction_bias)
 
-    elif provider == "musa" or provider == "musa1":
+    elif provider == "musa":
         if not MUSA_AVAILABLE:
             return (0, 0, 0)
 

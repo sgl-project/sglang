@@ -131,6 +131,7 @@ class TestExternalLinkerConfig(unittest.TestCase):
                 unified_cache_external_linker_backend=backend,
                 unified_cache_external_linker_config=config,
                 disable_radix_cache=True,
+                pp_size=2,
             )
             with (
                 self.subTest(backend=backend, config=config),
@@ -201,6 +202,7 @@ class TestExternalLinkerConfig(unittest.TestCase):
             {"enable_linker_mla_dedup": True},
             {"disable_radix_cache": True},
             {"radix_cache_backend": "custom"},
+            {"pp_size": 2},
         ):
             fields = dict(
                 model_path="dummy",
@@ -364,7 +366,6 @@ class TestBuiltinLinkerConfig(unittest.TestCase):
             token_to_kv_pool_allocator=Mock(),
             page_size=1,
         )
-        legacy = {"master_server_address": "legacy:50051"}
         for backend, module_path in (
             ("mooncake", "mooncake_store.mooncake_direct_linker"),
             ("mori", "umbp.umbp_direct_linker"),
@@ -386,7 +387,6 @@ class TestBuiltinLinkerConfig(unittest.TestCase):
                     get_context().override_server_args(
                         unified_cache_external_linker_backend=backend,
                         unified_cache_external_linker_config=config,
-                        hicache_storage_backend_extra_config=json.dumps(legacy),
                     ),
                     patch.object(
                         module, "resolve_hybrid_device_pool_group", return_value=group
@@ -404,7 +404,7 @@ class TestBuiltinLinkerConfig(unittest.TestCase):
                 ):
                     _create_startup_linker("args", params, components={"full"})
                 passed = storage_config.call_args.kwargs["extra_config"]
-                expected = legacy if config is None else config
+                expected = config or {}
                 self.assertNotIn("load_mode", passed)
                 self.assertNotIn("prefetch_policy", passed)
                 self.assertEqual(
@@ -414,7 +414,7 @@ class TestBuiltinLinkerConfig(unittest.TestCase):
                 if backend == "mori":
                     self.assertIs(passed["ssd_enabled"], False)
                     self.assertNotIn("ssd_enabled", expected)
-                if config == {}:
+                if not config:
                     self.assertNotIn("master_server_address", passed)
 
     def test_unsupported_prefetch_fails_before_storage_initialization(self):

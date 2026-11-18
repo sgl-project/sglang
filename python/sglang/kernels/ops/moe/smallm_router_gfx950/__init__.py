@@ -1,6 +1,6 @@
-"""gfx950 one-launch MoE routers. Qwen3.5 for 1..8 tokens: gate GEMV (routed logits rounded to bf16, as today) +
-softmax top-10 + renormalize + fused shared-expert slot, written as the [M, 11] int32 ids / fp32 weights that
-smallm_moe_gfx950 consumes; GLM-5.x (sigmoid noaux_tc top-8 + shared slot, [M, 9]) for 1..16 tokens.
+"""One-launch MoE routers. Qwen3.5 (gfx950/gfx942) for 1..8 tokens: gate GEMV (routed logits rounded to bf16, as
+today) + softmax top-10 + renormalize + fused shared-expert slot, written as the [M, 11] int32 ids / fp32 weights
+that smallm_moe_gfx950 consumes; GLM-5.x (gfx950; sigmoid noaux_tc top-8 + shared slot, [M, 9]) for 1..16 tokens.
 A build/load failure disables both."""
 
 import ctypes
@@ -11,13 +11,16 @@ import subprocess
 import torch
 
 from sglang.kernels.arch import current_arch
-from sglang.kernels.jit.utils.hipcc import HipKernel, build_gfx950_module
+from sglang.kernels.jit.utils.hipcc import HipKernel, build_hip_module
 from sglang.srt.environ import envs
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smallm_router.hip")
 MAX_TOK = 8  # MAX_TOK in smallm_router.hip; from 9 tokens the unfused path is faster
+# gfx942 builds the same source with the bf16 dot product as two FMAs (no dot12-insts there).
+_ARCHS = ("gfx950", "gfx942")
 GLM_MAX_TOK = 16  # G_MAX_TOK in smallm_router.hip
 GLM_E, GLM_TOPK = 288, 8
+_GLM_ARCHS = ("gfx950",)  # measured on MI355X only
 # (rows per block, tokens per GEMV pass, waves per block = max tokens): GLM_ROUTER instances in smallm_router.hip
 _GLM_VARIANTS = ((2, 4, 4), (2, 8, 8), (2, 8, 16))
 _kernels: dict = {}
@@ -58,7 +61,9 @@ def _load() -> bool:
     if _disabled:
         return False
     try:
-        mod = build_gfx950_module(_SRC, "sglang_smallm_router_")
+        mod = build_hip_module(
+            _SRC, "sglang_smallm_router_", current_arch().hip.gcn_arch
+        )
         for r in (1, 2):
             _kernels[r] = HipKernel(mod, f"smallm_router_r{r}")
         for v in _GLM_VARIANTS:
@@ -71,12 +76,14 @@ def _load() -> bool:
     return True
 
 
-def smallm_router_supported(x: torch.Tensor, max_tok: int = MAX_TOK) -> bool:
+def smallm_router_supported(
+    x: torch.Tensor, max_tok: int = MAX_TOK, archs: tuple = _ARCHS
+) -> bool:
     hip = current_arch().hip
     return (
         not _disabled
         and hip is not None
-        and hip.gcn_arch == "gfx950"
+        and hip.gcn_arch in archs
         and 1 <= x.shape[0] <= max_tok
         and x.dtype == torch.bfloat16
         and x.shape[1] == 4096
@@ -215,7 +222,7 @@ def glm_moe_topk_output(moe, hidden_states):
         )
     if (
         not ok
-        or not smallm_router_supported(hidden_states, GLM_MAX_TOK)
+        or not smallm_router_supported(hidden_states, GLM_MAX_TOK, _GLM_ARCHS)
         or is_in_tc_piecewise_cuda_graph()
     ):
         return None

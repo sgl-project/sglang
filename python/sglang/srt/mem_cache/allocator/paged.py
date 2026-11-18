@@ -26,7 +26,7 @@ from sglang.kernels.ops.memory.allocator import (
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.utils import get_num_new_pages
 from sglang.srt.platforms import current_platform
-from sglang.srt.utils import get_bool_env_var, is_hip, next_power_of_2
+from sglang.srt.utils import get_bool_env_var, is_hip
 
 _is_hip = is_hip()
 
@@ -258,7 +258,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 last_loc,
                 self.free_pages,
                 out_indices,
-                next_power_of_2(bs),
                 self.page_size,
             )
         else:
@@ -315,7 +314,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 last_loc,
                 self.free_pages,
                 out_indices,
-                next_power_of_2(bs),
                 self.page_size,
             )
         else:

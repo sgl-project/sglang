@@ -41,7 +41,7 @@ def _aot_v2(x, x_q, x_s):
 
 
 def _jit_v2(x, x_q, x_s):
-    per_token_group_quant_8bit_v2(x, x_q, x_s, G, 1e-10, float(fp8_min), float(fp8_max))
+    per_token_group_quant_8bit_v2(x, x_q, x_s, G)
 
 
 FN = {"aot_v2": _aot_v2, "jit_v2": _jit_v2}

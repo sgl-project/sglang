@@ -14,25 +14,28 @@ class StreamDelta(msgspec.Struct, omit_defaults=True):
     """Delta content for streaming responses.
 
     OpenAI Python SDK's ChoiceDelta does not declare reasoning_content; it is
-    surfaced via pydantic `extra`. With omit_defaults=True, defaulting to
-    None would drop the key entirely from the SSE payload, making
-    `data.reasoning_content` raise AttributeError on the client. Keep it
-    required (no default) so it is always serialized as null or a string.
+    surfaced via pydantic `extra`, so a missing key makes
+    `data.reasoning_content` raise AttributeError on the client. It is required
+    and serialized as null, except under the K3 streaming format, which passes
+    UNSET: there a present reasoning_content must be a string.
     """
 
-    reasoning_content: Optional[str]
+    reasoning_content: Union[Optional[str], msgspec.UnsetType]
     role: Optional[str] = None
     content: Optional[str] = None
 
 
 class StreamChoice(msgspec.Struct):
-    """A single choice in a streaming response."""
+    """A single choice in a streaming response. No omit_defaults: the
+    finish_reason key has to appear on every frame."""
 
     index: int
     delta: StreamDelta
     logprobs: Optional[dict] = None
     finish_reason: Optional[str] = None
     matched_stop: Union[None, int, str] = None
+    usage: Union[dict, msgspec.UnsetType] = msgspec.UNSET
+    internal_content: Union[list[dict], msgspec.UnsetType] = msgspec.UNSET
 
 
 class StreamChunk(msgspec.Struct, omit_defaults=True):
@@ -61,6 +64,9 @@ def build_sse_content(
     logprobs: Optional[dict] = None,
     matched_stop: Union[None, int, str] = None,
     usage: Optional[dict] = None,
+    internal_content: Optional[list[dict]] = None,
+    choice_usage: Optional[dict] = None,
+    omit_null_reasoning: bool = False,
 ) -> str:
     """Build an SSE chunk string for content/reasoning updates.
 
@@ -80,13 +86,23 @@ def build_sse_content(
     Returns:
         SSE-formatted string "data: {...}\\n\\n"
     """
-    delta = StreamDelta(role=role, content=content, reasoning_content=reasoning_content)
+    if reasoning_content is None and omit_null_reasoning:
+        reasoning_content = msgspec.UNSET
+    delta = StreamDelta(
+        role=role,
+        content=content,
+        reasoning_content=reasoning_content,
+    )
     choice = StreamChoice(
         index=index,
         delta=delta,
         logprobs=logprobs,
         finish_reason=finish_reason,
         matched_stop=matched_stop,
+        usage=choice_usage if choice_usage is not None else msgspec.UNSET,
+        internal_content=internal_content
+        if internal_content is not None
+        else msgspec.UNSET,
     )
     chunk = StreamChunk(
         id=chunk_id,
