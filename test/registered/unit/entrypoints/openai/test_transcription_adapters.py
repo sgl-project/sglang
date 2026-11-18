@@ -9,15 +9,22 @@ Covers the pieces that are easy to regress and cheap to check on CPU:
   keep language auto-detection off and each implement ``build_sampling_params``
   (duration-scaled ``max_new_tokens`` above a per-model floor) and
   ``build_verbose_response`` (no segments, per-model default language).
+* The Qwen3-Omni adapter forwards the request language in ``sampling_params``
+  (the processor pops it to render the ASR prompt) and reports it back.
+* The Gemma 4 adapter bans ``<|channel>`` so the model cannot open the empty
+  thought-channel blocks it otherwise loops on instead of transcribing, and
+  caps clips at the model's 30s audio limit.
 """
 
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import TranscriptionRequest
 from sglang.srt.entrypoints.openai.transcription_adapters import (
+    Gemma4Adapter,
     GlmAsrAdapter,
     GraniteSpeechAdapter,
     Qwen2AudioAdapter,
+    Qwen3OmniAdapter,
     WhisperAdapter,
     resolve_adapter,
 )
@@ -45,6 +52,20 @@ class TestTranscriptionAdapterResolution(CustomTestCase):
         for arch, cls, _, _ in _SPEECH_LM_CASES:
             with self.subTest(arch=arch):
                 self.assertIsInstance(resolve_adapter([arch]), cls)
+
+    def test_resolves_qwen3_omni(self):
+        self.assertIsInstance(
+            resolve_adapter(["Qwen3OmniMoeForConditionalGeneration"]), Qwen3OmniAdapter
+        )
+
+    def test_resolves_gemma4_architectures(self):
+        # Both the encoder-free unified 12B and the conformer E2B/E4B archs.
+        for arch in (
+            "Gemma4UnifiedForConditionalGeneration",
+            "Gemma4ForConditionalGeneration",
+        ):
+            with self.subTest(arch=arch):
+                self.assertIsInstance(resolve_adapter([arch]), Gemma4Adapter)
 
     def test_unknown_architecture_falls_back_to_whisper(self):
         # Whisper is the registered default; a non-ASR arch must not match one
@@ -145,6 +166,59 @@ class TestSpeechLMAdapterContract(CustomTestCase):
         self.assertEqual(
             adapter.postprocess_text("just the transcript"), "just the transcript"
         )
+
+
+class TestQwen3OmniAdapter(CustomTestCase):
+    def _request(self, duration=3.0, language=None):
+        return TranscriptionRequest(
+            model="m", temperature=0.0, audio_duration_s=duration, language=language
+        )
+
+    def test_sampling_params_forward_language(self):
+        adapter = Qwen3OmniAdapter()
+        self.assertFalse(adapter.supports_language_detection)
+        self.assertEqual(
+            adapter.build_sampling_params(self._request(language="en")),
+            {"temperature": 0.0, "max_new_tokens": 448, "language": "en"},
+        )
+        self.assertIsNone(adapter.build_sampling_params(self._request())["language"])
+        scaled = adapter.build_sampling_params(self._request(duration=60.0))
+        self.assertEqual(scaled["max_new_tokens"], 60 * _TOKENS_PER_SECOND)
+
+    def test_verbose_response_reports_request_language(self):
+        resp = Qwen3OmniAdapter().build_verbose_response(
+            self._request(duration=3.456, language="fr"), "bonjour", {}, None, None
+        )
+        self.assertEqual(resp.language, "fr")
+        self.assertEqual(resp.duration, 3.46)
+        self.assertEqual(resp.segments, [])
+
+
+class TestGemma4Adapter(CustomTestCase):
+    def _request(self, temperature=0.0, duration=3.0):
+        return TranscriptionRequest(
+            model="m", temperature=temperature, audio_duration_s=duration
+        )
+
+    def test_sampling_params_ban_channel_token(self):
+        # Token 100 is <|channel> in every Gemma 4 tokenizer; a transcription never
+        # needs a thought channel, and opening one is how the empty-block loop starts.
+        adapter = Gemma4Adapter()
+        self.assertEqual(
+            adapter.build_sampling_params(self._request(temperature=0.2)),
+            {
+                "temperature": 0.2,
+                "max_new_tokens": 448,
+                "logit_bias": {"100": -100.0},
+            },
+        )
+        scaled = adapter.build_sampling_params(self._request(duration=60.0))
+        self.assertEqual(scaled["max_new_tokens"], 60 * _TOKENS_PER_SECOND)
+
+    def test_language_detection_off_and_clips_capped_at_30s(self):
+        adapter = Gemma4Adapter()
+        self.assertFalse(adapter.supports_language_detection)
+        self.assertEqual(adapter.max_audio_clip_s, 30.0)
 
 
 if __name__ == "__main__":

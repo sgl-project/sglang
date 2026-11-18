@@ -7,6 +7,9 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (  # noqa:
 )
 
 # Import built-in adapters so they self-register via @register_transcription_adapter.
+from sglang.srt.entrypoints.openai.transcription_adapters.gemma4 import (  # noqa: F401
+    Gemma4Adapter,
+)
 from sglang.srt.entrypoints.openai.transcription_adapters.glmasr import (  # noqa: F401
     GlmAsrAdapter,
 )
@@ -25,6 +28,9 @@ from sglang.srt.entrypoints.openai.transcription_adapters.qwen2_audio import (  
 from sglang.srt.entrypoints.openai.transcription_adapters.qwen3_asr import (  # noqa: F401
     Qwen3ASRAdapter,
 )
+from sglang.srt.entrypoints.openai.transcription_adapters.qwen3_omni import (  # noqa: F401
+    Qwen3OmniAdapter,
+)
 from sglang.srt.entrypoints.openai.transcription_adapters.whisper import (  # noqa: F401
     WhisperAdapter,
 )
@@ -40,4 +46,6 @@ __all__ = [
     "Qwen2AudioAdapter",
     "Lfm3AudioAdapter",
     "GlmAsrAdapter",
+    "Qwen3OmniAdapter",
+    "Gemma4Adapter",
 ]
