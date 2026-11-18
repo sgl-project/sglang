@@ -11,6 +11,7 @@ from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     shard_like,
     tail_attn_meta,
 )
+from sglang.multimodal_gen.runtime.models.dits.zimage_joint_sp import shard_block_inputs
 
 
 def _fake_sp(monkeypatch, sp_size, sp_rank=0):
@@ -19,6 +20,26 @@ def _fake_sp(monkeypatch, sp_size, sp_rank=0):
 
 
 # --- build_shard_plan math --------------------------------------------------------
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_joint_sp_preserves_batched_condition_and_rope(monkeypatch, rank):
+    _fake_sp(monkeypatch, 2, rank)
+    # Three image tokens followed by five condition tokens per sample.
+    tokens = torch.tensor(
+        [[0, 1, 2, 100, 101, 102, 103, 104], [3, 4, 5, 105, 106, 107, 108, 109]]
+    ).unsqueeze(-1)
+    positions = torch.arange(16)
+    cache = positions.square().unsqueeze(-1)
+    cosine = cache.view(2, 8, 1)
+    local, (local_cos, local_sin), (indexed_cache, indices, _) = shard_block_inputs(
+        tokens, (cosine, -cosine), (cache, positions, None), None, None
+    )
+    expected = slice(rank * 4, (rank + 1) * 4)
+    torch.testing.assert_close(local, tokens[:, expected])
+    torch.testing.assert_close(local_cos, cosine[:, expected])
+    torch.testing.assert_close(local_sin, -local_cos)
+    torch.testing.assert_close(indexed_cache[indices].view_as(local_cos), local_cos)
 
 
 def test_plan_shard_divisible(monkeypatch):
