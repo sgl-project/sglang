@@ -48,9 +48,9 @@ Then run the **Python** output of the command panel below in that environment.
 <Tab title="Docker">
 
 ```bash Command
-docker pull lmsysorg/sglang:dev-minimax-m31-flash
+docker pull lmsysorg/sglang:latest
 # AMD MI350X / MI355X (ROCm 7.2):
-docker pull lmsysorg/sglang:dev-minimax-m31-flash-mi35x
+docker pull lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261113
 ```
 
 For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
@@ -118,10 +118,10 @@ import { agentx } from "/src/snippets/agentx/MiniMaxAI/minimax-m3.1.jsx";
 
 ### MonoKernel (Low-Latency)
 
-The B300 **Low-Latency** recipe serves batch-size-1 decode through the MSA-V1 MonoKernel plugin with `--monokernel-backend msa`. The plugin supports Blackwell sm_100 and sm_103 (B200 / GB200 and B300 / GB300) at `--tp 4` only; it has been measured on B300. B200 and GB200 run the same command; their final verification is in progress. Each MoE layer of the DSpark verify step runs as two persistent kernels, MegaAttention then the token-parallel MoE, each fused with its TP4 all-reduce. The DSpark draft step runs as one cooperative kernel per rank. On 4x B300 with the acceptance length fixed at 5, decode reaches 1028 tokens/s at 1K context, 919 at 256K and 723 at 1M, against 479, 465 and 408 on the standard path.
+The B300 **Low-Latency** recipe serves batch-size-1 decode through the MSA-V1 MonoKernel plugin with `--enable-nvidia-megakernel`. The plugin supports Blackwell sm_100 and sm_103 (B200 / GB200 and B300 / GB300) at `--tp 4` only; it has been measured on B300. B200 and GB200 run the same command; their final verification is in progress. Each MoE layer of the DSpark verify step runs as two persistent kernels, MegaAttention then the token-parallel MoE, each fused with its TP4 all-reduce. The DSpark draft step runs as one cooperative kernel per rank. On 4x B300 with the acceptance length fixed at 5, decode reaches 1028 tokens/s at 1K context, 919 at 256K and 723 at 1M, against 479, 465 and 408 on the standard path.
 
 - **Batch size 1 only.** Prefill, plain decode and batches of more than one request run on the standard path, so throughput under concurrency is lower than the Balanced recipe. The recipe caps `--max-running-requests` at 8.
-- **Required flags.** The plugin needs `--page-size 128`, a DSpark chain of 8 draft tokens (`--speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 8 --speculative-dspark-block-size 7`), and `--disable-attn-tp-gather`; without the last one SGLang pads the 7-row draft block and the server refuses to start. At startup the server lists every unsupported setting it finds, and the log confirms the plugin with `--monokernel-backend msa: minimax_m3_msa_v1 on sm_103, widths [8]`.
+- **Required flags.** The plugin needs `--page-size 128`, a DSpark chain of 8 draft tokens (`--speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 8 --speculative-dspark-block-size 7`), and `--disable-attn-tp-gather`; without the last one SGLang pads the 7-row draft block and the server refuses to start. At startup the server lists every unsupported setting it finds, and the log confirms the plugin with `NVIDIA megakernel: active (minimax_m3_msa_v1: ...; widths [8]; ...)`.
 - **`ALLOW_JIT=1`** lets the MonoKernel kernels compile on first launch; set `CACHE_DIR` to keep the compiled kernels across restarts.
 - **`SGLANG_FORCE_COARSE_WAR_BARRIER=1`** runs MegaAttention in canonical cluster placement, about 3–4% faster end to end. Canonical placement faults if another kernel holds SMs when MegaAttention launches, so the server must have the GPUs to itself. Without the variable, the server keeps cluster placement on, which is safe and slightly slower. The log prints `cluster placement off (canonical)` or `cluster placement on`.
 - **Memory.** The plugin keeps its own copy of the routed experts (54.1 GiB per rank), so at `--mem-fraction-static 0.8` the KV pool holds about 6.5M tokens instead of 10.4M.
