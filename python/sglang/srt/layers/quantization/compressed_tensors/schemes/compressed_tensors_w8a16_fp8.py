@@ -20,14 +20,17 @@ from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     apply_fp8_marlin_linear,
     prepare_fp8_layer_for_marlin,
 )
-from sglang.srt.layers.quantization.utils import convert_to_channelwise
-from sglang.srt.utils import is_cpu, use_intel_amx_backend
+from sglang.srt.layers.quantization.utils import (
+    convert_to_channelwise,
+    requantize_with_max_scale,
+)
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, use_intel_amx_backend
 
 __all__ = ["CompressedTensorsW8A16Fp8"]
 
-_is_cpu = is_cpu()
-
 SUPPORTED_STRATEGIES = [QuantizationStrategy.CHANNEL, QuantizationStrategy.TENSOR]
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 
 class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
@@ -44,6 +47,27 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
     # So if we have a fused module (QKV, MLP) with per tensor scales,
     # we expand each scale to its shard's channels.
     def process_weights_after_loading(self, layer) -> None:
+        if _is_cpu and self.strategy == QuantizationStrategy.TENSOR:
+            assert _is_cpu_amx_available, (
+                "CPU compressed-tensors W8A16 FP8 requires AMX support."
+            )
+            # The CPU GEMM takes a single scale, so fused shards are requantized to the max scale.
+            max_w_scale, weight = requantize_with_max_scale(
+                layer.weight.data, layer.weight_scale.data, layer.logical_widths
+            )
+            layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+            layer.weight_scale = torch.nn.Parameter(
+                max_w_scale.reshape(()), requires_grad=False
+            )
+            # Packs the weight into the AMX layout and converts the bias to fp32.
+            _amx_process_weight_after_loading(layer, ["weight"])
+            if not layer.use_intel_amx_backend:
+                raise NotImplementedError(
+                    "CPU compressed-tensors W8A16 FP8 requires an AMX-packable weight "
+                    "(output dim divisible by 16, input dim divisible by 32)."
+                )
+            return
+
         if self.strategy == QuantizationStrategy.TENSOR:
             ws_channelwise = convert_to_channelwise(
                 layer.weight_scale, layer.logical_widths
@@ -139,6 +163,16 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
         if _is_cpu:
             batch_shape = x.shape[:-1]
             x = x.reshape(-1, x.shape[-1])
+            if self.strategy == QuantizationStrategy.TENSOR:
+                output = torch.ops.sgl_kernel.fp8_per_tensor_scaled_mm_cpu(
+                    x.contiguous(),
+                    layer.weight,
+                    layer.weight_scale,
+                    bias.float() if bias is not None else None,
+                    x.dtype,
+                    True,
+                )
+                return output.reshape(*batch_shape, output.shape[-1])
             # block_size_N == 1 selects the per-channel (as opposed to block)
             # weight-only scale layout in fp8_scaled_mm_cpu: one scale value
             # per output row (layer.weight_scale is [N, 1]), constant across K.

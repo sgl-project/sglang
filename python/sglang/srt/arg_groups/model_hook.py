@@ -77,7 +77,7 @@ def _validate_dsa_tbo_index_sharing(server_args: Any, hf_config: Any) -> None:
 
 
 def _rocm_fp8_wo_a_supported() -> bool:
-    """True when ROCm can run the DeepSeek-V4 fp8 wo_a GEMM (gfx950 + aiter)."""
+    """True when ROCm can run the DeepSeek-V4 fp8 wo_a GEMM (gfx950/gfx1250 + aiter)."""
     try:
         from sglang.srt.models.deepseek_common.amd.deepseek_v4_wo_a_fp8 import (
             is_wo_a_fp8_mxscale_supported,
@@ -791,7 +791,7 @@ def handle_model_capability_adjustments(server_args: Any):
         logger.warning(
             "HRM-Text (prefix_lm) detected: forcing --attention-backend "
             "triton, --chunked-prefill-size -1, --disable-radix-cache, and "
-            "--disable-cuda-graph for correctness of the bidirectional "
+            "--disable-decode-cuda-graph --disable-prefill-cuda-graph for correctness of the bidirectional "
             "prompt attention."
         )
 
