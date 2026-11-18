@@ -11,7 +11,7 @@ from sglang.test.ci.ci_register import register_amd_ci  # noqa: E402
 from sglang.test.kernels.mla_q_cache import mla_q_cache_inputs  # noqa: E402
 
 # MI300-class runner: off gfx950 this kernel is the K3 writer's only fused path.
-register_amd_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(est_time=10, stage="base-b", runner_config="1-gpu-small-amd")
 
 pytestmark = pytest.mark.skipif(
     not mla_q_cache_aiter_triton.available(),
