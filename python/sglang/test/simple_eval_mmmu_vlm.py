@@ -184,10 +184,9 @@ class MMMUVLMEval(Eval):
 
         If no tag is present, treat the whole prompt as prefix and empty suffix.
         """
-        if "<" in prompt and ">" in prompt:
-            prefix = prompt.split("<")[0]
-            suffix = prompt.split(">", 1)[1]
-            return prefix, suffix
+        image_tag = re.search(r"<image(?:\s+\d+)?>", prompt)
+        if image_tag:
+            return prompt[: image_tag.start()], prompt[image_tag.end() :]
         return prompt, ""
 
     @staticmethod
