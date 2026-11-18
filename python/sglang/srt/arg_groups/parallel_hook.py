@@ -254,7 +254,7 @@ def handle_shared_experts_tp(server_args: Any):
         )
 
 
-_KDA_WEIGHT_SHARD_LOAD_FORMATS_REFUSED = (
+_KDA_DWDP_LOAD_FORMATS_REFUSED = (
     "sharded_state",
     "presharded",
     "remote",
@@ -294,7 +294,7 @@ def handle_kda_dwdp(server_args: Any):
         raise ValueError("--kda-dwdp-size does not support --attn-cp-size > 1.")
     if cfg.pp_size > 1:
         raise ValueError("--kda-dwdp-size does not support pipeline parallelism.")
-    if cfg.load_format in _KDA_WEIGHT_SHARD_LOAD_FORMATS_REFUSED:
+    if cfg.load_format in _KDA_DWDP_LOAD_FORMATS_REFUSED:
         raise ValueError(
             f"--kda-dwdp-size does not support --load-format {cfg.load_format}: "
             "the shards are filled by the model's load_weights (use a checkpoint format "
