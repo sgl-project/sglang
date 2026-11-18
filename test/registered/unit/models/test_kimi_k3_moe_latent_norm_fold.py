@@ -58,6 +58,8 @@ def _fused_front_moe():
     moe._front_block_w = None
     moe._moe_front_needs_dense_bf16 = True
     moe._route_quant_fuse_eligible = False
+    # gfx950: AITER's fused_moe, not the A8W4 grouped GEMMs, runs the toy experts
+    moe._a8w4_moe_min_tokens = None
     moe._latent_norm_folded = False
     moe._derived_weight_cache_error = None
     moe.gate = nn.Linear(4, 1, bias=False)
