@@ -777,6 +777,48 @@ def low_ratio_index_topk_hip_extend(
         backend.candidate_masks = publish
 
 
+# Measured on MI355X with 16,384-row calls, by the compressed positions their rows see on
+# average: at TP4 0.57-0.77x at 4,096 and 1.01-1.23x at 12,288; at TP2 0.65x at 12,288 and
+# 1.24x at 28,672. The all-gather and the per-call schedule cost about 0.6 ms whatever the
+# context, and a larger group saves a larger share of the scoring, so TP4's floor also
+# holds above TP4.
+INDEXER_ROW_SHARD_MIN_CONTEXT = 12288
+INDEXER_ROW_SHARD_MIN_CONTEXT_BELOW_TP4 = 24576
+
+
+def _compressed_positions_seen(n: int, ratio: int) -> int:
+    """sum(q // ratio for q in 1..n): what rows at positions 0..n-1 see in all."""
+    a, b = divmod(n, ratio)
+    return ratio * a * (a - 1) // 2 + a * (b + 1)
+
+
+def indexer_row_shard_pays(
+    backend, ratio: int, forward_batch: ForwardBatch, world: int
+) -> bool:
+    """Whether the call's rows see enough compressed context on average for the row
+    shard over world ranks to pay; a row at position p sees (p + 1) // ratio positions,
+    and a request's rows are the last of its sequence. Every input is a replicated CPU
+    list, so all ranks agree."""
+    tail = backend.forward_metadata.late_layer_tail
+    lens = (
+        tail.extend_seq_lens_cpu
+        if tail is not None
+        else _as_int_list(forward_batch.extend_seq_lens_cpu)
+    )
+    seq_lens = _as_int_list(forward_batch.seq_lens_cpu)
+    rows = sum(lens)
+    context = sum(
+        _compressed_positions_seen(s, ratio) - _compressed_positions_seen(s - n, ratio)
+        for n, s in zip(lens, seq_lens)
+    )
+    floor = (
+        INDEXER_ROW_SHARD_MIN_CONTEXT
+        if world >= 4
+        else INDEXER_ROW_SHARD_MIN_CONTEXT_BELOW_TP4
+    )
+    return rows > 0 and context >= floor * rows
+
+
 def _clip_requests(
     extend_lens: List[int], rows: slice
 ) -> Tuple[List[int], int, int, List[int]]:
