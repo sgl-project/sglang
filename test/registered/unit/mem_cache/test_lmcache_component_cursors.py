@@ -178,5 +178,21 @@ def test_external_slots_on_a_shared_memory_reclaim_the_load_demand(
     )
 
 
+def test_external_slots_on_independent_full_pool_reclaim_for_allocation(cache_class):
+    from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+
+    cache = cache_class.__new__(cache_class)
+    cache.tree_components = (ComponentType.FULL,)
+    cache.is_swa_enabled = False
+    cache.evict_for_alloc = mock.Mock()
+    allocator = mock.Mock(pools_share_memory=False)
+    allocator.available_size.return_value = 3840
+    cache.token_to_kv_pool_allocator = allocator
+
+    assert cache._allocate_external_slots(4096) is allocator.alloc.return_value
+    cache.evict_for_alloc.assert_called_once_with(KVDemand(full_tokens=4096))
+    allocator.alloc.assert_called_once_with(4096)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -511,7 +511,10 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             )
         elif not self.is_swa_enabled:
             if allocator.available_size() < num_tokens:
-                self.evict(EvictParams(num_tokens=num_tokens))
+                if self.tree_components == (ComponentType.FULL,):
+                    self.evict_for_alloc(KVDemand(full_tokens=num_tokens))
+                else:
+                    self.evict(EvictParams(num_tokens=num_tokens))
         else:
             if allocator.full_attn_allocator.available_size() < num_tokens:
                 self.evict(EvictParams(num_tokens=num_tokens))
