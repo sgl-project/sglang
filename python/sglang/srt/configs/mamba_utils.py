@@ -15,7 +15,7 @@
 import logging
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -189,7 +189,9 @@ class Mamba2StateShape:
     # head-sharded INDEPENDENTLY across attn-TP, so PD transfer across different
     # attn_tp_size must slice per sub-block. None when the single contiguous
     # slice already matches the layout (e.g. standard Mamba2 conv order differs).
-    conv_shard_groups: Optional[List[int]] = None
+    # An entry may be a (full_dim, num_heads) pair so PD can slice TP sizes
+    # larger than the head count (replicated heads, see create()).
+    conv_shard_groups: Optional[List[Union[int, Tuple[int, int]]]] = None
 
     @staticmethod
     def create(
@@ -201,7 +203,7 @@ class Mamba2StateShape:
         head_dim: int,
         state_size: int,
         conv_kernel: int,
-        conv_shard_groups: Optional[List[int]] = None,
+        conv_shard_groups: Optional[List[Union[int, Tuple[int, int]]]] = None,
     ) -> "Mamba2StateShape":
         # The q/k projections are sharded by `num_k_heads // tp` heads (the
         # ORIGINAL n_groups, before the conv head-shard extension below), so the
