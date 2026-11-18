@@ -2346,6 +2346,54 @@ Same card, 50-step run. Speedup is vs BF16+FA. PSNR is vs same-tree INT8+FA (Spe
 
 Prefer FA + `11 / 5 / 1.0` when the bar is FA-like. Sage / hybrid + Spectrum is faster; quality then follows the attention backend, not the skip schedule.
 
+### RTX 4090 24 GB with a 32 GB host, vs ComfyUI
+
+Setup:
+
+- **Hardware:** one RTX 4090 (24 GB) on RunPod.
+- **Host memory:** capped at 32 GiB by a nested cgroup v2 (`memory.max=32G`, no swap). The page cache was evicted before every launch, so weights stream from the local NVMe (5.3 GiB/s sequential read).
+- **Software:** sglang 0.5.23 from PyPI; ComfyUI master `05e878f` with default launch flags.
+- **Weights:** unpruned bf16 on both sides.
+- **Sampling:** 20 steps, sigma shift 12.0/3.0, seed 42, 24 fps.
+- **ComfyUI graph:** the `video_minimax_h3_t2v` benchmark graph with the bf16 files swapped in and its default `res_multistep` sampler. Per-step times are comparable; pixels are not.
+- **Protocol:** one request per cell after a 480P warmup. Text conditioning is cached on both engines after the first request of each mode.
+
+```bash 24 GB VRAM + 32 GB host, until #51188 is fixed
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
+  --pin-cpu-memory false --warmup-mode off
+```
+
+| Task | 480P 5 s | 480P 10 s | 768P 5 s | denoise step (768P 5 s) |
+| --- | ---: | ---: | ---: | ---: |
+| T2VA | 190.5 s | 360.8 s | **493.1 s** | 23.67 s |
+| FL2VA, first frame | 196.5 s | 381.0 s | **543.2 s** | 25.76 s |
+| Ref2VA, one 5 s reference video (`--model-variant ref2va`) | 860.0 s | — | — | — |
+
+| 768P 5 s, same pod and cap | sglang | ComfyUI default | ratio |
+| --- | ---: | ---: | ---: |
+| T2VA request | **493.1 s** | 685.5 s | 1.39× |
+| FL2VA request | **543.2 s** | 737.7 s | 1.36× |
+| denoise step, T2VA / FL2VA | 23.67 / 25.76 s | 29.7 / 31.85 s | 1.25× / 1.24× |
+| host anonymous memory, peak | 21.2 GiB | 30.4 GiB | |
+
+**At 32 GB the pin budget, not the card, is the limit.** Without the two flags above, both the default command and the 24 GB recipe were OOM-killed during the synthetic warmup:
+
+- The planner pinned up to 12 DiT layers (14.4 GiB) into memfd shmem, which the kernel cannot reclaim.
+- That left no page cache for the mmap-streamed weights.
+- The server still came up and answered every request with 503 ([#51188](https://github.com/sgl-project/sglang/issues/51188)).
+
+With pinning off, peak host use was 21.2 GiB anonymous plus 3.9 GiB shmem. Treat the table as a floor: a capped pin of about 5 GiB measured 11% faster at 480P on the same pod.
+
+**Duration scales linearly, resolution with pixels.**
+
+- 5 s → 10 s costs 1.9×.
+- 480P → 768P costs 2.6–2.8× (the pixel ratio is 2.5×).
+- A first-frame keyframe adds 3–10%.
+- A 5 s reference video makes each Ref2VA step 4.5× a T2VA step. That is 14 minutes at 480P, so a 768P Ref2VA clip is a job of more than 30 minutes on this card.
+
+**The cap is the server's, not the desktop's.** ComfyUI fit but peaked 1.6 GiB under the cap. A 32 GB desktop also hosts the OS and desktop session, so expect less headroom than these runs had.
+
 ### AMD Instinct task and scaling runs
 
 The AMD recipes keep the released BF16/FP32 precision policy and use AITER
