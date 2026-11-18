@@ -59,7 +59,8 @@ def use_hopper_bf16_gemv(m: int, n: int, k: int) -> bool:
     if (
         current_arch().is_sm(12, 0)
         and m == 1
-        and (n, k) in {
+        and (n, k)
+        in {
             (18432, 2560),  # MLP gate/up
             (12288, 2560),  # GDN QKVZ
             (248320, 2560),  # LM head

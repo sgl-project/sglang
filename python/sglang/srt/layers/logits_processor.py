@@ -1391,9 +1391,8 @@ class LogitsProcessor(nn.Module):
                 )
             elif _aiter_lm_head_ok(hidden_states, lm_head.weight):
                 logits = tgemm.mm(hidden_states, lm_head.weight)
-            elif (
-                embedding_bias is None
-                and _sm120_bf16_lm_head_candidate(hidden_states, lm_head.weight, out)
+            elif embedding_bias is None and _sm120_bf16_lm_head_candidate(
+                hidden_states, lm_head.weight, out
             ):
                 logits = bf16_gemm_dispatch(hidden_states, lm_head.weight, None)
             else:
