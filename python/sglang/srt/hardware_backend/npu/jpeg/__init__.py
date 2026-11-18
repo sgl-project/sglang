@@ -12,12 +12,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import torch
 
-from sglang.srt.hardware_backend.npu.jpeg.dvpp import (
-    ACLFailure,
-    UnsupportedJPEG,
-    check,
-    inspect_jpeg,
-)
+from sglang.srt.hardware_backend.npu.dvpp import ACLFailure, check, supports_device
+from sglang.srt.hardware_backend.npu.jpeg_header import prepare_jpeg
 
 _local = threading.local()
 _live = {}
@@ -65,7 +61,7 @@ def _reap_locked(device):
             del _live[token]
 
 
-def _decoder(device):
+def _get_dvpp(device):
     _check_process()
     key = (os.getpid(), threading.get_ident(), device)
     with _guard:
@@ -73,7 +69,7 @@ def _decoder(device):
             raise RuntimeError("NPU JPEG decoder pool has been closed")
         _reap_locked(device)
         previous = getattr(_local, "slot", None)
-        if previous and previous[0] == key:
+        if previous and previous[0] == key and not previous[1].closed:
             return previous[1]
         if previous:
             _local.slot = None
@@ -81,15 +77,15 @@ def _decoder(device):
             _ensure_cleanup_context(device)
             previous[1].close()
             del _live[id(previous[1])]
-        from sglang.srt.hardware_backend.npu.jpeg.dvpp import VPCJPEGDecoder
+        from sglang.srt.hardware_backend.npu.dvpp import Dvpp
 
-        decoder = VPCJPEGDecoder(device)
+        decoder = Dvpp()
         _live[id(decoder)] = _Entry(weakref.ref(threading.current_thread()), decoder)
         _local.slot = (key, decoder)
         return decoder
 
 
-def close_decoders():
+def _close_cached_dvpp():
     """Terminal cleanup after workers join; initialize a missing thread context.
 
     An existing caller context is restored by each decoder; if the caller has
@@ -118,7 +114,7 @@ def close_decoders():
         raise first_error
 
 
-atexit.register(close_decoders)
+atexit.register(_close_cached_dvpp)
 
 
 def decode_jpeg(
@@ -135,19 +131,10 @@ def decode_jpeg(
     """
     import torch
 
-    if not isinstance(data, bytes):
-        if not isinstance(data, torch.Tensor):
-            raise TypeError("NPU JPEG input must be bytes or a CPU uint8 tensor")
-        if data.ndim != 1 or data.dtype != torch.uint8 or data.device.type != "cpu":
-            raise ValueError("NPU JPEG tensor input must be one-dimensional CPU uint8")
-        data = data.contiguous()
-    encoded = memoryview(data if isinstance(data, bytes) else data.numpy())
-    if not (encoded[:2] == b"\xff\xd8" and encoded[-2:] == b"\xff\xd9"):
+    prepared = prepare_jpeg(data)
+    if prepared is None:
         return None
-    try:
-        inspect_jpeg(encoded)
-    except UnsupportedJPEG:
-        return None
+    data, _ = prepared
     import torch_npu  # noqa: F401 - registers the NPU device backend
 
     target = torch.device(device)
@@ -156,13 +143,7 @@ def decode_jpeg(
     device_index = target.index
     if device_index is None:
         device_index = torch.npu.current_device()
-    import acl
-
-    # ACL_DEV_ATTR_NPU_ARCH: A2/A3 use 2201 and support V1 VPC conversion.
-    # Query the target device before constructing any DVPP resources.
-    arch, ret = acl.rt.get_device_info(device_index, 601)
-    check(ret, "query NPU architecture")
-    if arch != 2201:
+    if not supports_device(device_index):
         return None
     with torch.npu.device(device_index):
-        return _decoder(device_index).decode(data)
+        return _get_dvpp(device_index).process_jpeg_dec(data)

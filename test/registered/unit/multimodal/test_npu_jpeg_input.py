@@ -38,21 +38,21 @@ def _encoded_tensor(data):
 
 def _load_modules():
     repository = Path(__file__).resolve().parents[4]
-    directory = repository / "python/sglang/srt/hardware_backend/npu/jpeg"
-    package = "sglang.srt.hardware_backend.npu.jpeg"
+    directory = repository / "python/sglang/srt/hardware_backend/npu"
+    package = "sglang.srt.hardware_backend.npu"
     loaded = []
     with patch.dict(sys.modules):
         for name, filename in (
-            (package + ".normalize", "normalize.py"),
+            (package + ".jpeg_header", "jpeg_header.py"),
             (package + ".dvpp", "dvpp.py"),
-            (package, "__init__.py"),
+            (package + ".jpeg", "jpeg/__init__.py"),
         ):
             spec = importlib.util.spec_from_file_location(name, directory / filename)
             module = importlib.util.module_from_spec(spec)
             sys.modules[name] = module
             spec.loader.exec_module(module)
             loaded.append(module)
-        atexit.unregister(loaded[-1].close_decoders)
+        atexit.unregister(loaded[-1]._close_cached_dvpp)
     return loaded
 
 
@@ -152,16 +152,32 @@ class TestNpuJpegInput(unittest.TestCase):
         cls.normalizer, cls.dvpp, cls.jpeg = _load_modules()
 
     def _decoder(self, data, owner=None, memcpy_error=0):
-        info = self.dvpp.inspect_jpeg(data)
+        info = self.normalizer.inspect_jpeg(data)
         acl = _ACL(info, owner, memcpy_error)
-        decoder = self.dvpp.JPEGDecoder.__new__(self.dvpp.JPEGDecoder)
-        decoder.acl = acl
-        decoder.pid = os.getpid()
-        decoder.lock = threading.RLock()
-        decoder.frames = set()
-        decoder.context, decoder.stream, decoder.channel = 1, 2, 3
-        decoder.poisoned = False
+        resources = self.dvpp.Dvpp.__new__(self.dvpp.Dvpp)
+        resources.acl = acl
+        resources.pid = os.getpid()
+        resources.owner = threading.current_thread()
+        resources.lock = threading.RLock()
+        resources.context, resources.stream = 1, 2
+        resources.closed = resources.poisoned = False
+        resources._images = set()
+        decoder = self.dvpp.Jpegd(resources)
+        decoder.channel = 3
+        decoder.channel_created = True
         return decoder, acl
+
+    @contextmanager
+    def _decode(self, decoder, data):
+        # Exercise JPEGD directly; this test owns the returned NV12 allocation.
+        prepared = self.normalizer.prepare_jpeg(data)
+        self.assertIsNotNone(prepared)
+        data, info = prepared
+        image = decoder.decode(data, info=info)
+        try:
+            yield image
+        finally:
+            image.close()
 
     @contextmanager
     def _npu(self, current=3, arch=2201, arch_error=0):
@@ -222,7 +238,7 @@ class TestNpuJpegInput(unittest.TestCase):
                 self.assertTrue(data.is_contiguous())
                 self.assertEqual(data.storage_offset(), offset)
                 decoder, acl = self._decoder(memoryview(data.numpy()))
-                with decoder.decode(data):
+                with self._decode(decoder, data):
                     self.assertEqual(acl.host_pointer, data.data_ptr())
                     self.assertEqual(acl.input_bytes, bytes(encoded.tolist()))
                     self.assertEqual(len(acl.input_bytes), encoded.numel())
@@ -234,7 +250,7 @@ class TestNpuJpegInput(unittest.TestCase):
         data = _encoded_tensor(original)
         offset = self.normalizer.inspect_420_sof(memoryview(data.numpy()), 65, 49)
         decoder, acl = self._decoder(memoryview(data.numpy()))
-        with decoder.decode(data):
+        with self._decode(decoder, data):
             self.assertNotEqual(acl.host_pointer, data.data_ptr())
             self.assertEqual(bytes(data.tolist()), original)
             self.assertEqual(acl.input_bytes[:offset], original[:offset])
@@ -252,7 +268,7 @@ class TestNpuJpegInput(unittest.TestCase):
             acl.owner = weakref.ref(tensor)
             return tensor
 
-        with decoder.decode(temporary_input()):
+        with self._decode(decoder, temporary_input()):
             self.assertTrue(acl.synchronized)
             self.assertEqual(acl.input_bytes, encoded)
         gc.collect()
@@ -261,7 +277,7 @@ class TestNpuJpegInput(unittest.TestCase):
     def test_bytes_input_preserves_legacy_pointer_path(self):
         data = _jpeg()
         decoder, acl = self._decoder(data)
-        with decoder.decode(data):
+        with self._decode(decoder, data):
             self.assertEqual(acl.input_bytes, data)
             self.assertEqual(acl.bytes_to_ptr_calls, 1)
 
@@ -274,7 +290,7 @@ class TestNpuJpegInput(unittest.TestCase):
         pointer.restype = ctypes.c_void_p
         original_pointer = pointer(data)
         decoder, acl = self._decoder(data)
-        with decoder.decode(data):
+        with self._decode(decoder, data):
             self.assertNotEqual(acl.host_pointer, original_pointer)
             self.assertEqual(data, original)
             self.assertEqual(acl.input_bytes[:offset], original[:offset])
@@ -300,7 +316,10 @@ class TestNpuJpegInput(unittest.TestCase):
             ("read", (0,)),
         )
         data = b"0123456789"
-        actual, expected = self.dvpp._BufferReader(memoryview(data)), io.BytesIO(data)
+        actual, expected = (
+            self.normalizer._BufferReader(memoryview(data)),
+            io.BytesIO(data),
+        )
         for method, arguments in operations:
             with self.subTest(method=method, arguments=arguments):
                 self.assertEqual(
@@ -312,13 +331,14 @@ class TestNpuJpegInput(unittest.TestCase):
             for stream in (actual, expected):
                 with self.assertRaises(ValueError):
                     stream.seek(*arguments)
-        self.assertEqual(self.dvpp._BufferReader(memoryview(b"")).read(), b"")
+        self.assertEqual(self.normalizer._BufferReader(memoryview(b"")).read(), b"")
 
     def test_acl_copy_error_propagates(self):
         data = _encoded_tensor(_jpeg())
         decoder, acl = self._decoder(memoryview(data.numpy()), memcpy_error=17)
         with self.assertRaisesRegex(self.dvpp.ACLFailure, "memcpy H2D JPEG"):
-            decoder.decode(data)
+            with self._decode(decoder, data):
+                pass
         self.assertFalse(acl.synchronized)
         self.assertEqual(len(acl.freed), 2)
 
@@ -338,7 +358,9 @@ class TestNpuJpegInput(unittest.TestCase):
         with (
             self._npu() as (state, _),
             patch.object(
-                self.jpeg, "_decoder", return_value=types.SimpleNamespace(decode=decode)
+                self.jpeg,
+                "_get_dvpp",
+                return_value=types.SimpleNamespace(process_jpeg_dec=decode),
             ) as factory,
         ):
             self.assertEqual(self.jpeg.decode_jpeg(data, device="npu:1"), "decoded")
@@ -347,19 +369,20 @@ class TestNpuJpegInput(unittest.TestCase):
         self.assertEqual(observed, [(True, bytes(encoded.tolist()), 1)])
 
     def test_decoder_factory_import_and_reuse(self):
-        # Exercise the real factory after moving VPC into dvpp.py. Only hardware
-        # construction is mocked; the lazy import and per-thread reuse are real.
-        package = "sglang.srt.hardware_backend.npu.jpeg"
+        # Exercise the real no-argument factory and same-thread reuse.
+        # Only construction is mocked; the lazy import and cache are real.
+        package = "sglang.srt.hardware_backend.npu"
         with (
             patch.dict(sys.modules, {package + ".dvpp": self.dvpp}),
-            patch.object(self.dvpp, "VPCJPEGDecoder") as constructor,
+            patch.object(self.dvpp, "Dvpp") as constructor,
             patch.object(self.jpeg, "_local", threading.local()),
             patch.object(self.jpeg, "_live", {}),
         ):
-            decoder = self.jpeg._decoder(1)
+            constructor.return_value.closed = False
+            decoder = self.jpeg._get_dvpp(1)
             self.assertIs(decoder, constructor.return_value)
-            self.assertIs(self.jpeg._decoder(1), decoder)
-            constructor.assert_called_once_with(1)
+            self.assertIs(self.jpeg._get_dvpp(1), decoder)
+            constructor.assert_called_once_with()
 
     def test_public_default_device_and_failure_restore(self):
         data = _encoded_tensor(_jpeg())
@@ -370,9 +393,9 @@ class TestNpuJpegInput(unittest.TestCase):
                     self.assertEqual(state.current, expected_device)
                     raise RuntimeError("decoder failure")
 
-                failing = types.SimpleNamespace(decode=fail)
+                failing = types.SimpleNamespace(process_jpeg_dec=fail)
                 with patch.object(
-                    self.jpeg, "_decoder", return_value=failing
+                    self.jpeg, "_get_dvpp", return_value=failing
                 ) as factory:
                     with self.assertRaisesRegex(RuntimeError, "decoder failure"):
                         self.jpeg.decode_jpeg(data, device=device)
@@ -395,7 +418,7 @@ class TestNpuJpegInput(unittest.TestCase):
             _jpeg((16, 16)),
         )
         with patch.object(
-            self.jpeg, "_decoder", side_effect=AssertionError("decoder constructed")
+            self.jpeg, "_get_dvpp", side_effect=AssertionError("decoder constructed")
         ):
             for encoded in cases:
                 with self.subTest(length=len(encoded)):
@@ -408,7 +431,7 @@ class TestNpuJpegInput(unittest.TestCase):
             torch.empty(8, dtype=torch.uint8, device="meta"),
         )
         with patch.object(
-            self.jpeg, "_decoder", side_effect=AssertionError("decoder constructed")
+            self.jpeg, "_get_dvpp", side_effect=AssertionError("decoder constructed")
         ):
             for data in cases:
                 with (
@@ -425,7 +448,7 @@ class TestNpuJpegInput(unittest.TestCase):
             with (
                 self.subTest(arch=arch),
                 self._npu(arch=arch) as (state, backend),
-                patch.object(self.jpeg, "_decoder") as factory,
+                patch.object(self.jpeg, "_get_dvpp") as factory,
             ):
                 self.assertIsNone(self.jpeg.decode_jpeg(data, device="npu:1"))
                 backend.architecture_query.assert_called_once_with(1, 601)
@@ -438,7 +461,7 @@ class TestNpuJpegInput(unittest.TestCase):
         data = _encoded_tensor(_jpeg())
         with (
             self._npu(arch_error=17) as (state, backend),
-            patch.object(self.jpeg, "_decoder") as factory,
+            patch.object(self.jpeg, "_get_dvpp") as factory,
         ):
             with self.assertRaisesRegex(self.dvpp.ACLFailure, "query NPU architecture"):
                 self.jpeg.decode_jpeg(data, device="npu:1")
