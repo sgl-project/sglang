@@ -23,12 +23,14 @@ from sglang.srt.layers.layer_boundary import ops
 from sglang.srt.layers.layer_boundary.contracts import ReadoutFusion
 from sglang.srt.layers.layer_boundary.facts import residual_facts
 from sglang.srt.layers.layer_boundary.layout import SumGroup
-from sglang.srt.layers.layer_boundary.residual import LayerResidualOps, attn_bank_hip
+from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_gfx95_supported
 
 _is_gfx95 = is_gfx95_supported()
+if _is_gfx95:
+    from sglang.srt.layers.layer_boundary.residual import attn_bank_hip
 
 
 class AttnBank:
@@ -106,7 +108,7 @@ class AttnBankState:
     # otherwise every rank writes every row and the attention reads them all.
     reads_slices: bool = False
     # K3's row-sharded FFN read on gfx950, or None.
-    ffn_row_shard: Optional[attn_bank_hip.RowShardRead] = None
+    ffn_row_shard: Optional["attn_bank_hip.RowShardRead"] = None
 
     def _aggregate(
         self, contribution, residual, norm, *, score_proj, score_norm, write
@@ -283,7 +285,7 @@ class _FfnReadout(_BankReadout):
     @property
     def completing_fusions(self) -> Tuple[ReadoutFusion, ...]:
         state = self.state
-        if state.ffn_row_shard is not None:
+        if _is_gfx95 and state.ffn_row_shard is not None:
             return (attn_bank_hip.row_sharded_ffn_read(state), *state.ffn_input_fusions)
         if not state.fuses_slice_collectives:
             return state.ffn_input_fusions

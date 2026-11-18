@@ -23,10 +23,6 @@ from sglang.srt.layers.activation import SituAndMul
 from sglang.srt.layers.communication import k3_ar_fusion
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.layer_boundary.residual.attn_bank import AttnBank
-from sglang.srt.layers.layer_boundary.residual.attn_bank_hip import (
-    RowShardRead,
-    row_shard,
-)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear, RowParallelLinear
 from sglang.srt.layers.moe.topk import TopKOutputChecker
@@ -46,6 +42,10 @@ if _is_gfx95:
     from sglang.kernels.ops.attention import k3_attn_res_read_hip
     from sglang.kernels.ops.gemm import kimi_k3_latent_tail_hip
     from sglang.srt.layers import attn_residual_hip
+    from sglang.srt.layers.layer_boundary.residual.attn_bank_hip import (
+        RowShardRead,
+        row_shard,
+    )
 # Up to this many rows the column tail's slice comes from split-K partials (faster than the
 # replicated tail on MI350X); above it, from a GEMM of the RMSNorm'd latent.
 _COLUMN_TAIL_PARTIALS_MAX_TOKENS = 64
