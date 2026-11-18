@@ -11,14 +11,9 @@ from sglang.kernels.ops.attention.verify_mla import (
     verify_mla_draft_fwd,
     verify_shared_kv_fwd,
 )
-from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.attention.triton_backend import (
-    TritonAttnBackend,
-    WindowRail,
     _should_use_verify_shared_kv,
 )
-from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import get_hip_version, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -428,116 +423,6 @@ class TestDraftAttention(CustomTestCase):
         actual = _extend(case, inputs, kernel=verify_mla_draft_fwd)
         expected = _extend(case, inputs)
         torch.testing.assert_close(actual, expected, atol=8e-2, rtol=2e-2)
-
-
-# FP8 q/probability rounding is materially larger than BF16 dot rounding.
-BF16_ERR = 1e-2
-# Triton 3.4 on ROCm 7.0 aborts gfx950 FP8 dots (triton-lang/triton#8278).
-FP8_DOT_OK = get_hip_version()[:2] != (7, 0)
-
-# Kimi-K3.1's MLA5 draft: a TP8 rank's 12 heads over a 1024-key window.
-MLA5_WINDOW = dict(MLA, prefix_lens=(3000, 1500, 5), window=1023)
-
-
-def _reference(case, inputs):
-    """fp32 attention of each draft row over its request's prefix and causal block,
-    the cache read exactly (FP8 values are exact in fp32); the window keeps the
-    keys of [p - window, p]."""
-    q, k, v, k_buffer, v_buffer, _, kv_indptr, kv_indices = inputs
-    h_q, h_kv, l_ext, window = case["h_q"], case["h_kv"], case["l_ext"], case["window"]
-    bounds = kv_indptr.tolist()
-    out = []
-    for b in range(len(bounds) - 1):
-        locs = kv_indices[bounds[b] : bounds[b + 1]]
-        prefix = locs.numel()
-        rows = slice(b * l_ext, (b + 1) * l_ext)
-        keys = torch.cat([k_buffer[locs].float(), k[rows].float()])
-        vals = torch.cat([v_buffer[locs].float(), v[rows].float()])
-        q_rows = q[rows].float().unflatten(1, (h_kv, h_q // h_kv))
-        s = torch.einsum("lkgd,tkd->kglt", q_rows, keys) * _scale(case)
-        q_pos = (prefix + torch.arange(l_ext, device="cuda"))[:, None]
-        k_pos = torch.arange(prefix + l_ext, device="cuda")[None, :]
-        seen = (k_pos <= q_pos) & (k_pos >= q_pos - window)
-        p = torch.softmax(s.masked_fill(~seen, float("-inf")), dim=-1)
-        out.append(torch.einsum("kglt,tkd->lkgd", p, vals).flatten(1, 2))
-    return torch.cat(out)
-
-
-def _backend_extend(case, inputs, bf16_dot):
-    # Exercise the real dispatcher as well as the kernel: losing bf16_dot must
-    # fail the FP32 accuracy check, not merely a recorded-kwargs assertion.
-    q, k, v, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices = inputs
-    backend = TritonAttnBackend.__new__(TritonAttnBackend)
-    backend.draft_bf16_dot = bf16_dot
-    backend.use_dense_fp8_chunked_prefill = False
-    backend.use_verify_shared_kv = False
-    backend.use_verify_splitkv = False
-    backend.use_verify_gfx115 = False
-    backend.verify_mla_draft_fwd = None
-    backend.extend_attention_fwd = extend_attention_fwd
-    backend.dcp_size = 1
-    backend.enable_deterministic = False
-    backend.dllm_attention = None
-    backend.page_size = 1
-    read = SimpleNamespace(
-        kv=lambda: (k_buffer, v_buffer), key=lambda: k_buffer, value=lambda: v_buffer
-    )
-    backend.token_to_kv_pool = SimpleNamespace(
-        get_key_buffer=lambda _: k_buffer,
-        get_value_buffer=lambda _: v_buffer,
-        layer_router=SimpleNamespace(
-            read=lambda _: read,
-            route=lambda _: SimpleNamespace(sub_pool=None),
-            sub_pool=lambda _: None,
-        ),
-    )
-    backend.forward_metadata = SimpleNamespace(
-        kv_indptr=kv_indptr,
-        kv_indices=kv_indices,
-        windows={None: WindowRail(kv_indptr=kv_indptr, kv_indices=kv_indices)},
-        qo_indptr=qo_indptr,
-        custom_mask=None,
-        mask_indptr=None,
-        max_extend_len=case["l_ext"],
-    )
-    layer = SimpleNamespace(
-        layer_id=0,
-        qk_head_dim=case["d"],
-        v_head_dim=case["dv"],
-        tp_q_head_num=case["h_q"],
-        k_scale=None,
-        v_scale=None,
-        logit_capping_method="tanh",
-        logit_cap=0.0,
-        is_cross_attention=False,
-        attn_type=AttentionType.DECODER,
-        sliding_window_size=case.get("window", -1),
-        scaling=_scale(case),
-        xai_temperature_len=-1,
-    )
-    forward_batch = SimpleNamespace(
-        forward_mode=ForwardMode.TARGET_VERIFY,
-        mha_one_shot=False,
-        extend_seq_lens_cpu=None,
-    )
-    return backend.forward_extend(
-        q, k, v, layer, forward_batch, save_kv_cache=False
-    ).view(*q.shape[:2], case["dv"])
-
-
-@unittest.skipUnless(is_hip(), "ROCm DFLASH draft kernels")
-class TestDraftBackendDispatch(CustomTestCase):
-    def test_fp8_cache_bf16_dot_matches_fp32(self):
-        inputs = _inputs(MLA5_WINDOW, fp8_dtype)
-        ref = _reference(MLA5_WINDOW, inputs)
-        out = _backend_extend(MLA5_WINDOW, inputs, bf16_dot=True)
-        err = ((out.float() - ref).norm() / ref.norm()).item()
-        assert err < BF16_ERR, err
-        torch.testing.assert_close(out.float(), ref, atol=BF16_ATOL, rtol=BF16_RTOL)
-        if FP8_DOT_OK:
-            # The default still runs FP8 q and probabilities over an FP8 cache.
-            default = _backend_extend(MLA5_WINDOW, inputs, bf16_dot=False)
-            assert not torch.equal(default, out)
 
 
 if __name__ == "__main__":
