@@ -43,6 +43,55 @@ class TestBaseReasoningFormatDetector(CustomTestCase):
         self.assertEqual(result.normal_text, text)
         self.assertEqual(result.reasoning_text, "")
 
+    def test_force_nonempty_content_treats_whitespace_as_empty(self):
+        """Whitespace-only content must not block the reasoning-to-content rescue."""
+        for detector_class in (Qwen3Detector, DeepSeekR1Detector, Glm45Detector):
+            with self.subTest(detector=detector_class.__name__):
+                detector = detector_class(force_nonempty_content=True)
+                text = (
+                    detector.think_start_token
+                    + "The answer is 42."
+                    + detector.think_end_token
+                    + " \n"
+                )
+
+                result = detector.detect_and_parse(text)
+
+                self.assertEqual(result.normal_text, "The answer is 42.")
+                self.assertEqual(result.reasoning_text, " \n")
+
+    def test_force_nonempty_content_preserves_nonempty_answer(self):
+        for detector_class in (Qwen3Detector, DeepSeekR1Detector, Glm45Detector):
+            with self.subTest(detector=detector_class.__name__):
+                detector = detector_class(force_nonempty_content=True)
+                result = detector.detect_and_parse(
+                    detector.think_start_token
+                    + "Reasoning"
+                    + detector.think_end_token
+                    + " \nAnswer"
+                )
+                self.assertEqual(result.normal_text, " \nAnswer")
+                self.assertEqual(result.reasoning_text, "Reasoning")
+
+    def test_whitespace_fallback_respects_disabled_option(self):
+        for detector_class in (Qwen3Detector, DeepSeekR1Detector, Glm45Detector):
+            with self.subTest(detector=detector_class.__name__):
+                detector = detector_class(force_nonempty_content=False)
+                result = detector.detect_and_parse(
+                    detector.think_start_token
+                    + "Reasoning"
+                    + detector.think_end_token
+                    + " \n"
+                )
+                self.assertEqual(result.normal_text, " \n")
+                self.assertEqual(result.reasoning_text, "Reasoning")
+
+    def test_force_nonempty_content_preserves_text_without_reasoning(self):
+        detector = BaseReasoningFormatDetector(
+            "<think>", "</think>", force_nonempty_content=True
+        )
+        self.assertEqual(detector.detect_and_parse(" \n").normal_text, " \n")
+
     def test_detect_and_parse_with_start_token(self):
         """Test parsing text starting with think token."""
         text = "<think>This is reasoning"
