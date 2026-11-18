@@ -210,6 +210,13 @@ def _uses_modelopt_fp8_pb_wo(
     return resolver is not None and resolver(prefix) == "FP8_PB_WO"
 
 
+def _uses_modelopt_mxfp8(
+    quant_config: Optional[QuantizationConfig], prefix: str
+) -> bool:
+    resolver = getattr(quant_config, "_resolve_quant_algo", None)
+    return resolver is not None and resolver(prefix) == "MXFP8"
+
+
 def _uses_split_gguf_kv_b(
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
@@ -227,13 +234,18 @@ def _maybe_map_fp8_pb_scale_name(name: str, params_dict: dict) -> str:
 
 
 def _get_k3_dense_weight(module: nn.Module) -> torch.Tensor:
-    """Return a dense weight with serialized block-FP8 scales applied."""
+    """Return a dense weight with serialized block-FP8 or MXFP8 scales applied."""
     weight = module.weight.data
     if not hasattr(module, "weight_scale_inv"):
         return weight
+    scale = module.weight_scale_inv.data
+    if scale.dtype == torch.uint8:
+        # MXFP8 UE8M0 exponents, still in checkpoint layout: the model's
+        # post-load runs before process_weights_after_loading reorders them.
+        scale = torch.exp2(scale.to(torch.float32) - 127.0)
     return block_quant_dequant(
         weight,
-        module.weight_scale_inv,
+        scale,
         module.quant_method.weight_block_size,
         module.params_dtype,
     )
@@ -501,6 +513,7 @@ def _uses_ep_a2a() -> bool:
         _a2a_backend.is_megamoe()
         or _a2a_backend.is_flashinfer_megamoe()
         or _a2a_backend.is_deepep()
+        or _a2a_backend.is_ascend_ops()
         or _a2a_backend.is_mooncake()
         or _a2a_backend.is_ascend_fuseep()
         or _a2a_backend.is_mori()
@@ -959,6 +972,8 @@ class KimiK3MoE(nn.Module):
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.mega_moe import (
             _configure_mega_moe_deep_gemm_num_sms,
+            _mega_moe_global_tokens_hint,
+            _mega_moe_mma_type,
         )
 
         # Under SP-MoE these rows are this rank's shard of the batch; an unpadded
@@ -973,6 +988,7 @@ class KimiK3MoE(nn.Module):
             f"{num_max_tokens_per_rank}; K3 has no non-mega fallback — raise "
             f"the env var to cover the per-rank rows"
         )
+        mma_type = _mega_moe_mma_type(self.experts)
         buf = self._mega_moe_buffer()
 
         if num_tokens > 0:
@@ -986,7 +1002,18 @@ class KimiK3MoE(nn.Module):
                 (0, self._mega_top_k), dtype=torch.float32
             )
 
-        mega_moe_pre_dispatch(
+        valid_rows = None
+        if valid_token_count is not None and mma_type == "mxf4xmxf4":
+            # The graph bucket is static; its live CP prefix changes on replay.
+            # Mask NaNs as well as routes before quantization/dispatch.
+            valid_rows = (
+                torch.arange(num_tokens, device=routed_input.device) < valid_token_count
+            )
+            routed_input = routed_input.masked_fill(~valid_rows[:, None], 0)
+            topk_ids_in = topk_ids_in.masked_fill(~valid_rows[:, None], -1)
+            topk_weights_in = topk_weights_in.masked_fill(~valid_rows[:, None], 0)
+
+        dispatch_args = (
             routed_input,
             topk_ids_in,
             topk_weights_in,
@@ -994,9 +1021,21 @@ class KimiK3MoE(nn.Module):
             buf.x_sf,
             buf.topk_idx,
             buf.topk_weights,
-            quant_group_size=32,
-            num_token_non_padded=valid_token_count,
         )
+        if mma_type == "mxf4xmxf4":
+            # The SGLang dispatcher writes FP8; packed E2M1 uses DeepGEMM.
+            deep_gemm.mega_moe_pre_dispatch(
+                *dispatch_args,
+                num_tokens=num_tokens,
+                group_size=32,
+                mma_type=mma_type,
+            )
+        else:
+            mega_moe_pre_dispatch(
+                *dispatch_args,
+                quant_group_size=32,
+                num_token_non_padded=valid_token_count,
+            )
         # At least one row so the tvm-ffi binding sees a non-null data_ptr.
         y = torch.empty(
             (max(num_tokens, 1), self.moe_hidden_size),
@@ -1012,10 +1051,12 @@ class KimiK3MoE(nn.Module):
                 recipe=(1, 1, 32),
                 activation="situ",
                 fast_math=True,
+                global_num_tokens=_mega_moe_global_tokens_hint(buf),
             )
         y = y[:num_tokens]
-        if valid_token_count is not None:
-            valid_rows = torch.arange(num_tokens, device=y.device) < valid_token_count
+        # fp8xfp4: the pre-dispatch routes rows past valid_token_count to -1 and
+        # the combine writes zeros for a row with no route, so only mxf4 masks.
+        if valid_rows is not None:
             y.masked_fill_(~valid_rows[:, None], 0)
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
             if (
@@ -1368,6 +1409,9 @@ class KimiK3MoE(nn.Module):
         topk_output = None
         if routed_input is not None:
             topk_output, routed_input = routed_input
+        elif hidden_states.shape[0] == 0:
+            # An idle DP-attention rank routes nothing but still enters the EP dispatch.
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
         else:
             # MoEGate produces fp32 router logits on CUDA (via linear_bf16_fp32
             # or tiny_gemm_bf16); non-CUDA falls back to F.linear (bf16). The
@@ -1836,6 +1880,9 @@ class KimiK3DeltaAttention(nn.Module):
         self._bfa_uses_block_fp8 = self.use_full_rank_gate and _uses_modelopt_fp8_pb_wo(
             quant_config, f"{prefix}.b_proj"
         )
+        self._bfa_uses_mxfp8 = self.use_full_rank_gate and _uses_modelopt_mxfp8(
+            quant_config, f"{prefix}.b_proj"
+        )
 
         # The full-rank [q, k, v, g] merged projection is explicitly sharded
         # using attention-TP placement, so it also supports DP attention.
@@ -2120,7 +2167,7 @@ class KimiK3DeltaAttention(nn.Module):
             self._bfa_f_b_w = self.f_b_proj.weight
             return
         mods = [self.f_a_proj, self.b_proj]
-        if self._bfa_uses_block_fp8:
+        if self._bfa_uses_block_fp8 or self._bfa_uses_mxfp8:
             weights = [_get_k3_dense_weight(mod) for mod in mods]
             sizes = [weight.shape[0] for weight in weights]
             pad = (-sum(sizes)) % 8
@@ -2206,9 +2253,9 @@ class KimiK3DeltaAttention(nn.Module):
             return False
         if not (self.do_fuse_qkvbfg or get_exec().kernel.enable_amd_monokernel):
             return False
-        # Block-FP8 in-proj needs dequantized BF16 buffers; a raw row-cat
+        # Block-FP8 / MXFP8 in-proj needs dequantized BF16 buffers; a raw row-cat
         # would drop the scales. Leave fusion to the split [f_a|b] path.
-        if self._bfa_uses_block_fp8:
+        if self._bfa_uses_block_fp8 or self._bfa_uses_mxfp8:
             return False
         ws = [m.weight for m in (self.fused_qkvg_proj, self.f_a_proj, self.b_proj)]
         if not all(type(w.data) is torch.Tensor and w.dim() == 2 for w in ws):
@@ -2549,6 +2596,8 @@ class KimiK3DeltaAttention(nn.Module):
 class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     """MLA with output gate for K3. Gate is applied in TP-local space before o_proj."""
 
+    # Kimi-K3.1 DSA layers (K3 has no indexer)
+    dsa_decode_absorb_under_indexer = True
     dcp_v_preproject = True
 
     def __init__(
@@ -2928,7 +2977,13 @@ def _stage_facts(
         # reads full context and its output sums over TP.
         attn_ops["tp_group"] = SumGroup.TP
     return (
-        declare_attn(**attn_ops),
+        declare_attn(
+            **attn_ops,
+            # Interleave KDA restores sequence order inside the attention;
+            # zigzag delegates that transport to the stage boundary.
+            in_token_order=config.is_kda_layer(layer_idx)
+            and get_parallel().cp_strategy == "zigzag",
+        ),
         declare_ffn(
             **ffn_ops,
             sparse=is_moe,
@@ -3152,13 +3207,16 @@ class KimiK3DecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         if isinstance(self.mlp, KimiK3MoE) and self.mlp._use_mega_moe:
-            valid_token_count = None
             if is_interleave_extend(forward_batch):
                 from sglang.srt.layers.cp.base import get_cp_strategy
 
                 valid_token_count = get_cp_strategy().moe_num_token_non_padded(
                     forward_batch
                 )
+            else:
+                # Padded rows (a graph bucket, or SP rows rounded up to attention TP)
+                # would route stale contents onto a few experts every rank waits on.
+                valid_token_count = forward_batch.moe_num_token_non_padded()
             hidden_states = self.mlp(
                 hidden_states,
                 prefix_sum=(
@@ -3475,11 +3533,16 @@ class KimiK3LinearForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import register_tgv_m_ranges
+        if not (_is_hip or _is_npu):
+            # The CuTe DSL GEMM module imports cuda.bindings and cutlass at
+            # module level; neither ships on ROCm or Ascend NPU.
+            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
+                register_tgv_m_ranges,
+            )
 
-        register_tgv_m_ranges(_K3_TGV_M_RANGES)
-        if get_platform().device_sm == 103:
-            register_tgv_m_ranges(_K3_GB300_TGV_M_RANGES)
+            register_tgv_m_ranges(_K3_TGV_M_RANGES)
+            if get_platform().device_sm == 103:
+                register_tgv_m_ranges(_K3_GB300_TGV_M_RANGES)
         if quant_config is not None:
             if isinstance(quant_config, ModelSlimConfig):
                 model_mapping = {
@@ -3799,8 +3862,12 @@ class KimiK3LinearForCausalLM(nn.Module):
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
-                    if name.endswith(".b_proj.weight_scale_inv"):
-                        # All TP ranks share K3's single beta output-scale block.
+                    if (
+                        name.endswith(".b_proj.weight_scale_inv")
+                        and param.data.shape == loaded_weight.shape
+                    ):
+                        # FP8_PB_WO: all TP ranks share K3's single beta
+                        # output-scale block. MXFP8 per-row scales shard below.
                         param.data.copy_(loaded_weight)
                     else:
                         weight_loader = getattr(
@@ -3816,6 +3883,19 @@ class KimiK3LinearForCausalLM(nn.Module):
     def _check_dsa_indexer_loaded(self, loaded_params: set[str]) -> None:
         if self.config.dsa_config is None:
             return
+        start, end = self.model.start_layer, self.model.end_layer
+        num_dsa_layers = sum(
+            start <= i < end for i in self.config.full_attention_layer_ids
+        )
+        num_indexers = sum(
+            isinstance(layer.self_attn, KimiK3MLAAttention)
+            and layer.self_attn.indexer is not None
+            for layer in self.model.layers[start:end]
+        )
+        assert num_indexers == num_dsa_layers, (
+            f"Kimi-K3.1: built {num_indexers} DSA indexers for {num_dsa_layers} "
+            "DSA layers."
+        )
         expected = {
             name for name, _ in self.named_parameters() if ".self_attn.indexer." in name
         }
@@ -3931,6 +4011,12 @@ class KimiK3LinearForCausalLM(nn.Module):
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()
+            if (
+                isinstance(layer.self_attn, KimiK3MLAAttention)
+                and layer.self_attn.indexer is not None
+            ):
+                layer.self_attn.indexer.prepare_merged_k_gate()
+                layer.self_attn.indexer.tp_split_min_rows = 1024
 
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer) or not isinstance(

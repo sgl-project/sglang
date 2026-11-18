@@ -558,14 +558,14 @@ class TestStorageWorkerLiveness(unittest.TestCase):
         cache.tree_core = SimpleNamespace(enable_storage=True)
         cache.cache_controller = cc
         cache.linker = None
-        cache._drain_async_work = Mock(side_effect=_Proceeded)
+        cache._bound_async_work = Mock(side_effect=_Proceeded)
         dead = threading.Thread(target=lambda: None, name="hicache-backup")
         dead.start()
         dead.join()
         cc.backup_thread = dead
         with self.assertRaises(RuntimeError):
             cache.check_hicache_events()
-        cache._drain_async_work.assert_not_called()
+        cache._bound_async_work.assert_not_called()
         # Under a pending stop the finished worker is not dead: the tick goes on.
         cc.storage_stop_event.set()
         with self.assertRaises(_Proceeded):

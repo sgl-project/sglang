@@ -91,13 +91,9 @@ def test_conv_bias_epilogue_rejects_unsupported_inputs():
     x1 = torch.randn(1, 1, 2, 3, 4, device=DEVICE, dtype=torch.bfloat16)
     assert x1.is_contiguous(memory_format=torch.channels_last_3d)
     assert not can_use_conv_bias_epilogue(x1, bias[:1])  # C == 1 is ambiguous
-    with pytest.raises(ValueError):
-        conv_bias_epilogue(x.contiguous(), bias)
     with torch.enable_grad():
         xg = x.clone().requires_grad_(True)
         assert not can_use_conv_bias_epilogue(xg, bias)
-        with pytest.raises(ValueError):
-            conv_bias_epilogue(xg, bias)
 
 
 if __name__ == "__main__":

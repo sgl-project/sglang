@@ -2,7 +2,8 @@
 //! `add_api_key_middleware` and `decide_request_auth`
 //! (`sglang.srt.utils.auth`) apply them to the HTTP server.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 
 use axum::{
     Json, Router,
@@ -11,86 +12,195 @@ use axum::{
     http::{Method, StatusCode, header::AUTHORIZATION},
     middleware::Next,
     response::{IntoResponse, Response},
+    routing::MethodRouter,
 };
+use serde::Deserialize;
 
+use crate::api_server::handlers::ADMIN_KEY_MISSING;
 use crate::message::config::ApiKeys;
 
-/// The served routes Python marks `@auth_level(AuthLevel.ADMIN_OPTIONAL)`;
-/// every other route is `NORMAL`. None of them is `ADMIN_FORCE`. The DP
-/// control relay carries those same operations, so it needs their key too.
-const ADMIN_OPTIONAL_PATHS: &[&str] = &[
-    crate::api_server::core::FORWARD_PEER_PATH,
-    "/flush_cache",
-    "/start_profile",
-    "/stop_profile",
-    "/weights_checker",
-    "/abort_request",
-    "/hicache/storage-backend",
-    "/hicache/storage-backend/clear",
-];
+/// Python's `AuthLevel`.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AuthLevel {
+    Normal,
+    AdminOptional,
+    AdminForce,
+}
 
-/// Wrap `app` in the key check. Python installs its middleware only when a
-/// key is configured, so without one `app` is returned untouched.
-pub(super) fn apply(app: Router, keys: &ApiKeys) -> Router {
-    match configured(keys) {
-        Some(keys) => app.layer(axum::middleware::from_fn_with_state(keys, check)),
-        None => app,
+/// Every HTTP route sglang serves and its auth level, the table the Python
+/// server reads too.
+static ROUTE_LEVELS: LazyLock<HashMap<String, AuthLevel>> = LazyLock::new(|| {
+    serde_json::from_str(include_str!(
+        "../../../../../python/sglang/srt/utils/auth_levels.json"
+    ))
+    .expect("auth_levels.json")
+});
+
+/// The level of a served `path`. A served admin route takes no path
+/// parameters (`declared_route` checks), so an exact match finds it.
+fn level(path: &str) -> AuthLevel {
+    ROUTE_LEVELS.get(path).copied().unwrap_or(AuthLevel::Normal)
+}
+
+pub(super) fn is_admin_force(path: &str) -> bool {
+    level(path) == AuthLevel::AdminForce
+}
+
+/// Whether `auth_levels.json` declares `path` as `level` looks it up.
+#[cfg(test)]
+pub(super) fn has_level(path: &str) -> bool {
+    ROUTE_LEVELS.contains_key(path)
+}
+
+/// The declared level of the route `path`, its parameters written as axum's
+/// `{name}` / `{*name}` or FastAPI's `{name}` / `{name:path}`.
+fn declared_level(path: &str) -> Option<AuthLevel> {
+    fn bare_params(path: &str) -> String {
+        path.split('/')
+            .map(|segment| match segment.strip_prefix('{') {
+                Some(param) => {
+                    let name = param.trim_start_matches('*').trim_end_matches('}');
+                    format!("{{{}}}", name.split(':').next().unwrap_or(name))
+                }
+                None => segment.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("/")
     }
+    let path = bare_params(path);
+    ROUTE_LEVELS
+        .iter()
+        .find(|(route, _)| bare_params(route) == path)
+        .map(|(_, level)| *level)
+}
+
+/// `Router::route` for one of sglang's own routes, which `auth_levels.json`
+/// must declare: an undeclared one panics as the router is built, so the tests
+/// that build it fail. Routes an embedding package adds (`HttpLayer`) skip this
+/// and are `NORMAL`, as an undeclared route is in Python.
+pub(super) trait DeclaredRoute<S> {
+    fn declared_route(self, path: &str, method_router: MethodRouter<S>) -> Self;
+}
+
+impl<S: Clone + Send + Sync + 'static> DeclaredRoute<S> for Router<S> {
+    fn declared_route(self, path: &str, method_router: MethodRouter<S>) -> Self {
+        let level = declared_level(path).unwrap_or_else(|| {
+            panic!("route {path} has no auth level in python/sglang/srt/utils/auth_levels.json")
+        });
+        assert!(
+            level == AuthLevel::Normal || !path.contains('{'),
+            "admin route {path} takes a path parameter, which `level` cannot match"
+        );
+        self.route(path, method_router)
+    }
+}
+
+/// Wrap `app` in the key check. It applies without keys too: the forced
+/// admin routes are refused unless an admin key is configured.
+pub(super) fn apply(app: Router, keys: &ApiKeys) -> Router {
+    app.layer(axum::middleware::from_fn_with_state(
+        Arc::new(keys.clone()),
+        check,
+    ))
 }
 
 /// Key the fallback of `app`, a router merged from keyed and open routes (the
 /// merge keeps an open fallback): an unknown path needs the API key, as in
-/// Python, where unmatched paths are `NORMAL`.
+/// Python, where unmatched paths are `NORMAL` -- also a path Python serves as
+/// an admin route, which this server would only answer with 404.
 pub(super) fn guard_fallback(app: Router, keys: &ApiKeys) -> Router {
-    match configured(keys) {
-        Some(keys) => app.fallback(
-            (|| async { StatusCode::NOT_FOUND })
-                .layer(axum::middleware::from_fn_with_state(keys, check)),
-        ),
-        None => app,
-    }
+    app.fallback(
+        (|| async { StatusCode::NOT_FOUND }).layer(axum::middleware::from_fn_with_state(
+            Arc::new(keys.clone()),
+            check_unserved,
+        )),
+    )
 }
 
-fn configured(keys: &ApiKeys) -> Option<Arc<ApiKeys>> {
-    (keys.api_key.is_some() || keys.admin_api_key.is_some()).then(|| Arc::new(keys.clone()))
+/// Python's 403 for an admin-only operation on a server without an admin key.
+pub(super) fn admin_key_missing() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({ "error": ADMIN_KEY_MISSING })),
+    )
+        .into_response()
 }
 
 async fn check(State(keys): State<Arc<ApiKeys>>, request: Request, next: Next) -> Response {
+    let level = level(request.uri().path());
+    check_at(level, &keys, request, next).await
+}
+
+async fn check_unserved(
+    State(keys): State<Arc<ApiKeys>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    check_at(AuthLevel::Normal, &keys, request, next).await
+}
+
+async fn check_at(level: AuthLevel, keys: &ApiKeys, request: Request, next: Next) -> Response {
     let authorization = request
         .headers()
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    if allowed(request.method(), request.uri().path(), authorization, &keys) {
-        next.run(request).await
-    } else {
-        (
+    match decide(
+        request.method(),
+        request.uri().path(),
+        level,
+        authorization,
+        keys,
+    ) {
+        Decision::Allowed => next.run(request).await,
+        Decision::Unauthorized => (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "error": "Unauthorized" })),
         )
-            .into_response()
+            .into_response(),
+        Decision::AdminKeyMissing => admin_key_missing(),
     }
 }
 
-/// Python's `decide_request_auth` for the `NORMAL` and `ADMIN_OPTIONAL`
-/// levels.
-fn allowed(method: &Method, path: &str, authorization: Option<&str>, keys: &ApiKeys) -> bool {
+#[derive(Debug, PartialEq)]
+enum Decision {
+    Allowed,
+    Unauthorized,
+    AdminKeyMissing,
+}
+
+/// Python's `decide_request_auth`.
+fn decide(
+    method: &Method,
+    path: &str,
+    level: AuthLevel,
+    authorization: Option<&str>,
+    keys: &ApiKeys,
+) -> Decision {
     // Probes and scrapes never carry a key.
     if method == Method::OPTIONS
         || path.starts_with("/health")
         || path.starts_with("/ready")
         || path.starts_with("/metrics")
     {
-        return true;
+        return Decision::Allowed;
     }
-    let required = if ADMIN_OPTIONAL_PATHS.contains(&path) {
+    let required = match level {
+        AuthLevel::AdminForce => match keys.admin_api_key.as_deref() {
+            Some(key) => Some(key),
+            None => return Decision::AdminKeyMissing,
+        },
         // The admin key when configured (the API key then does not unlock
         // these), else the API key.
-        keys.admin_api_key.as_deref().or(keys.api_key.as_deref())
-    } else {
+        AuthLevel::AdminOptional => keys.admin_api_key.as_deref().or(keys.api_key.as_deref()),
         // The API key alone; the admin key does not unlock these.
-        keys.api_key.as_deref()
+        AuthLevel::Normal => keys.api_key.as_deref(),
     };
-    required.is_none_or(|key| bearer_matches(authorization, key))
+    if required.is_none_or(|key| bearer_matches(authorization, key)) {
+        Decision::Allowed
+    } else {
+        Decision::Unauthorized
+    }
 }
 
 /// `Authorization: Bearer <key>`, the scheme case-insensitive and the token
@@ -122,117 +232,76 @@ mod tests {
         ApiKeys::new(api_key.map(Into::into), admin_api_key.map(Into::into))
     }
 
-    /// Python's `decide_request_auth` table for every key configuration, at
-    /// both levels, with no / a wrong / the API / the admin key.
+    /// `decide_request_auth`'s answers, recorded by Python's `test_auth.py`
+    /// (`render_auth_decisions_fixture`).
     #[test]
     fn decisions_match_python() {
-        let wrong = "Bearer nope".to_string();
-        let api = format!("Bearer {API}");
-        let admin = format!("Bearer {ADMIN}");
-        let presented = [
-            None,
-            Some(wrong.as_str()),
-            Some(api.as_str()),
-            Some(admin.as_str()),
-        ];
-        // (api_key, admin_api_key, path, [allowed for each presented key])
-        let cases = [
-            (None, None, "/generate", [true, true, true, true]),
-            (None, None, "/flush_cache", [true, true, true, true]),
-            (Some(API), None, "/generate", [false, false, true, false]),
-            (Some(API), None, "/flush_cache", [false, false, true, false]),
-            (None, Some(ADMIN), "/generate", [true, true, true, true]),
-            (
-                None,
-                Some(ADMIN),
-                "/flush_cache",
-                [false, false, false, true],
-            ),
-            (
-                Some(API),
-                Some(ADMIN),
-                "/v1/chat/completions",
-                [false, false, true, false],
-            ),
-            (
-                Some(API),
-                Some(ADMIN),
-                "/abort_request",
-                [false, false, false, true],
-            ),
-            (
-                Some(API),
-                Some(ADMIN),
-                "/weights_checker",
-                [false, false, false, true],
-            ),
-            (
-                Some(API),
-                Some(ADMIN),
-                "/start_profile",
-                [false, false, false, true],
-            ),
-            (
-                Some(API),
-                Some(ADMIN),
-                "/stop_profile",
-                [false, false, false, true],
-            ),
-            (
-                Some(API),
-                Some(ADMIN),
-                "/hicache/storage-backend",
-                [false, false, false, true],
-            ),
-            (
-                Some(API),
-                Some(ADMIN),
-                "/hicache/storage-backend/clear",
-                [false, false, false, true],
-            ),
-        ];
-        for (api_key, admin_api_key, path, expected) in cases {
-            let keys = keys(api_key, admin_api_key);
-            for (authorization, expected) in presented.iter().zip(expected) {
+        #[derive(Deserialize)]
+        struct Case {
+            api_key: Option<String>,
+            admin_api_key: Option<String>,
+            method: String,
+            path: String,
+            level: AuthLevel,
+            statuses: Vec<u16>,
+        }
+        #[derive(Deserialize)]
+        struct Fixture {
+            authorizations: Vec<Option<String>>,
+            cases: Vec<Case>,
+        }
+        let fixture: Fixture =
+            serde_json::from_str(include_str!("../../../testdata/auth_decisions.json")).unwrap();
+        for case in fixture.cases {
+            let keys = ApiKeys::new(case.api_key.clone(), case.admin_api_key.clone());
+            let method = Method::from_bytes(case.method.as_bytes()).unwrap();
+            assert_eq!(case.statuses.len(), fixture.authorizations.len());
+            for (authorization, status) in fixture.authorizations.iter().zip(case.statuses) {
+                let decision = decide(
+                    &method,
+                    &case.path,
+                    case.level,
+                    authorization.as_deref(),
+                    &keys,
+                );
+                let expected = match status {
+                    200 => Decision::Allowed,
+                    401 => Decision::Unauthorized,
+                    403 => Decision::AdminKeyMissing,
+                    _ => panic!("unexpected status {status}"),
+                };
                 assert_eq!(
-                    allowed(&Method::POST, path, *authorization, &keys),
-                    expected,
-                    "{api_key:?} {admin_api_key:?} {path} {authorization:?}"
+                    decision, expected,
+                    "{:?} {:?} {} {} {:?} {authorization:?}",
+                    case.api_key, case.admin_api_key, case.method, case.path, case.level
                 );
             }
         }
-        let both = keys(Some(API), Some(ADMIN));
-        for path in [
-            "/health",
-            "/health_generate",
-            "/metrics",
-            "/metrics/x",
-            "/ready",
-        ] {
-            assert!(allowed(&Method::GET, path, None, &both), "{path}");
-        }
-        assert!(allowed(&Method::OPTIONS, "/generate", None, &both));
-        // Unknown paths are NORMAL, as Python's unmatched routes.
-        assert!(!allowed(&Method::GET, "/nope", None, &both));
     }
 
     #[test]
-    fn bearer_parsing_matches_python() {
-        assert!(bearer_matches(Some("Bearer sk"), "sk"));
-        assert!(bearer_matches(Some("bEaReR sk"), "sk"));
-        assert!(!bearer_matches(Some("Bearer  sk"), "sk"));
-        assert!(!bearer_matches(Some("Bearer sk "), "sk"));
-        assert!(!bearer_matches(Some("Basic sk"), "sk"));
-        assert!(!bearer_matches(Some("Bearer"), "sk"));
-        assert!(!bearer_matches(Some("Bearer s"), "sk"));
-        assert!(!bearer_matches(None, "sk"));
-        // An empty key is no key.
-        assert!(allowed(
-            &Method::POST,
-            "/generate",
-            None,
-            &keys(Some(""), Some(""))
-        ));
+    fn levels_come_from_the_shared_table() {
+        assert_eq!(level("/start_profile"), AuthLevel::AdminForce);
+        assert_eq!(level("/flush_cache"), AuthLevel::AdminOptional);
+        assert_eq!(level("/generate"), AuthLevel::Normal);
+        assert_eq!(
+            level(crate::api_server::core::FORWARD_PEER_PATH),
+            AuthLevel::AdminOptional
+        );
+        assert_eq!(level("/nope"), AuthLevel::Normal);
+        // axum's parameter syntax finds FastAPI's.
+        assert_eq!(
+            declared_level("/v1/models/{model}"),
+            Some(AuthLevel::Normal)
+        );
+        assert_eq!(declared_level("/metrics/{*path}"), Some(AuthLevel::Normal));
+        assert_eq!(declared_level("/nope"), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "has no auth level")]
+    fn an_undeclared_route_stops_the_server() {
+        let _: Router = Router::new().declared_route("/nope", get(|| async { "ok" }));
     }
 
     /// A DP control relay passes a keyed peer's check: the relay presents the
@@ -281,25 +350,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejection_is_pythons_401() {
-        let app = Router::new().route("/generate", get(|| async { "ok" }));
-        let app = apply(app, &keys(Some(API), None));
-        let send = |authorization: Option<String>| {
-            let mut request = Request::builder().uri("/generate");
+    async fn rejections_are_pythons() {
+        let app = Router::new()
+            .route("/generate", get(|| async { "ok" }))
+            .route("/start_profile", get(|| async { "ok" }));
+        let api_only = keys(Some(API), None);
+        let app = guard_fallback(apply(app, &api_only), &api_only);
+        let send = |uri: &str, authorization: Option<String>| {
+            let mut request = Request::builder().uri(uri);
             if let Some(value) = authorization {
                 request = request.header(AUTHORIZATION, value);
             }
             app.clone().oneshot(request.body(Body::empty()).unwrap())
         };
+        let body = |response: Response| async {
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+        };
 
-        let rejected = send(None).await.unwrap();
+        let rejected = send("/generate", None).await.unwrap();
         assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
-        let body = axum::body::to_bytes(rejected.into_body(), 1024)
+        assert_eq!(&body(rejected).await[..], br#"{"error":"Unauthorized"}"#);
+
+        let accepted = send("/generate", Some(format!("Bearer {API}")))
             .await
             .unwrap();
-        assert_eq!(&body[..], br#"{"error":"Unauthorized"}"#);
-
-        let accepted = send(Some(format!("Bearer {API}"))).await.unwrap();
         assert_eq!(accepted.status(), StatusCode::OK);
+
+        let forced = send("/start_profile", Some(format!("Bearer {API}")))
+            .await
+            .unwrap();
+        assert_eq!(forced.status(), StatusCode::FORBIDDEN);
+        let error: serde_json::Value = serde_json::from_slice(&body(forced).await).unwrap();
+        assert_eq!(error["error"], ADMIN_KEY_MISSING);
+
+        // A wrong method is refused at the route's level before the 405, as in Python.
+        let wrong_method = Request::post("/start_profile")
+            .header(AUTHORIZATION, format!("Bearer {API}"))
+            .body(Body::empty())
+            .unwrap();
+        let wrong_method = app.clone().oneshot(wrong_method).await.unwrap();
+        assert_eq!(wrong_method.status(), StatusCode::FORBIDDEN);
+
+        // Python's admin route, not served here: NORMAL, so the API key gets the 404.
+        let unserved = send("/pause_generation", Some(format!("Bearer {API}")))
+            .await
+            .unwrap();
+        assert_eq!(unserved.status(), StatusCode::NOT_FOUND);
     }
 }
