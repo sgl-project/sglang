@@ -278,6 +278,10 @@ class TopKConfig:
     sqrtsoftplus_log1p: bool = False
     # Let the fused router also emit FlashInfer routed-MoE packed ids.
     fused_gate_packed_ids: bool = False
+    # Let the ROCm radix-4 router also emit AITER fused_moe's BM=16 sort. Set only
+    # by a layer whose experts are an AITER runner without an expert mask, the one
+    # consumer that takes the sort; any other would compute it and drop it.
+    fused_aiter_presort: bool = False
     # Draft-side MoE blocks set this False so they never write the target's
     # process-global routed-experts capture buffer.
     allow_routed_experts_capture: bool = True
@@ -1979,6 +1983,7 @@ def biased_grouped_topk_gpu(
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
     num_token_non_padded: Optional[torch.Tensor] = None,
+    fused_aiter_presort: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     num_tokens = gating_output.shape[0]
     num_experts = gating_output.shape[1]
@@ -2168,18 +2173,14 @@ def biased_grouped_topk_gpu(
             ):
                 from sglang.srt.layers.moe import aiter_presort
 
-                # Simulated routing rewrites ids in place after the sort is
-                # registered, and AITER would still run the registered sort.
-                if not routing_simulation_enabled() and aiter_presort.enabled(
-                    route_logits
-                ):
+                if fused_aiter_presort and aiter_presort.enabled(route_logits):
                     return aiter_presort.route_and_register(
-                        route_logits,
-                        route_bias,
-                        topk,
-                        renormalize,
-                        scaling,
-                        num_token_non_padded,
+                        scores=route_logits,
+                        bias=route_bias,
+                        topk=topk,
+                        renormalize=renormalize,
+                        routed_scaling_factor=scaling,
+                        num_token_non_padded=num_token_non_padded,
                     )
                 return moe_route_radix4.route_radix4(
                     route_logits, route_bias, topk, renormalize, scaling
@@ -2393,6 +2394,7 @@ def biased_grouped_topk_cpu(
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
     num_token_non_padded: Optional[torch.Tensor] = None,
+    fused_aiter_presort: bool = False,
 ):
     return torch.ops.sgl_kernel.biased_grouped_topk_cpu(
         hidden_states,
@@ -3013,6 +3015,14 @@ def select_experts(
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 num_token_non_padded=num_token_non_padded,
+                # AITER matches the sort to these exact topk tensors, so any later
+                # rewrite (EPLB remap, simulated routing, shared slots) wastes it.
+                fused_aiter_presort=(
+                    topk_config.fused_aiter_presort
+                    and expert_location_dispatch_info is None
+                    and not routing_overridden
+                    and num_shared_topk_slots == 0
+                ),
             )
             padded_rows_masked = route_quant_handoff.take_padded_rows_masked()
     elif torch_native and custom_routing_function is None:

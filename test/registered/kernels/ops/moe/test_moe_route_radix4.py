@@ -272,6 +272,49 @@ def test_select_experts_preserves_offset_fp32_bias(
     torch.testing.assert_close(weights, torch.full_like(weights, 2.5 / topk))
 
 
+@pytest.mark.parametrize("fused_aiter_presort", [False, True])
+@requires_aiter
+def test_select_experts_sorts_only_for_a_presort_consumer(fused_aiter_presort):
+    """Only an AITER fused_moe without an expert mask takes the router's sort;
+    for any other consumer (EP, another runner) the fused sort is pure overhead,
+    so select_experts must emit and register it only when the layer asks."""
+    from unittest.mock import patch
+
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe import aiter_presort
+    from sglang.srt.layers.moe import topk as topk_module
+    from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+    from sglang.srt.runtime_context import get_context
+
+    if not topk_module._use_aiter:
+        pytest.skip("Requires SGLANG_USE_AITER=1 before importing the router.")
+
+    m = 4
+    scores = torch.randn((m, NUM_EXPERTS), dtype=torch.bfloat16, device="cuda")
+    config = TopKConfig(
+        top_k=TOPK,
+        use_grouped_topk=True,
+        num_expert_group=1,
+        topk_group=1,
+        correction_bias=torch.zeros(NUM_EXPERTS, dtype=torch.float32, device="cuda"),
+        routed_scaling_factor=2.5,
+        fused_aiter_presort=fused_aiter_presort,
+    )
+    registrations = []
+    with (
+        get_context().override_server_args(),
+        envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.override(False),
+        envs.SGLANG_K3_RADIX4_TOPK.override(True),
+        patch.object(aiter_presort, "_registrar", return_value=registrations.append),
+    ):
+        _, ids, _ = select_experts(torch.zeros((m, 8), device="cuda"), scores, config)
+    if fused_aiter_presort:
+        assert len(registrations) == 1
+        assert registrations[0]["topk_ids_ptr"] == ids.data_ptr()
+    else:
+        assert registrations == []
+
+
 @requires_aiter
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("renormalize", [False, True])

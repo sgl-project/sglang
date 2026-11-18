@@ -640,6 +640,13 @@ class KimiK3MoE(nn.Module):
             self.experts.runner_backend,
             routing_method_type=self.experts.routing_method_type,
         )
+        # AITER fused_moe drops the radix-4 router's presort under an expert mask
+        # (EP), and other runners never see it.
+        self.topk.topk_config.fused_aiter_presort = (
+            self.experts.runner_backend is not None
+            and self.experts.runner_backend.is_aiter()
+            and self.experts.moe_ep_size == 1
+        )
 
         # MegaMoE (deep_gemm fused a2a+GEMM over the EP symm buffer) replaces
         # the routed experts call below. K3 routes ALL batches through it when
