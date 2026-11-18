@@ -194,6 +194,12 @@ class TestSpecKVLayoutBootstrap(CustomTestCase):
                 self.assertEqual(payload.get("spec_kv_layout"), expected)
                 self.assertEqual("spec_kv_layout" in payload, expected is not None)
 
+    def test_a_retried_registration_counts_once(self):
+        server = bootstrap_server()
+        for _ in range(2):
+            self.assertEqual(register(server, self.row).status, 200)
+        self.assertFalse(server._is_ready())
+
     def test_known_layouts_must_agree_across_ranks(self):
         server = bootstrap_server()
         self.assertEqual(register(server, self.row, spec_kv_layout=DSPARK).status, 200)
