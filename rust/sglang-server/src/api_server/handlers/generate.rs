@@ -309,7 +309,7 @@ impl CoreHandle {
         CoreCall::new(
             runtime,
             self.inner.metadata.weight_version.clone(),
-            Some(self.inner.dp_rank),
+            self.inner.metadata.deployment_info.reported_dp_rank(),
             metrics,
             record,
             in_flight,
