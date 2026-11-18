@@ -108,16 +108,16 @@ class TestMuseSparkFp8MoE(CustomTestCase):
 
     def run_moe(self, x, scores, ids, *, w2_scale=None, has_norm=True):
         return self.moe(
-            x,
-            scores,
-            ids,
-            self.w13,
-            self.s13,
-            self.w2,
-            self.s2 if w2_scale is None else w2_scale,
-            LOCAL_START,
-            self.norm,
-            EPS,
+            hidden_states=x,
+            topk_scores=scores,
+            topk_ids=ids,
+            w13=self.w13,
+            w13_scale=self.s13,
+            w2=self.w2,
+            w2_scale=self.s2 if w2_scale is None else w2_scale,
+            local_expert_start=LOCAL_START,
+            post_norm_weight=self.norm,
+            eps=EPS,
             post_norm_gain=GAIN,
             has_norm=has_norm,
         )
@@ -140,12 +140,37 @@ class TestMuseSparkFp8MoE(CustomTestCase):
         m = x.shape[0]
         ids32, scores32 = ids.to(torch.int32), scores.float()
         up, down = pick_configs(m * TOP_K)
-        align = moe_align_block_size(ids32, LOCAL, local_start, up["BLOCK_SIZE_M"])
+        align = moe_align_block_size(
+            topk_ids=ids32,
+            num_local_experts=LOCAL,
+            local_start=local_start,
+            block_m=up["BLOCK_SIZE_M"],
+        )
         gate_up = torch.empty(m * TOP_K, 2 * INTER, device="cuda", dtype=torch.bfloat16)
-        moe_fp8_gemm(x, self.w13, self.s13, gate_up, scores32, ids32, align, TOP_K, up)
+        moe_fp8_gemm(
+            a=x,
+            w=self.w13,
+            w_scale=self.s13,
+            out=gate_up,
+            scores=scores32,
+            ids=ids32,
+            align=align,
+            top_k=TOP_K,
+            config=up,
+        )
         inter = silu_and_mul(gate_up)
         y = torch.empty(m * TOP_K, HIDDEN, device="cuda", dtype=torch.bfloat16)
-        moe_fp8_gemm(inter, self.w2, w2_scale, y, scores32, ids32, align, 1, down)
+        moe_fp8_gemm(
+            a=inter,
+            w=self.w2,
+            w_scale=w2_scale,
+            out=y,
+            scores=scores32,
+            ids=ids32,
+            align=align,
+            top_k=1,
+            config=down,
+        )
         return gate_up, inter, y
 
     def assert_gemm(self, out, a_codes, a_scale, w, w_scale, rows, experts, what):
@@ -232,16 +257,16 @@ class TestMuseSparkFp8MoE(CustomTestCase):
         poisoned = y.masked_fill(remote.unsqueeze(-1), float("nan"))
         ids32, scores32 = ids.to(torch.int32), scores.float()
         out_poisoned = finalize_slots(
-            poisoned,
-            scores32,
-            ids32,
-            LOCAL_START,
-            LOCAL,
-            self.norm,
-            EPS,
-            GAIN,
-            has_norm,
-            torch.bfloat16,
+            y=poisoned,
+            scores32=scores32,
+            ids32=ids32,
+            local_expert_start=LOCAL_START,
+            num_local=LOCAL,
+            post_norm_weight=self.norm,
+            eps=EPS,
+            post_norm_gain=GAIN,
+            has_norm=has_norm,
+            dtype=torch.bfloat16,
         )
         self.assert_finalize(out_poisoned, y, scores, slots, has_norm=has_norm)
         return x, scores, ids, out
@@ -294,16 +319,16 @@ class TestMuseSparkFp8MoE(CustomTestCase):
             self.s2 = torch.stack([banks[1][i][1] for i in perm])
             start = rank * LOCAL
             out = self.moe(
-                x,
-                scores,
-                ids,
-                self.w13,
-                self.s13,
-                self.w2,
-                self.s2,
-                start,
-                self.norm,
-                EPS,
+                hidden_states=x,
+                topk_scores=scores,
+                topk_ids=ids,
+                w13=self.w13,
+                w13_scale=self.s13,
+                w2=self.w2,
+                w2_scale=self.s2,
+                local_expert_start=start,
+                post_norm_weight=self.norm,
+                eps=EPS,
                 post_norm_gain=GAIN,
             )
             self.assertTrue(bool(torch.isfinite(out).all()))

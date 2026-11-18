@@ -11,8 +11,13 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Mapping
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.quantization.base_config import QuantizationConfig
+    from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 
 FP8_DTYPE = torch.float8_e4m3fn
 
@@ -38,12 +43,18 @@ _DECODER_RE = re.compile(r"(?:model\.)?(?:language_model\.)?layers(?:\.|$)")
 _DECODER_ANCESTORS = ("model", "language_model", "model.language_model")
 
 
-def _quark_dict(quant_config) -> dict:
-    config = getattr(quant_config, "quant_config", None)
-    return config if isinstance(config, dict) else {}
+def _as_quark(quant_config: QuantizationConfig | None) -> QuarkConfig | None:
+    from sglang.srt.layers.quantization.quark.quark import QuarkConfig
+
+    return quant_config if isinstance(quant_config, QuarkConfig) else None
 
 
-def _exclude_entries(quant_config) -> list:
+def _quark_dict(quant_config: QuantizationConfig | None) -> dict:
+    quark = _as_quark(quant_config)
+    return quark.quant_config if quark is not None else {}
+
+
+def _exclude_entries(quant_config: QuantizationConfig | None) -> list:
     """The export's exclude list; any other container (a string, a mapping) would be read as characters or keys."""
     entries = _quark_dict(quant_config).get("exclude")
     if entries is None:
@@ -53,7 +64,9 @@ def _exclude_entries(quant_config) -> list:
     return list(entries)
 
 
-def _check_quantizer(spec, role: str, ch_axis: int, dynamic: bool) -> str | None:
+def _check_quantizer(
+    *, spec: object, role: str, ch_axis: int, dynamic: bool
+) -> str | None:
     if not isinstance(spec, Mapping):
         return f"{role} quantizer missing"
     expected = {
@@ -78,7 +91,9 @@ def _check_quantizer(spec, role: str, ch_axis: int, dynamic: bool) -> str | None
     return None
 
 
-def excluded_expert_layers(quant_config, num_experts: int) -> frozenset[int]:
+def excluded_expert_layers(
+    *, quant_config: QuantizationConfig | None, num_experts: int
+) -> frozenset[int]:
     """Decoder layers whose routed experts the export keeps in BF16.
 
     Quark names excluded experts leaf by leaf (``layers.N.mlp.experts.E.gate_proj``
@@ -130,22 +145,31 @@ def _exclude_rejection(entries: Iterable) -> str | None:
     return None
 
 
-def ptpc_fp8_rejection(quant_config, num_experts: int) -> str | None:
+def ptpc_fp8_rejection(
+    *, quant_config: QuantizationConfig | None, num_experts: int
+) -> str | None:
     """Why ``quant_config`` is not the supported Quark PTPC-FP8 export, or None."""
-    get_name = getattr(quant_config, "get_name", None)
-    if get_name is None or get_name() != "quark":
+    quark = _as_quark(quant_config)
+    if quark is None:
         return "not a Quark config"
-    for attr in ("online_scheme", "dequantization_config", "excluded_fp8_config"):
-        if getattr(quant_config, attr, None) is not None:
+    for attr, value in (
+        ("online_scheme", quark.online_scheme),
+        ("dequantization_config", quark.dequantization_config),
+        ("excluded_fp8_config", quark.excluded_fp8_config),
+    ):
+        if value is not None:
             return f"{attr} is set (online or requantized Quark config)"
-    config = _quark_dict(quant_config)
+    config = quark.quant_config
     global_config = config.get("global_quant_config")
     if not isinstance(global_config, Mapping):
         return "global_quant_config missing"
     reason = _check_quantizer(
-        global_config.get("weight"), "weight", ch_axis=0, dynamic=False
+        spec=global_config.get("weight"), role="weight", ch_axis=0, dynamic=False
     ) or _check_quantizer(
-        global_config.get("input_tensors"), "input_tensors", ch_axis=1, dynamic=True
+        spec=global_config.get("input_tensors"),
+        role="input_tensors",
+        ch_axis=1,
+        dynamic=True,
     )
     if reason:
         return reason
@@ -170,19 +194,23 @@ def ptpc_fp8_rejection(quant_config, num_experts: int) -> str | None:
         return "export merges KV-cache or weight groups"
     try:
         reason = _exclude_rejection(_exclude_entries(quant_config))
-        excluded_expert_layers(quant_config, num_experts)
+        excluded_expert_layers(quant_config=quant_config, num_experts=num_experts)
     except ValueError as error:
         return str(error)
     return reason
 
 
-def is_quark_ptpc_fp8(quant_config, num_experts: int) -> bool:
-    return quant_config is not None and (
-        ptpc_fp8_rejection(quant_config, num_experts) is None
+def is_quark_ptpc_fp8(
+    *, quant_config: QuantizationConfig | None, num_experts: int
+) -> bool:
+    return (
+        ptpc_fp8_rejection(quant_config=quant_config, num_experts=num_experts) is None
     )
 
 
-def check_rope_rows(loaded: torch.Tensor, heads: int, head_dim: int, name: str):
+def check_rope_rows(
+    *, loaded: torch.Tensor, heads: int, head_dim: int, name: str
+) -> None:
     """A q/k weight or per-row scale must carry one row per head channel before the
     rope de-interleave permutes them; a scalar or short scale would otherwise skip
     or misapply the permutation."""
@@ -195,7 +223,9 @@ def check_rope_rows(loaded: torch.Tensor, heads: int, head_dim: int, name: str):
         )
 
 
-def check_serialized_dtype(param: torch.Tensor, loaded: torch.Tensor, name: str):
+def check_serialized_dtype(
+    *, param: torch.Tensor, loaded: torch.Tensor, name: str
+) -> None:
     """``copy_`` casts silently; a PTPC export must never land BF16 values in an
     FP8 parameter, FP8 codes in a BF16 one, or non-fp32 per-channel scales."""
     if (param.dtype == FP8_DTYPE or loaded.dtype == FP8_DTYPE) and (
@@ -210,7 +240,7 @@ def check_serialized_dtype(param: torch.Tensor, loaded: torch.Tensor, name: str)
             raise ValueError(f"{name}: scale dtype {loaded.dtype}, expected float32")
 
 
-def check_channel_scales(name: str, scale: torch.Tensor, rows: int) -> None:
+def check_channel_scales(*, name: str, scale: torch.Tensor, rows: int) -> None:
     """Per-channel scales after loading: one per output row, finite and positive.
     Unloaded scales keep their sentinel (negative or NaN) and fail here."""
     if scale.dtype != torch.float32 or scale.shape[-1] != rows:
@@ -238,7 +268,7 @@ class LoadCoverage:
         self.weights: set = set()
         self.scales: set = set()
 
-    def add(self, key, suffix: str) -> None:
+    def add(self, *, key: tuple, suffix: str) -> None:
         seen = {"weight": self.weights, "weight_scale": self.scales}.get(suffix)
         if seen is None:
             return

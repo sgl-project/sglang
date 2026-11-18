@@ -458,7 +458,11 @@ class TestPtpcFp8Loading(CustomTestCase):
             with self.subTest(backend=backend):
                 with patch.dict(os.environ, {"MUSE_MOE_BACKEND": backend}):
                     with self.assertRaisesRegex(ValueError, "has no FP8 path"):
-                        muse.MuseSpark1xFp8Experts(2, MOE_HIDDEN, MOE_INTER)
+                        muse.MuseSpark1xFp8Experts(
+                            num_local_experts=2,
+                            expert_hidden_size=MOE_HIDDEN,
+                            intermediate_size=MOE_INTER,
+                        )
         from sglang.kernels.ops.moe import fused_moe_triton_kernels as wrapper
 
         # Backend selection only: an unpadded wrapper, whatever SGLANG_MOE_PADDING this runner sets.
@@ -466,7 +470,24 @@ class TestPtpcFp8Loading(CustomTestCase):
             patch.dict(os.environ, {"MUSE_MOE_BACKEND": "auto"}),
             patch.object(wrapper, "padding_size", 0),
         ):
-            muse.MuseSpark1xFp8Experts(2, MOE_HIDDEN, MOE_INTER)
+            muse.MuseSpark1xFp8Experts(
+                num_local_experts=2,
+                expert_hidden_size=MOE_HIDDEN,
+                intermediate_size=MOE_INTER,
+            )
+
+    def test_fp8_experts_refuse_fnuz_fp8(self):
+        """gfx942-class GPUs use FNUZ FP8; the serialized OCP e4m3fn codes would need a conversion this path lacks."""
+        from sglang.srt.rocm_muse_spark import muse_moe_fp8
+
+        # Hardware capability boundary: the query answers for the GPU, not for the checkpoint.
+        with patch.object(muse_moe_fp8, "is_fp8_fnuz", return_value=True):
+            with self.assertRaisesRegex(ValueError, "need OCP FP8 e4m3fn"):
+                muse.MuseSpark1xFp8Experts(
+                    num_local_experts=2,
+                    expert_hidden_size=MOE_HIDDEN,
+                    intermediate_size=MOE_INTER,
+                )
 
     def test_fp8_experts_refuse_padded_k_without_aiter(self):
         """Without aiter the generic MoE wrapper subtracts SGLANG_MOE_PADDING from K; Muse weights are unpadded."""
@@ -477,7 +498,11 @@ class TestPtpcFp8Loading(CustomTestCase):
             patch.object(wrapper, "padding_size", 128),
         ):
             with self.assertRaisesRegex(ValueError, "not K-padded"):
-                muse.MuseSpark1xFp8Experts(2, MOE_HIDDEN, MOE_INTER)
+                muse.MuseSpark1xFp8Experts(
+                    num_local_experts=2,
+                    expert_hidden_size=MOE_HIDDEN,
+                    intermediate_size=MOE_INTER,
+                )
 
 
 if __name__ == "__main__":

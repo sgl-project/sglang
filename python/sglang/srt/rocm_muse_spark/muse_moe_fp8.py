@@ -109,22 +109,33 @@ def check_moe_fp8_supported() -> None:
         )
 
 
-def moe_fp8_gemm(a, w, w_scale, out, scores, ids, align, top_k: int, config: dict):
+def moe_fp8_gemm(
+    *,
+    a: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    out: torch.Tensor,
+    scores: torch.Tensor,
+    ids: torch.Tensor,
+    align: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    top_k: int,
+    config: dict,
+) -> None:
     """One slot-sorted PTPC GEMM: ``out[slot] = q(a[slot // top_k]) @ (w[e] * w_scale[e]).T`` for local slots."""
     sorted_ids, expert_ids, num_post = align
     invoke_fused_moe_kernel(
-        a,
-        w,
-        None,
-        out,
-        None,
-        w_scale,
-        None,
-        scores,
-        ids,
-        sorted_ids,
-        expert_ids,
-        num_post,
+        A=a,
+        B=w,
+        bias=None,
+        C=out,
+        A_scale=None,  # dynamic per-token quantization inside the wrapper
+        B_scale=w_scale,
+        B_zp=None,
+        topk_weights=scores,
+        topk_ids=ids,
+        sorted_token_ids=sorted_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_post,
         mul_routed_weight=False,
         top_k=top_k,
         config=config,
@@ -139,6 +150,7 @@ def moe_fp8_gemm(a, w, w_scale, out, scores, ids, align, top_k: int, config: dic
 
 
 def muse_moe_fp8(
+    *,
     hidden_states: torch.Tensor,  # [M, K] bf16, pooled + pre-expert-normed
     topk_scores: torch.Tensor,  # [M, top_k] routing weights
     topk_ids: torch.Tensor,  # [M, top_k] global expert ids
@@ -171,32 +183,56 @@ def muse_moe_fp8(
     up, down = pick_configs(num_slots)
     ids32 = topk_ids.to(torch.int32).contiguous()
     scores32 = topk_scores.to(torch.float32).contiguous()
-    align = moe_align_block_size(ids32, E, local_expert_start, up["BLOCK_SIZE_M"])
+    align = moe_align_block_size(
+        topk_ids=ids32,
+        num_local_experts=E,
+        local_start=local_expert_start,
+        block_m=up["BLOCK_SIZE_M"],
+    )
     dev = hidden_states.device
 
     gate_up = torch.empty((num_slots, two_i), dtype=torch.bfloat16, device=dev)
     moe_fp8_gemm(
-        hidden_states, w13, w13_scale, gate_up, scores32, ids32, align, top_k, up
+        a=hidden_states,
+        w=w13,
+        w_scale=w13_scale,
+        out=gate_up,
+        scores=scores32,
+        ids=ids32,
+        align=align,
+        top_k=top_k,
+        config=up,
     )
     inter = silu_and_mul(gate_up)
     y = torch.empty((num_slots, H), dtype=torch.bfloat16, device=dev)
-    moe_fp8_gemm(inter, w2, w2_scale, y, scores32, ids32, align, 1, down)
+    moe_fp8_gemm(
+        a=inter,
+        w=w2,
+        w_scale=w2_scale,
+        out=y,
+        scores=scores32,
+        ids=ids32,
+        align=align,
+        top_k=1,
+        config=down,
+    )
 
     return finalize_slots(
-        y,
-        scores32,
-        ids32,
-        local_expert_start,
-        E,
-        post_norm_weight,
-        eps,
-        post_norm_gain,
-        has_norm,
-        hidden_states.dtype,
+        y=y,
+        scores32=scores32,
+        ids32=ids32,
+        local_expert_start=local_expert_start,
+        num_local=E,
+        post_norm_weight=post_norm_weight,
+        eps=eps,
+        post_norm_gain=post_norm_gain,
+        has_norm=has_norm,
+        dtype=hidden_states.dtype,
     )
 
 
 def finalize_slots(
+    *,
     y: torch.Tensor,  # [M * top_k, H] per-slot expert outputs; rows of non-local slots are never read
     scores32: torch.Tensor,  # [M, top_k] fp32
     ids32: torch.Tensor,  # [M, top_k] int32 global expert ids

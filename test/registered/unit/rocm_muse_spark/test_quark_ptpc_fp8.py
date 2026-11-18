@@ -11,7 +11,6 @@ ROCm image's kernel libraries).
 
 import copy
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -122,12 +121,16 @@ class TestPtpcFp8Contract(CustomTestCase):
     """Only the release's PTPC scheme is accepted; anything else is refused by name."""
 
     def assertRejected(self, config: dict, fragment: str):
-        reason = ptpc_fp8_rejection(quark(config), 256)
+        reason = ptpc_fp8_rejection(quant_config=quark(config), num_experts=256)
         self.assertIsNotNone(reason)
         self.assertIn(fragment, reason)
 
     def test_release_config_is_accepted(self):
-        self.assertIsNone(ptpc_fp8_rejection(quark(release_quant_config()), 256))
+        self.assertIsNone(
+            ptpc_fp8_rejection(
+                quant_config=quark(release_quant_config()), num_experts=256
+            )
+        )
 
     def test_quantizer_contract_rejections(self):
         def variant(role, **fields):
@@ -182,8 +185,12 @@ class TestPtpcFp8Contract(CustomTestCase):
         whole = release_quant_config()
         whole["exclude"] += expert_leaves(0, range(256))
         whole["exclude"].append("model.language_model.layers.61.mlp.experts")
-        self.assertIsNone(ptpc_fp8_rejection(quark(whole), 256))
-        self.assertEqual(excluded_expert_layers(quark(whole), 256), {0, 61})
+        self.assertIsNone(
+            ptpc_fp8_rejection(quant_config=quark(whole), num_experts=256)
+        )
+        self.assertEqual(
+            excluded_expert_layers(quant_config=quark(whole), num_experts=256), {0, 61}
+        )
 
         partial = release_quant_config()
         partial["exclude"] += expert_leaves(3, range(255))
@@ -204,7 +211,9 @@ class TestPtpcFp8Contract(CustomTestCase):
             with self.subTest(entry=entry):
                 config = release_quant_config()
                 config["exclude"].append(entry)
-                self.assertIsNotNone(ptpc_fp8_rejection(quark(config), 256))
+                self.assertIsNotNone(
+                    ptpc_fp8_rejection(quant_config=quark(config), num_experts=256)
+                )
 
     def test_malformed_exclude_containers_are_rejected(self):
         for value in ("lm_head", {"lm_head": True}):
@@ -223,10 +232,17 @@ class TestPtpcFp8Contract(CustomTestCase):
                 scale_format="e8m0",
                 ch_axis=-1,
             )
-        self.assertIsNotNone(ptpc_fp8_rejection(quark(mxfp4), 256))
-        nvfp4 = SimpleNamespace(get_name=lambda: "modelopt_fp4")
-        self.assertEqual(ptpc_fp8_rejection(nvfp4, 256), "not a Quark config")
-        self.assertIsNotNone(ptpc_fp8_rejection(None, 256))
+        self.assertIsNotNone(
+            ptpc_fp8_rejection(quant_config=quark(mxfp4), num_experts=256)
+        )
+        from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
+
+        nvfp4 = ModelOptFp4Config(is_checkpoint_nvfp4_serialized=True, group_size=16)
+        self.assertEqual(
+            ptpc_fp8_rejection(quant_config=nvfp4, num_experts=256),
+            "not a Quark config",
+        )
+        self.assertIsNotNone(ptpc_fp8_rejection(quant_config=None, num_experts=256))
 
 
 class TestAttentionProjectionLoaders(CustomTestCase):
@@ -334,8 +350,18 @@ class TestAttentionProjectionLoaders(CustomTestCase):
 
     def test_rope_rows_need_one_per_head_channel(self):
         rows = HEADS * HEAD_DIM
-        check_rope_rows(torch.ones(rows), HEADS, HEAD_DIM, "q_proj.weight_scale")
-        check_rope_rows(torch.ones(rows, 4), HEADS, HEAD_DIM, "q_proj.weight")
+        check_rope_rows(
+            loaded=torch.ones(rows),
+            heads=HEADS,
+            head_dim=HEAD_DIM,
+            name="q_proj.weight_scale",
+        )
+        check_rope_rows(
+            loaded=torch.ones(rows, 4),
+            heads=HEADS,
+            head_dim=HEAD_DIM,
+            name="q_proj.weight",
+        )
         for value, name in (
             (torch.ones(()), "q_proj.weight_scale"),
             (torch.ones(rows - 1), "q_proj.weight_scale"),
@@ -344,7 +370,9 @@ class TestAttentionProjectionLoaders(CustomTestCase):
         ):
             with self.subTest(shape=tuple(value.shape), name=name):
                 with self.assertRaisesRegex(ValueError, "expected"):
-                    check_rope_rows(value, HEADS, HEAD_DIM, name)
+                    check_rope_rows(
+                        loaded=value, heads=HEADS, head_dim=HEAD_DIM, name=name
+                    )
 
 
 if __name__ == "__main__":

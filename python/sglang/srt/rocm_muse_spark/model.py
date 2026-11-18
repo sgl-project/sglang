@@ -63,6 +63,7 @@ from sglang.srt.configs.muse_spark import (
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import (
+    LinearBase,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -554,7 +555,7 @@ def _dense_linear(
     return linear(x)
 
 
-def _check_ptpc_linear(linear: nn.Module, prefix: str) -> None:
+def _check_ptpc_linear(*, linear: LinearBase, prefix: str) -> None:
     """A PTPC attention projection must resolve to the per-channel weight x per-token activation Quark scheme."""
     from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
 
@@ -664,8 +665,8 @@ class MuseSpark1xAttention(nn.Module):
         )
         self.fp8_serialized = quant_config is not None
         if self.fp8_serialized:
-            _check_ptpc_linear(self.qkv_proj, prefix)
-            _check_ptpc_linear(self.o_proj, prefix)
+            _check_ptpc_linear(linear=self.qkv_proj, prefix=prefix)
+            _check_ptpc_linear(linear=self.o_proj, prefix=prefix)
             # The dense FP8 fast paths read these copies of BF16 weights; serialized FP8 weights are stored
             # preshuffled for the generic Quark GEMM, so those paths stay off and the Quark linears run instead.
             self.qkv_proj.small_m_fp8_weight = None
@@ -1118,16 +1119,16 @@ class MuseSpark1xFp8Experts(nn.Module):
 
         weight, gain, has_norm = _post_expert_norm_args(post_expert_norm)
         return muse_moe_fp8(
-            hidden_states,
-            topk_scores,
-            topk_ids,
-            self.w13_weight,
-            self.w13_weight_scale,
-            self.w2_weight,
-            self.w2_weight_scale,
-            int(local_expert_start),
-            weight,
-            float(post_expert_norm.eps) if post_expert_norm is not None else 0.0,
+            hidden_states=hidden_states,
+            topk_scores=topk_scores,
+            topk_ids=topk_ids,
+            w13=self.w13_weight,
+            w13_scale=self.w13_weight_scale,
+            w2=self.w2_weight,
+            w2_scale=self.w2_weight_scale,
+            local_expert_start=int(local_expert_start),
+            post_norm_weight=weight,
+            eps=float(post_expert_norm.eps) if post_expert_norm is not None else 0.0,
             post_norm_gain=gain,
             has_norm=has_norm,
         )
@@ -1215,8 +1216,10 @@ class MuseSpark1xMoE(nn.Module):
         self.nvfp4_checkpoint = nvfp4_checkpoint
         self.mxfp4_checkpoint = _uses_quark_mxfp4_experts(quant_config, prefix)
         self.fp8_checkpoint = is_quark_ptpc_fp8(
-            quant_config, self.num_experts
-        ) and layer_idx not in excluded_expert_layers(quant_config, self.num_experts)
+            quant_config=quant_config, num_experts=self.num_experts
+        ) and layer_idx not in excluded_expert_layers(
+            quant_config=quant_config, num_experts=self.num_experts
+        )
         if nvfp4_checkpoint:
             # Packed NVFP4: the FlashInfer TRT-LLM kernel runs the experts and we
             # finalize in torch so the post-expert norm lands before the top-k sum.
@@ -1237,9 +1240,9 @@ class MuseSpark1xMoE(nn.Module):
             )
         elif self.fp8_checkpoint:
             self.experts = MuseSpark1xFp8Experts(
-                self.num_local_experts,
-                self.expert_hidden_size,
-                self.intermediate_size,
+                num_local_experts=self.num_local_experts,
+                expert_hidden_size=self.expert_hidden_size,
+                intermediate_size=self.intermediate_size,
             )
         else:
             self.experts = MuseSpark1xNativeExperts(
@@ -1633,7 +1636,9 @@ class MuseSpark1xDecoderLayer(nn.Module):
             add_prefix("self_attn", prefix),
             quant_config=(
                 quant_config
-                if is_quark_ptpc_fp8(quant_config, config.num_local_experts)
+                if is_quark_ptpc_fp8(
+                    quant_config=quant_config, num_experts=config.num_local_experts
+                )
                 else None
             ),
         )
@@ -2168,7 +2173,9 @@ class MuseSparkTextForCausalLM(nn.Module):
                 f"PTPC-FP8 are supported, got {quant_name}"
             )
         if quant_name == "quark" and not _is_quark_mxfp4(quant_config):
-            reason = ptpc_fp8_rejection(quant_config, config.num_local_experts)
+            reason = ptpc_fp8_rejection(
+                quant_config=quant_config, num_experts=config.num_local_experts
+            )
             if reason is not None:
                 raise ValueError(
                     "Unsupported Quark format; expected FP4/E8M0/group-size 32 or "
@@ -2188,6 +2195,7 @@ class MuseSparkTextForCausalLM(nn.Module):
             quant_config
         )
         self._nvfp4_pending: dict[tuple[str, str], dict[str, torch.Tensor]] = {}
+        self._fp8_coverage = LoadCoverage()
         self.model = MuseSparkModel(config, quant_config, add_prefix("model", prefix))
         if self.fp8_checkpoint:
             self._log_ptpc_fp8_methods()
@@ -2449,7 +2457,11 @@ class MuseSparkTextForCausalLM(nn.Module):
             )
         if self.fp8_checkpoint:
             self._track_fp8_piece(
-                param, loaded_weight, name, (prefix, local_id, projection), suffix
+                param=param,
+                loaded_weight=loaded_weight,
+                name=name,
+                key=(prefix, local_id, projection),
+                suffix=suffix,
             )
         if suffix == "weight_scale_2":
             if is_w13 and param.ndim == 2:
@@ -2471,10 +2483,18 @@ class MuseSparkTextForCausalLM(nn.Module):
         target.copy_(loaded_weight)
         return True
 
-    def _track_fp8_piece(self, param, loaded_weight, name: str, key, suffix: str):
-        check_serialized_dtype(param, loaded_weight, name)
+    def _track_fp8_piece(
+        self,
+        *,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        name: str,
+        key: tuple,
+        suffix: str,
+    ) -> None:
+        check_serialized_dtype(param=param, loaded=loaded_weight, name=name)
         if param.dtype == FP8_DTYPE or suffix == "weight_scale":
-            self._fp8_coverage.add(key, suffix)
+            self._fp8_coverage.add(key=key, suffix=suffix)
 
     @torch.no_grad()
     def _check_ptpc_fp8_load(self) -> None:
@@ -2483,8 +2503,8 @@ class MuseSparkTextForCausalLM(nn.Module):
         self._fp8_coverage.check()
         for layer in self.model.layers:
             tag = f"layers.{layer.layer_idx}"
-            for attr in ("qkv_proj", "o_proj"):
-                linear = getattr(layer.self_attn, attr)
+            attn = layer.self_attn
+            for attr, linear in (("qkv_proj", attn.qkv_proj), ("o_proj", attn.o_proj)):
                 rows = linear.weight.shape[0]
                 if linear.weight.dtype != FP8_DTYPE or rows % 16:
                     raise RuntimeError(
@@ -2492,20 +2512,22 @@ class MuseSparkTextForCausalLM(nn.Module):
                         f"got {tuple(linear.weight.shape)} {linear.weight.dtype}"
                     )
                 check_channel_scales(
-                    f"{tag}.self_attn.{attr}.weight_scale", linear.weight_scale, rows
+                    name=f"{tag}.self_attn.{attr}.weight_scale",
+                    scale=linear.weight_scale,
+                    rows=rows,
                 )
             experts = layer.mlp.experts if layer.is_moe_layer else None
             if isinstance(experts, MuseSpark1xFp8Experts):
                 tag = f"{tag}.mlp.experts"
                 check_channel_scales(
-                    f"{tag}.w13_weight_scale",
-                    experts.w13_weight_scale,
-                    experts.w13_weight.shape[1],
+                    name=f"{tag}.w13_weight_scale",
+                    scale=experts.w13_weight_scale,
+                    rows=experts.w13_weight.shape[1],
                 )
                 check_channel_scales(
-                    f"{tag}.w2_weight_scale",
-                    experts.w2_weight_scale,
-                    experts.w2_weight.shape[1],
+                    name=f"{tag}.w2_weight_scale",
+                    scale=experts.w2_weight_scale,
+                    rows=experts.w2_weight.shape[1],
                 )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
@@ -2548,7 +2570,12 @@ class MuseSparkTextForCausalLM(nn.Module):
                     else self.config.num_key_value_heads
                 )
                 if self.fp8_checkpoint:
-                    check_rope_rows(loaded_weight, heads, self.config.head_dim, name)
+                    check_rope_rows(
+                        loaded=loaded_weight,
+                        heads=heads,
+                        head_dim=self.config.head_dim,
+                        name=name,
+                    )
                 loaded_weight = self._deinterleave_rope_halves(loaded_weight, heads)
             for old, new in self._WEIGHT_REMAPS:
                 if old in name:
@@ -2591,7 +2618,11 @@ class MuseSparkTextForCausalLM(nn.Module):
                 if self.fp8_checkpoint:
                     base, _, suffix = candidate.rpartition(".")
                     self._track_fp8_piece(
-                        param, loaded_weight, raw_name, (base, shard_id), suffix
+                        param=param,
+                        loaded_weight=loaded_weight,
+                        name=raw_name,
+                        key=(base, shard_id),
+                        suffix=suffix,
                     )
                 loader = getattr(param, "weight_loader", default_weight_loader)
                 loader(param, loaded_weight, shard_id)
@@ -2609,7 +2640,13 @@ class MuseSparkTextForCausalLM(nn.Module):
                 loaded_weight = loaded_weight.t().contiguous()
             if self.fp8_checkpoint:
                 base, _, suffix = name.rpartition(".")
-                self._track_fp8_piece(param, loaded_weight, raw_name, (base,), suffix)
+                self._track_fp8_piece(
+                    param=param,
+                    loaded_weight=loaded_weight,
+                    name=raw_name,
+                    key=(base,),
+                    suffix=suffix,
+                )
             if ".experts.w" in name:
                 self._copy_expert_stack(param, loaded_weight, name)
             else:

@@ -220,9 +220,7 @@ class TestMuseSparkQuarkPtpcLinear(CustomTestCase):
                 prefix="model.language_model.layers.0.self_attn.o_proj",
                 parallel_group="attn_tp",
             )
-        codes, scale = quantize_rows(
-            torch.randn(HIDDEN, HEADS * HEAD_DIM, device="cuda") * 0.02
-        )
+        codes, scale = _weight(HIDDEN, HEADS * HEAD_DIM)
         self.loaded(layer, [(codes, scale)])
         k = HEADS * HEAD_DIM // TP
         local = codes[:, RANK * k : (RANK + 1) * k]
