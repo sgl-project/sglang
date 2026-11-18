@@ -17,7 +17,9 @@ scripts must too.
 uTLX adds fbtriton's extra ``HIPOptions`` codegen fields (``reverse_local_assignment``
 and friends) but forwards their LLVM flags only through ``llvm.translate_*``, which
 triton-rocm 3.9's ``make_amdgcn`` no longer calls, and it has no ``llvm_cl_opts``.
-``add_missing_hip_options`` fills both gaps. uTLX also lacks fbtriton's intra-wave
+``add_missing_hip_options`` fills both gaps. ROCm Triton release/3.8 (the
+``BUILD_UTLX=1`` build in ``docker/rocm.Dockerfile``) still compiles through
+``llvm.translate_*``, so there only ``llvm_cl_opts`` is missing. uTLX also lacks fbtriton's intra-wave
 ``tlx.warp_pipeline_stage`` scope; see ``inline_intra_wave_pipeline_stages``.
 """
 
@@ -88,6 +90,21 @@ def add_missing_hip_options() -> None:
     hip.HIPOptions = HIPOptions
 
     orig_make_amdgcn = hip.HIPBackend.make_amdgcn
+    if not hasattr(hip, "compile_amdgpu"):
+        # ROCm Triton 3.8: make_amdgcn hands its flags to llvm.translate_*, where uTLX
+        # already appends its codegen flags; add llvm_cl_opts there.
+        hip.llvm = _ClOptsLLVM(hip.llvm)
+
+        def make_amdgcn_38(src, metadata, options):
+            cl_opts = (f"{name}={value}" for name, value in options.llvm_cl_opts)
+            token = _llvm_flags.set(tuple(cl_opts))
+            try:
+                return orig_make_amdgcn(src, metadata, options)
+            finally:
+                _llvm_flags.reset(token)
+
+        hip.HIPBackend.make_amdgcn = staticmethod(make_amdgcn_38)
+        return
     orig_compile_amdgpu = hip.compile_amdgpu
 
     def make_amdgcn(src, metadata, options):
@@ -102,6 +119,40 @@ def add_missing_hip_options() -> None:
 
     hip.HIPBackend.make_amdgcn = staticmethod(make_amdgcn)
     hip.compile_amdgpu = compile_amdgpu
+
+
+# The llvm entry points Triton 3.8's make_amdgcn passes its flag list to, fifth positional argument.
+_FLAGGED_LLVM_FUNCS = (
+    "translate_to_mir",
+    "dump_sched_dag",
+    "translate_mir_to_asm",
+    "translate_to_asm",
+)
+
+
+class _ClOptsLLVM:
+    """Stand-in for ``libtriton.llvm`` that appends the active ``llvm_cl_opts``."""
+
+    def __init__(self, llvm):
+        self._llvm = llvm
+
+    def __getattr__(self, name):
+        fn = getattr(self._llvm, name)
+        if name not in _FLAGGED_LLVM_FUNCS:
+            return fn
+
+        def call(src, triple, arch, features, flags, *args, **kwargs):
+            return fn(
+                src,
+                triple,
+                arch,
+                features,
+                [*flags, *_llvm_flags.get()],
+                *args,
+                **kwargs,
+            )
+
+        return call
 
 
 def _parse_llvm_cl_opts(opts) -> tuple[tuple[str, str], ...]:
