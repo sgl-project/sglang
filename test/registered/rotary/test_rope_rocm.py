@@ -134,8 +134,13 @@ class TestDeepseekScalingRotaryEmbeddingHip(CustomTestCase):
         torch.testing.assert_close(
             latent_hip[..., :512], latent[..., :512], atol=0, rtol=0
         )
-        torch.testing.assert_close(q_out, q_ref, atol=4e-2, rtol=1e-2)
-        torch.testing.assert_close(k_out, k_ref, atol=4e-2, rtol=1e-2)
+        # forward_native's neox branch returns an extra leading dimension.
+        torch.testing.assert_close(
+            q_out, q_ref.reshape(q_out.shape), atol=4e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            k_out, k_ref.reshape(k_out.shape), atol=4e-2, rtol=1e-2
+        )
 
     def test_mla_views(self) -> None:
         for is_neox in (False, True):
