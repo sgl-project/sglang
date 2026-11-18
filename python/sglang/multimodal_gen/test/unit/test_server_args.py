@@ -2875,6 +2875,24 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.vae_cpu_offload)
 
+    def test_auto_cosmos3_nano_streams_a_dit_that_overflows_the_card(self):
+        """With no placement flags, Cosmos3-Nano OOMed on every request with 24 GiB
+        free and on the default video request with 32 GiB free."""
+        for memory_gb in (24, 32):
+            with self.subTest(memory_gb=memory_gb):
+                args = self._from_dict_with_pipeline_config(
+                    Cosmos3Config(model_path="nvidia/Cosmos3-Nano"),
+                    memory_gb=memory_gb,
+                    dit_parameter_count=15_200_000_000,
+                    kwargs={
+                        "model_path": "nvidia/Cosmos3-Nano",
+                        "performance_mode": "auto",
+                    },
+                )
+
+                self.assertEqual(args.residency_mode("transformer"), LAYERWISE_OFFLOAD)
+                self.assertEqual(args.layerwise_offload_components[0], "dit")
+
     def test_auto_cosmos3_super_keeps_dit_resident_on_high_memory_gpu(self):
         # Super is a single-DiT pipeline like Nano, so above the threshold the
         # component-offload round trip is pure per-request copy cost.

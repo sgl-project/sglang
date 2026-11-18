@@ -207,6 +207,8 @@ class Cosmos3Config(PipelineConfig):
             else COSMOS3_DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB
         )
         return ModelDeploymentConfig(
+            # under component offload the Nano DiT fits a 32 GB card only for images
+            dit_layerwise_offload_modes=("memory",) if is_nano else (),
             keep_resident_min_available_gb=threshold_gb,
             keep_resident_components=("dit", "vae"),
         )
