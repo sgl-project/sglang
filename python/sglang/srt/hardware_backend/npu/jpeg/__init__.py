@@ -148,11 +148,11 @@ def decode_jpeg(
         device_index = torch.npu.current_device()
     if not supports_device(device_index):
         return None
-    # A3 measurements: small JPEGs may be faster on CPU, depending on its workload.
-    if info.width * info.height <= 104 * 104:
+    # Lower end of the measured crossover for square JPEGs with four CPU threads.
+    if info.width * info.height <= 376 * 376:
         logger.warning_once(
             "NPU JPEG decoding may be slower than CPU/PIL for images "
-            "with up to 10,816 pixels (104x104). "
+            "with up to 141,376 pixels (376x376). "
             "Actual performance depends on CPU configuration and workload."
         )
     with torch.npu.device(device_index):
