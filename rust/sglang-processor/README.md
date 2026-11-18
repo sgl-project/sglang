@@ -187,6 +187,14 @@ kernels, under the recorded Pillow version. `tests/mm_parity.rs` checks the
 expanded ids, offsets, grids, M-RoPE positions and feature bytes of every case,
 over the images in `tests/fixtures/mm_parity/images/`.
 
+### Proposed PCM ingress
+
+Extend the `api.v1` shared-memory transport from
+[#50781](https://github.com/sgl-project/sglang/pull/50781) to engine-owned PCM.
+The native audio integration in [#51205](https://github.com/sgl-project/sglang/pull/51205)
+provides the common processor and scheduler handoff for PCM and decoded WAV.
+The initial target is Qwen3-ASR-0.6B.
+
 ## parser
 
 ```rust
