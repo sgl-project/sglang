@@ -1134,7 +1134,7 @@ pub enum MmFamily {
 pub enum MmResample {
     /// `Qwen2VLImageProcessor` / `…Fast` — torchvision on a uint8 tensor.
     AtenU8,
-    /// `Qwen2VLImageProcessorPil`, behind `--disable-fast-image-processor`.
+    /// `Qwen2VLImageProcessorPil`, behind `--image-processor-backend pil`.
     Pil,
 }
 

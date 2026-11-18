@@ -27,7 +27,8 @@ class TestQwen3VL235BA22B(TestVLMModels):
         0.8,
         "--attention-backend",
         "ascend",
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph",
+        "--disable-prefill-cuda-graph",
         "--tp-size",
         16,
     ]
