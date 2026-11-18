@@ -245,6 +245,7 @@ def _flashinfer_draft_backend(reader, max_context_len, steps=3):
         updater.q_indptr = torch.arange(3, device="cuda", dtype=torch.int32)
         updater.kv_indptr = torch.zeros(3, device="cuda", dtype=torch.int32)
         backend.runner_ids = reader
+        backend.fp8_kv_reader = None
         backend.indices_updater_decode = updater
         backend.device = "cuda"
         backend.q_indptr_decode = updater.q_indptr
