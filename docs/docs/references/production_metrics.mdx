@@ -115,6 +115,45 @@ sglang:spec_num_steps{model_name="meta-llama/Llama-3.1-8B-Instruct"} 3.0
 sglang:spec_num_draft_tokens{model_name="meta-llama/Llama-3.1-8B-Instruct"} 4.0
 ```
 
+## Scheduler load and queueing
+
+Use these metrics alongside request latency to distinguish waiting requests from
+active work. This is a focused operational reference, not an exhaustive list.
+Availability depends on the enabled server features and workload.
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `sglang:num_running_reqs` | Gauge | Requests currently running in the scheduler. |
+| `sglang:num_queue_reqs` | Gauge | Requests waiting for scheduling. |
+| `sglang:gen_throughput` | Gauge | Reported generation rate in tokens per second. |
+| `sglang:cache_hit_rate` | Gauge | Reported prefix-cache hit rate. |
+| `sglang:num_used_tokens` | Gauge | Tokens currently using the KV pool. |
+| `sglang:token_usage` | Gauge | Reported KV token capacity usage. |
+| `sglang:queue_time_seconds` | Histogram | Time requests spend queued, in seconds. |
+| `sglang:num_retracted_reqs` | Gauge | Reported retracted-request count. |
+| `sglang:num_retracted_requests_total` | Counter | Cumulative request retractions. |
+| `sglang:num_grammar_cache_hit_total` | Counter | Grammar-cache hits. |
+
+Use `rate()` with counters to measure changes over time. Gauges describe reported
+state and must not be treated as cumulative counters. For example:
+
+```promql
+sum(rate(sglang:num_retracted_requests_total[5m]))
+```
+
+To inspect queueing latency, aggregate histogram buckets while retaining `le`:
+
+```promql
+histogram_quantile(0.95, sum by (le) (rate(sglang:queue_time_seconds_bucket[5m])))
+```
+
+These queries combine all selected series. Add label filters or grouping for the
+model and scheduler replicas you want to compare. Inspect your `/metrics` output
+for the labels your deployment exports before copying a dashboard query.
+
+The names and types are defined in
+[`metrics_collector.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/observability/metrics_collector.py).
+
 ## Request-level time per output token (TPOT)
 
 `sglang:request_time_per_output_token_seconds` records TPOT once per successfully finished request:
