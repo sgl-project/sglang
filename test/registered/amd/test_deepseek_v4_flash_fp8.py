@@ -6,7 +6,7 @@ Combined accuracy + performance test for DeepSeek-V4-Flash FP8 on MI35x ROCm 7.2
 
 Both tests share a single launched server.
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-flash suite
+Registry: nightly-test-8-gpu-amd-mi35x-deepseek-v4-flash suite
 """
 
 import json
@@ -27,7 +27,7 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=7200, suite="nightly-amd-8-gpu-mi35x-deepseek-v4-flash", nightly=True
+    est_time=7200, suite="nightly-test-8-gpu-amd-mi35x-deepseek-v4-flash", nightly=True
 )
 
 DEEPSEEK_V4_FP8_MODEL_PATH = os.environ.get(

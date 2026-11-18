@@ -377,7 +377,7 @@ def kda_extend_in_graph(
     if meta.track:
         h_track = torch.empty(
             (meta.max_seqs, *ssm_states.shape[1:]),
-            dtype=torch.float32,
+            dtype=ssm_states.dtype if meta.flashinfer is not None else torch.float32,
             device=ssm_states.device,
         )
     if meta.flashinfer is not None:

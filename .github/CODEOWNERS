@@ -12,7 +12,7 @@
 /python/sglang/kernels/ops/attention/linear @yizhang2077 @hebiao064 @yuan-luo
 /python/sglang/kernels/ops/lora @Ying1123 @Fridge003 @lifuhuang @yushengsu-thu @jybsuper
 /python/sglang/kernels/jit/csrc/lora @Ying1123 @Fridge003 @lifuhuang @yushengsu-thu @jybsuper
-/python/sglang/multimodal_gen @mickqian @ping1jing2 @HaiShaw @yichiche @AgainstEntropy @BBuf @triple-mu @kevin-mii @niehen6174 @JackZeng0208
+/python/sglang/multimodal_gen @mickqian @ping1jing2 @HaiShaw @yichiche @AgainstEntropy @BBuf @triple-mu @kevin-mii @niehen6174 @JackZeng0208 @rwang5203
 /python/sglang/multimodal_gen/runtime/cache @DefTruth
 /python/sglang/multimodal_gen/runtime/layers/quantization/ @HaiShaw @BowenBao @OrangeRedeng @TallMessiWu
 /python/sglang/multimodal_gen/test/server/ascend  @ping1jing2 @ssshinigami @Makcum888e @e-martirosian
@@ -63,6 +63,7 @@
 /python/sglang/srt/mem_cache/rust_tree_core @Jialin @hzh0425 @xiezhq-hermann @ispobock @alphabetc1
 /python/sglang/srt/mem_cache/storage/mooncake_store @huangtingwei9988 @stmatengss
 /python/sglang/srt/mem_cache/storage/nixl @iyastreb @ovidiusm @lluki
+/python/sglang/srt/mem_cache/storage/umbp @TianDi101 @Duyi-Wang
 /python/sglang/srt/mem_cache/embedding_*.py @liusy58
 /python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_embedding_store.py @liusy58
 /python/sglang/srt/model_executor @merrymercy @Ying1123 @hnyls2002 @Fridge003 @ispobock
