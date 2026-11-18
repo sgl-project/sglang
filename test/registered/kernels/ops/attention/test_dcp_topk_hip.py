@@ -10,7 +10,6 @@ from sglang.kernels.ops.attention.dsa.dcp_topk_hip import (
     dcp_global_slots_hip,
     dcp_local_candidates_hip,
 )
-from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
@@ -23,6 +22,9 @@ PAGE = 64
 _GARBAGE = 1e30
 # kPer scores per thread stay in registers; a longer local row re-reads the excess
 _REGISTER_SCORES = 16 * 1024
+# a batch whose logits (local rows + 64 below) fit two register blocks runs one block
+# per row; a wider batch runs chunks + merge
+_SINGLE_BLOCK_MAX_LOCAL = 2 * _REGISTER_SCORES - 64
 
 
 def _row_lengths(world: int) -> list[int]:
@@ -98,18 +100,19 @@ def _dcp_topk(scores, world, table, span):
 
 
 @pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
-@pytest.mark.parametrize("chunked", [False, True])
-def test_selects_the_global_topk_slots(chunked):
+@pytest.mark.parametrize("single_block", [True, False], ids=["single-block", "chunked"])
+def test_selects_the_global_topk_slots(single_block):
     """DCP8: the slots of exactly the top-min(len, 2048) global positions, -1 after
     them, whichever local path (copy, radix, register tail, chunks + merge) each
     rank's share takes."""
     world, span = 8, PAGE * 8
     lengths = _row_lengths(world)
+    if single_block:
+        lengths = [n for n in lengths if -(-n // world) <= _SINGLE_BLOCK_MAX_LOCAL]
     gen = torch.Generator().manual_seed(world * 7)
     scores = [_scores(n, gen) for n in lengths]
     table = _page_table(len(lengths), -(-max(lengths) // span), gen)
-    with envs.SGLANG_DSA_DCP_TOPK_CHUNKED.override(chunked):
-        out, num_owners = _dcp_topk(scores, world, table, span)
+    out, num_owners = _dcp_topk(scores, world, table, span)
     out, num_owners, table = out.cpu(), num_owners.cpu(), table.cpu()
     for i, s in enumerate(scores):
         k = min(s.numel(), TOPK)

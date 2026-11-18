@@ -1100,8 +1100,6 @@ class Envs:
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
-    # ROCm: 16..512-row triton_sparse_mla_fwd calls (target verify) run the HIP split-K kernel
-    SGLANG_ROCM_SPARSE_MLA_DECODE_HIP = EnvBool(True)
     # Run the gfx950 TP4 quick all-reduce on the JIT build (quick_all_reduce_hip) instead of
     # sgl-kernel's; off by default, MiniMax-M3.1 turns it on at TP4 under INT4 or INT8.
     SGLANG_ROCM_QUICK_ALL_REDUCE_JIT = EnvBool(False)
@@ -2333,9 +2331,6 @@ class Envs:
     SGLANG_DSA_INDEXER_BF16_LOGITS = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
-    # DCP local top-2048 on HIP: split rows longer than one block's registers over several
-    # blocks, then merge (exact). Set 0 for the single-block-per-row kernel.
-    SGLANG_DSA_DCP_TOPK_CHUNKED = EnvBool(True)
     # DCP8 decode: the indexer's local top-k, candidate exchange, merge and
     # localization in one kernel (DcpFusedTopK, SM100, multicast).
     SGLANG_ENABLE_DSA_DCP_FUSED_TOPK = EnvBool(False)
