@@ -1965,28 +1965,25 @@ def build_hicache_draft_sidecars(
     assert len(draft_device_pools) == 1
     draft_kv_pool = draft_device_pools[0]
     router = draft_kv_pool.layer_router
-    target_window_host = target_window_host_pool(tree_cache)
-    has_swa = router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
-    if not has_swa and (
+    if (
         isinstance(draft_kv_pool, DeepSeekV4TokenToKVPool)
         or draft_kv_pool.follows_target_swa_ids
     ):
         return build_swa_draft_pools(
             draft_kv_pool=draft_kv_pool,
             tree_cache=tree_cache,
-            target_window_host=target_window_host,
+            target_window_host=target_window_host_pool(tree_cache),
         )
-    if not has_swa:
+    if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is None:
         return build_full_draft_pools(
-            draft_kv_pool=draft_kv_pool,
-            tree_cache=tree_cache,
+            draft_kv_pool=draft_kv_pool, tree_cache=tree_cache
         )
     # A hybrid draft keeps full-attention layers next to its SWA layers;
     # both must be restored or the draft reads stale KV after a hit.
     specs, entries = build_swa_draft_pools(
         draft_kv_pool=draft_kv_pool,
         tree_cache=tree_cache,
-        target_window_host=target_window_host,
+        target_window_host=target_window_host_pool(tree_cache),
     )
     if router.routes_to(IdSpaceKind.FULL):
         full_specs, full_entries = build_full_draft_pools(
