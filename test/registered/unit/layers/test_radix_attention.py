@@ -20,9 +20,11 @@ from sglang.srt.model_executor.runner_utils.forward_batch import (
     set_forward_batch,
 )
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    PrefillAttentionState,
     get_prefill_raw_num_tokens,
     is_in_full_prefill_graph,
     prefill_graph_scope,
+    record_prefill_attention_breaks,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -318,6 +320,31 @@ def test_prefill_graph_policy_restores_after_exception():
         assert get_prefill_raw_num_tokens() == 3
     assert not is_in_full_prefill_graph()
     assert get_prefill_raw_num_tokens() is None
+
+
+def test_breakable_attention_records_the_batch_state_it_breaks_on():
+    """Capture must see each break's layer and MHA fields, or BCG replays them unset."""
+    layer = RadixAttention(2, 3, 1.0, 2, 7)
+    batch = make_batch()
+    batch.mha_one_shot = True
+    batch.attn_attend_prefix_cache = False
+    backend = SimpleNamespace(forward=lambda q, *args, **kwargs: torch.zeros_like(q))
+    q = torch.zeros(4, 2, 3)
+    with (
+        attention_scope(batch, backend, raw_num_tokens=2),
+        patch(
+            "sglang.srt.layers.radix_attention.is_in_breakable_cuda_graph",
+            return_value=True,
+        ),
+    ):
+        with record_prefill_attention_breaks() as breaks:
+            layer(q, q, q, batch, key_value_num_tokens=3)
+    assert breaks.layers == {layer}
+    assert breaks.states == {
+        PrefillAttentionState(
+            mha_one_shot=True, mha_return_lse=False, attn_attend_prefix_cache=False
+        )
+    }
 
 
 @pytest.mark.parametrize("mode_name", ["DECODE", "TARGET_VERIFY", "DLLM_EXTEND"])

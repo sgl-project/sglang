@@ -72,7 +72,6 @@ def _runner(dcp_active):
     runner.max_seq_len = None
     runner.backend = SimpleNamespace()
     runner.prefill_backend_name = Backend.BREAKABLE
-    runner.has_mha_companion_layers = False
     runner._is_full_backend = False
     runner._capture_chunked_prefix = False
     runner.use_captured_attn_metadata = False

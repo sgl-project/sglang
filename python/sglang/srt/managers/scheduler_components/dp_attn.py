@@ -458,7 +458,10 @@ def _local_prefill_cuda_graph_vote(
         num_tokens = local_batch.batch_size()
         input_embeds = None
         replace_embeds = None
-        prefix_lens = None
+        # Every converted row carries its context as prefix; a runner that
+        # replays only prefix-free batches must vote eager here, not split from
+        # its peers at forward time.
+        prefix_lens = local_batch.decode_to_extend_prefix_lens()
         return_logprob = False
     else:
         return False

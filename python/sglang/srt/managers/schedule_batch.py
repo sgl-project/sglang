@@ -2936,6 +2936,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.is_prefill_only = False
 
+    def decode_to_extend_prefix_lens(self) -> List[int]:
+        """Each request's prefix once convert_decode_to_extend views it as a
+        1-token extend; the DP vote judges replay on the same view."""
+        return [
+            seq_len - 1 for seq_len in self.seq_lens_cpu[: self.batch_size()].tolist()
+        ]
+
     def convert_decode_to_extend(self):
         """View every decode request as a 1-token extend with its context as
         prefix, making this a plain extend (prefill) batch. Called after the
@@ -2965,7 +2972,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # As in mix_with_running, read prefix and extend length off the batch.
             req.extend_end = seq_len
 
-        self.prefix_lens = [seq_len - 1 for seq_len in seq_lens]
+        self.prefix_lens = self.decode_to_extend_prefix_lens()
         self.extend_lens = [1] * bs
         self.extend_num_tokens = bs
         self.extend_logprob_start_lens = [0] * bs
