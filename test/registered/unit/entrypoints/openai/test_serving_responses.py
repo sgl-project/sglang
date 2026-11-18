@@ -43,6 +43,7 @@ from sglang.srt.entrypoints.openai.serving_responses import (
     OpenAIServingResponses,
     _build_output_text_logprobs,
 )
+from sglang.srt.entrypoints.openai.utils import _build_byte_decoder
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
@@ -1862,6 +1863,141 @@ class BuildOutputTextLogprobsTestCase(CustomTestCase):
         out = _build_output_text_logprobs(meta_info)
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0].top_logprobs, [])
+
+
+_PIECE_OF_BYTE = {b: ch for ch, b in _build_byte_decoder().items()}
+
+
+class _FakeTokenizer:
+    def __init__(self, *, is_byte_level: bool, pieces: dict[int, str]):
+        self.is_byte_level = is_byte_level
+        self._pieces = pieces
+
+    def convert_ids_to_tokens(self, token_id):
+        return self._pieces.get(token_id)
+
+
+def _byte_level_piece(raw: bytes) -> str:
+    return "".join(_PIECE_OF_BYTE[b] for b in raw)
+
+
+# Qwen3 ids: THAI DIGIT ONE (E0 B9 91) is 8158 (E0 B9) + 239 (91), each U+FFFD alone;
+# 240 (92) ends THAI DIGIT TWO, and 40327 is KHO KHWAI.
+# Module-level to outlive the id()-keyed cache.
+_QWEN3_LIKE_TOKENIZER = _FakeTokenizer(
+    is_byte_level=True,
+    pieces={
+        8158: _byte_level_piece(b"\xe0\xb9"),
+        239: _byte_level_piece(b"\x91"),
+        240: _byte_level_piece(b"\x92"),
+        40327: _byte_level_piece("ค".encode("utf-8")),
+    },
+)
+_SENTENCEPIECE_LIKE_TOKENIZER = _FakeTokenizer(is_byte_level=False, pieces={5: "é"})
+
+
+class OutputTextLogprobBytesTestCase(CustomTestCase):
+    """``bytes`` must be the token's own bytes; a byte-level fragment token
+    must not report the UTF-8 of its U+FFFD display text."""
+
+    _FRAGMENT_META_INFO = {
+        "output_token_logprobs": [(-0.1, 8158, "\ufffd"), (-0.2, 239, "\ufffd")],
+        "output_top_logprobs": [
+            [(-0.1, 8158, "\ufffd"), (-2.5, 40327, "ค")],
+            [(-0.2, 239, "\ufffd")],
+        ],
+    }
+
+    def test_byte_level_fragments_report_raw_token_bytes(self):
+        out = _build_output_text_logprobs(
+            self._FRAGMENT_META_INFO, tokenizer=_QWEN3_LIKE_TOKENIZER
+        )
+        self.assertEqual([lp.bytes for lp in out], [[224, 185], [145]])
+        self.assertEqual(b"".join(bytes(lp.bytes) for lp in out), "๑".encode("utf-8"))
+        self.assertEqual(
+            [(top.logprob, top.bytes) for top in out[0].top_logprobs],
+            [(-0.1, [224, 185]), (-2.5, [224, 184, 132])],
+        )
+        self.assertEqual(out[1].top_logprobs[0].bytes, [145])
+        # The display text is unchanged; only ``bytes`` is recovered.
+        self.assertEqual([lp.token for lp in out], ["\ufffd", "\ufffd"])
+
+    def test_fragment_candidates_in_one_top_list_are_all_kept(self):
+        """Fragment candidates all display as U+FFFD;
+        each one must keep its own entry, logprob and bytes instead of collapsing."""
+        out = _build_output_text_logprobs(
+            {
+                "output_token_logprobs": [(-0.2, 239, "\ufffd")],
+                "output_top_logprobs": [
+                    [(-0.2, 239, "\ufffd"), (-1.7, 240, "\ufffd"), (-3.0, 40327, "ค")]
+                ],
+            },
+            tokenizer=_QWEN3_LIKE_TOKENIZER,
+        )
+        self.assertEqual(
+            [(top.token, top.logprob, top.bytes) for top in out[0].top_logprobs],
+            [
+                ("\ufffd", -0.2, [145]),
+                ("\ufffd", -1.7, [146]),
+                ("ค", -3.0, [224, 184, 132]),
+            ],
+        )
+
+    def test_non_byte_level_tokenizer_keeps_display_text_bytes(self):
+        # U+00E9 is also the GPT-2 byte-level piece for byte 233, so decoding
+        # it through the byte table here would corrupt it to [233].
+        out = _build_output_text_logprobs(
+            {
+                "output_token_logprobs": [(-0.3, 5, "é")],
+                "output_top_logprobs": [[(-0.3, 5, "é")]],
+            },
+            tokenizer=_SENTENCEPIECE_LIKE_TOKENIZER,
+        )
+        self.assertEqual(out[0].bytes, [195, 169])
+        self.assertEqual(out[0].top_logprobs[0].bytes, [195, 169])
+
+    def test_full_response_recovers_fragment_bytes(self):
+        serving = make_serving()
+        serving.tokenizer_manager.tokenizer = _QWEN3_LIKE_TOKENIZER
+        context = SimpleContext()
+        context.last_output = {
+            "text": "๑",
+            "meta_info": {
+                "prompt_tokens": 3,
+                "completion_tokens": 2,
+                **self._FRAGMENT_META_INFO,
+            },
+        }
+        request = ResponsesRequest(
+            model="x",
+            input="count in Thai digits",
+            request_id="resp_logprob_bytes",
+            store=False,
+            include=["message.output_text.logprobs"],
+            top_logprobs=2,
+        )
+
+        async def empty_generator():
+            for _ in ():
+                yield None
+
+        response = asyncio.run(
+            serving.responses_full_generator(
+                request,
+                sampling_params={},
+                result_generator=empty_generator(),
+                context=context,
+                model_name="x",
+                tokenizer=serving.tokenizer_manager.tokenizer,
+                request_metadata=RequestResponseMetadata(request_id=request.request_id),
+                created_time=123,
+                require_reasoning=False,
+            )
+        )
+
+        [message] = [i for i in response.output if i.type == "message"]
+        logprobs = message.content[0].logprobs
+        self.assertEqual([lp.bytes for lp in logprobs], [[224, 185], [145]])
 
 
 class ChatToolChoiceConversionTestCase(CustomTestCase):
