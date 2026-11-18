@@ -9,7 +9,6 @@ The BMM absorb steps stay module level to keep ROCm kernel selection localized.
 
 from __future__ import annotations
 
-import functools
 import logging
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -50,11 +49,9 @@ from sglang.srt.lora.deepseek_mla_correction import (
     is_kv_b_lora_active,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
-from sglang.srt.mem_cache.kv.router import KVLayer
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
-    get_attn_backend,
     get_kv_layers,
     get_token_to_kv_pool,
 )
@@ -88,7 +85,9 @@ logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.memory_pool import KVCache
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+    from sglang.srt.models.kimi_k3_rocm_mla import KimiK3RocmMlaQCacheWriter
 
 if _use_aiter:
     # On gfx1250 the aiter `module_fused_qk_norm_rope_cache_quant_shuffle` kernel
@@ -445,17 +444,15 @@ def rocm_absorb_v_bmm(
     return attn_bmm_output
 
 
-def _mla_cache_write_target(
-    *, layer_id: int, out_cache_loc: torch.Tensor
-) -> Tuple[KVLayer, torch.Tensor]:
-    kv_pool = get_token_to_kv_pool()
+def _mla_cache_slot_mapping(
+    *, kv_pool: KVCache, out_cache_loc: torch.Tensor
+) -> torch.Tensor:
+    """out_cache_loc as the slot_mapping a fused AITER MLA cache write takes."""
     if isinstance(kv_pool, HiSparseDSATokenToKVPool):
         # The fused write bypasses set_mla_kv_buffer()'s logical-to-device mapping.
         out_cache_loc = kv_pool.translate_loc_to_hisparse_device(out_cache_loc)
     # AITER reads slot_mapping with stride 1, including on the resident path.
-    out_cache_loc = out_cache_loc.contiguous()
-    kv_layer = kv_pool.layer_router.read(layer_id)
-    return kv_layer, out_cache_loc
+    return out_cache_loc.contiguous()
 
 
 def _fused_rope_cat_and_cache(
@@ -490,16 +487,16 @@ def _fused_rope_cat_and_cache(
         cos, sin = attn.rotary_emb.cos_sin_cache.chunk(2, dim=-1)
     else:
         cos, sin = attn.rotary_emb.cos_cache, attn.rotary_emb.sin_cache
-    layer_id = attn.attn_mqa.layer_id
-    kv_layer, out_cache_loc = _mla_cache_write_target(
-        layer_id=layer_id, out_cache_loc=out_cache_loc
+    kv_pool = get_token_to_kv_pool()
+    out_cache_loc = _mla_cache_slot_mapping(
+        kv_pool=kv_pool, out_cache_loc=out_cache_loc
     )
     return fused_qk_rope_cat_and_cache_mla(
         q_nope_out,
         q_pe,
         k_nope,
         k_pe,
-        kv_layer.key(),
+        kv_pool.layer_router.read(attn.attn_mqa.layer_id).key(),
         out_cache_loc,
         positions,
         cos,
@@ -587,6 +584,10 @@ class DeepseekMLARocmForwardMixin:
     mixin's forward methods to support MLA_ROCM. ROCm dense MHA preparation
     does dispatch ``run_mla_indexer``.
     """
+
+    # Model-installed writer for the absorbed decode Q and latent KV cache;
+    # None keeps the split rope/concat/cache chain.
+    rocm_mla_q_cache_writer: Optional[KimiK3RocmMlaQCacheWriter] = None
 
     def forward_absorb_rocm_prepare(
         self: DeepseekV2AttentionMLA,
@@ -1257,32 +1258,24 @@ class DeepseekMLARocmForwardMixin:
             or not (mode.is_decode() or mode.is_target_verify())
         ):
             return None
-        kv_layer, slot_mapping = _mla_cache_write_target(
-            layer_id=self.attn_mqa.layer_id, out_cache_loc=forward_batch.out_cache_loc
-        )
+        kv_pool = get_token_to_kv_pool()
+        kv_layer = kv_pool.layer_router.read(self.attn_mqa.layer_id)
         # The writer scatters at out_cache_loc; KVLayer.store writes there only for
         # the owner sub-pool, and at the batch's swa_loc for any other.
         if not kv_layer.owner:
             return None
-        # The writer calls this only on its HIP path, after its own backend, scale
-        # and shape checks, so a write it declines early allocates no fp8 buffer.
-        get_fp8_q_out = functools.partial(
-            get_attn_backend().mla_fp8_q_out,
-            forward_batch=forward_batch,
-            num_tokens=q_nope_out.shape[0],
-            head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
-        )
         return self.rocm_mla_q_cache_writer.write(
             q_nope=q_nope_out,
             q_pe=q_pe,
             k_nope=k_nope,
             k_pe=k_pe,
-            slot_mapping=slot_mapping,
+            slot_mapping=_mla_cache_slot_mapping(
+                kv_pool=kv_pool, out_cache_loc=forward_batch.out_cache_loc
+            ),
             kv_cache=kv_layer.key(),
             k_scale_float=self.attn_mqa.k_scale_float,
             attention_backend=self.current_attention_backend,
             is_target_verify=mode.is_target_verify(),
-            get_fp8_q_out=get_fp8_q_out,
         )
 
     def _dcp_q_gather_dtype(self: DeepseekV2AttentionMLA) -> Optional[torch.dtype]:

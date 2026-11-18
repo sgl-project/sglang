@@ -13,23 +13,27 @@
 # ==============================================================================
 """Kimi-K3 ROCm MLA decode: write the query and the latent KV cache in one launch.
 
-K3 MLA applies no RoPE. The gfx950 HIP op has only a RoPE form, so it runs against
-one-row identity cos/sin tables with all-zero positions; the Triton fallback uses
-AITER's no-RoPE kernel.
+K3 MLA applies no RoPE. The writer runs AITER's fused RoPE/concat/cache kernel, the
+one DeepSeek MLA uses on ROCm (rocm_linear_utils), against one-row identity cos/sin
+tables with all-zero positions, which leaves Q and the cache bytes equal to the
+split concat/cache chain's.
 """
 
 from typing import Callable, Optional, Tuple
 
 import torch
-from torch import nn
 
-from sglang.kernels.ops.attention import (
-    mla_q_cache_aiter_hip,
-    mla_q_cache_aiter_triton,
-)
+from sglang.kernels.arch import current_arch
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_buffer
 from sglang.srt.utils.device import is_device_stream_capturing
-from sglang.srt.utils.log_utils import print_warning_once
+from sglang.srt.utils.log_utils import print_info_once
+
+_KV_LORA_RANK = 512
+_ROPE_HEAD_DIM = 64
+# SGLang's MLA pool is [slots, 1, 576]; the kernel takes BF16 or e4m3fn (gfx950's
+# FP8) and asserts on anything else.
+_CACHE_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
 
 # With save_kv_cache=False, these backends read only the BF16 Q and the KV cache;
 # Triton target-verify runs its extend kernel, which also reads k.
@@ -37,83 +41,113 @@ _DECODE_BACKENDS = frozenset({"aiter", "triton"})
 _TARGET_VERIFY_BACKENDS = frozenset({"aiter"})
 
 
-class _ZeroPositions:
-    """Int64 zeros that every K3 MLA layer passes as the identity-RoPE positions.
+class _IdentityRope:
+    """The identity-RoPE inputs every K3 MLA layer shares: one-row cos = 1 and
+    sin = 0 tables, a unit scale, and int64 zero positions.
 
-    Only eager steps lease or grow the buffer; the graph runner's eager warmups before
-    each capture size it, so a capture never allocates.
+    Only eager steps allocate or grow them; the graph runner's eager warmups before
+    each capture size the positions, so a capture never allocates.
     """
 
     def __init__(self) -> None:
-        self.buf: Optional[torch.Tensor] = None
+        self.tables: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+        self.positions: Optional[torch.Tensor] = None
         self.retired: list[torch.Tensor] = []
 
-    def get(self, tokens: int, device: torch.device) -> Optional[torch.Tensor]:
-        """The first `tokens` zeros, or None inside a capture the warmup did not size."""
-        buf = self.buf
-        if buf is None or buf.numel() < tokens or buf.device != device:
+    def get(
+        self, *, tokens: int, half_rope_dim: int, device: torch.device
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """(cos, sin, unit scale, the first `tokens` zero positions), or None inside
+        a capture the warmup did not size."""
+        positions = self.positions
+        grow = (
+            positions is None
+            or positions.device != device
+            or positions.numel() < tokens
+        )
+        new_tables = self.tables is None or self.tables[0].device != device
+        if grow or new_tables:
             if is_device_stream_capturing(device):
                 return None
-            if buf is not None:
-                # Captured graphs keep reading the old pointer;
-                # power-of-two growth keeps retired buffers smaller than the live one.
-                self.retired.append(buf)
+            # Captured graphs keep reading the old pointers.
+            if grow and positions is not None:
+                self.retired.append(positions)
+            if new_tables and self.tables is not None:
+                self.retired.extend(self.tables)
+        if grow:
+            # Power-of-two growth keeps retired buffers smaller than the live one.
             rows = 1 << (tokens - 1).bit_length()
-            self.buf = buf = torch.zeros((rows,), dtype=torch.int64, device=device)
-        return buf[:tokens]
+            self.positions = positions = torch.zeros(
+                (rows,), dtype=torch.int64, device=device
+            )
+        if new_tables:
+            self.tables = (
+                torch.ones((1, half_rope_dim), dtype=torch.bfloat16, device=device),
+                torch.zeros((1, half_rope_dim), dtype=torch.bfloat16, device=device),
+                torch.ones((1,), dtype=torch.float32, device=device),
+            )
+        return (*self.tables, positions[:tokens])
+
+
+def fused_q_cache_available() -> bool:
+    """Whether the fused write runs here: gfx950 with SGLANG_USE_AITER=1, the only
+    target it was measured on."""
+    if not (
+        envs.SGLANG_USE_AITER.get()
+        and torch.version.hip is not None
+        and torch.cuda.is_available()
+    ):
+        return False
+    hip = current_arch().hip
+    return hip is not None and hip.gcn_arch == "gfx950"
 
 
 def create_q_cache_writer(
     *, kv_lora_rank: int, qk_rope_head_dim: int
 ) -> Optional["KimiK3RocmMlaQCacheWriter"]:
-    """The writer for this device, or None where neither fused kernel can run."""
-    use_hip = mla_q_cache_aiter_hip.available()
-    use_triton = mla_q_cache_aiter_triton.available()
-    if not (use_hip or use_triton):
-        print_warning_once(
-            "Kimi-K3 MLA Q/cache fusion: no fused kernel for this device or AITER "
-            "build (the HIP op needs gfx950, the no-RoPE Triton kernel is missing on "
-            "gfx1250 and older AITER); keeping the split chain."
-        )
+    """The writer where the fused kernel runs, else None, which keeps the split
+    chain."""
+    if (kv_lora_rank, qk_rope_head_dim) != (
+        _KV_LORA_RANK,
+        _ROPE_HEAD_DIM,
+    ) or not fused_q_cache_available():
         return None
+    # rocm_linear_utils imports AITER at module level.
+    from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
+
+    print_info_once(
+        "Kimi-K3 MLA: decode and target-verify write Q and the latent KV cache "
+        "in one AITER launch (fused_qk_rope_cat_and_cache_mla)"
+    )
     return KimiK3RocmMlaQCacheWriter(
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
-        use_hip=use_hip,
-        use_triton=use_triton,
+        fused_rope_cat_and_cache=fused_qk_rope_cat_and_cache_mla,
     )
 
 
-class KimiK3RocmMlaQCacheWriter(nn.Module):
+def _supports_cache(kv_cache: torch.Tensor) -> bool:
+    """Whether the kernel can write this KV cache: the [slots, 1, 576] MLA pool in
+    BF16 or e4m3fn. A paged 4D cache would be indexed as one slot per block."""
+    return (
+        kv_cache.ndim == 3
+        and kv_cache.shape[1] == 1
+        and kv_cache.shape[2] == _KV_LORA_RANK + _ROPE_HEAD_DIM
+        and kv_cache.dtype in _CACHE_DTYPES
+    )
+
+
+class KimiK3RocmMlaQCacheWriter:
     def __init__(
         self,
         *,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
-        use_hip: bool,
-        use_triton: bool,
+        fused_rope_cat_and_cache: Callable[..., Tuple[torch.Tensor, ...]],
     ) -> None:
-        super().__init__()
-        self._kv_lora_rank = kv_lora_rank
-        self._qk_rope_head_dim = qk_rope_head_dim
+        self._fused_rope_cat_and_cache = fused_rope_cat_and_cache
         self._head_dim = kv_lora_rank + qk_rope_head_dim
-        # The HIP op is preferred; the Triton kernel takes the inputs it rejects.
-        self._use_hip = use_hip
-        self._use_triton = use_triton
-        half_rope_dim = qk_rope_head_dim // 2
-        self.register_buffer(
-            "_identity_cos",
-            torch.ones((1, half_rope_dim), dtype=torch.bfloat16),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_identity_sin",
-            torch.zeros((1, half_rope_dim), dtype=torch.bfloat16),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_unit_scale", torch.ones((1,), dtype=torch.float32), persistent=False
-        )
+        self._half_rope_dim = qk_rope_head_dim // 2
 
     def write(
         self,
@@ -127,54 +161,35 @@ class KimiK3RocmMlaQCacheWriter(nn.Module):
         k_scale_float: Optional[float],
         attention_backend: str,
         is_target_verify: bool,
-        get_fp8_q_out: Optional[
-            Callable[[], Optional[Tuple[torch.Tensor, torch.Tensor]]]
-        ] = None,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Return (q, k placeholder) after writing Q and the KV cache,
-        or None to leave both to the split rope/concat/cache chain.
-
-        ``get_fp8_q_out`` calls the attention backend's ``mla_fp8_q_out``, only on
-        the HIP path: q is then written to that buffer in FP8, and the padded buffer
-        is returned as q.
-        """
+        or None to leave both to the split rope/concat/cache chain."""
         backends = _TARGET_VERIFY_BACKENDS if is_target_verify else _DECODE_BACKENDS
         if (
-            attention_backend not in backends
+            # An idle rank has nothing to write.
+            q_nope.shape[0] == 0
+            or attention_backend not in backends
             # The split chain's AITER write casts without the scale,
             # its Triton decode write divides by it; they agree only at 1.
             or k_scale_float not in (None, 1.0)
-            or not self._shapes_match(
-                q_nope=q_nope,
-                q_pe=q_pe,
-                k_nope=k_nope,
-                k_pe=k_pe,
-                slot_mapping=slot_mapping,
-            )
+            or not _supports_cache(kv_cache)
         ):
             return None
-
-        kernel_args = dict(
+        if slot_mapping.stride(0) != 1:
+            # The kernel indexes slot_mapping without a stride; the caller makes it
+            # contiguous, so this is a contract violation, not a fallback.
+            raise ValueError(
+                f"slot_mapping must be contiguous, got stride {slot_mapping.stride()}"
+            )
+        q = self._write_fused(
             q_nope=q_nope,
             q_pe=q_pe,
             k_nope=k_nope,
             k_pe=k_pe,
             kv_cache=kv_cache,
             slot_mapping=slot_mapping,
-            k_scale=self._unit_scale,
         )
-        q = (
-            self._write_hip(kernel_args=kernel_args, get_fp8_q_out=get_fp8_q_out)
-            if self._use_hip
-            else None
-        )
-        if q is None and self._use_triton:
-            q = mla_q_cache_aiter_triton.run(**kernel_args)
         if q is None:
-            print_warning_once(
-                "Kimi-K3 MLA Q/cache fusion: inputs are outside the fused kernels' "
-                "contract (dtype, stride or cache layout); keeping the split chain."
-            )
             return None
         # The KV cache is already written; attention reads only the shape of k.
         k_placeholder = torch.empty(
@@ -184,57 +199,39 @@ class KimiK3RocmMlaQCacheWriter(nn.Module):
         )
         return q, k_placeholder
 
-    def _shapes_match(
+    def _write_fused(
         self,
         *,
         q_nope: torch.Tensor,
         q_pe: torch.Tensor,
         k_nope: torch.Tensor,
         k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
-    ) -> bool:
-        tokens, num_heads = q_nope.shape[0], q_nope.shape[1]
-        return (
-            tokens > 0
-            and q_nope.shape == (tokens, num_heads, self._kv_lora_rank)
-            and q_pe.shape == (tokens, num_heads, self._qk_rope_head_dim)
-            and k_nope.shape == (tokens, 1, self._kv_lora_rank)
-            and k_pe.shape == (tokens, 1, self._qk_rope_head_dim)
-            and slot_mapping.shape == (tokens,)
-        )
-
-    def _write_hip(
-        self,
-        *,
-        kernel_args: dict,
-        get_fp8_q_out: Optional[
-            Callable[[], Optional[Tuple[torch.Tensor, torch.Tensor]]]
-        ],
     ) -> Optional[torch.Tensor]:
-        q_nope = kernel_args["q_nope"]
-        tokens, num_heads = q_nope.shape[0], q_nope.shape[1]
-        # The identity tables have one row and not every AITER build clamps positions
-        # in every kernel, so every token reads row 0.
-        positions = get_buffer("kimi_k3_mla_zero_positions", _ZeroPositions).get(
-            tokens=tokens, device=q_nope.device
+        """Q from the fused launch, or None inside a capture the eager warmup did
+        not size the zero positions for."""
+        # The identity tables have one row, so every token reads row 0.
+        rope = get_buffer("kimi_k3_mla_identity_rope", _IdentityRope).get(
+            tokens=q_nope.shape[0],
+            half_rope_dim=self._half_rope_dim,
+            device=q_nope.device,
         )
-        if positions is None:
+        if rope is None:
             return None
-        fp8_q_out = None if get_fp8_q_out is None else get_fp8_q_out()
-        if fp8_q_out is None:
-            q_out = torch.empty(
-                (tokens, num_heads, self._head_dim),
-                dtype=q_nope.dtype,
-                device=q_nope.device,
-            )
-            q_scale = self._unit_scale
-        else:
-            q_out, q_scale = fp8_q_out
-        return mla_q_cache_aiter_hip.run(
-            **kernel_args,
-            positions=positions,
-            cos_cache=self._identity_cos,
-            sin_cache=self._identity_sin,
-            out=q_out,
-            q_scale=q_scale,
+        cos, sin, unit_scale, positions = rope
+        q, _, _, _ = self._fused_rope_cat_and_cache(
+            q_nope,
+            q_pe,
+            k_nope,
+            k_pe,
+            kv_cache,
+            slot_mapping,
+            positions,
+            cos,
+            sin,
+            unit_scale,
+            True,  # is_neox; identity tables make the layout moot
+            q_out_dtype=q_nope.dtype,
         )
+        return q
