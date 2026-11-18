@@ -19,7 +19,11 @@ from sglang.kernels.ops.quantization.fp4_indexer_quant import (
     quantize_fp4_indexer_tensor,
 )
 from sglang.kernels.ops.quantization.fp4_to_fp8 import widen_fp4_to_fp8
-from sglang.srt.layers.attention.dsv4.v41_indexer import dense_blocks, scoring
+from sglang.srt.layers.attention.dsv4.v41_indexer import (
+    dense_blocks,
+    scoring,
+    sparse_table,
+)
 from sglang.srt.layers.attention.dsv4.v41_indexer.types import PrefillInputs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -395,6 +399,54 @@ class TestDensePrefillIndexer(CustomTestCase):
                     selected, torch.full(shape, -1, dtype=torch.int32, device="cuda")
                 )
                 self.assertEqual(tuple(candidates.blocks.shape), block_shape)
+
+    def test_sparse_publish_reuses_batch_offsets_across_tiles(self):
+        inputs = make_inputs([(33, 511), (65, 4097)])
+        data = prefill_data(inputs)
+        lens = data.compress_lens
+        nblocks = (lens + 7) // 8
+        positions = data.empty_selection(inputs["topk"])
+        blocks = data.empty_selection(8)
+        zeros_like = torch.zeros_like
+
+        def reject_block_offset_allocation(value, *args, **kwargs):
+            if (
+                value.untyped_storage().data_ptr()
+                == nblocks.untyped_storage().data_ptr()
+            ):
+                raise AssertionError("block selection allocated per-tile offsets")
+            return zeros_like(value, *args, **kwargs)
+
+        scores = dense_scores(inputs)
+        with (
+            patch.object(scoring, "_DEEP_GEMM_SCORE_BUDGET_BYTES", 128 << 10),
+            patch.object(
+                torch, "zeros_like", side_effect=reject_block_offset_allocation
+            ),
+        ):
+            sparse_table.select_prefill_rows(
+                data=data,
+                kv=inputs["kv"],
+                nblocks=nblocks,
+                out_positions=positions,
+                out_blocks=blocks,
+            )
+        selected = torch.where(
+            positions >= 0, positions + data.request_starts[:, None], -1
+        )
+        self.assert_topk(inputs, selected, scores)
+        expected = (
+            torch.nn.functional.pad(scores, (0, -scores.shape[1] % 8), value=-torch.inf)
+            .unflatten(1, (-1, 8))
+            .amax(-1)
+        )
+        newest = (lens - 1) // 8
+        expected.scatter_(1, newest[:, None].long(), torch.inf)
+        picked = expected.gather(1, blocks.long().clamp_min(0))
+        picked.masked_fill_(blocks < 0, -torch.inf)
+        torch.testing.assert_close(
+            picked.sort(descending=True).values, expected.topk(blocks.shape[1]).values
+        )
 
     @unittest.skipUnless(torch.cuda.is_available() and is_hopper(), "Hopper scores")
     def test_hopper_consumer_selects_published_blocks(self):

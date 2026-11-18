@@ -345,6 +345,8 @@ def select_prefill_block_ids(
     lens: torch.Tensor,
     nblocks: torch.Tensor,
     out: torch.Tensor,
+    *,
+    offsets: torch.Tensor,
 ) -> None:
     """Select size-8 blocks by their maximum score, keeping the newest block."""
     width = (logits.shape[1] + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
@@ -352,7 +354,7 @@ def select_prefill_block_ids(
         (logits.shape[0], (width + 3) // 4 * 4), dtype=torch.float32
     )
     amax8_varlen(logits, lens, out=keys)
-    topk_ragged(keys, nblocks, out=out, offsets=torch.zeros_like(nblocks))
+    topk_ragged(keys, nblocks, out=out, offsets=offsets)
 
 
 def dense_prefill_topk(

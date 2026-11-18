@@ -518,7 +518,9 @@ def select_prefill_rows(
     for tile, logits in score_tiles(data, kv):
         lens = lens_all[tile]
         topk_ragged(logits, lens, out=out_positions[tile], offsets=zero_offsets[tile])
-        select_prefill_block_ids(logits, lens, nblocks[tile], out_blocks[tile])
+        select_prefill_block_ids(
+            logits, lens, nblocks[tile], out_blocks[tile], offsets=zero_offsets[tile]
+        )
 
 
 # TODO(dark): support fusion of publish + topk of publish layer

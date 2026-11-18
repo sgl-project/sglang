@@ -357,11 +357,14 @@ def _publish_prefill_blocks(
     blocks = torch.full(
         (data.num_rows, width), -1, dtype=torch.int32, device=selected.device
     )
+    zero_offsets = torch.zeros_like(data.compress_lens) if fast_block_topk else None
     for tile, logits in score_tiles(data, kv):
         if fast_block_topk and block_size == CANDIDATE_BLOCK_SIZE and width:
             lens = data.compress_lens[tile]
             nblocks, _ = candidate_row_lens(lens, width)
-            select_prefill_block_ids(logits, lens, nblocks, blocks[tile])
+            select_prefill_block_ids(
+                logits, lens, nblocks, blocks[tile], offsets=zero_offsets[tile]
+            )
         else:
             _publish_tile_blocks(
                 data=data,
