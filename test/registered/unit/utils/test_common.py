@@ -8,7 +8,9 @@ from unittest import mock
 import torch
 from PIL import Image
 
+from sglang.srt.environ import envs
 from sglang.srt.multimodal.media_io import _load_image
+from sglang.srt.utils import gc_utils
 from sglang.srt.utils.common import flatten_arrays_to_int64_tensor
 from sglang.srt.utils.device import (
     _get_device_sm_via_nvml,
@@ -19,7 +21,7 @@ from sglang.srt.utils.device import (
     is_gfx1250_supported,
     is_hip,
 )
-from sglang.srt.utils.gc_utils import freeze_gc
+from sglang.srt.utils.gc_utils import configure_gc_logging, freeze_gc
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -304,6 +306,55 @@ class TestFreezeGc(CustomTestCase):
     def test_applies_configured_threshold(self):
         freeze_gc("test", [700, 10, 1000])
         self.assertEqual(gc.get_threshold(), (700, 10, 1000))
+
+
+class TestGcWarning(CustomTestCase):
+    def _install_callback(self, threshold_secs):
+        before = list(gc.callbacks)
+        with (
+            mock.patch.object(
+                gc_utils,
+                "get_observability",
+                return_value=mock.Mock(gc_warning_threshold_secs=threshold_secs),
+            ),
+            envs.SGLANG_LOG_GC.override(False),
+        ):
+            configure_gc_logging("test")
+        added = [cb for cb in gc.callbacks if cb not in before]
+        for cb in added:
+            self.addCleanup(gc.callbacks.remove, cb)
+        return added
+
+    def test_long_pass_warns_without_walking_the_heap(self):
+        (callback,) = self._install_callback(0.01)
+        info = {"generation": 2, "collected": 5, "uncollectable": 1}
+        with (
+            mock.patch.object(gc_utils.time, "perf_counter", side_effect=[0.0, 0.5]),
+            mock.patch.object(
+                gc_utils, "gc_object_counts", side_effect=AssertionError("walked")
+            ),
+            self.assertLogs(gc_utils.logger, level="WARNING") as logs,
+        ):
+            callback("start", info)
+            callback("stop", info)
+        (message,) = logs.output
+        self.assertIn("Generation 2", message)
+        self.assertIn("Duration: 0.5000s", message)
+        self.assertIn("Collected: 5 | Uncollectable: 1", message)
+
+    def test_short_pass_does_not_warn(self):
+        (callback,) = self._install_callback(1.0)
+        info = {"generation": 0, "collected": 0, "uncollectable": 0}
+        with (
+            mock.patch.object(gc_utils.time, "perf_counter", side_effect=[0.0, 0.5]),
+            mock.patch.object(gc_utils.logger, "warning") as warning,
+        ):
+            callback("start", info)
+            callback("stop", info)
+        warning.assert_not_called()
+
+    def test_disabled_installs_no_callback(self):
+        self.assertEqual(self._install_callback(0), [])
 
 
 if __name__ == "__main__":
