@@ -55,7 +55,6 @@ from sglang.kernels.ops.attention.kv_indices import (
 from sglang.srt.configs.model_config import is_kimi_k31, is_qwen4_exp
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
-from sglang.srt.layers.attention.dsa import capture_slots_hip
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 from sglang.srt.layers.cp.bcg.bcg import (
@@ -1692,7 +1691,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         for seq_len in capture_seq_lens[:-1]:
             capture_start_locs.append(capture_start_locs[-1] + seq_len)
         if self._kimi_k31_rocm_bcg:
-            capture_slots_hip.fill_by_dcp_owner(self.model_runner, capture_seq_lens)
+            from sglang.srt.layers.attention.dsa.dsa_dcp_sharded_hip import (
+                fill_capture_slots_by_dcp_owner,
+            )
+
+            fill_capture_slots_by_dcp_owner(self.model_runner, capture_seq_lens)
 
         with torch.device(self.device):
             shape_inputs = {
