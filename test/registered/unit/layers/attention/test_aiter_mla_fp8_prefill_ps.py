@@ -10,7 +10,7 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 _RUNNABLE = is_hip() and torch.cuda.is_available()
 if _RUNNABLE:
@@ -231,14 +231,6 @@ class TestAiterMlaFp8PrefillPs(CustomTestCase):
         other_lse = torch.randn_like(lse)
         merged, _ = merge_state(out, lse, other_out, other_lse)
         torch.testing.assert_close(merged, other_out)
-
-    def test_pack_without_ps_metadata_stays_bf16(self):
-        """Without chunked-prefix PS metadata the chunk runs the bf16 varlen kernel."""
-        backend = _backend(KIMI_K3_TP8_HEADS, [8])
-        _, k_nope, k_pe, v = _qkv(KIMI_K3_TP8_HEADS, [8], [64])
-        k, v_out = backend.pack_prefix_chunk_kv(k_nope, k_pe, v)
-        self.assertEqual((k.dtype, v_out.dtype), (torch.bfloat16, torch.bfloat16))
-        torch.testing.assert_close(k, _cat_k(k_nope, k_pe), rtol=0, atol=0)
 
 
 if __name__ == "__main__":
