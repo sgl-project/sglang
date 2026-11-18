@@ -17,7 +17,7 @@ import triton.language as tl
         triton.Config({"BLOCK_M": 64}, num_stages=5, num_warps=1),
     ],
     key=[
-        "n_loc",
+        "n_loc_bucket",
         "nope_dim",
         "rope_dim",
         "buffer_stride",
@@ -31,7 +31,7 @@ import triton.language as tl
         "SINGLE_TILE": lambda a: a["n_loc"] <= a["BLOCK_M"] * a["core_count"],
     }
 )
-@triton.jit
+@triton.jit(do_not_specialize=["n_loc", "n_loc_bucket"])
 def _get_mla_kv_buffer_kernel(
     kv_buffer_ptr,
     cache_k_nope_ptr,
@@ -43,6 +43,7 @@ def _get_mla_kv_buffer_kernel(
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
     n_loc,
+    n_loc_bucket,
     core_count: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -92,6 +93,10 @@ def get_mla_kv_buffer_mlu(
     n_loc = loc.numel()
     if n_loc == 0:
         return
+    # Split each power-of-two interval in two to bound tuning without
+    # sharing one configuration across a full 2x change in row count.
+    bucket_size = max(1, triton.next_power_of_2(n_loc) // 4)
+    n_loc_bucket = triton.cdiv(n_loc, bucket_size) * bucket_size
     # Each program loops over row tiles, avoiding a token-count-sized grid.
     grid = lambda meta: (min(triton.cdiv(n_loc, meta["BLOCK_M"]), core_count),)
     _get_mla_kv_buffer_kernel[grid](
@@ -105,5 +110,6 @@ def get_mla_kv_buffer_mlu(
         cache_k_nope.shape[-1],
         cache_k_rope.shape[-1] if cache_k_rope is not None else 0,
         n_loc,
+        n_loc_bucket,
         core_count,
     )
