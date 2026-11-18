@@ -143,8 +143,8 @@ pub trait MmProcessor: Send + Sync {
     }
 
     /// Finish item layout after caller hash overrides, before feature publication.
-    /// An item whose feature or metadata changes here must not keep a
-    /// precomputed `identity`.
+    /// An item whose feature, auxiliary tensors, or metadata change here must
+    /// not keep a precomputed `identity`.
     fn finalize(&self, _entry: &mut MmEncodedEntry) -> Result<(), String> {
         Ok(())
     }
@@ -238,6 +238,7 @@ fn encode_output(output: MmOutput) -> Result<MmProcessOutput, String> {
                         Ok((name, meta))
                     })
                     .collect::<Result<_, String>>()?,
+                auxiliary_tensors: Default::default(),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -374,15 +375,27 @@ fn place_features(
 }
 
 /// The ring's named buffers for one result: the per-item features (see
-/// [`place_features`]), the M-RoPE positions, and the `mm.meta` sidecar --
-/// always last, so a reader that finds it knows the rest is present.
+/// [`place_features`]), inline auxiliary tensors, the M-RoPE positions, and
+/// the `mm.meta` sidecar, always last.
 fn make_buffers(entry: MmEncodedEntry, feature_shm: bool) -> Result<Vec<Buffer>, String> {
     let meta = MmMeta::of(&entry)?.encode()?;
     let MmEncodedEntry { items, mrope, .. } = entry;
-    let features = items.into_iter().map(|item| item.feature).collect();
+    let mut features = Vec::with_capacity(items.len());
+    let mut auxiliary = Vec::new();
+    for (index, item) in items.into_iter().enumerate() {
+        features.push(item.feature);
+        for (ordinal, tensor) in item.auxiliary_tensors.into_values().enumerate() {
+            auxiliary.push(Buffer::inline_shaped(
+                format!("mm.aux.{index}.{ordinal}"),
+                tensor.shape,
+                tensor_data(tensor.data),
+            )?);
+        }
+    }
     let mut buffers = place_features(features, feature_shm, |_| {
         crate::utils::shm::unique_name("mm")
     });
+    buffers.extend(auxiliary);
     if let Some(mrope) = mrope {
         let len = mrope.positions.len() / 3;
         buffers.push(Buffer::inline_shaped(
@@ -563,6 +576,7 @@ mod tests {
                             "clip_index".to_owned(),
                             MmMetaValue::Int(3),
                         )]),
+                        auxiliary_tensors: BTreeMap::new(),
                     }],
                     token_ids: None,
                     mrope: None,
@@ -666,6 +680,7 @@ mod tests {
                 "image_grid_thw".to_owned(),
                 MmMetaValue::Ints(grid.to_vec()),
             )]),
+            auxiliary_tensors: BTreeMap::new(),
         };
         MmEncodedEntry {
             items: vec![
@@ -730,6 +745,49 @@ mod tests {
         );
         assert_eq!(get(&meta, "mrope_delta").as_i64(), Some(-1));
         assert!(get(&meta, "token_ids").is_nil());
+    }
+
+    #[test]
+    fn audio_mask_reaches_the_scheduler_with_shape_dtype_and_identity() {
+        let mut entry = qwen_entry();
+        entry.items.truncate(1);
+        let item = &mut entry.items[0];
+        item.modality = MmModality::Audio;
+        item.model_specific_data.clear();
+        let without_mask = item.hash_identity().unwrap();
+        item.auxiliary_tensors.insert(
+            "feature_attention_mask".into(),
+            Tensor {
+                shape: vec![1, 2],
+                data: TensorData::I64(vec![1, 0]),
+            },
+        );
+        assert_ne!(item.hash_identity().unwrap(), without_mask);
+        let mask = item
+            .auxiliary_tensors
+            .get_mut("feature_attention_mask")
+            .unwrap();
+        mask.shape = vec![1, 3];
+        assert!(entry.validate(3).is_err());
+        entry.items[0]
+            .auxiliary_tensors
+            .get_mut("feature_attention_mask")
+            .unwrap()
+            .shape = vec![1, 2];
+        entry.validate(3).unwrap();
+        entry.resolve_identities().unwrap();
+
+        let buffers = make_buffers(entry, false).unwrap();
+        let mask = find(&buffers, "mm.aux.0.0").unwrap();
+        assert_eq!(mask.shape, [1, 2]);
+        assert!(matches!(&mask.store, BufferStore::Inline(BufferData::I64(v)) if v == &[1, 0]));
+        let meta = decoded_meta(&buffers);
+        let item = &meta["items"][0];
+        assert_eq!(item["modality"].as_str(), Some("audio"));
+        assert_eq!(
+            item["auxiliary_tensor_names"][0].as_str(),
+            Some("feature_attention_mask")
+        );
     }
 
     /// Shm: each item's tensor lands in its own segment holding exactly its
@@ -931,6 +989,7 @@ mod tests {
                     identity: None,
                     offsets: vec![(1, self.final_end)],
                     model_specific_data: BTreeMap::new(),
+                    auxiliary_tensors: BTreeMap::new(),
                 });
                 Ok(())
             }

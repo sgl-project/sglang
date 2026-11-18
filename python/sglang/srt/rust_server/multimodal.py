@@ -333,18 +333,17 @@ class RustMmProcessor:
         )
 
     @staticmethod
-    def wrap_encoded(spec: RustMmSpec, buffers):
+    def wrap_encoded(spec: RustMmSpec | None, buffers):
         """Drain-time adapter: wrap one request's ``mm.*`` buffers (a
         ``{name: numpy array | ShmBuffer}`` mapping from ``recv_requests``) into
         the scheduler's ``MultimodalProcessorOutput``. Wrapping only -- load,
         resize, patchify, token expansion and M-RoPE all ran in Rust.
 
-        The buffers are ``mm.feature.{i}`` per item (shaped ``[rows,
-        feature_dim]`` f32, inline or shm), ``mm.mrope`` (``[3, seq_len]``
-        int64), and ``mm.meta``, a msgpack sidecar decoding to ``{"items":
-        [{"modality", "hash", "identity", "offsets", "model_specific_data"}, ...],
-        "token_ids", "mrope_delta"}`` with the items in buffer order. External
-        model packages receive the same layout and wrap it their own way.
+        Each item has a shaped ``mm.feature.{i}`` buffer and can also have
+        inline ``mm.aux.{i}.{j}`` tensors. The ``mm.meta`` msgpack sidecar lists
+        the names of those tensors, along with item metadata and token IDs.
+        When present, ``mm.mrope`` carries the ``[3, seq_len]`` int64 positions.
+        ``spec`` supplies legacy vision token IDs when the processor omits them.
 
         Runs on the scheduler loop, so it must stay copy-free *and* hash-free:
         the inline numpy arrays own the Rust buffers, ``torch.from_numpy`` just
@@ -376,17 +375,20 @@ class RustMmProcessor:
             if envs.SGLANG_MM_PRECOMPUTE_HASH.get():
                 for item in items:
                     item.set_pad_value()
-            output = MultimodalProcessorOutput(
-                mm_items=items,
-                im_token_id=spec.image_token_id,
-                im_start_id=spec.vision_start_token_id,
-                im_end_id=spec.vision_end_token_id,
-                video_token_id=spec.video_token_id,
-                mrope_positions=torch.from_numpy(buffers["mm.mrope"]),
-                mrope_position_delta=torch.tensor(
+            token_ids = meta["token_ids"]
+            if token_ids is None and spec is not None:
+                token_ids = {
+                    "im_token_id": spec.image_token_id,
+                    "im_start_id": spec.vision_start_token_id,
+                    "im_end_id": spec.vision_end_token_id,
+                    "video_token_id": spec.video_token_id,
+                }
+            output = MultimodalProcessorOutput(mm_items=items, **(token_ids or {}))
+            if meta["mrope_delta"] is not None:
+                output.mrope_positions = torch.from_numpy(buffers["mm.mrope"])
+                output.mrope_position_delta = torch.tensor(
                     [[meta["mrope_delta"]]], dtype=torch.long
-                ),
-            )
+                )
         except BaseException:
             for stub in stubs:
                 stub.close_and_unlink()
@@ -423,14 +425,25 @@ class RustMmProcessor:
             )
             stubs.append(stub)
             feature = stub
-        t, h, w = item["model_specific_data"]["image_grid_thw"]
+        model_data = item["model_specific_data"]
+        if "image_grid_thw" in model_data:
+            # Older image producers encode their grid as three scalar integers.
+            model_data["image_grid_thw"] = torch.tensor(
+                [model_data["image_grid_thw"]], dtype=torch.long
+            )
+        for ordinal, name in enumerate(item.get("auxiliary_tensor_names", ())):
+            array = buffers[f"mm.aux.{index}.{ordinal}"]
+            if array.dtype == np.uint16:
+                # TensorData::Bf16 crosses the numpy boundary as raw u16 bits.
+                tensor = torch.from_numpy(array.view(np.int16)).view(torch.bfloat16)
+            else:
+                tensor = torch.from_numpy(array)
+            model_data[name] = tensor
         return MultimodalDataItem(
             modality=_MODALITIES[item["modality"]],
             feature=feature,
             hash=item["hash"],
             identity=bytes(item["identity"]),
             offsets=[tuple(span) for span in item["offsets"]],
-            model_specific_data={
-                "image_grid_thw": torch.tensor([[t, h, w]], dtype=torch.long)
-            },
+            model_specific_data=model_data,
         )

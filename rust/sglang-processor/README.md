@@ -188,7 +188,7 @@ expanded ids, offsets, grids, M-RoPE positions and feature bytes of every case,
 over the images in `tests/fixtures/mm_parity/images/`.
 
 
-### Proposed native audio integration
+### Native audio integration
 
 The first target is `api.v1 Generate.audio_data` on Qwen3-ASR-0.6B with a
 single 16 kHz mono PCM16 WAV. The shared audio family supplies features,
@@ -197,9 +197,9 @@ media prefetch and the scheduler handoff.
 
 Align the processor entry after decode with the native video work in
 [#51156](https://github.com/sgl-project/sglang/pull/51156) and
-[#51157](https://github.com/sgl-project/sglang/pull/51157). The existing
-scheduler ring can carry an optional named tensor buffer for the audio mask,
-preserving its shape and dtype. Model support depends on a qualified family
+[#51157](https://github.com/sgl-project/sglang/pull/51157). The scheduler ring
+now carries named auxiliary tensors with their shape and dtype, for example
+an audio attention mask. Model support depends on a qualified family
 built over the [shared audio primitives](https://github.com/ai-dynamo/frontend-crates/pull/619).
 
 ## parser

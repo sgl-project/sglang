@@ -1,9 +1,8 @@
 //! The one result shape every multimodal processor produces -- the built-in
 //! Qwen pipeline and external model packages alike -- and its msgpack
 //! sidecar. The worker turns it into the ring's named buffers (see
-//! `worker::make_buffers`): one shaped feature buffer per item, the M-RoPE
-//! positions, and `mm.meta`, the sidecar carrying everything small and
-//! structured.
+//! `worker::make_buffers`): shaped feature and auxiliary buffers, M-RoPE
+//! positions, and `mm.meta`, the sidecar carrying the structured metadata.
 
 use std::collections::BTreeMap;
 
@@ -51,7 +50,7 @@ pub struct MmEncodedItem {
     /// identity, never this scalar (which callers may override).
     pub hash: u64,
     /// The item's [`hash_identity`](Self::hash_identity), when its processor
-    /// already computed it over this exact feature, e.g. for a feature served
+    /// already computed it over this exact item, e.g. for a feature served
     /// from its own cache. `None` leaves it to the worker, which fills it in
     /// after all processor hooks, so a request hashes each feature at most
     /// once. Caller `mm_hashes` never touch it.
@@ -59,6 +58,8 @@ pub struct MmEncodedItem {
     /// Inclusive token spans in the expanded prompt.
     pub offsets: Vec<(u32, u32)>,
     pub model_specific_data: BTreeMap<String, MmMetaValue>,
+    /// Shaped model inputs besides the primary feature, e.g. an audio mask.
+    pub auxiliary_tensors: BTreeMap<String, Tensor>,
 }
 
 /// M-RoPE positions for the expanded prompt, row-major `[3, input_len]`, and
@@ -81,15 +82,22 @@ impl MmEncodedEntry {
     /// expects, before anything leaves the worker.
     pub(super) fn validate(&self, input_len: usize) -> Result<(), String> {
         for (index, item) in self.items.iter().enumerate() {
-            let elements = item
-                .feature
-                .shape
-                .iter()
-                .try_fold(1usize, |size, &dim| size.checked_mul(dim));
-            if elements != Some(item.feature.data.len()) {
+            if !valid_tensor_shape(&item.feature) {
                 return Err(format!(
                     "multimodal item {index}: feature shape does not match its data"
                 ));
+            }
+            for (name, tensor) in &item.auxiliary_tensors {
+                if name.is_empty() || item.model_specific_data.contains_key(name) {
+                    return Err(format!(
+                        "multimodal item {index}: invalid or duplicate auxiliary tensor name {name:?}"
+                    ));
+                }
+                if !valid_tensor_shape(tensor) {
+                    return Err(format!(
+                        "multimodal item {index}: auxiliary tensor {name:?} shape does not match its data"
+                    ));
+                }
             }
             if item
                 .offsets
@@ -118,7 +126,7 @@ impl MmEncodedEntry {
                 assert_eq!(
                     Ok(identity),
                     item.hash_identity(),
-                    "a processor-supplied identity must match the item's feature"
+                    "a processor-supplied identity must match the item's output"
                 );
             }
             item.identity = Some(identity);
@@ -127,10 +135,18 @@ impl MmEncodedEntry {
     }
 }
 
+fn valid_tensor_shape(tensor: &Tensor) -> bool {
+    tensor
+        .shape
+        .iter()
+        .try_fold(1usize, |size, &dim| size.checked_mul(dim))
+        == Some(tensor.data.len())
+}
+
 /// The `mm.meta` sidecar, msgpack-encoded with named maps so Python decodes it
 /// straight into dicts: per-item metadata in `items` order (the item's feature
-/// is the `mm.feature.{i}` buffer), the token ids, and the M-RoPE delta (its
-/// positions are the `mm.mrope` buffer).
+/// is the `mm.feature.{i}` buffer and its auxiliary tensors are `mm.aux.{i}.{j}`),
+/// the token ids, and the M-RoPE delta (its positions are the `mm.mrope` buffer).
 #[derive(Serialize)]
 pub(super) struct MmMeta<'a> {
     pub items: Vec<MmItemMeta<'a>>,
@@ -145,6 +161,8 @@ pub(super) struct MmItemMeta<'a> {
     pub identity: [u8; 32],
     pub offsets: &'a [(u32, u32)],
     pub model_specific_data: &'a BTreeMap<String, MmMetaValue>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub auxiliary_tensor_names: Vec<&'a str>,
 }
 
 impl<'a> MmMeta<'a> {
@@ -160,6 +178,11 @@ impl<'a> MmMeta<'a> {
                         identity: item.cache_identity()?,
                         offsets: &item.offsets,
                         model_specific_data: &item.model_specific_data,
+                        auxiliary_tensor_names: item
+                            .auxiliary_tensors
+                            .keys()
+                            .map(String::as_str)
+                            .collect(),
                     })
                 })
                 .collect::<Result<_, String>>()?,
@@ -173,6 +196,14 @@ impl<'a> MmMeta<'a> {
     }
 }
 
+fn tensor_bytes(tensor: &Tensor) -> (&'static str, &[u8]) {
+    match &tensor.data {
+        TensorData::F32(values) => ("f32", bytemuck::cast_slice(values)),
+        TensorData::I64(values) => ("i64", bytemuck::cast_slice(values)),
+        TensorData::Bf16(values) => ("bf16", bytemuck::cast_slice(values)),
+    }
+}
+
 impl MmEncodedItem {
     /// The item's full output identity: the precomputed one when set, else
     /// [`hash_identity`](Self::hash_identity).
@@ -180,15 +211,11 @@ impl MmEncodedItem {
         self.identity.map_or_else(|| self.hash_identity(), Ok)
     }
 
-    /// Hash the typed content/geometry identity of the actual feature. The
+    /// Hash the typed content and geometry of the feature and auxiliary tensors. The
     /// worker does this after all processor hooks and before publication,
     /// unless the processor supplied [`identity`](Self::identity).
     pub fn hash_identity(&self) -> Result<[u8; 32], String> {
-        let (dtype, data): (&str, &[u8]) = match &self.feature.data {
-            TensorData::F32(values) => ("f32", bytemuck::cast_slice(values)),
-            TensorData::I64(values) => ("i64", bytemuck::cast_slice(values)),
-            TensorData::Bf16(values) => ("bf16", bytemuck::cast_slice(values)),
-        };
+        let (dtype, data) = tensor_bytes(&self.feature);
         // A path-specific domain keeps different preprocessing implementations
         // separate; the raw bytes are never copied into the metadata buffer.
         let metadata = rmp_serde::to_vec_named(&(
@@ -205,6 +232,15 @@ impl MmEncodedItem {
         hash.update(metadata);
         hash.update((data.len() as u64).to_be_bytes());
         hash.update(data);
+        for (name, tensor) in &self.auxiliary_tensors {
+            let (dtype, data) = tensor_bytes(tensor);
+            let descriptor = rmp_serde::to_vec(&(name, dtype, &tensor.shape))
+                .map_err(|e| format!("mm auxiliary tensor identity encode: {e}"))?;
+            hash.update((descriptor.len() as u64).to_be_bytes());
+            hash.update(descriptor);
+            hash.update((data.len() as u64).to_be_bytes());
+            hash.update(data);
+        }
         Ok(hash.finalize().into())
     }
 }
@@ -227,6 +263,7 @@ mod tests {
                 "image_grid_thw".into(),
                 MmMetaValue::Ints(vec![1, 2, 2]),
             )]),
+            auxiliary_tensors: BTreeMap::new(),
         }
     }
 
