@@ -9,6 +9,7 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -131,6 +132,10 @@ class TestSchedulePolicyHRRN(CustomTestCase):
 
 class TestShortestPrefillFirst(CustomTestCase):
     def setUp(self):
+        # The chunk reservation reads the encoder replay flag.
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
         self.policy = SchedulePolicy(
             policy="shortest-prefill-first",
             tree_cache=RadixCache.create_simulated(),
@@ -172,6 +177,18 @@ class TestShortestPrefillFirst(CustomTestCase):
         ):
             queue = self.policy.calc_priority(queue)
         self.assertEqual(queue, [other, duplicate])
+
+    def test_shared_prefix_holds_the_longer_request_not_the_shorter(self):
+        # long and short share 32 tokens, the dedupe threshold.
+        shared = list(range(32))
+        long = _make_req("long", "", shared + list(range(1000, 5000)))
+        other = _make_req("other", "", list(range(20000, 26000)))
+        short = _make_req("short", "", shared + list(range(9000, 9393)))
+        for arrived, req in enumerate([long, other, short]):
+            req.full_untruncated_fill_ids = req.origin_input_ids[:]
+            req.time_stats.wait_queue_entry_time = arrived
+        queue = self.policy.calc_priority([long, other, short])
+        self.assertEqual([req.rid for req in queue], ["short", "other", "long"])
 
     def test_retracted_output_is_part_of_uncached_work(self):
         replay = self.make_req("replay", 16, cached=1024)

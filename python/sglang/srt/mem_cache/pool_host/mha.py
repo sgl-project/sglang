@@ -167,9 +167,9 @@ class MHATokenToKVPoolHost(HostKVCache):
             )
         infos = (buffer_info, *draft_buffer_infos)
         for info in infos:
-            if (
-                info.scales is not None
-                and info.scales.layout != KVScaleLayout.MXFP8_INTERLEAVED
+            if info.scales is not None and info.scales.layout not in (
+                KVScaleLayout.MXFP8_INTERLEAVED,
+                KVScaleLayout.MXFP8_MODELSLIM_K_DYNAMIC_V_PER_CHANNEL,
             ):
                 raise ValueError(
                     f"{pool_label}: MHA host transfers do not support "
@@ -1749,17 +1749,22 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
 
 
 def get_mha_host_pool_cls(buffer_info: MHABufferInfo) -> type:
-    is_mxfp8 = (
-        buffer_info.scales is not None
-        and buffer_info.scales.layout == KVScaleLayout.MXFP8_INTERLEAVED
-    )
-    if is_mxfp8:
+    scale_layout = buffer_info.scales.layout if buffer_info.scales is not None else None
+    if scale_layout in (
+        KVScaleLayout.MXFP8_INTERLEAVED,
+        KVScaleLayout.MXFP8_MODELSLIM_K_DYNAMIC_V_PER_CHANNEL,
+    ):
         if buffer_info.head_dim != buffer_info.v_head_dim:
             raise NotImplementedError(
                 "MXFP8 HiCache does not support asymmetric K/V head dimensions yet."
             )
-        from sglang.srt.mem_cache.pool_host.mha_mxfp8 import MHATokenToKVPoolMXFP8Host
+        from sglang.srt.mem_cache.pool_host.mha_mxfp8 import (
+            MHATokenToKVPoolMXFP8Host,
+            NPUModelSlimMXFP8KDynamicVPerChannelHost,
+        )
 
+        if scale_layout == KVScaleLayout.MXFP8_MODELSLIM_K_DYNAMIC_V_PER_CHANNEL:
+            return NPUModelSlimMXFP8KDynamicVPerChannelHost
         return MHATokenToKVPoolMXFP8Host
     if buffer_info.head_dim != buffer_info.v_head_dim:
         return AsymmetricMHATokenToKVPoolHost

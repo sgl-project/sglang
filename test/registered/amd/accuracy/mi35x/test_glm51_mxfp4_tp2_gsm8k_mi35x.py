@@ -3,7 +3,7 @@
 This is a nightly AMD regression test for the GLM-5.1-MXFP4 TP=2
 accuracy drop seen on MI355X/gfx950 when aiter selected a bad BF16 GEMM path.
 
-Registry: nightly-amd-2-gpu-mi35x-glm51-mxfp4 suite
+Registry: nightly-test-2-gpu-amd-mi35x-glm51-mxfp4 suite
 """
 
 import resource
@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
 
 register_amd_ci(
     est_time=3600,
-    suite="nightly-amd-2-gpu-mi35x-glm51-mxfp4",
+    suite="nightly-test-2-gpu-amd-mi35x-glm51-mxfp4",
     nightly=True,
     disabled="Older model generation; AMD nightly keeps the latest two per family",
 )

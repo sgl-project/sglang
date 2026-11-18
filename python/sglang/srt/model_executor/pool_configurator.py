@@ -146,6 +146,8 @@ def _charges_dflash_draft_kv_per_token(kvc: KVCacheConfigurator) -> bool:
     return (
         not kvc.is_draft_worker
         and kvc.spec_algorithm.is_dflash_family()
+        # DFLASH and DSPARK only build the draft on the final PP stage.
+        and (kvc.pp_size == 1 or kvc.pp_group.is_last_rank)
         and not get_spec().speculative_dflash_draft_kv_ring
     )
 
@@ -652,12 +654,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 ) // scale_block_size
 
         cell_size += self._compute_qsa_cell_size(
-            hf_config=model_config.hf_config, num_layers=num_layers
+            hf_config=model_config.hf_config,
+            num_layers=num_layers,
+            kv_shard_size=kvc.kv_shard_size,
         )
         return cell_size
 
     @staticmethod
-    def _compute_qsa_cell_size(*, hf_config, num_layers: int) -> int:
+    def _compute_qsa_cell_size(
+        *, hf_config, num_layers: int, kv_shard_size: int
+    ) -> int:
         from sglang.srt.layers.attention.qsa.config import (
             parse_qsa_profile,
         )
@@ -671,7 +677,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         qsa_profile = parse_qsa_profile(hf_config)
         if qsa_profile is None:
             return 0
-        return QSATokenToKVPool.qsa_bytes_per_token(
+        # Under KV sharding the compressed keys stay replicated over the
+        # N-times widened logical slot space (see QSATokenToKVPool).
+        return kv_shard_size * QSATokenToKVPool.qsa_bytes_per_token(
             kv_heads=qsa_profile.kv_heads,
             head_dim=qsa_profile.head_dim,
             compress_ratio=qsa_profile.compress_ratio,
@@ -709,12 +717,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     kvc.server_args.indexer_kv_cache_dtype, dtype
                 )
                 if indexer_quant_mode == QUANT_MODE_TOKEN_INT8:
+                    if get_dsa_index_kpool(kvc.model_config.hf_config) > 1:
+                        raise ValueError(
+                            "INT8 indexer KV cache is not supported with NPU KPool."
+                        )
                     indexer_size_per_token = (
                         index_head_dim + torch._utils._element_size(torch.float16)
                     )
                     element_size = 1
                 else:
-                    indexer_size_per_token = index_head_dim
+                    indexer_size_per_token = ceil_div(
+                        index_head_dim, get_dsa_index_kpool(kvc.model_config.hf_config)
+                    )
                     element_size = torch._utils._element_size(dtype)
         memory_config = get_memory()
         indexer_ratio = 1

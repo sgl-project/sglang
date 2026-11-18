@@ -1,5 +1,4 @@
-"""--attn-dp-size sets the attention data-parallel width; the deprecated
-`--dp-size N --enable-dp-attention` spelling resolves to `--attn-dp-size N`."""
+"""--attn-dp-size sets the attention data-parallel width."""
 
 import argparse
 import json
@@ -55,31 +54,18 @@ class TestAttnDpSize(CustomTestCase):
 
     def layout(self, server_args):
         return tuple(
-            resolution_result(server_args, name)
-            for name in ("dp_size", "attn_dp_size", "enable_dp_attention")
+            resolution_result(server_args, name) for name in ("dp_size", "attn_dp_size")
         )
-
-    def test_the_deprecated_spelling_moves_the_width_to_attn_dp_size(self):
-        for tp_size, width in ((2, 2), (4, 4), (4, 2), (8, 4)):
-            with self.subTest(tp_size=tp_size, width=width):
-                legacy = self.resolve(
-                    tp_size=tp_size, dp_size=width, enable_dp_attention=True
-                )
-                new = self.resolve(tp_size=tp_size, attn_dp_size=width)
-                self.assertEqual(self.layout(legacy), (1, width, False))
-                self.assertEqual(legacy.resolved_dict(), new.resolved_dict())
 
     def test_without_attention_dp_the_width_is_one(self):
         for fields in (
             {"tp_size": 2},
             {"tp_size": 2, "dp_size": 2},
-            # One DP group under the deprecated flag is no attention DP.
-            {"tp_size": 2, "dp_size": 1, "enable_dp_attention": True},
         ):
             with self.subTest(**fields):
                 server_args = self.resolve(**fields)
                 self.assertEqual(
-                    self.layout(server_args), (fields.get("dp_size", 1), 1, False)
+                    self.layout(server_args), (fields.get("dp_size", 1), 1)
                 )
 
     def test_rejected_layouts(self):
@@ -88,49 +74,27 @@ class TestAttnDpSize(CustomTestCase):
                 {"tp_size": 4, "dp_size": 2, "attn_dp_size": 2},
                 "replicas combined with attention data parallelism",
             ),
-            (
-                {
-                    "tp_size": 4,
-                    "dp_size": 2,
-                    "attn_dp_size": 2,
-                    "enable_dp_attention": True,
-                },
-                "replicas combined with attention data parallelism",
-            ),
             ({"tp_size": 2, "attn_dp_size": 0}, "must be positive"),
         ):
             with self.subTest(**fields):
                 with self.assertRaisesRegex(ValueError, message):
                     self.resolve(**fields)
 
-    def test_the_deprecated_flag_next_to_attn_dp_size_is_redundant(self):
-        both = self.resolve(tp_size=4, attn_dp_size=2, enable_dp_attention=True)
-        new = self.resolve(tp_size=4, attn_dp_size=2)
-        self.assertEqual(self.layout(both), (1, 2, False))
-        self.assertEqual(both.resolved_dict(), new.resolved_dict())
-
-    def test_the_readback_reports_the_deprecated_field_as_attention_dp(self):
+    def test_the_readback_reports_enable_dp_attention_as_attention_dp(self):
         for fields, attention_dp in (
             ({"tp_size": 4, "attn_dp_size": 2}, True),
-            ({"tp_size": 4, "dp_size": 2, "enable_dp_attention": True}, True),
             ({"tp_size": 4, "dp_size": 2}, False),
             ({"tp_size": 4}, False),
         ):
             with self.subTest(**fields):
                 server_args = self.resolve(**fields)
-                self.assertFalse(resolution_result(server_args, "enable_dp_attention"))
                 readback = server_args.resolved_dict()
                 self.assertIs(readback["enable_dp_attention"], attention_dp)
                 # A read-back config resolves to the same layout.
                 again = self.resolve(
                     **{
                         name: readback[name]
-                        for name in (
-                            "tp_size",
-                            "dp_size",
-                            "attn_dp_size",
-                            "enable_dp_attention",
-                        )
+                        for name in ("tp_size", "dp_size", "attn_dp_size")
                     }
                 )
                 self.assertEqual(self.layout(again), self.layout(server_args))
@@ -160,18 +124,6 @@ class TestAttnDpSize(CustomTestCase):
                 raw = parser.parse_args(["--model-path", self.path, flag, "2"])
                 self.assertEqual(ServerArgs.from_cli_args(raw).attn_dp_size, 2)
 
-    def test_the_deprecated_flag_warns_with_its_replacement(self):
-        parser = argparse.ArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        argv = ["--model-path", self.path, "--dp-size", "2", "--enable-dp-attention"]
-        with self.assertLogs(
-            "sglang.srt.arg_groups.argparse_actions", "WARNING"
-        ) as logs:
-            raw = parser.parse_args(argv)
-        self.assertEqual(len(logs.output), 1)
-        self.assertIn("--attn-dp-size", logs.output[0])
-        self.assertTrue(ServerArgs.from_cli_args(raw).enable_dp_attention)
-
 
 class TestPublishedAttnDpSize(CustomTestCase):
     """What the runtime reads: the attention-DP switch and the DP rank count."""
@@ -179,7 +131,6 @@ class TestPublishedAttnDpSize(CustomTestCase):
     def test_the_published_layout(self):
         for fields, (attn_dp_size, num_dp_ranks) in (
             ({"tp_size": 4, "attn_dp_size": 2}, (2, 2)),
-            ({"tp_size": 4, "dp_size": 2, "enable_dp_attention": True}, (2, 2)),
             ({"tp_size": 2, "dp_size": 2}, (1, 2)),
             ({"tp_size": 2}, (1, 1)),
         ):

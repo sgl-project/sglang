@@ -3,7 +3,7 @@
 This test benchmarks the DeepSeek-R1-MXFP4 quantized model on MI35x with 8 GPUs
 using --kv-cache-dtype fp8_e4m3.
 
-Registry: nightly-perf-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8 suite
+Registry: nightly-perf-test-8-gpu-amd-mi35x-deepseek-r1-mxfp4-kv-fp8 suite
 """
 
 import os
@@ -18,7 +18,7 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 # Register for AMD CI - DeepSeek-R1-MXFP4 KV FP8 benchmark on MI35x (~300 min)
 register_amd_ci(
     est_time=18000,
-    suite="nightly-perf-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8",
+    suite="nightly-perf-test-8-gpu-amd-mi35x-deepseek-r1-mxfp4-kv-fp8",
     nightly=True,
 )
 

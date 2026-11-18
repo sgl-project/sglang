@@ -160,9 +160,6 @@ class Mm(msgspec.Struct):
             choices=["mooncake"],
         ),
     ] = "mooncake"
-    disable_fast_image_processor: A[
-        bool, "Deprecated. Use --image-processor-backend=pil instead."
-    ] = False
     mm_feature_transport: A[
         Optional[Literal["cpu", "cuda_ipc", "cuda_vmm"]],
         Arg(

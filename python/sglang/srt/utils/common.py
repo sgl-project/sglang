@@ -809,3 +809,17 @@ class TypeBasedDispatcher:
         if self._fallback_fn is not None:
             return self._fallback_fn(obj)
         raise ValueError(f"Invalid object: {obj}")
+
+
+# TODO(zijiexia): drop once the MSA plugin pinned by MSA_COMMIT imports these from dp_attention.
+_MOVED_TO_DP_ATTENTION = frozenset(
+    {"get_cuda_graph_batch_size_alignment", "require_attn_tp_gather"}
+)
+
+
+def __getattr__(name: str):
+    if name in _MOVED_TO_DP_ATTENTION:
+        from sglang.srt.layers import dp_attention
+
+        return getattr(dp_attention, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -3,7 +3,7 @@
 - Accuracy: GSM8K few-shot eval
 - Acceptance: mtp acc length eval
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-pro-mtp suite
+Registry: nightly-test-8-gpu-amd-mi35x-deepseek-v4-pro-mtp suite
 """
 
 import os
@@ -25,7 +25,9 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=7200, suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro-mtp", nightly=True
+    est_time=7200,
+    suite="nightly-test-8-gpu-amd-mi35x-deepseek-v4-pro-mtp",
+    nightly=True,
 )
 
 DEEPSEEK_V4_PRO_FP4_MODEL_PATH = os.environ.get(

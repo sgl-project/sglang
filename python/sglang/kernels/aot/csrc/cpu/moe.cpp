@@ -1115,8 +1115,8 @@ at::Tensor fused_experts_cpu(
       constexpr int64_t group_size = 32;
       auto w1s = w1_scale.value();
       auto w2s = w2_scale.value();
-      TORCH_CHECK(w1s.numel(), E * 2 * N * K >> 5);
-      TORCH_CHECK(w2s.numel(), E * K * N >> 5);
+      TORCH_CHECK(w1s.numel() == (E * 2 * N * K >> 5), "mxfp4 w1_scale must hold one scale per 32 weights.");
+      TORCH_CHECK(w2s.numel() == (E * K * N >> 5), "mxfp4 w2_scale must hold one scale per 32 weights.");
       fused_experts_fp_kernel_impl<scalar_t, uint8_t, uint8_t, true>(
           out_hidden_states.data_ptr<scalar_t>(),
           intermediate_cache0,
@@ -1180,7 +1180,7 @@ at::Tensor fused_experts_cpu(
           w1_scale.value().data_ptr<float>(),
           w2_scale.value().data_ptr<float>(),
           group_size,
-          topk_weights.data_ptr<float>(),
+          topk_weights_.data_ptr<float>(),
           sorted_ids,
           expert_ids,
           offsets,

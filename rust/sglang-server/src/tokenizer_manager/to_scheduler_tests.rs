@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::message::buffers::{Buffer, BufferData, find};
+use crate::message::config::{HiddenStatesMode, ServerArgs};
 use crate::message::request::{GenerateRequest, TokenizeInput};
 use crate::message::response::ResponseSink;
 use crate::message::sampling::SamplingParams;
@@ -214,7 +215,7 @@ fn test_limits() -> Limits {
         context_len: NO_CONTEXT_CEILING,
         num_reserved_tokens: 0,
         allow_auto_truncate: false,
-        enable_return_hidden_states: false,
+        return_hidden_states_mode: HiddenStatesMode::Null,
     }
 }
 
@@ -472,9 +473,8 @@ fn auto_truncate_cannot_invert_min_and_max_new_tokens() {
     assert_eq!(g.sampling_params.max_new_tokens, Some(7));
 }
 
-/// `return_hidden_states` on a server not launched for it is a 400: the
-/// scheduler never computes them, so the request would otherwise 200 with
-/// `meta_info.hidden_states` silently missing.
+/// A request above the server's hidden-states mode is a 400
+/// (Python `TokenizerManager._validate_one_request`).
 #[test]
 fn hidden_states_gated_on_server_support() {
     let req = |want| {
@@ -488,18 +488,54 @@ fn hidden_states_gated_on_server_support() {
     let err = validate(&mut req(true), &disabled).unwrap_err();
     assert!(matches!(err, Error::Validation(_)));
     assert!(
-        err.to_string().contains("--enable-return-hidden-states"),
-        "message must name the flag: {err}"
+        err.to_string().contains(
+            "not configured to return hidden states. Please set `--return-hidden-states-mode last`"
+        ),
+        "message must name the flags: {err}"
     );
     // Not asking for them (the client sent `false`, or sent nothing and
     // `into_requests` resolved the default), or asking on a server that
     // supports them, is fine.
     assert!(validate(&mut req(false), &disabled).is_ok());
     let enabled = Limits {
-        enable_return_hidden_states: true,
+        return_hidden_states_mode: HiddenStatesMode::Full,
         ..test_limits()
     };
     assert!(validate(&mut req(true), &enabled).is_ok());
+    // `true` asks for `full`, above a server launched with `last`.
+    let last = Limits {
+        return_hidden_states_mode: HiddenStatesMode::Last,
+        ..test_limits()
+    };
+    let err = validate(&mut req(true), &last).unwrap_err();
+    assert!(matches!(err, Error::Validation(_)));
+    assert!(
+        err.to_string()
+            .contains("exceeds the server maximum `last`. Please launch with `--return-hidden-states-mode full`"),
+        "message must name the mode and the flag: {err}"
+    );
+    assert!(validate(&mut req(false), &last).is_ok());
+}
+
+/// The server's hidden-state mode survives the handoff from Python's resolved `server_args`
+/// (Python `get_server_return_hidden_states_mode`).
+#[test]
+fn limits_resolve_the_hidden_states_mode() {
+    let mode = |mode: Option<&str>, enable| {
+        Limits::from(&ServerArgs {
+            return_hidden_states_mode: mode.map(str::to_owned),
+            enable_return_hidden_states: enable,
+            ..Default::default()
+        })
+        .return_hidden_states_mode
+    };
+    assert_eq!(mode(None, false), HiddenStatesMode::Null);
+    assert_eq!(mode(Some("last"), true), HiddenStatesMode::Last);
+    assert_eq!(mode(Some("full"), true), HiddenStatesMode::Full);
+    // The legacy `--enable-return-hidden-states` alone means `full`.
+    assert_eq!(mode(None, true), HiddenStatesMode::Full);
+    // `--enable-return-aux-hidden-states` alone resolves to `full` and leaves the bool unset.
+    assert_eq!(mode(Some("full"), false), HiddenStatesMode::Full);
 }
 
 /// End-to-end through `drive`: an over-context request is rejected on the way

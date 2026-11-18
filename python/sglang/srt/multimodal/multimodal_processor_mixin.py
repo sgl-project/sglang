@@ -62,8 +62,6 @@ class MultimodalProcessorMixin:
         )
 
         self.image_processor_backend = processor_config.image_processor_backend
-        if processor_config.disable_fast_image_processor:
-            self.image_processor_backend = "pil"
         self.disable_fast_image_processor = self.image_processor_backend == "pil"
 
         mm_process_config = processor_config.mm_process_config

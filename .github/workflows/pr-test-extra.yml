@@ -94,15 +94,14 @@ jobs:
 
   # =============================================== PR Gate ====================================================
   # Runtime live-fetch gate. Mirrors pr-test.yml's call-gate, but additionally
-  # requires `run-ci-nv-extra`. Failure here cascades down to every test job
-  # via `needs`, so the workflow ends with one red gate job (~30s) plus a
-  # row of skipped test jobs instead of consuming a runner.
+  # opts in on `run-ci-nv-extra`. Without it the gate passes with
+  # opted-in=false and every test job skips, so the run is green and
+  # consumes no runner.
   call-gate:
     needs: check-changes
     if: github.event_name != 'schedule' && needs.check-changes.result == 'success'
     uses: ./.github/workflows/pr-gate.yml
     with:
-      require-run-ci: true
       require-label: run-ci-nv-extra
     secrets: inherit
 
@@ -113,6 +112,7 @@ jobs:
       needs.check-changes.result == 'success' &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
       needs.check-changes.outputs.sgl_kernel == 'true'
+      && needs.call-gate.outputs.opted-in != 'false'
     uses: ./.github/workflows/_pr-test-sgl-kernel-build.yml
     with:
       runs_on: x64-kernel-build-node
@@ -132,6 +132,7 @@ jobs:
       !cancelled() &&
       needs.check-changes.result == 'success' &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+      && needs.call-gate.outputs.opted-in != 'false'
     uses: ./.github/workflows/_pr-test-rust-ext-build.yml
     with:
       runs_on: ubuntu-22.04
@@ -163,7 +164,7 @@ jobs:
 
   simulator-test-cpu:
     needs: [check-changes, call-gate, rust-ext-build]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') && needs.call-gate.outputs.opted-in != 'false' }}
     uses: ./.github/workflows/_pr-test-simulator-cpu.yml
     with:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
@@ -173,7 +174,7 @@ jobs:
 
   simulator-test-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') && needs.call-gate.outputs.opted-in != 'false' }}
     uses: ./.github/workflows/_pr-test-simulator-gpu.yml
     with:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
@@ -185,7 +186,7 @@ jobs:
   extra-test:
     name: ${{ matrix.stage }}-test-${{ matrix.runner_config }}
     needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build, sgl-router-build, sgl-router-build-aarch64]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') && needs.call-gate.outputs.opted-in != 'false' }}
     strategy:
       fail-fast: false
       matrix:
@@ -231,16 +232,6 @@ jobs:
       sgl_router_artifact: ${{ matrix.arch == 'aarch64' && needs.sgl-router-build-aarch64.outputs.artifact_name || matrix.arch != 'aarch64' && needs.sgl-router-build.outputs.artifact_name || '' }}
     secrets: inherit
 
-  xeon-extra:
-    needs: [check-changes, call-gate]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
-    uses: ./.github/workflows/pr-test-xeon.yml
-    with:
-      ref: ${{ inputs.git_ref || github.ref }}
-      run_all_tests: ${{ inputs.run_all_tests == true }}
-      extra_only: true
-    secrets: inherit
-
   # =============================================== aggregator ====================================================
   # Mirrors pr-test.yml's `pr-test-finish` so notify-pr-states below only
   # depends on one job rather than re-listing every stage. Fails if any
@@ -257,25 +248,19 @@ jobs:
         simulator-test-cpu,
         simulator-test-gpu,
         extra-test,
-        xeon-extra,
       ]
-    if: always()
+    if: always() && needs.call-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
         run: |
-          json_needs='${{ toJson(needs) }}'
-          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
-          for job in $job_names; do
-            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
-            echo "$job: $result"
-            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
-              echo "The above jobs failed."
-              exit 1
-            fi
-          done
-          echo "All jobs completed successfully"
-          exit 0
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$NEEDS_JSON"
+          if jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' <<< "$NEEDS_JSON" >/dev/null; then
+            echo "::error::A dependent job failed or was cancelled."
+            exit 1
+          fi
 
   # =============================================== notify pr-states ====================================================
   # Dispatches pr-states.yml after every attempt (initial + every rerun).

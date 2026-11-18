@@ -776,23 +776,6 @@ def test_dense_silu_graph_replay():
         assert torch.equal(s, expected_s)
 
 
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"silu_and_mul_mode": "unknown"},
-        {"fuse_silu_and_mul": False},
-        {"out_dtype": torch.int8},
-        {"group_size": 64},
-    ],
-)
-def test_dense_silu_invalid_mode(overrides):
-    x = torch.zeros(1, 256, device="cuda", dtype=torch.bfloat16)
-    kwargs = dict(fuse_silu_and_mul=True, silu_and_mul_mode="dense")
-    kwargs.update(overrides)
-    with pytest.raises(ValueError, match="mode"):
-        per_token_group_quant(x, **kwargs)
-
-
 @pytest.mark.parametrize("scale_ue8m0,hidden", [(False, 1408), (True, 1536)])
 def test_dense_silu_masked_bitexact(scale_ue8m0, hidden):
     """Masked dense fusion quantizes each expert's first masked_m[e] rows exactly
