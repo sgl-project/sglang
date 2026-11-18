@@ -3,7 +3,10 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
+from sglang.kernels.ops.quantization.int8_kernel import (
+    per_token_group_quant_int8,
+    per_token_quant_int8,
+)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
@@ -170,6 +173,45 @@ class TestW8A8Int8FusedMoE(CustomTestCase):
                 seed=params[7],
             ):
                 self._w8a8_int8_fused_moe(*params)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires a CUDA device")
+class TestInt8QuantLargeInputOffsets(CustomTestCase):
+    """Row offsets of the int8 quant kernels must not wrap at 2^31 elements."""
+
+    ROWS = 83890
+    COLS = 25600  # ROWS * COLS is just past 2^31 elements (fp16: 4.3 GB)
+
+    @classmethod
+    def setUpClass(cls):
+        assert cls.ROWS * cls.COLS > 2**31
+        free_bytes, _ = torch.cuda.mem_get_info()
+        if free_bytes < 10 * 2**30:
+            raise unittest.SkipTest("needs about 10 GB of free GPU memory")
+        # Row r holds the constant value r % 100 + 1, so every int8 code is 127
+        # and the per-row scale is value / 127, whatever the row offset.
+        cls.values = (torch.arange(cls.ROWS, device="cuda") % 100 + 1).half()
+        cls.x = cls.values[:, None].expand(cls.ROWS, cls.COLS).contiguous()
+        cls.expected_scales = cls.values.float() / 127
+
+    @classmethod
+    def tearDownClass(cls):
+        for name in ("x", "values", "expected_scales"):
+            if hasattr(cls, name):
+                delattr(cls, name)
+        torch.cuda.empty_cache()
+
+    def test_per_token_quant_int8(self):
+        x_q, scales = per_token_quant_int8(self.x)
+        torch.testing.assert_close(scales.view(-1), self.expected_scales)
+        self.assertTrue(bool((x_q[-16:] == 127).all()))
+        self.assertTrue(bool((x_q[:16] == 127).all()))
+
+    def test_per_token_group_quant_int8(self):
+        x_q, scales = per_token_group_quant_int8(self.x, group_size=self.COLS)
+        torch.testing.assert_close(scales.view(-1), self.expected_scales)
+        self.assertTrue(bool((x_q[-16:] == 127).all()))
+        self.assertTrue(bool((x_q[:16] == 127).all()))
 
 
 if __name__ == "__main__":

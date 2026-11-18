@@ -33,7 +33,7 @@ def _per_token_quant_int8(
     IS_HIP: tl.constexpr,
 ):
     # Adapted from https://github.com/InternLM/lmdeploy/blob/086481ed84b59bee3b8e4274e5fc69620040c048/lmdeploy/pytorch/kernels/cuda/w8a8_triton_kernels.py#L282
-    row_id = tl.program_id(0)
+    row_id = tl.program_id(0).to(tl.int64)
 
     cols = tl.arange(0, BLOCK)
     mask = cols < N
@@ -126,7 +126,7 @@ def _per_token_group_quant_int8(
     This function converts the tensor values into int8 values.
     """
     # Map the program id to the row of X and Y it should compute.
-    g_id = tl.program_id(0)
+    g_id = tl.program_id(0).to(tl.int64)
     y_ptr += g_id * y_stride
     y_q_ptr += g_id * y_stride
     y_s_ptr += g_id
