@@ -73,7 +73,12 @@ class TestDllmKvOnlyPrefill(CustomTestCase):
                         "42",
                     ]
                     if eager:
-                        args.append("--disable-cuda-graph")
+                        args.extend(
+                            [
+                                "--disable-decode-cuda-graph",
+                                "--disable-prefill-cuda-graph",
+                            ]
+                        )
                     with log_path.open("w") as log:
                         process = popen_launch_server(
                             model,

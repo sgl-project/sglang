@@ -81,7 +81,8 @@ class DisaggregationHiCacheBase(PDDisaggregationServerBase):
             "wait_complete",
             "--mem-fraction-static",
             "0.9",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
         ]
         env = {
             **os.environ,
