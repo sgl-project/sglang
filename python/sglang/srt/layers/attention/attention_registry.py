@@ -166,6 +166,13 @@ def create_wave_backend(runner):
     return WaveAttnBackend(runner)
 
 
+@register_attention_backend("tlx")
+def create_tlx_backend(runner):
+    from sglang.srt.layers.attention.tlx_backend import TlxAttnBackend
+
+    return TlxAttnBackend(runner)
+
+
 @register_attention_backend("ascend")
 def create_ascend_backend(runner):
     from sglang.srt.configs.model_config import get_dsa_index_kpool, is_deepseek_dsa

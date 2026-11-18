@@ -653,6 +653,7 @@ class AiterAttnBackend(AttentionBackend):
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
         topk: int = 1,
+        force_unified_attention: bool = False,
     ):
         super().__init__()
         # Lazy import to avoid the initialization of cuda context
@@ -827,7 +828,7 @@ class AiterAttnBackend(AttentionBackend):
         )
         _require_untranslated_storage(model_runner.token_to_kv_pool, self.swa_kv_pool)
 
-        if self.use_sliding_window_kv_pool:
+        if self.use_sliding_window_kv_pool or force_unified_attention:
             self.use_triton_unified_attention = True
         else:
             self.use_triton_unified_attention = get_bool_env_var(
@@ -1705,6 +1706,11 @@ class AiterAttnBackend(AttentionBackend):
         )
         return page_table, swa_page_table
 
+    @staticmethod
+    def _run_unified_attention(**kwargs):
+        """Kernel dispatch seam; metadata and cache ownership stay in this backend."""
+        return unified_attention(**kwargs)
+
     def _forward_extend_unified(
         self,
         q: torch.Tensor,
@@ -1836,7 +1842,7 @@ class AiterAttnBackend(AttentionBackend):
                 window=uni_window[0] + 1 if swa_gluon else 0,
             )
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-        unified_attention(
+        self._run_unified_attention(
             q=q_u,
             k=k_paged,
             v=v_paged,
@@ -5056,7 +5062,7 @@ class AiterAttnBackend(AttentionBackend):
                     # signature num_query_heads_16/num_queries_per_kv_1). GQA head
                     # mapping here is identical to the proven decode path.
 
-                    unified_attention(
+                    self._run_unified_attention(
                         q=q_unified,
                         k=k_unified,
                         v=v_unified,
@@ -5185,7 +5191,7 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 ):
                     return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-                unified_attention(
+                self._run_unified_attention(
                     q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     k=k_cache.view(
                         -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
@@ -5693,7 +5699,7 @@ class AiterAttnBackend(AttentionBackend):
                 if self.kv_cache_dtype == fp8_dtype:
                     q, q_descale = self._quantize_q_fp8(q)
 
-                unified_attention(
+                self._run_unified_attention(
                     q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     k=k_cache.view(
                         -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
