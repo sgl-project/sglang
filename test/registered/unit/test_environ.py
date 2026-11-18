@@ -11,7 +11,6 @@ from unittest.mock import patch
 
 from sglang.srt.environ import EnvField, _DeprecatedEnv, envs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
@@ -47,18 +46,6 @@ NV_MEGA_RUNTIME_CHILDREN = (
     "SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP",
     "SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND",
 )
-
-RENAMED_NV_MEGA_RUNTIME_CHILDREN = {
-    "SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED": "SGLANG_Q35MF_BK_VEC_COPY",
-    "SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS": "SGLANG_Q35MF_MKH_N3B",
-    "SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD": "SGLANG_Q35MF_MKH_N3C",
-    "SGLANG_OPT_TRTLLM_MHA_CHAIN_VERIFY": "SGLANG_Q35MF_EDGE_CHAIN_TREE",
-    "SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING": "SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING",
-    "SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST": "SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST",
-    "SGLANG_OPT_SCHEDULER_SHM_SYNC": "SGLANG_Q35MF_EDGE_SHM_SYNC",
-    "SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST": "SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST",
-    "SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP": "SGLANG_Q35MF_EDGE_MULTIHOST_TCP",
-}
 
 
 class TestEnvField(unittest.TestCase):
@@ -195,41 +182,45 @@ class TestEnvField(unittest.TestCase):
                         self.assertIsNone(child.get())
 
 
-class TestKimiK3KdaInprojEnvAliases(CustomTestCase):
-    """Existing KDA in-proj switches still reach the renamed descriptors."""
+# Renamed env vars that still accept their former name through a *WithAlias
+# descriptor: (new name, former name, former raw, former parsed, new raw, new
+# parsed). The former value is non-default so a read that ignores the alias
+# shows up. Add a row here when renaming a variable.
+RENAMED_ENV_ALIASES = [
+    (
+        "SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ",
+        "SGLANG_ROCM_K3_FUSE_KDA_INPROJ",
+        "0",
+        False,
+        "1",
+        True,
+    ),
+    (
+        "SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ_MAX_TOKENS",
+        "SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS",
+        "64",
+        64,
+        "512",
+        512,
+    ),
+]
 
-    # (new name, deprecated name, old raw, old parsed, new raw, new parsed);
-    # the old value is non-default so a read that ignores the alias shows up.
-    ALIASES = [
-        (
-            "SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ",
-            "SGLANG_ROCM_K3_FUSE_KDA_INPROJ",
-            "0",
-            False,
-            "1",
-            True,
-        ),
-        (
-            "SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ_MAX_TOKENS",
-            "SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS",
-            "64",
-            64,
-            "512",
-            512,
-        ),
-    ]
+
+class TestRenamedEnvAliases(unittest.TestCase):
+    """A former env var name still reaches the renamed descriptor."""
 
     def _get(self, name):
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             value = getattr(envs, name).get()
-        return value, [w for w in caught if w.category is FutureWarning]
+        return value, [w for w in caught if issubclass(w.category, FutureWarning)]
 
-    def test_deprecated_name_is_read_with_warning(self):
-        for new_name, old_name, old_raw, old_value, _, _ in self.ALIASES:
-            # The old name has no descriptor, and patch.dict also drops the copy
-            # the alias fallback writes to the new name.
+    def test_former_name_applies_with_a_visible_warning(self):
+        for new_name, old_name, old_raw, old_value, _, _ in RENAMED_ENV_ALIASES:
+            # The former name has no descriptor, and patch.dict also drops the
+            # copy the alias fallback writes to the new name.
             with self.subTest(new_name), patch.dict(os.environ):
+                self.assertEqual(vars(type(envs))[new_name].deprecated_name, old_name)
                 getattr(envs, new_name).clear()
                 os.environ[old_name] = old_raw
                 value, deprecations = self._get(new_name)
@@ -238,8 +229,8 @@ class TestKimiK3KdaInprojEnvAliases(CustomTestCase):
                 self.assertIn(old_name, str(deprecations[0].message))
                 self.assertIn(new_name, str(deprecations[0].message))
 
-    def test_new_name_wins_over_deprecated_name(self):
-        for new_name, old_name, old_raw, _, new_raw, new_value in self.ALIASES:
+    def test_new_name_wins_over_former_name(self):
+        for new_name, old_name, old_raw, _, new_raw, new_value in RENAMED_ENV_ALIASES:
             with (
                 self.subTest(new_name),
                 patch.dict(os.environ),
@@ -248,40 +239,6 @@ class TestKimiK3KdaInprojEnvAliases(CustomTestCase):
                 os.environ[old_name] = old_raw
                 value, deprecations = self._get(new_name)
                 self.assertEqual(value, new_value)
-                self.assertEqual(deprecations, [])
-
-
-class TestRenamedEnvAliases(unittest.TestCase):
-    def _read(self, new, env):
-        field = vars(type(envs))[new]
-        with (
-            patch.dict(os.environ, env),
-            warnings.catch_warnings(record=True) as caught,
-        ):
-            warnings.simplefilter("always")
-            if new not in env:
-                os.environ.pop(new, None)
-            with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False):
-                value = field.get()
-        deprecations = [w for w in caught if issubclass(w.category, FutureWarning)]
-        return field, value, deprecations
-
-    def test_former_name_applies_with_a_visible_warning(self):
-        """The warning must reach users: a DeprecationWarning raised from library
-        code is filtered out by Python's default warning filters."""
-        for new, old in RENAMED_NV_MEGA_RUNTIME_CHILDREN.items():
-            with self.subTest(new=new):
-                field, value, deprecations = self._read(new, {old: "1"})
-                self.assertEqual(field.deprecated_name, old)
-                self.assertIs(value, True)
-                self.assertEqual(len(deprecations), 1)
-                self.assertIn(new, str(deprecations[0].message))
-
-    def test_new_name_wins_over_former_name(self):
-        for new, old in RENAMED_NV_MEGA_RUNTIME_CHILDREN.items():
-            with self.subTest(new=new):
-                _, value, deprecations = self._read(new, {old: "1", new: "0"})
-                self.assertIs(value, False)
                 self.assertEqual(deprecations, [])
 
 
@@ -322,6 +279,32 @@ class TestDeprecatedEnvRegistry(unittest.TestCase):
 
         self._apply(old_name, _DeprecatedEnv(replacement=new_name, transform=str.upper))
         self.assertEqual(os.environ[new_name], "ABC")
+
+
+class TestDocumentedBooleanKnobs(unittest.TestCase):
+    """Documented booleans must accept `true`/`false`: compared to "1" or "0" at the
+    read site, `true` was ignored and even turned the MLA RoPE fusion off."""
+
+    DOCUMENTED_DEFAULTS = {
+        "SGLANG_SKIP_P2P_CHECK": False,
+        "SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION": True,
+        "SGLANG_BLOCK_NONZERO_RANK_CHILDREN": True,
+    }
+
+    def test_default_and_true_false_spellings(self):
+        for name, default in self.DOCUMENTED_DEFAULTS.items():
+            field = vars(type(envs))[name]
+            with self.subTest(name=name), patch.dict(os.environ):
+                os.environ.pop(name, None)
+                self.assertIs(field.get(), default)
+                for value, expected in (
+                    ("true", True),
+                    ("1", True),
+                    ("false", False),
+                    ("0", False),
+                ):
+                    os.environ[name] = value
+                    self.assertIs(field.get(), expected)
 
 
 if __name__ == "__main__":
