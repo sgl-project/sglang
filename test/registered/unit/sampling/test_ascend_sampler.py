@@ -217,6 +217,23 @@ class TestAscendSamplingMaskCapture(unittest.TestCase):
         self.assertEqual(tuple(sampled.shape), (1,))
         self.assertIsNone(capture)
 
+    @torch.random.fork_rng(devices=[])
+    def test_unfiltered_batch_captures_the_whole_distribution(self):
+        info = SimpleNamespace(
+            sampling_seed=None,
+            temperatures=torch.ones(1, 1),
+            sampling_mask_batch_indices=torch.tensor([0]),
+        )
+        logits = torch.tensor([[1.0, 3.0, 0.0, 2.0]])
+        _, _, capture = self.sampler._forward_ascend_backend(
+            logits.clone(),
+            info,
+            simple_sampling_case=True,
+            return_logprob=False,
+            positions=torch.zeros(1, dtype=torch.int64),
+        )
+        self.assertTrue(torch.allclose(capture.weights, torch.softmax(logits, dim=-1)))
+
 
 if __name__ == "__main__":
     unittest.main()
