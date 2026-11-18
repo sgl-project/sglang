@@ -350,8 +350,8 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
 }
 
 // ----------------------------------------------------------------------------
-// Launcher (JIT). All shape-derived scalars are computed in the Python wrapper
-// and passed in, so the C++ side only needs TensorView::data_ptr()/device().
+// Launcher (JIT). Shape-derived scalars are passed in from the Python wrapper;
+// the flat FP32 power-of-two scale path validates its buffers before dispatch.
 // Runtime combos (column_major / ue8m0 / silu / masked / group_size) are
 // dispatched to the templated kernel; launch is PDL-aware via LaunchKernel.
 // ----------------------------------------------------------------------------
@@ -491,6 +491,19 @@ struct PerTokenGroupQuant8bitV2Kernel {
       int64_t num_tokens_per_expert,
       int64_t scale_expert_stride,
       int64_t scale_hidden_stride) {
+    // Validate the BF16 group32 FP8 fallback used by the FP32-scale trait path.
+    if (std::is_same_v<T, bf16_t> && std::is_same_v<DST_DTYPE, fp8_e4m3_t> && group_size == 32 && scale_ue8m0 &&
+        !is_column_major && !fuse_silu_and_mul && !masked_layout && input.dim() == 2) {
+      using namespace host;
+      auto device = SymbolicDevice{};
+      device.set_options<kDLGPU>();
+      auto N = SymbolicSize{"num_tokens"};
+      auto H = SymbolicSize{"hidden_size"};
+      TensorMatcher({N, H}).with_dtype<T>().with_device(device).ensure_alignment(16).verify(input);
+      TensorMatcher({N, H}).with_dtype<DST_DTYPE>().with_device(device).ensure_alignment(16).verify(output_q);
+      CHECK_HOST(H.unwrap() % group_size == 0);
+      TensorMatcher({N, H.unwrap() / group_size}).with_dtype<float>().with_device(device).verify(output_s);
+    }
     const DLDevice dev = input.device();
     const void* in = input.data_ptr();
     void* oq = output_q.data_ptr();

@@ -28,10 +28,10 @@
 #                        off (e.g. hosts with a broken RDMA driver)
 #   SGLANG_USE_CHECKOUT_RUNTIME
 #                      - default 1. Reinstall this workflow checkout's Python
-#                        sglang package inside each runtime container, and the
-#                        checkout sglang-router package inside the bench
-#                        container, before launching servers/bench. Set 0 to
-#                        use the image's baked-in packages.
+#                        sglang package inside each runtime container, and build
+#                        the checkout's sgl-router inside the bench container,
+#                        before launching servers/bench. Set 0 to use the
+#                        image's sglang and /usr/local/bin/sgl-router.
 #   RUNNER_NAME        - GitHub runner name (a built-in default env var)
 #   GITHUB_RUN_ID      - GitHub Actions run id (a built-in default env var)
 #                        The allocation is named
@@ -335,7 +335,6 @@ DSV4_ENV=(
   -e SGLANG_USE_ROCM700A=$ROCM700A
   -e SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton
   -e SGLANG_OPT_FP8_WO_A_GEMM=false -e SGLANG_OPT_USE_JIT_INDEXER_METADATA=false
-  -e SGLANG_OPT_USE_TOPK_V2=false -e SGLANG_OPT_USE_AITER_INDEXER=true
   -e SGLANG_OPT_USE_TILELANG_INDEXER=false -e SGLANG_OPT_USE_TILELANG_MHC_PRE=false
   -e SGLANG_OPT_USE_TILELANG_MHC_POST=false -e SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
   -e SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=false -e SGLANG_ROCM_USE_MULTI_STREAM=false
@@ -397,7 +396,7 @@ if (( PN_PER > 1 || DN_PER > 1 )); then
 -e MORI_RDMA_SL=3 -e MORI_RDMA_TC=104 -e MORI_IO_SL=3 -e MORI_IO_TC=104 -e MORI_IO_TC_DISABLE=0 \
 -e SGLANG_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD=4096 \
 -e SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600 -e SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600 \
--e SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS=32 -e SGLANG_EAGER_INPUT_NO_COPY=true \
+-e SGLANG_EAGER_INPUT_NO_COPY=true \
 -e MORI_BOOTSTRAP_TIMEOUT=300"
     # The overlap plan stream is a wide-EP perf knob, but it makes
     # EAGLEWorkerV2.verify call attn_backend.update_verify_buffers_to_fill_after_draft,
@@ -718,7 +717,11 @@ for f in README.md LICENSE; do
 done
 
 python3 -m pip uninstall -y sglang || true
-python3 -m pip install --no-deps --no-build-isolation -e "$RUNTIME_CHECKOUT/python"
+# Install with runtime_base (the torch-free deps) instead of --no-deps: the
+# image can predate a dependency the checkout imports (blake3 from #47120
+# failed every 11-05 job on image 20261104). pip's default only-if-needed
+# strategy leaves already-satisfied packages, including torch/aiter, alone.
+python3 -m pip install --no-build-isolation -e "$RUNTIME_CHECKOUT/python[runtime_base]"
 
 export RUNTIME_CHECKOUT
 export PYTHONPATH="$RUNTIME_CHECKOUT/python:${PYTHONPATH:-}"
@@ -847,72 +850,34 @@ set -euo pipefail
 
 case "${SGLANG_USE_CHECKOUT_RUNTIME:-1}" in
   0|false|False|FALSE|no|No|NO|off|Off|OFF)
-    echo "[checkout-router] disabled; using image-baked sglang-router"
-    python3 - <<'PY' || true
-import importlib.metadata
-import sglang_router
-
-print(f"[checkout-router] sglang_router_file={sglang_router.__file__}")
-print(
-    "[checkout-router] sglang_router_version="
-    f"{importlib.metadata.version('sglang-router')}"
-)
-try:
-    import sglang_router.sglang_router_rs as rs
-
-    print(f"[checkout-router] sglang_router_rs_file={rs.__file__}")
-except Exception as exc:
-    print(f"[checkout-router] sglang_router_rs_import_error={exc}")
-PY
+    echo "[checkout-router] disabled; using image-baked sgl-router"
+    if ! command -v sgl-router >/dev/null; then
+      echo "[checkout-router] ERROR: no sgl-router in the image" >&2
+      exit 1
+    fi
+    echo "[checkout-router] sgl_router=$(command -v sgl-router) $(sgl-router --version)"
     exit 0
     ;;
 esac
 
 RUNTIME_CHECKOUT="${RUNTIME_CHECKOUT:-/tmp/sglang-checkout-runtime}"
-ROUTER_SRC="$RUNTIME_CHECKOUT/sgl-model-gateway/bindings/python"
-WHEEL_DIR="${SGLANG_ROUTER_WHEEL_DIR:-/tmp/sglang-router-wheels}"
+ROUTER_SRC="$RUNTIME_CHECKOUT/sgl-router"
+TARGET_DIR=/tmp/sgl-router-target
 
-if [[ ! -f "$ROUTER_SRC/pyproject.toml" ]]; then
+if [[ ! -f "$ROUTER_SRC/Cargo.toml" ]]; then
   echo "[checkout-router] ERROR: invalid router checkout: $ROUTER_SRC" >&2
   exit 1
 fi
 
-echo "[checkout-router] building sglang-router from $ROUTER_SRC"
+echo "[checkout-router] building sgl-router from $ROUTER_SRC"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
-python3 -m maturin --version >/dev/null 2>&1 \
-  || python3 -m pip install --no-cache-dir "maturin<1.14"
-
-# Match the ROCm image build recipe when compiling from the checkout copy.
-if [[ -f "$RUNTIME_CHECKOUT/sgl-model-gateway/Cargo.toml" ]]; then
-  sed -i -E 's|^(smg-[a-zA-Z-]+)\s*=\s*"~1\.0\.0"|\1 = "=1.0.0"|' \
-    "$RUNTIME_CHECKOUT/sgl-model-gateway/Cargo.toml"
-fi
-
-rm -rf "$WHEEL_DIR"
-mkdir -p "$WHEEL_DIR"
 (
   cd "$ROUTER_SRC"
-  ulimit -n 65536 || true
-  python3 -m maturin build --release --features vendored-openssl --out "$WHEEL_DIR"
+  rustup toolchain install
+  CARGO_TARGET_DIR="$TARGET_DIR" cargo build --locked --release --bin sgl-router
 )
-
-python3 -m pip uninstall -y sglang-router || true
-python3 -m pip install --force-reinstall --no-deps "$WHEEL_DIR"/*.whl
-
-python3 - <<'PY'
-import importlib.metadata
-import sglang_router
-import sglang_router.sglang_router_rs as rs
-from sglang_router.sglang_router_rs import Router
-
-print(f"[checkout-router] sglang_router_file={sglang_router.__file__}")
-print(
-    "[checkout-router] sglang_router_version="
-    f"{importlib.metadata.version('sglang-router')}"
-)
-print(f"[checkout-router] sglang_router_rs_file={rs.__file__}")
-print(f"[checkout-router] Router={Router}")
-PY
+install -m 0755 "$TARGET_DIR/release/sgl-router" /usr/local/bin/sgl-router
+echo "[checkout-router] sgl_router=$(command -v sgl-router) $(sgl-router --version)"
 EOF
 
 if (( PN_PER > 1 || DN_PER > 1 )); then
@@ -1072,28 +1037,33 @@ if not (t and t.strip()):
 print("[probe] ok:", t[:80].replace("\n", " "))
 PY
 
-# Prefill health-wait + router --prefill args. For PW=1 this is a single endpoint
-# (byte-identical to the pre-fan-out launcher); for PW>1 it iterates the comma-
-# separated engine node0 IPs in PCSV ($3), health-waits each, and passes one
-# --prefill per engine so the router fans requests across all prefill engines.
+# Prefill health-wait + router worker URLs. For PW=1 this is a single prefill
+# endpoint; for PW>1 it iterates the comma-separated engine node0 IPs in PCSV
+# ($3), health-waits each, and passes every engine to the router so it fans
+# requests across all prefill engines.
+#
+# sgl-router reads each worker's PD role and bootstrap port from its
+# /server_info, and serves only workers whose served model name is --model-id
+# (the model path here). The workers tokenize, so the router loads no
+# tokenizer. The request timeout is raised from 300s to 1800s for long
+# benchmark requests; the stale-request reaper (600s by default) would
+# otherwise cut them first.
+ROUTER_ARGS="--model-id \"\$MODEL_PATH\" --host 0.0.0.0 --port $LBPORT --no-tokenizer --request-timeout-secs 1800 --stale-request-timeout-secs 1800 --disable-circuit-breaker"
 if (( PW > 1 )); then
   PREFILL_WAIT_ROUTER="    IFS=',' read -ra PIPS <<< \"\${PCSV:-\$PIP}\"
-    PREFILL_ARGS=\"\"
+    PREFILL_URLS=\"\"
     for pip in \"\${PIPS[@]}\"; do
       echo \"[wait] prefill \$pip\"; for i in \$(seq 1 600); do curl -sf http://\$pip:$PPORT/health >/dev/null && break; sleep 5; done
-      PREFILL_ARGS=\"\$PREFILL_ARGS --prefill http://\$pip:$PPORT $PBOOT\"
+      PREFILL_URLS=\"\$PREFILL_URLS http://\$pip:$PPORT\"
     done
     echo \"[wait] decode\";  for i in \$(seq 1 600); do curl -sf http://\$DIP:$DPORT/health >/dev/null && break; sleep 5; done
-    python3 -m sglang_router.launch_router \\
-      --pd-disaggregation \\
-      \$PREFILL_ARGS \\
-      --decode http://\$DIP:$DPORT \\
-      --host 0.0.0.0 --port $LBPORT \\
-      --disable-circuit-breaker &"
+    sgl-router \\
+      --worker-urls \$PREFILL_URLS http://\$DIP:$DPORT \\
+      $ROUTER_ARGS &"
 else
   PREFILL_WAIT_ROUTER="    echo \"[wait] prefill\"; for i in \$(seq 1 600); do curl -sf http://\$PIP:$PPORT/health >/dev/null && break; sleep 5; done
     echo \"[wait] decode\";  for i in \$(seq 1 600); do curl -sf http://\$DIP:$DPORT/health >/dev/null && break; sleep 5; done
-    python3 -m sglang_router.launch_router       --pd-disaggregation       --prefill http://\$PIP:$PPORT $PBOOT       --decode http://\$DIP:$DPORT       --host 0.0.0.0 --port $LBPORT       --disable-circuit-breaker &"
+    sgl-router --worker-urls http://\$PIP:$PPORT http://\$DIP:$DPORT $ROUTER_ARGS &"
 fi
 
 # Bench script runs on the prefill node; \$PIP/\$DIP injected at srun time.
@@ -1116,7 +1086,7 @@ docker run $DOCKER_COMMON "\${IONIC_MOUNTS[@]}" --name mi355x_bench \
     fi
     bash \$CIDIR/install_checkout_router.sh
 $PREFILL_WAIT_ROUTER
-    for i in \$(seq 1 30); do curl -sf http://127.0.0.1:$LBPORT/health >/dev/null && break; sleep 2; done
+    for i in \$(seq 1 30); do curl -sf http://127.0.0.1:$LBPORT/readiness >/dev/null && break; sleep 2; done
     echo "[probe] PD end-to-end check via LB"
     curl -sf -X POST http://127.0.0.1:$LBPORT/generate \
       -H "content-type: application/json" -d @\$CIDIR/probe.json > \$CIDIR/probe_out.json \

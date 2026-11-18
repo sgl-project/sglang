@@ -37,7 +37,16 @@ from sglang.multimodal_gen.configs.models.dits.ernie_image import (
 )
 from sglang.multimodal_gen.configs.models.fsdp import is_layer
 from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_world_size,
     get_tp_world_size,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_parallel_world_size,
+)
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+    build_shard_plan,
+    gather_seq,
+    shard_seq_prefix,
 )
 from sglang.multimodal_gen.runtime.layers.attention.layer import (
     USPAttention,
@@ -54,6 +63,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import RotaryEmbedding
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -248,15 +258,18 @@ class ErnieImageSelfAttention(nn.Module):
         if qk_layernorm:
             self.norm_q = RMSNorm(head_dim, eps=eps)
             self.norm_k = RMSNorm(head_dim, eps=eps)
+        self.rotary_emb = RotaryEmbedding(
+            head_size=head_dim,
+            rotary_dim=head_dim,
+            is_neox_style=True,
+            use_precomputed_cache=False,
+        )
 
-        # The joint [image, text] stream is fully replicated, so the ulysses
-        # all-to-all would wrongly treat it as sharded and duplicate it. Skip
-        # SP until the stream is sharded (sp_shard + num_replicated_suffix).
         self.attn = USPAttention(
             num_heads=self.num_local_heads,
             head_size=head_dim,
             prefix=f"{prefix}.attn",
-            skip_sequence_parallel=True,
+            skip_sequence_parallel=get_ring_parallel_world_size() > 1,
         )
 
     def forward(
@@ -268,6 +281,11 @@ class ErnieImageSelfAttention(nn.Module):
         rope_positions: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
         attn_mask_meta: dict | None = None,
+        num_replicated_suffix: int = 0,
+        use_sp: bool = False,
+        *,
+        shared_rope_cos: torch.Tensor,
+        shared_rope_sin: torch.Tensor,
     ) -> torch.Tensor:
         B, S, H = x.shape
 
@@ -279,7 +297,7 @@ class ErnieImageSelfAttention(nn.Module):
         k = k.view(B, S, self.num_local_heads, self.head_dim)
         v = v.view(B, S, self.num_local_heads, self.head_dim)
 
-        if self.qk_layernorm:
+        if self.qk_layernorm and q.is_cuda:
             q, k = _ernie_qknorm_rope(
                 q,
                 k,
@@ -291,12 +309,30 @@ class ErnieImageSelfAttention(nn.Module):
                 rope_cache,
                 rope_positions,
             )
+        elif self.qk_layernorm:
+            # The full-width fused QKNorm+RoPE kernel is CUDA/ROCm-only; skip its gate.
+            q, k = _ernie_qknorm_rotary(
+                q,
+                k,
+                self.norm_q,
+                self.norm_k,
+                self.head_dim,
+                rotary_emb=self.rotary_emb,
+                shared_rope_cos=shared_rope_cos,
+                shared_rope_sin=shared_rope_sin,
+            )
         else:
             q = _ernie_rope(q, rope_cos, rope_sin)
             k = _ernie_rope(k, rope_cos, rope_sin)
 
         attn_out = self.attn(
-            q, k, v, attn_mask=attn_mask, attn_mask_meta=attn_mask_meta
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            attn_mask_meta=attn_mask_meta,
+            num_replicated_suffix=num_replicated_suffix,
+            skip_sequence_parallel_override=not use_sp,
         )
         attn_out = attn_out.reshape(B, S, self.num_local_heads * self.head_dim)
         out, _ = self.to_out[0](attn_out)
@@ -374,6 +410,11 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
         gate_mlp: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
         attn_mask_meta: dict | None = None,
+        num_replicated_suffix: int = 0,
+        use_sp: bool = False,
+        *,
+        shared_rope_cos: torch.Tensor,
+        shared_rope_sin: torch.Tensor,
     ) -> torch.Tensor:
         residual = x
         x = _ernie_norm_scale_shift(self.adaLN_sa_ln, x, scale_msa, shift_msa)
@@ -385,6 +426,10 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
             rope_positions,
             attn_mask=attn_mask,
             attn_mask_meta=attn_mask_meta,
+            shared_rope_cos=shared_rope_cos,
+            shared_rope_sin=shared_rope_sin,
+            num_replicated_suffix=num_replicated_suffix,
+            use_sp=use_sp,
         )
         x, residual = _ernie_gated_norm_scale_shift(
             self.adaLN_mlp_ln, residual, attn_out, gate_msa, scale_mlp, shift_mlp
@@ -457,6 +502,22 @@ def _ernie_qknorm_rope_reference(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     q, k = apply_qk_norm(q, k, q_norm, k_norm, head_dim)
     return _ernie_rope(q, rope_cos, rope_sin), _ernie_rope(k, rope_cos, rope_sin)
+
+
+def _ernie_qknorm_rotary(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    head_dim: int,
+    *,
+    rotary_emb: RotaryEmbedding,
+    shared_rope_cos: torch.Tensor,
+    shared_rope_sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """QK RMSNorm and RoPE through the class, for devices without the fused kernel."""
+    q, k = apply_qk_norm(q, k, q_norm, k_norm, head_dim)
+    return rotary_emb(query=q, key=k, cos=shared_rope_cos, sin=shared_rope_sin)
 
 
 def _ernie_qknorm_rope(
@@ -678,6 +739,15 @@ class ErnieImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
         p = self.patch_size
         Hp, Wp = H // p, W // p
         N_img = Hp * Wp
+        sp_size = get_sp_world_size()
+        # The replicated suffix path requires an unmasked, evenly split image.
+        use_sp = (
+            sp_size > 1
+            and get_ring_parallel_world_size() == 1
+            and N_img % sp_size == 0
+            and encoder_hidden_states_mask is None
+        )
+        local_image_len = N_img // sp_size if use_sp else N_img
 
         img_tokens = self.x_embedder["proj"](hidden_states)  # [B, D, Hp, Wp]
         img_tokens = img_tokens.reshape(B, self.inner_dim, N_img).transpose(
@@ -726,6 +796,20 @@ class ErnieImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
         all_ids = torch.cat([image_ids, text_ids], dim=1)
         rotary_pos_emb = self.pos_embed(all_ids)
         rope_cos, rope_sin = _precompute_rope_cos_sin(rotary_pos_emb, dtype)
+        if use_sp:
+            plan = build_shard_plan(N_img)
+            x = shard_seq_prefix(x, N_img, plan, dim=1)
+            # Preserve global positions while sharding the image prefix.
+            rope_cos, rope_sin = (
+                shard_seq_prefix(
+                    rope.view(B, N_img + Tmax, -1), N_img, plan, dim=1
+                ).flatten(0, 1)
+                for rope in (rope_cos, rope_sin)
+            )
+        # ids are expanded over B, so every batch row block is identical; the
+        # first local [S, rot] block broadcasts over B inside RotaryEmbedding.
+        shared_rope_cos = rope_cos.view(B, -1, rope_cos.shape[-1])[0]
+        shared_rope_sin = rope_sin.view(B, -1, rope_sin.shape[-1])[0]
         rope_cache = torch.cat((rope_cos, rope_sin), dim=-1).contiguous()
         rope_positions = torch.arange(
             rope_cache.shape[0], device=device, dtype=torch.long
@@ -768,12 +852,18 @@ class ErnieImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
                 gate_mlp,
                 attn_mask=attn_mask,
                 attn_mask_meta=attn_mask_meta,
+                shared_rope_cos=shared_rope_cos,
+                shared_rope_sin=shared_rope_sin,
+                num_replicated_suffix=Tmax if use_sp else 0,
+                use_sp=use_sp,
             )
 
         scale, shift = self.final_norm["linear"](c).chunk(2, dim=-1)
         x = self.final_norm["norm"](x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
-        patches, _ = self.final_linear(x[:, :N_img, :])
+        patches, _ = self.final_linear(x[:, :local_image_len, :])
+        if use_sp:
+            patches = gather_seq(patches, N_img)
 
         output = patches.view(B, Hp, Wp, p, p, self.out_channels)
         output = output.permute(0, 5, 1, 3, 2, 4).contiguous()

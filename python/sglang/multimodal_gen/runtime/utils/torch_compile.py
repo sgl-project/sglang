@@ -61,7 +61,7 @@ def build_torch_compile_kwargs(
         ):
             compile_kwargs["mode"] = mode
     elif current_platform.is_npu():
-        from sglang.srt.utils.common import get_compiler_backend
+        from sglang.srt.utils.device import get_compiler_backend
 
         compile_kwargs["backend"] = get_compiler_backend()
         compile_kwargs["dynamic"] = False

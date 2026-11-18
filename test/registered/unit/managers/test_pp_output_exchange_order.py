@@ -15,7 +15,8 @@ import unittest
 from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest import mock
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import torch
 
@@ -29,6 +30,7 @@ from sglang.test.test_utils import (
 maybe_stub_sgl_kernel()
 
 from sglang.srt.environ import envs  # noqa: E402
+from sglang.srt.managers import scheduler_pp_mixin as pp_mod  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
     PPBatchMetadata,
     SchedulerPPMixin,
@@ -103,7 +105,9 @@ class TestPPOutputExchangeOrder(CustomTestCase):
         scheduler.last_rank_comm_queue = deque()
         scheduler.send_req_work = []
         scheduler.increment_scheduler_iterations = MagicMock()
-        scheduler.ingest_requests = MagicMock(return_value=["request"])
+        scheduler._flush_staging_scatters = MagicMock()
+        scheduler._pp_ingest_requests = MagicMock(return_value=["request"])
+        scheduler.pause_state = SimpleNamespace(may_launch=lambda: True)
         scheduler.get_next_disagg_decode_batch_to_run = MagicMock(
             return_value=SimpleNamespace(running_batch=batch, batch_to_run=batch)
         )
@@ -123,6 +127,9 @@ class TestPPOutputExchangeOrder(CustomTestCase):
         scheduler._pp_pd_send_consensus_release_ids.return_value = ([], None)
         sent = []
         scheduler._pp_send_pyobj_to_next_stage.side_effect = lambda data, **kwargs: (
+            sent.append(data) or []
+        )
+        scheduler._pp_send_reqs_to_next_stage.side_effect = lambda data: (
             sent.append(data) or []
         )
         scheduler._pp_send_proxy_to_next_stage.side_effect = sent.append
@@ -149,12 +156,13 @@ class TestPPOutputExchangeOrder(CustomTestCase):
     def test_decode_readback_preserves_device_relay_and_future_tokens(self):
         # Exercise real result preparation and copy_to_cpu. Only transport,
         # stream/event and copy primitives are replaced in this CPU regression.
-        for mode, spec, should_copy in (
+        for mode, spec, cuda in (
             (ForwardMode.DECODE, SpeculativeAlgorithm.NONE, True),
-            (ForwardMode.EXTEND, SpeculativeAlgorithm.NONE, False),
-            (ForwardMode.DECODE, SpeculativeAlgorithm.EAGLE, False),
+            (ForwardMode.DECODE, SpeculativeAlgorithm.NONE, False),
+            (ForwardMode.EXTEND, SpeculativeAlgorithm.NONE, True),
+            (ForwardMode.DECODE, SpeculativeAlgorithm.EAGLE, True),
         ):
-            with self.subTest(mode=mode, spec=spec):
+            with self.subTest(mode=mode, spec=spec, cuda=cuda):
                 tokens = torch.tensor([7, 11], dtype=torch.int64)
                 scheduler = SchedulerPPMixin()
                 scheduler.pp_group = SimpleNamespace(is_first_rank=False)
@@ -181,6 +189,9 @@ class TestPPOutputExchangeOrder(CustomTestCase):
                     published_topology(
                         role="scheduler", ranks={"world_rank": 1}, pp_size=2
                     ),
+                    patch.object(
+                        torch.Tensor, "is_cuda", PropertyMock(return_value=cuda)
+                    ),
                     patch(
                         "sglang.srt.managers.utils._async_d2h",
                         side_effect=lambda tensor: tensor.clone(),
@@ -197,6 +208,7 @@ class TestPPOutputExchangeOrder(CustomTestCase):
                         )
                     )
 
+                should_copy = mode.is_decode() and spec.is_none() and cuda
                 self.assertEqual(copy.call_count, int(should_copy))
                 self.assertEqual(result.next_token_ids.tolist(), [7, 11])
                 self.assertIs(result.copy_done, done if should_copy else None)
@@ -207,7 +219,7 @@ class TestPPOutputExchangeOrder(CustomTestCase):
                 scheduler.copy_stream.wait_event.assert_called_once_with(recv_done)
                 if should_copy:
                     self.assertIsNot(result.next_token_ids, tokens)
-                    done.record.assert_called_once_with()
+                    self.assertEqual(done.record.call_count, 2)
                 else:
                     self.assertIs(result.next_token_ids, tokens)
 
@@ -255,6 +267,32 @@ class TestPPOutputExchangeOrder(CustomTestCase):
                         pp_rank, spec_relay, "relay", "output", **server_args
                     )
                     self.assertNotIn(("wait", "own-forward"), ops)
+
+
+class TestPPOutputSkipWhileCapturingRoutedExperts(CustomTestCase):
+    def test_middle_prefill_chunks_keep_their_output_message(self):
+        """The output message carries a chunk's routed experts to the first
+        stage; skipping it returns zeros for that chunk's tokens."""
+        middle_chunk = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            reqs=[object()],
+            contains_last_prefill_chunk=False,
+            return_logprob=False,
+        )
+        with envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.override(True):
+            for capturing in (False, True):
+                features = SimpleNamespace(enable_return_routed_experts=capturing)
+                with (
+                    self.subTest(capturing=capturing),
+                    mock.patch.object(
+                        pp_mod,
+                        "get_exec",
+                        return_value=SimpleNamespace(features=features),
+                    ),
+                ):
+                    self.assertEqual(
+                        pp_mod._pp_can_skip_output_comm(middle_chunk), not capturing
+                    )
 
 
 if __name__ == "__main__":
