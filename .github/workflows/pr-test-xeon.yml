@@ -92,7 +92,7 @@ jobs:
           # full machine, no partitioning. 4 files: 3 TP + autoround.
           - runner: xeon-gnr
             role: gnr
-            suite: "stage-a-tp-test-cpu-intel"
+            suite: "extra-tp-test-cpu-intel"
             name: gnr
 
           # Each SPR box (2 sockets / 2 NUMA, 32 physical cores each) runs TWO
@@ -104,14 +104,14 @@ jobs:
           # exhaust host RAM. 2 boxes x 2 sockets = 4 partitions.
           - runner: xeon-spr
             role: spr
-            suite: "stage-a-test-cpu-intel,stage-b-test-cpu-intel"
+            suite: "extra-test-cpu-intel"
             name: spr1
             part_lo: 0
             part_hi: 1
             part_size: 4
           - runner: xeon-spr
             role: spr
-            suite: "stage-a-test-cpu-intel,stage-b-test-cpu-intel"
+            suite: "extra-test-cpu-intel"
             name: spr2
             part_lo: 2
             part_hi: 3
