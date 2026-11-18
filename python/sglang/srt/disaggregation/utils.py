@@ -1911,6 +1911,7 @@ def setup_state_kv_args(
             owner_view.index_bytes_per_token - key_bytes,
         )
     if draft_kv_ring is not None:
+        kv_args.draft_kv_ring_paged = draft_kv_ring.paged
         append_state_component(
             kv_args, StateType.DRAFT_RING, *draft_kv_ring.ring_buf_infos()
         )
