@@ -360,6 +360,7 @@ POSITIONAL_FIELD_ORDER = (
     "hicache_storage_backend",
     "hicache_storage_prefetch_policy",
     "hicache_storage_backend_extra_config",
+    "release_hicache",
     "hicache_storage_prefetch_retry_poll_interval",
     "hicache_storage_prefetch_retry_max_attempts",
     "enable_unified_cache_external_linker",

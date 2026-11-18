@@ -149,6 +149,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         )
         self._layer_shard_enabled = layer_shard_enabled
         self._native_buffers = None
+        # Kept so a resume after release_memory_occupation() rebuilds the same views.
+        self._write_back_staging = write_back_staging
         if self._is_dummy:
             if draft_buffer_infos:
                 raise ValueError(
@@ -284,6 +286,25 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             return
 
         self._initialize_transfer_views(write_back_staging)
+        if (
+            self._native_buffers is not None
+            and self._transfer_device.type == "npu"
+            and self.layout in ("page_first_kv_split", "layer_first_kv_split")
+        ):
+            self._init_npu_transfer_bindings()
+
+    def _host_buffer_attr_names(self) -> tuple[str, ...]:
+        return (
+            "kv_buffer",
+            "k_buffer",
+            "v_buffer",
+            "index_k_buffer",
+            "index_k_scale_buffer",
+        )
+
+    def _post_init_host_buffers(self) -> None:
+        # Rebuild the per-layer views and NPU transfer bindings over the new buffers.
+        self._initialize_transfer_views(self._write_back_staging)
         if (
             self._native_buffers is not None
             and self._transfer_device.type == "npu"

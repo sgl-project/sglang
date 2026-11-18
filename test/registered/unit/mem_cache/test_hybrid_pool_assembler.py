@@ -1764,6 +1764,39 @@ class TestFusedDraftHiCacheValidation(CustomTestCase):
 
 
 class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
+    def test_release_resume_shared_host_backing(self):
+        """The shared backing is freed only once every sharing pool offloads."""
+        full, swa = _build_unified_host_pair(_build_unified_swa_pool())
+        self.addCleanup(full.destroy)
+        self.addCleanup(swa.destroy)
+        backing = full._shared_backing
+        self.assertIsNotNone(full.alloc(4))
+        self.assertIsNotNone(swa.alloc(4))
+        full.release_memory_occupation()
+        # One side offloaded: its sibling still addresses the backing.
+        self.assertIsNotNone(backing.raw)
+        self.assertIsNone(full._host_page_buffer_view)
+        self.assertIsNotNone(swa._host_page_buffer_view)
+        swa.release_memory_occupation()
+        self.assertIsNone(backing.raw)
+        self.assertIsNone(full._host_page_buffer_view)
+        self.assertIsNone(swa._host_page_buffer_view)
+        self.assertIsNone(full.alloc(4))
+
+        full.release_memory_occupation()
+        full.resume_memory_occupation()
+        allocation = backing.raw
+        self.assertIsNotNone(allocation)
+        swa.resume_memory_occupation()
+        self.assertIs(backing.raw, allocation)
+        self.assertIsNotNone(full.alloc(4))
+        self.assertIsNotNone(swa.alloc(4))
+        # Destroying an offloaded pair must not attempt to unregister None.
+        full.release_memory_occupation()
+        swa.release_memory_occupation()
+        full.destroy()
+        swa.destroy()
+
     def test_shared_hosts_use_one_captured_description_per_device_pool(self):
         """Shared backing and both hosts must consume the same captured views."""
         bundle = _build_unified_swa_pool()

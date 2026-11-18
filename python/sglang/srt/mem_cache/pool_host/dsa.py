@@ -158,6 +158,7 @@ class DSAIndexerPoolHost(HostKVCache):
                 self.size,
             )
             self.lock = threading.RLock()
+            self._host_memory_released = False
             self.clear()
             return
 
@@ -191,13 +192,30 @@ class DSAIndexerPoolHost(HostKVCache):
         self.init_kv_buffer()
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
+        self._host_memory_released = False
         self.clear()
+
+    def _host_buffer_attr_names(self) -> tuple[str, ...]:
+        return ("index_k_with_scale_buffer",)
+
+    def _host_derived_attr_names(self) -> tuple[str, ...]:
+        return ("index_k_data_refs", "index_k_data_ptrs", "index_k_device_ptrs")
+
+    def _rebuild_host_buffers(self) -> None:
+        self.init_kv_buffer()
+        self._init_write_back_staging_buffers()
 
     def destroy(self):
         if self._destroyed:
             return
-        if not self._is_dummy and self.pin_memory and (_is_cuda or _is_hip):
-            _cuda_host_unregister(self.index_k_with_scale_buffer)
+        buffer = self.index_k_with_scale_buffer
+        if (
+            buffer is not None
+            and not self._is_dummy
+            and self.pin_memory
+            and (_is_cuda or _is_hip)
+        ):
+            _cuda_host_unregister(buffer)
         self.index_k_with_scale_buffer = None
         self.index_k_data_refs = []
         super().destroy()

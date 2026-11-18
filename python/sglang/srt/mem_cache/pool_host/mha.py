@@ -213,6 +213,9 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.head_num = buffer_info.head_num
         self.layer_num = self.target_layer_num + len(draft_buffer_infos)
         self._buffer_infos = infos
+        # Kept so a resume after release_memory_occupation() can rebuild the
+        # views and reuse (or re-prepare) the prepared write-back staging.
+        self._write_back_staging = write_back_staging
         self.head_group_num = head_group_num
         self.page_size = page_size
         self.page_unified_layout = page_unified_layout
@@ -246,6 +249,11 @@ class MHATokenToKVPoolHost(HostKVCache):
                 else buffer_info.buffers.v_data_ptrs
             )
         self._initialize_transfer_views(buffer_info, write_back_staging)
+
+    def _post_init_host_buffers(self) -> None:
+        # Host buffers were re-allocated: every per-layer view and pointer table
+        # points into the old (freed) buffers, so rebuild them.
+        self._initialize_transfer_views(self._buffer_infos[0], self._write_back_staging)
 
     def _initialize_transfer_views(self, buffer_info, write_back_staging) -> None:
         self.element_dim = self.head_num * self.head_dim

@@ -543,6 +543,26 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self.tree_core.kv_events.record_all_cleared()
 
+    def release_memory_occupation(self) -> None:
+        """Free the HiCache host pool while the scheduler offloads KV memory.
+
+        Skipped for storage-backed caches: the L3 backend and its in-flight
+        transfers address the host pool, so it cannot be dropped under them.
+        """
+        if self.enable_storage:
+            logger.warning(
+                "Skipping HiCache host memory release while a storage backend is enabled."
+            )
+            return
+        if self.cache_controller is not None:
+            self.cache_controller.mem_pool_host.release_memory_occupation()
+
+    def resume_memory_occupation(self) -> None:
+        if self.enable_storage:
+            return
+        if self.cache_controller is not None:
+            self.cache_controller.mem_pool_host.resume_memory_occupation()
+
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
         self.host_memory_mode = get_memory().hicache_host_memory_mode

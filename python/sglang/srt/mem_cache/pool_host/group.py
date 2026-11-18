@@ -63,6 +63,20 @@ class HostPoolGroup:
         self.logical_size = self.anchor_entry.host_pool.logical_size
         self._refresh_transfer_capabilities()
 
+    def release_memory_occupation(self) -> None:
+        """Offload every pool in the group (each one is idempotent)."""
+        for entry in self.entries:
+            release = getattr(entry.host_pool, "release_memory_occupation", None)
+            if release is not None:
+                release()
+
+    def resume_memory_occupation(self) -> None:
+        """Restore every pool in the group that was offloaded."""
+        for entry in self.entries:
+            resume = getattr(entry.host_pool, "resume_memory_occupation", None)
+            if resume is not None:
+                resume()
+
     def _refresh_transfer_capabilities(self) -> None:
         child_write_back_jit = [
             entry.host_pool.can_use_write_back_jit for entry in self.entries

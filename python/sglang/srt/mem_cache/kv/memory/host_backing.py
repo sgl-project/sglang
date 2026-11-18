@@ -8,7 +8,10 @@ from contextlib import contextmanager
 import torch
 
 from sglang.srt.mem_cache.device_pool_info import PageEnvelopeBufferInfo
-from sglang.srt.mem_cache.pool_host.base import host_memory_preflight
+from sglang.srt.mem_cache.pool_host.base import (
+    _trim_host_allocator,
+    host_memory_preflight,
+)
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     _cuda_host_unregister,
@@ -188,6 +191,12 @@ class _SharedPageEnvelopeHostBacking:
         self.pin_memory = pin_memory
         self.lock = threading.RLock()
         alloc_func = ALLOC_MEMORY_FUNCS[device_buffers[0].device]
+        # Kept for the release/resume round trip: the backing is re-allocated
+        # with the same geometry once every sharing pool has been offloaded.
+        self._alloc_func = alloc_func
+        self._total_bytes = total_bytes
+        self._allocation_device = device
+        self._released_users: set[str] = set()
         self.raw = alloc_func(
             (total_bytes,),
             dtype=torch.uint8,
@@ -231,6 +240,7 @@ class _SharedPageEnvelopeHostBacking:
     def release(self, name: str) -> None:
         with self.lock:
             self._users.discard(name)
+            self._released_users.discard(name)
             self.destroy_if_unused()
 
     def destroy_if_unused(self) -> None:
@@ -242,11 +252,56 @@ class _SharedPageEnvelopeHostBacking:
             try:
                 for event in events:
                     event.synchronize()
-                if self.pin_memory and (_is_cuda or _is_hip):
+                if self.raw is not None and self.pin_memory and (_is_cuda or _is_hip):
                     _cuda_host_unregister(self.raw)
                 self.raw = None
             finally:
                 self._finish_compaction()
+
+    def release_memory_occupation(self, name: str) -> None:
+        """Free the shared allocation once every pool sharing it is offloaded.
+
+        A pool that offloads alone only drops out of the released set; the
+        backing stays mapped because its siblings still address it.
+        """
+        with self.lock:
+            self._released_users.add(name)
+            if self._released_users != self._users or self.raw is None:
+                return
+            events = self._begin_compaction()
+            try:
+                for event in events:
+                    event.synchronize()
+                if self.pin_memory and (_is_cuda or _is_hip):
+                    _cuda_host_unregister(self.raw)
+                self.raw = None
+                self.fd = None
+            finally:
+                self._finish_compaction()
+            _trim_host_allocator()
+
+    def resume_memory_occupation(self, name: str) -> None:
+        """Re-map the backing if an earlier resume did not, then rejoin it."""
+        with self.lock:
+            if self.raw is None:
+                allocation_bytes, available_bytes = host_memory_preflight(
+                    [self._total_bytes], self.allocator, self._allocation_device
+                )
+                if allocation_bytes > available_bytes:
+                    raise ValueError(
+                        "Not enough host memory to resume the unified HiCache pool. "
+                        f"Requesting {allocation_bytes / 1e9:.2f} GB but only have "
+                        f"{available_bytes / 1e9:.2f} GB free."
+                    )
+                self.raw = self._alloc_func(
+                    (self._total_bytes,),
+                    dtype=torch.uint8,
+                    device=self._allocation_device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
+                )
+                self.fd = getattr(self.allocator, "fd", None)
+            self._released_users.discard(name)
 
     def page_buffer(self, name: str) -> torch.Tensor:
         side = self.sides[name]

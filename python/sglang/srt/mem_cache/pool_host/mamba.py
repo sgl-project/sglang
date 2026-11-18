@@ -247,7 +247,21 @@ class MambaPoolHost(HostKVCache):
         self._configure_npu_mamba_io()
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
+        self._host_memory_released = False
         self.clear()
+
+    def _host_buffer_attr_names(self) -> tuple[str, ...]:
+        return (
+            "kv_buffer",
+            "temporal_buffer",
+            "conv_buffer",
+            "slot_state_buffers",
+        )
+
+    def _rebuild_host_buffers(self) -> None:
+        self.kv_buffer = self.init_kv_buffer()
+        self._configure_npu_mamba_io()
+        self._init_write_back_staging_buffers()
 
     def _configure_npu_mamba_io(self) -> None:
         mode = _npu_hicache_mamba_io_mode()

@@ -5,6 +5,7 @@ import sys
 import threading
 import unittest
 import unittest.mock
+import weakref
 from functools import partial
 from types import SimpleNamespace
 
@@ -78,6 +79,34 @@ class TestHostKVCache(CustomTestCase):
             start_layer=self.device_pool.start_layer,
             end_layer=self.device_pool.end_layer,
             write_back_staging=self.device_pool.hicache_write_back_staging,
+        )
+
+    def test_release_resume_drops_host_views_and_restores_capacity(self):
+        """Offloading the pool frees its host buffers; resume restores capacity."""
+        import weakref
+
+        buffer = weakref.ref(self.host_pool.kv_buffer)
+        self.host_pool.release_memory_occupation()
+        # Idempotent: a second release is a no-op, not a double free.
+        self.host_pool.release_memory_occupation()
+        self.assertIsNone(buffer())
+        self.assertIsNone(self.host_pool.kv_buffer)
+        self.assertIsNone(self.host_pool.host_kv_data_refs)
+        self.assertIsNone(self.host_pool.k_data_refs)
+        self.assertEqual(self.host_pool.free_slots.numel(), 0)
+        # No slot may be handed out while the pool is offloaded.
+        self.assertEqual(self.host_pool.available_size(), 0)
+        self.assertIsNone(self.host_pool.alloc(self.page_size))
+
+        self.host_pool.resume_memory_occupation()
+        self.host_pool.resume_memory_occupation()
+        self.assertIsNotNone(self.host_pool.kv_buffer)
+        self.assertEqual(self.host_pool.available_size(), self.host_pool.size)
+        self.assertIsNotNone(self.host_pool.alloc(self.page_size))
+        # Views must point into the new buffer, not the freed one.
+        self.assertIs(
+            self.host_pool.k_data_refs[0].untyped_storage(),
+            self.host_pool.kv_buffer.untyped_storage(),
         )
 
     def test_info_host_does_not_retain_owner_or_rebuild_pointer_tables(self):
@@ -1523,6 +1552,33 @@ class TestMLAKvSplitMappingLengths(CustomTestCase):
             host_token_capacity=80,
         )
 
+    def test_release_resume_rebuilds_kv_split_buffers(self):
+        pool = self._pool()
+        self.addCleanup(pool.destroy)
+        k_buffer = weakref.ref(pool.k_buffer)
+        v_buffer = weakref.ref(pool.v_buffer)
+        index_buffer = weakref.ref(pool.index_k_buffer)
+        self.assertIsNotNone(pool.alloc(16))
+
+        pool.release_memory_occupation()
+        self.assertIsNone(k_buffer())
+        self.assertIsNone(v_buffer())
+        self.assertIsNone(index_buffer())
+        self.assertIsNone(pool.data_refs)
+        self.assertIsNone(pool.data_ptrs)
+        self.assertEqual(pool.available_size(), 0)
+
+        pool.resume_memory_occupation()
+        self.assertIsNotNone(pool.k_buffer)
+        self.assertIsNotNone(pool.v_buffer)
+        self.assertIsNotNone(pool.index_k_buffer)
+        self.assertEqual(pool.available_size(), pool.size)
+        # The rebuilt per-layer views address the new buffers.
+        self.assertTrue(pool.data_refs)
+        for view in pool.data_refs:
+            self.assertIs(view.untyped_storage(), pool.k_buffer.untyped_storage())
+        self.assertIsNotNone(pool.alloc(16))
+
     def test_kv_split_books_each_buffer_as_its_own_mapping(self):
         rows = 5 * 16
         with self.subTest("k, v and indexer mirrors"):
@@ -1738,3 +1794,37 @@ class TestMambaXpuBackupDispatch(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMambaHostPoolRelease(CustomTestCase):
+    """The Mamba host pool rebuilds its state buffers across an offload."""
+
+    SLOTS = 6
+
+    def test_release_resume_rebuilds_state_buffers(self):
+        target = _mamba_state(layers=2, slots=self.SLOTS)
+        host = MambaPoolHost(
+            target,
+            host_to_device_ratio=2,
+            host_size=0,
+            device_capacity=self.SLOTS,
+            layout="page_first",
+            pin_memory=False,
+        )
+        self.addCleanup(host.destroy)
+        temporal = weakref.ref(host.temporal_buffer)
+        conv = weakref.ref(host.conv_buffer[0])
+        self.assertIsNotNone(host.alloc(1))
+
+        host.release_memory_occupation()
+        self.assertIsNone(temporal())
+        self.assertIsNone(conv())
+        self.assertIsNone(host.kv_buffer)
+        self.assertEqual(host.available_size(), 0)
+
+        host.resume_memory_occupation()
+        self.assertIsNotNone(host.temporal_buffer)
+        self.assertIsNotNone(host.conv_buffer[0])
+        self.assertIsNotNone(host.kv_buffer)
+        self.assertEqual(host.available_size(), host.size)
+        self.assertIsNotNone(host.alloc(1))

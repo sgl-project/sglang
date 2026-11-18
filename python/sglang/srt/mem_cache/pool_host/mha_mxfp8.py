@@ -78,6 +78,9 @@ class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
         self.v_sf_page_bytes = v_scales[0][0].numel()
         self.k_scale_host: torch.Tensor | None = None
         self.v_scale_host: torch.Tensor | None = None
+        # Device-side scale rows; kept so a resume can rebuild the host mirror.
+        self._k_scales = k_scales
+        self._v_scales = v_scales
         super().__init__(
             buffer_info,
             host_to_device_ratio,
@@ -109,6 +112,13 @@ class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
                 "(io_backend='kernel', page_first layout, CUDA or HIP)."
             )
         self._init_scale_buffers(k_scales, v_scales)
+
+    def _host_buffer_attr_names(self) -> tuple[str, ...]:
+        return (*super()._host_buffer_attr_names(), "k_scale_host", "v_scale_host")
+
+    def _post_init_host_buffers(self) -> None:
+        super()._post_init_host_buffers()
+        self._init_scale_buffers(self._k_scales, self._v_scales)
 
     def get_size_per_token(self):
         payload = super().get_size_per_token()
