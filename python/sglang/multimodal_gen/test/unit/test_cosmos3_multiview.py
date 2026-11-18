@@ -1846,6 +1846,41 @@ class TestSamplingParamsAndInputStage(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "multiview.views"):
             stage._resolve_views(batch_for(Cosmos3MultiviewSamplingParams()))
 
+        released = threading.Event()
+
+        def decode(path, max_frames=None):
+            released.wait(timeout=10)
+            return iter(())
+
+        def loaders():
+            return {
+                thread
+                for thread in threading.enumerate()
+                if thread.name.startswith("cosmos3-multiview-load")
+            }
+
+        before = loaders()
+        params = Cosmos3MultiviewSamplingParams(
+            multiview={"views": subset, "condition_frame_indexes_vision": [0]},
+            aspect_ratio="16:9",
+        )
+        batch = SimpleNamespace(
+            sampling_params=params,
+            is_warmup=False,
+            height=16,
+            width=16,
+            num_frames=5,
+            fps=30,
+            extra={},
+        )
+        try:
+            with mock.patch.object(multiview_stage, "iter_video_frames", decode):
+                with self.assertRaisesRegex(ValueError, "per-camera vision inputs"):
+                    stage.forward(batch, None)
+                self.assertEqual(loaders() - before, set())
+        finally:
+            released.set()
+
 
 class TestPerViewCaptions(unittest.TestCase):
     CAMERAS = ("camera_front_wide_120fov", "camera_rear_tele_30fov")

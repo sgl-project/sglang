@@ -1009,18 +1009,6 @@ class Cosmos3MultiviewInputStage(PipelineStage):
                 raise ValueError(
                     "View completion requires complete RGB videos for the known cameras."
                 )
-            (
-                batch.extra[EXTRA_CONTROL_PIXELS],
-                batch.extra[EXTRA_VISION_PIXELS],
-            ) = self._start_pixel_loads(
-                views,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                vision_keep_first=condition_video_as_image or vision_is_image,
-                completion=completion,
-            )
-            batch.extra[EXTRA_VIEW_PROMPTS] = [view.prompt or "" for view in views]
             explicit_indexes = sampling_params.resolved_local_condition_indexes()
             if completion:
                 if explicit_indexes:
@@ -1042,6 +1030,18 @@ class Cosmos3MultiviewInputStage(PipelineStage):
                 local_indexes = [0]
             else:
                 local_indexes = [0, 1]
+            (
+                batch.extra[EXTRA_CONTROL_PIXELS],
+                batch.extra[EXTRA_VISION_PIXELS],
+            ) = self._start_pixel_loads(
+                views,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                vision_keep_first=condition_video_as_image or vision_is_image,
+                completion=completion,
+            )
+            batch.extra[EXTRA_VIEW_PROMPTS] = [view.prompt or "" for view in views]
             if not completion:
                 known_views = []
 
