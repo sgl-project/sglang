@@ -174,7 +174,7 @@ if _is_xpu:
 
 if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
-
+if _use_aiter_gfx95:
     from sglang.kernels.ops.attention.dsa import fp4_index_hip
     from sglang.srt.layers.attention.dsa import dsa_indexer_hip
 
@@ -663,7 +663,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     fp8_dtype=fp8_dtype,
                 )
 
-        if _use_aiter:
+        if _use_aiter_gfx95:
             dsa_indexer_hip.init_indexer_hip(self, config)
 
         # After the gfx950 fused indexer's gate, which may turn the writer off.
@@ -2046,7 +2046,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         dst, dst_base = topk_dst, 0
         if tp_split is not None:
-            if _use_aiter:
+            if _use_aiter_gfx95:
                 gather_buf, dst = dsa_indexer_hip.tp_split_topk_rows(
                     tp_split, row_hi - row_lo, self.index_topk, device
                 )
@@ -2133,7 +2133,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             dcp_all_gather_rows_(topk_dst, row_per, row_slot)
             if topk_dst is not topk_result:
                 topk_result[:q_offset] = topk_dst[:q_offset]
-        if tp_split is not None and _use_aiter:
+        if tp_split is not None and _use_aiter_gfx95:
             dsa_indexer_hip.tp_split_gather_topk(
                 tp_split, gather_buf, topk_result[:q_offset]
             )
@@ -2235,7 +2235,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             # the top-k gather is all_gatherv, which runs on PyNCCL only; aiter's
             # (dsa_indexer_hip.tp_split_gather_topk) does not need it
             or (
-                not _use_aiter
+                not _use_aiter_gfx95
                 and (group.pynccl_comm is None or not group.pynccl_comm.available)
             )
         ):
