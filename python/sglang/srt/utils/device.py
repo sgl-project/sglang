@@ -112,6 +112,7 @@ __all__ = [
     "get_compiler_backend",
     "set_cuda_arch",
     "is_gfx95_supported",
+    "is_gfx950_supported",
     "is_gfx942_supported",
     "is_gfx115_supported",
     "use_gfx115_kernels",

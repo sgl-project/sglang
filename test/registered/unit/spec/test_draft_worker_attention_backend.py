@@ -157,6 +157,13 @@ class TestIsGfx950Supported(CustomTestCase):
             with self.subTest(hip=hip):
                 self.assertFalse(self._probe(hip))
 
+    def test_platform_probe_resolves(self):
+        """PlatformContext.is_gfx950 resolves its probe through sglang.srt.utils."""
+        from sglang.srt import utils
+        from sglang.srt.utils import device
+
+        self.assertIs(utils.is_gfx950_supported, device.is_gfx950_supported)
+
 
 if __name__ == "__main__":
     unittest.main()
