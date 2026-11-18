@@ -25,6 +25,7 @@ from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
 from sglang.srt.dllm.algorithm.low_confidence import LowConfidence
+from sglang.srt.dllm.prefill import can_use_kv_only_prefill
 from sglang.srt.environ import envs
 from sglang.srt.hf_transformers import (
     get_processor,
@@ -598,11 +599,20 @@ class TpModelWorker(BaseTpWorker):
         forward_batch: ForwardBatch,
         batch: Optional[ScheduleBatch] = None,
     ) -> GenerationBatchResult:
+        forward_batch.dllm_kv_only_prefill = False
         algo_states = None
         if self.dllm_algorithm.fdfo and type(self.dllm_algorithm) is LowConfidence:
             prefill_tokens = self.dllm_algorithm.prefill_tokens(batch)
             if prefill_tokens is not None:
-                out = self.model_runner.forward(forward_batch, pp_proxy_tensors=None)
+                forward_batch.dllm_kv_only_prefill = can_use_kv_only_prefill(
+                    self.model_runner, forward_batch, batch
+                )
+                try:
+                    out = self.model_runner.forward(
+                        forward_batch, pp_proxy_tensors=None
+                    )
+                finally:
+                    forward_batch.dllm_kv_only_prefill = False
                 return GenerationBatchResult(
                     logits_output=out.logits_output,
                     next_token_ids=prefill_tokens,

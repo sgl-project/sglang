@@ -6,6 +6,7 @@ from sglang.srt.dllm.algorithm.low_confidence import LowConfidence
 from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.managers.schedule_batch import Req as ScheduleReq
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -29,7 +30,7 @@ class Req:
         return self.ids
 
 
-class TestPrefillTokens(unittest.TestCase):
+class TestPrefillTokens(CustomTestCase):
     def setUp(self):
         self.alg = LowConfidence(
             SimpleNamespace(

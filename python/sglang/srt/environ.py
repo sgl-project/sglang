@@ -714,6 +714,8 @@ class Envs:
     # Window for the token-weighted recent cache-hit rate used to estimate
     # waiting-queue prefill load.
     SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS = EnvFloat(15.0)
+    # Startup-only opt-in for LLaDA2 prompt-only model forwards.
+    SGLANG_ENABLE_DLLM_KV_ONLY_PREFILL = EnvBool(False)
     SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(None)
     SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK = EnvFloat(None)
     # Compact extend-attention scheduler tile-budget admission (AMD/HIP-only).

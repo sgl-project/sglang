@@ -123,6 +123,15 @@ SGLang supports various environment variables that can be used to configure its 
 
 ## Performance Tuning
 
+Set `SGLANG_ENABLE_DLLM_KV_ONLY_PREFILL=1` before starting a server to skip
+the last FFN, output normalization, and vocabulary projection for complete
+LLaDA2 prompt blocks. This opt-in path uses BF16 weights on one NVIDIA GPU,
+`LowConfidence` with FDFO, FlashInfer attention, and the Triton MoE backend.
+It supports eager execution and an additional CUDA Graph variant per captured
+batch size. Requests that need hidden states, logprobs, or expert-routing outputs
+use the ordinary forward. Quantization, LoRA, torch.compile, and multi-GPU
+configurations also use the ordinary forward. The default is `0`.
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "33.3%"}} />

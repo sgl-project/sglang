@@ -39,6 +39,7 @@ from sglang.kernels.ops.memory.small_copy import try_small_copy
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.prefill import supports_kv_only_prefill
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia.binding import (
     megakernel_can_run_graph,
@@ -854,6 +855,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
+        if forward_batch.dllm_kv_only_prefill:
+            return "dllm_kv_only"
         if not self.record_nolora_graph:
             return None
         if forward_batch.lora_ids is not None and any(
@@ -1571,6 +1574,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     capture_inputs=None,
                     post_warmup_hook=post_warmup_hook,
                 )
+                if supports_kv_only_prefill(self.model_runner):
+                    # Both graphs must use the same attention metadata. Re-running
+                    # capture_prepare would replace the wrapper used by replay.
+                    forward_batch.dllm_kv_only_prefill = True
+                    try:
+                        self.backend.capture_one(
+                            dataclasses.replace(
+                                shape_key, variant_label="dllm_kv_only"
+                            ),
+                            run_once,
+                            capture_inputs=None,
+                            post_warmup_hook=post_warmup_hook,
+                        )
+                    finally:
+                        forward_batch.dllm_kv_only_prefill = False
 
     def _set_dp_real_num_tokens(self, raw_num_token: int) -> None:
         # An idle DP rank replays a fabricated batch whose count may not reach
@@ -2139,13 +2157,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
                     "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d "
-                    "attention=%s%s",
+                    "attention=%s variant=%s%s",
                     "draft" if self.model_runner.is_draft_worker else "target",
                     self._replay_graph_key.size,
                     "num_tokens" if self.ragged_verify_mode else "bs",
                     forward_batch.forward_mode.name,
                     forward_batch.batch_size,
                     self._replay_graph_key.attention_variant,
+                    self._replay_graph_key.variant_label,
                     (
                         f" slots={self._ragged_capture_slots(self._replay_graph_key.size)}"
                         if self.ragged_verify_mode
