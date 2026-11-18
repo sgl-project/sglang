@@ -1089,8 +1089,7 @@ class KimiK3MoE(nn.Module):
             # The monokernel keeps its own copies of the checkpoint weights.
             and not get_exec().kernel.enable_amd_monokernel
             and self._eligible_for_fused_front
-            and type(norm) is RMSNorm
-            and not norm.cast_x_before_out_mul
+            and norm.weight_folds_into_consumer()
             and isinstance(up.quant_method, UnquantizedLinearMethod)
         )
         if not self._latent_norm_folded:

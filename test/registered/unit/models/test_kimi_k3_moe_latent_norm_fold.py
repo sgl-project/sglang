@@ -130,12 +130,14 @@ class TestLatentNormFold(CustomTestCase):
 
     def test_fold_leaves_the_weights_unless_it_can_run(self):
         """Multiplying the norm into a quantized (packed) up weight would corrupt
-        it, the monokernel keeps checkpoint copies of both weights, and the fold
-        is opt-in."""
+        it, the monokernel keeps checkpoint copies of both weights, a norm that
+        casts x before the weight multiply is not ``x * rstd * weight``, and the
+        fold is opt-in."""
         cases = (
-            dict(quantized=True, enabled=True, monokernel=False),
-            dict(quantized=False, enabled=True, monokernel=True),
-            dict(quantized=False, enabled=False, monokernel=False),
+            dict(quantized=True, enabled=True, monokernel=False, cast_x=False),
+            dict(quantized=False, enabled=True, monokernel=True, cast_x=False),
+            dict(quantized=False, enabled=True, monokernel=False, cast_x=True),
+            dict(quantized=False, enabled=False, monokernel=False, cast_x=False),
         )
         for case in cases:
             with (
@@ -149,6 +151,7 @@ class TestLatentNormFold(CustomTestCase):
                 moe = _fused_front_moe()
                 if case["quantized"]:
                     moe.routed_expert_up_proj.quant_method = mock.Mock()
+                moe.routed_expert_norm.cast_x_before_out_mul = case["cast_x"]
                 up = moe.routed_expert_up_proj.weight.detach().clone()
                 moe._fold_latent_norm()
                 self.assertFalse(moe._latent_norm_folded)

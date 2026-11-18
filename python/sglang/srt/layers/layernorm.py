@@ -518,6 +518,19 @@ class RMSNorm(BaseFusedOp):
         if force_native:
             self._forward_method = self.forward_native
 
+    def weight_folds_into_consumer(self) -> bool:
+        """Whether the next linear may absorb ``weight`` (``W <- W * weight``).
+
+        Then ``RMSNorm(x) @ W^T == rstd(x) * (x @ (W * weight)^T)``, which needs the
+        plain ``x * rstd * weight`` form over the full row; subclasses may change it.
+        """
+        return (
+            type(self) is RMSNorm
+            and self.has_weight
+            and not self.cast_x_before_out_mul
+            and self.variance_size_override is None
+        )
+
     def _batch_invariant_add_rms_norm(
         self,
         x: torch.Tensor,
