@@ -553,6 +553,9 @@ def init_dcp_push_combine(cp_group: "GroupCoordinator", num_heads: int) -> None:
 
     if _PUSH_COMBINE_COMM is not None or cp_group.world_size == 1:
         return
+    # gfx950 keeps the a2a reduce: the push plane's HIP VMM IPC stalls DCP8 startup
+    if get_platform().is_gfx95:
+        return
     if not envs.SGLANG_ENABLE_DCP_PUSH_COMBINE.get() or num_heads % cp_group.world_size:
         return
     from sglang.kernels.ops.attention import dcp_push_combine as pc
