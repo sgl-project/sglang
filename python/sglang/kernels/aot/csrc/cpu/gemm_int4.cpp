@@ -712,8 +712,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_weight_packed_scale_zp(
     int64_t Kc = K / _block_k;
     int64_t buffer_size_nbytes = _block_k * block_n / 2 + block_n * sizeof(int32_t);
     auto blocked_weight = at::empty({E, Nc, Kc, buffer_size_nbytes}, _qweight.options());
-    auto blocked_scales = at::empty({E, Nc, G, block_n}, _scales.options()).to(at::kFloat);
-    auto blocked_qzeros = at::empty({E, Nc, G, block_n}, _qzeros.options()).to(at::kChar);
+    auto blocked_scales = at::empty({E, Nc, G, block_n}, _scales.options().dtype(at::kFloat));
+    auto blocked_qzeros = at::empty({E, Nc, G, block_n}, _qzeros.options().dtype(at::kChar));
     for (int i = 0; i < _qweight.size(0); i++) {
       auto res_ = convert_int4_weight_packed_with_compensation(_qweight[i], _scales[i], _qzeros[i]);
       blocked_weight[i] = std::get<0>(res_);

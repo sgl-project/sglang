@@ -116,6 +116,15 @@ if("$ENV{SGLANG_CPU_FP8_CVT_FTZ}" STREQUAL "1")
     add_compile_definitions(SGLANG_CPU_FP8_CVT_FTZ)
 endif()
 
+if(NOT DEFINED ENV{SGLANG_CPU_FP8_BRGEMM})
+    set(ENV{SGLANG_CPU_FP8_BRGEMM} "0")
+endif()
+
+if("$ENV{SGLANG_CPU_FP8_BRGEMM}" STREQUAL "1")
+    message(STATUS "Enabling macro: SGLANG_CPU_FP8_BRGEMM")
+    add_compile_definitions(SGLANG_CPU_FP8_BRGEMM)
+endif()
+
 if(MY_ARCH_DIR STREQUAL "x86_64")
     add_compile_options(
         -O3

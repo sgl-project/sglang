@@ -543,6 +543,9 @@ void shm_allgather_into_tensor(at::Tensor& output_tensor, at::Tensor& data, int6
 // shared memory reduce_scatter_tensor
 void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int64_t op, int64_t handle = -1);
 
+std::tuple<at::Tensor, at::Tensor>
+_quantize_fp8e4m3(const at::Tensor& t, bool channelwise, c10::optional<at::Tensor> scale_opt = c10::nullopt);
+
 // rope
 void rotary_embedding_cpu(
     at::Tensor& positions,
@@ -645,10 +648,33 @@ void store_cache_cpu(
 void copy_all_layer_kv_cache_cpu(
     const at::Tensor& data_ptrs, const at::Tensor& strides, const at::Tensor& tgt_loc, const at::Tensor& src_loc);
 
+std::tuple<at::Tensor, at::Tensor> float8_linear_prepack_impl(const at::Tensor& weight, const at::Tensor& scales);
+at::Tensor float8_linear_impl(
+    const at::Tensor& input,
+    const at::Tensor& input_scales,
+    const at::Tensor& weight,
+    const at::Tensor& weight_scales,
+    const std::optional<at::Tensor>& bias,
+    at::ScalarType output_dtype);
+at::Tensor fp8_scaled_mm_with_quant(
+    const at::Tensor& act,
+    const std::optional<at::Tensor>& act_scales,
+    bool channelwise,
+    const at::Tensor& weight,
+    const at::Tensor& weight_scales,
+    const std::optional<at::Tensor>& bias,
+    at::ScalarType output_dtype);
+std::tuple<at::Tensor, at::Tensor>
+_quantize_fp8e4m3_vec(const at::Tensor& t, bool channelwise, c10::optional<at::Tensor> scale_opt);
+
 // [NOTE] When registering kernels, we should accurately describe the in-place information.
 // Taking fused_add_rmsnorm_cpu as an example, add `Tensor(a!)` modifier to all tensors that
 // will be modified in-place to avoid incorrect fusing and execution order on graph mode.
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+  m.def("quantize_fp8e4m3(Tensor input, bool channelwise, Tensor? scale_opt) -> (Tensor,Tensor)");
+  m.impl("quantize_fp8e4m3", torch::kCPU, &_quantize_fp8e4m3);
+  m.def("_quantize_fp8e4m3_vec(Tensor input, bool channelwise, Tensor? scale_opt) -> (Tensor,Tensor)");
+  m.impl("_quantize_fp8e4m3_vec", torch::kCPU, &_quantize_fp8e4m3_vec);
   // activation
   m.def("silu_and_mul_cpu(Tensor input) -> Tensor");
   m.impl("silu_and_mul_cpu", torch::kCPU, &silu_and_mul_cpu);
@@ -658,6 +684,17 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gelu_and_mul_cpu", torch::kCPU, &gelu_and_mul_cpu);
   m.def("fused_sigmoid_mul_cpu(Tensor(a!) input, Tensor gate) -> ()");
   m.impl("fused_sigmoid_mul_cpu", torch::kCPU, &fused_sigmoid_mul_cpu);
+
+  m.def("float8_linear_prepack_cpu(Tensor weight, Tensor scales) -> (Tensor, Tensor)");
+  m.impl("float8_linear_prepack_cpu", torch::kCPU, &float8_linear_prepack_impl);
+  m.def(
+      "float8_linear_cpu(Tensor input, Tensor input_scales, Tensor weight, Tensor weight_scales, Tensor? bias, "
+      "ScalarType output_dtype) -> Tensor");
+  m.impl("float8_linear_cpu", torch::kCPU, &float8_linear_impl);
+  m.def(
+      "fp8_scaled_mm_with_quant(Tensor act, Tensor? act_scales, bool channelwise, Tensor weight, Tensor weight_scales, "
+      "Tensor? bias, ScalarType output_dtype) -> Tensor");
+  m.impl("fp8_scaled_mm_with_quant", torch::kCPU, &fp8_scaled_mm_with_quant);
 
   // norm
   m.def("rmsnorm_cpu(Tensor input, Tensor weight, float eps) -> Tensor");

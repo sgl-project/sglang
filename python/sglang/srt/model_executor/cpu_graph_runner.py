@@ -1053,6 +1053,73 @@ def register_fake_ops(tp_size: int):
 
     _CPU_COMPILE_FAKE_OPS_REGISTERED = True
 
+    @torch.library.register_fake("sgl_kernel::float8_linear_cpu")
+    def _(
+        input,
+        input_scales,
+        weight,
+        weight_scales,
+        bias,
+        output_dtype,
+    ):
+        in_shape = input.shape
+        if weight.dim() == 4:
+            N = weight.size(0) * weight.size(-1)
+        else:
+            N = weight.size(0)
+        return input.new_empty(*in_shape[:-1], N, dtype=output_dtype)
+
+    @torch.library.register_fake("sgl_kernel::fp8_scaled_mm_with_quant")
+    def _(
+        input,
+        input_scales,
+        channelwise,
+        weight,
+        weight_scales,
+        bias,
+        output_dtype,
+    ):
+        in_shape = input.shape
+        if weight.dim() == 4:
+            N = weight.size(0) * weight.size(-1)
+        else:
+            N = weight.size(0)
+        return input.new_empty(*in_shape[:-1], N, dtype=output_dtype)
+
+    @torch.library.register_fake("sgl_kernel::_quantize_fp8e4m3_vec")
+    def _(
+        input,
+        channelwise,
+        input_scales,
+    ):
+        M = input.shape[0]
+        K = input.shape[1]
+        act_quant = input.new_empty(M, K, dtype=torch.float8_e4m3fn)
+        scale = (
+            input.new_empty(M, dtype=torch.float)
+            if channelwise
+            else input.new_empty(1, dtype=torch.float)
+        )
+        return act_quant, scale
+
+    @torch.library.register_fake("sgl_kernel::quantize_fp8e4m3")
+    def _(
+        input,
+        channelwise,
+        input_scales,
+    ):
+        M = input.shape[0]
+        K = input.shape[1]
+        act_quant = input.new_empty(M, K, dtype=torch.float8_e4m3fn)
+        scale = (
+            input.new_empty(M, dtype=torch.float)
+            if channelwise
+            else input.new_empty(1, dtype=torch.float)
+        )
+        return act_quant, scale
+
+    _CPU_COMPILE_FAKE_OPS_REGISTERED = True
+
 
 class CPUGraphRunner:
     """CPU torch.compile runner for decode and prefill buckets.
