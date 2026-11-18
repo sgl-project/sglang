@@ -3,7 +3,7 @@
 A name is ``None`` where the platform has no kernel for it.
 """
 
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip, is_musa, is_npu
 
 if is_npu():
     try:
@@ -23,7 +23,7 @@ else:
         from sglang.kernels.ops.speculative.sampling import (
             tree_speculative_sampling_target_only,
         )
-    elif is_hip():
+    elif is_hip() and is_gfx95_supported():
         # Triton port of the CUDA kernel above, same operands and results.
         from sglang.kernels.ops.speculative.target_only_sampling import (
             tree_speculative_sampling_target_only_triton,
