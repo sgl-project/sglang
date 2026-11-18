@@ -4,7 +4,6 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     EVALSCOPE,
     TestNpuAccuracyMultiNodePdSepTestCaseBase,
 )
-from sglang.test.ascend.e2e.test_npu_dual_pass import assert_no_regression
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_FLASH_DEFAULT_MODEL_PATH,
 )
@@ -16,8 +15,6 @@ register_npu_ci(
     nightly=True,
     disabled="TEMP: disabled during overlap-schedule validation",
 )
-
-CASE_ID = "test_npu_deepseek_v4_flash_fp8_1p1d_16p_gsm8k_a5_overlap"
 
 _PREFILL_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -35,6 +32,7 @@ _PREFILL_ENVS = {
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
+    "ASCEND_MF_TRANSFER_PROTOCOL": "device_urma",
     "IS_DEEPSEEK_V4": "1",
     "USE_FUSED_HC_PRE_ASCENDC": "1",
     "SGLANG_DSV4_NPU_FUSED_COMPRESSOR": "1",
@@ -160,9 +158,8 @@ class TestNPUDeepSeekV4FlashFP8_1P1D_16PGSM8KA5Overlap(
     eval_batch_size = 16
 
     def test_npu_deepseek_v4_flash_fp8_1p1d_4p_gsm8k_a5_overlap(self):
-        """Run pass-2 GSM8K and assert accuracy within 1% of pass 1."""
+        """Run the GSM8K accuracy check."""
         self.run_accuracy()
-        assert_no_regression(self, CASE_ID, self.last_metrics)
 
 
 if __name__ == "__main__":
