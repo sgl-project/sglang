@@ -48,6 +48,7 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
     align_window_tails,
     build_transfer_entry_pairs,
@@ -1111,6 +1112,8 @@ class MoriKVManager(CommonKVManager):
             self.aux_mem_descs = []
             self.state_mem_descs = []
             self.engine = None
+        if isinstance(self.request_status, PPConsensusStore):
+            self.request_status.close()
         logger.info(
             "MoriKVManager torn down (was role=%s)", self.disaggregation_mode.value
         )
