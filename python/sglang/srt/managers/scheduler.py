@@ -703,6 +703,12 @@ class Scheduler(
             and self.tree_cache.cache_controller is not None
             and not decode_offloads_kvcache()
         )
+        if _is_npu and self.spec_algorithm is SpeculativeAlgorithm.EAGLE:
+            # NextN's final draft uses the same forward-stream cache fences.
+            last_reader = self.model_worker.last_shared_read_runner
+            last_reader.kv_offload_fenced_on_forward_stream = (
+                self.tp_worker.model_runner.kv_offload_fenced_on_forward_stream
+            )
 
         # Init running status
         self.init_running_status()

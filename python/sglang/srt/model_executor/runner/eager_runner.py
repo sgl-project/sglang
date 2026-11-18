@@ -26,6 +26,7 @@ from sglang.kernels.ops.attention.kv_indices import (
 )
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
     cp_shard_model_inputs,
@@ -46,6 +47,7 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.model_executor.runner_utils.shared_read_event import (
+    maybe_publish_eager_shared_read_done,
     maybe_publish_prefill_shared_read_done,
 )
 from sglang.srt.runtime_context import (
@@ -228,6 +230,12 @@ class EagerRunner(BaseRunner):
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
+        if is_npu():
+            maybe_publish_eager_shared_read_done(
+                model_runner,
+                forward_batch,
+                torch.get_device_module(model_runner.device),
+            )
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
 
@@ -305,6 +313,27 @@ class EagerRunner(BaseRunner):
             maybe_publish_prefill_shared_read_done(
                 model_runner,
                 shared_read_ends,
+                torch.get_device_module(model_runner.device),
+                # Only an audited final draft can bypass the target-prefill gate.
+                allow_speculative_draft=(
+                    shared_read_ends is SharedReadEnds.PRE_REPLAY
+                    and is_npu()
+                    and model_runner.is_draft_worker
+                    and model_runner.attn_backend.resolve_eager_shared_read_ends(
+                        forward_batch
+                    )
+                    is SharedReadEnds.PRE_REPLAY
+                ),
+            )
+
+        if is_npu() and (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            # Planner preparation may precede the final NPU padding and re-plan.
+            maybe_publish_eager_shared_read_done(
+                model_runner,
+                forward_batch,
                 torch.get_device_module(model_runner.device),
             )
 

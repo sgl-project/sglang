@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -559,21 +558,29 @@ class AscendAttnBackend(AttentionBackend):
             self.dllm_block_size = self.dllm_config.block_size
 
         self.attn_cp_size = get_parallel().attn_cp_size
-        self.prepare_in_graph = self._should_prepare_metadata_in_graph(model_runner)
-
-    def _should_prepare_metadata_in_graph(self, model_runner: ModelRunner) -> bool:
-        supports_in_graph_metadata = (
-            self.use_quant_flash_attn
-            or (
-                self.use_dsa
-                and not get_parallel().dcp_enabled
-                and is_glm_moe_dsa(model_runner.model_config.hf_config)
-            )
+        supports_shared_read = self._supports_shared_read(model_runner)
+        self.prepare_in_graph = (
+            supports_shared_read
+            and envs.SGLANG_NPU_PREPARE_METADATA_IN_GRAPH.get()
+            and get_disagg().disaggregation_mode != "prefill"
         )
-        if (
-            supports_in_graph_metadata
+        self.shared_read_enabled = (
+            supports_shared_read
             and envs.SGLANG_ENABLE_WAR_BARRIER.get()
             and not get_schedule().disable_overlap_schedule
+        )
+        if self.shared_read_enabled:
+            from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
+                get_npu_shared_read_event_api,
+            )
+
+            self.shared_read_enabled = get_npu_shared_read_event_api() is not None
+
+    def _supports_shared_read(self, model_runner: ModelRunner) -> bool:
+        if (
+            self.use_dsa
+            and is_glm_moe_dsa(model_runner.model_config.hf_config)
+            and get_parallel().pp_size == 1
             # Host-only Mamba backups rely on the whole-forward fence.
             and not envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.get()
             and not self.enable_sparsity_driven_kv_offload
@@ -586,26 +593,41 @@ class AscendAttnBackend(AttentionBackend):
             )
         ):
             disagg = get_disagg()
-            if disagg.disaggregation_mode == "prefill" or (
+            if (
                 # Decode offload copies KV on a stream without a forward fence.
                 disagg.disaggregation_mode == "decode"
                 and disagg.disaggregation_decode_enable_offload_kvcache
             ):
                 return False
 
-            from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
-                get_npu_shared_read_event_api,
-            )
-
-            return get_npu_shared_read_event_api() is not None
+            return True
         return False
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
-        if not self.prepare_in_graph:
+        if not self.shared_read_enabled:
             return SharedReadEnds.UNKNOWN
-        if fm.is_draft_extend_v2():
-            return SharedReadEnds.IN_REPLAY
-        return super().shared_read_ends(fm)
+        if fm == ForwardMode.EXTEND:
+            return SharedReadEnds.PRE_REPLAY
+        if fm.is_decode() or fm.is_target_verify() or fm.is_draft_extend_v2():
+            return (
+                SharedReadEnds.IN_REPLAY
+                if self.prepare_in_graph
+                else SharedReadEnds.PRE_REPLAY
+            )
+        return SharedReadEnds.UNKNOWN
+
+    def resolve_eager_shared_read_ends(
+        self, forward_batch: ForwardBatch
+    ) -> SharedReadEnds:
+        if not self.shared_read_enabled:
+            return SharedReadEnds.UNKNOWN
+        mode = forward_batch.forward_mode
+        if mode.is_decode() or mode.is_target_verify() or mode.is_draft_extend_v2():
+            return SharedReadEnds.PRE_REPLAY
+        # NextN prefill ends with this draft's EXTEND, after the target's reads.
+        if mode == ForwardMode.EXTEND and self.is_draft_worker:
+            return SharedReadEnds.PRE_REPLAY
+        return SharedReadEnds.UNKNOWN
 
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
         return (
@@ -683,6 +705,20 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.seq_lens,
                 forward_batch.out_cache_loc,
             )
+        if self.dsa_dcp_target:
+            # The indexer reads this fixed input; its live source can change per batch.
+            buffer = self.graph_metadata["dcp_origin_out_cache_loc"]
+            origin_out_cache_loc = getattr(forward_batch, "origin_out_cache_loc", None)
+            if origin_out_cache_loc is None:
+                buffer.zero_()
+            else:
+                num_tokens = origin_out_cache_loc.shape[0]
+                assert num_tokens <= buffer.shape[0], (
+                    "NPU DSA+DCP origin_out_cache_loc exceeds its graph buffer: "
+                    f"{num_tokens} > {buffer.shape[0]}"
+                )
+                buffer[:num_tokens].copy_(origin_out_cache_loc)
+                buffer[num_tokens:].zero_()
         if self.prepare_in_graph:
             # The captured graph fills this bucket after its static inputs are ready.
             self.forward_metadata = self.graph_metadata[bs]
@@ -704,7 +740,6 @@ class AscendAttnBackend(AttentionBackend):
             forward_mode=forward_batch.forward_mode,
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
-            origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
             max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
         )
 
@@ -714,29 +749,47 @@ class AscendAttnBackend(AttentionBackend):
         mode = forward_batch.forward_mode
         metadata = self.forward_metadata
         bs = metadata.block_tables.shape[0]
-        # Hybrid SWA graph kernels take the window size directly and need translated IDs.
         self._fill_graph_block_table(
-            metadata.block_tables,
-            forward_batch.req_pool_indices[:bs],
-            block_tables_swa=metadata.block_tables_swa,
+            metadata.block_tables, forward_batch.req_pool_indices[:bs]
         )
-        if metadata.swa_out_cache_loc is not None:
-            metadata.swa_out_cache_loc.copy_(
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
-                )
-            )
         seq_lens = forward_batch.seq_lens[:bs]
-        if self.use_quant_flash_attn:
-            self._prepare_quant_flash_attn_metadata(
-                metadata, seq_lens, mode, spec_info=forward_batch.spec_info
-            )
-        elif mode.is_target_verify():
+        if mode.is_target_verify():
             torch.add(
                 seq_lens, self.speculative_num_draft_tokens, out=metadata.seq_lens
             )
         elif self.is_draft_worker and mode.is_decode():
             torch.add(seq_lens, self.speculative_step_offset_npu, out=metadata.seq_lens)
+
+        if self.dsa_dcp_target:
+            # Local pages derive from the global snapshot without another shared read.
+            local_pages = metadata.block_tables[:, :: self.dcp_size] // self.dcp_size
+            if mode.is_target_verify():
+                block_tables = metadata.dcp_spec_block_tables.view(
+                    bs, self.speculative_num_draft_tokens, -1
+                )
+                local_pages = local_pages[:, None, :]
+                metadata.dcp_spec_seq_lens.copy_(
+                    get_dcp_chain_spec_lens(
+                        metadata.seq_lens,
+                        self.speculative_num_draft_tokens,
+                        self.dcp_size,
+                        self.dcp_rank,
+                        interleave_size=self.page_size,
+                    )
+                )
+            else:
+                block_tables = metadata.dcp_block_tables
+                metadata.dcp_seq_lens.copy_(
+                    get_dcp_lens(
+                        metadata.seq_lens,
+                        self.dcp_size,
+                        self.dcp_rank,
+                        interleave_size=self.page_size,
+                    )
+                )
+            pages = min(local_pages.shape[-1], block_tables.shape[-1])
+            block_tables[..., :pages].copy_(local_pages[..., :pages])
+            block_tables[..., pages:].zero_()
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -1051,7 +1104,7 @@ class AscendAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput] = None,
         extend_seq_lens: Optional[torch.Tensor] = None,
     ):
-        """Prepare QFA on device, preserving graph-bound addresses."""
+        """Prepare QFA on device outside capture, preserving graph-bound addresses."""
         bs = seq_lens.shape[0]
         if metadata.seq_lens is None:
             metadata.seq_lens = torch.empty_like(seq_lens, dtype=torch.int32)
@@ -1336,7 +1389,6 @@ class AscendAttnBackend(AttentionBackend):
         self,
         block_tables: torch.Tensor,
         req_pool_indices: torch.Tensor,
-        block_tables_swa: Optional[torch.Tensor] = None,
     ):
         total_pages = min(
             block_tables.shape[1],
@@ -1347,11 +1399,6 @@ class AscendAttnBackend(AttentionBackend):
         ]
         block_tables[:, :total_pages].copy_(full_page_locs // self.page_size)
         block_tables[:, total_pages:].fill_(0)
-        if block_tables_swa is not None:
-            block_tables_swa[:, :total_pages].copy_(
-                self.full_to_swa_index_mapping[full_page_locs] // self.page_size
-            )
-            block_tables_swa[:, total_pages:].zero_()
 
     def _apply_cuda_graph_metadata(
         self,
@@ -1362,7 +1409,6 @@ class AscendAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         out_cache_loc: Optional[torch.Tensor] = None,
-        origin_out_cache_loc: Optional[torch.Tensor] = None,
         max_seq_len_host: Optional[int] = None,
     ):
         """Shared capture+replay body for the cuda-graph init path.
@@ -1473,18 +1519,6 @@ class AscendAttnBackend(AttentionBackend):
             metadata.block_tables[:bs, num_pages:].fill_(0)
 
         if self.dsa_dcp_target:
-            if "dcp_origin_out_cache_loc" in self.graph_metadata:
-                buffer = self.graph_metadata["dcp_origin_out_cache_loc"]
-                if origin_out_cache_loc is None:
-                    buffer.zero_()
-                else:
-                    num_tokens = origin_out_cache_loc.shape[0]
-                    assert num_tokens <= buffer.shape[0], (
-                        "NPU DSA+DCP origin_out_cache_loc exceeds its graph buffer: "
-                        f"{num_tokens} > {buffer.shape[0]}"
-                    )
-                    buffer[:num_tokens].copy_(origin_out_cache_loc)
-                    buffer[num_tokens:].zero_()
             # DCP decode/speculative paths use rank-local KV lengths and a block
             # table whose stride is page_size * dcp_world_size. Draft attention
             # uses the ordinary full-KV metadata above instead.
@@ -4693,19 +4727,7 @@ class AscendAttnMultiStepDraftBackend:
     def common_template(self, forward_batch: ForwardBatch, call_fn: int):
         assert forward_batch.spec_info is not None
 
-        backend = self.attn_backends[0]
-        locs = (
-            forward_batch.out_cache_loc
-            if backend.use_sliding_window_kv_pool and backend.prepare_in_graph
-            else None
-        )
-        if locs is not None:
-            forward_batch = copy(forward_batch)
         for i in range(self.speculative_num_steps - 1):
-            if locs is not None:
-                # EAGLE packs writes as [batch, topk, step]. The pool's tensor
-                # lookup accepts this strided view without a step-major copy.
-                forward_batch.out_cache_loc = locs[i :: self.speculative_num_steps]
             call_fn(i, forward_batch)
 
     def init_forward_metadata_out_graph(
@@ -4721,15 +4743,15 @@ class AscendAttnMultiStepDraftBackend:
             forward_mode=ForwardMode.DECODE,
         )
 
-        def call_fn(i, inner_fb):
+        def call_fn(i, _forward_batch):
             self.attn_backends[i].init_forward_metadata_out_graph(
                 inner_fb, in_capture=in_capture
             )
 
-        self.common_template(inner_fb, call_fn)
+        self.common_template(forward_batch, call_fn)
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
-        def call_fn(i, forward_batch):
+        def call_fn(i, _forward_batch):
             self.attn_backends[i].init_forward_metadata_in_graph(forward_batch)
 
         self.common_template(forward_batch, call_fn)

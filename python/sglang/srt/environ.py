@@ -1309,6 +1309,8 @@ class Envs:
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
     # Set to 0 to allow AscendAttnBackend to set needs_cpu_seq_lens to False for dsa models.
     SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS = EnvBool(True)
+    # Prepare supported NPU attention metadata inside the captured decode graph.
+    SGLANG_NPU_PREPARE_METADATA_IN_GRAPH = EnvBool(False)
 
     # ===================================================================
     # MUSA
