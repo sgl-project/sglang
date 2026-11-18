@@ -1765,7 +1765,10 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
         kwargs = {}
-        if sinks is not None:
+        # For cascade attention, sinks must only be passed to the suffix call.
+        # The prefix LSE already includes the sink when passed; passing it to
+        # both prefix and suffix would double-count it during merge.
+        if sinks is not None and not use_cascade_attn:
             kwargs["sinks"] = sinks
         if score_mod is not None:
             kwargs["score_mod"] = score_mod
@@ -2024,6 +2027,10 @@ class FlashAttentionBackend(AttentionBackend):
                     softmax_scale=layer.scaling,
                 )
             elif use_cascade_attn:
+                # Prefix LSE was computed without sinks; the suffix call needs
+                # them so the merge produces correct LSE values.
+                if sinks is not None:
+                    kwargs["sinks"] = sinks
                 o_expand, softmax_lse_expand, *rest_expand = (
                     self._forward_suffix_attention(
                         q,
@@ -2326,7 +2333,10 @@ class FlashAttentionBackend(AttentionBackend):
             causal = False
 
         kwargs = {}
-        if sinks is not None:
+        # For cascade attention, sinks must only be passed to the suffix call.
+        # The prefix LSE already includes the sink when passed; passing it to
+        # both prefix and suffix would double-count it during merge.
+        if sinks is not None and not use_cascade_attn:
             kwargs["sinks"] = sinks
         if score_mod is not None:
             kwargs["score_mod"] = score_mod
@@ -2491,6 +2501,10 @@ class FlashAttentionBackend(AttentionBackend):
                         kwargs["max_seqlen_k"] = (
                             self.forward_metadata_spec_decode_expand.max_seq_len_k
                         )
+                    # Prefix LSE was computed without sinks; the suffix call needs
+                    # them so the merge produces correct LSE values.
+                    if sinks is not None:
+                        kwargs["sinks"] = sinks
                     o_expand, softmax_lse_expand, *rest_expand = (
                         self._forward_suffix_attention(
                             q_reshaped,
@@ -2549,6 +2563,8 @@ class FlashAttentionBackend(AttentionBackend):
             )
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
+                # Prefix LSE was computed without sinks; the suffix call needs
+                # them so the merge produces correct LSE values.
                 o_expand, softmax_lse_expand, *rest_expand = (
                     self.flash_attn_with_kvcache(
                         q=q_rope,
@@ -2568,6 +2584,7 @@ class FlashAttentionBackend(AttentionBackend):
                         v_descale=fa_v_descale,
                         return_softmax_lse=True,
                         num_splits=self.num_splits,
+                        sinks=sinks,
                         ver=ver,
                     )
                 )
