@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 import torch
 from torch.profiler import profiler as torch_profiler
 
+from sglang.srt.hardware_backend import npu as npu_backend
 from sglang.srt.managers.scheduler_components import profiler_manager
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability import profile_analysis_npu, profile_utils
@@ -27,7 +28,7 @@ class TestNPUTraceHandler(unittest.TestCase):
     def test_dependency_import_requires_available_npu(self):
         with patch("sglang.srt.utils.is_npu", return_value=False):
             with self.assertRaisesRegex(RuntimeError, "requires an available NPU"):
-                profile_analysis_npu.get_torch_npu()
+                npu_backend.get_torch_npu()
 
     def test_policy_depends_on_process_not_workload_name(self):
         api = SimpleNamespace(tensorboard_trace_handler=Mock())
@@ -45,7 +46,7 @@ class TestNPUTraceHandler(unittest.TestCase):
                     return_value=SimpleNamespace(daemon=daemon),
                 ),
                 patch.object(
-                    profile_analysis_npu,
+                    npu_backend,
                     "get_torch_npu",
                     return_value=SimpleNamespace(profiler=api),
                 ),
@@ -86,7 +87,7 @@ class TestNPUTraceHandler(unittest.TestCase):
             )
             with (
                 self.subTest(modes=modes),
-                patch.object(profile_analysis_npu, "get_torch_npu", return_value=npu),
+                patch.object(npu_backend, "get_torch_npu", return_value=npu),
             ):
                 for mode in modes:
                     profile_analysis_npu.NPUTraceHandler.apply_patches(mode)
@@ -115,7 +116,7 @@ class TestNPUTraceHandler(unittest.TestCase):
                 )
 
     def test_invalid_patch_mode_does_not_import_npu(self):
-        with patch.object(profile_analysis_npu, "get_torch_npu") as get_npu:
+        with patch.object(npu_backend, "get_torch_npu") as get_npu:
             with self.assertRaisesRegex(ValueError, "patch mode"):
                 profile_analysis_npu.NPUTraceHandler.apply_patches("unknown")
         get_npu.assert_not_called()
@@ -234,7 +235,7 @@ class TestSRTNPUTraceHandler(unittest.TestCase):
         self.api = api
         npu = SimpleNamespace(profiler=api)
         self.get_npu = self.enterContext(
-            patch.object(profile_analysis_npu, "get_torch_npu", return_value=npu)
+            patch.object(npu_backend, "get_torch_npu", return_value=npu)
         )
         self.enterContext(patch.object(profiler_manager, "torch_npu", npu, create=True))
         self.enterContext(patch.object(profiler_manager, "_is_npu", True))
