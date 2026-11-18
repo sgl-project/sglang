@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -19,8 +19,28 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
 _is_gfx95 = is_gfx95_supported()
+
+
+def sharded_index_k_ctx_lens(
+    backend: DeepseekSparseAttnBackend,
+    forward_mode: ForwardMode,
+    cache_seqlens_int32: torch.Tensor,
+    seqlens_expanded: torch.Tensor,
+    bs: int,
+) -> Optional[torch.Tensor]:
+    """The paged_mqa_ctx_lens_2d of a decode or target-verify batch on a sharded
+    index-K: this rank's index-K lengths, without DeepGEMM's schedule; else None."""
+    if not (
+        backend.dsa_shards_index_k
+        and (forward_mode.is_decode_or_idle() or forward_mode.is_target_verify())
+    ):
+        return None
+    return backend._build_paged_mqa_schedule_2d_ctx_lens(
+        forward_mode, cache_seqlens_int32, seqlens_expanded, bs
+    )
 
 
 def forward_triton_dcp_partial(
