@@ -1,11 +1,10 @@
 """CPU operator/lifecycle contracts; not CUDA Graph or TP parity evidence."""
 
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-
 from sglang.srt.models.dflash import CandidateSelector
 from sglang.srt.speculative.dmtp_graph_tails import DMTPGraphSamplingTail
 from sglang.srt.speculative.dmtp_selector_graph import native_proposal
@@ -57,14 +56,19 @@ class TailTest(unittest.TestCase):
 
     def test_t1_tail_preserves_original_q_and_all_eight_embeddings(self):
         group = SimpleNamespace(world_size=1, broadcast=lambda value, src: None)
-        with patch(
-            "sglang.srt.speculative.dmtp_selector_graph.get_tp_group",
-            return_value=group,
-        ), patch(
-            "sglang.srt.speculative.dmtp_graph_tails.get_tp_group", return_value=group
-        ), patch(
-            "sglang.srt.speculative.dmtp_selector_graph.candidate_topk",
-            side_effect=cpu_topk,
+        with (
+            patch(
+                "sglang.srt.speculative.dmtp_selector_graph.get_tp_group",
+                return_value=group,
+            ),
+            patch(
+                "sglang.srt.speculative.dmtp_graph_tails.get_tp_group",
+                return_value=group,
+            ),
+            patch(
+                "sglang.srt.speculative.dmtp_selector_graph.candidate_topk",
+                side_effect=cpu_topk,
+            ),
         ):
             tail = self.fixture(True)
             tail.block_ids[:2, 0] = torch.tensor([2, 3])
@@ -90,12 +94,15 @@ class TailTest(unittest.TestCase):
             torch.testing.assert_close(actual[3][:, 2:], blocks[:, 2:], rtol=0, atol=0)
 
     def test_df_tail_uses_next_scored_rows_and_captured_outputs_survive_reference(self):
-        with patch(
-            "sglang.srt.speculative.dmtp_selector_graph.get_tp_group",
-            return_value=SimpleNamespace(world_size=1),
-        ), patch(
-            "sglang.srt.speculative.dmtp_selector_graph.candidate_topk",
-            side_effect=cpu_topk,
+        with (
+            patch(
+                "sglang.srt.speculative.dmtp_selector_graph.get_tp_group",
+                return_value=SimpleNamespace(world_size=1),
+            ),
+            patch(
+                "sglang.srt.speculative.dmtp_selector_graph.candidate_topk",
+                side_effect=cpu_topk,
+            ),
         ):
             tail = self.fixture(False)
             hidden = torch.randn(2, 8, 8)
@@ -122,14 +129,19 @@ class TailTest(unittest.TestCase):
 
     def test_stage_selects_reordered_sampling_rows_and_rejects_changed_weights(self):
         group = SimpleNamespace(world_size=1, broadcast=lambda value, src: None)
-        with patch(
-            "sglang.srt.speculative.dmtp_selector_graph.get_tp_group",
-            return_value=group,
-        ), patch(
-            "sglang.srt.speculative.dmtp_graph_tails.get_tp_group", return_value=group
-        ), patch(
-            "sglang.srt.speculative.dmtp_graph_tails.resolve_greedy_mask",
-            return_value=torch.tensor([False, True, False]),
+        with (
+            patch(
+                "sglang.srt.speculative.dmtp_selector_graph.get_tp_group",
+                return_value=group,
+            ),
+            patch(
+                "sglang.srt.speculative.dmtp_graph_tails.get_tp_group",
+                return_value=group,
+            ),
+            patch(
+                "sglang.srt.speculative.dmtp_graph_tails.resolve_greedy_mask",
+                return_value=torch.tensor([False, True, False]),
+            ),
         ):
             tail = self.fixture(True)
             info = SimpleNamespace(temperatures=torch.tensor([0.7, 1.0, 1.3]))
@@ -144,13 +156,67 @@ class TailTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "weights/layout changed"):
                 tail.stage(torch.tensor([1, 2, 3]), info)
 
+    @patch(
+        "sglang.srt.speculative.dmtp_selector_graph.get_tp_group",
+        return_value=SimpleNamespace(world_size=1),
+    )
+    def test_stage_rejects_replaced_embedding_or_conditioner(self, _group):
+        for replacement in ("embedding", "conditioner"):
+            with self.subTest(replacement=replacement):
+                tail = self.fixture(True)
+                if replacement == "embedding":
+                    tail.worker.target_worker.model_runner.model.get_input_embeddings = (
+                        lambda: torch.nn.Embedding(32, 8)
+                    )
+                else:
+                    tail.worker.draft_model.mtp_prefix_conditioner = (
+                        MTPPrefixConditioner(8, 4, 1e-6)
+                    )
+                with self.assertRaisesRegex(RuntimeError, "weights/layout changed"):
+                    tail.stage(
+                        torch.tensor([1]),
+                        SimpleNamespace(temperatures=torch.ones(1)),
+                    )
+
+    @patch(
+        "sglang.srt.speculative.dmtp_selector_graph.get_tp_group",
+        return_value=SimpleNamespace(world_size=1),
+    )
+    def test_stage_refreshes_sampling_state_without_reusing_previous_rows(self, _group):
+        group = SimpleNamespace(world_size=1, broadcast=lambda value, src: None)
+        with (
+            patch(
+                "sglang.srt.speculative.dmtp_graph_tails.get_tp_group",
+                return_value=group,
+            ),
+            patch(
+                "sglang.srt.speculative.dmtp_graph_tails.resolve_greedy_mask",
+                side_effect=[torch.tensor([False, True]), torch.tensor([True])],
+            ),
+        ):
+            tail = self.fixture(True)
+            tail.stage(
+                torch.tensor([3, 4]),
+                SimpleNamespace(temperatures=torch.tensor([0.7, 1.2])),
+            )
+            tail.stage(
+                torch.tensor([9]), SimpleNamespace(temperatures=torch.tensor([0.5]))
+            )
+            torch.testing.assert_close(tail.temperatures[:1], torch.tensor([0.5]))
+            self.assertTrue(tail.greedy_mask[0])
+            self.assertEqual(tail.block_ids[0, 0].item(), 9)
+            self.assertTrue((tail.block_ids[0, 1:] == 31).all())
+
     def test_dense_df_tail_keeps_its_different_six_scored_rows(self):
-        with patch(
-            "sglang.srt.speculative.dmtp_selector_graph.get_tp_group",
-            return_value=SimpleNamespace(world_size=1),
-        ), patch(
-            "sglang.srt.speculative.dmtp_selector_graph.candidate_topk",
-            side_effect=cpu_topk,
+        with (
+            patch(
+                "sglang.srt.speculative.dmtp_selector_graph.get_tp_group",
+                return_value=SimpleNamespace(world_size=1),
+            ),
+            patch(
+                "sglang.srt.speculative.dmtp_selector_graph.candidate_topk",
+                side_effect=cpu_topk,
+            ),
         ):
             tail = self.fixture(False)
             tail.scored_start = 2
