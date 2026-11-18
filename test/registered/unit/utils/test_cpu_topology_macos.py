@@ -15,8 +15,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 class TestCpuTopologyOnMacos(CustomTestCase):
     def test_macos_reports_one_node_without_lscpu_or_affinity(self):
-        """macOS has no `lscpu` and no `Process.cpu_affinity()`; resolving a
-        `--device cpu` server must not crash and must see a single node."""
+        """macOS has no `lscpu` and no `Process.cpu_affinity()`; the helper must
+        report a single node of physical cores instead of consulting either."""
         with (
             patch("sglang.srt.utils.device.platform.system", return_value="Darwin"),
             patch("sglang.srt.utils.device.psutil.cpu_count", return_value=4),
