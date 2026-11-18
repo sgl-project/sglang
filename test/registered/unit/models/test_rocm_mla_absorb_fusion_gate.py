@@ -127,6 +127,235 @@ class TestAbsorbBmmConfig(CustomTestCase):
         self.assertIsNone(_ABSORB_CONFIG(16, 257, 512))
 
 
+class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
+    """The K3 writer replaces the split chain only where attention never reads its k,
+    and the cache holds the bytes the split chain would have written."""
+
+    def setUp(self):
+        self.writer = KimiK3RocmMlaQCacheWriter(
+            kv_lora_rank=512, qk_rope_head_dim=64, use_hip=True, use_triton=False
+        )
+        self.fused_q = torch.zeros(2, 12, 576, dtype=torch.bfloat16)
+        # The kernels are the boundary; the gate in front of them is under test.
+        self.writer._write_hip = lambda **_: self.fused_q
+
+    def _write(
+        self, *, attention_backend, is_target_verify, k_scale_float=1.0, **extra
+    ):
+        return self.writer.write(
+            q_nope=torch.zeros(2, 12, 512, dtype=torch.bfloat16),
+            q_pe=torch.zeros(2, 12, 64, dtype=torch.bfloat16),
+            k_nope=torch.zeros(2, 1, 512, dtype=torch.bfloat16),
+            k_pe=torch.zeros(2, 1, 64, dtype=torch.bfloat16),
+            slot_mapping=torch.arange(2, dtype=torch.int64),
+            kv_cache=torch.zeros(4, 1, 576, dtype=torch.bfloat16),
+            k_scale_float=k_scale_float,
+            attention_backend=attention_backend,
+            is_target_verify=is_target_verify,
+            **extra,
+        )
+
+    def test_triton_target_verify_keeps_the_split_chain(self):
+        """Triton target-verify runs the extend kernel, which reads k;
+        fusing it would feed that kernel the uninitialized k placeholder."""
+        self.assertIsNone(
+            self._write(attention_backend="triton", is_target_verify=True)
+        )
+
+    def test_fused_routes(self):
+        for backend, verify in (("aiter", False), ("aiter", True), ("triton", False)):
+            with self.subTest(backend=backend, verify=verify):
+                fused = self._write(attention_backend=backend, is_target_verify=verify)
+                self.assertIs(fused[0], self.fused_q)
+                self.assertEqual(tuple(fused[1].shape), (2, 1, 576))
+
+    def test_non_unit_kv_scale_keeps_the_split_chain(self):
+        """The split chain's AITER cache write casts without the KV scale,
+        while the fused kernels divide by it; their bytes differ unless it is 1."""
+        for k_scale_float in (None, 1.0):
+            with self.subTest(k_scale_float=k_scale_float):
+                self.assertIsNotNone(
+                    self._write(
+                        attention_backend="aiter",
+                        is_target_verify=False,
+                        k_scale_float=k_scale_float,
+                    )
+                )
+        self.assertIsNone(
+            self._write(
+                attention_backend="aiter", is_target_verify=False, k_scale_float=2.0
+            )
+        )
+
+    def test_rejected_inputs_without_triton_keep_the_split_chain(self):
+        """Inputs the HIP op rejects, with no Triton kernel to take them,
+        must fall back to the split chain instead of failing the decode step."""
+        self.writer._write_hip = lambda **_: None
+        self.assertIsNone(
+            self._write(attention_backend="aiter", is_target_verify=False)
+        )
+
+    def test_triton_only_writer_requests_no_fp8_query_buffer(self):
+        """The backend allocates and logs its fp8 query buffer on the first request;
+        a writer without the HIP op writes a BF16 query and must not make one."""
+        writer = KimiK3RocmMlaQCacheWriter(
+            kv_lora_rank=512, qk_rope_head_dim=64, use_hip=False, use_triton=True
+        )
+        get_fp8_q_out = mock.Mock()
+        with mock.patch.object(
+            kimi_k3_rocm_mla.mla_q_cache_aiter_triton, "run", return_value=self.fused_q
+        ):
+            self.writer = writer
+            fused = self._write(
+                attention_backend="aiter",
+                is_target_verify=True,
+                get_fp8_q_out=get_fp8_q_out,
+            )
+        self.assertIs(fused[0], self.fused_q)
+        get_fp8_q_out.assert_not_called()
+
+    def test_hip_writer_passes_the_fp8_query_buffer_to_the_op(self):
+        """On the HIP path the op writes q into the backend's padded fp8 buffer
+        with its scale, and that buffer is returned as q."""
+        writer = KimiK3RocmMlaQCacheWriter(
+            kv_lora_rank=512, qk_rope_head_dim=64, use_hip=True, use_triton=False
+        )
+        fp8_buf, fp8_scale = object(), object()
+        with (
+            mock.patch.object(
+                kimi_k3_rocm_mla,
+                "get_buffer",
+                return_value=SimpleNamespace(get=lambda **_: torch.zeros(2)),
+            ),
+            mock.patch.object(
+                kimi_k3_rocm_mla.mla_q_cache_aiter_hip,
+                "run",
+                side_effect=lambda **kw: kw["out"],
+            ) as run,
+        ):
+            self.writer = writer
+            fused = self._write(
+                attention_backend="aiter",
+                is_target_verify=True,
+                get_fp8_q_out=lambda: (fp8_buf, fp8_scale),
+            )
+        self.assertIs(fused[0], fp8_buf)
+        self.assertIs(run.call_args.kwargs["q_scale"], fp8_scale)
+
+    def test_no_writer_without_a_fused_kernel(self):
+        """Where neither kernel can run (gfx1250, an old AITER), no writer is
+        installed, so every layer keeps the split chain without per-step checks."""
+        with (
+            mock.patch.object(
+                kimi_k3_rocm_mla.mla_q_cache_aiter_hip, "available", lambda: False
+            ),
+            mock.patch.object(
+                kimi_k3_rocm_mla.mla_q_cache_aiter_triton, "available", lambda: False
+            ),
+        ):
+            self.assertIsNone(
+                kimi_k3_rocm_mla.create_q_cache_writer(
+                    kv_lora_rank=512, qk_rope_head_dim=64
+                )
+            )
+
+    def test_other_backends_keep_the_split_chain(self):
+        for verify in (False, True):
+            with self.subTest(verify=verify):
+                self.assertIsNone(
+                    self._write(attention_backend="dsa", is_target_verify=verify)
+                )
+
+
+class TestMlaQCacheWriterCallSite(CustomTestCase):
+    """forward_absorb_rocm_core consults the writer only for non-DCP decode
+    and target-verify; every other step keeps the split chain."""
+
+    # The backend's fp8 query buffer, which the writer must receive unchanged.
+    fp8_q_out = object()
+
+    def _call(self, *, mode, dcp_enabled=False, owner=True, out_cache_loc=None):
+        writer = mock.Mock()
+        kv_layer = SimpleNamespace(owner=owner, key=lambda: None)
+        attn = SimpleNamespace(
+            rocm_mla_q_cache_writer=writer,
+            attn_mqa=SimpleNamespace(layer_id=0, k_scale_float=1.0),
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            current_attention_backend="aiter",
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_decode=lambda: mode == "decode",
+                is_target_verify=lambda: mode == "target_verify",
+            ),
+            out_cache_loc=torch.arange(2) if out_cache_loc is None else out_cache_loc,
+        )
+        with (
+            mock.patch.object(
+                forward_mla_rocm,
+                "get_parallel",
+                return_value=SimpleNamespace(dcp_enabled=dcp_enabled),
+            ),
+            mock.patch.object(
+                forward_mla_rocm,
+                "get_token_to_kv_pool",
+                return_value=SimpleNamespace(
+                    layer_router=SimpleNamespace(read=lambda _: kv_layer)
+                ),
+            ),
+            mock.patch.object(
+                forward_mla_rocm,
+                "get_attn_backend",
+                return_value=SimpleNamespace(mla_fp8_q_out=lambda **_: self.fp8_q_out),
+            ),
+        ):
+            result = forward_mla_rocm.DeepseekMLARocmForwardMixin._maybe_fused_q_cache(
+                attn,
+                q_nope_out=torch.zeros(2, 12, 512),
+                q_pe=None,
+                k_nope=None,
+                k_pe=None,
+                forward_batch=forward_batch,
+            )
+        return result, writer.write
+
+    def test_decode_and_target_verify_use_the_writer(self):
+        for mode in ("decode", "target_verify"):
+            with self.subTest(mode=mode):
+                result, write = self._call(mode=mode)
+                write.assert_called_once()
+                self.assertIs(result, write.return_value)
+                self.assertEqual(
+                    write.call_args.kwargs["is_target_verify"], mode == "target_verify"
+                )
+                self.assertIs(write.call_args.kwargs["get_fp8_q_out"](), self.fp8_q_out)
+
+    def test_dcp_and_extend_keep_the_split_chain(self):
+        """DCP decode all-gathers q from the split chain, and extend is not covered."""
+        for mode, dcp_enabled in (("decode", True), ("extend", False)):
+            with self.subTest(mode=mode, dcp_enabled=dcp_enabled):
+                result, write = self._call(mode=mode, dcp_enabled=dcp_enabled)
+                self.assertIsNone(result)
+                write.assert_not_called()
+
+    def test_strided_out_cache_loc_reaches_the_writer_contiguous(self):
+        """AITER reads slot_mapping at stride 1; a strided out_cache_loc passed
+        through as is would land tokens in the wrong slots."""
+        loc = torch.arange(8)[::2]
+        _, write = self._call(mode="decode", out_cache_loc=loc)
+        slot_mapping = write.call_args.kwargs["slot_mapping"]
+        self.assertTrue(slot_mapping.is_contiguous())
+        self.assertTrue(torch.equal(slot_mapping, loc))
+
+    def test_non_owner_sub_pool_keeps_the_split_chain(self):
+        """The writer scatters at out_cache_loc, but a non-owner sub-pool's layer
+        is written at the batch's swa_loc; fusing it would write the wrong rows."""
+        result, write = self._call(mode="decode", owner=False)
+        self.assertIsNone(result)
+        write.assert_not_called()
+
+
 _ROPE_HEAD_DIM = 64
 _LAYER_ID = 3
 _FP8 = forward_mla_rocm.fp8_dtype
@@ -360,177 +589,6 @@ class TestGfx1250FusedRopeCall(_Gfx1250Case):
         for table, expected in ((cos, torch.cos), (sin, torch.sin)):
             self.assertEqual(table.stride(), (rope.rotary_dim, 1))
             torch.testing.assert_close(table[position], expected(position * inv_freq))
-
-
-class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
-    """The K3 writer replaces the split chain only where attention never reads its k,
-    and the cache holds the bytes the split chain would have written."""
-
-    def setUp(self):
-        self.writer = KimiK3RocmMlaQCacheWriter(kv_lora_rank=512, qk_rope_head_dim=64)
-        self.fused_q = torch.zeros(2, 12, 576, dtype=torch.bfloat16)
-        # The kernels are the boundary; the gate in front of them is under test.
-        self.writer._write_aiter = lambda **_: self.fused_q
-
-    def _write(
-        self, *, attention_backend, is_target_verify, k_scale_float=1.0, **extra
-    ):
-        return self.writer.write(
-            q_nope=torch.zeros(2, 12, 512, dtype=torch.bfloat16),
-            q_pe=torch.zeros(2, 12, 64, dtype=torch.bfloat16),
-            k_nope=torch.zeros(2, 1, 512, dtype=torch.bfloat16),
-            k_pe=torch.zeros(2, 1, 64, dtype=torch.bfloat16),
-            out_cache_loc=torch.arange(2, dtype=torch.int64),
-            kv_cache=torch.zeros(4, 1, 576, dtype=torch.bfloat16),
-            k_scale_float=k_scale_float,
-            attention_backend=attention_backend,
-            is_target_verify=is_target_verify,
-            **extra,
-        )
-
-    def test_triton_target_verify_keeps_the_split_chain(self):
-        """Triton target-verify runs the extend kernel, which reads k;
-        fusing it would feed that kernel the uninitialized k placeholder."""
-        self.assertIsNone(
-            self._write(attention_backend="triton", is_target_verify=True)
-        )
-
-    def test_fused_routes(self):
-        for backend, verify in (("aiter", False), ("aiter", True), ("triton", False)):
-            with self.subTest(backend=backend, verify=verify):
-                fused = self._write(attention_backend=backend, is_target_verify=verify)
-                self.assertIs(fused[0], self.fused_q)
-                self.assertEqual(tuple(fused[1].shape), (2, 1, 576))
-
-    def test_non_unit_kv_scale_keeps_the_split_chain(self):
-        """The split chain's AITER cache write casts without the KV scale,
-        while the fused kernels divide by it; their bytes differ unless it is 1."""
-        for k_scale_float in (None, 1.0):
-            with self.subTest(k_scale_float=k_scale_float):
-                self.assertIsNotNone(
-                    self._write(
-                        attention_backend="aiter",
-                        is_target_verify=False,
-                        k_scale_float=k_scale_float,
-                    )
-                )
-        self.assertIsNone(
-            self._write(
-                attention_backend="aiter", is_target_verify=False, k_scale_float=2.0
-            )
-        )
-
-    def test_missing_triton_fallback_keeps_the_split_chain(self):
-        """Off gfx950, an AITER build without the no-RoPE Triton kernel must fall
-        back to the split chain instead of failing the decode step."""
-        self.writer._write_aiter = lambda **_: None
-        with mock.patch.object(kimi_k3_rocm_mla, "_triton_q_cache_op", lambda: None):
-            self.assertIsNone(
-                self._write(attention_backend="aiter", is_target_verify=False)
-            )
-
-    def test_unavailable_aiter_op_requests_no_fp8_query_buffer(self):
-        """The backend allocates and logs its fp8 query buffer on the first request;
-        a write that cannot run the AITER op must not make one."""
-        del self.writer._write_aiter
-        get_fp8_q_out = mock.Mock()
-        with (
-            mock.patch.object(
-                kimi_k3_rocm_mla.mla_q_cache_aiter_hip, "available", return_value=False
-            ),
-            mock.patch.object(kimi_k3_rocm_mla, "_triton_q_cache_op", lambda: None),
-        ):
-            self._write(
-                attention_backend="aiter",
-                is_target_verify=True,
-                get_fp8_q_out=get_fp8_q_out,
-            )
-        get_fp8_q_out.assert_not_called()
-
-    def test_other_backends_keep_the_split_chain(self):
-        for verify in (False, True):
-            with self.subTest(verify=verify):
-                self.assertIsNone(
-                    self._write(attention_backend="dsa", is_target_verify=verify)
-                )
-
-
-class TestMlaQCacheWriterCallSite(CustomTestCase):
-    """forward_absorb_rocm_core consults the writer only for non-DCP decode
-    and target-verify; every other step keeps the split chain."""
-
-    # The backend's fp8 query buffer, which the writer must receive unchanged.
-    fp8_q_out = object()
-
-    def _call(self, *, mode, dcp_enabled=False, owner=True):
-        writer = mock.Mock()
-        kv_layer = SimpleNamespace(owner=owner, key=lambda: None)
-        attn = SimpleNamespace(
-            rocm_mla_q_cache_writer=writer,
-            attn_mqa=SimpleNamespace(layer_id=0, k_scale_float=1.0),
-            kv_lora_rank=512,
-            qk_rope_head_dim=64,
-            current_attention_backend="aiter",
-        )
-        forward_batch = SimpleNamespace(
-            forward_mode=SimpleNamespace(
-                is_decode=lambda: mode == "decode",
-                is_target_verify=lambda: mode == "target_verify",
-            ),
-            out_cache_loc=torch.arange(2),
-        )
-        with (
-            mock.patch.object(
-                forward_mla_rocm,
-                "get_parallel",
-                return_value=SimpleNamespace(dcp_enabled=dcp_enabled),
-            ),
-            mock.patch.object(
-                forward_mla_rocm,
-                "get_kv_layers",
-                return_value=SimpleNamespace(read=lambda _: kv_layer),
-            ),
-            mock.patch.object(
-                forward_mla_rocm,
-                "get_attn_backend",
-                return_value=SimpleNamespace(mla_fp8_q_out=lambda **_: self.fp8_q_out),
-            ),
-        ):
-            result = forward_mla_rocm.DeepseekMLARocmForwardMixin._maybe_fused_q_cache(
-                attn,
-                q_nope_out=torch.zeros(2, 12, 512),
-                q_pe=None,
-                k_nope=None,
-                k_pe=None,
-                forward_batch=forward_batch,
-            )
-        return result, writer.write
-
-    def test_decode_and_target_verify_use_the_writer(self):
-        for mode in ("decode", "target_verify"):
-            with self.subTest(mode=mode):
-                result, write = self._call(mode=mode)
-                write.assert_called_once()
-                self.assertIs(result, write.return_value)
-                self.assertEqual(
-                    write.call_args.kwargs["is_target_verify"], mode == "target_verify"
-                )
-                self.assertIs(write.call_args.kwargs["get_fp8_q_out"](), self.fp8_q_out)
-
-    def test_dcp_and_extend_keep_the_split_chain(self):
-        """DCP decode all-gathers q from the split chain, and extend is not covered."""
-        for mode, dcp_enabled in (("decode", True), ("extend", False)):
-            with self.subTest(mode=mode, dcp_enabled=dcp_enabled):
-                result, write = self._call(mode=mode, dcp_enabled=dcp_enabled)
-                self.assertIsNone(result)
-                write.assert_not_called()
-
-    def test_non_owner_sub_pool_keeps_the_split_chain(self):
-        """The writer scatters at out_cache_loc, but a non-owner sub-pool's layer
-        is written at the batch's swa_loc; fusing it would write the wrong rows."""
-        result, write = self._call(mode="decode", owner=False)
-        self.assertIsNone(result)
-        write.assert_not_called()
 
 
 if __name__ == "__main__":
