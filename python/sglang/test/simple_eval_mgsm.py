@@ -95,7 +95,7 @@ def parse_answer(answer: str, answer_prefix: str) -> str:
     answer_text = answer.split(answer_prefix)[-1].strip()
 
     # find all the numbers (including decimals) in the string
-    numbers = re.findall(r"\d+\.?\d*", answer_text.replace(",", ""))
+    numbers = re.findall(r"-?\d+\.?\d*", answer_text.replace(",", ""))
 
     # return the first number (removing trailing decimal point if present),
     # or an empty string if there were no numbers
