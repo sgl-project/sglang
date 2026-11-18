@@ -84,6 +84,14 @@ class MambaAttnBackendBase(AttentionBackend):
     # graph); set at init by backends whose supports_prefill_graph_extend holds.
     prefill_graph_max_seqs: int
 
+    # Whether full prefill CUDA graphs can capture the extend: it reads only
+    # forward_metadata's mamba_cache_indices and query_start_loc, and its launch
+    # grids depend only on the token count.
+    supports_full_cuda_graph_prefill: bool = False
+    # Forward metadata for full prefill CUDA graphs, created on the first capture
+    # and refilled in place before every replay.
+    full_cg_prefill_metadata: Optional[ForwardMetadata] = None
+
     def __init__(self, model_runner: ModelRunner):
         self.validate_mis_support(model_runner.server_args)
         super().__init__()
@@ -437,19 +445,70 @@ class MambaAttnBackendBase(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        self.forward_metadata = self._replay_metadata(
-            forward_batch.batch_size,
-            forward_batch.req_pool_indices,
-            forward_batch.forward_mode,
-            forward_batch.spec_info,
-            forward_batch.seq_lens_cpu if not in_capture else None,
-            num_padding=(
-                0 if in_capture else getattr(forward_batch, "num_padding", None)
-            ),
-            in_capture=in_capture,
-            mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
-            ragged_verify_layout=forward_batch.ragged_verify_layout,
+        # Runs before every capture and replay. The full prefill graph runner
+        # passes EXTEND (and MIXED, which replays the EXTEND graphs); the decode,
+        # verify and draft graph runners pass the other modes, which
+        # _replay_metadata handles.
+        if forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
+            self._init_full_cg_prefill_metadata(forward_batch)
+        else:
+            self.forward_metadata = self._replay_metadata(
+                forward_batch.batch_size,
+                forward_batch.req_pool_indices,
+                forward_batch.forward_mode,
+                forward_batch.spec_info,
+                forward_batch.seq_lens_cpu if not in_capture else None,
+                num_padding=(
+                    0 if in_capture else getattr(forward_batch, "num_padding", None)
+                ),
+                in_capture=in_capture,
+                mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
+                ragged_verify_layout=forward_batch.ragged_verify_layout,
+            )
+
+    def _init_full_cg_prefill_metadata(self, forward_batch: ForwardBatch) -> None:
+        """Metadata for plain EXTEND under full prefill CUDA graph. The runner pads
+        the request axis to its fixed slot count with zero-length sentinel requests;
+        the captured kernels read these buffers, refilled in place each replay."""
+        if self.full_cg_prefill_metadata is None:
+            if not self.supports_full_cuda_graph_prefill:
+                raise ValueError(
+                    f"{type(self).__name__} cannot run its extend inside full "
+                    "prefill CUDA graphs; use --cuda-graph-backend-prefill breakable"
+                )
+            if get_exec().mamba.enable_mamba_extra_buffer:
+                raise ValueError(
+                    "Full prefill CUDA graphs of linear attention do not support "
+                    "the extra_buffer mamba prefix cache; use "
+                    "--cuda-graph-backend-prefill breakable"
+                )
+            req_slots = forward_batch.batch_size
+            self.full_cg_prefill_metadata = ForwardMetadata(
+                query_start_loc=torch.zeros(
+                    (req_slots + 1,), dtype=torch.int32, device=self.device
+                ),
+                mamba_cache_indices=torch.empty(
+                    (req_slots,), dtype=torch.int32, device=self.device
+                ),
+            )
+        m = self.full_cg_prefill_metadata
+        assert forward_batch.batch_size == m.mamba_cache_indices.shape[0], (
+            "full-CG prefill metadata must be created at capture with the same "
+            "fixed request-slot count used at replay"
         )
+        extend_seq_lens = forward_batch.extend_seq_lens
+        mamba_indices = self._translate_mamba_indices(
+            self.req_to_token_pool.get_mamba_indices(forward_batch.req_pool_indices)
+        )
+        # Sentinels are empty sequences on PAD_SLOT_ID, which the kernels skip; the
+        # bucket's padding tokens follow the last sequence and belong to none.
+        m.mamba_cache_indices.copy_(
+            torch.where(extend_seq_lens > 0, mamba_indices, PAD_SLOT_ID)
+        )
+        torch.cumsum(
+            extend_seq_lens, dim=0, dtype=torch.int32, out=m.query_start_loc[1:]
+        )
+        self.forward_metadata = m
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.forward_metadata = self._forward_metadata(forward_batch)
