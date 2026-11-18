@@ -552,6 +552,71 @@ crate-type = ["cdylib"]
                     torch_module=fake_torch,
                 )
 
+    def test_torch_build_cache_respects_cxxflags(self):
+        """A fresh import must not reuse native code built with different C++ flags."""
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = self._workspace(root)
+            torch_root = root / "torch"
+            (torch_root / "lib").mkdir(parents=True)
+            compat_header = root / "compat.h"
+            compat_header.write_text("// compatibility\n", encoding="utf-8")
+            fake_torch = SimpleNamespace(
+                __version__="2.14.1+cu130",
+                __file__=str(torch_root / "__init__.py"),
+                compiled_with_cxx11_abi=lambda: True,
+                version=SimpleNamespace(cuda="13.0", hip=None),
+            )
+
+            def build_artifact(crate, target_dir, *, features, build_environment):
+                target_dir.mkdir(parents=True, exist_ok=True)
+                artifact = target_dir / "libdemo_extension.so"
+                self.assertFalse(
+                    artifact.exists(), "Unchanged flags must reuse the cache"
+                )
+                artifact.write_text(build_environment["CXXFLAGS"], encoding="utf-8")
+                return artifact
+
+            def load_artifact(module_name, path):
+                module = ModuleType(module_name)
+                module.cxxflags = path.read_text(encoding="utf-8")
+                module.artifact = path
+                return module
+
+            with (
+                mock.patch.object(
+                    rust_extension, "_command_version", return_value="toolchain 1.0"
+                ),
+                mock.patch.object(
+                    rust_extension, "_cargo_build", side_effect=build_artifact
+                ),
+                mock.patch.object(
+                    rust_extension,
+                    "_load_extension_from_path",
+                    side_effect=load_artifact,
+                ),
+            ):
+                artifacts = []
+                for flags in ("-O0", "-O3 -march=native", "-O3 -march=native"):
+                    build = torch_build_configuration(
+                        compat_header=compat_header,
+                        python_module="demo._core",
+                        torch_module=fake_torch,
+                        base_environment={"CXXFLAGS": flags},
+                    )
+                    module = load_rust_extension(
+                        "demo._core",
+                        mode="auto",
+                        workspace=workspace,
+                        cache_dir=root / "cache",
+                        build_environment=build.environment,
+                        build_fingerprint=build.fingerprint,
+                    )
+                    self.assertEqual(module.cxxflags, build.environment["CXXFLAGS"])
+                    artifacts.append(module.artifact)
+                self.assertNotEqual(artifacts[0], artifacts[1])
+                self.assertEqual(artifacts[1], artifacts[2])
+
     def test_filesystem_lock_serializes_processes(self):
         with TemporaryDirectory() as directory:
             lock_path = Path(directory) / "build.lock"
