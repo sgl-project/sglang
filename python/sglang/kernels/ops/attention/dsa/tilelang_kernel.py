@@ -1769,7 +1769,7 @@ def dpsk_v4_fp8_partial_kernel(
                 actual_n_groups_1 = T.ceildiv(tk_len_1, BI * inner_iter_1)
                 actual_n_groups_2 = T.ceildiv(tk_len_2, BI * inner_iter_2)
 
-                if (group_i < n_groups_1) & (group_i < actual_n_groups_1):
+                if T.And(group_i < n_groups_1, group_i < actual_n_groups_1):
                     # Phase 1 active: SWA cache work + Partial_O write.
                     T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
                     T.copy(Q[b_i, s_i, H0:H1, D : D + D_tail], Q_tail_shared)
