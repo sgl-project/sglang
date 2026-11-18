@@ -11,7 +11,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import ForwardMode  # noqa: E402
+from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (  # noqa: E402
     NgramEmbeddingManager,
     update_ngram_token_table_after_sampling,
