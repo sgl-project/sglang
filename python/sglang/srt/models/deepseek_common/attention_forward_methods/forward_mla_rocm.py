@@ -471,18 +471,20 @@ def _fused_rope_cat_and_cache(
         cos, sin = attn.rotary_emb.cos_sin_cache.chunk(2, dim=-1)
     else:
         cos, sin = attn.rotary_emb.cos_cache, attn.rotary_emb.sin_cache
+    layer_id = attn.attn_mqa.layer_id
     kv_pool = get_token_to_kv_pool()
     if isinstance(kv_pool, HiSparseDSATokenToKVPool):
         # The fused write bypasses set_mla_kv_buffer()'s logical-to-device mapping.
         out_cache_loc = kv_pool.translate_loc_to_hisparse_device(out_cache_loc)
     # AITER reads slot_mapping with stride 1, including on the resident path.
     out_cache_loc = out_cache_loc.contiguous()
+    kv_layer = kv_pool.layer_router.read(layer_id)
     return fused_qk_rope_cat_and_cache_mla(
         q_nope_out,
         q_pe,
         k_nope,
         k_pe,
-        kv_pool.layer_router.read(attn.attn_mqa.layer_id).key(),
+        kv_layer.key(),
         out_cache_loc,
         positions,
         cos,
