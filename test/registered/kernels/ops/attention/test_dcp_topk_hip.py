@@ -15,7 +15,7 @@ from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=25, stage="base-b", runner_config="1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=14, stage="base-b", runner_config="1-gpu-small-amd-mi35x")
 
 PAGE = 64
 # logits past a row's local length and gathered entries past a rank's share are left
