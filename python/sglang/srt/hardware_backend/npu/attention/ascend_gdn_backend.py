@@ -1,15 +1,13 @@
 from typing import Optional, Tuple, Union
 
 import torch
-from sgl_kernel_npu.implementation.triton.attention.gdn.gdn_utils import (
-    prepare_chunk_indices,
-)
 from sgl_kernel_npu.operators.attention.gdn import (
     chunk_gated_delta_rule,
     fused_gdn_gating,
     fused_gdn_gating_without_sigmoid,
     recurrent_gated_delta_rule,
 )
+from sgl_kernel_npu.operators.attention.gdn.gdn_utils import prepare_chunk_indices
 from sgl_kernel_npu.operators.mamba import causal_conv1d
 from sgl_kernel_npu.operators.norm import l2norm_fwd
 
