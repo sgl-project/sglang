@@ -52,7 +52,7 @@ def _make_server_args(
         *ADMIN_LAUNCH_ARGS_FOR_TEST,
     ]
     if disable_cuda_graph:
-        extra.append("--disable-cuda-graph")
+        extra.extend(["--disable-decode-cuda-graph", "--disable-prefill-cuda-graph"])
     if canary_on:
         extra += ["--kv-canary", "raise"]
     extra += ["--port", str(DEFAULT_PORT_FOR_SRT_TEST_RUNNER)]

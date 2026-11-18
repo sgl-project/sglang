@@ -66,7 +66,7 @@ pub fn dynamo_tool_parser_name(parser: &str) -> &str {
     match parser {
         "llama3" => "llama3_json",
         "qwen" => "qwen25",
-        "glm" | "glm45" => "glm47",
+        "glm" => "glm47",
         other => other,
     }
 }
@@ -337,7 +337,7 @@ mod tests {
     fn tool_parser_aliases() {
         assert_eq!(dynamo_tool_parser_name("llama3"), "llama3_json");
         assert_eq!(dynamo_tool_parser_name("qwen"), "qwen25");
-        assert_eq!(dynamo_tool_parser_name("glm45"), "glm47");
+        assert_eq!(dynamo_tool_parser_name("glm"), "glm47");
         assert_eq!(dynamo_tool_parser_name("deepseekv4"), "deepseekv4");
     }
 
