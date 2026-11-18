@@ -168,31 +168,53 @@ def test_native_hybrid_encoder_matches_hf(
 
 
 @pytest.mark.parametrize(
-    "hip_version, forces_math",
-    [("7.2.26015", True), ("10.0.0", False), (None, False)],
+    "hip_version, head_dim, needs_math",
+    [
+        ("7.2.26015", 32, True),
+        ("7.2.26015", 128, False),
+        ("10.0.0", 32, False),
+        (None, 32, False),
+    ],
 )
-def test_masked_attention_forces_math_only_on_rocm72(
-    monkeypatch, hip_version, forces_math
+def test_rocm_masked_sdpa_needs_math_only_on_rocm72(
+    monkeypatch, hip_version, head_dim, needs_math
 ):
     """Only torch built for ROCm 7.2 gets masked head_dim 32 wrong in efficient SDPA
-    (the [*-17] cases above); other builds must keep their default backend."""
+    (the [*-17] cases above); other builds and head dims keep their default backend."""
+    from sglang.multimodal_gen.runtime.platforms.rocm import RocmPlatform
+
+    monkeypatch.setattr(torch.version, "hip", hip_version)
+    assert RocmPlatform.masked_sdpa_needs_math(head_dim) is needs_math
+
+
+@pytest.mark.parametrize("needs_math", [True, False])
+def test_masked_attention_runs_math_when_the_platform_needs_it(monkeypatch, needs_math):
     from sglang.multimodal_gen.runtime.layers.attention import layer
 
-    entered = []
+    entered, asked = [], []
     real_sdpa_kernel = layer.sdpa_kernel
 
     def recording_sdpa_kernel(backends, *args, **kwargs):
         entered.append(backends)
         return real_sdpa_kernel(backends, *args, **kwargs)
 
+    def masked_sdpa_needs_math(head_dim):
+        asked.append(head_dim)
+        return needs_math
+
     attn = layer.LocalAttention(num_heads=2, head_size=32)
     monkeypatch.setattr(layer, "sdpa_kernel", recording_sdpa_kernel)
-    monkeypatch.setattr(torch.version, "hip", hip_version)
+    monkeypatch.setattr(
+        layer,
+        "current_platform",
+        SimpleNamespace(masked_sdpa_needs_math=masked_sdpa_needs_math),
+    )
     q = torch.randn(1, 17, 2, 32)
     mask = torch.ones(1, 17, dtype=torch.bool)
     with torch.inference_mode(), set_forward_context(0, None):
         attn(q, q, q, attn_mask=mask)
-    assert (SDPBackend.MATH in entered) is forces_math
+    assert asked == [32]
+    assert (SDPBackend.MATH in entered) is needs_math
 
 
 def test_encoder_rejects_non_text_prefill(small_text_encoder):

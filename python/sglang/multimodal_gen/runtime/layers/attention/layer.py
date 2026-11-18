@@ -74,7 +74,10 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     ForwardContext,
     get_forward_context,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.precision import get_compute_dtype
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -87,19 +90,6 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
     SDPBackend.EFFICIENT_ATTENTION,
     SDPBackend.MATH,
 ]
-
-# Workaround: torch built for ROCm 7.2 (AOTriton 0.11.2) efficient SDPA returns wrong
-# masked outputs for head dims 32/48/96; these measured correct. Drop once fixed upstream.
-_HIP_MASKED_EFFICIENT_SDPA_HEAD_DIMS = (16, 64, 80, 128, 256)
-
-
-def _hip_masked_sdpa_needs_math(head_dim: int) -> bool:
-    hip_version = torch.version.hip or ""
-    return (
-        hip_version.startswith("7.2.")
-        and head_dim not in _HIP_MASKED_EFFICIENT_SDPA_HEAD_DIMS
-    )
-
 
 # Set ``SGLANG_VARLEN_FA=0`` to disable the varlen FA fast path in
 # USPAttention masked branch and fall back to SDPA.
@@ -807,7 +797,7 @@ class LocalAttention(nn.Module):
                 k_ = k_.repeat_interleave(repeat_factor, dim=1)
                 v_ = v_.repeat_interleave(repeat_factor, dim=1)
 
-            if _hip_masked_sdpa_needs_math(q_.shape[-1]):
+            if current_platform.masked_sdpa_needs_math(q_.shape[-1]):
                 sdpa_context = sdpa_kernel(SDPBackend.MATH)
             elif self.allow_cudnn_sdp and q_.device.type == "cuda":
                 sdpa_context = sdpa_kernel(

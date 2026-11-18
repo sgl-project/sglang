@@ -217,6 +217,13 @@ class Platform:
         return False
 
     @classmethod
+    def masked_sdpa_needs_math(cls, head_dim: int) -> bool:
+        """True when torch's default SDPA kernel returns wrong values for a
+        masked call with this head dim, so it must run on SDPBackend.MATH.
+        Overridden on RocmPlatform; every other platform is False."""
+        return False
+
+    @classmethod
     def is_cuda_static(cls) -> bool:
         return cls._enum == PlatformEnum.CUDA
 
