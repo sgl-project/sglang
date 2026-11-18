@@ -37,7 +37,6 @@ SERVER_ENVS = {
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "HCCL_SOCKET_IFNAME": "lo",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
-    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "1",
     "SGLANG_SET_CPU_AFFINITY": "1",
 }
 
@@ -93,6 +92,8 @@ SERVER_ARGS = [
     "qwen3",
     "--tool-call-parser",
     "qwen3_coder",
+    "--prefill-delayer-max-delay-passes",
+    "1",
 ]
 
 

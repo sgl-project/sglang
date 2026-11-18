@@ -29,34 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 def get_startup_linker_config() -> dict[str, Any] | None:
-    """Resolve legacy launch options once, outside the linker implementations."""
-    memory = get_memory()
-    config = memory.unified_cache_external_linker_config
-    if config is None and memory.unified_cache_external_linker_backend in (
-        "mooncake",
-        "mori",
-    ):
-        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-            HybridCacheController,
-        )
-
-        # TODO(#46388): Remove this fallback after one full stable-release
-        # deprecation cycle following the first release containing #46388.
-        legacy_config = memory.hicache_storage_backend_extra_config
-        config, *_ = HybridCacheController.parse_storage_backend_extra_config(
-            legacy_config
-        )
-        if legacy_config:
-            logger.warning(
-                "Using --hicache-storage-backend-extra-config for an external "
-                "linker is deprecated. Migrate to "
-                "--unified-cache-external-linker-config with a JSON object. "
-                "For @file input, pass the file contents as JSON instead. "
-                "This fallback will be removed after a full stable-release "
-                "deprecation cycle. Ordinary HiCache use of the old flag "
-                "is unaffected."
-            )
-    return deepcopy(config)
+    return deepcopy(get_memory().unified_cache_external_linker_config)
 
 
 def create_unified_cache_linker(

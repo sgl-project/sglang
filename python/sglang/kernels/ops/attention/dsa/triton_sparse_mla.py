@@ -20,12 +20,13 @@ from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.metadata import q8kv8_topk_length_from_indices
 from sglang.kernels.ops.quantization.dsa_quant_k_cache import fp8_ds_mla_row_width
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.utils import get_device_core_count, is_gfx95_supported
+from sglang.srt.utils import get_device_core_count, is_gfx95_supported, print_info_once
 
 _ASYNC_COPY_OFF_ARCHES = frozenset({"gfx950"})
 _IS_FNUZ = is_fp8_fnuz()
 _FP8_MAX = 240.0 if _IS_FNUZ else 448.0
 _LOG2E = 1.4426950408889634
+_LN2 = tl.constexpr(0.6931471805599453)
 _G = tl.constexpr(128)
 _PREFERRED_BLOCK_K = 64
 _MIN_BLOCK_K = 16
@@ -397,6 +398,8 @@ def _sparse_mla_fwd_split_dim_kernel(
     KV_SCALED: tl.constexpr,
     SEQ_BUCKET: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    lse_out_ptr=None,
+    STORE_LSE: tl.constexpr = False,
 ):
     s_i = tl.program_id(0).to(tl.int64)
 
@@ -489,6 +492,10 @@ def _sparse_mla_fwd_split_dim_kernel(
 
     l_safe = tl.where(l_i == 0.0, 1.0, l_i)
     inv_l = 1.0 / l_safe
+    if STORE_LSE:
+        # A row whose keys are all masked keeps m_i at the -3.4e38 sentinel.
+        lse = tl.where(m_i > -1.0e38, (m_i + tl.log2(l_safe)) * _LN2, float("-inf"))
+        tl.store(lse_out_ptr + s_i * H + h, lse)
     acc0 = acc0 * inv_l[:, None]
     if NUM_GROUPS >= 2:
         acc1 = acc1 * inv_l[:, None]
@@ -524,11 +531,13 @@ def _triton_sparse_mla_fwd_single(
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
-) -> torch.Tensor:
+    return_lse: bool = False,
+    bf16_dot: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Single-pass prefill: grid=(seq,), loops over all topk per CTA."""
     kv, kv_scaled = _as_scaled_fp8_kv(kv, d_v, q_rope.shape[-1])
     is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
-    use_fp8_dot = is_fp8 and not kv_scaled
+    use_fp8_dot = is_fp8 and not kv_scaled and not bf16_dot
     seq, H, d_v_in = q_nope.shape
     assert d_v_in == d_v
     assert d_v % 128 == 0, f"Triton sparse MLA requires d_v divisible by 128, got {d_v}"
@@ -573,6 +582,11 @@ def _triton_sparse_mla_fwd_single(
         out_pad = torch.empty(
             seq, H_pad, d_v, device=q_nope.device, dtype=torch.bfloat16
         )
+        lse = (
+            torch.empty(seq, H_pad, device=q_nope.device, dtype=torch.float32)
+            if return_lse
+            else None
+        )
         _sparse_mla_fwd_split_dim_kernel[(seq,)](
             q_nope_pad,
             q_rope_pad,
@@ -594,9 +608,18 @@ def _triton_sparse_mla_fwd_single(
             USE_FP8_DOT=use_fp8_dot,
             KV_SCALED=kv_scaled,
             SEQ_BUCKET=seq_bucket,
+            lse_out_ptr=lse,
+            STORE_LSE=return_lse,
         )
         out = out_pad[:, :H, :].contiguous()
+        if return_lse:
+            lse = lse[:, :H].contiguous()
     else:
+        lse = (
+            torch.empty(seq, H, device=q_nope.device, dtype=torch.float32)
+            if return_lse
+            else None
+        )
         _sparse_mla_fwd_split_dim_kernel[(seq,)](
             q_nope,
             q_rope,
@@ -618,8 +641,10 @@ def _triton_sparse_mla_fwd_single(
             USE_FP8_DOT=use_fp8_dot,
             KV_SCALED=kv_scaled,
             SEQ_BUCKET=seq_bucket,
+            lse_out_ptr=lse,
+            STORE_LSE=return_lse,
         )
-    return out.unsqueeze(0)
+    return (out.unsqueeze(0), lse) if return_lse else out.unsqueeze(0)
 
 
 def _prev_pow2(n: int) -> int:
@@ -674,6 +699,7 @@ def _sparse_mla_fused_kernel(
     PIPE_STAGES: tl.constexpr = 3,
     lse_out_ptr=None,
     STORE_LSE: tl.constexpr = False,
+    NATURAL_LSE: tl.constexpr = False,
     # Set only when 0 <= topk_length <= topk and every index past it is -1,
     # as transform_index_page_table_dcp writes the DCP-localized table: the
     # tile count skips the clamp and the index load masks on the constexpr
@@ -812,9 +838,13 @@ def _sparse_mla_fused_kernel(
         acc3 = tl.where(l_i[:, None] > 0.0, acc3 * inv_denom[:, None], 0.0)
 
     if STORE_LSE:
-        # Finite floor: the DCP merge weights an empty rank by exp2(lse - max),
-        # so an all-masked row must not come back as -inf.
-        lse = tl.where(l_i > 0.0, tl.log2(denom) + m_i, -1073741824.0)
+        if NATURAL_LSE:
+            # A row whose keys are all masked keeps m_i at the -3.4e38 sentinel.
+            lse = tl.where(m_i > -1.0e38, (m_i + tl.log2(denom)) * _LN2, float("-inf"))
+        else:
+            # Finite floor: the DCP merge weights an empty rank by exp2(lse - max),
+            # so an all-masked row must not come back as -inf.
+            lse = tl.where(l_i > 0.0, tl.log2(denom) + m_i, -1073741824.0)
         tl.store(lse_out_ptr + t * H + h_offs, lse, mask=h_mask)
 
     o_base = out_ptr + t * H * D_V
@@ -1057,6 +1087,7 @@ def _sparse_mla_reduce_kernel(
     BLOCK_K: tl.constexpr,
     lse_out_ptr=None,
     STORE_LSE: tl.constexpr = False,
+    NATURAL_LSE: tl.constexpr = False,
 ):
     """Reduce split-K partials via log-space combine. grid=(seq, H, d_v_chunks)."""
     t = tl.program_id(0).to(tl.int64)
@@ -1104,10 +1135,11 @@ def _sparse_mla_reduce_kernel(
     )
     if STORE_LSE:
         if dc == 0:
-            tl.store(
-                lse_out_ptr + t * H + h,
-                lse_max + tl.log2(tl.maximum(w_sum, 1.0e-30)),
-            )
+            lse = lse_max + tl.log2(tl.maximum(w_sum, 1.0e-30))
+            if NATURAL_LSE:
+                # Every split empty leaves lse_max at the -3.4e38 sentinel.
+                lse = tl.where(lse_max > -1.0e38, lse * _LN2, float("-inf"))
+            tl.store(lse_out_ptr + t * H + h, lse)
 
 
 def _triton_sparse_mla_fwd_splitk(
@@ -1120,11 +1152,13 @@ def _triton_sparse_mla_fwd_splitk(
     kv_splits: int,
     topk_length: torch.Tensor | None = None,
     use_topk_length: bool = False,
-) -> torch.Tensor:
+    return_lse: bool = False,
+    bf16_dot: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Split-K path for short sequences."""
     kv, kv_scaled = _as_scaled_fp8_kv(kv, d_v, q_rope.shape[-1])
     is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
-    use_fp8_dot = is_fp8 and not kv_scaled
+    use_fp8_dot = is_fp8 and not kv_scaled and not bf16_dot
     seq, H, d_v_in = q_nope.shape
     assert d_v_in == d_v
     d_tail = q_rope.shape[-1]
@@ -1166,6 +1200,11 @@ def _triton_sparse_mla_fwd_splitk(
         kv_splits = 1
 
     out = torch.empty(seq, H, d_v, device=q_nope.device, dtype=torch.bfloat16)
+    lse = (
+        torch.empty(seq, H, device=q_nope.device, dtype=torch.float32)
+        if return_lse
+        else None
+    )
 
     if kv_splits == 1:
         fused_num_warps = 4
@@ -1201,10 +1240,13 @@ def _triton_sparse_mla_fwd_splitk(
             USE_I64_PAGE=not (i32_page_safe and i32_page_tuned),
             PIPE_STAGES=1 if use_topk_length else 3,
             KV_SCALED=kv_scaled,
+            lse_out_ptr=lse,
+            STORE_LSE=return_lse,
+            NATURAL_LSE=True,
             num_warps=fused_num_warps,
             num_stages=2,
         )
-        return out.unsqueeze(0)
+        return (out.unsqueeze(0), lse) if return_lse else out.unsqueeze(0)
 
     tiles_per_split = (topk + kv_splits * BLOCK_K - 1) // (kv_splits * BLOCK_K)
     active_splits = (topk + tiles_per_split * BLOCK_K - 1) // (
@@ -1263,14 +1305,22 @@ def _triton_sparse_mla_fwd_splitk(
             ACTIVE_SPLITS_POW2=_next_pow2(active_splits),
             D_CHUNK=D_CHUNK,
             BLOCK_K=BLOCK_K,
+            lse_out_ptr=lse,
+            STORE_LSE=return_lse,
+            NATURAL_LSE=True,
             num_warps=4,
         )
-    return out.unsqueeze(0)
+    return (out.unsqueeze(0), lse) if return_lse else out.unsqueeze(0)
 
 
 # ---------------------------------------------------------------------------
 # Unified entry point
 # ---------------------------------------------------------------------------
+
+
+# 16..512 verify rows take the gfx950 HIP split-K (faster on MI355X); fewer stay on Triton split-K
+_HIP_SPLIT_MIN_ROWS = 16
+_HIP_SPLIT_MAX_ROWS = 512
 
 
 def triton_sparse_mla_fwd(
@@ -1282,15 +1332,20 @@ def triton_sparse_mla_fwd(
     d_v: int = 512,
     topk_length: torch.Tensor | None = None,
     max_topk_length: int | None = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+    bf16_dot: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Unified sparse MLA forward. Auto-selects single-pass vs split-K.
 
     q_nope: [seq, H, d_v] fp8/bf16, q_rope: [seq, H, dim-d_v] fp8/bf16,
     kv: [num_pages, 1, dim] fp8/bf16, indices: [seq, 1, topk].
     topk_length optionally gives a per-row upper bound on the last valid index;
     max_topk_length is its host-known batch maximum.
+    bf16_dot: with a raw (unscaled) FP8 KV and BF16 q, upcast the KV and run the
+    dots in BF16 instead of casting q and the probabilities to FP8.
 
-    Returns [1, seq, H, d_v] bf16 to match tilelang_sparse_fwd.
+    Returns [1, seq, H, d_v] bf16 to match tilelang_sparse_fwd, and with
+    return_lse also its [seq, H] fp32 natural-log LSE (-inf for rows with no key).
     """
     seq = q_nope.shape[0]
     H = q_nope.shape[1]
@@ -1328,14 +1383,67 @@ def triton_sparse_mla_fwd(
                 kv_splits=1,
                 topk_length=topk_length,
                 use_topk_length=True,
+                return_lse=return_lse,
+                bf16_dot=bf16_dot,
             )
+    if _HIP_SPLIT_MIN_ROWS <= seq <= _HIP_SPLIT_MAX_ROWS and is_gfx95_supported():
+        from sglang.kernels.ops.attention.dsa.sparse_mla_prefill_gfx950 import (
+            sparse_mla_decode_splits,
+            sparse_mla_split_gfx950,
+            supports_sparse_mla_prefill_gfx950,
+        )
+
+        if supports_sparse_mla_prefill_gfx950(q_nope, q_rope, kv, d_v):
+            return sparse_mla_split_gfx950(
+                q_nope,
+                q_rope,
+                kv,
+                indices,
+                sm_scale,
+                sparse_mla_decode_splits(seq),
+                d_v=d_v,
+                return_lse=return_lse,
+            )
+    if base_ctas > num_cu and is_gfx95_supported():
+        from sglang.kernels.ops.attention.dsa.sparse_mla_prefill_gfx950 import (
+            sparse_mla_prefill_gfx950,
+            supports_sparse_mla_prefill_gfx950,
+        )
+
+        if supports_sparse_mla_prefill_gfx950(q_nope, q_rope, kv, d_v):
+            return sparse_mla_prefill_gfx950(
+                q_nope, q_rope, kv, indices, sm_scale, d_v, return_lse=return_lse
+            )
+        print_info_once(
+            "gfx950 sparse MLA prefill takes only 656-byte fp8_ds_mla rows, at most 16 "
+            "heads and a KV pool within 31-bit offsets; long prefill stays on Triton"
+        )
     if base_ctas > num_cu:
-        if optimize_gfx950_fp8:
+        # The single-pass kernel needs H <= 16 or a power of two (DCP decode
+        # gathers q from the group, e.g. 96 heads); the fused kernel masks heads.
+        if optimize_gfx950_fp8 or (H > 16 and H & (H - 1)):
             with _no_async_copy():
                 return _triton_sparse_mla_fwd_splitk(
-                    q_nope, q_rope, kv, indices, sm_scale, d_v, kv_splits=1
+                    q_nope,
+                    q_rope,
+                    kv,
+                    indices,
+                    sm_scale,
+                    d_v,
+                    kv_splits=1,
+                    return_lse=return_lse,
+                    bf16_dot=bf16_dot,
                 )
-        return _triton_sparse_mla_fwd_single(q_nope, q_rope, kv, indices, sm_scale, d_v)
+        return _triton_sparse_mla_fwd_single(
+            q_nope,
+            q_rope,
+            kv,
+            indices,
+            sm_scale,
+            d_v,
+            return_lse=return_lse,
+            bf16_dot=bf16_dot,
+        )
     kv_splits = min(
         _kv_splits_heuristic(
             seq, H, BLOCK_H, target_wg_per_cu=1.0, max_kv_splits=max_kv_splits
@@ -1352,5 +1460,13 @@ def triton_sparse_mla_fwd(
             max_kv_splits,
         )
     return _triton_sparse_mla_fwd_splitk(
-        q_nope, q_rope, kv, indices, sm_scale, d_v, kv_splits
+        q_nope,
+        q_rope,
+        kv,
+        indices,
+        sm_scale,
+        d_v,
+        kv_splits,
+        return_lse=return_lse,
+        bf16_dot=bf16_dot,
     )
