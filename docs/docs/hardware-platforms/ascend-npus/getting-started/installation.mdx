@@ -664,15 +664,10 @@ python3 -m sglang.launch_server \
 
 3. Launch Router
 
-The router is the `sgl-router` binary. It is pre-installed in the Docker image at `/usr/local/bin/sgl-router`; if you
-installed SGLang from source, build it from the `sgl-router` directory of the SGLang repository (this needs a Rust
-toolchain, e.g., from [rustup](https://rustup.rs)) and put it on your `PATH`:
-
-```bash Command
-cd sgl-router
-cargo build --release --bin sgl-router
-cp target/release/sgl-router /usr/local/bin/
-```
+The router is the `sgl-router` binary. It is pre-installed in the Docker image at `/usr/local/bin/sgl-router`; otherwise
+install it with `pip install sgl-router`, or see
+[installing sgl-router](/docs/advanced_features/dp_dpa_router_guide#quick-start-for-sgl-router) for the container image
+and building from source.
 
 ```bash Command
 sgl-router \

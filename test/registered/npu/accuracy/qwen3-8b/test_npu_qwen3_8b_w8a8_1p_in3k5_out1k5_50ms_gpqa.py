@@ -11,7 +11,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=3700,
-    suite="full-acc-2-npu-a3",
+    suite="full-acc-test-2-npu-a3",
     nightly=True,
 )
 
@@ -22,8 +22,6 @@ QWEN3_8B_ENVS = {
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
-    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "50",
 }
 
 QWEN3_8B_OTHER_ARGS = [
@@ -81,6 +79,9 @@ QWEN3_8B_OTHER_ARGS = [
     "qwen3",
     "--tool-call-parser",
     "qwen",
+    "--enable-prefill-delayer",
+    "--prefill-delayer-max-delay-passes",
+    "50",
 ]
 
 
