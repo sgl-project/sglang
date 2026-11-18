@@ -147,7 +147,7 @@ class TestPrefillAdder(CustomTestCase):
     def create_running_batch(self, reqs=None) -> MagicMock:
         batch = MagicMock()
         batch.reqs = list(reqs or [])
-        batch.release_req.return_value = None
+        batch.release_req.return_value = True
         batch.filter_batch.return_value = None
         return batch
 
