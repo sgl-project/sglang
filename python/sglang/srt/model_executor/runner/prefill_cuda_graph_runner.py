@@ -158,7 +158,12 @@ from sglang.srt.model_executor.runner_utils.forward_batch import set_forward_bat
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_capture_stream,
 )
-from sglang.srt.model_executor.runner_utils.prefill_graph import prefill_graph_scope
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    PrefillAttentionBreaks,
+    PrefillAttentionState,
+    prefill_graph_scope,
+    record_prefill_attention_breaks,
+)
 from sglang.srt.model_executor.runner_utils.shared_read_event import (
     maybe_publish_prefill_shared_read_done,
 )
@@ -348,18 +353,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     _dcp_extend_active = False
     _kimi_k31_rocm_bcg = False
     _is_breakable_backend = False
+    # Distinct states BCG capture saw at its eager attention breaks.
+    _captured_attn_states: frozenset[PrefillAttentionState] = frozenset()
+    _captured_mha_companion = False
     dllm_attention = None
 
     @property
-    def _attn_backend_is_dsa(self) -> bool:
-        from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
-
-        # DSA sets use_mha=False inside piecewise/breakable graphs, so the MHA
-        # companion never runs there and any prefix goes through sparse MLA.
-        if self._kimi_k31_rocm_bcg:  # KDA + DSA: the hybrid backend wraps DSA
-            backend = self.model_runner.attn_backend.full_attn_backend
-            return isinstance(backend, DeepseekSparseAttnBackend)
-        return isinstance(self.model_runner.attn_backend, DeepseekSparseAttnBackend)
+    def _breakable_attn_state(self) -> Optional[PrefillAttentionState]:
+        states = self._captured_attn_states
+        return next(iter(states)) if len(states) == 1 else None
 
     def __init__(self, model_runner: ModelRunner):
         if get_schedule().enable_mixed_chunk:
@@ -536,9 +538,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         self.attention_layers = self.model_runner.attention_layers
         self.mha_companion_layers = self.model_runner.mha_companion_layers
-        self.has_mha_companion_layers = any(
-            layer is not None for layer in self.mha_companion_layers
-        )
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
         self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
@@ -1450,13 +1449,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch, build_snapshot=build_snapshot
         )
 
-    @staticmethod
-    def _restore_mha_capture_state(forward_batch: ForwardBatch) -> None:
-        """Restore Python state omitted from breakable graph segments."""
-        forward_batch.mha_one_shot = True
-        forward_batch.mha_return_lse = False
-        forward_batch.set_attn_attend_prefix_cache(False)
-
     def can_replay_locally(
         self,
         *,
@@ -1513,15 +1505,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if replace_embeds is not None:
             return False
-        # Off CUDA, BCG takes the MHA companion, whose prefix path is
-        # uncapturable. DSA is exempt: it stays on sparse MLA under BCG.
+        # One replay restore cannot serve breaks captured in different states.
+        if len(self._captured_attn_states) > 1:
+            return False
+        # A captured MHA companion break is prefix-free; the prefix pass is
+        # per-batch Python that a replay skips.
         if (
-            self.prefill_backend_name == Backend.BREAKABLE
-            and self.has_mha_companion_layers
-            and not is_cuda()
+            self._captured_mha_companion
             and prefix_lens is not None
             and any(prefix_lens)
-            and not self._attn_backend_is_dsa
         ):
             return False
         # FullCG's chunked-prefix topology covers a bounded prefix. Its capture
@@ -1863,14 +1855,34 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     stream=get_or_create_global_graph_capture_stream()
                 ) as graph_capture_context:
                     self.stream = graph_capture_context.stream
-                    with self.backend.capture_session(self.stream):
+                    with (
+                        self.backend.capture_session(self.stream),
+                        record_prefill_attention_breaks() as attn_breaks,
+                    ):
                         self._capture_one_stream()
         finally:
             dp_flags.capturing_prefill_graph = False
+        if self._is_breakable_backend:
+            self._publish_attention_breaks(attn_breaks)
         if dp_flags.prefill_graph_has_dp_gather:
             logger.info(
                 "Prefill CUDA graph captured a DP gather/scatter; "
                 "DP ranks will replay a shared MAX_LEN bucket."
+            )
+
+    def _publish_attention_breaks(self, breaks: PrefillAttentionBreaks) -> None:
+        self._captured_attn_states = frozenset(breaks.states)
+        self._captured_mha_companion = any(
+            layer in breaks.layers
+            for layer in self.mha_companion_layers
+            if layer is not None
+        )
+        if len(breaks.states) > 1:
+            logger.warning(
+                "Breakable prefill graph captured attention breaks in %d different "
+                "batch states, so prefill runs eagerly: %s",
+                len(breaks.states),
+                list(breaks.states),
             )
 
     def _capture_one_stream(self) -> None:
@@ -2239,12 +2251,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 static_forward_batch.next_token_logits_buffer
             )
 
-        if (
-            self._is_breakable_backend
-            and self.has_mha_companion_layers
-            and not is_cuda()
-        ):
-            self._restore_mha_capture_state(static_forward_batch)
+        attn_state = self._breakable_attn_state
+        if attn_state is not None:
+            attn_state.apply(static_forward_batch)
 
         # Under Breakable / Full, copy serving-time values into the static
         # buffers so the addresses captured segments hold stay live with

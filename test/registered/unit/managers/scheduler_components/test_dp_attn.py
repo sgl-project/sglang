@@ -515,7 +515,8 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         runner._captured_attn_metadata_max_bs = 2
         runner.prefer_eager_mixed_prefill = False
         runner.prefill_backend_name = Backend.BREAKABLE
-        runner.has_mha_companion_layers = False
+        runner._captured_attn_states = frozenset()
+        runner._captured_mha_companion = False
         runner._has_uncapturable_chunked_prefix.return_value = False
         runner.max_num_tokens = 64
         runner.capture_num_tokens = [64]

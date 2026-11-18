@@ -42,6 +42,7 @@ from sglang.srt.model_executor.runner_utils.prefill_graph import (
     get_prefill_raw_num_tokens,
     is_in_full_prefill_graph,
     is_in_prefill_graph_scope,
+    note_prefill_attention_break,
 )
 
 if TYPE_CHECKING:
@@ -156,6 +157,7 @@ class RadixAttention(nn.Module):
             and (breakable_cg or full_cg)
         )
         if use_eager_attention:
+            note_prefill_attention_break(self, forward_batch)
             # `head_cls` identifies DASH: its 2D router inputs return one
             # tensor, unlike MiniMax-M3's 3D dual-output path.
             is_sparse = (
