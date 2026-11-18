@@ -603,10 +603,11 @@ def _load_image(
                     e,
                 )
     elif is_jpeg_with_npu(image_bytes, gpu_image_decode):
-        from sglang.srt.hardware_backend.npu.jpeg import decode_jpeg
+        from sglang.srt.hardware_backend.npu.jpeg import (
+            decode_jpeg as decode_jpeg_with_dvpp,
+        )
 
-        encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
-        image_tensor = decode_jpeg(encoded_image)
+        image_tensor = decode_jpeg_with_dvpp(image_bytes)
         if image_tensor is not None:
             # Warning range from A3 measurements, not a routing threshold. The
             # crossover varies with CPU threading and image content.

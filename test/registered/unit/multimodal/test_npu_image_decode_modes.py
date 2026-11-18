@@ -82,10 +82,8 @@ class TestNPUImageDecodeModes(unittest.TestCase):
         self.decode.return_value = expected
         image, _ = media_io.load_image(data, True)
         self.assertIs(image, expected)
-        args, kwargs = self.decode.call_args
-        self.assertEqual(bytes(args[0].numpy()), data)
-        self.assertFalse(kwargs)
-        self.decode.assert_called_once()
+        self.decode.assert_called_once_with(data)
+        self.assertIs(self.decode.call_args.args[0], data)
 
     def test_small_npu_jpeg_warning_uses_pixel_area(self):
         self.decode.side_effect = None
