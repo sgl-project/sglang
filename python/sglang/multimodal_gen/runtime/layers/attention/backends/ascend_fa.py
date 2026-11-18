@@ -336,13 +336,14 @@ class AscendFAImpl(AttentionImpl):
                     "Quantized MXFP4 attention is supported only for unmasked "
                     "DiT self-attention"
                 )
-            if current_platform.is_npu():
+            if current_platform.is_npu() and self._explicit_precision() != "bf16":
                 if get_ring_parallel_world_size() > 1:
                     raise NotImplementedError(
                         "Quantized MXFP4 attention does not support Ring/LSE"
                     )
                 # The checkpoint may quantize any timestep, so the SDK must be
                 # available even when the public precision config omits it.
+                # An explicit BF16 override never takes this path.
                 load_mindiesd_quant_attention()
         if self._use_mxfp8_attention:
             self._mxfp8_head_chunk_size = envs.SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE
@@ -358,14 +359,20 @@ class AscendFAImpl(AttentionImpl):
             attn_metadata = context.attn_metadata if context is not None else None
         return attn_metadata if isinstance(attn_metadata, AscendFAMetadata) else None
 
-    def _sd_precision(self, metadata: AscendFAMetadata | None) -> str | None:
-        """Effective delegate precision; None keeps the native paths.
+    @staticmethod
+    def _explicit_precision() -> str | None:
+        """Public precision from the server config, if one is set."""
+        from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
-        An explicit public precision wins over the checkpoint. Without one,
-        a descriptor-selected MXFP4 layer follows its fa timestep policy
-        (MXFP4 now, FLOAT meaning native BF16 for that step). The native
-        MXFP8 path stays on its torch_npu operator.
-        """
+        try:
+            config = get_global_server_args().attention_backend_config or {}
+        except ValueError:
+            # Global args are not initialized yet; no explicit override.
+            return None
+        return config.get("precision")
+
+    def _sd_precision(self, metadata: AscendFAMetadata | None) -> str | None:
+        """Effective delegate precision (explicit config wins); None keeps native."""
         explicit = metadata.precision if metadata is not None else None
         if explicit is not None:
             return None if explicit == "bf16" else explicit
@@ -377,20 +384,17 @@ class AscendFAImpl(AttentionImpl):
         return None
 
     def _get_sd_executor(self, metadata: AscendFAMetadata | None):
+        if metadata is None:
+            metadata = self._resolve_metadata(None)
         precision = self._sd_precision(metadata)
-        if precision in (None, "bf16"):
+        if precision is None:
             return None
-        config = {
-            "precision": precision,
-            "head_chunk_size": (
-                metadata.head_chunk_size if metadata is not None else 4
-            ),
-        }
+        # The dataclass supplies the defaults for unset head_chunk/fp8/rotation.
+        metadata = metadata or AscendFAMetadata()
+        config = {"precision": precision, "head_chunk_size": metadata.head_chunk_size}
         if precision == "fp8":
-            config["fp8_fa_mode"] = (
-                metadata.fp8_fa_mode if metadata is not None else "HIGH_PRECISION"
-            )
-        if metadata is not None and metadata.qk_rotation is not None:
+            config["fp8_fa_mode"] = metadata.fp8_fa_mode
+        if metadata.qk_rotation is not None:
             config["qk_rotation"] = metadata.qk_rotation
         if config != self._sd_config:
             executor = AscendQuantAttention(
@@ -398,8 +402,7 @@ class AscendFAImpl(AttentionImpl):
                 head_size=self._head_size,
                 softmax_scale=self.softmax_scale,
                 causal=self.causal,
-                # The layer-local decision replaces the shared quant-config
-                # flag so exported rotations are never doubled by the SDK.
+                # The layer-local decision keeps the SDK from doubling exported rotations.
                 offline_qk_rotation=self.use_offline_qk_rotation,
                 **self._extra_impl_args,
             )
@@ -408,20 +411,14 @@ class AscendFAImpl(AttentionImpl):
         return self._sd_executor
 
     def should_apply_qk_rot(self, query, key, value) -> bool:
-        """Whether callers must apply the checkpoint's exported rotations.
-
-        Apply them exactly once on quantized steps; native BF16 steps and an
-        explicit public precision override skip them. Legacy native MXFP8
-        keeps its shape-gated TND contract.
-        """
+        """Apply the exported rotations exactly once, on quantized delegates only."""
         if not self.use_offline_qk_rotation:
             return False
-        metadata = self._resolve_metadata(None)
         if self.use_mxfp4_attention:
-            return self._sd_precision(metadata) == "mxfp4"
+            return self._sd_precision(self._resolve_metadata(None)) is not None
         return (
             self._use_mxfp8_attention
-            and self._sd_precision(metadata) is None
+            and self._sd_precision(self._resolve_metadata(None)) is None
             and not self.causal
             and not self._is_cross_attention
             and query.shape[1:3] == key.shape[1:3]

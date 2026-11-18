@@ -66,7 +66,6 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
 
             self.single_level_kernel = NPUSingleLevelMXFP4OfflineLinearMethod()
             self.w4a8_kernel = NPUMXFP4W4A8OfflineLinearMethod()
-            self.w4a8_kernel.use_wan_bias = True
         elif self.dual_scale_key not in self.quant_config:
             raise ValueError(
                 f"Dual-level MXFP4 quantization requires missing '{self.dual_scale_key}' in quant_config."

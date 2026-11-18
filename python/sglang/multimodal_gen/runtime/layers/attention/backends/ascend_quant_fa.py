@@ -1,10 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MindIE-SD quantized attention adapter for Ascend FA.
-
-The 4-bit/8-bit attention families (FP8, MXFP8, MXFP4) run through the
-public ``mindiesd.quant_attention`` API; the float16/BF16 paths stay in
-``ascend_fa.py``.
-"""
+"""MindIE-SD quantized attention adapter (FP8/MXFP8/MXFP4) for Ascend FA."""
 
 from collections.abc import Callable
 from numbers import Integral
