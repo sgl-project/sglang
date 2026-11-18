@@ -778,8 +778,12 @@ class TestMemoryOccupationLifecycle(_WeightUpdaterManagerTestBase):
         manager = self._offloaded_manager(events)
         manager.scheduler = None
         manager.offload_tags = {"weights", "kv_cache"}
-        import_state = Mock()
-        barrier = Mock()
+        import_state = Mock(
+            side_effect=lambda model, state: events.append(("import", None))
+        )
+        barrier = Mock(
+            side_effect=lambda *args, **kwargs: events.append(("barrier", None))
+        )
 
         with (
             patch(
