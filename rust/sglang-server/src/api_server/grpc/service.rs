@@ -1222,6 +1222,46 @@ mod tests {
         assert_eq!(info.num_reserved_tokens, 4);
     }
 
+    /// gRPC `GetServerInfo` advertises the same nonempty owning-runtime id on
+    /// repeated calls against the same core-backed adapter.
+    #[tokio::test]
+    async fn server_info_instance_id_is_stable_across_grpc_reads() {
+        let Harness {
+            service,
+            intake_rx,
+            abort_rx: _,
+        } = Harness::new(1, false, Duration::from_secs(1));
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let call = service.get_server_info(Request::new(api::GetServerInfoRequest {}));
+            let scheduler = async {
+                let TmEvent::Intake {
+                    request: control,
+                    admission,
+                } = intake_rx.recv_async().await.unwrap()
+                else {
+                    panic!("server info must submit one control request");
+                };
+                assert!(admission.try_accept());
+                let envelope = rmpv::Value::Map(vec![(
+                    rmpv::Value::from("internal_state"),
+                    rmpv::Value::Map(Vec::new()),
+                )]);
+                let mut payload = Vec::new();
+                rmpv::encode::write_value(&mut payload, &envelope).unwrap();
+                control
+                    .sink
+                    .try_send(ResponseItem::Control(bytes::Bytes::from(payload)))
+                    .unwrap();
+            };
+            let (response, ()) = tokio::join!(call, scheduler);
+            ids.push(response.unwrap().into_inner().instance_id);
+        }
+        let uuid = uuid::Uuid::parse_str(&ids[0]).unwrap();
+        assert_eq!(uuid.get_version(), Some(uuid::Version::Random));
+        assert_eq!(ids[0], ids[1]);
+    }
+
     #[tokio::test]
     async fn list_models_uses_static_metadata_without_intake() {
         let harness = Harness::new(2, false, Duration::from_secs(1));

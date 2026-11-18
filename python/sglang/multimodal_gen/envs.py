@@ -74,6 +74,9 @@ if TYPE_CHECKING:
     # distinct (n_local, n_peer, dtype) staging pairs kept; each is two
     # slots and is never freed, so multi-resolution serving needs a cap
     SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS: int = 16
+    # two-rank TP on one host: a row-parallel layer's epilogue kernel reads both
+    # ranks' partial sums instead of an all-reduced tensor. Set 0 to all-reduce.
+    SGLANG_DIFFUSION_TP_PEER_PARTIALS: bool = True
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
     SGLANG_CACHE_DIT_BN: int = 0
@@ -410,6 +413,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS": _lazy_int(
         "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS", 16
+    ),
+    "SGLANG_DIFFUSION_TP_PEER_PARTIALS": _lazy_bool(
+        "SGLANG_DIFFUSION_TP_PEER_PARTIALS", "true"
     ),
     "SGLANG_CACHE_DIT_ENABLED": _lazy_bool("SGLANG_CACHE_DIT_ENABLED"),
     # Number of first blocks to always compute (DBCache F parameter)

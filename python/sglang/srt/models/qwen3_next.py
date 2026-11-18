@@ -45,6 +45,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.utils import validate_quant_param_compatibility
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
@@ -237,12 +238,8 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         # Override weight_loader for packed checkpoint format.
         # Must capture original_loader BEFORE overwriting.
-        self._override_weight_loader(
-            self.in_proj_qkvz, self._make_packed_weight_loader(self.in_proj_qkvz)
-        )
-        self._override_weight_loader(
-            self.in_proj_ba, self._make_packed_weight_loader(self.in_proj_ba)
-        )
+        self._bind_packed_weight_loaders(self.in_proj_qkvz)
+        self._bind_packed_weight_loaders(self.in_proj_ba)
 
         # Conv1d weight loader setup
         query_key_settings = (self.key_dim, 0, False)
@@ -337,12 +334,18 @@ class Qwen3GatedDeltaNet(nn.Module):
         ModelWeightParameter exposes weight_loader as a read-only property
         backed by _weight_loader, while plain parameters store it as a
         regular attribute.  This helper handles both cases."""
+        if new_loader is None:
+            return
         for attr_name in (
             "weight",
             "weight_scale_inv",
             "weight_scale",
             "input_scale",
             "weight_offset",
+            "qweight",
+            "qzeros",
+            "scales",
+            "g_idx",
         ):
             param = getattr(module, attr_name, None)
             if param is None:
@@ -352,19 +355,55 @@ class Qwen3GatedDeltaNet(nn.Module):
             else:
                 param.weight_loader = new_loader
 
+    @classmethod
+    def _bind_packed_weight_loaders(cls, module):
+        """Bind packed-checkpoint-aware loaders to all present params on a module."""
+        for attr_name in (
+            "weight",
+            "weight_scale_inv",
+            "weight_scale",
+            "input_scale",
+            "weight_offset",
+            "qweight",
+            "qzeros",
+            "scales",
+            "g_idx",
+        ):
+            param = getattr(module, attr_name, None)
+            if param is None:
+                continue
+            original_loader = getattr(param, "weight_loader", None)
+            if original_loader is None:
+                continue
+            wrapped_loader = cls._make_packed_weight_loader(module, original_loader)
+            if hasattr(param, "_weight_loader"):
+                param._weight_loader = wrapped_loader
+            else:
+                param.weight_loader = wrapped_loader
+
     @staticmethod
-    def _make_packed_weight_loader(module):
+    def _make_packed_weight_loader(module, original_loader=None):
         """Create a weight_loader that does contiguous TP slicing for fused
         (packed-format) checkpoint weights (shard_id=None), and delegates
         to the standard MergedColumnParallelLinear loader for split checkpoint
         weights (shard_id=int/tuple)."""
-        original_loader = module.weight.weight_loader
+        if original_loader is None:
+            weight = getattr(module, "weight", None)
+            original_loader = getattr(weight, "weight_loader", None)
 
         def weight_loader(param, loaded_weight, loaded_shard_id=None):
             if loaded_shard_id is None:
                 # Fused checkpoint: weight is in packed (per-head-group)
                 # format. Do contiguous TP slice like ColumnParallelLinear.
                 output_dim = getattr(param, "output_dim", None)
+                if (
+                    output_dim is None
+                    and loaded_weight.numel() == 1
+                    and param.data.shape != loaded_weight.shape
+                    and original_loader is not None
+                ):
+                    original_loader(param, loaded_weight, loaded_shard_id)
+                    return
                 group = module.tp_group
                 if (
                     output_dim is not None
@@ -392,6 +431,10 @@ class Qwen3GatedDeltaNet(nn.Module):
                     param.data.copy_(loaded_weight)
             else:
                 # Split checkpoint (int or tuple shard_id) → standard path
+                if original_loader is None:
+                    raise AttributeError(
+                        f"{type(module).__name__} parameter has no original weight_loader"
+                    )
                 original_loader(param, loaded_weight, loaded_shard_id)
 
         return weight_loader
@@ -1329,6 +1372,7 @@ class Qwen3NextForCausalLM(nn.Module):
                     continue
 
                 replaced_name = name.replace(weight_name, param_name)
+                validate_quant_param_compatibility(replaced_name, params_dict)
                 # Skip loading extra bias for GPTQ models.
                 if replaced_name.endswith(".bias") and replaced_name not in params_dict:
                     continue
@@ -1370,6 +1414,7 @@ class Qwen3NextForCausalLM(nn.Module):
                     )
                     break
                 else:
+                    validate_quant_param_compatibility(name, params_dict)
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue

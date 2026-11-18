@@ -133,6 +133,10 @@ class P2PWork:
     work: Optional[torch.distributed.Work]
     payload: Optional[torch.Tensor]
 
+    def wait(self) -> None:
+        if self.work is not None:
+            self.work.wait()
+
 
 def _split_tensor_dict(
     tensor_dict: Dict[str, Union[torch.Tensor, Any]],
