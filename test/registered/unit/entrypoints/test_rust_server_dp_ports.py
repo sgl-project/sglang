@@ -186,6 +186,32 @@ def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected
 
 
 @pytest.mark.parametrize(
+    "tokenizer,resolved,bos",
+    [
+        (None, False, None),
+        (SimpleNamespace(bos_token_id=None), True, None),
+        (SimpleNamespace(bos_token_id=0), True, 0),
+        (type("ClassDefaultTokenizer", (), {"bos_token_id": 50256})(), True, 50256),
+    ],
+    ids=["skip-tokenizer", "resolved-none", "zero", "class-default"],
+)
+def test_typed_config_hands_off_python_bos(tokenizer, resolved, bos):
+    scheduler = _scheduler_for_typed_config()
+    scheduler.tokenizer = tokenizer
+    extension = MagicMock()
+    with (
+        get_context().override_server_args(grpc_port=50051),
+        get_parallel().override(attn_dp_rank=0, dp_rank=None),
+        patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
+        patch.object(rust_config, "_launch_server_info", return_value="{}"),
+    ):
+        rust_config._build_server_args(scheduler, extension=extension)
+    kwargs = extension.ServerArgs.call_args.kwargs
+    assert kwargs["tokenizer_bos_token_id_resolved"] is resolved
+    assert kwargs["tokenizer_bos_token_id"] == bos
+
+
+@pytest.mark.parametrize(
     "server_args,ranks,expected",
     [
         ({"tp_size": 4, "attn_dp_size": 4}, {"attn_dp_rank": 2, "dp_rank": None}, 2),

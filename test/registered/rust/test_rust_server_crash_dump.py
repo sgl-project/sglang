@@ -40,6 +40,8 @@ def _server_args(ext, port: int):
         model_path="rust-server-test",
         served_model_name="rust-server-test",
         tokenizer_path="",
+        tokenizer_bos_token_id_resolved=False,
+        tokenizer_bos_token_id=None,
         public_tokenizer_path="",
         revision=None,
         load_format=None,

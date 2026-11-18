@@ -233,6 +233,10 @@ def _build_server_args(
         tokenizer_model_max_length=_tokenizer_model_max_length(
             scheduler.tokenizer, mc.context_len
         ),
+        # Python has already applied tokenizer class defaults and post-load fixes.
+        # Keep a known absence distinct from the standalone metadata fallback.
+        tokenizer_bos_token_id_resolved=scheduler.tokenizer is not None,
+        tokenizer_bos_token_id=getattr(scheduler.tokenizer, "bos_token_id", None),
         # Launch-time facts Python's /server_info and /model_info report from
         # scheduler_info / the package / the model — stamped here so the rust
         # endpoints can serve them statically (no scheduler round-trip).

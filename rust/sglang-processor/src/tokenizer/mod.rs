@@ -103,6 +103,13 @@ impl DynamoTokenizer {
         Ok(tokenizer)
     }
 
+    /// Use Python's post-load BOS fact for continuation encoding, including a
+    /// known absence. Standalone callers can retain [`Self::load`]'s fallback.
+    pub fn with_resolved_bos_token_id(mut self, bos: Option<i32>) -> Self {
+        self.bos = bos;
+        self
+    }
+
     /// The handle that adds the tokenizer's specials, which decoding shares.
     pub fn tokenizer(&self) -> &dynamo_tokenizers::Tokenizer {
         &self.with_specials
@@ -182,11 +189,8 @@ mod tests {
 
     use super::*;
 
-    /// With a configured, auto-added `<s>`, the template encodes without it and the
-    /// continuation loses one leading BOS, as on Python.
-    #[test]
-    fn chat_encode_drops_one_configured_bos() {
-        let dir = std::env::temp_dir().join(format!("processor-bos-{}", std::process::id()));
+    fn bos_tokenizer(name: &str, configured_bos: bool) -> DynamoTokenizer {
+        let dir = std::env::temp_dir().join(format!("processor-bos-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let tokenizer = serde_json::json!({
             "added_tokens": [{"id": 0, "content": "<s>", "single_word": false, "lstrip": false,
@@ -202,9 +206,19 @@ mod tests {
         });
         let file = dir.join("tokenizer.json");
         std::fs::write(&file, tokenizer.to_string()).unwrap();
-        std::fs::write(dir.join("tokenizer_config.json"), r#"{"bos_token": "<s>"}"#).unwrap();
+        if configured_bos {
+            std::fs::write(dir.join("tokenizer_config.json"), r#"{"bos_token": "<s>"}"#).unwrap();
+        }
         let tokenizer = DynamoTokenizer::load(file.to_str().unwrap(), None).unwrap();
         std::fs::remove_dir_all(&dir).ok();
+        tokenizer
+    }
+
+    /// With a configured, auto-added `<s>`, the template encodes without it and the
+    /// continuation loses one leading BOS, as on Python.
+    #[test]
+    fn chat_encode_drops_one_configured_bos() {
+        let tokenizer = bos_tokenizer("configured", true);
         assert_eq!(tokenizer.bos_token_id(), Some(0));
 
         let prompt = [EncodeSegment::new("Hi", true)];
@@ -214,5 +228,24 @@ mod tests {
             tokenizer.encode_chat(&prompt, "<s><s>It").unwrap(),
             vec![2, 0, 0, 3]
         );
+    }
+
+    /// Python may resolve a class-default BOS even with no BOS metadata. A
+    /// resolved absence must also override a token named by stale metadata.
+    #[test]
+    fn chat_encode_uses_resolved_python_bos() {
+        let prompt = [EncodeSegment::new("Hi", true)];
+        // No BOS metadata: only the scheduler's resolved fact identifies it.
+        let tokenizer =
+            bos_tokenizer("python-class-default", false).with_resolved_bos_token_id(Some(0));
+        assert_eq!(tokenizer.encode_chat(&prompt, "It").unwrap(), vec![2, 3]);
+        assert_eq!(
+            tokenizer.encode_chat(&prompt, "<s>It").unwrap(),
+            vec![2, 0, 3]
+        );
+        // Metadata is only the standalone fallback, not an override of Python.
+        let tokenizer = bos_tokenizer("python-none", true).with_resolved_bos_token_id(None);
+        assert_eq!(tokenizer.encode_chat(&prompt, "It").unwrap(), vec![2, 0, 3]);
+        assert_eq!(tokenizer.encode_chat(&prompt, "").unwrap(), vec![2]);
     }
 }

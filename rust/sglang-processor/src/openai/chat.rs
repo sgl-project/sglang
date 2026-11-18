@@ -396,8 +396,6 @@ const TASKS: &[&str] = &[
     "read_url",
 ];
 
-const EFFORT_TIERS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
-
 /// `ChatCompletionMessageGenericParam` roles, matched case-insensitively.
 const GENERIC_ROLES: &[&str] = &[
     "system",
@@ -419,9 +417,10 @@ pub fn lower_chat(
     render: impl FnOnce(&Value) -> Option<Vec<u32>>,
     tokenizer: Option<Arc<dyn OpenAiTokenizer>>,
 ) -> Result<(GenerateRequest, ChatResponder), Unsupported> {
-    let original: Value =
+    let mut original: Value =
         serde_json::from_slice(body).map_err(|_| Unsupported("unparsed_request"))?;
-    let Value::Object(mut raw) = original.clone() else {
+    crate::prepare_reasoning(&mut original).map_err(|_| Unsupported("invalid_request"))?;
+    let Value::Object(raw) = original.clone() else {
         return Err(Unsupported("unparsed_request"));
     };
     if UNSUPPORTED_FIELDS
@@ -478,13 +477,7 @@ pub fn lower_chat(
     {
         return Err(Unsupported("invalid_request"));
     }
-    let thinking_kwarg = normalize_reasoning_inputs(&mut raw)?;
-    if raw
-        .get("reasoning_effort")
-        .is_some_and(|e| !valid_effort(e))
-    {
-        return Err(Unsupported("invalid_request"));
-    }
+    let thinking_kwarg = crate::requested_thinking(&original).map(Value::from);
     let mut request: ChatRequest =
         serde_json::from_value(Value::Object(raw)).map_err(|_| Unsupported("unparsed_request"))?;
     validate(&request, settings, model)?;
@@ -743,61 +736,6 @@ fn has_tools_or_media(message: &Value) -> bool {
         || message["content"]
             .as_array()
             .is_some_and(|parts| parts.iter().any(media))
-}
-
-fn valid_effort(effort: &Value) -> bool {
-    match effort {
-        Value::String(tier) => EFFORT_TIERS.contains(&tier.as_str()),
-        Value::Number(n) => n.as_f64().is_some_and(|f| (0.0..=0.99).contains(&f)),
-        _ => false,
-    }
-}
-
-/// `ChatCompletionRequest.normalize_reasoning_inputs`: lift `reasoning` into
-/// `reasoning_effort` and return the `thinking` it implies.
-fn normalize_reasoning_inputs(raw: &mut Map<String, Value>) -> Result<Option<Value>, Unsupported> {
-    let mut thinking = None;
-    if let Some(Value::Object(reasoning)) = raw.get("reasoning").cloned() {
-        let effort = match reasoning.get("effort").filter(|e| !e.is_null()) {
-            Some(effort) => effort.clone(),
-            None => reasoning
-                .get("reasoning_effort")
-                .cloned()
-                .unwrap_or(Value::Null),
-        };
-        match &effort {
-            Value::String(tier) if EFFORT_TIERS.contains(&tier.as_str()) => {
-                raw.insert("reasoning_effort".into(), effort.clone());
-            }
-            Value::Number(n) => {
-                raw.insert("reasoning_effort".into(), json!(n.as_f64()));
-            }
-            Value::Null => {}
-            _ => return Err(Unsupported("invalid_request")),
-        }
-        let enabled = match reasoning.get("enabled").filter(|e| !e.is_null()) {
-            Some(enabled) => Some(enabled),
-            None => reasoning.get("enable"),
-        };
-        let enabled = match enabled {
-            Some(Value::String(s)) => {
-                ["1", "true", "yes", "y", "on"].contains(&s.trim().to_lowercase().as_str())
-            }
-            Some(Value::Bool(b)) => *b,
-            Some(Value::Null) | None => false,
-            Some(_) => return Err(Unsupported("invalid_request")),
-        };
-        if enabled {
-            thinking = Some(Value::Bool(true));
-        }
-    }
-    if let Some(effort) = raw.get("reasoning_effort").filter(|e| !e.is_null()) {
-        if effort.is_boolean() {
-            return Err(Unsupported("invalid_request"));
-        }
-        thinking = Some(Value::Bool(effort != "none"));
-    }
-    Ok(thinking)
 }
 
 /// `OpenAIServingChat._validate_request`, for the checks requests here can fail.
@@ -1526,6 +1464,127 @@ impl ChatResponder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Python parses nested numeric effort before the prompt renderer sees it.
+    #[test]
+    fn renderer_receives_normalized_reasoning_effort() {
+        let body = serde_json::to_vec(&json!({
+            "model": "m", "messages": [{"role": "user", "content": "Hi"}],
+            "reasoning": {"reasoning_effort": "0.25"}
+        }))
+        .unwrap();
+        let result = lower_chat(
+            &body,
+            &OpenAiHeaders::default(),
+            &OpenAiSettings::default(),
+            &ChatModel::default(),
+            |body| {
+                assert_eq!(body["reasoning_effort"], json!(0.25));
+                assert_eq!(body["chat_template_kwargs"]["thinking"], true);
+                Some(vec![1])
+            },
+            None,
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    /// Python's thinking object overrides reasoning aliases, beneath explicit kwargs.
+    #[test]
+    fn renderer_receives_thinking_overrides() {
+        let body = serde_json::to_vec(&json!({
+            "model": "m", "messages": [{"role": "user", "content": "Hi"}],
+            "reasoning": {"effort": 2},
+            "thinking": {"effort": "0.5", "type": "disabled"},
+            "chat_template_kwargs": {"thinking": true}
+        }))
+        .unwrap();
+        let result = lower_chat(
+            &body,
+            &OpenAiHeaders::default(),
+            &OpenAiSettings::default(),
+            &ChatModel::default(),
+            |body| {
+                assert_eq!(body["reasoning_effort"], json!(0.5));
+                assert_eq!(body["chat_template_kwargs"]["thinking"], true);
+                assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+                Some(vec![1])
+            },
+            None,
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn non_object_chat_body_is_rejected() {
+        assert!(
+            lower_chat(
+                b"[]",
+                &OpenAiHeaders::default(),
+                &OpenAiSettings::default(),
+                &ChatModel::default(),
+                |_| panic!("invalid body reached renderer"),
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    /// Expected coercions and overrides from Python's ChatCompletionRequest.
+    #[test]
+    fn reasoning_inputs_match_python_validation_and_normalization() {
+        let cases: Value = serde_json::from_str(r#"[
+{"body":{"reasoning":{"reasoning_effort":"0.25"}},"ok":true,"effort":0.25,"kwargs":{"thinking":true,"enable_thinking":true}},
+{"body":{"reasoning_effort":" +2.5e-1 "},"ok":true,"effort":0.25,"kwargs":{"thinking":true,"enable_thinking":true}},
+{"body":{"reasoning_effort":true,"reasoning":{"effort":"none"}},"ok":true,"effort":"none","kwargs":{"thinking":false,"enable_thinking":false}},
+{"body":{"reasoning":{"effort":2},"thinking":{"effort":"0.5"}},"ok":true,"effort":0.5,"kwargs":{"thinking":true,"enable_thinking":true}},
+{"body":{"reasoning":{"effort":true},"thinking":{"effort":"0.5"}},"ok":false},
+{"body":{"thinking":{"type":"disabled","effort":"0.5"}},"ok":true,"effort":0.5,"kwargs":{"thinking":false,"enable_thinking":false}},
+{"body":{"reasoning_effort":"none","thinking":{}},"ok":true,"effort":"none","kwargs":{"thinking":false,"enable_thinking":false}},
+{"body":{"thinking":{}},"ok":true,"effort":null,"kwargs":{"thinking":true,"enable_thinking":true}},
+{"body":{"thinking":{"type":"enabled"},"chat_template_kwargs":{"thinking":false}},"ok":true,"effort":null,"kwargs":{"thinking":false,"enable_thinking":true}},
+{"body":{"reasoning":{"enabled":[0]}},"ok":true,"effort":null,"kwargs":{"thinking":true,"enable_thinking":true}},
+{"body":{"reasoning":{"enabled":0}},"ok":true,"effort":null,"kwargs":null},
+{"body":{"reasoning":{"enabled":"\u001cyes\u001f"}},"ok":true,"effort":null,"kwargs":{"thinking":true,"enable_thinking":true}},
+{"body":{"reasoning_effort":"ultra"},"ok":true,"effort":"ultra","kwargs":{"thinking":true,"enable_thinking":true}},
+{"body":{"reasoning_effort":"0_.5"},"ok":true,"effort":0.5,"kwargs":{"thinking":true,"enable_thinking":true}},
+{"body":{"reasoning":{"effort":"0_.5"}},"ok":false},
+{"body":{"reasoning":{"effort":"٠.٥"}},"ok":true,"effort":0.5,"kwargs":{"thinking":true,"enable_thinking":true}},
+{"body":{"reasoning_effort":"٠.٥"},"ok":false},
+{"body":{"reasoning_effort":-0.1,"chat_template_kwargs":{"reasoning_effort":"low"}},"ok":false},
+{"body":{"reasoning":{"enabled":false},"chat_template_kwargs":"wrong"},"ok":false},
+{"body":{"reasoning":{"enabled":true},"chat_template_kwargs":"wrong"},"ok":true,"effort":null,"kwargs":{"thinking":true,"enable_thinking":true}}
+,
+{"body":{"reasoning_effort":null},"ok":true,"effort":null,"kwargs":{}}
+        ]"#).unwrap();
+        for case in cases.as_array().unwrap() {
+            let mut body = case["body"].clone();
+            body["model"] = "m".into();
+            body["messages"] = json!([{"role": "user", "content": "Hi"}]);
+            let result = lower_chat(
+                &serde_json::to_vec(&body).unwrap(),
+                &OpenAiHeaders::default(),
+                &OpenAiSettings::default(),
+                &ChatModel::default(),
+                |normalized| {
+                    assert!(case["ok"].as_bool().unwrap(), "unexpected render: {body}");
+                    assert_eq!(normalized["reasoning_effort"], case["effort"], "{body}");
+                    assert_eq!(
+                        normalized["chat_template_kwargs"],
+                        Value::Object(case["kwargs"].as_object().cloned().unwrap_or_default()),
+                        "{body}"
+                    );
+                    Some(vec![1])
+                },
+                None,
+            );
+            assert_eq!(
+                result.is_ok(),
+                case["ok"].as_bool().unwrap(),
+                "{body}: {:?}",
+                result.err()
+            );
+        }
+    }
 
     /// Kimi K3 starts in reasoning unless the merged kwargs turn `thinking` off;
     /// a parser the port does not cover keeps its own default.

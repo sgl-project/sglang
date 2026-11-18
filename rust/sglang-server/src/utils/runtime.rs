@@ -401,6 +401,13 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         cfg.server_args.revision.as_deref(),
         skip_tokenizer_init,
     )?
+    .map(|tokenizer| {
+        if cfg.server_args.tokenizer_bos_token_id_resolved {
+            tokenizer.with_resolved_bos_token_id(cfg.server_args.tokenizer_bos_token_id)
+        } else {
+            tokenizer
+        }
+    })
     .map(Arc::new);
     let dyn_tokenizer = tokenizer.as_ref().map(|t| t.tokenizer().clone());
 

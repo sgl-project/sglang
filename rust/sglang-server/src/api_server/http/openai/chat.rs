@@ -84,8 +84,41 @@ pub(super) struct ChatBody {
 
 impl<'de> Deserialize<'de> for ChatBody {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = Value::deserialize(deserializer)?;
-        let request = ChatRequest::deserialize(&raw).map_err(serde::de::Error::custom)?;
+        let mut raw = Value::deserialize(deserializer)?;
+        sglang_processor::prepare_reasoning(&mut raw).map_err(serde::de::Error::custom)?;
+        if let Some(tools) = raw.get_mut("tools").and_then(Value::as_array_mut) {
+            for tool in tools {
+                if let Some(tool) = tool.as_object_mut() {
+                    tool.entry("type").or_insert_with(|| "function".into());
+                }
+            }
+        }
+        if let Some(choice) = raw.get_mut("tool_choice").and_then(Value::as_object_mut) {
+            choice.entry("type").or_insert_with(|| "function".into());
+        }
+        // Dynamo's enum cannot carry Python's numeric effort (or `ultra`).
+        // The normalized raw body keeps it for the processor/template path.
+        let mut typed = raw.clone();
+        if let Some(tools) = typed.get_mut("tools").and_then(Value::as_array_mut) {
+            for tool in tools {
+                // Python permits any string Tool.type; preserve it in `raw`
+                // while adapting the shared request's function-only enum.
+                if tool.get("type").is_some_and(Value::is_string) {
+                    tool["type"] = "function".into();
+                }
+                if let Some(strict) = tool.get_mut("function").and_then(|f| f.get_mut("strict"))
+                    && !strict.is_null()
+                {
+                    *strict = sglang_processor::pydantic_bool(strict)
+                        .map_err(serde::de::Error::custom)?
+                        .into();
+                }
+            }
+        }
+        if typed["reasoning_effort"].is_number() || typed["reasoning_effort"] == "ultra" {
+            typed["reasoning_effort"] = Value::Null;
+        }
+        let request = ChatRequest::deserialize(&typed).map_err(serde::de::Error::custom)?;
         Ok(Self { request, raw })
     }
 }
@@ -1251,6 +1284,115 @@ mod tests {
     use sglang_processor::dynamo_tokenizers::Tokenizer;
     use sglang_processor::openai::ChatModel;
     use sglang_processor::{DeepSeekOutputOptions, ReasoningOptions};
+
+    /// Python's Tool model supplies the omitted function discriminator.
+    #[test]
+    fn chat_body_defaults_missing_tool_type() {
+        let body = serde_json::json!({
+            "model": "test", "messages": [{"role": "user", "content": "Hi"}],
+            "tools": [{"function": {"name": "f"}}]
+        });
+        let parsed = serde_json::from_value::<super::ChatBody>(body);
+        assert!(parsed.is_ok(), "{:?}", parsed.err());
+    }
+
+    #[test]
+    fn chat_body_defaults_named_tool_choice_type() {
+        let body = serde_json::json!({
+            "model": "test", "messages": [{"role": "user", "content": "Hi"}],
+            "tools": [{"type": "function", "function": {"name": "f"}}],
+            "tool_choice": {"function": {"name": "f"}}
+        });
+        let parsed = serde_json::from_value::<super::ChatBody>(body);
+        assert!(parsed.is_ok(), "{:?}", parsed.err());
+    }
+
+    #[test]
+    fn chat_body_accepts_python_lax_strict_flag() {
+        let body = serde_json::json!({
+            "model": "test", "messages": [{"role": "user", "content": "Hi"}],
+            "tools": [{"type": "function", "function": {"name": "f", "strict": "yes"}}]
+        });
+        let parsed = serde_json::from_value::<super::ChatBody>(body);
+        assert!(parsed.is_ok(), "{:?}", parsed.err());
+    }
+
+    #[test]
+    fn chat_body_preserves_python_numeric_effort_and_rejects_invalid_values() {
+        for effort in [
+            serde_json::json!(0.25),
+            serde_json::json!("+.25"),
+            serde_json::json!("ultra"),
+        ] {
+            let body = serde_json::json!({
+                "model": "test", "messages": [{"role": "user", "content": "Hi"}],
+                "reasoning_effort": effort,
+            });
+            let parsed = serde_json::from_value::<super::ChatBody>(body).unwrap();
+            assert_eq!(
+                parsed.raw["reasoning_effort"],
+                if effort == "ultra" {
+                    effort
+                } else {
+                    serde_json::json!(0.25)
+                }
+            );
+        }
+        for invalid in [
+            serde_json::json!(true),
+            serde_json::json!(-1),
+            serde_json::json!("bad"),
+        ] {
+            let body = serde_json::json!({
+                "model": "test", "messages": [{"role": "user", "content": "Hi"}],
+                "reasoning_effort": invalid,
+                "chat_template_kwargs": {"reasoning_effort": "low"}
+            });
+            assert!(serde_json::from_value::<super::ChatBody>(body).is_err());
+        }
+    }
+
+    /// Python's Tool.type is an arbitrary string; only the typed adapter uses
+    /// Dynamo's function discriminator. The template still sees the raw string.
+    #[test]
+    fn chat_body_preserves_custom_tool_type_for_template() {
+        for kind in ["custom", ""] {
+            let body = serde_json::json!({
+                "model": "test", "messages": [{"role": "user", "content": "Hi"}],
+                "tools": [{"type": kind, "function": {"name": "f"}}]
+            });
+            let parsed = serde_json::from_value::<super::ChatBody>(body).unwrap();
+            assert_eq!(parsed.raw["tools"][0]["type"], kind);
+            let formatter = ChatFormatter::from_tokenizer_config(&serde_json::json!({
+                "chat_template": "{{ tools[0].type }}"
+            }))
+            .unwrap();
+            let args =
+                sglang_processor::TemplateArgs::new(&parsed.raw, &std::collections::HashMap::new());
+            let (prompt, _) = formatter
+                .render_template(&parsed.request.request, &args)
+                .unwrap();
+            assert_eq!(prompt.as_str(), kind);
+        }
+        for kind in [
+            serde_json::Value::Null,
+            serde_json::json!(true),
+            serde_json::json!(1),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            let body = serde_json::json!({
+                "model": "test", "messages": [{"role": "user", "content": "Hi"}],
+                "tools": [{"type": kind, "function": {"name": "f"}}]
+            });
+            assert!(serde_json::from_value::<super::ChatBody>(body).is_err());
+        }
+        let body = serde_json::json!({
+            "model": "test", "messages": [{"role": "user", "content": "Hi"}],
+            "tool_choice": {"type": "custom", "function": {"name": "f"}}
+        });
+        assert!(serde_json::from_value::<super::ChatBody>(body).is_err());
+    }
 
     fn request() -> CreateChatCompletionRequest {
         serde_json::from_value(serde_json::json!({

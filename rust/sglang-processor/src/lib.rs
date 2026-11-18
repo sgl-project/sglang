@@ -20,8 +20,13 @@ mod parser;
 #[cfg(any(feature = "parser", feature = "openai", feature = "render"))]
 #[cfg_attr(not(any(feature = "parser", feature = "openai")), allow(dead_code))]
 mod py;
+#[cfg(all(feature = "openai", not(feature = "render")))]
+#[path = "render/reasoning.rs"]
+mod reasoning;
 #[cfg(feature = "render")]
 mod render;
+#[cfg(all(feature = "openai", not(feature = "render")))]
+pub use reasoning::{prepare_reasoning, requested_thinking};
 #[cfg(any(feature = "parser", feature = "openai"))]
 mod think;
 #[cfg(feature = "tokenizer")]
@@ -48,7 +53,7 @@ pub use parser::{
 pub use render::{
     ChatFormatter, ChatFormatterOptions, DeepSeekTokenizer, OneOrMany, TemplateArgs, TemplateError,
     ThinkingTemplates, continues_final_message, extract_images, load_chat_formatter,
-    requested_effort, requested_thinking, select_chat_formatter,
+    prepare_reasoning, pydantic_bool, requested_effort, requested_thinking, select_chat_formatter,
 };
 #[cfg(any(feature = "parser", feature = "openai"))]
 pub use think::ReasoningOptions;
