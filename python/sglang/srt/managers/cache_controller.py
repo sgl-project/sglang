@@ -332,13 +332,13 @@ def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
     if entry.name == PoolName.MAMBA and isinstance(pool, MambaPoolHost):
         return  # KDA state: one slot per key
     if (
-        entry.name in (PoolName.INDEXER, PoolName.INDEXER_SCALE)
+        entry.name == PoolName.INDEXER
         and isinstance(pool, DSAIndexerPoolHost)
         and dsa_shards_index_k()
         and pool.dcp_size == anchor.dcp_size
         and pool.size == anchor.size
     ):
-        return  # index-K and its FP4 exponents, row-sharded like the MLA KV (Kimi-K3.1)
+        return  # index-K row-sharded like the MLA KV (Kimi-K3.1)
     if (
         entry.name == PoolName.INDEXER
         and isinstance(pool, DSAIndexerPoolHost)
