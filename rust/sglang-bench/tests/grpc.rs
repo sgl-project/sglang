@@ -368,6 +368,13 @@ impl SglangService for Mock {
         unimplemented!()
     }
 
+    async fn open_ai_responses(
+        &self,
+        _: Request<api::OpenAiResponsesRequest>,
+    ) -> Result<Response<api::OpenAiResponsesResponse>, Status> {
+        unimplemented!()
+    }
+
     async fn open_ai_list_models(
         &self,
         _: Request<api::OpenAiListModelsRequest>,
