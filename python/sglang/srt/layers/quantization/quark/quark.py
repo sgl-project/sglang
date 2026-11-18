@@ -29,6 +29,7 @@ from sglang.srt.layers.quantization.quark.schemes import (
     QuarkW4A4MXFp4MoE,
     QuarkW4A8MXFp4MoE,
     QuarkW4A16Int4,
+    QuarkW4A16Uint4MoE,
     QuarkW8A8Fp8,
     QuarkW8A8FP8MoE,
 )
@@ -43,6 +44,7 @@ from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     get_device_capability,
     is_gfx95_supported,
+    is_gfx115_supported,
     is_hip,
 )
 
@@ -874,6 +876,33 @@ class QuarkConfig(QuantizationConfig):
             return False
         return weight_quant.get("is_dynamic") is not True
 
+    def _is_uint4_w4a16_moe(
+        self,
+        weight_quant: Optional[dict[str, Any]],
+        input_quant: Optional[dict[str, Any]],
+    ) -> bool:
+        # uint4 experts on the Triton WNA16 MoE kernel. gfx115x only: the one
+        # architecture this path has run on. The loader reads one export layout:
+        # packed int32 codes and zero points, asymmetric, grouped along the input
+        # axis, in "reorder" packing.
+        if not is_gfx115_supported():
+            return False
+        if weight_quant is None or input_quant is not None:
+            return False
+        export = self.quant_config.get("export") or {}
+        return (
+            weight_quant.get("dtype") == "uint4"
+            and weight_quant.get("symmetric") is False
+            and weight_quant.get("qscheme") == "per_group"
+            and weight_quant.get("ch_axis") in (-1, 1)
+            and weight_quant.get("zero_point_type") == "int32"
+            and weight_quant.get("group_size") in (32, 64, 128)
+            and weight_quant.get("is_dynamic") is False
+            and self.is_prequantized
+            and export.get("weight_format") == "real_quantized"
+            and self.pack_method == "reorder"
+        )
+
     def _is_mx_fp4(
         self,
         weight_quant: Optional[dict[str, Any]],
@@ -1125,6 +1154,9 @@ class QuarkConfig(QuantizationConfig):
             return QuarkW4A8MXFp4MoE(weight_config, input_config)
         elif self._is_fp8_w8a8(weight_config, input_config):
             return QuarkW8A8FP8MoE(weight_config, input_config)
+        elif self._is_uint4_w4a16_moe(weight_config, input_config):
+            logger.info_once("Using Quark W4A16 UINT4 MoE scheme (Triton WNA16)")
+            return QuarkW4A16Uint4MoE(weight_config)
         else:
             raise RuntimeError("Unsupported FusedMoe scheme")
 
