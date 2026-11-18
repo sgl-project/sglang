@@ -204,25 +204,22 @@ def _asm_cprr_kernel_heads(gathered_heads: int, q_len: int) -> int:
 # aiter/csrc/kernels/mla/reduce.cu. See https://github.com/ROCm/aiter/blob/7915f53a4225b3f9cb632a97a23369dbebcf1be0/csrc/kernels/mla/reduce.cu#L923
 _MLA_REDUCE_V1_HEADS = {
     64: frozenset({64}),
-    128: frozenset({1, 2, 4, 8, 10, 16, 32, 40, 64, 128}),
+    128: frozenset({1, 2, 4, 8, 10, 16, 32, 40, 48, 64, 96, 128}),
     512: frozenset({8, 16, 32, 48, 64, 80, 96, 112, 128}),
 }
 
-# Instances newer than the pinned AITER (ROCm/aiter#7087 adds nh12_hd128);
-# fold them into the table above once docker/rocm.Dockerfile pins an AITER with them.
-_MLA_REDUCE_V1_OPTIONAL_HEADS = {128: frozenset({12})}
-
 
 @functools.lru_cache(maxsize=None)
-def _aiter_has_mla_reduce_v1_instance(num_head: int, head_dim: int) -> bool:
+def _aiter_has_mla_reduce_v1_instance(*, num_head: int, head_dim: int) -> bool:
     # mla_reduce_v1 aborts the process on a shape it has no instance for,
-    # so ask the compiled AITER, as its own planner does;
-    # an AITER without the query (ROCm/aiter#6107) pads instead.
+    # so ask the compiled AITER, as its own planner does (nh12_hd128 is ROCm/aiter#7087);
+    # an AITER without the query (ROCm/aiter#6107), or whose .so predates it, pads instead.
     try:
         from aiter.ops.attention import mla_reduce_v1_supports
-    except ImportError:
+
+        return mla_reduce_v1_supports(num_heads=num_head, head_dim=head_dim)
+    except (ImportError, AttributeError):
         return False
-    return mla_reduce_v1_supports(num_heads=num_head, head_dim=head_dim)
 
 
 # Persist
@@ -745,21 +742,19 @@ class AiterAttnBackend(AttentionBackend):
             ]
 
         # The asm fp8 prefill reduces through mla_reduce_v1, which only has
-        # instantiations for the head shapes in _MLA_REDUCE_V1_HEADS; anything
-        # else is zero-padded up to one it does carry, or falls back to
-        # flash_attn_varlen_func when the table has nothing to reach.
+        # instantiations for the head shapes in _MLA_REDUCE_V1_HEADS or the ones the
+        # compiled AITER reports; anything else is zero-padded up to one it does carry,
+        # or falls back to flash_attn_varlen_func when the table has nothing to reach.
         self.fp8_prefill_num_head = (
             self.check_fp8_prefill_num_head(
                 num_head=self.num_head,
                 num_kv_head=self.num_kv_head,
                 v_head_dim=self.v_head_dim,
             )
-            if self.use_mla
+            if self.use_mla and _use_fp8_prefill_attn
             else None
         )
-        self.use_fp8_prefill_attn = (
-            _use_fp8_prefill_attn and self.fp8_prefill_num_head is not None
-        )
+        self.use_fp8_prefill_attn = self.fp8_prefill_num_head is not None
         # Padding is only offered at GQA ratio 1, so the kv side takes the same
         # delta and the ratio the PS metadata is built for stays put.
         self.fp8_prefill_num_kv_head = self.num_kv_head + (
@@ -1200,12 +1195,10 @@ class AiterAttnBackend(AttentionBackend):
         mla prefill, return None if it is invalid so we will fall it back to
         aiter fa implementation.
         """
-        supported = _MLA_REDUCE_V1_HEADS.get(v_head_dim, frozenset()) | {
-            h
-            for h in _MLA_REDUCE_V1_OPTIONAL_HEADS.get(v_head_dim, ())
-            if _aiter_has_mla_reduce_v1_instance(num_head=h, head_dim=v_head_dim)
-        }
-        if num_head in supported:
+        supported = _MLA_REDUCE_V1_HEADS.get(v_head_dim, frozenset())
+        if num_head in supported or _aiter_has_mla_reduce_v1_instance(
+            num_head=num_head, head_dim=v_head_dim
+        ):
             return num_head
         if num_head != num_kv_head:
             return None

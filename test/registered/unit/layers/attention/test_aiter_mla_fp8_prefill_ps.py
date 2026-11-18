@@ -117,11 +117,14 @@ class TestAiterMlaFp8PrefillPs(CustomTestCase):
         """Heads without an mla_reduce_v1 instance pad up to one;
         padding must not perturb the real heads' output or LSE, nor reach a missing instance."""
         q_lens, kv_lens = [300, 77], [517, 1200]
-        # Which 12-head path runs depends on the installed AITER, so also force the padded one.
+        # Which 12-head path runs depends on the installed AITER, so also force the padded one;
+        # 48 and 96 (Kimi-K3 at TP2 and TP1) run natively from the static table.
         for num_heads, pad in (
             (KIMI_K3_TP8_HEADS, False),
             (KIMI_K3_TP8_HEADS, True),
             (16, False),
+            (48, False),
+            (96, False),
         ):
             with self.subTest(num_heads=num_heads, pad=pad):
                 if pad:
@@ -129,6 +132,7 @@ class TestAiterMlaFp8PrefillPs(CustomTestCase):
                     self.assertEqual(backend.fp8_prefill_num_head, 16)
                 else:
                     backend = _backend(num_heads, q_lens)
+                    self.assertEqual(backend.fp8_prefill_num_head, num_heads)
                 kv_indptr = torch.zeros(len(kv_lens) + 1, dtype=torch.int32)
                 kv_indptr[1:] = torch.tensor(kv_lens).cumsum(0)
                 ps = backend._build_prefill_ps_metadata(
