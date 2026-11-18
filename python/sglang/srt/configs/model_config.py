@@ -2893,6 +2893,20 @@ def is_layer_types_hybrid_swa_model(
     )
 
 
+# LFM3 family: every variant resolves a text config whose `layer_types` interleaves
+# `conv` layers with full and sliding attention, so mixed_sliding_layer_types()
+# (which requires every entry to be sliding or full) never matches it and the
+# archs have to be listed.
+LFM3_HYBRID_SWA_ARCHS = frozenset(
+    {
+        "Lfm3ForCausalLM",
+        "Lfm3VlForConditionalGeneration",
+        "Lfm3OmniForConditionalGeneration",
+        "Lfm3AudioForConditionalGeneration",
+    }
+)
+
+
 def _is_listed_hybrid_swa_model(
     model_architectures: List[str],
     hf_text_config: Optional[PretrainedConfig] = None,
@@ -2921,6 +2935,7 @@ def _is_listed_hybrid_swa_model(
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
         "UnlimitedOCRForCausalLM",
+        *LFM3_HYBRID_SWA_ARCHS,
     }
     if any(arch in hybrid_swa_archs for arch in model_architectures):
         if "BeamForCausalLM" in model_architectures and hf_text_config is not None:
@@ -2947,7 +2962,43 @@ def get_hybrid_layer_ids(
     hf_text_config: PretrainedConfig,
 ):
     num_hidden_layers = hf_text_config.num_hidden_layers
-    if "Llama4ForConditionalGeneration" in model_architectures:
+    if any(arch in LFM3_HYBRID_SWA_ARCHS for arch in model_architectures):
+        # LFM3's conv layers hold their state in the Mamba pool and read no KV
+        # cache, so they belong to neither side of the split. Only the attention
+        # layers that RadixAttention builds with a sliding window go to the
+        # window pool; ModelRunner re-checks this split against the built model.
+        layer_types = getattr(hf_text_config, "layer_types", None)
+        if not layer_types:
+            raise ValueError(
+                "LFM3 hybrid SWA model requires `layer_types` in its text config, "
+                f"but got {layer_types!r} for architectures {model_architectures}."
+            )
+        if len(layer_types) != num_hidden_layers:
+            raise ValueError(
+                "LFM3 `layer_types` length does not match num_hidden_layers: "
+                f"{len(layer_types)} != {num_hidden_layers}."
+            )
+        unknown = sorted(
+            {
+                kind
+                for kind in layer_types
+                if kind not in ("conv", "full_attention", "sliding_attention")
+            }
+        )
+        if unknown:
+            raise ValueError(f"LFM3 has unsupported layer types: {unknown}.")
+        swa_attention_layer_ids = [
+            i for i, kind in enumerate(layer_types) if kind == "sliding_attention"
+        ]
+        full_attention_layer_ids = [
+            i for i, kind in enumerate(layer_types) if kind == "full_attention"
+        ]
+        if not swa_attention_layer_ids:
+            raise ValueError(
+                "LFM3 hybrid SWA model must contain at least one sliding_attention "
+                f"layer, but layer_types={layer_types!r}."
+            )
+    elif "Llama4ForConditionalGeneration" in model_architectures:
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 != 0
         ]
