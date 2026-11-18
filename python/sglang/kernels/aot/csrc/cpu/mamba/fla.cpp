@@ -613,7 +613,7 @@ void l2norm_fwd_kernel_impl(
     int64_t q_strideH,
     int64_t k_strideT,
     int64_t k_strideH) {
-  // expected to be contuguous
+  // expected to be contiguous
   int64_t qn_strideH = D;
   int64_t kn_strideH = D;
 
