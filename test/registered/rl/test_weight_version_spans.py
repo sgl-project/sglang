@@ -8,12 +8,12 @@ import requests
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
-    ADMIN_API_KEY_FOR_TEST,
-    ADMIN_HEADERS_FOR_TEST,
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    admin_post,
     popen_launch_server,
     terminate_and_kill_process_tree,
 )
@@ -84,8 +84,7 @@ class TestWeightVersionSpans(CustomTestCase):
                 "--max-running-requests",
                 "8",
                 "--enable-prefill-weight-versions",
-                "--admin-api-key",
-                ADMIN_API_KEY_FOR_TEST,
+                *ADMIN_LAUNCH_ARGS_FOR_TEST,
             ],
         )
 
@@ -124,52 +123,45 @@ class TestWeightVersionSpans(CustomTestCase):
         return response.json()["weight_version"]
 
     def _pause(self, mode: str):
-        requests.post(
+        admin_post(
             f"{self.base_url}/pause_generation",
             json={"mode": mode},
-            headers=ADMIN_HEADERS_FOR_TEST,
             timeout=30,
         ).raise_for_status()
 
     def _continue(self):
-        requests.post(
+        admin_post(
             f"{self.base_url}/continue_generation",
             json={},
-            headers=ADMIN_HEADERS_FOR_TEST,
             timeout=30,
         ).raise_for_status()
 
     def _abort_all(self):
-        requests.post(
+        admin_post(
             f"{self.base_url}/abort_request",
             json={"abort_all": True},
-            headers=ADMIN_HEADERS_FOR_TEST,
             timeout=30,
         ).raise_for_status()
 
     def _flush_cache(self):
-        requests.post(
-            f"{self.base_url}/flush_cache", headers=ADMIN_HEADERS_FOR_TEST, timeout=30
-        ).raise_for_status()
+        admin_post(f"{self.base_url}/flush_cache", timeout=30).raise_for_status()
 
     def _set_weight_version(self, new_version: str, abort_all_requests: bool = False):
-        response = requests.post(
+        response = admin_post(
             f"{self.base_url}/update_weight_version",
             json={
                 "new_version": new_version,
                 "abort_all_requests": abort_all_requests,
             },
-            headers=ADMIN_HEADERS_FOR_TEST,
             timeout=30,
         )
         self.assertEqual(response.status_code, 200)
         return response.json()
 
     def _update_weights_from_disk(self, **fields) -> None:
-        response = requests.post(
+        response = admin_post(
             f"{self.base_url}/update_weights_from_disk",
             json={"model_path": self.model, "flush_cache": False, **fields},
-            headers=ADMIN_HEADERS_FOR_TEST,
             timeout=_REQUEST_TIMEOUT,
         )
         self.assertEqual(response.status_code, 200)

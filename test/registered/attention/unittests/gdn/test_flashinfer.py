@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -13,6 +14,10 @@ from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import 
     run_gdn_attention_case,
     run_gdn_fixture_eager,
 )
+from sglang.test.kits.attention_unittest.attention_methods.gdn_prewarm import (
+    assert_prewarm_leaves_nothing_to_compile,
+    prewarm_case,
+)
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_gdn_cuda_graph_decode_case,
 )
@@ -25,8 +30,8 @@ from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=18, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=18, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=36, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=36, stage="base-b", runner_config="1-gpu-large")
 
 _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
 _sm_major = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
@@ -390,6 +395,126 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         torch.testing.assert_close(
             flashinfer_tracked, triton_tracked, atol=3e-2, rtol=3e-2
         )
+
+    def test_prewarm_leaves_no_prefill_variant_to_compile_while_serving(self):
+        # Qwen3.5-like heads: FlashInfer runs one sequence on its
+        # context-parallel kernel and three on its native kernel, on SM90 and
+        # on SM100.
+        assert_prewarm_leaves_nothing_to_compile(
+            self,
+            [
+                prewarm_case("one_sequence", 16, 32, (0,), (192,), [129]),
+                prewarm_case(
+                    "three_sequences",
+                    16,
+                    32,
+                    (0, 64, 128),
+                    (64, 65, 129),
+                    [64, 129, 257],
+                ),
+            ],
+        )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "the prewarm runs on a CUDA stream")
+class TestFlashInferGDNPrewarmPolicy(CustomTestCase):
+    """Which prefills the startup prewarm runs, with FlashInfer's prefill
+    replaced by a recorder; the compile coverage itself is checked above."""
+
+    CHECKPOINT_EVERY = 64
+
+    def _kernel(self, prefill_fn):
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            FlashInferGDNKernel,
+        )
+
+        kernel = object.__new__(FlashInferGDNKernel)
+        kernel.use_state_pool = True
+        kernel._prefill_needs_fp32_state = False
+        kernel._prefill_fn = prefill_fn
+        return kernel
+
+    def _prewarm(self, kernel):
+        return kernel.prewarm_extend(
+            num_qk_heads=2,
+            num_v_heads=4,
+            head_k_dim=16,
+            head_v_dim=16,
+            io_dtype=torch.bfloat16,
+            pool_state_dtype=torch.bfloat16,
+            checkpoint_every_n_tokens=self.CHECKPOINT_EVERY,
+            device=torch.device("cuda"),
+        )
+
+    @staticmethod
+    def _recorder(reject_cp=False, fail_native=False):
+        calls = []
+
+        def prefill(**kwargs):
+            use_cp = kwargs["use_cp"]
+            calls.append(
+                (
+                    use_cp,
+                    kwargs["cu_seqlens"].numel() - 1,
+                    kwargs["checkpoint_every_n_tokens"],
+                )
+            )
+            if use_cp is True and reject_cp:
+                raise ValueError("context-parallel prefill is unavailable here")
+            if use_cp is False and fail_native:
+                raise ValueError("native prefill is unavailable here")
+            return kwargs["v"], kwargs["output_state"]
+
+        return prefill, calls
+
+    def _cp_counts(self, counts):
+        from sglang.srt.layers.attention.linear.kernels import gdn_flashinfer
+
+        return patch.object(
+            gdn_flashinfer,
+            "_context_parallel_sequence_counts",
+            lambda num_heads, device: list(counts),
+        )
+
+    def test_a_rejected_context_parallel_prefill_does_not_fail_startup(self):
+        # Serving asks with use_cp="auto", which falls back to the native kernel
+        # when FlashInfer cannot run context-parallel; the prewarm forces each
+        # kernel, so it must skip a rejected context-parallel one, not raise.
+        prefill, calls = self._recorder(reject_cp=True)
+        with (
+            self._cp_counts([1, 2, 4]),
+            self.assertLogs(
+                "sglang.srt.layers.attention.linear.kernels.gdn_flashinfer", "WARNING"
+            ) as logs,
+        ):
+            runs = self._prewarm(self._kernel(prefill))
+        native = [call for call in calls if call[0] is False]
+        self.assertEqual(native, [(False, 1, 0), (False, 1, self.CHECKPOINT_EVERY)])
+        # One refused try per checkpoint mode, then that mode's counts are skipped.
+        self.assertEqual(
+            [call for call in calls if call[0] is True],
+            [(True, 1, 0), (True, 1, self.CHECKPOINT_EVERY)],
+        )
+        self.assertEqual(runs, len(native))
+        self.assertEqual(len(logs.records), 2)
+
+    def test_a_native_prefill_failure_still_fails_startup(self):
+        prefill, _ = self._recorder(fail_native=True)
+        with self._cp_counts([1]), self.assertRaises(ValueError):
+            self._prewarm(self._kernel(prefill))
+
+    def test_no_context_parallel_prefill_runs_where_the_policy_never_picks_it(self):
+        try:
+            from flashinfer.gdn_kernels.delta_rule_dsl import varlen_helper
+        except ImportError:
+            self.skipTest("FlashInfer's automatic CP policy is not importable")
+        prefill, calls = self._recorder()
+        with patch.object(
+            varlen_helper, "should_use_cp_host", lambda *args, **kwargs: False
+        ):
+            runs = self._prewarm(self._kernel(prefill))
+        self.assertEqual([call for call in calls if call[0] is True], [])
+        self.assertEqual(runs, 2)
 
 
 if __name__ == "__main__":

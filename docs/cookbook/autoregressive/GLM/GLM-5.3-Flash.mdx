@@ -426,16 +426,13 @@ sglang serve \
 ```
 
 ```bash Router
-python -m sglang_router.launch_router \
-  --pd-disaggregation \
-  --mini-lb \
-  --prefill http://127.0.0.1:31000 8998 \
-  --decode http://127.0.0.1:32000 \
+sgl-router \
+  --model-id zai-org/GLM-5.3-Flash \
+  --no-tokenizer \
+  --worker-urls http://127.0.0.1:31000 http://127.0.0.1:32000 \
   --host 0.0.0.0 \
   --port 30000
 ```
-
-The positional `8998` after `--prefill` must equal the prefill server's `--disaggregation-bootstrap-port`.
 
 </Accordion>
 
