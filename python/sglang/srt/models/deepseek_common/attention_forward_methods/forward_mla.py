@@ -1231,7 +1231,7 @@ class DeepseekMLAForwardMixin:
         """
         if self.rotary_emb is None:
             return False
-        if self.current_attention_backend in ("dsa", "nsa"):
+        if self.current_attention_backend == "dsa":
             return (
                 uses_raw_fp8_dsa_kv_layout(get_exec().kernel.dsa_decode_backend)
                 or uses_raw_fp8_dsa_kv_layout(get_exec().kernel.dsa_prefill_backend)
