@@ -403,6 +403,58 @@ class InputMessageConstructionTestCase(CustomTestCase):
         except Exception:
             pass
 
+    def test_instructions_only_request_constructs_system_message(self):
+        # `input` is optional; an instructions-only request must not hit the
+        # old extend(None) TypeError in _response_input_history.
+        serving = make_serving()
+        request = ResponsesRequest(model="x", instructions="You are a knight.")
+
+        messages = serving._construct_input_messages(request)
+
+        self.assertEqual(messages, [{"role": "system", "content": "You are a knight."}])
+
+    def test_missing_input_and_instructions_returns_400(self):
+        serving = make_serving()
+        request = ResponsesRequest(model="x")
+
+        result = asyncio.run(serving.create_responses(request, raw_request=None))
+
+        self.assertEqual(getattr(result, "status_code", None), 400)
+        self.assertIn(b"must be provided", result.body)
+        serving.tokenizer_manager.generate_request.assert_not_called()
+
+    def test_previous_response_id_without_input_replays_history(self):
+        serving = make_serving()
+        serving.msg_store["resp_prev"] = [
+            {"role": "user", "content": "old input"},
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "old answer"}],
+            },
+        ]
+        request = ResponsesRequest(
+            model="x",
+            instructions="Be brief",
+            previous_response_id="resp_prev",
+            store=False,
+        )
+
+        messages = serving._construct_input_messages(
+            request, Mock(id="resp_prev", output=[])
+        )
+
+        self.assertEqual(
+            messages,
+            [
+                {"role": "system", "content": "Be brief"},
+                {"role": "user", "content": "old input"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "old answer"}],
+                },
+            ],
+        )
+
 
 class ChatToolForwardingTestCase(CustomTestCase):
     def test_make_request_passes_function_tools_to_chat_processing(self):
@@ -2054,6 +2106,49 @@ class StreamingLogprobsRejectionTestCase(CustomTestCase):
         body = orjson.loads(result.body)
         self.assertIn("streaming mode", body["error"]["message"])
 
+    def test_stream_with_top_logprobs_rejected(self):
+        import orjson
+
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            store=False,
+            stream=True,
+            top_logprobs=5,
+        )
+        result = asyncio.run(serving.create_responses(request))
+        self.assertEqual(result.status_code, 400)
+        body = orjson.loads(result.body)
+        self.assertIn("streaming mode", body["error"]["message"])
+
+
+class StreamDisablesBackgroundTestCase(CustomTestCase):
+    def test_stream_forces_background_off(self):
+        request = ResponsesRequest(model="x", background=True, stream=True)
+        self.assertFalse(request.background)
+        self.assertTrue(request.stream)
+
+    def test_background_kept_without_stream(self):
+        request = ResponsesRequest(model="x", background=True)
+        self.assertTrue(request.background)
+
+
+class IncludeOutputLogprobsTestCase(CustomTestCase):
+    def test_include_flag(self):
+        request = ResponsesRequest(model="x", include=["message.output_text.logprobs"])
+        self.assertTrue(request.is_include_output_logprobs())
+
+    def test_positive_top_logprobs_implies_logprobs(self):
+        request = ResponsesRequest(model="x", top_logprobs=5)
+        self.assertTrue(request.is_include_output_logprobs())
+
+    def test_default_and_zero_top_logprobs_do_not(self):
+        self.assertFalse(ResponsesRequest(model="x").is_include_output_logprobs())
+        self.assertFalse(
+            ResponsesRequest(model="x", top_logprobs=0).is_include_output_logprobs()
+        )
+
 
 STORE_DISABLED_MESSAGE = (
     "Response store is disabled. Stateful Responses require "
@@ -2232,7 +2327,7 @@ def test_response_store_admission(response_serving, enabled, fields, param, mess
     serving.response_store = Mock()
     serving.msg_store = Mock()
     request = ResponsesRequest(
-        model="unknown", input="hi", background=True, stream=True, store=None, **fields
+        model="unknown", input="hi", background=True, store=None, **fields
     )
     assert_response_error(
         asyncio.run(serving.create_responses(request)), param, message
