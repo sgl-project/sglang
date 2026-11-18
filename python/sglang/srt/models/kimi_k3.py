@@ -54,7 +54,6 @@ from sglang.srt.layers.dcp.layout import set_dsa_shards_index_k
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     _note_dp_gather_in_prefill_graph,
-    get_dp_global_num_tokens,
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
@@ -1261,80 +1260,41 @@ class KimiK3MoE(nn.Module):
             return self._latent_norm(latent)
         return self._latent_norm(tensor_model_parallel_all_reduce(latent))
 
-    def _shared_tp_rows(self, hidden_states: torch.Tensor) -> int:
-        rows = hidden_states.shape[0]
-        if not self._shared_experts_tp_across_dp:
-            return rows
-        max_rows = max(get_dp_global_num_tokens())
-        if rows > max_rows:
-            raise RuntimeError(
-                f"shared-expert TP across DP: {rows} local rows exceed the DP "
-                f"maximum {max_rows}"
-            )
-        return max_rows
-
     def _shared_tp_sp_state(self, rows: int):
-        # The K3 symmetric buffers hold one chunk; a DP-gathered prefill can exceed it.
-        if (
-            not self._shared_experts_tp_sp_comm
-            or rows == 0
-            or rows * self._shared_experts_tp_group.world_size
-            > k3_ar_fusion._max_buffer_rows()
-        ):
+        if not self._shared_experts_tp_sp_comm:
             return None
-        return k3_sp_collective.tp_group_state()
+        return k3_sp_collective.tp_rows_state(
+            rows * self._shared_experts_tp_group.world_size
+        )
 
     def _gather_shared_expert_inputs(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        group = self._shared_experts_tp_group
-        rows = self._shared_tp_rows(hidden_states)
+        rows = hidden_states.shape[0]
         if self._shared_experts_tp_across_dp:
+            rows = k3_sp_collective.dp_max_rows(rows)
             # A prefill graph holding this replays only when every DP rank runs its bucket.
             _note_dp_gather_in_prefill_graph()
-        if rows != hidden_states.shape[0]:
-            hidden_states = torch.nn.functional.pad(
-                hidden_states, (0, 0, 0, rows - hidden_states.shape[0])
-            )
-        state = self._shared_tp_sp_state(rows)
-        if state is not None:
-            # The direct strategy's output stays valid until the next layer's gather.
-            gathered = k3_sp_collective.all_gather(
-                hidden_states.contiguous(),
-                state=state,
-                buffer_name="shared_tp_all_gather",
-            )
-            if gathered is not None:
-                return gathered
-        # The attention DP buffer spans the entire attention-TP replica.
-        # Size this buffer from the subgroup's actual token shards instead.
-        with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
-            gathered = hidden_states.new_empty(
-                (rows * group.world_size, *hidden_states.shape[1:])
-            )
-        group.all_gather_into_tensor(gathered, hidden_states)
-        return gathered
+        # The direct strategy's output stays valid until the next layer's gather.
+        return k3_sp_collective.all_gather_rows(
+            hidden_states,
+            rows,
+            self._shared_experts_tp_group,
+            self._shared_tp_sp_state(rows),
+            "shared_tp_all_gather",
+            symmetric_fallback=True,
+        )
 
     def _reduce_scatter_shared_experts(
         self, shared_output: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         group = self._shared_experts_tp_group
-        rows = shared_output.shape[0] // group.world_size
-        state = self._shared_tp_sp_state(rows)
-        # The pull strategy needs a multicast alias, which the down_proj output lacks.
-        if state is not None and not k3_sp_collective.requires_symmetric_rs(
-            shared_output.shape[0],
-            shared_output.device,
-            shared_output.element_size(),
-            state=state,
-            fused=False,
-        ):
-            output = k3_sp_collective.reduce_scatter_res(
-                shared_output, None, state=state
-            )
-            if output is not None:
-                return output[: hidden_states.shape[0]]
-        output = hidden_states.new_empty((rows, *hidden_states.shape[1:]))
-        group.reduce_scatter_tensor(output, shared_output)
-        return output[: hidden_states.shape[0]]
+        # The down_proj output is not in symmetric storage.
+        return k3_sp_collective.reduce_scatter_rows(
+            shared_output,
+            hidden_states.shape[0],
+            group,
+            self._shared_tp_sp_state(shared_output.shape[0] // group.world_size),
+            input_symmetric=False,
+        )
 
     def _forward_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run TP-sharded shared experts while DeepEP tokens stay scattered."""
@@ -2704,7 +2664,7 @@ class KimiK3DeltaAttention(nn.Module):
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
         ctx = self._kda_tp.context()
-        x = kda_tp.all_gather_rows(hidden_states, ctx.R)
+        x = self._kda_tp.all_gather_rows(hidden_states, ctx.R)
         backend = get_attn_backend()
         H, D = self.local_num_heads, self.head_dim
         if ctx.sources is None:
@@ -2792,12 +2752,12 @@ class KimiK3DeltaAttention(nn.Module):
         if not fused_onorm:
             core = self.o_norm(core, g_proj_states.unflatten(-1, (-1, D)))
         core = core.reshape(core.shape[0], H * D)
-        out = kda_tp.o_proj_output(core.shape[0], self.hidden_size, core.dtype)
+        out = self._kda_tp.o_proj_output(core.shape[0], self.hidden_size, core.dtype)
         if out is not None:
             partial, _ = self.o_proj(core, output_tensor=out)
         else:
             partial = self.o_proj(core)[0]
-        return kda_tp.reduce_scatter_rows(partial, local_rows)
+        return self._kda_tp.reduce_scatter_rows(partial, local_rows)
 
 
 class KimiK3MLAAttention(DeepseekV2AttentionMLA):

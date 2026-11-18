@@ -9,7 +9,7 @@ the checked-in GB200/GB300 tuning envelope.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -214,6 +214,85 @@ def tp_group_state() -> Optional[_State]:
         "K3 TP-group collectives enabled (TP%d push/pull RS + AG)", group.world_size
     )
     return _TP_STATE
+
+
+def dp_max_rows(local_rows: int, counts: Optional[List[int]] = None) -> int:
+    """Rows per rank of a TP-group collective over every attention-DP rank's rows."""
+    from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+
+    if counts is None:
+        counts = get_dp_global_num_tokens()
+    if not counts:
+        raise RuntimeError("K3 TP-group rows need the DP global token counts")
+    rows = max(counts)
+    if local_rows > rows:
+        raise RuntimeError(
+            f"K3 TP-group rows: {local_rows} local rows exceed the DP maximum {rows}"
+        )
+    return rows
+
+
+def tp_rows_state(total_rows: int) -> Optional[_State]:
+    """The TP-group state when a collective over ``total_rows`` rows fits its buffers."""
+    # The K3 symmetric buffers hold one chunk; a DP-gathered prefill can exceed it.
+    if total_rows == 0 or total_rows > k3_ar_fusion._max_buffer_rows():
+        return None
+    return tp_group_state()
+
+
+def all_gather_rows(
+    x: torch.Tensor,
+    rows: int,
+    group,
+    state: Optional[_State],
+    buffer_name: str,
+    symmetric_fallback: bool = False,
+) -> torch.Tensor:
+    """Every group rank's ``rows`` rows (``x`` zero-padded to them); NCCL without ``state``."""
+    if x.shape[0] != rows:
+        x = torch.nn.functional.pad(x, (0, 0, 0, rows - x.shape[0]))
+    x = x.contiguous()
+    if state is not None:
+        out = all_gather(x, state=state, buffer_name=buffer_name)
+        if out is not None:
+            return out
+    if symmetric_fallback:
+        from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+            use_symmetric_memory,
+        )
+        from sglang.srt.layers.dp_attention import is_allocation_symmetric
+
+        # Sized from the group's rows, not the attention-DP buffer.
+        with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
+            out = x.new_empty((group.world_size * rows, *x.shape[1:]))
+    else:
+        out = x.new_empty((group.world_size * rows, *x.shape[1:]))
+    group.all_gather_into_tensor(out, x)
+    return out
+
+
+def reduce_scatter_rows(
+    y: torch.Tensor,
+    local_rows: int,
+    group,
+    state: Optional[_State],
+    input_symmetric: bool = True,
+) -> torch.Tensor:
+    """This rank's first ``local_rows`` rows of the group-summed ``y``; NCCL without ``state``."""
+    rows = y.shape[0] // group.world_size
+    # The pull strategy reads y through a multicast alias, which only symmetric storage has.
+    if state is not None and (
+        input_symmetric
+        or not requires_symmetric_rs(
+            y.shape[0], y.device, y.element_size(), state=state, fused=False
+        )
+    ):
+        out = reduce_scatter_res(y, None, state=state)
+        if out is not None:
+            return out[:local_rows]
+    out = y.new_empty((rows, *y.shape[1:]))
+    group.reduce_scatter_tensor(out, y.contiguous())
+    return out[:local_rows]
 
 
 def _symm_buffer(

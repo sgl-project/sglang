@@ -13,9 +13,9 @@ from sglang.srt.layers.communication import k3_sp_collective
 from sglang.srt.layers.communication.kda_tp import (
     all_gather_padded,
     group,
-    padded_rows,
     width,
 )
+from sglang.srt.layers.dp_attention import _note_dp_gather_in_prefill_graph
 
 
 class Source(msgspec.Struct):
@@ -140,6 +140,40 @@ class KdaTp:
             )
         return self.ctx
 
+    def all_gather_rows(self, x: torch.Tensor, rows: int) -> torch.Tensor:
+        # May return a persistent buffer that the next KDA TP all-gather overwrites.
+        # A prefill graph holding this replays only when every DP rank runs its recorded bucket.
+        _note_dp_gather_in_prefill_graph()
+        g = group()
+        return k3_sp_collective.all_gather_rows(
+            x,
+            rows,
+            g,
+            k3_sp_collective.tp_rows_state(g.world_size * rows),
+            "kda_tp_all_gather",
+        )
+
+    def o_proj_output(
+        self, total_rows: int, width: int, dtype: torch.dtype
+    ) -> Optional[torch.Tensor]:
+        state = k3_sp_collective.tp_rows_state(total_rows)
+        if state is None or not k3_sp_collective.requires_symmetric_rs(
+            total_rows,
+            torch.device("cuda"),
+            torch.empty((), dtype=dtype).element_size(),
+            state=state,
+            fused=False,
+        ):
+            return None
+        return k3_sp_collective.get_o_proj_output_buffer(
+            total_rows, dtype, width, state=state
+        )
+
+    def reduce_scatter_rows(self, y: torch.Tensor, local_rows: int) -> torch.Tensor:
+        return k3_sp_collective.reduce_scatter_rows(
+            y, local_rows, group(), k3_sp_collective.tp_rows_state(y.shape[0])
+        )
+
     def _buffer(self, name: str, numel: int, dtype: torch.dtype) -> torch.Tensor:
         buf = self._buffers.get((name, dtype))
         if buf is not None and buf.numel() >= numel:
@@ -173,7 +207,7 @@ class KdaTp:
         counts: Optional[List[int]] = None,
     ) -> None:
         # A collective: idle DP ranks call it too.
-        R = padded_rows(local_rows, counts)
+        R = k3_sp_collective.dp_max_rows(local_rows, counts)
         kinds = _global_kinds(forward_batch)
         active = {k for k in kinds if k != "idle"}
         if len(active) <= 1 and active <= {"decode", "verify"}:
