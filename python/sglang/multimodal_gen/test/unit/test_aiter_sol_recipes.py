@@ -146,9 +146,16 @@ class _SolTestCase(CustomTestCase):
         )
         return torch.zeros_like(q)
 
-    def _record_fused(self, q, k, v, beta, recipe, block_tile=None):
+    def _record_fused(self, q, k, v, beta, recipe, block_tile=None, force_blocks=None):
         self.fused_calls.append(
-            {"q": q, "k": k, "v": v, "beta": beta, "recipe": recipe}
+            {
+                "q": q,
+                "k": k,
+                "v": v,
+                "beta": beta,
+                "recipe": recipe,
+                "force_blocks": force_blocks,
+            }
         )
         return self._stand_in_routing(q[0], k[0], *BLOCK_TILE)
 
@@ -357,6 +364,67 @@ class TestSolKeyPadding(_SolTestCase):
         query, key, value = self._operands(seqlen=SEQUENCE - 1)
         aiter_sol_dispatch.sol_attn_bshd(query, key, value, recipe="fp8")
         self.assertEqual(self._key_seen().shape[1], SEQUENCE - 1)
+
+
+class TestSolExactKvTokens(_SolTestCase):
+    """Keys a caller flags are computed exactly on every routing path."""
+
+    def _forward_varlen(self, impl, flags, used=SEQUENCE - 64):
+        query, key, value = (
+            tensor.squeeze(0) for tensor in self._operands(seqlen=SEQUENCE)
+        )
+        return impl.forward_varlen(
+            query,
+            key,
+            value,
+            cu_seqlens=None,
+            max_seqlen=used,
+            cu_seqlens_host=(0, used, SEQUENCE),
+            exact_kv_tokens=flags,
+        )
+
+    def test_flags_reach_the_fused_kernel_as_kv_blocks(self):
+        """Block j is forced when any of its live keys is flagged; pad flags are dropped."""
+        flags = torch.zeros(SEQUENCE, dtype=torch.bool)
+        flags[0] = True  # block 0
+        flags[300] = True  # block 2
+        flags[SEQUENCE - 32] = True  # trailing pad row, past the live keys
+        self._forward_varlen(self._build({"recipe": "fp8"}), flags)
+
+        (call,) = self.fused_calls
+        expected = torch.zeros(SEQUENCE // BLOCK_TILE[1], dtype=torch.bool)
+        expected[[0, 2]] = True
+        self.assertTrue(torch.equal(call["force_blocks"], expected))
+
+    def test_forced_blocks_leave_the_raw_entry_point(self):
+        """mha_v4_sol routes internally, so it cannot add forced blocks."""
+        flags = torch.zeros(SEQUENCE, dtype=torch.bool)
+        flags[:10] = True
+        with patch.object(aiter_sol_dispatch, "SOL_PREPARE_FORCES_BLOCKS", True):
+            self._forward_varlen(self._build({"recipe": "mxfp4"}), flags)
+
+        self.assertEqual(self.sol_calls, [])
+        self.assertEqual(len(self.packed_calls), 1)
+        (prepare,) = self.prepare_calls
+        self.assertTrue(prepare["force_block_mask"][0].item())
+        self.assertFalse(prepare["force_block_mask"][1:].any().item())
+
+    def test_unflagged_calls_keep_the_raw_entry_point(self):
+        self._forward_varlen(self._build({"recipe": "mxfp4"}), None)
+        self.assertEqual(len(self.sol_calls), 1)
+        self.assertEqual(self.prepare_calls, [])
+
+    def test_an_aiter_without_force_block_mask_refuses_flags(self):
+        """An older sol_prepare would silently route the flagged blocks."""
+        flags = torch.zeros(SEQUENCE, dtype=torch.bool)
+        flags[0] = True
+        with (
+            patch.object(aiter_sol_dispatch, "SOL_PREPARE_FORCES_BLOCKS", False),
+            self.assertRaisesRegex(
+                aiter_sol_dispatch.SolAttnUnsupported, "force_block_mask"
+            ),
+        ):
+            self._forward_varlen(self._build({"recipe": "mxfp8"}), flags)
 
 
 class TestSolBetaSchedule(_SolTestCase):
@@ -774,6 +842,59 @@ class TestSolAgainstRealAiter(CustomTestCase):
         density = fused["block_attn_mask"].float().mean().item()
         self.assertGreater(density, 0.0)
         self.assertLess(density, 1.0)
+
+    @unittest.skipUnless(
+        aiter_sol_dispatch.AITER_SOL_AVAILABLE
+        and aiter_sol_dispatch.SOL_PREPARE_FORCES_BLOCKS
+        and torch.cuda.is_available(),
+        "requires a GPU and an aiter whose sol_prepare takes force_block_mask",
+    )
+    def test_forced_fused_routing_reproduces_aiter_routing(self):
+        """Forced blocks join after the tail and empty-row rules, as in aiter."""
+        torch.manual_seed(0)
+        recipe = aiter_sol_dispatch._RECIPES["bf16"]
+        kv_tile = aiter_sol_dispatch.sol_attn_block_tile(recipe)[1]
+        seqlen = 4000  # not a multiple of any row's KV tile: a ragged last block
+        num_kv_blocks = -(-seqlen // kv_tile)
+        centers = torch.randn(8, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+
+        def clustered():
+            pick = torch.randint(0, centers.shape[0], (1, seqlen, HEADS), device="cuda")
+            noise = torch.randn(
+                1, seqlen, HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16
+            )
+            return centers[pick] + 0.25 * noise
+
+        operands = aiter_sol_dispatch._quantize(
+            recipe, clustered(), clustered(), clustered(), SOFTMAX_SCALE
+        )
+        flags = torch.zeros(seqlen, dtype=torch.bool, device="cuda")
+        flags[:200] = True
+        flags[3000:3050] = True
+        force = aiter_sol_dispatch._force_blocks_from_tokens(flags, seqlen, kv_tile)
+        expected = sorted({row // kv_tile for row in [*range(200), *range(3000, 3050)]})
+        self.assertEqual(force.nonzero().view(-1).tolist(), expected)
+        self.assertEqual(force.shape, (num_kv_blocks,))
+
+        # 0.5 selects a fraction of each row. No z-score over n values exceeds
+        # sqrt(n - 1), so the second beta empties every row and leaves only the
+        # tail, the kept maximum and the forced blocks.
+        for beta in (0.5, 1.0 + num_kv_blocks**0.5):
+            with self.subTest(beta=beta):
+                reference = aiter_sol_dispatch.sol_attn_routing_for(
+                    *operands, beta, recipe, force_blocks=force
+                )
+                fused = aiter_sol_dispatch.sol_attn_routing_fused(
+                    *operands, beta, recipe, force_blocks=force
+                )
+                for key in ("block_attn_mask", "lut_count", "block_bitmap"):
+                    self.assertTrue(torch.equal(reference[key], fused[key]), key)
+                mask = fused["block_attn_mask"]
+                self.assertTrue(mask[..., force].all().item())
+                if beta > 1:
+                    # tail + forced + at most the kept maximum per row
+                    bound = len(expected) + 2
+                    self.assertLessEqual(mask.sum(dim=-1).max().item(), bound)
 
     @unittest.skipUnless(
         aiter_sol_dispatch.AITER_SOL_AVAILABLE,

@@ -22,6 +22,7 @@ import triton.language as tl
 @triton.jit
 def _sol_route_pack_kernel(
     proxy_ptr,
+    force_ptr,
     mask_ptr,
     lut_count_ptr,
     bitmap_ptr,
@@ -40,6 +41,7 @@ def _sol_route_pack_kernel(
     num_heads,
     bitmap_ds,
     BETA_IS_TENSOR: tl.constexpr,
+    HAS_FORCE: tl.constexpr,
     PARTIAL_TAIL: tl.constexpr,
     NUM_WORDS: tl.constexpr,
 ):
@@ -58,7 +60,9 @@ def _sol_route_pack_kernel(
     where its proxy is above tau. A partial tail block is always exact, because
     the pooled branch is defined for whole blocks only. A row that selects
     nothing keeps its highest-proxy block, which gives the softmax a real
-    maximum to work from.
+    maximum to work from. Forced blocks, one flag per KV block shared by every
+    row, are added after both rules, as AITER's sol_prepare adds
+    force_block_mask to the routed selection.
     """
     idx = tl.program_id(0)
     heads_tiles = num_heads * num_q_tiles
@@ -94,6 +98,9 @@ def _sol_route_pack_kernel(
     best = tl.argmax(tl.reshape(ranked, (NUM_WORDS * 32,)), axis=0)
     empty = tl.sum(selected.to(tl.int32)) == 0
     selected = selected | (empty & (j == best) & in_row)
+    if HAS_FORCE:
+        forced = tl.load(force_ptr + j, mask=in_row, other=0)
+        selected = selected | ((forced != 0) & in_row)
 
     out = mask_ptr + b * stride_mask_b + h * stride_mask_h + i * stride_mask_i
     tl.store(out + j * stride_mask_j, selected.to(tl.int8), mask=in_row)
@@ -142,11 +149,14 @@ def route_and_pack(
     num_kv_blocks: int,
     bitmap_ds: int,
     partial_tail: bool,
+    force_blocks: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Selection mask, exact-block count, packed bitmap and index list.
 
     proxy is (batch, nheads_q, num_q_tiles, num_kv_blocks) float32. The index
     list holds num_kv_blocks entries per row, which row_lut_start addresses.
+    force_blocks is an optional (num_kv_blocks,) bool mask of blocks every row
+    computes exactly.
     """
     if isinstance(beta, torch.Tensor):
         if beta.numel() != 1 or beta.device != proxy.device:
@@ -156,6 +166,13 @@ def route_and_pack(
         raise ValueError(
             f"proxy's last axis is {blocks}, expected num_kv_blocks={num_kv_blocks}."
         )
+    if force_blocks is not None:
+        if force_blocks.shape != (num_kv_blocks,) or force_blocks.dtype != torch.bool:
+            raise ValueError(
+                f"force_blocks must be a ({num_kv_blocks},) bool tensor, got "
+                f"{tuple(force_blocks.shape)} {force_blocks.dtype}."
+            )
+        force_blocks = force_blocks.to(device=proxy.device, dtype=torch.int8)
     num_work_items = batch * num_heads * num_q_tiles
     num_words = triton.next_power_of_2(bitmap_ds * 32) // 32
     # Keep about 32 lanes per work item as the row grows.
@@ -176,6 +193,7 @@ def route_and_pack(
 
     _sol_route_pack_kernel[(num_work_items,)](
         proxy,
+        proxy if force_blocks is None else force_blocks,
         mask,
         lut_count,
         bitmap,
@@ -194,6 +212,7 @@ def route_and_pack(
         num_heads,
         bitmap_ds,
         BETA_IS_TENSOR=isinstance(beta, torch.Tensor),
+        HAS_FORCE=force_blocks is not None,
         PARTIAL_TAIL=partial_tail,
         NUM_WORDS=num_words,
         num_warps=num_warps,

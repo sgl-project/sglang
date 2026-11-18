@@ -51,6 +51,16 @@ _DEFAULT_RECIPE = "fp8"
 _DEFAULT_BETA = 0.5
 
 
+class AITERSolMetadata(msgspec.Struct, frozen=True):
+    """Per-forward state a model hands Sol-Attn through the forward context.
+
+    exact_kv_tokens is a (seq_len,) bool mask over the packed sequence: every KV
+    block holding a flagged key is computed exactly for every query.
+    """
+
+    exact_kv_tokens: torch.Tensor | None = None
+
+
 class _SolConfig(msgspec.Struct, frozen=True):
     recipe: str
     beta: float
@@ -229,8 +239,13 @@ class AITERSolImpl(AttentionImpl):
         cu_seqlens_host: tuple[int, ...] | None = None,
         cu_seqlens_k: torch.Tensor | None = None,
         max_seqlen_k: int | None = None,
+        exact_kv_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Serve one sequence with optional trailing padding."""
+        """Serve one sequence with optional trailing padding.
+
+        exact_kv_tokens is an optional bool mask over the packed keys; see
+        AITERSolMetadata.
+        """
         del max_seqlen_k
         total_tokens = query.shape[0]
         if max_seqlen == total_tokens and cu_seqlens_host in (
@@ -262,6 +277,7 @@ class AITERSolImpl(AttentionImpl):
             softmax_scale=self.softmax_scale,
             recipe=self.recipe,
             block_tile=self.block_tile,
+            exact_kv_tokens=None if exact_kv_tokens is None else exact_kv_tokens[:used],
         )
         live_output = live_output.squeeze(0)
         if used == query.shape[0]:
@@ -274,5 +290,6 @@ class AITERSolImpl(AttentionImpl):
 __all__ = [
     "AITERSolBackend",
     "AITERSolImpl",
+    "AITERSolMetadata",
     "SolAttnUnsupported",
 ]

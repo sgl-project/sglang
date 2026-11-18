@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import Any, Callable
 
 import msgspec
@@ -165,6 +166,13 @@ if USE_AITER:
         FUSED_ROUTING_AVAILABLE = True
     except ImportError:
         pass
+
+# Whether aiter's sol_prepare can add forced blocks to its selection. Builds that
+# predate force_block_mask still serve every unforced call.
+SOL_PREPARE_FORCES_BLOCKS = (
+    AITER_SOL_AVAILABLE
+    and "force_block_mask" in inspect.signature(_aiter_sol_prepare).parameters
+)
 
 
 class _Recipe(msgspec.Struct, frozen=True):
@@ -533,14 +541,21 @@ def sol_attn_routing_for(
     recipe: _Recipe,
     block_attn_mask: torch.Tensor | None = None,
     block_tile: tuple[int, int] | None = None,
+    force_blocks: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Pooled K/V, ragged LUT and selection bitmap for one call, as the kernel
     consumes them.
 
     q/k/v are the (tensor, descale, source) triples `_quantize` returns.
     block_attn_mask supplies an already chosen selection instead of routing from
-    beta; pass exactly one of the two.
+    beta; pass exactly one of the two. force_blocks, a (num_kv_blocks,) bool
+    mask, is added to the selection either way.
     """
+    if force_blocks is not None and not SOL_PREPARE_FORCES_BLOCKS:
+        raise SolAttnUnsupported(
+            "Exact KV tokens on this recipe need an aiter whose sol_prepare takes "
+            "force_block_mask; update aiter."
+        )
     qk_packed = recipe.k_packed is not None
     # An addressable E8M0-scaled operand's codes are not proportional to its
     # values, so routing and pooling are handed the scale.
@@ -565,6 +580,8 @@ def sol_attn_routing_for(
         v_packed_format=recipe.v_packed,
         block_attn_mask=block_attn_mask,
         q_scale=q[1] if qk_block_scaled else None,
+        # Only when set, so a build without the argument serves unforced calls.
+        **({} if force_blocks is None else {"force_block_mask": force_blocks}),
     )
 
 
@@ -582,16 +599,19 @@ def _takes_raw_entry(
     routing: dict[str, Any] | None,
     return_head_cost: bool,
     use_fused: bool,
+    forced: bool,
 ) -> bool:
     """Whether the call goes to mha_v4_sol rather than mha_v4_packed.
 
     The raw entry point routes internally, so it serves only a call that wants
-    neither its own routing in, nor the mask out, nor the fused kernel's.
+    neither its own routing in, nor the mask out, nor the fused kernel's, nor
+    forced blocks.
     """
     return (
         routing is None
         and not return_head_cost
         and not use_fused
+        and not forced
         and recipe.routes_through_raw
     )
 
@@ -632,6 +652,7 @@ def sol_attn_routing_fused(
     beta,
     recipe: _Recipe,
     block_tile: tuple[int, int] | None = None,
+    force_blocks: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Routing built by the fused kernel, in the shape mha_v4_packed consumes.
 
@@ -670,6 +691,7 @@ def sol_attn_routing_fused(
         num_kv_blocks,
         bitmap_ds,
         seqlen_k % block_n != 0,
+        force_blocks=force_blocks,
     )
     lut_start = row_lut_start(
         batch * nheads_q * num_q_tiles, num_kv_blocks, proxy.device
@@ -692,8 +714,8 @@ def sol_attn_routing_fused(
 
 
 def _with_scale_lookahead(scale: torch.Tensor) -> torch.Tensor:
-    # xDiT #980: MXFP8 reads past the last pooled scale tile; remove this copy
-    # when AITER's sol_prepare supplies the same lookahead storage.
+    # The MXFP8 row reads past the last pooled scale tile; drop this copy once
+    # sol_prepare allocates the pooled scale with the same lookahead rows.
     backed = _aiter_block_scale_storage(
         scale,
         *scale.shape,
@@ -702,6 +724,30 @@ def _with_scale_lookahead(scale: torch.Tensor) -> torch.Tensor:
     )
     backed.copy_(scale)
     return backed
+
+
+def _force_blocks_from_tokens(
+    exact_kv_tokens: torch.Tensor, seqlen_k: int, kv_tile: int
+) -> torch.Tensor:
+    """(num_kv_blocks,) bool: the KV blocks holding any flagged token.
+
+    Flags past seqlen_k belong to a pad the caller has already dropped.
+    """
+    if exact_kv_tokens.dim() != 1 or exact_kv_tokens.dtype != torch.bool:
+        raise SolAttnUnsupported(
+            "exact_kv_tokens must be a 1-D bool tensor, got "
+            f"{tuple(exact_kv_tokens.shape)} {exact_kv_tokens.dtype}."
+        )
+    if exact_kv_tokens.shape[0] < seqlen_k:
+        raise SolAttnUnsupported(
+            f"exact_kv_tokens covers {exact_kv_tokens.shape[0]} keys, the call "
+            f"has {seqlen_k}."
+        )
+    flags = exact_kv_tokens[:seqlen_k]
+    pad = -seqlen_k % kv_tile
+    if pad:
+        flags = torch.nn.functional.pad(flags, (0, pad))
+    return flags.view(-1, kv_tile).any(dim=1)
 
 
 def _head_cost_from_routing(routing: dict[str, Any]) -> torch.Tensor:
@@ -724,6 +770,7 @@ def sol_attn_bshd(
     block_tile: tuple[int, int] | None = None,
     routing: dict[str, Any] | None = None,
     return_head_cost: bool = False,
+    exact_kv_tokens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Sol-Attn over BSHD tensors, returning (BSHD bf16 output, per-head cost or None).
 
@@ -741,6 +788,13 @@ def sol_attn_bshd(
 
     block_tile is the (q_tile, kv_tile) to route and dispatch at. None takes the
     recipe's default.
+
+    exact_kv_tokens is a (seqlen_k,) bool mask, or longer by the caller's pad.
+    Every KV block holding a flagged key is computed exactly for every query,
+    on top of what routing selects: routing judges each block against
+    statistics over all blocks, so a small part of a mixed sequence would
+    otherwise be routed by the majority. It does not apply to a caller-supplied
+    `routing`.
     """
     check_sol_attn_values(
         head_dim=query.shape[-1],
@@ -757,6 +811,11 @@ def sol_attn_bshd(
     # Before the tile pad, so the caller's pad and the tile pad do not stack.
     if key_seqlen is not None and key_seqlen < key.shape[1]:
         key, value = key[:, :key_seqlen], value[:, :key_seqlen]
+    force_blocks = (
+        None
+        if exact_kv_tokens is None or routing is not None
+        else _force_blocks_from_tokens(exact_kv_tokens, key.shape[1], block_tile[1])
+    )
     key, value = _pad_kv_to_tile(key, value, recipe, block_tile)
     _warn_if_kv_too_short(key.shape[1], block_tile[1])
 
@@ -764,7 +823,9 @@ def sol_attn_bshd(
         softmax_scale = query.shape[-1] ** -0.5
 
     use_fused = _takes_fused_routing(recipe, routing)
-    if _takes_raw_entry(recipe, routing, return_head_cost, use_fused):
+    if _takes_raw_entry(
+        recipe, routing, return_head_cost, use_fused, force_blocks is not None
+    ):
         qk_fmt, v_fmt = _format(recipe.qk_format), _format(recipe.v_format)
         out = _aiter_mha_v4_sol(
             query,
@@ -782,7 +843,9 @@ def sol_attn_bshd(
     q, k, v = _quantize(recipe, query, key, value, softmax_scale)
     if routing is None:
         builder = sol_attn_routing_fused if use_fused else sol_attn_routing_for
-        routing = builder(q, k, v, beta, recipe, block_tile=block_tile)
+        routing = builder(
+            q, k, v, beta, recipe, block_tile=block_tile, force_blocks=force_blocks
+        )
     qk_fmt, v_fmt = _format(recipe.qk_format), _format(recipe.v_format)
     qk_scale = _scale_mode(recipe.qk_scale_mode)
     v_scale = _scale_mode(recipe.v_scale_mode)
