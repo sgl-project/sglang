@@ -57,6 +57,12 @@ fn fixtures_decode_to_their_canonical_bytes() {
             "DetachHiCacheStorageRequest" => {
                 check::<api::DetachHiCacheStorageRequest>(&name, input, canonical)
             }
+            "UpdateWeightsFromDiskRequest" => {
+                check::<api::UpdateWeightsFromDiskRequest>(&name, input, canonical)
+            }
+            "UpdateWeightsFromTensorRequest" => {
+                check::<api::UpdateWeightsFromTensorRequest>(&name, input, canonical)
+            }
             "GetHiCacheStorageRequest" => {
                 check::<api::GetHiCacheStorageRequest>(&name, input, canonical)
             }
@@ -65,6 +71,42 @@ fn fixtures_decode_to_their_canonical_bytes() {
             "DetokenizeResponse" => check::<api::DetokenizeResponse>(&name, input, canonical),
             "AbortRequest" => check::<api::AbortRequest>(&name, input, canonical),
             "AbortResponse" => check::<api::AbortResponse>(&name, input, canonical),
+            "SetInternalStateRequest" => {
+                check::<api::SetInternalStateRequest>(&name, input, canonical)
+            }
+            "StartProfileRequest" => check::<api::StartProfileRequest>(&name, input, canonical),
+            "SlowDownRequest" => check::<api::SlowDownRequest>(&name, input, canonical),
+            "ReleaseMemoryOccupationRequest" => {
+                check::<api::ReleaseMemoryOccupationRequest>(&name, input, canonical)
+            }
+            "GetWeightsByNameRequest" => {
+                check::<api::GetWeightsByNameRequest>(&name, input, canonical)
+            }
+            "InitWeightsUpdateGroupRequest" => {
+                check::<api::InitWeightsUpdateGroupRequest>(&name, input, canonical)
+            }
+            "SendWeightsToRemoteInstanceRequest" => {
+                check::<api::SendWeightsToRemoteInstanceRequest>(&name, input, canonical)
+            }
+            "ParseFunctionCallRequest" => {
+                check::<api::ParseFunctionCallRequest>(&name, input, canonical)
+            }
+            "ParseFunctionCallResponse" => {
+                check::<api::ParseFunctionCallResponse>(&name, input, canonical)
+            }
+            "AddExternalCorpusRequest" => {
+                check::<api::AddExternalCorpusRequest>(&name, input, canonical)
+            }
+            "ListExternalCorporaResponse" => {
+                check::<api::ListExternalCorporaResponse>(&name, input, canonical)
+            }
+            "PauseGenerationRequest" => {
+                check::<api::PauseGenerationRequest>(&name, input, canonical)
+            }
+            "PdRoleSwitchRequest" => check::<api::PdRoleSwitchRequest>(&name, input, canonical),
+            "UpdateWeightVersionRequest" => {
+                check::<api::UpdateWeightVersionRequest>(&name, input, canonical)
+            }
             other => panic!("fixture type {other} has no Rust mapping; add it here"),
         }
     }

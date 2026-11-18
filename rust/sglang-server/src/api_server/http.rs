@@ -1,6 +1,7 @@
 pub(crate) mod app;
 mod auth;
 mod connections;
+mod corpus;
 mod dp_relay;
 pub(crate) mod generate_hook;
 mod hicache;
@@ -9,6 +10,8 @@ mod loads;
 mod metrics;
 mod native_api;
 mod openai;
+mod parsers;
 pub(crate) mod pre_generate;
 mod request_decompression;
 mod request_headers;
+pub(crate) mod weights;

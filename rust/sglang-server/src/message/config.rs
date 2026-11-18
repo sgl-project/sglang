@@ -602,6 +602,16 @@ pub struct DeploymentInfo {
     pub max_prefill_tokens: u64,
     pub enable_dp_attention: bool,
     pub speculative_algorithm: Option<String>,
+    /// `--speculative-ngram-external-corpus-max-tokens`; 0 when the launcher
+    /// did not pass it.
+    pub speculative_ngram_external_corpus_max_tokens: u64,
+    /// `--gc-threshold`, which `/freeze_gc` forwards to every scheduler.
+    pub gc_threshold: Option<Vec<i64>>,
+    /// `--enable-pd-role-switch`.
+    pub enable_pd_role_switch: bool,
+    /// The engine-info bootstrap server (`--engine-info-bootstrap-port`), as
+    /// the base URL Python's `ServerArgs.engine_info_bootstrap_url` builds.
+    pub engine_info_bootstrap_url: Option<String>,
     pub enable_hierarchical_cache: bool,
     pub hicache_ratio: Option<f64>,
     pub hicache_size: u64,
@@ -907,7 +917,7 @@ impl<'py> pyo3::FromPyObject<'_, 'py> for JsonObject {
     module = "sglang.srt.rust_extensions._server"
 )]
 // Lowercase to match the values Python reports for the same field.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DisaggregationMode {
     /// Unified prefill + decode.
@@ -924,6 +934,17 @@ pub enum HiddenStatesMode {
     Null,
     Last,
     Full,
+}
+
+impl DisaggregationMode {
+    /// The value Python reports for the same field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+        }
+    }
 }
 
 /// The slice of the resolved Python `ModelConfig` the rust server reads.
