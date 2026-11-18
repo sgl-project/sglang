@@ -10,7 +10,8 @@ import torch
 from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
 
 from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
-    _install_persistent_trtllm_semaphores,
+    _get_trtllm_kv_counter_buffer,
+    _reserve_trtllm_query_rows,
 )
 
 
@@ -22,7 +23,7 @@ from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
 class TestTrtllmPrefill(unittest.TestCase):
     def test_prefill_reference_and_dispatch(self):
         torch.manual_seed(41603)
-        _install_persistent_trtllm_semaphores(8192)
+        _reserve_trtllm_query_rows(8192)
         device = "cuda"
         dtype = torch.float8_e4m3fn
         heads, dim, topk = 16, 512, 2176
@@ -59,6 +60,9 @@ class TestTrtllmPrefill(unittest.TestCase):
                         backend="trtllm-gen",
                         cum_seq_lens_q=cu,
                         max_q_len=rows,
+                        multi_ctas_kv_counter_buffer=_get_trtllm_kv_counter_buffer(
+                            heads, q.device
+                        ),
                     )
 
                 out = run()

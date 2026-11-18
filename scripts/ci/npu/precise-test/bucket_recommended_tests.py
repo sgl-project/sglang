@@ -2,8 +2,10 @@
 """
 Bucket coverage-recommended tests per CI suite.
 
-Runs after test_selector.py has produced recommended_pytest_paths.txt (one
-pytest path per line, repo-relative, optional ::case suffix). For each
+Runs after the precision selector has produced recommended_pytest_paths.txt
+(one pytest path per line, repo-relative, optional ::case suffix). In CI that
+selector is the lb-actions/precision-test step (build-map + PR selection
+share the same Python package). For each
 requested suite, enumerate the suite's registered test files via list_tests.py
 and intersect with the recommended files, then write per-suite GitHub Actions
 step outputs:
@@ -33,7 +35,7 @@ every suite runs in full, no matter what was recommended. Otherwise a full run
 is triggered by only three signals:
 
   - a changed path in _FULL_RUN_PATHS (the pipeline configuration files),
-  - a missing changed-file list (test_selector.py failed),
+  - a missing changed-file list (precision selector did not run to completion),
   - no suite enumerating a single registered file (the enumeration itself is
     broken: unreadable test tree or list_tests/run_suite drift),
 
@@ -79,7 +81,7 @@ Usage:
     python3 bucket_recommended_tests.py \
         --recommended recommended_pytest_paths.txt \
         --changed-files pr_changed_files.txt \
-        --suites base-a-test-npu,base-b-test-1-npu-a3 \
+        --suites extra-a-test-npu,extra-b-test-1-npu-a3 \
         --diffusion-suites multimodal-gen-test-1-npu-a3:1-npu,multimodal-gen-test-4-npu-a3:2-npu \
         --case-map test_case_map.json \
         --precision-mode true \
@@ -477,7 +479,7 @@ def write_github_summary(
         lines.append("")
         lines.append(
             "Recommended but not registered in any suite this workflow runs "
-            "(base-a / CPU / nightly suites belong to other pipelines, or the "
+            "(extra-a / CPU / nightly suites belong to other pipelines, or the "
             "file was deleted). Running the full suites would not run them "
             "either."
         )
@@ -506,13 +508,13 @@ def main():
         "--recommended",
         type=str,
         default=str(SCRIPT_DIR / "recommended_pytest_paths.txt"),
-        help="recommended_pytest_paths.txt written by test_selector.py",
+        help="recommended_pytest_paths.txt written by lb-actions/precision-test",
     )
     parser.add_argument(
         "--suites",
         type=str,
         required=True,
-        help="Comma-separated suite names to bucket (e.g. base-a-test-npu,base-b-test-1-npu-a3)",
+        help="Comma-separated suite names to bucket (e.g. extra-a-test-npu,extra-b-test-1-npu-a3)",
     )
     parser.add_argument(
         "--diffusion-suites",
@@ -539,7 +541,7 @@ def main():
         "--changed-files",
         type=str,
         default="",
-        help="pr_changed_files.txt written by test_selector.py. A path listed "
+        help="pr_changed_files.txt exported by the workflow (gh api). A path listed "
         "in _FULL_RUN_PATHS (pr-test-npu.yml, pyproject_npu.toml, "
         "npu_ci_install_dependency.sh) forces a full run; a missing or empty "
         "file forces it too, and everything else is decided by the "
@@ -710,10 +712,13 @@ def main():
         decision = "full"
         decision_reason = "precision mode disabled (--precision-mode is not 'true')"
     elif not changed_files:
-        # test_selector.py writes this file on every PR run; missing/empty
-        # means it failed, so there is no evidence to narrow anything down.
+        # The workflow writes this file only after the precision selector
+        # succeeded; missing/empty means selection failed, so there is no
+        # evidence to narrow anything down.
         decision = "full"
-        decision_reason = "changed-file list unavailable (test_selector.py did not run)"
+        decision_reason = (
+            "changed-file list unavailable (precision selector did not run)"
+        )
     elif enumeration_empty:
         decision = "full"
         decision_reason = "no suite enumerated any registered test file"
@@ -733,7 +738,7 @@ def main():
     )
 
     total_count = sum(len(b) for b in buckets.values())
-    # Recommendations no suite here contains: base-a / CPU / nightly tests run
+    # Recommendations no suite here contains: extra-a / CPU / nightly tests run
     # by other pipelines, or a deleted file. None of them can be run by this
     # workflow, and a full run would not run them either, so this is reported
     # but never escalates to a full run.

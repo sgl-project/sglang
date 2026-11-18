@@ -5,13 +5,16 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, ClassVar, List, Optional, Tuple
 
+import msgspec
 import torch
 
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
 )
+from sglang.srt.mem_cache.device_pool_info import MHABufferInfo
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.layout.base import (
+    HostPoolOptions,
     SubPoolSpec,
     _check_row_alignment,
     _store_dtype_for,
@@ -20,13 +23,14 @@ from sglang.srt.mem_cache.kv.layout.base import (
 )
 from sglang.srt.mem_cache.kv.memory.views import MHAKVView
 from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
-from sglang.srt.mem_cache.layout.fused_draft import DenseDraftRegion
+from sglang.srt.mem_cache.layout.fused_draft import DenseDraftRegion, MLADraftRegion
 from sglang.srt.mem_cache.layout.token_major import (
     DenseEntryLayout,
     DensePart,
     align_entry_bytes,
     align_part_offset,
     build_dense_views,
+    replicated_token_layout,
 )
 from sglang.srt.mem_cache.memory_pool import (
     _set_kv_buffer_impl,
@@ -87,7 +91,7 @@ class MHASubPoolSpec(SubPoolSpec):
             f"v_head_dim must be positive; got {self.v_head_dim}"
         )
         if self.draft_region is not None:
-            assert isinstance(self.draft_region, DenseDraftRegion), (
+            assert isinstance(self.draft_region, (DenseDraftRegion, MLADraftRegion)), (
                 "dense entries carry dense draft K/V rows, never a state region"
             )
             self.draft_region.validate()
@@ -108,6 +112,10 @@ class MHASubPoolSpec(SubPoolSpec):
         return align_part_offset(self.host_entry_bytes())
 
     def entry_bytes(self) -> int:
+        if self.draft_region is not None and self.draft_region.token_replicas > 1:
+            return replicated_token_layout(self._target_parts(), self.draft_region)[
+                0
+            ].entry_bytes
         if self.draft_region is None:
             return align_entry_bytes(self.host_entry_bytes())
         return align_entry_bytes(
@@ -117,10 +125,11 @@ class MHASubPoolSpec(SubPoolSpec):
     def page_bytes(self, page_size: int) -> int:
         return page_size * self.entry_bytes()
 
-    def layout(self) -> DenseEntryLayout:
+    def _target_parts(self):
         """Token-major entry ``[K_0 | V_0 | K_1 | V_1 | ...]`` per slot; a page
         is ``page_size`` such entries back to back."""
-        _check_row_alignment(self.name, K=self.k_row_bytes(), V=self.v_row_bytes())
+        if self.layer_num:
+            _check_row_alignment(self.name, K=self.k_row_bytes(), V=self.v_row_bytes())
         layer_stride = self.k_row_bytes() + self.v_row_bytes()
         parts = (
             DensePart(
@@ -140,13 +149,23 @@ class MHASubPoolSpec(SubPoolSpec):
                 dtype=self.store_dtype,
             ),
         )
+        if not self.layer_num:
+            parts = ()
+        return parts
+
+    def layout(self) -> DenseEntryLayout:
+        parts = self._target_parts()
         if self.draft_region is not None:
+            if self.draft_region.token_replicas > 1:
+                return replicated_token_layout(parts, self.draft_region)[0]
             parts += self.draft_region.parts(self.draft_offset_in_entry())
         return DenseEntryLayout(entry_bytes=self.entry_bytes(), parts=parts)
 
     def views(self, arena) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """Per-layer K and V views over this sub-pool's band of ``arena``,
         indexed by the physical token id."""
+        if not self.layer_num:
+            return [], []
         rows = dense_rows(arena, self.name)
         check_physical_id_bound(sub_pool=self.name, n_rows=rows)
         return self._part_views(arena, rows, "k"), self._part_views(arena, rows, "v")
@@ -158,9 +177,24 @@ class MHASubPoolSpec(SubPoolSpec):
             f"sub-pool {self.name!r} carries no fused draft region"
         )
         rows = dense_rows(arena, self.name)
-        return (
-            self._part_views(arena, rows, "draft_k"),
-            self._part_views(arena, rows, "draft_v"),
+        region = self.draft_region
+        layout = (
+            self.layout()
+            if region.token_replicas == 1
+            else replicated_token_layout(self._target_parts(), region)[1]
+        )
+        return tuple(
+            build_dense_views(
+                arena.raw,
+                layout=layout,
+                part_name=name,
+                num_slots=rows * region.token_replicas,
+            )
+            for name in (
+                ("draft_kv",)
+                if isinstance(region, MLADraftRegion)
+                else ("draft_k", "draft_v")
+            )
         )
 
     def _part_views(self, arena, rows: int, part: str) -> List[torch.Tensor]:
@@ -216,6 +250,7 @@ class MHAView(MHAKVView):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
     ):
+        self._has_draft_parts = spec.draft_region is not None
         k_buffer, v_buffer = spec.views(arena)
         self._bind(
             arena=arena,
@@ -256,7 +291,9 @@ class MHAView(MHAKVView):
         self._sub_pool_name = sub_pool
         self.k_buffer, self.v_buffer = k_buffer, v_buffer
         # The pages the view spans, and one page envelope's bytes (all layers).
-        self.num_pages = arena.extent_entries(sub_pool) // page_size
+        self.num_pages = (
+            k_buffer[0].shape[0] if k_buffer else arena.extent_entries(sub_pool)
+        ) // page_size
         self.page_bytes = page_size * entry_bytes
         # Rows 0..page_size-1 are the padding sink; physical ids run to the rows.
         self.size = self.num_pages * page_size - page_size
@@ -466,6 +503,29 @@ class MHAView(MHAKVView):
 
     # -- host transfer and PD --
 
+    def host_layout(self):
+        from sglang.srt.mem_cache.kv.layout.page import page_envelope_host_layout
+
+        if self._has_draft_parts:
+            return page_envelope_host_layout(
+                self._arena,
+                self._sub_pool_name,
+                self.size
+                if self.host_capacity_tokens is None
+                else self.host_capacity_tokens,
+                self.page_size,
+            )
+        (info,) = self.get_device_pool_infos()
+        return MHAHostLayout(
+            buffer_info=info.buffer_info,
+            capacity=self.size
+            if self.host_capacity_tokens is None
+            else self.host_capacity_tokens,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            write_back_staging=self.hicache_write_back_staging,
+        )
+
     def get_device_pool_infos(self) -> "tuple[DevicePoolInfo, ...]":
         """The view's buffers, as host assembly reads them."""
         from sglang.srt.mem_cache.device_pool_info import (
@@ -584,10 +644,12 @@ class DraftMHAView(MHAView):
         layer_lanes: "dict[int, int]",
         page_size: int,
     ):
+        self._has_draft_parts = True
         region = host_spec.draft_region
         assert region is not None, (
             f"sub-pool {host_spec.name!r} carries no fused draft region"
         )
+        self.token_replicas = region.token_replicas
         layer_ids = sorted(layer_lanes)
         assert layer_ids, "a fused draft view binds at least one layer"
         start_layer = layer_ids[0]
@@ -612,7 +674,7 @@ class DraftMHAView(MHAView):
             # result as the storage dtype (bytes for FP8).
             dtype=region.resolved_kv_dtype(),
             page_size=page_size,
-            entry_bytes=host_spec.entry_bytes(),
+            entry_bytes=host_spec.entry_bytes() // region.token_replicas,
             model_layer_ids=tuple(layer_ids),
             start_layer=start_layer,
             end_layer=start_layer + len(layer_ids) - 1,
@@ -637,3 +699,54 @@ class DraftMHAView(MHAView):
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
         raise NotImplementedError("CPU offloading is unsupported for fused draft KV")
+
+
+class MHAHostLayout(msgspec.Struct, frozen=True, kw_only=True):
+    """MHA host rows and their layer order; transfers read the declared buffers."""
+
+    buffer_info: MHABufferInfo
+    capacity: int
+    start_layer: int
+    end_layer: int
+    write_back_staging: object = None
+
+    @property
+    def device_layer_num(self) -> int:
+        return len(self.buffer_info.buffers.k)
+
+    def build(self, options: HostPoolOptions, *, draft_buffer_infos=()):
+        from sglang.srt.mem_cache.hicache_key_scheme import resolve_head_group_num
+        from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
+        from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
+
+        if options.dcp_size != 1:
+            raise ValueError("MHA host transfers require unsharded token ids")
+        info = self.buffer_info
+        page_layout = None
+        if options.layout == "page_unified":
+            page_layout = PageUnifiedLayout(
+                page_size=options.page_size,
+                layer_num=self.device_layer_num + len(draft_buffer_infos),
+                head_num=info.head_num,
+                head_group_num=resolve_head_group_num(info.head_num),
+                head_dim=info.head_dim,
+                itemsize=info.dtype.itemsize,
+                is_mla=False,
+            )
+        return get_mha_host_pool_cls(info)(
+            info,
+            options.ratio,
+            options.size,
+            options.page_size,
+            options.layout,
+            pin_memory=options.pin_memory,
+            allocator_type=options.allocator_type,
+            pool_label=options.pool_label,
+            device_capacity_tokens=self.capacity,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            draft_buffer_infos=draft_buffer_infos,
+            write_back_staging=self.write_back_staging,
+            page_unified_layout=page_layout,
+            head_group_num=1 if page_layout is None else page_layout.head_group_num,
+        )

@@ -4,7 +4,7 @@ AMD GSM8K Evaluation Test (Migrated from test/srt/nightly/)
 This test evaluates instruction-tuned models on the gsm8k benchmark using chat completions.
 Models are tested with various TP configurations on AMD GPUs.
 
-Registry: nightly-amd suite (2-GPU tests)
+Registry: nightly-test-amd suite (2-GPU tests)
 """
 
 import json
@@ -31,7 +31,7 @@ from sglang.test.test_utils import (
 )
 
 # Register for AMD CI - GSM8K evaluation tests (~60 min)
-register_amd_ci(est_time=3600, suite="nightly-amd", nightly=True)
+register_amd_ci(est_time=3600, suite="nightly-test-amd", nightly=True)
 
 MODEL_SCORE_THRESHOLDS = {
     # Thresholds set at 5% below reported GSM8K (5-shot/CoT) scores
