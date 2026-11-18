@@ -26,9 +26,9 @@ from sglang.srt.layers.layer_boundary.layout import SumGroup
 from sglang.srt.layers.layer_boundary.residual import LayerResidualOps, attn_bank_hip
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx95_supported
 
-_is_hip = is_hip()
+_is_gfx95 = is_gfx95_supported()
 
 
 class AttnBank:
@@ -66,7 +66,7 @@ def _bank_rows(bank: AttnResidual, hidden_states) -> Optional[slice]:
     if rows == total:
         return None
     parallel = get_parallel()
-    if _is_hip and (shard := attn_bank_hip.stream_rows(rows, total, parallel)):
+    if _is_gfx95 and (shard := attn_bank_hip.stream_rows(rows, total, parallel)):
         return shard
     if rows * parallel.attn_tp_size != total:
         raise RuntimeError(
@@ -139,7 +139,7 @@ class AttnBankState:
             score_norm=self.attn_score_norm,
             write=self.writes_block,
         )
-        if _is_hip and not self.reads_slices:
+        if _is_gfx95 and not self.reads_slices:
             normed = attn_bank_hip.gather_stream_read(self.bank.require(), normed)
         return normed, None if self.writes_block else residual
 
@@ -348,7 +348,7 @@ class AttnBankOutputRead:
         )
         if read is None:
             read = bank.forward(*read_args, self.norm, rows=rows)
-            if _is_hip and not self.reads_attn_tp_slices:
+            if _is_gfx95 and not self.reads_attn_tp_slices:
                 read, rows = attn_bank_hip.gather_stream_output(bank, read, rows)
             if rows is not None:
                 read = (self._gather(read[0]), read[1])
