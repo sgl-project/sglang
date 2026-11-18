@@ -187,6 +187,21 @@ kernels, under the recorded Pillow version. `tests/mm_parity.rs` checks the
 expanded ids, offsets, grids, M-RoPE positions and feature bytes of every case,
 over the images in `tests/fixtures/mm_parity/images/`.
 
+
+### Proposed native audio integration
+
+The first target is `api.v1 Generate.audio_data` on Qwen3-ASR-0.6B with a
+single 16 kHz mono PCM16 WAV. The shared audio family supplies features,
+prompt layout, positions and the encoder mask. SGLang owns request admission,
+media prefetch and the scheduler handoff.
+
+Align the processor entry after decode with the native video work in
+[#51156](https://github.com/sgl-project/sglang/pull/51156) and
+[#51157](https://github.com/sgl-project/sglang/pull/51157). The existing
+scheduler ring can carry an optional named tensor buffer for the audio mask,
+preserving its shape and dtype. Model support depends on a qualified family
+built over the [shared audio primitives](https://github.com/ai-dynamo/frontend-crates/pull/619).
+
 ## parser
 
 ```rust
