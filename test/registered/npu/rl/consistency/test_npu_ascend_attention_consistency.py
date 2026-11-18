@@ -152,9 +152,7 @@ def _collect_logprob(base_url):
             },
         )
         meta = body.get("meta_info", {})
-        logprobs = tuple(
-            item[0] for item in (meta.get("output_token_logprobs") or [])
-        )
+        logprobs = tuple(item[0] for item in (meta.get("output_token_logprobs") or []))
         if not logprobs:
             raise AssertionError(f"no output_token_logprobs returned for {prompt!r}")
         result[index] = (tuple(body["output_ids"]), logprobs)

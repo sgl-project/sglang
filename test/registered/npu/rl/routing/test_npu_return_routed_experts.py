@@ -141,9 +141,7 @@ class TestNpuReturnRoutedExperts(CustomTestCase):
             "return_routed_experts": True,
         }
         payload.update(extra)
-        response = requests.post(
-            self.base_url + "/generate", json=payload, timeout=120
-        )
+        response = requests.post(self.base_url + "/generate", json=payload, timeout=120)
         response.raise_for_status()
         body = response.json()
         if "error" in body:
@@ -172,7 +170,8 @@ class TestNpuReturnRoutedExperts(CustomTestCase):
         for row in moe:
             for layer_ids in row:
                 self.assertEqual(
-                    len(layer_ids), len(set(layer_ids.tolist())),
+                    len(layer_ids),
+                    len(set(layer_ids.tolist())),
                     f"duplicate expert ids in one token: {layer_ids}",
                 )
 
@@ -233,7 +232,13 @@ class TestNpuReturnRoutedExperts(CustomTestCase):
         # request (DP slicing must not shift rows across requests).
         batch = list(PROMPTS) + [LONG_PROMPT * 3]
         body = self._generate(batch)
-        per_request = body if isinstance(body, list) else body["data"] if "data" in body else [body]
+        per_request = (
+            body
+            if isinstance(body, list)
+            else body["data"]
+            if "data" in body
+            else [body]
+        )
         bodies = per_request if isinstance(per_request, list) else [per_request]
         self.assertEqual(len(bodies), len(batch))
         for prompt, item in zip(batch, bodies):
@@ -241,7 +246,8 @@ class TestNpuReturnRoutedExperts(CustomTestCase):
             experts = self._experts(item)
             self._check_shape_and_ids(experts)
             self.assertEqual(
-                experts.shape[0], self._seqlen(item) - 1,
+                experts.shape[0],
+                self._seqlen(item) - 1,
                 f"rows of one request leaked across the batch for {prompt!r}",
             )
 
@@ -281,11 +287,13 @@ class TestNpuReturnRoutedExperts(CustomTestCase):
         for t in threads:
             t.join()
         self.assertNotIn(
-            "routed_experts", results[0].get("meta_info", {}),
+            "routed_experts",
+            results[0].get("meta_info", {}),
             "return_routed_experts=False must not return the field",
         )
         self.assertIn(
-            "routed_experts", results[1].get("meta_info", {}),
+            "routed_experts",
+            results[1].get("meta_info", {}),
             "return_routed_experts=True must return the field",
         )
 

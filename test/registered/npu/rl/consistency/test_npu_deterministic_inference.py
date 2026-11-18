@@ -110,9 +110,7 @@ def _collect_determinism_trials(base_url, prompts):
     trials = {}
 
     _flush_cache(base_url)
-    trials["bs1"] = [
-        _request_signatures(base_url, [prompt])[0] for prompt in prompts
-    ]
+    trials["bs1"] = [_request_signatures(base_url, [prompt])[0] for prompt in prompts]
 
     _flush_cache(base_url)
     trials["bsn"] = _request_signatures(base_url, prompts)
@@ -217,9 +215,7 @@ class TestNpuDeterministicInferenceOnPolicyTarget(_DeterministicServerTestCase):
         response = requests.get(self.base_url + "/server_info", timeout=30)
         if response.status_code == 404:
             # Older builds expose the same payload under /get_server_info.
-            response = requests.get(
-                self.base_url + "/get_server_info", timeout=30
-            )
+            response = requests.get(self.base_url + "/get_server_info", timeout=30)
         response.raise_for_status()
         info = response.json()
         args = info.get("server_args", info)
