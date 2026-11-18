@@ -29,6 +29,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
+    ragged_verify_token_rows,
 )
 from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 
@@ -285,7 +286,7 @@ class CompressorAscendBackendMixin:
         fm.dsv4_explicit_state_block_tables = {}
         fm.dsv4_max_input_capacity = 1 if is_decode else None
 
-        if self._dsv4_has_c4 or self._dsv4_has_c128:
+        if self._dsv4_has_c4 or self._dsv4_has_c128: # dsv4的路径
             # V4 c4/c128 metadata; V4.1 runs the else branch.
             _verify_compress = is_verify and bool(self._dsv4_compress_ratios)
             _seq_lens = forward_batch.seq_lens.to(torch.int32)
@@ -325,7 +326,8 @@ class CompressorAscendBackendMixin:
 
             if _verify_compress:
                 self._build_npu_compress_metadata_verify(forward_batch)
-        else:
+
+        else: #dsv4.1的路径
             # V4.1: no allocator bundle and no c4/c128 tables; only the shared
             # seq scalars the fused low-ratio compressor consumes.
             if is_decode:
@@ -1815,12 +1817,47 @@ class LowRatioCompressAscendBackendMixin:
         length, not ``seq_lens > 0``: the latter misreads an idle DP rank's
         dummy verify batch (seq_lens == 1 < W) as live. Anything else returns
         None and leaves the lengths untouched.
+        给每个 token 标记：这一行是真请求的，还是为了凑 graph 大小补进去的假行。
         """
+        """返回逐 query token 的有效性；无法确定时返回 None。"""
         seq_lens = getattr(forward_batch, "seq_lens", None)
         if seq_lens is None:
             return None
-        seq_lens = seq_lens.reshape(-1)
+
+        seq_lens = seq_lens.reshape(-1) # 请求长度数组的容量，不是 token 数
         n = int(seq_lens.numel())
+        mode = getattr(forward_batch, "forward_mode", None)
+        layout = getattr(forward_batch, "ragged_verify_layout", None)
+
+        # ==================== 新增：compact / ragged 路径 ====================
+        if layout is not None and mode is not None and mode.is_target_verify():
+            raw_num_requests = int(layout.bs)
+            # 原始布局layout描述的输入请求数，不包含图回放新增的 BS padding 槽位。 ctx.ragged_layout才会包含padding后的信息
+
+            if raw_num_requests == 0: # 后续检视看是否删除
+                return torch.zeros( t, dtype=torch.bool, device=seq_lens.device)
+
+            # ragged_verify_token_rows： 给 compact 后的一维 verify token 数组中的每个位置，找出它属于 batch 中的第几个请求。
+            request_rows = ragged_verify_token_rows(layout, t).to(device=seq_lens.device) #(num_token, )
+            # 每个 token 所属请求，shape: (t,)
+            # eg. raw_num_requests=bs=3: verify_lens=[2,3,1] → [0,0,1,1,1,2]
+            # eg. raw_num_requests=3,bs=4:
+            # request_rows = [0, 0, 1, 1, 1,     2, 3, 3]
+#                                 请求0    请求1   请求2   ↑  ↑ 尾部补齐行
+
+            valid_request = request_rows < raw_num_requests
+            # 屏蔽虚拟请求及未归属的尾部补齐行。
+            # 返回逐 token 的 bool mask，shape: (layout.graph_num_token,)
+            # 无 padding 示例：[T,T,T,T,T,T]
+            # 若另有两个未归属尾部行：[T,T,T,T,T,T,F,F]
+
+            out_loc = forward_batch.out_cache_loc.reshape(-1)
+            valid_cache_loc = out_loc > 0
+            # 排除没有实际 KV 写入槽位的 padding / dummy token。
+
+            return valid_request & valid_cache_loc
+
+        # ==================== 保留：原有路径 ====================
         if n == t:
             return seq_lens > 0
         mode = getattr(forward_batch, "forward_mode", None)
@@ -1849,7 +1886,7 @@ class LowRatioCompressAscendBackendMixin:
         if precomputed is not None and int(precomputed.numel()) == t:
             return precomputed
         return self._dsv41_live_row_mask(
-            forward_batch, t, getattr(fm, "seq_lens_cpu_int", None)
+            forward_batch, t, getattr(fm, "seq_lens_cpu_int", None) #给每个 token 标记：这一行是真请求的，还是为了凑 graph 大小补进去的假行。
         )
 
     def _dsv41_window_indices(self, forward_batch: ForwardBatch):
@@ -2166,12 +2203,16 @@ class LowRatioCompressAscendBackendMixin:
             )
         setattr(fm, f"c{ratio}_index_page_table", index_page_table)
 
-    def _init_dsv41_graph_metadata(
-        self, metadata, bs: int, tokens_per_req: int, device
-    ) -> None:
+    def _init_dsv41_graph_metadata(self, metadata, bs: int, tokens_per_req: int, device,
+                                   num_tokens: Optional[int] = None, ) -> None:
         """Allocate the aclgraph-persistent low-ratio buffers for one bs bucket."""
-        t = bs * tokens_per_req
-        for ratio in self._dsv41_low_ratios():
+        # t = bs * tokens_per_req
+        # static：默认 t = bs * tokens_per_req。
+        # compact：调用者传入 num_tokens = graph_num_tokens。
+        # bs 是图的请求槽位容量；t 是图的 token 容量，两者不能混用。
+        t = bs * tokens_per_req if num_tokens is None else int(num_tokens)
+
+        for ratio in self._dsv41_low_ratios(): # 压缩输出容量：为各请求跨前缀完成的压缩组预留余量
             pad = min(t, t // ratio + bs)
             setattr(
                 metadata,
@@ -2224,9 +2265,15 @@ class LowRatioCompressAscendBackendMixin:
             metadata.kernel_metadata = {}
         # Variable-size dispatch tables: probe one tensor per attention type.
         ds41 = _ds41_ops()
-        cu_seqlens_q = (
-            torch.arange(bs + 1, dtype=torch.int32, device=device) * tokens_per_req
-        )
+
+        # 复用调用者已经生成的请求累计偏移，shape: (bs + 1,)。
+        # static 示例：bs=3、w=6 → [0, 6, 12, 18]。
+        # compact 示例：verify_lens=[2,3,1] → [0, 2, 5, 6]。
+        # 实际图若补齐请求槽位，使用的也是上层准备好的对应分段。
+        cu_seqlens_q = getattr(metadata, "actual_seq_lengths_q_pa", None)
+        if cu_seqlens_q is None:
+            cu_seqlens_q = (torch.arange(bs + 1, dtype=torch.int32, device=device) * tokens_per_req)
+
         probe_cmp_lengths = torch.zeros((t, 1), dtype=torch.int32, device=device)
         for ratio in (0, *self._dsv41_low_ratios()):
             attention_type = "win" if ratio == 0 else f"c{ratio}a"
@@ -2249,6 +2296,7 @@ class LowRatioCompressAscendBackendMixin:
                 buf = torch.zeros_like(probe)
                 self.graph_metadata[key] = buf
             metadata.kernel_metadata[f"{attention_type}_metadata"] = buf
+
         for ratio in self._dsv41_low_ratios():
             probe = ds41.quant_lightning_indexer_metadata_dsl(
                 cu_seqlens_q=cu_seqlens_q,
@@ -2282,6 +2330,7 @@ class LowRatioCompressAscendBackendMixin:
         candidate_ratio = self._dsv41_candidate_ratio()
         if candidate_ratio is None:
             return
+
         block = int(self._dsv41_candidate_block_size)
         if block <= 0 or self._dsv41_candidate_topk_blocks <= 0:
             raise RuntimeError(
@@ -2386,6 +2435,8 @@ class LowRatioCompressAscendBackendMixin:
                     slot_dst, slot_values, keep, fill=self._DSV41_SLOT_SKIP
                 )
 
+
+
     def _refresh_graph_dsv41_index_page_tables(self, fm) -> None:
         """Re-derive the indexer-K page-table expansion into the captured buffers.
 
@@ -2424,31 +2475,89 @@ class LowRatioCompressAscendBackendMixin:
         window through the shared row formulas, matching the eager verify path
         element for element.
         """
+
+        #假设本轮请求数量bs=3, 本轮验证长度是 [2, 3, 1], 前缀长度是[6,7,4]
         fm = ctx.fm
+        layout = ctx.ragged_layout
         w = int(ctx.tokens_per_bs)
-        n = int(ctx.bs) * w
-        live = ctx.live_seq_lens[: ctx.bs].to(torch.int64)
-        positions = ctx.forward_batch.positions.reshape(-1).to(torch.int64)
+        # n = int(ctx.bs) * w
+        live = ctx.live_seq_lens[: ctx.bs].to(torch.int64) # 各请求已提交的前缀长度，统一为 int64 eg.[6, 7, 4] (bs=3,)
+
+        # positions:本轮验证 token 的绝对位置，从 0 开始编号，shape: (n,)
+        # static:
+        #   [6,7,8,9,10,11, 7,8,9,10,11,12, 4,5,6,7,8,9]，shape: (18,)
+        # compact:
+        #   [6,7, 7,8,9, 4]，shape: (6,)
+        #   └A─┘ └─B──┘  C
+        positions = ctx.forward_batch.positions.reshape(-1).to(torch.int64) # 展平本轮 token 的绝对位置
+
+        # Static uses a request-major rectangle; ragged uses a token-tier capacity.
+        n = (int(layout.graph_num_tokens)if layout is not None else int(ctx.bs) * w)  #图容量
+
         if positions.numel() != n:
             raise RuntimeError(
                 "V4.1 verify replay rows do not match the bucket width: "
                 f"positions={positions.numel()} vs bs*tokens_per_req={n}."
             )
+
+        # Ragged verify: request boundaries come from the packed Q indptr.
+        if layout is not None:
+            if int(ctx.bs) == 0: # 防御性处理：当前没有请求槽位，不能执行索引读取
+                self._clear_graph_dsv41_verify_metadata(ctx) #清理可能残留的 V4.1 验证元数据
+                return
+
+            # Ragged: use Q indptr to map each packed token to its request.
+            request_rows = ragged_verify_token_rows(layout, n) #返回每个 token 所属的是第几个请求 eg.  [0, 0, 1, 1, 1, 2]
+            valid_request = request_rows < int(ctx.raw_bs) # ctx.raw_bs:原始请求数量/ ctx.bs:补齐后，图执行使用的请求槽位数量 /仅保留实际请求，屏蔽图补齐产生的虚拟请求
+            safe_request_rows = request_rows.clamp(max=int(ctx.bs) - 1)  #将越界编号限制到合法范围，保证读取安全
+            row_live = live[safe_request_rows] # 展开所属请求的前缀长度，eg. [6,6,7,7,7,4]，shape: (n,)，int64
+            row_live = torch.where(valid_request, row_live, torch.zeros_like(row_live),) # 真实请求保留前缀长度，虚拟请求或未归属行置 0，shape: (n,)
+
+        else: # static 分支：每个请求都有相同数量的验证行
+            # Static: every request owns the same number of token rows.
+            # 每个请求的前缀长度重复 w 次，shape: (bs*w,) = (18,)
+            # eg. [6,6,6,6,6,6, 7,7,7,7,7,7, 4,4,4,4,4,4]
+            # 这里保留整数长度；辅助函数内部通过 row_live > 0 判断有效性
+            row_live = live.repeat_interleave(w)
+
         # The replay view's out_cache_loc is UNPADDED: scatter it into the
         # padded window; padding rows keep 0 and the slot filter drops them.
+        # raw_out_loc:v 本轮输入 token 的完整 KV 物理槽位，shape: (m_raw,)  注意：这是物理槽位，不是上面的逻辑 positions  m_raw 通常等于图容量。
+        # compact 示例，假设 page_size=128：
+        # 如果没 有padding [134,135, 263,264,265, 388]，shape: (6,)
+        # 如果有 有 token 图容量 padding [134, 135, 263, 264, 265, 388, 0, 0] (8, )
+        #                                               ↑   ↑  padding
         raw_out_loc = ctx.forward_batch.out_cache_loc.reshape(-1).to(torch.int64)
-        out_loc = torch.zeros(n, dtype=torch.int64, device=ctx.device)
-        if raw_out_loc.numel() > 0:
-            m = min(int(raw_out_loc.numel()), n)
-            out_loc[:m] = raw_out_loc[:m]
+        if layout is not None and raw_out_loc.numel() != n:  #    # compact 正常输入应已经补齐到 token 图容量
+            raise RuntimeError(
+                "V4.1 ragged verify cache locations exceed the token tier: "
+                f"out_cache_loc={raw_out_loc.numel()} vs graph_num_tokens={n}."
+            )
+
+        if raw_out_loc.numel() == n:
+            out_loc = raw_out_loc  # 已补齐，直接复用        # out_loc = torch.zeros(n, dtype=torch.int64, device=ctx.device)
+        else:
+            # static 模式下目前没有补齐
+            out_loc = torch.zeros(n, dtype=torch.int64, device=ctx.device)
+            if raw_out_loc.numel() > 0:
+                m = min(int(raw_out_loc.numel()), n)
+                out_loc[:m] = raw_out_loc[:m]
         # start_pos/seqused are written by _refresh_graph_verify_rows.
-        row_live = live.repeat_interleave(w)
         for ratio in self._dsv41_low_ratios():
+            # 为每个 token 判断是否需要产生一个压缩 KV，并计算对应的组起始位置和压缩缓存槽位，
+            # 和_fill_ragged_verify_positions_cmp_padding_one的作用是类似的
+
+            # compact 本例，ratio=1： keep   = [T,T,T,T,T,T] / pos_values  = [6,7,7,8,9,4] / slot_values = [134,135,263,264,265,388]
+            # compact 本例，ratio=2：
+            # keep   = [F,T,T,F,T,F]  # 奇数位置完成两 token 一组
+            # pos_values  = [6,6,6,8,8,4]  # 每行所属压缩组的起点位置
+            # slot_values = [67,67,131,132,132,194]  # out_loc // 2
+            # 其中只有 keep=True 的值会被写入有效压缩结果
             keep, pos_values, slot_values = self._dsv41_ratio_row_values(
                 positions, out_loc, ratio, int(self.page_size), row_live=row_live
             )
-            pos_dst = getattr(fm, f"positions_cmp_padding_c{ratio}")
-            slot_dst = getattr(fm, f"c{ratio}_loc")
+            pos_dst = getattr(fm, f"positions_cmp_padding_c{ratio}")   # 已分配的压缩位置缓冲区，shape: (P,)
+            slot_dst = getattr(fm, f"c{ratio}_loc")                    # 已分配的压缩槽位缓冲区，shape: (P,)，与 pos_dst 逐行对应
             if ratio == 1:
                 # Per-token rows (native projection): identity, not compacted.
                 pos_dst.copy_(
@@ -2462,10 +2571,16 @@ class LowRatioCompressAscendBackendMixin:
                     ).to(slot_dst.dtype)
                 )
             else:
+                # _stable_compact_1d() 的作用是：按照 keep 筛选有效元素，保持原顺序，写进固定长度的缓冲区，并填充剩余尾部。
+                # pos_values = [6, 6, 6, 8, 8, 4, 0, 0]  # shape: (8,)
+                # keep = [F, T, T, F, T, F, F, F]
+                # 保留的元素，顺序不变：
+                #              [6, 6, 8]
+                #输出：
+                # # pos_dst = [6, 6, 8, 0, 0, 0, 0]
+                # #             有效值    未使用的尾部
                 self._stable_compact_1d(pos_dst, pos_values, keep, fill=0)
-                self._stable_compact_1d(
-                    slot_dst, slot_values, keep, fill=self._DSV41_SLOT_SKIP
-                )
+                self._stable_compact_1d(slot_dst, slot_values, keep, fill=self._DSV41_SLOT_SKIP)
 
     def _clear_graph_dsv41_verify_metadata(self, ctx) -> None:
         """DP-idle verify replay: neutralize the V4.1 metadata.
@@ -2638,7 +2753,7 @@ class DeepseekV4AscendAttnBackend(
                 f"decoding (static mode), got {spec_algorithm!r}."
             )
         ragged_mode = read_ragged_verify_mode()
-        if ragged_mode is not RaggedVerifyMode.STATIC:
+        if ragged_mode not in (RaggedVerifyMode.STATIC, RaggedVerifyMode.COMPACT):
             raise ValueError(
                 "DeepSeek-V4.1 on NPU supports only DSpark speculative "
                 "decoding in static mode (SGLANG_RAGGED_VERIFY_MODE=static), "
@@ -3066,6 +3181,7 @@ class DeepseekV4AscendAttnBackend(
                 dtype=torch.int32,
                 device=device,
             )
+
             # The draft-worker host metadata op consumes this fixed graph
             # geometry without introducing a replay-time D2H synchronization.
             metadata.actual_seq_lengths_q_pa_cpu = torch.arange(
@@ -3172,10 +3288,10 @@ class DeepseekV4AscendAttnBackend(
             # The live-row mask the captured graphs read; filled per replay by
             # _refresh_graph_seq_metadata (never traced inside the graph).
             metadata.dsv41_live_mask_buf = torch.zeros(
-                bs * tokens_per_req, dtype=torch.bool, device=device
+                n_tok, dtype=torch.bool, device=device
             )
             # V4.1: MQSMLA/QLI dispatch tables plus window/topk-length buffers.
-            self._init_dsv41_graph_metadata(metadata, bs, tokens_per_req, device)
+            self._init_dsv41_graph_metadata(metadata, bs, tokens_per_req, device,num_tokens=n_tok)
 
         metadata.ori_sparse_indices = None
         metadata.ori_topk_length = None
@@ -3437,6 +3553,7 @@ class DeepseekV4AscendAttnBackend(
                 )
             )
         attn_seq_lens = ctx.live_seq_lens
+
         if ctx.graph_mode.is_target_verify():
             valid_verify_rows = ctx.live_seq_lens > 0
             final_seq_lens = ctx.final_seq_lens_cpu.to(
@@ -3465,13 +3582,52 @@ class DeepseekV4AscendAttnBackend(
         mask_buf = getattr(fm, "dsv41_live_mask_buf", None)
         if mask_buf is not None:
             if ctx.graph_mode.is_target_verify():
-                per_req = ctx.final_seq_lens_cpu.reshape(-1)[: ctx.bs].to(
-                    torch.int64
-                ) > int(ctx.tokens_per_bs)
-                mask = per_req.repeat_interleave(int(ctx.tokens_per_bs))
+                if ctx.ragged_layout is not None:
+                    # 新增 compact 分支：按真实请求边界展开有效性
+                    layout = ctx.ragged_layout
+                    n = int(layout.graph_num_tokens)  # 图的 token 容量
+                    if mask_buf.numel() != n:
+                        raise RuntimeError(
+                            "V4.1 ragged verify live-mask capacity mismatch: "
+                            f"mask={mask_buf.numel()} vs graph_num_tokens={n}."
+                        )
+                    if int(ctx.bs) == 0:
+                        mask = torch.zeros_like(mask_buf)  # 无请求槽位时全部无效
+                    else:
+                        request_rows = ragged_verify_token_rows(layout, n)
+                        # 每个 token 所属的请求，shape: (n,)
+                        # eg. [0,0,1,1,1,2]
+
+                        valid_request = request_rows < int(ctx.raw_bs)
+                        # 排除虚拟请求和未归属的尾部补齐行，shape: (n,)
+
+                        safe_request_rows = request_rows.clamp( max=int(ctx.bs) - 1)
+                        # 保证下面索引前缀长度时不会越界
+
+                        per_req = ctx.live_seq_lens[: ctx.bs] > 0
+                        # 各请求是否活跃，shape: (bs,)
+                        # eg. [6,7,4] → [T,T,T]
+                        # mask = valid_request & per_req[safe_request_rows]
+
+                        out_loc = ctx.forward_batch.out_cache_loc.reshape(-1) #DP dummy：所有槽位都是 0  → 全 False
+                        mask = (valid_request& per_req[safe_request_rows]& (out_loc > 0))
+                        # 展开为逐 token 的有效性，shape: (n,)
+                        # 无 padding 示例：[T,T,T,T,T,T]
+                        # 若另有两个未归属尾部行：[T,T,T,T,T,T,F,F]
+
+                else: #ctx.final_seq_lens_cpu=前缀长度+本轮验证长度
+                    per_req = ctx.final_seq_lens_cpu.reshape(-1)[: ctx.bs].to(
+                        torch.int64
+                    ) > int(ctx.tokens_per_bs)
+                    mask = per_req.repeat_interleave(int(ctx.tokens_per_bs))  # shape: (bs * tokens_per_bs,)
             else:
+                # 原有普通 decode 分支：每请求一个 query token, shape: (bs,)
                 mask = ctx.live_seq_lens_cpu[: ctx.bs].to(torch.int64) > 0
+
+            # 原地更新 bool 缓冲区，不重新绑定，保留图捕获使用的地址
             mask_buf.copy_(mask.to(mask_buf.dtype))
+
+        # 原地刷新设备端 KV 长度；无效行是否参与计算由上面的 mask 控制
         fm.actual_seq_lengths_kv.copy_(attn_seq_lens.clamp(min=1))
 
     def _refresh_cycle_state_block_table(self, ctx) -> None:
@@ -3751,6 +3907,7 @@ class DeepseekV4AscendAttnBackend(
             finally:
                 self.forward_metadata = previous
             return
+
         kernel_metadata_new = self._kernel_metadata_from_parts(
             bs=ctx.bs,
             actual_seq_lengths_q_pa=fm.actual_seq_lengths_q_pa,
