@@ -11,7 +11,7 @@ export const Qwen3NextDeployment = () => {
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
-        { id: 'a3', label: 'A3 (NPU)', default: false },
+        { id: 'a3', label: 'A3', default: false },
         { id: 'xeon', label: 'Xeon', default: false }
       ]
     },
@@ -46,11 +46,15 @@ export const Qwen3NextDeployment = () => {
     toolcall: {
       name: 'toolcall',
       title: 'Tool Call Parser',
-      condition: (values) => values.hardware !== 'a3',
-      items: [
-        { id: 'disabled', label: 'Disabled', default: true },
-        { id: 'enabled', label: 'Enabled', default: false }
-      ],
+      getDynamicItems: (values) => values.hardware === 'a3'
+        ? [
+            { id: 'disabled', label: 'Disabled', default: false },
+            { id: 'enabled', label: 'Enabled', subtitle: 'qwen3_coder', default: true }
+          ]
+        : [
+            { id: 'disabled', label: 'Disabled', default: true },
+            { id: 'enabled', label: 'Enabled', default: false }
+          ],
       commandRule: (value) => value === 'enabled' ? '--tool-call-parser qwen' : null
     },
     speculative: {
@@ -118,13 +122,12 @@ export const Qwen3NextDeployment = () => {
         'DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048',
         'DEEPEP_NORMAL_LONG_SEQ_ROUND=10',
         'FORCE_DRAFT_MODEL_NON_QUANT=1',
-        'GLOO_SOCKET_IFNAME=eth0',
+        'GLOO_SOCKET_IFNAME="<gloo-network-interface>"',
         'HCCL_OP_EXPANSION_MODE=AIV',
-        'HCCL_SOCKET_IFNAME=eth0',
+        'HCCL_SOCKET_IFNAME="<hccl-network-interface>"',
         'PYTORCH_NPU_ALLOC_CONF=expandable_segments:True',
         'SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=400',
         'SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1',
-        'SGLANG_ENABLE_SPEC_V2=1',
         'SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0',
         'SGLANG_NPU_USE_MULTI_STREAM=0',
         'SGLANG_SET_CPU_AFFINITY=1',
@@ -135,10 +138,11 @@ export const Qwen3NextDeployment = () => {
         'ZBCCL_ENABLE_GRAPH=1',
         'ZBCCL_LOCAL_MEM_SIZE=60416',
         'ZBCCL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True',
-      ];
+      ].filter((env) => values.speculative === 'enabled' || !env.startsWith('FORCE_DRAFT_MODEL_NON_QUANT='));
       const npuFlags = [
+        '--model-path "$MODEL_PATH"',
+        '--host 127.0.0.1 --port 6688',
         '--trust-remote-code',
-        '--model-path /path/to/Qwen3-Next-80B-A3B-Instruct-W8A8',
         '--attention-backend ascend',
         '--device npu',
         '--quantization modelslim',
@@ -155,17 +159,47 @@ export const Qwen3NextDeployment = () => {
         '--speculative-eagle-topk 1',
         '--speculative-num-draft-tokens 4',
         '--speculative-draft-model-quantization unquant',
-        '--speculative-draft-model-path /path/to/Qwen3-Next-80B-A3B-Instruct',
         '--chunked-prefill-size -1',
         '--max-running-requests 2',
         '--cuda-graph-bs-decode 2',
         '--mamba-ssm-dtype bfloat16',
+        '--speculative-draft-model-path "$DRAFT_MODEL_PATH"',
         '--reasoning-parser qwen3',
         '--tool-call-parser qwen3_coder',
-        '--host 127.0.0.1',
-        '--port 30000',
+      ].filter((flag) => {
+        if (flag.startsWith('--speculative-')) {
+          return values.speculative === 'enabled';
+        }
+        if (flag.startsWith('--tool-call-parser')) {
+          return values.toolcall === 'enabled';
+        }
+        return true;
+      });
+      const npuSetup = [
+        '# Run inside quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3.',
+        '# Before running, set MODEL_PATH, GLOO_SOCKET_IFNAME',
+        '# and HCCL_SOCKET_IFNAME for your host.',
+        ...(values.speculative === 'enabled' ? ['# Set DRAFT_MODEL_PATH for NEXTN speculative decoding.'] : []),
+        'MODEL_PATH="/path/to/Qwen3-Next-80B-A3B-Instruct-W8A8"',
+        ...(values.speculative === 'enabled'
+          ? ['DRAFT_MODEL_PATH="/path/to/Qwen3-Next-80B-A3B-Instruct"']
+          : []),
+        '',
+        'echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor',
+        'sysctl -w vm.swappiness=0',
+        'sysctl -w kernel.numa_balancing=0',
+        'sysctl -w kernel.sched_migration_cost_ns=50000',
+        '',
+        'unset https_proxy',
+        'unset http_proxy',
+        'unset HTTPS_PROXY',
+        'unset HTTP_PROXY',
+        'unset ASCEND_LAUNCH_BLOCKING',
+        '',
+        'source /usr/local/Ascend/ascend-toolkit/set_env.sh',
+        'source /usr/local/Ascend/nnal/atb/set_env.sh',
       ];
-      return `${npuEnv.join(' \\\n')} \\\nsglang serve \\\n${npuFlags.map((flag) => `  ${flag}`).join(' \\\n')}`;
+      return `${npuSetup.join('\n')}\n\n${npuEnv.map((env) => `export ${env}`).join('\n')}\n\npython3 -m sglang.launch_server \\\n${npuFlags.map((flag) => `  ${flag}`).join(' \\\n')}`;
     }
 
     const quantSuffix = quantization === 'fp8' ? '-FP8' : '';
@@ -277,6 +311,8 @@ export const Qwen3NextDeployment = () => {
         hardware: value,
         quantization: value === 'a3' ? 'w8a8' : 'bf16',
         thinking: 'instruct',
+        toolcall: value === 'a3' ? 'enabled' : prev.hardware === 'a3' ? 'disabled' : prev.toolcall,
+        speculative: value === 'a3' ? 'enabled' : prev.hardware === 'a3' ? 'disabled' : prev.speculative,
       };
     });
   };
