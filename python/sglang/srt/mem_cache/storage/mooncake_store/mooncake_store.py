@@ -2,6 +2,7 @@ import contextlib
 import ctypes
 import json
 import logging
+import numbers
 import os
 import time
 import uuid
@@ -467,13 +468,28 @@ class MooncakeBaseStore:
             self.clear_request_context()
 
     @staticmethod
+    def _is_non_bool_integral(value: Any) -> bool:
+        return isinstance(value, numbers.Integral) and not isinstance(value, bool)
+
+    @staticmethod
     def _valid_object_buffers(ptrs, sizes):
-        ptrs = ptrs if isinstance(ptrs, Sequence) else (ptrs,)
-        sizes = sizes if isinstance(sizes, Sequence) else (sizes,)
+        ptrs = (
+            ptrs
+            if isinstance(ptrs, Sequence) and not isinstance(ptrs, (str, bytes))
+            else (ptrs,)
+        )
+        sizes = (
+            sizes
+            if isinstance(sizes, Sequence) and not isinstance(sizes, (str, bytes))
+            else (sizes,)
+        )
         return (
             bool(ptrs)
             and len(ptrs) == len(sizes)
-            and all(type(value) is int and value > 0 for value in (*ptrs, *sizes))
+            and all(
+                MooncakeBaseStore._is_non_bool_integral(value) and int(value) > 0
+                for value in (*ptrs, *sizes)
+            )
         )
 
     @staticmethod
@@ -482,12 +498,22 @@ class MooncakeBaseStore:
             return [-1] * len(buffer_sizes)
         checked = []
         for result, size in zip(results, buffer_sizes):
-            expected_bytes = sum(size) if isinstance(size, Sequence) else size
-            valid = (
-                isinstance(result, int)
-                and not isinstance(result, bool)
-                and expected_bytes > 0
-                and (result == 0 if is_set else result == expected_bytes)
+            if isinstance(size, Sequence) and not isinstance(size, (str, bytes)):
+                if not size or not all(
+                    MooncakeBaseStore._is_non_bool_integral(part) and int(part) > 0
+                    for part in size
+                ):
+                    checked.append(-1)
+                    continue
+                expected_bytes = sum(int(part) for part in size)
+            elif MooncakeBaseStore._is_non_bool_integral(size) and int(size) > 0:
+                expected_bytes = int(size)
+            else:
+                checked.append(-1)
+                continue
+
+            valid = MooncakeBaseStore._is_non_bool_integral(result) and (
+                int(result) == 0 if is_set else int(result) == expected_bytes
             )
             checked.append(result if valid else -1)
         return checked

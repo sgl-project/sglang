@@ -7,6 +7,8 @@ never propagate a short/long result vector into the per-pool hit results.
 
 import unittest
 
+import numpy as np
+
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_embedding_store import (
     MooncakeEmbeddingStore,
 )
@@ -83,6 +85,39 @@ class TestMooncakeStoreIntegrity(unittest.TestCase):
         self.assertFalse(MooncakeStore._valid_object_buffers([123], [0]))
         self.assertTrue(MooncakeStore._valid_object_buffers([123], [16]))
         self.assertTrue(MooncakeStore._valid_object_buffers([1, 2], [8, 8]))
+
+    def test_numpy_integral_buffers_accepted_and_bool_rejected(self):
+        self.assertTrue(
+            MooncakeStore._valid_object_buffers([np.uintp(4096)], [np.int64(16)])
+        )
+        self.assertTrue(
+            MooncakeStore._valid_object_buffers(
+                [np.int64(1), np.int64(2)], [np.int64(8), np.int64(8)]
+            )
+        )
+        self.assertFalse(MooncakeStore._valid_object_buffers([True], [16]))
+        self.assertFalse(MooncakeStore._valid_object_buffers([123], [True]))
+        self.assertFalse(MooncakeStore._valid_object_buffers("123", [16]))
+        self.assertFalse(MooncakeStore._valid_object_buffers([123], "16"))
+
+        self.assertEqual(
+            MooncakeStore._checked_io_results(
+                [np.int64(16)], [[np.int64(8), np.int64(8)]], is_set=False
+            ),
+            [np.int64(16)],
+        )
+        self.assertEqual(
+            MooncakeStore._checked_io_results([True], [1], is_set=False), [-1]
+        )
+        self.assertEqual(
+            MooncakeStore._checked_io_results([False], [1], is_set=True), [-1]
+        )
+        self.assertEqual(
+            MooncakeStore._checked_io_results([16], [[True, 15]], is_set=False), [-1]
+        )
+        self.assertEqual(
+            MooncakeStore._checked_io_results([16], ["16"], is_set=False), [-1]
+        )
 
     def test_short_native_result_vector_marks_all_rows(self):
         fake = _FakeStore(get_results=[16, 15])
@@ -173,7 +208,16 @@ class TestMooncakeEmbeddingStoreIntegrity(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "counts differ"):
             store.batch_get(["a", "b"], [100], [16])
         self.assertEqual(store.batch_get(["a"], [0], [16]), [False])
+        self.assertEqual(store.batch_get(["a"], [True], [16]), [False])
         self.assertEqual(store.store.get_calls, 0)
+
+    def test_embedding_numpy_integral_buffers_succeed(self):
+        store = MooncakeEmbeddingStore.__new__(MooncakeEmbeddingStore)
+        store.store = _FakeStore(get_results=[np.int64(16)])
+        self.assertEqual(
+            store.batch_get(["a"], [np.uintp(100)], [np.int64(16)]), [True]
+        )
+        self.assertEqual(store.store.get_calls, 1)
 
 
 if __name__ == "__main__":
