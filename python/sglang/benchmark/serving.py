@@ -54,10 +54,10 @@ from sglang.benchmark.utils import (
     remove_prefix,
     set_ulimit,
 )
+from sglang.srt.constants import ROUTING_KEY_HEADER
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
+from sglang.srt.utils.auth import admin_auth_headers
 from sglang.srt.utils.network import resolve_base_url, resolve_host_port
-
-_ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
 _EMBEDDING_UNSUPPORTED_DATASETS = {"image", "mmmu", "mooncake"}
 
@@ -332,7 +332,7 @@ async def async_request_openai_completions(
 
         headers = get_request_headers()
         if request_func_input.routing_key:
-            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
+            headers[ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -488,7 +488,7 @@ async def async_request_openai_chat_completions(
 
         headers = get_request_headers()
         if request_func_input.routing_key:
-            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
+            headers[ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -725,7 +725,7 @@ async def async_request_sglang_generate(
 
         headers = get_request_headers()
         if request_func_input.routing_key:
-            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
+            headers[ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -839,7 +839,7 @@ async def async_request_openai_embeddings(
 
         headers = get_request_headers()
         if request_func_input.routing_key:
-            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
+            headers[ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -915,7 +915,10 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
                 body["start_step"] = str(args.profile_start_step)
             if hasattr(args, "profile_steps") and args.profile_steps is not None:
                 body["num_steps"] = str(args.profile_steps)
-            async with session.post(url=api_url, json=body) as response:
+            headers = admin_auth_headers(getattr(args, "admin_api_key", None))
+            async with session.post(
+                url=api_url, json=body, headers=headers
+            ) as response:
                 if response.status == 200:
                     output.success = True
                 else:
@@ -1015,6 +1018,7 @@ def flush_server_cache(
     base_url: str,
     backend: str,
     flush_cache_timeout: float = _DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT,
+    admin_api_key: Optional[str] = None,
 ) -> None:
     """Flush an engine's prefix cache after benchmark warmup."""
     if backend.startswith("vllm"):
@@ -1024,7 +1028,7 @@ def flush_server_cache(
     elif backend.startswith("sglang"):
         response = requests.post(
             base_url + "/flush_cache",
-            headers=get_auth_headers(),
+            headers=admin_auth_headers(admin_api_key) or get_auth_headers(),
             params={"timeout": flush_cache_timeout},
         )
     else:
@@ -1520,7 +1524,12 @@ async def benchmark(
         "sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")
     ) or flush_cache
     if should_flush_cache:
-        flush_server_cache(base_url, backend, flush_cache_timeout)
+        flush_server_cache(
+            base_url,
+            backend,
+            flush_cache_timeout,
+            getattr(args, "admin_api_key", None),
+        )
 
     await asyncio.sleep(1.0)
 
@@ -2584,6 +2593,13 @@ def cli_main():
         "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
     )
     parser.add_argument(
+        "--admin-api-key",
+        type=str,
+        default=None,
+        help="The server's --admin-api-key, which --profile requires and "
+        "--flush-cache uses when the server has one (default: SGLANG_ADMIN_API_KEY).",
+    )
+    parser.add_argument(
         "--plot-throughput",
         action="store_true",
         help="Plot throughput and concurrent requests over time. Requires termplotlib and gnuplot.",
@@ -2758,7 +2774,7 @@ def cli_main():
     group.add_argument(
         "--gsp-send-routing-key",
         action="store_true",
-        help="Send routing key in requests via X-SMG-Routing-Key header. Requests with the same prefix share the same routing key.",
+        help="Send routing key in requests via X-SGL-Routing-Key header. Requests with the same prefix share the same routing key.",
     )
     group.add_argument(
         "--gsp-num-turns",
