@@ -36,10 +36,12 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    BoundRMSNormNoWeight,
+)
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm as SGLangRMSNorm
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     apply_qk_norm_with_optional_rope,
-    BoundRMSNormNoWeight,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
