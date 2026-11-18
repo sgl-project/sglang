@@ -74,6 +74,11 @@ _LOAD_LOOP = re.compile(
 _CAPTURED_BS = re.compile(
     r"Capture target (?:decode|verify) CUDA graph end\. bs=\[([0-9, ]*)\]"
 )
+# Rank 0 prints the first only when a layout has such state (EP dispatchers, TP gatherers).
+_PREBUILT_STATE = re.compile(
+    r"Prebuilt capture state: (\d+) MoE dispatchers, (\d+) logits gatherers\."
+)
+_CAPTURE_BEGIN = re.compile(r"Capture [\w ]*CUDA graph begin\.")
 # SGLang's own startup timers (the launcher prints them once the schedulers are up).
 _STARTUP_TIMINGS = re.compile(r"Engine startup timings \(s\): (.*)")
 _STARTUP_FIELDS = re.compile(r"scheduler_e2e=([0-9.]+), cuda_graph=\{([^}]*)\}")
@@ -408,6 +413,20 @@ class TestFoundryGraphPersistence(CustomTestCase):
                 self.assertEqual({mode for _, mode in active}, {engine})
                 # An allocation outside the region is only logged by the hook.
                 self.assertNotIn("[HOOK] ERROR", engine_log)
+
+    def test_capture_state_is_built_before_capture(self):
+        """Catches the lazy comm state built after the first capture began,
+        or built on one of native / SAVE / LOAD only; one layout's outputs can miss both."""
+        native = _PREBUILT_STATE.findall(self.runs["native"]["log"])
+        for engine in ("native", "save", "load"):
+            log = self.runs[engine]["log"]
+            with self.subTest(engine=engine):
+                self.assertEqual(_PREBUILT_STATE.findall(log), native)
+                prebuilt = _PREBUILT_STATE.search(log)
+                if prebuilt is not None:
+                    capture = _CAPTURE_BEGIN.search(log)
+                    self.assertIsNotNone(capture, "no capture-begin line in the log")
+                    self.assertLess(prebuilt.start(), capture.start())
 
     def test_load_startup_stays_bounded(self):
         """Catches LOAD paying capture work again (a warmup forward per shape,
