@@ -4603,6 +4603,11 @@ class TestGrpcServerArgs(CustomTestCase):
         with self.assertRaises(ValueError):
             handle_grpc_args(sa)
 
+    def test_rust_server_grpc_accepts_multi_tokenizer(self):
+        sa = self._args(grpc_port=40000, tokenizer_worker_num=4)
+        with envs.SGLANG_RUST_SERVER.override(True):
+            handle_grpc_args(sa)
+
     def test_native_grpc_rejects_http_auth(self):
         sa = self._args(grpc_port=40000, api_key="secret")
         with self.assertRaises(ValueError):
