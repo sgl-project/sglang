@@ -919,6 +919,9 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # gfx950: override --hicache-ratio for Mamba states in ratio mode; a cached KV
+    # prefix cannot be reused after its host state is evicted.
+    SGLANG_HICACHE_MAMBA_HOST_RATIO = EnvFloat(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
@@ -1087,6 +1090,12 @@ class Envs:
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
+    # Kimi-K3 gfx950 prefill: the MoE front on row shards, shared experts TP-sharded
+    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT = EnvBool(False)
+    # Kimi-K3 gfx950 prefill: leave the stream on each rank's rows after the row-sharded tail
+    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM = EnvBool(False)
+    # GiB of gfx950 memory kept out of torch's allocator for HSA queue scratch (0: none)
+    SGLANG_ROCM_RUNTIME_RESERVE_GB = EnvFloat(0.0)
     # Run the gfx950 TP4 quick all-reduce on the JIT build (quick_all_reduce_hip) instead of
     # sgl-kernel's; off by default, MiniMax-M3.1 turns it on at TP4 under INT4 or INT8.
     SGLANG_ROCM_QUICK_ALL_REDUCE_JIT = EnvBool(False)
@@ -1590,6 +1599,16 @@ class Envs:
     # Drop the GB/s and TFLOPS columns from the benchmark marker's table.
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH = EnvBool(False)
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_FLOPS = EnvBool(False)
+    # Directory the benchmark marker appends one JSONL record per case to.
+    # Unset: no records.
+    SGLANG_JIT_BENCHMARK_OUTPUT = EnvStr(None)
+    # Run the full `vals` of every parametrize axis even when SGLANG_IS_IN_CI picks `ci_vals`.
+    SGLANG_JIT_BENCHMARK_FORCE_FULL = EnvBool(False)
+    # Comma-separated case_ids (from the records); when set, only those cases run.
+    SGLANG_JIT_BENCHMARK_CASE_FILTER = EnvTuple(tuple())
+    # Run kind stamped on the records (nightly / main / pr); default derives from
+    # GITHUB_EVENT_NAME, else "local".
+    SGLANG_JIT_BENCHMARK_RUN_KIND = EnvStr(None)
     # The hgcc --gpu-architecture target used by JIT builds on SAIL (hgcc
     # cannot read CUDA sources, so they are converted by sailify first).
     # One of: native, all, all-ppu,
@@ -2144,6 +2163,8 @@ class Envs:
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     # Unset: bf16 on SM100 (with bf16 head weights), fp32 elsewhere.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(None)
+    # Use the shared FP8 scorer and ragged top-k for Hopper prefill candidates.
+    SGLANG_OPT_DSV41_SM90_DEEPGEMM_PREFILL = EnvBool(False)
     # Prefill index top-k by the sampled-threshold indexers of kernels/ops/attention/dsa/litetopk_prefill
     # (after LiteTopK, https://arxiv.org/abs/2607.11976) instead of dense logits + top-k, on SM100.
     SGLANG_OPT_USE_PREFILL_LITE_TOPK = EnvBool(False)
