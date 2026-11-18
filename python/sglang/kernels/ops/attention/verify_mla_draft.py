@@ -13,7 +13,6 @@ from sglang.kernels.ops.attention.verify_mla import (
     DEFAULT_BLOCK_H,
     DEFAULT_BLOCK_N,
     DEFAULT_NUM_WARPS,
-    MAX_N_SPLITS,
     TARGET_PROGRAMS,
     VerifyMLA,
     _verify_mla_combine_stage2_body,
@@ -27,7 +26,7 @@ MLA_MAX_N_SPLITS = 128
 # splits the combine reads per step; the per-split online loop pays one dependent
 # round trip per split
 MLA_SPLIT_BLOCK = 16
-# draft rows per combine program on the MLA path; the other path takes all L_EXT
+# draft rows per combine program; VerifyMLA's combine takes all L_EXT rows
 MLA_COMBINE_ROWS = 2
 # The shared launch's waves_per_eu 4 caps stage 1 at 128 VGPRs, where the MLA draft
 # tile spills on gfx950; 2 compiles it spill-free.
@@ -90,15 +89,18 @@ def _verify_mla_draft_combine_stage2(
 class DraftVerifyMLA(VerifyMLA):
     """``VerifyMLA`` for the gfx950 monokernel's DFLASH MLA draft.
 
-    It serves empty prefixes and a window trimmed from each rail. On the MLA shape
-    it also splits further, combines blocks of splits over row tiles, and compiles
-    stage 1 spill-free.
+    It serves empty prefixes and a window trimmed from each rail, splits further,
+    combines blocks of splits over row tiles, and compiles stage 1 spill-free.
     """
 
-    max_splits = MAX_N_SPLITS
-    split_block = 1
-    row_block = 0
-    stage1_launch = _AMD_LAUNCH_KWARGS
+    # the base constructor's _alloc sizes the partials by max_splits
+    max_splits = MLA_MAX_N_SPLITS
+    split_block = MLA_SPLIT_BLOCK
+    stage1_launch = (
+        dict(_AMD_LAUNCH_KWARGS, waves_per_eu=DRAFT_STAGE1_WAVES_PER_EU)
+        if _AMD_LAUNCH_KWARGS
+        else _AMD_LAUNCH_KWARGS
+    )
 
     @staticmethod
     def block_config(head_dim):
@@ -108,17 +110,8 @@ class DraftVerifyMLA(VerifyMLA):
         )
 
     def __init__(self, max_bs, h_q, head_dim, v_head_dim, l_ext, **kwargs):
-        mla = head_dim > v_head_dim
-        if mla:
-            # the base constructor's _alloc sizes the partials by max_splits
-            self.max_splits, self.split_block = MLA_MAX_N_SPLITS, MLA_SPLIT_BLOCK
-            if _AMD_LAUNCH_KWARGS:
-                self.stage1_launch = dict(
-                    _AMD_LAUNCH_KWARGS, waves_per_eu=DRAFT_STAGE1_WAVES_PER_EU
-                )
         super().__init__(max_bs, h_q, head_dim, v_head_dim, l_ext, **kwargs)
-        if mla:
-            self.row_block = min(MLA_COMBINE_ROWS, self.l_pad)
+        self.row_block = min(MLA_COMBINE_ROWS, self.l_pad)
 
     def _alloc(self, max_bs):
         self.max_bs = max_bs
@@ -230,7 +223,7 @@ class DraftVerifyMLA(VerifyMLA):
         is_causal=True,
         window=0,
     ):
-        grid = (bs, self.h_q, self.l_pad // self.row_block if self.row_block else 1)
+        grid = (bs, self.h_q, self.l_pad // self.row_block)
         _verify_mla_draft_combine_stage2[grid](
             att_out,
             att_lse,
