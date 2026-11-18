@@ -42,6 +42,9 @@ from sglang.srt.mem_cache.pool_host.mha import (
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.npu_host_memory import (
+    reserve_dsv4_paged_host_memory,
+)
 from sglang.srt.mem_cache.pool_host.page_interleave import (
     PageInterleaveHostPool,
 )
@@ -854,6 +857,14 @@ def build_deepseek_v4_hicache_stack(
         c128_attn_allocator=c128_attn_allocator,
     )
 
+    reserve_dsv4_paged_host_memory(
+        infos=infos,
+        num_host_pages=num_host_pages,
+        swa_num_host_pages=swa_num_host_pages,
+        c128_num_host_pages=c128_num_host_pages,
+        num_draft_swa_layers=len(mtp_swa_device_buffers),
+    )
+
     logical_host_pool = LogicalHostPool(
         num_host_pages * page_size, page_size, layout=get_memory().hicache_mem_layout
     )
@@ -1095,7 +1106,9 @@ def _state_host_layout() -> str:
     # pool has no separate K/V buffers, so kv_split does not apply; override
     # to page_first_direct.
     layout = get_memory().hicache_mem_layout
-    return "page_first_direct" if layout == "page_first_kv_split" else layout
+    if layout in ("page_first_kv_split", "layer_first_kv_split"):
+        return "page_first_direct"
+    return layout
 
 
 def build_mamba_host_pool(
@@ -1587,7 +1600,14 @@ def _build_sidecar_host_pool(
         config.buffer_info,
         layer_mapping=config.device_to_host_layer,
         target_device_layer_num=root.layer_num,
-        num_host_pages=root_host_pool.page_num,
+        # A replicated index-K spans every rank's slots, so the host mirror
+        # pages the widened transfer indices untranslated. A sharded one does
+        # not, and keeps the per-rank page count.
+        num_host_pages=(
+            root_host_pool.page_num
+            if dsa_shards_index_k()
+            else root_host_pool.page_num * root_host_pool.dcp_size
+        ),
         transfer_page_size=root_host_pool.page_size,
         layout=root_host_pool.layout,
         buffer_device=root.device,
@@ -1595,6 +1615,9 @@ def _build_sidecar_host_pool(
         layer_sharded=root.layer_shard_enabled,
         dcp_size=root_host_pool.dcp_size if dsa_shards_index_k() else 1,
         dcp_rank=root_host_pool.dcp_rank if dsa_shards_index_k() else 0,
+        # One L3 key covers the anchor's widened page either way: a sharded
+        # mirror spends one page per rank, a replicated one spends dcp_size.
+        storage_pages_per_key=(1 if dsa_shards_index_k() else root_host_pool.dcp_size),
         allocator_type=_get_allocator_type(),
     )
     host.start_layer, host.end_layer = root.start_layer, root.end_layer
@@ -1695,7 +1718,7 @@ def _build_mha_mla_host_pool(
     # The global layout is page_first_kv_split only when the target model
     # uses MLA; that layout is MLA-specific, so MHA draft pools must use
     # the non-MLA layout (NPU default: page_first_direct).
-    if is_mha and layout == "page_first_kv_split":
+    if is_mha and layout in ("page_first_kv_split", "layer_first_kv_split"):
         layout = "page_first_direct"
 
     kwargs = dict(
@@ -1941,9 +1964,9 @@ def build_hicache_draft_sidecars(
 
     assert len(draft_device_pools) == 1
     draft_kv_pool = draft_device_pools[0]
+    router = draft_kv_pool.layer_router
     if (
-        draft_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
-        or isinstance(draft_kv_pool, DeepSeekV4TokenToKVPool)
+        isinstance(draft_kv_pool, DeepSeekV4TokenToKVPool)
         or draft_kv_pool.follows_target_swa_ids
     ):
         return build_swa_draft_pools(
@@ -1951,10 +1974,23 @@ def build_hicache_draft_sidecars(
             tree_cache=tree_cache,
             target_window_host=target_window_host_pool(tree_cache),
         )
-    return build_full_draft_pools(
+    if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is None:
+        return build_full_draft_pools(
+            draft_kv_pool=draft_kv_pool, tree_cache=tree_cache
+        )
+    # A hybrid draft keeps full-attention layers next to its SWA layers;
+    # both must be restored or the draft reads stale KV after a hit.
+    specs, entries = build_swa_draft_pools(
         draft_kv_pool=draft_kv_pool,
         tree_cache=tree_cache,
+        target_window_host=target_window_host_pool(tree_cache),
     )
+    if router.routes_to(IdSpaceKind.FULL):
+        full_specs, full_entries = build_full_draft_pools(
+            draft_kv_pool=router.view(IdSpaceKind.FULL), tree_cache=tree_cache
+        )
+        specs, entries = full_specs + specs, full_entries + entries
+    return specs, entries
 
 
 _COMPONENT_HOST_ATTR: dict[ComponentType, tuple[str, str]] = {
@@ -2015,13 +2051,6 @@ class StackStrategy:
         raise NotImplementedError
 
 
-def _delegate_c128_host_evict(cache, n: int) -> int:
-    """Delegate C128 host pressure to FULL leaf eviction.
-
-    For example, ``n`` C128 slots request ``n * 128`` FULL tokens."""
-    return cache.evict_host(n * 128, ComponentType.FULL)
-
-
 class _DeepSeekV4Strategy(StackStrategy):
     def owns(self, kvcache):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -2068,9 +2097,9 @@ class _DeepSeekV4Strategy(StackStrategy):
             storage_backend=storage_backend,
             host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
             device_swa_evict_fn=lambda n: _evict_swa_for_device_alloc(cache, n),
-            # _delegate_c128_host_evict converts C128 slots to FULL tokens.
+            # C128's host eviction counts reclaimed summary slots directly.
             host_c128_evict_fn=(
-                (lambda n: _delegate_c128_host_evict(cache, n))
+                (lambda n: cache.evict_host(n, ComponentType.C128))
                 if independent_c128
                 else None
             ),
