@@ -37,8 +37,24 @@ _is_gfx1250 = _is_hip and is_gfx1250_supported()
 
 logger = logging.getLogger(__name__)
 
+
 # DFlash draft blocks (Muse Spark DFlash2 at TP8) on gfx950 take the split-KV kernel.
-_use_dflash_block_splitkv = _is_gfx95 and envs.SGLANG_ROCM_MUSE_DFLASH_SPLITKV.get()
+def _gfx1250_try_gfx95():
+    import os as _os
+
+    if _os.environ.get("SGLANG_ROCM_MUSE_GFX1250_TRY_GFX95", "1") != "1":
+        return False
+    try:
+        import torch as _t
+
+        return "gfx1250" in _t.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+
+
+_use_dflash_block_splitkv = (
+    _is_gfx95 or _gfx1250_try_gfx95()
+) and envs.SGLANG_ROCM_MUSE_DFLASH_SPLITKV.get()
 _dflash_block_splitkv_logged: set = set()
 
 try:
@@ -1025,6 +1041,9 @@ def extend_attention_fwd(
                 sliding_window_size,
                 k_buffer.data_ptr(),
             )
+        # gfx1250, 1 KV head (TP8), 2048-token window, from 16 requests: one 64-row tile per request (8 tokens x
+        # 8 heads, KV read once), 64-key tiles, 8 splits; faster than the default split-KV launch at these batches.
+        wide = _is_gfx1250 and k_extend.shape[1] == 1 and batch_size >= 16
         dflash_block_splitkv(
             q_extend,
             k_extend,
@@ -1037,10 +1056,12 @@ def extend_attention_fwd(
             kscale=k_scale,
             vscale=v_scale,
             softmax_scale=sm_scale,
-            splits=8 if k_extend.shape[1] == 2 else 16,
+            splits=8 if k_extend.shape[1] == 2 or wide else 16,
             pv_bf16=True,
             out=o_extend,
             window_left=sliding_window_size,
+            block_m=64 if wide else 16,
+            block_n=64 if wide else 128,
         )
         return
 
