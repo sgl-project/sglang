@@ -2704,6 +2704,12 @@ def _set_uvicorn_worker_stop_hook(tokenizer_manager: TokenizerManager) -> None:
         tokenizer_manager.set_server_stop_hook(
             lambda: setattr(server, "should_exit", True)
         )
+    else:
+        logger.warning(
+            "SIGTERM handler %r is not a uvicorn.Server method; this tokenizer "
+            "worker will exit on SIGTERM without the lifespan shutdown.",
+            handler,
+        )
 
 
 def _shutdown_schedulers_after_http_workers(
