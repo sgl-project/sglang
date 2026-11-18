@@ -67,7 +67,9 @@ from sglang.srt.layers.layer_boundary.residual.attn_bank import (
     AttnBank,
     AttnBankOutputRead,
     AttnBankState,
+    _bank_rows,
 )
+from sglang.srt.layers.layer_boundary.residual.attn_bank_hip import gather_row_shards
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -3512,12 +3514,21 @@ class KimiK3LinearModel(nn.Module):
             score_proj = self.output_attn_res_proj
             score_norm = self.output_attn_res_norm
             nvb = _cdiv(self.end_layer, self.config.attn_res_block_size)
-        return aggregate_stream(
+        bank = self.attn_bank.require()
+        # gfx950's row-sharded MoE tail can leave the stream on this rank's rows
+        rows = _bank_rows(bank, hidden_states) if _is_gfx95 else None
+        mixed = aggregate_stream(
             hidden_states,
-            self.attn_bank.require().block_residual,
+            bank.block_residual if rows is None else bank.block_residual[rows],
             nvb,
             score_proj,
             score_norm,
+        )
+        # the draft reads every row: gather the mixture and keep the bank sharded
+        return (
+            mixed
+            if rows is None
+            else gather_row_shards(mixed, bank.block_residual.shape[0])
         )
 
 
