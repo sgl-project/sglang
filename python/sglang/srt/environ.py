@@ -1103,9 +1103,7 @@ class Envs:
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
-    # Kimi-K3 gfx950 prefill: the MoE front on row shards, full shared experts (+264 MB a layer)
-    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_FRONT = EnvBool(False)
-    # The same front, shared experts TP-sharded (no extra memory); FRONT takes precedence
+    # Kimi-K3 gfx950 prefill: the MoE front on row shards, shared experts TP-sharded
     SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT = EnvBool(False)
     # Kimi-K3 gfx950 prefill: leave the stream on each rank's rows after the row-sharded tail
     SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM = EnvBool(False)
