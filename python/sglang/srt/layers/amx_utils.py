@@ -1,3 +1,4 @@
+import functools
 import logging
 
 import torch
@@ -229,3 +230,9 @@ class PackWeightMethod:
         _amx_process_weight_after_loading(
             module, self.weight_names, self.transpose_dims
         )
+
+
+@functools.lru_cache(maxsize=None)
+def cpu_fp8_w8a8_available() -> bool:
+    """Whether FP8 linear/MoE layers should use W8A8 instead of weight-only W8A16."""
+    return cpu_has_amx_support() and torch.ops.sgl_kernel.fp8_w8a8_supported_cpu()

@@ -1,10 +1,15 @@
 import unittest
+from unittest import mock
 
 # TODO: use interface in cpu.py
 import sgl_kernel  # noqa: F401
 import torch
 import torch.nn as nn
 
+import sglang.srt.layers.quantization.fp8 as fp8_module
+from sglang.srt.layers.amx_utils import cpu_fp8_w8a8_available
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+from sglang.srt.utils import cpu_has_amx_support
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cpu_test_utils import (
     MXFP4QuantizeUtil,
@@ -278,6 +283,56 @@ class TestGemm(CustomTestCase):
                 with self.assertRaises(RuntimeError):
                     torch.ops.sgl_kernel.per_token_quant_fp8_cpu(input)
 
+    @parametrize(rows=[1, 7, 64], columns=[32, 96, 4096])
+    def test_fp8_row_quant_matches_per_token_quant(self, rows, columns):
+        generator = torch.Generator().manual_seed(1234)
+        input = torch.randn(rows, columns, generator=generator).bfloat16()
+        input[0].zero_()
+        expected, expected_scales = torch.ops.sgl_kernel.per_token_quant_fp8_cpu(input)
+        output, scales = torch.ops.sgl_kernel._quantize_fp8e4m3_vec(input, True, None)
+        torch.testing.assert_close(scales, expected_scales, atol=0, rtol=0)
+        torch.testing.assert_close(
+            output.view(torch.uint8), expected.view(torch.uint8), atol=0, rtol=0
+        )
+
+    @parametrize(M=[0, 1, 11, 130], N=[128, 224], K=[512, 1024], has_bias=[False, True])
+    def test_fp8_w8a8_gemm(self, M, N, K, has_bias):
+        # dynamic per-row activation quantization, 128-wide block weight scales
+        weight = (torch.randn(N, K) * 8).to(torch.float8_e4m3fn)
+        scales = (torch.rand(N, K // 128) + 0.5) * 0.02
+        bias = torch.randn(N, dtype=torch.float32) if has_bias else None
+        data = torch.randn(M, K, dtype=torch.bfloat16)
+
+        x = data.float()
+        row_scales = (x.abs().amax(dim=-1) / 448).clamp_min(
+            torch.finfo(torch.float32).eps
+        )
+        xq = (
+            (x * row_scales.reciprocal().unsqueeze(-1))
+            .clamp(-448, 448)
+            .to(torch.float8_e4m3fn)
+        )
+        dq_weight = weight.float() * scales.repeat_interleave(128, dim=-1)
+        ref = torch.matmul(xq.float(), dq_weight.T) * row_scales.unsqueeze(-1)
+        if has_bias:
+            ref = ref + bias
+        ref = ref.to(torch.bfloat16)
+
+        packed_weight, packed_scales = torch.ops.sgl_kernel.float8_linear_prepack_cpu(
+            weight, scales
+        )
+        atol = rtol = precision[ref.dtype]
+
+        out = torch.ops.sgl_kernel.float8_linear_cpu(
+            xq, row_scales, packed_weight, packed_scales, bias, torch.bfloat16
+        )
+        torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+
+        out = torch.ops.sgl_kernel.fp8_scaled_mm_with_quant(
+            data, None, True, packed_weight, packed_scales, bias, torch.bfloat16
+        )
+        torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+
     @parametrize(M=[1, 11], N=[128, 224], K=[512, 576], has_bias=[False, True])
     def test_mxfp4_gemm(self, M, N, K, has_bias):
         prepack = True
@@ -444,6 +499,74 @@ class TestGemm(CustomTestCase):
         )
         atol = rtol = precision[reference.dtype]
         torch.testing.assert_close(actual, reference, atol=atol, rtol=rtol)
+
+
+class TestFp8LinearAutoSelect(CustomTestCase):
+    N, K, M = 256, 512, 5
+
+    def _run(self, config, w8a8):
+        method = Fp8LinearMethod(config)
+        layer = torch.nn.Module()
+        layer.tp_group = None
+        layer.logical_widths = [self.N]
+        method.create_weights(
+            layer,
+            self.K,
+            [self.N],
+            self.K,
+            self.N,
+            torch.bfloat16,
+            weight_loader=lambda *args, **kwargs: None,
+        )
+        weight = (torch.randn(self.N, self.K) * 8).to(torch.float8_e4m3fn)
+        layer.weight.data = weight
+        if config.weight_block_size is not None:
+            scales = (torch.rand(self.N // 128, self.K // 128) + 0.5) * 0.02
+            layer.weight_scale_inv.data = scales
+            dq_weight = weight.float() * scales.repeat_interleave(
+                128, 0
+            ).repeat_interleave(128, 1)
+        else:
+            layer.weight_scale.data = torch.tensor([0.02])
+            layer.input_scale.data = torch.tensor([0.05])
+            dq_weight = weight.float() * 0.02
+        x = torch.randn(self.M, self.K, dtype=torch.bfloat16)
+        with mock.patch.object(fp8_module, "cpu_fp8_w8a8_available", return_value=w8a8):
+            method.process_weights_after_loading(layer)
+            out = method.apply(layer, x)
+        ref = x.float() @ dq_weight.T
+        return layer, (out.float() - ref).norm() / ref.norm()
+
+    def test_availability_follows_hardware(self):
+        supported = torch.ops.sgl_kernel.fp8_w8a8_supported_cpu()
+        self.assertEqual(cpu_fp8_w8a8_available(), supported)
+        if supported:
+            self.assertTrue(cpu_has_amx_support())
+
+    def test_block_quant_weight_only_and_w8a8(self):
+        config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[128, 128],
+        )
+        layer, err = self._run(config, w8a8=False)
+        self.assertFalse(layer.use_f8f8)
+        self.assertLess(err, 0.01)
+        layer, err = self._run(config, w8a8=True)
+        self.assertTrue(layer.use_f8f8)
+        self.assertEqual(layer.weight.dim(), 4)
+        self.assertLess(err, 0.05)
+
+    def test_static_per_tensor_weight_only_and_w8a8(self):
+        config = Fp8Config(
+            is_checkpoint_fp8_serialized=True, activation_scheme="static"
+        )
+        layer, err = self._run(config, w8a8=False)
+        self.assertEqual(layer.weight.dim(), 2)
+        self.assertLess(err, 0.01)
+        layer, err = self._run(config, w8a8=True)
+        self.assertEqual(layer.weight.dim(), 4)
+        self.assertLess(err, 0.05)
 
 
 if __name__ == "__main__":

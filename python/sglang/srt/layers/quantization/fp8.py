@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -27,6 +27,7 @@ from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
+    cpu_fp8_w8a8_available,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
@@ -506,6 +507,40 @@ class Fp8Config(QuantizationConfig):
             )
 
 
+def requantize_with_max_scale_cpu(
+    weight: torch.Tensor, weight_scale: torch.Tensor, logical_widths: List[int]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Max scale to be used for requanitzation.
+    max_w_scale = weight_scale.max()
+
+    # QKV / MLP is fused in the on disk checkpoint if any of the
+    # weight scales are still set to the default since we initialize
+    # N weight scales for N shards but we only load 1 weight scale
+    # from disk in this case. Skip requantization in this case (since)
+    # we already are quantized with the single scale.
+    # * Sample Model: nm-testing/Phi-3-mini-128k-instruct-FP8
+    unfused_module_in_checkpoint = (
+        weight_scale[-1] > torch.finfo(torch.float8_e4m3fn).min
+    )
+
+    # If unfused checkpoint, need requanize with the single scale.
+    if unfused_module_in_checkpoint:
+        start = 0
+        for idx, logical_width in enumerate(logical_widths):
+            end = start + logical_width
+            weight_dq = per_tensor_dequantize(weight[start:end, :], weight_scale[idx])
+            # weight[start:end, :], _ = ops.scaled_fp8_quant(
+            #     weight_dq, max_w_scale)
+            weight[start:end, :] = torch.clamp(
+                (weight_dq / max_w_scale),
+                torch.finfo(torch.float8_e4m3fn).min,
+                torch.finfo(torch.float8_e4m3fn).max,
+            ).to(torch.float8_e4m3fn)
+            start = end
+
+    return max_w_scale, weight
+
+
 class Fp8LinearMethod(LinearMethodBase):
     """Linear method for FP8.
 
@@ -868,10 +903,32 @@ class Fp8LinearMethod(LinearMethodBase):
             assert _is_cpu_amx_available, (
                 "Fp8LinearMethod on CPU requires that CPU has AMX support"
             )
-            _amx_process_weight_after_loading(layer, ["weight"])
-            layer.weight_scale_inv = torch.nn.Parameter(
-                layer.weight_scale_inv.data, requires_grad=False
-            )
+            layer.use_f8f8 = cpu_fp8_w8a8_available()
+            if layer.use_f8f8:
+                layer.use_intel_amx_backend = True
+                if layer.weight_scale_inv.size(0) != layer.weight.size(0):
+                    weight_scale_inv = torch.repeat_interleave(
+                        layer.weight_scale_inv, 128, 0
+                    )
+                    weight_scale_inv = weight_scale_inv[
+                        : layer.weight.size(0), :
+                    ].contiguous()
+                else:
+                    weight_scale_inv = layer.weight_scale_inv
+                qweight, weight_scale_inv = (
+                    torch.ops.sgl_kernel.float8_linear_prepack_cpu(
+                        layer.weight, weight_scale_inv
+                    )
+                )
+                layer.weight = torch.nn.Parameter(qweight, requires_grad=False)
+                layer.weight_scale_inv = torch.nn.Parameter(
+                    weight_scale_inv, requires_grad=False
+                )
+            else:
+                _amx_process_weight_after_loading(layer, ["weight"])
+                layer.weight_scale_inv = torch.nn.Parameter(
+                    layer.weight_scale_inv.data, requires_grad=False
+                )
             return
         else:
             # Requantize block scales to UE8M0 when DeepGEMM is the active runner.
@@ -1242,12 +1299,61 @@ class Fp8LinearMethod(LinearMethodBase):
         self._process_mxfp8_linear_weight_scale(layer)
         layer.input_scale = None
 
+    def _use_cpu_static_w8a8(self) -> bool:
+        return (
+            _is_cpu
+            and self.quant_config.activation_scheme == "static"
+            and cpu_fp8_w8a8_available()
+        )
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
             # Only LinearBase defines this; an MXFP8 ParallelLMHead does not.
             if getattr(layer, "deepgemm_mxfp8_input", False):
                 layer.deepgemm_mxfp8_input = self.prepare_deepgemm_mxfp8_input(layer)
+        elif self._use_cpu_static_w8a8():
+            assert _is_cpu_amx_available, (
+                "Fp8LinearMethod on CPU requires that CPU has AMX support"
+            )
+            layer.weight_scale = torch.nn.Parameter(
+                layer.weight_scale.data, requires_grad=False
+            )
+            layer.input_scale = torch.nn.Parameter(
+                layer.input_scale.data, requires_grad=False
+            )
+            # Dequant -> Quant with max scale so we can run per tensor.
+            weight = layer.weight
+            weight_scale = layer.weight_scale
+            weight_scale, weight = requantize_with_max_scale_cpu(
+                weight=weight,
+                weight_scale=weight_scale,
+                logical_widths=layer.logical_widths,
+            )
+
+            # Update layer with new values.
+            layer.weight = torch.nn.Parameter(weight.detach(), requires_grad=False)
+            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+            layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
+            if layer.weight_scale.numel() == 1:
+                weight_scale_inv = layer.weight_scale.repeat(layer.weight.size(0))
+            elif layer.weight_scale.size(0) != layer.weight.size(0):
+                weight_scale_inv = torch.repeat_interleave(
+                    layer.weight_scale,
+                    layer.weight.size(0) // layer.weight_scale.size(0),
+                    0,
+                )
+                weight_scale_inv = weight_scale_inv.unsqueeze(1).contiguous()
+            else:
+                weight_scale_inv = layer.weight_scale
+            q_weight, weight_scale_inv = torch.ops.sgl_kernel.float8_linear_prepack_cpu(
+                layer.weight, weight_scale_inv
+            )
+            layer.weight = torch.nn.Parameter(q_weight, requires_grad=False)
+            layer.weight_scale = torch.nn.Parameter(
+                weight_scale_inv, requires_grad=False
+            )
+            return
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -1509,15 +1615,26 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
 
             if use_intel_amx_backend(layer):
-                return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
-                    x,
-                    layer.weight,
-                    layer.weight_scale_inv,
-                    self.weight_block_size,
-                    bias,
-                    x.dtype,
-                    True,  # is_vnni
-                )
+                if layer.use_f8f8:
+                    return torch.ops.sgl_kernel.fp8_scaled_mm_with_quant(
+                        x,
+                        None,
+                        True,
+                        layer.weight,
+                        layer.weight_scale_inv,
+                        bias,
+                        x.dtype,
+                    )
+                else:
+                    return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
+                        x,
+                        layer.weight,
+                        layer.weight_scale_inv,
+                        self.weight_block_size,
+                        bias,
+                        x.dtype,
+                        True,  # is_vnni
+                    )
 
             cached_weight = getattr(layer, "_block_fp8_bf16_weight", None)
             extra_kwargs = (
@@ -1542,6 +1659,16 @@ class Fp8LinearMethod(LinearMethodBase):
                 input_scale=None,
                 bias=bias,
                 **extra_kwargs,
+            )
+        if self._use_cpu_static_w8a8():
+            return torch.ops.sgl_kernel.fp8_scaled_mm_with_quant(
+                x,
+                layer.input_scale,
+                False,
+                layer.weight,
+                layer.weight_scale,
+                bias,
+                x.dtype,
             )
 
         if use_intel_amx_backend(layer):
