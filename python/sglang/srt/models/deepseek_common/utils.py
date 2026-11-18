@@ -67,7 +67,6 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "fa3",
     "fa4",
     "dsa",
-    "nsa",  # Deprecated alias for "dsa"
     "flashinfer",
     "trtllm_mla",
     "cutedsl_mla",

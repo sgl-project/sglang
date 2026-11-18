@@ -130,7 +130,6 @@ from sglang.srt.hf_transformers import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
-    resolve_image_processor_backend,
 )
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import from_cp_sharded
@@ -275,6 +274,7 @@ from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
 )
 from sglang.srt.managers.scheduler_components.exit_ledger import record_send
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
+from sglang.srt.managers.scheduler_components.gc_freezer import GCFreezer
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
     RustServerIdleSleeper,
@@ -787,6 +787,7 @@ class Scheduler(
         self.init_pool_stats_observer()
 
         self.init_invariant_checker()
+        self.init_gc_freezer()
 
         self.init_load_publisher()
 
@@ -973,7 +974,7 @@ class Scheduler(
                     tokenizer_mode=get_serving().tokenizer_mode,
                     trust_remote_code=get_model().trust_remote_code,
                     revision=get_model().revision,
-                    image_processor_backend=resolve_image_processor_backend(get_mm()),
+                    image_processor_backend=get_mm().image_processor_backend,
                     tokenizer_backend=get_serving().tokenizer_backend,
                     model_name=get_model().model_path,
                 )
@@ -2177,6 +2178,12 @@ class Scheduler(
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
 
+    def wait_for_launched_forward(self) -> None:
+        """Order later schedule_stream work after every launched forward, not only
+        after its shared reads; an in_place pause can leave one reading the weights."""
+        if self.enable_overlap or get_parallel().pp_size > 1:
+            self.schedule_stream.wait_stream(self.forward_stream)
+
     def increment_scheduler_iterations(self) -> None:
         if get_observability().enable_metrics:
             self.metrics_collector.increment_scheduler_iterations()
@@ -2829,6 +2836,12 @@ class Scheduler(
                 )
             ),
             scheduler_stage_metrics=self.scheduler_stage_metrics,
+        )
+
+    def init_gc_freezer(self) -> None:
+        """Freeze the heap when idle; warn on heap growth and frozen garbage."""
+        self.gc_freezer = GCFreezer(
+            freeze_on_idle_secs=get_device().gc_freeze_on_idle_secs
         )
 
     def init_rank_consensus_checker(self) -> None:
@@ -5762,6 +5775,8 @@ class Scheduler(
             return_hidden_states=batch.return_hidden_states,
         )
         self.copy_stream.wait_stream(self.forward_stream)
+        if batch_result.side_stream_done is not None:
+            self.copy_stream.wait_event(batch_result.side_stream_done)
         with self.copy_stream_ctx:
             if not self.enable_async_d2h_copy:
                 copy_fn()
@@ -6033,6 +6048,7 @@ class Scheduler(
             self.token_to_kv_pool_allocator.flush_opportunistic()
 
         self.invariant_checker.run(CheckPhase.IDLE)
+        self.gc_freezer.on_idle(self.forward_ct)
 
         # metrics every 30s
         self.metrics_reporter._maybe_log_idle_metrics()
@@ -6289,6 +6305,7 @@ class Scheduler(
             if self.metrics_reporter.is_stats_logging_rank:
                 logger.info("Cache flushed successfully!")
             self.invariant_checker.run(CheckPhase.FLUSH)
+            self.gc_freezer.on_cache_reset()
             success = True
         else:
             logging.warning(
