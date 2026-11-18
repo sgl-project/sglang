@@ -1019,8 +1019,8 @@ class DeepseekSparseAttnBackend(
             assert not get_exec().features.enable_return_indexer_topk
             if not init_dcp_topk_merge(max_rows, self.dsa_index_topk):
                 init_dcp_candidate_all_gather(max_rows, self.dsa_index_topk)
-            # ROCm's DCP top-k takes the fused top-k's place
-            if envs.SGLANG_ENABLE_DSA_DCP_FUSED_TOPK.get() or _is_hip:
+            # gfx950's DCP top-k takes the fused top-k's place
+            if envs.SGLANG_ENABLE_DSA_DCP_FUSED_TOPK.get() or _IS_GFX95:
                 init_dcp_fused_topk(
                     max_rows,
                     self.dsa_index_topk,
@@ -1469,7 +1469,7 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
         # DCP prefill: the batch's KV rows from all ranks, request after request
         # in position order, padded to whole pages (the ragged top-k layout)
-        if _is_hip:
+        if _IS_GFX95:
             from sglang.srt.layers.attention.dsa.dsa_backend_hip import (
                 dcp_gather_kv_cache,
             )
@@ -1847,11 +1847,15 @@ class DeepseekSparseAttnBackend(
             paged_mqa_schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
                 paged_mqa_ctx_lens_2d, 64, resolve_num_sms()
             )
-        elif self.dsa_shards_index_k and (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
+        elif (
+            _IS_GFX95
+            and self.dsa_shards_index_k
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            )
         ):
-            # ROCm: this rank's index-K lengths, without the DeepGEMM schedule
+            # gfx950: this rank's index-K lengths, without the DeepGEMM schedule
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_batch.forward_mode,
                 cache_seqlens_int32,
@@ -2262,8 +2266,10 @@ class DeepseekSparseAttnBackend(
             paged_mqa_schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
                 paged_mqa_ctx_lens_2d, 64, resolve_num_sms()
             )
-        elif self.dsa_shards_index_k and (
-            forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
+        elif (
+            _IS_GFX95
+            and self.dsa_shards_index_k
+            and (forward_mode.is_decode_or_idle() or forward_mode.is_target_verify())
         ):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
@@ -2579,8 +2585,10 @@ class DeepseekSparseAttnBackend(
                     object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
                 else:
                     metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
-        elif self.dsa_shards_index_k and (
-            forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
+        elif (
+            _IS_GFX95
+            and self.dsa_shards_index_k
+            and (forward_mode.is_decode_or_idle() or forward_mode.is_target_verify())
         ):
             metadata.paged_mqa_ctx_lens_2d.copy_(
                 self._build_paged_mqa_schedule_2d_ctx_lens(
@@ -2677,7 +2685,7 @@ class DeepseekSparseAttnBackend(
                 object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
             else:
                 metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
-        elif self.dsa_shards_index_k:
+        elif _IS_GFX95 and self.dsa_shards_index_k:
             metadata.paged_mqa_ctx_lens_2d.copy_(
                 self._build_paged_mqa_schedule_2d_ctx_lens(
                     forward_mode,
@@ -2904,9 +2912,10 @@ class DeepseekSparseAttnBackend(
                     layer=layer,
                     topk_indices=shared_topk_indices,
                 )
-            # the dcp_partial of _forward_flashmla_kv on ROCm's sharded index-K
+            # the dcp_partial of _forward_flashmla_kv on gfx950's sharded index-K
             if (
-                self.dsa_shards_index_k
+                _IS_GFX95
+                and self.dsa_shards_index_k
                 and forward_batch.forward_mode.is_target_verify()
             ):
                 from sglang.srt.layers.attention.dsa.dsa_backend_hip import (
@@ -3289,7 +3298,7 @@ class DeepseekSparseAttnBackend(
                     layer=layer,
                     topk_indices=shared_topk_indices,
                 )
-            if self.dsa_shards_index_k:
+            if _IS_GFX95 and self.dsa_shards_index_k:
                 from sglang.srt.layers.attention.dsa.dsa_backend_hip import (
                     forward_triton_dcp_partial,
                 )
