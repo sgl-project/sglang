@@ -4276,7 +4276,8 @@ def get_model_loader(
 
     # Online modelopt_fp4 converts weights through DefaultModelLoader unless the
     # caller explicitly requests ModelOpt calibration/checkpoint/export work.
-    # Non-local loaders still own their weight transport path.
+    # Non-local loaders still own their weight transport path, and so does a
+    # weight-cache client (IPC_CACHE), which receives the daemon's weights.
     modelopt_fp4_online = (
         model_config
         and model_config.quantization == "modelopt_fp4"
@@ -4287,14 +4288,34 @@ def get_model_loader(
         model_config
         and not modelopt_fp4_online
         and load_config.load_format
-        not in (LoadFormat.RUNAI_STREAMER, LoadFormat.REMOTE_INSTANCE)
+        not in (
+            LoadFormat.RUNAI_STREAMER,
+            LoadFormat.REMOTE_INSTANCE,
+            LoadFormat.IPC_CACHE,
+        )
     )
 
-    if model_optloader_allowed and (
+    modelopt_quantization = model_config and (
         (hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant)
         or model_config.quantization
         in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed", "modelopt"]
+    )
+    # A weight-cache client cannot run ModelOpt's load-time quantization
+    # (calibration, checkpoint restore or export); its disk fallback skips it too.
+    if (
+        load_config.load_format == LoadFormat.IPC_CACHE
+        and modelopt_quantization
+        and not modelopt_fp4_online
+        and not model_config._is_already_quantized()
     ):
+        raise ValueError(
+            "The weight cache serves a daemon's loaded weights and cannot "
+            "quantize this checkpoint with ModelOpt at load time (calibration, "
+            "checkpoint restore or export). Set --weight-cache-mode off to load "
+            "and quantize it from disk."
+        )
+
+    if model_optloader_allowed and modelopt_quantization:
         logger.info("Using ModelOptModelLoader due to ModelOpt quantization config.")
         return ModelOptModelLoader(load_config)
 

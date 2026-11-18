@@ -166,6 +166,9 @@ class WeightCacheDaemon:
         dist_init_method: Optional[str] = None,
     ):
         self.server_args = server_args
+        # Resolution can still change fields read below (e.g. dtype), and the
+        # engine compares them via CacheConfig; a resolved record is kept as is.
+        server_args.resolve_once()
         cfg = resolving_view(server_args)
         self.model_path = cfg.model_path
         self.gpu_id = gpu_id
@@ -794,6 +797,9 @@ def launch_weight_cache_daemons(
             --nnodes 2 --node-rank 1 \\
             --dist-init-method tcp://node0-ip:29500
     """
+    # Resolve here, as the engine does before it spawns its daemons: the rank
+    # layout below and every child read the resolved record.
+    server_args.resolve_once()
     cfg = resolving_view(server_args)
     import socket as sock_mod
 
