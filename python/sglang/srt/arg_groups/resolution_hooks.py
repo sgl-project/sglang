@@ -13,7 +13,7 @@ from typing import Any, Callable, Dict, FrozenSet, List
 # to every invocation of that name, including repeated steps.
 _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
     {
-        "handle_deprecated_dp_attention",
+        "validate_removed_options",
         "handle_mega_moe",
         "validate_rust_server_unsupported_args",
         "handle_admin_api_key_env",
@@ -35,8 +35,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_multimodal",
         "handle_ssl_validation",
         "handle_asr_validation",
-        "handle_deprecated_args",
-        "handle_prefill_delayer_env_compat",
+        "handle_grpc_args",
         "handle_missing_default_values",
         "handle_expert_pack",
         "handle_pd_disaggregation",

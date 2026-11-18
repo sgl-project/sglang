@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=700, suite="nightly-16-npu-a3", nightly=True)
+register_npu_ci(est_time=700, suite="nightly-test-16-npu-a3", nightly=True)
 
 
 class TestDPAttentionRoundBinLoadBalance(CustomTestCase):
@@ -46,7 +46,8 @@ class TestDPAttentionRoundBinLoadBalance(CustomTestCase):
             cls.mode,
             "--attention-backend",
             "ascend",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
             "--quantization",
             "modelslim",
             "--mem-fraction-static",

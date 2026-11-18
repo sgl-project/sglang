@@ -7,7 +7,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(
     est_time=400,
-    suite="full-4-npu-a3",
+    suite="full-test-4-npu-a3",
     nightly=True,
 )
 
@@ -27,7 +27,8 @@ class TestQwen332B(GSM8KAscendMixin, CustomTestCase):
         "0.8",
         "--attention-backend",
         "ascend",
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph",
+        "--disable-prefill-cuda-graph",
         "--tp-size",
         "4",
     ]
