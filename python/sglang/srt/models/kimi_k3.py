@@ -11,7 +11,7 @@ import re
 from array import array
 from collections.abc import Iterable
 from dataclasses import replace
-from functools import cache, cached_property
+from functools import cached_property
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -521,12 +521,6 @@ _PREFILL_SP_AG_BLOCKS = 32
 _PREFILL_SP_SHARED_RS_BLOCKS = 16
 
 
-@cache
-def _prefill_sp_shared_stream() -> torch.cuda.Stream:
-    """Shared-expert stream for the SP tail, prioritized over the routed experts."""
-    return torch.cuda.Stream(priority=torch.cuda.Stream.priority_range()[1])
-
-
 class _PrefillSP:
     __slots__ = (
         "num_tokens",
@@ -584,6 +578,7 @@ class KimiK3MoE(nn.Module):
         prefix: str = "",
         layer_idx: int = 0,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        sp_shared_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         # K3 allocates one weight slot per logical expert. Online relocation
@@ -601,6 +596,7 @@ class KimiK3MoE(nn.Module):
         self.num_shared_experts = config.num_shared_experts
         self.layer_idx = layer_idx
         self.alt_stream = alt_stream
+        self.sp_shared_stream = sp_shared_stream
 
         self.use_latent_moe = _uses_latent_moe(config)
         # Merged front weight ([H, gate_up + E + latent]), built after weight
@@ -1776,6 +1772,7 @@ class KimiK3MoE(nn.Module):
         return (
             self._eligible_for_fused_front
             and self.fuse_ar_norm
+            and self.sp_shared_stream is not None
             and self.routed_expert_up_proj is not None
             and not self._use_mega_moe
             and k3_ar_fusion.enabled()
@@ -1850,7 +1847,10 @@ class KimiK3MoE(nn.Module):
         )
 
         if TYPE_CHECKING:
-            assert self.routed_expert_up_proj is not None
+            assert (
+                self.routed_expert_up_proj is not None
+                and self.sp_shared_stream is not None
+            )
         hidden_size = normed.shape[1]
         latent_size = self.moe_hidden_size
         num_tokens, padded = sp.num_tokens, sp.padded
@@ -1877,13 +1877,12 @@ class KimiK3MoE(nn.Module):
         shared_local = normed.new_empty((sp.local, hidden_size))
 
         current_stream = torch.cuda.current_stream()
-        side = _prefill_sp_shared_stream()
-        side.wait_stream(current_stream)
+        self.sp_shared_stream.wait_stream(current_stream)
         if own_rows:
             self._forward_routed_gathered(*routed, latent)
         else:
             self._forward_routed(hidden_states, router_logits, routed_input, latent)
-        with torch.cuda.stream(side):
+        with torch.cuda.stream(self.sp_shared_stream):
             if own_rows:
                 gate_up = _k3_bf16_gemm(
                     sp.gather(normed),
@@ -1895,7 +1894,7 @@ class KimiK3MoE(nn.Module):
                 shared_full, shared_local, num_blocks=_PREFILL_SP_SHARED_RS_BLOCKS
             )
         # The latent and shared reduce-scatters share pull semaphores.
-        current_stream.wait_stream(side)
+        current_stream.wait_stream(self.sp_shared_stream)
         latent_local = sp.reduce_scatter(
             latent_full, normed.new_empty((sp.local, latent_size))
         )
@@ -3156,6 +3155,7 @@ class KimiK3DecoderLayer(nn.Module):
                 layer_idx=layer_idx,
                 prefix=f"{prefix}.mlp",
                 alt_stream=alt_streams[0] if alt_streams is not None else None,
+                sp_shared_stream=alt_streams[3] if alt_streams is not None else None,
             )
         else:
             self.mlp = KimiK3MLP(
@@ -3417,8 +3417,14 @@ class KimiK3LinearModel(nn.Module):
         #   [0] MoE dual-stream shared-expert tail
         #   [1] DeepseekV2AttentionMLA base internals (forwarded; unused by K3)
         #   [2] MLA output-gate GEMM, overlaps the attention core
+        #   [3] SP tail shared experts, at high priority ahead of the routed experts
         # Disable on HIP code path.
-        self.alt_streams = None if _is_hip else [torch.cuda.Stream() for _ in range(3)]
+        self.alt_streams = (
+            None
+            if _is_hip
+            else [torch.cuda.Stream() for _ in range(3)]
+            + [torch.cuda.Stream(priority=torch.cuda.Stream.priority_range()[1])]
+        )
 
         # The attention-residual bank of one forward, which every layer's
         # stage boundaries read.
