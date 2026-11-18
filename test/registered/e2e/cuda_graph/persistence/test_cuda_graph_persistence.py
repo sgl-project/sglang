@@ -90,7 +90,7 @@ _PREFILL_PASSES = re.compile(
 
 
 # Keep in sync with the foundry extra in python/pyproject.toml.
-_FOUNDRY_REQUIREMENT = "foundry-core>=0.1.0rc4,<0.2"
+_FOUNDRY_REQUIREMENT = "foundry-core>=0.1.0rc5,<0.2"
 _HAS_FOUNDRY = is_in_ci() or importlib.util.find_spec("foundry") is not None
 _foundry_pythonpath: Optional[str] = None
 
