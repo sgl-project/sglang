@@ -40,7 +40,11 @@ from sglang.srt.layers.aux_hidden_states import (
 )
 from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective, kda_tp
 from sglang.srt.layers.communication.kda_dwdp import KdaDwdp
-from sglang.srt.layers.communication.kda_tp import forward as kda_tp_forward
+from sglang.srt.layers.communication.kda_tp.forward import (
+    KdaTp,
+    source_scratch_rows,
+    source_tokens,
+)
 from sglang.srt.layers.cp.interleave import (
     cp_interleave_to_sequence_order,
     cp_sequence_to_interleave_order,
@@ -1922,6 +1926,7 @@ class KimiK3DeltaAttention(nn.Module):
         bfa_alt_stream: Optional[torch.cuda.Stream] = None,
         sp_moe: bool = False,
         kda_dwdp: Optional[KdaDwdp] = None,
+        kda_tp: Optional[KdaTp] = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -1942,8 +1947,8 @@ class KimiK3DeltaAttention(nn.Module):
         self.head_tp_size = linear_attn_tp_size()
         self.head_tp_rank = linear_attn_tp_rank()
         # --enable-kda-tp: heads sharded over the TP group across attention-DP ranks.
-        self._kda_tp = kda_tp.enabled()
-        if self._kda_tp:
+        self._kda_tp = kda_tp
+        if kda_tp is not None:
             self.head_group = "tp"
             self.head_tp_size = get_parallel().tp_size
             self.head_tp_rank = get_parallel().tp_rank
@@ -2681,7 +2686,7 @@ class KimiK3DeltaAttention(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        if self._kda_tp:
+        if self._kda_tp is not None:
             return self.forward_kda_tp(hidden_states)
         core_attn_out = self.forward_pre_o_proj(
             hidden_states=hidden_states,
@@ -2698,7 +2703,7 @@ class KimiK3DeltaAttention(nn.Module):
     def forward_kda_tp(self, hidden_states: torch.Tensor) -> torch.Tensor:
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
-        ctx = kda_tp_forward.current()
+        ctx = self._kda_tp.context()
         x = kda_tp.all_gather_rows(hidden_states, ctx.R)
         backend = get_attn_backend()
         H, D = self.local_num_heads, self.head_dim
@@ -2719,13 +2724,19 @@ class KimiK3DeltaAttention(nn.Module):
                 self.attn._k3_onorm_consumed = False
             if defer_f_b:
                 self.attn._k3_deferred_f_b = True
-            core = backend.forward(
-                layer=self.attn,
-                forward_batch=ctx.batch,
-                mixed_qkv=mixed_qkv,
-                a=forget_gate,
-                b=beta,
-            )
+            linear = backend.linear_attn_backend
+            own_metadata = linear.forward_metadata
+            linear.forward_metadata = ctx.metadata
+            try:
+                core = backend.forward(
+                    layer=self.attn,
+                    forward_batch=ctx.batch,
+                    mixed_qkv=mixed_qkv,
+                    a=forget_gate,
+                    b=beta,
+                )
+            finally:
+                linear.forward_metadata = own_metadata
             if fused_onorm:
                 self.attn._k3_onorm_gate = None
                 fused_onorm = self.attn._k3_onorm_consumed
@@ -2745,11 +2756,11 @@ class KimiK3DeltaAttention(nn.Module):
             try:
                 for src in ctx.sources:
                     start = src.rank * ctx.R
-                    rows = slice(start, start + kda_tp_forward.source_tokens(src))
+                    rows = slice(start, start + source_tokens(src))
                     linear.forward_metadata = src.metadata
                     if src.batch.forward_mode.is_target_verify():
-                        linear.verify_intermediate_state_indices = (
-                            kda_tp_forward.source_scratch_rows(linear, src)
+                        linear.verify_intermediate_state_indices = source_scratch_rows(
+                            linear, src
                         )
                     a = forget_gate[rows]
                     if not src.batch.forward_mode.is_decode():
@@ -3214,6 +3225,7 @@ class KimiK3DecoderLayer(nn.Module):
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
         attn_bank: Optional[AttnBank] = None,
         kda_dwdp: Optional[KdaDwdp] = None,
+        kda_tp: Optional[KdaTp] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -3226,6 +3238,7 @@ class KimiK3DecoderLayer(nn.Module):
         self.all_reduce_fusion = not self._sp_moe and _fuses_attn_all_reduce(config)
 
         # Attention
+        self._kda_tp = kda_tp if config.is_kda_layer(layer_idx) else None
         if config.is_kda_layer(layer_idx):
             self.self_attn = KimiK3DeltaAttention(
                 layer_idx=layer_idx,
@@ -3236,6 +3249,7 @@ class KimiK3DecoderLayer(nn.Module):
                 all_reduce_fusion=self.all_reduce_fusion,
                 sp_moe=self._sp_moe,
                 kda_dwdp=kda_dwdp,
+                kda_tp=kda_tp,
                 # Shared with the MLA gate stream: KDA and MLA layers never
                 # run concurrently within one forward, so the stream is free.
                 bfa_alt_stream=(alt_streams[2] if alt_streams is not None else None),
@@ -3366,7 +3380,7 @@ class KimiK3DecoderLayer(nn.Module):
         # attention metadata; pass hidden_states through shape-preserving
         # (matching the idle skip in other DP-attention models).
         if forward_batch.forward_mode.is_idle():
-            if getattr(self.self_attn, "_kda_tp", False):
+            if self._kda_tp is not None:
                 # KDA TP: the other DP ranks' rows need this rank's heads.
                 return self.self_attn.forward_kda_tp(hidden_states)
             return hidden_states
@@ -3534,10 +3548,7 @@ class KimiK3LinearModel(nn.Module):
             )
         else:
             self.norm = PPMissingLayer()
-        self._kda_tp = kda_tp.enabled()
-        if self._kda_tp:
-            # Collective workspace request: every rank, before graph capture.
-            k3_sp_collective.tp_group_state()
+        self.kda_tp = KdaTp() if kda_tp.enabled() else None
         self.kda_dwdp = None
         dwdp_size = get_parallel().kda_dwdp_size
         if dwdp_size is not None:
@@ -3565,6 +3576,7 @@ class KimiK3LinearModel(nn.Module):
                 alt_streams=self.alt_streams,
                 attn_bank=self.attn_bank,
                 kda_dwdp=self.kda_dwdp,
+                kda_tp=self.kda_tp,
             ),
             prefix=f"{prefix}.layers",
             final_read=self._final_read if self.pp_group.is_last_rank else None,
@@ -3600,11 +3612,11 @@ class KimiK3LinearModel(nn.Module):
                 pp_proxy_tensors, forward_batch
             )
 
-        if self._kda_tp:
+        if self.kda_tp is not None:
             # Every rank, idle ones included: gathers this forward's KDA metadata.
             from sglang.srt.model_executor.forward_context import get_attn_backend
 
-            kda_tp_forward.begin_forward(
+            self.kda_tp.begin_forward(
                 forward_batch,
                 get_attn_backend().linear_attn_backend,
                 hidden_states.shape[0],

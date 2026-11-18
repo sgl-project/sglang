@@ -11,29 +11,12 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.communication.kda_tp import (
     all_gather_padded,
-    forward,
     group,
     width,
 )
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
-
-
-def _local_state_slots(model_runner, bs: int):
-    # Not the request table, which the scheduler may have rewritten since the forward.
-    from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
-
-    fm = model_runner.attn_backend.linear_attn_backend.forward_metadata
-    if fm is None:
-        raise RuntimeError("KDA TP commit: no verify forward metadata")
-    gathered = forward._GATHERED
-    if gathered is not None and fm is gathered[0]:
-        fm = gathered[1]
-    track = fm.mamba_track_indices
-    return ForwardStateSlots(
-        fm.mamba_cache_indices[:bs], None if track is None else track[:bs]
-    )
 
 
 def commit_after_verify(
@@ -64,7 +47,10 @@ def commit_after_verify(
     pack[3].fill_(-1)  # no track step
     if bs:
         if state_slots is None:
-            state_slots = _local_state_slots(model_runner, bs)
+            # Not the request table, which the scheduler may have rewritten since the forward.
+            state_slots = model_runner.attn_backend.forward_state_slots(
+                bs, batch.mamba_track_indices
+            )
         slots = state_slots.working[:bs]
         track = state_slots.track
         pack[0, :bs] = slots.to(torch.int64)

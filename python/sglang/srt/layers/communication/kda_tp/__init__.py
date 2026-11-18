@@ -7,7 +7,7 @@ rank's heads/W with a head-sharded state pool (global slot ids), and reduce-scat
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -128,43 +128,13 @@ def reduce_scatter_rows(y: torch.Tensor, local_rows: int) -> torch.Tensor:
     return out[:local_rows]
 
 
-def all_gather_padded(
-    t: torch.Tensor,
-    n: int,
-    pad_value: int,
-    name: Optional[str] = None,
-    capacity: int = 0,
-) -> torch.Tensor:
+def all_gather_padded(t: torch.Tensor, n: int, pad_value: int) -> torch.Tensor:
     g = group()
-    if name is None:
-        if t.shape[0] < n:
-            t = torch.cat([t, t.new_full((n - t.shape[0],), pad_value)])
-        out = t.new_empty((g.world_size * n,))
-        g.all_gather_into_tensor(out, t.contiguous())
-        return out
-    src = _static(f"{name}.in", capacity, t.dtype)[:n]
-    src[t.shape[0] :].fill_(pad_value)
-    src[: t.shape[0]].copy_(t)
-    out = _static(f"{name}.out", g.world_size * capacity, t.dtype)[: g.world_size * n]
-    g.all_gather_into_tensor(out, src)
+    if t.shape[0] < n:
+        t = torch.cat([t, t.new_full((n - t.shape[0],), pad_value)])
+    out = t.new_empty((g.world_size * n,))
+    g.all_gather_into_tensor(out, t.contiguous())
     return out
-
-
-# Never freed or rebound: CUDA-graph captures record their addresses.
-_STATIC: Dict[Tuple[str, torch.dtype], torch.Tensor] = {}
-
-
-def _static(name: str, numel: int, dtype: torch.dtype) -> torch.Tensor:
-    buf = _STATIC.get((name, dtype))
-    if buf is not None and buf.numel() >= numel:
-        return buf
-    if buf is not None and torch.cuda.is_current_stream_capturing():
-        raise RuntimeError(
-            f"KDA TP: static buffer {name} must grow to {numel} during a CUDA graph capture"
-        )
-    buf = torch.empty(numel, dtype=dtype, device=torch.cuda.current_device())
-    _STATIC[(name, dtype)] = buf
-    return buf
 
 
 def lazy_mamba_slot(enable_mamba_extra_buffer: bool) -> bool:
