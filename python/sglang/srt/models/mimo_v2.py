@@ -1824,16 +1824,14 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
             )
 
     def restore_ipc_weight_runtime(self) -> None:
-        """Rebind local routing state and use the daemon's prepared projections."""
+        """Restore local A2A state and use the daemon's prepared projections."""
         if self.model is None:
             return
         self._fold_attention_value_scale_into_o_proj(weights_already_folded=True)
         for module in self.model.modules():
-            if isinstance(module, MiMoV2MoE):
+            if isinstance(module, MiMoV2MoE) and module._enable_a2a_moe:
                 bias = module.gate.e_score_correction_bias
-                module.topk.topk_config.correction_bias = bias
-                if module._enable_a2a_moe:
-                    module.correction_bias = bias.data if bias is not None else None
+                module.correction_bias = bias.data if bias is not None else None
 
     def get_embed_and_head(self):
         assert self.model is not None and self.lm_head is not None, (
