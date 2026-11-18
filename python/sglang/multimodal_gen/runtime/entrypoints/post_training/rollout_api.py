@@ -495,6 +495,7 @@ def _build_sampling_kwargs(request: RolloutRequest) -> dict:
         fps=request.fps,
         image_path=request.image_path,
         rollout=request.rollout,
+        rollout_extra_streams=tuple(request.rollout_extra_streams),
         rollout_sde_type=request.rollout_sde_type,
         rollout_noise_level=request.rollout_noise_level,
         rollout_log_prob_no_const=request.rollout_log_prob_no_const,
@@ -555,9 +556,12 @@ async def rollout_generate(request: RolloutRequest):
         raise HTTPException(
             status_code=400, detail=f"Invalid sampling params: {exc}"
         ) from exc
-    pipeline_request = prepare_request(
-        server_args=server_args, sampling_params=sampling_params
-    )
+    try:
+        pipeline_request = prepare_request(
+            server_args=server_args, sampling_params=sampling_params
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid request: {exc}") from exc
     try:
         with stamps.span("forward"):
             output_batch: OutputBatch = await async_scheduler_client.forward(

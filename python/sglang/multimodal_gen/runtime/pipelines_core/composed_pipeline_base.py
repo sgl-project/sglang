@@ -97,6 +97,9 @@ class ComposedPipelineBase(ABC):
     pipeline_name: str
     default_model_subfolder: str | None = None
 
+    # Extra streams a rollout may request; the denoising stage must prepare each.
+    supported_rollout_extra_streams: frozenset[str] = frozenset()
+
     def is_lora_effective(self):
         return False
 

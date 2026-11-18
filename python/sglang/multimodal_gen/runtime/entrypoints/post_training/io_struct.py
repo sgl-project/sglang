@@ -79,6 +79,8 @@ class RolloutRequest(BaseModel):
     fps: Optional[int] = None
 
     rollout: bool = True
+    # Streams to roll out besides the primary one, e.g. ["audio"].
+    rollout_extra_streams: list[str] = []
     # "uint8": quantise the video engine-side; None: ship unchanged
     rollout_video_dtype: Optional[str] = None
     rollout_sde_type: str = "sde"

@@ -437,6 +437,7 @@ class SamplingParams:
     save_output: bool = True
     return_frames: bool = field(default=False, metadata={"batch_sig_exclude": True})
     rollout: bool = False
+    rollout_extra_streams: tuple[str, ...] = ()
     rollout_sde_type: str = "sde"
     rollout_noise_level: float = 0.7
     rollout_log_prob_no_const: bool = False  # exclude constants in rollout logprob
