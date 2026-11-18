@@ -90,6 +90,27 @@ class TestEmbeddingModelSpec(unittest.TestCase):
                     resolution_result(args, "prefill_only_disable_kv_cache")
                 )
 
+    def test_jina_ranking_runs_each_prompt_in_one_uncached_prefill(self):
+        """JinaForRanking scores at marker tokens inside the prompt; a cached
+        prefix or a chunk split would drop them from the scoring forward."""
+        args = ServerArgs(model_path="dummy")
+        args._model_config = SimpleNamespace(
+            embedding_model_spec=resolve_embedding_model_spec(
+                ["JinaForRanking"],
+                is_embedding_requested=False,
+                is_embedding_gemma=False,
+            ),
+            joint_head_config=None,
+            pointer_head=None,
+            is_multimodal=False,
+            hf_config=SimpleNamespace(architectures=["JinaForRanking"]),
+        )
+        handle_model_capability_adjustments(args)
+
+        self.assertTrue(resolution_result(args, "is_embedding"))
+        self.assertTrue(resolution_result(args, "disable_radix_cache"))
+        self.assertEqual(resolution_result(args, "chunked_prefill_size"), -1)
+
     def test_encoder_embedding_models_enable_embedding_mode_automatically(self):
         spec = resolve_embedding_model_spec(
             ["BertModel"],

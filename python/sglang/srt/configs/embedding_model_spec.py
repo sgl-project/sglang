@@ -257,6 +257,30 @@ def _embedding_nemotron3_spec() -> EmbeddingModelSpec:
     )
 
 
+def _jina_ranking_spec() -> EmbeddingModelSpec:
+    # Listwise reranker: scores are read at marker tokens inside one prompt,
+    # so each prompt must run in one uncached prefill.
+    return EmbeddingModelSpec(
+        family="jina_ranking",
+        task=EmbeddingTask.CLASSIFY,
+        execution=EmbeddingExecution.CLASSIFICATION,
+        attention=AttentionPattern.CAUSAL,
+        pooling=PoolingStrategy.MODEL_DEFINED,
+        normalize=False,
+        postprocessor="model_defined",
+        tokenizer_special_tokens="model_default",
+        supports_dimensions=False,
+        supports_token_embeddings=False,
+        supports_multimodal=False,
+        requires_embedding_flag=False,
+        auto_enable_embedding=True,
+        bidirectional_attention=False,
+        bcg_prefill_policy=BCGPrefillPolicy.DEFAULT,
+        safe_disable_radix_cache=True,
+        safe_disable_chunked_prefill=True,
+    )
+
+
 def _native_embedding_spec(
     family: str, execution: EmbeddingExecution, pooling: PoolingStrategy
 ) -> EmbeddingModelSpec:
@@ -347,6 +371,8 @@ def resolve_embedding_model_spec(
 
     if "EmbeddingNemotron3Model" in architecture_set:
         return _embedding_nemotron3_spec()
+    if "JinaForRanking" in architecture_set:
+        return _jina_ranking_spec()
 
     if architecture_set & _CLASSIFICATION_ARCHITECTURES:
         return EmbeddingModelSpec(
