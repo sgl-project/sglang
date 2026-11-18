@@ -250,11 +250,20 @@ class FlowRolloutController:
             self.latents_shape, device, dtype
         )
         for i in range(B):
-            torch.randn(
-                self.latents_shape,
-                out=buffer[i : i + 1],
-                generator=generators[i],
-            )
+            row = buffer[i : i + 1]
+            generator = generators[i]
+            if generator.device.type == device.type:
+                torch.randn(row.shape, out=row, generator=generator)
+            else:
+                # LTX-2 defaults to CPU generators even when latents are on CUDA.
+                row.copy_(
+                    torch.randn(
+                        row.shape,
+                        device=generator.device,
+                        dtype=dtype,
+                        generator=generator,
+                    )
+                )
 
         sharded_noise = self.shard_for_sp(batch, buffer)
         if tuple(sharded_noise.shape) != local_shape:
