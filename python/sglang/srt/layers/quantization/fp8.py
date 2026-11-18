@@ -27,6 +27,8 @@ from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
+    call_fused_experts_cpu,
+    cpp_wrapper_enabled,
     cpu_fp8_w8a8_available,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
@@ -1809,6 +1811,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # they never call create_moe_runner, so moe_runner_config is unset.
         self._owns_moe_runner = False
         self._moe_runner_backend = None
+        self.cpp_wrapper = cpp_wrapper_enabled()
+        self.use_cpu_w8a8 = _is_cpu and self.block_quant and cpu_fp8_w8a8_available()
+        # Full W8A8 also quantizes the down projection to FP8.
+        self.use_full_fp8_moe = (
+            self.use_cpu_w8a8
+            and not self.use_mxfp8
+            and not self.is_fp4_expert
+            and self.weight_block_size == [128, 128]
+            and quant_config.is_checkpoint_fp8_serialized
+        )
         if get_moe_runner_backend().is_cutlass():
             assert cutlass_fp8_supported(), (
                 "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
@@ -2209,6 +2221,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         with_bias: bool = False,
         **extra_weight_attrs,
     ):
+        if self.use_cpu_w8a8 and (with_bias or params_dtype != torch.bfloat16):
+            self.use_cpu_w8a8 = self.use_full_fp8_moe = False
         self.weight_block_size, self.w2_weight_block_size = self._tp_weight_block_sizes(
             layer=layer,
             hidden_size=hidden_size,
@@ -2620,7 +2634,32 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             assert _is_cpu_amx_available, (
                 "Fp8MoEMethod on CPU requires that CPU has AMX support"
             )
-            _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+            if self.use_full_fp8_moe:
+                self._pack_full_fp8_cpu_weights(layer)
+            elif not self.use_cpu_w8a8:
+                _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+            else:
+                _amx_process_weight_after_loading(layer, ["w2_weight"])
+                a8_w13_weight = []
+                a8_w13_weight_scale = []
+                w1 = layer.w13_weight
+                w1s = layer.w13_weight_scale_inv
+                for i in range(layer.w13_weight.size(0)):
+                    new_w1s = torch.repeat_interleave(
+                        w1s[i], w1[i].size(0) // w1s[i].size(0), 0
+                    )
+                    new_w1s = new_w1s[: w1[i].size(0), :].contiguous()
+                    w1_a8, w1_a8_scale = torch.ops.sgl_kernel.float8_linear_prepack_cpu(
+                        w1[i], new_w1s
+                    )
+                    a8_w13_weight.append(w1_a8)
+                    a8_w13_weight_scale.append(w1_a8_scale)
+                layer.w13_weight = torch.nn.Parameter(
+                    torch.stack(a8_w13_weight).detach(), requires_grad=False
+                )
+                layer.w13_weight_scale_inv = torch.nn.Parameter(
+                    torch.stack(a8_w13_weight_scale).detach(), requires_grad=False
+                )
         else:
             # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
             from sglang.srt.layers import deep_gemm_wrapper
@@ -2759,6 +2798,67 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer.w2_weight_scale_inv = Parameter(w2_s, requires_grad=False)
         layer.w13_input_scale = None
         layer.w2_input_scale = None
+
+    @staticmethod
+    def _pack_fp8_cpu_expert_weight(
+        weight: torch.Tensor, scales: torch.Tensor
+    ) -> tuple[Parameter, Parameter]:
+        if weight.dtype != torch.float8_e4m3fn or scales.dtype != torch.float32:
+            raise ValueError(
+                "Full FP8 CPU MoE requires E4M3FN weights and FP32 scales."
+            )
+        if scales.shape != (
+            weight.shape[0],
+            weight.shape[1] // 128,
+            weight.shape[2] // 128,
+        ):
+            raise ValueError("Full FP8 CPU MoE has incompatible block-scale shapes.")
+        packed_weights = []
+        packed_scales = []
+        for expert_weight, expert_scales in zip(weight, scales):
+            row_scales = expert_scales.repeat_interleave(128, dim=0).contiguous()
+            packed_weight, packed_scale = (
+                torch.ops.sgl_kernel.float8_linear_prepack_cpu(
+                    expert_weight, row_scales
+                )
+            )
+            packed_weights.append(packed_weight)
+            packed_scales.append(packed_scale)
+        return (
+            Parameter(torch.stack(packed_weights), requires_grad=False),
+            Parameter(torch.stack(packed_scales), requires_grad=False),
+        )
+
+    def _pack_full_fp8_cpu_weights(self, layer: Module) -> None:
+        w13 = layer.w13_weight
+        w2 = layer.w2_weight
+        if (
+            w13.ndim != 3
+            or w2.ndim != 3
+            or w13.shape[0] == 0
+            or w13.shape[0] != w2.shape[0]
+            or w13.shape[1] != 2 * w2.shape[2]
+            or w13.shape[2] != w2.shape[1]
+            or w2.shape[1] == 0
+            or w2.shape[2] == 0
+            or w2.shape[1] % 128 != 0
+            or w2.shape[2] % 128 != 0
+        ):
+            raise ValueError(
+                "Full FP8 CPU MoE requires unpacked [E, 2N, K]/[E, K, N] "
+                "weights with positive K and N divisible by 128."
+            )
+        packed_w13, packed_w13_scales = self._pack_fp8_cpu_expert_weight(
+            w13, layer.w13_weight_scale_inv
+        )
+        packed_w2, packed_w2_scales = self._pack_fp8_cpu_expert_weight(
+            w2, layer.w2_weight_scale_inv
+        )
+        layer.w13_weight = packed_w13
+        layer.w13_weight_scale_inv = packed_w13_scales
+        layer.w2_weight = packed_w2
+        layer.w2_weight_scale_inv = packed_w2_scales
+        layer.use_intel_amx_backend = True
 
     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
 
@@ -3411,6 +3511,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self._owns_moe_runner = False
+        if self.use_cpu_w8a8 and moe_runner_config.activation not in (None, "silu"):
+            self.use_cpu_w8a8 = self.use_full_fp8_moe = False
         self.moe_runner_config = moe_runner_config
 
         # MXFP4 experts on NPU run through the ASCEND runner, which
@@ -3524,26 +3626,59 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_config.apply_router_weight_on_input, topk_weights, x
             )
 
-            output = torch.ops.sgl_kernel.fused_experts_cpu(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights,
-                topk_ids,
-                False,  # inplace See [Note] inplace should be False in fused_experts.
-                CPUQuantMethod.FP8_W8A16,
-                layer.w13_weight_scale_inv,  # w1_scale
-                layer.w2_weight_scale_inv,  # w2_scale
-                None,  # w1_zp
-                None,  # w2_zp
-                self.quant_config.weight_block_size,  # block_size
-                None,  # w1 bias
-                None,  # w3 bias
-                None,  # alpha
-                None,  # limit
-                True,  # is_vnni
-                moe_runner_config.activation,  # activation
-            )
+            if not self.use_cpu_w8a8:
+                output = call_fused_experts_cpu(
+                    self.cpp_wrapper,
+                    x,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    topk_weights,
+                    topk_ids,
+                    False,  # inplace See [Note] inplace should be False in fused_experts.
+                    CPUQuantMethod.FP8_W8A16,
+                    layer.w13_weight_scale_inv,  # w1_scale
+                    layer.w2_weight_scale_inv,  # w2_scale
+                    None,  # w1_zp
+                    None,  # w2_zp
+                    None,  # a1_scale
+                    self.quant_config.weight_block_size,  # block_size
+                    None,  # w1 bias
+                    None,  # w3 bias
+                    None,  # alpha
+                    None,  # limit
+                    True,  # is_vnni
+                    moe_runner_config.activation,  # activation
+                )
+            else:
+                if self.use_full_fp8_moe and x.shape[0] == 0:
+                    return StandardCombineInput(hidden_states=x)
+                x_q, x_s = torch.ops.sgl_kernel._quantize_fp8e4m3_vec(x, True, None)
+                output = call_fused_experts_cpu(
+                    self.cpp_wrapper,
+                    x_q,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    topk_weights,
+                    topk_ids,
+                    False,  # inplace See [Note] inplace should be False in fused_experts.
+                    (
+                        CPUQuantMethod.FP8_W8A8_FULL
+                        if self.use_full_fp8_moe
+                        else CPUQuantMethod.FP8_W8A8
+                    ),
+                    layer.w13_weight_scale_inv,  # w1_scale
+                    layer.w2_weight_scale_inv,  # w2_scale
+                    None,  # w1_zp
+                    None,  # w2_zp
+                    x_s,  # a1_scale
+                    self.quant_config.weight_block_size,  # block_size
+                    None,  # w1 bias
+                    None,  # w3 bias
+                    None,  # alpha
+                    None,  # limit
+                    True,  # is_vnni
+                    moe_runner_config.activation,  # activation
+                )
             return StandardCombineInput(hidden_states=output)
 
         if (
