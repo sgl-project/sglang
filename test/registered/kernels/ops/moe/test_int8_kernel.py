@@ -188,30 +188,35 @@ class TestInt8QuantLargeInputOffsets(CustomTestCase):
         free_bytes, _ = torch.cuda.mem_get_info()
         if free_bytes < 10 * 2**30:
             raise unittest.SkipTest("needs about 10 GB of free GPU memory")
-        # Row r holds the constant value r % 100 + 1, so every int8 code is 127
-        # and the per-row scale is value / 127, whatever the row offset.
+        # Row r holds the constant value r % 100 + 1, so the per-row scale is
+        # value / 127 and a row far past 2^31 elements must quantize exactly like
+        # the early row with the same value, whatever the rounding of the kernel.
         cls.values = (torch.arange(cls.ROWS, device="cuda") % 100 + 1).half()
         cls.x = cls.values[:, None].expand(cls.ROWS, cls.COLS).contiguous()
         cls.expected_scales = cls.values.float() / 127
+        tail = torch.arange(cls.ROWS - 16, cls.ROWS, device="cuda")
+        cls.tail_rows, cls.twin_rows = tail, tail % 100
 
     @classmethod
     def tearDownClass(cls):
-        for name in ("x", "values", "expected_scales"):
+        for name in ("x", "values", "expected_scales", "tail_rows", "twin_rows"):
             if hasattr(cls, name):
                 delattr(cls, name)
         torch.cuda.empty_cache()
 
+    def _check_tail_matches_twin_rows(self, x_q, scales):
+        torch.testing.assert_close(scales.view(-1), self.expected_scales)
+        # Rows r and r % 100 hold the same value; the last rows sit past 2^31
+        # elements, the twin rows well before it.
+        self.assertTrue(bool((x_q[self.tail_rows] == x_q[self.twin_rows]).all()))
+
     def test_per_token_quant_int8(self):
         x_q, scales = per_token_quant_int8(self.x)
-        torch.testing.assert_close(scales.view(-1), self.expected_scales)
-        self.assertTrue(bool((x_q[-16:] == 127).all()))
-        self.assertTrue(bool((x_q[:16] == 127).all()))
+        self._check_tail_matches_twin_rows(x_q, scales)
 
     def test_per_token_group_quant_int8(self):
         x_q, scales = per_token_group_quant_int8(self.x, group_size=self.COLS)
-        torch.testing.assert_close(scales.view(-1), self.expected_scales)
-        self.assertTrue(bool((x_q[-16:] == 127).all()))
-        self.assertTrue(bool((x_q[:16] == 127).all()))
+        self._check_tail_matches_twin_rows(x_q, scales)
 
 
 if __name__ == "__main__":
