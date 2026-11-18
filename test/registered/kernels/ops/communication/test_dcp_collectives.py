@@ -178,6 +178,16 @@ def test_request_ordered_byte_gather():
             actual = dcp_gather_request_rows(rows, torch.tensor(lengths))
             assert actual.dtype == full.dtype and actual.is_contiguous()
             assert torch.equal(actual, full)
+            # The same rows read out of a pool, padded to whole pages.
+            index = torch.randperm(local.shape[0], device="cuda")
+            pool = torch.empty_like(local)
+            pool[index] = local
+            actual = dcp_gather_request_rows(
+                pool, torch.tensor(lengths), index=index, pad_to=64
+            )
+            assert actual.shape[0] % 64 == 0 and actual.is_contiguous()
+            assert torch.equal(actual[: len(full)], full)
+            assert not actual[len(full) :].any()
 
 
 def test_candidate_merge_scratch_and_graph_replay():

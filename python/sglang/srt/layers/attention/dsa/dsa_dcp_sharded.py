@@ -30,7 +30,7 @@ they can also select and merge in one kernel (``DcpFusedTopK``).
 
 from __future__ import annotations
 
-from functools import partial
+from functools import lru_cache, partial
 from typing import Optional
 
 import torch
@@ -513,17 +513,85 @@ def dcp_local_topk(
     return dcp_localize_compact(slots, out_len)[0]
 
 
+# Position p of a request is local row p // world of rank p % world, and every
+# rank sends ceil(len / world) rows per request (a missing last one is never read).
+@lru_cache(maxsize=4)  # the layers of a forward ask for the same lengths
+def _request_rows_layout(lens: tuple, world: int, rank: int, device: torch.device):
+    # Built from host scalars, without a host-device sync: one per forward here
+    # cost 2% of the prefill throughput in serving (Kimi-K3.1, DCP8).
+    pos = torch.arange(max(lens), device=device)
+    num_sent = sum((n + world - 1) // world for n in lens)
+    send, order, sent_start, local_start = [], [], 0, 0
+    for n in lens:
+        n_sent, n_local = (n + world - 1) // world, (n - rank + world - 1) // world
+        # [n_sent]: this rank's local row per send row
+        row = pos[:n_sent]
+        send.append(torch.where(row < n_local, row + local_start, 0))
+        # [n]: row of the rank-major all-gather output per output row
+        order.append((pos[:n] % world) * num_sent + pos[:n] // world + sent_start)
+        sent_start, local_start = sent_start + n_sent, local_start + n_local
+    return torch.cat(send), torch.cat(order)
+
+
+def _word_dtype(rows: torch.Tensor) -> torch.dtype:
+    # index_select copies byte rows several times faster as words; the
+    # conditions are those of Tensor.view(dtype).
+    for dtype in (torch.int64, torch.int32):
+        size = dtype.itemsize
+        if (
+            rows.shape[1] % size == 0
+            and rows.stride(0) % size == 0
+            and rows.storage_offset() % size == 0
+        ):
+            return dtype
+    return torch.uint8
+
+
 def dcp_gather_request_rows(
-    local_rows: torch.Tensor, seq_lens_cpu: torch.Tensor
+    local_rows: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    index: Optional[torch.Tensor] = None,
+    pad_to: int = 1,
 ) -> torch.Tensor:
     """Prefill: every request's cache rows from all ranks, in position order.
 
     ``local_rows``: [sum of this rank's shares, W] uint8, request by request
-    in local position order. Returns [sum(seq_lens), W]: request after
-    request, the rows of positions 0..seq_len-1 (the layout of the ragged
-    top-k indices).
+    in local position order; with ``index``, the rows ``index`` of it are.
+    Returns [sum(seq_lens), W]: request after request, the rows of positions
+    0..seq_len-1 (the layout of the ragged top-k indices), zero-padded to a
+    multiple of ``pad_to`` rows.
     """
-    return all_gather_kv_cache_for_dcp(local_rows, local_rows[:, :0], seq_lens_cpu)
+    parallel = get_parallel()
+    total = int(seq_lens_cpu.sum())
+    if not (get_platform().is_hip and parallel.dcp_enabled and total):
+        if index is not None:
+            local_rows = local_rows[index]
+        out = all_gather_kv_cache_for_dcp(local_rows, local_rows[:, :0], seq_lens_cpu)
+        pad = -out.shape[0] % pad_to
+        return torch.cat([out, out.new_zeros(pad, out.shape[1])]) if pad else out
+
+    # Two indexed copies around the all-gather instead of the copies of the path
+    # above, about half of its time on gfx950; the wire is the same.
+    world, width = parallel.dcp_size, local_rows.shape[1]
+    send, order = _request_rows_layout(
+        lens=tuple(seq_lens_cpu.tolist()),
+        world=world,
+        rank=parallel.dcp_rank,
+        device=local_rows.device,
+    )
+    words = _word_dtype(local_rows)
+    buf = local_rows.new_empty(send.shape[0], width)
+    # A rank that holds none of the batch sends only padding.
+    if (local_rows if index is None else index).shape[0]:
+        if index is not None:
+            send = index[send]
+        torch.index_select(local_rows.view(words), 0, send, out=buf.view(words))
+    gathered = local_rows.new_empty(world * buf.shape[0], width)
+    parallel.dcp_group.all_gather_into_tensor(gathered, buf)
+    out = local_rows.new_empty(total + -total % pad_to, width)
+    torch.index_select(gathered.view(words), 0, order, out=out.view(words)[:total])
+    out[total:] = 0
+    return out
 
 
 class DcpFusedTopK:
