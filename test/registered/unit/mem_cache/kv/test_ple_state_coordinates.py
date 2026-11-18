@@ -6,16 +6,19 @@ from unittest.mock import patch
 
 import torch
 from test_declared_parts import _build
+from torch.overrides import TorchFunctionMode
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+from sglang.srt.mem_cache.ple_state_pool import NGRAM_PART, NGramPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.qwen4_exp import (
     Qwen4ExpPLELayer,
     _commit_ple_batch,
+    _PLEBatch,
     _prepare_ple_batch,
 )
 from sglang.srt.runtime_context import reset_context
@@ -309,6 +312,72 @@ class TestPLEStateCoordinates(unittest.TestCase):
                     _commit_ple_batch(batch, fb)
                     torch.testing.assert_close(conv, expected_conv)
                     torch.testing.assert_close(ngram.context, expected_ngram)
+
+    def test_verify_ngram_commit_builds_the_row_mask_only_for_stable_rows(self):
+        """Without PP spec stable rows the verify commit writes positional rows and
+        computes no row mask; with them, request rows and the padding row."""
+
+        class CountNe(TorchFunctionMode):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def __torch_function__(self, func, types, args=(), kwargs=None):
+                if func is torch.Tensor.ne:
+                    self.calls += 1
+                return func(*args, **(kwargs or {}))
+
+        # Request 0 verifies two tokens; request 1 is a padding row.
+        batch = _PLEBatch(
+            mode=ForwardMode.TARGET_VERIFY,
+            use_decode_fast_path=False,
+            physical_tokens=4,
+            processed_tokens=2,
+            lengths=torch.tensor([2, 0]),
+            row_width=2,
+            req_indices=torch.tensor([0, 0]),
+            token_offsets=torch.tensor([0, 1]),
+            valid_tokens=torch.tensor([True, True, False, False]),
+            state_indices=torch.tensor([0, 0]),
+            query_start_loc=None,
+            ngram_context=torch.tensor([[5, 6, 7, 8], [17, 17, 17, 17]]),
+            ngram_eos_token_id=17,
+        )
+        fb = SimpleNamespace(req_pool_indices=torch.tensor([3, 1]))
+        step_contexts = torch.tensor([[[6, 7], [7, 8]], [[17, 17], [17, 17]]])
+        for stable_rows, rows in ((False, [0, 1]), (True, [3, 4])):
+            with self.subTest(stable_rows=stable_rows):
+                ngram = NGramPool(
+                    size=4,
+                    context_len=2,
+                    eos_token_id=17,
+                    device="cpu",
+                    spec_state_size=4,
+                    speculative_num_draft_tokens=2,
+                )
+                ngram.intermediate_context.fill_(-1)
+                expected = ngram.intermediate_context.clone()
+                expected[rows] = step_contexts
+                count_ne = CountNe()
+                with (
+                    forward_context(
+                        ForwardContext(
+                            attn_backend=SimpleNamespace(
+                                req_to_token_pool=SimpleNamespace(size=4),
+                                token_to_kv_pool=SimpleNamespace(
+                                    layer_router=SimpleNamespace(
+                                        part_view={NGRAM_PART: ngram}.get
+                                    )
+                                ),
+                            )
+                        )
+                    ),
+                    envs.SGLANG_ENABLE_PP_SPEC.override(stable_rows),
+                    count_ne,
+                ):
+                    _commit_ple_batch(batch, fb)
+                torch.testing.assert_close(ngram.intermediate_context, expected)
+                self.assertEqual(count_ne.calls, int(stable_rows))
 
 
 if __name__ == "__main__":
