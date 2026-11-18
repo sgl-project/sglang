@@ -640,7 +640,7 @@ class Req(ReqDllmMixin):
         self.host_loaded_length = 0
         # Buffer-mode host memory is transport staging, not an L2 cache tier.
         self.host_hit_is_storage = False
-        # Absolute external-cache hit boundary shared by PP0; None outside PP.
+        # Absolute boundary agreed by the PP layer-wise linker ticket.
         self.external_cache_hit_length: Optional[int] = None
         self.storage_prefetch_retry_attempts = 0
         self.staged_prefetch_plan: Optional[StagedPrefetchPlan] = None
@@ -883,6 +883,7 @@ class Req(ReqDllmMixin):
         self.mm_token_counts_ready = True
 
     def advance_cache_request_handle(self) -> None:
+        self.external_cache_hit_length = None
         self.cache_request_handle = dataclasses.replace(
             self.cache_request_handle,
             attempt_id=self.cache_request_handle.attempt_id + 1,

@@ -40,11 +40,12 @@ Set common load options alongside Mooncake connection settings:
 --unified-cache-external-linker-config '{"load_mode":"prefetch","prefetch_policy":"timeout","master_server_address":"HOST:50051"}'
 ```
 
-`load_mode` defaults to `layer_wise`. Prefetch starts at `_prefetch_kvcache()` on
-enqueue and reuses the load thread for concurrent requests. It supports
-Full/SWA/Mamba within existing linker layout limits and requires PP=1.
-All attention TP ranks read into private GPU slots; only complete KV confirmed
-successful by every rank joins the radix tree. Failed reads fall back to recomputation.
+`load_mode` defaults to `layer_wise`. With pipeline parallelism, PP0 issues a
+ticket on request arrival and each rank queries its local storage shard. In
+`prefetch` mode the ranks agree on a common prefix that also fits their reserved
+GPU slots. They publish it to the radix tree after every rank finishes its read.
+Failed reads fall back to recomputation. Full, SWA and Mamba follow the backend's
+existing layout limits.
 
 Set `prefetch_policy` in the same JSON:
 

@@ -66,7 +66,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.runtime_context import get_context, get_disagg
+from sglang.srt.runtime_context import get_context, get_disagg, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache import fixtures as shared_cache_suite
@@ -81,7 +81,8 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
 )
 from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.tree_slots import FAMILY_OF, index_slots
+from sglang.test.tree_slots import FAMILY_OF, index_slots, tree_slots_of
+from sglang.test.unified_allocator_fixtures import build_window_chain
 
 register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 register_cuda_ci(est_time=18, stage="base-b", runner_config="1-gpu-small")
@@ -419,6 +420,141 @@ class TestLinkerDevicePrefetch(CustomTestCase):
         )
         Scheduler._prefetch_kvcache(scheduler, req)
 
+    def test_pp_reservation_retargets_window_and_checkpoint_to_common_boundary(self):
+        cache, backend, req, allocator = self._fixture(swa=True, mamba=True)
+        req.init_next_round_input(cache, cow_mamba=False)
+        handle = req.cache_request_handle
+        key = RadixKey(req.origin_input_ids[:-1])
+        hashes = [f"page-{i}" for i in range(6)]
+        # Only four FULL slots remain for six possible pages.
+        occupied = allocator.full_attn_allocator.alloc(28)
+        self.addCleanup(allocator.full_attn_allocator.free, occupied)
+        assert (
+            cache.linker.reserve_pp_prefetch(handle, req.last_node, key, 0, hashes) == 4
+        )
+        before = {
+            t.name: t.device_indices.clone()
+            for _, t in cache.linker.prefetches[handle].component_transfers
+        }
+        assert len(before[PoolName.KV]) == 4
+        assert len(before[PoolName.SWA]) == 2
+        future = cache.linker.submit_pp_prefetch(handle, 1)
+        fetched = {t.name: t for t in backend.prefetch.call_args.args[0]}
+        for pool in (PoolName.KV, PoolName.SWA, PoolName.MAMBA):
+            assert fetched[pool].keys == hashes[:1]
+            assert torch.equal(fetched[pool].device_indices, before[pool][:1])
+        assert allocator.full_attn_allocator.available_size() == 3
+        assert allocator.swa_attn_allocator.available_size() == 31
+        assert allocator.state_slots.available_size() == 19
+        future.set_result(True)
+        cache.linker._finish_prefetch(handle, publish=True)
+        assert self._match(cache, req).device_prefix_len == 1
+        assert torch.equal(
+            allocator.translate_loc_from_full_to_swa(
+                fetched[PoolName.KV].device_indices
+            ),
+            fetched[PoolName.SWA].device_indices,
+        )
+
+    def test_pp_prefetch_zero_end_releases_only_its_attempt(self):
+        cache, backend, req, allocator = self._fixture(swa=True, mamba=True)
+        retry = self._request(req.rid, attempt=1)
+        key = RadixKey(req.origin_input_ids[:-1])
+        for attempt in (req, retry):
+            attempt.init_next_round_input(cache, cow_mamba=False)
+            assert (
+                cache.linker.reserve_pp_prefetch(
+                    attempt.cache_request_handle, attempt.last_node, key, 0, ["a", "b"]
+                )
+                == 2
+            )
+        cache.linker.submit_pp_prefetch(req.cache_request_handle, 0)
+        assert req.cache_request_handle not in cache.linker.prefetches
+        assert retry.cache_request_handle in cache.linker.prefetches
+        assert allocator.full_attn_allocator.available_size() == 30
+        assert allocator.swa_attn_allocator.available_size() == 30
+        assert allocator.state_slots.available_size() == 19
+        with patch.object(backend, "prefetch", return_value=None):
+            assert (
+                cache.linker.submit_pp_prefetch(retry.cache_request_handle, 2) is None
+            )
+        assert not cache.linker.prefetches
+        self._assert_balanced(cache, allocator)
+
+    def test_pp_reservation_prices_full_and_window_in_one_arena(self):
+        cache, _, _, _ = self._fixture(swa=True)
+        with get_parallel().override(attn_dcp_size=1):
+            _, chain, _ = build_window_chain(
+                n_full_slots=32,
+                n_swa_slots=16,
+                full_layer_num=1,
+                swa_layer_num=1,
+                page_size=2,
+            )
+        with (
+            patch.object(cache, "token_to_kv_pool_allocator", chain),
+            patch.object(
+                cache.components[ComponentType.SWA], "sliding_window_size", 24
+            ),
+        ):
+            assert chain.units_fit({"full": 12}) and chain.units_fit({"swa": 12})
+            assert cache.linker._pp_prefetch_fits(11)
+            assert not cache.linker._pp_prefetch_fits(12)
+
+    def test_pp_reservation_leaves_other_requests_cached_and_unwinds_partial_takes(
+        self,
+    ):
+        cache, backend, req, allocator = self._fixture()
+        other = self._request("other", start=11)
+        self._enqueue(cache, other)
+        backend.prefetch_futures[-1].set_result(True)
+        cache.linker.check_prefetch_events()
+        other.init_next_round_input(cache, cow_mamba=False)
+        assert other.prefix_len == 6
+        other_key = RadixKey(other.origin_input_ids[:-1])
+        cached_end = cache.linker.reserve_pp_prefetch(
+            other.cache_request_handle, other.last_node, other_key, 6, []
+        )
+        assert cached_end == 3
+        occupied = allocator.alloc(24)
+        req.init_next_round_input(cache, cow_mamba=False)
+        key = RadixKey(req.origin_input_ids[:-1])
+        # Two free slots can vote just one page, even with six evictable tokens.
+        with patch.object(
+            cache, "evict_for_alloc", wraps=cache.evict_for_alloc
+        ) as evict:
+            assert (
+                cache.linker.reserve_pp_prefetch(
+                    req.cache_request_handle, req.last_node, key, 0, ["a", "b", "c"]
+                )
+                == 1
+            )
+            assert self._match(cache, other).device_prefix_len == 6
+            evict.assert_not_called()
+        cache.linker.submit_pp_prefetch(req.cache_request_handle, 0)
+        allocator.free(occupied)
+        self._assert_balanced(cache, allocator)
+
+        cache, _, req, allocator = self._fixture(swa=True, mamba=True)
+        req.init_next_round_input(cache, cow_mamba=False)
+        # The state take can still fail after the joint capacity check and
+        # successful FULL/window takes. Neither slots nor locks may leak.
+        with (
+            patch.object(cache.kv_storage(), "take_state_slots", return_value=None),
+            patch.object(
+                cache, "evict_for_alloc", wraps=cache.evict_for_alloc
+            ) as evict,
+        ):
+            assert (
+                cache.linker.reserve_pp_prefetch(
+                    req.cache_request_handle, req.last_node, key, 0, ["a", "b"]
+                )
+                == 0
+            )
+            evict.assert_not_called()
+        assert req.cache_request_handle not in cache.linker.prefetches
+        self._assert_balanced(cache, allocator)
+
     def test_timeout_config_overrides_legacy_including_empty_object(self):
         cache, backend, _, _ = self._fixture()
         for config, legacy, expected in (
@@ -731,6 +867,7 @@ class TestLinkerDevicePrefetch(CustomTestCase):
 
 def test_cache_linker_attachment_is_backend_independent():
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.pp_size = 1
     cache.tree_core = SimpleNamespace(
         enable_external_cache_linker=False,
         write_through_threshold=256,
@@ -769,17 +906,13 @@ def test_cache_linker_rejects_unsupported_tree_components(component_type, load_m
     assert not cache.tree_core.enable_external_cache_linker
 
 
-def test_pipeline_parallelism_rejects_only_prefetch_mode():
-    cache = _cache_for_wrapper(pp_size=2)
-    UnifiedCacheLinkerWrapper(cache, _FakeLinker())
-    assert cache.tree_core.enable_external_cache_linker
-
+@pytest.mark.parametrize("mode", ["layer_wise", "prefetch"])
+def test_pipeline_parallelism_accepts_both_load_modes(mode):
     cache = _cache_for_wrapper(pp_size=2)
     backend = _FakeLinker()
-    backend.load_mode = "prefetch"
-    with pytest.raises(ValueError, match="prefetch currently requires PP=1"):
-        UnifiedCacheLinkerWrapper(cache, backend)
-    assert not cache.tree_core.enable_external_cache_linker
+    backend.load_mode = mode
+    UnifiedCacheLinkerWrapper(cache, backend)
+    assert cache.tree_core.enable_external_cache_linker
 
 
 class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
@@ -1663,7 +1796,7 @@ def test_restorable_prefix_intersects_sparse_rank_results():
 
 @pytest.mark.parametrize("hit_pages", [0, 1, 2])
 @pytest.mark.parametrize("device_hit_len", [0, 2, 4])
-def test_pp0_queries_and_later_stage_reuses_hit_boundary(hit_pages, device_hit_len):
+def test_all_stages_match_only_the_agreed_ticket_boundary(hit_pages, device_hit_len):
     class _Component:
         def build_external_linker_transfer(self, phase, node, keys):
             assert phase == LinkerTransferPhase.LOOKUP
@@ -1687,33 +1820,18 @@ def test_pp0_queries_and_later_stage_reuses_hit_boundary(hit_pages, device_hit_l
         best_match_node=0,
     )
 
-    pp0_backend = _FakeLinker()
-    pp0_backend.restorable = [hit_pages] if hit_pages else []
-    pp0 = UnifiedCacheLinkerWrapper(make_cache(pp_rank=0), pp0_backend)
-    pp0_req = SimpleNamespace(rid="rid", external_cache_hit_length=None)
-    pp0_result = pp0.match(key, pp0_req, empty_match)
-
-    assert pp0_req.external_cache_hit_length == hit_pages * 2
-    assert pp0_result.host_hit_length == hit_pages * 2
-    assert len(pp0_backend.lookup_calls) == 1
-
-    pp1_backend = _FakeLinker()
-    pp1 = UnifiedCacheLinkerWrapper(make_cache(pp_rank=1), pp1_backend)
-    pp1_req = SimpleNamespace(
-        rid="rid", external_cache_hit_length=pp0_req.external_cache_hit_length
-    )
     local_match = empty_match._replace(device_prefix_len=device_hit_len)
-    pp1_result = pp1.match(key, pp1_req, local_match)
-
-    assert pp1_result.host_hit_length == max(0, hit_pages * 2 - device_hit_len)
-    assert pp1_backend.lookup_calls == []
-
-    # Repeated matching on PP0 also reuses its query, including a cached miss.
-    assert pp0.match(key, pp0_req, local_match).host_hit_length == (
-        pp1_result.host_hit_length
-    )
-    assert len(pp0_backend.lookup_calls) == 1
-    assert pp0.has_hit("rid") == (hit_pages * 2 > device_hit_len)
+    for rank in (0, 1):
+        backend = _FakeLinker()
+        linker = UnifiedCacheLinkerWrapper(make_cache(rank), backend)
+        req = SimpleNamespace(rid="rid", external_cache_hit_length=None)
+        assert linker.match(key, req, empty_match).host_hit_length == 0
+        req.external_cache_hit_length = hit_pages * 2
+        assert linker.match(key, req, local_match).host_hit_length == max(
+            0, hit_pages * 2 - device_hit_len
+        )
+        assert linker.has_hit("rid") == (hit_pages * 2 > device_hit_len)
+        assert backend.lookup_calls == []
 
 
 @pytest.fixture
@@ -1745,10 +1863,11 @@ def pp_cache(request):
             pp_size=2,
             pp_rank=0,
             sliding_window_size=4,
-            tree_components=(ComponentType.FULL, ComponentType.SWA),
+            tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.SWA), window=4),
         )
     )
     backend = _FakeLinker()
+    backend.pools[PoolName.SWA] = pool
     backend.restorable = [4]
     cache.init_cache_linker(backend)
     req = Req(
@@ -1757,6 +1876,7 @@ def pp_cache(request):
         origin_input_ids=array("q", [1, 2, 3, 4, 5]),
         sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
     )
+    req.external_cache_hit_length = 4
     req.init_next_round_input(cache)
     return cache, allocator, req, backend
 
@@ -1769,6 +1889,8 @@ def _alloc_pp_extend(cache, req, seq_len):
         device="cpu",
         reqs=[req],
         req_to_token_pool=cache.req_to_token_pool,
+        token_to_kv_pool_allocator=cache.token_to_kv_pool_allocator,
+        hisparse_coordinator=None,
         tree_cache=cache,
         prefix_lens=[req.prefix_len],
         extend_lens=[extend_len],
@@ -1903,7 +2025,8 @@ def _bind_pp_private_prefix(cache, req):
     loaded = cache.linker.private_load_indices[req.rid]
     cache.req_to_token_pool.alloc([req])
     cache.req_to_token_pool.write((req.kv.req_pool_idx, slice(0, len(loaded))), loaded)
-    req.prefix_len = req.kv.kv_allocated_len = req.kv.kv_committed_len = len(loaded)
+    req.prefix_len = len(loaded)
+    req.kv.set_row_len(len(loaded))
 
 
 @pytest.mark.parametrize(
@@ -1920,7 +2043,7 @@ def test_pp_private_prefix_release_waits_for_dma(
         cache.linker.start_layer_wise_loading()
     if already_completed:
         assert cache.linker.finish_loads() == []
-    cache.linker.release_request(req.rid)
+    cache.linker.release_request(req.cache_request_handle)
     if not cancel_queued and not already_completed:
         assert allocator.full_available_size() == 28
         assert allocator.swa_available_size() == 28

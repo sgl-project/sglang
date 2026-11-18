@@ -48,8 +48,7 @@ def _storage_suffix(
     parts = []
     if not rank_replicated:
         parts.append(f"tp{tp_rank}")
-    # Keep PP as the final numeric field for Mooncake's shared PP query path.
-    parts.extend((f"cp{attn_cp_rank}", str(pp_rank)))
+    parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
     return "_".join(parts)
 
 
@@ -288,20 +287,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         page_keys = list(kv.keys)
         if not page_keys:
             return []
-        # PP0 queries every PP shard; the wrapper's existing TP/CP reduction
-        # then selects a boundary that all ranks can restore.
-        restorable = set(range(1, len(page_keys) + 1))
-        for pp_rank in range(self.storage.pp_size):
-            result = self.storage.batch_exists_v2(
-                page_keys,
-                expanded,
-                HiCacheStorageExtraInfo(extra_info={"pp_rank": pp_rank}),
-            )
-            # SWA may leave holes, so intersect valid boundaries, not maxima.
-            restorable.intersection_update(result.restorable_prefix_pages or [])
-            if not restorable:
-                break
-        restorable = sorted(restorable)
+        result = self.storage.batch_exists_v2(page_keys, expanded)
+        restorable = result.restorable_prefix_pages or []
         self.stats["lookup"] += 1
         if restorable:
             logger.info(

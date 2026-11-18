@@ -1316,10 +1316,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # IPC senders decode as None.
     mm_routing_labels: Optional[Dict[str, List[str]]] = None
 
-    # Internal PP handoff: PP0 records the absolute prefix boundary found in
-    # the external cache; later stages reuse it instead of querying again.
-    external_cache_hit_length: Optional[int] = None
-
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)
         self.positional_embed_overrides = wrap_object_fields_as_pickle(

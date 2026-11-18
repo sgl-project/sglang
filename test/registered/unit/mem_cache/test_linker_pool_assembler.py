@@ -1220,105 +1220,71 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
 
 
 class TestMooncakeLinkerPPLookup(CustomTestCase):
-    def setUp(self):
-        self.keys = [f"page{i}" for i in range(6)]
-        self.existing = set()
-        self.queried = []
-
-    def make_linker(self, *, side_pool=None, pp_size=3):
-        names = [PoolName.DEEPSEEK_V4_C4]
-        if side_pool is not None:
-            names.append(side_pool)
-        entries = [
-            SimpleNamespace(
-                name=name,
-                indices_from_pool=(
-                    PoolName.SWA if name == PoolName.SWA else PoolName.KV
-                ),
-                components=[[], []],
-            )
-            for name in names
-        ]
-        group = DevicePoolGroup(entries, num_layers=1, page_size=1)
-        storage = MooncakeStore.__new__(MooncakeStore)
-        storage.mem_pool_host = group
-        storage.registered_pools = group.entry_map
-        storage.pp_rank, storage.pp_size = 0, pp_size
-        storage.mla_suffix = _storage_suffix(
-            rank_replicated=True, tp_rank=2, attn_cp_rank=1, pp_rank=0
-        )
-        storage.mha_suffix = _storage_suffix(
-            rank_replicated=False, tp_rank=2, attn_cp_rank=1, pp_rank=0
-        )
-        storage.config_prefix = "model_0_tag"
-        storage.is_mla_backend = True
-
-        def exists(keys):
-            self.queried.extend(keys)
-            return [int(key in self.existing) for key in keys]
-
-        storage.store = SimpleNamespace(batch_is_exist=exists)
-        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
-        linker.pool_group, linker.storage = group, storage
-        linker.stats = {"lookup": 0}
-        return linker
-
-    def add_pages(self, pp_rank, pages, pool=PoolName.DEEPSEEK_V4_C4):
-        self.existing.update(
-            f"model_0_tag_{self.keys[page]}_cp1_{pp_rank}_{pool}" for page in pages
-        )
-
-    def test_pp0_uses_shortest_stage_prefix(self):
-        for stage_lengths in ((6, 4, 2), (6, 4, 0)):
-            with self.subTest(stage_lengths=stage_lengths):
-                self.existing.clear()
-                self.queried.clear()
-                linker = self.make_linker()
-                for pp_rank, pages in enumerate(stage_lengths):
-                    self.add_pages(pp_rank, range(pages))
-                result = linker.lookup(
-                    "req", [PoolTransfer(PoolName.KV, keys=self.keys)]
-                )
-                self.assertEqual(result, list(range(1, min(stage_lengths) + 1)))
-                self.assertEqual(len(self.queried), len(self.keys) * 3)
-                self.assertEqual(linker.stats["lookup"], 1)
-                # Query must not mutate suffixes used concurrently by load/offload.
-                self.assertEqual(linker.storage.mla_suffix, "cp1_0")
-                self.assertEqual(linker.storage.mha_suffix, "tp2_cp1_0")
-
-    def test_pp_swa_requires_a_common_restorable_boundary(self):
-        linker = self.make_linker(side_pool=PoolName.SWA)
-        for pp_rank, swa_pages in enumerate((range(6), (0, 1, 4, 5), range(4))):
-            self.add_pages(pp_rank, range(6))
-            self.add_pages(pp_rank, swa_pages, PoolName.SWA)
-        result = linker.lookup(
-            "req",
+    def test_each_stage_queries_its_own_pool_keys_and_returns_sparse_boundaries(self):
+        keys = [f"page{i}" for i in range(6)]
+        group = DevicePoolGroup(
             [
-                PoolTransfer(PoolName.KV, keys=self.keys),
-                PoolTransfer(
-                    PoolName.SWA,
-                    keys=self.keys[-2:],
-                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
-                ),
+                DevicePoolEntry(
+                    name=pool,
+                    indices_from_pool=pool,
+                    device_pool=None,
+                    components=[[torch.empty(6, 1)]],
+                    layer_mapping={0: 0},
+                    page_size=1,
+                    rows_are_pages=True,
+                )
+                for pool in (PoolName.KV, PoolName.SWA)
             ],
+            num_layers=1,
+            page_size=1,
         )
-        # Per-stage maxima are 6, 6, 4, but PP1 cannot restore at 4.
-        self.assertEqual(result, [1, 2])
+        transfers = [
+            PoolTransfer(PoolName.KV, keys=keys),
+            PoolTransfer(
+                PoolName.SWA, keys=keys[-2:], hit_policy=PoolHitPolicy.TRAILING_PAGES
+            ),
+        ]
+        window_pages = (range(6), (0, 1, 4, 5), range(4), ())
+        boundaries = ([1, 2, 3, 4, 5, 6], [1, 2, 6], [1, 2, 3, 4], [])
+        for replicated, tp_prefix in ((True, ""), (False, "tp2_")):
+            existing = set()
+            for pp_rank, pages in enumerate(window_pages):
+                suffix = f"{tp_prefix}cp1_pp{pp_rank}"
+                for i in range(6):
+                    existing.add(f"model_{keys[i]}_{suffix}_k")
+                for i in pages:
+                    existing.add(f"model_{keys[i]}_{suffix}_swa")
 
-    def test_default_storage_query_and_single_pp_stay_local(self):
-        self.add_pages(0, range(6))
-        transfers = [PoolTransfer(PoolName.KV, keys=self.keys)]
-        linker = self.make_linker()
-        result = linker.storage.batch_exists_v2(
-            self.keys, linker.pool_group.resolve_transfers(transfers)
-        )
-        self.assertEqual(result.restorable_prefix_pages, list(range(1, 7)))
-        self.assertEqual(len(self.queried), 6)
-        self.queried.clear()
-        self.assertEqual(
-            self.make_linker(pp_size=1).lookup("req", transfers), list(range(1, 7))
-        )
-        self.assertEqual(len(self.queried), 6)
+            for pp_rank, expected in enumerate(boundaries):
+                with self.subTest(replicated=replicated, pp_rank=pp_rank):
+                    storage = MooncakeStore.__new__(MooncakeStore)
+                    storage.pp_rank, storage.pp_size = pp_rank, len(boundaries)
+                    storage.mem_pool_host = group
+                    storage.registered_pools = group.entry_map
+                    storage.config_prefix = "model"
+                    storage._has_request_context_support = False
+                    storage.mla_suffix = _storage_suffix(
+                        rank_replicated=replicated,
+                        tp_rank=2,
+                        attn_cp_rank=1,
+                        pp_rank=pp_rank,
+                    )
+                    exists = Mock(
+                        side_effect=lambda batch: [k in existing for k in batch]
+                    )
+                    storage.store = SimpleNamespace(batch_is_exist=exists)
+                    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+                    linker.pool_group, linker.storage = group, storage
+                    linker.stats = {"lookup": 0}
+                    self.assertEqual(linker.lookup("req", transfers), expected)
+                    suffix = f"{tp_prefix}cp1_pp{pp_rank}"
+                    exists.assert_called_once_with(
+                        [
+                            f"model_{key}_{suffix}_{pool}"
+                            for pool in ("k", "swa")
+                            for key in keys
+                        ]
+                    )
 
 
 if __name__ == "__main__":

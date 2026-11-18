@@ -15,6 +15,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchAck
+from sglang.srt.mem_cache import pp_ticket_worker
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
@@ -212,7 +213,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         def broadcast(objects, *args, **kwargs):
             return [next(commands)] if self.c.storage_config.pp_rank else objects
 
-        with patch(f"{HybridCacheController.__module__}.broadcast_pyobj", broadcast):
+        with patch.object(pp_ticket_worker, "broadcast_pyobj", broadcast):
             self.c.pp_prefetch_command_thread_func()
 
     def sync_acks(self, *acks):
@@ -1012,8 +1013,9 @@ class TestPPPrefetchTicket(unittest.TestCase):
     def test_command_failure_finishes_queue_task_and_is_reported_on_poll(self):
         c = self.c
         with (
-            patch(
-                f"{HybridCacheController.__module__}.broadcast_pyobj",
+            patch.object(
+                pp_ticket_worker,
+                "broadcast_pyobj",
                 side_effect=RuntimeError("broken"),
             ),
             self.assertLogs(level="ERROR"),
@@ -1053,8 +1055,9 @@ class TestPPPrefetchTicket(unittest.TestCase):
             patch.object(
                 torch.distributed, "get_process_group_ranks", return_value=[1, 3, 5, 7]
             ),
-            patch(
-                f"{HybridCacheController.__module__}.broadcast_pyobj",
+            patch.object(
+                pp_ticket_worker,
+                "broadcast_pyobj",
                 side_effect=lambda objects, *args, **kwargs: objects,
             ) as broadcast,
         ):
@@ -1076,8 +1079,9 @@ class TestPPPrefetchTicket(unittest.TestCase):
         ticket = c.pp_prefetch_states.pop("hit").ticket
         c.storage_config.pp_rank = 1
         with (
-            patch(
-                f"{HybridCacheController.__module__}.broadcast_pyobj",
+            patch.object(
+                pp_ticket_worker,
+                "broadcast_pyobj",
                 side_effect=[[], [], [ticket], [None]],
             ),
             patch.object(c.pp_prefetch_command_queue, "task_done") as task_done,
