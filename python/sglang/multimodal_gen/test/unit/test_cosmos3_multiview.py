@@ -686,7 +686,6 @@ class TestBlockSparsity(unittest.TestCase):
         ]
         torch.testing.assert_close(unpacked.bool(), sparsity.group_allowed)
 
-        # Key-expanded, the byte at (query run, key position) is the answer.
         expanded = build_multiview_block_sparsity(
             metadata, q_block_size=4, kv_block_size=4, key_expanded_table=True
         )
@@ -906,8 +905,6 @@ class TestPaddedFlexAttention(unittest.TestCase):
         "needs an SM90 or SM100 device with the FA4 CuTe kernels",
     )
     def test_cuda_fa4_table_forms_agree_bit_for_bit(self):
-        """The key-expanded bytes and the packed words a larger table falls back
-        to are one predicate, so the kernel returns the same bits for both."""
         layout = MultiviewLayout(
             num_views=3,
             latent_frames=6,
@@ -1242,7 +1239,6 @@ class TestLayoutHelpers(unittest.TestCase):
 
 
 def _whole_clip_fit(frames, *, height, width):
-    """The canvas fit of ``uint8 [3, T, H, W]`` in one resize call, the loader's reference."""
     orig_h, orig_w = int(frames.shape[2]), int(frames.shape[3])
     scale = max(width / orig_w, height / orig_h)
     resize_h = int(math.ceil(scale * orig_h))
@@ -1323,9 +1319,6 @@ class TestPixelHelpersAndPrompt(unittest.TestCase):
             fit_uint8_cthw(clip, height=480, width=832, chunk_frames=0)
 
     def test_load_media_fits_frames_as_they_decode(self):
-        """Decoder arrays and PIL frames reach the canvas with the pixels of the
-        whole-clip resize, and a caller's destination is filled in place and
-        narrowed to the frames that decoded."""
         generator = torch.Generator().manual_seed(1)
         arrays = [
             torch.randint(
@@ -1607,7 +1600,6 @@ class TestDeploymentConfig(unittest.TestCase):
 
 
 def _stage(stage_cls, *args, **kwargs):
-    """A pipeline stage built without a running server."""
     from sglang.multimodal_gen.runtime.server_args import (
         server_args as server_args_module,
     )
@@ -1619,7 +1611,6 @@ def _stage(stage_cls, *args, **kwargs):
 
 
 def _tiny_wan_vae(**config_kwargs) -> AutoencoderKLWan:
-    """A tiny Wan 2.2 VAE: residual blocks, 2x2 patches, 16x spatial and 4x temporal compression."""
     config = WanVAEConfig(
         arch_config=WanVAEArchConfig(
             base_dim=8,
@@ -1953,7 +1944,6 @@ class TestInputLoading(unittest.TestCase):
             self.assertEqual(len(load_video(path, max_frames=100)), 24)
             with self.assertRaisesRegex(ValueError, "max_frames"):
                 load_video(path, max_frames=0)
-            # The streamed reader hands out the same pixels without the PIL wrapper.
             streamed = list(iter_video_frames(path, max_frames=5))
             self.assertEqual(len(streamed), 5)
             for array, image in zip(streamed, full):
@@ -1963,10 +1953,6 @@ class TestInputLoading(unittest.TestCase):
 
     @_fails_if_hung
     def test_rig_packing_fills_each_camera_slice_in_place(self):
-        """Clips land camera-major, truncated or padded with their own last frame,
-        from worker threads that write a rig allocated under the stage's
-        thread-local inference mode; ``keep_first`` packs the one frame the
-        latent stage reads."""
         generator = torch.Generator().manual_seed(3)
         lengths = {"a.mp4": 5, "b.mp4": 2, "c.mp4": 7}
         clips = {
@@ -2017,7 +2003,6 @@ class TestInputLoading(unittest.TestCase):
         for index, clip in enumerate(expected):
             self.assertTrue(torch.equal(first[0, :, index], clip[:, 0]))
 
-        # A camera without an RGB clip is a gray canvas; a short known view fails.
         vision = pack(field="vision", num_frames=5, keep_first=False)
         self.assertEqual(vision.unique().tolist(), [128])
         views = [msgspec_replace(view, vision=view.control) for view in views]
@@ -2026,9 +2011,6 @@ class TestInputLoading(unittest.TestCase):
 
     @_fails_if_hung
     def test_a_camera_is_encoded_while_the_next_one_still_loads(self):
-        """The input stage returns before its clips have decoded, and the latent
-        stage encodes camera 0 without waiting for camera 1; the latents are
-        those of the loaded rig."""
         generator = torch.Generator().manual_seed(5)
         clips = {
             path: torch.randint(
@@ -2090,9 +2072,6 @@ class TestInputLoading(unittest.TestCase):
 
     @_fails_if_hung
     def test_camera_loads_start_one_at_a_time_until_the_consumer_waits(self):
-        """Loads start in camera order, one at a time, which leaves the CPU to
-        the thread driving the GPU; a consumer blocked on a later camera lets
-        one more load run."""
         clips = {
             path: np.zeros((2, 4, 6, 3), dtype=np.uint8)
             for path in ("a.mp4", "b.mp4", "c.mp4")
@@ -2142,9 +2121,6 @@ class TestInputLoading(unittest.TestCase):
         self.assertEqual(started, ["a.mp4", "b.mp4", "c.mp4"])
 
     def test_anchor_encode_reads_only_the_frames_its_latents_depend_on(self):
-        """A condition on the first latents encodes a causal prefix of each
-        camera's clip, and a one-frame rig stands for that frame repeated; the
-        latents the sampler reads equal the full-clip encode bit for bit."""
         vae = _tiny_wan_vae(load_decoder=False)
         stage = _stage(
             multiview_stage.Cosmos3MultiviewLatentStage,
@@ -2191,8 +2167,6 @@ class TestInputLoading(unittest.TestCase):
                 self.assertTrue(torch.equal(prefix[:, :, indexes], full[:, :, indexes]))
 
     def test_streamed_decode_hands_out_the_camera_major_clip(self):
-        """With a frame consumer the stage builds no clip, and the frames it
-        hands out are the batched clip in camera-major order."""
         vae = _tiny_wan_vae(load_encoder=False)
         stage = _stage(multiview_stage.Cosmos3MultiviewDecodingStage, vae)
         latents = torch.randn(1, 4, 6, 2, 3)

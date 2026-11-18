@@ -255,7 +255,6 @@ def _fit_geometry(orig_h: int, orig_w: int, height: int, width: int) -> tuple[in
 
 
 def _resize_chunk_frames(orig_h: int, orig_w: int, chunk_frames: int) -> int:
-    """Frames per resize chunk for a source of this size, at least one."""
     if chunk_frames < 1:
         raise ValueError(f"chunk_frames must be positive, got {chunk_frames}")
     float_frame_bytes = orig_h * orig_w * 3 * 4
@@ -280,8 +279,7 @@ def _fit_frames_uint8_cthw(
     which lands one row off on 1720x1080 fisheye sources.
 
     Resize, crop, round and clamp act on each frame alone, so consuming the
-    frames a chunk at a time changes no value. ``out`` is filled in place and
-    returned narrowed to the ``T`` frames ``frames`` produced.
+    frames a chunk at a time changes no value.
     """
     if out is None:
         dest = torch.empty((3, max_frames, height, width), dtype=torch.uint8)
@@ -303,6 +301,7 @@ def _fit_frames_uint8_cthw(
     if first is not None:
         orig_h, orig_w = int(first.shape[0]), int(first.shape[1])
         arrays = _same_size_frames(chain([first], arrays), orig_h, orig_w)
+        # At scale 1 the antialiased resize and the crop are the identity.
         if (orig_h, orig_w) == (height, width):
             count = _copy_frames(arrays, dest)
         else:
@@ -324,7 +323,6 @@ def _same_size_frames(arrays: Iterable[np.ndarray], orig_h: int, orig_w: int):
 
 
 def _copy_frames(arrays: Iterable[np.ndarray], dest: torch.Tensor) -> int:
-    """Store canvas-sized frames unchanged; at scale 1 the antialiased resize and the crop are the identity."""
     dest_np = dest.numpy()
     count = 0
     for array in arrays:
@@ -341,7 +339,6 @@ def _resize_frames(
     orig_w: int,
     chunk_frames: int,
 ) -> int:
-    """Resize source-size frames into ``dest`` a chunk at a time, reusing the chunk buffers."""
     height, width = int(dest.shape[2]), int(dest.shape[3])
     resize_h, resize_w = _fit_geometry(orig_h, orig_w, height, width)
     chunk_frames = _resize_chunk_frames(orig_h, orig_w, chunk_frames)
@@ -360,7 +357,6 @@ def _resize_frames(
         chunk.copy_(torch.from_numpy(staging[:filled]).permute(0, 3, 1, 2))
         resized = TF.resize(chunk, [resize_h, resize_w])
         cropped = TF.center_crop(resized, [height, width])
-        # The rounded values are integers in 0..255, so the uint8 store is exact.
         dest[:, count : count + filled].copy_(
             cropped.round_().clamp_(0, 255).permute(1, 0, 2, 3)
         )
@@ -424,10 +420,8 @@ class CameraLoadGate:
     """Starts a request's camera loads in order, as many at once as their consumer needs.
 
     A load slows the thread that drives the GPU, so one runs at a time while
-    the consumer keeps up; each time it has to wait for a load after the
-    first, one more may run alongside. Measured on a 24-core host with an RTX
-    5880 and seven 720p clips: one load at a time is fastest at 121 frames,
-    two at 61, and all seven at once is slower than not overlapping at all.
+    the consumer keeps up, and each time it has to wait for a load after the
+    first, one more may run alongside.
     """
 
     def __init__(self) -> None:
@@ -438,14 +432,13 @@ class CameraLoadGate:
         self._limit = 1
 
     def ticket(self) -> int:
-        """The next load's place in the start order; issued from one thread."""
+        # Tickets are issued from one thread, so this needs no lock.
         ticket = self._tickets
         self._tickets += 1
         return ticket
 
     @contextmanager
     def turn(self, ticket: int) -> Iterator[None]:
-        """Hold one of the running slots, from this load's turn until it ends."""
         with self._changed:
             self._changed.wait_for(
                 lambda: ticket == self._next and self._running < self._limit
@@ -461,7 +454,7 @@ class CameraLoadGate:
                 self._changed.notify_all()
 
     def consumer_waits(self, ticket: int) -> None:
-        """The consumer is blocked on this load: the loads are behind unless it is the first."""
+        # Waiting for the first load says nothing about the loads falling behind.
         if ticket == 0:
             return
         with self._changed:
@@ -472,9 +465,7 @@ class CameraLoadGate:
 class PendingCameraMajorPixels:
     """A camera-major ``uint8 [1, 3, V*F, H, W]`` rig whose cameras are still loading.
 
-    Each camera's loader fills its own slice on a worker thread, so a consumer
-    that takes the cameras in order works on camera 0 while the later ones
-    decode. A failed load is raised by the call that waits for its camera.
+    A failed load is raised by the call that waits for its camera.
     """
 
     def __init__(
@@ -496,7 +487,6 @@ class PendingCameraMajorPixels:
         return self._rig.shape
 
     def camera(self, view: int) -> torch.Tensor:
-        """Camera ``view``'s ``[1, 3, F, H, W]`` slice, once it has loaded."""
         load = self._loads[view]
         if not load.done():
             self._gate.consumer_waits(self._tickets[view])
@@ -505,7 +495,6 @@ class PendingCameraMajorPixels:
         return self._rig[:, :, view * frames : (view + 1) * frames]
 
     def result(self) -> torch.Tensor:
-        """The whole rig, once every camera has loaded."""
         for load in self._loads:
             load.result()
         return self._rig
@@ -811,7 +800,7 @@ class Cosmos3MultiviewInputStage(PipelineStage):
         """One field of the rig as camera-major ``uint8 [1, 3, V*F, H, W]``, loading on ``pool``.
 
         ``F`` is ``num_frames``, every clip truncated or padded with its last
-        frame; with ``keep_first`` it is 1, the frame that padding would repeat.
+        frame, or 1 with ``keep_first``.
         """
         frames_per_view = 1 if keep_first else num_frames
         rig = torch.empty(
@@ -1276,12 +1265,8 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
     ) -> torch.Tensor:
         """Encode camera-major ``uint8 [1, 3, V*P, H, W]`` one camera at a time into ``[1, C, V*Fl, h, w]``.
 
-        Each camera's ``P`` packed frames are truncated or last-frame padded to
-        the ``frames_per_view`` its encode reads. ``latent_frames`` is forwarded
-        to ``AutoencoderKLWan.encode`` for clips cut to a causal prefix. The Wan
-        VAE is causal in time, so the camera-major stream must never be encoded
-        as one long clip. A pending rig hands each camera over once it has
-        loaded, so an encode overlaps the later cameras' decode.
+        The Wan VAE is causal in time, so the camera-major stream must never be
+        encoded as one long clip.
         """
         pending = isinstance(pixels, PendingCameraMajorPixels)
         if len(pixels.shape) != 5 or num_views < 1 or pixels.shape[2] % num_views:
@@ -1332,12 +1317,8 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Encode the RGB conditions; only the latents at ``condition_indexes`` are meaningful.
-
-        The cached Wan encode is causal, so a clip cut to the frames the highest
-        read latent depends on gives those latents bit-identical; the rest of
-        each camera's ``latent_frames_per_view`` is filler.
-        """
+        """Encode the RGB conditions. Only the latents at ``condition_indexes`` are
+        meaningful, and the rest may be filler."""
         needed = 1 + max(index % latent_frames_per_view for index in condition_indexes)
         latent_frames = None
         if needed < latent_frames_per_view and self.vae.use_feature_cache:
@@ -1707,7 +1688,7 @@ class Cosmos3MultiviewDecodingStage(Cosmos3DecodingStage):
         latent_frames_per_view: int,
         on_frames: Callable[[torch.Tensor], None] | None = None,
     ) -> torch.Tensor | None:
-        """Decode every camera; the camera-major clip, or ``None`` when ``on_frames`` took the frames."""
+        """The camera-major clip, or ``None`` when ``on_frames`` took the frames."""
         clips = []
         for view in range(num_views):
             clip = self._decode_latents(

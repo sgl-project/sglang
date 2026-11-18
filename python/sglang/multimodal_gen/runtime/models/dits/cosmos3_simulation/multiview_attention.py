@@ -637,8 +637,7 @@ def build_multiview_block_sparsity(
     The projection works at semantic-run and sparse-block granularity. Its
     largest dense intermediates are block-grid sized (about 10.4M entries for
     the released 11-view geometry at 64x64), never the ~42B-pair dense mask.
-    ``key_expanded_table`` asks for the larger table FA4 reads fastest; only
-    the FA4 backend reads the table at all.
+    Only the FA4 backend reads the table.
     """
     q_vectors = metadata.query_vectors()
     k_vectors = metadata.key_vectors()
