@@ -6,6 +6,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
+    DSV4CheckpointBufferInfo,
+    DSV4CompressedBufferInfo,
+    DSV4IndexerBufferInfo,
+    DSV4PagedBufferInfo,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
@@ -90,20 +96,64 @@ def _draft_bytes(target, draft) -> int:
     return total
 
 
+def _paged_info_bytes(region: DSV4PagedBufferInfo) -> int:
+    return region.page_bytes * sum(buffer.shape[0] for buffer in region.buffers)
+
+
+def _dsv4_pool_bytes(pool: DeepSeekV4TokenToKVPool) -> int:
+    """Device bytes of every V4 paged pool mirrored into HiCache."""
+    total = 0
+    for info in pool.get_device_pool_infos():
+        region = info.buffer_info
+        if isinstance(region, DSV4PagedBufferInfo):
+            total += _paged_info_bytes(region)
+        elif isinstance(region, DSV4CompressedBufferInfo):
+            total += _paged_info_bytes(region.kv)
+            if region.rope is not None:
+                total += _paged_info_bytes(region.rope)
+        elif isinstance(region, DSV4IndexerBufferInfo):
+            total += _paged_info_bytes(region.key)
+            if region.scale is not None:
+                total += _paged_info_bytes(region.scale)
+        elif isinstance(region, DSV4CheckpointBufferInfo):
+            raise ValueError(
+                "HiCache auto-sizing does not support DeepSeek V4 persistent "
+                "state; set --hicache-ratio explicitly."
+            )
+        else:
+            raise ValueError(
+                "HiCache auto-sizing does not support DeepSeek V4 region "
+                f"{type(region).__name__}; set --hicache-ratio explicitly."
+            )
+    return total
+
+
 def _estimate_hicache_bytes(
     params: CacheInitParams, draft_plan: HiCacheDraftPlan | None
 ) -> int:
     """Device bytes whose host mirrors scale with the HiCache ratio."""
     # Every token KV view the pool routes to, and the recurrent state beside it.
     pool = params.token_to_kv_pool_allocator.get_kvcache()
-    if not (isinstance(pool, _SIZEABLE_POOLS) or _sub_pool_views(pool)):
-        raise ValueError(
-            f"HiCache auto-sizing does not support {type(pool).__name__}; "
-            "set --hicache-ratio or --hicache-size explicitly."
-        )
-    total = _pool_bytes(pool)
+    if isinstance(pool, DeepSeekV4TokenToKVPool):
+        if params.mtp_draft_device_pools or (
+            draft_plan is not None and draft_plan.mode == "sidecar"
+        ):
+            raise ValueError(
+                "HiCache auto-sizing with DeepSeek V4 draft pools is not "
+                "supported; set --hicache-ratio explicitly."
+            )
+        total = _dsv4_pool_bytes(pool)
+    else:
+        if not (isinstance(pool, _SIZEABLE_POOLS) or _sub_pool_views(pool)):
+            raise ValueError(
+                f"HiCache auto-sizing does not support {type(pool).__name__}; "
+                "set --hicache-ratio or --hicache-size explicitly."
+            )
+        total = _pool_bytes(pool)
     if params.req_to_token_pool.holds_state_slots:
         total += _leaf_bytes(params.token_to_kv_pool_allocator.state.pool)
+    if isinstance(pool, DeepSeekV4TokenToKVPool):
+        return total
     drafts = params.mtp_draft_device_pools
     if draft_plan is not None and draft_plan.mode == "sidecar":
         drafts = draft_plan.device_pools

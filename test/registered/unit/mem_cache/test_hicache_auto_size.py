@@ -8,6 +8,10 @@ from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.mem_cache import hicache_auto_size as sizing
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4PagedBufferInfo
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -42,6 +46,50 @@ def _windowed(pool, full_layers=None, swa_layers=None):
 
 
 class TestHiCacheAutoSize(CustomTestCase):
+    def test_dsv4_paged_pools_are_sized_for_auto(self):
+        def info(name, pages, page_slots, row_bytes, layers=1):
+            buffers = tuple(
+                torch.zeros((pages, page_slots, 1, row_bytes), dtype=torch.uint8)
+                for _ in range(layers)
+            )
+            return DevicePoolInfo(
+                pool_name=name,
+                indices_from_pool=PoolName.KV,
+                layer_ids=tuple(range(layers)),
+                buffer_info=DSV4PagedBufferInfo.from_buffers(
+                    buffers, page_slots=page_slots, layout="pa_nd"
+                ),
+            )
+
+        pool = Mock(spec=DeepSeekV4TokenToKVPool)
+        pool.get_device_pool_infos.return_value = (
+            info(PoolName.SWA, 2, 128, 544),
+            info(PoolName.DEEPSEEK_V4_C1, 2, 128, 320),
+            info(PoolName.DEEPSEEK_V4_C1_INDEXER, 4, 64, 64),
+            info(PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE, 4, 64, 4),
+            info(PoolName.DEEPSEEK_V4_C2, 2, 64, 320),
+            info(PoolName.DEEPSEEK_V4_C2_INDEXER, 2, 64, 64),
+            info(PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE, 2, 64, 4),
+        )
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=SimpleNamespace(holds_state_slots=False),
+            token_to_kv_pool_allocator=Mock(
+                get_kvcache=Mock(return_value=pool), storage=None
+            ),
+            page_size=128,
+        )
+        expected = (
+            2 * 128 * 544
+            + 2 * 128 * 320
+            + 4 * 64 * 64
+            + 4 * 64 * 4
+            + 2 * 64 * 320
+            + 2 * 64 * 64
+            + 2 * 64 * 4
+        )
+        self.assertEqual(sizing._estimate_hicache_bytes(params, None), expected)
+
     def test_hybrid_target_draft_uses_its_sidecar_slot_capacity(self):
         # EAGLE3 can pair a hybrid target with a plain MHA draft. Full drafts
         # follow full target slots; SWA drafts follow the smaller SWA capacity.
