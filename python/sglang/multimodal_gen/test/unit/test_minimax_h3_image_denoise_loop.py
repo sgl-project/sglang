@@ -19,8 +19,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     minimax_h3_image_denoise_loop,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
-    MiniMaxH3RolloutCollector,
-    MiniMaxH3RolloutCtx,
+    MiniMaxH3ImageRollout,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (
     minimax_h3_packed_sequence,
@@ -344,18 +343,20 @@ def test_state_dependent_predictions_use_fp32_euler_deltas(dtype):
 _ROLLOUT_SIGMAS = [1.0, 0.9675236940383911, 0.75, 0.23200887441635132, 0.0]
 
 
-def _rollout_ctx(*, sde_type, noise_level, sde_step_indices):
+def _rollout(*, sde_type, noise_level, sde_step_indices, log_prob_no_const=False):
     batch = SimpleNamespace(
         rollout_sde_type=sde_type,
         rollout_noise_level=noise_level,
         rollout_sde_step_indices=sde_step_indices,
-        rollout_log_prob_no_const=False,
+        rollout_log_prob_no_const=log_prob_no_const,
+        rollout_return_step_indices=None,
+        rollout_debug_mode=True,
     )
-    return MiniMaxH3RolloutCtx(
+    return MiniMaxH3ImageRollout(
         batch=batch,
+        sigmas=_ROLLOUT_SIGMAS,
         generator=torch.Generator().manual_seed(7),
-        sigmas_video=_ROLLOUT_SIGMAS,
-        collector=MiniMaxH3RolloutCollector(sigmas_video=_ROLLOUT_SIGMAS),
+        pos_cond_kwargs={},
     )
 
 
@@ -377,35 +378,50 @@ def test_rollout_step_outside_the_noise_window_is_the_serving_step():
         sigmas=_ROLLOUT_SIGMAS,
         initial_video_rows=initial_rows,
     )
-    rollout_ctx = _rollout_ctx(sde_type="cps", noise_level=0.8, sde_step_indices=[])
+    rollout = _rollout(sde_type="cps", noise_level=0.8, sde_step_indices=[])
 
     rolled = _run(
         _state_dependent_model(),
         positive,
         sigmas=_ROLLOUT_SIGMAS,
         initial_video_rows=initial_rows,
-        rollout_ctx=rollout_ctx,
+        rollout=rollout,
     )
 
     assert torch.equal(rolled, serving)
-    trajectory = rollout_ctx.collector.build_trajectory_data()
+    trajectory = rollout.build_trajectory_data()
     assert torch.equal(trajectory.dit_trajectory.latents[0, -1], serving)
     assert not trajectory.rollout_log_probs.any()
+    debug = trajectory.rollout_debug_tensors
+    # a deterministic step is its own mean, reached without noise
+    assert torch.equal(
+        debug.rollout_prev_sample_means[0], trajectory.dit_trajectory.latents[0, 1:]
+    )
+    assert not debug.rollout_noise_std_devs.any()
 
 
+# miles scores cps without the Gaussian constants and flow-sde with them
 @pytest.mark.parametrize(
-    "sde_type,noise_level", [("cps", 0.8), ("sde", 0.7)], ids=["cps", "sde"]
+    "sde_type,noise_level,log_prob_no_const",
+    [("cps", 0.8, True), ("sde", 0.7, False)],
+    ids=["cps", "sde"],
 )
-def test_rollout_noisy_step_is_the_transition_the_trainer_scores(sde_type, noise_level):
+def test_rollout_noisy_step_is_the_transition_the_trainer_scores(
+    sde_type, noise_level, log_prob_no_const
+):
     """The trainer rebuilds this density from the recorded latents and sigmas; step 0 sits at sigma == 1."""
     model = _state_dependent_model()
-    rollout_ctx = _rollout_ctx(
-        sde_type=sde_type, noise_level=noise_level, sde_step_indices=[0, 2]
+    rollout = _rollout(
+        sde_type=sde_type,
+        noise_level=noise_level,
+        sde_step_indices=[0, 2],
+        log_prob_no_const=log_prob_no_const,
     )
-    _run(model, _inputs(3, 0.25), sigmas=_ROLLOUT_SIGMAS, rollout_ctx=rollout_ctx)
+    _run(model, _inputs(3, 0.25), sigmas=_ROLLOUT_SIGMAS, rollout=rollout)
 
-    trajectory = rollout_ctx.collector.build_trajectory_data()
+    trajectory = rollout.build_trajectory_data()
     latents = trajectory.dit_trajectory.latents[0]
+    debug = trajectory.rollout_debug_tensors
     assert torch.isfinite(latents).all()
     assert trajectory.rollout_log_probs[0, 1] == 0
     for step in (0, 2):
@@ -428,11 +444,28 @@ def test_rollout_noisy_step_is_the_transition_the_trainer_scores(sde_type, noise
                 + model_output * (1 + std_dev_t**2 * (1 - sigma) / (2 * sigma)) * dt
             )
             std = std_dev_t * math.sqrt(-dt)
-        log_prob = (
-            -((latents[step + 1] - mean) ** 2) / (2 * std**2)
-            - math.log(std)
-            - math.log(math.sqrt(2 * math.pi))
-        ).mean()
+        squared_error = (latents[step + 1] - mean) ** 2
+        if log_prob_no_const:
+            log_prob = -squared_error.mean()
+        else:
+            log_prob = (
+                -squared_error / (2 * std**2)
+                - math.log(std)
+                - math.log(math.sqrt(2 * math.pi))
+            ).mean()
         torch.testing.assert_close(
             trajectory.rollout_log_probs[0, step], log_prob, rtol=1e-4, atol=1e-4
+        )
+        # what debug mode hands the trainer to compare its own forward and mean against
+        torch.testing.assert_close(debug.rollout_model_outputs[0, step], model_output)
+        torch.testing.assert_close(
+            debug.rollout_prev_sample_means[0, step], mean, rtol=1e-4, atol=1e-5
+        )
+        torch.testing.assert_close(
+            debug.rollout_prev_sample_means[0, step]
+            + debug.rollout_variance_noises[0, step]
+            * debug.rollout_noise_std_devs[0, step],
+            latents[step + 1],
+            rtol=1e-5,
+            atol=1e-6,
         )

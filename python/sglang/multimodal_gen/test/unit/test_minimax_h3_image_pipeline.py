@@ -173,12 +173,25 @@ def test_real_denoise_loop_from_stage_state_to_rgb(server, task):
     assert output.audio is None
 
 
-@pytest.mark.skipif(
-    torch.cuda.is_available(),
-    reason="CPU-only weight-free test; it mixes CPU and CUDA tensors on GPU hosts",
-)
-def test_rollout_request_returns_its_trajectory_and_conditioning(server):
-    """The trainer replays a rollout from the decode output: each step's latents and the DiT's conditioning."""
+class _OnDeviceZeroVelocityModel(ZeroVelocityModel):
+    def forward(self, **kwargs):
+        get_forward_context()
+        positions = kwargs["img_pos_for_infer_output_info"]["position_ids"]
+        device = positions.device
+        return torch.zeros(len(positions), 96, device=device), torch.empty(
+            0, 32, device=device
+        )
+
+
+class _OnDeviceVAE:
+    def decode_image_raw(self, x):
+        get_forward_context()
+        return torch.full(
+            (1, 3, x.shape[-2] * 16, x.shape[-1] * 16), 0.25, device=x.device
+        )
+
+
+def _rollout_through_the_stages(server, **rollout_fields):
     req = prepare_request(
         server,
         MiniMaxH3ImageSamplingParams(
@@ -190,17 +203,21 @@ def test_rollout_request_returns_its_trajectory_and_conditioning(server):
             rollout=True,
             rollout_sde_type="cps",
             rollout_noise_level=0.8,
-            rollout_sde_step_indices=[1, 2],
+            **rollout_fields,
         ),
     )
     req.extra[TEXT] = make_req(server).extra[TEXT]
     MiniMaxH3TimestepPreparationStage().forward(req, server)
     MiniMaxH3LatentPreparationStage().forward(req, server)
-    MiniMaxH3DenoisingStage(ZeroVelocityModel()).forward(req, server)
+    MiniMaxH3DenoisingStage(_OnDeviceZeroVelocityModel()).forward(req, server)
+    output = MiniMaxH3DecodingStage(_OnDeviceVAE(), None).forward(req, server)
+    return output.rollout_trajectory_data
 
-    output = MiniMaxH3DecodingStage(RecordingVAE(), None).forward(req, server)
 
-    trajectory = output.rollout_trajectory_data
+def test_rollout_request_returns_its_trajectory_and_conditioning(server):
+    """The trainer replays a rollout from the decode output: each step's latents and the DiT's conditioning."""
+    trajectory = _rollout_through_the_stages(server, rollout_sde_step_indices=[1, 2])
+
     # 6 steps of the 2 target rows of a 64x32 image, and the initial noise
     assert trajectory.dit_trajectory.latents.shape == (1, 7, 2, 96)
     noisy_steps = (trajectory.rollout_log_probs[0] != 0).tolist()

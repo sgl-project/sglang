@@ -9,7 +9,7 @@ import math
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -54,6 +54,14 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
+        PackedBranchInputs,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
+        MiniMaxH3ImageRollout,
+    )
 
 logger = init_logger(__name__)
 
@@ -128,34 +136,26 @@ def _image_branch_inputs(
     return PackedBranchInputs(packed=packed, text_embeddings=hidden, token_tags=tags)
 
 
-def _image_rollout_ctx(*, batch: Req, plan: Any, positive: Any, device: torch.device):
+def _image_rollout(
+    *, batch: Req, positive: PackedBranchInputs, device: torch.device
+) -> MiniMaxH3ImageRollout:
     """Rollout state of an image request: its noise generator, and the conditioning the trainer replays."""
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
-        MiniMaxH3RolloutCollector,
-        MiniMaxH3RolloutCtx,
+        MiniMaxH3ImageRollout,
     )
 
-    sigmas = [float(sigma) for sigma in batch.sigmas]
-    return_step_indices = batch.rollout_return_step_indices
-    collector = MiniMaxH3RolloutCollector(
-        sigmas_video=sigmas,
-        return_step_indices=(
-            None if return_step_indices is None else set(return_step_indices)
-        ),
-    )
-    collector.pos_cond_kwargs = {
-        "encoder_hidden_states": positive.text_embeddings.detach().cpu(),
-        "h3_packed_layout": {
-            key: value.detach().cpu() if isinstance(value, torch.Tensor) else value
-            for key, value in positive.packed.items()
-        },
-        "h3_token_tags": positive.token_tags.detach().cpu(),
-    }
-    return MiniMaxH3RolloutCtx(
+    return MiniMaxH3ImageRollout(
         batch=batch,
-        generator=torch.Generator(device=device).manual_seed(int(plan.seed)),
-        sigmas_video=sigmas,
-        collector=collector,
+        sigmas=[float(sigma) for sigma in batch.sigmas],
+        generator=torch.Generator(device=device).manual_seed(int(batch.seed)),
+        pos_cond_kwargs={
+            "encoder_hidden_states": positive.text_embeddings.detach().cpu(),
+            "h3_packed_layout": {
+                key: value.detach().cpu() if isinstance(value, torch.Tensor) else value
+                for key, value in positive.packed.items()
+            },
+            "h3_token_tags": positive.token_tags.detach().cpu(),
+        },
     )
 
 
@@ -1012,10 +1012,8 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             # Noised anchors from draw 2 of the request generator (image_noise.py).
             anchors = minimax_h3_image_anchor_rows(batch, rows)
         initial_rows = torch.cat((anchors, state["initial_video_rows"]), dim=0)
-        rollout_ctx = (
-            _image_rollout_ctx(
-                batch=batch, plan=plan, positive=positive, device=self.device
-            )
+        rollout = (
+            _image_rollout(batch=batch, positive=positive, device=self.device)
             if batch.rollout
             else None
         )
@@ -1067,12 +1065,10 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     device=self.device,
                     on_step=on_step,
                     step_profiler=partial(self._profile_denoising_step, batch=batch),
-                    rollout_ctx=rollout_ctx,
+                    rollout=rollout,
                 )
-        if rollout_ctx is not None:
-            batch.rollout_trajectory_data = (
-                rollout_ctx.collector.build_trajectory_data()
-            )
+        if rollout is not None:
+            batch.rollout_trajectory_data = rollout.build_trajectory_data()
         target = output[positive.packed["update_mask"].to(output.device)]
         batch.latents = minimax_h3_unpatchify_video_tokens(
             target,

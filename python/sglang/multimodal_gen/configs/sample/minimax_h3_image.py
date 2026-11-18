@@ -123,6 +123,7 @@ class MiniMaxH3ImageSamplingParams(SamplingParams):
                     "MiniMax H3 image rollout runs every step of the PDD grid; "
                     "rollout_stop_step_index is not supported"
                 )
+            self._reject_rollout_steps_off_the_grid()
         if self.quality not in ("exact", "lossless"):
             raise ValueError("MiniMax H3 image supports quality='exact' or 'lossless'")
         if (
@@ -132,6 +133,28 @@ class MiniMaxH3ImageSamplingParams(SamplingParams):
             or self.skip_softmax_params is not None
         ):
             raise ValueError("MiniMax H3 image does not support approximate caching")
+
+    def _reject_rollout_steps_off_the_grid(self) -> None:
+        """A noisy step off the grid would silently run no noise; a missing latent fails after the denoise."""
+        steps = self.num_inference_steps
+        if steps is None:
+            return
+        # Steps are numbered 0..steps-1; latents 0..steps, the last being the image's.
+        for name, last in (
+            ("rollout_sde_step_indices", steps - 1),
+            ("rollout_return_step_indices", steps),
+        ):
+            indices = getattr(self, name)
+            if indices is not None and any(not 0 <= index <= last for index in indices):
+                raise ValueError(
+                    f"MiniMax H3 image {name} must lie in 0..{last}, got {list(indices)!r}"
+                )
+        if self.rollout_return_step_indices is not None and not list(
+            self.rollout_return_step_indices
+        ):
+            raise ValueError(
+                "MiniMax H3 image rollout_return_step_indices must name at least one latent"
+            )
 
     def _adjust(self, server_args) -> None:
         # Do not call the video/visual adjuster: it strips text and changes shape.

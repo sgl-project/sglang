@@ -169,6 +169,32 @@ def test_request_steps(override, steps):
         ({"seed": -1}, "seed"),
         ({"rollout": True, "image_path": "reference.png"}, "rollout supports t2i only"),
         ({"rollout": True, "rollout_stop_step_index": 2}, "rollout_stop_step_index"),
+        # a noisy step off the 6-step grid would run as a deterministic rollout
+        (
+            {
+                "rollout": True,
+                "num_inference_steps": 6,
+                "rollout_sde_step_indices": [6],
+            },
+            r"rollout_sde_step_indices must lie in 0\.\.5",
+        ),
+        # latents the loop never produces fail only after the denoise
+        (
+            {
+                "rollout": True,
+                "num_inference_steps": 6,
+                "rollout_return_step_indices": [7],
+            },
+            r"rollout_return_step_indices must lie in 0\.\.6",
+        ),
+        (
+            {
+                "rollout": True,
+                "num_inference_steps": 6,
+                "rollout_return_step_indices": [],
+            },
+            "at least one latent",
+        ),
     ],
 )
 def test_invalid_image_requests_fail_at_constructor(override, match):
