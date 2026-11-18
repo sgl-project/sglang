@@ -71,6 +71,18 @@ pub struct EngineReportedWorkerLoad {
     pub captured_at: Instant,
 }
 
+/// One DP rank's fresh engine reading, for `--dp-rank-policy least_tokens`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RankLoad {
+    pub rank: u32,
+    /// KV tokens in use.
+    pub num_tokens: u64,
+    /// Requests running or waiting on the rank.
+    pub num_reqs: u64,
+    /// When the router received the reading.
+    pub at: Instant,
+}
+
 /// Engine-reported per-worker scheduling load: capacity, queue pressure, and prefill estimates.
 ///
 /// Shared by cache-aware, power-of-two, session-aware, and decode selection and admission.
@@ -566,21 +578,28 @@ impl EngineReportedLoadTable {
             .collect()
     }
 
-    /// KV tokens in use on each DP rank of one worker, as `(rank, num_tokens)`
-    /// in rank order, for `--dp-rank-policy least_tokens`. `None` unless every
-    /// rank the worker advertised (or, with no advertisement, every rank
-    /// observed) is fresh, by the same rule as [`Self::capture_snapshot`]: a
-    /// silent rank must not look idle and draw traffic. Read at selection
-    /// time rather than from the request's ingress snapshot because in PD mode
-    /// the decode rank is chosen after the admission wait.
-    pub fn fresh_rank_tokens(&self, worker_url: &str, now: Instant) -> Option<Vec<(u32, u64)>> {
-        let mut observed: HashMap<u32, (u64, bool)> = HashMap::new();
+    /// One fresh reading per DP rank of one worker, in rank order, for
+    /// `--dp-rank-policy least_tokens`. `None` unless every rank the worker
+    /// advertised (or, with no advertisement, every rank observed) is fresh,
+    /// by the same rule as [`Self::capture_snapshot`]: a silent rank must not
+    /// look idle and draw traffic. Read at selection time rather than from
+    /// the request's ingress snapshot because in PD mode the decode rank is
+    /// chosen after the admission wait.
+    pub fn fresh_rank_loads(&self, worker_url: &str, now: Instant) -> Option<Vec<RankLoad>> {
+        let mut observed: HashMap<u32, (RankLoad, bool)> = HashMap::new();
         for entry in self.by_rank.iter() {
             if entry.key().0 != worker_url {
                 continue;
             }
-            let fresh = now.saturating_duration_since(entry.value().at) <= self.freshness;
-            observed.insert(entry.key().1, (entry.value().load.num_tokens, fresh));
+            let LoadEntry { load, at, .. } = entry.value();
+            let fresh = now.saturating_duration_since(*at) <= self.freshness;
+            let reading = RankLoad {
+                rank: entry.key().1,
+                num_tokens: load.num_tokens,
+                num_reqs: load.num_running_reqs.saturating_add(load.num_waiting_reqs),
+                at: *at,
+            };
+            observed.insert(reading.rank, (reading, fresh));
         }
         let mut required: Vec<u32> = self
             .expected
@@ -598,7 +617,7 @@ impl EngineReportedLoadTable {
         required
             .into_iter()
             .map(|rank| match observed.get(&rank) {
-                Some(&(num_tokens, true)) => Some((rank, num_tokens)),
+                Some(&(reading, true)) => Some(reading),
                 _ => None,
             })
             .collect()
@@ -708,33 +727,39 @@ mod tests {
     }
 
     #[test]
-    fn rank_tokens_need_every_advertised_rank_fresh() {
+    fn rank_loads_need_every_advertised_rank_fresh() {
         let t = EngineReportedLoadTable::with_freshness(Duration::from_millis(10));
         let now = Instant::now();
-        assert_eq!(t.fresh_rank_tokens("http://w:30000", now), None);
+        let tokens = |at: Instant| {
+            t.fresh_rank_loads("http://w:30000", at).map(|loads| {
+                loads
+                    .iter()
+                    .map(|l| (l.rank, l.num_tokens))
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(tokens(now), None);
         t.set("http://w:30000", 1, with_tokens(300), now);
         t.set("http://w:30000", 0, with_tokens(700), now);
         t.set("http://other:30000", 0, with_tokens(1), now);
         // Nothing advertised: every observed rank counts, in rank order.
-        assert_eq!(
-            t.fresh_rank_tokens("http://w:30000", now),
-            Some(vec![(0, 700), (1, 300)])
-        );
+        assert_eq!(tokens(now), Some(vec![(0, 700), (1, 300)]));
         // An advertised rank that never published hides the whole worker.
         for rank in 0..3 {
             t.mark_expected_rank("http://w:30000", rank);
         }
-        assert_eq!(t.fresh_rank_tokens("http://w:30000", now), None);
+        assert_eq!(tokens(now), None);
         t.set("http://w:30000", 2, with_tokens(0), now);
-        assert_eq!(
-            t.fresh_rank_tokens("http://w:30000", now),
-            Some(vec![(0, 700), (1, 300), (2, 0)])
-        );
+        assert_eq!(tokens(now), Some(vec![(0, 700), (1, 300), (2, 0)]));
         // So does one whose reading went stale.
         let later = now + Duration::from_secs(1);
         t.set("http://w:30000", 0, with_tokens(700), later);
         t.set("http://w:30000", 1, with_tokens(300), later);
-        assert_eq!(t.fresh_rank_tokens("http://w:30000", later), None);
+        assert_eq!(tokens(later), None);
+        // Each reading keeps its own timestamp and request count.
+        t.set("http://w:30000", 2, load(3, 2), later);
+        let rank_2 = t.fresh_rank_loads("http://w:30000", later).unwrap()[2];
+        assert_eq!((rank_2.num_reqs, rank_2.at), (5, later));
     }
 
     #[test]

@@ -9,8 +9,33 @@
 //! the fewest engine-reported KV tokens, or the worker's ranks in turn.
 
 use crate::config::DpRankPolicy;
+use crate::state::load_monitor::engine_reported_load::RankLoad;
 use crate::workers::Worker;
 use sha2::{Digest, Sha256};
+
+/// `rank_tokens` for [`select_dp_rank`]: each reading moved forward by the
+/// stamped requests this router sent to the rank since it, at the worker's
+/// mean KV per request, so a burst between two engine reports does not all
+/// land on the rank that was lightest at the last one.
+pub fn projected_rank_tokens(worker: &Worker, loads: &[RankLoad]) -> Vec<(u32, u64)> {
+    let (tokens, reqs) = loads.iter().fold((0u64, 0u64), |(tokens, reqs), load| {
+        (
+            tokens.saturating_add(load.num_tokens),
+            reqs.saturating_add(load.num_reqs),
+        )
+    });
+    let per_req = tokens.checked_div(reqs).unwrap_or(0);
+    loads
+        .iter()
+        .map(|load| {
+            let sent = worker.dp_rank_dispatched_since(load.rank, load.at) as u64;
+            (
+                load.rank,
+                load.num_tokens.saturating_add(sent.saturating_mul(per_req)),
+            )
+        })
+        .collect()
+}
 
 /// `None` for a single-rank worker. `prefix_depths` is `(rank, cached blocks)`;
 /// `rank_tokens` is `(rank, KV tokens in use)` from the engine's load feed, read
@@ -76,6 +101,7 @@ mod tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
     use crate::workers::{EngineProfile, WireProtocol};
+    use std::time::{Duration, Instant};
 
     fn worker(dp_ranks: u32) -> Worker {
         let spec = WorkerSpec {
@@ -140,5 +166,30 @@ mod tests {
         // least_in_flight never reads the tokens.
         let picked = select_dp_rank(&w, None, &[], &tokens, LEAST).unwrap();
         assert!(picked == 0 || picked == 3, "{picked}");
+    }
+
+    #[test]
+    fn projection_counts_stamped_dispatches_since_each_reading() {
+        let w = worker(2);
+        let reading = |rank, num_tokens, num_reqs, at| RankLoad {
+            rank,
+            num_tokens,
+            num_reqs,
+            at,
+        };
+        let at = Instant::now();
+        // Mean KV per request over the worker: (100 + 400) / (1 + 4).
+        let loads = [reading(0, 100, 1, at), reading(1, 400, 4, at)];
+        assert_eq!(projected_rank_tokens(&w, &loads), [(0, 100), (1, 400)]);
+        let _sent = [0, 0, 0, 0].map(|rank| w.dp_rank_timestamped_guard(rank));
+        let _plain = w.dp_rank_guard(0);
+        assert_eq!(projected_rank_tokens(&w, &loads), [(0, 500), (1, 400)]);
+        // A newer reading already covers them.
+        let newer = Instant::now() + Duration::from_secs(1);
+        let loads = [reading(0, 100, 1, newer), reading(1, 400, 4, newer)];
+        assert_eq!(projected_rank_tokens(&w, &loads), [(0, 100), (1, 400)]);
+        // No request on the worker: nothing to scale by.
+        let loads = [reading(0, 0, 0, at), reading(1, 0, 0, at)];
+        assert_eq!(projected_rank_tokens(&w, &loads), [(0, 0), (1, 0)]);
     }
 }

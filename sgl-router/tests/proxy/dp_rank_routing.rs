@@ -340,6 +340,67 @@ async fn least_tokens_sends_decode_to_the_rank_holding_the_fewest_kv_tokens() {
     assert!(send(&app, &decode, &[(KEY, "conv-pd")]).await.is_some());
 }
 
+/// Between two engine reports, requests still in flight on a rank count as
+/// its mean KV per request, so a burst spreads instead of herding the rank
+/// that was lightest at the last report.
+#[tokio::test]
+async fn least_tokens_charges_in_flight_requests_to_their_rank() {
+    let (prefill, decode) = (
+        MockWorker::start(vec![]).await,
+        MockWorker::start_hanging(Duration::from_secs(30)).await,
+    );
+    let workers = [
+        (&prefill, WorkerMode::Prefill, 1),
+        (&decode, WorkerMode::Decode, 4),
+    ];
+    let mut cfg = sticky_config();
+    cfg.model.dp_rank_policy = DpRankPolicy::LeastTokens;
+    let load = EngineReportedLoadTable::new();
+    let app = router_with_load(cfg, &workers, Default::default(), Arc::clone(&load));
+    // Mean KV per request over the worker: 1650 / 16, about 103.
+    for (rank, num_tokens, num_reqs) in [(0, 400, 4), (1, 100, 1), (2, 900, 9), (3, 250, 2)] {
+        let stat = LoadStat {
+            num_running_reqs: num_reqs,
+            num_waiting_reqs: 0,
+            num_tokens,
+            max_total_num_tokens: 1_000,
+            native_cache: None,
+        };
+        load.set(&decode.url, rank, stat, Instant::now());
+    }
+    let mut ranks = Vec::new();
+    let mut in_flight = Vec::new();
+    for _ in 0..3 {
+        decode.captured.lock().unwrap().headers.clear();
+        let app = app.clone();
+        in_flight.push(tokio::spawn(async move {
+            let request = Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(KEY, "conv-pd")
+                .body(Body::from(body().to_string()))
+                .unwrap();
+            let _ = app.oneshot(request).await;
+        }));
+        let started = Instant::now();
+        let rank = loop {
+            if let Some(rank) = decode.captured.lock().unwrap().headers.get(RANK).cloned() {
+                break rank;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "decode never called"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        ranks.push(rank);
+    }
+    // Rank 1 at 100, then 203 with one request charged, then 306 > rank 3's 250.
+    assert_eq!(ranks, ["1", "1", "3"]);
+    for task in in_flight {
+        task.abort();
+    }
+}
+
 #[tokio::test]
 async fn any_policy_picks_the_rank_with_the_deepest_prefix() {
     let worker = MockWorker::start(vec![]).await;

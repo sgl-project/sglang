@@ -217,8 +217,10 @@ client sent. The router picks the first of these that applies:
    `--dp-rank-policy round_robin`, the worker's ranks in turn; or with
    `--dp-rank-policy least_tokens`, the rank holding the fewest KV tokens as
    the engine reports them on its `--load-publish-endpoint` feed, which sees
-   every router replica's traffic. Ties, and a worker without a fresh reading
-   for every one of its ranks, fall back to the in-flight count.
+   every router replica's traffic, plus the requests this router has sent to
+   the rank since that reading at the worker's mean KV per request. Ties,
+   and a worker without a fresh reading for every one of its ranks, fall
+   back to the in-flight count.
 
 In PD mode, decode is ranked by step 3 only. The decode request names the
 prefill rank in `disagg_prefill_dp_rank`, and the bootstrap room satisfies
