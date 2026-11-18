@@ -12,7 +12,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import MmItemMemoryPool
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=30, suite="base-b-test-2-npu-a3")
+register_npu_ci(est_time=30, suite="extra-b-test-2-npu-a3")
 
 POOL_BYTES = 1 << 20
 CONSUMER_SLOTS = 1
