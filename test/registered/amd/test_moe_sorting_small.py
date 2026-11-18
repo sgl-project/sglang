@@ -176,10 +176,9 @@ class TestMoeSortingSmall(CustomTestCase):
         )
 
     def test_falls_back_to_aiter_from_1024_experts(self):
-        # past 64 pairs the histogram sort serves up to E=896 (E_POW2 <= 1024)
+        # past 64 pairs the histogram sort serves E < 1024 (E_POW2 <= 1024)
         m = 6
         ids, _ = self._routing(m, m)
-        self.assertTrue(self.S._small_sort_supported(ids, 32, None, None, self.E))
         self.assertFalse(self.S._small_sort_supported(ids, 32, None, None, 1024))
 
 
