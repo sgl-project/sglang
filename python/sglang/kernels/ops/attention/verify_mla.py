@@ -305,14 +305,15 @@ def _verify_mla_draft_prefix_stage1(
     KV_GROUP_NUM: tl.constexpr, HAS_KV_HEADS: tl.constexpr, NOPE_DIM: tl.constexpr,
     PE_DIM: tl.constexpr, V_HEAD_DIM: tl.constexpr, BLOCK_DNOPE: tl.constexpr,
     BLOCK_DPE: tl.constexpr, BLOCK_DV: tl.constexpr, BLOCK_N: tl.constexpr,
-    BF16_DOT: tl.constexpr = False, WINDOW: tl.constexpr = 0,
+    BF16_DOT: tl.constexpr = False, TRIM_WINDOW: tl.constexpr = 0,
 ):
     _verify_mla_prefix_stage1_body(
         Q, K_Buffer, V_Buffer, sm_scale, k_scale, v_scale, qo_indptr, kv_indptr, kv_indices,
         Att_Out, Att_Lse, num_splits, stride_qbs, stride_qh, stride_buf_kbs, stride_buf_vbs,
         stride_buf_kh, stride_buf_vh, stride_ob, stride_oh, stride_os, stride_ol, stride_lb,
         stride_lh, stride_ls, H_Q, L_EXT, BLOCK_H, KV_GROUP_NUM, HAS_KV_HEADS, NOPE_DIM,
-        PE_DIM, V_HEAD_DIM, BLOCK_DNOPE, BLOCK_DPE, BLOCK_DV, BLOCK_N, -1, BF16_DOT, WINDOW,
+        PE_DIM, V_HEAD_DIM, BLOCK_DNOPE, BLOCK_DPE, BLOCK_DV, BLOCK_N, -1, BF16_DOT,
+        TRIM_WINDOW,
     )
 # fmt: on
 
@@ -565,14 +566,16 @@ def _verify_mla_draft_combine_stage2(
     L_EXT: tl.constexpr, HEAD_DIM: tl.constexpr, V_HEAD_DIM: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr, BLOCK_DV: tl.constexpr, BLOCK_N: tl.constexpr,
     KV_GROUP_NUM: tl.constexpr, HAS_KV_HEADS: tl.constexpr, IS_CAUSAL: tl.constexpr,
-    SPLIT_BLOCK: tl.constexpr = 1, ROW_BLOCK: tl.constexpr = 0, WINDOW: tl.constexpr = 0,
+    SPLIT_BLOCK: tl.constexpr = 1, ROW_BLOCK: tl.constexpr = 0,
+    TRIM_WINDOW: tl.constexpr = 0,
 ):
     _verify_mla_combine_stage2_body(
         Att_Out, Att_Lse, Q, K_Extend, V_Extend, O_Out, sm_scale, qo_indptr, kv_indptr,
         num_splits, stride_ob, stride_oh, stride_os, stride_ol, stride_lb, stride_lh,
         stride_ls, stride_qbs, stride_qh, stride_kebs, stride_vebs, stride_keh, stride_veh,
         stride_oobs, stride_ooh, L_EXT, HEAD_DIM, V_HEAD_DIM, BLOCK_DMODEL, BLOCK_DV,
-        BLOCK_N, KV_GROUP_NUM, HAS_KV_HEADS, IS_CAUSAL, SPLIT_BLOCK, ROW_BLOCK, WINDOW, True,
+        BLOCK_N, KV_GROUP_NUM, HAS_KV_HEADS, IS_CAUSAL, SPLIT_BLOCK, ROW_BLOCK, TRIM_WINDOW,
+        True,
     )
 # fmt: on
 
@@ -946,7 +949,7 @@ class DraftVerifyMLA(VerifyMLA):
             BLOCK_DV=triton.next_power_of_2(self.v_head_dim),
             BLOCK_N=self.block_n,
             BF16_DOT=bf16_dot,
-            WINDOW=window,
+            TRIM_WINDOW=window,
             num_warps=self.num_warps,
             # 2 stages spill on the MLA tile and miscompute
             num_stages=1,
@@ -1007,7 +1010,7 @@ class DraftVerifyMLA(VerifyMLA):
             IS_CAUSAL=is_causal,
             SPLIT_BLOCK=self.split_block,
             ROW_BLOCK=self.row_block,
-            WINDOW=window,
+            TRIM_WINDOW=window,
             num_warps=4,
             num_stages=1,
         )
