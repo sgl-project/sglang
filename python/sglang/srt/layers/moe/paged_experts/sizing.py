@@ -37,10 +37,12 @@ class KVFloor:
 
 
 def _requests_set() -> Optional[int]:
-    """--max-running-requests as the user set it. SGLang resolves its own value only under
-    speculative decoding, which paged experts refuse, and for DeepSeek-V4, whose experts they
-    do not page yet, so here the resolved value is the user's (None if unset)."""
-    return get_schedule().max_running_requests
+    """--max-running-requests if the user set it, else None: a value SGLang resolves itself
+    (DeepSeek-V4's default) caps the request pool, but is no target for the KV cache."""
+    schedule = get_schedule()
+    if not schedule._max_running_requests_explicitly_set:
+        return None
+    return schedule.max_running_requests
 
 
 def kv_floor(model_context_len: int) -> KVFloor:
@@ -115,6 +117,16 @@ def _kv_tokens(kv_configurator, budget_bytes: int) -> int:
     return configurator.calculate_pool_sizes(
         max(budget_bytes, 0), get_schedule().page_size
     ).max_total_num_tokens
+
+
+def _step_tokens(kv_minimum: int) -> int:
+    """The most tokens one host-planned step carries: a prefill chunk, or without chunking
+    the larger of a prefill batch and one full request."""
+    schedule = get_schedule()
+    chunk = schedule.chunked_prefill_size
+    if chunk is not None and chunk > 0:
+        return chunk
+    return max(schedule.max_prefill_tokens or 0, kv_minimum)
 
 
 def _bytes_per_slot(method) -> int:
@@ -235,7 +247,32 @@ class ExpertSlotSizing:
             m.release_slots(layer)
         spare = static_budget_bytes(self.kv_configurator, self.pre_model_load_memory)
         spare -= sum(k * r for k, r in zip(base, row))
-        ks = self._grow(base, num_experts, row, spare)
+        # A host-planned step (a prefill chunk) needs its merged entries and one compacted
+        # runner call beyond what the runner itself takes; one MoE layer runs at a time.
+        tokens = _step_tokens(self.floor.minimum)
+        reserve = max(
+            m.contract.prefill_bytes(
+                m.hidden_size,
+                m.intermediate_size,
+                tokens,
+                _router_top_k(layer),
+                m.params_dtype,
+            )
+            for layer, m in zip(self.layers, methods)
+        )
+        spare -= reserve
+        if spare < 0:
+            logger.warning(
+                "Paged experts: the smallest expert slots (K = top-k) leave %.2f GiB less "
+                "than a %d-token prefill step needs (%.2f GiB); long prompts may run out of "
+                "GPU memory. Lower --chunked-prefill-size or --max-total-tokens, or raise "
+                "--mem-fraction-static",
+                -spare / _GIB,
+                tokens,
+                reserve / _GIB,
+            )
+        # On the disk tier a layer grows to its host rows at most.
+        ks = self._grow(base, [m.max_resident for m in methods], row, spare)
         slab = self._allocate(ks, methods)
         offset = 0
         for layer, m, k in zip(self.layers, methods, ks):
