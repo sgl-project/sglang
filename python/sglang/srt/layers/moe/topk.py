@@ -294,6 +294,11 @@ class TopKConfig:
     def num_shared_topk_slots(self) -> int:
         return self.shared_experts.num_shared_topk_slots
 
+    def set_correction_bias(self, bias: torch.Tensor) -> None:
+        self.correction_bias = bias
+        self._correction_bias_dtype_cache = None
+        self._correction_bias_cache_key = None
+
     def correction_bias_for_dtype(self, dtype: torch.dtype) -> Optional[torch.Tensor]:
         """Return correction bias in ``dtype``, reusing a per-TopK lazy copy."""
         correction_bias = self.correction_bias

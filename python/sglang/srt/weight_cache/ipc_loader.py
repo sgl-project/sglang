@@ -43,6 +43,25 @@ logger = logging.getLogger(__name__)
 _DAEMON_LIVENESS_POLL_INTERVAL = 5.0
 
 
+def _capture_moe_bias_references(model, existing_params):
+    """Record TopK configs directly referencing parameters replaced by IPC."""
+    from sglang.srt.layers.moe.topk import TopKConfig
+
+    configs_by_bias = {}
+    for module in model.modules():
+        config = getattr(module, "topk_config", None)
+        if isinstance(config, TopKConfig):
+            bias = config.correction_bias
+            if bias is not None and bias.is_meta:
+                configs_by_bias.setdefault(id(bias), []).append(config)
+    references = []
+    for name, param in existing_params.items():
+        configs = configs_by_bias.pop(id(param), None)
+        if configs is not None:
+            references.append((name, configs))
+    return references
+
+
 class IpcModelLoader(BaseModelLoader):
     """Load model weights from a Weight Cache Daemon via CUDA IPC handles.
 
@@ -168,6 +187,20 @@ class IpcModelLoader(BaseModelLoader):
         # replaced via IPC mapping, these views still point to the old
         # meta storage. We must recreate them from the now-valid tensors.
         self._rebuild_stale_views(model)
+
+        from sglang.srt.layers.moe.topk import TopKConfig
+
+        for path, module in model.named_modules():
+            config = getattr(module, "topk_config", None)
+            if (
+                isinstance(config, TopKConfig)
+                and config.correction_bias is not None
+                and config.correction_bias.is_meta
+            ):
+                field = f"{path}.topk_config.correction_bias".lstrip(".")
+                raise RuntimeError(
+                    f"[IpcModelLoader] Unrestored meta MoE routing bias at {field}"
+                )
 
         # The model now points into the daemon's GPU memory via CUDA IPC. If the
         # daemon dies, those pointers dangle, so watch it and fail loud.
@@ -345,6 +378,7 @@ class IpcModelLoader(BaseModelLoader):
         }
         existing_buffers = {name: buf for name, buf in model.named_buffers()}
         existing_names = set(existing_params) | set(existing_buffers)
+        bias_references = _capture_moe_bias_references(model, existing_params)
 
         imported_refs = []
         imported_count = 0
@@ -430,6 +464,10 @@ class IpcModelLoader(BaseModelLoader):
                 f"{'...' if len(still_on_meta_buffers) > 10 else ''}"
             )
 
+        for name, configs in bias_references:
+            parameter = model.get_parameter(name)
+            for config in configs:
+                config.set_correction_bias(parameter)
         map_elapsed = time.perf_counter() - map_tic
 
         # Stash IPC refs on the model to prevent GC (which would unmap the memory)
