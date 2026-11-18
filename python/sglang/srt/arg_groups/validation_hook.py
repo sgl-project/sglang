@@ -424,8 +424,9 @@ def check_server_args(server_args: Any):
         assert cfg.schedule_policy in [
             "fcfs",
             "lof",
+            "lpm",
         ], (
-            f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{cfg.schedule_policy}' is not supported."
+            f"To use priority scheduling, schedule_policy must be 'fcfs', 'lof' or 'lpm'. '{cfg.schedule_policy}' is not supported."
         )
         if cfg.enable_unified_memory and not cfg.disable_priority_preemption:
             logger.warning(

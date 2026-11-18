@@ -392,5 +392,87 @@ class TestAdmissionMatchedPrefixTokens(CustomTestCase):
         self.assertEqual(req.num_matched_prefix_tokens, len(self.PREFIX))
 
 
+class TestLpmWithPriority(CustomTestCase):
+    def setUp(self):
+        # Tail handling reads the disaggregation and memory config.
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+
+    def make_policy(self, *, low_values_first=False):
+        return SchedulePolicy(
+            policy="lpm",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=True,
+            schedule_low_priority_values_first=low_values_first,
+        )
+
+    def make_req(self, rid, *, priority, cached=0, arrived=0.0):
+        req = _make_req(rid, "", list(range(cached + 8)), priority=priority)
+        req.num_matched_prefix_tokens = cached
+        req.time_stats.wait_queue_entry_time = arrived
+        return req
+
+    def sort(self, policy, queue):
+        # Keep the num_matched_prefix_tokens set by make_req.
+        with patch.object(policy, "_compute_prefix_matches", return_value=set()):
+            return [r.rid for r in policy.calc_priority(queue)]
+
+    def test_priority_outranks_cache_hit(self):
+        policy = self.make_policy()
+        queue = [
+            self.make_req("low_hot", priority=0, cached=100_000, arrived=1),
+            self.make_req("high_cold", priority=10, cached=0, arrived=2),
+            self.make_req("high_hot", priority=10, cached=50_000, arrived=3),
+        ]
+        self.assertEqual(self.sort(policy, queue), ["high_hot", "high_cold", "low_hot"])
+
+    def test_low_priority_values_first_is_respected(self):
+        policy = self.make_policy(low_values_first=True)
+        queue = [
+            self.make_req("p5_hot", priority=5, cached=100_000, arrived=1),
+            self.make_req("p1_cold", priority=1, cached=0, arrived=2),
+        ]
+        self.assertEqual(self.sort(policy, queue), ["p1_cold", "p5_hot"])
+
+    def test_priority_holds_beyond_prefix_match_window(self):
+        """Plain lpm falls back to unsorted FCFS above 128 waiting requests;
+        with priority the late high-priority request must still lead."""
+        policy = self.make_policy()
+        queue = [
+            self.make_req(f"low{i}", priority=0, cached=i, arrived=float(i))
+            for i in range(200)
+        ]
+        queue.append(self.make_req("late_high", priority=10, arrived=1_000.0))
+        order = self.sort(policy, queue)
+        self.assertEqual(order[0], "late_high")
+        head = order[1:128]
+        self.assertEqual(head, sorted(head, key=lambda rid: -int(rid[3:])))
+        self.assertEqual(order[128:], [f"low{i}" for i in range(127, 200)])
+
+    def test_prefix_matching_is_bounded_to_head(self):
+        policy = self.make_policy()
+        queue = [
+            self.make_req(f"r{i}", priority=0, arrived=float(i)) for i in range(300)
+        ]
+        with patch.object(policy, "_compute_prefix_matches", return_value=set()) as m:
+            policy.calc_priority(queue)
+        (matched, _), _ = m.call_args
+        self.assertEqual(len(matched), 128)
+
+    def test_new_high_priority_is_not_held_behind_a_bounded_batch(self):
+        """Bounded lpm commits the queue head to a fixed batch; with priority, a
+        later high-priority arrival must still go first."""
+        policy = self.make_policy()
+        queue = [
+            self.make_req(f"low{i}", priority=0, arrived=float(i)) for i in range(200)
+        ]
+        with patch.object(policy, "_should_start_bounded_batch", return_value=True):
+            self.sort(policy, queue)
+            queue.append(self.make_req("late_high", priority=10, arrived=1_000.0))
+            self.assertEqual(self.sort(policy, queue)[0], "late_high")
+
+
 if __name__ == "__main__":
     unittest.main()
