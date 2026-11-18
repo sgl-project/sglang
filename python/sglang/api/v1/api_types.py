@@ -129,6 +129,631 @@ class ErrorBody(msgspec.Struct, kw_only=True, frozen=True):
         return encode_ErrorBody(self)
 
 
+class SetInternalStateRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.SetInternalStateRequest: JSON object (unknown keys ignored)."""
+
+    server_args: Optional[Any] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "SetInternalStateRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_SetInternalStateRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_SetInternalStateRequest(self)
+
+
+class StartProfileRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.StartProfileRequest: JSON object (unknown keys ignored)."""
+
+    output_dir: Optional[str] = None
+    start_step: Optional[int] = None
+    num_steps: Optional[int] = None
+    activities: Optional[StringList] = None
+    profile_by_stage: bool = False
+    with_stack: Optional[bool] = None
+    record_shapes: Optional[bool] = None
+    profile_id: Optional[str] = None
+    merge_profiles: bool = False
+    profile_prefix: Optional[str] = None
+    profile_stages: Optional[StringList] = None
+    detailed_annotations: bool = False
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "StartProfileRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_StartProfileRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_StartProfileRequest(self)
+
+
+class StopProfileRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.StopProfileRequest: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "StopProfileRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_StopProfileRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_StopProfileRequest(self)
+
+
+class ProfileResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ProfileResponse: JSON object (unknown keys ignored)."""
+
+    success: bool = False
+    message: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ProfileResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ProfileResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ProfileResponse(self)
+
+
+class ExpertDistributionRecordRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ExpertDistributionRecordRequest: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ExpertDistributionRecordRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ExpertDistributionRecordRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ExpertDistributionRecordRequest(self)
+
+
+class ExpertDistributionRecordResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ExpertDistributionRecordResponse: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ExpertDistributionRecordResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ExpertDistributionRecordResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ExpertDistributionRecordResponse(self)
+
+
+class SlowDownRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.SlowDownRequest: JSON object (unknown keys ignored)."""
+
+    forward_sleep_time: Optional[float] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "SlowDownRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_SlowDownRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_SlowDownRequest(self)
+
+
+class SlowDownResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.SlowDownResponse: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "SlowDownResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_SlowDownResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_SlowDownResponse(self)
+
+
+class ReleaseMemoryOccupationRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ReleaseMemoryOccupationRequest: JSON object (unknown keys ignored)."""
+
+    tags: Optional[StringList] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ReleaseMemoryOccupationRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ReleaseMemoryOccupationRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ReleaseMemoryOccupationRequest(self)
+
+
+class ResumeMemoryOccupationRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ResumeMemoryOccupationRequest: JSON object (unknown keys ignored)."""
+
+    tags: Optional[StringList] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ResumeMemoryOccupationRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ResumeMemoryOccupationRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ResumeMemoryOccupationRequest(self)
+
+
+class MemoryOccupationResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.MemoryOccupationResponse: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "MemoryOccupationResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_MemoryOccupationResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_MemoryOccupationResponse(self)
+
+
+class FreezeGcRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.FreezeGcRequest: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "FreezeGcRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_FreezeGcRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_FreezeGcRequest(self)
+
+
+class FreezeGcResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.FreezeGcResponse: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "FreezeGcResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_FreezeGcResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_FreezeGcResponse(self)
+
+
+class PauseGenerationRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.PauseGenerationRequest: JSON object (unknown keys ignored)."""
+
+    mode: Optional[str] = "abort"
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "PauseGenerationRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_PauseGenerationRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_PauseGenerationRequest(self)
+
+
+class ContinueGenerationRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ContinueGenerationRequest: JSON object (unknown keys ignored)."""
+
+    torch_empty_cache: Optional[bool] = True
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ContinueGenerationRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ContinueGenerationRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ContinueGenerationRequest(self)
+
+
+class GenerationPauseResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.GenerationPauseResponse: JSON object (unknown keys ignored)."""
+
+    message: str = ""
+    status: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "GenerationPauseResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_GenerationPauseResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_GenerationPauseResponse(self)
+
+
+class PdRoleSwitchRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.PdRoleSwitchRequest: JSON object (unknown keys ignored)."""
+
+    new_role: Optional[str] = ""
+    decode_cuda_graph_bs: Optional[Int64List] = None
+    decode_cuda_graph_memory_gb: Optional[float] = None
+    prepare_only: bool = False
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "PdRoleSwitchRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_PdRoleSwitchRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_PdRoleSwitchRequest(self)
+
+
+class PdRoleSwitchResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.PdRoleSwitchResponse: JSON object (unknown keys ignored)."""
+
+    success: bool = False
+    message: str = ""
+    old_role: str = ""
+    new_role: str = ""
+    safe_to_restore: bool = False
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "PdRoleSwitchResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_PdRoleSwitchResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_PdRoleSwitchResponse(self)
+
+
+class UpdateWeightVersionRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.UpdateWeightVersionRequest: JSON object (unknown keys ignored)."""
+
+    new_version: str = ""
+    abort_all_requests: Optional[bool] = True
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "UpdateWeightVersionRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_UpdateWeightVersionRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_UpdateWeightVersionRequest(self)
+
+
+class UpdateWeightVersionResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.UpdateWeightVersionResponse: JSON object (unknown keys ignored)."""
+
+    success: bool = False
+    message: str = ""
+    new_version: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "UpdateWeightVersionResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_UpdateWeightVersionResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_UpdateWeightVersionResponse(self)
+
+
+class GetHiCacheL3CacheLayoutRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.GetHiCacheL3CacheLayoutRequest: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "GetHiCacheL3CacheLayoutRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_GetHiCacheL3CacheLayoutRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_GetHiCacheL3CacheLayoutRequest(self)
+
+
+class GetHiCacheL3CacheLayoutResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.GetHiCacheL3CacheLayoutResponse: JSON object (unknown keys ignored)."""
+
+    layout: Optional[Any] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "GetHiCacheL3CacheLayoutResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_GetHiCacheL3CacheLayoutResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_GetHiCacheL3CacheLayoutResponse(self)
+
+
+class ConfigureLoggingRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ConfigureLoggingRequest: JSON object (unknown keys ignored)."""
+
+    log_requests: Optional[bool] = None
+    log_requests_level: Optional[int] = None
+    log_requests_format: Optional[str] = None
+    log_level: Optional[str] = None
+    dump_requests_folder: Optional[str] = None
+    dump_requests_threshold: Optional[int] = None
+    crash_dump_folder: Optional[str] = None
+    dump_requests_exclude_meta_keys: Optional[StringList] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ConfigureLoggingRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ConfigureLoggingRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ConfigureLoggingRequest(self)
+
+
+class ConfigureLoggingResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ConfigureLoggingResponse: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ConfigureLoggingResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ConfigureLoggingResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ConfigureLoggingResponse(self)
+
+
+class DumperControlRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.DumperControlRequest: JSON object (unknown keys ignored)."""
+
+    method: str = ""
+    body: Optional[Any] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "DumperControlRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_DumperControlRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_DumperControlRequest(self)
+
+
+class DumperControlResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.DumperControlResponse: JSON object (unknown keys ignored)."""
+
+    responses: Optional[Any] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "DumperControlResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_DumperControlResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_DumperControlResponse(self)
+
+
+class ScaleElasticEpRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ScaleElasticEpRequest: JSON object (unknown keys ignored)."""
+
+    new_ep_size: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ScaleElasticEpRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ScaleElasticEpRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ScaleElasticEpRequest(self)
+
+
+class ScaleElasticEpResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ScaleElasticEpResponse: JSON object (unknown keys ignored)."""
+
+    message: str = ""
+    old_ep_size: int = 0
+    new_ep_size: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ScaleElasticEpResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ScaleElasticEpResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ScaleElasticEpResponse(self)
+
+
+class ElasticEpStateRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ElasticEpStateRequest: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ElasticEpStateRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ElasticEpStateRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ElasticEpStateRequest(self)
+
+
+class ElasticEpStateResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ElasticEpStateResponse: JSON object (unknown keys ignored)."""
+
+    is_scaling_elastic_ep: bool = False
+    effective_ep_size: int = 0
+    pending_ep_size: Optional[int] = None
+    scale_phase: str = ""
+    last_error: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ElasticEpStateResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ElasticEpStateResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ElasticEpStateResponse(self)
+
+
+class OpenSessionRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenSessionRequest: JSON object (unknown keys ignored)."""
+
+    capacity_of_str_len: int = 0
+    session_id: Optional[str] = None
+    streaming: Optional[bool] = None
+    timeout: Optional[float] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenSessionRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenSessionRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenSessionRequest(self)
+
+
+class OpenSessionResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenSessionResponse: JSON object (unknown keys ignored)."""
+
+    session_id: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenSessionResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenSessionResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenSessionResponse(self)
+
+
+class CloseSessionRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.CloseSessionRequest: JSON object (unknown keys ignored)."""
+
+    session_id: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "CloseSessionRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_CloseSessionRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_CloseSessionRequest(self)
+
+
+class CloseSessionResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.CloseSessionResponse: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "CloseSessionResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_CloseSessionResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_CloseSessionResponse(self)
+
+
+class AddExternalCorpusRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AddExternalCorpusRequest: JSON object (unknown keys ignored)."""
+
+    corpus_id: Optional[str] = None
+    file_path: Optional[str] = None
+    documents: Optional[StringList] = None
+    token_chunks: Optional[TokenIdsList] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AddExternalCorpusRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AddExternalCorpusRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AddExternalCorpusRequest(self)
+
+
+class AddExternalCorpusResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AddExternalCorpusResponse: JSON object (unknown keys ignored)."""
+
+    success: bool = False
+    corpus_id: str = ""
+    message: str = ""
+    loaded_token_count: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AddExternalCorpusResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AddExternalCorpusResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AddExternalCorpusResponse(self)
+
+
+class RemoveExternalCorpusRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.RemoveExternalCorpusRequest: JSON object (unknown keys ignored)."""
+
+    corpus_id: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "RemoveExternalCorpusRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_RemoveExternalCorpusRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_RemoveExternalCorpusRequest(self)
+
+
+class RemoveExternalCorpusResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.RemoveExternalCorpusResponse: JSON object (unknown keys ignored)."""
+
+    success: bool = False
+    message: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "RemoveExternalCorpusResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_RemoveExternalCorpusResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_RemoveExternalCorpusResponse(self)
+
+
+class ListExternalCorporaRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ListExternalCorporaRequest: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ListExternalCorporaRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ListExternalCorporaRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ListExternalCorporaRequest(self)
+
+
+class ListExternalCorporaResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ListExternalCorporaResponse: JSON object (unknown keys ignored)."""
+
+    success: bool = False
+    corpus_token_counts: Dict[str, int] = {}
+    message: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ListExternalCorporaResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ListExternalCorporaResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ListExternalCorporaResponse(self)
+
+
 class FinishStop(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.FinishStop: JSON object (unknown keys ignored)."""
 
@@ -582,6 +1207,776 @@ class HiCacheStorageResponse(msgspec.Struct, kw_only=True, frozen=True):
         return encode_HiCacheStorageResponse(self)
 
 
+class OllamaMessage(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OllamaMessage: JSON object (unknown keys ignored)."""
+
+    role: str = ""
+    content: str = ""
+    images: Optional[StringList] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OllamaMessage":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OllamaMessage(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OllamaMessage(self)
+
+
+class OllamaOptions(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OllamaOptions: JSON object (unknown keys ignored)."""
+
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    num_predict: Optional[int] = None
+    stop: Optional[StringOrList] = None
+    presence_penalty: Optional[float] = None
+    frequency_penalty: Optional[float] = None
+    seed: Optional[int] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OllamaOptions":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OllamaOptions(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OllamaOptions(self)
+
+
+class OllamaChatRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OllamaChatRequest: JSON object (unknown keys ignored)."""
+
+    model: str = ""
+    messages: List[OllamaMessage] = []
+    stream: Optional[bool] = True
+    format: Optional[Any] = None
+    options: Optional[OllamaOptions] = None
+    keep_alive: Optional[Any] = None
+    think: Optional[Any] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OllamaChatRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OllamaChatRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OllamaChatRequest(self)
+
+
+class OllamaChatResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OllamaChatResponse: JSON object (unknown keys ignored)."""
+
+    model: str = ""
+    created_at: str = ""
+    message: Optional[OllamaMessage] = None
+    done: bool = False
+    done_reason: Optional[str] = None
+    total_duration: Optional[int] = None
+    load_duration: Optional[int] = None
+    prompt_eval_count: Optional[int] = None
+    prompt_eval_duration: Optional[int] = None
+    eval_count: Optional[int] = None
+    eval_duration: Optional[int] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OllamaChatResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OllamaChatResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OllamaChatResponse(self)
+
+
+class OllamaGenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OllamaGenerateRequest: JSON object (unknown keys ignored)."""
+
+    model: str = ""
+    prompt: str = ""
+    suffix: Optional[str] = None
+    system: Optional[str] = None
+    template: Optional[str] = None
+    context: Optional[Int64List] = None
+    stream: Optional[bool] = True
+    raw: Optional[bool] = False
+    format: Optional[Any] = None
+    options: Optional[OllamaOptions] = None
+    keep_alive: Optional[Any] = None
+    images: Optional[StringList] = None
+    think: Optional[bool] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OllamaGenerateRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OllamaGenerateRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OllamaGenerateRequest(self)
+
+
+class OllamaGenerateResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OllamaGenerateResponse: JSON object (unknown keys ignored)."""
+
+    model: str = ""
+    created_at: str = ""
+    response: str = ""
+    done: bool = False
+    done_reason: Optional[str] = None
+    context: Optional[Int64List] = None
+    total_duration: Optional[int] = None
+    load_duration: Optional[int] = None
+    prompt_eval_count: Optional[int] = None
+    prompt_eval_duration: Optional[int] = None
+    eval_count: Optional[int] = None
+    eval_duration: Optional[int] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OllamaGenerateResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OllamaGenerateResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OllamaGenerateResponse(self)
+
+
+class OllamaTagsRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OllamaTagsRequest: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OllamaTagsRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OllamaTagsRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OllamaTagsRequest(self)
+
+
+class OllamaTagsResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OllamaTagsResponse: JSON object (unknown keys ignored)."""
+
+    models: List[OllamaModelInfo] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OllamaTagsResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OllamaTagsResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OllamaTagsResponse(self)
+
+
+class OllamaModelInfo(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OllamaModelInfo: JSON object (unknown keys ignored)."""
+
+    name: str = ""
+    model: str = ""
+    modified_at: str = ""
+    size: int = 0
+    digest: str = ""
+    details: Optional[OllamaModelDetails] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OllamaModelInfo":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OllamaModelInfo(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OllamaModelInfo(self)
+
+
+class OllamaModelDetails(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OllamaModelDetails: JSON object (unknown keys ignored)."""
+
+    parent_model: Optional[str] = None
+    format: str = ""
+    family: str = ""
+    families: List[str] = []
+    parameter_size: str = ""
+    quantization_level: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OllamaModelDetails":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OllamaModelDetails(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OllamaModelDetails(self)
+
+
+class OllamaShowRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OllamaShowRequest: JSON object (unknown keys ignored)."""
+
+    model: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OllamaShowRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OllamaShowRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OllamaShowRequest(self)
+
+
+class OllamaShowResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OllamaShowResponse: JSON object (unknown keys ignored)."""
+
+    license: str = ""
+    modelfile: str = ""
+    parameters: str = ""
+    template: str = ""
+    modified_at: str = ""
+    details: Optional[OllamaModelDetails] = None
+    model_info: Optional[Any] = None
+    capabilities: List[str] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OllamaShowResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OllamaShowResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OllamaShowResponse(self)
+
+
+class ParseFunctionCallRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ParseFunctionCallRequest: JSON object (unknown keys ignored)."""
+
+    text: str = ""
+    tools: List[ToolSpec] = []
+    tool_call_parser: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ParseFunctionCallRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ParseFunctionCallRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ParseFunctionCallRequest(self)
+
+
+class ToolSpec(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ToolSpec: JSON object (unknown keys ignored)."""
+
+    function: Optional[ToolFunctionSpec] = None
+    type: Optional[str] = "function"
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ToolSpec":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ToolSpec(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ToolSpec(self)
+
+
+class ToolFunctionSpec(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ToolFunctionSpec: JSON object (unknown keys ignored)."""
+
+    name: Optional[str] = None
+    description: Optional[str] = None
+    parameters: Optional[Any] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ToolFunctionSpec":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ToolFunctionSpec(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ToolFunctionSpec(self)
+
+
+class ParsedToolCall(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ParsedToolCall: JSON object (unknown keys ignored)."""
+
+    tool_index: int = 0
+    name: Optional[str] = None
+    parameters: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ParsedToolCall":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ParsedToolCall(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ParsedToolCall(self)
+
+
+class ParseFunctionCallResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ParseFunctionCallResponse: JSON object (unknown keys ignored)."""
+
+    normal_text: str = ""
+    calls: List[ParsedToolCall] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ParseFunctionCallResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ParseFunctionCallResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ParseFunctionCallResponse(self)
+
+
+class SeparateReasoningRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.SeparateReasoningRequest: JSON object (unknown keys ignored)."""
+
+    text: str = ""
+    reasoning_parser: str = ""
+    return_blocks: bool = False
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "SeparateReasoningRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_SeparateReasoningRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_SeparateReasoningRequest(self)
+
+
+class SeparateReasoningResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.SeparateReasoningResponse: JSON object (unknown keys ignored)."""
+
+    reasoning_text: str = ""
+    text: str = ""
+    reasoning_blocks: Optional[StringList] = None
+    text_blocks: Optional[StringList] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "SeparateReasoningResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_SeparateReasoningResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_SeparateReasoningResponse(self)
+
+
+class GetWeightsByNameRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.GetWeightsByNameRequest: JSON object (unknown keys ignored)."""
+
+    name: str = ""
+    truncate_size: Optional[int] = 100
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "GetWeightsByNameRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_GetWeightsByNameRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_GetWeightsByNameRequest(self)
+
+
+class GetWeightsByNameResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.GetWeightsByNameResponse: JSON object (unknown keys ignored)."""
+
+    parameters: List[Any] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "GetWeightsByNameResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_GetWeightsByNameResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_GetWeightsByNameResponse(self)
+
+
+class InitWeightsUpdateGroupRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.InitWeightsUpdateGroupRequest: JSON object (unknown keys ignored)."""
+
+    master_address: str = ""
+    master_port: int = 0
+    rank_offset: int = 0
+    world_size: int = 0
+    group_name: Optional[str] = "weight_update_group"
+    backend: Optional[str] = "nccl"
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "InitWeightsUpdateGroupRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_InitWeightsUpdateGroupRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_InitWeightsUpdateGroupRequest(self)
+
+
+class DestroyWeightsUpdateGroupRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.DestroyWeightsUpdateGroupRequest: JSON object (unknown keys ignored)."""
+
+    group_name: Optional[str] = "weight_update_group"
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "DestroyWeightsUpdateGroupRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_DestroyWeightsUpdateGroupRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_DestroyWeightsUpdateGroupRequest(self)
+
+
+class InitWeightsSendGroupForRemoteInstanceRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.InitWeightsSendGroupForRemoteInstanceRequest: JSON object (unknown keys ignored)."""
+
+    master_address: str = ""
+    ports: str = ""
+    group_rank: int = 0
+    world_size: int = 0
+    group_name: Optional[str] = "weight_send_group"
+    backend: Optional[str] = "nccl"
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "InitWeightsSendGroupForRemoteInstanceRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_InitWeightsSendGroupForRemoteInstanceRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_InitWeightsSendGroupForRemoteInstanceRequest(self)
+
+
+class SendWeightsToRemoteInstanceRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.SendWeightsToRemoteInstanceRequest: JSON object (unknown keys ignored)."""
+
+    master_address: str = ""
+    ports: str = ""
+    group_name: Optional[str] = "weight_send_group"
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "SendWeightsToRemoteInstanceRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_SendWeightsToRemoteInstanceRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_SendWeightsToRemoteInstanceRequest(self)
+
+
+class WeightGroupResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.WeightGroupResponse: JSON object (unknown keys ignored)."""
+
+    success: bool = False
+    message: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "WeightGroupResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_WeightGroupResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_WeightGroupResponse(self)
+
+
+class RemoteInstanceTransferEngineInfoRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.RemoteInstanceTransferEngineInfoRequest: JSON object (unknown keys ignored)."""
+
+    rank: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "RemoteInstanceTransferEngineInfoRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_RemoteInstanceTransferEngineInfoRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_RemoteInstanceTransferEngineInfoRequest(self)
+
+
+class RemoteInstanceTransferEngineInfoResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.RemoteInstanceTransferEngineInfoResponse: JSON object (unknown keys ignored)."""
+
+    info: Optional[Any] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "RemoteInstanceTransferEngineInfoResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_RemoteInstanceTransferEngineInfoResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_RemoteInstanceTransferEngineInfoResponse(self)
+
+
+class UpdateWeightsFromDiskRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.UpdateWeightsFromDiskRequest: JSON object (unknown keys ignored)."""
+
+    model_path: str = ""
+    load_format: Optional[str] = None
+    abort_all_requests: bool = False
+    weight_version: Optional[str] = None
+    is_async: bool = False
+    torch_empty_cache: bool = False
+    keep_pause: bool = False
+    recapture_cuda_graph: bool = False
+    token_step: int = 0
+    flush_cache: Optional[bool] = True
+    manifest: Optional[Any] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "UpdateWeightsFromDiskRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_UpdateWeightsFromDiskRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_UpdateWeightsFromDiskRequest(self)
+
+
+class UpdateWeightsFromDiskResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.UpdateWeightsFromDiskResponse: JSON object (unknown keys ignored)."""
+
+    success: bool = False
+    message: str = ""
+    num_paused_requests: List[int] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "UpdateWeightsFromDiskResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_UpdateWeightsFromDiskResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_UpdateWeightsFromDiskResponse(self)
+
+
+class UpdateWeightsFromDistributedRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.UpdateWeightsFromDistributedRequest: JSON object (unknown keys ignored)."""
+
+    names: List[str] = []
+    dtypes: List[str] = []
+    shapes: List[Int64List] = []
+    group_name: Optional[str] = "weight_update_group"
+    flush_cache: Optional[bool] = True
+    abort_all_requests: bool = False
+    weight_version: Optional[str] = None
+    load_format: Optional[str] = None
+    selector: Optional[str] = "all"
+    torch_empty_cache: bool = False
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "UpdateWeightsFromDistributedRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_UpdateWeightsFromDistributedRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_UpdateWeightsFromDistributedRequest(self)
+
+
+class UpdateWeightsFromTensorRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.UpdateWeightsFromTensorRequest: JSON object (unknown keys ignored)."""
+
+    serialized_named_tensors: List[str] = []
+    load_format: Optional[str] = None
+    flush_cache: Optional[bool] = True
+    abort_all_requests: bool = False
+    weight_version: Optional[str] = None
+    selector: Optional[str] = "all"
+    torch_empty_cache: bool = False
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "UpdateWeightsFromTensorRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_UpdateWeightsFromTensorRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_UpdateWeightsFromTensorRequest(self)
+
+
+class UpdateWeightsFromIpcRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.UpdateWeightsFromIpcRequest: JSON object (unknown keys ignored)."""
+
+    zmq_handles: Dict[str, str] = {}
+    flush_cache: Optional[bool] = True
+    weight_version: Optional[str] = None
+    torch_empty_cache: bool = False
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "UpdateWeightsFromIpcRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_UpdateWeightsFromIpcRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_UpdateWeightsFromIpcRequest(self)
+
+
+class BeginWeightUpdateRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.BeginWeightUpdateRequest: JSON object (unknown keys ignored)."""
+
+    selector: Optional[str] = "all"
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "BeginWeightUpdateRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_BeginWeightUpdateRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_BeginWeightUpdateRequest(self)
+
+
+class EndWeightUpdateRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.EndWeightUpdateRequest: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "EndWeightUpdateRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_EndWeightUpdateRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_EndWeightUpdateRequest(self)
+
+
+class PluginWeightUpdateRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.PluginWeightUpdateRequest: JSON object (unknown keys ignored)."""
+
+    handler: str = ""
+    payload: Optional[Any] = None
+    flush_cache: Optional[bool] = True
+    abort_all_requests: bool = False
+    weight_version: Optional[str] = None
+    selector: Optional[str] = "all"
+    torch_empty_cache: bool = False
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "PluginWeightUpdateRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_PluginWeightUpdateRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_PluginWeightUpdateRequest(self)
+
+
+class PluginWeightUpdateResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.PluginWeightUpdateResponse: JSON object (unknown keys ignored)."""
+
+    success: bool = False
+    message: str = ""
+    received_tensor_counts: List[int] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "PluginWeightUpdateResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_PluginWeightUpdateResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_PluginWeightUpdateResponse(self)
+
+
+class WeightUpdateResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.WeightUpdateResponse: JSON object (unknown keys ignored)."""
+
+    success: bool = False
+    message: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "WeightUpdateResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_WeightUpdateResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_WeightUpdateResponse(self)
+
+
+class LoadLoraAdapterRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.LoadLoraAdapterRequest: JSON object (unknown keys ignored)."""
+
+    lora_name: str = ""
+    lora_path: str = ""
+    pinned: bool = False
+    lora_id: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "LoadLoraAdapterRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_LoadLoraAdapterRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_LoadLoraAdapterRequest(self)
+
+
+class LoadLoraAdapterFromTensorsRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.LoadLoraAdapterFromTensorsRequest: JSON object (unknown keys ignored)."""
+
+    lora_name: str = ""
+    config_dict: Optional[Any] = None
+    serialized_named_tensors: List[str] = []
+    pinned: bool = False
+    added_tokens_config: Dict[str, int] = {}
+    lora_id: Optional[str] = None
+    load_format: Optional[str] = None
+    expected_checksums: Dict[str, str] = {}
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "LoadLoraAdapterFromTensorsRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_LoadLoraAdapterFromTensorsRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_LoadLoraAdapterFromTensorsRequest(self)
+
+
+class UnloadLoraAdapterRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.UnloadLoraAdapterRequest: JSON object (unknown keys ignored)."""
+
+    lora_name: str = ""
+    lora_id: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "UnloadLoraAdapterRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_UnloadLoraAdapterRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_UnloadLoraAdapterRequest(self)
+
+
+class LoraUpdateResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.LoraUpdateResponse: JSON object (unknown keys ignored)."""
+
+    success: bool = False
+    error_message: Optional[str] = None
+    loaded_adapters: Dict[str, str] = {}
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "LoraUpdateResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_LoraUpdateResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_LoraUpdateResponse(self)
+
+
 class ListModelsRequest(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.ListModelsRequest: JSON object (unknown keys ignored)."""
 
@@ -894,11 +2289,20 @@ OptionalString = Optional[str]
 # sglang.api.v1.OptionalStringList: JSON bare array.
 OptionalStringList = List[OptionalString]
 
+# sglang.api.v1.OptionalDouble: JSON: the wrapped value itself, null when unset.
+OptionalDouble = Optional[float]
+
+# sglang.api.v1.DoubleList: JSON bare array.
+DoubleList = List[float]
+
 # sglang.api.v1.OptionalInt64: JSON: the wrapped value itself, null when unset.
 OptionalInt64 = Optional[int]
 
 # sglang.api.v1.OptionalInt64List: JSON bare array.
 OptionalInt64List = List[OptionalInt64]
+
+# sglang.api.v1.SetInternalStateResponse: JSON bare array.
+SetInternalStateResponse = List[bool]
 
 # sglang.api.v1.MatchedTokens: JSON bare array.
 MatchedTokens = List[int]
@@ -1124,6 +2528,22 @@ def encode_OptionalStringList(v: OptionalStringList) -> List[Any]:
     return [encode_OptionalString(e) for e in v]
 
 
+def decode_OptionalDouble(value: Any) -> OptionalDouble:
+    return None if value is None else _expect_float(value, expected="f64")
+
+
+def encode_OptionalDouble(v: OptionalDouble) -> Any:
+    return None if v is None else float(v)
+
+
+def decode_DoubleList(value: Any) -> DoubleList:
+    return [_expect_float(e, expected="f64") for e in _expect_seq(value, expected="a sequence")]
+
+
+def encode_DoubleList(v: DoubleList) -> List[Any]:
+    return [float(e) for e in v]
+
+
 def decode_OptionalInt64(value: Any) -> OptionalInt64:
     return None if value is None else _expect_int(value, expected="i64")
 
@@ -1178,6 +2598,741 @@ def encode_ErrorBody(v: ErrorBody) -> Dict[str, Any]:
     return d
 
 
+def decode_SetInternalStateRequest(value: Any) -> SetInternalStateRequest:
+    m = _expect_map(value, expected="struct SetInternalStateRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "server_args":
+            kw["server_args"] = x
+    return SetInternalStateRequest(**kw)
+
+
+def encode_SetInternalStateRequest(v: SetInternalStateRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.server_args is not None:
+        d["server_args"] = v.server_args
+    return d
+
+
+def decode_SetInternalStateResponse(value: Any) -> SetInternalStateResponse:
+    return [_expect_bool(e, expected="a boolean") for e in _expect_seq(value, expected="a sequence")]
+
+
+def encode_SetInternalStateResponse(v: SetInternalStateResponse) -> List[Any]:
+    return list(v)
+
+
+def decode_StartProfileRequest(value: Any) -> StartProfileRequest:
+    m = _expect_map(value, expected="struct StartProfileRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "output_dir":
+            kw["output_dir"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "start_step":
+            kw["start_step"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "num_steps":
+            kw["num_steps"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "activities":
+            kw["activities"] = None if x is None else decode_StringList(x)
+        elif key == "profile_by_stage":
+            kw["profile_by_stage"] = _expect_bool(x, expected="a boolean")
+        elif key == "with_stack":
+            kw["with_stack"] = None if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "record_shapes":
+            kw["record_shapes"] = None if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "profile_id":
+            kw["profile_id"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "merge_profiles":
+            kw["merge_profiles"] = _expect_bool(x, expected="a boolean")
+        elif key == "profile_prefix":
+            kw["profile_prefix"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "profile_stages":
+            kw["profile_stages"] = None if x is None else decode_StringList(x)
+        elif key == "detailed_annotations":
+            kw["detailed_annotations"] = _expect_bool(x, expected="a boolean")
+    return StartProfileRequest(**kw)
+
+
+def encode_StartProfileRequest(v: StartProfileRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.output_dir is not None:
+        d["output_dir"] = v.output_dir
+    if v.start_step is not None:
+        d["start_step"] = v.start_step
+    if v.num_steps is not None:
+        d["num_steps"] = v.num_steps
+    if v.activities is not None:
+        d["activities"] = encode_StringList(v.activities)
+    d["profile_by_stage"] = v.profile_by_stage
+    if v.with_stack is not None:
+        d["with_stack"] = v.with_stack
+    if v.record_shapes is not None:
+        d["record_shapes"] = v.record_shapes
+    if v.profile_id is not None:
+        d["profile_id"] = v.profile_id
+    d["merge_profiles"] = v.merge_profiles
+    if v.profile_prefix is not None:
+        d["profile_prefix"] = v.profile_prefix
+    if v.profile_stages is not None:
+        d["profile_stages"] = encode_StringList(v.profile_stages)
+    d["detailed_annotations"] = v.detailed_annotations
+    return d
+
+
+def decode_StopProfileRequest(value: Any) -> StopProfileRequest:
+    m = _expect_map(value, expected="struct StopProfileRequest")
+    return StopProfileRequest()
+
+
+def encode_StopProfileRequest(v: StopProfileRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_ProfileResponse(value: Any) -> ProfileResponse:
+    m = _expect_map(value, expected="struct ProfileResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "success":
+            kw["success"] = _expect_bool(x, expected="a boolean")
+        elif key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+    return ProfileResponse(**kw)
+
+
+def encode_ProfileResponse(v: ProfileResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["success"] = v.success
+    d["message"] = v.message
+    return d
+
+
+def decode_ExpertDistributionRecordRequest(value: Any) -> ExpertDistributionRecordRequest:
+    m = _expect_map(value, expected="struct ExpertDistributionRecordRequest")
+    return ExpertDistributionRecordRequest()
+
+
+def encode_ExpertDistributionRecordRequest(v: ExpertDistributionRecordRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_ExpertDistributionRecordResponse(value: Any) -> ExpertDistributionRecordResponse:
+    m = _expect_map(value, expected="struct ExpertDistributionRecordResponse")
+    return ExpertDistributionRecordResponse()
+
+
+def encode_ExpertDistributionRecordResponse(v: ExpertDistributionRecordResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_SlowDownRequest(value: Any) -> SlowDownRequest:
+    m = _expect_map(value, expected="struct SlowDownRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "forward_sleep_time":
+            kw["forward_sleep_time"] = None if x is None else _expect_float(x, expected="f64")
+    return SlowDownRequest(**kw)
+
+
+def encode_SlowDownRequest(v: SlowDownRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.forward_sleep_time is not None:
+        d["forward_sleep_time"] = float(v.forward_sleep_time)
+    return d
+
+
+def decode_SlowDownResponse(value: Any) -> SlowDownResponse:
+    m = _expect_map(value, expected="struct SlowDownResponse")
+    return SlowDownResponse()
+
+
+def encode_SlowDownResponse(v: SlowDownResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_ReleaseMemoryOccupationRequest(value: Any) -> ReleaseMemoryOccupationRequest:
+    m = _expect_map(value, expected="struct ReleaseMemoryOccupationRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "tags":
+            kw["tags"] = None if x is None else decode_StringList(x)
+    return ReleaseMemoryOccupationRequest(**kw)
+
+
+def encode_ReleaseMemoryOccupationRequest(v: ReleaseMemoryOccupationRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.tags is not None:
+        d["tags"] = encode_StringList(v.tags)
+    return d
+
+
+def decode_ResumeMemoryOccupationRequest(value: Any) -> ResumeMemoryOccupationRequest:
+    m = _expect_map(value, expected="struct ResumeMemoryOccupationRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "tags":
+            kw["tags"] = None if x is None else decode_StringList(x)
+    return ResumeMemoryOccupationRequest(**kw)
+
+
+def encode_ResumeMemoryOccupationRequest(v: ResumeMemoryOccupationRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.tags is not None:
+        d["tags"] = encode_StringList(v.tags)
+    return d
+
+
+def decode_MemoryOccupationResponse(value: Any) -> MemoryOccupationResponse:
+    m = _expect_map(value, expected="struct MemoryOccupationResponse")
+    return MemoryOccupationResponse()
+
+
+def encode_MemoryOccupationResponse(v: MemoryOccupationResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_FreezeGcRequest(value: Any) -> FreezeGcRequest:
+    m = _expect_map(value, expected="struct FreezeGcRequest")
+    return FreezeGcRequest()
+
+
+def encode_FreezeGcRequest(v: FreezeGcRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_FreezeGcResponse(value: Any) -> FreezeGcResponse:
+    m = _expect_map(value, expected="struct FreezeGcResponse")
+    return FreezeGcResponse()
+
+
+def encode_FreezeGcResponse(v: FreezeGcResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_PauseGenerationRequest(value: Any) -> PauseGenerationRequest:
+    m = _expect_map(value, expected="struct PauseGenerationRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "mode":
+            kw["mode"] = "abort" if x is None else _expect_str(x, expected="a string")
+    return PauseGenerationRequest(**kw)
+
+
+def encode_PauseGenerationRequest(v: PauseGenerationRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.mode is not None:
+        d["mode"] = v.mode
+    return d
+
+
+def decode_ContinueGenerationRequest(value: Any) -> ContinueGenerationRequest:
+    m = _expect_map(value, expected="struct ContinueGenerationRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "torch_empty_cache":
+            kw["torch_empty_cache"] = True if x is None else _expect_bool(x, expected="a boolean")
+    return ContinueGenerationRequest(**kw)
+
+
+def encode_ContinueGenerationRequest(v: ContinueGenerationRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.torch_empty_cache is not None:
+        d["torch_empty_cache"] = v.torch_empty_cache
+    return d
+
+
+def decode_GenerationPauseResponse(value: Any) -> GenerationPauseResponse:
+    m = _expect_map(value, expected="struct GenerationPauseResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+        elif key == "status":
+            kw["status"] = _expect_str(x, expected="a string")
+    return GenerationPauseResponse(**kw)
+
+
+def encode_GenerationPauseResponse(v: GenerationPauseResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["message"] = v.message
+    d["status"] = v.status
+    return d
+
+
+def decode_PdRoleSwitchRequest(value: Any) -> PdRoleSwitchRequest:
+    m = _expect_map(value, expected="struct PdRoleSwitchRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "new_role":
+            kw["new_role"] = "" if x is None else _expect_str(x, expected="a string")
+        elif key == "decode_cuda_graph_bs":
+            kw["decode_cuda_graph_bs"] = None if x is None else decode_Int64List(x)
+        elif key == "decode_cuda_graph_memory_gb":
+            kw["decode_cuda_graph_memory_gb"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "prepare_only":
+            kw["prepare_only"] = _expect_bool(x, expected="a boolean")
+    return PdRoleSwitchRequest(**kw)
+
+
+def encode_PdRoleSwitchRequest(v: PdRoleSwitchRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.new_role is not None:
+        d["new_role"] = v.new_role
+    if v.decode_cuda_graph_bs is not None:
+        d["decode_cuda_graph_bs"] = encode_Int64List(v.decode_cuda_graph_bs)
+    if v.decode_cuda_graph_memory_gb is not None:
+        d["decode_cuda_graph_memory_gb"] = float(v.decode_cuda_graph_memory_gb)
+    d["prepare_only"] = v.prepare_only
+    return d
+
+
+def decode_PdRoleSwitchResponse(value: Any) -> PdRoleSwitchResponse:
+    m = _expect_map(value, expected="struct PdRoleSwitchResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "success":
+            kw["success"] = _expect_bool(x, expected="a boolean")
+        elif key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+        elif key == "old_role":
+            kw["old_role"] = _expect_str(x, expected="a string")
+        elif key == "new_role":
+            kw["new_role"] = _expect_str(x, expected="a string")
+        elif key == "safe_to_restore":
+            kw["safe_to_restore"] = _expect_bool(x, expected="a boolean")
+    return PdRoleSwitchResponse(**kw)
+
+
+def encode_PdRoleSwitchResponse(v: PdRoleSwitchResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["success"] = v.success
+    d["message"] = v.message
+    d["old_role"] = v.old_role
+    d["new_role"] = v.new_role
+    d["safe_to_restore"] = v.safe_to_restore
+    return d
+
+
+def decode_UpdateWeightVersionRequest(value: Any) -> UpdateWeightVersionRequest:
+    m = _expect_map(value, expected="struct UpdateWeightVersionRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "new_version":
+            kw["new_version"] = _expect_str(x, expected="a string")
+        elif key == "abort_all_requests":
+            kw["abort_all_requests"] = True if x is None else _expect_bool(x, expected="a boolean")
+    return UpdateWeightVersionRequest(**kw)
+
+
+def encode_UpdateWeightVersionRequest(v: UpdateWeightVersionRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["new_version"] = v.new_version
+    if v.abort_all_requests is not None:
+        d["abort_all_requests"] = v.abort_all_requests
+    return d
+
+
+def decode_UpdateWeightVersionResponse(value: Any) -> UpdateWeightVersionResponse:
+    m = _expect_map(value, expected="struct UpdateWeightVersionResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "success":
+            kw["success"] = _expect_bool(x, expected="a boolean")
+        elif key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+        elif key == "new_version":
+            kw["new_version"] = None if x is None else _expect_str(x, expected="a string")
+    return UpdateWeightVersionResponse(**kw)
+
+
+def encode_UpdateWeightVersionResponse(v: UpdateWeightVersionResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["success"] = v.success
+    d["message"] = v.message
+    if v.new_version is not None:
+        d["new_version"] = v.new_version
+    return d
+
+
+def decode_GetHiCacheL3CacheLayoutRequest(value: Any) -> GetHiCacheL3CacheLayoutRequest:
+    m = _expect_map(value, expected="struct GetHiCacheL3CacheLayoutRequest")
+    return GetHiCacheL3CacheLayoutRequest()
+
+
+def encode_GetHiCacheL3CacheLayoutRequest(v: GetHiCacheL3CacheLayoutRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_GetHiCacheL3CacheLayoutResponse(value: Any) -> GetHiCacheL3CacheLayoutResponse:
+    m = _expect_map(value, expected="struct GetHiCacheL3CacheLayoutResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "layout":
+            kw["layout"] = x
+    return GetHiCacheL3CacheLayoutResponse(**kw)
+
+
+def encode_GetHiCacheL3CacheLayoutResponse(v: GetHiCacheL3CacheLayoutResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.layout is not None:
+        d["layout"] = v.layout
+    return d
+
+
+def decode_ConfigureLoggingRequest(value: Any) -> ConfigureLoggingRequest:
+    m = _expect_map(value, expected="struct ConfigureLoggingRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "log_requests":
+            kw["log_requests"] = None if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "log_requests_level":
+            kw["log_requests_level"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "log_requests_format":
+            kw["log_requests_format"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "log_level":
+            kw["log_level"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "dump_requests_folder":
+            kw["dump_requests_folder"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "dump_requests_threshold":
+            kw["dump_requests_threshold"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "crash_dump_folder":
+            kw["crash_dump_folder"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "dump_requests_exclude_meta_keys":
+            kw["dump_requests_exclude_meta_keys"] = None if x is None else decode_StringList(x)
+    return ConfigureLoggingRequest(**kw)
+
+
+def encode_ConfigureLoggingRequest(v: ConfigureLoggingRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.log_requests is not None:
+        d["log_requests"] = v.log_requests
+    if v.log_requests_level is not None:
+        d["log_requests_level"] = v.log_requests_level
+    if v.log_requests_format is not None:
+        d["log_requests_format"] = v.log_requests_format
+    if v.log_level is not None:
+        d["log_level"] = v.log_level
+    if v.dump_requests_folder is not None:
+        d["dump_requests_folder"] = v.dump_requests_folder
+    if v.dump_requests_threshold is not None:
+        d["dump_requests_threshold"] = v.dump_requests_threshold
+    if v.crash_dump_folder is not None:
+        d["crash_dump_folder"] = v.crash_dump_folder
+    if v.dump_requests_exclude_meta_keys is not None:
+        d["dump_requests_exclude_meta_keys"] = encode_StringList(v.dump_requests_exclude_meta_keys)
+    return d
+
+
+def decode_ConfigureLoggingResponse(value: Any) -> ConfigureLoggingResponse:
+    m = _expect_map(value, expected="struct ConfigureLoggingResponse")
+    return ConfigureLoggingResponse()
+
+
+def encode_ConfigureLoggingResponse(v: ConfigureLoggingResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_DumperControlRequest(value: Any) -> DumperControlRequest:
+    m = _expect_map(value, expected="struct DumperControlRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "method":
+            kw["method"] = _expect_str(x, expected="a string")
+        elif key == "body":
+            kw["body"] = x
+    return DumperControlRequest(**kw)
+
+
+def encode_DumperControlRequest(v: DumperControlRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["method"] = v.method
+    if v.body is not None:
+        d["body"] = v.body
+    return d
+
+
+def decode_DumperControlResponse(value: Any) -> DumperControlResponse:
+    m = _expect_map(value, expected="struct DumperControlResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "responses":
+            kw["responses"] = x
+    return DumperControlResponse(**kw)
+
+
+def encode_DumperControlResponse(v: DumperControlResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.responses is not None:
+        d["responses"] = v.responses
+    return d
+
+
+def decode_ScaleElasticEpRequest(value: Any) -> ScaleElasticEpRequest:
+    m = _expect_map(value, expected="struct ScaleElasticEpRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "new_ep_size":
+            kw["new_ep_size"] = _expect_int(x, expected="i64")
+    return ScaleElasticEpRequest(**kw)
+
+
+def encode_ScaleElasticEpRequest(v: ScaleElasticEpRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["new_ep_size"] = v.new_ep_size
+    return d
+
+
+def decode_ScaleElasticEpResponse(value: Any) -> ScaleElasticEpResponse:
+    m = _expect_map(value, expected="struct ScaleElasticEpResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+        elif key == "old_ep_size":
+            kw["old_ep_size"] = _expect_int(x, expected="i64")
+        elif key == "new_ep_size":
+            kw["new_ep_size"] = _expect_int(x, expected="i64")
+    return ScaleElasticEpResponse(**kw)
+
+
+def encode_ScaleElasticEpResponse(v: ScaleElasticEpResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["message"] = v.message
+    d["old_ep_size"] = v.old_ep_size
+    d["new_ep_size"] = v.new_ep_size
+    return d
+
+
+def decode_ElasticEpStateRequest(value: Any) -> ElasticEpStateRequest:
+    m = _expect_map(value, expected="struct ElasticEpStateRequest")
+    return ElasticEpStateRequest()
+
+
+def encode_ElasticEpStateRequest(v: ElasticEpStateRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_ElasticEpStateResponse(value: Any) -> ElasticEpStateResponse:
+    m = _expect_map(value, expected="struct ElasticEpStateResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "is_scaling_elastic_ep":
+            kw["is_scaling_elastic_ep"] = _expect_bool(x, expected="a boolean")
+        elif key == "effective_ep_size":
+            kw["effective_ep_size"] = _expect_int(x, expected="i64")
+        elif key == "pending_ep_size":
+            kw["pending_ep_size"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "scale_phase":
+            kw["scale_phase"] = _expect_str(x, expected="a string")
+        elif key == "last_error":
+            kw["last_error"] = None if x is None else _expect_str(x, expected="a string")
+    return ElasticEpStateResponse(**kw)
+
+
+def encode_ElasticEpStateResponse(v: ElasticEpStateResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["is_scaling_elastic_ep"] = v.is_scaling_elastic_ep
+    d["effective_ep_size"] = v.effective_ep_size
+    d["pending_ep_size"] = v.pending_ep_size
+    d["scale_phase"] = v.scale_phase
+    d["last_error"] = v.last_error
+    return d
+
+
+def decode_OpenSessionRequest(value: Any) -> OpenSessionRequest:
+    m = _expect_map(value, expected="struct OpenSessionRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "capacity_of_str_len":
+            kw["capacity_of_str_len"] = _expect_int(x, expected="i64")
+        elif key == "session_id":
+            kw["session_id"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "streaming":
+            kw["streaming"] = None if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "timeout":
+            kw["timeout"] = None if x is None else _expect_float(x, expected="f64")
+    return OpenSessionRequest(**kw)
+
+
+def encode_OpenSessionRequest(v: OpenSessionRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["capacity_of_str_len"] = v.capacity_of_str_len
+    if v.session_id is not None:
+        d["session_id"] = v.session_id
+    if v.streaming is not None:
+        d["streaming"] = v.streaming
+    if v.timeout is not None:
+        d["timeout"] = float(v.timeout)
+    return d
+
+
+def decode_OpenSessionResponse(value: Any) -> OpenSessionResponse:
+    m = _expect_map(value, expected="struct OpenSessionResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "session_id":
+            kw["session_id"] = _expect_str(x, expected="a string")
+    return OpenSessionResponse(**kw)
+
+
+def encode_OpenSessionResponse(v: OpenSessionResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["session_id"] = v.session_id
+    return d
+
+
+def decode_CloseSessionRequest(value: Any) -> CloseSessionRequest:
+    m = _expect_map(value, expected="struct CloseSessionRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "session_id":
+            kw["session_id"] = _expect_str(x, expected="a string")
+    return CloseSessionRequest(**kw)
+
+
+def encode_CloseSessionRequest(v: CloseSessionRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["session_id"] = v.session_id
+    return d
+
+
+def decode_CloseSessionResponse(value: Any) -> CloseSessionResponse:
+    m = _expect_map(value, expected="struct CloseSessionResponse")
+    return CloseSessionResponse()
+
+
+def encode_CloseSessionResponse(v: CloseSessionResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_AddExternalCorpusRequest(value: Any) -> AddExternalCorpusRequest:
+    m = _expect_map(value, expected="struct AddExternalCorpusRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "corpus_id":
+            kw["corpus_id"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "file_path":
+            kw["file_path"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "documents":
+            kw["documents"] = None if x is None else decode_StringList(x)
+        elif key == "token_chunks":
+            kw["token_chunks"] = None if x is None else decode_TokenIdsList(x)
+    return AddExternalCorpusRequest(**kw)
+
+
+def encode_AddExternalCorpusRequest(v: AddExternalCorpusRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.corpus_id is not None:
+        d["corpus_id"] = v.corpus_id
+    if v.file_path is not None:
+        d["file_path"] = v.file_path
+    if v.documents is not None:
+        d["documents"] = encode_StringList(v.documents)
+    if v.token_chunks is not None:
+        d["token_chunks"] = encode_TokenIdsList(v.token_chunks)
+    return d
+
+
+def decode_AddExternalCorpusResponse(value: Any) -> AddExternalCorpusResponse:
+    m = _expect_map(value, expected="struct AddExternalCorpusResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "success":
+            kw["success"] = _expect_bool(x, expected="a boolean")
+        elif key == "corpus_id":
+            kw["corpus_id"] = _expect_str(x, expected="a string")
+        elif key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+        elif key == "loaded_token_count":
+            kw["loaded_token_count"] = _expect_int(x, expected="i64")
+    return AddExternalCorpusResponse(**kw)
+
+
+def encode_AddExternalCorpusResponse(v: AddExternalCorpusResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["success"] = v.success
+    d["corpus_id"] = v.corpus_id
+    d["message"] = v.message
+    d["loaded_token_count"] = v.loaded_token_count
+    return d
+
+
+def decode_RemoveExternalCorpusRequest(value: Any) -> RemoveExternalCorpusRequest:
+    m = _expect_map(value, expected="struct RemoveExternalCorpusRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "corpus_id":
+            kw["corpus_id"] = None if x is None else _expect_str(x, expected="a string")
+    return RemoveExternalCorpusRequest(**kw)
+
+
+def encode_RemoveExternalCorpusRequest(v: RemoveExternalCorpusRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.corpus_id is not None:
+        d["corpus_id"] = v.corpus_id
+    return d
+
+
+def decode_RemoveExternalCorpusResponse(value: Any) -> RemoveExternalCorpusResponse:
+    m = _expect_map(value, expected="struct RemoveExternalCorpusResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "success":
+            kw["success"] = _expect_bool(x, expected="a boolean")
+        elif key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+    return RemoveExternalCorpusResponse(**kw)
+
+
+def encode_RemoveExternalCorpusResponse(v: RemoveExternalCorpusResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["success"] = v.success
+    d["message"] = v.message
+    return d
+
+
+def decode_ListExternalCorporaRequest(value: Any) -> ListExternalCorporaRequest:
+    m = _expect_map(value, expected="struct ListExternalCorporaRequest")
+    return ListExternalCorporaRequest()
+
+
+def encode_ListExternalCorporaRequest(v: ListExternalCorporaRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_ListExternalCorporaResponse(value: Any) -> ListExternalCorporaResponse:
+    m = _expect_map(value, expected="struct ListExternalCorporaResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "success":
+            kw["success"] = _expect_bool(x, expected="a boolean")
+        elif key == "corpus_token_counts":
+            kw["corpus_token_counts"] = {} if x is None else {k: _expect_int(e, expected="i64") for k, e in _expect_map(x, expected="a map").items()}
+        elif key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+    return ListExternalCorporaResponse(**kw)
+
+
+def encode_ListExternalCorporaResponse(v: ListExternalCorporaResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["success"] = v.success
+    if v.corpus_token_counts:
+        d["corpus_token_counts"] = dict(v.corpus_token_counts)
+    d["message"] = v.message
+    return d
+
+
 def decode_Matched(value: Any) -> Matched:
     if isinstance(value, str):
         return value
@@ -1217,8 +3372,7 @@ def decode_FinishStop(value: Any) -> FinishStop:
 
 def encode_FinishStop(v: FinishStop) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
-    if v.matched is not None:
-        d["matched"] = encode_Matched(v.matched)
+    d["matched"] = None if v.matched is None else encode_Matched(v.matched)
     return d
 
 
@@ -1233,8 +3387,7 @@ def decode_FinishLength(value: Any) -> FinishLength:
 
 def encode_FinishLength(v: FinishLength) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
-    if v.length is not None:
-        d["length"] = v.length
+    d["length"] = v.length
     return d
 
 
@@ -1265,23 +3418,23 @@ def decode_FinishReason(value: Any) -> FinishReason:
     if tag == "stop":
         try:
             return FinishStop(
-                matched=None if raw.get("matched") is None else decode_Matched(raw["matched"]),
+                matched=None if raw.get("matched") is None else decode_Matched(raw.get("matched")),
             )
         except JsonContractError:
             return dict(raw)
     elif tag == "length":
         try:
             return FinishLength(
-                length=None if raw.get("length") is None else _expect_uint(raw["length"], expected="u64"),
+                length=None if raw.get("length") is None else _expect_uint(raw.get("length"), expected="u64"),
             )
         except JsonContractError:
             return dict(raw)
     elif tag == "abort":
         try:
             return FinishAbort(
-                message=None if raw.get("message") is None else _expect_str(raw["message"], expected="a string"),
-                status_code=None if raw.get("status_code") is None else _expect_uint(raw["status_code"], expected="u32"),
-                err_type=None if raw.get("err_type") is None else _expect_str(raw["err_type"], expected="a string"),
+                message=None if raw.get("message") is None else _expect_str(raw.get("message"), expected="a string"),
+                status_code=None if raw.get("status_code") is None else _expect_uint(raw.get("status_code"), expected="u32"),
+                err_type=None if raw.get("err_type") is None else _expect_str(raw.get("err_type"), expected="a string"),
             )
         except JsonContractError:
             return dict(raw)
@@ -2124,18 +4277,22 @@ def decode_MediaInput(value: Any) -> MediaInput:
     if isinstance(value, dict):
         return decode_MediaItem(value)
     if isinstance(value, list):
-        if value and isinstance(value[0], list):
+        if not value:
+            return decode_MediaItems(value)
+        if isinstance(value[0], str) or isinstance(value[0], dict) or value[0] is None or isinstance(value[0], (MediaRef,)):
+            return decode_MediaItems(value)
+        if isinstance(value[0], list) or value[0] is None:
             return decode_MediaItemsList(value)
-        return decode_MediaItems(value)
+        raise _invalid_type(value, expected="one of the MediaInput list shapes")
     raise _invalid_type(value, expected="one of the MediaInput shapes")
 
 
 def encode_MediaInput(v: MediaInput) -> Any:
     if isinstance(v, (str, MediaRef,)):
         return encode_MediaItem(v)
-    if isinstance(v, list) and not (v and isinstance(v[0], list)):
+    if isinstance(v, list) and (not v or isinstance(v[0], str) or isinstance(v[0], dict) or v[0] is None or isinstance(v[0], (MediaRef,))):
         return encode_MediaItems(v)
-    if isinstance(v, list) and (v and isinstance(v[0], list)):
+    if isinstance(v, list) and bool(v) and (isinstance(v[0], list) or v[0] is None):
         return encode_MediaItemsList(v)
     return v
 
@@ -2237,6 +4394,1164 @@ def encode_HiCacheStorageResponse(v: HiCacheStorageResponse) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
     d["success"] = v.success
     d["message"] = v.message
+    return d
+
+
+def decode_OllamaMessage(value: Any) -> OllamaMessage:
+    m = _expect_map(value, expected="struct OllamaMessage")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "role":
+            kw["role"] = _expect_str(x, expected="a string")
+        elif key == "content":
+            kw["content"] = _expect_str(x, expected="a string")
+        elif key == "images":
+            kw["images"] = None if x is None else decode_StringList(x)
+    return OllamaMessage(**kw)
+
+
+def encode_OllamaMessage(v: OllamaMessage) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["role"] = v.role
+    d["content"] = v.content
+    if v.images is not None:
+        d["images"] = encode_StringList(v.images)
+    return d
+
+
+def decode_OllamaOptions(value: Any) -> OllamaOptions:
+    m = _expect_map(value, expected="struct OllamaOptions")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "temperature":
+            kw["temperature"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "top_p":
+            kw["top_p"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "top_k":
+            kw["top_k"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "num_predict":
+            kw["num_predict"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "stop":
+            kw["stop"] = None if x is None else decode_StringOrList(x)
+        elif key == "presence_penalty":
+            kw["presence_penalty"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "frequency_penalty":
+            kw["frequency_penalty"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "seed":
+            kw["seed"] = None if x is None else _expect_int(x, expected="i64")
+    return OllamaOptions(**kw)
+
+
+def encode_OllamaOptions(v: OllamaOptions) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.temperature is not None:
+        d["temperature"] = float(v.temperature)
+    if v.top_p is not None:
+        d["top_p"] = float(v.top_p)
+    if v.top_k is not None:
+        d["top_k"] = v.top_k
+    if v.num_predict is not None:
+        d["num_predict"] = v.num_predict
+    if v.stop is not None:
+        d["stop"] = encode_StringOrList(v.stop)
+    if v.presence_penalty is not None:
+        d["presence_penalty"] = float(v.presence_penalty)
+    if v.frequency_penalty is not None:
+        d["frequency_penalty"] = float(v.frequency_penalty)
+    if v.seed is not None:
+        d["seed"] = v.seed
+    return d
+
+
+def decode_OllamaChatRequest(value: Any) -> OllamaChatRequest:
+    m = _expect_map(value, expected="struct OllamaChatRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "model":
+            kw["model"] = _expect_str(x, expected="a string")
+        elif key == "messages":
+            kw["messages"] = [] if x is None else [decode_OllamaMessage(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "stream":
+            kw["stream"] = True if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "format":
+            kw["format"] = x
+        elif key == "options":
+            kw["options"] = None if x is None else decode_OllamaOptions(x)
+        elif key == "keep_alive":
+            kw["keep_alive"] = x
+        elif key == "think":
+            kw["think"] = x
+    return OllamaChatRequest(**kw)
+
+
+def encode_OllamaChatRequest(v: OllamaChatRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["model"] = v.model
+    if v.messages:
+        d["messages"] = [encode_OllamaMessage(e) for e in v.messages]
+    if v.stream is not None:
+        d["stream"] = v.stream
+    if v.format is not None:
+        d["format"] = v.format
+    if v.options is not None:
+        d["options"] = encode_OllamaOptions(v.options)
+    if v.keep_alive is not None:
+        d["keep_alive"] = v.keep_alive
+    if v.think is not None:
+        d["think"] = v.think
+    return d
+
+
+def decode_OllamaChatResponse(value: Any) -> OllamaChatResponse:
+    m = _expect_map(value, expected="struct OllamaChatResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "model":
+            kw["model"] = _expect_str(x, expected="a string")
+        elif key == "created_at":
+            kw["created_at"] = _expect_str(x, expected="a string")
+        elif key == "message":
+            kw["message"] = None if x is None else decode_OllamaMessage(x)
+        elif key == "done":
+            kw["done"] = _expect_bool(x, expected="a boolean")
+        elif key == "done_reason":
+            kw["done_reason"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "total_duration":
+            kw["total_duration"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "load_duration":
+            kw["load_duration"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "prompt_eval_count":
+            kw["prompt_eval_count"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "prompt_eval_duration":
+            kw["prompt_eval_duration"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "eval_count":
+            kw["eval_count"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "eval_duration":
+            kw["eval_duration"] = None if x is None else _expect_int(x, expected="i64")
+    return OllamaChatResponse(**kw)
+
+
+def encode_OllamaChatResponse(v: OllamaChatResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["model"] = v.model
+    d["created_at"] = v.created_at
+    if v.message is not None:
+        d["message"] = encode_OllamaMessage(v.message)
+    d["done"] = v.done
+    if v.done_reason is not None:
+        d["done_reason"] = v.done_reason
+    if v.total_duration is not None:
+        d["total_duration"] = v.total_duration
+    if v.load_duration is not None:
+        d["load_duration"] = v.load_duration
+    if v.prompt_eval_count is not None:
+        d["prompt_eval_count"] = v.prompt_eval_count
+    if v.prompt_eval_duration is not None:
+        d["prompt_eval_duration"] = v.prompt_eval_duration
+    if v.eval_count is not None:
+        d["eval_count"] = v.eval_count
+    if v.eval_duration is not None:
+        d["eval_duration"] = v.eval_duration
+    return d
+
+
+def decode_OllamaGenerateRequest(value: Any) -> OllamaGenerateRequest:
+    m = _expect_map(value, expected="struct OllamaGenerateRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "model":
+            kw["model"] = _expect_str(x, expected="a string")
+        elif key == "prompt":
+            kw["prompt"] = _expect_str(x, expected="a string")
+        elif key == "suffix":
+            kw["suffix"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "system":
+            kw["system"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "template":
+            kw["template"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "context":
+            kw["context"] = None if x is None else decode_Int64List(x)
+        elif key == "stream":
+            kw["stream"] = True if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "raw":
+            kw["raw"] = False if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "format":
+            kw["format"] = x
+        elif key == "options":
+            kw["options"] = None if x is None else decode_OllamaOptions(x)
+        elif key == "keep_alive":
+            kw["keep_alive"] = x
+        elif key == "images":
+            kw["images"] = None if x is None else decode_StringList(x)
+        elif key == "think":
+            kw["think"] = None if x is None else _expect_bool(x, expected="a boolean")
+    return OllamaGenerateRequest(**kw)
+
+
+def encode_OllamaGenerateRequest(v: OllamaGenerateRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["model"] = v.model
+    d["prompt"] = v.prompt
+    if v.suffix is not None:
+        d["suffix"] = v.suffix
+    if v.system is not None:
+        d["system"] = v.system
+    if v.template is not None:
+        d["template"] = v.template
+    if v.context is not None:
+        d["context"] = encode_Int64List(v.context)
+    if v.stream is not None:
+        d["stream"] = v.stream
+    if v.raw is not None:
+        d["raw"] = v.raw
+    if v.format is not None:
+        d["format"] = v.format
+    if v.options is not None:
+        d["options"] = encode_OllamaOptions(v.options)
+    if v.keep_alive is not None:
+        d["keep_alive"] = v.keep_alive
+    if v.images is not None:
+        d["images"] = encode_StringList(v.images)
+    if v.think is not None:
+        d["think"] = v.think
+    return d
+
+
+def decode_OllamaGenerateResponse(value: Any) -> OllamaGenerateResponse:
+    m = _expect_map(value, expected="struct OllamaGenerateResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "model":
+            kw["model"] = _expect_str(x, expected="a string")
+        elif key == "created_at":
+            kw["created_at"] = _expect_str(x, expected="a string")
+        elif key == "response":
+            kw["response"] = _expect_str(x, expected="a string")
+        elif key == "done":
+            kw["done"] = _expect_bool(x, expected="a boolean")
+        elif key == "done_reason":
+            kw["done_reason"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "context":
+            kw["context"] = None if x is None else decode_Int64List(x)
+        elif key == "total_duration":
+            kw["total_duration"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "load_duration":
+            kw["load_duration"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "prompt_eval_count":
+            kw["prompt_eval_count"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "prompt_eval_duration":
+            kw["prompt_eval_duration"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "eval_count":
+            kw["eval_count"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "eval_duration":
+            kw["eval_duration"] = None if x is None else _expect_int(x, expected="i64")
+    return OllamaGenerateResponse(**kw)
+
+
+def encode_OllamaGenerateResponse(v: OllamaGenerateResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["model"] = v.model
+    d["created_at"] = v.created_at
+    d["response"] = v.response
+    d["done"] = v.done
+    if v.done_reason is not None:
+        d["done_reason"] = v.done_reason
+    if v.context is not None:
+        d["context"] = encode_Int64List(v.context)
+    if v.total_duration is not None:
+        d["total_duration"] = v.total_duration
+    if v.load_duration is not None:
+        d["load_duration"] = v.load_duration
+    if v.prompt_eval_count is not None:
+        d["prompt_eval_count"] = v.prompt_eval_count
+    if v.prompt_eval_duration is not None:
+        d["prompt_eval_duration"] = v.prompt_eval_duration
+    if v.eval_count is not None:
+        d["eval_count"] = v.eval_count
+    if v.eval_duration is not None:
+        d["eval_duration"] = v.eval_duration
+    return d
+
+
+def decode_OllamaTagsRequest(value: Any) -> OllamaTagsRequest:
+    m = _expect_map(value, expected="struct OllamaTagsRequest")
+    return OllamaTagsRequest()
+
+
+def encode_OllamaTagsRequest(v: OllamaTagsRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_OllamaTagsResponse(value: Any) -> OllamaTagsResponse:
+    m = _expect_map(value, expected="struct OllamaTagsResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "models":
+            kw["models"] = [] if x is None else [decode_OllamaModelInfo(e) for e in _expect_seq(x, expected="a sequence")]
+    return OllamaTagsResponse(**kw)
+
+
+def encode_OllamaTagsResponse(v: OllamaTagsResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.models:
+        d["models"] = [encode_OllamaModelInfo(e) for e in v.models]
+    return d
+
+
+def decode_OllamaModelInfo(value: Any) -> OllamaModelInfo:
+    m = _expect_map(value, expected="struct OllamaModelInfo")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "name":
+            kw["name"] = _expect_str(x, expected="a string")
+        elif key == "model":
+            kw["model"] = _expect_str(x, expected="a string")
+        elif key == "modified_at":
+            kw["modified_at"] = _expect_str(x, expected="a string")
+        elif key == "size":
+            kw["size"] = _expect_int(x, expected="i64")
+        elif key == "digest":
+            kw["digest"] = _expect_str(x, expected="a string")
+        elif key == "details":
+            kw["details"] = None if x is None else decode_OllamaModelDetails(x)
+    return OllamaModelInfo(**kw)
+
+
+def encode_OllamaModelInfo(v: OllamaModelInfo) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["name"] = v.name
+    d["model"] = v.model
+    d["modified_at"] = v.modified_at
+    d["size"] = v.size
+    d["digest"] = v.digest
+    if v.details is not None:
+        d["details"] = encode_OllamaModelDetails(v.details)
+    return d
+
+
+def decode_OllamaModelDetails(value: Any) -> OllamaModelDetails:
+    m = _expect_map(value, expected="struct OllamaModelDetails")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "parent_model":
+            kw["parent_model"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "format":
+            kw["format"] = _expect_str(x, expected="a string")
+        elif key == "family":
+            kw["family"] = _expect_str(x, expected="a string")
+        elif key == "families":
+            kw["families"] = [] if x is None else [_expect_str(e, expected="a string") for e in _expect_seq(x, expected="a sequence")]
+        elif key == "parameter_size":
+            kw["parameter_size"] = _expect_str(x, expected="a string")
+        elif key == "quantization_level":
+            kw["quantization_level"] = None if x is None else _expect_str(x, expected="a string")
+    return OllamaModelDetails(**kw)
+
+
+def encode_OllamaModelDetails(v: OllamaModelDetails) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.parent_model is not None:
+        d["parent_model"] = v.parent_model
+    d["format"] = v.format
+    d["family"] = v.family
+    if v.families:
+        d["families"] = list(v.families)
+    d["parameter_size"] = v.parameter_size
+    if v.quantization_level is not None:
+        d["quantization_level"] = v.quantization_level
+    return d
+
+
+def decode_OllamaShowRequest(value: Any) -> OllamaShowRequest:
+    m = _expect_map(value, expected="struct OllamaShowRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "model":
+            kw["model"] = _expect_str(x, expected="a string")
+    return OllamaShowRequest(**kw)
+
+
+def encode_OllamaShowRequest(v: OllamaShowRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["model"] = v.model
+    return d
+
+
+def decode_OllamaShowResponse(value: Any) -> OllamaShowResponse:
+    m = _expect_map(value, expected="struct OllamaShowResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "license":
+            kw["license"] = _expect_str(x, expected="a string")
+        elif key == "modelfile":
+            kw["modelfile"] = _expect_str(x, expected="a string")
+        elif key == "parameters":
+            kw["parameters"] = _expect_str(x, expected="a string")
+        elif key == "template":
+            kw["template"] = _expect_str(x, expected="a string")
+        elif key == "modified_at":
+            kw["modified_at"] = _expect_str(x, expected="a string")
+        elif key == "details":
+            kw["details"] = None if x is None else decode_OllamaModelDetails(x)
+        elif key == "model_info":
+            kw["model_info"] = x
+        elif key == "capabilities":
+            kw["capabilities"] = [] if x is None else [_expect_str(e, expected="a string") for e in _expect_seq(x, expected="a sequence")]
+    return OllamaShowResponse(**kw)
+
+
+def encode_OllamaShowResponse(v: OllamaShowResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["license"] = v.license
+    d["modelfile"] = v.modelfile
+    d["parameters"] = v.parameters
+    d["template"] = v.template
+    d["modified_at"] = v.modified_at
+    if v.details is not None:
+        d["details"] = encode_OllamaModelDetails(v.details)
+    if v.model_info is not None:
+        d["model_info"] = v.model_info
+    if v.capabilities:
+        d["capabilities"] = list(v.capabilities)
+    return d
+
+
+def decode_ParseFunctionCallRequest(value: Any) -> ParseFunctionCallRequest:
+    m = _expect_map(value, expected="struct ParseFunctionCallRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "text":
+            kw["text"] = _expect_str(x, expected="a string")
+        elif key == "tools":
+            kw["tools"] = [] if x is None else [decode_ToolSpec(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "tool_call_parser":
+            kw["tool_call_parser"] = None if x is None else _expect_str(x, expected="a string")
+    return ParseFunctionCallRequest(**kw)
+
+
+def encode_ParseFunctionCallRequest(v: ParseFunctionCallRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["text"] = v.text
+    if v.tools:
+        d["tools"] = [encode_ToolSpec(e) for e in v.tools]
+    if v.tool_call_parser is not None:
+        d["tool_call_parser"] = v.tool_call_parser
+    return d
+
+
+def decode_ToolSpec(value: Any) -> ToolSpec:
+    m = _expect_map(value, expected="struct ToolSpec")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "function":
+            kw["function"] = None if x is None else decode_ToolFunctionSpec(x)
+        elif key == "type":
+            kw["type"] = "function" if x is None else _expect_str(x, expected="a string")
+    return ToolSpec(**kw)
+
+
+def encode_ToolSpec(v: ToolSpec) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.function is not None:
+        d["function"] = encode_ToolFunctionSpec(v.function)
+    if v.type is not None:
+        d["type"] = v.type
+    return d
+
+
+def decode_ToolFunctionSpec(value: Any) -> ToolFunctionSpec:
+    m = _expect_map(value, expected="struct ToolFunctionSpec")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "name":
+            kw["name"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "description":
+            kw["description"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "parameters":
+            kw["parameters"] = x
+    return ToolFunctionSpec(**kw)
+
+
+def encode_ToolFunctionSpec(v: ToolFunctionSpec) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.name is not None:
+        d["name"] = v.name
+    if v.description is not None:
+        d["description"] = v.description
+    if v.parameters is not None:
+        d["parameters"] = v.parameters
+    return d
+
+
+def decode_ParsedToolCall(value: Any) -> ParsedToolCall:
+    m = _expect_map(value, expected="struct ParsedToolCall")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "tool_index":
+            kw["tool_index"] = _expect_int(x, expected="i64")
+        elif key == "name":
+            kw["name"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "parameters":
+            kw["parameters"] = _expect_str(x, expected="a string")
+    return ParsedToolCall(**kw)
+
+
+def encode_ParsedToolCall(v: ParsedToolCall) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["tool_index"] = v.tool_index
+    d["name"] = v.name
+    d["parameters"] = v.parameters
+    return d
+
+
+def decode_ParseFunctionCallResponse(value: Any) -> ParseFunctionCallResponse:
+    m = _expect_map(value, expected="struct ParseFunctionCallResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "normal_text":
+            kw["normal_text"] = _expect_str(x, expected="a string")
+        elif key == "calls":
+            kw["calls"] = [] if x is None else [decode_ParsedToolCall(e) for e in _expect_seq(x, expected="a sequence")]
+    return ParseFunctionCallResponse(**kw)
+
+
+def encode_ParseFunctionCallResponse(v: ParseFunctionCallResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["normal_text"] = v.normal_text
+    if v.calls:
+        d["calls"] = [encode_ParsedToolCall(e) for e in v.calls]
+    return d
+
+
+def decode_SeparateReasoningRequest(value: Any) -> SeparateReasoningRequest:
+    m = _expect_map(value, expected="struct SeparateReasoningRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "text":
+            kw["text"] = _expect_str(x, expected="a string")
+        elif key == "reasoning_parser":
+            kw["reasoning_parser"] = _expect_str(x, expected="a string")
+        elif key == "return_blocks":
+            kw["return_blocks"] = _expect_bool(x, expected="a boolean")
+    return SeparateReasoningRequest(**kw)
+
+
+def encode_SeparateReasoningRequest(v: SeparateReasoningRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["text"] = v.text
+    d["reasoning_parser"] = v.reasoning_parser
+    d["return_blocks"] = v.return_blocks
+    return d
+
+
+def decode_SeparateReasoningResponse(value: Any) -> SeparateReasoningResponse:
+    m = _expect_map(value, expected="struct SeparateReasoningResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "reasoning_text":
+            kw["reasoning_text"] = _expect_str(x, expected="a string")
+        elif key == "text":
+            kw["text"] = _expect_str(x, expected="a string")
+        elif key == "reasoning_blocks":
+            kw["reasoning_blocks"] = None if x is None else decode_StringList(x)
+        elif key == "text_blocks":
+            kw["text_blocks"] = None if x is None else decode_StringList(x)
+    return SeparateReasoningResponse(**kw)
+
+
+def encode_SeparateReasoningResponse(v: SeparateReasoningResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["reasoning_text"] = v.reasoning_text
+    d["text"] = v.text
+    if v.reasoning_blocks is not None:
+        d["reasoning_blocks"] = encode_StringList(v.reasoning_blocks)
+    if v.text_blocks is not None:
+        d["text_blocks"] = encode_StringList(v.text_blocks)
+    return d
+
+
+def decode_GetWeightsByNameRequest(value: Any) -> GetWeightsByNameRequest:
+    m = _expect_map(value, expected="struct GetWeightsByNameRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "name":
+            kw["name"] = _expect_str(x, expected="a string")
+        elif key == "truncate_size":
+            kw["truncate_size"] = 100 if x is None else _expect_int(x, expected="i64")
+    return GetWeightsByNameRequest(**kw)
+
+
+def encode_GetWeightsByNameRequest(v: GetWeightsByNameRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["name"] = v.name
+    if v.truncate_size is not None:
+        d["truncate_size"] = v.truncate_size
+    return d
+
+
+def decode_GetWeightsByNameResponse(value: Any) -> GetWeightsByNameResponse:
+    m = _expect_map(value, expected="struct GetWeightsByNameResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "parameters":
+            kw["parameters"] = [] if x is None else list(_expect_seq(x, expected="a sequence"))
+    return GetWeightsByNameResponse(**kw)
+
+
+def encode_GetWeightsByNameResponse(v: GetWeightsByNameResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.parameters:
+        d["parameters"] = list(v.parameters)
+    return d
+
+
+def decode_InitWeightsUpdateGroupRequest(value: Any) -> InitWeightsUpdateGroupRequest:
+    m = _expect_map(value, expected="struct InitWeightsUpdateGroupRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "master_address":
+            kw["master_address"] = _expect_str(x, expected="a string")
+        elif key == "master_port":
+            kw["master_port"] = _expect_int(x, expected="i64")
+        elif key == "rank_offset":
+            kw["rank_offset"] = _expect_int(x, expected="i64")
+        elif key == "world_size":
+            kw["world_size"] = _expect_int(x, expected="i64")
+        elif key == "group_name":
+            kw["group_name"] = "weight_update_group" if x is None else _expect_str(x, expected="a string")
+        elif key == "backend":
+            kw["backend"] = "nccl" if x is None else _expect_str(x, expected="a string")
+    return InitWeightsUpdateGroupRequest(**kw)
+
+
+def encode_InitWeightsUpdateGroupRequest(v: InitWeightsUpdateGroupRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["master_address"] = v.master_address
+    d["master_port"] = v.master_port
+    d["rank_offset"] = v.rank_offset
+    d["world_size"] = v.world_size
+    if v.group_name is not None:
+        d["group_name"] = v.group_name
+    if v.backend is not None:
+        d["backend"] = v.backend
+    return d
+
+
+def decode_DestroyWeightsUpdateGroupRequest(value: Any) -> DestroyWeightsUpdateGroupRequest:
+    m = _expect_map(value, expected="struct DestroyWeightsUpdateGroupRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "group_name":
+            kw["group_name"] = "weight_update_group" if x is None else _expect_str(x, expected="a string")
+    return DestroyWeightsUpdateGroupRequest(**kw)
+
+
+def encode_DestroyWeightsUpdateGroupRequest(v: DestroyWeightsUpdateGroupRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.group_name is not None:
+        d["group_name"] = v.group_name
+    return d
+
+
+def decode_InitWeightsSendGroupForRemoteInstanceRequest(value: Any) -> InitWeightsSendGroupForRemoteInstanceRequest:
+    m = _expect_map(value, expected="struct InitWeightsSendGroupForRemoteInstanceRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "master_address":
+            kw["master_address"] = _expect_str(x, expected="a string")
+        elif key == "ports":
+            kw["ports"] = _expect_str(x, expected="a string")
+        elif key == "group_rank":
+            kw["group_rank"] = _expect_int(x, expected="i64")
+        elif key == "world_size":
+            kw["world_size"] = _expect_int(x, expected="i64")
+        elif key == "group_name":
+            kw["group_name"] = "weight_send_group" if x is None else _expect_str(x, expected="a string")
+        elif key == "backend":
+            kw["backend"] = "nccl" if x is None else _expect_str(x, expected="a string")
+    return InitWeightsSendGroupForRemoteInstanceRequest(**kw)
+
+
+def encode_InitWeightsSendGroupForRemoteInstanceRequest(v: InitWeightsSendGroupForRemoteInstanceRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["master_address"] = v.master_address
+    d["ports"] = v.ports
+    d["group_rank"] = v.group_rank
+    d["world_size"] = v.world_size
+    if v.group_name is not None:
+        d["group_name"] = v.group_name
+    if v.backend is not None:
+        d["backend"] = v.backend
+    return d
+
+
+def decode_SendWeightsToRemoteInstanceRequest(value: Any) -> SendWeightsToRemoteInstanceRequest:
+    m = _expect_map(value, expected="struct SendWeightsToRemoteInstanceRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "master_address":
+            kw["master_address"] = _expect_str(x, expected="a string")
+        elif key == "ports":
+            kw["ports"] = _expect_str(x, expected="a string")
+        elif key == "group_name":
+            kw["group_name"] = "weight_send_group" if x is None else _expect_str(x, expected="a string")
+    return SendWeightsToRemoteInstanceRequest(**kw)
+
+
+def encode_SendWeightsToRemoteInstanceRequest(v: SendWeightsToRemoteInstanceRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["master_address"] = v.master_address
+    d["ports"] = v.ports
+    if v.group_name is not None:
+        d["group_name"] = v.group_name
+    return d
+
+
+def decode_WeightGroupResponse(value: Any) -> WeightGroupResponse:
+    m = _expect_map(value, expected="struct WeightGroupResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "success":
+            kw["success"] = _expect_bool(x, expected="a boolean")
+        elif key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+    return WeightGroupResponse(**kw)
+
+
+def encode_WeightGroupResponse(v: WeightGroupResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["success"] = v.success
+    d["message"] = v.message
+    return d
+
+
+def decode_RemoteInstanceTransferEngineInfoRequest(value: Any) -> RemoteInstanceTransferEngineInfoRequest:
+    m = _expect_map(value, expected="struct RemoteInstanceTransferEngineInfoRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "rank":
+            kw["rank"] = _expect_int(x, expected="i64")
+    return RemoteInstanceTransferEngineInfoRequest(**kw)
+
+
+def encode_RemoteInstanceTransferEngineInfoRequest(v: RemoteInstanceTransferEngineInfoRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["rank"] = v.rank
+    return d
+
+
+def decode_RemoteInstanceTransferEngineInfoResponse(value: Any) -> RemoteInstanceTransferEngineInfoResponse:
+    m = _expect_map(value, expected="struct RemoteInstanceTransferEngineInfoResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "info":
+            kw["info"] = x
+    return RemoteInstanceTransferEngineInfoResponse(**kw)
+
+
+def encode_RemoteInstanceTransferEngineInfoResponse(v: RemoteInstanceTransferEngineInfoResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.info is not None:
+        d["info"] = v.info
+    return d
+
+
+def decode_UpdateWeightsFromDiskRequest(value: Any) -> UpdateWeightsFromDiskRequest:
+    m = _expect_map(value, expected="struct UpdateWeightsFromDiskRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "model_path":
+            kw["model_path"] = _expect_str(x, expected="a string")
+        elif key == "load_format":
+            kw["load_format"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "abort_all_requests":
+            kw["abort_all_requests"] = _expect_bool(x, expected="a boolean")
+        elif key == "weight_version":
+            kw["weight_version"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "is_async":
+            kw["is_async"] = _expect_bool(x, expected="a boolean")
+        elif key == "torch_empty_cache":
+            kw["torch_empty_cache"] = _expect_bool(x, expected="a boolean")
+        elif key == "keep_pause":
+            kw["keep_pause"] = _expect_bool(x, expected="a boolean")
+        elif key == "recapture_cuda_graph":
+            kw["recapture_cuda_graph"] = _expect_bool(x, expected="a boolean")
+        elif key == "token_step":
+            kw["token_step"] = _expect_int(x, expected="i64")
+        elif key == "flush_cache":
+            kw["flush_cache"] = True if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "manifest":
+            kw["manifest"] = x
+    return UpdateWeightsFromDiskRequest(**kw)
+
+
+def encode_UpdateWeightsFromDiskRequest(v: UpdateWeightsFromDiskRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["model_path"] = v.model_path
+    if v.load_format is not None:
+        d["load_format"] = v.load_format
+    d["abort_all_requests"] = v.abort_all_requests
+    if v.weight_version is not None:
+        d["weight_version"] = v.weight_version
+    d["is_async"] = v.is_async
+    d["torch_empty_cache"] = v.torch_empty_cache
+    d["keep_pause"] = v.keep_pause
+    d["recapture_cuda_graph"] = v.recapture_cuda_graph
+    d["token_step"] = v.token_step
+    if v.flush_cache is not None:
+        d["flush_cache"] = v.flush_cache
+    if v.manifest is not None:
+        d["manifest"] = v.manifest
+    return d
+
+
+def decode_UpdateWeightsFromDiskResponse(value: Any) -> UpdateWeightsFromDiskResponse:
+    m = _expect_map(value, expected="struct UpdateWeightsFromDiskResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "success":
+            kw["success"] = _expect_bool(x, expected="a boolean")
+        elif key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+        elif key == "num_paused_requests":
+            kw["num_paused_requests"] = [] if x is None else [_expect_int(e, expected="i64") for e in _expect_seq(x, expected="a sequence")]
+    return UpdateWeightsFromDiskResponse(**kw)
+
+
+def encode_UpdateWeightsFromDiskResponse(v: UpdateWeightsFromDiskResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["success"] = v.success
+    d["message"] = v.message
+    if v.num_paused_requests:
+        d["num_paused_requests"] = list(v.num_paused_requests)
+    return d
+
+
+def decode_UpdateWeightsFromDistributedRequest(value: Any) -> UpdateWeightsFromDistributedRequest:
+    m = _expect_map(value, expected="struct UpdateWeightsFromDistributedRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "names":
+            kw["names"] = [] if x is None else [_expect_str(e, expected="a string") for e in _expect_seq(x, expected="a sequence")]
+        elif key == "dtypes":
+            kw["dtypes"] = [] if x is None else [_expect_str(e, expected="a string") for e in _expect_seq(x, expected="a sequence")]
+        elif key == "shapes":
+            kw["shapes"] = [] if x is None else [decode_Int64List(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "group_name":
+            kw["group_name"] = "weight_update_group" if x is None else _expect_str(x, expected="a string")
+        elif key == "flush_cache":
+            kw["flush_cache"] = True if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "abort_all_requests":
+            kw["abort_all_requests"] = _expect_bool(x, expected="a boolean")
+        elif key == "weight_version":
+            kw["weight_version"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "load_format":
+            kw["load_format"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "selector":
+            kw["selector"] = "all" if x is None else _expect_str(x, expected="a string")
+        elif key == "torch_empty_cache":
+            kw["torch_empty_cache"] = _expect_bool(x, expected="a boolean")
+    return UpdateWeightsFromDistributedRequest(**kw)
+
+
+def encode_UpdateWeightsFromDistributedRequest(v: UpdateWeightsFromDistributedRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.names:
+        d["names"] = list(v.names)
+    if v.dtypes:
+        d["dtypes"] = list(v.dtypes)
+    if v.shapes:
+        d["shapes"] = [encode_Int64List(e) for e in v.shapes]
+    if v.group_name is not None:
+        d["group_name"] = v.group_name
+    if v.flush_cache is not None:
+        d["flush_cache"] = v.flush_cache
+    d["abort_all_requests"] = v.abort_all_requests
+    if v.weight_version is not None:
+        d["weight_version"] = v.weight_version
+    if v.load_format is not None:
+        d["load_format"] = v.load_format
+    if v.selector is not None:
+        d["selector"] = v.selector
+    d["torch_empty_cache"] = v.torch_empty_cache
+    return d
+
+
+def decode_UpdateWeightsFromTensorRequest(value: Any) -> UpdateWeightsFromTensorRequest:
+    m = _expect_map(value, expected="struct UpdateWeightsFromTensorRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "serialized_named_tensors":
+            kw["serialized_named_tensors"] = [] if x is None else [_expect_str(e, expected="a string") for e in _expect_seq(x, expected="a sequence")]
+        elif key == "load_format":
+            kw["load_format"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "flush_cache":
+            kw["flush_cache"] = True if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "abort_all_requests":
+            kw["abort_all_requests"] = _expect_bool(x, expected="a boolean")
+        elif key == "weight_version":
+            kw["weight_version"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "selector":
+            kw["selector"] = "all" if x is None else _expect_str(x, expected="a string")
+        elif key == "torch_empty_cache":
+            kw["torch_empty_cache"] = _expect_bool(x, expected="a boolean")
+    return UpdateWeightsFromTensorRequest(**kw)
+
+
+def encode_UpdateWeightsFromTensorRequest(v: UpdateWeightsFromTensorRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.serialized_named_tensors:
+        d["serialized_named_tensors"] = list(v.serialized_named_tensors)
+    if v.load_format is not None:
+        d["load_format"] = v.load_format
+    if v.flush_cache is not None:
+        d["flush_cache"] = v.flush_cache
+    d["abort_all_requests"] = v.abort_all_requests
+    if v.weight_version is not None:
+        d["weight_version"] = v.weight_version
+    if v.selector is not None:
+        d["selector"] = v.selector
+    d["torch_empty_cache"] = v.torch_empty_cache
+    return d
+
+
+def decode_UpdateWeightsFromIpcRequest(value: Any) -> UpdateWeightsFromIpcRequest:
+    m = _expect_map(value, expected="struct UpdateWeightsFromIpcRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "zmq_handles":
+            kw["zmq_handles"] = {} if x is None else {k: _expect_str(e, expected="a string") for k, e in _expect_map(x, expected="a map").items()}
+        elif key == "flush_cache":
+            kw["flush_cache"] = True if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "weight_version":
+            kw["weight_version"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "torch_empty_cache":
+            kw["torch_empty_cache"] = _expect_bool(x, expected="a boolean")
+    return UpdateWeightsFromIpcRequest(**kw)
+
+
+def encode_UpdateWeightsFromIpcRequest(v: UpdateWeightsFromIpcRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.zmq_handles:
+        d["zmq_handles"] = dict(v.zmq_handles)
+    if v.flush_cache is not None:
+        d["flush_cache"] = v.flush_cache
+    if v.weight_version is not None:
+        d["weight_version"] = v.weight_version
+    d["torch_empty_cache"] = v.torch_empty_cache
+    return d
+
+
+def decode_BeginWeightUpdateRequest(value: Any) -> BeginWeightUpdateRequest:
+    m = _expect_map(value, expected="struct BeginWeightUpdateRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "selector":
+            kw["selector"] = "all" if x is None else _expect_str(x, expected="a string")
+    return BeginWeightUpdateRequest(**kw)
+
+
+def encode_BeginWeightUpdateRequest(v: BeginWeightUpdateRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.selector is not None:
+        d["selector"] = v.selector
+    return d
+
+
+def decode_EndWeightUpdateRequest(value: Any) -> EndWeightUpdateRequest:
+    m = _expect_map(value, expected="struct EndWeightUpdateRequest")
+    return EndWeightUpdateRequest()
+
+
+def encode_EndWeightUpdateRequest(v: EndWeightUpdateRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_PluginWeightUpdateRequest(value: Any) -> PluginWeightUpdateRequest:
+    m = _expect_map(value, expected="struct PluginWeightUpdateRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "handler":
+            kw["handler"] = _expect_str(x, expected="a string")
+        elif key == "payload":
+            kw["payload"] = x
+        elif key == "flush_cache":
+            kw["flush_cache"] = True if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "abort_all_requests":
+            kw["abort_all_requests"] = _expect_bool(x, expected="a boolean")
+        elif key == "weight_version":
+            kw["weight_version"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "selector":
+            kw["selector"] = "all" if x is None else _expect_str(x, expected="a string")
+        elif key == "torch_empty_cache":
+            kw["torch_empty_cache"] = _expect_bool(x, expected="a boolean")
+    return PluginWeightUpdateRequest(**kw)
+
+
+def encode_PluginWeightUpdateRequest(v: PluginWeightUpdateRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["handler"] = v.handler
+    if v.payload is not None:
+        d["payload"] = v.payload
+    if v.flush_cache is not None:
+        d["flush_cache"] = v.flush_cache
+    d["abort_all_requests"] = v.abort_all_requests
+    if v.weight_version is not None:
+        d["weight_version"] = v.weight_version
+    if v.selector is not None:
+        d["selector"] = v.selector
+    d["torch_empty_cache"] = v.torch_empty_cache
+    return d
+
+
+def decode_PluginWeightUpdateResponse(value: Any) -> PluginWeightUpdateResponse:
+    m = _expect_map(value, expected="struct PluginWeightUpdateResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "success":
+            kw["success"] = _expect_bool(x, expected="a boolean")
+        elif key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+        elif key == "received_tensor_counts":
+            kw["received_tensor_counts"] = [] if x is None else [_expect_int(e, expected="i64") for e in _expect_seq(x, expected="a sequence")]
+    return PluginWeightUpdateResponse(**kw)
+
+
+def encode_PluginWeightUpdateResponse(v: PluginWeightUpdateResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["success"] = v.success
+    d["message"] = v.message
+    if v.received_tensor_counts:
+        d["received_tensor_counts"] = list(v.received_tensor_counts)
+    return d
+
+
+def decode_WeightUpdateResponse(value: Any) -> WeightUpdateResponse:
+    m = _expect_map(value, expected="struct WeightUpdateResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "success":
+            kw["success"] = _expect_bool(x, expected="a boolean")
+        elif key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+    return WeightUpdateResponse(**kw)
+
+
+def encode_WeightUpdateResponse(v: WeightUpdateResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["success"] = v.success
+    d["message"] = v.message
+    return d
+
+
+def decode_LoadLoraAdapterRequest(value: Any) -> LoadLoraAdapterRequest:
+    m = _expect_map(value, expected="struct LoadLoraAdapterRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "lora_name":
+            kw["lora_name"] = _expect_str(x, expected="a string")
+        elif key == "lora_path":
+            kw["lora_path"] = _expect_str(x, expected="a string")
+        elif key == "pinned":
+            kw["pinned"] = _expect_bool(x, expected="a boolean")
+        elif key == "lora_id":
+            kw["lora_id"] = None if x is None else _expect_str(x, expected="a string")
+    return LoadLoraAdapterRequest(**kw)
+
+
+def encode_LoadLoraAdapterRequest(v: LoadLoraAdapterRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["lora_name"] = v.lora_name
+    d["lora_path"] = v.lora_path
+    d["pinned"] = v.pinned
+    if v.lora_id is not None:
+        d["lora_id"] = v.lora_id
+    return d
+
+
+def decode_LoadLoraAdapterFromTensorsRequest(value: Any) -> LoadLoraAdapterFromTensorsRequest:
+    m = _expect_map(value, expected="struct LoadLoraAdapterFromTensorsRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "lora_name":
+            kw["lora_name"] = _expect_str(x, expected="a string")
+        elif key == "config_dict":
+            kw["config_dict"] = x
+        elif key == "serialized_named_tensors":
+            kw["serialized_named_tensors"] = [] if x is None else [_expect_str(e, expected="a string") for e in _expect_seq(x, expected="a sequence")]
+        elif key == "pinned":
+            kw["pinned"] = _expect_bool(x, expected="a boolean")
+        elif key == "added_tokens_config":
+            kw["added_tokens_config"] = {} if x is None else {k: _expect_int(e, expected="i64") for k, e in _expect_map(x, expected="a map").items()}
+        elif key == "lora_id":
+            kw["lora_id"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "load_format":
+            kw["load_format"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "expected_checksums":
+            kw["expected_checksums"] = {} if x is None else {k: _expect_str(e, expected="a string") for k, e in _expect_map(x, expected="a map").items()}
+    return LoadLoraAdapterFromTensorsRequest(**kw)
+
+
+def encode_LoadLoraAdapterFromTensorsRequest(v: LoadLoraAdapterFromTensorsRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["lora_name"] = v.lora_name
+    if v.config_dict is not None:
+        d["config_dict"] = v.config_dict
+    if v.serialized_named_tensors:
+        d["serialized_named_tensors"] = list(v.serialized_named_tensors)
+    d["pinned"] = v.pinned
+    if v.added_tokens_config:
+        d["added_tokens_config"] = dict(v.added_tokens_config)
+    if v.lora_id is not None:
+        d["lora_id"] = v.lora_id
+    if v.load_format is not None:
+        d["load_format"] = v.load_format
+    if v.expected_checksums:
+        d["expected_checksums"] = dict(v.expected_checksums)
+    return d
+
+
+def decode_UnloadLoraAdapterRequest(value: Any) -> UnloadLoraAdapterRequest:
+    m = _expect_map(value, expected="struct UnloadLoraAdapterRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "lora_name":
+            kw["lora_name"] = _expect_str(x, expected="a string")
+        elif key == "lora_id":
+            kw["lora_id"] = None if x is None else _expect_str(x, expected="a string")
+    return UnloadLoraAdapterRequest(**kw)
+
+
+def encode_UnloadLoraAdapterRequest(v: UnloadLoraAdapterRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["lora_name"] = v.lora_name
+    if v.lora_id is not None:
+        d["lora_id"] = v.lora_id
+    return d
+
+
+def decode_LoraUpdateResponse(value: Any) -> LoraUpdateResponse:
+    m = _expect_map(value, expected="struct LoraUpdateResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "success":
+            kw["success"] = _expect_bool(x, expected="a boolean")
+        elif key == "error_message":
+            kw["error_message"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "loaded_adapters":
+            kw["loaded_adapters"] = {} if x is None else {k: _expect_str(e, expected="a string") for k, e in _expect_map(x, expected="a map").items()}
+    return LoraUpdateResponse(**kw)
+
+
+def encode_LoraUpdateResponse(v: LoraUpdateResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["success"] = v.success
+    if v.error_message is not None:
+        d["error_message"] = v.error_message
+    if v.loaded_adapters:
+        d["loaded_adapters"] = dict(v.loaded_adapters)
     return d
 
 

@@ -298,6 +298,895 @@ pub mod sglang_service_client {
                 .insert(GrpcMethod::new("sglang.api.v1.SglangService", "Abort"));
             self.inner.unary(req, path, codec).await
         }
+        /// `/set_internal_state`: override numeric scheduler knobs on every DP rank;
+        /// one `updated` flag per rank.
+        pub async fn set_internal_state(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SetInternalStateRequest>,
+        ) -> std::result::Result<tonic::Response<super::SetInternalStateResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/SetInternalState",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "SetInternalState",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        /// `/start_profile` and `/stop_profile`: a profiler capture on every DP rank.
+        pub async fn start_profile(
+            &mut self,
+            request: impl tonic::IntoRequest<super::StartProfileRequest>,
+        ) -> std::result::Result<tonic::Response<super::ProfileResponse>, tonic::Status> {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/StartProfile");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "StartProfile",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn stop_profile(
+            &mut self,
+            request: impl tonic::IntoRequest<super::StopProfileRequest>,
+        ) -> std::result::Result<tonic::Response<super::ProfileResponse>, tonic::Status> {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/StopProfile");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "StopProfile",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        /// `/{start,stop,dump}_expert_distribution_record`.
+        pub async fn start_expert_distribution_record(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ExpertDistributionRecordRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ExpertDistributionRecordResponse>,
+            tonic::Status,
+        > {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/StartExpertDistributionRecord",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "StartExpertDistributionRecord",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn stop_expert_distribution_record(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ExpertDistributionRecordRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ExpertDistributionRecordResponse>,
+            tonic::Status,
+        > {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/StopExpertDistributionRecord",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "StopExpertDistributionRecord",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn dump_expert_distribution_record(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ExpertDistributionRecordRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ExpertDistributionRecordResponse>,
+            tonic::Status,
+        > {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/DumpExpertDistributionRecord",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "DumpExpertDistributionRecord",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        /// `/slow_down`: a per-forward sleep on every DP rank, for testing.
+        pub async fn slow_down(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SlowDownRequest>,
+        ) -> std::result::Result<tonic::Response<super::SlowDownResponse>, tonic::Status> {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/SlowDown");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("sglang.api.v1.SglangService", "SlowDown"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// `/release_memory_occupation`, `/resume_memory_occupation`.
+        pub async fn release_memory_occupation(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ReleaseMemoryOccupationRequest>,
+        ) -> std::result::Result<tonic::Response<super::MemoryOccupationResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/ReleaseMemoryOccupation",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "ReleaseMemoryOccupation",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn resume_memory_occupation(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ResumeMemoryOccupationRequest>,
+        ) -> std::result::Result<tonic::Response<super::MemoryOccupationResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/ResumeMemoryOccupation",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "ResumeMemoryOccupation",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        /// `/get_weights_by_name`: one parameter per DP rank.
+        pub async fn get_weights_by_name(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetWeightsByNameRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetWeightsByNameResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/GetWeightsByName",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "GetWeightsByName",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Weight-update process groups and remote-instance sends. Single-DP-rank
+        /// deployments only, as in Python.
+        pub async fn init_weights_update_group(
+            &mut self,
+            request: impl tonic::IntoRequest<super::InitWeightsUpdateGroupRequest>,
+        ) -> std::result::Result<tonic::Response<super::WeightGroupResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/InitWeightsUpdateGroup",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "InitWeightsUpdateGroup",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn destroy_weights_update_group(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DestroyWeightsUpdateGroupRequest>,
+        ) -> std::result::Result<tonic::Response<super::WeightGroupResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/DestroyWeightsUpdateGroup",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "DestroyWeightsUpdateGroup",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn init_weights_send_group_for_remote_instance(
+            &mut self,
+            request: impl tonic::IntoRequest<super::InitWeightsSendGroupForRemoteInstanceRequest>,
+        ) -> std::result::Result<tonic::Response<super::WeightGroupResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/InitWeightsSendGroupForRemoteInstance",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "InitWeightsSendGroupForRemoteInstance",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn send_weights_to_remote_instance(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SendWeightsToRemoteInstanceRequest>,
+        ) -> std::result::Result<tonic::Response<super::WeightGroupResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/SendWeightsToRemoteInstance",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "SendWeightsToRemoteInstance",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        /// The weight updates, each under the frontend's update lock on every
+        /// listener. Distributed, tensor and plugin updates run inside a
+        /// `BeginWeightUpdate` / `EndWeightUpdate` session and on single-DP-rank
+        /// deployments only, as in Python.
+        pub async fn update_weights_from_disk(
+            &mut self,
+            request: impl tonic::IntoRequest<super::UpdateWeightsFromDiskRequest>,
+        ) -> std::result::Result<tonic::Response<super::UpdateWeightsFromDiskResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/UpdateWeightsFromDisk",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "UpdateWeightsFromDisk",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn update_weights_from_distributed(
+            &mut self,
+            request: impl tonic::IntoRequest<super::UpdateWeightsFromDistributedRequest>,
+        ) -> std::result::Result<tonic::Response<super::WeightUpdateResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/UpdateWeightsFromDistributed",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "UpdateWeightsFromDistributed",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn update_weights_from_tensor(
+            &mut self,
+            request: impl tonic::IntoRequest<super::UpdateWeightsFromTensorRequest>,
+        ) -> std::result::Result<tonic::Response<super::WeightUpdateResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/UpdateWeightsFromTensor",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "UpdateWeightsFromTensor",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn update_weights_from_ipc(
+            &mut self,
+            request: impl tonic::IntoRequest<super::UpdateWeightsFromIpcRequest>,
+        ) -> std::result::Result<tonic::Response<super::WeightUpdateResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/UpdateWeightsFromIpc",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "UpdateWeightsFromIpc",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn begin_weight_update(
+            &mut self,
+            request: impl tonic::IntoRequest<super::BeginWeightUpdateRequest>,
+        ) -> std::result::Result<tonic::Response<super::WeightUpdateResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/BeginWeightUpdate",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "BeginWeightUpdate",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn end_weight_update(
+            &mut self,
+            request: impl tonic::IntoRequest<super::EndWeightUpdateRequest>,
+        ) -> std::result::Result<tonic::Response<super::WeightUpdateResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/EndWeightUpdate",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "EndWeightUpdate",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn plugin_weight_update(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PluginWeightUpdateRequest>,
+        ) -> std::result::Result<tonic::Response<super::PluginWeightUpdateResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/PluginWeightUpdate",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "PluginWeightUpdate",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        /// LoRA adapters; refused as "LoRA is not enabled" (see weights.proto).
+        pub async fn load_lora_adapter(
+            &mut self,
+            request: impl tonic::IntoRequest<super::LoadLoraAdapterRequest>,
+        ) -> std::result::Result<tonic::Response<super::LoraUpdateResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/LoadLoraAdapter",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "LoadLoraAdapter",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn load_lora_adapter_from_tensors(
+            &mut self,
+            request: impl tonic::IntoRequest<super::LoadLoraAdapterFromTensorsRequest>,
+        ) -> std::result::Result<tonic::Response<super::LoraUpdateResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/LoadLoraAdapterFromTensors",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "LoadLoraAdapterFromTensors",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn unload_lora_adapter(
+            &mut self,
+            request: impl tonic::IntoRequest<super::UnloadLoraAdapterRequest>,
+        ) -> std::result::Result<tonic::Response<super::LoraUpdateResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/UnloadLoraAdapter",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "UnloadLoraAdapter",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        /// `/remote_instance_transfer_engine_info`: proxied from the engine-info
+        /// bootstrap server.
+        pub async fn get_remote_instance_transfer_engine_info(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RemoteInstanceTransferEngineInfoRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RemoteInstanceTransferEngineInfoResponse>,
+            tonic::Status,
+        > {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/GetRemoteInstanceTransferEngineInfo",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "GetRemoteInstanceTransferEngineInfo",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        /// `/parse_function_call`, `/separate_reasoning`: frontend-only parsing.
+        pub async fn parse_function_call(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ParseFunctionCallRequest>,
+        ) -> std::result::Result<tonic::Response<super::ParseFunctionCallResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/ParseFunctionCall",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "ParseFunctionCall",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn separate_reasoning(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SeparateReasoningRequest>,
+        ) -> std::result::Result<tonic::Response<super::SeparateReasoningResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/SeparateReasoning",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "SeparateReasoning",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        /// `/add_external_corpus`, `/remove_external_corpus`, `/list_external_corpora`.
+        pub async fn add_external_corpus(
+            &mut self,
+            request: impl tonic::IntoRequest<super::AddExternalCorpusRequest>,
+        ) -> std::result::Result<tonic::Response<super::AddExternalCorpusResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/AddExternalCorpus",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "AddExternalCorpus",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn remove_external_corpus(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RemoveExternalCorpusRequest>,
+        ) -> std::result::Result<tonic::Response<super::RemoveExternalCorpusResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/RemoveExternalCorpus",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "RemoveExternalCorpus",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn list_external_corpora(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListExternalCorporaRequest>,
+        ) -> std::result::Result<tonic::Response<super::ListExternalCorporaResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/ListExternalCorpora",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "ListExternalCorpora",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        /// `/freeze_gc`, `/pause_generation`, `/continue_generation`,
+        /// `/pd_role_switch`, `/update_weight_version`.
+        pub async fn freeze_gc(
+            &mut self,
+            request: impl tonic::IntoRequest<super::FreezeGcRequest>,
+        ) -> std::result::Result<tonic::Response<super::FreezeGcResponse>, tonic::Status> {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/FreezeGc");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("sglang.api.v1.SglangService", "FreezeGc"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn pause_generation(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PauseGenerationRequest>,
+        ) -> std::result::Result<tonic::Response<super::GenerationPauseResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/PauseGeneration",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "PauseGeneration",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn continue_generation(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ContinueGenerationRequest>,
+        ) -> std::result::Result<tonic::Response<super::GenerationPauseResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/ContinueGeneration",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "ContinueGeneration",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn pd_role_switch(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PdRoleSwitchRequest>,
+        ) -> std::result::Result<tonic::Response<super::PdRoleSwitchResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/PdRoleSwitch");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "PdRoleSwitch",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn update_weight_version(
+            &mut self,
+            request: impl tonic::IntoRequest<super::UpdateWeightVersionRequest>,
+        ) -> std::result::Result<tonic::Response<super::UpdateWeightVersionResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/UpdateWeightVersion",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "UpdateWeightVersion",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        /// `/open_session`, `/close_session`: multi-turn sessions on the schedulers.
+        pub async fn open_session(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OpenSessionRequest>,
+        ) -> std::result::Result<tonic::Response<super::OpenSessionResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/OpenSession");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "OpenSession",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn close_session(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CloseSessionRequest>,
+        ) -> std::result::Result<tonic::Response<super::CloseSessionResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/CloseSession");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "CloseSession",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        /// `/get_hicache_l3_cache_layout`: the merged HiCache L3 layout.
+        pub async fn get_hi_cache_l3_cache_layout(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetHiCacheL3CacheLayoutRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetHiCacheL3CacheLayoutResponse>,
+            tonic::Status,
+        > {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/GetHiCacheL3CacheLayout",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "GetHiCacheL3CacheLayout",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        /// `/configure_logging`: the scheduler ranks' log level.
+        pub async fn configure_logging(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ConfigureLoggingRequest>,
+        ) -> std::result::Result<tonic::Response<super::ConfigureLoggingResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/ConfigureLogging",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "ConfigureLogging",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        /// `/dumper/{method}`: the debug dumper's control surface.
+        pub async fn dumper_control(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DumperControlRequest>,
+        ) -> std::result::Result<tonic::Response<super::DumperControlResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/DumperControl");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "DumperControl",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        /// `/scale_elastic_ep`, `/is_scaling_elastic_ep`.
+        pub async fn scale_elastic_ep(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ScaleElasticEpRequest>,
+        ) -> std::result::Result<tonic::Response<super::ScaleElasticEpResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/ScaleElasticEp");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "ScaleElasticEp",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_elastic_ep_state(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ElasticEpStateRequest>,
+        ) -> std::result::Result<tonic::Response<super::ElasticEpStateResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/GetElasticEpState",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "GetElasticEpState",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Ollama data plane. Chat and generate are server-streaming like Generate:
+        /// a unary request is a one-frame stream, and the final frame carries the
+        /// counters. Chat renders the messages with the served chat template.
+        pub async fn ollama_chat(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OllamaChatRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::OllamaChatResponse>>,
+            tonic::Status,
+        > {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/OllamaChat");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("sglang.api.v1.SglangService", "OllamaChat"));
+            self.inner.server_streaming(req, path, codec).await
+        }
+        pub async fn ollama_generate(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OllamaGenerateRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::OllamaGenerateResponse>>,
+            tonic::Status,
+        > {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/OllamaGenerate");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "OllamaGenerate",
+            ));
+            self.inner.server_streaming(req, path, codec).await
+        }
+        pub async fn ollama_tags(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OllamaTagsRequest>,
+        ) -> std::result::Result<tonic::Response<super::OllamaTagsResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/OllamaTags");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("sglang.api.v1.SglangService", "OllamaTags"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn ollama_show(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OllamaShowRequest>,
+        ) -> std::result::Result<tonic::Response<super::OllamaShowResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/OllamaShow");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("sglang.api.v1.SglangService", "OllamaShow"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -379,6 +1268,243 @@ pub mod sglang_service_server {
             &self,
             request: tonic::Request<super::AbortRequest>,
         ) -> std::result::Result<tonic::Response<super::AbortResponse>, tonic::Status>;
+        /// `/set_internal_state`: override numeric scheduler knobs on every DP rank;
+        /// one `updated` flag per rank.
+        async fn set_internal_state(
+            &self,
+            request: tonic::Request<super::SetInternalStateRequest>,
+        ) -> std::result::Result<tonic::Response<super::SetInternalStateResponse>, tonic::Status>;
+        /// `/start_profile` and `/stop_profile`: a profiler capture on every DP rank.
+        async fn start_profile(
+            &self,
+            request: tonic::Request<super::StartProfileRequest>,
+        ) -> std::result::Result<tonic::Response<super::ProfileResponse>, tonic::Status>;
+        async fn stop_profile(
+            &self,
+            request: tonic::Request<super::StopProfileRequest>,
+        ) -> std::result::Result<tonic::Response<super::ProfileResponse>, tonic::Status>;
+        /// `/{start,stop,dump}_expert_distribution_record`.
+        async fn start_expert_distribution_record(
+            &self,
+            request: tonic::Request<super::ExpertDistributionRecordRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ExpertDistributionRecordResponse>,
+            tonic::Status,
+        >;
+        async fn stop_expert_distribution_record(
+            &self,
+            request: tonic::Request<super::ExpertDistributionRecordRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ExpertDistributionRecordResponse>,
+            tonic::Status,
+        >;
+        async fn dump_expert_distribution_record(
+            &self,
+            request: tonic::Request<super::ExpertDistributionRecordRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ExpertDistributionRecordResponse>,
+            tonic::Status,
+        >;
+        /// `/slow_down`: a per-forward sleep on every DP rank, for testing.
+        async fn slow_down(
+            &self,
+            request: tonic::Request<super::SlowDownRequest>,
+        ) -> std::result::Result<tonic::Response<super::SlowDownResponse>, tonic::Status>;
+        /// `/release_memory_occupation`, `/resume_memory_occupation`.
+        async fn release_memory_occupation(
+            &self,
+            request: tonic::Request<super::ReleaseMemoryOccupationRequest>,
+        ) -> std::result::Result<tonic::Response<super::MemoryOccupationResponse>, tonic::Status>;
+        async fn resume_memory_occupation(
+            &self,
+            request: tonic::Request<super::ResumeMemoryOccupationRequest>,
+        ) -> std::result::Result<tonic::Response<super::MemoryOccupationResponse>, tonic::Status>;
+        /// `/get_weights_by_name`: one parameter per DP rank.
+        async fn get_weights_by_name(
+            &self,
+            request: tonic::Request<super::GetWeightsByNameRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetWeightsByNameResponse>, tonic::Status>;
+        /// Weight-update process groups and remote-instance sends. Single-DP-rank
+        /// deployments only, as in Python.
+        async fn init_weights_update_group(
+            &self,
+            request: tonic::Request<super::InitWeightsUpdateGroupRequest>,
+        ) -> std::result::Result<tonic::Response<super::WeightGroupResponse>, tonic::Status>;
+        async fn destroy_weights_update_group(
+            &self,
+            request: tonic::Request<super::DestroyWeightsUpdateGroupRequest>,
+        ) -> std::result::Result<tonic::Response<super::WeightGroupResponse>, tonic::Status>;
+        async fn init_weights_send_group_for_remote_instance(
+            &self,
+            request: tonic::Request<super::InitWeightsSendGroupForRemoteInstanceRequest>,
+        ) -> std::result::Result<tonic::Response<super::WeightGroupResponse>, tonic::Status>;
+        async fn send_weights_to_remote_instance(
+            &self,
+            request: tonic::Request<super::SendWeightsToRemoteInstanceRequest>,
+        ) -> std::result::Result<tonic::Response<super::WeightGroupResponse>, tonic::Status>;
+        /// The weight updates, each under the frontend's update lock on every
+        /// listener. Distributed, tensor and plugin updates run inside a
+        /// `BeginWeightUpdate` / `EndWeightUpdate` session and on single-DP-rank
+        /// deployments only, as in Python.
+        async fn update_weights_from_disk(
+            &self,
+            request: tonic::Request<super::UpdateWeightsFromDiskRequest>,
+        ) -> std::result::Result<tonic::Response<super::UpdateWeightsFromDiskResponse>, tonic::Status>;
+        async fn update_weights_from_distributed(
+            &self,
+            request: tonic::Request<super::UpdateWeightsFromDistributedRequest>,
+        ) -> std::result::Result<tonic::Response<super::WeightUpdateResponse>, tonic::Status>;
+        async fn update_weights_from_tensor(
+            &self,
+            request: tonic::Request<super::UpdateWeightsFromTensorRequest>,
+        ) -> std::result::Result<tonic::Response<super::WeightUpdateResponse>, tonic::Status>;
+        async fn update_weights_from_ipc(
+            &self,
+            request: tonic::Request<super::UpdateWeightsFromIpcRequest>,
+        ) -> std::result::Result<tonic::Response<super::WeightUpdateResponse>, tonic::Status>;
+        async fn begin_weight_update(
+            &self,
+            request: tonic::Request<super::BeginWeightUpdateRequest>,
+        ) -> std::result::Result<tonic::Response<super::WeightUpdateResponse>, tonic::Status>;
+        async fn end_weight_update(
+            &self,
+            request: tonic::Request<super::EndWeightUpdateRequest>,
+        ) -> std::result::Result<tonic::Response<super::WeightUpdateResponse>, tonic::Status>;
+        async fn plugin_weight_update(
+            &self,
+            request: tonic::Request<super::PluginWeightUpdateRequest>,
+        ) -> std::result::Result<tonic::Response<super::PluginWeightUpdateResponse>, tonic::Status>;
+        /// LoRA adapters; refused as "LoRA is not enabled" (see weights.proto).
+        async fn load_lora_adapter(
+            &self,
+            request: tonic::Request<super::LoadLoraAdapterRequest>,
+        ) -> std::result::Result<tonic::Response<super::LoraUpdateResponse>, tonic::Status>;
+        async fn load_lora_adapter_from_tensors(
+            &self,
+            request: tonic::Request<super::LoadLoraAdapterFromTensorsRequest>,
+        ) -> std::result::Result<tonic::Response<super::LoraUpdateResponse>, tonic::Status>;
+        async fn unload_lora_adapter(
+            &self,
+            request: tonic::Request<super::UnloadLoraAdapterRequest>,
+        ) -> std::result::Result<tonic::Response<super::LoraUpdateResponse>, tonic::Status>;
+        /// `/remote_instance_transfer_engine_info`: proxied from the engine-info
+        /// bootstrap server.
+        async fn get_remote_instance_transfer_engine_info(
+            &self,
+            request: tonic::Request<super::RemoteInstanceTransferEngineInfoRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RemoteInstanceTransferEngineInfoResponse>,
+            tonic::Status,
+        >;
+        /// `/parse_function_call`, `/separate_reasoning`: frontend-only parsing.
+        async fn parse_function_call(
+            &self,
+            request: tonic::Request<super::ParseFunctionCallRequest>,
+        ) -> std::result::Result<tonic::Response<super::ParseFunctionCallResponse>, tonic::Status>;
+        async fn separate_reasoning(
+            &self,
+            request: tonic::Request<super::SeparateReasoningRequest>,
+        ) -> std::result::Result<tonic::Response<super::SeparateReasoningResponse>, tonic::Status>;
+        /// `/add_external_corpus`, `/remove_external_corpus`, `/list_external_corpora`.
+        async fn add_external_corpus(
+            &self,
+            request: tonic::Request<super::AddExternalCorpusRequest>,
+        ) -> std::result::Result<tonic::Response<super::AddExternalCorpusResponse>, tonic::Status>;
+        async fn remove_external_corpus(
+            &self,
+            request: tonic::Request<super::RemoveExternalCorpusRequest>,
+        ) -> std::result::Result<tonic::Response<super::RemoveExternalCorpusResponse>, tonic::Status>;
+        async fn list_external_corpora(
+            &self,
+            request: tonic::Request<super::ListExternalCorporaRequest>,
+        ) -> std::result::Result<tonic::Response<super::ListExternalCorporaResponse>, tonic::Status>;
+        /// `/freeze_gc`, `/pause_generation`, `/continue_generation`,
+        /// `/pd_role_switch`, `/update_weight_version`.
+        async fn freeze_gc(
+            &self,
+            request: tonic::Request<super::FreezeGcRequest>,
+        ) -> std::result::Result<tonic::Response<super::FreezeGcResponse>, tonic::Status>;
+        async fn pause_generation(
+            &self,
+            request: tonic::Request<super::PauseGenerationRequest>,
+        ) -> std::result::Result<tonic::Response<super::GenerationPauseResponse>, tonic::Status>;
+        async fn continue_generation(
+            &self,
+            request: tonic::Request<super::ContinueGenerationRequest>,
+        ) -> std::result::Result<tonic::Response<super::GenerationPauseResponse>, tonic::Status>;
+        async fn pd_role_switch(
+            &self,
+            request: tonic::Request<super::PdRoleSwitchRequest>,
+        ) -> std::result::Result<tonic::Response<super::PdRoleSwitchResponse>, tonic::Status>;
+        async fn update_weight_version(
+            &self,
+            request: tonic::Request<super::UpdateWeightVersionRequest>,
+        ) -> std::result::Result<tonic::Response<super::UpdateWeightVersionResponse>, tonic::Status>;
+        /// `/open_session`, `/close_session`: multi-turn sessions on the schedulers.
+        async fn open_session(
+            &self,
+            request: tonic::Request<super::OpenSessionRequest>,
+        ) -> std::result::Result<tonic::Response<super::OpenSessionResponse>, tonic::Status>;
+        async fn close_session(
+            &self,
+            request: tonic::Request<super::CloseSessionRequest>,
+        ) -> std::result::Result<tonic::Response<super::CloseSessionResponse>, tonic::Status>;
+        /// `/get_hicache_l3_cache_layout`: the merged HiCache L3 layout.
+        async fn get_hi_cache_l3_cache_layout(
+            &self,
+            request: tonic::Request<super::GetHiCacheL3CacheLayoutRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetHiCacheL3CacheLayoutResponse>,
+            tonic::Status,
+        >;
+        /// `/configure_logging`: the scheduler ranks' log level.
+        async fn configure_logging(
+            &self,
+            request: tonic::Request<super::ConfigureLoggingRequest>,
+        ) -> std::result::Result<tonic::Response<super::ConfigureLoggingResponse>, tonic::Status>;
+        /// `/dumper/{method}`: the debug dumper's control surface.
+        async fn dumper_control(
+            &self,
+            request: tonic::Request<super::DumperControlRequest>,
+        ) -> std::result::Result<tonic::Response<super::DumperControlResponse>, tonic::Status>;
+        /// `/scale_elastic_ep`, `/is_scaling_elastic_ep`.
+        async fn scale_elastic_ep(
+            &self,
+            request: tonic::Request<super::ScaleElasticEpRequest>,
+        ) -> std::result::Result<tonic::Response<super::ScaleElasticEpResponse>, tonic::Status>;
+        async fn get_elastic_ep_state(
+            &self,
+            request: tonic::Request<super::ElasticEpStateRequest>,
+        ) -> std::result::Result<tonic::Response<super::ElasticEpStateResponse>, tonic::Status>;
+        /// Server streaming response type for the OllamaChat method.
+        type OllamaChatStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::OllamaChatResponse, tonic::Status>,
+            > + std::marker::Send
+            + 'static;
+        /// Ollama data plane. Chat and generate are server-streaming like Generate:
+        /// a unary request is a one-frame stream, and the final frame carries the
+        /// counters. Chat renders the messages with the served chat template.
+        async fn ollama_chat(
+            &self,
+            request: tonic::Request<super::OllamaChatRequest>,
+        ) -> std::result::Result<tonic::Response<Self::OllamaChatStream>, tonic::Status>;
+        /// Server streaming response type for the OllamaGenerate method.
+        type OllamaGenerateStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::OllamaGenerateResponse, tonic::Status>,
+            > + std::marker::Send
+            + 'static;
+        async fn ollama_generate(
+            &self,
+            request: tonic::Request<super::OllamaGenerateRequest>,
+        ) -> std::result::Result<tonic::Response<Self::OllamaGenerateStream>, tonic::Status>;
+        async fn ollama_tags(
+            &self,
+            request: tonic::Request<super::OllamaTagsRequest>,
+        ) -> std::result::Result<tonic::Response<super::OllamaTagsResponse>, tonic::Status>;
+        async fn ollama_show(
+            &self,
+            request: tonic::Request<super::OllamaShowRequest>,
+        ) -> std::result::Result<tonic::Response<super::OllamaShowResponse>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct SglangServiceServer<T> {
@@ -889,6 +2015,1956 @@ pub mod sglang_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = AbortSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/SetInternalState" => {
+                    #[allow(non_camel_case_types)]
+                    struct SetInternalStateSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::SetInternalStateRequest>
+                        for SetInternalStateSvc<T>
+                    {
+                        type Response = super::SetInternalStateResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::SetInternalStateRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::set_internal_state(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SetInternalStateSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/StartProfile" => {
+                    #[allow(non_camel_case_types)]
+                    struct StartProfileSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::StartProfileRequest>
+                        for StartProfileSvc<T>
+                    {
+                        type Response = super::ProfileResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::StartProfileRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::start_profile(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = StartProfileSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/StopProfile" => {
+                    #[allow(non_camel_case_types)]
+                    struct StopProfileSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::StopProfileRequest>
+                        for StopProfileSvc<T>
+                    {
+                        type Response = super::ProfileResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::StopProfileRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::stop_profile(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = StopProfileSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/StartExpertDistributionRecord" => {
+                    #[allow(non_camel_case_types)]
+                    struct StartExpertDistributionRecordSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::ExpertDistributionRecordRequest>
+                        for StartExpertDistributionRecordSvc<T>
+                    {
+                        type Response = super::ExpertDistributionRecordResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ExpertDistributionRecordRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::start_expert_distribution_record(
+                                    &inner, request,
+                                )
+                                .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = StartExpertDistributionRecordSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/StopExpertDistributionRecord" => {
+                    #[allow(non_camel_case_types)]
+                    struct StopExpertDistributionRecordSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::ExpertDistributionRecordRequest>
+                        for StopExpertDistributionRecordSvc<T>
+                    {
+                        type Response = super::ExpertDistributionRecordResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ExpertDistributionRecordRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::stop_expert_distribution_record(
+                                    &inner, request,
+                                )
+                                .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = StopExpertDistributionRecordSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/DumpExpertDistributionRecord" => {
+                    #[allow(non_camel_case_types)]
+                    struct DumpExpertDistributionRecordSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::ExpertDistributionRecordRequest>
+                        for DumpExpertDistributionRecordSvc<T>
+                    {
+                        type Response = super::ExpertDistributionRecordResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ExpertDistributionRecordRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::dump_expert_distribution_record(
+                                    &inner, request,
+                                )
+                                .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DumpExpertDistributionRecordSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/SlowDown" => {
+                    #[allow(non_camel_case_types)]
+                    struct SlowDownSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::SlowDownRequest> for SlowDownSvc<T> {
+                        type Response = super::SlowDownResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::SlowDownRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::slow_down(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SlowDownSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/ReleaseMemoryOccupation" => {
+                    #[allow(non_camel_case_types)]
+                    struct ReleaseMemoryOccupationSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::ReleaseMemoryOccupationRequest>
+                        for ReleaseMemoryOccupationSvc<T>
+                    {
+                        type Response = super::MemoryOccupationResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ReleaseMemoryOccupationRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::release_memory_occupation(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ReleaseMemoryOccupationSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/ResumeMemoryOccupation" => {
+                    #[allow(non_camel_case_types)]
+                    struct ResumeMemoryOccupationSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::ResumeMemoryOccupationRequest>
+                        for ResumeMemoryOccupationSvc<T>
+                    {
+                        type Response = super::MemoryOccupationResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ResumeMemoryOccupationRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::resume_memory_occupation(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ResumeMemoryOccupationSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/GetWeightsByName" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetWeightsByNameSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::GetWeightsByNameRequest>
+                        for GetWeightsByNameSvc<T>
+                    {
+                        type Response = super::GetWeightsByNameResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetWeightsByNameRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::get_weights_by_name(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetWeightsByNameSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/InitWeightsUpdateGroup" => {
+                    #[allow(non_camel_case_types)]
+                    struct InitWeightsUpdateGroupSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::InitWeightsUpdateGroupRequest>
+                        for InitWeightsUpdateGroupSvc<T>
+                    {
+                        type Response = super::WeightGroupResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::InitWeightsUpdateGroupRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::init_weights_update_group(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = InitWeightsUpdateGroupSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/DestroyWeightsUpdateGroup" => {
+                    #[allow(non_camel_case_types)]
+                    struct DestroyWeightsUpdateGroupSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::DestroyWeightsUpdateGroupRequest>
+                        for DestroyWeightsUpdateGroupSvc<T>
+                    {
+                        type Response = super::WeightGroupResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DestroyWeightsUpdateGroupRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::destroy_weights_update_group(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DestroyWeightsUpdateGroupSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/InitWeightsSendGroupForRemoteInstance" => {
+                    #[allow(non_camel_case_types)]
+                    struct InitWeightsSendGroupForRemoteInstanceSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<
+                            super::InitWeightsSendGroupForRemoteInstanceRequest,
+                        > for InitWeightsSendGroupForRemoteInstanceSvc<T>
+                    {
+                        type Response = super::WeightGroupResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::InitWeightsSendGroupForRemoteInstanceRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::init_weights_send_group_for_remote_instance(
+                                    &inner, request,
+                                )
+                                .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = InitWeightsSendGroupForRemoteInstanceSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/SendWeightsToRemoteInstance" => {
+                    #[allow(non_camel_case_types)]
+                    struct SendWeightsToRemoteInstanceSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::SendWeightsToRemoteInstanceRequest>
+                        for SendWeightsToRemoteInstanceSvc<T>
+                    {
+                        type Response = super::WeightGroupResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::SendWeightsToRemoteInstanceRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::send_weights_to_remote_instance(
+                                    &inner, request,
+                                )
+                                .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SendWeightsToRemoteInstanceSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/UpdateWeightsFromDisk" => {
+                    #[allow(non_camel_case_types)]
+                    struct UpdateWeightsFromDiskSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::UpdateWeightsFromDiskRequest>
+                        for UpdateWeightsFromDiskSvc<T>
+                    {
+                        type Response = super::UpdateWeightsFromDiskResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::UpdateWeightsFromDiskRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::update_weights_from_disk(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UpdateWeightsFromDiskSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/UpdateWeightsFromDistributed" => {
+                    #[allow(non_camel_case_types)]
+                    struct UpdateWeightsFromDistributedSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::UpdateWeightsFromDistributedRequest>
+                        for UpdateWeightsFromDistributedSvc<T>
+                    {
+                        type Response = super::WeightUpdateResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::UpdateWeightsFromDistributedRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::update_weights_from_distributed(
+                                    &inner, request,
+                                )
+                                .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UpdateWeightsFromDistributedSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/UpdateWeightsFromTensor" => {
+                    #[allow(non_camel_case_types)]
+                    struct UpdateWeightsFromTensorSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::UpdateWeightsFromTensorRequest>
+                        for UpdateWeightsFromTensorSvc<T>
+                    {
+                        type Response = super::WeightUpdateResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::UpdateWeightsFromTensorRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::update_weights_from_tensor(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UpdateWeightsFromTensorSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/UpdateWeightsFromIpc" => {
+                    #[allow(non_camel_case_types)]
+                    struct UpdateWeightsFromIpcSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::UpdateWeightsFromIpcRequest>
+                        for UpdateWeightsFromIpcSvc<T>
+                    {
+                        type Response = super::WeightUpdateResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::UpdateWeightsFromIpcRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::update_weights_from_ipc(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UpdateWeightsFromIpcSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/BeginWeightUpdate" => {
+                    #[allow(non_camel_case_types)]
+                    struct BeginWeightUpdateSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::BeginWeightUpdateRequest>
+                        for BeginWeightUpdateSvc<T>
+                    {
+                        type Response = super::WeightUpdateResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::BeginWeightUpdateRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::begin_weight_update(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = BeginWeightUpdateSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/EndWeightUpdate" => {
+                    #[allow(non_camel_case_types)]
+                    struct EndWeightUpdateSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::EndWeightUpdateRequest>
+                        for EndWeightUpdateSvc<T>
+                    {
+                        type Response = super::WeightUpdateResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::EndWeightUpdateRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::end_weight_update(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = EndWeightUpdateSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/PluginWeightUpdate" => {
+                    #[allow(non_camel_case_types)]
+                    struct PluginWeightUpdateSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::PluginWeightUpdateRequest>
+                        for PluginWeightUpdateSvc<T>
+                    {
+                        type Response = super::PluginWeightUpdateResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PluginWeightUpdateRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::plugin_weight_update(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PluginWeightUpdateSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/LoadLoraAdapter" => {
+                    #[allow(non_camel_case_types)]
+                    struct LoadLoraAdapterSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::LoadLoraAdapterRequest>
+                        for LoadLoraAdapterSvc<T>
+                    {
+                        type Response = super::LoraUpdateResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::LoadLoraAdapterRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::load_lora_adapter(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = LoadLoraAdapterSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/LoadLoraAdapterFromTensors" => {
+                    #[allow(non_camel_case_types)]
+                    struct LoadLoraAdapterFromTensorsSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::LoadLoraAdapterFromTensorsRequest>
+                        for LoadLoraAdapterFromTensorsSvc<T>
+                    {
+                        type Response = super::LoraUpdateResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::LoadLoraAdapterFromTensorsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::load_lora_adapter_from_tensors(
+                                    &inner, request,
+                                )
+                                .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = LoadLoraAdapterFromTensorsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/UnloadLoraAdapter" => {
+                    #[allow(non_camel_case_types)]
+                    struct UnloadLoraAdapterSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::UnloadLoraAdapterRequest>
+                        for UnloadLoraAdapterSvc<T>
+                    {
+                        type Response = super::LoraUpdateResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::UnloadLoraAdapterRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::unload_lora_adapter(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UnloadLoraAdapterSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/GetRemoteInstanceTransferEngineInfo" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetRemoteInstanceTransferEngineInfoSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::RemoteInstanceTransferEngineInfoRequest>
+                        for GetRemoteInstanceTransferEngineInfoSvc<T>
+                    {
+                        type Response = super::RemoteInstanceTransferEngineInfoResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RemoteInstanceTransferEngineInfoRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::get_remote_instance_transfer_engine_info(
+                                    &inner, request,
+                                )
+                                .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetRemoteInstanceTransferEngineInfoSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/ParseFunctionCall" => {
+                    #[allow(non_camel_case_types)]
+                    struct ParseFunctionCallSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::ParseFunctionCallRequest>
+                        for ParseFunctionCallSvc<T>
+                    {
+                        type Response = super::ParseFunctionCallResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ParseFunctionCallRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::parse_function_call(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ParseFunctionCallSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/SeparateReasoning" => {
+                    #[allow(non_camel_case_types)]
+                    struct SeparateReasoningSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::SeparateReasoningRequest>
+                        for SeparateReasoningSvc<T>
+                    {
+                        type Response = super::SeparateReasoningResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::SeparateReasoningRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::separate_reasoning(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SeparateReasoningSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/AddExternalCorpus" => {
+                    #[allow(non_camel_case_types)]
+                    struct AddExternalCorpusSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::AddExternalCorpusRequest>
+                        for AddExternalCorpusSvc<T>
+                    {
+                        type Response = super::AddExternalCorpusResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::AddExternalCorpusRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::add_external_corpus(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = AddExternalCorpusSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/RemoveExternalCorpus" => {
+                    #[allow(non_camel_case_types)]
+                    struct RemoveExternalCorpusSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::RemoveExternalCorpusRequest>
+                        for RemoveExternalCorpusSvc<T>
+                    {
+                        type Response = super::RemoveExternalCorpusResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RemoveExternalCorpusRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::remove_external_corpus(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RemoveExternalCorpusSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/ListExternalCorpora" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListExternalCorporaSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::ListExternalCorporaRequest>
+                        for ListExternalCorporaSvc<T>
+                    {
+                        type Response = super::ListExternalCorporaResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListExternalCorporaRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::list_external_corpora(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListExternalCorporaSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/FreezeGc" => {
+                    #[allow(non_camel_case_types)]
+                    struct FreezeGcSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::FreezeGcRequest> for FreezeGcSvc<T> {
+                        type Response = super::FreezeGcResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::FreezeGcRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::freeze_gc(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = FreezeGcSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/PauseGeneration" => {
+                    #[allow(non_camel_case_types)]
+                    struct PauseGenerationSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::PauseGenerationRequest>
+                        for PauseGenerationSvc<T>
+                    {
+                        type Response = super::GenerationPauseResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PauseGenerationRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::pause_generation(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PauseGenerationSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/ContinueGeneration" => {
+                    #[allow(non_camel_case_types)]
+                    struct ContinueGenerationSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::ContinueGenerationRequest>
+                        for ContinueGenerationSvc<T>
+                    {
+                        type Response = super::GenerationPauseResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ContinueGenerationRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::continue_generation(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ContinueGenerationSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/PdRoleSwitch" => {
+                    #[allow(non_camel_case_types)]
+                    struct PdRoleSwitchSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::PdRoleSwitchRequest>
+                        for PdRoleSwitchSvc<T>
+                    {
+                        type Response = super::PdRoleSwitchResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PdRoleSwitchRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::pd_role_switch(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PdRoleSwitchSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/UpdateWeightVersion" => {
+                    #[allow(non_camel_case_types)]
+                    struct UpdateWeightVersionSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::UpdateWeightVersionRequest>
+                        for UpdateWeightVersionSvc<T>
+                    {
+                        type Response = super::UpdateWeightVersionResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::UpdateWeightVersionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::update_weight_version(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UpdateWeightVersionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/OpenSession" => {
+                    #[allow(non_camel_case_types)]
+                    struct OpenSessionSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::OpenSessionRequest>
+                        for OpenSessionSvc<T>
+                    {
+                        type Response = super::OpenSessionResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OpenSessionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::open_session(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OpenSessionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/CloseSession" => {
+                    #[allow(non_camel_case_types)]
+                    struct CloseSessionSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::CloseSessionRequest>
+                        for CloseSessionSvc<T>
+                    {
+                        type Response = super::CloseSessionResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::CloseSessionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::close_session(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CloseSessionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/GetHiCacheL3CacheLayout" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetHiCacheL3CacheLayoutSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::GetHiCacheL3CacheLayoutRequest>
+                        for GetHiCacheL3CacheLayoutSvc<T>
+                    {
+                        type Response = super::GetHiCacheL3CacheLayoutResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetHiCacheL3CacheLayoutRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::get_hi_cache_l3_cache_layout(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetHiCacheL3CacheLayoutSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/ConfigureLogging" => {
+                    #[allow(non_camel_case_types)]
+                    struct ConfigureLoggingSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::ConfigureLoggingRequest>
+                        for ConfigureLoggingSvc<T>
+                    {
+                        type Response = super::ConfigureLoggingResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ConfigureLoggingRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::configure_logging(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ConfigureLoggingSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/DumperControl" => {
+                    #[allow(non_camel_case_types)]
+                    struct DumperControlSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::DumperControlRequest>
+                        for DumperControlSvc<T>
+                    {
+                        type Response = super::DumperControlResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DumperControlRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::dumper_control(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DumperControlSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/ScaleElasticEp" => {
+                    #[allow(non_camel_case_types)]
+                    struct ScaleElasticEpSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::ScaleElasticEpRequest>
+                        for ScaleElasticEpSvc<T>
+                    {
+                        type Response = super::ScaleElasticEpResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ScaleElasticEpRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::scale_elastic_ep(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ScaleElasticEpSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/GetElasticEpState" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetElasticEpStateSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::ElasticEpStateRequest>
+                        for GetElasticEpStateSvc<T>
+                    {
+                        type Response = super::ElasticEpStateResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ElasticEpStateRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::get_elastic_ep_state(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetElasticEpStateSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/OllamaChat" => {
+                    #[allow(non_camel_case_types)]
+                    struct OllamaChatSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::ServerStreamingService<super::OllamaChatRequest>
+                        for OllamaChatSvc<T>
+                    {
+                        type Response = super::OllamaChatResponse;
+                        type ResponseStream = T::OllamaChatStream;
+                        type Future =
+                            BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OllamaChatRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::ollama_chat(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OllamaChatSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/OllamaGenerate" => {
+                    #[allow(non_camel_case_types)]
+                    struct OllamaGenerateSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::ServerStreamingService<super::OllamaGenerateRequest>
+                        for OllamaGenerateSvc<T>
+                    {
+                        type Response = super::OllamaGenerateResponse;
+                        type ResponseStream = T::OllamaGenerateStream;
+                        type Future =
+                            BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OllamaGenerateRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::ollama_generate(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OllamaGenerateSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/OllamaTags" => {
+                    #[allow(non_camel_case_types)]
+                    struct OllamaTagsSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::OllamaTagsRequest> for OllamaTagsSvc<T> {
+                        type Response = super::OllamaTagsResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OllamaTagsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::ollama_tags(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OllamaTagsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/OllamaShow" => {
+                    #[allow(non_camel_case_types)]
+                    struct OllamaShowSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::OllamaShowRequest> for OllamaShowSvc<T> {
+                        type Response = super::OllamaShowResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OllamaShowRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::ollama_show(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OllamaShowSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

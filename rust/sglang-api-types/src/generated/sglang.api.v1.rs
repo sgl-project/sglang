@@ -140,6 +140,17 @@ pub struct OptionalStringList {
     #[prost(message, repeated, tag = "1")]
     pub items: ::prost::alloc::vec::Vec<OptionalString>,
 }
+/// A nullable double list element (e.g. a completion token logprob).
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct OptionalDouble {
+    #[prost(double, optional, tag = "1")]
+    pub value: ::core::option::Option<f64>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DoubleList {
+    #[prost(double, repeated, tag = "1")]
+    pub items: ::prost::alloc::vec::Vec<f64>,
+}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OptionalInt64 {
     #[prost(int64, optional, tag = "1")]
@@ -180,6 +191,335 @@ pub struct ErrorBody {
     pub r#type: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(bool, optional, tag = "4")]
     pub retryable: ::core::option::Option<bool>,
+}
+/// `/set_internal_state`: numeric scheduler knobs to override at runtime.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SetInternalStateRequest {
+    /// Python's `SetInternalStateReq.server_args: Dict\[str, int | float\]`. The
+    /// key set is the scheduler's (`Scheduler.set_internal_state` rejects
+    /// unknown keys), so the object passes through as JSON text.
+    #[prost(string, optional, tag = "1")]
+    pub server_args: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// One `updated` flag per DP rank, in rank order; Python's `List\[bool\]`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SetInternalStateResponse {
+    #[prost(bool, repeated, tag = "1")]
+    pub updated: ::prost::alloc::vec::Vec<bool>,
+}
+/// `/start_profile`: begin a profiler capture on every DP rank. Python's
+/// `ProfileReq` minus `req_type`, which the operation implies. The frontend
+/// fills `with_stack`/`record_shapes` from `SGLANG_PROFILE_WITH_STACK` /
+/// `SGLANG_PROFILE_RECORD_SHAPES` when unset and mints `profile_id` when
+/// absent, as Python's TokenizerManager does.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StartProfileRequest {
+    #[prost(string, optional, tag = "1")]
+    pub output_dir: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "2")]
+    pub start_step: ::core::option::Option<i64>,
+    /// Stop automatically after this many steps; no `/stop_profile` needed.
+    #[prost(int64, optional, tag = "3")]
+    pub num_steps: ::core::option::Option<i64>,
+    /// Among "CPU", "GPU", "MEM", "RPD"; the scheduler's default when unset.
+    #[prost(message, optional, tag = "4")]
+    pub activities: ::core::option::Option<StringList>,
+    #[prost(bool, tag = "5")]
+    pub profile_by_stage: bool,
+    #[prost(bool, optional, tag = "6")]
+    pub with_stack: ::core::option::Option<bool>,
+    #[prost(bool, optional, tag = "7")]
+    pub record_shapes: ::core::option::Option<bool>,
+    #[prost(string, optional, tag = "8")]
+    pub profile_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag = "9")]
+    pub merge_profiles: bool,
+    #[prost(string, optional, tag = "10")]
+    pub profile_prefix: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "11")]
+    pub profile_stages: ::core::option::Option<StringList>,
+    #[prost(bool, tag = "12")]
+    pub detailed_annotations: bool,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StopProfileRequest {}
+/// The merged outcome of a profile start or stop across DP ranks.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ProfileResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+}
+/// `/start_expert_distribution_record`, `/stop_expert_distribution_record`,
+/// `/dump_expert_distribution_record`: the MoE expert-distribution recorder
+/// on every DP rank. The operation implies the action.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExpertDistributionRecordRequest {}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExpertDistributionRecordResponse {}
+/// `/slow_down`: sleep this long before every forward, for testing; unset or
+/// non-positive clears the delay.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct SlowDownRequest {
+    #[prost(double, optional, tag = "1")]
+    pub forward_sleep_time: ::core::option::Option<f64>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SlowDownResponse {}
+/// `/release_memory_occupation` and `/resume_memory_occupation`: free or
+/// reclaim the GPU memory of the tagged regions (`weights`, `kv_cache`); every
+/// region when `tags` is unset.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReleaseMemoryOccupationRequest {
+    #[prost(message, optional, tag = "1")]
+    pub tags: ::core::option::Option<StringList>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ResumeMemoryOccupationRequest {
+    #[prost(message, optional, tag = "1")]
+    pub tags: ::core::option::Option<StringList>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MemoryOccupationResponse {}
+/// `/freeze_gc`: freeze the Python garbage collector on every DP rank's
+/// scheduler, with the launch's `--gc-threshold`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FreezeGcRequest {}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FreezeGcResponse {}
+/// `/pause_generation`. `in_place` holds the scheduler loop with its batches
+/// intact; `retract` returns running requests to the waiting queue; `abort`
+/// cancels them and is handled by the frontend alone.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PauseGenerationRequest {
+    #[prost(string, optional, tag = "1")]
+    pub mode: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `/continue_generation`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ContinueGenerationRequest {
+    #[prost(bool, optional, tag = "1")]
+    pub torch_empty_cache: ::core::option::Option<bool>,
+}
+/// Python's `{"message": ..., "status": "ok"}` body for pause and continue.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GenerationPauseResponse {
+    #[prost(string, tag = "1")]
+    pub message: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub status: ::prost::alloc::string::String,
+}
+/// `/pd_role_switch`: flip this instance between prefill and decode at
+/// runtime (`--enable-pd-role-switch`). With several DP ranks the frontend
+/// first runs a `prepare_only` preflight on every rank.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PdRoleSwitchRequest {
+    #[prost(string, optional, tag = "1")]
+    pub new_role: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "2")]
+    pub decode_cuda_graph_bs: ::core::option::Option<Int64List>,
+    #[prost(double, optional, tag = "3")]
+    pub decode_cuda_graph_memory_gb: ::core::option::Option<f64>,
+    #[prost(bool, tag = "4")]
+    pub prepare_only: bool,
+}
+/// Python's `PdRoleSwitchReqOutput`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PdRoleSwitchResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub old_role: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub new_role: ::prost::alloc::string::String,
+    #[prost(bool, tag = "5")]
+    pub safe_to_restore: bool,
+}
+/// `/update_weight_version`: relabel the served weights on every DP rank.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UpdateWeightVersionRequest {
+    #[prost(string, tag = "1")]
+    pub new_version: ::prost::alloc::string::String,
+    #[prost(bool, optional, tag = "2")]
+    pub abort_all_requests: ::core::option::Option<bool>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UpdateWeightVersionResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "3")]
+    pub new_version: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `/get_hicache_l3_cache_layout`: the HiCache L3 (object storage) layout,
+/// read from every DP rank and merged as Python's `merge_l3_layouts` merges
+/// them (replicas must agree, pipeline stages concatenate).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetHiCacheL3CacheLayoutRequest {}
+/// The merged layout as JSON text: Python's scheduler-sanitized dict, or the
+/// `disabled_l3_layout` envelope with its reason.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetHiCacheL3CacheLayoutResponse {
+    #[prost(string, optional, tag = "1")]
+    pub layout: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `/configure_logging`: Python's `ConfigureLoggingReq`. `log_level` reaches
+/// every scheduler rank; the other fields configure the Python frontend's
+/// own request logging and dumps, which the Rust frontend does not apply.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ConfigureLoggingRequest {
+    #[prost(bool, optional, tag = "1")]
+    pub log_requests: ::core::option::Option<bool>,
+    #[prost(int64, optional, tag = "2")]
+    pub log_requests_level: ::core::option::Option<i64>,
+    #[prost(string, optional, tag = "3")]
+    pub log_requests_format: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "4")]
+    pub log_level: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "5")]
+    pub dump_requests_folder: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "6")]
+    pub dump_requests_threshold: ::core::option::Option<i64>,
+    #[prost(string, optional, tag = "7")]
+    pub crash_dump_folder: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "8")]
+    pub dump_requests_exclude_meta_keys: ::core::option::Option<StringList>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ConfigureLoggingResponse {}
+/// `/dumper/{method}`: a method of the debug dumper's control surface
+/// (`get_state`, `configure`, `reset`) with the request's JSON object as its
+/// body, on every rank. Served only when the frontend runs with
+/// `DUMPER_SERVER_PORT=reuse`, as Python mounts it.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DumperControlRequest {
+    #[prost(string, tag = "1")]
+    pub method: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "2")]
+    pub body: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Python's success body: every rank's per-worker responses flattened, as
+/// JSON text; a failure is a status carrying the ranks' errors.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DumperControlResponse {
+    #[prost(string, optional, tag = "1")]
+    pub responses: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `/scale_elastic_ep` and `/is_scaling_elastic_ep`. Both answer Python's
+/// "elastic EP is not enabled" without `--elastic-ep-backend`; the Rust
+/// frontend does not serve a scale on a deployment that has it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScaleElasticEpRequest {
+    #[prost(int64, tag = "1")]
+    pub new_ep_size: i64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScaleElasticEpResponse {
+    #[prost(string, tag = "1")]
+    pub message: ::prost::alloc::string::String,
+    #[prost(int64, tag = "2")]
+    pub old_ep_size: i64,
+    #[prost(int64, tag = "3")]
+    pub new_ep_size: i64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ElasticEpStateRequest {}
+/// Python's `get_elastic_ep_state`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ElasticEpStateResponse {
+    #[prost(bool, tag = "1")]
+    pub is_scaling_elastic_ep: bool,
+    #[prost(int64, tag = "2")]
+    pub effective_ep_size: i64,
+    #[prost(int64, optional, tag = "3")]
+    pub pending_ep_size: ::core::option::Option<i64>,
+    #[prost(string, tag = "4")]
+    pub scale_phase: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "5")]
+    pub last_error: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `/open_session`: open a multi-turn session on every DP rank's scheduler.
+/// Python's `OpenSessionReqInput`; the frontend mints `session_id` when unset.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenSessionRequest {
+    #[prost(int64, tag = "1")]
+    pub capacity_of_str_len: i64,
+    #[prost(string, optional, tag = "2")]
+    pub session_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// A streaming session needs `--enable-streaming-session`.
+    #[prost(bool, optional, tag = "3")]
+    pub streaming: ::core::option::Option<bool>,
+    #[prost(double, optional, tag = "4")]
+    pub timeout: ::core::option::Option<f64>,
+}
+/// The session's id; HTTP answers it as a bare JSON string, as Python does.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenSessionResponse {
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+}
+/// `/close_session`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CloseSessionRequest {
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CloseSessionResponse {}
+/// `/add_external_corpus`: exactly one of `file_path` (a JSONL file of strings
+/// on the server) or `documents`; `token_chunks` is for pre-tokenized input.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AddExternalCorpusRequest {
+    /// Minted when absent.
+    #[prost(string, optional, tag = "1")]
+    pub corpus_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub file_path: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "3")]
+    pub documents: ::core::option::Option<StringList>,
+    #[prost(message, optional, tag = "4")]
+    pub token_chunks: ::core::option::Option<TokenIdsList>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AddExternalCorpusResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub corpus_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub message: ::prost::alloc::string::String,
+    #[prost(int64, tag = "4")]
+    pub loaded_token_count: i64,
+}
+/// `/remove_external_corpus`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RemoveExternalCorpusRequest {
+    #[prost(string, optional, tag = "1")]
+    pub corpus_id: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RemoveExternalCorpusResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+}
+/// `/list_external_corpora`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListExternalCorporaRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListExternalCorporaResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    /// Corpus id to its token count; every rank loads the same set.
+    #[prost(map = "string, int64", tag = "2")]
+    pub corpus_token_counts: ::std::collections::HashMap<::prost::alloc::string::String, i64>,
+    #[prost(string, tag = "3")]
+    pub message: ::prost::alloc::string::String,
 }
 /// Python's `matched` key, `Union\[str, int, List[int]\]`: the three wire shapes
 /// are disjoint, so shape alone picks the arm (untagged).
@@ -831,6 +1171,590 @@ pub struct HiCacheStorageResponse {
     pub success: bool,
     #[prost(string, tag = "2")]
     pub message: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OllamaMessage {
+    #[prost(string, tag = "1")]
+    pub role: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub content: ::prost::alloc::string::String,
+    /// Base64 images; accepted and not rendered.
+    #[prost(message, optional, tag = "3")]
+    pub images: ::core::option::Option<StringList>,
+}
+/// The Ollama `options` keys SGLang maps onto its sampling params; any other
+/// key is ignored, as Python's `_convert_options_to_sampling_params` does.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OllamaOptions {
+    #[prost(double, optional, tag = "1")]
+    pub temperature: ::core::option::Option<f64>,
+    #[prost(double, optional, tag = "2")]
+    pub top_p: ::core::option::Option<f64>,
+    #[prost(int64, optional, tag = "3")]
+    pub top_k: ::core::option::Option<i64>,
+    /// `max_new_tokens`; defaults to 2048 when absent (Ollama answers run long).
+    #[prost(int64, optional, tag = "4")]
+    pub num_predict: ::core::option::Option<i64>,
+    #[prost(message, optional, tag = "5")]
+    pub stop: ::core::option::Option<StringOrList>,
+    #[prost(double, optional, tag = "6")]
+    pub presence_penalty: ::core::option::Option<f64>,
+    #[prost(double, optional, tag = "7")]
+    pub frequency_penalty: ::core::option::Option<f64>,
+    /// `sampling_seed`.
+    #[prost(int64, optional, tag = "8")]
+    pub seed: ::core::option::Option<i64>,
+}
+/// `POST /api/chat`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OllamaChatRequest {
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub messages: ::prost::alloc::vec::Vec<OllamaMessage>,
+    #[prost(bool, optional, tag = "3")]
+    pub stream: ::core::option::Option<bool>,
+    /// "json" or a JSON schema; accepted and ignored.
+    #[prost(string, optional, tag = "4")]
+    pub format: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "5")]
+    pub options: ::core::option::Option<OllamaOptions>,
+    /// Seconds or a duration string; accepted and ignored (no model unloading).
+    #[prost(string, optional, tag = "6")]
+    pub keep_alive: ::core::option::Option<::prost::alloc::string::String>,
+    /// Bool or "low" | "medium" | "high"; accepted and ignored.
+    #[prost(string, optional, tag = "7")]
+    pub think: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// One `/api/chat` frame. Unary: the whole answer with `done` set and the
+/// counters filled. Streamed: a delta per frame, then a `done` frame whose
+/// counters are filled (Python leaves them out; the Ollama API fills them).
+/// Durations are nanoseconds, as Ollama reports them.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OllamaChatResponse {
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub created_at: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub message: ::core::option::Option<OllamaMessage>,
+    #[prost(bool, tag = "4")]
+    pub done: bool,
+    #[prost(string, optional, tag = "5")]
+    pub done_reason: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "6")]
+    pub total_duration: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "7")]
+    pub load_duration: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "8")]
+    pub prompt_eval_count: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "9")]
+    pub prompt_eval_duration: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "10")]
+    pub eval_count: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "11")]
+    pub eval_duration: ::core::option::Option<i64>,
+}
+/// `POST /api/generate`. `prompt` is sent raw; `system` is prepended with a
+/// blank line. `suffix`, `template`, `context`, `raw`, `format`, `images`,
+/// `keep_alive`, and `think` are accepted and ignored, as in Python.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OllamaGenerateRequest {
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub prompt: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "3")]
+    pub suffix: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "4")]
+    pub system: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "5")]
+    pub template: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "6")]
+    pub context: ::core::option::Option<Int64List>,
+    #[prost(bool, optional, tag = "7")]
+    pub stream: ::core::option::Option<bool>,
+    #[prost(bool, optional, tag = "8")]
+    pub raw: ::core::option::Option<bool>,
+    #[prost(string, optional, tag = "9")]
+    pub format: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "10")]
+    pub options: ::core::option::Option<OllamaOptions>,
+    #[prost(string, optional, tag = "11")]
+    pub keep_alive: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "12")]
+    pub images: ::core::option::Option<StringList>,
+    #[prost(bool, optional, tag = "13")]
+    pub think: ::core::option::Option<bool>,
+}
+/// One `/api/generate` frame; the same unary / streamed contract as
+/// OllamaChatResponse. `context` is never filled (no conversation encoding).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OllamaGenerateResponse {
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub created_at: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub response: ::prost::alloc::string::String,
+    #[prost(bool, tag = "4")]
+    pub done: bool,
+    #[prost(string, optional, tag = "5")]
+    pub done_reason: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "6")]
+    pub context: ::core::option::Option<Int64List>,
+    #[prost(int64, optional, tag = "7")]
+    pub total_duration: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "8")]
+    pub load_duration: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "9")]
+    pub prompt_eval_count: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "10")]
+    pub prompt_eval_duration: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "11")]
+    pub eval_count: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "12")]
+    pub eval_duration: ::core::option::Option<i64>,
+}
+/// `GET /api/tags`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OllamaTagsRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OllamaTagsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub models: ::prost::alloc::vec::Vec<OllamaModelInfo>,
+}
+/// One served model as an Ollama model card: SGLang has no model files, so
+/// `size` is 0 and `digest` a fixed placeholder.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OllamaModelInfo {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub modified_at: ::prost::alloc::string::String,
+    #[prost(int64, tag = "4")]
+    pub size: i64,
+    #[prost(string, tag = "5")]
+    pub digest: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "6")]
+    pub details: ::core::option::Option<OllamaModelDetails>,
+}
+/// Ollama's `details` block. `/api/tags` fills format, family, and
+/// parameter_size; `/api/show` fills every field.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OllamaModelDetails {
+    #[prost(string, optional, tag = "1")]
+    pub parent_model: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, tag = "2")]
+    pub format: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub family: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "4")]
+    pub families: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "5")]
+    pub parameter_size: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "6")]
+    pub quantization_level: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `POST /api/show`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OllamaShowRequest {
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
+}
+/// A model card synthesized from the model name and context length.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OllamaShowResponse {
+    #[prost(string, tag = "1")]
+    pub license: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub modelfile: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub parameters: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub template: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub modified_at: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "6")]
+    pub details: ::core::option::Option<OllamaModelDetails>,
+    /// Ollama's GGUF-style metadata; its keys are prefixed with the model
+    /// family (`<family>.context_length`), so it is an open object.
+    #[prost(string, optional, tag = "7")]
+    pub model_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "8")]
+    pub capabilities: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// `/parse_function_call`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ParseFunctionCallRequest {
+    #[prost(string, tag = "1")]
+    pub text: ::prost::alloc::string::String,
+    /// The tools the text may call; `tool_index` in the reply indexes this list.
+    #[prost(message, repeated, tag = "2")]
+    pub tools: ::prost::alloc::vec::Vec<ToolSpec>,
+    /// e.g. "llama3", "qwen25", "mistral"; required.
+    #[prost(string, optional, tag = "3")]
+    pub tool_call_parser: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// An OpenAI-shaped tool definition, as Python's `io_struct.Tool`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ToolSpec {
+    #[prost(message, optional, tag = "1")]
+    pub function: ::core::option::Option<ToolFunctionSpec>,
+    #[prost(string, optional, tag = "2")]
+    pub r#type: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ToolFunctionSpec {
+    #[prost(string, optional, tag = "1")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub description: ::core::option::Option<::prost::alloc::string::String>,
+    /// The JSON Schema of the arguments, passed through as JSON text.
+    #[prost(string, optional, tag = "3")]
+    pub parameters: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Python's `ToolCallItem`: `parameters` is the arguments as a JSON string.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ParsedToolCall {
+    #[prost(int64, tag = "1")]
+    pub tool_index: i64,
+    #[prost(string, optional, tag = "2")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, tag = "3")]
+    pub parameters: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ParseFunctionCallResponse {
+    #[prost(string, tag = "1")]
+    pub normal_text: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub calls: ::prost::alloc::vec::Vec<ParsedToolCall>,
+}
+/// `/separate_reasoning`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SeparateReasoningRequest {
+    #[prost(string, tag = "1")]
+    pub text: ::prost::alloc::string::String,
+    /// e.g. "deepseek-r1", "qwen3"; required.
+    #[prost(string, tag = "2")]
+    pub reasoning_parser: ::prost::alloc::string::String,
+    /// Also return the segments as blocks.
+    #[prost(bool, tag = "3")]
+    pub return_blocks: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SeparateReasoningResponse {
+    #[prost(string, tag = "1")]
+    pub reasoning_text: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub text: ::prost::alloc::string::String,
+    /// Only with `return_blocks`.
+    #[prost(message, optional, tag = "3")]
+    pub reasoning_blocks: ::core::option::Option<StringList>,
+    #[prost(message, optional, tag = "4")]
+    pub text_blocks: ::core::option::Option<StringList>,
+}
+/// `/get_weights_by_name`: read one parameter, truncated, from every DP rank.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetWeightsByNameRequest {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Elements kept per dimension; Python's `truncate_size: int = 100`.
+    #[prost(int64, optional, tag = "2")]
+    pub truncate_size: ::core::option::Option<i64>,
+}
+/// One parameter per DP rank in rank order, each the scheduler's
+/// `List\[float | List[float]\]` as JSON text (a rank that found no parameter
+/// contributes `null`). HTTP unwraps a single rank to the bare value, as
+/// Python does.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetWeightsByNameResponse {
+    #[prost(string, repeated, tag = "1")]
+    pub parameters: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// `/init_weights_update_group`: join the trainer's weight-update process group.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InitWeightsUpdateGroupRequest {
+    #[prost(string, tag = "1")]
+    pub master_address: ::prost::alloc::string::String,
+    #[prost(int64, tag = "2")]
+    pub master_port: i64,
+    #[prost(int64, tag = "3")]
+    pub rank_offset: i64,
+    #[prost(int64, tag = "4")]
+    pub world_size: i64,
+    #[prost(string, optional, tag = "5")]
+    pub group_name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "6")]
+    pub backend: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `/destroy_weights_update_group`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DestroyWeightsUpdateGroupRequest {
+    #[prost(string, optional, tag = "1")]
+    pub group_name: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `/init_weights_send_group_for_remote_instance`: open the send group toward
+/// another engine instance.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InitWeightsSendGroupForRemoteInstanceRequest {
+    #[prost(string, tag = "1")]
+    pub master_address: ::prost::alloc::string::String,
+    /// One port per rank, as the comma-separated string Python takes.
+    #[prost(string, tag = "2")]
+    pub ports: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub group_rank: i64,
+    #[prost(int64, tag = "4")]
+    pub world_size: i64,
+    #[prost(string, optional, tag = "5")]
+    pub group_name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "6")]
+    pub backend: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `/send_weights_to_remote_instance`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SendWeightsToRemoteInstanceRequest {
+    #[prost(string, tag = "1")]
+    pub master_address: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub ports: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "3")]
+    pub group_name: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `{success, message}` as Python answers every group operation; HTTP 200 on
+/// success, 400 otherwise.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WeightGroupResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+}
+/// `/remote_instance_transfer_engine_info?rank=N` (and its deprecated alias
+/// `/get_remote_instance_transfer_engine_info`): the transfer-engine info a
+/// rank registered with this node's engine-info bootstrap server, proxied.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RemoteInstanceTransferEngineInfoRequest {
+    #[prost(int64, tag = "1")]
+    pub rank: i64,
+}
+/// The bootstrap server's reply as it sent it: `{"rank": N,  "remote_instance_transfer_engine_info": \[...\]}`, passed through as JSON.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RemoteInstanceTransferEngineInfoResponse {
+    #[prost(string, optional, tag = "1")]
+    pub info: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `/update_weights_from_disk`: reload the weights from `model_path` on every
+/// DP rank. Python's `UpdateWeightFromDiskReqInput`; `is_async`, `keep_pause`,
+/// `token_step` and `manifest` are accepted as Python accepts them and read
+/// by nothing.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UpdateWeightsFromDiskRequest {
+    #[prost(string, tag = "1")]
+    pub model_path: ::prost::alloc::string::String,
+    /// The launch's `--load-format` when unset.
+    #[prost(string, optional, tag = "2")]
+    pub load_format: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag = "3")]
+    pub abort_all_requests: bool,
+    #[prost(string, optional, tag = "4")]
+    pub weight_version: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag = "5")]
+    pub is_async: bool,
+    #[prost(bool, tag = "6")]
+    pub torch_empty_cache: bool,
+    #[prost(bool, tag = "7")]
+    pub keep_pause: bool,
+    #[prost(bool, tag = "8")]
+    pub recapture_cuda_graph: bool,
+    #[prost(int64, tag = "9")]
+    pub token_step: i64,
+    #[prost(bool, optional, tag = "10")]
+    pub flush_cache: ::core::option::Option<bool>,
+    #[prost(string, optional, tag = "11")]
+    pub manifest: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Python's `UpdateWeightFromDiskReqOutput`, merged across DP ranks: one
+/// `num_paused_requests` per rank in rank order (HTTP unwraps a single rank
+/// to the bare number, as Python does).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UpdateWeightsFromDiskResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+    #[prost(int64, repeated, tag = "3")]
+    pub num_paused_requests: ::prost::alloc::vec::Vec<i64>,
+}
+/// `/update_weights_from_distributed`: receive the named tensors over the
+/// trainer's process group, between `/begin_weight_update` and
+/// `/end_weight_update`. Single-DP-rank deployments only, as in Python.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UpdateWeightsFromDistributedRequest {
+    #[prost(string, repeated, tag = "1")]
+    pub names: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "2")]
+    pub dtypes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "3")]
+    pub shapes: ::prost::alloc::vec::Vec<Int64List>,
+    #[prost(string, optional, tag = "4")]
+    pub group_name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "5")]
+    pub flush_cache: ::core::option::Option<bool>,
+    #[prost(bool, tag = "6")]
+    pub abort_all_requests: bool,
+    #[prost(string, optional, tag = "7")]
+    pub weight_version: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "8")]
+    pub load_format: ::core::option::Option<::prost::alloc::string::String>,
+    /// Which model runners the update loads into: "target", "draft" or "all".
+    #[prost(string, optional, tag = "9")]
+    pub selector: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag = "10")]
+    pub torch_empty_cache: bool,
+}
+/// `/update_weights_from_tensor`: load serialized tensors, one payload per TP
+/// rank, between `/begin_weight_update` and `/end_weight_update`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UpdateWeightsFromTensorRequest {
+    /// Python's `List\[bytes\]`: each payload base64 text, as the JSON body
+    /// carries it; decoded before it reaches the scheduler.
+    #[prost(string, repeated, tag = "1")]
+    pub serialized_named_tensors: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub load_format: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "3")]
+    pub flush_cache: ::core::option::Option<bool>,
+    #[prost(bool, tag = "4")]
+    pub abort_all_requests: bool,
+    #[prost(string, optional, tag = "5")]
+    pub weight_version: ::core::option::Option<::prost::alloc::string::String>,
+    /// Which model runners the update loads into: "target", "draft" or "all".
+    #[prost(string, optional, tag = "6")]
+    pub selector: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag = "7")]
+    pub torch_empty_cache: bool,
+}
+/// `/update_weights_from_ipc`: load weights the checkpoint engine serves over
+/// the given ZMQ handles (one per device).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UpdateWeightsFromIpcRequest {
+    #[prost(map = "string, string", tag = "1")]
+    pub zmq_handles:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "2")]
+    pub flush_cache: ::core::option::Option<bool>,
+    #[prost(string, optional, tag = "3")]
+    pub weight_version: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag = "4")]
+    pub torch_empty_cache: bool,
+}
+/// `/begin_weight_update`: open a weight-update session on the selected
+/// runners; `/end_weight_update` closes it and runs the post-load steps.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BeginWeightUpdateRequest {
+    /// Which model runners the update loads into: "target", "draft" or "all".
+    #[prost(string, optional, tag = "1")]
+    pub selector: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EndWeightUpdateRequest {}
+/// `/plugin_weight_update`: run the platform's named weight-update handler
+/// with `payload`, inside an open session.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PluginWeightUpdateRequest {
+    #[prost(string, tag = "1")]
+    pub handler: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "2")]
+    pub payload: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "3")]
+    pub flush_cache: ::core::option::Option<bool>,
+    #[prost(bool, tag = "4")]
+    pub abort_all_requests: bool,
+    #[prost(string, optional, tag = "5")]
+    pub weight_version: ::core::option::Option<::prost::alloc::string::String>,
+    /// Which model runners the update loads into: "target", "draft" or "all".
+    #[prost(string, optional, tag = "6")]
+    pub selector: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag = "7")]
+    pub torch_empty_cache: bool,
+}
+/// Python's `PluginWeightUpdateReqOutput.merged`: the counts come from the
+/// first DP rank's reply, one per TP rank, and only on success.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PluginWeightUpdateResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+    #[prost(int64, repeated, tag = "3")]
+    pub received_tensor_counts: ::prost::alloc::vec::Vec<i64>,
+}
+/// `{success, message}` as Python answers the other weight updates; HTTP
+/// 200 on success, 400 otherwise.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WeightUpdateResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+}
+/// LoRA adapters: `/load_lora_adapter`, `/load_lora_adapter_from_tensors`,
+/// `/unload_lora_adapter`. Rust-server mode refuses `--enable-lora` at
+/// launch, so these answer Python's "LoRA is not enabled" refusal.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LoadLoraAdapterRequest {
+    #[prost(string, tag = "1")]
+    pub lora_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub lora_path: ::prost::alloc::string::String,
+    #[prost(bool, tag = "3")]
+    pub pinned: bool,
+    #[prost(string, optional, tag = "4")]
+    pub lora_id: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LoadLoraAdapterFromTensorsRequest {
+    #[prost(string, tag = "1")]
+    pub lora_name: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "2")]
+    pub config_dict: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "3")]
+    pub serialized_named_tensors: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(bool, tag = "4")]
+    pub pinned: bool,
+    #[prost(map = "string, int64", tag = "5")]
+    pub added_tokens_config: ::std::collections::HashMap<::prost::alloc::string::String, i64>,
+    #[prost(string, optional, tag = "6")]
+    pub lora_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "7")]
+    pub load_format: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(map = "string, string", tag = "8")]
+    pub expected_checksums:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UnloadLoraAdapterRequest {
+    #[prost(string, tag = "1")]
+    pub lora_name: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "2")]
+    pub lora_id: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Python's `LoRAUpdateOutput`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LoraUpdateResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_message: ::core::option::Option<::prost::alloc::string::String>,
+    /// Every adapter loaded after the call, name to path.
+    #[prost(map = "string, string", tag = "3")]
+    pub loaded_adapters:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListModelsRequest {}
