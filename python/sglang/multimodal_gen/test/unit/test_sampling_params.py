@@ -622,6 +622,23 @@ _KEEP_16 = {
     "below_multiple": (16, 992, True),
     "float": (992.0, 512, True),
 }
+# MOSS-Image leaves a non-int size to request validation.
+_KEEP_16_INT_ONLY = {**_KEEP_16, "float": (1000.0, 520, False)}
+# The missing side is derived from 16:9 first, as InputValidationStage does.
+_FILL_16 = {
+    **_KEEP_16,
+    "width_none": (912, 512, True),
+    "height_none": (992, 560, True),
+    "negative_and_none": (-16, -9, False),
+}
+# Each set, positive side is aligned on its own.
+_PER_SIDE_16 = {
+    **_KEEP_16,
+    "width_none": (None, 512, True),
+    "height_none": (992, None, True),
+    "zero": (0, 512, True),
+    "negative": (-16, 512, True),
+}
 
 
 def _size_alignment_models():
@@ -629,10 +646,29 @@ def _size_alignment_models():
     from sglang.multimodal_gen.configs.pipeline_configs.anima import (
         AnimaPipelineConfig,
     )
+    from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
+    from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
+        Cosmos3MultiviewConfig,
+    )
     from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
         DiffusersGenericPipelineConfig,
     )
+    from sglang.multimodal_gen.configs.pipeline_configs.flux3_image import (
+        Flux3ImagePipelineConfig,
+        Flux3ImageSamplingParams,
+    )
+    from sglang.multimodal_gen.configs.pipeline_configs.moss_image import (
+        MOSSImagePipelineConfig,
+    )
+    from sglang.multimodal_gen.configs.pipeline_configs.zimage import (
+        ZImagePipelineConfig,
+    )
     from sglang.multimodal_gen.configs.sample.anima import AnimaSamplingParams
+    from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
+    from sglang.multimodal_gen.configs.sample.moss_image import (
+        MOSSImageSamplingParams,
+    )
+    from sglang.multimodal_gen.configs.sample.zimage import ZImageSamplingParams
 
     diffusers = DiffusersGenericPipelineConfig()
 
@@ -642,6 +678,15 @@ def _size_alignment_models():
     unchanged = both(_UNCHANGED)
     return [
         (
+            "zimage",
+            "Z-Image",
+            16,
+            ZImageSamplingParams,
+            ZImagePipelineConfig(),
+            both(_FILL_16),
+        ),
+        ("zimage-diffusers", "Z-Image", 16, ZImageSamplingParams, diffusers, unchanged),
+        (
             "anima",
             "Anima",
             16,
@@ -650,6 +695,55 @@ def _size_alignment_models():
             both(_KEEP_16),
         ),
         ("anima-diffusers", "Anima", 16, AnimaSamplingParams, diffusers, unchanged),
+        (
+            "moss",
+            "MOSS-Image",
+            16,
+            MOSSImageSamplingParams,
+            MOSSImagePipelineConfig(),
+            both(_KEEP_16_INT_ONLY),
+        ),
+        (
+            "moss-diffusers",
+            "MOSS-Image",
+            16,
+            MOSSImageSamplingParams,
+            diffusers,
+            unchanged,
+        ),
+        (
+            "cosmos3",
+            "Cosmos3",
+            16,
+            Cosmos3SamplingParams,
+            Cosmos3Config(),
+            both(_KEEP_16),
+        ),
+        # The simulation pipelines subclass Cosmos3Config and size their own canvas.
+        (
+            "cosmos3-multiview",
+            "Cosmos3",
+            16,
+            Cosmos3SamplingParams,
+            Cosmos3MultiviewConfig(),
+            unchanged,
+        ),
+        (
+            "flux3",
+            "FLUX.3",
+            16,
+            Flux3ImageSamplingParams,
+            Flux3ImagePipelineConfig(),
+            both(_PER_SIDE_16),
+        ),
+        (
+            "flux3-diffusers",
+            "FLUX.3",
+            16,
+            Flux3ImageSamplingParams,
+            diffusers,
+            unchanged,
+        ),
     ]
 
 
