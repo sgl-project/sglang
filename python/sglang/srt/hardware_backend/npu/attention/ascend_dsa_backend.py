@@ -461,7 +461,8 @@ def _get_topk_npu(
         indices, _ = pool_key_indexer(
             query=query_safe,
             pool_key=pool.get_index_k_buffer(layer_id),
-            weights=weights_safe.to(torch.float16),
+            # quant_mode=1 accepts BF16; cast FP32->BF16 directly.
+            weights=weights_safe.to(torch.bfloat16),
             pool_tail_k=tail_lens_safe,
             actual_seq_q=query_ends_safe,
             actual_seq_k=pool_lens_safe,
@@ -480,7 +481,8 @@ def _get_topk_npu(
         indices, _ = pool_key_indexer(
             query=query_safe,
             pool_key=pool.get_index_k_buffer(layer_id),
-            weights=weights_safe,
+            # quant_mode=-1: weights must match query/pool_key (BF16 cache).
+            weights=weights_safe.to(torch.bfloat16),
             pool_tail_k=tail_lens_safe,
             actual_seq_q=query_ends_safe,
             actual_seq_k=pool_lens_safe,

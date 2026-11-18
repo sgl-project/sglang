@@ -1905,7 +1905,7 @@ class IndexerKPool(MultiPlatformOp):
         # --- Read Phase ---
         # Get model weights. Here only apply 1/sqrt(H). PoolKeyIndexer will apply 1/sqrt(D)
         weights, _ = self.weights_proj(x.float())  # [T,H]
-        weights = (weights * self.n_heads**-0.5).to(torch.bfloat16).contiguous()
+        weights = (weights * self.n_heads**-0.5).contiguous()  # Keep FP32 here
         return _get_topk_npu(
             layer_id=layer_id,
             query=query,
