@@ -16,6 +16,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding.bailing_mrope import BailingMRotaryEmbedding
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.rope_variant import (
@@ -132,10 +133,14 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
     and the cache holds the bytes the split chain would have written."""
 
     def setUp(self):
-        self.writer = KimiK3RocmMlaQCacheWriter(kv_lora_rank=512, qk_rope_head_dim=64)
+        self.writer = KimiK3RocmMlaQCacheWriter(
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            fused_rope_cat_and_cache=mock.Mock(side_effect=AssertionError),
+        )
         self.fused_q = torch.zeros(2, 12, 576, dtype=torch.bfloat16)
-        # The kernels are the boundary; the gate in front of them is under test.
-        self.writer._write_hip = lambda **_: self.fused_q
+        # The kernel is the boundary; the gate in front of it is under test.
+        self.writer._write_fused = lambda **_: self.fused_q
 
     def _write(self, *, attention_backend, is_target_verify, k_scale_float=1.0):
         return self.writer.write(
@@ -185,14 +190,14 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
     def test_unsized_capture_keeps_the_split_chain(self):
         """A capture the eager warmup did not size gets no fused launch;
         the writer must hand that step back to the split chain."""
-        self.writer._write_hip = lambda **_: None
+        self.writer._write_fused = lambda **_: None
         self.assertIsNone(
             self._write(attention_backend="aiter", is_target_verify=False)
         )
 
     def test_cache_the_op_cannot_write_keeps_the_split_chain(self):
         """A paged 4D or e5m2 cache is not the op's [slots, 1, 576] BF16/e4m3fn
-        pool; it must reach the split chain, not run() and its ValueError."""
+        pool; it must reach the split chain, not the kernel's asserts."""
         for kv_cache in (
             torch.zeros(4, 1, 1, 576, dtype=torch.bfloat16),
             torch.zeros(4, 1, 576, dtype=torch.float8_e5m2),
@@ -213,10 +218,10 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
                 )
 
     def test_no_writer_without_the_fused_kernel(self):
-        """Where the op cannot run (not gfx950, an old AITER), no writer is
-        installed, so every layer keeps the split chain without per-step checks."""
+        """Where the kernel does not run (not gfx950, SGLANG_USE_AITER=0), no writer
+        is installed, so every layer keeps the split chain without per-step checks."""
         with mock.patch.object(
-            kimi_k3_rocm_mla.mla_q_cache_aiter_hip, "available", lambda: False
+            kimi_k3_rocm_mla, "fused_q_cache_available", lambda: False
         ):
             self.assertIsNone(
                 kimi_k3_rocm_mla.create_q_cache_writer(
@@ -224,28 +229,30 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
                 )
             )
 
-    def test_op_is_available_on_gfx950_only(self):
-        """The op is built for gfx950; every other HIP target, including gfx942
-        and gfx1250, must keep the split chain."""
-        hip_op = kimi_k3_rocm_mla.mla_q_cache_aiter_hip
-        for gcn_arch, expected in (
-            ("gfx950", True),
-            ("gfx942", False),
-            ("gfx90a", False),
-            ("gfx1250", False),
+    def test_fused_write_is_available_on_gfx950_with_aiter_only(self):
+        """The fused write was validated on gfx950; every other HIP target,
+        including gfx942 and gfx1250, and SGLANG_USE_AITER=0 keep the split chain."""
+        for gcn_arch, use_aiter, expected in (
+            ("gfx950", True, True),
+            ("gfx950", False, False),
+            ("gfx942", True, False),
+            ("gfx90a", True, False),
+            ("gfx1250", True, False),
         ):
             with (
-                self.subTest(gcn_arch=gcn_arch),
-                mock.patch.object(hip_op.torch.version, "hip", "7.0"),
-                mock.patch.object(hip_op.torch.cuda, "is_available", lambda: True),
+                self.subTest(gcn_arch=gcn_arch, use_aiter=use_aiter),
+                envs.SGLANG_USE_AITER.override(use_aiter),
+                mock.patch.object(kimi_k3_rocm_mla.torch.version, "hip", "7.0"),
                 mock.patch.object(
-                    hip_op,
+                    kimi_k3_rocm_mla.torch.cuda, "is_available", lambda: True
+                ),
+                mock.patch.object(
+                    kimi_k3_rocm_mla,
                     "current_arch",
                     lambda: SimpleNamespace(hip=SimpleNamespace(gcn_arch=gcn_arch)),
                 ),
-                mock.patch.object(hip_op, "_op", lambda: object()),
             ):
-                self.assertIs(hip_op.available.__wrapped__(), expected)
+                self.assertIs(kimi_k3_rocm_mla.fused_q_cache_available(), expected)
 
     def test_other_backends_keep_the_split_chain(self):
         for verify in (False, True):

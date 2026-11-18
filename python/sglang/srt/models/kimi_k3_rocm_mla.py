@@ -13,19 +13,27 @@
 # ==============================================================================
 """Kimi-K3 ROCm MLA decode: write the query and the latent KV cache in one launch.
 
-K3 MLA applies no RoPE. The gfx950 HIP op has only a RoPE form, so it runs against
-one-row identity cos/sin tables with all-zero positions, which leaves Q and the
-cache bytes equal to the split rope/concat/cache chain's.
+K3 MLA applies no RoPE. The writer runs AITER's fused RoPE/concat/cache kernel, the
+one DeepSeek MLA uses on ROCm (rocm_linear_utils), against one-row identity cos/sin
+tables with all-zero positions, which leaves Q and the cache bytes equal to the
+split concat/cache chain's.
 """
 
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 
-from sglang.kernels.ops.attention import mla_q_cache_aiter_hip
+from sglang.kernels.arch import current_arch
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_buffer
 from sglang.srt.utils.device import is_device_stream_capturing
 from sglang.srt.utils.log_utils import print_info_once
+
+_KV_LORA_RANK = 512
+_ROPE_HEAD_DIM = 64
+# SGLang's MLA pool is [slots, 1, 576]; the kernel takes BF16 or e4m3fn (gfx950's
+# FP8) and asserts on anything else.
+_CACHE_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
 
 # With save_kv_cache=False, these backends read only the BF16 Q and the KV cache;
 # Triton target-verify runs its extend kernel, which also reads k.
@@ -81,24 +89,63 @@ class _IdentityRope:
         return (*self.tables, positions[:tokens])
 
 
+def fused_q_cache_available() -> bool:
+    """Whether the fused write runs here: gfx950 with SGLANG_USE_AITER=1, the only
+    target it was measured on."""
+    if not (
+        envs.SGLANG_USE_AITER.get()
+        and torch.version.hip is not None
+        and torch.cuda.is_available()
+    ):
+        return False
+    hip = current_arch().hip
+    return hip is not None and hip.gcn_arch == "gfx950"
+
+
 def create_q_cache_writer(
     *, kv_lora_rank: int, qk_rope_head_dim: int
 ) -> Optional["KimiK3RocmMlaQCacheWriter"]:
-    """The writer where the fused kernel runs (gfx950 with AITER's HIP op), else
-    None, which keeps the split chain."""
-    if not mla_q_cache_aiter_hip.available():
+    """The writer where the fused kernel runs, else None, which keeps the split
+    chain."""
+    if (kv_lora_rank, qk_rope_head_dim) != (
+        _KV_LORA_RANK,
+        _ROPE_HEAD_DIM,
+    ) or not fused_q_cache_available():
         return None
+    # rocm_linear_utils imports AITER at module level.
+    from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
+
     print_info_once(
         "Kimi-K3 MLA: decode and target-verify write Q and the latent KV cache "
-        "in one AITER launch (fused_qk_rope_concat_and_cache_mla)"
+        "in one AITER launch (fused_qk_rope_cat_and_cache_mla)"
     )
     return KimiK3RocmMlaQCacheWriter(
-        kv_lora_rank=kv_lora_rank, qk_rope_head_dim=qk_rope_head_dim
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        fused_rope_cat_and_cache=fused_qk_rope_cat_and_cache_mla,
+    )
+
+
+def _supports_cache(kv_cache: torch.Tensor) -> bool:
+    """Whether the kernel can write this KV cache: the [slots, 1, 576] MLA pool in
+    BF16 or e4m3fn. A paged 4D cache would be indexed as one slot per block."""
+    return (
+        kv_cache.ndim == 3
+        and kv_cache.shape[1] == 1
+        and kv_cache.shape[2] == _KV_LORA_RANK + _ROPE_HEAD_DIM
+        and kv_cache.dtype in _CACHE_DTYPES
     )
 
 
 class KimiK3RocmMlaQCacheWriter:
-    def __init__(self, *, kv_lora_rank: int, qk_rope_head_dim: int) -> None:
+    def __init__(
+        self,
+        *,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        fused_rope_cat_and_cache: Callable[..., Tuple[torch.Tensor, ...]],
+    ) -> None:
+        self._fused_rope_cat_and_cache = fused_rope_cat_and_cache
         self._head_dim = kv_lora_rank + qk_rope_head_dim
         self._half_rope_dim = qk_rope_head_dim // 2
 
@@ -125,10 +172,16 @@ class KimiK3RocmMlaQCacheWriter:
             # The split chain's AITER write casts without the scale,
             # its Triton decode write divides by it; they agree only at 1.
             or k_scale_float not in (None, 1.0)
-            or not mla_q_cache_aiter_hip.supports_cache(kv_cache)
+            or not _supports_cache(kv_cache)
         ):
             return None
-        q = self._write_hip(
+        if slot_mapping.stride(0) != 1:
+            # The kernel indexes slot_mapping without a stride; the caller makes it
+            # contiguous, so this is a contract violation, not a fallback.
+            raise ValueError(
+                f"slot_mapping must be contiguous, got stride {slot_mapping.stride()}"
+            )
+        q = self._write_fused(
             q_nope=q_nope,
             q_pe=q_pe,
             k_nope=k_nope,
@@ -146,7 +199,7 @@ class KimiK3RocmMlaQCacheWriter:
         )
         return q, k_placeholder
 
-    def _write_hip(
+    def _write_fused(
         self,
         *,
         q_nope: torch.Tensor,
@@ -158,30 +211,27 @@ class KimiK3RocmMlaQCacheWriter:
     ) -> Optional[torch.Tensor]:
         """Q from the fused launch, or None inside a capture the eager warmup did
         not size the zero positions for."""
-        tokens, num_heads = q_nope.shape[0], q_nope.shape[1]
-        # The identity tables have one row and not every AITER build clamps positions
-        # in every kernel, so every token reads row 0.
+        # The identity tables have one row, so every token reads row 0.
         rope = get_buffer("kimi_k3_mla_identity_rope", _IdentityRope).get(
-            tokens=tokens, half_rope_dim=self._half_rope_dim, device=q_nope.device
+            tokens=q_nope.shape[0],
+            half_rope_dim=self._half_rope_dim,
+            device=q_nope.device,
         )
         if rope is None:
             return None
         cos, sin, unit_scale, positions = rope
-        return mla_q_cache_aiter_hip.run(
-            q_nope=q_nope,
-            q_pe=q_pe,
-            k_nope=k_nope,
-            k_pe=k_pe,
-            kv_cache=kv_cache,
-            slot_mapping=slot_mapping,
-            k_scale=unit_scale,
-            positions=positions,
-            cos_cache=cos,
-            sin_cache=sin,
-            out=torch.empty(
-                (tokens, num_heads, self._head_dim),
-                dtype=q_nope.dtype,
-                device=q_nope.device,
-            ),
-            q_scale=unit_scale,
+        q, _, _, _ = self._fused_rope_cat_and_cache(
+            q_nope,
+            q_pe,
+            k_nope,
+            k_pe,
+            kv_cache,
+            slot_mapping,
+            positions,
+            cos,
+            sin,
+            unit_scale,
+            True,  # is_neox; identity tables make the layout moot
+            q_out_dtype=q_nope.dtype,
         )
+        return q
