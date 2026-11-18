@@ -31,7 +31,7 @@ from sglang.srt.utils import cpu_has_amx_support
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="stage-a-test-cpu-intel")
+register_cpu_ci(est_time=10, suite="extra-test-cpu-intel")
 
 # e4m3 has 3 mantissa bits, so rounding error is up to 1/16 of the value.
 FP8_RTOL = 0.0625
