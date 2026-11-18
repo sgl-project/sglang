@@ -10,7 +10,7 @@ from sglang.srt.layers.hyperconnection import GatedResidual, HyperConnectionConf
 from sglang.srt.utils import is_npu
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=30, suite="base-b-test-1-npu-a3")
+register_npu_ci(est_time=30, suite="extra-b-test-1-npu-a3")
 pytestmark = pytest.mark.skipif(not is_npu(), reason="NPU is required")
 
 
