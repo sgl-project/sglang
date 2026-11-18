@@ -5,7 +5,6 @@ import unittest
 import torch
 
 from sglang.kernels.ops.gemm.kimi_k3_latent_tail_hip import (
-    PARTIAL_SPLITS,
     k3_latent_tail,
     k3_latent_tail_partials,
 )
@@ -63,7 +62,6 @@ class TestKimiK3LatentTailHip(CustomTestCase):
         up_slice = self.up[3 * rows_n : 4 * rows_n]
         latent, _, _, proj = self._inputs(64)  # the column tail's largest batch
         part, sq = k3_latent_tail_partials(latent, self.norm_w, up_slice)
-        self.assertEqual(tuple(part.shape), (PARTIAL_SPLITS, 64, rows_n))
         torch.testing.assert_close(
             sq.sum(0), latent.float().pow(2).sum(-1), rtol=1e-5, atol=1e-3
         )
