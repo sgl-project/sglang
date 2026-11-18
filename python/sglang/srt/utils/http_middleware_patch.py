@@ -34,20 +34,26 @@ class _PureASGIDispatch:
 
         request = Request(scope, receive)
         status_code = 500
+        response_started = False
 
         async def call_next(_request):
             nonlocal status_code
 
             async def send_and_capture(message):
-                nonlocal status_code
+                nonlocal status_code, response_started
                 if message["type"] == "http.response.start":
                     status_code = message["status"]
+                    response_started = True
                 await send(message)
 
             await self.app(scope, receive, send_and_capture)
             return _SentResponse(status_code)
 
-        await self.dispatch(request, call_next)
+        response = await self.dispatch(request, call_next)
+        # call_next sends the downstream response itself. A dispatch that
+        # short-circuits it still needs its returned response sent to the client.
+        if not response_started and response is not None:
+            await response(scope, receive, send)
 
 
 def patch_app_http_middleware(app):
