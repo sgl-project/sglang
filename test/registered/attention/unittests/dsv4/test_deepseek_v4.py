@@ -13,6 +13,7 @@ gate+norm+rotate compression itself) is a deferred follow-up.
 """
 
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest import mock
 
@@ -794,6 +795,72 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         self.assertEqual(grown.shape, (7, 1, 512))
         self.assertNotEqual(grown.data_ptr(), first.data_ptr())
         self.assertEqual(workspace._buffer.data_ptr(), grown.data_ptr())
+
+    def test_sparse_prefill_kv_buffer_frees_before_grow(self):
+        """A replacement must not need the old and the new scratch at once (#41076)."""
+        from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+            SparsePrefillKVBuffer,
+        )
+
+        real_empty = torch.empty
+        for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+            with self.subTest(dtype=dtype):
+                workspace = SparsePrefillKVBuffer(torch.device("cpu"))
+                workspace.get(3)
+                old = weakref.ref(workspace._buffer)
+                old_released_at_alloc = []
+
+                def empty(*args, **kwargs):
+                    old_released_at_alloc.append(old() is None)
+                    return real_empty(*args, **kwargs)
+
+                # A larger extent, or a new dtype at the same extent.
+                num_tokens = 7 if dtype == torch.bfloat16 else 3
+                with mock.patch.object(torch, "empty", empty):
+                    grown = workspace.get(num_tokens, dtype=dtype)
+
+                # The old scratch is gone before the new one is allocated, so
+                # the replacement never needs old + new at once.
+                self.assertEqual(old_released_at_alloc, [True])
+                self.assertEqual(grown.shape, (num_tokens, 1, 512))
+                self.assertEqual(grown.dtype, dtype)
+
+    def test_sparse_prefill_kv_buffer_keeps_held_views(self):
+        """Replacing the scratch must not move or reuse storage behind a held view."""
+        from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+            SparsePrefillKVBuffer,
+        )
+
+        workspace = SparsePrefillKVBuffer(torch.device("cpu"))
+        old_view = workspace.get(32)
+        old_view.fill_(1)
+        new_view = workspace.get(64)
+        new_view.fill_(2)
+        torch.testing.assert_close(old_view, torch.ones_like(old_view))
+        torch.testing.assert_close(new_view, torch.full_like(new_view, 2))
+        smaller_view = workspace.get(16)
+        self.assertEqual(smaller_view.data_ptr(), new_view.data_ptr())
+
+    def test_sparse_prefill_kv_buffer_head_reset_on_grow(self):
+        """A grow loses the head rows, so it must report the head unfilled."""
+        from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+            SparsePrefillKVBuffer,
+        )
+
+        source = ("k", 0)
+        workspace = SparsePrefillKVBuffer(torch.device("cpu"))
+        first, filled = workspace.get_with_head(3, head_source=source)
+        self.assertFalse(filled)
+        # Without a grow the rows and the head are reused.
+        reused, filled = workspace.get_with_head(2, head_source=source)
+        self.assertTrue(filled)
+        self.assertEqual(reused.data_ptr(), first.data_ptr())
+        # A grow drops the old rows, so the head must be refilled.
+        grown, filled = workspace.get_with_head(7, head_source=source)
+        self.assertFalse(filled)
+        self.assertEqual(grown.shape, (7, 1, 512))
+        _, filled = workspace.get_with_head(7, head_source=source)
+        self.assertTrue(filled)
 
     def test_sparse_prefill_c4_uses_live_extent(self):
         page_table = torch.zeros((2, 4096), dtype=torch.int32)
