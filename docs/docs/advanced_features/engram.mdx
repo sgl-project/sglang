@@ -112,11 +112,10 @@ all-reduce.
 - `--engram-config` applies to DeepSeek-V4.1 only; a DeepSeek-V4 checkpoint without Engram layers
   rejects it.
 
-## Deprecated environment variables
+## Removed environment variables
 
-Earlier releases chose the placement with environment variables. They still work when
-`--engram-config` is not given, with a deprecation warning that prints the equivalent JSON, and are
-ignored when it is:
+Earlier releases chose the placement with environment variables. SGLang 1.0 removed them: a server
+started with one of them set stops and names the replacement.
 
 | Environment variables | `--engram-config` |
 |---|---|
@@ -124,7 +123,3 @@ ignored when it is:
 | plus `SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank` | `{"placement": "cpu"}` |
 | plus `SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=shared` | `{"placement": "cpu", "replication": "per_node"}` |
 | `SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS=1` | `{"lookup": "peer_read"}` |
-
-`SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT` used to default to `shared`; a host table set by
-`SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1` alone now gets one shard per rank, which is backed by
-huge pages.
