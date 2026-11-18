@@ -14,6 +14,9 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
     BaseBreakableCudaGraphRunner,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.aiter_sol import (
+    AITERSolMetadata,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
@@ -38,6 +41,7 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     _needs_device_weight_postprocess,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MINIMAX_H3_FP32_BUFFER_NAMES,
     MINIMAX_H3_FP32_PARAM_NAMES,
@@ -47,11 +51,13 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     _apply_qk_norm,
     _copy_grouped_qkv_tp_shard,
     _diffusers_h3_checkpoint,
+    _minimax_h3_attention_core_impl,
     _minimax_h3_group_attend,
     _modulate_gate,
     _norm,
     _qkv_scale_block_rows,
     _reorder_grouped_qkv_to_qkv,
+    minimax_h3_text_audio_key_mask,
 )
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -621,6 +627,96 @@ def test_token_refiner_routes_cube_selection_to_exact_fa():
         torch.bfloat16,
         selected_attention_backend=AttentionBackendEnum.FA,
     )
+
+
+def test_token_refiner_routes_sol_selection_to_dense_aiter():
+    """A few hundred text keys are too few KV blocks for Sol-Attn's routing."""
+
+    class FakeImpl:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeBackend:
+        def __init__(self, enum):
+            self.enum = enum
+
+        def get_enum(self):
+            return self.enum
+
+        def get_impl_cls(self):
+            return FakeImpl
+
+    def build(sparse_capable):
+        attention = MiniMaxH3Attention.__new__(MiniMaxH3Attention)
+        torch.nn.Module.__init__(attention)
+        attention.head_dim = 128
+        attention.num_heads = 8
+        attention.softmax_scale = 128**-0.5
+        attention.prefix = "test.attn"
+        attention._cube_sparse_capable = sparse_capable
+        return attention
+
+    sol = FakeBackend(AttentionBackendEnum.AITER_SOL)
+    aiter = FakeBackend(AttentionBackendEnum.AITER)
+    refiner, block = build(False), build(True)
+    with patch(
+        "sglang.multimodal_gen.runtime.models.dits.minimax_h3.get_attn_backend",
+        return_value=aiter,
+    ) as resolve:
+        refiner._set_attention_backend(sol)
+        block._set_attention_backend(sol)
+
+    assert refiner._attention_backend_enum is AttentionBackendEnum.AITER
+    assert block._attention_backend_enum is AttentionBackendEnum.AITER_SOL
+    resolve.assert_called_once_with(
+        128,
+        torch.bfloat16,
+        selected_attention_backend=AttentionBackendEnum.AITER,
+    )
+
+
+def test_text_audio_key_mask_marks_exactly_the_text_and_audio_rows():
+    kwargs = {
+        "x": torch.zeros(1, 12, 4),
+        "text_pos_info": {"position_ids": torch.arange(0, 3)},
+        "audio_pos_info": {"position_ids": torch.tensor([7, 8])},
+    }
+    mask = minimax_h3_text_audio_key_mask(kwargs)
+    assert mask.dtype is torch.bool
+    assert mask.nonzero().view(-1).tolist() == [0, 1, 2, 7, 8]
+
+
+def test_attention_core_hands_sol_the_context_key_mask():
+    """The mask is read from the forward context inside the eager core, so a
+    breakable CUDA graph replay sees the current request's mask."""
+    seen = []
+
+    class FakeSolImpl:
+        def forward_varlen(self, q, k, v, **kwargs):
+            seen.append(kwargs)
+            return q
+
+    attention = SimpleNamespace(
+        _attention_impl=FakeSolImpl(),
+        _attention_backend_enum=AttentionBackendEnum.AITER_SOL,
+        prefix="blocks.0.attn",
+    )
+    q = torch.zeros(8, 2, 128, dtype=torch.bfloat16)
+    mask = torch.zeros(8, dtype=torch.bool)
+    mask[:3] = True
+    core_kwargs = dict(
+        cu_seqlens=torch.tensor([0, 6, 8], dtype=torch.int32),
+        cu_seqlens_host=(0, 6, 8),
+        max_seqlen=6,
+        ulysses_active=False,
+    )
+    with set_forward_context(0, AITERSolMetadata(exact_kv_tokens=mask)):
+        _minimax_h3_attention_core_impl(attention, q, q, q, **core_kwargs)
+    with set_forward_context(0, None):
+        _minimax_h3_attention_core_impl(attention, q, q, q, **core_kwargs)
+
+    assert seen[0]["exact_kv_tokens"] is mask
+    assert seen[1]["exact_kv_tokens"] is None
 
 
 def test_meta_model_captures_component_attention_override():

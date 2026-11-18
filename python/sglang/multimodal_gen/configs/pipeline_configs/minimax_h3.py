@@ -254,6 +254,17 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                     "pass --enable-torch-compile false"
                 )
         selected_backend = self.resolve_transformer_attention_backend(server_args)
+        global_backend = self._server_arg_value(server_args.attention_backend)
+        if str(global_backend).strip().lower() == "aiter_sol" and not (
+            server_args.component_attention_backends or {}
+        ).get("text_encoder"):
+            # Sol-Attn has no causal variant and takes only head_dim 128, and
+            # the Qwen3-VL text encoder needs causal attention and head_dim 72.
+            raise ValueError(
+                "aiter_sol serves only the MiniMax-H3 transformer. Select it with "
+                "--component-attention-backends transformer=aiter_sol and keep "
+                "--attention-backend on a dense backend such as aiter."
+            )
         if int(server_args.ring_degree or 1) > 1 and selected_backend not in (
             AttentionBackendEnum.FA,
             AttentionBackendEnum.AITER,

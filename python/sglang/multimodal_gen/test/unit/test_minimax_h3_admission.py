@@ -776,6 +776,36 @@ def test_validate_server_args_requires_packed_varlen_backend():
         MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
 
 
+def test_validate_server_args_points_global_sol_at_the_transformer():
+    """A global aiter_sol would reach the causal, head_dim-72 text encoder and
+    fail deep inside component loading."""
+    config = MiniMaxH3PipelineConfig()
+    server_args = SimpleNamespace(
+        component_attention_backends={},
+        attention_backend="aiter_sol",
+        ring_degree=1,
+        performance_mode="speed",
+        resolve_component_attention_backend=lambda *_names: (None, None),
+    )
+    with pytest.raises(ValueError, match="transformer=aiter_sol"):
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+
+    server_args.attention_backend = "aiter"
+    server_args.component_attention_backends = {"transformer": "aiter_sol"}
+    server_args.resolve_component_attention_backend = lambda *_names: (
+        AttentionBackendEnum.AITER_SOL,
+        "transformer",
+    )
+    with patch(
+        "sglang.multimodal_gen.runtime.layers.attention.selector.get_attn_backend"
+    ) as get_attn_backend:
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+    assert (
+        get_attn_backend.call_args.kwargs["selected_attention_backend"]
+        is AttentionBackendEnum.AITER_SOL
+    )
+
+
 @pytest.mark.parametrize("backend", ["fa", "aiter"])
 def test_validate_server_args_accepts_ring_on_lse_backends(backend):
     config = MiniMaxH3PipelineConfig()

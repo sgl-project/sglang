@@ -10,6 +10,9 @@ import torch
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.aiter_sol import (
+    AITERSolMetadata,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
     MiniMaxH3DenoiseBranch,
@@ -32,6 +35,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
     minimax_h3_time_shift_sigmas,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 def _minimax_h3_rf_v_to_x0(
@@ -414,6 +418,43 @@ def test_native_dit_forward_publishes_cube_metadata_in_forward_context():
         )
     assert video.shape == (1, 96)
     assert audio.shape == (1, 32)
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [AttentionBackendEnum.AITER_SOL, AttentionBackendEnum.AITER],
+)
+def test_native_dit_forward_publishes_sol_key_mask_only_for_sol(backend):
+    """Each forward's own text and audio rows reach Sol-Attn; CFG branches pack
+    text of different lengths, so the mask follows the call's kwargs."""
+    seen = []
+
+    def model(**_kwargs):
+        seen.append(get_forward_context().attn_metadata)
+        return torch.zeros(1, 96), torch.zeros(1, 32)
+
+    stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+    stage.server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            resolve_transformer_attention_backend=lambda server_args: backend
+        )
+    )
+    call_kwargs = {
+        "x": torch.zeros(1, 10, 4),
+        "text_pos_info": {"position_ids": torch.arange(0, 3)},
+        "audio_pos_info": {"position_ids": torch.tensor([8, 9])},
+    }
+    with patch.object(
+        MiniMaxH3DenoisingStage, "_maybe_get_bcg_runner", return_value=None
+    ):
+        stage._forward_dit(model, call_kwargs, 0, batch=SimpleNamespace())
+
+    (metadata,) = seen
+    if backend is AttentionBackendEnum.AITER:
+        assert metadata is None
+        return
+    assert isinstance(metadata, AITERSolMetadata)
+    assert metadata.exact_kv_tokens.nonzero().view(-1).tolist() == [0, 1, 2, 8, 9]
 
 
 def test_grouped_outputs_share_prompt_refinement():

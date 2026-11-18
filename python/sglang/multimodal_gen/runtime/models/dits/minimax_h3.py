@@ -117,6 +117,7 @@ from sglang.multimodal_gen.runtime.layers.usp import (
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
+    get_forward_context_or_none,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -934,6 +935,14 @@ def _minimax_h3_group_attend(
     return attend
 
 
+# Backends the text-only token refiner swaps for a dense one: cube metadata
+# describes only the packed multimodal sequence, and a few hundred text keys are
+# too few KV blocks for Sol-Attn's routing threshold.
+_TOKEN_REFINER_DENSE_BACKENDS = {
+    AttentionBackendEnum.CUBE_SPARSE_ATTN: AttentionBackendEnum.FA,
+    AttentionBackendEnum.AITER_SOL: AttentionBackendEnum.AITER,
+}
+
 # aiter's varlen kernel gives a head group the same bytes as those heads inside
 # the full call (checked at H3's shapes on MI355X)
 _COLLECTIVE_PIPELINED_ATTENTION_BACKENDS = (AttentionBackendEnum.AITER,)
@@ -1066,6 +1075,36 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
     return _minimax_h3_pipelined_dense_attention(
         attention, q, k, v, **pipeline_kwargs, sequential=sequential, fill=fill
     )
+
+
+def minimax_h3_text_audio_key_mask(forward_kwargs: dict[str, Any]) -> torch.Tensor:
+    """(seq_len,) bool over the packed sequence, True at the text and audio rows.
+
+    Text and audio are a small part of the sequence, so a block-routing backend
+    that thresholds against statistics over every KV block would let the video
+    blocks set the threshold and drop the blocks the video queries need most.
+    """
+    x = _required_kwarg(forward_kwargs, "x")
+    mask = torch.zeros(x.shape[1], dtype=torch.bool, device=x.device)
+    for key in ("text_pos_info", "audio_pos_info"):
+        rows = MiniMaxH3DiTModel._pos_ids(_required_kwarg(forward_kwargs, key), key)
+        mask[rows.to(x.device)] = True
+    return mask
+
+
+def _minimax_h3_sol_exact_kv_tokens() -> torch.Tensor | None:
+    """The forward's text and audio key mask, which the denoising stage hands
+    Sol-Attn through the forward context. Read here, in the eager body, so a
+    breakable CUDA graph replay sees the current request's mask."""
+    from sglang.multimodal_gen.runtime.layers.attention.backends.aiter_sol import (
+        AITERSolMetadata,
+    )
+
+    context = get_forward_context_or_none()
+    metadata = None if context is None else context.attn_metadata
+    if not isinstance(metadata, AITERSolMetadata):
+        return None
+    return metadata.exact_kv_tokens
 
 
 def _minimax_h3_attention_core_impl(
@@ -1204,6 +1243,16 @@ def _minimax_h3_attention_core_impl(
                     subblock_sparse_query_block_mask
                 ),
             )
+        elif attention._attention_backend_enum is AttentionBackendEnum.AITER_SOL:
+            out = attention._attention_impl.forward_varlen(
+                q,
+                k,
+                v,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                cu_seqlens_host=cu_seqlens_host,
+                exact_kv_tokens=_minimax_h3_sol_exact_kv_tokens(),
+            )
         else:
             out = attention._attention_impl.forward_varlen(
                 q,
@@ -1340,14 +1389,12 @@ class MiniMaxH3Attention(nn.Module):
         )
 
     def _set_attention_backend(self, backend) -> None:
-        if (
-            backend.get_enum() is AttentionBackendEnum.CUBE_SPARSE_ATTN
-            and not self._cube_sparse_capable
-        ):
+        dense_backend = _TOKEN_REFINER_DENSE_BACKENDS.get(backend.get_enum())
+        if dense_backend is not None and not self._cube_sparse_capable:
             backend = get_attn_backend(
                 self.head_dim,
                 _BF16_DTYPE,
-                selected_attention_backend=AttentionBackendEnum.FA,
+                selected_attention_backend=dense_backend,
             )
         impl_cls = backend.get_impl_cls()
         self._attention_impl = impl_cls(
