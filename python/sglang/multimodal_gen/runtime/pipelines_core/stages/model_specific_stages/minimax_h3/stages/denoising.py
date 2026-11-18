@@ -17,6 +17,10 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
+    AscendFAMetadata,
+    AscendFAMetadataBuilder,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.cube_sparse_attn import (
     CubeSparseAttentionMetadata,
     CubeSparseAttentionMetadataBuilder,
@@ -32,7 +36,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
-    MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIG,
+    MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_PHASES,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
     minimax_h3_plan_from_batch,
@@ -486,6 +490,16 @@ def _precompute_rope_cache(
     return True
 
 
+def _high_quality_steps_computation_mask(num_inference_steps: int) -> list[int]:
+    # 1 runs the DiT stack, 0 reuses the cached residual; the final step always runs
+    mask = [1] * num_inference_steps
+    for start, end, period in MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_PHASES:
+        for step in range(start, min(end, num_inference_steps)):
+            mask[step] = int((step - start) % period == period - 1)
+    mask[-1] = 1
+    return mask
+
+
 class MiniMaxH3DenoisingStage(DenoisingStage):
     def __init__(
         self, transformer, pipeline=None, stochastic_sampling: bool = False
@@ -644,7 +658,12 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         self, primary_num_steps: int, secondary_num_steps: int | None = None
     ) -> tuple[str, str, list[int] | None, list[int] | None]:
         if getattr(self, "_minimax_h3_quality", "exact") == "high":
-            return "none", "dynamic", None, None
+            return (
+                "none",
+                "static",
+                _high_quality_steps_computation_mask(primary_num_steps),
+                None,
+            )
         return super()._cache_dit_scm_masks(primary_num_steps, secondary_num_steps)
 
     def _build_cache_dit_config(
@@ -662,14 +681,15 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 scm_policy,
                 secondary=secondary,
             )
-        warmup, threshold, max_cached = MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIG
+        # the static mask decides every step, so the residual threshold and the
+        # consecutive-reuse cap are never consulted
         return CacheDitConfig(
             enabled=True,
             Fn_compute_blocks=1,
             Bn_compute_blocks=0,
-            max_warmup_steps=warmup,
-            residual_diff_threshold=threshold,
-            max_continuous_cached_steps=max_cached,
+            max_warmup_steps=MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_PHASES[0][0],
+            residual_diff_threshold=0.0,
+            max_continuous_cached_steps=-1,
             enable_taylorseer=False,
             taylorseer_order=1,
             num_inference_steps=num_inference_steps,
@@ -794,6 +814,16 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             num_steps=len(sigmas_video) - 1,
             device=device,
         )
+        transformer_backend = (server_args.component_attention_backends or {}).get(
+            "transformer", server_args.attention_backend
+        )
+        if current_platform.is_npu() and (
+            transformer_backend is None or transformer_backend.lower() == "fa"
+        ):
+            attn_metadata = AscendFAMetadataBuilder().build(
+                attention_backend_config=server_args.attention_backend_config,
+                ring_degree=server_args.ring_degree,
+            )
 
         placement_managed = self._component_residency_manager is not None
         if placement_managed:
@@ -1068,7 +1098,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         step_index: int,
         *,
         batch: Req,
-        attn_metadata: CubeSparseAttentionMetadata | None = None,
+        attn_metadata: AscendFAMetadata | CubeSparseAttentionMetadata | None = None,
         build_vsa_h3_step_metadata: Callable[[int], Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Route the custom full loop through the native denoising runner."""

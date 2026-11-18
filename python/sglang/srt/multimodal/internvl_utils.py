@@ -137,7 +137,6 @@ def compute_dynamic_image_size(
         post-pixel-shuffle token count.
     """
     ds = int(1 / downsample_ratio)
-    snap = patch_size * ds
 
     pw = max(1, round(orig_w / patch_size))
     ph = max(1, round(orig_h / patch_size))
@@ -166,41 +165,6 @@ def compute_dynamic_image_size(
     num_tokens = (target_pw * target_ph) // (ds * ds)
 
     return target_w, target_h, num_tokens
-
-
-def dynamic_resize_image(
-    image: Image.Image,
-    patch_size: int,
-    downsample_ratio: float,
-    min_num_patches: int,
-    max_num_patches: int,
-    mean: tuple[float, float, float] = IMAGENET_MEAN,
-    std: tuple[float, float, float] = IMAGENET_STD,
-) -> tuple[torch.Tensor, int]:
-    """Resize image for dynamic resolution and return pixel tensor + token count.
-
-    Returns:
-        (pixel_values [1, 3, H, W], num_tokens)
-    """
-    orig_w, orig_h = image.size
-    target_w, target_h, num_tokens = compute_dynamic_image_size(
-        orig_w,
-        orig_h,
-        patch_size,
-        downsample_ratio,
-        min_num_patches,
-        max_num_patches,
-    )
-    image = image.convert("RGB")
-    image = image.resize((target_w, target_h), Image.BICUBIC)
-    transform = T.Compose(
-        [
-            T.ToTensor(),
-            T.Normalize(mean=mean, std=std),
-        ]
-    )
-    pixel_values = transform(image).unsqueeze(0)
-    return pixel_values, num_tokens
 
 
 def resize_image_to_pixels(

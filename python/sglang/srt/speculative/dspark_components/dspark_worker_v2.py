@@ -262,7 +262,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model.logits_mup_width_multiplier = getattr(
             target_model_config.hf_text_config, "logits_mup_width_multiplier", None
         )
-        self._target_is_mambaish = mambaish_config(target_model_config) is not None
         runtime_config = resolve_runtime_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config,
             speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
@@ -349,7 +348,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise ValueError(
                 "DSpark dense-draft compact verify under attention DP does not "
                 "yet support cuda graph (idle DP groups cannot join the token-keyed "
-                "compact graph). Re-run with --disable-cuda-graph (eager is lossless), "
+                "compact graph). Re-run with --disable-decode-cuda-graph --disable-prefill-cuda-graph (eager is lossless), "
                 "or use SGLANG_RAGGED_VERIFY_MODE=static. The dsv4 (MoE) draft supports "
                 "cuda graph under DP."
             )
@@ -842,8 +841,13 @@ class DSparkWorkerV2(BaseSpecWorker):
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
             if get_parallel().attn_dp_enabled:
+                # Idle DP ranks still run the target to join its MoE collectives.
+                # On the last PP stage that forward consumes the previous stage's
+                # relay, so hand the received proxy through instead of dropping it.
                 self.target_worker.forward_batch_generation(
-                    batch, capture_hidden_mode=CaptureHiddenMode.FULL
+                    batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
             return self._decode_idle_result(on_publish=on_publish)
 

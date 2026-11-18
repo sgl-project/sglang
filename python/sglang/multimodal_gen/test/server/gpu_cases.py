@@ -34,6 +34,8 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MULTI_IMAGE_TI2I_sampling_params,
     MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
     PI05_ACTION_CI_sampling_params,
+    PRAXIS_DROID_CI_sampling_params,
+    PRAXIS_YAM_CI_sampling_params,
     REALTIME_MODEL_sampling_params,
     SANA_VIDEO_T2V_CI_sampling_params,
     SANA_WM_TI2V_CI_sampling_params,
@@ -133,6 +135,25 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_perf_check=False,
         perf_warmup_requests=1,
         # No Diffusers counterpart to compare components against.
+        run_component_accuracy_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    # Action GT (consistency) files live in sgl-project/ci-data-diffusion and are not added yet.
+    DiffusionTestCase(
+        "praxis_droid_http",
+        DiffusionServerArgs(model_path="runwayml/praxis-1-droid-lerobot"),
+        PRAXIS_DROID_CI_sampling_params,
+        perf_warmup_requests=1,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
+        "praxis_yam_http",
+        DiffusionServerArgs(model_path="runwayml/praxis-1-yam-lerobot"),
+        PRAXIS_YAM_CI_sampling_params,
+        perf_warmup_requests=1,
+        run_consistency_check=False,
         run_component_accuracy_check=False,
         run_t2v_input_reference_check=False,
     ),
@@ -760,34 +781,41 @@ else:
         ),
     ]
 
-# MiniMax-H3-Image weights are not public yet, so PR CI cannot download them.
-# Add these cases back to ONE_GPU_B200_CASES together with their B200
-# consistency GT and perf baselines once the checkpoint is published.
+# Explicit entries (no comprehension) so the CI case parser can list them.
 MINIMAX_H3_IMAGE_B200_CASES = [
     DiffusionTestCase(
-        f"minimax_h3_image_{task}",
+        "minimax_h3_image_t2i",
         DiffusionServerArgs(
             model_path="MiniMaxAI/MiniMax-H3-Image",
             modality="image",
             extras=["--component-residency", "all=resident"],
         ),
-        sampling,
+        MINIMAX_H3_IMAGE_T2I_sampling_params,
         perf_warmup_requests=1,
         perf_repeat_requests=2,
-        # Consistency remains required; pre-release goldens stay private until
-        # the checkpoint and its authorized golden artifacts are published.
         run_consistency_check=True,
         # The release provides a native SGLang reference, not a Diffusers pipeline.
         run_component_accuracy_check=False,
         run_t2v_input_reference_check=False,
-    )
-    for task, sampling in (
-        ("t2i", MINIMAX_H3_IMAGE_T2I_sampling_params),
-        ("edit", MINIMAX_H3_IMAGE_EDIT_sampling_params),
-    )
+    ),
+    DiffusionTestCase(
+        "minimax_h3_image_edit",
+        DiffusionServerArgs(
+            model_path="MiniMaxAI/MiniMax-H3-Image",
+            modality="image",
+            extras=["--component-residency", "all=resident"],
+        ),
+        MINIMAX_H3_IMAGE_EDIT_sampling_params,
+        perf_warmup_requests=1,
+        perf_repeat_requests=2,
+        run_consistency_check=True,
+        # The release provides a native SGLang reference, not a Diffusers pipeline.
+        run_component_accuracy_check=False,
+        run_t2v_input_reference_check=False,
+    ),
 ]
 
-ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES
+ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES + MINIMAX_H3_IMAGE_B200_CASES
 
 MINIMAX_H3_FOUR_GPU_H100_CASES = [
     DiffusionTestCase(
