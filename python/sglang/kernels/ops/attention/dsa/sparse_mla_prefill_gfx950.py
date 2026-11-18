@@ -1,9 +1,5 @@
-"""DSA sparse MLA prefill for fp8_ds_mla KV on gfx950 (HIP).
-
-csrc/attention/sparse_mla_prefill_gfx950.cuh: one CTA per query token, 4 waves, one wave
-per fp8 scale group, BF16 MFMA with the group scales applied after the dots. Same contract
-as ``triton_sparse_mla_fwd`` for H <= 16 heads and 656-byte KV rows.
-"""
+"""DSA sparse MLA prefill for fp8_ds_mla KV on gfx950: same contract as
+`triton_sparse_mla_fwd` for H <= 16 heads and 656-byte KV rows."""
 
 from __future__ import annotations
 

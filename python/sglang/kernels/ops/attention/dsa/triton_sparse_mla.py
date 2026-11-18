@@ -392,7 +392,6 @@ def _sparse_mla_fwd_split_dim_kernel(
     D_V: tl.constexpr,
     D_TAIL: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
-    # runtime, not constexpr: a head-major q's head stride (tokens * D) varies per batch
     STRIDE_QN_T,
     STRIDE_QN_H,
     STRIDE_QR_T,
@@ -688,7 +687,6 @@ def _sparse_mla_fused_kernel(
     D_V: tl.constexpr,
     D_TAIL: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
-    # runtime, not constexpr: a head-major q's head stride (tokens * D) varies per batch
     STRIDE_QN_T,
     STRIDE_QN_H,
     STRIDE_QR_T,
@@ -876,7 +874,6 @@ def _sparse_mla_split_k_kernel(
     D_V: tl.constexpr,
     D_TAIL: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
-    # runtime, not constexpr: a head-major q's head stride (tokens * D) varies per batch
     STRIDE_QN_T,
     STRIDE_QN_H,
     STRIDE_QR_T,
