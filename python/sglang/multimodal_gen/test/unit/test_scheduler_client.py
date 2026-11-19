@@ -203,6 +203,10 @@ def test_server_warmup_reaches_every_replica_without_skewing_round_robin(
         "sglang.multimodal_gen.runtime.server_warmup.should_include_warmup_image",
         lambda *args, **kwargs: False,
     )
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.server_warmup.should_include_warmup_audio",
+        lambda *args, **kwargs: False,
+    )
     server_args = SimpleNamespace(
         scheduler_endpoints=endpoints,
         scheduler_rpc_timeout=None,
