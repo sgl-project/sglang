@@ -2,7 +2,7 @@
 
 // Fixup kernel for TRT-LLM ragged attention zero-KV rows.
 // For sequences with kv_len == 0, forces out=0 and lse=-inf.
-// 2D grid: (blocks_per_seq, batch_size). Y-dim early-exits for non-zero KV.
+// One CTA per (sequence, query offset), with a flat launch grid.
 // Uses vectorised float4 stores for bandwidth efficiency.
 
 #include <sgl_kernel/tensor.h>
@@ -75,8 +75,9 @@ __global__ void fixup_zero_kv_rows_kernel(
     const int32_t* __restrict__ kv_lens,
     const int32_t* __restrict__ cum_seq_lens,
     const int out_stride,
-    const int lse_stride) {
-  const int seq_idx = blockIdx.y;
+    const int lse_stride,
+    const int blocks_per_seq) {
+  const int seq_idx = blockIdx.x / blocks_per_seq;
   if (kv_lens[seq_idx] > 0) return;
 
   const int tok_start = cum_seq_lens[seq_idx];
@@ -84,13 +85,16 @@ __global__ void fixup_zero_kv_rows_kernel(
   const int num_tokens = tok_end - tok_start;
   if (num_tokens <= 0) return;
 
-  // blockIdx.x selects a token within this sequence.
-  const int tok = tok_start + blockIdx.x;
-  if (tok >= tok_end) return;
+  const int query_offset = static_cast<int>(blockIdx.x % blocks_per_seq);
+  if (query_offset >= num_tokens) return;
+
+  const int64_t tok = static_cast<int64_t>(tok_start) + query_offset;
+  const int64_t out_offset = tok * static_cast<int64_t>(out_stride);
+  const int64_t lse_offset = tok * static_cast<int64_t>(lse_stride);
 
   // Each block handles one token: zero out[tok] and set lse[tok] = -inf.
-  vec_zero_fill(out + tok * out_stride, out_stride);
-  vec_neginf_fill(lse + tok * lse_stride, lse_stride);
+  vec_zero_fill(out + out_offset, out_stride);
+  vec_neginf_fill(lse + lse_offset, lse_stride);
 }
 
 // -- host launcher ---------------------------------------------------------
@@ -120,10 +124,13 @@ void fixup_zero_kv_rows(
   const int bs = static_cast<int>(batch_size.unwrap());
   const int nh = static_cast<int>(num_heads.unwrap());
   const int vd = static_cast<int>(v_head_dim.unwrap());
+  const int64_t out_stride = static_cast<int64_t>(nh) * vd;
+  RuntimeCheck(out_stride >= 0 && out_stride <= 2147483647, "invalid fixup output stride");
 
-  // Grid: one block per (token, sequence). X = max tokens in any seq.
-  const int blocks_x = static_cast<int>(max_seq_len);
-  dim3 grid(blocks_x, bs);
+  if (bs == 0 || max_seq_len == 0) return;
+  const int64_t total_blocks = bs * max_seq_len;
+  RuntimeCheck(total_blocks > 0 && total_blocks <= 2147483647, "invalid fixup grid size");
+  dim3 grid(static_cast<unsigned int>(total_blocks));
   dim3 block(kFixupBlockSize);
 
   LaunchKernel(grid, block, device.unwrap())(
@@ -132,8 +139,9 @@ void fixup_zero_kv_rows(
       static_cast<float*>(lse.data_ptr()),
       static_cast<const int32_t*>(kv_lens.data_ptr()),
       static_cast<const int32_t*>(cum_seq_lens.data_ptr()),
-      nh * vd,
-      nh);
+      static_cast<int>(out_stride),
+      nh,
+      static_cast<int>(max_seq_len));
 }
 
 }  // namespace sglang

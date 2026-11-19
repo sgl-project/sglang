@@ -9,7 +9,8 @@ Covers:
 """
 
 import unittest
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -256,6 +257,25 @@ class TestLSEBaseByBackend(CustomTestCase):
         self.assertFalse(is_mla_dcp_lse_base_on_e("flashinfer_mla"))
         self.assertFalse(is_mla_dcp_lse_base_on_e("trtllm_mla"))
         self.assertFalse(is_mla_dcp_lse_base_on_e(None))
+
+    def test_dsa_lse_base_with_replicated_index_k(self):
+        from sglang.srt.layers.dcp import layout
+
+        kernel = SimpleNamespace(dsa_decode_backend="fa3")
+        with (
+            patch.object(
+                layout, "get_exec", return_value=SimpleNamespace(kernel=kernel)
+            ),
+            patch.object(layout, "dsa_shards_index_k", return_value=False),
+        ):
+            for backend in ("dsa", "nsa"):
+                with self.subTest(backend=backend):
+                    kernel.dsa_decode_backend = "fa3"
+                    self.assertTrue(layout.is_mla_dcp_lse_base_on_e(backend))
+
+                    for base_2_backend in ("trtllm", "triton"):
+                        kernel.dsa_decode_backend = base_2_backend
+                        self.assertFalse(layout.is_mla_dcp_lse_base_on_e(backend))
 
 
 class TestDCPA2AReduceWithCUDAGraphBuffers(CustomTestCase):

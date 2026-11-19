@@ -37,9 +37,10 @@ def dsa_shards_index_k() -> bool:
 
 
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
-    if attention_backend == "dsa":
-        # trtllm-gen partials carry a base-2 LSE.
-        return dsa_shards_index_k() and get_exec().kernel.dsa_decode_backend != "trtllm"
+    if attention_backend in ("dsa", "nsa"):
+        backend = get_exec().kernel.dsa_decode_backend
+        # FA3 returns natural-log LSE even with replicated index-K.
+        return backend == "fa3" or (dsa_shards_index_k() and backend != "trtllm")
     return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
 
 

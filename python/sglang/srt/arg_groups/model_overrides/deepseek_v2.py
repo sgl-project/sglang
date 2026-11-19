@@ -15,7 +15,7 @@ from sglang.srt.runtime_context import get_platform
 logger = logging.getLogger(__name__)
 
 
-def _dsa_dcp_overrides(cfg: Any) -> dict:
+def _dsa_dcp_overrides(cfg: Any, hf_config: Any) -> dict:
     if cfg.dcp_size <= 1:
         return {}
     if cfg.enable_hisparse:
@@ -29,7 +29,9 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
         raise ValueError("DSA DCP requires --speculative-eagle-topk 1.")
     # NPU has its own DSA DCP attention path; these split backends are CUDA/ROCm.
     overrides = {}
-    if not platform.is_npu:
+    if platform.is_sm90 and hf_config.architectures[0] == "GlmMoeDsaForCausalLM":
+        overrides.update(_glm_dsa_hopper_dcp_overrides(cfg, hf_config))
+    elif not platform.is_npu:
         backend = "triton" if platform.is_hip else "trtllm"
         overrides.update(
             {
@@ -41,6 +43,38 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
     if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in ("a2a", "fi_a2a"):
         overrides["dcp_replicate_q_proj"] = True
     return overrides
+
+
+def _glm_dsa_hopper_dcp_overrides(cfg: Any, hf_config: Any) -> dict:
+    if cfg.kv_cache_dtype not in ("auto", "bf16", "bfloat16"):
+        raise ValueError("Hopper GLM DSA DCP requires a bfloat16 KV cache.")
+    if cfg.page_size not in (None, 64):
+        raise ValueError("Hopper GLM DSA DCP requires --page-size 64.")
+    if cfg.enable_mixed_chunk:
+        raise ValueError("Hopper GLM DSA DCP does not support --enable-mixed-chunk.")
+
+    prefill = cfg.dsa_prefill_backend
+    decode = cfg.dsa_decode_backend
+    backend = decode or prefill or "fa3"
+    if backend != "fa3" or prefill not in (None, backend):
+        raise ValueError("Hopper GLM DSA DCP requires fa3 for both prefill and decode.")
+
+    if cfg.speculative_algorithm is not None and (
+        cfg.speculative_algorithm not in ("EAGLE", "NEXTN")
+        or not getattr(hf_config, "num_nextn_predict_layers", 0)
+        or cfg.speculative_draft_model_path not in (None, cfg.model_path)
+        or cfg.enable_multi_layer_eagle
+    ):
+        raise ValueError(
+            "Hopper GLM DSA DCP supports only the checkpoint's embedded NextN "
+            "MTP draft with single-chain EAGLE."
+        )
+
+    return {
+        name: backend
+        for name in ("dsa_prefill_backend", "dsa_decode_backend")
+        if getattr(cfg, name) is None
+    }
 
 
 @_register_for(
@@ -110,7 +144,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
 
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
         if not is_kimi_k31(hf_config):
-            overrides.update(_dsa_dcp_overrides(cfg))
+            overrides.update(_dsa_dcp_overrides(cfg, hf_config))
         # Set attention backend for DeepSeek
         if is_attention_backend_not_set(cfg):
             overrides["attention_backend"] = "dsa"

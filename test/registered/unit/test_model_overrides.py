@@ -3010,6 +3010,41 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             {},
         )
 
+    def test_glm_hopper_dcp_resolves_fa3_for_mtp(self):
+        from sglang.srt.arg_groups.model_overrides.deepseek_v2 import _dsa_dcp_overrides
+
+        hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"], num_nextn_predict_layers=1
+        )
+        args = SimpleNamespace(
+            dcp_size=2,
+            dcp_comm_backend="a2a",
+            dcp_replicate_q_proj=None,
+            disaggregation_mode="null",
+            enable_hierarchical_cache=False,
+            enable_hisparse=False,
+            enable_mixed_chunk=False,
+            enable_multi_layer_eagle=False,
+            kv_cache_dtype="bfloat16",
+            page_size=64,
+            dsa_prefill_backend=None,
+            dsa_decode_backend=None,
+            speculative_algorithm="EAGLE",
+            speculative_eagle_topk=1,
+            speculative_draft_model_path=None,
+            model_path="zai-org/GLM-5.3",
+        )
+
+        with override_platform(is_sm90=True, is_npu=False, is_hip=False):
+            resolved = _dsa_dcp_overrides(args, hf_config)
+            # Hopper used to select the Blackwell-only TRT-LLM sparse path.
+            self.assertEqual(resolved["dsa_prefill_backend"], "fa3")
+            self.assertEqual(resolved["dsa_decode_backend"], "fa3")
+
+            args.dsa_prefill_backend = "flashmla_sparse"
+            with self.assertRaisesRegex(ValueError, "requires fa3"):
+                _dsa_dcp_overrides(args, hf_config)
+
     def test_dsa_split_backend_resolution_pass(self):
         from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import _dsa_split_backend_resolution

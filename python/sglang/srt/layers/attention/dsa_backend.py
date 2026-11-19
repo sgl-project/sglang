@@ -44,6 +44,7 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
+from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
 from sglang.kernels.ops.attention.metadata import q8kv8_topk_length_from_indices
 from sglang.kernels.ops.attention.mla_qk_prep import (
     concat_and_cast_q_fp8_heads,
@@ -550,13 +551,11 @@ def _validate_triton_sparse_mla_backend(
 
 
 def _validate_prims_ts_dcp(*, dcp_size: int, shards_index_k: bool) -> None:
-    # Prims-TS partials carry a natural-log LSE, but the DCP combine merges DSA
-    # partials base e only under sharded index-K (is_mla_dcp_lse_base_on_e).
+    # The Prims-TS DCP route has only been validated with sharded index-K.
     if dcp_size > 1 and not shards_index_k:
         raise ValueError(
             "--dsa-*-backend prims_ts supports --dcp-size > 1 only with sharded "
-            "index-K DCP (Kimi-K3.1); this model keeps index-K replicated, whose "
-            "DCP combine merges base-2 LSE partials. Use trtllm, or --dcp-size 1."
+            "index-K DCP (Kimi-K3.1). Use trtllm or --dcp-size 1 for this model."
         )
 
 
@@ -2882,6 +2881,22 @@ class DeepseekSparseAttnBackend(
                     page_table_1
                 ).to(torch.int32)
 
+        topk_lengths = metadata.dsa_cache_seqlens_int32
+        dcp_partial = self._uses_bf16_dcp_attention(dsa_impl) and (
+            forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_target_verify()
+        )
+        if dcp_partial:
+            page_table_1, topk_lengths = localize_dcp_page_table(
+                self._dcp_page_table_cache,
+                metadata=metadata,
+                layer_id=layer.layer_id,
+                topk_indices=shared_topk_indices,
+                page_table=page_table_1,
+                dcp_size=self.attn_dcp_size,
+                dcp_rank=self.attn_dcp_rank,
+            )
+
         if dsa_impl == "tilelang":
             if q_rope is not None:
                 # Cat-skip, as in forward_decode: q_rope=None means the caller
@@ -3078,19 +3093,23 @@ class DeepseekSparseAttnBackend(
                 and forward_batch.forward_mode.is_target_verify(),
             )
         elif dsa_impl == "fa3":
+            cu_seqlens_q, cu_seqlens_k = self._fa3_cu_seqlens(
+                metadata, topk_lengths, dcp_partial
+            )
             return self._forward_fa3(
                 q_rope=q_rope,
                 kv_cache=kv_cache,
                 v_head_dim=layer.v_head_dim,
                 q_nope=q_nope,
                 page_table=page_table_1,
-                cache_seqlens=metadata.dsa_cache_seqlens_int32,
-                cu_seqlens_q=metadata.dsa_cu_seqlens_q,
-                cu_seqlens_k=metadata.dsa_cu_seqlens_k,
+                cache_seqlens=topk_lengths,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=metadata.dsa_max_seqlen_q,
                 sm_scale=layer.scaling,
                 logit_cap=layer.logit_cap,
                 page_size=1,
+                return_lse=dcp_partial,
             )
         elif dsa_impl == "aiter":
             if q_rope is not None:
@@ -3225,6 +3244,19 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
             )
 
+        topk_lengths = metadata.dsa_cache_seqlens_int32
+        dcp_partial = self._uses_bf16_dcp_attention(dsa_impl)
+        if dcp_partial:
+            page_table_1, topk_lengths = localize_dcp_page_table(
+                self._dcp_page_table_cache,
+                metadata=metadata,
+                layer_id=layer.layer_id,
+                topk_indices=shared_topk_indices,
+                page_table=page_table_1,
+                dcp_size=self.attn_dcp_size,
+                dcp_rank=self.attn_dcp_rank,
+            )
+
         if dsa_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -3304,19 +3336,23 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
             )
         elif dsa_impl == "fa3":
+            cu_seqlens_q, cu_seqlens_k = self._fa3_cu_seqlens(
+                metadata, topk_lengths, dcp_partial
+            )
             return self._forward_fa3(
                 q_rope=q_rope,
                 kv_cache=kv_cache,
                 v_head_dim=layer.v_head_dim,
                 q_nope=q_nope,
                 page_table=page_table_1,
-                cache_seqlens=metadata.dsa_cache_seqlens_int32,
-                cu_seqlens_q=metadata.dsa_cu_seqlens_q,
-                cu_seqlens_k=metadata.dsa_cu_seqlens_k,
+                cache_seqlens=topk_lengths,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=metadata.dsa_max_seqlen_q,
                 sm_scale=layer.scaling,
                 logit_cap=layer.logit_cap,
                 page_size=1,
+                return_lse=dcp_partial,
             )
         elif dsa_impl == "aiter":
             if q_all is None or not _is_hip:
@@ -3342,6 +3378,27 @@ class DeepseekSparseAttnBackend(
         else:
             assert False, f"Unsupported {dsa_impl = }"
 
+    def _uses_bf16_dcp_attention(self, backend: str) -> bool:
+        # Replicated NextN drafts have a runner-local DCP size of one.
+        return (
+            self.attn_dcp_size > 1
+            and not self.dsa_shards_index_k
+            and self.device_sm_major == 9
+            and backend == "fa3"
+        )
+
+    @staticmethod
+    def _fa3_cu_seqlens(
+        metadata: DSAMetadata, topk_lengths: torch.Tensor, dcp_partial: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not dcp_partial:
+            return metadata.dsa_cu_seqlens_q, metadata.dsa_cu_seqlens_k
+        # The localized table's rank-local counts replace the global lengths.
+        return (
+            metadata.dsa_cu_seqlens_q[: topk_lengths.shape[0] + 1],
+            compute_cu_seqlens(topk_lengths),
+        )
+
     def _forward_fa3(
         self,
         q_rope: torch.Tensor,
@@ -3356,7 +3413,8 @@ class DeepseekSparseAttnBackend(
         sm_scale: float,
         logit_cap: float,
         page_size: int,
-    ) -> torch.Tensor:
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # Sparse DSA represents each query token as a one-token FA3 sequence.
         # MoE synchronization can pad length metadata, while the prefill graph
         # attention bridge narrows Q and the page table to real query tokens.
@@ -3391,7 +3449,7 @@ class DeepseekSparseAttnBackend(
         c_kv_cache = c_kv_cache.view(num_blocks, page_size, 1, v_head_dim)
         if self.dsa_index_kpool > 1:
             page_table = page_table.clamp(min=0)
-        o = flash_attn_with_kvcache(
+        result = flash_attn_with_kvcache(
             q=None if only_qv else q_rope,
             k_cache=k_rope_cache,
             v_cache=c_kv_cache,
@@ -3405,10 +3463,20 @@ class DeepseekSparseAttnBackend(
             softmax_scale=sm_scale,
             causal=True,
             softcap=logit_cap,
-            return_softmax_lse=False,
+            return_softmax_lse=return_lse,
             num_splits=self.num_splits,
         )
-        return o  # type: ignore
+        if not return_lse:
+            return result
+
+        out, lse = result[:2]
+        if lse.ndim != 2:
+            raise RuntimeError(f"FA3 returned an uncombined LSE: {tuple(lse.shape)}")
+        # FA3 varlen returns [heads, query tokens]. The DCP merge needs
+        # [query tokens, heads] and zero weight for empty local shards.
+        lse = lse.transpose(0, 1).contiguous()
+        fixup_zero_kv_rows(out, lse, cache_seqlens, cu_seqlens_q, max_seqlen_q)
+        return out, lse
 
     def _forward_flashmla_sparse(
         self,

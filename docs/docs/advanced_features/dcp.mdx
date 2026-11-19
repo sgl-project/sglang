@@ -178,10 +178,13 @@ DeepSeek Sparse Attention attends over a top-k slice of the context, so DCP keep
 
 1. The index-K cache is addressed by the widened virtual slot and costs `c` times its usual share of each rank's KV budget (about 6% at DCP2 and 17% at DCP4 on GLM-5.3).
 2. Each layer maps the global top-k to rank-local rows with one Triton kernel; layers that share the previous layer's top-k reuse the mapping.
-3. The TRT-LLM sparse kernel returns the per-head LSE and the usual DCP merge combines the partial outputs.
+3. The sparse attention kernel returns the per-head LSE and the DCP merge combines the partial outputs.
 4. The MTP draft (nextn) layer keeps a replicated KV cache over the widened slots and attends without the DCP group, so MTP index share feeds the draft directly.
 
-Requirements: CUDA SM100/SM103 with the `trtllm` DSA backends (selected automatically), an `fp8_e4m3` or `bf16` KV cache, `attn_tp_size % dcp_size == 0`, and, with speculative decoding, the checkpoint's own MTP draft as a single EAGLE chain (`--speculative-eagle-topk 1`, draft tokens equal to steps + 1). HiSparse, prefill CP, HiCache, PD disaggregation, unified memory and `index_kpool > 1` are not supported in this combination.
+- **Blackwell (SM100/SM103)** uses the `trtllm` DSA backend with an `fp8_e4m3` or `bf16` KV cache.
+- **Hopper (SM90)** defaults both DSA backends to `fa3` for `GlmMoeDsaForCausalLM` checkpoints, including GLM-5, GLM-5.1, GLM-5.2, and GLM-5.3. Use a `bf16` KV cache and page size 64. Mixed chunk prefill is unsupported on this path.
+
+Both require `attn_tp_size % dcp_size == 0`. With speculative decoding, use the checkpoint's own MTP draft as a single EAGLE chain (`--speculative-eagle-topk 1`, draft tokens equal to steps + 1). HiSparse, prefill CP, HiCache, PD disaggregation, unified memory and `index_kpool > 1` are not supported in this combination.
 
 ```bash Command
 sglang serve \
