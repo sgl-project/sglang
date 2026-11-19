@@ -671,6 +671,7 @@ class SchedulerMetricsReporter:
         # aren't estimated here (follow-up); zeroing is the honest fallback.
         if getattr(model_config, "attention_arch", None) == AttentionArch.SSM:
             num_mlp_layers = 0.0
+            num_attn_layers = 0.0
 
         head_dim = float(getattr(model_config, "head_dim", 0))
         num_attn_heads = float(
@@ -734,7 +735,7 @@ class SchedulerMetricsReporter:
             v_head_dim = getattr(model_config, "v_head_dim", None)
             v_head_dim = (
                 float(v_head_dim)
-                if v_head_dim is not None and v_head_dim != head_dim
+                if v_head_dim is not None
                 else hidden_size / num_attn_heads
             )
             qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
@@ -816,6 +817,7 @@ class SchedulerMetricsReporter:
                 * moe_intermediate_size
                 * active_expert_units
             )
+            ffn_act_intermediate_size = moe_intermediate_size * active_expert_units
         else:
             # Dense (non-MoE) FFN FLOPs/weight-elems depend on whether the FFN is
             # gated (SwiGLU-style: separate gate_proj + up_proj + down_proj, 3
@@ -859,6 +861,7 @@ class SchedulerMetricsReporter:
                 if intermediate_size > 0
                 else 0.0
             )
+            ffn_act_intermediate_size = intermediate_size
 
         self._linear_flops_per_token = max(
             0.0, attn_linear_flops * num_attn_layers + mlp_flops * num_mlp_layers
@@ -892,8 +895,8 @@ class SchedulerMetricsReporter:
             + hidden_size * act_bytes * num_attn_layers
         )
         self._ffn_act_bytes_per_token = (
-            mlp_weight_mult * intermediate_size * act_bytes * num_mlp_layers
-            if intermediate_size > 0
+            mlp_weight_mult * ffn_act_intermediate_size * act_bytes * num_mlp_layers
+            if ffn_act_intermediate_size > 0
             else 0.0
         )
 

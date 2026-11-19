@@ -1682,6 +1682,88 @@ class TestEstimatedPerfConstants(CustomTestCase):
             attn_linear_flops * layers + mlp_flops * layers,
         )
 
+    def test_pure_ssm_has_zero_attention_and_mlp_layers(self):
+        # falcon-mamba-7b(-instruct) et al: every layer is a Mamba mixer, not a
+        # GQA/MLA attention layer and not a dense/MoE FFN layer. Before this
+        # fix, num_attn_layers wrongly fell back to num_layers (the fallback
+        # only has a hybrid-SWA full_attention_layer_ids path, which is never
+        # populated for pure SSM configs), so every Mamba layer was charged
+        # fake attention-linear FLOPs and fake KV-cache bytes on top of the
+        # already-fixed fake MLP cost.
+        self._init(
+            _fake_model_config(
+                hidden_size=4096,
+                num_attention_layers=64,
+                attention_arch=AttentionArch.SSM,
+                hf_text_config_overrides={"intermediate_size": 8192},
+            )
+        )
+        self.assertEqual(self.reporter._linear_flops_per_token, 0.0)
+        self.assertEqual(self.reporter._attn_dot_flops_coeff, 0.0)
+        self.assertEqual(self.reporter._kv_cache_bytes_per_token, 0.0)
+        self.assertEqual(self.reporter._weight_read_bytes_per_token, 0.0)
+
+    def test_moe_ffn_act_bytes_scale_by_active_experts_not_dense_intermediate_size(
+        self,
+    ):
+        # _ffn_act_bytes_per_token must track the same per-token FFN size as
+        # mlp_flops/mlp_weight_elems_per_layer (moe_intermediate_size *
+        # active_expert_units), not the stale dense intermediate_size left
+        # over from before the MoE branch existed.
+        hidden, layers = 4096, 4
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                num_attention_layers=layers,
+                dtype_itemsize=2,
+                hf_text_config_overrides={
+                    "intermediate_size": 18432,
+                    "moe_intermediate_size": 1408,
+                    "num_experts_per_tok": 6,
+                    "n_shared_experts": 2,
+                },
+            )
+        )
+        active_expert_units = 6 + 2
+        expected = 3.0 * (1408 * active_expert_units) * 2.0 * layers
+        wrong_dense_based = 3.0 * 18432 * 2.0 * layers
+        self.assertNotEqual(self.reporter._ffn_act_bytes_per_token, wrong_dense_based)
+        self.assertAlmostEqual(self.reporter._ffn_act_bytes_per_token, expected)
+
+    def test_mla_v_head_dim_equal_to_head_dim_is_not_treated_as_unset(self):
+        # v_head_dim is a real, explicitly-configured field here that happens
+        # to equal head_dim -- using "!= head_dim" as an unset-sentinel must
+        # not discard it in favor of the hidden_size/num_attn_heads guess.
+        hidden, heads, layers, head_dim = 2048, 16, 4, 128.0
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                head_dim=head_dim,
+                num_attn_heads=heads,
+                num_attention_layers=layers,
+                attention_arch=AttentionArch.MLA,
+                kv_lora_rank=64.0,
+                qk_rope_head_dim=32.0,
+                qk_nope_head_dim=96.0,
+                v_head_dim=head_dim,
+                hf_text_config_overrides={"q_lora_rank": 0, "intermediate_size": 10944},
+            )
+        )
+        qk_head_dim = 96.0 + 32.0
+        kv_b_out_dim = heads * (96.0 + head_dim)
+        kv_b_proj_flops = 2.0 * 64.0 * kv_b_out_dim
+        o_proj_flops = 2.0 * heads * head_dim * hidden
+        q_proj_flops = 2.0 * hidden * heads * qk_head_dim
+        kv_a_proj_flops = 2.0 * hidden * (64.0 + 32.0)
+        attn_linear_flops = (
+            q_proj_flops + kv_a_proj_flops + kv_b_proj_flops + o_proj_flops
+        )
+        mlp_flops = 6.0 * hidden * 10944
+        self.assertEqual(
+            self.reporter._linear_flops_per_token,
+            attn_linear_flops * layers + mlp_flops * layers,
+        )
+
     def test_num_experts_per_tok_alone_does_not_trigger_moe_without_expert_count(self):
         # num_experts_per_tok present but no num_experts/num_local_experts/
         # n_routed_experts field at all: must NOT guess intermediate_size is
