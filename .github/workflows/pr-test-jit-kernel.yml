@@ -127,7 +127,7 @@ jobs:
         run: echo "SGLANG_CI_DEP_WHEELS_DIR=$GITHUB_WORKSPACE/dep-wheels" >> "$GITHUB_ENV"
 
       - name: Install dependencies
-        timeout-minutes: 20
+        timeout-minutes: 45
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{ inputs.sgl_kernel }} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
