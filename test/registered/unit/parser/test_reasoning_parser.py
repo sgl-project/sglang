@@ -1090,6 +1090,17 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
                         self._feed(DeepSeekR1Detector(), text, chunk_size), expected
                     )
 
+    def test_tool_start_before_think_end_ends_reasoning(self):
+        """A tool call opened inside the think block, with the think end after it,
+        must end reasoning at the tool marker at every chunk width and one-shot,
+        where the grammar also ends it; it must not turn into reasoning text."""
+        tool_call = '<tool_call>{"x":1}</tool_call>'
+        self._assert_invariant(
+            Qwen3Detector,
+            f"<think>thinking{tool_call}</think>answer",
+            ("thinking", f"{tool_call}</think>answer"),
+        )
+
     def test_text_before_think_token_is_chunk_dependent(self):
         """Accepted divergence, inherited from main: text before `<think>` lands
         in reasoning or content depending on where the chunk boundary falls."""

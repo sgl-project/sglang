@@ -13,11 +13,11 @@ from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 from sglang.utils import wait_for_server
 
-register_npu_ci(est_time=3600, suite="base-c-test-acc-16-npu-a3")
+register_npu_ci(est_time=3600, suite="extra-c-acc-test-16-npu-a3")
 
 register_npu_ci(
     est_time=3600,
-    suite="full-acc-16-npu-a3",
+    suite="full-acc-test-16-npu-a3",
     nightly=True,
 )
 
