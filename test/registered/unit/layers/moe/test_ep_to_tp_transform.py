@@ -4,12 +4,13 @@ Verifies that loading weights via load_tp_by_experts (EP-style loading
 followed by all_to_all redistribution) produces identical MoE weights to
 normal TP loading.
 
-Launch with torchrun:
-    torchrun --nproc_per_node=2 -m pytest python/sglang/test/test_ep_to_tp_transform.py -v -s
+Run with ``python test_ep_to_tp_transform.py``; it relaunches itself under
+torchrun on 2 GPUs.
 """
 
 from __future__ import annotations
 
+import os
 import unittest
 from unittest import mock
 
@@ -38,7 +39,11 @@ from sglang.srt.runtime_context import (
     override_platform,
     reset_context,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.utils import multigpu_pytest_main
 from sglang.test.test_utils import publish_build_topology
+
+register_cuda_ci(est_time=120, stage="extra-b", runner_config="2-gpu-gb300")
 
 
 def _make_tiny_config(n_routed_experts: int = 16) -> PretrainedConfig:
@@ -1092,4 +1097,9 @@ class TestEpToTpTransform(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    # Inside a torchrun worker (relaunched below, or started by hand), run the
+    # tests on this rank; otherwise relaunch this file under torchrun.
+    if "LOCAL_RANK" in os.environ:
+        unittest.main()
+    else:
+        multigpu_pytest_main(__name__, __file__, num_gpus=(2,))
