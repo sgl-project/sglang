@@ -21,9 +21,11 @@ import torch.multiprocessing as mp
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchAck
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
+    EvictParams,
     InsertParams,
     MatchPrefixParams,
 )
@@ -1286,6 +1288,113 @@ def _check_layer_wise(cache, allocator, rank):
             assert [pages for rid, pages in queries if rid == "gap"] == [4, 6]
         full_get.assert_not_called()
 
+    def make_adder():
+        return PrefillAdder(
+            page_size=1,
+            tree_cache=cache,
+            token_to_kv_pool_allocator=allocator,
+            running_batch=None,
+            new_token_ratio=1.0,
+            rem_input_tokens=100,
+            rem_chunk_tokens=None,
+        )
+
+    # Both stages can budget this request; only PP1's physical take fails.
+    # The next request has room for one copy of its hit but not two.
+    store.load = Mock(return_value=True)
+    store.start_layer_wise_loading = Mock(return_value=0)
+    store.finish_layer_wise_loading = Mock(return_value=True)
+    for failed in (True, False):
+        req = _request(f"take-{failed}", 95)
+        free = allocator.available_size()
+        held = allocator.alloc(free - 10)
+        assert tickets.bind(req, expected=True)
+        with (
+            patch.object(type(cache.kv_storage()), "take_units", return_value=None)
+            if failed and rank == 1
+            else nullcontext()
+        ):
+            _drain_until(cache, lambda: not tickets.pending)
+        req.init_next_round_input(cache, cow_mamba=False)
+        adder = make_adder()
+        # The physical destinations must already be held through admission.
+        with patch.object(
+            type(cache.kv_storage()), "take_units", side_effect=AssertionError
+        ):
+            adder.add_one_req(req, False, None)
+        assert adder.can_run_list == [req]
+        assert (req.prefix_len, req.extend_len) == ((0, 7) if failed else (4, 3))
+        if not failed:
+            slots = cache.linker.private_load_indices[req.rid]
+            cache.linker.start_layer_wise_loading()
+            assert not cache.linker.finish_loads()
+            allocator.free(slots)
+        cache.unlock(req.lock)
+        tickets.release(req.cache_request_handle)
+        allocator.free(held)
+        assert allocator.available_size() == free
+
+    # A full queue can defer every layer-wise admission. At most one ticket
+    # holds private rows, then its scheduling turn expires and frees them.
+    free = allocator.available_size()
+    held = allocator.alloc(free - 10)
+    waiting = [_request(f"queued-{i}", 110 + 10 * i) for i in range(8)]
+    for req in waiting:
+        assert tickets.bind(req, expected=True)
+
+    def deferred():
+        assert len(cache.linker.prefetches) <= 1
+        assert allocator.available_size() >= 4
+        return not tickets.pending
+
+    _drain_until(cache, deferred)
+    assert all(req.external_cache_hit_length == 0 for req in waiting[:-1])
+    assert waiting[-1].external_cache_hit_length == 4
+    cache.check_hicache_events()
+    assert all(req.external_cache_hit_length == 0 for req in waiting)
+    assert allocator.available_size() == 10
+    assert tickets.layer_admission is None
+
+    req = waiting[0]
+    req.init_next_round_input(cache, cow_mamba=False)
+    adder = make_adder()
+    adder.add_one_req(req, False, None)
+    assert adder.can_run_list == [req] and (req.prefix_len, req.extend_len) == (0, 7)
+    cache.unlock(req.lock)
+
+    req = _request("cancel-ready", 200)
+    assert tickets.bind(req, expected=True)
+    _drain_until(cache, lambda: not tickets.pending)
+    assert req.external_cache_hit_length == 4
+    cache.linker.release_request(req.cache_request_handle)
+    assert not cache.linker.prefetches and tickets.layer_admission is None
+    assert allocator.available_size() == 10
+    allocator.free(held)
+
+    # A later request hits the entire pool only on PP1. Its queued ticket must
+    # leave those pages evictable until the earlier miss has entered the batch.
+    cache.evict(EvictParams(num_tokens=allocator.size))
+    cold = _request("gap", 230, size=6)
+    later = _request("all-local-on-pp1", 300, size=allocator.size + 1)
+    if rank == 1:
+        cache.insert(
+            InsertParams(
+                key=RadixKey(later.origin_input_ids[:-1]),
+                value=allocator.alloc(allocator.size),
+            )
+        )
+    for req in (cold, later):
+        assert tickets.bind(req, expected=True)
+    _drain_until(cache, lambda: tickets.can_admit(cold.cache_request_handle))
+    assert later.cache_request_handle in tickets.pending
+    cold.init_next_round_input(cache, cow_mamba=False)
+    adder = make_adder()
+    adder.add_one_req(cold, False, None)
+    assert adder.can_run_list == [cold] and (cold.prefix_len, cold.extend_len) == (0, 6)
+    cache.unlock(cold.lock)
+    tickets.release(later.cache_request_handle)
+    _drain_until(cache, lambda: not tickets.pending)
+
 
 def _check_unbound_and_retracted_tickets(cache, store):
     tickets = cache.linker.pp_tickets
@@ -1328,6 +1437,123 @@ def _check_unbound_and_retracted_tickets(cache, store):
     assert active.bind(following, expected=True)
     _drain_until(cache, lambda: not active.pending)
     assert cache.prefetch_loaded_tokens_by_reqid[following.cache_request_handle] == 2
+
+
+def _check_layer_load_verdict(cache, rank):
+    """Use the real launch/retirement paths and move their wire payloads over Gloo."""
+    from collections import deque
+    from types import SimpleNamespace
+
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler_pp_mixin import (
+        SchedulerPPMixin,
+        _pp_can_skip_output_comm,
+    )
+    from sglang.srt.managers.utils import GenerationBatchResult
+    from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+    from sglang.srt.model_executor.forward_mode import ForwardMode
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    scheduler = SchedulerPPMixin()
+    scheduler.tree_cache = cache
+    scheduler.pp_group = SimpleNamespace(
+        is_first_rank=rank == 0, is_last_rank=rank == 1
+    )
+    scheduler.forward_stream_ctx = nullcontext()
+    scheduler._pp_wait_forward_dependencies = lambda: None
+    scheduler.device_module = Mock()
+    scheduler.future_map = Mock()
+    scheduler.tp_worker = Mock()
+    scheduler.enable_unified_cache_external_linker = True
+    for failing_stage, rejected, middle in (
+        (1, False, True),
+        (0, False, False),
+        (1, True, False),
+        (None, False, True),
+    ):
+        req = _request("layer-restore", 90)
+        req.pp_linker_verdict_end = req.extend_end = 4
+        healthy = _request("unrelated-request", 120)
+        scheduler.chunked_req = req if middle else None
+        batch = ScheduleBatch(
+            reqs=[req] if middle else [req, healthy],
+            chunked_req=scheduler.chunked_req,
+            contains_last_prefill_chunk=not middle,
+            forward_mode=ForwardMode.EXTEND,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+        )
+        linker = cache.linker
+        # Only one stage needs storage; the other has the entire boundary in L1.
+        reads_here = rank == (failing_stage if failing_stage is not None else 1)
+        linker.inflight_load_rids = [req.rid] if reads_here else []
+        linker.inflight_load_index = 0 if reads_here and not rejected else -1
+        if reads_here and rejected:
+            linker.rejected_pp_loads.add(req.rid)
+        linker.cache_linker.finish_layer_wise_loading = Mock(
+            return_value=failing_stage is None
+        )
+
+        def forward(batch, proxy):
+            assert proxy is None or "pp_failed_load_rids" not in proxy.tensors
+            result = GenerationBatchResult(
+                next_token_ids=torch.zeros(len(batch.reqs), dtype=torch.int64),
+                pp_hidden_states_proxy_tensors=PPProxyTensors(
+                    {"hidden_states": torch.ones(1)}
+                ),
+            )
+            result.pp_failed_load_rids = tuple(linker.finish_loads(batch.reqs))
+            return result
+
+        scheduler.run_batch = forward
+        metadata, outputs = [None], deque()
+        payload = [None]
+        if rank == 1:
+            dist.recv_object_list(payload, src=0)
+        result, _ = scheduler._pp_launch_batch(
+            0, batch, PPProxyTensors(payload[0]) if rank else None, metadata, outputs
+        )
+        with envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.override(True):
+            assert batch.pp_linker_load and not _pp_can_skip_output_comm(batch)
+        if middle:
+            assert scheduler._pp_linker_chunk_batch is batch
+            # The chunk cannot be consumed by the prefill planner during the
+            # return trip. Other decode work and the output ring remain runnable.
+            assert Scheduler._get_new_batch_prefill_raw(scheduler, None, batch) == (
+                None,
+                batch,
+            )
+        if rank == 0:
+            scheduler.launch_event = None
+            scheduler._pp_send_dict_to_next_stage = lambda tensors, **kwargs: (
+                dist.send_object_list([tensors], dst=1)
+            )
+            scheduler._pp_send_proxy_to_next_stage(result)
+            assert (
+                "pp_failed_load_rids"
+                not in result.pp_hidden_states_proxy_tensors.tensors
+            )
+        else:
+            payload[0] = outputs.popleft()[1].tensors
+        dist.broadcast_object_list(payload, src=1)
+        if rejected:
+            # Speculative PP can filter the live rows before its output returns.
+            metadata[0].fwd_batch = batch.copy()
+            batch.reqs = [healthy]
+        scheduler._pp_prep_batch_result(batch, metadata[0], PPProxyTensors(payload[0]))
+        assert scheduler._pp_linker_chunk_batch is None
+        assert bool(req.skip_radix_cache_insert) == (failing_stage is not None)
+        assert (
+            healthy.discard_output_reason is None
+            and not healthy.skip_radix_cache_insert
+        )
+        if failing_stage is None:
+            assert req.discard_output_reason is None
+        else:
+            assert req.discard_output_reason.status_code == 503
+            if middle:
+                assert scheduler._pending_chunked_abort_req is req
+        dist.barrier()
 
 
 def _run_linker_stage(rank, init_method):
@@ -1387,6 +1613,7 @@ def _run_linker_stage(rank, init_method):
         _check_unbound_and_retracted_tickets(cache, store)
         cache.linker.close()
         _check_layer_wise(cache, allocator, rank)
+        _check_layer_load_verdict(cache, rank)
     finally:
         if store.slow_read is not None and not store.slow_read.done():
             store.slow_read.set_result(False)

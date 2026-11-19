@@ -2029,6 +2029,43 @@ def _bind_pp_private_prefix(cache, req):
     req.kv.set_row_len(len(loaded))
 
 
+@pytest.mark.parametrize("raises", [False, True])
+def test_reserved_pp_load_rejection_preserves_shape_until_abort(pp_cache, raises):
+    cache, allocator, req, backend = pp_cache
+    linker = cache.linker
+    marker = linker.hit_markers[req.rid]
+    end = linker.reserve_pp_prefetch(
+        req.cache_request_handle,
+        req.last_node,
+        linker._prefetch_key(req),
+        marker.device_hit_len,
+        marker.tail_hashes,
+    )
+    assert end == 4
+    with (
+        patch.object(linker, "pp_tickets", MagicMock()),
+        patch.object(
+            backend,
+            "load",
+            return_value=False,
+            side_effect=IOError("rejected") if raises else None,
+        ),
+    ):
+        assert linker.load_back(req) == (4, req.last_node)
+        _bind_pp_private_prefix(cache, req)
+        assert linker.finish_loads([req]) == [req.rid]
+        assert not linker.private_load_indices
+        assert not linker.rejected_pp_loads
+    assert (
+        cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(req.origin_input_ids))
+        ).device_prefix_len
+        == 0
+    )
+    cache.free_kv_row(req.kv, [(0, req.kv.kv_allocated_len)])
+    assert allocator.full_available_size() == allocator.swa_available_size() == 32
+
+
 @pytest.mark.parametrize(
     "cancel_queued,already_completed", [(True, False), (False, False), (False, True)]
 )

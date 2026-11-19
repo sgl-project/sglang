@@ -1082,6 +1082,7 @@ class PrefillAdder:
         chunk_limit: Optional[int],
         chunk_align: Optional[int] = None,
         host_hit_tokens: int = 0,
+        reserved_state_slots: int = 0,
     ) -> tuple[bool, Optional[int]]:
         """Whether ``req`` is admitted, and the chunk limit it is priced at; a
         whole-request budget may admit at a smaller limit than ``chunk_limit``."""
@@ -1097,7 +1098,7 @@ class PrefillAdder:
             chunk_align=chunk_align,
             host_hit_tokens=host_hit_tokens,
             held_state_slots=(
-                self.memory_budget.request_held_state_slots(req)
+                self.memory_budget.request_held_state_slots(req) + reserved_state_slots
                 if self.memory_budget.has_state_slots
                 else 0
             ),
@@ -1904,7 +1905,16 @@ class PrefillAdder:
             return self.add_one_req_ignore_eos(req, truncation_align_size)
 
         max_new = self._swa_new_tokens(req)
+        layer_reserved = bool(
+            getattr(req, "external_cache_hit_length", None) and req.host_hit_length
+        )
         total_tokens, state_slots = self._prefill_charge(req)
+        if layer_reserved:
+            # The ticket holds the FULL/window destinations and the Mamba
+            # checkpoint, which replaces the request's working state at load-back.
+            total_tokens -= req.host_hit_length
+            if self.memory_budget.has_state_slots and req.mamba_host_hit_length:
+                state_slots -= req.mamba_host_hit_length + int(not req.kv.holds_mamba)
         if not self.memory_budget.state_slots_fit(state_slots):
             if (
                 isinstance(self.tree_cache, UnifiedRadixCache)
@@ -1921,7 +1931,10 @@ class PrefillAdder:
                 total_tokens=total_tokens,
                 state_slots=state_slots,
                 host_hit_length=req.host_hit_length,
-                window_host_hit_lengths=req.window_host_hit_lengths,
+                window_host_hit_lengths={}
+                if layer_reserved
+                else req.window_host_hit_lengths,
+                reserved_host_tokens=req.host_hit_length if layer_reserved else 0,
                 truncation_align_size=truncation_align_size,
                 has_chunked_req=has_chunked_req,
             )
@@ -1964,7 +1977,7 @@ class PrefillAdder:
                     if isinstance(self.tree_cache, UnifiedRadixCache)
                     else nullcontext()
                 ):
-                    full_load_tokens = req.host_hit_length
+                    full_load_tokens = 0 if layer_reserved else req.host_hit_length
                     if (
                         self.memory_budget.load_back_needs_full_tokens
                         and isinstance(self.tree_cache, UnifiedRadixCache)
@@ -1988,7 +2001,9 @@ class PrefillAdder:
                         ),
                         extend_input_len=admission.extend_len,
                         max_new_tokens=load_max_new,
-                        window_host_hit_lengths=req.window_host_hit_lengths,
+                        window_host_hit_lengths={}
+                        if layer_reserved
+                        else req.window_host_hit_lengths,
                         chunk_limit=admission.chunk_limit,
                     )
                     if not self.memory_budget.prepare_load_back(**load_budget):
@@ -2044,7 +2059,8 @@ class PrefillAdder:
                     # No FULL was loaded; recomputation may no longer fit.
                     admission = self._select_prefill_admission(
                         req,
-                        total_tokens=total_tokens,
+                        total_tokens=total_tokens
+                        + (promised_host_hit if layer_reserved else 0),
                         state_slots=state_slots,
                         host_hit_length=0,
                         window_host_hit_lengths={},
@@ -2102,6 +2118,7 @@ class PrefillAdder:
         truncation_align_size: Optional[int],
         has_chunked_req: bool = False,
         state_slots: int = 0,
+        reserved_host_tokens: int = 0,
     ) -> _PrefillAdmission | AddReqResult:
         """Select a prefill shape without allocating or publishing cached KV."""
         prefix_len = req.prefix_len + host_hit_length
@@ -2128,7 +2145,10 @@ class PrefillAdder:
             # The cut below lands on this alignment: no admitted limit is
             # below it, so a request is never cut to an empty chunk.
             chunk_align=truncation_align_size,
-            host_hit_tokens=host_hit_length,
+            host_hit_tokens=host_hit_length - reserved_host_tokens,
+            reserved_state_slots=req.mamba_host_hit_length
+            if reserved_host_tokens
+            else 0,
         )
         if not can_admit:
             return self._refused()
@@ -2187,7 +2207,9 @@ class PrefillAdder:
             and self.memory_budget.requires_final_shape_check
             and not self.memory_budget.can_allocate_prefill(
                 paged_input=(
-                    self.ceil_paged_tokens(host_hit_length + extend_len)
+                    self.ceil_paged_tokens(
+                        host_hit_length - reserved_host_tokens + extend_len
+                    )
                     + self.per_req_token_overhead
                     + self._request_slot_reserve_for_req(
                         req, extend_input_len=extend_len

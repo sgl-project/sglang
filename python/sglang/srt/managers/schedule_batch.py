@@ -642,6 +642,8 @@ class Req(ReqDllmMixin):
         self.host_hit_is_storage = False
         # Absolute boundary agreed by the PP layer-wise linker ticket.
         self.external_cache_hit_length: Optional[int] = None
+        # Shared ticket boundary, retained through admission even on an L1 hit.
+        self.pp_linker_verdict_end = 0
         self.storage_prefetch_retry_attempts = 0
         self.staged_prefetch_plan: Optional[StagedPrefetchPlan] = None
         # The tree lock this request holds; None while it runs on a session
@@ -884,6 +886,7 @@ class Req(ReqDllmMixin):
 
     def advance_cache_request_handle(self) -> None:
         self.external_cache_hit_length = None
+        self.pp_linker_verdict_end = 0
         self.cache_request_handle = dataclasses.replace(
             self.cache_request_handle,
             attempt_id=self.cache_request_handle.attempt_id + 1,
@@ -1976,6 +1979,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     chunked_req: Optional[Req] = None
     chunked_req_next_prompt_token: Optional[int] = None
     contains_last_prefill_chunk: bool = True
+    pp_linker_load: bool = False
 
     # Tracks process_prefill_chunk() on the original scheduler batch only.
     prefill_chunk_processed: bool = False
@@ -3509,6 +3513,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             reqs=self.reqs[:],
             launched_reqs=self.launched_reqs,
             chunked_req=self.chunked_req,
+            pp_linker_load=self.pp_linker_load,
             extend_lens=self.extend_lens,
             prefix_lens=self.prefix_lens,
             req_to_token_pool=self.req_to_token_pool,

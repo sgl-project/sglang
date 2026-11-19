@@ -4485,7 +4485,11 @@ class UnifiedRadixCache(BasePrefixCache):
         them."""
         if self.linker is None:
             return []
-        failed_rids = set(self.linker.finish_loads())
+        return self.mark_failed_linker_loads(reqs, self.linker.finish_loads())
+
+    @staticmethod
+    def mark_failed_linker_loads(reqs, failed_rids) -> list[Req]:
+        failed_rids = set(failed_rids)
         failed = [req for req in reqs if req.rid in failed_rids]
         if failed:
             from sglang.srt.managers.req_types import FINISH_ABORT
