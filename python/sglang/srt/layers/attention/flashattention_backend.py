@@ -571,7 +571,7 @@ class FlashAttentionBackend(AttentionBackend):
         # Ragged layouts and encoder offsets still use their eager builders.
         return (
             forward_batch.forward_mode.is_target_verify()
-            and self.fa_impl_ver == 4
+            and self._draft_kv_ring is None
             and self.runner_ids.reads_are_translated
             and self.topk <= 1
             and forward_batch.encoder_lens is None

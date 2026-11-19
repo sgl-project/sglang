@@ -7,6 +7,7 @@ import torch
 
 import sglang.srt.model_executor.model_runner as model_runner_module
 import sglang.srt.speculative.spec_utils as spec_utils
+from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention import flashattention_backend as flashattention_module
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
@@ -338,16 +339,19 @@ class TestUnifiedVerifyGraphMetadata(CustomTestCase):
         builder leaves stale physical pages after replay. Both violate the
         expected physical addresses checked after each mapping change.
         """
-        for page_size in (1, 128):
+        for fa_version, page_size in ((3, 64), (4, 1), (4, 128)):
             for use_swa in (False, True):
-                with self.subTest(page_size=page_size, use_swa=use_swa):
-                    self._check_replay(page_size, use_swa)
+                with self.subTest(
+                    fa_version=fa_version, page_size=page_size, swa=use_swa
+                ):
+                    self._check_replay(fa_version, page_size, use_swa)
 
-    def _check_replay(self, ps, use_swa):
+    def _check_replay(self, fa_version, ps, use_swa):
         device = "cuda"
         bs, pages, delta = 3, 6, 3
         b = FlashAttentionBackend.__new__(FlashAttentionBackend)
-        b.fa_impl_ver = 4
+        b.fa_impl_ver = fa_version
+        b.needs_cpu_seq_lens = False
         b.topk = 1
         b.page_size = ps
         b.max_num_pages = pages
@@ -365,9 +369,17 @@ class TestUnifiedVerifyGraphMetadata(CustomTestCase):
         swa = torch.arange(24, device=device, dtype=torch.int32)
         swa[7] = -1
         runner_ids = RunnerIds.__new__(RunnerIds)
+        runner_ids.is_translating = True
+        runner_ids._rows = torch.arange(b.req_to_token.size(0), device=device)
+        runner_ids.req_to_token = b.req_to_token
+        runner_ids.page_size = ps
         runner_ids._role_sub_pools = {}
         runner_ids._spaces = {
-            IdSpaceKind.FULL: IdSpace(key="full", read_v2p=full),
+            IdSpaceKind.FULL: IdSpace(
+                key="full",
+                read_v2p=full,
+                write=lambda loc: translate_token_ids(loc=loc, v2p=full, page_size=ps),
+            ),
         }
         if use_swa:
             runner_ids._spaces[IdSpaceKind.SLIDING_WINDOW] = IdSpace(
@@ -402,6 +414,13 @@ class TestUnifiedVerifyGraphMetadata(CustomTestCase):
             positions=torch.arange(bs * delta, device=device),
             out_cache_loc=None,
         )
+        fb.iteration_ids = runner_ids.plan(
+            req_pool_indices=fb.req_pool_indices,
+            seq_lens=fb.seq_lens,
+            seq_lens_cpu=None,
+            write_virtual=None,
+            read_extent=delta,
+        )
         b.init_forward_metadata_out_graph(fb, in_capture=True)
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
@@ -427,6 +446,8 @@ class TestUnifiedVerifyGraphMetadata(CustomTestCase):
                 full[12:18] = 4
                 fb.seq_lens.copy_(torch.tensor([2 * ps, 0, 1], device=device))
             b.init_forward_metadata_out_graph(fb)
+            # A different graph bucket can overwrite the shared buffer before replay.
+            metadata.page_table.fill_(-99)
             graph.replay()
             torch.cuda.synchronize()
             self.assertEqual(metadata.page_table.data_ptr(), pointer)
