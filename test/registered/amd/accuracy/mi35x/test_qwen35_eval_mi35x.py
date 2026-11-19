@@ -3,7 +3,7 @@
 Tests Qwen/Qwen3.5-397B-A17B (MoE, Hybrid Attention with Gated Delta Networks)
 with lm-eval GSM8K benchmark on MI35x, matching the AMD Day 0 article.
 
-Registry: nightly-amd-accuracy-8-gpu-mi35x-qwen35 suite
+Registry: nightly-accuracy-test-8-gpu-amd-mi35x-qwen35 suite
 """
 
 import os
@@ -26,7 +26,7 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=3600, suite="nightly-amd-accuracy-8-gpu-mi35x-qwen35", nightly=True
+    est_time=3600, suite="nightly-accuracy-test-8-gpu-amd-mi35x-qwen35", nightly=True
 )
 
 QWEN35_MODEL_PATH = "Qwen/Qwen3.5-397B-A17B"
