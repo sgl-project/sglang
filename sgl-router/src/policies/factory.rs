@@ -328,6 +328,7 @@ mod tests {
 
     fn cfg_with_model(id: &str, policy: PolicyKind) -> Config {
         Config {
+            additional_models: Vec::new(),
             server: ServerConfig {
                 host: "0".into(),
                 port: 0,

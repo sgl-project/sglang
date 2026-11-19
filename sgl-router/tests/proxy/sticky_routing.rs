@@ -33,6 +33,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// out so the background sweeper never fires mid-test.
 fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext> {
     let cfg = Config {
+        additional_models: Vec::new(),
         server: ServerConfig {
             host: "0".into(),
             port: 0,

@@ -115,6 +115,7 @@ mod tests {
 
     fn ctx_with_tiny() -> Arc<AppContext> {
         let cfg = crate::config::Config {
+            additional_models: Vec::new(),
             server: crate::config::ServerConfig {
                 host: "x".into(),
                 port: 0,

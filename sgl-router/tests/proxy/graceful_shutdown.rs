@@ -44,6 +44,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
     let cfg = Config {
+        additional_models: Vec::new(),
         server: ServerConfig {
             host: "127.0.0.1".into(),
             port: 0,

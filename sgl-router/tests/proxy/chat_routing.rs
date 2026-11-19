@@ -31,6 +31,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn config_for(_worker_url: &str) -> Config {
     Config {
+        additional_models: Vec::new(),
         server: ServerConfig {
             host: "0".into(),
             port: 0,

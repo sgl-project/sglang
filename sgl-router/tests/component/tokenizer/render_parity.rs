@@ -123,6 +123,7 @@ fn registry_with_defaults(
     default_chat_template_kwargs: ChatTemplateKwargs,
 ) -> TokenizerRegistry {
     let cfg = Config {
+        additional_models: Vec::new(),
         server: ServerConfig {
             host: "0".into(),
             port: 0,

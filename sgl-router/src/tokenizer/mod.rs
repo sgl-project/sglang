@@ -343,6 +343,7 @@ mod tests {
 
     fn cfg() -> crate::config::Config {
         crate::config::Config {
+            additional_models: Vec::new(),
             server: crate::config::ServerConfig {
                 host: "0".into(),
                 port: 0,

@@ -63,12 +63,24 @@ pub struct Cli {
 
 #[derive(clap::Args, Debug)]
 pub struct ModelArgs {
-    /// Model id this router serves (the OpenAI `model` field).
+    /// Default model id this router serves (the OpenAI `model` field).
     #[arg(long)]
     pub model_id: String,
 
+    /// Additional model and its tokenizer source (repeatable); routing parameters are shared.
+    #[arg(
+        long,
+        value_name = "MODEL=TOKENIZER_PATH",
+        conflicts_with = "no_tokenizer"
+    )]
+    pub additional_model: Vec<String>,
+
+    /// JSON routing overrides keyed by already-declared model IDs.
+    #[arg(long, value_name = "PATH")]
+    pub model_config: Option<String>,
+
     /// Extra `model` value rewritten to --model-id in the forwarded body (repeatable),
-    /// preserving a LoRA suffix. /v1/models lists only --model-id.
+    /// preserving a LoRA suffix. /v1/models lists configured IDs, excluding aliases.
     #[arg(long = "model-alias", value_name = "MODEL")]
     pub model_alias: Vec<String>,
 
@@ -602,17 +614,6 @@ impl Cli {
              --kv-bootstrap-seed-required require --kv-peer-selector, which is \
              what enables peer bootstrap"
         );
-        if has_peer_selector {
-            match cache_aware.as_ref().map(|c| c.prefix_provider) {
-                None => bail!("--kv-peer-selector requires --policy cache_aware"),
-                Some(p) if p != CachePrefixProvider::RadixTree => bail!(
-                    "--kv-peer-selector requires --cache-prefix-provider radix_tree \
-                     (there is no local tree to bootstrap when an external Indexer is \
-                     the prefix source)"
-                ),
-                _ => {}
-            }
-        }
         let fused = self.routing.build_fused()?;
         let eligibility = self.routing.build_eligibility(reorg)?;
         let reorg_admission = self.routing.build_reorg_admission()?;
@@ -644,7 +645,8 @@ impl Cli {
             .as_deref()
             .map(bearer)
             .transpose()?;
-        let config = Config {
+        let mut config = Config {
+            additional_models: Vec::new(),
             server: ServerConfig {
                 host: self.server.host,
                 port: self.server.port,
@@ -700,11 +702,171 @@ impl Cli {
                 stale_request_timeout_secs: self.server.stale_request_timeout_secs,
             },
         };
+        for entry in self.model.additional_model {
+            let (id, source) = entry
+                .split_once('=')
+                .context("--additional-model requires MODEL=TOKENIZER_PATH")?;
+            anyhow::ensure!(
+                !id.is_empty() && !source.is_empty(),
+                "--additional-model requires non-empty MODEL and TOKENIZER_PATH"
+            );
+            let mut model = config.model.clone();
+            model.id = id.into();
+            model.aliases.clear();
+            model.tokenizer_path = Some(source.into());
+            config.additional_models.push(model);
+        }
+        if let Some(path) = self.model.model_config {
+            let raw = std::fs::read_to_string(&path)
+                .with_context(|| format!("--model-config cannot read {path:?}"))?;
+            let overrides: ModelOverridesFile = serde_json::from_str(&raw)
+                .with_context(|| format!("--model-config {path:?} is not valid JSON"))?;
+            let cache_defaults = CacheAwareConfig {
+                bootstrap_timeout_ms: kv_bootstrap_timeout_ms
+                    .unwrap_or(DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS),
+                bootstrap_fetch_timeout_cap_ms: kv_bootstrap_fetch_timeout_cap_ms
+                    .unwrap_or(DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS),
+                bootstrap_seed_required: kv_bootstrap_seed_required,
+                ..Default::default()
+            };
+            overrides.apply(&mut config, reorg, &cache_defaults)?;
+        }
+        if has_peer_selector {
+            match config.cache_aware().map(|cache| cache.prefix_provider) {
+                None => bail!("--kv-peer-selector requires --policy cache_aware"),
+                Some(provider) if provider != CachePrefixProvider::RadixTree => bail!(
+                    "--kv-peer-selector requires --cache-prefix-provider radix_tree \
+                     (there is no local tree to bootstrap when an external Indexer is \
+                     the prefix source)"
+                ),
+                _ => {}
+            }
+        }
         config.validate()?;
         if self.routing.chat_routing == ChatRoutingKind::Reorg {
-            crate::policies_reorg::factory::validate(&config.model)?;
+            for model in config.models() {
+                crate::policies_reorg::factory::validate(model)?;
+            }
         }
         Ok(config)
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelOverridesFile {
+    models: Vec<ModelRoutingOverrides>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelRoutingOverrides {
+    id: String,
+    policy: Option<PolicyKind>,
+    decode_policy: Option<DecodePolicyKind>,
+    dp_aware: Option<bool>,
+    dp_rank_policy: Option<DpRankPolicy>,
+    bucket_config: Option<serde_json::Value>,
+    reorg_admission: Option<AdmissionLimits>,
+}
+
+impl ModelOverridesFile {
+    fn apply(
+        self,
+        config: &mut Config,
+        reorg: bool,
+        cache_defaults: &CacheAwareConfig,
+    ) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for entry in self.models {
+            ensure!(
+                seen.insert(entry.id.clone()),
+                "--model-config duplicates model {:?}",
+                entry.id
+            );
+            let model = std::iter::once(&mut config.model)
+                .chain(&mut config.additional_models)
+                .find(|model| model.id == entry.id)
+                .with_context(|| {
+                    format!("--model-config references unknown model {:?}", entry.id)
+                })?;
+            if let Some(policy) = entry.policy.filter(|policy| *policy != model.policy) {
+                ensure!(
+                    policy != PolicyKind::Sticky || model.sticky.is_some(),
+                    "--model-config sticky requires existing CLI sticky configuration"
+                );
+                ensure!(
+                    !matches!(policy, PolicyKind::FusedScore | PolicyKind::ScorePolicy)
+                        || model.fused.is_some(),
+                    "--model-config score policies require existing CLI --fuse configuration"
+                );
+                model.policy = policy;
+                if policy == PolicyKind::CacheAware {
+                    model
+                        .cache_aware
+                        .get_or_insert_with(|| cache_defaults.clone());
+                } else {
+                    model.cache_aware = None;
+                }
+                if matches!(policy, PolicyKind::SessionAware | PolicyKind::CacheAware) {
+                    let affinity = model.affinity.get_or_insert_with(|| {
+                        let mut affinity = AffinityConfig::default();
+                        if reorg {
+                            affinity.mode = AffinityMode::Prefer;
+                        }
+                        affinity
+                    });
+                    if policy == PolicyKind::SessionAware {
+                        affinity.route_by_uncached_tokens = false;
+                    } else {
+                        affinity.stable_pair = false;
+                        affinity.session_affinity_mode = SessionAffinityMode::Bucket;
+                    }
+                } else {
+                    model.affinity = None;
+                }
+                if policy != PolicyKind::Sticky {
+                    model.sticky = None;
+                } else {
+                    model.eligibility = None;
+                }
+                if !matches!(policy, PolicyKind::FusedScore | PolicyKind::ScorePolicy) {
+                    model.fused = None;
+                }
+            }
+            if let Some(policy) = entry.decode_policy {
+                model.decode_policy = policy;
+            }
+            if let Some(enabled) = entry.dp_aware {
+                model.dp_aware = enabled;
+            }
+            if let Some(policy) = entry.dp_rank_policy {
+                model.dp_rank_policy = policy;
+            }
+            if let Some(bucket_config) = entry.bucket_config {
+                if reorg {
+                    model.reorg_buckets = Some(serde_json::from_value(bucket_config).context(
+                        "--model-config bucket_config must use the reorg bucket schema",
+                    )?);
+                } else {
+                    model.bucket_config = Some(serde_json::from_value(bucket_config).context(
+                        "--model-config bucket_config must use the legacy bucket schema",
+                    )?);
+                }
+            }
+            if let Some(admission) = entry.reorg_admission {
+                ensure!(
+                    reorg,
+                    "--model-config reorg_admission requires --chat-routing reorg"
+                );
+                model.reorg_admission = admission.or(&model.reorg_admission);
+                model
+                    .reorg_admission
+                    .validate()
+                    .map_err(|error| anyhow!("--model-config reorg_admission: {error}"))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1554,6 +1716,240 @@ mod tests {
         assert_eq!(c.model.id, "Qwen/Qwen3-0.6B");
         assert_eq!(c.model.tokenizer_path.as_deref(), Some("Qwen/Qwen3-0.6B"));
         assert!(c.model.aliases.is_empty());
+    }
+
+    #[test]
+    fn model_config_overrides_one_declared_model() {
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(&path, r#"{"models":[{"id":"second","policy":"load_based","decode_policy":"legacy_host_affinity","dp_aware":true,"dp_rank_policy":"round_robin","bucket_config":{"buckets":[{"id":"second-prefill","stage":"prefill","rank":0,"worker_ids":["second-worker"]}]}}]}"#).unwrap();
+        let config = into_config(&[
+            "--model-id",
+            "first",
+            "--worker-urls",
+            "http://x:30000",
+            "--additional-model",
+            "second=org/second",
+            "--model-config",
+            path.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(config.model.policy, PolicyKind::RoundRobin);
+        assert!(config.model.bucket_config.is_none());
+        let second = &config.additional_models[0];
+        assert_eq!(second.policy, PolicyKind::LoadBased);
+        assert_eq!(second.decode_policy, DecodePolicyKind::LegacyHostAffinity);
+        assert!(second.dp_aware);
+        assert_eq!(second.dp_rank_policy, DpRankPolicy::RoundRobin);
+        assert_eq!(
+            second.bucket_config.as_ref().unwrap().buckets[0].id,
+            "second-prefill"
+        );
+        assert_eq!(second.tokenizer_path.as_deref(), Some("org/second"));
+    }
+
+    #[test]
+    fn model_config_enables_cache_aware_on_additional_model() {
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            r#"{"models":[{"id":"second","policy":"cache_aware"}]}"#,
+        )
+        .unwrap();
+        let config = into_config(&[
+            "--model-id",
+            "first",
+            "--worker-urls",
+            "http://x:30000",
+            "--additional-model",
+            "second=org/second",
+            "--model-config",
+            path.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(config.model.cache_aware.is_none());
+        assert!(config.additional_models[0].cache_aware.is_some());
+        assert!(config.additional_models[0].affinity.is_some());
+    }
+
+    #[test]
+    fn model_config_retains_compatible_affinity_tuning() {
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            r#"{"models":[{"id":"second","policy":"cache_aware"}]}"#,
+        )
+        .unwrap();
+        let config = into_config(&[
+            "--model-id",
+            "first",
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "session_aware",
+            "--pressure-rel-threshold",
+            "2.0",
+            "--stable-pair",
+            "--additional-model",
+            "second=org/second",
+            "--model-config",
+            path.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(config.model.affinity.as_ref().unwrap().stable_pair);
+        let affinity = config.additional_models[0].affinity.as_ref().unwrap();
+        assert_eq!(affinity.pressure_rel_threshold, 2.0);
+        assert!(!affinity.stable_pair);
+    }
+
+    #[test]
+    fn model_config_rejects_unknown_duplicate_or_invalid_overrides() {
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let path = dir.path().join("models.json");
+        let base = [
+            "--model-id",
+            "first",
+            "--worker-urls",
+            "http://x:30000",
+            "--additional-model",
+            "second=org/second",
+            "--model-config",
+            path.to_str().unwrap(),
+        ];
+        for body in [
+            r#"{"models":[{"id":"unknown","policy":"load_based"}]}"#,
+            r#"{"models":[{"id":"second"},{"id":"second"}]}"#,
+            r#"{"models":[{"id":"second","unknown":true}]}"#,
+            r#"{"models":[],"unknown":true}"#,
+            r#"{"models":[{"id":"second","decode_policy":"round_robin"}]}"#,
+            r#"{"models":[{"id":"second","policy":"sticky"}]}"#,
+            r#"{"models":[{"id":"second","policy":"fused_score"}]}"#,
+            r#"{"models":[{"id":"second","reorg_admission":{"max_inflight_requests":2}}]}"#,
+            r#"{"models":[{"id":"second","bucket_config":{"buckets":[{"id":"r","plain":{}}]}}]}"#,
+            r#"{"models":[{"id":"second","bucket_config":{"buckets":[]}}]}"#,
+        ] {
+            std::fs::write(&path, body).unwrap();
+            assert!(into_config(&base).is_err(), "accepted {body}");
+        }
+    }
+
+    #[test]
+    fn model_config_reorg_uses_existing_bucket_and_admission_schema() {
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(&path, r#"{"models":[{"id":"second","policy":"cache_aware","bucket_config":{"buckets":[{"id":"second-plain","plain":{}}]},"reorg_admission":{"max_waiting_requests":3}}]}"#).unwrap();
+        let config = into_config(&[
+            "--model-id",
+            "first",
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "power_of_two",
+            "--chat-routing",
+            "reorg",
+            "--max-inflight-requests",
+            "4",
+            "--additional-model",
+            "second=org/second",
+            "--model-config",
+            path.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(config.model.policy, PolicyKind::PowerOfTwo);
+        let second = &config.additional_models[0];
+        assert_eq!(second.policy, PolicyKind::CacheAware);
+        assert!(second.bucket_config.is_none());
+        assert_eq!(
+            second.reorg_buckets.as_ref().unwrap().buckets[0].id,
+            "second-plain"
+        );
+        assert_eq!(second.reorg_admission.max_waiting_requests, Some(3));
+        assert_eq!(second.reorg_admission.max_inflight_requests, Some(4));
+        assert_eq!(second.affinity.as_ref().unwrap().mode, AffinityMode::Prefer);
+    }
+
+    #[test]
+    fn additional_models_have_independent_sources_and_shared_policy() {
+        let config = into_config(&[
+            "--model-id",
+            "first",
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "random",
+            "--additional-model",
+            "second=/models/second",
+            "--additional-model",
+            "third=org/third",
+        ])
+        .unwrap();
+        assert_eq!(
+            config
+                .models()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second", "third"]
+        );
+        assert_eq!(
+            config.additional_models[0].tokenizer_path.as_deref(),
+            Some("/models/second")
+        );
+        assert_eq!(
+            config.additional_models[1].tokenizer_path.as_deref(),
+            Some("org/third")
+        );
+        assert!(config
+            .models()
+            .all(|model| model.policy == PolicyKind::Random));
+        assert!(config.resolve_model("unknown").is_none());
+        assert_eq!(config.resolve_model("second:adapter").unwrap().id, "second");
+    }
+
+    #[test]
+    fn additional_models_reject_invalid_or_ambiguous_names() {
+        let base = ["--model-id", "first", "--worker-urls", "http://x:30000"];
+        for value in ["second", "=/models/second", "second=", "first=path"] {
+            assert!(
+                into_config(&[&base[..], &["--additional-model", value]].concat()).is_err(),
+                "{value}"
+            );
+        }
+        assert!(into_config(
+            &[
+                &base[..],
+                &[
+                    "--additional-model",
+                    "second=path",
+                    "--additional-model",
+                    "second=other"
+                ]
+            ]
+            .concat()
+        )
+        .is_err());
+        assert!(into_config(
+            &[
+                &base[..],
+                &[
+                    "--model-alias",
+                    "second",
+                    "--additional-model",
+                    "second=path"
+                ]
+            ]
+            .concat()
+        )
+        .is_err());
+        assert!(into_config(
+            &[
+                &base[..],
+                &["--no-tokenizer", "--additional-model", "second=path"]
+            ]
+            .concat()
+        )
+        .is_err());
     }
 
     #[test]

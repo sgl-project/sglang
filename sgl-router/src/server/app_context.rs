@@ -206,6 +206,7 @@ impl AppContext {
     pub fn stub() -> Self {
         Self {
             config: Config {
+                additional_models: Vec::new(),
                 server: crate::config::ServerConfig {
                     host: "x".into(),
                     port: 0,

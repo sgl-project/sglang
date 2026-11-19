@@ -669,6 +669,7 @@ mod tests {
 
     fn cfg_with_model_cb(id: &str, threshold: u32, cool_down_secs: u64) -> Config {
         Config {
+            additional_models: Vec::new(),
             server: ServerConfig {
                 host: "0".into(),
                 port: 0,

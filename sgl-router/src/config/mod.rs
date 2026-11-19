@@ -41,18 +41,64 @@ pub fn shutdown_drain_advisory(
 }
 
 impl Config {
+    pub fn models(&self) -> impl Iterator<Item = &ModelConfig> {
+        std::iter::once(&self.model).chain(&self.additional_models)
+    }
+
+    pub fn cache_aware(&self) -> Option<&CacheAwareConfig> {
+        self.models()
+            .filter(|model| model.policy == PolicyKind::CacheAware)
+            .find_map(|model| model.cache_aware.as_ref())
+    }
+
+    /// Single-model deployments preserve the engine's permissive model naming.
+    pub fn resolve_model(&self, name: &str) -> Option<&ModelConfig> {
+        if self.additional_models.is_empty() {
+            return Some(&self.model);
+        }
+        self.models()
+            .find(|model| model.id == name || model.aliases.iter().any(|alias| alias == name))
+            .or_else(|| {
+                self.models()
+                    .filter_map(|model| {
+                        std::iter::once(&model.id)
+                            .chain(&model.aliases)
+                            .filter(|id| {
+                                name.strip_prefix(id.as_str())
+                                    .is_some_and(|suffix| suffix.starts_with(':'))
+                            })
+                            .map(|id| (model, id.len()))
+                            .max_by_key(|(_, len)| *len)
+                    })
+                    .max_by_key(|(_, len)| *len)
+                    .map(|(model, _)| model)
+            })
+    }
+
     /// Validate invariants not enforced by the CLI parser.
     pub(crate) fn validate(&self) -> Result<()> {
-        ensure!(!self.model.id.is_empty(), "model id must be non-empty");
-        // Policies that read the prompt are checked against the built routing at startup.
-        ensure!(
-            self.model.tokenizer_path.is_some() || self.model.bucket_config.is_none(),
-            "--no-tokenizer is incompatible with --bucket-config"
-        );
-        if let Some(bucket_config) = self.model.bucket_config.as_ref() {
-            validate_bucket_config(bucket_config)?;
+        let mut names = std::collections::HashSet::new();
+        for model in self.models() {
+            ensure!(!model.id.is_empty(), "model id must be non-empty");
+            model.validate()?;
+            if !self.additional_models.is_empty() {
+                for name in std::iter::once(&model.id).chain(&model.aliases) {
+                    ensure!(
+                        names.insert(name),
+                        "model name or alias is duplicated: {name}"
+                    );
+                }
+            }
         }
-        self.model.sampling_overrides.validate()?;
+        if let Some(shared) = self.cache_aware() {
+            ensure!(
+                self.models()
+                    .filter(|model| model.policy == PolicyKind::CacheAware)
+                    .filter_map(|model| model.cache_aware.as_ref())
+                    .all(|cache| cache == shared),
+                "cache-aware prefix source and cache settings must be shared across models"
+            );
+        }
         ensure!(
             self.proxy.request_timeout_secs > 0,
             "request_timeout_secs must be greater than zero"
@@ -73,25 +119,6 @@ impl Config {
              can check it against the pod's real budget",
             self.server.shutdown_drain_secs,
         );
-        if let Some(cache) = self.model.cache_aware.as_ref() {
-            let ms = cache.bootstrap_timeout_ms;
-            ensure!(
-                ms > 0,
-                "--kv-bootstrap-timeout-ms must be greater than zero; to boot cold, \
-                 leave --kv-peer-selector unset"
-            );
-            ensure!(
-                ms <= MAX_KV_BOOTSTRAP_TIMEOUT_MS,
-                "--kv-bootstrap-timeout-ms {ms} exceeds the {MAX_KV_BOOTSTRAP_TIMEOUT_MS}ms ceiling"
-            );
-            let cap = cache.bootstrap_fetch_timeout_cap_ms;
-            ensure!(
-                (MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS..=MAX_KV_BOOTSTRAP_TIMEOUT_MS)
-                    .contains(&cap),
-                "--kv-bootstrap-fetch-timeout-cap-ms {cap} is out of range \
-                 ({MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS}..={MAX_KV_BOOTSTRAP_TIMEOUT_MS}ms)"
-            );
-        }
         match &self.discovery {
             DiscoveryBackend::StaticUrls(s) => {
                 ensure!(
@@ -126,6 +153,48 @@ impl Config {
             }
             // Kubernetes selector combinations are validated by `resolve_mode` during construction.
             DiscoveryBackend::K8s(_) => {}
+        }
+        Ok(())
+    }
+}
+
+impl ModelConfig {
+    fn validate(&self) -> Result<()> {
+        // Policies that read the prompt are checked against the built routing at startup.
+        ensure!(
+            self.tokenizer_path.is_some() || self.bucket_config.is_none(),
+            "--no-tokenizer is incompatible with --bucket-config"
+        );
+        if let Some(bucket_config) = self.bucket_config.as_ref() {
+            validate_bucket_config(bucket_config)?;
+        }
+        self.sampling_overrides.validate()?;
+        ensure!(
+            self.dp_aware || self.dp_rank_policy == DpRankPolicy::default(),
+            "dp_rank_policy requires dp_aware for model {:?}",
+            self.id
+        );
+        self.reorg_admission
+            .validate()
+            .map_err(|error| anyhow!("model {:?} admission: {error}", self.id))?;
+        if let Some(cache) = self.cache_aware.as_ref() {
+            let ms = cache.bootstrap_timeout_ms;
+            ensure!(
+                ms > 0,
+                "--kv-bootstrap-timeout-ms must be greater than zero; to boot cold, \
+                 leave --kv-peer-selector unset"
+            );
+            ensure!(
+                ms <= MAX_KV_BOOTSTRAP_TIMEOUT_MS,
+                "--kv-bootstrap-timeout-ms {ms} exceeds the {MAX_KV_BOOTSTRAP_TIMEOUT_MS}ms ceiling"
+            );
+            let cap = cache.bootstrap_fetch_timeout_cap_ms;
+            ensure!(
+                (MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS..=MAX_KV_BOOTSTRAP_TIMEOUT_MS)
+                    .contains(&cap),
+                "--kv-bootstrap-fetch-timeout-cap-ms {cap} is out of range \
+                 ({MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS}..={MAX_KV_BOOTSTRAP_TIMEOUT_MS}ms)"
+            );
         }
         Ok(())
     }
@@ -252,6 +321,7 @@ mod tests {
 
     fn cfg(model_id: &str, urls: &[&str]) -> Config {
         Config {
+            additional_models: Vec::new(),
             server: ServerConfig::default(),
             observability: ObservabilityConfig::default(),
             model: ModelConfig {
@@ -282,6 +352,31 @@ mod tests {
             proxy: ProxyConfig::default(),
             router_inflight_load: InflightLoadConfig::default(),
         }
+    }
+
+    #[test]
+    fn model_resolution_preserves_single_model_names_and_longest_adapter_prefix() {
+        let mut config = cfg("first", &["http://x:30000"]);
+        assert_eq!(config.resolve_model("unknown").unwrap().id, "first");
+        config.model.aliases = vec!["s3://bucket/base".into()];
+        let mut second = config.model.clone();
+        second.id = "s3://bucket/base:extended".into();
+        second.aliases.clear();
+        config.additional_models.push(second);
+        for name in [
+            "s3://bucket/base:extended",
+            "s3://bucket/base:extended:adapter",
+        ] {
+            assert_eq!(
+                config.resolve_model(name).unwrap().id,
+                "s3://bucket/base:extended"
+            );
+        }
+        assert_eq!(
+            config.resolve_model("s3://bucket/base:adapter").unwrap().id,
+            "first"
+        );
+        assert!(config.resolve_model("unknown").is_none());
     }
 
     #[test]

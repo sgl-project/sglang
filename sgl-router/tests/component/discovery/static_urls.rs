@@ -122,6 +122,7 @@ async fn static_urls_pd_role_resolved_end_to_end() {
     });
 
     let cfg = Config {
+        additional_models: Vec::new(),
         server: ServerConfig {
             host: "127.0.0.1".into(),
             port: 0,

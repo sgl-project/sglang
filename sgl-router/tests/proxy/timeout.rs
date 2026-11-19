@@ -30,6 +30,7 @@ use tower::ServiceExt;
 
 fn config(_worker_url: &str) -> Config {
     Config {
+        additional_models: Vec::new(),
         server: ServerConfig {
             host: "0".into(),
             port: 0,

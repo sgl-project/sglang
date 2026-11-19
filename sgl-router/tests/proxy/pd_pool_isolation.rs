@@ -36,6 +36,7 @@ use tower::ServiceExt;
 
 fn config() -> Config {
     Config {
+        additional_models: Vec::new(),
         server: ServerConfig {
             host: "0".into(),
             port: 0,

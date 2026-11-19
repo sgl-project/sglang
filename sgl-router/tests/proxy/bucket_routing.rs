@@ -52,6 +52,7 @@ fn build_app_context(
     affinity: Option<AffinityConfig>,
 ) -> AppContext {
     let config = Config {
+        additional_models: Vec::new(),
         server: ServerConfig {
             host: "0".into(),
             port: 0,
