@@ -18,15 +18,14 @@ import torch
 from torch import nn
 
 from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
-from sglang.kernels.ops.diffusion import fused_packed_silu_mul_bitexact
 from sglang.kernels.spec import KernelBackend
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.layernorm import apply_qk_norm_rope
 from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
 from sglang.multimodal_gen.runtime.layers.quantization.flux3_prims_ts import (
     FLUX3_PRIMS_TS_CAPABILITIES,
     Flux3PrimsTsRole,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
 def _base_layer(layer: nn.Module) -> nn.Module:
@@ -56,23 +55,8 @@ def _prims_ts_method(layer: nn.Module, role: Flux3PrimsTsRole):
     return None
 
 
-def _silu_and_mul(x: torch.Tensor) -> torch.Tensor:
-    if (
-        x.dim() == 3
-        and x.dtype is torch.bfloat16
-        and x.is_contiguous()
-        and x.is_cuda
-        and current_platform.is_cuda()
-        and not torch.compiler.is_compiling()
-    ):
-        # one pass at aten's two bf16 roundings, half silu_and_mul's time at these widths
-        return fused_packed_silu_mul_bitexact(x)
-    from sgl_kernel import silu_and_mul
-
-    d = x.shape[-1] // 2
-    out = torch.empty(x.shape[:-1] + (d,), dtype=x.dtype, device=x.device)
-    silu_and_mul(x.view(-1, 2 * d), out.view(-1, d))
-    return out
+# platform-selected kernel: on NVIDIA under half the time of sgl_kernel's silu_and_mul at these widths
+_SILU_AND_MUL = SiluAndMul()
 
 
 def _unpack_qkv(qkv: torch.Tensor, local_heads: int):
@@ -205,7 +189,7 @@ class Flux3GatedMLPOp(_Flux3PrimsTsOp):
 
     def forward_native(self, mlp_in, mlp_out, x, quantized=None) -> torch.Tensor:
         mlp, _ = mlp_in(x)
-        return flux3_linear(mlp_out, _silu_and_mul(mlp))
+        return flux3_linear(mlp_out, _SILU_AND_MUL(mlp))
 
     def forward_flashinfer(self, mlp_in, mlp_out, x, quantized=None) -> torch.Tensor:
         up_layer = _base_layer(mlp_in)
