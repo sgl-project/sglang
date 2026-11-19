@@ -531,18 +531,20 @@ class TestTRTLLMMHADecodeGroupHoist(CustomTestCase):
         with mock.patch.object(
             trtllm_mha_backend, "flashinfer", fake_flashinfer, create=True
         ):
-            return trtllm_mha_backend.TRTLLMHAAttnBackend._run_fixed_q_len_decode(
+            return trtllm_mha_backend.TRTLLMHAAttnBackend._run_decode_groups(
                 backend,
-                query,
-                None,
-                block_tables,
-                seq_lens,
+                query=query,
+                kv_cache=None,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
                 bmm1_scale=1.0,
                 bmm2_scale=1.0,
                 window_left=-1,
                 sinks=None,
                 q_len_per_req=q_len,
+                kv_cache_sf=None,
                 out=out,
+                out_dtype=torch.bfloat16,
                 mask=mask,
             )
 
