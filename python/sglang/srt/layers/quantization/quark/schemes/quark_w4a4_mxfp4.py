@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import os
 import threading
 from typing import Any, Callable, Optional
 
@@ -117,6 +118,25 @@ def _asm_fp4_prequantized_input(
 # This trades a little memory for correctness on hardware that cannot execute
 # the fp4 kernel at all.
 _dequant_linear_to_bf16 = is_gfx1250_supported()
+# SGLANG_OPT_QUARK_BF16_TGEMM=1: run those dequantized bf16 linears via aiter tgemm.mm (tuned BF16 GEMM CSV) instead of
+# F.linear, for inputs of at most SGLANG_OPT_QUARK_BF16_TGEMM_MAX_M rows (default 128, decode); larger M keeps F.linear.
+# SGLANG_OPT_QUARK_BF16_TGEMM_EXACT_M: comma-separated token counts that also use tgemm.mm, even above that cap.
+# Each listed M must have its own CSV row. A hipBLASLt solution tuned at one M and reused at a padded M can fault
+# on gfx1250 (a row tuned at M=2048 faulted at M=1536), so this is not a higher cap. Empty by default.
+_dequant_bf16_use_tgemm = _dequant_linear_to_bf16 and os.environ.get("SGLANG_OPT_QUARK_BF16_TGEMM", "0") == "1"
+_dequant_bf16_tgemm_max_m = int(os.environ.get("SGLANG_OPT_QUARK_BF16_TGEMM_MAX_M", "128"))
+
+
+def _parse_exact_m(raw: str) -> frozenset:
+    out = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if part:
+            out.add(int(part))
+    return frozenset(out)
+
+
+_dequant_bf16_tgemm_exact_m = _parse_exact_m(os.environ.get("SGLANG_OPT_QUARK_BF16_TGEMM_EXACT_M", ""))
 
 # MXFP4 (OCP MX FP4 / e2m1) decode table, indexed by the 4-bit code.
 _MXFP4_VALUES = [
@@ -872,6 +892,21 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         if getattr(layer, "dequantized_bf16", False):
             if isinstance(x, tuple):
                 x = x[0]
+            if _dequant_bf16_use_tgemm:
+                # Route small-M calls through aiter tgemm so the tuned BF16 GEMM CSV applies: F.linear takes torch's
+                # hipBLASLt heuristic, 11-17 us per call at decode M on the TP16 shared-expert shapes vs 3-5 us tuned.
+                from aiter.tuned_gemm import tgemm
+
+                x2 = x.reshape(-1, x.shape[-1])
+                # Larger M stays on F.linear: tuned hipBLASLt rows reused at a padded M can fault on gfx1250 (a solution
+                # tuned at M=2048 faulted at M=1536). An M listed in SGLANG_OPT_QUARK_BF16_TGEMM_EXACT_M is the
+                # exception: that call hits its own row, and every other M above the cap still stays here.
+                if (
+                    x2.shape[0] <= _dequant_bf16_tgemm_max_m
+                    or x2.shape[0] in _dequant_bf16_tgemm_exact_m
+                ):
+                    out = tgemm.mm(x2, layer.weight, bias, otype=x.dtype)
+                    return out.view(*x.shape[:-1], out.shape[-1])
             return torch.nn.functional.linear(x, layer.weight, bias)
 
         if getattr(layer, "use_aiter_asm_fp4_gemm", False):

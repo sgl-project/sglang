@@ -1186,6 +1186,37 @@ class Envs:
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
+    # 5D prefix extend: FlyDSL a8w8 (fp8 Q/K/V, bf16 out) instead of bf16; used only when the layer K/V scales are 1.0.
+    SGLANG_OPT_FLYDSL_EXTEND_FP8 = EnvBool(False)
+    # aiter backend SHUFFLE 5D decode via FlyDSL pa_decode instead of pa_decode_gluon (gfx1250, sliding window aware).
+    SGLANG_OPT_FLYDSL_PA_DECODE = EnvBool(False)
+    # gfx1250 aiter backend: prefix-free causal extend attention via FlyDSL FMHA (sliding window aware).
+    SGLANG_OPT_FLYDSL_EXTEND_ATTN = EnvBool(False)
+    # gfx1250 only: Laguna fp32 router logits via FlyDSL GEMV/WMMA for M <= 64 (F.linear otherwise).
+    SGLANG_OPT_LAGUNA_ROUTER_FLYDSL = EnvBool(False)
+    # M>64 router logits: split the fp32 weight into 3 bf16 residuals and run
+    # one tuned bf16 GEMM. M<=64 stays on the FlyDSL GEMV when that flag is set.
+    SGLANG_OPT_LAGUNA_ROUTER_BF16X3 = EnvBool(False)
+    # gfx1250 Laguna router for 1 <= M <= 64: one FlyDSL launch (gemv + split-K reduce + sigmoid top-k)
+    # instead of gemv + torch.sum + triton gate; same selection and tie rule as the triton gate.
+    SGLANG_OPT_LAGUNA_ROUTER_FUSED = EnvBool(False)
+    # with ROUTER_FUSED: the fused kernel zeroes CUDA-graph padding rows itself (id 0, weight 0), so the HIP
+    # post-process (2 fill launches per layer) is skipped; only on HIP without EPLB / shared slots / MORI_NO_PAD_MASK
+    SGLANG_OPT_LAGUNA_ROUTER_FUSED_PADMASK = EnvBool(False)
+    # routed + shared expert add inside aiter's gfx1250 gather-reduce epilogue (bitwise equal; falls back when not fused)
+    SGLANG_OPT_LAGUNA_MOE_FUSED_SHARED_ADD = EnvBool(False)
+    # Laguna decode: one Triton kernel for q/k RMSNorm + RoPE + fp8 KV store (triton backend, MHA pools).
+    SGLANG_OPT_LAGUNA_FUSED_QK_NORM_ROPE_KV = EnvBool(False)
+    # Laguna prefill sequence parallel (TP, any EP): for plain EXTEND batches of at least
+    # SGLANG_OPT_LAGUNA_PREFILL_SP_MIN_TOKENS tokens (multiple of tp), the attention all-reduce becomes a
+    # reduce-scatter, the post-attention add+norm, router and topk run on 1/tp of the tokens, the normed bf16
+    # shard and the topk results are all-gathered for the MoE, and one all-reduce per layer sums attn + ffn.
+    SGLANG_OPT_LAGUNA_PREFILL_SP = EnvBool(False)
+    SGLANG_OPT_LAGUNA_PREFILL_SP_MIN_TOKENS = EnvInt(4096)
+    # FlyDSL pa_decode (gfx1250): partition cap of the sliding-window decode plans. 1 (default) = one task per
+    # sequence and direct output; 0 = the device CU count (aiter bounds it by the window's 256-token tiles and
+    # merges a sequence's partitions in the tile kernel); n = at most n partitions.
+    SGLANG_OPT_FLYDSL_PA_SWA_MAX_PARTITIONS = EnvInt(1)
     # Apply RoPE inside the ROCm fused MLA decode kernel instead of before it.
     SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION = EnvBool(True)
     # Send Qwen3.8's 512-expert softmax router back to aiter `fused_topk`

@@ -142,7 +142,6 @@ def test_gfx1250_table_hier_ranges(dev_kernarg):
         assert configs[world_size].graph.hier_2shot_push == want
         assert configs[world_size].eager.hier_2shot_push == want
 
-
 @pytest.mark.parametrize(
     ("world_size", "nbytes", "expected"),
     [
@@ -476,6 +475,201 @@ def test_pick_config_hier_2shot_push(nbytes, expected):
             config, nbytes, can_use_graph=use_graph
         )
         assert _choice_name(choice) == expected
+
+
+_KB, _MB = 1024, 1024 * 1024
+
+
+def test_gfx1250_table_enables_hier_only_at_tp16():
+    from sglang.srt.distributed.device_communicators.configs import (
+        custom_all_reduce_v2 as cfg,
+    )
+
+    configs = cfg._rocm_gfx1250_configs.__wrapped__(96)
+    assert configs[16].graph.hier_2shot_push == cfg.Range(256 * _KB, 64 * _MB)
+    assert configs[16].eager.hier_2shot_push == cfg.Range(256 * _KB, 64 * _MB)
+    for world_size in range(2, 9):
+        assert configs[world_size].graph.hier_2shot_push.max_bytes == 0
+
+
+@pytest.mark.parametrize(
+    ("world_size", "nbytes", "expected"),
+    [
+        (2, 64 * _KB, "ONE_SHOT_PUSH"),
+        (2, 64 * _KB + 16, "TWO_SHOT_PUSH"),
+        (2, 8 * _MB, "TWO_SHOT_PUSH"),
+        (2, 8 * _MB + 16, "RING_SIMPLE"),
+        (4, 64 * _KB, "ONE_SHOT_PUSH"),
+        (4, 64 * _KB + 16, "TWO_SHOT_PUSH"),
+        (4, 16 * _MB, "TWO_SHOT_PUSH"),
+        (4, 16 * _MB + 16, "RING_SIMPLE"),
+        (8, 64 * _KB, "ONE_SHOT_PUSH"),
+        (8, 128 * _KB, "TWO_SHOT_PUSH"),
+        (8, 8 * _MB, "TWO_SHOT_PUSH"),
+        (8, 8 * _MB + 16, "RING_SIMPLE"),
+    ],
+)
+def test_gfx1250_table_picks_measured_best(world_size, nbytes, expected):
+    assert (
+        _choice_name(_gfx1250_comm(world_size)._pick_config(nbytes, False)) == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("world_size", "nbytes", "expected"),
+    [
+        (2, 2 * _MB, "ONE_SHOT_PUSH"),
+        (2, 2 * _MB + 16, "TWO_SHOT_PUSH"),
+        (2, 16 * _MB, "TWO_SHOT_PUSH"),
+        (2, 16 * _MB + 16, "RING_SIMPLE"),
+        (3, 64 * _KB + 16, "TWO_SHOT_PUSH"),
+        (3, 8 * _MB + 16, "RING_SIMPLE"),
+        (4, 2 * _MB, "ONE_SHOT_PUSH"),
+        (4, 2 * _MB + 16, "TWO_SHOT_PUSH"),
+        (4, 32 * _MB, "TWO_SHOT_PUSH"),
+        (4, 32 * _MB + 16, "RING_SIMPLE"),
+        (8, 768 * _KB, "ONE_SHOT_PUSH"),
+        (8, 768 * _KB + 16, "TWO_SHOT_PUSH"),
+        (8, 32 * _MB, "TWO_SHOT_PUSH"),
+        (8, 32 * _MB + 16, "RING_SIMPLE"),
+    ],
+)
+def test_gfx1250_dev_kernarg_table(world_size, nbytes, expected):
+    comm = _gfx1250_comm(world_size, dev_kernarg=True)
+    assert _choice_name(comm._pick_config(nbytes, False)) == expected
+
+
+@pytest.mark.parametrize("dev_kernarg", [False, True])
+@pytest.mark.parametrize("world_size", range(2, 9))
+def test_gfx1250_table_has_no_rccl_gap(world_size, dev_kernarg):
+    """Every 16 B multiple up to 4 GB picks a carv2 algo."""
+    comm = _gfx1250_comm(world_size, dev_kernarg)
+    heuristic = comm.config.graph
+    edges = {
+        16,
+        heuristic.one_shot_push_threshold,
+        heuristic.two_shot_push_threshold,
+        heuristic.ring_simple.min_bytes,
+        heuristic.ring_simple.max_bytes,
+    }
+    for edge in edges:
+        for nbytes in (edge - 16, edge, edge + 16):
+            if 0 < nbytes <= 4 * 1024 * _MB:
+                assert comm._pick_config(nbytes, False) is not None, nbytes
+
+
+def _gfx1250_comm(world_size, dev_kernarg=False):
+    from sglang.srt.distributed.device_communicators.configs import (
+        custom_all_reduce_v2 as cfg,
+    )
+
+    comm = object.__new__(custom_all_reduce_v2.CustomAllReduceV2)
+    comm.disabled = True
+    comm.config = cfg._rocm_gfx1250_configs.__wrapped__(96, dev_kernarg)[world_size]
+    return comm
+
+
+@pytest.mark.parametrize(
+    ("max_size", "sizes_own_push", "hier_max", "two_shot"),
+    [
+        # a pair slot holds half a message and stays within max_size; 2shot_push
+        # keeps the sizes above a hier range it no longer covers
+        (16 * _MB, False, 32 * _MB, 64 * _MB),
+        # hier covers 2shot_push: its slots stay at the hier minimum
+        (32 * _MB, False, 64 * _MB, 256 * _KB),
+        # push-only, explicit or forced push sizes: no hier planes
+        (32 * _MB, True, 0, 64 * _MB),
+        # a cap at or below the hier minimum disables it
+        (128 * _KB, False, 0, 64 * _MB),
+    ],
+)
+def test_hier_sizing(max_size, sizes_own_push, hier_max, two_shot):
+    from sglang.srt.distributed.device_communicators.configs import (
+        custom_all_reduce_v2 as cfg,
+    )
+
+    config = cfg._rocm_gfx1250_configs.__wrapped__(96)[16]
+    got = dpx_hier_all_reduce._hier_max_bytes(
+        config, max_size, sizes_own_push=sizes_own_push
+    )
+    assert got == hier_max
+    fitted = dpx_hier_all_reduce._fit_hier(config, got)
+    for heuristic in (fitted.graph, fitted.eager):
+        assert heuristic.hier_2shot_push.max_bytes == hier_max
+        assert heuristic.two_shot_push_threshold == two_shot
+
+
+def _choice_name(choice):
+    if choice is None:
+        return None
+    if choice.use_hier:
+        return "HIER_2SHOT_PUSH"
+    return "RING_SIMPLE" if choice.use_ring else choice.algo.name
+
+
+@pytest.mark.parametrize(
+    ("nbytes", "expected"),
+    [
+        (16 * _MB, "HIER_2SHOT_PUSH"),
+        (32 * _MB, "HIER_2SHOT_PUSH"),
+        # above the clipped hier range, 2shot_push keeps its tuned sizes
+        (48 * _MB, "TWO_SHOT_PUSH"),
+        # past the hier range at TP16, ring_simple takes over
+        (64 * _MB + 32, "RING_SIMPLE"),
+    ],
+)
+def test_pick_config_hier_at_default_cap(nbytes, expected):
+    from sglang.srt.distributed.device_communicators.configs import (
+        custom_all_reduce_v2 as cfg,
+    )
+
+    config = cfg._rocm_gfx1250_configs.__wrapped__(96)[16]
+    hier_max = dpx_hier_all_reduce._hier_max_bytes(
+        config, 16 * _MB, sizes_own_push=False
+    )
+    comm = object.__new__(custom_all_reduce_v2.CustomAllReduceV2)
+    comm.disabled = True
+    comm.config = dpx_hier_all_reduce._fit_hier(config, hier_max)
+    assert _choice_name(comm._pick_config(nbytes, False)) == expected
+
+
+@pytest.mark.parametrize(
+    ("nbytes", "expected"),
+    [
+        (256 * _KB, "ONE_SHOT_PUSH"),
+        (256 * _KB + 32, "HIER_2SHOT_PUSH"),
+        (64 * _MB, "HIER_2SHOT_PUSH"),
+        # cannot be halved into whole 16 B vectors; 2shot_push stops at the
+        # hier minimum, so NCCL takes it
+        (4 * _MB + 16, None),
+        (64 * _MB + 32, None),
+    ],
+)
+def test_pick_config_hier_2shot_push(nbytes, expected):
+    """With hier_2shot_push enabled, 2shot_push keeps only the sizes below it."""
+    from sglang.srt.distributed.device_communicators.configs import (
+        custom_all_reduce_v2 as cfg,
+    )
+
+    heuristic = cfg.Heuristic(
+        256 * _KB,
+        0,
+        0,
+        two_shot_push_threshold=256 * _KB,
+        hier_2shot_push=cfg.Range(256 * _KB, 64 * _MB),
+    )
+    comm = object.__new__(custom_all_reduce_v2.CustomAllReduceV2)
+    # dispatch does not look at it; close() at teardown does
+    comm.disabled = True
+    comm.config = cfg.AllReduceConfig(
+        graph=heuristic,
+        eager=heuristic,
+        num_push_blocks=96,
+        num_pull_blocks=32,
+        num_mc_blocks=None,
+    )
+    for use_graph in (False, True):
+        assert _choice_name(comm._pick_config(nbytes, use_graph)) == expected
 
 
 @pytest.mark.parametrize(

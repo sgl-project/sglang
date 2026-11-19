@@ -40,11 +40,12 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
 from sglang.srt.layers.moe.utils import adds_replicated_output_to_partial
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.utils.layer_list import make_pp_layers
@@ -54,6 +55,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.utils import get_default_hidden_dim
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_parallel
@@ -126,9 +129,76 @@ class LagunaMoEGate(nn.Module):
             torch.zeros(config.num_experts, dtype=torch.float32),
             requires_grad=False,
         )
+        self._flydsl_router = _load_flydsl_router()
+        # [3 * num_experts, hidden] bf16, built after weight loading when
+        # SGLANG_OPT_LAGUNA_ROUTER_BF16X3 is set.
+        self.weight_bf16x3: Optional[torch.Tensor] = None
+
+    def build_bf16x3(self):
+        # W == P0 + P1 + P2; stack along N so one bf16 GEMM reads the input once.
+        parts, rest = [], self.weight.data
+        for _ in range(3):
+            part = rest.to(torch.bfloat16)
+            parts.append(part)
+            rest = rest - part.float()
+        self.weight_bf16x3 = torch.cat(parts, dim=0)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # 64 is laguna_router_gemv_gfx1250.MAXM_V2. Above that the GEMV
+        # returns None and the caller used to fall back to F.linear.
+        if (
+            self.weight_bf16x3 is not None
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape[0] > 64
+        ):
+            from aiter.tuned_gemm import tgemm
+
+            out = tgemm.mm(
+                hidden_states, self.weight_bf16x3, None, otype=torch.float32
+            )
+            return out.view(-1, 3, self.weight.shape[0]).sum(1)
+        if self._flydsl_router is not None:
+            logits = self._flydsl_router(hidden_states, self.weight)
+            if logits is not None:
+                return logits
         return F.linear(hidden_states.to(torch.float32), self.weight, None)
+
+
+def _load_flydsl_router():
+    if not envs.SGLANG_OPT_LAGUNA_ROUTER_FLYDSL.get():
+        return None
+    if not torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx1250"):
+        return None
+    from sglang.srt.layers.moe.laguna_router_gemv_gfx1250 import router_logits_fp32
+
+    return router_logits_fp32
+
+
+def _load_router_fused(config, topk, softcap):
+    """Static conditions of the fused router (item R); per-call ones are in LagunaMoE._fused_topk."""
+    if not envs.SGLANG_OPT_LAGUNA_ROUTER_FUSED.get():
+        return None
+    if not torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx1250"):
+        return None
+    cfg = topk.topk_config
+    if (
+        softcap > 0.0
+        or config.num_experts != 512
+        or config.hidden_size != 16384
+        or cfg.scoring_func != "sigmoid"
+        or not cfg.renormalize
+        or cfg.use_grouped_topk
+        or cfg.custom_routing_function is not None
+        or cfg.routed_scaling_factor not in (None, 1.0)
+        or cfg.num_shared_topk_slots != 0
+        or not (1 <= cfg.top_k <= 32)
+        or envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+        or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+    ):
+        return None
+    from sglang.srt.layers.moe.laguna_router_fused_gfx1250 import laguna_router_fused
+
+    return laguna_router_fused
 
 
 class LagunaMoE(nn.Module):
@@ -175,6 +245,15 @@ class LagunaMoE(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
         )
         self.topk.bind_runner_backend(self.experts.runner_backend)
+        self._router_fused = _load_router_fused(config, self.topk, self.router_logit_softcapping)
+        from sglang.srt.layers.moe import topk as _topk_mod
+
+        self._router_padmask_ok = (
+            self._router_fused is not None
+            and envs.SGLANG_OPT_LAGUNA_ROUTER_FUSED_PADMASK.get()
+            and _topk_mod._is_hip
+            and not _topk_mod._skip_hip_pad_mask
+        )
 
         # HF safetensors key is singular `shared_expert.…`; mirror so the
         # default loader picks it up without remapping.
@@ -193,6 +272,54 @@ class LagunaMoE(nn.Module):
             **(dict(parallel_group="replicated") if self._shared_expert_tp1 else {}),
         )
 
+    def _fused_topk(self, hidden_states: torch.Tensor):
+        """SGLANG_OPT_LAGUNA_ROUTER_FUSED: weights / ids from one fused launch, then the ordinary
+        precomputed-top-k post-processing (padding, EPLB, recorder, waterfill). None -> ordinary path."""
+        if self._router_fused is None:
+            return None
+        m = hidden_states.shape[0]
+        if not (1 <= m <= 64) or hidden_states.dtype != torch.bfloat16:
+            return None
+        from sglang.srt.layers.moe.topk import (
+            TopKOutputFormat,
+            build_precomputed_topk_output,
+            get_parallel as _gp,
+            is_allocation_symmetric as _sym,
+            use_symmetric_memory as _usm,
+        )
+
+        topk = self.topk
+        cfg = topk.topk_config
+        if cfg.output_format != TopKOutputFormat.STANDARD:
+            return None
+        num_token_non_padded, dispatch_info = topk._resolve_routing_inputs(None, None)
+        # SGLANG_OPT_LAGUNA_ROUTER_FUSED_PADMASK: the kernel masks padded rows (id 0, weight 0) like the HIP
+        # post-process does when nothing else is active there (no EPLB remap, no shared slots, pad mask not skipped).
+        n_valid = None
+        if (
+            num_token_non_padded is not None
+            and self._router_padmask_ok
+            and cfg.num_shared_topk_slots == 0
+        ):
+            from sglang.srt.layers.moe.topk import is_expert_remapping_enabled as _remap
+
+            if not _remap():
+                n_valid, num_token_non_padded, dispatch_info = num_token_non_padded, None, None
+        with _usm(_gp().tp_group, disabled=not _sym()):
+            w, ids = self._router_fused(
+                hidden_states, self.gate.weight, self.gate.e_score_correction_bias, topk=cfg.top_k,
+                **({"n_valid": n_valid} if n_valid is not None else {}),
+            )
+            out = build_precomputed_topk_output(
+                w,
+                ids,
+                cfg,
+                topk.layer_id,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=dispatch_info,
+            )
+        return topk._apply_waterfill(out, m)
+
     def get_moe_weights(self):
         return [x.data for x in self.experts.parameters()]
 
@@ -206,12 +333,36 @@ class LagunaMoE(nn.Module):
 
         shared_out = self.shared_expert(hidden_states)
 
-        router_logits = self.gate(hidden_states)
-        if self.router_logit_softcapping > 0.0:
-            cap = self.router_logit_softcapping
-            router_logits = torch.tanh(router_logits / cap) * cap
-        topk_output = self.topk(hidden_states, router_logits)
-        routed_out = self.experts(hidden_states, topk_output)
+        topk_output = self._fused_topk(hidden_states)
+        if topk_output is None:
+            router_logits = self.gate(hidden_states)
+            if self.router_logit_softcapping > 0.0:
+                cap = self.router_logit_softcapping
+                router_logits = torch.tanh(router_logits / cap) * cap
+            topk_output = self.topk(hidden_states, router_logits)
+        # SGLANG_OPT_LAGUNA_MOE_FUSED_SHARED_ADD: aiter's gather-reduce adds shared_out into routed_out (same rounding
+        # as the add below) and reports it via ctx["consumed"]; otherwise the add below runs as before.
+        add_ctx = None
+        if (
+            envs.SGLANG_OPT_LAGUNA_MOE_FUSED_SHARED_ADD.get()
+            and not self._shared_expert_tp1
+            and self.routed_scaling_factor == 1.0
+            and shared_out.is_contiguous()
+        ):
+            try:
+                from aiter.ops.flydsl.grouped_moe_gfx1250 import set_moe_output_addend
+            except ImportError:
+                set_moe_output_addend = None
+            if set_moe_output_addend is not None:
+                add_ctx = {"addend": shared_out, "consumed": False}
+                set_moe_output_addend(add_ctx)
+        try:
+            routed_out = self.experts(hidden_states, topk_output)
+        finally:
+            if add_ctx is not None:
+                set_moe_output_addend(None)
+        if add_ctx is not None and add_ctx["consumed"]:
+            return routed_out
 
         # Non-grouped TopK doesn't honor apply_routed_scaling_factor_on_output,
         # so scale routed manually before adding the unscaled shared expert.
@@ -228,6 +379,43 @@ class LagunaMoE(nn.Module):
         if self._shared_expert_tp1 and adds_replicated_output_to_partial():
             final = final + shared_out
         return final
+
+    def forward_sp(self, x_shard: torch.Tensor, tp_group) -> torch.Tensor:
+        """Prefill SP: ``x_shard`` is this rank's normed bf16 token shard (1/tp of the
+        batch). Router + topk run on the shard; the topk results and the bf16 shard
+        are all-gathered, and the MoE / shared expert run exactly as in ``forward``
+        on all tokens (bf16 input, so any EP layout works unchanged). Returns this
+        rank's partial sum for all tokens; the caller all-reduces it."""
+        router_logits = self.gate(x_shard)
+        if self.router_logit_softcapping > 0.0:
+            cap = self.router_logit_softcapping
+            router_logits = torch.tanh(router_logits / cap) * cap
+        topk_shard = self.topk(x_shard, router_logits)
+        assert type(topk_shard) is StandardTopKOutput, type(topk_shard)
+        k = topk_shard.topk_ids.shape[1]
+        ws = tp_group.world_size
+        packed = torch.cat(
+            [
+                topk_shard.topk_weights.float().view(torch.int32),
+                topk_shard.topk_ids.to(torch.int32),
+            ],
+            dim=1,
+        )
+        packed_full = packed.new_empty((packed.shape[0] * ws, 2 * k))
+        tp_group.all_gather_into_tensor(packed_full, packed)
+        topk_output = StandardTopKOutput(
+            topk_weights=packed_full[:, :k].contiguous().view(torch.float32),
+            topk_ids=packed_full[:, k:].contiguous(),
+            router_logits=None,
+        )
+        x_full = x_shard.new_empty((x_shard.shape[0] * ws, x_shard.shape[1]))
+        tp_group.all_gather_into_tensor(x_full, x_shard.contiguous())
+
+        shared_out = self.shared_expert(x_full)
+        routed_out = self.experts(x_full, topk_output)
+        if self.routed_scaling_factor != 1.0:
+            routed_out = routed_out * self.routed_scaling_factor
+        return routed_out + shared_out
 
 
 class LagunaAttention(nn.Module):
@@ -335,6 +523,13 @@ class LagunaAttention(nn.Module):
             prefix=add_prefix("attn", prefix),
             sliding_window_size=sliding_window_size if use_sliding else -1,
         )
+        # The fused kernel assumes plain neox RoPE over the whole head.
+        self._use_fused_decode_prep = (
+            envs.SGLANG_OPT_LAGUNA_FUSED_QK_NORM_ROPE_KV.get()
+            and type(self.rotary_emb) is RotaryEmbedding
+            and self.rotary_emb.is_neox_style
+            and self.rotary_emb.rotary_dim == self.head_dim
+        )
 
     def forward(
         self,
@@ -348,16 +543,25 @@ class LagunaAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q, k = apply_qk_norm(
-            q=q,
-            k=k,
-            q_norm=self.q_norm,
-            k_norm=self.k_norm,
-            head_dim=self.head_dim,
+        fused_q = (
+            self._fused_decode_prep(
+                qkv=qkv, positions=positions, forward_batch=forward_batch
+            )
+            if self._use_fused_decode_prep and forward_batch.forward_mode.is_decode()
+            else None
         )
-        q, k = self.rotary_emb(positions, q, k)
-
-        attn_output = self.attn(q, k, v, forward_batch)
+        if fused_q is not None:
+            attn_output = self.attn(fused_q, k, v, forward_batch, save_kv_cache=False)
+        else:
+            q, k = apply_qk_norm(
+                q=q,
+                k=k,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+                head_dim=self.head_dim,
+            )
+            q, k = self.rotary_emb(positions, q, k)
+            attn_output = self.attn(q, k, v, forward_batch)
 
         if self.gating and self.g_proj is not None:
             gate, _ = self.g_proj(hidden_states)
@@ -371,6 +575,86 @@ class LagunaAttention(nn.Module):
 
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _fused_decode_prep(
+        self, *, qkv: torch.Tensor, positions: torch.Tensor, forward_batch: ForwardBatch
+    ) -> Optional[torch.Tensor]:
+        target = _fp8_kv_store_target(layer=self.attn, forward_batch=forward_batch)
+        if target is None:
+            return None
+        k_buf, v_buf, loc = target
+        from sglang.srt.layers.attention.laguna_qk_norm_rope_kv import (
+            qk_norm_rope_kv_store,
+        )
+
+        unscaled = self.attn.k_scale is None
+        return qk_norm_rope_kv_store(
+            qkv=qkv,
+            positions=positions,
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
+            eps=self.q_norm.variance_epsilon,
+            cos_sin_cache=self.rotary_emb.cos_sin_cache,
+            k_buf=k_buf,
+            v_buf=v_buf,
+            loc=loc,
+            k_scale=1.0 if unscaled else self.attn.k_scale_float,
+            v_scale=1.0 if unscaled else self.attn.v_scale_float,
+            num_q_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+        )
+
+
+def _fp8_kv_store_target(
+    *, layer: RadixAttention, forward_batch: ForwardBatch
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """(k_buf, v_buf, loc) a fused decode writer scatters into, mirroring the triton / aiter backends'
+    set_kv_buffer routing; None whenever that routing is not a plain fp8 NHD / SHUFFLE 5D MHA pool."""
+    from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+    from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+    backend = get_attn_backend()
+    if isinstance(backend, TritonAttnBackend):
+        dcp = backend.dcp_size
+    elif isinstance(backend, AiterAttnBackend):
+        dcp = backend.dcp_world_size
+    else:
+        return None
+    if backend.use_mla or dcp > 1:
+        return None
+    pool = backend.token_to_kv_pool
+    loc = forward_batch.out_cache_loc
+    pool_layer_id = layer.layer_id
+    if isinstance(pool, SWAKVPool):
+        pool_layer_id, is_swa = pool.layers_mapping[layer.layer_id]
+        if is_swa:
+            loc = backend.forward_metadata.swa_out_cache_loc
+            pool = pool.swa_kv_pool
+        else:
+            pool = pool.full_kv_pool
+    # Subclasses (e.g. page-major) and non-NHD layouts write through different buffer views.
+    if (
+        type(pool) is not MHATokenToKVPool
+        or pool.kv_cache_layout not in ("nhd", "vectorized_5d")
+        or loc is None
+        or pool.use_hnd
+        or pool.is_quantized_kv_cache
+        or pool.dtype != torch.float8_e4m3fn
+        or (
+            pool.requires_physical_write_loc
+            and not forward_batch.out_cache_loc_is_physical
+        )
+    ):
+        return None
+    idx = pool_layer_id - pool.start_layer
+    return (
+        pool.k_buffer[idx].view(torch.uint8),
+        pool.v_buffer[idx].view(torch.uint8),
+        loc,
+    )
 
 
 class LagunaDecoderLayer(nn.Module):
@@ -574,6 +858,9 @@ class LagunaModel(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        if self._sp_eligible(forward_batch, positions.shape[0]):
+            return self._sp_forward(input_ids, positions, forward_batch, input_embeds)
+
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -612,6 +899,84 @@ class LagunaModel(nn.Module):
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states
+
+    def _sp_supported(self) -> bool:
+        if getattr(self, "_sp_supported_cache", None) is None:
+            parallel = get_parallel()
+            layers = [self.layers[i] for i in range(self.start_layer, self.end_layer)]
+            self._sp_supported_cache = bool(
+                parallel.tp_size > 1
+                and self.pp_group.world_size == 1
+                and not is_dp_attention_enabled()
+                and parallel.attn_tp_size == parallel.tp_size
+                and not self.layers_to_capture
+                and all(
+                    layer.is_layer_sparse
+                    and not layer.mlp._shared_expert_tp1
+                    and not layer.mlp.experts.moe_runner_config.apply_router_weight_on_input
+                    for layer in layers
+                )
+            )
+            logger.info("Laguna prefill SP supported: %s", self._sp_supported_cache)
+        return self._sp_supported_cache
+
+    def _sp_eligible(self, forward_batch: ForwardBatch, num_tokens: int) -> bool:
+        if not envs.SGLANG_OPT_LAGUNA_PREFILL_SP.get():
+            return False
+        return (
+            forward_batch.forward_mode == ForwardMode.EXTEND
+            and num_tokens >= envs.SGLANG_OPT_LAGUNA_PREFILL_SP_MIN_TOKENS.get()
+            and num_tokens % get_parallel().tp_size == 0
+            and self._sp_supported()
+        )
+
+    def _sp_forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Prefill with the FFN in sequence-parallel form (port of the MI355X
+        feat/proxy-model-1020 ed3d8b0089 path, bf16 gather so any EP works).
+        Attention input stays replicated; the o_proj partial is reduce-scattered,
+        the post-attention add+norm, router and topk run on this rank's 1/tp token
+        shard, the MoE gets the all-gathered bf16 tokens, and the attention shard is
+        folded into the FFN partial so one all-reduce per layer returns attn + ffn.
+        RMSNorm with a residual is out-of-place, so ``residual`` is only advanced by
+        the per-layer ``norm(summed, residual)``."""
+        from sglang.srt.distributed.communication_op import (
+            tensor_model_parallel_all_reduce,
+        )
+
+        tp = get_parallel().tp_group
+        rank = tp.rank_in_group
+        if not getattr(self, "_sp_logged", False):
+            self._sp_logged = True
+            logger.info(
+                "Laguna prefill SP active (first batch: %d tokens)", positions.shape[0]
+            )
+        hidden = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+        m = hidden.shape[0] // tp.world_size
+        rows = slice(rank * m, (rank + 1) * m)
+        layers = [self.layers[i] for i in range(self.start_layer, self.end_layer)]
+        residual = hidden
+        x = layers[0].input_layernorm(hidden)
+        for idx, layer in enumerate(layers):
+            partial = layer.self_attn(
+                positions=positions, hidden_states=x, forward_batch=forward_batch
+            )
+            attn_shard = partial.new_empty((m, partial.shape[1]))
+            tp.reduce_scatter_tensor(attn_shard, partial)
+            x_shard, _ = layer.post_attention_layernorm(attn_shard, residual[rows])
+            partial = layer.mlp.forward_sp(x_shard, tp)
+            partial[rows] += attn_shard
+            summed = tensor_model_parallel_all_reduce(partial)
+            norm = (
+                layers[idx + 1].input_layernorm if idx + 1 < len(layers) else self.norm
+            )
+            x, residual = norm(summed, residual)
+        return x
 
 
 class LagunaForCausalLM(nn.Module):
@@ -820,6 +1185,11 @@ class LagunaForCausalLM(nn.Module):
                 f"(sample: {sample}). Expected {len(expected)} (layers={moe_layer_ids}, "
                 f"num_experts={self.config.num_experts}, shards=3)."
             )
+
+        if envs.SGLANG_OPT_LAGUNA_ROUTER_BF16X3.get():
+            for layer in self.model.layers:
+                if isinstance(layer, LagunaDecoderLayer) and layer.is_layer_sparse:
+                    layer.mlp.gate.build_bf16x3()
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

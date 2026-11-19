@@ -177,11 +177,18 @@ def _init_nccl_group_once() -> dist.ProcessGroup:
 
 
 @cache_once
-def _init_comm_once(max_push_blocks: int | None = None) -> CustomAllReduceV2:
+def _init_comm_once(
+    max_push_blocks: int | None = None, ring_simple_buffer_size: int | None = None
+) -> CustomAllReduceV2:
     cpu_group = _init_cpu_group_once()
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     max_size = max(TEST_SIZES) * max(
         torch.tensor([], dtype=d).element_size() for d in TEST_DTYPES
+    )
+    ring_kwargs = (
+        {}
+        if ring_simple_buffer_size is None
+        else {"ring_simple_buffer_size": ring_simple_buffer_size}
     )
     comm = CustomAllReduceV2(
         cpu_group,
@@ -189,6 +196,7 @@ def _init_comm_once(max_push_blocks: int | None = None) -> CustomAllReduceV2:
         max_pull_size=max_size,
         max_push_size=max_size,
         max_push_blocks=max_push_blocks,
+        **ring_kwargs,
     )
     if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")

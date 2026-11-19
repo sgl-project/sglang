@@ -223,7 +223,6 @@ __global__ __launch_bounds__(kUnrolledThreads, 1)
   epoch.commit();
 }
 #endif
-
 // The smallest block that keeps the grid within one block per SM.
 inline auto choose_block_size(uint32_t num_threads) -> uint32_t {
   static const uint32_t kNumSM = [] {

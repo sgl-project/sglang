@@ -151,7 +151,6 @@ def test_dpx_pairs(accel_ids, expected):
 def test_accelerator_ring_order(accel_ids, expected):
     assert gfx1250_fabric.accelerator_ring_order(accel_ids) == expected
 
-
 @pytest.mark.parametrize(("peer_accel_id", "expected"), [(52, [[0, 1]]), (None, None)])
 def test_probe_dpx_pairs_gathers_every_rank(monkeypatch, peer_accel_id, expected):
     """Pairs come from every rank's ID; one rank without an ID disables them."""

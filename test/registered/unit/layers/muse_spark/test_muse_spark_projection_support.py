@@ -1,7 +1,6 @@
 """Keep automatic B200 projection dispatch inside the validated TP8 envelope."""
 
 import unittest
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
