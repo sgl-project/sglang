@@ -9,7 +9,7 @@ the checked-in GB200/GB300 tuning envelope.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -152,6 +152,149 @@ def enabled() -> bool:
     return _init_state() is not None
 
 
+_TP_STATE: Optional[_State] = None
+_TP_INITIALIZED = False
+
+
+def tp_group_state() -> Optional[_State]:
+    global _TP_STATE, _TP_INITIALIZED
+    if _TP_INITIALIZED:
+        return _TP_STATE
+    _TP_INITIALIZED = True
+    if envs.SGLANG_K3_SP_COLLECTIVE.is_set() and not envs.SGLANG_K3_SP_COLLECTIVE.get():
+        return None
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        V2_PUSH_SLOT,
+        WorkspaceRequest,
+        request_group_workspace,
+    )
+    from sglang.srt.utils.device import get_device_sm
+
+    group = get_parallel().tp_group
+    device_sm = get_device_sm()
+    attn_state = _init_state()
+    lease = None
+    if (
+        device_sm in (100, 103)
+        and group.world_size in _SUPPORTED_WORLD_SIZES
+        # The kernels keep one communicator per world size.
+        and (attn_state is None or attn_state.group.world_size != group.world_size)
+    ):
+        lease = request_group_workspace(
+            group,
+            WorkspaceRequest(
+                owner="k3_sp_collective_tp", push_slot_bytes=V2_PUSH_SLOT, semaphores=1
+            ),
+        )
+    if lease is None or not lease.has_multicast:
+        logger.info(
+            "K3 TP-group collectives unavailable (sm=%s, world_size=%s, workspace=%s); "
+            "using NCCL",
+            device_sm,
+            group.world_size,
+            lease is not None,
+        )
+        return None
+    from sglang.kernels.ops.communication import sp_collective
+
+    if (
+        sp_collective.get_dispatch(
+            "reduce_scatter", group.world_size, _HIDDEN_SIZE, 1, torch.device("cuda")
+        )
+        is None
+    ):
+        logger.info(
+            "K3 TP-group collectives have no tuning table for %s; using NCCL.",
+            torch.cuda.get_device_name(),
+        )
+        return None
+    sp_collective.register_comm(lease.get_communicator, world_size=lease.world_size)
+    _TP_STATE = _State(group, lease)
+    logger.info(
+        "K3 TP-group collectives enabled (TP%d push/pull RS + AG)", group.world_size
+    )
+    return _TP_STATE
+
+
+def dp_max_rows(local_rows: int, counts: Optional[List[int]] = None) -> int:
+    """Rows per rank of a TP-group collective over every attention-DP rank's rows."""
+    from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+
+    if counts is None:
+        counts = get_dp_global_num_tokens()
+    if not counts:
+        raise RuntimeError("K3 TP-group rows need the DP global token counts")
+    rows = max(counts)
+    if local_rows > rows:
+        raise RuntimeError(
+            f"K3 TP-group rows: {local_rows} local rows exceed the DP maximum {rows}"
+        )
+    return rows
+
+
+def tp_rows_state(total_rows: int) -> Optional[_State]:
+    """The TP-group state when a collective over ``total_rows`` rows fits its buffers."""
+    # The K3 symmetric buffers hold one chunk; a DP-gathered prefill can exceed it.
+    if total_rows == 0 or total_rows > k3_ar_fusion._max_buffer_rows():
+        return None
+    return tp_group_state()
+
+
+def all_gather_rows(
+    x: torch.Tensor,
+    rows: int,
+    group,
+    state: Optional[_State],
+    buffer_name: str,
+    symmetric_fallback: bool = False,
+) -> torch.Tensor:
+    """Every group rank's ``rows`` rows (``x`` zero-padded to them); NCCL without ``state``."""
+    if x.shape[0] != rows:
+        x = torch.nn.functional.pad(x, (0, 0, 0, rows - x.shape[0]))
+    x = x.contiguous()
+    if state is not None:
+        out = all_gather(x, state=state, buffer_name=buffer_name)
+        if out is not None:
+            return out
+    if symmetric_fallback:
+        from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+            use_symmetric_memory,
+        )
+        from sglang.srt.layers.dp_attention import is_allocation_symmetric
+
+        # Sized from the group's rows, not the attention-DP buffer.
+        with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
+            out = x.new_empty((group.world_size * rows, *x.shape[1:]))
+    else:
+        out = x.new_empty((group.world_size * rows, *x.shape[1:]))
+    group.all_gather_into_tensor(out, x)
+    return out
+
+
+def reduce_scatter_rows(
+    y: torch.Tensor,
+    local_rows: int,
+    group,
+    state: Optional[_State],
+    input_symmetric: bool = True,
+) -> torch.Tensor:
+    """This rank's first ``local_rows`` rows of the group-summed ``y``; NCCL without ``state``."""
+    rows = y.shape[0] // group.world_size
+    # The pull strategy reads y through a multicast alias, which only symmetric storage has.
+    if state is not None and (
+        input_symmetric
+        or not requires_symmetric_rs(
+            y.shape[0], y.device, y.element_size(), state=state, fused=False
+        )
+    ):
+        out = reduce_scatter_res(y, None, state=state)
+        if out is not None:
+            return out[:local_rows]
+    out = y.new_empty((rows, *y.shape[1:]))
+    group.reduce_scatter_tensor(out, y.contiguous())
+    return out[:local_rows]
+
+
 def _symm_buffer(
     state: _State, name: str, rows: int, width: int, dtype: torch.dtype
 ) -> torch.Tensor:
@@ -162,10 +305,14 @@ def _symm_buffer(
 
 
 def requires_symmetric_rs(
-    num_tokens: int, device: torch.device, element_size: int
+    num_tokens: int,
+    device: torch.device,
+    element_size: int,
+    state: Optional[_State] = None,
+    fused: bool = True,
 ) -> bool:
     """Whether standalone or fused RS reads o_proj through its NVLS alias."""
-    state = _init_state()
+    state = state or _init_state()
     if state is None:
         return False
     from sglang.kernels.ops.communication import sp_collective
@@ -181,7 +328,7 @@ def requires_symmetric_rs(
     )
     if dispatch is not None and dispatch.strategy == "pull":
         return True
-    if not envs.SGLANG_K3_SP_ATTN_RES.get():
+    if not fused or not envs.SGLANG_K3_SP_ATTN_RES.get():
         return False
     fusion = sp_collective.get_fusion_dispatch(
         "reduce_scatter_attn_res",
@@ -258,10 +405,12 @@ def _eligible(
 
 
 def reduce_scatter_res(
-    tensor: torch.Tensor, residual: Optional[torch.Tensor]
+    tensor: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    state: Optional[_State] = None,
 ) -> Optional[torch.Tensor]:
     """Return a fused local shard, or None when the NCCL fallback should run."""
-    state = _init_state()
+    state = state or _init_state()
     if state is None or not _eligible(state, tensor, residual):
         return None
     from sglang.kernels.ops.communication import sp_collective
@@ -369,9 +518,13 @@ def reduce_scatter_attn_res(
     return normed, prefix
 
 
-def all_gather(tensor: torch.Tensor) -> Optional[torch.Tensor]:
+def all_gather(
+    tensor: torch.Tensor,
+    state: Optional[_State] = None,
+    buffer_name: str = _ALL_GATHER,
+) -> Optional[torch.Tensor]:
     """Return the reassembled full batch, or None for the NCCL fallback."""
-    state = _init_state()
+    state = state or _init_state()
     if state is None:
         return None
     global_tokens = tensor.shape[0] * state.group.world_size
@@ -407,7 +560,7 @@ def all_gather(tensor: torch.Tensor) -> Optional[torch.Tensor]:
         )
     if dispatch.strategy == "direct":
         output = _symm_buffer(
-            state, _ALL_GATHER, global_tokens, tensor.shape[1], tensor.dtype
+            state, buffer_name, global_tokens, tensor.shape[1], tensor.dtype
         )
         return sp_collective.all_gather_direct(
             state.group.world_size,
