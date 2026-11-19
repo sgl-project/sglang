@@ -8,7 +8,8 @@ members = [
     "sglang-mm",
     "sglang-processor",
     "sglang-runtime-v1-types",
-    "sglang-server"
+    "sglang-server",
+    "sglang-server-test"
 ]
 exclude = ["sglang-radix-tree"]
 

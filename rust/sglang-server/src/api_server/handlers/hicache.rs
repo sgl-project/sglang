@@ -177,13 +177,13 @@ struct AttachHiCacheOutput {
 mod tests {
     use super::*;
     use crate::api_server::core::fanout::ControlTarget;
-    use crate::api_server::core::fanout::testing::DummyTarget;
+
     use crate::api_server::handlers::{CoreConfig, CoreMetadata};
     use crate::message::response::ResponseItem;
     use crate::tokenizer_manager::wiring::TmEvent;
     use bytes::Bytes;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use std::time::Duration;
 
     fn manager_with(
@@ -219,58 +219,6 @@ mod tests {
         rmp_serde::to_vec_named(&serde_json::json!({"success": true}))
             .unwrap()
             .into()
-    }
-
-    /// Without an admin key, attach and detach are refused before the
-    /// fan-out, so neither the local scheduler nor a peer rank receives them;
-    /// with one, both do.
-    #[tokio::test]
-    async fn storage_changes_without_an_admin_key_reach_no_rank() {
-        let peer_calls = Arc::new(AtomicUsize::new(0));
-        let peer = |calls: Arc<AtomicUsize>| {
-            DummyTarget::replying(&[1], move |_| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                Ok(success_reply())
-            })
-        };
-        let attach_file = || api::AttachHiCacheStorageRequest {
-            hicache_storage_backend: Some("file".into()),
-            ..Default::default()
-        };
-
-        let (manager, intake_rx) = manager_with(None, vec![peer(peer_calls.clone())]);
-        assert!(matches!(
-            manager.attach(attach_file()).await,
-            Err(HiCacheError::AdminKeyMissing)
-        ));
-        assert!(matches!(
-            manager.detach().await,
-            Err(HiCacheError::AdminKeyMissing)
-        ));
-        assert!(intake_rx.is_empty(), "the local scheduler received it");
-        assert_eq!(peer_calls.load(Ordering::Relaxed), 0, "a peer received it");
-        assert_eq!(manager.status().await, api::HiCacheStatus::default());
-
-        let (manager, intake_rx) = manager_with(Some("sk-admin"), vec![peer(peer_calls.clone())]);
-        let attach = tokio::spawn({
-            let manager = manager.clone();
-            async move { manager.attach(attach_file()).await }
-        });
-        let TmEvent::Intake { request, admission } =
-            tokio::time::timeout(Duration::from_secs(5), intake_rx.recv_async())
-                .await
-                .unwrap()
-                .unwrap()
-        else {
-            panic!("expected control intake");
-        };
-        assert!(admission.try_accept());
-        request
-            .sink
-            .try_send(ResponseItem::Control(success_reply()))
-            .unwrap();
-        assert!(attach.await.unwrap().unwrap().success);
-        assert_eq!(peer_calls.load(Ordering::Relaxed), 1);
     }
 
     /// GET snapshots share the read lock, while an in-flight attach excludes readers.

@@ -896,52 +896,6 @@ mod tests {
         }
     }
 
-    /// A multi-rank operation reaches the local scheduler once and every
-    /// target once, and its outcome is the merge of all of them: one busy
-    /// rank fails the flush, with its reason.
-    #[tokio::test]
-    async fn flush_cache_merges_the_local_rank_with_every_target() {
-        use crate::api_server::core::fanout::testing::{DummyTarget, status_bytes};
-        let (intake_tx, intake_rx) = flume::unbounded();
-        let (abort_tx, _abort_rx) = flume::unbounded();
-        let handle = CoreHandle::new(
-            intake_tx,
-            abort_tx,
-            CoreConfig {
-                response_capacity: 8,
-                response_activity: Default::default(),
-                startup_ready: true,
-                is_disaggregation: false,
-                mm_limits: Vec::new(),
-                multimodal: false,
-                metrics: None,
-                metadata: CoreMetadata::default(),
-                peer_endpoints: vec![DummyTarget::replying(&[1, 2], |rank| {
-                    Ok(if rank == 2 {
-                        status_bytes(false, "peer busy")
-                    } else {
-                        status_bytes(true, "")
-                    })
-                })],
-                request_log: None,
-                generate_validator: None,
-                abort_hook: None,
-            },
-        );
-
-        let (outcome, ()) = tokio::join!(
-            handle.flush_cache(1.0),
-            answer_local_control(&intake_rx, status_bytes(true, "")),
-        );
-        let outcome = outcome.unwrap();
-        assert!(!outcome.success);
-        assert_eq!(outcome.message, "peer busy");
-        assert!(
-            intake_rx.try_recv().is_err(),
-            "one fan-out submits one local request"
-        );
-    }
-
     /// A relayed `AbortReq` ends this listener's own generations under the
     /// sender's public rid, as `/abort_request` would, without reaching the
     /// scheduler; the reply says whether anything matched.
