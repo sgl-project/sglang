@@ -273,6 +273,19 @@ def _uses_flat_entry_layout(
     return mla_backend or force_flat or has_layer_ids or is_single_region_swa
 
 
+def _kv_send_shard_by_room(num_queues: int) -> bool:
+    """Whether a prefill picks a room's transfer queue by its destination ports
+    plus the room (SGLANG_OPT_KV_SEND_SHARD_BY_ROOM)."""
+    enabled = envs.SGLANG_OPT_KV_SEND_SHARD_BY_ROOM.get()
+    if enabled:
+        logger.info(
+            "SGLANG_OPT_KV_SEND_SHARD_BY_ROOM engaged: the Mooncake KV send picks a "
+            "transfer queue by destination ports plus bootstrap room over %d queues",
+            num_queues,
+        )
+    return enabled
+
+
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     sender_trace_module = "mooncake"
 
@@ -357,6 +370,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
             ]
+            self.kv_send_shard_by_room = _kv_send_shard_by_room(transfer_queue_size)
             assert transfer_thread_pool_size >= transfer_queue_size, (
                 f"The environment variable SGLANG_DISAGGREGATION_THREAD_POOL_SIZE={transfer_thread_pool_size} must be "
                 f"greater than or equal to SGLANG_DISAGGREGATION_QUEUE_SIZE={transfer_queue_size}."
@@ -3531,6 +3545,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # queue, which enables early abort with failed sessions.
         dst_infos = self.transfer_infos[bootstrap_room].keys()
         session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
+        if self.kv_send_shard_by_room:
+            # Every worker checks the shared failed_sessions, so early abort holds.
+            session_port_sum += int(bootstrap_room)
         shard_idx = session_port_sum % len(self.transfer_queues)
 
         if trace_ctx is None:

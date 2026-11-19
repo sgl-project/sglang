@@ -645,6 +645,7 @@ class TestMooncakeEarlySend(CustomTestCase):
             check_status=lambda room: KVPoll.WaitingForInput,
             transfer_infos={1: {"127.0.0.1:80": object()}},
             transfer_queues=[queue],
+            kv_send_shard_by_room=False,
             send_record=MagicMock(),
             note_send_enqueued=MagicMock(),
         )
@@ -793,6 +794,67 @@ class TestMooncakeEarlySend(CustomTestCase):
                 manager, queue, MagicMock(), staging_buffer=object()
             )
         self.assertEqual(order, ["wait", "gather"])
+
+
+class TestMooncakeKvSendShardByRoom(CustomTestCase):
+    """SGLANG_OPT_KV_SEND_SHARD_BY_ROOM: the rooms of one decode instance share
+    their destination ports, so the port sum alone puts them on one queue."""
+
+    PORTS = tuple(17000 + i for i in range(8))
+    ROOMS = tuple((1 << 62) + 7919 * k for k in range(32))
+
+    def _dispatch(self, shard_by_room, chunks=3, num_queues=4):
+        """Queue (index, chunk start) of each room's chunks, added interleaved
+        like the scheduler: chunk c of every room, then chunk c + 1."""
+        sessions = {f"decode-host:{port}": object() for port in self.PORTS}
+        queues = [SimpleQueue() for _ in range(num_queues)]
+        manager = SimpleNamespace(
+            disaggregation_mode=DisaggregationMode.PREFILL,
+            request_status={room: KVPoll.WaitingForInput for room in self.ROOMS},
+            check_status=lambda room: KVPoll.WaitingForInput,
+            transfer_infos={room: dict(sessions) for room in self.ROOMS},
+            transfer_queues=queues,
+            kv_send_shard_by_room=shard_by_room,
+            send_record=MagicMock(),
+            note_send_enqueued=MagicMock(),
+        )
+        for c in range(chunks):
+            for room in self.ROOMS:
+                last = c == chunks - 1
+                MooncakeKVManager.add_transfer_request(
+                    manager,
+                    bootstrap_room=room,
+                    kv_indices=[c],
+                    index_slice=slice(c, c + 1),
+                    is_last_chunk=last,
+                    aux_index=0 if last else None,
+                )
+        placed = defaultdict(list)
+        for index, queue in enumerate(queues):
+            while not queue.empty():
+                chunk = queue.get_nowait()
+                placed[chunk.room].append((index, chunk.index_slice.start))
+        return placed
+
+    def test_spreads_one_decode_instance_over_the_queues(self):
+        placed = self._dispatch(shard_by_room=True)
+        port_sum = sum(self.PORTS)
+        self.assertEqual(sorted(placed), sorted(self.ROOMS))
+        for room in self.ROOMS:
+            # A room's chunks share one queue and keep their order.
+            queue_index = (port_sum + room) % 4
+            self.assertEqual(
+                placed[room], [(queue_index, 0), (queue_index, 1), (queue_index, 2)]
+            )
+        self.assertEqual({placed[room][0][0] for room in self.ROOMS}, {0, 1, 2, 3})
+
+    def test_off_keeps_the_port_sum_queue(self):
+        placed = self._dispatch(shard_by_room=False)
+        queue_index = sum(self.PORTS) % 4
+        for room in self.ROOMS:
+            self.assertEqual(
+                placed[room], [(queue_index, 0), (queue_index, 1), (queue_index, 2)]
+            )
 
 
 class TestMooncakeStagingDeviceType(unittest.TestCase):

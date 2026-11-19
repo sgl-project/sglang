@@ -1002,6 +1002,12 @@ class Envs:
     # synchronous all-layer Mooncake batch. Set to a positive value to split
     # larger transfers; 0 preserves the legacy single-batch behavior.
     SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES = EnvInt(0)
+    # Mooncake prefill: pick a room's KV transfer queue by its destination ports plus
+    # the room, not the ports alone, so one decode instance's rooms spread over the
+    # transfer workers. A room's chunks share one queue, in order. Same bytes sent.
+    SGLANG_OPT_KV_SEND_SHARD_BY_ROOM = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)

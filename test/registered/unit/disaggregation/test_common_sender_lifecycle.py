@@ -35,6 +35,7 @@ def make_sender(manager_type, room=42, *, sender_type=CommonKVSender):
     manager._num_shards = 1
     manager.transfer_queues = [queue.Queue()]
     manager._transfer_queues = manager.transfer_queues
+    manager.kv_send_shard_by_room = False
     with get_context().override_server_args(dp_size=1, enable_trace=False):
         sender = sender_type(manager, "unused", room)
     return sender, manager, manager.transfer_queues[0]
