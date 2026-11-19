@@ -6,6 +6,7 @@ from collections import defaultdict
 import torch
 
 from sglang.kernels.ops.lora.common import routing as routing_module
+from sglang.kernels.ops.lora.common.lora_a import grouped_lora_a
 from sglang.kernels.ops.lora.common.routing import build_route
 from sglang.srt.lora.workspace import LoraWorkspace
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -24,6 +25,43 @@ class TestMoeLoraRouting(CustomTestCase):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA required")
         cls.device = torch.device("cuda", torch.cuda.current_device())
+
+    def test_mapped_lora_a_preserves_sentinel_row(self):
+        """A dropped mapped row must leave the preceding storage row intact."""
+        slots = torch.zeros(2, dtype=torch.int32, device=self.device)
+        route = build_route(slots, max_loras=1, block_size=16)
+        row_map = torch.tensor([-1, 1], dtype=torch.int32, device=self.device)
+        x = torch.ones((2, 64), dtype=torch.bfloat16, device=self.device)
+        weight = x.new_ones((1, 16, 64))
+        storage = x.new_full((3, 16), -7)
+        out = storage[1:].unsqueeze(0)
+        expected = storage.clone()
+        expected[2].fill_(64)
+        partial = torch.empty((2, 2, 16), dtype=torch.float32, device=self.device)
+        counters = torch.zeros_like(route.block_bucket_ids)
+
+        for split_k in (1, 2):
+            with self.subTest(split_k=split_k):
+                storage.fill_(-7)
+                grouped_lora_a(
+                    x,
+                    weight,
+                    out,
+                    route,
+                    config={
+                        "BLOCK_SIZE_N": 16,
+                        "BLOCK_SIZE_K": 32,
+                        "GROUP_SIZE_M": 1,
+                        "SPLIT_K": split_k,
+                        "num_warps": 4,
+                        "num_stages": 2,
+                    },
+                    pair_to_row=row_map,
+                    place_rows=True,
+                    partial=partial,
+                    counters=counters,
+                )
+                torch.testing.assert_close(storage, expected, rtol=0, atol=0)
 
     @staticmethod
     def _inputs(rows, width, groups_per_slot, max_loras, dtype, shift=0):
