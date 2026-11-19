@@ -1725,6 +1725,33 @@ class LTX2DenoisingStage(DenoisingStage):
         # Legacy LTX-2 paths used the plain attention-metadata builder call here.
         return self._build_attn_metadata(step_index, batch, server_args)
 
+    @staticmethod
+    def _repeat_ltx2_prompts_to_latent_batch(batch: Req, latent_batch: int) -> None:
+        # With num_outputs_per_prompt > 1 the latents hold one sample per output while
+        # the prompt tensors hold one row per prompt. The guidance passes concatenate
+        # prompt rows per pass, which no longer lines up with the repeated latents.
+        for name in (
+            "prompt_embeds",
+            "audio_prompt_embeds",
+            "negative_prompt_embeds",
+            "negative_audio_prompt_embeds",
+            "prompt_attention_mask",
+            "negative_attention_mask",
+        ):
+            value = getattr(batch, name, None)
+            in_list = isinstance(value, list)
+            tensor = value[0] if in_list and value else value
+            if not isinstance(tensor, torch.Tensor) or tensor.shape[0] == latent_batch:
+                continue
+            if latent_batch % tensor.shape[0] != 0:
+                raise ValueError(
+                    f"LTX-2 {name} batch {tensor.shape[0]} does not divide the "
+                    f"latent batch {latent_batch}."
+                )
+            repeated = tensor.repeat_interleave(latent_batch // tensor.shape[0], dim=0)
+            # A new list: the request may share the old one with an encoder cache.
+            setattr(batch, name, [repeated, *value[1:]] if in_list else repeated)
+
     def _run_denoising_step(
         self,
         ctx: LTX2DenoisingContext,
@@ -1737,6 +1764,8 @@ class LTX2DenoisingStage(DenoisingStage):
             raise ValueError("LTX-2 requires audio latents for denoising.")
         if ctx.audio_scheduler is None:
             raise ValueError("LTX-2 audio scheduler was not prepared.")
+
+        self._repeat_ltx2_prompts_to_latent_batch(batch, int(ctx.latents.shape[0]))
 
         # 1. Read the sigma pair from the per-loop copies and derive the Euler delta.
         sigma = ctx.sigmas_device[step.step_index]

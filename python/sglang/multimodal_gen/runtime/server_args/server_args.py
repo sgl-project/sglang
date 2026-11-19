@@ -376,7 +376,6 @@ class ServerArgs(DisaggServerArgsMixin):
     # data parallelism
     # number of data parallelism groups
     dp_size: int = 1
-    # number of gpu in a dp group
     # cfg parallel (None = auto-decide based on num_gpus)
     enable_cfg_parallel: Optional[bool] = None
     # number of GPUs in each CFG parallel group (None = auto, 1 = disabled, N > 1 = enabled)
@@ -507,17 +506,17 @@ class ServerArgs(DisaggServerArgsMixin):
     enable_torch_compile: bool = False
     regional_compile: bool = False
 
-    # Breakable CUDA graph (BCG): capture the DiT forward as CUDA-graph
-    # segments split at attention modules (SP all-to-all / dynamic attention
-    # stay eager). Mutually exclusive with --enable-torch-compile and
-    # Cache-DiT; BCG takes priority when more than one is requested.
-    #
     # PyTorch's two approximate numerics defaults, set explicitly per worker
     # (see runtime/utils/numerics_policy.py). They are process-global, so they
     # cannot follow a request's quality level; the defaults keep PyTorch's own
     # values so the exact tier's speed is unchanged.
     allow_cudnn_tf32: bool = True
     allow_bf16_reduced_precision_reduction: bool = True
+    # Breakable CUDA graph (BCG): capture the DiT forward as CUDA-graph
+    # segments split at attention modules (SP all-to-all / dynamic attention
+    # stay eager). Mutually exclusive with --enable-torch-compile and
+    # Cache-DiT; BCG takes priority when more than one is requested.
+    #
     # BCG graphs are resolution-specific: every warmup resolution is captured at
     # warmup so serving never triggers a fresh capture. None resolves in
     # _adjust_breakable_cuda_graph_support (on for opted-in pipelines).
@@ -767,7 +766,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
         Falls back to :data:`DEFAULT_BCG_TEXT_BUCKETS` when ``--bcg-text-buckets``
         is unset, so both prompt padding and warmup capture share one source of
-        truth instead of the legacy ``SGLANG_BCG_TEXT_BUCKETS`` env var.
+        truth.
         """
         raw = self.bcg_text_buckets
         if not raw:
@@ -1280,15 +1279,16 @@ class ServerArgs(DisaggServerArgsMixin):
         if (
             self.backend != Backend.DIFFUSERS
             and isinstance(self.pipeline_config, MiniMaxH3PipelineConfig)
-            and self.attention_backend == "laser_attn"
+            and self.attention_backend in ("laser_attn", "ascend_sparse_attn")
             and "text_encoder" not in self.component_attention_backends
             and "text_encoder" not in self.component_attention_backend_roles
         ):
-            # Laser Attention is used only by the MiniMax-H3 transformer.
-            # SDPA is faster than Ascend FA for its Qwen3-VL text encoder.
+            # Laser and Ascend sparse attention target the H3 transformer. Keep the
+            # Qwen3-VL text encoder on SDPA to preserve its causal mask semantics.
             logger.info(
                 "Automatically set torch_sdpa backend for the MiniMax H3 text "
-                "encoder; laser_attn applies to the transformer"
+                "encoder; %s applies to the transformer",
+                self.attention_backend,
             )
             self.component_attention_backends["text_encoder"] = "torch_sdpa"
 
@@ -3862,13 +3862,6 @@ class ServerArgs(DisaggServerArgsMixin):
             with open(config_file, "r") as f:
                 return json.load(f)
         elif config_file.endswith((".yaml", ".yml")):
-            try:
-                import yaml
-            except ImportError:
-                raise ImportError(
-                    "Please install PyYAML to use YAML config files. "
-                    "`pip install pyyaml`"
-                )
             with open(config_file, "r") as f:
                 return yaml.safe_load(f)
         else:
@@ -4274,9 +4267,5 @@ def set_global_server_args(server_args: ServerArgs):
 
 def get_global_server_args() -> ServerArgs:
     if _global_server_args is None:
-        # in ci, usually when we test custom ops/modules directly,
-        # we don't set the sgl_diffusion config. In that case, we set a default
-        # config.
-        # TODO(will): may need to handle this for CI.
         raise ValueError("Global sgl_diffusion args is not set.")
     return _global_server_args

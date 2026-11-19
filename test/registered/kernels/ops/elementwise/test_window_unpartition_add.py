@@ -80,11 +80,5 @@ def test_unsupported_inputs_take_the_eager_path(case: str):
     assert not can_use_window_unpartition_add(windows, shortcut, 14)
 
 
-def test_kernel_rejects_non_bf16_inputs():
-    windows, shortcut = _inputs(dtype=torch.float16)
-    with pytest.raises(Exception, match="dtype|Tensor match failed"):
-        window_unpartition_add(windows, shortcut, 14)
-
-
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

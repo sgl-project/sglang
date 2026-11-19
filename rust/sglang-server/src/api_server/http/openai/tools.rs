@@ -85,7 +85,7 @@ struct SchemaToolCall<'a> {
 /// false truncates the batch to the first call, mirroring Python.
 ///
 /// When [`apply_tool_constraint`] selects the JSON schema, read the array first.
-pub(super) async fn parse_chat_tool_calls(
+pub(crate) async fn parse_chat_tool_calls(
     content: String,
     parser: Option<&str>,
     tools: Option<&[ToolDefinition]>,
@@ -106,6 +106,7 @@ pub(super) async fn parse_chat_tool_calls(
         id,
         r#type: FunctionType::Function,
         function: FunctionCall { name, arguments },
+        custom: None,
     };
     let (mut calls, normal): (Vec<_>, _) = match schema_calls {
         Some(Ok(calls)) => {
@@ -138,7 +139,7 @@ pub(super) async fn parse_chat_tool_calls(
 /// Map the scheduler's finish kind onto the OpenAI wire values. Length and
 /// content-filter keep their names; everything else (including a bare abort)
 /// reports as `stop`, matching Python's fallback.
-pub(super) fn chat_finish_reason(output: &CoreOutput) -> Option<OpenAIFinishReason> {
+pub(crate) fn chat_finish_reason(output: &CoreOutput) -> Option<OpenAIFinishReason> {
     let kind = output
         .finish_reason
         .as_ref()
@@ -368,7 +369,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(text, "Before <|python_");
         assert_eq!(
-            choice(&items[1]).finish_reason,
+            choice(items.last().expect("terminal chunk")).finish_reason,
             Some(OpenAIFinishReason::Stop)
         );
     }
@@ -488,6 +489,7 @@ mod tests {
                     name: Some("get_weather".into()),
                     arguments: Some("{}".into()),
                 }),
+                custom: None,
             }]),
             Some("thinking".into()),
         );

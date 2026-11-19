@@ -130,7 +130,6 @@ from sglang.srt.hf_transformers import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
-    resolve_image_processor_backend,
 )
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import from_cp_sharded
@@ -161,6 +160,7 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    ControlAckOutput,
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
@@ -273,6 +273,7 @@ from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
 )
 from sglang.srt.managers.scheduler_components.exit_ledger import record_send
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
+from sglang.srt.managers.scheduler_components.gc_freezer import GCFreezer
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
     RustServerIdleSleeper,
@@ -367,6 +368,9 @@ from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import (
 from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
     UocrSchedulerRuntime,
 )
+from sglang.srt.multimodal.token_space_mm_process.registry import (
+    register_token_space_models,
+)
 from sglang.srt.multimodal.transport.receive_budget import ReceiveFeatureBudget
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
@@ -409,7 +413,7 @@ from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_captur
 from sglang.srt.state_capturer.routed_experts import destroy_global_experts_capturer
 from sglang.srt.utils import (
     DynamicGradMode,
-    configure_gc_logger,
+    configure_gc_logging,
     configure_logger,
     freeze_gc,
     get_available_gpu_memory,
@@ -782,6 +786,7 @@ class Scheduler(
         self.init_pool_stats_observer()
 
         self.init_invariant_checker()
+        self.init_gc_freezer()
 
         self.init_load_publisher()
 
@@ -968,7 +973,7 @@ class Scheduler(
                     tokenizer_mode=get_serving().tokenizer_mode,
                     trust_remote_code=get_model().trust_remote_code,
                     revision=get_model().revision,
-                    image_processor_backend=resolve_image_processor_backend(get_mm()),
+                    image_processor_backend=get_mm().image_processor_backend,
                     tokenizer_backend=get_serving().tokenizer_backend,
                     model_name=get_model().model_path,
                 )
@@ -991,6 +996,7 @@ class Scheduler(
         ):
             try:
                 import_processors("sglang.srt.multimodal.processors")
+                register_token_space_models()
                 self._mm_processor = get_mm_processor(
                     self.model_config.hf_config,
                     server_args,
@@ -1499,6 +1505,19 @@ class Scheduler(
         self._prefill_decode_interval_remaining -= 1
         return True
 
+    def _negotiate_prefill_delayer_while_deferring(self) -> None:
+        # A DP peer below prefill_decode_interval_min_bs does not defer and runs
+        # the delayer's all-gather; join it with nothing to prefill.
+        if (
+            not self.require_mlp_sync
+            or self.prefill_decode_interval_min_bs == 0
+            or self.prefill_delayer is None
+        ):
+            return
+        PrefillDelayerSinglePassExecutor(
+            self.prefill_delayer, token_usage=0.0
+        ).finalize(actual_prefill_bs=0)
+
     def _arm_prefill_decode_interval(self, batch: Optional[ScheduleBatch]) -> None:
         if self.prefill_decode_interval == 0 or batch is None:
             return
@@ -1531,6 +1550,12 @@ class Scheduler(
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
             shortest_prefill_aging_factor=get_schedule().shortest_prefill_aging_factor,
+            bounded_lpm_enabled=self.dllm_config is None,
+        )
+        self.policy._on_bounded_state_change = lambda active: (
+            self.waiting_queue.set_on_leave(
+                self.policy.retire_waiting_members if active else None
+            )
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
@@ -1597,9 +1622,7 @@ class Scheduler(
             else None
         )
 
-        # Configure GC logger
-        if envs.SGLANG_LOG_GC.get():
-            configure_gc_logger()
+        configure_gc_logging("Scheduler")
 
     def init_disaggregation(self):
         self.mm_receiver = None
@@ -2077,9 +2100,7 @@ class Scheduler(
             result_dict["rust_server_pid"] = os.getpid()
         result_dict["hicache_object_layout"] = self._hicache_l3_layout()
 
-        if get_serving().grpc_port is not None and not (
-            get_serving().smg_grpc_mode or get_serving().grpc_mode
-        ):
+        if get_serving().grpc_port is not None:
             result_dict["kv_event_sources"] = (
                 self.kv_events_publisher.local_kv_event_sources(
                     self.page_size * get_parallel().dcp_size
@@ -2153,6 +2174,12 @@ class Scheduler(
         if ev is not None and not envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
             self.schedule_stream.wait_event(ev)
         else:
+            self.schedule_stream.wait_stream(self.forward_stream)
+
+    def wait_for_launched_forward(self) -> None:
+        """Order later schedule_stream work after every launched forward, not only
+        after its shared reads; an in_place pause can leave one reading the weights."""
+        if self.enable_overlap or get_parallel().pp_size > 1:
             self.schedule_stream.wait_stream(self.forward_stream)
 
     def increment_scheduler_iterations(self) -> None:
@@ -2366,6 +2393,8 @@ class Scheduler(
                 continue
 
             output = self._request_dispatcher(recv_req)
+            if output is None:
+                output = self._rust_control_ack(recv_req)
             if output is not None:
                 if self.rust_server is None and isinstance(output, RpcReqOutput):
                     if self.ipc_channels.recv_from_rpc is not None:
@@ -2399,6 +2428,24 @@ class Scheduler(
         else:
             self.output_streamer.release_detokenize_state(req)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+
+    # The control requests whose handlers return nothing: Python's
+    # TokenizerManager fire-and-forgets them. The Rust frontend waits for one
+    # reply per control request, so under it each gets a ControlAckOutput.
+    _RUST_ACKED_CONTROL_REQUESTS = (
+        PauseGenerationReqInput,
+        ContinueGenerationReqInput,
+        FreezeGCReq,
+        ConfigureLoggingReq,
+        CloseSessionReqInput,
+    )
+
+    def _rust_control_ack(self, recv_req):
+        """The reply the Rust frontend waits for after a no-reply control
+        handler ran; None for any other request, and under the Python frontend."""
+        if not isinstance(recv_req, self._RUST_ACKED_CONTROL_REQUESTS):
+            return None
+        return ControlAckOutput() if self.rust_server is not None else None
 
     def send_control_output(self, output, recv_req) -> None:
         """Answer a control request, at dispatch or later (a deferred flush)."""
@@ -2807,6 +2854,12 @@ class Scheduler(
                 )
             ),
             scheduler_stage_metrics=self.scheduler_stage_metrics,
+        )
+
+    def init_gc_freezer(self) -> None:
+        """Freeze the heap when idle; warn on heap growth and frozen garbage."""
+        self.gc_freezer = GCFreezer(
+            freeze_on_idle_secs=get_device().gc_freeze_on_idle_secs
         )
 
     def init_rank_consensus_checker(self) -> None:
@@ -3263,16 +3316,20 @@ class Scheduler(
 
     def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
         for req in batch.reqs:
-            if not req.finished() or not (mm_inputs := req.multimodal_inputs):
-                continue
-            # For session requests, keep mm_inputs for the next request
-            if req.session:
-                if isinstance(req.finished_reason, FINISH_ABORT):
-                    req.release_mm_inputs_on_abort()
-                continue
-            # For non-session requests, clear features and mm_inputs
-            mm_inputs.release_features()
-            req.multimodal_inputs = None
+            if req.finished():
+                self._release_mm_inputs(req)
+
+    def _release_mm_inputs(self, req: Req) -> None:
+        if not (mm_inputs := req.multimodal_inputs):
+            return
+        # For session requests, keep mm_inputs for the next request
+        if req.session:
+            if isinstance(req.finished_reason, FINISH_ABORT):
+                req.release_mm_inputs_on_abort()
+            return
+        # For non-session requests, clear features and mm_inputs
+        mm_inputs.release_features()
+        req.multimodal_inputs = None
 
     def _create_generation_req(
         self, recv_req: TokenizedGenerateReqInput, *args, **kwargs
@@ -3354,7 +3411,7 @@ class Scheduler(
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
                 kv_hints=recv_req.kv_hints,
-                vocab_size=self.model_config.vocab_size,
+                vocab_size=self.model_config.token_id_vocab_size,
                 priority=recv_req.priority,
                 metrics_collector=(
                     self.metrics_collector
@@ -3409,7 +3466,7 @@ class Scheduler(
             req = session.create_req(
                 recv_req,
                 self.tokenizer,
-                self.model_config.vocab_size,
+                self.model_config.token_id_vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 disagg_mode=self.disaggregation_mode,
                 req_factory=partial(self._create_generation_req, recv_req),
@@ -3440,7 +3497,7 @@ class Scheduler(
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
-                vocab_size=self.model_config.vocab_size,
+                vocab_size=self.model_config.token_id_vocab_size,
                 http_worker_ipc=recv_req.http_worker_ipc,
             )
             req.tokenizer = self.tokenizer
@@ -4336,6 +4393,7 @@ class Scheduler(
             new_batch = self.get_new_batch_dllm(running_batch, staged)
         elif self._should_defer_prefill(running_batch):
             new_batch = None
+            self._negotiate_prefill_delayer_while_deferring()
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
@@ -4669,12 +4727,22 @@ class Scheduler(
         # Requests no memory will ever come back for; aborted after the loop.
         unschedulable: List[Req] = []
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        bounded_active = self.policy._bounded_active
+        candidates = (
+            self.policy.admission_candidates(self.waiting_queue)
+            if bounded_active
+            else self.waiting_queue
+        )
+        for req in candidates:
+            if bounded_active and not self.policy.allows_admission(req):
+                break
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
             if chunk_parked or adder.budget_state() == AddReqResult.OTHER:
                 break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
+                if bounded_active:
+                    self.policy.mark_admission_skipped(req)
                 continue
 
             # A forward batch runs one pooling mode, so setwise readout requests
@@ -4684,6 +4752,8 @@ class Scheduler(
                 (req.token_indices_to_pool is not None)
                 != (adder.can_run_list[0].token_indices_to_pool is not None)
             ):
+                if bounded_active:
+                    self.policy.mark_admission_skipped(req)
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -4717,6 +4787,8 @@ class Scheduler(
                 req.time_stats.observe_storage_prefetch_ready(prefetch_done)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
+                    if bounded_active:
+                        self.policy.mark_admission_skipped(req)
                     continue
                 # Pop the L3-loaded span. Unified cache exposes its absolute
                 # start so cache-mode L2/L3 attribution survives L3-tail eviction.
@@ -4744,6 +4816,8 @@ class Scheduler(
             ):
                 if defer_cow_slot:
                     self._drop_unadmitted_match(req)
+                if bounded_active:
+                    self.policy.mark_admission_skipped(req)
                 continue
             if self.enable_hicache_storage and buffer_pipeline is not None:
                 staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
@@ -4751,6 +4825,8 @@ class Scheduler(
                 if not staging_ready:
                     if defer_cow_slot:
                         self._drop_unadmitted_match(req)
+                    if bounded_active:
+                        self.policy.mark_admission_skipped(req)
                     continue
             res = adder.add_one_req(
                 req,
@@ -5714,6 +5790,8 @@ class Scheduler(
             return_hidden_states=batch.return_hidden_states,
         )
         self.copy_stream.wait_stream(self.forward_stream)
+        if batch_result.side_stream_done is not None:
+            self.copy_stream.wait_event(batch_result.side_stream_done)
         with self.copy_stream_ctx:
             if not self.enable_async_d2h_copy:
                 copy_fn()
@@ -5764,12 +5842,18 @@ class Scheduler(
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
-        snapshot = self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+        # Extend and idle results always publish; decode steps are throttled
+        # to the publish interval. An idle batch exists only to join
+        # attention-DP collectives while other ranks have work, and on_idle
+        # never runs then, so a throttled idle rank's snapshot would lag its
+        # queues by many group steps.
+        force_publish = batch.forward_mode.is_extend() or batch.forward_mode.is_idle()
+        snapshot = self.publish_load_snapshot(force=force_publish)
         # Router-facing gauge on the dedicated PUB socket, reusing the
         # snapshot above rather than walking the queues again.
         self.load_publisher.publish_load_stat(
             self.load_inquirer.get_loads,
-            force=batch.forward_mode.is_extend(),
+            force=force_publish,
             snapshot=snapshot,
         )
 
@@ -5985,6 +6069,7 @@ class Scheduler(
             self.token_to_kv_pool_allocator.flush_opportunistic()
 
         self.invariant_checker.run(CheckPhase.IDLE)
+        self.gc_freezer.on_idle(self.forward_ct)
 
         # metrics every 30s
         self.metrics_reporter._maybe_log_idle_metrics()
@@ -6241,6 +6326,7 @@ class Scheduler(
             if self.metrics_reporter.is_stats_logging_rank:
                 logger.info("Cache flushed successfully!")
             self.invariant_checker.run(CheckPhase.FLUSH)
+            self.gc_freezer.on_cache_reset()
             success = True
         else:
             logging.warning(
@@ -6886,7 +6972,10 @@ class Scheduler(
     def configure_logging(self, recv_req: ConfigureLoggingReq):
         if recv_req.log_level is not None:
             logging.getLogger().setLevel(recv_req.log_level.upper())
-        self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
+        # The embedded Rust server's detokenizer runs in this process; no
+        # detokenizer process reads the socket (see handle_freeze_gc).
+        if self.rust_server is None:
+            self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
 
     def handle_dumper_control(self, recv_req: DumperControlReqInput):
         from sglang.srt.debug_utils.dumper import dumper
@@ -6900,12 +6989,12 @@ class Scheduler(
                 response = dumper._http_manager.handle_request(
                     method=recv_req.method, body=recv_req.body
                 )
-            self.ipc_channels.send_to_tokenizer.send_output(
+            self.send_control_output(
                 DumperControlReqOutput(success=True, response=response), recv_req
             )
         except Exception as e:
             print(f"[Scheduler] handle_dumper_control error: {e}", flush=True)
-            self.ipc_channels.send_to_tokenizer.send_output(
+            self.send_control_output(
                 DumperControlReqOutput(success=False, response=[], error=str(e)),
                 recv_req,
             )

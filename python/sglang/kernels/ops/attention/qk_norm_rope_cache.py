@@ -16,6 +16,10 @@ import triton.language as tl
 
 from sglang.kernels.ops.gemm.bf16_splitk_gemm import bf16_splitk_gemm_partials
 
+# (max rows, (BN, BK, SK, warps, stages)) of the QKV + gate projection, tuned at N 2304 (TP8) on gfx1250. BK and SK
+# match the default launch, so the partials are bit-identical to it.
+QKV_BF16_LAUNCH = ((16, (64, 128, 8, 4, 3)), (32, (128, 128, 8, 4, 2)))
+
 
 @triton.jit
 def _norm_rope(
@@ -260,9 +264,21 @@ def qkv_proj_qk_norm_rope_cache(
     assert x.is_contiguous() and weight.is_contiguous()
     assert cache_k.dtype == cache_v.dtype == torch.float8_e4m3fn
     assert cache_k.is_contiguous() and cache_v.is_contiguous()
-    # Split-K 8 / block_n 32 were tuned at N 2304 (TP8); not re-tuned for N 4608.
-    partials = torch.empty((8, m, n), device=x.device, dtype=torch.float32)
-    bf16_splitk_gemm_partials(x, weight, partials, block_n=32, block_k=128, split_k=8)
+    # Tuned at N 2304 (TP8); not re-tuned for N 4608.
+    block_n, block_k, split_k, warps, stages = next(
+        cfg for rows, cfg in QKV_BF16_LAUNCH if m <= rows
+    )
+    partials = torch.empty((split_k, m, n), device=x.device, dtype=torch.float32)
+    bf16_splitk_gemm_partials(
+        x,
+        weight,
+        partials,
+        block_n=block_n,
+        block_k=block_k,
+        split_k=split_k,
+        num_warps=warps,
+        num_stages=stages,
+    )
     qo = torch.empty((m, hq * d), device=x.device, dtype=torch.bfloat16)
     ko = torch.empty((m, hk * d), device=x.device, dtype=torch.bfloat16)
     vo = torch.empty_like(ko)

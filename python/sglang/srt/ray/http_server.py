@@ -35,6 +35,7 @@ def launch_server(
     """
     from sglang.srt.entrypoints.http_server import (
         _execute_server_warmup,
+        _reserve_http_socket,
         _setup_and_run_http_server,
     )
     from sglang.srt.ray.engine import RayEngine
@@ -42,27 +43,33 @@ def launch_server(
     if execute_warmup_func is None:
         execute_warmup_func = _execute_server_warmup
 
-    (
-        tokenizer_manager,
-        template_manager,
-        port_args,
-        scheduler_init_result,
-        subprocess_watchdog,
-        _weight_cache_daemon_procs,
-    ) = RayEngine._launch_subprocesses(
-        server_args,
-        init_tokenizer_manager_func=init_tokenizer_manager_func,
-        run_scheduler_process_func=run_scheduler_process_func,
-        run_detokenizer_process_func=run_detokenizer_process_func,
-    )
+    reserved_socket = _reserve_http_socket(server_args)
+    try:
+        (
+            tokenizer_manager,
+            template_manager,
+            port_args,
+            scheduler_init_result,
+            subprocess_watchdog,
+            _weight_cache_daemon_procs,
+        ) = RayEngine._launch_subprocesses(
+            server_args,
+            init_tokenizer_manager_func=init_tokenizer_manager_func,
+            run_scheduler_process_func=run_scheduler_process_func,
+            run_detokenizer_process_func=run_detokenizer_process_func,
+        )
 
-    _setup_and_run_http_server(
-        server_args,
-        tokenizer_manager,
-        template_manager,
-        port_args,
-        scheduler_init_result.scheduler_infos,
-        subprocess_watchdog,
-        execute_warmup_func=execute_warmup_func,
-        launch_callback=launch_callback,
-    )
+        _setup_and_run_http_server(
+            server_args,
+            tokenizer_manager,
+            template_manager,
+            port_args,
+            scheduler_init_result.scheduler_infos,
+            subprocess_watchdog,
+            execute_warmup_func=execute_warmup_func,
+            launch_callback=launch_callback,
+            reserved_socket=reserved_socket,
+        )
+    finally:
+        if reserved_socket is not None:
+            reserved_socket.close()

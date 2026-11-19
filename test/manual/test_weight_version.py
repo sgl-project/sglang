@@ -5,11 +5,11 @@ import unittest
 import requests
 
 from sglang.test.test_utils import (
-    ADMIN_API_KEY_FOR_TEST,
-    ADMIN_HEADERS_FOR_TEST,
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     CustomTestCase,
+    admin_post,
     popen_launch_server,
 )
 
@@ -29,8 +29,7 @@ class TestWeightVersion(CustomTestCase):
                 "test_version_1.0",
                 "--attention-backend",
                 "flashinfer",
-                "--admin-api-key",
-                ADMIN_API_KEY_FOR_TEST,
+                *ADMIN_LAUNCH_ARGS_FOR_TEST,
             ],
         )
 
@@ -95,10 +94,9 @@ class TestWeightVersion(CustomTestCase):
             "new_version": "updated_version_2.0",
             "abort_all_requests": False,
         }
-        response = requests.post(
+        response = admin_post(
             f"{self.base_url}/update_weight_version",
             json=update_data,
-            headers=ADMIN_HEADERS_FOR_TEST,
         )
         self.assertEqual(response.status_code, 200)
         data = response.json()
@@ -131,10 +129,9 @@ class TestWeightVersion(CustomTestCase):
         self.assertEqual(data["metadata"]["weight_version"], "updated_version_2.0")
 
         update_data = {"new_version": "final_version_3.0", "abort_all_requests": True}
-        response = requests.post(
+        response = admin_post(
             f"{self.base_url}/update_weight_version",
             json=update_data,
-            headers=ADMIN_HEADERS_FOR_TEST,
         )
         self.assertEqual(response.status_code, 200)
         data = response.json()
@@ -192,10 +189,9 @@ class TestWeightVersion(CustomTestCase):
             "weight_version": "disk_update_v2.0.0",
         }
 
-        response = requests.post(
+        response = admin_post(
             f"{self.base_url}/update_weights_from_disk",
             json=update_data,
-            headers=ADMIN_HEADERS_FOR_TEST,
         )
         self.assertEqual(
             response.status_code,

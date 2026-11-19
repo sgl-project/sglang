@@ -48,18 +48,18 @@ from sglang.test.ci.ci_register import (
     register_xpu_ci,
 )
 from sglang.test.test_utils import (
-    ADMIN_API_KEY_FOR_TEST,
-    ADMIN_HEADERS_FOR_TEST,
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    admin_post,
     find_available_port,
     popen_launch_server,
     run_distributed_test,
 )
 
 register_cuda_ci(est_time=30, stage="nightly", runner_config="2-gpu-large")
-register_amd_ci(est_time=60, suite="nightly-amd", nightly=True)
-register_xpu_ci(est_time=400, suite="nightly-xpu-kernel-main-2-gpu", nightly=True)
+register_amd_ci(est_time=60, suite="nightly-test-amd", nightly=True)
+register_xpu_ci(est_time=400, suite="nightly-kernel-main-test-2-gpu-xpu", nightly=True)
 
 
 @contextmanager
@@ -1694,8 +1694,7 @@ class TestDumperHttp:
                 other_args=[
                     "--max-total-tokens",
                     "128",
-                    "--admin-api-key",
-                    ADMIN_API_KEY_FOR_TEST,
+                    *ADMIN_LAUNCH_ARGS_FOR_TEST,
                 ],
                 env=env,
             )
@@ -1706,10 +1705,9 @@ class TestDumperHttp:
 
     @staticmethod
     def _post(base_url: str, method: str, **kwargs) -> list[dict]:
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/dumper/{method}",
             json=kwargs or None,
-            headers=ADMIN_HEADERS_FOR_TEST,
         )
         resp.raise_for_status()
         states = resp.json()
@@ -1784,26 +1782,23 @@ class TestDumperHttp:
             assert rank_config == configs[0], f"rank configs diverged: {configs}"
 
     def test_error_unknown_field(self, dumper_http_url: str):
-        resp = requests.post(
+        resp = admin_post(
             f"{dumper_http_url}/dumper/configure",
             json={"nonexistent_field": 123},
-            headers=ADMIN_HEADERS_FOR_TEST,
         )
         assert resp.status_code == 400
 
     def test_error_unknown_method(self, dumper_http_url: str):
-        resp = requests.post(
+        resp = admin_post(
             f"{dumper_http_url}/dumper/nonexistent",
             json={},
-            headers=ADMIN_HEADERS_FOR_TEST,
         )
         assert resp.status_code == 400
 
     def test_error_wrong_type(self, dumper_http_url: str):
-        resp = requests.post(
+        resp = admin_post(
             f"{dumper_http_url}/dumper/configure",
             json={"enable": "not_a_bool"},
-            headers=ADMIN_HEADERS_FOR_TEST,
         )
         assert resp.status_code == 400
 
@@ -2370,32 +2365,28 @@ class TestDumperE2E:
                 "2",
                 "--max-total-tokens",
                 "128",
-                "--admin-api-key",
-                ADMIN_API_KEY_FOR_TEST,
+                *ADMIN_LAUNCH_ARGS_FOR_TEST,
             ],
             env=env,
         )
         try:
-            states = requests.post(
+            states = admin_post(
                 f"{base_url}/dumper/get_state",
                 json={},
-                headers=ADMIN_HEADERS_FOR_TEST,
             ).json()
             assert len(states) == 2, f"Expected 2 ranks (tp=2), got {len(states)}"
             for state in states:
                 assert state["config"]["enable"] is False
                 assert state["step"] == 0
 
-            requests.post(
+            admin_post(
                 f"{base_url}/dumper/configure",
                 json={"enable": True, "dir": dump_dir},
-                headers=ADMIN_HEADERS_FOR_TEST,
             ).raise_for_status()
 
-            states = requests.post(
+            states = admin_post(
                 f"{base_url}/dumper/get_state",
                 json={},
-                headers=ADMIN_HEADERS_FOR_TEST,
             ).json()
             assert len(states) == 2
             for rank, state in enumerate(states):
@@ -2410,10 +2401,9 @@ class TestDumperE2E:
             )
             assert resp.status_code == 200, f"Generate failed: {resp.text}"
 
-            states = requests.post(
+            states = admin_post(
                 f"{base_url}/dumper/get_state",
                 json={},
-                headers=ADMIN_HEADERS_FOR_TEST,
             ).json()
             assert len(states) == 2
             steps = [s["step"] for s in states]
