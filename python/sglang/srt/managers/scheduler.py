@@ -2400,10 +2400,10 @@ class Scheduler(
                 output = self._rust_control_ack(recv_req)
             if output is not None:
                 if get_parallel().pp_size > 1 and isinstance(
-                    output, ReleaseMemoryOccupationReqOutput
+                    output, (ReleaseMemoryOccupationReqOutput, RpcReqOutput)
                 ):
-                    # Answered by the first stage once every stage has released.
-                    self._pp_pass_release_verdict(output, recv_req)
+                    # Answered by the first stage once every stage has run it.
+                    self._pp_pass_verdict(output, recv_req)
                 else:
                     self.send_control_output(output, recv_req)
 
