@@ -42,8 +42,16 @@ _MODE = _KERNEL_MODES[os.environ.get("SGLANG_ROCM_MUSE_AR_BOUNDARY_KERNEL", "fac
 _VEC_FROM_ROWS = int(os.environ.get("SGLANG_ROCM_MUSE_AR_BOUNDARY_VEC_FROM_ROWS", "0"))
 # batches below this many rows keep the plain all-reduce (TP8 decode: no e2e gain at 8 rows, +1.9% at 16)
 _MIN_ROWS = int(os.environ.get("SGLANG_ROCM_MUSE_AR_BOUNDARY_MIN_ROWS", "0"))
+# batches above this many rows keep the plain all-reduce (0: no limit). TP8 decode with FlyDSL's flagless_le8m3
+# routing: its flagless two-shot from 64 rows (1 MiB) beats the fused kernels' carv2 exchange.
+_MAX_ROWS = int(os.environ.get("SGLANG_ROCM_MUSE_AR_BOUNDARY_MAX_ROWS", "0"))
 # rows an own push plane is sized for; larger batches keep the plain all-reduce
 _OWN_PUSH_MAX_ROWS = 512
+# batches of at most this many rows run the boundary on FlyDSL's role-split one-shot instead
+# (ar_boundary_flydsl_oneshot.py; 0: never); needs sglang_meta_common's FlyDSL all-reduce helpers
+_FLYDSL_ONESHOT_MAX_ROWS = int(
+    os.environ.get("SGLANG_ROCM_MUSE_AR_BOUNDARY_FLYDSL_ONESHOT_MAX_ROWS", "0")
+)
 
 
 def _mode_for(num_rows: int) -> int:
@@ -105,6 +113,38 @@ def _ensure_comm(hidden: int) -> None:
     tp.ar_boundary_comm = None if comm.disabled else comm
 
 
+def _ensure_one_shot(boundary: FusedPostNormResidualPreNorm) -> None:
+    """The FlyDSL one-shot boundary kernel's scratch and compiled launchers, set once on the TP group
+    (collectively); none without sglang_meta_common."""
+    tp = get_parallel().tp_group
+    if hasattr(tp, "ar_boundary_one_shot"):
+        return
+    tp.ar_boundary_one_shot = None
+    # one lane per 256-column piece when a wave folds its row's sums
+    if (
+        _FLYDSL_ONESHOT_MAX_ROWS <= 0
+        or tp.world_size not in (2, 4, 8)
+        or boundary._hidden_size != 8 * 32 * 32
+    ):
+        return
+    try:
+        import sglang_meta_common.ops.comm.flydsl_ar  # noqa: F401
+    except ImportError:
+        return
+    from sglang.srt.rocm_muse_spark.ar_boundary_flydsl_oneshot import (
+        FlyDSLArBoundaryOneShot,
+    )
+
+    tp.ar_boundary_one_shot = FlyDSLArBoundaryOneShot(
+        tp,
+        boundary._hidden_size,
+        _FLYDSL_ONESHOT_MAX_ROWS,
+        boundary._post_norm.eps,
+        boundary._pre_norm.eps,
+    )
+    tp.ar_boundary_one_shot.warm()
+
+
 def _factored_layout(hidden: int, world_size: int) -> tuple[int, int] | None:
     """(segments, pieces) per row of the factored kernel, or None where it falls back to the
     per-vector one: a segment is a warp of 32 lanes times kTwoShotPushReduceUnroll 16-byte
@@ -154,9 +194,14 @@ class AllReduceAttnBoundary:
         self._applies: dict[tuple[int, bool], bool] = {}
         if self._form_supported:
             _ensure_comm(boundary._hidden_size)
+            _ensure_one_shot(boundary)
 
     def _comm(self):
         return getattr(get_parallel().tp_group, "ar_boundary_comm", None)
+
+    def _one_shot_for(self, num_rows: int):
+        one_shot = getattr(get_parallel().tp_group, "ar_boundary_one_shot", None)
+        return one_shot if one_shot is not None and one_shot.supports(num_rows) else None
 
     def _decide(self, comm, num_rows: int) -> bool:
         from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
@@ -164,6 +209,8 @@ class AllReduceAttnBoundary:
         )
 
         if not 2 <= comm.world_size <= 8 or num_rows < _MIN_ROWS:
+            return False
+        if 0 < _MAX_ROWS < num_rows:
             return False
         row_bytes = self._boundary._hidden_size * 2
         nbytes = num_rows * row_bytes
@@ -192,6 +239,8 @@ class AllReduceAttnBoundary:
         num_rows = stream.shape[0]
         if num_rows == 0:
             return False
+        if self._one_shot_for(num_rows) is not None:
+            return True
         from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
             CustomAllReduceV2,
         )
@@ -217,6 +266,16 @@ class AllReduceAttnBoundary:
         assert router_dtype in (None, torch.float32), router_dtype
         boundary = self._boundary
         boundary._ensure_cached_weights(torch.bfloat16)
+        one_shot = self._one_shot_for(partial.shape[0])
+        if one_shot is not None:
+            return one_shot(
+                stream,
+                partial.contiguous(),
+                boundary._cc_pre_weight,
+                boundary._cc_alpha,
+                boundary._cc_beta,
+                with_router=router_dtype is not None,
+            )
         comm = self._comm()
         output = torch.empty_like(partial)
         new_stream = torch.empty_like(stream)
