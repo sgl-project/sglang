@@ -1,6 +1,10 @@
+from typing import Optional, Tuple, Union
+
 import torch
 import triton
 import triton.language as tl
+
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
 
 
 @triton.jit
@@ -11,6 +15,11 @@ def reshape_and_cache_shuffle_5d(
     value_cache_ptr,
     slot_mapping_ptr,
     swa_slot_mapping_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
+    k_scale,
+    v_scale,
+    fp8_max,
     key_stride_token,
     value_stride_token,
     num_heads,
@@ -20,6 +29,9 @@ def reshape_and_cache_shuffle_5d(
     HEAD_BLOCK: tl.constexpr,
     BLOCK_D: tl.constexpr,
     HAS_SWA: tl.constexpr,
+    QUANT: tl.constexpr,
+    K_SCALE_IS_PTR: tl.constexpr,
+    V_SCALE_IS_PTR: tl.constexpr,
 ):
     """Scatter per-token (num_tokens, num_heads, head_size) K/V into the
     SHUFFLE 5D "vectorized" KV cache layout used by aiter CK
@@ -29,6 +41,11 @@ def reshape_and_cache_shuffle_5d(
     V cache shape: (num_blocks, num_heads, block_size // X, head_size, X)
     where X = 16 // element_size (=8 for bf16/fp16, =16 for fp8).
     block_size must be divisible by X, and head_size must be divisible by X.
+
+    With QUANT, the caches are fp8 and K/V are not: each value is divided by
+    its per-tensor scale in fp32, saturated to +-fp8_max and cast as it is
+    written. A scale is read from its pointer when *_SCALE_IS_PTR, else taken
+    as the value given.
 
     Each program handles one token and a HEAD_BLOCK-wide slice of heads.
     """
@@ -60,6 +77,15 @@ def reshape_and_cache_shuffle_5d(
         token_idx * value_stride_token + head_idx[:, None] * head_size + d[None, :]
     )
     v = tl.load(value_ptr + src_off_v, mask=src_mask)
+    if QUANT:
+        if K_SCALE_IS_PTR:
+            k_scale = tl.load(k_scale_ptr).to(tl.float32)
+        if V_SCALE_IS_PTR:
+            v_scale = tl.load(v_scale_ptr).to(tl.float32)
+        k = tl.clamp(k.to(tl.float32) / k_scale, -fp8_max, fp8_max)
+        v = tl.clamp(v.to(tl.float32) / v_scale, -fp8_max, fp8_max)
+    k = k.to(key_cache_ptr.dtype.element_ty)
+    v = v.to(value_cache_ptr.dtype.element_ty)
 
     layer_stride = num_heads * head_size * block_size
     head_stride = head_size * block_size
@@ -83,6 +109,18 @@ def reshape_and_cache_shuffle_5d(
     tl.store(value_cache_ptr + v_tgt, v, mask=src_mask)
 
 
+def _scale_arg(
+    scale: Optional[Union[float, torch.Tensor]], dummy: torch.Tensor
+) -> Tuple[torch.Tensor, float, bool]:
+    """(pointer, value, read from the pointer) for a per-tensor scale: a device
+    tensor is read in the kernel, so no host sync breaks graph capture; a host
+    tensor, a float or None (1.0) is passed by value."""
+    if isinstance(scale, torch.Tensor) and scale.device.type != "cpu":
+        return scale, 1.0, True
+    value = 1.0 if scale is None else float(scale)
+    return dummy, value, False
+
+
 def launch_reshape_and_cache_shuffle_5d(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -90,6 +128,8 @@ def launch_reshape_and_cache_shuffle_5d(
     value_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     swa_slot_mapping=None,
+    k_scale: Optional[Union[float, torch.Tensor]] = None,
+    v_scale: Optional[Union[float, torch.Tensor]] = None,
 ):
     """Launcher for reshape_and_cache_shuffle_5d.
 
@@ -98,6 +138,9 @@ def launch_reshape_and_cache_shuffle_5d(
         key_cache: (num_blocks, num_heads, head_size//X, block_size, X)
         value_cache: (num_blocks, num_heads, block_size//X, head_size, X)
         slot_mapping: per-token destination slot in [0, num_blocks*block_size)
+        k_scale/v_scale: per-tensor scales, used when the caches are fp8 and
+            key/value are not: key / k_scale and value / v_scale are written,
+            saturated to the fp8 range. A float, a one-element tensor or None (1.0).
     """
     num_tokens, num_heads, head_size = key.shape
     assert value.shape == key.shape, "K/V must share token-major shape"
@@ -116,6 +159,10 @@ def launch_reshape_and_cache_shuffle_5d(
     HEAD_BLOCK = min(4, triton.next_power_of_2(num_heads))
     BLOCK_D = triton.next_power_of_2(head_size)
     grid = (num_tokens, triton.cdiv(num_heads, HEAD_BLOCK))
+    quant = key_cache.dtype in _FP8_DTYPES and key.dtype not in _FP8_DTYPES
+    k_scale_ptr, k_scale_value, k_scale_is_ptr = _scale_arg(k_scale, slot_mapping)
+    v_scale_ptr, v_scale_value, v_scale_is_ptr = _scale_arg(v_scale, slot_mapping)
+    fp8_max = torch.finfo(key_cache.dtype).max if quant else 0.0
 
     reshape_and_cache_shuffle_5d[grid](
         key,
@@ -124,6 +171,11 @@ def launch_reshape_and_cache_shuffle_5d(
         value_cache,
         slot_mapping,
         swa_slot_mapping if swa_slot_mapping is not None else slot_mapping,
+        k_scale_ptr,
+        v_scale_ptr,
+        k_scale_value,
+        v_scale_value,
+        fp8_max,
         key.stride(0),
         value.stride(0),
         num_heads,
@@ -133,6 +185,9 @@ def launch_reshape_and_cache_shuffle_5d(
         HEAD_BLOCK=HEAD_BLOCK,
         BLOCK_D=BLOCK_D,
         HAS_SWA=(swa_slot_mapping is not None),
+        QUANT=quant,
+        K_SCALE_IS_PTR=k_scale_is_ptr,
+        V_SCALE_IS_PTR=v_scale_is_ptr,
     )
 
 
