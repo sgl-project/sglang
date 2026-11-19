@@ -12,8 +12,8 @@ import unittest
 
 import openai
 
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.hf_transformers import get_tokenizer
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -781,7 +781,7 @@ class TestToolChoiceQwen25(TestToolChoiceLlama32):
             api_key=cls.api_key,
             other_args=[
                 "--tool-call-parser",
-                "qwen25",
+                "qwen",
             ],
         )
         cls.base_url += "/v1"
@@ -850,7 +850,7 @@ class TestToolChoiceMistral(TestToolChoiceLlama32):
 #             other_args=[
 #                 # If your server needs extra parameters to test function calling, please add them here.
 #                 "--tool-call-parser",
-#                 "glm45",
+#                 "glm",
 #                 "--reasoning-parser",
 #                 "glm45",
 #                 "--tp-size",

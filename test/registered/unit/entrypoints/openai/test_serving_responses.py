@@ -336,6 +336,127 @@ class InputMessageConstructionTestCase(CustomTestCase):
         )
         self.assertEqual(messages[-1]["tool_calls"][0]["id"], "call_weather")
 
+    def test_replay_keeps_commentary_with_ordered_tool_calls(self):
+        """Splitting commentary from its calls inserts an assistant sampling
+        boundary before those calls, so replay must preserve one logical turn."""
+        for call_count in (1, 2):
+            with self.subTest(call_count=call_count):
+                serving = make_serving()
+                calls = [
+                    {
+                        "type": "function_call",
+                        "call_id": f"call_{index}",
+                        "name": f"tool_{index}",
+                        "arguments": f'{{"index":{index}}}',
+                    }
+                    for index in range(call_count)
+                ]
+                outputs = [
+                    {
+                        "type": "function_call_output",
+                        "call_id": f"call_{index}",
+                        "output": f"result {index}",
+                    }
+                    for index in range(call_count)
+                ]
+                request = ResponsesRequest(
+                    model="x",
+                    input=[
+                        {
+                            "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": "plan"}],
+                        },
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": "working",
+                            "phase": "commentary",
+                        },
+                        *calls,
+                        *outputs,
+                        {
+                            "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": "conclusion"}],
+                        },
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": "answer",
+                            "phase": "final_answer",
+                        },
+                    ],
+                    store=False,
+                )
+
+                messages = serving._construct_input_messages(request)
+
+                self.assertEqual(
+                    messages,
+                    [
+                        {
+                            "role": "assistant",
+                            "reasoning_content": "plan",
+                            "phase": "commentary",
+                            "content": "working",
+                            "tool_calls": [
+                                {
+                                    "id": f"call_{index}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": f"tool_{index}",
+                                        "arguments": f'{{"index":{index}}}',
+                                    },
+                                }
+                                for index in range(call_count)
+                            ],
+                        },
+                        *[
+                            {
+                                "role": "tool",
+                                "tool_call_id": f"call_{index}",
+                                "content": f"result {index}",
+                            }
+                            for index in range(call_count)
+                        ],
+                        {
+                            "role": "assistant",
+                            "reasoning_content": "conclusion",
+                            "phase": "final_answer",
+                            "content": "answer",
+                        },
+                    ],
+                )
+
+        boundary_request = ResponsesRequest(
+            model="x",
+            input=[
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": "intermediate",
+                    "phase": "commentary",
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": "done",
+                    "phase": "final_answer",
+                },
+            ],
+            store=False,
+        )
+        self.assertEqual(
+            serving._construct_input_messages(boundary_request),
+            [
+                {
+                    "role": "assistant",
+                    "content": "intermediate",
+                    "phase": "commentary",
+                },
+                {"role": "assistant", "content": "done", "phase": "final_answer"},
+            ],
+        )
+
     def test_input_parts_normalized_for_chat_templates(self):
         serving = make_serving()
         request = ResponsesRequest(
@@ -484,6 +605,7 @@ class ChatToolForwardingTestCase(CustomTestCase):
     def test_kimi_k3_request_uses_chat_encoder_fields(self):
         serving = make_serving()
         serving.chat_encoding_spec = "kimi_k3"
+        serving._encoding_adapter = serving._build_chat_encoding_adapter()
         serving.default_chat_template_kwargs = {}
         serving.template_manager.chat_template_name = None
         serving.tokenizer_manager.tokenizer.apply_chat_template.return_value = [4, 5, 6]
@@ -1686,6 +1808,9 @@ class ChatEncodingAdapterDispatchTestCase(CustomTestCase):
             tool_call_parsing_active=Mock(),
             history_tool_calls_count=Mock(),
             tool_call_id=Mock(),
+            effective_tools=Mock(),
+            split_assistant_prefix=Mock(),
+            append_assistant_prefix=Mock(),
         )
 
     def test_only_a_selected_inkling_encoding_requires_tml_renderers(self):
@@ -1704,19 +1829,18 @@ class ChatEncodingAdapterDispatchTestCase(CustomTestCase):
                 reasoning_parser="inkling",
                 tool_call_parser="inkling",
                 chat_hooks=self._hooks(),
-                hf_config=None,
+                hf_config=SimpleNamespace(model_type="kimi_k3"),
                 model_path="model",
                 revision=None,
             )
 
         with patch.dict(sys.modules, {"tml_renderers": None}):
-            for encoding in ("kimi_k3", "dsv32"):
-                with self.subTest(encoding=encoding):
-                    self.assertIsNone(
-                        chat_encoding_adapters.build_chat_encoding_adapter(
-                            ctx(encoding)
-                        )
-                    )
+            self.assertIsNone(
+                chat_encoding_adapters.build_chat_encoding_adapter(ctx("dsv32"))
+            )
+            self.assertIsNotNone(
+                chat_encoding_adapters.build_chat_encoding_adapter(ctx("kimi_k3"))
+            )
             with self.assertRaises(ImportError):
                 chat_encoding_adapters.build_chat_encoding_adapter(ctx("inkling"))
 
@@ -1726,7 +1850,7 @@ class ChatEncodingAdapterDispatchTestCase(CustomTestCase):
         )
 
         for reasoning_parser, tool_call_parser in (
-            ("inkling", "qwen25"),
+            ("inkling", "qwen"),
             ("qwen3", "inkling"),
         ):
             with self.subTest(reasoning=reasoning_parser, tool=tool_call_parser):
@@ -1790,7 +1914,7 @@ class ChatEncodingAdapterDispatchTestCase(CustomTestCase):
             patch.object(
                 OpenAIServingChat, "_resolve_chat_encoding_spec", return_value="inkling"
             ),
-            patch.object(serving_inkling, "_check_served_tokenizer"),
+            patch.object(serving_inkling, "check_served_tokenizer"),
             patch.object(
                 chat_encoding_adapters,
                 "build_chat_encoding_adapter",
@@ -1987,7 +2111,7 @@ class EnginePassthroughTestCase(CustomTestCase):
         # _process_messages turns it off so tool-call markers survive detokenize;
         # create_responses must re-apply it to the engine sampling dict.
         serving = make_serving()
-        serving.tool_call_parser = "qwen25"
+        serving.tool_call_parser = "qwen"
 
         captured = self._capture(
             serving,

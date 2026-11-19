@@ -32,9 +32,10 @@ from transformers import (
 )
 
 from sglang.srt.entrypoints.engine import Engine
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.srt.model_loader.ci_weight_validation import ci_validate_and_clean_hf_cache
-from sglang.srt.utils import get_device, is_npu, load_image
-from sglang.srt.utils.hf_transformers import get_tokenizer
+from sglang.srt.multimodal.media_io import load_image
+from sglang.srt.utils import get_device, is_npu
 from sglang.test.test_utils import (
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
     calculate_rouge_l,
@@ -110,7 +111,7 @@ def _get_sentence_transformer_embedding_model(
     from sentence_transformers import SentenceTransformer
     from sentence_transformers.util import is_sentence_transformer_model
 
-    from sglang.srt.utils.hf_transformers import _fix_v5_add_bos_eos_token
+    from sglang.srt.hf_transformers import _fix_v5_add_bos_eos_token
 
     if is_sentence_transformer_model(model_path):
         model = SentenceTransformer(

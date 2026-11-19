@@ -25,15 +25,20 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+from sglang.srt.mem_cache.kv.alloc.forward_steps import (
+    ForwardLaunch,
+    forward_steps_of,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.test.tree_slots import tree_slots_of
+from sglang.test.tree_slots import storage_tree_slots
 from sglang.test.unified_allocator_fixtures import (
     UnifiedGeometry,
     build_unified_bundle,
-    pin_every_band,
+    hold_every_band,
+    release_every_band,
     setup_allocator_context,
 )
 
@@ -44,15 +49,18 @@ STATE_CHAINS = ("mamba", "mamba_mla", "tri")
 
 
 class TraceConfig(msgspec.Struct, frozen=True, kw_only=True):
+    """One traced allocator: its chain and page size. A unified chain
+    compacts lazily (its ends compact only when asked), so every trace runs
+    lazy compaction."""
+
     chain: str
     page_size: int
-    lazy: bool
     # Paged extend and decode run device kernels; on "cpu" the stream uses
     # plain token allocation instead.
     device: str = "cuda"
 
     def key(self) -> str:
-        return f"{self.chain}/ps{self.page_size}/lazy{int(self.lazy)}/{self.device}"
+        return f"{self.chain}/ps{self.page_size}/{self.device}"
 
 
 def trace_geometry(config: TraceConfig) -> UnifiedGeometry:
@@ -70,7 +78,7 @@ def trace_geometry(config: TraceConfig) -> UnifiedGeometry:
         swa_tokens=64 * ps,
         context_len=256 * ps,
         window=32,
-        lazy=config.lazy,
+        lazy=True,
         device=config.device,
     )
 
@@ -126,9 +134,11 @@ class BuilderAdapter:
         )
         self.gate_open = True
         self.events: List[FakeEvent] = []
+        # A lazy chain's forward steps: each forward is a launched step whose
+        # frees pend until `fire` processes it.
+        self.steps = forward_steps_of(self.allocator)
+        self.launches: List[ForwardLaunch] = []
         self.tree = self._build_tree() if config.chain == "swa" else None
-        if config.lazy:
-            pin_every_band(self.allocator, lambda: not self.gate_open)
 
     def _build_tree(self) -> UnifiedRadixCache:
         return UnifiedRadixCache(
@@ -143,9 +153,7 @@ class BuilderAdapter:
                 token_to_kv_pool_allocator=self.allocator,
                 page_size=self.page_size,
                 sliding_window_size=32,
-                tree_slots=tree_slots_of(
-                    (ComponentType.FULL, ComponentType.SWA), window=32
-                ),
+                tree_slots=storage_tree_slots(self.allocator.storage, window=32),
             )
         )
 
@@ -162,6 +170,7 @@ class BuilderAdapter:
     # -- operations; each returns the ids it produced, or None on refusal --
 
     def extend(self, tokens: List[int], n: int) -> Optional[List[int]]:
+        self._sync_hold()
         if self.page_size == 1:
             # Production allocates page-1 pools token by token (`alloc_token_slots`).
             return self.alloc(n)
@@ -179,6 +188,7 @@ class BuilderAdapter:
         return None if out is None else out.tolist()
 
     def decode(self, token_lists: List[List[int]]) -> Optional[List[int]]:
+        self._sync_hold()
         if self.page_size == 1:
             return self.alloc(len(token_lists))
         seq = torch.tensor(
@@ -194,6 +204,7 @@ class BuilderAdapter:
         return None if out is None else out.tolist()
 
     def alloc(self, n: int) -> Optional[List[int]]:
+        self._sync_hold()
         out = self.allocator.alloc(n)
         return None if out is None else out.tolist()
 
@@ -217,6 +228,7 @@ class BuilderAdapter:
             self.allocator.free_group_end()
 
     def state_alloc(self, n: int) -> Optional[List[int]]:
+        self._sync_hold()
         out = self.state_allocator.alloc(n)
         return None if out is None else out.tolist()
 
@@ -226,23 +238,43 @@ class BuilderAdapter:
         )
 
     def flush(self, member: Optional[str]) -> None:
+        self._sync_hold()
         if member is None:
             self.allocator.flush_opportunistic()
         else:
             self._member(member).flush_for_allocation()
 
     def ensure(self, full: int, window: int) -> bool:
-        return bool(self.allocator.ensure_capacity(full, window))
+        self._sync_hold()
+        names = self.allocator.window_pool_names()
+        return bool(
+            self.allocator.ensure_capacity(KVDemand(full, dict.fromkeys(names, window)))
+        )
 
     def prepare_state(self, n: int) -> None:
-        self.allocator.prepare_mamba_allocation(n)
+        self._sync_hold()
+        # Lay the chain out so ``n`` state slots then fit in place.
+        state = self.allocator.mamba_allocator.sub_pool_name
+        self.allocator.lay_out_for({state: n})
 
     def gate(self, open_: bool) -> None:
         self.gate_open = open_
+        self._sync_hold()
+
+    def _sync_hold(self) -> None:
+        """A closed gate holds every band's live pages, re-taken before each
+        operation so pages freed meanwhile drop out and new ones join."""
+        release_every_band(self.allocator)
+        if not self.gate_open:
+            hold_every_band(self.allocator)
 
     def forward(self, ids: List[int]) -> None:
         event = FakeEvent()
         self.events.append(event)
+        if self.steps is not None:
+            # Back to back: no managed free or allocation between them.
+            self.launches.append(self.steps.forward_launched())
+            self.steps.forward_recorded(event)
         self.allocator.set_latest_forward_done_event(event)
         self.allocator.set_inflight_forward(
             event, torch.tensor(ids, dtype=torch.int64, device=self.device)
@@ -252,8 +284,13 @@ class BuilderAdapter:
         for event in self.events:
             event.fired = True
         self.events.clear()
+        if self.steps is not None:
+            for launch in self.launches:  # oldest first
+                self.steps.forward_processed(launch)
+        self.launches.clear()
 
     def reserve(self, member: str, n: int) -> Optional[List[int]]:
+        self._sync_hold()
         out = self._member(member).alloc_physical(n)
         return None if out is None else out.tolist()
 
@@ -267,7 +304,10 @@ class BuilderAdapter:
         )
 
     def evict(self, n: int) -> bool:
-        return bool(self.allocator.evict_to_free_tokens(self.tree, n))
+        self._sync_hold()
+        from sglang.srt.mem_cache.capacity import evict_to_free_tokens
+
+        return bool(evict_to_free_tokens(self.tree, self.allocator, n))
 
     def _member(self, name: str):
         return next(m for m in self.members() if m.sub_pool_name == name)
@@ -286,12 +326,11 @@ class BuilderAdapter:
                 out[f"{p}.edges"] = [m.watermark_physical]
             out[f"{p}.allocated_pages"] = m._allocated_pages()
             out[f"{p}.holes"] = sorted(m._free_phys_pages.tolist())
-            out[f"{p}.pending"] = sorted(m._pending_reuse_pages_cpu)
+            out[f"{p}.pending"] = sorted(m.usage.pending_pages)
             out[f"{p}.free_vids"] = (
                 None if m.free_virtual_ids is None else m.free_virtual_ids.tolist()
             )
             out[f"{p}.available"] = m.available_size()
-            out[f"{p}.schedulable"] = m.schedulable_available_size()
         a = self.allocator
         out["available"] = a.available_size()
         if self.config.chain in WINDOW_CHAINS:
@@ -492,9 +531,9 @@ def draw_op(rng: random.Random, model: HostModel, config: TraceConfig) -> dict:
         return {"op": "cache", "req": rng.choice(unretired)}
     if roll < 0.86 and config.chain == "swa" and model.cached:
         return {"op": "evict", "n": rng.randint(1, 8) * ps}
-    if roll < 0.90 and config.lazy:
+    if roll < 0.90:
         return {"op": "gate", "open": rng.random() < 0.7}
-    if roll < 0.94 and config.lazy:
+    if roll < 0.94:
         if rng.random() < 0.5:
             return {"op": "forward", "req": rng.choice(live)}
         return {"op": "fire"}
@@ -604,17 +643,16 @@ def corner_states(config: TraceConfig) -> Dict[str, List[dict]]:
     fill = [{"op": "extend", "req": i, "n": 4 * ps} for i in range(12)]
     holes = fill + [{"op": "free", "req": i} for i in range(0, 12, 2)]
     corners = {"holes": holes}
-    if config.lazy:
-        corners["closed_gate_over_holes"] = holes + [{"op": "gate", "open": False}]
-        corners["pending_reuse_behind_forward"] = (
-            fill
-            + [{"op": "forward", "req": 1}]
-            + [{"op": "free", "req": i} for i in range(0, 12, 2)]
-            + [{"op": "flush"}]
-        )
-        corners["hicache_reservation"] = holes + [
-            {"op": "reserve", "member": "full", "n": 2 * ps}
-        ]
+    corners["closed_gate_over_holes"] = holes + [{"op": "gate", "open": False}]
+    corners["pending_reuse_behind_forward"] = (
+        fill
+        + [{"op": "forward", "req": 1}]
+        + [{"op": "free", "req": i} for i in range(0, 12, 2)]
+        + [{"op": "flush"}]
+    )
+    corners["hicache_reservation"] = holes + [
+        {"op": "reserve", "member": "full", "n": 2 * ps}
+    ]
     if config.chain == "tri":
         corners["float_interior_holes"] = holes + [
             {"op": "retire", "req": i, "upto": 4 * ps} for i in range(1, 12, 4)

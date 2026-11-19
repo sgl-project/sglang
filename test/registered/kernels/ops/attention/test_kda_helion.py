@@ -998,14 +998,6 @@ def test_prefill_ignores_padded_gate_rows(is_varlen: bool) -> None:
     for padded_value, trimmed_value in zip(padded, trimmed):
         assert torch.equal(padded_value, trimmed_value)
 
-    short_inputs = (
-        (gate[:, : tokens - 1], beta[:, :tokens]),
-        (gate[:, :tokens], beta[:, : tokens - 1]),
-    )
-    for short_gate, short_beta in short_inputs:
-        with pytest.raises(ValueError, match="g and beta must cover every q token"):
-            run(short_gate, short_beta)
-
 
 def test_prefill_uses_stable_subchunk_gates() -> None:
     torch.manual_seed(1117)

@@ -86,16 +86,16 @@ export const config = {
   },
 
   // Per-hardware image for Docker mode. The two ROCm images are not
-  // interchangeable: MI300X (gfx942) takes the mi30x build on ROCm 7.00,
-  // MI350X/MI355X (gfx950) the mi35x build on ROCm 7.20.
+  // interchangeable: MI300X (gfx942) takes the mi30x build, MI350X/MI355X
+  // (gfx950) the mi35x build.
   dockerImages: {
-    h200:   "lmsysorg/sglang:qwen38",
-    b200:   "lmsysorg/sglang:qwen38",
-    b300:   "lmsysorg/sglang:qwen38",
-    gb300:  "lmsysorg/sglang:qwen38",
-    mi300x: "lmsysorg/sglang-rocm:v0.5.17-rocm700-mi30x-20260813",
-    mi350x: "lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260812",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260812",
+    h200:   "lmsysorg/sglang:latest",
+    b200:   "lmsysorg/sglang:latest",
+    b300:   "lmsysorg/sglang:latest",
+    gb300:  "lmsysorg/sglang:latest",
+    mi300x: "lmsysorg/sglang-rocm:v0.5.22-rocm720-mi30x-20261028",
+    mi350x: "lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261113",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261113",
   },
 
   // Per-hardware notes shown above a multi-node command. Every multi-node recipe
@@ -269,20 +269,19 @@ export const config = {
       ibDevices: [{ id: "auto", label: "Auto" }, "mlx5_0", "mlx5_7"],
       // Ports come from the engine's PD_PORTS, not literals — the decode role
       // serves on 30100, so a hardcoded target would not reach it.
-      // In PD mode, --policy is the prefill fallback; keep decode explicit.
+      // In PD mode, --policy picks the prefill worker; decode keeps power_of_two.
       router: {
         port: 8000,
         command:
-`python3 -m sglang_router.launch_router \\
-  --pd-disaggregation \\
-  --prefill http://<prefill-host>:{{PREFILL_PORT}} \\
-  --decode http://<decode-host>:{{DECODE_PORT}} \\
-  --policy round_robin \\
-  --decode-policy round_robin \\
+`sgl-router \\
+  --model-id {{MODEL_NAME}} \\
+  --no-tokenizer \\
+  --worker-urls http://<prefill-host>:{{PREFILL_PORT}} http://<decode-host>:{{DECODE_PORT}} \\
   --host 0.0.0.0 --port {{ROUTER_PORT}} \\
-  --worker-startup-timeout-secs 7200 \\
+  --policy round_robin \\
   --request-timeout-secs 6900 \\
-  --pool-idle-timeout-secs 4 \\
+  --stream-idle-timeout-secs 6900 \\
+  --stale-request-timeout-secs 6900 \\
   --disable-circuit-breaker`,
       },
     },
@@ -405,7 +404,6 @@ export const config = {
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "multi-4" },
       verified: true,
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_NVLS_ENABLE=1",
       ],
       flags: [
@@ -415,6 +413,7 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--attention-backend trtllm_mha",
         "--moe-runner-backend flashinfer_trtllm",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--mamba-ssm-dtype bfloat16",
         "--mamba-radix-cache-strategy extra_buffer",
         "--speculative-algorithm NEXTN",
@@ -481,7 +480,6 @@ export const config = {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2" },
       verified: true,
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_CUMEM_ENABLE=1",
         "NCCL_NVLS_ENABLE=1",
@@ -496,6 +494,7 @@ export const config = {
         "--attention-backend trtllm_mha",
         "--linear-attn-prefill-backend flashinfer",
         "--moe-runner-backend flashinfer_trtllm",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--mamba-radix-cache-strategy extra_buffer",
         "--mamba-ssm-dtype bfloat16",
         "--speculative-algorithm NEXTN",
@@ -517,7 +516,7 @@ export const config = {
     {
       // GB300 / NVFP4, high-throughput — full DP16 attention with EP16 MoE over
       // FlashInfer one-sided A2A, MTP off. flashinfer_trtllm_routed must stay:
-      // with a2a=flashinfer the auto runner resolution aborts at startup.
+      // with a2a=flashinfer_nvlink_one_sided the auto runner resolution aborts at startup.
       // SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK is load-bearing —
       // unset it falls back to 1024 and startup raises once 1024 x ep_size no
       // longer covers the largest CuteDSL MoE forward.
@@ -545,7 +544,7 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--linear-attn-prefill-backend flashinfer",
         "--moe-runner-backend flashinfer_trtllm_routed",
-        "--moe-a2a-backend flashinfer",
+        "--moe-a2a-backend flashinfer_nvlink_one_sided",
         "--ep-dispatch-algorithm static",
         "--mamba-radix-cache-strategy extra_buffer",
         "--mamba-ssm-dtype bfloat16",
@@ -571,7 +570,6 @@ export const config = {
       // The sizing is derived, not measured.
       match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "balanced", nodes: "multi-8" },
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_NVLS_ENABLE=1",
       ],
       flags: [
@@ -585,6 +583,7 @@ export const config = {
         "--mem-fraction-static 0.95",
         "--chunked-prefill-size 8192",
         "--max-prefill-tokens 8192",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
@@ -664,14 +663,13 @@ export const config = {
       // back to Triton.
       match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
         "--moe-runner-backend flashinfer_trtllm",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--mamba-radix-cache-strategy extra_buffer",
         "--mamba-ssm-dtype bfloat16",
         "--speculative-algorithm NEXTN",
@@ -810,7 +808,6 @@ export const config = {
       // DeepEP v2 a2a rules DSpark out under DP-attention.
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "dspark", nodes: "multi-4" },
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_NVLS_ENABLE=1",
       ],
       flags: [
@@ -824,6 +821,7 @@ export const config = {
         "--mem-fraction-static 0.95",
         "--chunked-prefill-size 8192",
         "--max-prefill-tokens 8192",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
@@ -835,7 +833,6 @@ export const config = {
       // model in place of NEXTN.
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "dspark", nodes: "multi-2" },
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_CUMEM_ENABLE=1",
         "NCCL_NVLS_ENABLE=1",
@@ -850,6 +847,7 @@ export const config = {
         "--attention-backend trtllm_mha",
         "--linear-attn-prefill-backend flashinfer",
         "--moe-runner-backend flashinfer_trtllm",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--mamba-radix-cache-strategy extra_buffer",
         "--mamba-ssm-dtype bfloat16",
         "--speculative-algorithm DSPARK",
@@ -870,7 +868,6 @@ export const config = {
       // of NEXTN.
       match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "dspark", nodes: "multi-8" },
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_NVLS_ENABLE=1",
       ],
       flags: [
@@ -883,6 +880,7 @@ export const config = {
         "--mem-fraction-static 0.95",
         "--chunked-prefill-size 8192",
         "--max-prefill-tokens 8192",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
@@ -899,7 +897,6 @@ export const config = {
       verified: true,
       env: [
         "SGLANG_ENABLE_MOE_DEFERRED_FINALIZE=1",
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -912,6 +909,7 @@ export const config = {
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--moe-runner-backend flashinfer_trtllm",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--mamba-radix-cache-strategy extra_buffer",
         "--mamba-ssm-dtype bfloat16",
         "--speculative-algorithm DSPARK",

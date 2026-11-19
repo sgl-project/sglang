@@ -20,14 +20,14 @@ The multi-node and prefill-decode disaggregation examples use a locally prepared
 | Feature                       | Example usage                                                                                           |
 |-------------------------------|---------------------------------------------------------------------------------------------------------|
 | Tensor Parallelism            | `--tp-size 16` or `--tp-size 32`                                                                          |
-| Data Parallelism              | `--dp-size 16` (mixed) or `--dp-size 32` (decode) with `--enable-dp-attention`                                                      |
+| Data Parallelism              | `--attn-dp-size 16` (mixed) or `--attn-dp-size 32` (decode)                                                      |
 | Expert Parallelism            | `--ep-size 32` with `--moe-a2a-backend deepep` and `--deepep-mode low_latency`                             |
 | Pipeline Parallelism          | `--pp-size 4` with `SGLANG_PP_LAYER_PARTITION=18,20,24,16`                                                |
 | Prefill Context Parallelism   | `--attn-cp-size 8` with `--enable-prefill-cp` and `--cp-strategy interleave`                                |
 | PD Disaggregation             | `--disaggregation-mode prefill` / `decode` with `--disaggregation-transfer-backend ascend`                  |
 | Quantization                  | `--quantization modelslim`                                                                               |
 | Chunked Prefill               | `--chunked-prefill-size 65536` / `--max-prefill-tokens 280000` (mixed deployment)                    |
-| NPU Graph                     | `--cuda-graph-bs-decode 2` (mixed); `--disable-cuda-graph` (prefill); `--cuda-graph-bs-decode 1 2 3` (decode)                               |
+| NPU Graph                     | `--cuda-graph-bs-decode 2` (mixed); `--disable-decode-cuda-graph --disable-prefill-cuda-graph` (prefill); `--cuda-graph-bs-decode 1 2 3` (decode)                               |
 | Speculative Decoding          | `--speculative-algorithm NEXTN` with `--speculative-num-steps 3` and `--speculative-num-draft-tokens 4`     |
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                             |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                                    |
@@ -35,7 +35,7 @@ The multi-node and prefill-decode disaggregation examples use a locally prepared
 <Note>
 The values in the **Example usage** column reflect the deployment scenarios described below and are not universal
 defaults. Some flags require a specific SGLang version or model checkpoint. For parameter details, see
-[Feature descriptions](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#feature-descriptions); for
+[Parameter Reference](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#parameter-reference); for
 recommended configurations, see [Best practices](#best-practices).
 </Note>
 
@@ -275,7 +275,7 @@ export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 # export HCCL_OP_EXPANSION_MODE=AIV
 # export SGLANG_NPU_USE_MULTI_STREAM=1
 # export SGLANG_USE_AG_AFTER_QLORA=1
-# export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
+# (and --enable-prefill-delayer on the launch command)
 
 # Match the configured node IP against all local IPv4 addresses.
 LOCAL_IPS=( $(hostname -I) )
@@ -297,7 +297,7 @@ for i in "${!IPS[@]}"; do
             --device npu \
             --dist-init-addr "${IPS[0]}:5000" \
             --tp-size 32 --nnodes 2 --node-rank "$i" \
-            --dp-size 16 --enable-dp-attention \
+            --attn-dp-size 16 \
             --chunked-prefill-size 65536 --max-prefill-tokens 280000 \
             --trust-remote-code \
             --host "${IPS[$i]}" \
@@ -411,16 +411,16 @@ for i in "${!P_IP[@]}"; do
             --mem-fraction-static 0.72 \
             --attention-backend ascend --device npu \
             --quantization modelslim --dtype bfloat16 \
-            --tp-size 8 --pp-size 4 --dp-size 1 \
+            --tp-size 8 --pp-size 4 --attn-dp-size 1 \
             --attn-cp-size 8 --enable-prefill-cp --cp-strategy interleave \
-            --enable-dp-attention --enable-dp-lm-head \
+ --enable-dp-lm-head \
             --moe-dense-tp 1 --load-balance-method round_robin \
             --disaggregation-transfer-backend ascend \
             --max-running-requests 64 \
             --served-model-name glm-5 \
             --chunked-prefill-size 4096 --max-prefill-tokens 180000 \
             --moe-a2a-backend deepep --deepep-mode normal \
-            --disable-shared-experts-fusion --disable-cuda-graph \
+            --disable-shared-experts-fusion --disable-decode-cuda-graph --disable-prefill-cuda-graph \
             --speculative-algorithm NEXTN \
             --speculative-num-steps 1 \
             --speculative-eagle-topk 1 \
@@ -444,7 +444,7 @@ for i in "${!D_IP[@]}"; do
             --trust-remote-code \
             --dist-init-addr "${D_IP[0]}:5000" \
             --nnodes 2 --node-rank "$i" \
-            --tp-size 32 --dp-size 32 --enable-dp-attention --ep-size 32 \
+            --tp-size 32 --attn-dp-size 32 --ep-size 32 \
             --mem-fraction-static 0.97 --max-running-requests 32 \
             --attention-backend ascend --device npu \
             --quantization modelslim --dtype bfloat16 \
@@ -481,11 +481,11 @@ P_MASTER_IP="<prefill-node-0-ip>"
 D_MASTER_IP="<decode-node-0-ip>"
 ROUTER_HOST_IP="<router-host-ip>"
 
-python3 -m sglang_router.launch_router \
-    --pd-disaggregation \
+sgl-router \
+    --model-id glm-5 \
+    --no-tokenizer \
     --policy round_robin \
-    --prefill http://${P_MASTER_IP}:8000 8998 \
-    --decode http://${D_MASTER_IP}:8003 \
+    --worker-urls http://${P_MASTER_IP}:8000 http://${D_MASTER_IP}:8003 \
     --host "${ROUTER_HOST_IP}" \
     --port 6688
 ```

@@ -226,6 +226,32 @@ def minimax_h3_resolve_reference_image_shape(
     }
 
 
+def minimax_h3_image_reference_size(
+    width: int,
+    height: int,
+    *,
+    min_short_edge: int,
+    max_short_edge: int,
+) -> tuple[int, int] | None:
+    """Size of an image-release (edit) reference for one consumer (Qwen, VAE).
+
+    A short edge within ``[min_short_edge, max_short_edge]`` returns None: the
+    consumer gets the original pixels. Otherwise the image is scaled up or
+    down, keeping its ratio, so that its short edge lands on the nearer bound;
+    each side rounds to the nearest 32px multiple, as ref2va references do.
+    """
+
+    short_edge = min(width, height)
+    if min_short_edge <= short_edge <= max_short_edge:
+        return None
+    bound = min_short_edge if short_edge < min_short_edge else max_short_edge
+    scale = bound / short_edge
+    return (
+        _nearest_multiple(width * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
+        _nearest_multiple(height * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
+    )
+
+
 def minimax_h3_resize_reference_image(
     image: Any,
     *,
@@ -250,6 +276,26 @@ def minimax_h3_resize_reference_image(
     if (target_width, target_height) == image.size:
         return image
     return image.resize((target_width, target_height), Image.Resampling.LANCZOS)
+
+
+def minimax_h3_bound_image_reference(
+    image: Any,
+    *,
+    min_short_edge: int,
+    max_short_edge: int,
+) -> Any:
+    """``image`` resized per ``minimax_h3_image_reference_size`` (itself when
+    its short edge is already within the bounds)."""
+
+    width, height = image.size
+    size = minimax_h3_image_reference_size(
+        width, height, min_short_edge=min_short_edge, max_short_edge=max_short_edge
+    )
+    if size is None:
+        return image
+    return minimax_h3_resize_reference_image(
+        image, target_width=size[0], target_height=size[1]
+    )
 
 
 def _load_waveform(
@@ -486,21 +532,25 @@ def minimax_h3_decode_reference_video_frames(
     )
 
 
+def _create_reference_video_memfd(name: str) -> int:
+    """Return an anonymous output fd, or -1 when memfd is unavailable."""
+    if not sys.platform.startswith("linux") or not hasattr(os, "memfd_create"):
+        return -1
+    try:
+        return os.memfd_create(name, flags=os.MFD_CLOEXEC)
+    except OSError:
+        # The Python API can exist while the syscall is unavailable or blocked
+        # by the container's seccomp policy.
+        return -1
+
+
 def _decode_reference_video_local(command: list[str]) -> tuple[Any, int]:
     """Write one worker's RGB stream without a large stdout aggregation."""
 
     # Linux workers can let ffmpeg write the exact RGB24 stream into an
     # anonymous file descriptor. Mapping that output avoids communicate()'s
     # chunk list and final bytes join for a several-hundred-MiB reference.
-    output_fd = -1
-    if sys.platform.startswith("linux"):
-        try:
-            output_fd = os.memfd_create(
-                "sglang-h3-reference-video",
-                flags=os.MFD_CLOEXEC,
-            )
-        except OSError:
-            output_fd = -1
+    output_fd = _create_reference_video_memfd("sglang-h3-reference-video")
 
     payload: Any = b""
     payload_size = 0
@@ -579,12 +629,10 @@ def _decode_reference_video_shared(command: list[str]) -> tuple[Any, int]:
     leader_state = None
     if is_leader:
         try:
-            try:
-                leader_fd = os.memfd_create(
-                    "sglang-h3-reference-video-shared",
-                    flags=os.MFD_CLOEXEC,
-                )
-            except OSError:
+            leader_fd = _create_reference_video_memfd(
+                "sglang-h3-reference-video-shared"
+            )
+            if leader_fd < 0:
                 # Anonymous file descriptors can be disabled by a container's
                 # seccomp policy. Tell every host to use the unchanged local
                 # decode path instead of failing a valid request.
@@ -895,6 +943,11 @@ def minimax_h3_prepared_reference_image(batch: Any, plan: Any) -> dict[str, Any]
     Qwen (pixel_values) and the visual-condition tokenizer consume the identical
     prepared image. The runtime never recomputes geometry from ``plan.shape``;
     it consumes the per-material width/height admitted before queueing.
+
+    Image-release edit references keep the original geometry instead: they
+    are read upright (EXIF orientation applied) and converted to RGB, with no
+    resize. Qwen and the VAE each resize their own input from it
+    (``minimax_h3_bound_image_reference``).
     """
     cached = batch.extra.get(MINIMAX_H3_PREPARED_REFERENCE_IMAGE_EXTRA_KEY)
     if cached is not None:
@@ -910,8 +963,25 @@ def minimax_h3_prepared_reference_image(batch: Any, plan: Any) -> dict[str, Any]
         minimax_h3_localize_material_uri,
     )
 
+    original_geometry = plan.output_modality == "image"
     prepared_images = []
     for material in images:
+        if original_geometry:
+            image_path = minimax_h3_localize_material_uri(
+                batch,
+                material.uri,
+                condition_type=material.condition_type,
+                condition_index=int(material.condition_index),
+            )
+            with Image.open(image_path) as source_image:
+                # The localization probe admits JPEG/PNG/WEBP; reject animation.
+                if getattr(source_image, "n_frames", 1) != 1:
+                    raise ValueError("image reference must not be animated")
+                image = ImageOps.exif_transpose(source_image).convert("RGB")
+            prepared_images.append(
+                {"image": image, "condition_index": int(material.condition_index)}
+            )
+            continue
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.prequeue import (
             MINIMAX_H3_PROBE_FACTS_EXTRA_KEY,
             MINIMAX_H3_RESOLVED_MATERIAL_SHAPES_EXTRA_KEY,
@@ -968,11 +1038,14 @@ def minimax_h3_prepared_reference_image(batch: Any, plan: Any) -> dict[str, Any]
 
 
 __all__ = [
+    "minimax_h3_bound_image_reference",
     "minimax_h3_decode_reference_video_frames",
     "minimax_h3_encode_reference_audio_rows",
     "minimax_h3_encode_reference_video_rows",
+    "minimax_h3_image_reference_size",
     "minimax_h3_prepared_reference_image",
     "minimax_h3_prepared_reference_videos",
+    "minimax_h3_resize_reference_image",
     "minimax_h3_resolve_reference_image_shape",
     "minimax_h3_sample_reference_video_frames",
 ]

@@ -36,9 +36,9 @@ if not hasattr(_hf_activations, "PytorchGELUTanh"):
 
 from sglang import Engine
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from sglang.srt.hf_transformers import _fix_added_tokens_encoding
 from sglang.srt.parser.conversation import generate_chat_conv
-from sglang.srt.utils.common import is_cuda, is_xpu
-from sglang.srt.utils.hf_transformers import _fix_added_tokens_encoding
+from sglang.srt.utils.device import is_cuda, is_xpu
 from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
 register_cuda_ci(est_time=213, stage="extra-a", runner_config="1-gpu-large")
@@ -711,7 +711,7 @@ class TestMiniCPMVUnderstandsImage(VLMInputTestBase, CustomTestCase):
         # which lacks model-specific attributes (e.g. im_start_id for MiniCPM-V).
         # Replace with sglang's tokenizer which handles this via declared-class
         # fallback, then fix added tokens encoding.
-        from sglang.srt.utils.hf_transformers import get_tokenizer
+        from sglang.srt.hf_transformers import get_tokenizer
 
         cls.processor.tokenizer = get_tokenizer(cls.model_path, trust_remote_code=True)
         _fix_added_tokens_encoding(cls.processor.tokenizer)

@@ -36,7 +36,7 @@ from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner_backend import capture_profile as profile_mod
-from sglang.srt.utils import profile_utils as putils
+from sglang.srt.observability import profile_utils as putils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

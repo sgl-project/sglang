@@ -1,8 +1,10 @@
 //! SGLang P/D extensions to Dynamo's standard OpenAI request types.
 
+use axum::http::HeaderMap;
 use serde::Deserialize;
 use sglang_api_types::api::v1::{Int64OrList, OptionalInt64OrList, StringOrList};
 
+use super::super::dp_relay::{HintRoute, lax_rank};
 use crate::message::request::{
     BootstrapColumns, check_broadcast_budget, normalize_bootstrap_columns,
 };
@@ -13,25 +15,26 @@ use crate::utils::error::Error;
 /// Python's OpenAI PDRoutingFields, using generated API carriers. Unlike the
 /// native API, OpenAI allows null list elements only for bootstrap_port.
 #[derive(Deserialize)]
-pub(super) struct PDRoutingFields {
-    bootstrap_host: Option<StringOrList>,
-    bootstrap_port: Option<OptionalInt64OrList>,
-    bootstrap_room: Option<Int64OrList>,
-    routed_dp_rank: Option<i64>,
-    disagg_prefill_dp_rank: Option<i64>,
+pub(crate) struct PDRoutingFields {
+    pub(crate) bootstrap_host: Option<StringOrList>,
+    pub(crate) bootstrap_port: Option<OptionalInt64OrList>,
+    pub(crate) bootstrap_room: Option<Int64OrList>,
+    #[serde(default, deserialize_with = "lax_rank")]
+    pub(crate) routed_dp_rank: Option<i64>,
+    pub(crate) disagg_prefill_dp_rank: Option<i64>,
 }
 
 /// Validated per-prompt columns, ready for admission.
-pub(super) struct NormalizedPDRouting {
-    pub(super) bootstrap: BootstrapColumns,
-    pub(super) routed_dp_rank: Option<i64>,
-    pub(super) disagg_prefill_dp_rank: Option<i64>,
+pub(crate) struct NormalizedPDRouting {
+    pub(crate) bootstrap: BootstrapColumns,
+    pub(crate) routed_dp_rank: Option<i64>,
+    pub(crate) disagg_prefill_dp_rank: Option<i64>,
 }
 
 impl PDRoutingFields {
     /// Normalize bootstrap fields per prompt and bound the handlers' host clones
     /// across choices. DP hints remain scalar.
-    pub(super) fn normalize(
+    pub(crate) fn normalize(
         self,
         prompt_count: usize,
         choices_per_prompt: usize,
@@ -76,6 +79,22 @@ impl PDRoutingFields {
     }
 }
 
+impl NormalizedPDRouting {
+    /// A DP rank `route`'s headers name wins over the body's, as in Python
+    /// ([`HintRoute::header_rank`]); an unparsable header is a 400.
+    pub(super) fn apply_header_rank(
+        &mut self,
+        route: HintRoute,
+        headers: &HeaderMap,
+        overrides: bool,
+    ) -> Result<(), String> {
+        if let Some(rank) = route.header_rank(headers, overrides)? {
+            self.routed_dp_rank = Some(rank);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::PDRoutingFields;
@@ -105,6 +124,34 @@ mod tests {
         );
         assert_eq!(routing.routed_dp_rank, Some(1));
         assert_eq!(routing.disagg_prefill_dp_rank, Some(3));
+    }
+
+    /// `routed_dp_rank` names the rank, and a header the route reads wins
+    /// over it.
+    #[test]
+    fn dp_rank_reads_the_body_then_the_route_headers() {
+        use super::HintRoute;
+        let routing = |body| {
+            serde_json::from_value::<PDRoutingFields>(body)
+                .unwrap()
+                .normalize(1, 1)
+                .unwrap()
+        };
+        // Pydantic reads a string of an integer.
+        assert_eq!(
+            routing(json!({"routed_dp_rank": "1"})).routed_dp_rank,
+            Some(1)
+        );
+        assert!(serde_json::from_value::<PDRoutingFields>(json!({"routed_dp_rank": "x"})).is_err());
+        let mut normalized = routing(json!({"routed_dp_rank": 0}));
+        let headers = [("x-data-parallel-rank", "1")]
+            .into_iter()
+            .map(|(name, value)| (name.parse().unwrap(), value.parse().unwrap()))
+            .collect();
+        normalized
+            .apply_header_rank(HintRoute::Completions, &headers, false)
+            .unwrap();
+        assert_eq!(normalized.routed_dp_rank, Some(1));
     }
 
     #[test]

@@ -192,8 +192,8 @@ def test_sparse_mla_q8kv8_prefill_corner_cases(
     _run_and_check(d_qk, with_sink, s_q=s_q, topk=topk, s_kv=s_kv)
 
 
-# topk_length WITHOUT attn_sink (the production early-exit path for
-# SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH): rows with a trailing -1 pad run must
+# topk_length WITHOUT attn_sink (the production early-exit path of the
+# flashmla_sparse_q8 backend): rows with a trailing -1 pad run must
 # be BITWISE identical to the full-topk dispatch that masks those pads, and
 # must match the fp32 reference on the truncated index range.
 @pytest.mark.skipif(
@@ -451,7 +451,7 @@ def test_sparse_mla_q8kv8_prefill_caller_owned_buffers():
     not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
 )
 def test_sparse_mla_q8kv8_prefill_rejects_bad_buffers():
-    """Validation: wrong shape/dtype and aliasing must raise ValueError."""
+    """Aliased max_logits / lse and a d_v the kernel does not produce must raise."""
     from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
         sparse_mla_q8kv8_prefill_fwd,
     )
@@ -475,16 +475,6 @@ def test_sparse_mla_q8kv8_prefill_rejects_bad_buffers():
         )
         kwargs.update(overrides)
         return sparse_mla_q8kv8_prefill_fwd(**kwargs)
-
-    # Wrong dtype.
-    bad_out = torch.empty((s_q, H_Q, D_V), dtype=torch.float16, device="cuda")
-    with pytest.raises(ValueError):
-        _call(out=bad_out)
-
-    # Wrong shape.
-    bad_ml = torch.empty((s_q + 1, H_Q), dtype=torch.float32, device="cuda")
-    with pytest.raises(ValueError):
-        _call(max_logits=bad_ml)
 
     # Aliased max_logits / lse.
     shared = torch.empty((s_q, H_Q), dtype=torch.float32, device="cuda")

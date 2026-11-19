@@ -51,7 +51,7 @@ export const Nemotron3NanoOmniDeployment = () => {
         { id: 'thinking_on', label: 'Enabled', default: true },
         { id: 'thinking_off', label: 'Disabled', default: false },
       ],
-      commandRule: (value) => value === 'thinking_on' ? '--reasoning-parser deepseek-r1' : null,
+      commandRule: (value) => value === 'thinking_on' ? '--reasoning-parser nemotron_3' : null,
     },
     toolcall: {
       name: 'toolcall',

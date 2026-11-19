@@ -250,9 +250,9 @@ fn logprob_tuple_shape() {
 }
 
 /// The /generate frame shape: key order (text, meta_info, output_ids),
-/// conditional keys, finish_reason always present (null pre-terminal), the
-/// cached-token details without a storage tier -- matching api_core/frame.rs's
-/// frame_value.
+/// conditional keys, finish_reason and dp_rank always present (null
+/// pre-terminal, and without data parallelism), the cached-token details
+/// without a storage tier -- matching api_core/frame.rs's frame_value.
 #[test]
 fn generate_response_matches_frame_value_shape() {
     let frame = GenerateResponse {
@@ -275,7 +275,7 @@ fn generate_response_matches_frame_value_shape() {
     };
     assert_eq!(
         serde_json::to_string(&frame).unwrap(),
-        r#"{"text":"ok","meta_info":{"id":"client-rid","prompt_tokens":5,"completion_tokens":2,"finish_reason":null,"cached_tokens":3,"reasoning_tokens":0,"cached_tokens_details":{"device":3,"host":0}},"output_ids":[7,8]}"#
+        r#"{"text":"ok","meta_info":{"id":"client-rid","prompt_tokens":5,"completion_tokens":2,"finish_reason":null,"cached_tokens":3,"reasoning_tokens":0,"cached_tokens_details":{"device":3,"host":0},"dp_rank":null},"output_ids":[7,8]}"#
     );
 }
 
@@ -365,4 +365,39 @@ fn string_list_or_list_shape_dispatch() {
 fn custom_params_raw_json_passthrough() {
     let p: SamplingParams = serde_json::from_str(r#"{"custom_params": {"k": 3}}"#).unwrap();
     assert_eq!(p.custom_params.as_deref(), Some(r#"{"k":3}"#));
+}
+
+/// `instance_id` is additive on the wire: old bytes without field 16 decode to
+/// an empty id, and a legacy reader that only knows `version` still preserves
+/// that field when a new peer includes identity.
+#[test]
+fn get_server_info_instance_id_is_wire_compatible() {
+    use prost::Message;
+
+    let legacy_bytes = GetServerInfoResponse {
+        version: "0.5.0".into(),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    let from_legacy = GetServerInfoResponse::decode(legacy_bytes.as_slice()).unwrap();
+    assert_eq!(from_legacy.instance_id, "");
+    assert_eq!(from_legacy.version, "0.5.0");
+
+    let current = GetServerInfoResponse {
+        version: "0.5.0".into(),
+        instance_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+        ..Default::default()
+    };
+    let bytes = current.encode_to_vec();
+    let decoded = GetServerInfoResponse::decode(bytes.as_slice()).unwrap();
+    assert_eq!(decoded.version, "0.5.0");
+    assert_eq!(decoded.instance_id, current.instance_id);
+
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    struct LegacyGetServerInfoResponse {
+        #[prost(string, tag = "6")]
+        version: ::prost::alloc::string::String,
+    }
+    let legacy_reader = LegacyGetServerInfoResponse::decode(bytes.as_slice()).unwrap();
+    assert_eq!(legacy_reader.version, "0.5.0");
 }

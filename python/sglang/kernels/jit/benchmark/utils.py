@@ -5,8 +5,8 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import torch
 import triton.testing
 
+from sglang.kernels.jit.benchmark.marker.config import CI_MODE
 from sglang.test.kernels.multigpu import multigpu_launch
-from sglang.utils import is_in_ci
 
 
 def multigpu_bench_main(
@@ -75,7 +75,10 @@ def create_random(*shape: int, dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE):
 
 def get_benchmark_range(full_range: List, ci_range: List) -> List:
     """Return appropriate benchmark range based on CI environment."""
-    return ci_range if is_in_ci() else full_range
+    if not all(v in full_range for v in ci_range):
+        missing = [v for v in ci_range if v not in full_range]
+        raise ValueError(f"{missing = } not in {full_range = }")
+    return ci_range if CI_MODE else full_range
 
 
 def run_benchmark(

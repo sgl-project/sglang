@@ -59,7 +59,7 @@ def decide_needs_confidence_relay() -> bool:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     algo = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
-    if not algo.is_dspark():
+    if not algo.is_dflash_family():
         return False
     return read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
 
@@ -124,7 +124,9 @@ def offer_future_relay_buffers(relay: FutureRelayBuffers) -> None:
     _offered_relay = relay
 
 
-def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> bool:
+def resolve_forward_inputs(
+    batch: ScheduleBatch, future_map: Optional[FutureMap]
+) -> bool:
     """Materialize input_ids at forward entry. Two sources:
 
     - Prefill: H2D copy from pinned CPU staging (prefill_input_ids_cpu).
@@ -132,7 +134,9 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> bool:
 
     return whether a decode graph owns input resolution and sequence-length publication
     """
-    if not future_map.takes_deferred_relay(batch):
+    # future_map is None for standalone prefill callers (e.g. the LLaDA-Image
+    # conditioning stage), which have no deferred relay to flush.
+    if future_map is not None and not future_map.takes_deferred_relay(batch):
         future_map.flush_deferred_relay()
     if batch.prefill_input_ids_cpu is not None:
         prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
@@ -251,6 +255,12 @@ class ConfidenceRelay(msgspec.Struct):
     def scatter(self, indices: torch.Tensor, confidence: torch.Tensor) -> None:
         if not self.initialized:
             self._lazy_init(confidence)
+        elif self.copy_done is not None and self.ring_pos > 0:
+            # The last ring copy reads confidence_buf on another stream.
+            last = (self.ring_pos - 1) % CONFIDENCE_RELAY_RING_DEPTH
+            torch.get_device_module(self.device).current_stream().wait_event(
+                self.copy_done[last]
+            )
         self.confidence_buf[indices] = confidence.to(self.confidence_buf.dtype)
 
     def issue_ring_copy(self, *, stream, publish_ready) -> None:
@@ -287,8 +297,7 @@ class ConfidenceRelay(msgspec.Struct):
         if self.ring_pos < CONFIDENCE_RELAY_RING_LAG:
             return None
         slot = (self.ring_pos - CONFIDENCE_RELAY_RING_LAG) % CONFIDENCE_RELAY_RING_DEPTH
-        if not self.copy_done[slot].query():
-            return None
+        self.copy_done[slot].synchronize()
 
         idx_cpu = batch.req_pool_indices_cpu
         return ResolvedConfidence(

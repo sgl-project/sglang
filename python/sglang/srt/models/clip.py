@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import CLIPConfig, CLIPTextConfig, CLIPVisionConfig
+from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.srt.layers.activation import QuickGELU, get_act_fn
 from sglang.srt.layers.conv import Conv2dLayer
@@ -20,11 +21,12 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.req_types import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, flatten_nested_list
+from sglang.srt.utils import flatten_nested_list
 
 
 def load_clip_weights(
@@ -667,8 +669,9 @@ def monkey_patch_weight_loader():
         revision: Optional[str],
         fall_back_to_pt: bool,
         # Must mirror DefaultModelLoader._prepare_weights; the override pins
-        # allow_patterns to *.bin, so the caller's patterns are ignored.
+        # allow_patterns to *.bin, so the caller's patterns and index are ignored.
         allow_patterns_overrides: Optional[List[str]] = None,
+        safetensors_index_file: Optional[str] = SAFE_WEIGHTS_INDEX_NAME,
     ) -> Tuple[str, List[str], bool]:
         model_name_or_path = (
             self._maybe_download_from_modelscope(model_name_or_path, revision)

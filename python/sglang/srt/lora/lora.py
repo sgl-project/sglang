@@ -26,11 +26,11 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.hf_transformers import AutoConfig
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader
-from sglang.srt.utils.hf_transformers import AutoConfig
 
 # Matches both per-expert keys ("...experts.0.<module>...") and shared-outer
 # keys ("...experts.<module>..."), while excluding "shared_experts." (where the
@@ -540,14 +540,3 @@ class LoRAAdapter(nn.Module):
             weights.pop(q_a_name)
             if kv_a_name in weights:
                 weights.pop(kv_a_name)
-
-    def pin_weights_in_cpu(self):
-        for layer in self.layers:
-            for name, weight in layer.weights.items():
-                layer.weights[name] = weight.pin_memory()
-
-        for name, weight in self.embedding_layers.items():
-            self.embedding_layers[name] = weight.pin_memory()
-
-        for name, weight in self.added_tokens_embeddings.items():
-            self.added_tokens_embeddings[name] = weight.pin_memory()

@@ -11,7 +11,7 @@ these hooks then:
 
 Compressor state is fixed ring storage and does not participate in this
 allocation/write path. PD reuses the public SWA/C128-state payloads and builds
-NPU-specific payloads for the independently addressed C128 KV pool and Ascend 950 C4
+NPU-specific payloads for the independently addressed C128 KV pool and C4
 compress-state rows.
 
 Non-DSV4 paths leave ``batch.out_cache_loc_dsv4`` None, so this module is a
@@ -78,20 +78,16 @@ def dsv4_state_payloads(
     cross-hardware ``StateType.SWA`` / ``StateType.DSV4_REQUEST_STATE`` defaults:
 
     * ``DSV4_C128`` — C128 KV pages from ``req_to_c128_sidecar``.
-    * ``DSV4_C4_STATE`` (Ascend 950 only) — live C4 compress-state rows.  Prefill
+    * ``DSV4_C4_STATE`` — live C4 compress-state rows.  Prefill
       and decode derive physical rows using their own local ring sizes, so
       decode-only MTP can safely transfer from an 8-row ring to a 16-row ring.
-      Pre-Ascend 950 uses EXPLICIT cache_mode and the C4 state is handled by the
-      shared ``StateType.SWA`` payload.
+      Both A3 and Ascend 950 derive rows from their local SWA pages.
     """
 
     import numpy as np
 
     from sglang.srt.disaggregation.ascend.conn import AscendStateType
     from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-    from sglang.srt.mem_cache.deepseek_v4_compress_state import (
-        c4_state_transfer_indices,
-    )
 
     seq_len = max(0, int(seq_len))
     prefix_len = max(0, min(int(prefix_len), seq_len))
@@ -110,20 +106,32 @@ def dsv4_state_payloads(
         )
         return pages[pages > 0]
 
-    payloads = {AscendStateType.DSV4_C128: c128_kv_pages}
-
-    if is_npu_arch35():
-
-        def c4_state_indices():
-            return c4_state_transfer_indices(
-                req_pool_idx,
-                seq_len,
-                ring_size=req_to_token_pool.get_dsv4_c4_state_ring_size(),
+    def c4_state_indices():
+        if is_npu_arch35():
+            return (
+                req_to_token_pool.get_dsv4_c4_state_transfer_rows(req_pool_idx, seq_len)
+                .to(torch.int32)
+                .cpu()
+                .numpy()
             )
 
-        payloads[AscendStateType.DSV4_C4_STATE] = c4_state_indices
+        # A3's explicit compressor table follows full -> SWA -> state. Pair
+        # the last coff * ratio (2 * 4) positions in logical token order,
+        # including history spanning noncontiguous SWA pages.
+        full_locs = req_to_token_pool.req_to_token[
+            req_pool_idx, max(0, seq_len - 8) : seq_len
+        ]
+        kv_pool = req_to_token_pool._dsv4_allocator.get_kvcache()
+        ring_size = kv_pool.get_ring_size(4)
+        swa_locs = kv_pool.translate_loc_from_full_to_swa(full_locs).to(torch.int64)
+        swa_pages = swa_locs // kv_pool.swa_page_size
+        rows = swa_pages * ring_size + swa_locs % ring_size
+        return rows.to(torch.int32).cpu().numpy()
 
-    return payloads
+    return {
+        AscendStateType.DSV4_C128: c128_kv_pages,
+        AscendStateType.DSV4_C4_STATE: c4_state_indices,
+    }
 
 
 def dsv4_prealloc_kwargs(allocator, req, fill_len, req_to_token_pool, *, device):
@@ -274,7 +282,35 @@ def maybe_build_dsv4_verify_bundle(
     if live_seq_lens_cpu is None:
         live_seq_lens_cpu = batch.seq_lens_cpu
     if live_seq_lens_cpu is None:
-        live_seq_lens_cpu = batch.seq_lens[: len(req_indices)].cpu()
+        # Mirrorless (SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0): the host
+        # seq_lens mirror does not exist, and a seq_lens.cpu() fallback here
+        # would be a pageable D2H that drains the whole async task queue (the
+        # per-step StreamSynchronize bubble). Build the whole bundle on
+        # device; every op stays asynchronous.
+        ragged_layout = getattr(
+            getattr(batch, "spec_info", None), "ragged_verify_layout", None
+        )
+        out_full_loc = batch.out_cache_loc
+        t = out_full_loc.numel()
+        bs = len(req_indices)
+        return type(reserve_bundle)(
+            out_full_loc=out_full_loc,
+            out_swa_loc=batch.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                out_full_loc
+            ),
+            out_c4_loc=_compact_c4_loc(out_full_loc, min(t, t // 4 + bs)),
+            out_c128_loc=_flatten_interval_device(
+                table=pool.req_to_c128_sidecar,
+                page_size=pool.c128_page_size,
+                req_pool_indices=batch.req_pool_indices[:bs],
+                live_seq_lens=batch.seq_lens[:bs],
+                verify_lens=(
+                    None if ragged_layout is None else ragged_layout.verify_lens[:bs]
+                ),
+                n_draft=int(draft_token_num),
+                upper=min(t, t // 128 + bs),
+            ),
+        )
     live_seq_lens = live_seq_lens_cpu[: len(req_indices)].tolist()
 
     ragged_layout = getattr(
@@ -319,6 +355,63 @@ def maybe_build_dsv4_verify_bundle(
         out_c4_loc=out_c4_loc,
         out_c128_loc=flatten_interval(pool.req_to_c128_sidecar, 128),
     )
+
+
+def _flatten_interval_device(
+    *,
+    table: torch.Tensor,
+    page_size: int,
+    req_pool_indices: torch.Tensor,
+    live_seq_lens: torch.Tensor,
+    verify_lens: torch.Tensor | None,
+    n_draft: int,
+    upper: int,
+) -> torch.Tensor:
+    """Device twin of the host ``flatten_interval`` loop (ratio=128): the c128
+    slots of the compressed positions ``[live // 128, (live + verify) // 128)``,
+    compacted req-major into a fixed ``upper``-wide buffer whose tail carries
+    the slot-map skip sentinel. Every op is an asynchronous device kernel and
+    the shape is host-known, so consumers' ``numel()`` never syncs. DP-padding
+    rows (live == 0) yield an empty interval, like the host ``end > start``
+    guard.
+    """
+    from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
+        _loc_pad_value,
+    )
+
+    device = live_seq_lens.device
+    bs = live_seq_lens.shape[0]
+    if verify_lens is None:
+        verify_lens = torch.full((bs,), n_draft, dtype=torch.int64, device=device)
+    live = live_seq_lens.reshape(-1)[:bs].to(torch.int64)
+    verify = verify_lens.reshape(-1)[:bs].to(torch.int64)
+    starts, ends = live // 128, (live + verify) // 128
+
+    # Per-req interval is at most n_draft // 128 + 1 compressed positions,
+    # which sizes the shared position grid without a host ``max()`` read.
+    positions = (
+        starts[:, None] + torch.arange(n_draft // 128 + 1, device=device)[None, :]
+    )
+    valid = positions < ends[:, None]
+
+    # Single flat gather; invalid lanes clamp their page index into the row
+    # and contribute garbage that the compact below drops.
+    n_cols = table.shape[1]
+    page_idx = (positions // page_size).clamp_(max=n_cols - 1)
+    flat_idx = (
+        req_pool_indices[:bs].to(torch.int64)[:, None] * n_cols + page_idx
+    ).reshape(-1)
+    locs = table.reshape(-1)[flat_idx] * page_size + positions.reshape(-1) % page_size
+
+    # Stable compact without NonZero, mirroring _compact_c4_loc: each valid
+    # lane lands on its ordinal among valid lanes; invalid lanes share the
+    # trash slot at ``upper`` (duplicate writes are fine) which the slice
+    # below drops.
+    flat_valid = valid.reshape(-1)
+    dest = flat_valid.cumsum(0).sub_(1).masked_fill_(~flat_valid, upper)
+    buf = torch.full((upper + 1,), _loc_pad_value(), dtype=locs.dtype, device=device)
+    buf.scatter_(0, dest, locs)
+    return buf[:upper]
 
 
 def _write_per_req(

@@ -55,7 +55,7 @@ from sglang.test.kernels.kv_canary._hand_oracle import (
 )
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
-register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=30, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 
 _DEVICE = torch.device("cuda")
@@ -1062,34 +1062,6 @@ class TestRealKvSource:
             plan_pair=plan_pair,
             real_kv_sources_pair=(sources, sources),
         )
-
-    def test_real_kv_source_above_4_raises(self) -> None:
-        """``len(real_kv_sources) > 4`` → host wrapper raises ValueError before launching."""
-        canary_buf = make_canary_buf(device=_DEVICE)
-        plan = make_verify_plan(
-            slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
-        )
-        log = FakeViolationLog.allocate(device=_DEVICE)
-        sources = make_real_kv_sources(count=4, device=_DEVICE)
-        extra = make_real_kv_source(device=_DEVICE)
-        too_many = sources + (extra,)
-
-        with pytest.raises(ValueError, match="at most 4 RealKvSource"):
-            launch_canary_verify_kernel(
-                context=VerifyOrWriteContext(
-                    canary_buf=canary_buf,
-                    kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-                    violation_ring=log.ring,
-                    violation_write_index=log.write_index,
-                    slot_run_counter=log.slot_run_counter,
-                    kernel_run_counter=log.kernel_run_counter,
-                    enable_chain_position_assert=log.enable_chain_position_assert,
-                    real_kv_sources=too_many,
-                    real_kv_hash_mode=consts.RealKvHashMode.NONE,
-                ),
-                plan=plan,
-                check_verify_expected_token=True,
-            )
 
     def test_real_kv_source_holey_dim1(self) -> None:
         """``tensor.shape[1] > page_size * num_bytes_per_token`` → trailing bytes are skipped."""

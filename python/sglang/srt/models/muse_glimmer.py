@@ -43,6 +43,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -59,7 +60,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm, permute_inv
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_cpu, is_cuda
+from sglang.srt.utils import is_cpu, is_cuda
 
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
@@ -439,7 +440,9 @@ def muse_glimmer_bilinear_pos_embed_lookup(
     weight_parts: List[List[torch.Tensor]] = [[] for _ in range(4)]
 
     for t, h, w in grid_thw.tolist():
-        t, h, w = int(t), int(h), int(w)
+        # Matches the trainer reference, which samples the position grid with
+        # `meshgrid(pos_h, pos_w, indexing="xy")`: height and width swap roles.
+        t, h, w = int(t), int(w), int(h)
         h_grid = (torch.arange(h, device=device).float() + 0.5) * (side / h) - 0.5
         w_grid = (torch.arange(w, device=device).float() + 0.5) * (side / w) - 0.5
 

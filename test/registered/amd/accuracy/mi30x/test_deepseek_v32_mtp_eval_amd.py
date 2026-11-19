@@ -3,7 +3,7 @@
 Tests DeepSeek-V3.2 with TP=8 + MTP (EAGLE speculative decoding) using few-shot
 completion benchmark on MI325/MI300X.
 
-Registry: nightly-amd-accuracy-8-gpu-deepseek-v32-mtp suite
+Registry: nightly-accuracy-test-8-gpu-amd-deepseek-v32-mtp suite
 """
 
 import os
@@ -28,8 +28,9 @@ from sglang.test.test_utils import (
 # Register for AMD CI - DeepSeek-V3.2 TP+MTP accuracy test
 register_amd_ci(
     est_time=3600,
-    suite="nightly-amd-accuracy-8-gpu-deepseek-v32-mtp",
+    suite="nightly-accuracy-test-8-gpu-amd-deepseek-v32-mtp",
     nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"

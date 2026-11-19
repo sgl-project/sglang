@@ -108,9 +108,7 @@ def _ragged_verify(cfg: Any) -> bool:
 _PROBES = {
     Feature.PIPELINE_PARALLEL: lambda c: c.pp_size > 1,
     Feature.MULTI_NODE_TP: lambda c: c.nnodes > 1,
-    Feature.DP_ATTENTION: lambda c: (
-        bool(c.enable_dp_attention) or (c.attn_dp_size or 1) > 1
-    ),
+    Feature.DP_ATTENTION: lambda c: (c.attn_dp_size or 1) > 1,
     Feature.EXPERT_PARALLEL: lambda c: (c.ep_size or 1) > 1,
     Feature.EPLB: lambda c: bool(c.enable_eplb),
     Feature.CONTEXT_PARALLEL: lambda c: (
@@ -402,6 +400,21 @@ def install_monokernel_forward(
                 for rank, (*_, (name, api_version)) in enumerate(lookups)
             )
         )
+    # Specs are found by architecture and model type, which another model's draft
+    # can share (every DFlash2 draft is a qwen3 DFlash2DraftModel). The target's
+    # hf_config requirements were checked with the server args; a draft that does
+    # not meet them is not this spec's model and keeps its forward. Every rank
+    # has the same config, so they all return here together.
+    mismatch = [
+        f"config.{key} {getattr(hf_config, key, None)!r} is not {want!r}"
+        for key, want in spec.requires.hf_config.items()
+        if getattr(hf_config, key, None) != want
+    ]
+    if mismatch:
+        logger.info(
+            "monokernel: %s: %s: the normal forward", spec.name, "; ".join(mismatch)
+        )
+        return
 
     reasons = list(spec.model_disable_reasons(model, hf_config, copies))
     if spec.load_tensor is not None and not is_load_observed:

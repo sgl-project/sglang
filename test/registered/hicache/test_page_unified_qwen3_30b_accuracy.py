@@ -60,7 +60,7 @@ class TestPageUnifiedQwen330BAccuracy(CustomTestCase):
     chunk_bytes = 24 * 2 * 64 * 128 * 2 * 2  # layers, heads, tokens, dim, K/V, BF16
 
     def _load_questions(self):
-        from sglang.srt.utils.hf_transformers import get_tokenizer
+        from sglang.srt.hf_transformers import get_tokenizer
 
         data_dir = os.environ.get("SGLANG_TEST_GSM8K_DATA_DIR")
 
@@ -231,7 +231,8 @@ class TestPageUnifiedQwen330BAccuracy(CustomTestCase):
     def _canonical_files(self, cases, namespace):
         digest = namespace_digest(
             derive_namespace(
-                model_id=self.model_path,
+                # As storage_model_name() builds it; this pool adds no format tag.
+                model_id=f"{self.model_path}-dtype_bfloat16",
                 dtype="bfloat16",
                 page_size=self.page_size,
                 rank_replicated=False,

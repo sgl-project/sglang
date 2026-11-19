@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import TYPE_CHECKING, NamedTuple, Optional
+from typing import TYPE_CHECKING, Callable, NamedTuple, Optional
 
 import torch
 
@@ -14,6 +14,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.ops.communication.comm_registry import CommRegistry
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -154,28 +155,34 @@ def _jit_module(world_size: int) -> Module:
         cuda_files=["kimi_k3/comm/sp_collective.cuh"],
         cuda_wrappers=[
             ("reduce_scatter_res", f"{cls}::reduce_scatter_res"),
+            ("reduce_scatter_pushed", f"{cls}::reduce_scatter_pushed"),
             ("reduce_scatter_pull", f"{cls}::reduce_scatter_pull"),
             ("all_gather", f"{cls}::all_gather"),
+            ("all_gather_push", f"{cls}::all_gather_push"),
             ("all_gather_direct", f"{cls}::all_gather_direct"),
+            *(
+                [
+                    (
+                        "reduce_scatter_res_unrolled",
+                        f"{cls}::reduce_scatter_res_unrolled",
+                    ),
+                ]
+                if torch.version.hip
+                else []
+            ),
         ],
         extra_cuda_cflags=["-O3"],
     )
 
 
-_COMM_MAP: dict[int, Communicator] = {}
+_COMMS = CommRegistry("sp_collective")
 
 
-def register_comm(comm: Communicator) -> None:
-    # One communicator per world_size per process -- see the note in
-    # communication/all_reduce_residual.py::register_comm. The ops key only on world_size, so an
-    # overwrite here would hand the old group's callers the new group's peer
-    # pointers.
-    prev = _COMM_MAP.get(comm.world_size)
-    assert prev is None or prev is comm, (
-        f"a different communicator is already registered for world_size="
-        f"{comm.world_size}"
-    )
-    _COMM_MAP[comm.world_size] = comm
+def register_comm(provider: Callable[[], Communicator], *, world_size: int) -> None:
+    """Register the provider of the communicator these ops launch over; it runs on
+    first launch (see ``CommRegistry``).
+    """
+    _COMMS.register(provider, world_size=world_size)
 
 
 @register_custom_op(mutates_args=["output"])
@@ -189,13 +196,47 @@ def _reduce_scatter_res_op(
     block_size: int,
 ) -> None:
     _jit_module(world_size).reduce_scatter_res(
-        _COMM_MAP[world_size],
+        _COMMS.get(world_size),
         input.view(-1),
         output.view(-1),
         None if residual is None else residual.view(-1),
         residual_is_local,
         num_blocks,
         block_size,
+    )
+
+
+@register_custom_op(mutates_args=["output"])
+def _reduce_scatter_res_unrolled_op(
+    world_size: int,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    residual_is_local: bool,
+    num_blocks: int,
+    block_size: int,
+) -> None:
+    _jit_module(world_size).reduce_scatter_res_unrolled(
+        _COMMS.get(world_size),
+        input.view(-1),
+        output.view(-1),
+        None if residual is None else residual.view(-1),
+        residual_is_local,
+        num_blocks,
+        block_size,
+    )
+
+
+@register_custom_op(mutates_args=["output"])
+def _reduce_scatter_pushed_op(
+    world_size: int,
+    output: torch.Tensor,
+    num_blocks: int,
+    block_size: int,
+    unrolled: bool,
+) -> None:
+    _jit_module(world_size).reduce_scatter_pushed(
+        _COMMS.get(world_size), output.view(-1), num_blocks, block_size, unrolled
     )
 
 
@@ -211,7 +252,7 @@ def _reduce_scatter_pull_op(
     block_size: int,
 ) -> None:
     _jit_module(world_size).reduce_scatter_pull(
-        _COMM_MAP[world_size],
+        _COMMS.get(world_size),
         input.view(-1),
         output.view(-1),
         None if residual is None else residual.view(-1),
@@ -231,7 +272,24 @@ def _all_gather_op(
     block_size: int,
 ) -> None:
     _jit_module(world_size).all_gather(
-        _COMM_MAP[world_size],
+        _COMMS.get(world_size),
+        input.view(-1),
+        output.view(-1),
+        num_blocks,
+        block_size,
+    )
+
+
+@register_custom_op(mutates_args=["output"])
+def _all_gather_push_op(
+    world_size: int,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    num_blocks: int,
+    block_size: int,
+) -> None:
+    _jit_module(world_size).all_gather_push(
+        _COMMS.get(world_size),
         input.view(-1),
         output.view(-1),
         num_blocks,
@@ -249,7 +307,7 @@ def _all_gather_direct_op(
     block_size: int,
 ) -> None:
     _jit_module(world_size).all_gather_direct(
-        _COMM_MAP[world_size],
+        _COMMS.get(world_size),
         input.view(-1),
         output.view(-1),
         output_mc_ptr,
@@ -275,6 +333,44 @@ def reduce_scatter_res(
         residual_is_local,
         tuning.num_blocks,
         tuning.block_size,
+    )
+    return output
+
+
+def reduce_scatter_res_unrolled(
+    world_size: int,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    residual: Optional[torch.Tensor] = None,
+    *,
+    tuning: Tuning = DEFAULT_TUNING,
+) -> torch.Tensor:
+    """ROCm ``reduce_scatter_res`` with peer-spread, unrolled pushes (one warp group per peer)."""
+    residual_is_local = residual is not None and residual.numel() == output.numel()
+    _reduce_scatter_res_unrolled_op(
+        world_size,
+        input,
+        output,
+        residual,
+        residual_is_local,
+        tuning.num_blocks,
+        tuning.block_size,
+    )
+    return output
+
+
+def reduce_scatter_pushed(
+    world_size: int,
+    output: torch.Tensor,
+    *,
+    tuning: Tuning = DEFAULT_TUNING,
+    unrolled: bool = False,
+) -> torch.Tensor:
+    """The reduction half of ``reduce_scatter_res`` (into this rank's shard ``output``) for partial rows a fused
+    producer already pushed into every owner's slot of the current phase (``sp_push_target``); ``unrolled``: the
+    ROCm ``reduce_scatter_res_unrolled`` reduction."""
+    _reduce_scatter_pushed_op(
+        world_size, output, tuning.num_blocks, tuning.block_size, unrolled
     )
     return output
 
@@ -310,6 +406,24 @@ def all_gather(
     tuning: Tuning = DEFAULT_TUNING,
 ) -> torch.Tensor:
     _all_gather_op(
+        world_size,
+        input,
+        output,
+        tuning.num_blocks,
+        tuning.block_size,
+    )
+    return output
+
+
+def all_gather_push(
+    world_size: int,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    tuning: Tuning = DEFAULT_TUNING,
+) -> torch.Tensor:
+    """``all_gather`` through unicast pushes, for push planes without multicast (ROCm)."""
+    _all_gather_push_op(
         world_size,
         input,
         output,

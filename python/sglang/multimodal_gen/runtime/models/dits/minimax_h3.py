@@ -33,6 +33,7 @@ from sglang.kernels.ops.diffusion import (
     can_use_aten_head_rmsnorm,
     can_use_aten_head_rmsnorm_rope,
     can_use_fused_inplace_qknorm_rope,
+    can_use_indexed_gate_rmsnorm_scale_shift,
     can_use_rmsnorm_indexed_scale_shift,
     fused_inplace_qknorm_rope,
     fused_qknorm_rope_out_of_place,
@@ -40,6 +41,7 @@ from sglang.kernels.ops.diffusion import (
     indexed_gate_bf16_,
     indexed_gate_fp32,
     indexed_gate_fp32_,
+    indexed_gate_rmsnorm_scale_shift_,
     indexed_scale_shift_bf16_,
     indexed_scale_shift_fp32_,
     indexed_scale_shift_mxfp8_,
@@ -72,32 +74,38 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_ulysses_ctx,
 )
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
     DynamicCudnnSDPAImpl,
 )
-from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
-    vsa_h3_fold_gate,
-)
 from sglang.multimodal_gen.runtime.layers.attention.layer import (
     PIPELINED_ATTENTION_BACKENDS,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    ComponentAttentionBackendNotAppliedError,
     claim_deferred_component_attn_backend,
     get_attn_backend,
+    get_component_attn_backend_context,
     get_component_forced_attn_backend,
     get_global_forced_attn_backend,
 )
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     LinearBase,
+    LinearMethodBase,
     MergedColumnParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
+)
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    RotaryEmbedding,
 )
 from sglang.multimodal_gen.runtime.layers.usp import (
     _ring_attention_varlen,
@@ -110,6 +118,7 @@ from sglang.multimodal_gen.runtime.layers.usp import (
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
+    get_forward_context_or_none,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -234,6 +243,8 @@ _MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER = (
     "final_layer.audio_out.bias",
 )
 MINIMAX_H3_FP32_PARAM_NAMES = frozenset(_MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER)
+# The modules an audio-free checkpoint (``audio_enabled: false``) omits.
+_MINIMAX_H3_AUDIO_MODULES = ("audio_patch_proj", "final_layer.audio_out")
 MINIMAX_H3_FP32_BUFFER_NAMES = frozenset({"rope.inv_freq"})
 
 
@@ -404,10 +415,11 @@ def _copy_grouped_qkv_tp_shard(
     return True
 
 
-def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> nn.RMSNorm:
-    # RMSNorm uses fp32 accumulation with bf16 inputs and outputs.
-    # torch.nn.RMSNorm upcasts reduced-precision inputs for the variance
-    # reduction, matching that accumulation semantic.
+def _norm(
+    size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE
+) -> nn.RMSNorm | RMSNorm:
+    if current_platform.is_npu():
+        return RMSNorm(size, eps=eps).to(dtype=dtype)
     return nn.RMSNorm(size, eps=eps, dtype=dtype)
 
 
@@ -418,7 +430,7 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 def _modulate_rmsnorm_scale_shift(
     x: torch.Tensor,
-    norm: nn.RMSNorm,
+    norm: nn.RMSNorm | RMSNorm,
     shift: torch.Tensor,
     scale: torch.Tensor,
     indices: torch.Tensor,
@@ -434,6 +446,7 @@ def _modulate_rmsnorm_scale_shift(
     """
     if (
         fused
+        and not current_platform.is_npu()
         and x.dtype == dtype == _BF16_DTYPE
         and norm.weight is not None
         and can_use_rmsnorm_indexed_scale_shift(x, norm.weight, shift, scale, indices)
@@ -447,6 +460,7 @@ def _accepts_mxfp8_input(linear: nn.Module) -> bool:
     return (
         isinstance(linear, LinearBase)
         and linear.quant_method is not None
+        and isinstance(linear.quant_method, LinearMethodBase)
         and linear.quant_method.accepts_mxfp8_input(linear)
     )
 
@@ -533,10 +547,12 @@ _ATEN_HEAD_RMSNORM = BitExactFusionGate("MiniMax-H3 ROCm QK RMSNorm")
 def _apply_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
-    q_norm: nn.RMSNorm,
-    k_norm: nn.RMSNorm,
+    q_norm: nn.RMSNorm | RMSNorm,
+    k_norm: nn.RMSNorm | RMSNorm,
     head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if current_platform.is_npu():
+        return q_norm(q), k_norm(k)
     if (
         q.is_cuda
         and q.dtype == _BF16_DTYPE
@@ -634,16 +650,15 @@ def _apply_rope_qk(
     k: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
+    *,
+    rotary_emb: RotaryEmbedding,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not q.is_cuda:
         half = cos_sin_cache.shape[-1] // 2
-        cos_half, sin_half = cos_sin_cache.split(half, dim=-1)
-        cos = torch.cat((cos_half, cos_half), dim=-1).unsqueeze(1)
-        sin = torch.cat((sin_half, sin_half), dim=-1).unsqueeze(1)
-        return (
-            _apply_rope_cos_sin(q, cos, sin),
-            _apply_rope_cos_sin(k, cos, sin),
-        )
+        cos, sin = cos_sin_cache.split(half, dim=-1)
+        # forward_npu sends 3D q/k to forward_native; npu_rotary_mul needs BSND.
+        q, k = rotary_emb(query=q.unsqueeze(0), key=k.unsqueeze(0), cos=cos, sin=sin)
+        return q.squeeze(0), k.squeeze(0)
 
     from sgl_kernel import rotary_embedding as apply_sgl_kernel_rotary_embedding
 
@@ -665,18 +680,22 @@ _ATEN_HEAD_RMSNORM_ROPE = BitExactFusionGate("MiniMax-H3 ROCm QK RMSNorm + RoPE"
 def _apply_qk_norm_rope(
     q: torch.Tensor,
     k: torch.Tensor,
-    q_norm: nn.RMSNorm,
-    k_norm: nn.RMSNorm,
+    q_norm: nn.RMSNorm | RMSNorm,
+    k_norm: nn.RMSNorm | RMSNorm,
     head_dim: int,
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
+    rotary_emb: RotaryEmbedding,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     def unfused():
         normed_q, normed_k = _apply_qk_norm(q, k, q_norm, k_norm, head_dim)
-        return _apply_rope_qk(normed_q, normed_k, cos_sin_cache, positions)
+        return _apply_rope_qk(
+            normed_q, normed_k, cos_sin_cache, positions, rotary_emb=rotary_emb
+        )
 
     if (
-        q_norm.eps is not None
+        not current_platform.is_npu()
+        and q_norm.eps is not None
         and k_norm.eps is not None
         and not torch.compiler.is_compiling()
         and can_use_aten_head_rmsnorm(q, q_norm.weight)
@@ -920,6 +939,8 @@ def _minimax_h3_group_attend(
 # aiter's varlen kernel gives a head group the same bytes as those heads inside
 # the full call (checked at H3's shapes on MI355X)
 _COLLECTIVE_PIPELINED_ATTENTION_BACKENDS = (AttentionBackendEnum.AITER,)
+# packed kernels that return the softmax LSE the ring merge needs
+_RING_ATTENTION_BACKENDS = (AttentionBackendEnum.FA, AttentionBackendEnum.AITER)
 
 
 def _minimax_h3_collective_pipelined_attention(
@@ -1124,6 +1145,10 @@ def _minimax_h3_attention_core_impl(
         if ulysses_active:
             out = _usp_output_all_to_all(out[None], head_dim=2)[0]
         if fold_after_exchange:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
+                vsa_h3_fold_gate,
+            )
+
             _, ulysses_rank = get_ulysses_ctx()
             vsa_h3_fold_gate(
                 out,
@@ -1136,10 +1161,10 @@ def _minimax_h3_attention_core_impl(
 
     if ring_active:
         ring_ws, _ = get_ring_ctx()
-        if attention._attention_backend_enum is not AttentionBackendEnum.FA:
+        if attention._attention_backend_enum not in _RING_ATTENTION_BACKENDS:
             raise NotImplementedError(
-                "MiniMax H3 ring parallelism requires the FlashAttention "
-                "backend (matches --ring-degree's general restriction)."
+                "MiniMax H3 ring parallelism requires the FlashAttention or "
+                "aiter backend (their packed kernels return the softmax LSE)."
             )
         # max_seqlen is cu_seqlens[1] (`used`) by construction -- the real,
         # non-padding row count ring needs, already a host int here.
@@ -1182,6 +1207,24 @@ def _minimax_h3_attention_core_impl(
                 ),
             )
         else:
+            extra_kwargs = {}
+            if (
+                current_platform.is_npu()
+                and attention._attention_backend_enum is AttentionBackendEnum.FA
+                and not attention.prefix.startswith("blocks.")
+            ):
+                from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
+                    AscendFAMetadata,
+                )
+
+                context = get_forward_context_or_none()
+                metadata = context.attn_metadata if context is not None else None
+                if (
+                    isinstance(metadata, AscendFAMetadata)
+                    and metadata.precision is not None
+                ):
+                    # Keep the refiner native when the DiT selects SD precision.
+                    extra_kwargs["attn_metadata"] = AscendFAMetadata(precision="bf16")
             out = attention._attention_impl.forward_varlen(
                 q,
                 k,
@@ -1189,6 +1232,7 @@ def _minimax_h3_attention_core_impl(
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 cu_seqlens_host=cu_seqlens_host,
+                **extra_kwargs,
             )
     if ulysses_active:
         out = _usp_output_all_to_all(out[None], head_dim=2)[0]
@@ -1226,6 +1270,7 @@ class MiniMaxH3Attention(nn.Module):
         self.local_inner_dim = self.num_heads * self.head_dim
         self.softmax_scale = self.head_dim**-0.5
         self.prefix = prefix
+        self._quant_config = quant_config
         self._attention_impl = None
         self._attention_backend_enum: AttentionBackendEnum | None = None
         # attention initializes on the first real QKV tensors, after the
@@ -1289,21 +1334,31 @@ class MiniMaxH3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
         )
-        # VSA compression gate; stays bf16 and unquantized (zero gate == pure sparse).
+        # VSA compression gate; bf16 and unquantized (zero gate == pure sparse),
+        # unless a serialized checkpoint quantized it (FastVideo's Comfy INT8 file).
         self.to_gate_compress: ColumnParallelLinear | None = None
         if arch.has_gate_compress and prefix.startswith("blocks."):
+            gate_prefix = f"{prefix}.to_gate_compress"
+            markers = getattr(quant_config, "layer_markers", None) or {}
             self.to_gate_compress = ColumnParallelLinear(
                 arch.hidden_size,
                 self.inner_dim,
                 bias=False,
                 gather_output=False,
                 params_dtype=_BF16_DTYPE,
-                quant_config=None,
-                prefix=f"{prefix}.to_gate_compress",
+                quant_config=quant_config if gate_prefix in markers else None,
+                prefix=gate_prefix,
             )
         # VDN-H3: None for the dense model and for the token refiner
         self.hybrid = MiniMaxH3VDNHybridAttention.build(
             arch, quant_config, prefix=prefix, local_heads=self.num_heads
+        )
+
+        self.rotary_emb = RotaryEmbedding(
+            head_size=self.head_dim,
+            rotary_dim=rope_dim,
+            is_neox_style=True,
+            use_precomputed_cache=False,
         )
 
     def _set_attention_backend(self, backend) -> None:
@@ -1325,10 +1380,11 @@ class MiniMaxH3Attention(nn.Module):
             num_kv_heads=self.num_heads,
             prefix=self.prefix,
             packed_trailing_padding=True,
+            quant_config=self._quant_config,
         )
-        # Ring only supports FA (see _minimax_h3_attention_core_impl); keep
-        # the resolved enum alongside the impl instance instead of a second
-        # get_attn_backend() call at the ring gate.
+        # Ring only supports _RING_ATTENTION_BACKENDS; keep the resolved enum
+        # alongside the impl instance instead of a second get_attn_backend()
+        # call at the ring gate.
         self._attention_backend_enum = backend.get_enum()
 
     def _install_qkv_weight_loader(self, arch: MiniMaxH3DiTArchConfig) -> None:
@@ -1375,6 +1431,21 @@ class MiniMaxH3Attention(nn.Module):
             weight.weight_loader = _weight_loader
         # rank-local FSDP must reorder grouped QKV before selecting each shard
         weight.rank_local_weight_transform = _reorder_checkpoint_weight
+
+        if isinstance(self.qkv_proj.quant_method, UnquantizedLinearMethod):
+            # Heads are contiguous in the grouped checkpoint. Read only this
+            # TP rank's heads, then pack its local Q/K/V on CPU before H2D.
+            # This differs from FSDP, which slices the globally reordered tensor.
+            def _reorder_tp_slice(local_weight: torch.Tensor) -> torch.Tensor:
+                return _reorder_grouped_qkv_to_qkv(
+                    local_weight,
+                    num_query_groups=arch.num_attention_heads // self.tp_size,
+                    heads_per_group=1,
+                    head_dim=arch.attention_head_dim,
+                )
+
+            weight.rank_local_tp_shard_dim = 0
+            weight.rank_local_tp_weight_transform = _reorder_tp_slice
 
         # A quantized checkpoint stores metadata indexed by output row next to the
         # rows themselves (NVFP4 block scales, fp8 per-channel scales). Those rows
@@ -1641,6 +1712,7 @@ class MiniMaxH3Attention(nn.Module):
                     self.head_dim,
                     cos_sin_cache,
                     positions,
+                    self.rotary_emb,
                 )
 
         gate_compress = None
@@ -1703,6 +1775,7 @@ class MiniMaxH3MLP(nn.Module):
         self.reuse_fc1_activation = quant_config is None or (
             quant_config.get_name() == "gguf"
         )
+        self._npu_swiglu = SiluAndMul() if current_platform.is_npu() else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not isinstance(x, tuple) and x.device.type == "mps":
@@ -1721,7 +1794,14 @@ class MiniMaxH3MLP(nn.Module):
         if _accepts_mxfp8_input(self.fc2) and can_use_silu_mul_mxfp8(hidden):
             out, _ = self.fc2(silu_mul_mxfp8(hidden))
             return out
-        hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
+        if (
+            self._npu_swiglu is not None
+            and hidden.device.type == "npu"
+            and hidden.dtype in (torch.float16, torch.bfloat16)
+        ):
+            hidden = self._npu_swiglu(hidden)
+        else:
+            hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
         out, _ = self.fc2(hidden)
         return out
 
@@ -1876,8 +1956,10 @@ class MiniMaxH3DiTBlock(nn.Module):
         *,
         prefix: str,
         use_adaln_cache: bool = False,
+        layer_index: int = 0,
     ) -> None:
         super().__init__()
+        self.layer_index = layer_index
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
         self.norm2 = _norm(arch.hidden_size, eps=arch.norm_eps)
         MINIMAX_H3_NORM_MODULATE.mark(self)
@@ -1915,6 +1997,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         ulysses_active: bool = False,
         ring_active: bool = False,
         adaln_params: tuple[torch.Tensor, ...] | None = None,
+        block_adaln_params: tuple[tuple[torch.Tensor, ...], ...] | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; adaln_input: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -1923,6 +2006,10 @@ class MiniMaxH3DiTBlock(nn.Module):
         norm1 -> scale/shift -> attention -> gated residual, followed by
         norm2 -> scale/shift -> MLP -> gated residual.
         """
+        if adaln_params is None and block_adaln_params is not None:
+            # Cache-DiT forwards the same kwargs to every wrapped block.
+            # Select by the original layer index, not the outer stack index.
+            adaln_params = block_adaln_params[self.layer_index]
         if adaln_params is None:
             if self.adaln_proj is None:
                 raise ValueError("MiniMax H3 AdaLN cache parameters are required")
@@ -1966,6 +2053,23 @@ class MiniMaxH3DiTBlock(nn.Module):
             ulysses_active=ulysses_active,
             ring_active=ring_active,
         )
+        if self._fuses_gate_norm2(
+            residual, gate_msa, h, shift_mlp, scale_mlp, combined_indices
+        ):
+            # the gated residual and norm2 in one pass, at the same roundings
+            h = indexed_gate_rmsnorm_scale_shift_(
+                residual,
+                gate_msa,
+                h,
+                self.norm2.weight,
+                shift_mlp,
+                scale_mlp,
+                combined_indices,
+                self.norm2.eps,
+            )
+            return _modulate_gate(
+                residual, gate_mlp, self.mlp(h), combined_indices, dtype=_BF16_DTYPE
+            )
         x = _modulate_gate(
             residual,
             gate_msa,
@@ -2009,6 +2113,37 @@ class MiniMaxH3DiTBlock(nn.Module):
             dtype=_BF16_DTYPE,
         )
 
+    def _fuses_gate_norm2(
+        self,
+        x: torch.Tensor,
+        gate: torch.Tensor,
+        other: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> bool:
+        """Whether the attention's gated residual (in place) and the fused
+        norm2 modulation run as one kernel."""
+        return (
+            not self.preserve_input_for_cache_dit
+            and not _accepts_mxfp8_input(self.mlp.fc1)
+            and MINIMAX_H3_NORM_MODULATE.is_enabled(self)
+            and self.norm2.weight is not None
+            and self.norm2.eps is not None
+            and can_use_indexed_gate_rmsnorm_scale_shift(
+                x, gate, other, self.norm2.weight, shift, scale, indices
+            )
+        )
+
+
+def _fp32_param_names_in_model_order(arch: MiniMaxH3DiTArchConfig) -> list[str]:
+    """The fp32 parameters in model order; audio-free checkpoints omit audio ones."""
+    return [
+        name
+        for name in _MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER
+        if arch.audio_enabled or name.rsplit(".", 1)[0] not in _MINIMAX_H3_AUDIO_MODULES
+    ]
+
 
 class MiniMaxH3FinalLayer(nn.Module):
     def __init__(
@@ -2048,14 +2183,20 @@ class MiniMaxH3FinalLayer(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.video_out",
         )
-        self.audio_out = ColumnParallelLinear(
-            arch.hidden_size,
-            arch.audio_latents_dim,
-            bias=True,
-            gather_output=False,
-            params_dtype=_FP32_DTYPE,
-            quant_config=None,
-            prefix=f"{prefix}.audio_out",
+        # An audio-free checkpoint has no audio head; `_project` returns
+        # zero-width audio rows.
+        self.audio_out = (
+            ColumnParallelLinear(
+                arch.hidden_size,
+                arch.audio_latents_dim,
+                bias=True,
+                gather_output=False,
+                params_dtype=_FP32_DTYPE,
+                quant_config=None,
+                prefix=f"{prefix}.audio_out",
+            )
+            if arch.audio_enabled
+            else None
         )
         # Parallel Decoding Distillation heads, one per denoise step, loaded by
         # `load_pdd_fused_heads`. None on every ordinary run.
@@ -2064,20 +2205,30 @@ class MiniMaxH3FinalLayer(nn.Module):
         self._pdd_device_heads: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def load_pdd_fused_heads(self, path: str) -> None:
-        """Swap the two output heads for a per-step stack (PDD).
+        """Swap the output heads for a per-step stack (PDD).
 
         PDD replicates the final linear layer once per time interval and lets one
         backbone evaluation advance a whole block of them; the per-block heads
         fuse into one because H3's euler-eta0 step is linear in the predicted
         velocity. `tools/fuse_minimax_h3_pdd_heads.py` does that fusion offline,
-        leaving one head per denoise step.
+        leaving one head per denoise step. An audio-free model takes only
+        ``video_out.{weight,bias}``.
         """
         from safetensors import safe_open
 
         with safe_open(path, "pt") as f:
             heads = {k: f.get_tensor(k) for k in f.keys()}
+        names = ("video_out",) if self.audio_out is None else ("video_out", "audio_out")
+        expected = {
+            f"{name}.{suffix}" for name in names for suffix in ("weight", "bias")
+        }
+        if set(heads) != expected:
+            raise ValueError(
+                f"MiniMax-H3 PDD heads must hold exactly {sorted(expected)}, "
+                f"got {sorted(heads)}"
+            )
         steps = heads["video_out.weight"].shape[0]
-        for name in ("video_out", "audio_out"):
+        for name in names:
             projection = getattr(self, name)
             for suffix, shape in (
                 ("weight", (steps, projection.output_size, projection.input_size)),
@@ -2092,7 +2243,15 @@ class MiniMaxH3FinalLayer(nn.Module):
         self._pdd_device_heads = {}
         logger.info("MiniMax-H3 PDD: %d fused output heads loaded from %s", steps, path)
 
-    def _pdd_project(self, h: torch.Tensor, name: str) -> torch.Tensor:
+    def _new_pdd_output(self, h: torch.Tensor, name: str) -> torch.Tensor:
+        out_features = self._pdd_heads[f"{name}.weight"].shape[1]
+        return h.new_empty((*h.shape[:-1], out_features))
+
+    # The PDD head follows the live denoising step in forward context.
+    @eager_on_graph(output_factory=_new_pdd_output, pass_output=True)
+    def _pdd_project(
+        self, h: torch.Tensor, name: str, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         heads = self._pdd_heads
         step = int(get_forward_context().current_timestep)
         stack = heads[f"{name}.weight"]
@@ -2109,12 +2268,21 @@ class MiniMaxH3FinalLayer(nn.Module):
                 heads[f"{name}.bias"].to(device=h.device, dtype=h.dtype),
             )
         weight, bias = self._pdd_device_heads[key]
-        return torch.nn.functional.linear(h, weight[step], bias[step])
+        result = torch.nn.functional.linear(h, weight[step], bias[step])
+        if out is None:
+            return result
+        out.copy_(result)
+        return out
 
     def _project(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self._pdd_heads is not None:
-            return self._pdd_project(h, "video_out"), self._pdd_project(h, "audio_out")
-        video, _ = self.video_out(h)
+            video = self._pdd_project(h, "video_out")
+        else:
+            video, _ = self.video_out(h)
+        if self.audio_out is None:
+            return video, h.new_empty((h.shape[0], 0))
+        if self._pdd_heads is not None:
+            return video, self._pdd_project(h, "audio_out")
         audio, _ = self.audio_out(h)
         return video, audio
 
@@ -2261,10 +2429,12 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             b = adapter[b_key]
             a64 = a.to(torch.float64)
             b64 = b.to(device=work_device, dtype=torch.float64)
-            projected[a_key] = (a64 @ work_basis.T).to(torch.float32)
+            # Keep the adapter dtype: the folded linear runs the LoRA delta with
+            # the raw activation dtype and rejects a float32 operand.
+            projected[a_key] = (a64 @ work_basis.T).to(a.dtype)
             projected[a_key[: -len("lora_A")] + "lora_output_offset"] = (
                 b64 @ (a64 @ work_mean)
-            ).to(torch.float32)
+            ).to(b.dtype)
 
         logger.info(
             "Projected %d MiniMax H3 AdaLN LoRA modules from width %d to %d",
@@ -2395,7 +2565,11 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             ("adaln_out_features", arch.adaln_out_features),
             ("final_adaln_out_features", arch.final_adaln_out_features),
             ("video_patch_output_dim", arch.latents_dim * math.prod(arch.patch_size)),
-            ("audio_patch_output_dim", arch.audio_latents_dim),
+            *(
+                (("audio_patch_output_dim", arch.audio_latents_dim),)
+                if arch.audio_enabled
+                else ()
+            ),
         ):
             if value % tp_size:
                 raise ValueError(
@@ -2452,10 +2626,17 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         super().__init__(config=config, hf_config=hf_config)
         arch = self.config
         if (
-            adaln_cache_path is not None or adaln_weight_files is not None
-        ) and quant_config is not None:
+            (adaln_cache_path is not None or adaln_weight_files is not None)
+            and quant_config is not None
+            and not (
+                adaln_cache_path is None
+                and quant_config.get_name() in ("fp8", "mxfp8")
+                and not getattr(quant_config, "is_checkpoint_fp8_serialized", True)
+            )
+        ):
             raise ValueError(
-                "MiniMax H3 AdaLN cache is only compatible with unquantized weights"
+                "MiniMax H3 AdaLN cache requires unquantized weights or online "
+                "FP8 with AdaLN rebuilt from native checkpoint weights"
             )
         if arch.adaln_curve_grid is not None and (
             adaln_cache_path is not None or adaln_weight_files is not None
@@ -2494,14 +2675,18 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             quant_config=None,
             prefix="video_patch_proj",
         )
-        self.audio_patch_proj = ColumnParallelLinear(
-            arch.audio_latents_dim,
-            arch.hidden_size,
-            bias=True,
-            gather_output=True,
-            params_dtype=_FP32_DTYPE,
-            quant_config=None,
-            prefix="audio_patch_proj",
+        self.audio_patch_proj = (
+            ColumnParallelLinear(
+                arch.audio_latents_dim,
+                arch.hidden_size,
+                bias=True,
+                gather_output=True,
+                params_dtype=_FP32_DTYPE,
+                quant_config=None,
+                prefix="audio_patch_proj",
+            )
+            if arch.audio_enabled
+            else None
         )
         self.condition_proj = ColumnParallelLinear(
             arch.text_dim,
@@ -2563,6 +2748,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     quant_config,
                     prefix=f"blocks.{index}",
                     use_adaln_cache=self._adaln_precomputed,
+                    layer_index=index,
                 )
                 for index in range(arch.num_layers)
             ]
@@ -2599,6 +2785,13 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         # only that selection; process-wide overrides are resolved at first use.
         self._component_attention_backend_override = (
             claim_deferred_component_attn_backend()
+        )
+        component_context = get_component_attn_backend_context()
+        self._required_component_attention_backend = (
+            component_context.backend
+            if component_context is not None
+            and component_context.require_backend_selection
+            else None
         )
         self._resolved_attention_backend: AttentionBackendEnum | None = None
         self._mark_missing_params_required()
@@ -2715,6 +2908,12 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             selected_attention_backend=selected_backend,
             attention_requirements=AttentionRequirements(packed_varlen=True),
         )
+        required_backend = self._required_component_attention_backend
+        if required_backend is not None and backend.get_enum() != required_backend:
+            raise ComponentAttentionBackendNotAppliedError(
+                f"MiniMax H3 deferred attention requires {required_backend.name.lower()}, "
+                f"but selected {backend.get_enum().name.lower()}"
+            )
         for module in self.modules():
             if isinstance(module, MiniMaxH3Attention):
                 module._set_attention_backend(backend)
@@ -2729,7 +2928,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                 param.missing_param_init = "error"
 
     def post_load_weights(self) -> None:
-        fp32_param_names = list(_MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER)
+        fp32_param_names = _fp32_param_names_in_model_order(self.arch)
         if self.adaln_t_table is not None:
             fp32_param_names = [
                 name
@@ -3093,6 +3292,11 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         audio_pos = self._pos_ids(
             _required_kwarg(kwargs, "audio_pos_info"), "audio_pos_info"
         )
+        if not self.arch.audio_enabled and audio_pos.numel():
+            raise ValueError(
+                "this MiniMax H3 checkpoint is audio-free (audio_enabled: false) "
+                f"but the request packs {audio_pos.numel()} audio rows"
+            )
         text_pos = self._pos_ids(
             _required_kwarg(kwargs, "text_pos_info"),
             "text_pos_info",
@@ -3191,7 +3395,12 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                 ),
             )
             self.release_mps_non_layer_weights("rope")
-        self.materialize_mps_non_layer_weights(*_MPS_EMBED_WEIGHT_PREFIXES)
+        embed_weight_prefixes = _MPS_EMBED_WEIGHT_PREFIXES
+        if not self.arch.audio_enabled:
+            embed_weight_prefixes = tuple(
+                p for p in embed_weight_prefixes if p != "audio_patch_proj"
+            )
+        self.materialize_mps_non_layer_weights(*embed_weight_prefixes)
         img_pos = img_pos.to(device)
         audio_pos = audio_pos.to(device)
         text_pos = text_pos.to(device)
@@ -3212,7 +3421,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             refined_prompt_embeds_length=kwargs.get("refined_prompt_embeds_length"),
             local_embedding_layout=kwargs.get("local_embedding_layout"),
         )
-        self.release_mps_non_layer_weights(*_MPS_EMBED_WEIGHT_PREFIXES)
+        self.release_mps_non_layer_weights(*embed_weight_prefixes)
         # request-step AdaLN input shared by all blocks
         adaln_input = (
             t_emb
@@ -3287,7 +3496,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             # (Ulysses) and/or ring-rotates KV across ring ranks; everything
             # else, including the final layer, is row-local. Only the narrow
             # video/audio logits are gathered after the final layer.
-            for index, block in enumerate(self.blocks):
+            for block in self.blocks:
                 hidden = block(
                     hidden,
                     adaln_input=adaln_input,
@@ -3299,11 +3508,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
                     ulysses_active=ulysses_ws > 1,
                     ring_active=ring_ws > 1,
-                    adaln_params=(
-                        None
-                        if block_adaln_params is None
-                        else block_adaln_params[index]
-                    ),
+                    block_adaln_params=block_adaln_params,
                 )
             if spectrum_on:
                 self._h3_spectrum_record_targets(
@@ -3352,10 +3557,15 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         # rows have been removed. For hybrid TP+Ulysses, the preceding SP row
         # gather also carries only the TP-local output width.
         video_logits = video_logits.index_select(0, infer_out_pos.to(device))
-        audio_logits = audio_logits.index_select(0, audio_pos.to(device))
+        if self.arch.audio_enabled:
+            audio_logits = audio_logits.index_select(0, audio_pos.to(device))
+        else:
+            # No audio rows (checked above) and no audio head.
+            audio_logits = video_logits.new_empty((0, self.arch.audio_latents_dim))
         if get_tp_world_size() > 1:
             video_logits = tensor_model_parallel_all_gather(video_logits)
-            audio_logits = tensor_model_parallel_all_gather(audio_logits)
+            if self.arch.audio_enabled:
+                audio_logits = tensor_model_parallel_all_gather(audio_logits)
         if not skip_mask_out_condition:
             update_mask = update_mask.view(-1).to(device)
             if update_mask.shape[0] != video_logits.shape[0]:

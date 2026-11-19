@@ -270,8 +270,6 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
     )
     torch.testing.assert_close(actual, expected)
     indexer._use_fused_prep.assert_not_called()
-    # Sizing the RoPE cache reads positions.max() on the host: a device sync per layer.
-    assert indexer.apply_rope.call_args.kwargs["ensure_cos_sin_cache"] is False
     update = indexer.update_key_state_and_compress.call_args
     torch.testing.assert_close(update.args[0], hidden.unsqueeze(1))
     assert update.kwargs["state_stored"] is False
@@ -307,8 +305,16 @@ def _cpu_sparse_chunk_attention(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
     [(torch.float32, torch.float32), (torch.bfloat16, torch.float8_e4m3fn)],
 )
 @pytest.mark.parametrize("prefetched", [False, True])
+@pytest.mark.parametrize("sharded", [False, True])
 def test_qsa_cp_cached_prefix_matches_full_context_attention(
-    monkeypatch, prefix_lens, rank, save_kv_cache, query_dtype, cache_dtype, prefetched
+    monkeypatch,
+    prefix_lens,
+    rank,
+    save_kv_cache,
+    query_dtype,
+    cache_dtype,
+    prefetched,
+    sharded,
 ):
     # Unequal request lengths exercise both zigzag halves and uneven rank sizes.
     extend_lens = [8, 5]
@@ -381,10 +387,13 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
     backend = SimpleNamespace(
         token_to_kv_pool=routed(pool),
         kv_layers=pool.layer_router,
+        _kv_shard_pool=object() if sharded else None,
         _pad_extend_output=QwenSparseAttnBackend._pad_extend_output,
         # Per-forward metadata: row i of the slot table is request i's row.
         _resolve_metadata=lambda forward_batch: SimpleNamespace(
-            token_slot_table=req_to_token[req_indices],
+            # Logical slots differ from the scratch addresses when sharded.
+            token_slot_table=req_to_token[req_indices] + (81 if sharded else 0),
+            kv_shard_slot_table=req_to_token[req_indices] if sharded else None,
             sequence_lengths=torch.tensor(seq_lens, dtype=torch.int32),
         ),
         _cp_kv_pending=None,
@@ -509,8 +518,7 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
     torch.testing.assert_close(v_cache.float(), initial_v.float(), equal_nan=True)
 
 
-@pytest.mark.parametrize("ensure_cos_sin_cache", [False, True])
-def test_qsa_apply_rope_cache_sizing_is_optional(ensure_cos_sin_cache):
+def test_qsa_apply_rope_does_not_size_rope_cache():
     class Sized(Exception):
         pass
 
@@ -523,23 +531,33 @@ def test_qsa_apply_rope_cache_sizing_is_optional(ensure_cos_sin_cache):
             SimpleNamespace(rotary_emb=rotary_emb),
             torch.arange(4),
             torch.zeros(4, 1, 4),
-            ensure_cos_sin_cache=ensure_cos_sin_cache,
         )
-    # Sizing reads positions.max() on the host: the CP path must skip it.
-    assert rotary_emb._ensure_cos_sin_cache_length.called is ensure_cos_sin_cache
+    # Sizing reads positions.max() on the host; the load-time reservation covers it.
+    rotary_emb._ensure_cos_sin_cache_length.assert_not_called()
 
 
-def test_qsa_cp_forward_metadata_joins_leftover_prefetch(monkeypatch):
+@pytest.mark.parametrize("sharded", [False, True])
+def test_qsa_cp_forward_metadata_joins_leftover_prefetch(monkeypatch, sharded):
     side, main = Mock(), Mock()
+    events = []
+    main.wait_stream.side_effect = lambda stream: events.append("join")
+    shard_pool = SimpleNamespace(
+        end_shard_extend=Mock(side_effect=lambda: events.append("end_shard_extend"))
+    )
     monkeypatch.setattr(qwen_sparse_attn_backend, "get_stream", lambda name: side)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: main)
-    backend = SimpleNamespace(_cp_kv_pending=(0, None, None))
+    backend = SimpleNamespace(
+        _cp_kv_pending=(0, None, None),
+        _kv_shard_pool=shard_pool if sharded else None,
+        req_to_token=None,
+    )
     QwenSparseAttnBackend.init_forward_metadata(
         backend, SimpleNamespace(forward_mode=ForwardMode.IDLE)
     )
     # Later CP collectives on the main stream must not overlap the gather.
     main.wait_stream.assert_called_once_with(side)
     assert backend._cp_kv_pending is None
+    assert events == (["join", "end_shard_extend"] if sharded else ["join"])
 
 
 if __name__ == "__main__":

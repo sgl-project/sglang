@@ -6,12 +6,54 @@ if [ ! -f "${sglang_source_path}/${test_case}" ];then
   exit 0
 fi
 
+# Optional single test method ("Class.method") injected as NPU_TEST_METHOD;
+# empty runs every test defined in the test case file.
+test_method="${NPU_TEST_METHOD:-}"
+test_method_args=()
+if [ -n "${test_method}" ]; then
+  echo "Restricting run to test method: ${test_method}"
+  test_method_args=("${test_method}")
+fi
+
 # Leave the image WORKDIR (/sgl-workspace): the sglang repo cloned there can
 # shadow the installed package on sys.path.
 cd "${sglang_source_path}"
 
+# CI hosts mount /root/.cache/huggingface read-only, but --trust-remote-code
+# needs a writable transformers dynamic-module cache.
+export HF_MODULES_CACHE="${HF_MODULES_CACHE:-/tmp/hf_modules}"
+
 echo "NPU info:"
 npu-smi info
+
+# Apply the container patches prepared by the workflow: every entry in
+# SGLANG_NPU_CONTAINER_PATCHES is a directory (relative to the repo root) whose
+# install.sh ships with that patch archive. The workflow downloads and extracts
+# the archives before the pods start; install.sh owns everything else, including
+# dependency installation and any package mirror configuration.
+if [ -n "${SGLANG_NPU_CONTAINER_PATCHES:-}" ]; then
+    echo "===== Apply container patches - Begin ====="
+    while IFS= read -r patch_dir; do
+        patch_dir="$(echo "${patch_dir}" | tr -d '[:space:]')"
+        if [ -z "${patch_dir}" ]; then
+            continue
+        fi
+        install_sh="${sglang_source_path}/${patch_dir}/install.sh"
+        if [ ! -f "${install_sh}" ]; then
+            echo "install.sh not found: ${install_sh}" >&2
+            exit 1
+        fi
+        echo "===== Apply container patch: ${patch_dir} - Begin ====="
+        (
+            cd "$(dirname "${install_sh}")"
+            bash ./install.sh
+        )
+        echo "===== Apply container patch: ${patch_dir} - End ====="
+    done <<< "$(echo "${SGLANG_NPU_CONTAINER_PATCHES}" | tr ',' '\n')"
+    echo "===== Apply container patches - End ====="
+else
+    echo "No container patch requested, skip."
+fi
 
 echo "===== Install kubernetes - Begin ====="
 KUBERNETES_PKG_PATH_SOURCE=/root/.cache/.cache/kubernetes
@@ -78,6 +120,13 @@ sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
 
+# Prefer the sgl-router CI built for this commit over the image's copy.
+sgl_router_bin="${sglang_source_path}/sgl-router-bin/sgl-router"
+if "${sgl_router_bin}" --help >/dev/null 2>&1; then
+    export SGLANG_TEST_PD_ROUTER_BINARY="${sgl_router_bin}"
+fi
+echo "sgl-router: $(command -v "${SGLANG_TEST_PD_ROUTER_BINARY:-sgl-router}" || echo 'not found')"
+
 export SGLANG_TEST_MAX_RETRY=0
 export SGLANG_SET_CPU_AFFINITY=1
 export HCCL_HOST_SOCKET_PORT_RANGE="auto"
@@ -98,17 +147,20 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-# use sglang from source or from image
-if [ "${INSTALL_SGLANG_FROM_SOURCE}" = "true" ] || [ "${INSTALL_SGLANG_FROM_SOURCE}" = "True" ];then
-    echo "Use sglang from source: ${sglang_source_path}"
-    export PYTHONPATH=${sglang_source_path}/python:$PYTHONPATH
+# SGLANG_USE_IMAGE=true keeps importing sglang from the image's site-packages
+# (release data runs against the published image). The checkout's test helpers
+# still have to be visible on top of whatever the image bundled, so they are
+# copied into site-packages before anything imports them.
+# Every other caller keeps the community behavior and imports the checked-out
+# sglang, so the pod tests the commit under test.
+if [ "${SGLANG_USE_IMAGE:-}" = "true" ] || [ "${SGLANG_USE_IMAGE:-}" = "True" ]; then
+    IMAGE_SGLANG_PKG="$(python -c 'import sglang, os; print(os.path.dirname(sglang.__file__))')"
+    if [ -d "${IMAGE_SGLANG_PKG}/test" ] && [ -d "${sglang_source_path}/python/sglang/test" ]; then
+        echo "Syncing PR sglang/test → ${IMAGE_SGLANG_PKG}/test"
+        cp -r "${sglang_source_path}/python/sglang/test/"* "${IMAGE_SGLANG_PKG}/test/"
+    fi
 else
-    echo "Use sglang from docker image"
-    sglang_pkg_path=/sgl-workspace/sglang/python
-    ascend_test_util_path=${sglang_pkg_path}/sglang/test/ascend
-    mkdir -p "${ascend_test_util_path}"
-    mv "${ascend_test_util_path}" "${ascend_test_util_path}_bak"
-    cp -r ${sglang_source_path}/python/sglang/test/ascend "${ascend_test_util_path}"
+    export PYTHONPATH="${sglang_source_path}/python${PYTHONPATH:+:${PYTHONPATH}}"
 fi
 
 # set environment of cann
@@ -121,6 +173,8 @@ source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bi
 export SGLANG_DSPARK_A5_EXTRA_OPS_SO=/usr/local/Ascend/extra-ops/vllm_ascend_C.cpython-312-x86_64-linux-gnu.so
 export ASCEND_CUSTOM_OPP_PATH=/usr/local/Ascend/extra-ops/vendors/custom_transformer/:$ASCEND_CUSTOM_OPP_PATH
 export LD_LIBRARY_PATH=/usr/local/Ascend/extra-ops/vendors/custom_transformer/op_api/lib:$LD_LIBRARY_PATH
+
+export TORCH_EXTENSIONS_DIR=/tmp/torch_extensions
 
 echo "Running test case ${test_case}"
 tc_name=${test_case##*/}
@@ -137,10 +191,10 @@ echo "Log path: ${log_path}"
 
 if [ "${TROUBLE_SHOTTING}" = "true" ] || [ "${TROUBLE_SHOTTING}" = "True" ];then
     echo "TROUBLE_SHOTTING=true, the pod will keep alive for four hour."
-    ( ${PYTHON_FOR_SGLANG} -u "${sglang_source_path}/${test_case}" 2>&1 || true ) | tee -a "${log_path}/${tc_name}.log"
+    ( ${PYTHON_FOR_SGLANG} -u "${sglang_source_path}/${test_case}" "${test_method_args[@]}" 2>&1 || true ) | tee -a "${log_path}/${tc_name}.log"
     sleep 14400
 else
-    ${PYTHON_FOR_SGLANG} -u "${sglang_source_path}/${test_case}" 2>&1 | tee -a "${log_path}/${tc_name}.log"
+    ${PYTHON_FOR_SGLANG} -u "${sglang_source_path}/${test_case}" "${test_method_args[@]}" 2>&1 | tee -a "${log_path}/${tc_name}.log"
 fi
 echo "Finished test case ${test_case}"
 

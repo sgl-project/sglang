@@ -6,6 +6,8 @@
 
 ## Estimate before implementing
 
+**Start from the best existing implementation, not the one in front of you.** Before optimizing a kernel, time every other implementation of the same contract on the dispatched shapes and compare each with the bound below. When another is already near the bound, migrating the callers and deleting the old kernel is the optimization (kernel-organization, "One implementation per contract").
+
 Classify each shape bucket the kernel serves, including padded sizes (CUDA-graph batch padding), as low latency or high throughput.
 
 **Low latency** (under one wave, or a few CTAs per SM). Time is dominated by dependency chains, not bandwidth:
@@ -42,7 +44,7 @@ Throughputs measured with microbenchmarks on one B200 (148 SMs, SM clock about 1
 Log registers, spills and stack frame with `SGLANG_JIT_LOG_RESOURCE_USAGE=1 SGLANG_JIT_FORCE_RECOMPILE=1`. Read the hot loop with `cuobjdump -sass` or the Nsight Compute source view. Check for:
 
 - no spills and a 0-byte stack frame. A register array punned to a wider type, or indexed at run time, ends up on the stack;
-- global loads and stores at the intended width (128-bit, or 256-bit on SM100). A generic `LD.E` instead of `LDG` splits a 32-byte access in two. It appears when a pointer passed through a shuffle or shared memory. It also appears for `__grid_constant__` struct pointer fields loaded after an asm with a `"memory"` clobber, such as `PDLWaitPrimary`; fix that by copying the field to a local after the asm and adding `__builtin_assume(__isGlobal(ptr))`;
+- global loads and stores at the intended width (128-bit, or 256-bit on SM100). A generic `LD.E` instead of `LDG` splits a 32-byte access in two. It appears when a pointer passed through a shuffle or shared memory. It also appears for `__grid_constant__` struct pointer fields loaded after an asm with a `"memory"` clobber, such as `PDLWaitPrimary`; fix that by wrapping the pointer in `device::assume_global` after the asm (from `utils.cuh`);
 - loads issued ahead of their use. The compiler does not hoist a load above a dynamic branch (it might fault), so prefetch manually across data-dependent loops;
 - no `BSSY` / `BRA` around short per-element conditionals. Select the operand, not the result: `f(c ? a : b)` stays branch-free, `c ? f(a) : b` branches once `f` is longer than a few instructions;
 - no lane loop (`ELECT` / `BRA.U.ANY`) around single-thread ops (TMA, `tcgen05.mma`, `tcgen05.commit`). Guard them with `warp::elect_one_lane()`, not `threadIdx.x == 0`.
@@ -64,6 +66,52 @@ Other compiler facts worth knowing:
 - Making trip counts and tile sizes template arguments lets loops fully unroll, which is why JIT kernels template them (see the Conventions in `SKILL.md`).
 - Shared-memory rows accessed with vectors need a compile-time pitch that is a multiple of the access width. When each lane reads its own row, a pitch that is an odd multiple of 16 B avoids bank conflicts. Check the padding against both the producer's and the consumer's access pattern.
 - To match a Triton reference bitwise, use the same approximate operators it lowers to (`ex2.approx`, `div.full`). For example, `a * rcp.approx.ftz(b)` matches `div.full.f32` for normal operands.
+
+## In-kernel tracing
+
+`sgl_kernel/debug/trace.cuh` marks per-warp ranges and points; `sglang.kernels.jit.debug.trace` records and summarizes them. It explains where time goes inside a kernel (phases, warp residency, CTA turnover); whether a change is faster is still decided by event timing of the uninstrumented kernel. Use it while debugging only: never commit instrumented kernels.
+
+```cpp
+#include <sgl_kernel/debug/trace.cuh>
+SGL_TRACE_DECLARE_RANGE(load);   // push / pop range        (right after the include)
+SGL_TRACE_DECLARE_SPAN(stage);   // start / end, may cross loop iterations
+SGL_TRACE_DECLARE_MARK(issued);  // point event
+
+__global__ void kernel(...) {
+  SGL_TRACE_KERNEL();            // naive: first statement (IKET: no-op)
+  { SGL_TRACE_SCOPE(load); ... } // or SGL_TRACE_PUSH(load); ...; SGL_TRACE_POP();
+  if (elect_one_lane()) { SGL_TRACE_MARK(issued); ... }
+  SGL_TRACE_SYNC();              // naive: after marks made by some lanes only (IKET: no-op)
+}
+```
+
+```python
+# SGLANG_JIT_DEBUG_TRACE=iket | iket-extended | naive | naive-debug
+from sglang.kernels.jit.debug import trace
+op(x)                                   # build and load the module first
+with trace.capture() as cap:            # backend follows SGLANG_JIT_DEBUG_TRACE
+    op(x); torch.cuda.synchronize()
+print(cap.trace.summary())              # span, resident warps per SM, CTA turnover, per-range percentiles
+cap.trace.save_chrome_trace("t.json")   # ui.perfetto.dev
+```
+
+| | `iket` | `naive` |
+|---|---|---|
+| clock | `%globaltimer`, 32 ns tick | `%clock` cycles, converted to ns with per-warp anchors |
+| needs | NVIDIA IKET (`pip install nvidia-cutlass-dsl`, closed source), Hopper or newer | nothing; any architecture |
+| per event | 4 instructions, rewritten by IKET at load time | about 10 instructions; an empty range measured 29 cycles on sm_86 and sm_100a (54 with `naive-debug`) |
+| divergence | any lanes may mark | see the rules below |
+| warp lifetimes, SM / CTA locations | from IKET | from `SGL_TRACE_KERNEL()` anchors |
+
+Rules and limits:
+
+- **Names:** declare every name right after the include. Event IDs come from `__COUNTER__`, so any other `__COUNTER__` expansion in between (tvm-ffi and CCCL headers use it) skips IDs. IKET's 4-byte records allow 30 names per translation unit; `iket-extended` uses 8-byte records and allows more.
+- **Issue, not arrival:** a range around loads measures their issue; the wait lands in the next range that consumes the data.
+- **naive cursor:** each lane keeps a cursor that every active lane advances while one elected lane writes, so it must stay warp-uniform. Inside a divergent region only one path may mark (typically the elected lane), and the warp calls `SGL_TRACE_SYNC()` once it reconverges. Marks on both sides of a branch, or a missing `SGL_TRACE_SYNC()`, overwrite records silently; `naive-debug` adds records with a fire-and-forget atomic and reports every overwrite when decoding (its timing is not representative).
+- **naive placement:** marks must be in code inlined into the kernel (the cursor is a kernel-scope PTX register; ptxas fails otherwise). One traced launch per `capture()`, one traced translation unit per module, and by default only CTAs 0..1023 record (`ctas=`).
+- **naive ns:** cycle counts are exact; ns use the mean SM clock of the recorded warps, and `summary()` warns when `%globaltimer` ticks too coarsely (about 1 us on Ampere) for that estimate.
+- **Perturbation:** ptxas moves arithmetic, including the tracing bookkeeping, across clock reads, but kept loads, stores and barriers in place in every case checked (sm_86, sm_100a, ptxas 13.4). Measure the cost: with IKET, compare the span of `capture(lifetime_only=True)` on a build without tracing (+0.5 % to +10 % observed); with naive, an empty range shows the per-event cost.
+- **IKET:** do not run it under Nsight Compute / Systems, and capture CUDA graphs before its session starts. Placeholders it does not recognize are dropped silently (an empty trace); after an IKET upgrade, check that IKET's own CUBIN parser (`iket._core.iket.IketContext`) still finds the events of an instrumented kernel.
 
 ## SM100 (tcgen05, TMA, clusters, PDL)
 

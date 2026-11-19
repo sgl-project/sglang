@@ -23,11 +23,18 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+    QSAMTPSharedSparseIndices,
+    QSAPoolView,
+    QSAStepView,
+    QwenSparseAttnBackend,
+)
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers import overlap_utils
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter, PlainPoolRouter
+from sglang.srt.mem_cache.kv.decl import STATE_PART
+from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_context, publish, reset_context
@@ -62,6 +69,31 @@ class KvPool:
         self.layer_router = KVLayerRouter.from_layer_maps(
             self, (("full", view, {3: 1, 7: 0}),)
         )
+
+
+class QsaPool(KvPool):
+    qsa_compress_ratio, qsa_compressed_page_size, qsa_token_topk = 4, 16, 8
+
+    def __init__(self):
+        super().__init__()
+        self.compressed = {i: torch.zeros(3, 1, 2) for i in (3, 7)}
+        self.key_state = {i: torch.zeros(8, 1, 2) for i in (3, 7)}
+        self.qsa_rope_position_buffer = torch.zeros(8, 3, dtype=torch.int64)
+
+    def get_qsa_compressed_k_buffer(self, layer_id):
+        return self.compressed[layer_id]
+
+    def get_qsa_key_state_buffer(self, layer_id):
+        return self.key_state[layer_id]
+
+
+def _qsa(pool):
+    return _backend(
+        QwenSparseAttnBackend,
+        forward_metadata=SimpleNamespace(),
+        token_to_kv_pool=pool,
+        _mtp_shared_sparse_indices=None,
+    )
 
 
 def _state_pool():
@@ -101,8 +133,8 @@ def _trtllm(pool):
     )
 
 
-def _hybrid():
-    pool = KvPool()
+def _hybrid(pool=None, full=_trtllm):
+    pool = KvPool() if pool is None else pool
     pool.layer_router.bind_part(
         sub_pool="mamba", part=STATE_PART, view=_state_pool(), indices={0: 1, 2: 0}
     )
@@ -118,7 +150,7 @@ def _hybrid():
     )
     return _backend(
         HybridLinearAttnBackend,
-        full_attn_backend=_trtllm(pool),
+        full_attn_backend=full(pool),
         linear_attn_backend=gdn,
         token_to_kv_pool=pool,
         req_to_token_pool=SimpleNamespace(),
@@ -155,7 +187,10 @@ def _megakernel(**entries):
             cuda_graph_runner=None,
             draft_runner=SimpleNamespace(
                 model=_model(**entries),
-                model_config=SimpleNamespace(hidden_size=4, dtype=torch.float32),
+                model_config=SimpleNamespace(
+                    hidden_size=4, spec_hidden_size=4, dtype=torch.float32
+                ),
+                spec_algorithm=SimpleNamespace(is_standalone=lambda: False),
             ),
         ),
     )
@@ -282,48 +317,6 @@ def _leaves(hint):
 
 
 class TestEagleBinding(CustomTestCase):
-    def test_real_eagle_binding_runs_covered_dispatch_and_capture_tail(self):
-        for arch, backend in (
-            ("Qwen3_5ForCausalLM", _hybrid()),
-            ("Qwen3_5ForCausalLMMTP", _trtllm(KvPool())),
-        ):
-            with self.subTest(architecture=arch):
-                binding = runtime._binding_class([arch])(model=torch.nn.Module())
-                self.assertIsInstance(binding, eb.EagleBinding)
-                built = SimpleNamespace(
-                    plan=MagicMock(return_value=Step(mode="decode", rows=2)),
-                    forward=lambda step, *args, **kwargs: step.view,
-                )
-                original = MagicMock(return_value="standard")
-                dispatch = runtime._Dispatch(
-                    built=built, original=original, binding=binding
-                )
-                forward = dispatch.wrapped()
-                batch = SimpleNamespace(batch_size=2)
-                ids = torch.zeros(2, dtype=torch.int64)
-                check = runtime._CaptureCheck(
-                    spec=SimpleNamespace(name="eagle"), dispatch=dispatch
-                )
-                runner = SimpleNamespace(capture_bs=(2,))
-                with patch.object(eb, "get_attn_backend", return_value=backend):
-                    for capturing in (False, True):
-                        with patch.object(
-                            torch.cuda,
-                            "is_current_stream_capturing",
-                            return_value=capturing,
-                        ):
-                            view = forward(ids, None, batch)
-                        self.assertIsInstance(view, eb.EagleForwardView)
-                    original.assert_not_called()
-                    check(runner, None, batch, 2)
-                    self.assertTrue(check.is_done)
-                    backend.token_to_kv_pool.k[3] = torch.zeros(4, 2)
-                    check = runtime._CaptureCheck(
-                        spec=SimpleNamespace(name="eagle"), dispatch=dispatch
-                    )
-                    with self.assertRaisesRegex(RuntimeError, "kv was reallocated"):
-                        check(runner, None, batch, 2)
-
     def test_a_qwen3_5_view_is_the_running_forward_and_tolerated_members_exist(self):
         """A covered step is captured once and replays SGLang's refills of the
         backends' metadata, so the view must hold those very tensors."""
@@ -373,6 +366,29 @@ class TestEagleBinding(CustomTestCase):
             owner, _, attr = name.partition(".")
             if owner in members:
                 self.assertIn(attr, members[owner], name)
+
+    def test_a_backend_with_its_own_views_supplies_the_step_and_pool_data(self):
+        pool = QsaPool()
+        backend = _hybrid(pool, full=_qsa)
+        qsa = backend.full_attn_backend
+        binding = eb.EagleBinding(model=torch.nn.Module())
+        view = _view(binding, backend)
+        self.assertIsInstance(view.attn, QSAStepView)
+        self.assertIs(view.attn.metadata, qsa.forward_metadata)
+        self.assertIsInstance(view.kv, QSAPoolView)
+        self.assertEqual(view.kv.layer_ids, (3, 7))
+        self.assertIs(view.kv.compressed_k[1], pool.compressed[7])
+        # a draft's decode steps get its draft extend's selection
+        shared = QSAMTPSharedSparseIndices(
+            layer_ids=(3, 7), num_requests=2, token_topk=8, tail_width=4, device="cpu"
+        )
+        qsa.set_mtp_shared_sparse_indices(shared)
+        self.assertIs(_view(binding, backend).attn.mtp_indices, shared.indices)
+        # the pool view is sealed at its first read, as KvPoolBuffers is
+        with patch.object(eb, "get_attn_backend", return_value=backend):
+            pool.compressed[7] = torch.zeros(3, 1, 2)
+            with self.assertRaisesRegex(RuntimeError, "kv was reallocated"):
+                binding.assert_live()
 
     def test_pool_views_keep_layer_offsets_and_fp8_scales(self):
         """Routed views use local indices; plain pools use model layer IDs.
@@ -441,6 +457,18 @@ class TestEagleBinding(CustomTestCase):
             view = binding.prefill_view()
         self.assertIs(view.state.temporal, state.temporal)
         self.assertIs(view.state_indices, meta.mamba_cache_indices)
+        self.assertEqual((view.is_graph, view.prefill_graph_metadata), (False, None))
+        linear.prefill_graph_metadata = SimpleNamespace()  # a graph bucket's tables
+        with patch.object(eb, "get_attn_backend", return_value=backend):
+            view = binding.prefill_view()
+        self.assertIs(view.prefill_graph_metadata, linear.prefill_graph_metadata)
+        runner = SimpleNamespace(
+            attn_backend=backend,
+            req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(9, 4)),
+        )
+        prepared = binding.preparation_view(runner)
+        self.assertEqual(prepared.num_request_rows, 9)
+        self.assertIs(prepared.mamba, _view(binding, backend).mamba)
 
     def test_existing_forward_wrapper_selects_the_prefill_data_view(self):
         views = SimpleNamespace(
@@ -511,7 +539,8 @@ class TestEagleBinding(CustomTestCase):
             for cls in vars(eb).values()
             if isinstance(cls, type) and issubclass(cls, msgspec.Struct)
         }
-        allowed = {torch.Tensor, int, float, bool, type(None)} | structs
+        allowed = {torch.Tensor, int, float, bool, type(None), msgspec.Struct}
+        allowed |= structs
         for cls in structs:
             for field, hint in typing.get_type_hints(cls).items():
                 for leaf in _leaves(hint):
@@ -519,6 +548,14 @@ class TestEagleBinding(CustomTestCase):
 
 
 class TestEagleEntries(CustomTestCase):
+    def test_a_draft_step_fold_is_offered_only_by_a_build_that_has_one(self):
+        fold = object()
+        model = _model(draft_step_fold=fold)
+        self.assertIs(runtime.megakernel_entry(model, "draft_step_fold"), fold)
+        self.assertIsNone(runtime.megakernel_entry(_model(), "draft_step_fold"))
+        # not a draft-loop entry: the stock dispatch stays
+        self.assertIsNone(_init(draft={"draft_step_fold": fold}))
+
     def test_always_present_dispatch_preserves_the_stock_path(self):
         stock_result = object()
         with patch.object(eagle_megakernel, "init_eagle_megakernel", return_value=None):
@@ -578,6 +615,96 @@ class TestEagleEntries(CustomTestCase):
             _init(draft=offer, target_backend=_trtllm(KvPool()))
         with self.assertRaisesRegex(ValueError, "multi-step draft"):
             _init(draft={"draft_extend": print}, num_steps=1)
+
+    def test_a_target_verify_megakernel_without_draft_entries_is_refused(self):
+        """A target megakernel covering only the verify step reads the same
+        ReplaySSM ring while its draft offers no entry, so SGLang's side of the
+        entries never runs: the install refuses it before the build, and so before
+        any capture. Static pools keep it."""
+        for unified in (False, True):
+            with self.subTest(unified_memory=unified):
+                model = torch.nn.Module()
+                original = model.forward
+                built = SimpleNamespace(
+                    widths=(2, 4),
+                    summary=lambda: "target_verify",
+                    plan=MagicMock(return_value=None),
+                    forward=MagicMock(),
+                    draft_sampler=None,
+                    draft_loop=None,
+                    draft_extend=None,
+                    begin_draft_round=None,
+                    graph_variants=None,
+                    speculative_runtime_hooks=None,
+                )
+                target_spec = SimpleNamespace(
+                    name="qwen3_5_verify",
+                    build=MagicMock(return_value=built),
+                    prepare=None,
+                    max_rows=4,
+                    numerics=SimpleNamespace(kind=SimpleNamespace(value="exact")),
+                    binding="",
+                    prefill_graph=False,
+                    tensor_verify_build=None,
+                    tensor_verify_binding_kind=0,
+                )
+                hooks = []
+                refused = (
+                    self.assertRaisesRegex(ValueError, "ReplaySSM speculative ring")
+                    if unified
+                    else contextlib.nullcontext()
+                )
+                with (
+                    self._target_install_context(unified_memory=unified),
+                    patch.object(
+                        runtime, "_find_spec_on_every_rank", return_value=target_spec
+                    ),
+                    refused,
+                ):
+                    runtime.install_megakernel(
+                        model=model,
+                        hf_config=SimpleNamespace(
+                            architectures=["Qwen3_5MoeForCausalLM"]
+                        ),
+                        capture_tail_hooks=hooks,
+                        is_draft=False,
+                    )
+                if unified:
+                    target_spec.build.assert_not_called()
+                    self.assertEqual(model.forward, original)
+                    self.assertEqual(hooks, [])
+                else:
+                    target_spec.build.assert_called_once()
+                    self.assertNotEqual(model.forward, original)
+                    self.assertEqual(len(hooks), 1)
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _target_install_context(*, unified_memory):
+        """install_megakernel's runtime reads on one CPU rank with speculative
+        ReplaySSM on, and unified memory as given."""
+        memory = SimpleNamespace(enable_unified_memory=unified_memory)
+        exec_ = SimpleNamespace(
+            mamba=SimpleNamespace(enable_linear_replayssm_spec=True)
+        )
+        with (
+            patch.object(runtime, "megakernel_enabled", return_value=True),
+            patch.object(runtime, "msa_serves", return_value=False),
+            patch.object(runtime, "_requirement_reasons", return_value=[]),
+            patch.object(runtime, "_model_disable_reasons", return_value=[]),
+            patch.object(runtime, "get_memory", return_value=memory),
+            patch.object(runtime, "get_exec", return_value=exec_),
+            patch.object(
+                runtime,
+                "get_device",
+                return_value=SimpleNamespace(watchdog_timeout=None),
+            ),
+            patch.object(runtime, "_tokens_per_request", return_value=2),
+            patch.object(runtime, "_decode_graphs_enabled", return_value=True),
+            patch.object(runtime, "_gather_tp", side_effect=lambda x, group=None: [x]),
+            patch.object(torch.cuda, "mem_get_info", return_value=(0, 0)),
+        ):
+            yield
 
     def test_the_draft_worker_takes_its_megakernel_once_both_backends_exist(self):
         """The draft's graph runners read the worker's megakernel when they capture,
@@ -926,6 +1053,57 @@ class TestSpecRelayBypass(CustomTestCase):
 
         future_map._stash.assert_called_once_with(indices, payload)
         self.assertIsNone(future_map._deferred_relay)
+
+
+class TestDraftOutputWidth(CustomTestCase):
+    def test_extend_outputs_follow_the_draft_hidden_stream(self):
+        for width, dtype, reuse in (
+            (4, torch.float32, True),
+            (16, torch.float32, False),
+        ):
+            with self.subTest(width=width, dtype=dtype):
+                supplied = {}
+
+                def extend(**buffers):
+                    supplied.update(buffers)
+                    return lambda bs: (lambda io: None) if bs == 1 else None
+
+                mk = _megakernel(draft_extend=extend)
+                mk._draft_config.spec_hidden_size = width
+                hidden = torch.zeros((2, 4), dtype=dtype)
+                mk._draft_worker.cuda_graph_runner = SimpleNamespace(
+                    buffers=SimpleNamespace(
+                        topk_index=torch.zeros((2, 1), dtype=torch.int64),
+                        topk_p=torch.ones((2, 1)),
+                        hidden_states=hidden,
+                    )
+                )
+                runner = SimpleNamespace(
+                    max_bs=1, device="cpu", captured_req_width=4, capture_bs=(1,)
+                )
+                with (
+                    patch.object(
+                        overlap_utils, "spec_relay_bypass_enabled", return_value=True
+                    ),
+                    patch.object(
+                        eagle_megakernel,
+                        "get_parallel",
+                        return_value=SimpleNamespace(moe_ep_size=1),
+                    ),
+                    patch.object(eagle_megakernel, "megakernel_agree"),
+                ):
+                    self.assertEqual(mk.bind_extend_graphs(runner), {1})
+                self.assertEqual(supplied["hidden"].shape, (1, width))
+                self.assertEqual(
+                    supplied["hidden"].data_ptr() == hidden.data_ptr(), reuse
+                )
+
+    def test_no_recurrent_hidden_stream_keeps_stock(self):
+        factory = MagicMock()
+        mk = _megakernel(draft_extend=factory)
+        mk._draft_runner.spec_algorithm = SimpleNamespace(is_standalone=lambda: True)
+        self.assertEqual(mk.bind_extend_graphs(SimpleNamespace()), frozenset())
+        factory.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(
     est_time=400,
-    suite="full-8-npu-a3",
+    suite="full-test-8-npu-a3",
     nightly=True,
 )
 
@@ -29,7 +29,8 @@ class TestMiniMaxM2(GSM8KAscendMixin, CustomTestCase):
         "ascend",
         "--tp-size",
         "8",
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph",
+        "--disable-prefill-cuda-graph",
         "--disable-radix-cache",
         "--disable-overlap-schedule",
         "--max-running-requests",

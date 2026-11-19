@@ -17,7 +17,7 @@ from sglang.kernels.ops.kvcache.set_mla_kv_buffer import (
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=15, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=15, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 DEVICE = "cuda"
 CACHE_SIZE = 4096
@@ -192,15 +192,16 @@ def test_set_mla_kv_buffer_zero_index_can_be_written_when_skip_disabled():
     )
 
 
+@pytest.mark.parametrize("rope_dim", [TRITON_ROPE_DIM, 0])
 @pytest.mark.parametrize("loc_dtype", [torch.int32, torch.int64])
-def test_set_mla_kv_buffer_triton_reserved_skip_index(loc_dtype):
+def test_set_mla_kv_buffer_triton_reserved_skip_index(loc_dtype, rope_dim):
     dtype = torch.bfloat16
     cache_k_nope = torch.randn((4, 1, TRITON_NOPE_DIM), dtype=dtype, device=DEVICE)
-    cache_k_rope = torch.randn((4, 1, TRITON_ROPE_DIM), dtype=dtype, device=DEVICE)
+    cache_k_rope = torch.randn((4, 1, rope_dim), dtype=dtype, device=DEVICE)
     cache_k_nope[[0, 2]] = torch.nan
     cache_k_rope[[0, 2]] = torch.nan
     kv_buffer = torch.randn(
-        (CACHE_SIZE, 1, TRITON_NOPE_DIM + TRITON_ROPE_DIM),
+        (CACHE_SIZE, 1, TRITON_NOPE_DIM + rope_dim),
         dtype=dtype,
         device=DEVICE,
     )
@@ -224,12 +225,15 @@ def test_set_mla_kv_buffer_triton_reserved_skip_index(loc_dtype):
     )
 
 
-def test_set_mla_kv_buffer_triton_zero_index_can_be_written_when_skip_disabled():
+@pytest.mark.parametrize("rope_dim", [TRITON_ROPE_DIM, 0])
+def test_set_mla_kv_buffer_triton_zero_index_can_be_written_when_skip_disabled(
+    rope_dim,
+):
     dtype = torch.bfloat16
     cache_k_nope = torch.randn((1, 1, TRITON_NOPE_DIM), dtype=dtype, device=DEVICE)
-    cache_k_rope = torch.randn((1, 1, TRITON_ROPE_DIM), dtype=dtype, device=DEVICE)
+    cache_k_rope = torch.randn((1, 1, rope_dim), dtype=dtype, device=DEVICE)
     kv_buffer = torch.randn(
-        (CACHE_SIZE, 1, TRITON_NOPE_DIM + TRITON_ROPE_DIM),
+        (CACHE_SIZE, 1, TRITON_NOPE_DIM + rope_dim),
         dtype=dtype,
         device=DEVICE,
     )

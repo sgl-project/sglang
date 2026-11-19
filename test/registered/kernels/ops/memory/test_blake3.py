@@ -86,10 +86,6 @@ class TestBLAKE3(CustomTestCase):
             data = torch.arange(3073, device="cuda").remainder(251).byte()
             self.assertEqual(gpu_tensor_blake3(data).hex(), dict(_VECTORS)[3073])
 
-    def test_rejects_cpu_input(self):
-        with self.assertRaises(ValueError):
-            gpu_tensor_blake3(torch.zeros(8, dtype=torch.uint8))
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -40,7 +40,7 @@ from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 # Pure unit test (no server); fast and runs on the 1-GPU XPU runner.
-register_xpu_ci(est_time=60, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=60, suite="extra-test-1-gpu-xpu")
 
 
 def _reference_store(k, v, k_cache, v_cache, indices):

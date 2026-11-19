@@ -1,13 +1,12 @@
 import argparse
 import copy
 import itertools
-import os
 
 import torch
 import triton
 from sgl_kernel import int8_scaled_mm
 
-from sglang.utils import is_in_ci
+from sglang.srt.environ import envs
 
 # Optional vLLM import
 try:
@@ -18,7 +17,7 @@ except ImportError:
     vllm_scaled_mm = None
     VLLM_AVAILABLE = False
 
-IS_CI = is_in_ci()
+IS_CI = envs.SGLANG_IS_IN_CI.get()
 
 
 def to_int8(tensor: torch.Tensor) -> torch.Tensor:

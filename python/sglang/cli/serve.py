@@ -3,7 +3,9 @@
 import argparse
 import logging
 import os
+import shlex
 
+from sglang.cli.interactive import recipes_for_this_machine, run_guide
 from sglang.cli.main import COOKBOOK_EPILOG
 from sglang.cli.serve_backends import (
     SERVE_BACKEND_API_VERSION,
@@ -20,7 +22,7 @@ from sglang.cli.utils import (
     try_get_model_path,
 )
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.common import suppress_noisy_warnings
+from sglang.srt.utils.log_utils import suppress_noisy_warnings
 
 suppress_noisy_warnings()
 
@@ -168,7 +170,12 @@ def _print_general_help(registry: ServeBackendRegistry) -> None:
         f"Optional override: --model-type {{{available}}} "
         "(default: auto, fallback to LLM when no backend matches).\n"
         "Use `sglang serve --model-type BACKEND --help` for backend-specific "
-        "help."
+        "help.\n\n"
+        "`sglang serve MODEL` with no other arguments runs the CLI Guide: it picks "
+        "the Cookbook command for the visible GPUs, prints it, and launches it. "
+        "Without a Cookbook command for those GPUs, it launches with the default "
+        "flags.\n"
+        "--dry-run prints the command without launching it."
     )
 
     print("\n--- Help for Standard Language Model Server ---")
@@ -181,6 +188,8 @@ def _print_general_help(registry: ServeBackendRegistry) -> None:
 def serve(args, extra_argv):
     del args  # The top-level parser currently has no serve-owned fields.
 
+    dry_run = "--dry-run" in extra_argv
+    extra_argv = [arg for arg in extra_argv if arg != "--dry-run"]
     backend_name, dispatch_argv = _extract_model_type_override(extra_argv)
     dispatch_argv, positional_model_path = _normalize_positional_model_path(
         dispatch_argv
@@ -217,8 +226,22 @@ def serve(args, extra_argv):
                 backend_name,
             )
 
+        if (
+            registered.name == "llm"
+            and len(extra_argv) == 1
+            and not extra_argv[0].startswith("-")
+        ):
+            recipes = recipes_for_this_machine(extra_argv[0])
+            if recipes:
+                run_guide(model=extra_argv[0], recipes=recipes, dry_run=dry_run)
+                return
+
         if registered.backend.requires_model_path and request.model_path is None:
             get_model_path(request.argv)  # Raise the existing actionable CLI error.
+
+        if dry_run:
+            print(shlex.join(["sglang", "serve", *extra_argv]))
+            return
 
         registered.backend.run(request)
     finally:
