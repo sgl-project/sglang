@@ -729,9 +729,13 @@ class TestMqaLogitsBudgetArithmetic(CustomTestCase):
             patch(
                 "torch.cuda.mem_get_info", return_value=(6 << 30, total)
             ) as mem_get_info,
+            patch("torch.cuda.memory_reserved", return_value=0) as memory_reserved,
+            patch("torch.cuda.memory_allocated", return_value=0) as memory_allocated,
         ):
             static = mqa_logits_budget_bytes(device_index=0, allow_sync=False)
             mem_get_info.assert_not_called()
+            memory_reserved.assert_not_called()
+            memory_allocated.assert_not_called()
             live = mqa_logits_budget_bytes(device_index=0, allow_sync=True)
             mem_get_info.assert_called_once_with(0)
         # static: 80 GiB x (1 - 0.9) x 0.2; live is further capped by 6 GiB free x 0.2.
