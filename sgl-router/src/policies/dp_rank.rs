@@ -16,19 +16,27 @@ use sha2::{Digest, Sha256};
 
 /// `rank_tokens` for [`select_dp_rank`]: the KV each rank is expected to
 /// hold, its committed tokens plus every request it holds, and every stamped
-/// request this router sent it since the reading, at the worker's mean KV per
-/// request. KV in use lags: a rank whose requests are all young holds little
-/// now and the most later, so ranking by it herds. Charging each request its
-/// expected size ranks by where the rank is heading instead, and a request
-/// dispatched between two reports counts before the engine has seen it.
+/// request this router sent it since the reading, at a typical request's KV.
+/// KV in use lags: a rank whose requests are all young holds little now and
+/// the most later, so ranking by it herds. Charging each request its expected
+/// size ranks by where the rank is heading instead, and a request dispatched
+/// between two reports counts before the engine has seen it.
+///
+/// A typical request is the lower median of the ranks' mean KV per request,
+/// not the worker-wide mean: one rank holding a few long-context requests
+/// would otherwise inflate what every short request on the others is charged,
+/// and a rank near its KV cap would outrank one that is nearly empty.
 pub fn expected_rank_tokens(worker: &Worker, loads: &[RankLoad]) -> Vec<(u32, u64)> {
-    let (tokens, reqs) = loads.iter().fold((0u64, 0u64), |(tokens, reqs), load| {
-        (
-            tokens.saturating_add(load.num_tokens),
-            reqs.saturating_add(load.num_reqs),
-        )
-    });
-    let per_req = tokens.checked_div(reqs).unwrap_or(0);
+    let mut means: Vec<u64> = loads
+        .iter()
+        .filter(|load| load.num_reqs > 0)
+        .map(|load| load.num_tokens / load.num_reqs)
+        .collect();
+    means.sort_unstable();
+    let per_req = means
+        .get(means.len().saturating_sub(1) / 2)
+        .copied()
+        .unwrap_or(0);
     loads
         .iter()
         .map(|load| {
@@ -184,8 +192,8 @@ mod tests {
             at,
         };
         let at = Instant::now();
-        // Mean KV per request over the worker: (100 + 400) / (1 + 4) = 100.
-        // Rank 1 holds more now; rank 0's one request is charged the same.
+        // Both ranks average 100 KV per request. Rank 1 holds more now; rank
+        // 0's one request is charged the same.
         let loads = [reading(0, 100, 1, at), reading(1, 400, 4, at)];
         assert_eq!(expected_rank_tokens(&w, &loads), [(0, 200), (1, 800)]);
         // Stamped dispatches since the reading count as requests it will hold.
@@ -199,5 +207,10 @@ mod tests {
         // No request on the worker: nothing to scale by.
         let loads = [reading(0, 0, 0, at), reading(1, 0, 0, at)];
         assert_eq!(expected_rank_tokens(&w, &loads), [(0, 0), (1, 0)]);
+        // Mixed sizes: one long-context request on rank 0 must not inflate
+        // what rank 1's eight short ones are charged, or the rank near its
+        // cap would look lighter than the nearly empty one.
+        let loads = [reading(0, 30_000, 1, newer), reading(1, 4_000, 8, newer)];
+        assert_eq!(expected_rank_tokens(&w, &loads), [(0, 30_500), (1, 8_000)]);
     }
 }

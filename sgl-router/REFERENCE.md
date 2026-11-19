@@ -220,10 +220,12 @@ client sent. The router picks the first of these that applies:
    still queued, as the engine reports them on its `--load-publish-endpoint`
    feed, which sees every router replica's traffic, plus every request it
    holds, and every request this router has sent it since that reading, at
-   the worker's mean KV per request. Expected rather than current KV because
-   KV in use lags: a rank whose requests are all young holds little now and
-   the most later. Ties, and a worker without a fresh reading for every one
-   of its ranks, fall back to the in-flight count.
+   a typical request's KV (the lower median of the ranks' mean KV per
+   request, so a few long-context requests on one rank do not inflate what
+   short requests elsewhere are charged). Expected rather than current KV
+   because KV in use lags: a rank whose requests are all young holds little
+   now and the most later. Ties, and a worker without a fresh reading for
+   every one of its ranks, fall back to the in-flight count.
 
 In PD mode, decode is ranked by step 3 only, under `--decode-dp-rank-policy`
 when set and `--dp-rank-policy` otherwise, so prefill and decode can balance

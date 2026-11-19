@@ -392,9 +392,9 @@ async fn least_tokens_sends_decode_to_the_rank_expected_to_hold_the_fewest_kv_to
 }
 
 /// Every request a rank holds, and every one this router sent it since the
-/// engine's reading, counts as the worker's mean KV per request, so a rank
-/// with few tokens but many young requests is not the lightest, and a burst
-/// between two reports spreads instead of herding.
+/// engine's reading, counts as a typical request's KV, so a rank with few
+/// tokens but many young requests is not the lightest, and a burst between
+/// two reports spreads instead of herding.
 #[tokio::test]
 async fn least_tokens_charges_in_flight_requests_to_their_rank() {
     let (prefill, decode) = (
@@ -409,9 +409,9 @@ async fn least_tokens_charges_in_flight_requests_to_their_rank() {
     cfg.model.dp_rank_policy = DpRankPolicy::LeastTokens;
     let load = EngineReportedLoadTable::new();
     let app = router_with_load(cfg, &workers, Default::default(), Arc::clone(&load));
-    // Mean KV per request over the worker: 500 / 3 = 166. Rank 0 is expected
-    // to hold 400 + 2 * 166 = 732, rank 1 100 + 166 = 266.
-    for (rank, num_tokens, num_reqs) in [(0, 400, 2), (1, 100, 1)] {
+    // Per-rank means 400 and 100; the lower median charges 100 per request.
+    // Rank 0 is expected to hold 400 + 100 = 500, rank 1 100 + 100 = 200.
+    for (rank, num_tokens, num_reqs) in [(0, 400, 1), (1, 100, 1)] {
         let stat = LoadStat {
             num_running_reqs: num_reqs,
             num_waiting_reqs: 0,
@@ -447,8 +447,8 @@ async fn least_tokens_charges_in_flight_requests_to_their_rank() {
         };
         ranks.push(rank);
     }
-    // Rank 1 at 266, then 432, 598 and 764 as each request is charged; at
-    // 764 it passes rank 0's 732.
+    // Rank 1 at 200, then 300, 400 and 500 as each request is charged; at
+    // 500 it ties rank 0, whose router in-flight count is lower.
     assert_eq!(ranks, ["1", "1", "1", "0"]);
     for task in in_flight {
         task.abort();
