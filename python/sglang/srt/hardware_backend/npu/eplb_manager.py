@@ -17,22 +17,23 @@ logger = logging.getLogger(__name__)
 
 
 class AsyncEplbRecorder(_ExpertDistributionRecorderReal):
-    """Count only completed target forwards that actually contributed statistics."""
+    """Count the target forwards in the current recorder window."""
 
-    completed_forward_passes = 0
+    window_samples = 0
 
     def _on_forward_pass_end(self, forward_pass_id, outputs):
         super()._on_forward_pass_end(forward_pass_id, outputs)
         if self._recording and self._record_current_pass:
-            self.completed_forward_passes += 1
+            self.window_samples += 1
+
+    def _reset(self):
+        super()._reset()
+        self.window_samples = 0
 
 
 class NpuAsyncEPLBManager(EPLBManager):
     def __init__(self, **kwargs):
-        if get_exec().moe.expert_distribution_recorder_buffer_size <= 0:
-            raise ValueError("Async EPLB requires a finite positive recorder window")
         self._async_coordinator = None
-        self._async_sample_floor = 0
         super().__init__(**kwargs)
 
     def init_after_model_load(self, startup_weight_load):
@@ -55,9 +56,7 @@ class NpuAsyncEPLBManager(EPLBManager):
     def reset_generator(self):
         if self._async_coordinator is not None:
             self._async_coordinator.reset()
-            self._async_sample_floor = (
-                get_global_expert_distribution_recorder().completed_forward_passes
-            )
+            get_global_expert_distribution_recorder()._reset()
         super().reset_generator()
 
     def _rebalance(self):
@@ -68,7 +67,7 @@ class NpuAsyncEPLBManager(EPLBManager):
             )
         recorder = get_global_expert_distribution_recorder()
         enough_samples = (
-            recorder.completed_forward_passes - self._async_sample_floor
+            recorder.window_samples
             >= get_exec().moe.expert_distribution_recorder_buffer_size
         )
         ready, _ = coordinator.control.vote(
@@ -81,7 +80,6 @@ class NpuAsyncEPLBManager(EPLBManager):
         if not self._check_rebalance_needed(
             snapshot["average_utilization_rate_over_window"]
         ):
-            self._async_sample_floor = recorder.completed_forward_passes
             return
         coordinator.control.wait_seconds = 0.0
         coordinator.start(coordinator.runtime.planner(snapshot["logical_count"]))
@@ -95,7 +93,6 @@ class NpuAsyncEPLBManager(EPLBManager):
             logger.exception("Async EPLB drained; disabling further rebalances")
         # A partial/mixed-layout statistics window must never feed the next plan.
         recorder._reset()
-        self._async_sample_floor = recorder.completed_forward_passes
         runtime = coordinator.runtime
         logger.info(
             "Async EPLB epoch=%d layers=%d elapsed=%.3fs control_wait=%.6fs "

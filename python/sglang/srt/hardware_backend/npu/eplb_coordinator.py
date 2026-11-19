@@ -7,7 +7,7 @@ results through Futures; an error is voted on by all ranks before any install.
 from __future__ import annotations
 
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from enum import IntEnum
 from typing import Any, Callable, Protocol
 
@@ -33,8 +33,6 @@ class Control(Protocol):
         self, epoch: int, phase: int, layer: int, ready: bool, error: bool
     ) -> tuple[bool, bool]: ...
 
-    def drained(self, success: bool) -> bool: ...
-
 
 WeightWriteback = Callable[[], None]
 
@@ -58,6 +56,12 @@ _FAILED_OWNERS: list[Any] = []
 
 
 class AsyncEplbCoordinator:
+    """Run one plan or layer transfer at a time so staging can be reused.
+
+    A failed plan can be disabled once every worker has drained. An uncertain
+    transfer or partial install is fatal because other ranks may own live work.
+    """
+
     def __init__(self, control: Control, runtime: Runtime, timeout: float = 60):
         self.control, self.runtime, self.timeout = control, runtime, timeout
         self.phase = Phase.IDLE
@@ -66,7 +70,7 @@ class AsyncEplbCoordinator:
         self.layers_installed = 0
         self._future: Future | None = None
         self._error: BaseException | None = None
-        self._stage_deadline = 0.0
+        self._deadline = 0.0
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="eplb")
         self._closed = False
 
@@ -85,8 +89,12 @@ class AsyncEplbCoordinator:
         def plan_layers():
             return self.runtime.prepare(planner())
 
-        self._future = self._executor.submit(plan_layers)
         self.phase = Phase.PLANNING
+        self._deadline = time.monotonic() + self.timeout
+        try:
+            self._future = self._executor.submit(plan_layers)
+        except Exception as error:
+            self._fatal("EPLB could not launch the planner", error)
 
     def _local_ready(self, layer: int) -> bool:
         if self._error is not None:
@@ -95,8 +103,11 @@ class AsyncEplbCoordinator:
             if self._future is not None and self._future.done():
                 self._error = self._future.exception()
                 return self._error is None
-            if self.phase == Phase.STAGING and time.monotonic() >= self._stage_deadline:
-                self._error = TimeoutError(f"EPLB P2P did not finish for layer {layer}")
+            if time.monotonic() >= self._deadline:
+                operation = (
+                    "planning" if self.phase == Phase.PLANNING else f"P2P layer {layer}"
+                )
+                self._error = TimeoutError(f"EPLB {operation} did not finish")
         except Exception as error:
             self._error = error
         return False
@@ -143,7 +154,7 @@ class AsyncEplbCoordinator:
             return True
 
         self.phase = Phase.STAGING
-        self._stage_deadline = time.monotonic() + self.timeout
+        self._deadline = time.monotonic() + self.timeout
         try:
             self.runtime.record_source_ready()
             next_layer = self._layers[self.layers_installed]
@@ -162,10 +173,13 @@ class AsyncEplbCoordinator:
         local_error = None
         try:
             if self._future is not None:
+                # Distinguish an unfinished Future from a worker that finished
+                # by raising TimeoutError (for example, a failed CPU plan).
+                remaining = max(0.0, self._deadline - time.monotonic())
+                if not wait((self._future,), timeout=remaining).done:
+                    raise TimeoutError("EPLB worker did not drain")
                 try:
-                    self._future.result(timeout=self.timeout)
-                except TimeoutError:
-                    raise
+                    self._future.result()
                 except Exception:
                     if self.phase == Phase.STAGING:
                         # A submission can fail after enqueuing work on peers.
@@ -176,7 +190,11 @@ class AsyncEplbCoordinator:
         except Exception as error:
             local_error = error
         try:
-            drained = self.control.drained(local_error is None)
+            # Keep the same collective as a forward vote. If a peer is still
+            # polling, the phase mismatch is reported on both ranks.
+            drained, _ = self.control.vote(
+                self.epoch, Phase.DISABLED, -1, local_error is None, False
+            )
         except Exception as error:
             self._fatal("EPLB drain agreement failed", error)
         if not drained:

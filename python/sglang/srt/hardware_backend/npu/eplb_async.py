@@ -48,6 +48,7 @@ class EplbControl:
         flags = torch.tensor(
             [epoch, -epoch, phase, -phase, layer, -layer, int(not ready), int(error)],
             dtype=torch.int64,
+            device="cpu",
         )
         start = time.perf_counter()
         dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=self.group)
@@ -56,11 +57,6 @@ class EplbControl:
         if any(values[i] != -values[i + 1] for i in (0, 2, 4)):
             raise RuntimeError("EPLB ranks reached different protocol boundaries")
         return values[6] == 0, bool(values[7])
-
-    def drained(self, success):
-        value = torch.tensor([int(success)], dtype=torch.int32)
-        dist.all_reduce(value, op=dist.ReduceOp.MIN, group=self.group)
-        return bool(value.item())
 
 
 @dataclass(frozen=True)

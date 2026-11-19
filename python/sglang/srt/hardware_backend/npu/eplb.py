@@ -426,6 +426,13 @@ def validate_async_eplb_args(cfg) -> None:
         raise ValueError(
             "Async NPU EPLB commits one layer per boundary; use chunk size 1"
         )
+    window = cfg.expert_distribution_recorder_buffer_size
+    interval = cfg.eplb_rebalance_num_iterations
+    if interval <= 0 or (window is not None and not 0 < window <= interval):
+        raise ValueError(
+            "Async NPU EPLB requires a positive recorder window no longer than "
+            "--eplb-rebalance-num-iterations"
+        )
     if cfg.eplb_algorithm.startswith("elasticity"):
         raise ValueError("Async NPU EPLB does not support elastic placement")
 
