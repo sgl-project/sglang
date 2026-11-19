@@ -232,6 +232,7 @@ class TestMooncakePrefetch(CustomTestCase):
         linker.storage = MooncakeStore.__new__(MooncakeStore)
         linker.storage.registered_pools = linker.pools
         linker.storage.config_prefix = None
+        linker.storage.unified_suffixes = None
         linker.storage.mla_suffix = "cp0_pp0"
         linker.storage.store = SimpleNamespace(batch_get_into_multi_buffers=read)
         linker.load_thread = threading.Thread(target=linker.load_thread_func)
@@ -1736,6 +1737,86 @@ def test_offload_skips_node_already_stored_by_tree_core():
     wrapper.offload_nodes([node.id])
 
     assert linker.queued_offloads == []
+
+
+class _ScriptedRangeStore:
+    def __init__(self, *gets):
+        self.gets = list(gets)
+        self.get_calls = []
+        self.renewed = []
+
+    def batch_get_into_multi_buffer_ranges(self, keys, ptrs, sizes, offsets):
+        self.get_calls.append(list(keys))
+        return self.gets.pop(0)
+
+    def batch_get_session_start(self, keys):
+        self.renewed.append(sorted(keys))
+        return [0] * len(keys)
+
+
+def _range_linker(store):
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.storage = SimpleNamespace(store=store)
+    return linker
+
+
+def test_range_get_renews_leases_of_keys_shared_across_requests():
+    store = _ScriptedRangeStore([-707, -707, -600, -600], [4, 4, 4, 4])
+    keys = ["a", "b", "a", "b"]
+
+    result = _range_linker(store)._get_layer_ranges(
+        keys, [[0]] * 4, [[4]] * 4, [[0]] * 4
+    )
+
+    assert result == [4, 4, 4, 4]
+    assert store.renewed == [["a", "b"]]
+    assert store.get_calls == [keys, keys]
+
+
+def test_range_get_renews_keys_another_read_already_reported():
+    store = _ScriptedRangeStore([-600, -600, 4, 4], [4, 4])
+
+    result = _range_linker(store)._get_layer_ranges(
+        ["a", "b", "c", "d"], [[0]] * 4, [[4]] * 4, [[0]] * 4
+    )
+
+    assert result == [4, 4, 4, 4]
+    assert store.renewed == [["a", "b"]]
+    assert store.get_calls[1] == ["a", "b"]
+
+
+def test_range_get_renews_again_after_a_racing_read():
+    store = _ScriptedRangeStore([-707, -707, 4, 4], [-600, -600], [4, 4])
+
+    result = _range_linker(store)._get_layer_ranges(
+        ["a", "b", "c", "d"], [[0]] * 4, [[4]] * 4, [[0]] * 4
+    )
+
+    assert result == [4, 4, 4, 4]
+    assert store.renewed == [["a", "b"], ["a", "b"]]
+
+
+def test_range_get_gives_up_after_bounded_renewals():
+    store = _ScriptedRangeStore([-600, 4], *([-600],) * 4)
+
+    result = _range_linker(store)._get_layer_ranges(
+        ["a", "b"], [[0]] * 2, [[4]] * 2, [[0]] * 2
+    )
+
+    assert result == [-600, 4]
+    assert len(store.renewed) == 4
+
+
+def test_range_get_does_not_renew_other_failures():
+    first = [-707, -1, 4, 4]
+    store = _ScriptedRangeStore(list(first))
+
+    result = _range_linker(store)._get_layer_ranges(
+        ["a", "b", "c", "d"], [[0]] * 4, [[4]] * 4, [[0]] * 4
+    )
+
+    assert result == first
+    assert store.renewed == []
 
 
 def test_layer_counter_reports_failure_after_the_forward():

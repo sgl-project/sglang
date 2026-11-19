@@ -66,6 +66,7 @@ from pydantic import (
     ConfigDict,
     Field,
     PrivateAttr,
+    SerializationInfo,
     StrictBool,
     field_serializer,
     field_validator,
@@ -259,13 +260,16 @@ class UsageInfo(BaseModel):
     # Used to return cached tokens info when --enable-cache-report is set
     prompt_tokens_details: Optional[PromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
-    # The OpenAI location of reasoning_tokens; set only when there are some.
+    # The OpenAI location of reasoning_tokens; always set, so 0 means no reasoning.
     completion_tokens_details: Optional[CompletionTokensDetails] = None
 
 
 class StreamOptions(BaseModel):
     include_usage: Optional[bool] = None
     continuous_usage_stats: Optional[bool] = False
+    # Kimi-K3 extension, ignored elsewhere: attach
+    # choices[].internal_content[].token_ids to every increment frame.
+    include_internal_content: Optional[bool] = False
 
 
 class JsonSchemaResponseFormat(BaseModel):
@@ -365,20 +369,6 @@ class BatchResponse(BaseModel):
     metadata: Optional[dict] = None
 
 
-def _migrate_deprecated_dp_rank(values: dict) -> dict:
-    if isinstance(values, dict) and values.get("data_parallel_rank") is not None:
-        import warnings
-
-        warnings.warn(
-            "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        if values.get("routed_dp_rank") is None:
-            values["routed_dp_rank"] = values["data_parallel_rank"]
-    return values
-
-
 class PDRoutingFields(BaseModel):
     """PD and DP routing fields a router may inject into a request."""
 
@@ -460,9 +450,6 @@ class CompletionRequest(PDRoutingFields):
     # Unlimited-OCR v2 reads them as defaults under images_config.
     mm_processor_kwargs: Optional[Dict] = None
 
-    # Deprecated: use routed_dp_rank instead
-    data_parallel_rank: Optional[int] = None
-
     # For request id
     rid: Optional[Union[List[str], str]] = None
     # Extra key for caller-defined request classification
@@ -474,11 +461,6 @@ class CompletionRequest(PDRoutingFields):
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def _handle_deprecated_dp_rank(cls, values):
-        return _migrate_deprecated_dp_rank(values)
 
     @field_validator("max_tokens")
     @classmethod
@@ -622,20 +604,6 @@ class ChatCompletionMessageContentTextPart(BaseModel):
     text: str
 
 
-class ChatCompletionMessageContentThinkingPart(BaseModel):
-    type: Literal["thinking", "reasoning"]
-    thinking: Optional[str] = None
-    text: Optional[str] = None
-
-    @model_validator(mode="after")
-    def validate_payload(self):
-        if (self.thinking is None) == (self.text is None):
-            raise ValueError(
-                "thinking parts require exactly one of 'thinking' or 'text'"
-            )
-        return self
-
-
 class ChatCompletionMessageContentImageURL(BaseModel):
     url: str
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
@@ -752,7 +720,6 @@ class ChatCompletionMessageContentToolReferenceBlock(BaseModel):
 
 ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentTextPart,
-    ChatCompletionMessageContentThinkingPart,
     ChatCompletionMessageContentImagePart,
     ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageContentAudioPart,
@@ -769,11 +736,33 @@ RerankContentPart = Union[
 RerankContent = Union[str, List[RerankContentPart]]
 
 
+# Request messages reuse ToolCall and reach chat templates through model_dump(),
+# so stream chunks drop null delta keys only under this context.
+STREAM_DELTA_CONTEXT = {"stream_delta": True}
+
+
+def _is_stream_delta(info: SerializationInfo) -> bool:
+    return bool(info.context and info.context.get("stream_delta"))
+
+
 class FunctionResponse(BaseModel):
     """Function response."""
 
     name: Optional[str] = None
     arguments: Optional[str | Dict[str, Any]] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler, info: SerializationInfo):
+        # Continuation chunks must not carry a name key, not even null; the
+        # arguments key must always be present.
+        data = handler(self)
+        if not _is_stream_delta(info):
+            return data
+        if data.get("name") is None:
+            data.pop("name", None)
+        if data.get("arguments") is None:
+            data["arguments"] = ""
+        return data
 
 
 class ToolCall(BaseModel):
@@ -783,6 +772,20 @@ class ToolCall(BaseModel):
     index: Optional[int] = None
     type: Literal["function"] = "function"
     function: FunctionResponse
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler, info: SerializationInfo):
+        # Continuation chunks (id is None) may only carry index +
+        # function.arguments; id/type must not appear, not even null.
+        data = handler(self)
+        if not _is_stream_delta(info):
+            return data
+        if data.get("id") is None:
+            data.pop("id", None)
+            data.pop("type", None)
+        if data.get("index") is None:
+            data.pop("index", None)
+        return data
 
 
 _GenericMessageRole = Literal[
@@ -805,6 +808,18 @@ class ChatCompletionMessageGenericParam(BaseModel):
     # DeepSeek API prefix completion: continue this final assistant message.
     prefix: Optional[bool] = None
 
+    @model_validator(mode="after")
+    def validate_assistant_tool_call_names(self):
+        # FunctionResponse.name is optional for streaming deltas,
+        # but request history must name each call so the chat template can render it.
+        if self.role != "assistant" or not self.tool_calls:
+            return self
+        for index, tool_call in enumerate(self.tool_calls):
+            name = tool_call.function.name
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"tool_calls[{index}]: 'function.name' is required")
+        return self
+
     @field_validator("role", mode="before")
     @classmethod
     def _normalize_role(cls, v):
@@ -816,30 +831,10 @@ class ChatCompletionMessageGenericParam(BaseModel):
             return v_lower
         raise ValueError("'role' must be a string")
 
-    @model_validator(mode="after")
-    def validate_thinking_parts_role(self):
-        if self.role != "assistant" and isinstance(self.content, list):
-            for part in self.content:
-                if isinstance(part, ChatCompletionMessageContentThinkingPart):
-                    raise ValueError(
-                        "thinking content parts are only valid in assistant messages"
-                    )
-        return self
-
 
 class ChatCompletionMessageUserParam(BaseModel):
     role: Literal["user"]
     content: Union[str, List[ChatCompletionMessageContentPart]]
-
-    @model_validator(mode="after")
-    def validate_thinking_parts_role(self):
-        if isinstance(self.content, list):
-            for part in self.content:
-                if isinstance(part, ChatCompletionMessageContentThinkingPart):
-                    raise ValueError(
-                        "thinking content parts are only valid in assistant messages"
-                    )
-        return self
 
 
 ChatCompletionMessageParam = Union[
@@ -1054,6 +1049,9 @@ class ChatCompletionRequest(PDRoutingFields):
     return_flat_raw_output_top_logprobs: bool = False
     # Base64 by default on chat, unlike /generate; false returns plain JSON lists.
     return_flat_raw_top_logprobs_b64: bool = True
+    # Flat sampling masks in choices[].meta_info (requires return_meta_info); base64 by default as above.
+    return_flat_raw_sampling_mask: bool = False
+    return_flat_raw_sampling_mask_b64: bool = True
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
@@ -1142,9 +1140,6 @@ class ChatCompletionRequest(PDRoutingFields):
     # Priority for the request
     priority: Optional[int] = None
 
-    # Deprecated: use routed_dp_rank instead
-    data_parallel_rank: Optional[int] = None
-
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
@@ -1153,11 +1148,6 @@ class ChatCompletionRequest(PDRoutingFields):
         "min_p": 0.0,
         "repetition_penalty": 1.0,
     }
-
-    @model_validator(mode="before")
-    @classmethod
-    def _handle_deprecated_dp_rank(cls, values):
-        return _migrate_deprecated_dp_rank(values)
 
     @model_validator(mode="wrap")
     @classmethod
@@ -1438,7 +1428,13 @@ class ChatCompletionResponseChoice(BaseModel):
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[
         Literal[
-            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
+            "stop",
+            "length",
+            "tool_calls",
+            "content_filter",
+            "function_call",
+            "abort",
+            "server_interrupted",
         ]
     ] = None
     matched_stop: Union[None, int, str] = None
@@ -1487,8 +1483,12 @@ class DeltaMessage(BaseModel):
     hidden_states: Optional[object] = None
 
     @model_serializer(mode="wrap")
-    def _serialize(self, handler):
+    def _serialize(self, handler, info: SerializationInfo):
         data = handler(self)
+        # Without the context, null keys stay: OpenAI SDK clients read
+        # reasoning_content as an attribute.
+        if _is_stream_delta(info):
+            return {k: v for k, v in data.items() if v is not None}
         if self.hidden_states is None:
             data.pop("hidden_states", None)
         return data
@@ -1500,14 +1500,23 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[
         Literal[
-            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
+            "stop",
+            "length",
+            "tool_calls",
+            "content_filter",
+            "function_call",
+            "abort",
+            "server_interrupted",
         ]
     ] = None
     matched_stop: Union[None, int, str] = None
+    internal_content: Optional[List[Dict[str, Any]]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
+        if self.internal_content is None:
+            data.pop("internal_content", None)
         if self.delta.tool_calls is None:
             data["delta"].pop("tool_calls", None)
         return data
@@ -2114,9 +2123,6 @@ class ResponsesRequest(PDRoutingFields):
         default=None, description="Cache salt for request caching"
     )
 
-    # Deprecated: use routed_dp_rank instead
-    data_parallel_rank: Optional[int] = None
-
     # SGLang sampling extras. ``None`` defers to ``--preferred-sampling-params``.
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
@@ -2133,11 +2139,6 @@ class ResponsesRequest(PDRoutingFields):
         "min_p": 0.0,
         "repetition_penalty": 1.0,
     }
-
-    @model_validator(mode="before")
-    @classmethod
-    def _handle_deprecated_dp_rank(cls, values):
-        return _migrate_deprecated_dp_rank(values)
 
     @model_validator(mode="before")
     @classmethod
@@ -2283,10 +2284,6 @@ class ResponsesRequest(PDRoutingFields):
                 max_tokens = min(max_tokens, default_max_tokens)
         else:
             max_tokens = default_max_tokens
-
-        # Headroom for BOS/EOS the engine appends on top of prompt+budget.
-        if max_tokens is not None:
-            max_tokens -= 2
 
         temperature = self.temperature
         if temperature is None:

@@ -512,7 +512,7 @@ export const config = {
     numPromptsByConc: { 1: 16, 16: 80, 64: 320, 256: 1280, 1024: 5120 },
   },
 
-  // Recommend the published CUDA 13 image for every NVIDIA recipe. MI35x keeps
+  // Recommend the published CUDA 13 image for every NVIDIA recipe. MI35x uses
   // the ROCm 7.2 image.
   dockerImages: {
     h100:   "lmsysorg/sglang:kimi-k3",
@@ -521,10 +521,8 @@ export const config = {
     gb300:  "lmsysorg/sglang:kimi-k3",
     b200:   "lmsysorg/sglang:kimi-k3",
     gb200:  "lmsysorg/sglang:kimi-k3",
-    // 20260903 or newer: the AITER SiTU A4W4/A8W4 layout fix (sgl-project/sglang#33838,
-    // merged Sep 3) and the fused gfx950 KDA decode boundary (#34198) first ship here.
-    mi350x: "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260916",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260916",
+    mi350x: "lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261113",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261113",
     // NVFP4 needs a build with sgl-project/sglang#35077; the purpose-built dev
     // image is cut from that PR's head (CUDA 13).
     "b300|nvfp4":  "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
@@ -532,9 +530,9 @@ export const config = {
     "b200|nvfp4":  "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
     "gb200|nvfp4": "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
     a3:     "quay.io/ascend/sglang:main-cann9.1.0-a3",
-    // 950PR/DT Series builds are CANN 9.1.0 and published from the Ascend SWR
-    // registry (the quay.io A2/A3 line carries no 950PR/DT tag).
-    a5:     "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-B070",
+    // 950PR/DT Series uses the Docker Hub daily build (the quay.io A2/A3 line
+    // carries no 950PR/DT tag).
+    a5:     "lmsysorg/sglang:main-cann9.1.0-950",
   },
   // Pre-selects the issue template's `model` field on "Submit verified cell".
   github: {
@@ -799,18 +797,14 @@ export const config = {
         port: 8000,
         // Ports come from the engine's PD_PORTS, the same source the role
         // commands rewrite `--port` from, so the router always targets the
-        // ports the two roles actually bind. The positional after --prefill is
-        // the bootstrap port; it must match the prefill server's
-        // --disaggregation-bootstrap-port (default 8998) or only the decode
-        // worker registers.
+        // ports the two roles actually bind.
         command:
-`python3 -m sglang_router.launch_router \\
-  --pd-disaggregation \\
-  --prefill http://<prefill-host>:{{PREFILL_PORT}} 8998 \\
-  --decode http://<decode-host>:{{DECODE_PORT}} \\
+`sgl-router \\
+  --model-id {{MODEL_NAME}} \\
+  --no-tokenizer \\
+  --worker-urls http://<prefill-host>:{{PREFILL_PORT}} http://<decode-host>:{{DECODE_PORT}} \\
   --host 0.0.0.0 --port {{ROUTER_PORT}} \\
-  --disable-circuit-breaker \\
-  --health-check-interval-secs 999999`,
+  --disable-circuit-breaker`,
       },
     },
 
@@ -992,10 +986,10 @@ export const config = {
         // dispatch. Env var, not a flag, so it emits via env/stripEnv.
         id: "kdaFusedDecode", title: "Fused KDA Decode (AMD gfx950)",
         showWhen: (b) => ["mi350x", "mi355x"].includes(b.hw),
-        stripEnv: ["SGLANG_ROCM_K3_KDA_FUSED_BACKEND"],
+        stripEnv: ["SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND"],
         options: [
           { id: "off",   label: "Off" },
-          { id: "aiter", label: "On (AITER fused boundary)", env: ["SGLANG_ROCM_K3_KDA_FUSED_BACKEND=aiter"] },
+          { id: "aiter", label: "On (AITER fused boundary)", env: ["SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND=aiter"] },
         ],
       },
       {
@@ -2565,7 +2559,7 @@ export const config = {
         "--enable-dense-mlp-attn-tp",
         "--disable-radix-cache",
         "--disable-custom-all-reduce",
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph", "--disable-prefill-cuda-graph",
         "--mem-fraction-static 0.85",
         "--chunked-prefill-size 4096",
         "--max-running-requests 16",
@@ -2673,7 +2667,6 @@ export const config = {
         "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
         "SGLANG_RAGGED_VERIFY_MODE=static",
         "SGLANG_DSPARK_FOLDED_PROPOSAL=0",
-        "SGLANG_DSPARK_FOLDED_SAMPLING=0",
         "SGLANG_DSPARK_STACKED_CTX_KV=0",
         "SGLANG_DSPARK_EMBED_IN_GRAPH=0",
         "STREAMS_PER_DEVICE=32",
@@ -2695,7 +2688,6 @@ export const config = {
         "--device npu",
         "--dtype bfloat16",
         "--tp-size 32",
-        "--enable-dp-attention",
         "--enable-dp-lm-head",
         "--mem-fraction-static 0.9",
         "--max-total-tokens 200000",
