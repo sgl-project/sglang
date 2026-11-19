@@ -43,6 +43,9 @@ from sglang.multimodal_gen.runtime.layers.attention.autotune import (
 from sglang.multimodal_gen.runtime.layers.attention.backends import (
     flash_attn as _fa_backend,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends import (
+    xpu_deepsymm_ring,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionImpl,
     wrap_attention_impl_forward,
@@ -1596,14 +1599,35 @@ class USPAttention(nn.Module):
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:
-            out = ring_attn(
-                q,
-                k,
-                v,
-                attn_impl=self.attn_impl,
-                is_causal=self.causal,
-                dropout_p=self.dropout_p,
+            deepsymm_precision = (
+                xpu_deepsymm_ring.deepsymm_ring_precision(
+                    q,
+                    self.attn_impl,
+                    ring_group=get_sp_group().ring_group,
+                    causal=self.causal,
+                    is_cross_attention=self.is_cross_attention,
+                    dropout_p=self.dropout_p,
+                )
+                if xpu_deepsymm_ring.DEEPSYMM_RING_PRECISION is not None and q.is_xpu
+                else None
             )
+            if deepsymm_precision is not None:
+                out = xpu_deepsymm_ring.deepsymm_ring_attn(
+                    q,
+                    k,
+                    v,
+                    ring_group=get_sp_group().ring_group,
+                    precision=deepsymm_precision,
+                )
+            else:
+                out = ring_attn(
+                    q,
+                    k,
+                    v,
+                    attn_impl=self.attn_impl,
+                    is_causal=self.causal,
+                    dropout_p=self.dropout_p,
+                )
         else:
             # -> [B, S, H_local, D]
             out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
