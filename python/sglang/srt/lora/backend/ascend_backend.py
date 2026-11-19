@@ -148,7 +148,9 @@ class AscendLoRABackend(BaseLoRABackend):
             qkv_lora_a,
             self.batch_info.weight_indices,
             self.batch_info.seg_lens,
-            self.batch_info.lora_ranks,
+            # A stores Q/K/V consecutively with each adapter's actual rank.
+            # Shrink must compute all slices; expand receives the per-slice rank.
+            self.batch_info.lora_ranks * n_slices,
             self.batch_info.scalings,
             lora_a_output,
             n_slices,
@@ -200,7 +202,7 @@ class AscendLoRABackend(BaseLoRABackend):
             gate_up_lora_a,
             self.batch_info.weight_indices,
             self.batch_info.seg_lens,
-            self.batch_info.lora_ranks,
+            self.batch_info.lora_ranks * 2,
             self.batch_info.scalings,
             lora_a_output,
             n_slices,
