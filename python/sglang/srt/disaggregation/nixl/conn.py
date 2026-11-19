@@ -2911,7 +2911,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
     ):
         """Attempt staging transfer. Returns (xfer_handle, deferred, chunk_idx).
 
-        Mirrors mooncake._do_staging_transfer semantics:
+        Outcomes:
           - staging not ready (watermark/alloc pending) -> ``queue.put(kv_chunk)``
             re-enqueue the chunk and return ``(None, True, chunk_idx)``. Caller should
             ``break`` out of the per-req loop and ``continue`` the worker

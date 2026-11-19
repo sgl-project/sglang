@@ -720,14 +720,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         target_info,
         chunked_dst_kv_indice,
         executor,
-        queue,
     ):
         """Execute staging transfer for one chunk. Returns (ret, deferred).
 
         Handles readiness check, transfer, and CHUNK_READY notification; a chunk
         that cannot fit returns -1 (the caller fails only this room) instead of
         falling back to the slice path, which would leak the decode-side
-        allocation. deferred=True means caller should re-enqueue and break.
+        allocation. deferred=True means the caller retries this target later.
         """
         ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
             req,
@@ -746,12 +745,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     "reduce chunked_prefill_size."
                 )
                 return (-1, False)
-            # Not ready yet: wait (bounded) for a watermark advance, then
-            # re-enqueue to retry. A plain block-until-ready would head-of-line
-            # block other rooms on this single worker thread.
-            with self._staging_ctx.watermark_cv:
-                self._staging_ctx.watermark_cv.wait(STAGING_WATERMARK_WAIT_S)
-            queue.put(kv_chunk)
             return (-1, True)
 
         ret = staging_strategy.transfer(
@@ -3216,12 +3209,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 reqs_to_be_processed = list(
                     self.transfer_infos.get(kv_chunk.room, {}).values()
                 )
+                done_targets = kv_chunk.staging_done_targets
                 polls = []
                 dst_ranks_infos = []
-                # When staging transfer is not yet ready (watermark/allocation pending),
-                # the chunk is re-enqueued and we break out of the req loop to retry later.
+                if kv_chunk.is_last_chunk:
+                    # Targets reached on an earlier pass still count toward the
+                    # room's conclusion.
+                    for req in reqs_to_be_processed:
+                        if req.mooncake_session_id in done_targets:
+                            polls.append(done_targets[req.mooncake_session_id])
+                            dst_ranks_infos.append((req.endpoint, req.dst_port))
+                # A target whose staging region is not ready yet (watermark or
+                # allocation pending) is skipped; the chunk is re-enqueued once.
                 staging_deferred = False
                 for req in reqs_to_be_processed:
+                    if req.mooncake_session_id in done_targets:
+                        continue
                     start_ts = time.perf_counter()
                     if not req.is_dummy:
                         # Early exit if the request has failed
@@ -3378,12 +3381,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 target_rank_registration_info,
                                 chunked_dst_kv_indice,
                                 executor,
-                                queue,
                             )
                             if deferred:
+                                # Offer the chunk to the remaining targets: one
+                                # pinned decode ring must not stall the others.
                                 staging_deferred = True
-                                # Chunk re-enqueued; stop processing remaining reqs for this chunk
-                                break
+                                continue
                         else:
                             ret = self.send_kvcache_slice(
                                 req.mooncake_session_id,
@@ -3500,6 +3503,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                         else f"Failed to send aux data of {req.room}"
                                     ),
                                 )
+                        done_targets[req.mooncake_session_id] = ret == 0
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
                         # Dummy request does not need to sync status to decode endpoint
@@ -3521,6 +3525,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
 
                 if staging_deferred:
+                    # One bounded wait per pass, not per unready target: other rooms
+                    # share this single worker thread.
+                    with self._staging_ctx.watermark_cv:
+                        self._staging_ctx.watermark_cv.wait(STAGING_WATERMARK_WAIT_S)
+                    queue.put(kv_chunk)
                     continue
 
                 # A room started anew since this chunk was counted no longer
