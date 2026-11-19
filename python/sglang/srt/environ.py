@@ -753,6 +753,11 @@ class Envs:
     SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION = EnvBool(False)
     # Replay the trie beam selection step as a CUDA graph.
     SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH = EnvBool(False)
+    # Replay all-beam decode batches of the compact trie head as CUDA graphs.
+    SGLANG_ENABLE_BEAM_TRIE_DECODE_GRAPH = EnvBool(False)
+    # The one beam width those graphs serve under shared-context attention; a
+    # decode graph size holds this many rows per request.
+    SGLANG_BEAM_SHARED_CONTEXT_WIDTH = EnvInt(2000)
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism
