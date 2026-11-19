@@ -9,7 +9,7 @@ import sglang.multimodal_gen.runtime.layers.usp as usp
 from sglang.kernels.ops.diffusion import pack_qkv_destination_major_cpu
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu-intel")
+register_cpu_ci(est_time=5, suite="extra-test-cpu-intel")
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

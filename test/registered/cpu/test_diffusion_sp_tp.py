@@ -8,7 +8,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1800, suite="stage-a-tp-test-cpu-intel")
+register_cpu_ci(est_time=5, suite="extra-tp-test-cpu-intel")
 
 DEFAULT_WAN_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
 GENERATE_TIMEOUT = int(os.environ.get("WAN_GENERATE_TIMEOUT", "1800"))
