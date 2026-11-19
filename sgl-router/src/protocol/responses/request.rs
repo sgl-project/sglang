@@ -8,12 +8,18 @@ use std::collections::HashMap;
 
 use serde_json::{json, Map, Value};
 
-/// Request fields echoed on every Response object.
+/// Request fields echoed on every Response object, and what the reply's
+/// reasoning items carry.
 #[derive(Debug, Clone)]
 pub struct EchoContext {
     pub model: String,
     pub fields: Map<String, Value>,
     pub tools: ToolMap,
+    /// `reasoning.summary` was set: the trace is mirrored into `summary`.
+    pub reasoning_summary: bool,
+    /// `include` has `reasoning.encrypted_content`: the trace is also packed
+    /// into `encrypted_content`, so a `store: false` client can replay it.
+    pub encrypted_reasoning: bool,
 }
 
 /// A namespaced or `custom` tool, keyed in [`ToolMap`] by its chat function name.
@@ -72,7 +78,20 @@ const CONSUMED: &[&str] = &[
     "n",
 ];
 
-pub fn to_chat(req: Value) -> Result<Converted, String> {
+/// `include` values the engine accepts; the others are a client error.
+const INCLUDE_VALUES: &[&str] = &[
+    "code_interpreter_call.outputs",
+    "computer_call_output.output.image_url",
+    "file_search_call.results",
+    "message.input_image.image_url",
+    "message.output_text.logprobs",
+    "reasoning.encrypted_content",
+];
+
+/// `inline_system`: every worker renders a system message after the first,
+/// so `developer` items stay where they are. Otherwise every system message
+/// joins the leading one, where the engine's own `/v1/responses` puts it.
+pub fn to_chat(req: Value, inline_system: bool) -> Result<Converted, String> {
     let Value::Object(mut req) = req else {
         return Err("request body must be a JSON object".into());
     };
@@ -86,6 +105,11 @@ pub fn to_chat(req: Value) -> Result<Converted, String> {
     };
 
     reject_unsupported(&req)?;
+    let encrypted_reasoning = include_encrypted_reasoning(&req)?;
+    let reasoning_summary = req
+        .get("reasoning")
+        .and_then(|r| r.get("summary"))
+        .is_some_and(|v| !v.is_null());
 
     let stream = match req.get("stream") {
         None | Some(Value::Null) => false,
@@ -111,7 +135,9 @@ pub fn to_chat(req: Value) -> Result<Converted, String> {
         }
         Some(_) => return Err("`input` must be a string or an array of input items".into()),
     }
-    merge_leading_system(&mut messages);
+    if !inline_system {
+        coalesce_system(&mut messages);
+    }
 
     let mut chat = Map::new();
     // Passthrough first so the translations below win.
@@ -167,6 +193,8 @@ pub fn to_chat(req: Value) -> Result<Converted, String> {
             model,
             fields: echo_fields(&req),
             tools: tool_map,
+            reasoning_summary,
+            encrypted_reasoning,
         },
         stream,
     })
@@ -199,6 +227,31 @@ fn reject_unsupported(req: &Map<String, Value>) -> Result<(), String> {
         return Err("`top_logprobs` is not supported".into());
     }
     Ok(())
+}
+
+/// Whether `include` asks for `reasoning.encrypted_content`. Logprobs are
+/// not translated, so that value is refused like `top_logprobs`.
+fn include_encrypted_reasoning(req: &Map<String, Value>) -> Result<bool, String> {
+    let Some(include) = req.get("include").filter(|v| !v.is_null()) else {
+        return Ok(false);
+    };
+    let Value::Array(values) = include else {
+        return Err("`include` must be an array of strings".into());
+    };
+    let mut encrypted = false;
+    for v in values {
+        let Some(s) = v.as_str() else {
+            return Err("`include` entries must be strings".into());
+        };
+        if !INCLUDE_VALUES.contains(&s) {
+            return Err(format!("`include`: unexpected value `{s}`"));
+        }
+        if s == "message.output_text.logprobs" {
+            return Err("`include`: `message.output_text.logprobs` is not supported".into());
+        }
+        encrypted |= s == "reasoning.encrypted_content";
+    }
+    Ok(encrypted)
 }
 
 /// Assistant turn built from consecutive reasoning / message / function_call items.
@@ -277,14 +330,14 @@ fn convert_items(items: Vec<Value>, messages: &mut Vec<Value>) -> Result<(), Str
                     }
                     "user" | "system" | "developer" => {
                         pending.flush(messages);
-                        // Templates know `system` (some drop `developer`) but
-                        // several reject it after the first turn, where a
-                        // developer item is sent as `user` instead.
-                        let leading = messages.iter().all(|m| m["role"] == "system");
-                        let role = match role.as_str() {
-                            "developer" if leading => "system",
-                            "developer" => "user",
-                            r => r,
+                        // Templates know `system` but not `developer`: the
+                        // item is sent as `system`, its text labelled so the
+                        // tier survives, as the engine's own `/v1/responses`
+                        // does. `coalesce_system` decides where it goes.
+                        let (role, content) = if role == "developer" {
+                            ("system", label_developer_content(content))
+                        } else {
+                            (role.as_str(), content)
                         };
                         messages.push(json!({
                             "role": role,
@@ -367,41 +420,62 @@ fn convert_items(items: Vec<Value>, messages: &mut Vec<Value>) -> Result<(), Str
     Ok(())
 }
 
-/// Join leading text-only system messages into one: templates treat only the
-/// first message as the system prompt.
-fn merge_leading_system(messages: &mut Vec<Value>) {
-    let texts: Vec<String> = messages
-        .iter()
-        .map_while(|m| {
-            (m["role"] == "system")
-                .then(|| plain_text(&m["content"]))
-                .flatten()
-        })
-        .collect();
-    if texts.len() < 2 {
-        return;
-    }
-    let n = texts.len();
-    messages.splice(
-        ..n,
-        [json!({"role": "system", "content": texts.join("\n\n")})],
-    );
-}
+/// Label a `developer` item's text with its tier, as the engine does:
+/// collapsed into `system`, an unlabelled block reads as one more
+/// instruction a later user message can override.
+const DEVELOPER_LABEL: &str = "Developer instructions:";
 
-/// Content as one string when it is text only.
-fn plain_text(content: &Value) -> Option<String> {
+fn label_developer_content(content: Value) -> Value {
     match content {
-        Value::String(s) => Some(s.clone()),
-        Value::Array(parts) => parts
-            .iter()
-            .map(|p| (p["type"] == "text").then(|| p["text"].as_str()).flatten())
-            .collect::<Option<Vec<_>>>()
-            .map(|t| t.join("\n")),
-        _ => None,
+        Value::String(text) => Value::String(format!("{DEVELOPER_LABEL}\n{text}")),
+        Value::Array(mut parts) => {
+            match parts
+                .iter_mut()
+                .find(|p| p.get("text").is_some_and(Value::is_string))
+            {
+                Some(part) => {
+                    let text = part["text"].as_str().unwrap_or_default().to_owned();
+                    part["text"] = Value::String(format!("{DEVELOPER_LABEL}\n{text}"));
+                }
+                None => parts.insert(0, json!({"type": "input_text", "text": DEVELOPER_LABEL})),
+            }
+            Value::Array(parts)
+        }
+        other => other,
     }
 }
 
-/// `content[].text`, else `summary[].text`.
+/// Join the text of every system message into one leading system message,
+/// as the engine does for a model whose template renders only the first:
+/// `instructions` plus interleaved developer items become one block, and
+/// the turns either side of a moved item stay apart. Non-text parts of a
+/// system message are dropped, as the engine drops them.
+fn coalesce_system(messages: &mut Vec<Value>) {
+    let mut chunks = Vec::new();
+    messages.retain(|m| {
+        if m["role"] != "system" {
+            return true;
+        }
+        match &m["content"] {
+            Value::String(text) => chunks.push(text.clone()),
+            Value::Array(parts) => chunks.extend(
+                parts
+                    .iter()
+                    .filter(|p| p["type"] == "text")
+                    .filter_map(|p| p["text"].as_str().map(str::to_owned)),
+            ),
+            _ => {}
+        }
+        false
+    });
+    if !chunks.is_empty() {
+        messages.insert(0, json!({"role": "system", "content": chunks.join("\n\n")}));
+    }
+}
+
+/// `summary[].text`, else `content[].text`, else the trace packed into
+/// `encrypted_content` by an earlier reply (a `store: false` client may
+/// replay only the blob). The engine reads them in the same order.
 fn reasoning_text(obj: &Map<String, Value>) -> String {
     let join = |key: &str| -> String {
         obj.get(key)
@@ -410,17 +484,22 @@ fn reasoning_text(obj: &Map<String, Value>) -> String {
                 parts
                     .iter()
                     .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .filter(|t| !t.is_empty())
                     .collect::<Vec<_>>()
                     .join("\n")
             })
             .unwrap_or_default()
     };
-    let content = join("content");
-    if content.is_empty() {
-        join("summary")
-    } else {
-        content
+    for key in ["summary", "content"] {
+        let text = join(key);
+        if !text.is_empty() {
+            return text;
+        }
     }
+    obj.get("encrypted_content")
+        .and_then(Value::as_str)
+        .and_then(super::decode_reasoning_state)
+        .unwrap_or_default()
 }
 
 /// Content as plain text, for assistant turns and tool outputs.
@@ -824,7 +903,7 @@ mod tests {
     use super::*;
 
     fn chat(req: Value) -> Value {
-        to_chat(req).expect("converts").chat
+        to_chat(req, false).expect("converts").chat
     }
 
     #[test]
@@ -850,24 +929,119 @@ mod tests {
         );
     }
 
-    #[test]
-    fn developer_becomes_system_and_leading_system_merges() {
-        let c = chat(json!({"model": "m", "instructions": "A", "input": [
+    fn developer_items() -> Value {
+        json!({"model": "m", "instructions": "A", "input": [
             {"role": "developer", "content": [
                 {"type": "input_text", "text": "B1"}, {"type": "input_text", "text": "B2"}]},
             {"role": "system", "content": [{"type": "input_text", "text": "C"}]},
             {"role": "user", "content": "hi"},
             {"role": "developer", "content": "D"},
-        ]}));
-        // A developer item after the first turn is sent as `user`.
+            {"role": "user", "content": "go"},
+        ]})
+    }
+
+    #[test]
+    fn developer_is_labelled_system_and_joins_the_leading_system() {
+        // Like the engine: every system message, including a developer item
+        // after the first turn, joins one leading block, and the turns either
+        // side of the moved item stay apart.
+        let c = chat(developer_items());
         assert_eq!(
             c["messages"],
             json!([
-                {"role": "system", "content": "A\n\nB1\nB2\n\nC"},
+                {"role": "system", "content":
+                    "A\n\nDeveloper instructions:\nB1\n\nB2\n\nC\n\nDeveloper instructions:\nD"},
                 {"role": "user", "content": "hi"},
-                {"role": "user", "content": "D"},
+                {"role": "user", "content": "go"},
             ])
         );
+    }
+
+    #[test]
+    fn inline_system_keeps_developer_items_in_place() {
+        let c = to_chat(developer_items(), true).unwrap().chat;
+        assert_eq!(
+            c["messages"],
+            json!([
+                {"role": "system", "content": "A"},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "Developer instructions:\nB1"},
+                    {"type": "text", "text": "B2"}]},
+                {"role": "system", "content": "C"},
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "Developer instructions:\nD"},
+                {"role": "user", "content": "go"},
+            ])
+        );
+    }
+
+    #[test]
+    fn developer_parts_without_text_get_a_label_part() {
+        let c = to_chat(
+            json!({"model": "m", "input": [
+                {"role": "developer", "content": [
+                    {"type": "input_image", "image_url": "https://x/a.png"}]},
+                {"role": "user", "content": "hi"},
+            ]}),
+            true,
+        )
+        .unwrap()
+        .chat;
+        assert_eq!(
+            c["messages"][0]["content"][0],
+            json!({"type": "text", "text": "Developer instructions:"})
+        );
+        assert_eq!(c["messages"][0]["content"][1]["type"], "image_url");
+        // Coalesced, the image is dropped as the engine drops it.
+        let c = chat(json!({"model": "m", "input": [
+            {"role": "developer", "content": [
+                {"type": "input_image", "image_url": "https://x/a.png"}]},
+            {"role": "user", "content": "hi"},
+        ]}));
+        assert_eq!(
+            c["messages"][0],
+            json!({"role": "system", "content": "Developer instructions:"})
+        );
+    }
+
+    #[test]
+    fn include_and_summary_flags() {
+        let e = |req: Value| to_chat(req, false).unwrap().echo;
+        let plain = e(json!({"model": "m", "input": "x"}));
+        assert!(!plain.encrypted_reasoning && !plain.reasoning_summary);
+        let full = e(json!({"model": "m", "input": "x",
+                            "include": ["reasoning.encrypted_content", "file_search_call.results"],
+                            "reasoning": {"effort": "low", "summary": "auto"}}));
+        assert!(full.encrypted_reasoning && full.reasoning_summary);
+        for (include, needle) in [
+            (json!(["nope"]), "unexpected value"),
+            (json!(["message.output_text.logprobs"]), "not supported"),
+            (json!("reasoning.encrypted_content"), "array"),
+        ] {
+            let err = to_chat(
+                json!({"model": "m", "input": "x", "include": include}),
+                false,
+            )
+            .unwrap_err();
+            assert!(err.contains(needle), "{err}");
+        }
+    }
+
+    #[test]
+    fn reasoning_items_prefer_summary_then_content_then_encrypted() {
+        let blob = crate::protocol::responses::encode_reasoning_state("packed");
+        let c = chat(json!({"model": "m", "input": [
+            {"role": "user", "content": "q"},
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "s"}],
+             "content": [{"type": "reasoning_text", "text": "c"}]},
+            {"type": "reasoning", "summary": [], "content": [],
+             "encrypted_content": blob},
+            {"type": "reasoning", "summary": [], "content": [],
+             "encrypted_content": "not-ours"},
+            {"role": "assistant", "content": "A"},
+        ]}));
+        assert_eq!(c["messages"][1]["reasoning_content"], "s\npacked");
+        assert_eq!(c["messages"][1]["content"], "A");
     }
 
     #[test]
@@ -1012,16 +1186,19 @@ mod tests {
                 "more than one tool",
             ),
         ] {
-            let err = to_chat(req.clone()).expect_err(&req.to_string());
+            let err = to_chat(req.clone(), false).expect_err(&req.to_string());
             assert!(err.contains(needle), "{req}: {err}");
         }
     }
 
     #[test]
     fn echo_defaults() {
-        let e = to_chat(json!({"model": "m", "input": "x", "max_output_tokens": 16}))
-            .unwrap()
-            .echo;
+        let e = to_chat(
+            json!({"model": "m", "input": "x", "max_output_tokens": 16}),
+            false,
+        )
+        .unwrap()
+        .echo;
         assert_eq!(e.model, "m");
         assert_eq!(e.fields["max_output_tokens"], 16);
         assert_eq!(e.fields["tool_choice"], "auto");
@@ -1036,22 +1213,25 @@ mod tests {
 
     #[test]
     fn codex_namespace_and_custom_tools() {
-        let c = to_chat(json!({"model": "m", "tools": [
-            {"type": "function", "name": "shell", "parameters": {"type": "object"}},
-            {"type": "custom", "name": "apply_patch", "description": "Edit files.",
-             "format": {"type": "grammar", "syntax": "lark", "definition": "start: patch"}},
-            {"type": "namespace", "name": "mcp__fs__", "description": "fs",
-             "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}]},
-        ],
-            "input": [
-                {"type": "message", "role": "user", "content": "go"},
-                {"type": "custom_tool_call", "call_id": "c1", "name": "apply_patch",
-                 "input": "*** Begin Patch"},
-                {"type": "custom_tool_call_output", "call_id": "c1", "output": "ok"},
-                {"type": "function_call", "call_id": "c2", "name": "read",
-                 "namespace": "mcp__fs__", "arguments": "{}"},
-                {"type": "function_call_output", "call_id": "c2", "output": "data"},
-            ]}))
+        let c = to_chat(
+            json!({"model": "m", "tools": [
+                {"type": "function", "name": "shell", "parameters": {"type": "object"}},
+                {"type": "custom", "name": "apply_patch", "description": "Edit files.",
+                 "format": {"type": "grammar", "syntax": "lark", "definition": "start: patch"}},
+                {"type": "namespace", "name": "mcp__fs__", "description": "fs",
+                 "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}]},
+            ],
+                "input": [
+                    {"type": "message", "role": "user", "content": "go"},
+                    {"type": "custom_tool_call", "call_id": "c1", "name": "apply_patch",
+                     "input": "*** Begin Patch"},
+                    {"type": "custom_tool_call_output", "call_id": "c1", "output": "ok"},
+                    {"type": "function_call", "call_id": "c2", "name": "read",
+                     "namespace": "mcp__fs__", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "c2", "output": "data"},
+                ]}),
+            false,
+        )
         .unwrap();
         let names: Vec<&str> = c.chat["tools"]
             .as_array()
@@ -1122,7 +1302,7 @@ mod tests {
             .collect();
         assert_eq!(names, ["b", "mcp__fs__read"]);
         assert_eq!(c["tool_choice"], "required");
-        let err = to_chat(choice(json!([{"type": "function", "name": "zzz"}]))).unwrap_err();
+        let err = to_chat(choice(json!([{"type": "function", "name": "zzz"}])), false).unwrap_err();
         assert!(err.contains("zzz"), "{err}");
     }
 }

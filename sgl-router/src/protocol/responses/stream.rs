@@ -178,8 +178,10 @@ impl ResponsesStream {
             self.close_open(Finish::Completed, out);
             let id = new_id("rs");
             let index = self.next_index();
-            let mut item = reasoning_item(&id, "", "in_progress");
+            let mut item = reasoning_item(&id, "", "in_progress", &self.echo);
             item["content"] = json!([]);
+            item["summary"] = json!([]);
+            item["encrypted_content"] = Value::Null;
             self.emit(
                 "response.output_item.added",
                 json!({"output_index": index, "item": item}),
@@ -326,7 +328,10 @@ impl ResponsesStream {
                            "part": {"type": "reasoning_text", "text": text}}),
                     out,
                 );
-                (index, reasoning_item(&id, &text, finish.item_status()))
+                (
+                    index,
+                    reasoning_item(&id, &text, finish.item_status(), &self.echo),
+                )
             }
             Open::Message { id, index, text } => {
                 self.emit(
@@ -492,7 +497,7 @@ mod tests {
     use crate::protocol::responses::to_chat;
 
     fn echo() -> EchoContext {
-        to_chat(json!({"model": "m", "input": "x", "stream": true}))
+        to_chat(json!({"model": "m", "input": "x", "stream": true}), false)
             .unwrap()
             .echo
     }
@@ -670,6 +675,7 @@ mod tests {
         let echo = to_chat(
             json!({"model": "m", "input": "x", "stream": true, "tools": [
             {"type": "custom", "name": "apply_patch"}]}),
+            false,
         )
         .unwrap()
         .echo;
@@ -878,7 +884,9 @@ mod tests {
         let mut input = vec![json!({"role": "user", "content": "go"})];
         input.extend(output.as_array().unwrap().iter().cloned());
         input.push(json!({"type": "function_call_output", "call_id": call_id, "output": "ok"}));
-        let chat = to_chat(json!({"model": "m", "input": input})).unwrap().chat;
+        let chat = to_chat(json!({"model": "m", "input": input}), false)
+            .unwrap()
+            .chat;
         let roles: Vec<&str> = chat["messages"]
             .as_array()
             .unwrap()

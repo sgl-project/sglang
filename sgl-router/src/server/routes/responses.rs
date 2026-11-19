@@ -11,6 +11,7 @@ use axum::extract::State;
 use axum::http::{header, HeaderMap, Response, StatusCode};
 use bytes::Bytes;
 
+use crate::off_worker;
 use crate::protocol::responses::{
     self, response::chat_to_response, stream::ResponsesStream, EchoContext,
 };
@@ -18,20 +19,27 @@ use crate::protocol::sse::transduce_body;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::routes::chat::chat_completions;
-use crate::server::routes::reply::{is_sse, rebuild, MAX_REPLY_BYTES};
+use crate::server::routes::reply::{
+    is_sse, model_supports_inline_system, rebuild, MAX_REPLY_BYTES,
+};
 
 pub(crate) async fn responses(
     State(ctx): State<Arc<AppContext>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
-    let req: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| ApiError::BadRequest(format!("request body is not valid JSON: {e}")))?;
-    let converted = responses::to_chat(req).map_err(ApiError::BadRequest)?;
-    let chat_body = Bytes::from(
-        serde_json::to_vec(&converted.chat)
-            .map_err(|e| ApiError::Internal(anyhow::anyhow!("serialize chat request: {e}")))?,
-    );
+    let inline_system = model_supports_inline_system(&ctx);
+    // Input items carry base64 images: parse and rebuild off the async worker.
+    let (converted, chat_body) = off_worker::run_for_body(body.len(), || {
+        let req: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| ApiError::BadRequest(format!("request body is not valid JSON: {e}")))?;
+        let converted = responses::to_chat(req, inline_system).map_err(ApiError::BadRequest)?;
+        let chat_body = Bytes::from(
+            serde_json::to_vec(&converted.chat)
+                .map_err(|e| ApiError::Internal(anyhow::anyhow!("serialize chat request: {e}")))?,
+        );
+        Ok::<_, ApiError>((converted, chat_body))
+    })?;
     let resp = chat_completions(State(ctx), headers, chat_body).await?;
     Ok(adapt(resp, converted.echo, converted.stream).await)
 }
@@ -59,18 +67,21 @@ async fn adapt(resp: Response<Body>, echo: EchoContext, streaming: bool) -> Resp
     if !parts.status.is_success() {
         return rebuild(parts, responses::wrap_error_body(&bytes, status));
     }
-    match serde_json::from_slice::<serde_json::Value>(&bytes) {
-        Ok(chat) => {
-            let body = serde_json::to_vec(&chat_to_response(&chat, &echo)).expect("serialize");
-            rebuild(parts, body)
+    // A non-streaming reply can be as large as a request body.
+    off_worker::run_for_body(bytes.len(), || {
+        match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(chat) => {
+                let body = serde_json::to_vec(&chat_to_response(&chat, &echo)).expect("serialize");
+                rebuild(parts, body)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "responses: upstream reply is not JSON");
+                parts.status = StatusCode::BAD_GATEWAY;
+                rebuild(
+                    parts,
+                    responses::error_body(502, "upstream reply is not a valid chat completion"),
+                )
+            }
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "responses: upstream reply is not JSON");
-            parts.status = StatusCode::BAD_GATEWAY;
-            rebuild(
-                parts,
-                responses::error_body(502, "upstream reply is not a valid chat completion"),
-            )
-        }
-    }
+    })
 }

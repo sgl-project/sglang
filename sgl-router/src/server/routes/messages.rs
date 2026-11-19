@@ -14,7 +14,6 @@ use axum::middleware::Next;
 use axum::response::IntoResponse;
 use bytes::Bytes;
 
-use crate::discovery::ModelId;
 use crate::off_worker;
 use crate::protocol::anthropic::{
     self, response::chat_to_message, stream::MessagesStream, EchoContext,
@@ -23,7 +22,9 @@ use crate::protocol::sse::transduce_body;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::routes::chat::{chat_completions, enforce_minimax_m31_thinking};
-use crate::server::routes::reply::{is_sse, rebuild, MAX_REPLY_BYTES};
+use crate::server::routes::reply::{
+    is_sse, model_supports_inline_system, rebuild, MAX_REPLY_BYTES,
+};
 use crate::server::routes::tokenize::served_tokenizer;
 
 pub(crate) async fn messages(
@@ -91,15 +92,6 @@ fn parse(
     let req: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| ApiError::BadRequest(format!("request body is not valid JSON: {e}")))?;
     anthropic::to_chat(req, count_only, inline_system).map_err(ApiError::BadRequest)
-}
-
-/// Whether every worker of the served model renders a system message after
-/// the first; a worker that does not report it counts as no.
-fn model_supports_inline_system(ctx: &AppContext) -> bool {
-    let workers = ctx
-        .registry
-        .workers_for(&ModelId(ctx.config.model.id.clone()));
-    !workers.is_empty() && workers.iter().all(|w| w.supports_inline_system())
 }
 
 /// `echo` is `Some((echo, streaming))`, `None` on the error paths.

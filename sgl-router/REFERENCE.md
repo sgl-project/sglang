@@ -585,6 +585,49 @@ forwarded as sent, since the engine renders and tokenizes each query-document
 pair. Routing is on load, with each pair's size estimated from its text. As for
 embeddings, a PD fleet answers 400 and `--dp-aware` pins no rank.
 
+## OpenAI Responses
+
+`/v1/responses` converts each request to a chat completion at ingress, so it is
+routed exactly like `/v1/chat/completions`, and converts the reply (or stream)
+back to a Response object or the Responses event sequence, with a gapless
+`sequence_number` and `usage` (including `cached_tokens`) on every finished
+Response. Conversion works on the raw JSON, so sglang chat extensions such as
+`top_k` and `chat_template_kwargs` pass through.
+
+Input: a string or input items; `message` items (`developer` is sent as
+`system`, its text labelled `Developer instructions:` as the engine's own
+`/v1/responses` does), `reasoning`, `function_call` / `function_call_output`
+and their `custom_tool_call` forms; `input_text` and `input_image` parts.
+Consecutive reasoning, assistant and function-call items form one assistant
+turn. `instructions`, `max_output_tokens`, `reasoning.effort`, `text.format`
+(JSON schema) and `tool_choice` (including `allowed_tools`) are translated.
+
+Tools: `function`, plus the shapes Codex sends: `namespace` groups, flattened
+to `<namespace>__<name>` chat functions, and `custom` freeform tools, shimmed
+into a function with one `input` string (a grammar is described to the model,
+not enforced). Calls map back to namespaced `function_call` /
+`custom_tool_call` items. Built-in tools (`web_search`, ...) are rejected.
+
+A developer item after the first turn stays in place only when every worker of
+the model reports `supports_inline_system` in `/server_info`; otherwise its
+text joins the leading system message, where the engine's own `/v1/responses`
+puts it, and the turns either side of it stay apart.
+
+Reasoning items carry the trace in `content`; `reasoning.summary` mirrors it
+into `summary`, and `include: ["reasoning.encrypted_content"]` also packs it
+into `encrypted_content` in the engine's own encoding, so a `store: false`
+client (Codex) can replay reasoning across turns through either the router or
+the engine. Replayed items are read as `summary`, then `content`, then the
+blob.
+
+The router is stateless: `previous_response_id`, `conversation`, `background`,
+stored `prompt` templates and `item_reference` items are rejected with 400, as
+are `top_logprobs` and `include: ["message.output_text.logprobs"]`. The
+stored-response routes under `/v1/responses/` answer 501. Every error uses the
+OpenAI `{"error": {...}}` envelope; 5xx messages are replaced with a generic
+one. A generation cut off by `max_output_tokens` ends `incomplete`; an engine
+abort or a broken stream ends `failed`, with open items closed `incomplete`.
+
 ## Anthropic Messages
 
 `/v1/messages` converts each request to a chat completion at ingress, so it is

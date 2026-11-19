@@ -29,7 +29,7 @@ pub fn chat_to_response(chat: &Value, echo: &EchoContext) -> Value {
             .filter(|s| !s.is_empty())
     };
     if let Some(r) = str_field("reasoning_content") {
-        output.push(reasoning_item(&new_id("rs"), r, item_status));
+        output.push(reasoning_item(&new_id("rs"), r, item_status, echo));
     }
     let tool_calls = message
         .and_then(|m| m.get("tool_calls"))
@@ -98,9 +98,12 @@ mod tests {
     use serde_json::json;
 
     fn echo() -> EchoContext {
-        to_chat(json!({"model": "m", "input": "x", "max_output_tokens": 512}))
-            .unwrap()
-            .echo
+        to_chat(
+            json!({"model": "m", "input": "x", "max_output_tokens": 512}),
+            false,
+        )
+        .unwrap()
+        .echo
     }
 
     #[test]
@@ -174,13 +177,16 @@ mod tests {
 
     #[test]
     fn codex_tool_calls_map_back() {
-        let echo = to_chat(json!({"model": "m", "input": "x", "tools": [
-            {"type": "function", "name": "shell", "parameters": {"type": "object"}},
-            {"type": "custom", "name": "apply_patch", "description": "Edit files.",
-             "format": {"type": "grammar", "syntax": "lark", "definition": "start: patch"}},
-            {"type": "namespace", "name": "mcp__fs__", "description": "fs",
-             "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}]},
-        ]}))
+        let echo = to_chat(
+            json!({"model": "m", "input": "x", "tools": [
+                {"type": "function", "name": "shell", "parameters": {"type": "object"}},
+                {"type": "custom", "name": "apply_patch", "description": "Edit files.",
+                 "format": {"type": "grammar", "syntax": "lark", "definition": "start: patch"}},
+                {"type": "namespace", "name": "mcp__fs__", "description": "fs",
+                 "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}]},
+            ]}),
+            false,
+        )
         .unwrap()
         .echo;
         let chat = json!({"choices": [{"finish_reason": "tool_calls", "message": {

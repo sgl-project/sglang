@@ -203,8 +203,8 @@ async fn router_side_rejections_are_structured() {
             StatusCode::BAD_REQUEST,
         ),
         (
-            json!({"model": "no-such-model", "input": "x"}),
-            StatusCode::NOT_FOUND,
+            json!({"model": MODEL, "input": "x", "include": ["message.output_text.logprobs"]}),
+            StatusCode::BAD_REQUEST,
         ),
     ] {
         let (status, _, body) =

@@ -136,15 +136,60 @@ pub(crate) fn response_object(
     Value::Object(m)
 }
 
-pub(crate) fn reasoning_item(id: &str, text: &str, status: &str) -> Value {
+/// The trace goes in `content`; `reasoning.summary` mirrors it into
+/// `summary`, and `include: ["reasoning.encrypted_content"]` packs it into
+/// `encrypted_content`, both as the engine's own `/v1/responses` does.
+pub(crate) fn reasoning_item(id: &str, text: &str, status: &str, echo: &EchoContext) -> Value {
+    let summary = if echo.reasoning_summary {
+        json!([{"type": "summary_text", "text": text}])
+    } else {
+        json!([])
+    };
+    let encrypted = if echo.encrypted_reasoning {
+        Value::String(encode_reasoning_state(text))
+    } else {
+        Value::Null
+    };
     json!({
         "id": id,
         "type": "reasoning",
-        "summary": [],
+        "summary": summary,
         "content": [{"type": "reasoning_text", "text": text}],
-        "encrypted_content": null,
+        "encrypted_content": encrypted,
         "status": status,
     })
+}
+
+/// The engine's `reasoning.encrypted_content` blob: a prefix plus the
+/// zlib-compressed, URL-safe base64 trace. Encoded, not encrypted: it lets a
+/// `store: false` client replay reasoning without server-side state, and it
+/// is interchangeable with the engine's own.
+const REASONING_STATE_PREFIX: &str = "sglang-reasoning-v1.";
+
+pub(crate) fn encode_reasoning_state(text: &str) -> String {
+    use base64::Engine;
+    use std::io::Write;
+    let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    let _ = z.write_all(text.as_bytes());
+    let packed = z.finish().unwrap_or_default();
+    format!(
+        "{REASONING_STATE_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE.encode(packed)
+    )
+}
+
+/// `None` for a blob this engine family did not produce, or a damaged one.
+pub(crate) fn decode_reasoning_state(blob: &str) -> Option<String> {
+    use base64::Engine;
+    use std::io::Read;
+    let packed = base64::engine::general_purpose::URL_SAFE
+        .decode(blob.strip_prefix(REASONING_STATE_PREFIX)?)
+        .ok()?;
+    let mut text = String::new();
+    flate2::read::ZlibDecoder::new(&packed[..])
+        .read_to_string(&mut text)
+        .ok()?;
+    Some(text)
 }
 
 pub(crate) fn output_text_part(text: &str) -> Value {
@@ -230,6 +275,45 @@ pub(crate) fn wrap_error_body(body: &[u8], status: u16) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_state_round_trips_and_rejects_foreign_blobs() {
+        let blob = encode_reasoning_state("why: 42 ✓");
+        assert!(blob.starts_with("sglang-reasoning-v1."));
+        assert_eq!(decode_reasoning_state(&blob).as_deref(), Some("why: 42 ✓"));
+        assert_eq!(decode_reasoning_state("gAAAAA"), None);
+        assert_eq!(decode_reasoning_state("sglang-reasoning-v1.@@"), None);
+        // The engine's own encoding (Python zlib.compress + urlsafe_b64encode).
+        assert_eq!(
+            decode_reasoning_state("sglang-reasoning-v1.eJzLyAQAATsA0g==").as_deref(),
+            Some("hi")
+        );
+        assert_eq!(
+            encode_reasoning_state("why: 42 ✓"),
+            "sglang-reasoning-v1.eJwrz6i0UjAxUng0ZzIAF0wESg=="
+        );
+    }
+
+    #[test]
+    fn reasoning_item_honours_summary_and_encrypted_flags() {
+        let mut echo = to_chat(json!({"model": "m", "input": "x"}), false)
+            .unwrap()
+            .echo;
+        let plain = reasoning_item("rs_1", "t", "completed", &echo);
+        assert_eq!(plain["summary"], json!([]));
+        assert_eq!(plain["encrypted_content"], Value::Null);
+        echo.reasoning_summary = true;
+        echo.encrypted_reasoning = true;
+        let full = reasoning_item("rs_1", "t", "completed", &echo);
+        assert_eq!(
+            full["summary"],
+            json!([{"type": "summary_text", "text": "t"}])
+        );
+        assert_eq!(
+            decode_reasoning_state(full["encrypted_content"].as_str().unwrap()).as_deref(),
+            Some("t")
+        );
+    }
 
     #[test]
     fn usage_maps_and_defaults_details() {

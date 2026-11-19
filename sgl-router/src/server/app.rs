@@ -245,7 +245,7 @@ pub fn build_router_with_body_limit(ctx: Arc<AppContext>, max_body_bytes: usize)
         .route(
             "/v1/responses",
             post(crate::server::routes::responses::responses)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_body_bytes))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
