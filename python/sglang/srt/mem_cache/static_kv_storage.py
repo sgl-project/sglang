@@ -965,18 +965,6 @@ def _static_state_entries(
             )
         )
 
-    def append_dsa_tail(pool) -> None:
-        if not pool.kpool_use_compress:
-            return
-        tail_ptrs, tail_lens, tail_item_lens = pool.get_compress_tail_buf_infos()
-        if tail_ptrs:
-            add(
-                StateType.DSA_TAIL,
-                tail_ptrs,
-                tail_lens,
-                tail_item_lens,
-            )
-
     if isinstance(token_to_kv_pool, MHATokenToKVPoolMXFP8):
         add(
             StateType.BLOCK_SCALE,
@@ -1096,13 +1084,27 @@ def _static_state_entries(
             if getattr(token_to_kv_pool, "use_dsa", False):
                 dsa_pool = token_to_kv_pool.full_kv_pool
                 dsa_ptrs, dsa_lens, dsa_item_lens = dsa_pool.get_state_buf_infos()
-                add(
-                    StateType.DSA,
-                    dsa_ptrs,
-                    dsa_lens,
-                    dsa_item_lens,
+                tail_ptrs, tail_lens, tail_item_lens = (
+                    dsa_pool.get_compress_tail_buf_infos()
                 )
-                append_dsa_tail(dsa_pool)
+                # The draft's index cache and tail follow the target's in the
+                # same components, as in the plain DSA branch below.
+                if isinstance(draft_token_to_kv_pool, DSATokenToKVPool):
+                    draft_ptrs, draft_lens, draft_item_lens = (
+                        draft_token_to_kv_pool.get_state_buf_infos()
+                    )
+                    dsa_ptrs = list(dsa_ptrs) + list(draft_ptrs)
+                    dsa_lens = list(dsa_lens) + list(draft_lens)
+                    dsa_item_lens = list(dsa_item_lens) + list(draft_item_lens)
+                    draft_tail_ptrs, draft_tail_lens, draft_tail_item_lens = (
+                        draft_token_to_kv_pool.get_compress_tail_buf_infos()
+                    )
+                    tail_ptrs = list(tail_ptrs) + list(draft_tail_ptrs)
+                    tail_lens = list(tail_lens) + list(draft_tail_lens)
+                    tail_item_lens = list(tail_item_lens) + list(draft_tail_item_lens)
+                add(StateType.DSA, dsa_ptrs, dsa_lens, dsa_item_lens)
+                if tail_ptrs:
+                    add(StateType.DSA_TAIL, tail_ptrs, tail_lens, tail_item_lens)
             if isinstance(token_to_kv_pool, QSATokenToKVPool):
                 qsa_ptrs, qsa_lens, qsa_item_lens = (
                     token_to_kv_pool.get_qsa_pending_state_buf_infos()
