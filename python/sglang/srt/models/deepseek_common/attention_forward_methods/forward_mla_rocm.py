@@ -69,6 +69,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_gfx1250_supported,
     _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
+    _use_aiter_fused_mla_rope,
     _use_aiter_gfx95,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
@@ -153,6 +154,8 @@ if _use_aiter_gfx95:
         fused_flatten_mxfp4_quant,
         fused_rms_mxfp4_quant,
     )
+
+if _use_aiter_fused_mla_rope:
     from sglang.srt.layers.rocm_linear_utils import (
         fused_fp8_bmm_rope_cat_and_cache_mla,
         fused_qk_rope_cat_and_cache_mla,
@@ -472,7 +475,7 @@ def _fused_rope_cat_and_cache(
     positions: torch.Tensor,
     out_cache_loc: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """RoPE + concat + KV-cache write via the AITER fused kernel on gfx95 or gfx1250."""
+    """RoPE + concat + KV-cache write via the AITER fused kernel on gfx942, gfx95 or gfx1250."""
     kv_cache_dtype = (
         fp8_dtype if attn.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
     )
@@ -517,7 +520,9 @@ def _fused_rope_cat_and_cache(
     )
 
 
-def _can_fuse_bmm_rope_cat_and_cache(attn: DeepseekV2AttentionMLA) -> bool:
+def _can_fuse_bmm_rope_cat_and_cache(
+    attn: DeepseekV2AttentionMLA, *, is_capture_mode: bool
+) -> bool:
     """Whether one AITER kernel can do the q absorb, the RoPE and the KV write.
 
     Those are otherwise two launches -- ``rocm_absorb_q_bmm`` in prepare and
@@ -535,9 +540,8 @@ def _can_fuse_bmm_rope_cat_and_cache(attn: DeepseekV2AttentionMLA) -> bool:
     has not happened yet.
     """
     return (
-        _use_aiter_gfx95
+        _use_fp8_absorb_bmm(attn, is_capture_mode=is_capture_mode)
         and attn.dcp_size == 1
-        and attn.w_kc.dtype == torch.float8_e4m3fn
         and attn.rotary_emb is not None
         and attn._skip_rope_for_dsa_tilelang_fused()
         and attn.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
@@ -801,7 +805,9 @@ class DeepseekMLARocmForwardMixin:
             pre_qn is None
             and not q_replicate_active
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-            and _can_fuse_bmm_rope_cat_and_cache(self)
+            and _can_fuse_bmm_rope_cat_and_cache(
+                self, is_capture_mode=get_is_capture_mode()
+            )
         )
 
         if pre_qn is not None:
@@ -1309,11 +1315,11 @@ class DeepseekMLARocmForwardMixin:
 
     def _skip_rope_for_dsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
         """
-        Check if we should skip rope and use fused rope+cache path for TileLang/Triton DSA on gfx95.
+        Check if we should skip rope and use fused rope+cache path for TileLang/Triton DSA on gfx942/gfx95.
         """
         # The fused write targets the unsharded loc and its core path takes no LSE.
         return (
-            _use_aiter_gfx95
+            _use_aiter_fused_mla_rope
             and self.dcp_size == 1
             and self.current_attention_backend == "dsa"
             and (
