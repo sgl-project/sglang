@@ -20,13 +20,24 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse imp
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
     SubBlockSparseAttentionImpl,
+    SubBlockSparseSchedule,
 )
 
 
 @pytest.mark.parametrize(
-    "mode,layer", [("sage_fp8", 0), ("bf16", 0), ("sage_fp8", None)]
+    "mode,layer,quantize,dense_mode,expect_sage",
+    [
+        ("sage_fp8", 0, True, "auto", True),
+        ("sage_fp8", 0, False, "auto", False),
+        ("sage_fp8", 0, False, "sage_fp8", True),
+        ("sage_fp8", 0, True, "bf16", False),
+        ("bf16", 0, False, "auto", False),
+        ("sage_fp8", None, True, "auto", False),
+    ],
 )
-def test_sage_ssa_uses_dense_sage_for_dit_warmup(monkeypatch, mode, layer):
+def test_sage_ssa_dense_compute_selection(
+    monkeypatch, mode, layer, quantize, dense_mode, expect_sage
+):
     from sglang.multimodal_gen.runtime.layers.attention import selector
 
     selected = []
@@ -45,7 +56,11 @@ def test_sage_ssa_uses_dense_sage_for_dit_warmup(monkeypatch, mode, layer):
         ),
     )
     impl = SimpleNamespace(
-        schedule=SimpleNamespace(compute_mode=mode, quantize_before_a2a=True),
+        schedule=SimpleNamespace(
+            compute_mode=mode,
+            quantize_before_a2a=quantize,
+            dense_compute_mode=dense_mode,
+        ),
         layer_idx=layer,
         num_heads=8,
         head_size=128,
@@ -54,12 +69,97 @@ def test_sage_ssa_uses_dense_sage_for_dit_warmup(monkeypatch, mode, layer):
         softmax_scale=0.125,
     )
     result = SubBlockSparseAttentionImpl._build_dense_impl(impl, causal=False)
-    if mode == "sage_fp8" and layer is not None:
+    if expect_sage:
         assert isinstance(result, sage_attn.SageAttentionImpl)
-        assert result.quantize_before_a2a and result.packed_trailing_padding
+        assert result.quantize_before_a2a is quantize
+        assert result.packed_trailing_padding
         assert not selected
     else:
         assert result is fallback and len(selected) == 1
+
+
+@pytest.mark.parametrize("dense_mode", ["auto", "bf16", "sage_fp8"])
+def test_subblock_accepts_explicit_dense_compute_mode(monkeypatch, dense_mode):
+    from sglang.multimodal_gen.runtime import server_args
+
+    monkeypatch.setattr(
+        server_args,
+        "get_global_server_args",
+        lambda: SimpleNamespace(
+            attention_backend_config={
+                "compute_mode": "sage_fp8",
+                "dense_compute_mode": dense_mode,
+            }
+        ),
+    )
+    assert SubBlockSparseSchedule.from_server_args().dense_compute_mode == dense_mode
+
+
+def test_existing_sage_subblock_config_does_not_require_sageattention(monkeypatch):
+    from sglang.multimodal_gen.runtime import server_args
+    from sglang.multimodal_gen.runtime.layers.attention import selector
+
+    monkeypatch.setattr(
+        server_args,
+        "get_global_server_args",
+        lambda: SimpleNamespace(attention_backend_config={"compute_mode": "sage_fp8"}),
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (12, 0))
+
+    def missing_sage(*args, **kwargs):
+        raise ModuleNotFoundError("No module named 'sageattention'")
+
+    monkeypatch.setattr(sage_attn, "SageAttentionImpl", missing_sage)
+    fallback = object()
+    monkeypatch.setattr(
+        selector,
+        "get_attn_backend",
+        lambda *args, **kwargs: SimpleNamespace(
+            get_impl_cls=lambda: lambda **kwargs: fallback
+        ),
+    )
+    impl = SimpleNamespace(
+        schedule=SubBlockSparseSchedule.from_server_args(),
+        layer_idx=0,
+        num_heads=8,
+        head_size=128,
+        num_kv_heads=8,
+        prefix="blocks.0.attn",
+        softmax_scale=0.125,
+    )
+    assert not impl.schedule.quantize_before_a2a
+    assert impl.schedule.dense_compute_mode == "auto"
+    assert SubBlockSparseAttentionImpl._build_dense_impl(impl, causal=False) is fallback
+
+
+@pytest.mark.parametrize("dense_mode", ["invalid", True, None])
+def test_subblock_rejects_invalid_dense_compute_mode(monkeypatch, dense_mode):
+    from sglang.multimodal_gen.runtime import server_args
+
+    monkeypatch.setattr(
+        server_args,
+        "get_global_server_args",
+        lambda: SimpleNamespace(
+            attention_backend_config={"dense_compute_mode": dense_mode}
+        ),
+    )
+    with pytest.raises(ValueError, match="dense_compute_mode must"):
+        SubBlockSparseSchedule.from_server_args()
+
+
+def test_dense_sage_opt_in_requires_sage_subblock_mode(monkeypatch):
+    from sglang.multimodal_gen.runtime import server_args
+
+    monkeypatch.setattr(
+        server_args,
+        "get_global_server_args",
+        lambda: SimpleNamespace(
+            attention_backend_config={"dense_compute_mode": "sage_fp8"}
+        ),
+    )
+    with pytest.raises(ValueError, match="requires compute_mode='sage_fp8'"):
+        SubBlockSparseSchedule.from_server_args()
 
 
 @pytest.mark.parametrize("gate", ["step", "layer", "length"])
@@ -369,6 +469,7 @@ def test_h3_backend_binding_passes_the_dense_opt_in(monkeypatch, enabled):
         softmax_scale=0.125,
         prefix="blocks.0.attn",
         _cube_sparse_capable=True,
+        _quant_config=None,
     )
     model.MiniMaxH3Attention._set_attention_backend(
         attention, sage_attn.SageAttentionBackend

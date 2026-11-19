@@ -96,6 +96,7 @@ rejected.
 | `min_seq_len` | 4096 | shorter sequences run dense |
 | `compute_mode` | `"bf16"` | compute path: `"bf16"` or architecture-dispatched `"sage_fp8"` |
 | `quantize_before_a2a` | `false` | experimental H3 SM120 prepared Sage2 exchange over NCCL; requires `sage_fp8` and newer FlashInfer |
+| `dense_compute_mode` | `"auto"` | SM120 DiT dense steps: `"auto"` uses Sage only with prepared exchange, `"bf16"` keeps the existing dense backend, `"sage_fp8"` explicitly enables dense Sage after ordinary exchange too |
 
 `compute_mode="sage_fp8"` is the stable public name, not a promise that every
 architecture quantizes every operand identically. On SM90 it calls
@@ -285,19 +286,31 @@ a different quantization contract. Causal/dropout calls and unsupported
 geometry retain the existing path before prepared exchange. Dense Sage has
 no SubBlock routing-metadata limit. Both consumers share transport workspaces,
 geometry replacement and teardown. The dense CUDA/multi-GPU validation entry
-point below has not been run for this revision.
+point is listed below.
 
 Supported calls are inference on SM120, head dimension 128, Ulysses degree 4
 or 8, and one live packed H3 document followed by padding. Ring, training,
 graph capture, unsupported geometry and oversized routing metadata decline
-before prepared QKV exchange. On SM120, `compute_mode="sage_fp8"` uses dense
-SageAttention2 for DiT warmup steps, skipped DiT layers and short dense DiT
-calls. With `quantize_before_a2a=true`, these calls use the dense prepared
-consumer and subsequent sparse steps use SubBlock/CAKE over the same
-transport. Without prepared exchange they use the dense Sage backend after
-the ordinary BF16 QKV exchange. Non-DiT token-refiner calls keep their dense
-backend. Once collective preparation starts, failures propagate. The option
-does not change the existing `quality=high` admission rules.
+before prepared QKV exchange. On SM120, the default
+`dense_compute_mode="auto"` uses dense SageAttention2 for DiT warmup steps,
+skipped DiT layers and short calls only when `quantize_before_a2a=true`.
+Dense and sparse prepared consumers then share the same transport. Ordinary
+`compute_mode="sage_fp8"` without prepared exchange retains the previous
+dense fallback and works with FlashInfer alone; it does not require the
+optional `sageattention` package. Set `dense_compute_mode="bf16"` to keep
+that fallback even when prepared sparse exchange is enabled.
+
+To explicitly use dense Sage after the ordinary BF16 QKV exchange, install
+SageAttention for SM120 and configure:
+
+```bash
+--attention-backend-config '{"compute_mode":"sage_fp8","quantize_before_a2a":false,"dense_compute_mode":"sage_fp8"}'
+```
+
+`dense_compute_mode="sage_fp8"` requires `compute_mode="sage_fp8"` and opts
+into the optional SageAttention dependency. Non-DiT token-refiner calls keep
+their dense backend. Once collective preparation starts, failures propagate.
+The option does not change the existing `quality=high` admission rules.
 
 Before exchange, the transport clears disposable padded Q/K/V projection rows
 in place as required by the prepared API. Live rows and projection-view strides

@@ -219,7 +219,9 @@ class DecodeHiCacheTransferMixin:
         if pm.l3_storage_hit_length > 0:
             if not self.tree_cache.check_prefetch_progress(dr.req.cache_request_handle):
                 return False
-            self.tree_cache.pop_prefetch_loaded_tokens(dr.req.cache_request_handle)
+            dr.req.storage_hit_length, dr.req.storage_hit_start = (
+                self.tree_cache.pop_prefetch_loaded_span(dr.req.cache_request_handle)
+            )
 
         # The transfer suffix is already allocated: rematch only promised tokens,
         # without overwriting the request's preallocation state or lock receipt.
@@ -267,6 +269,9 @@ class DecodeHiCacheTransferMixin:
             return False
 
         # The load published its span: the restored path holds the whole prefix.
+        dr.req.host_loaded_length = max(
+            0, pm.decode_prefix_len - rematch.device_prefix_len
+        )
         dr.hicache_restored_kv_indices = self.tree_cache.path_device_indices(
             restored_node
         )[pm.l1_prefix_len : pm.decode_prefix_len]

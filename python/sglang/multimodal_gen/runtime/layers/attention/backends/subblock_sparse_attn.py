@@ -421,6 +421,7 @@ class SubBlockSparseSchedule(msgspec.Struct, frozen=True):
     min_seq_len: int
     compute_mode: str
     quantize_before_a2a: bool = False
+    dense_compute_mode: str = "auto"
 
     @classmethod
     def from_server_args(cls) -> SubBlockSparseSchedule:
@@ -428,6 +429,15 @@ class SubBlockSparseSchedule(msgspec.Struct, frozen=True):
 
         config = get_global_server_args().attention_backend_config or {}
         compute_mode = str(config.get("compute_mode", DEFAULT_COMPUTE_MODE))
+        dense_compute_mode = config.get("dense_compute_mode", "auto")
+        if dense_compute_mode not in ("auto", "bf16", "sage_fp8"):
+            raise ValueError(
+                "subblock dense_compute_mode must be 'auto', 'bf16' or 'sage_fp8'"
+            )
+        if dense_compute_mode == "sage_fp8" and compute_mode != "sage_fp8":
+            raise ValueError(
+                "subblock dense_compute_mode='sage_fp8' requires compute_mode='sage_fp8'"
+            )
         quantize_before_a2a = config.get("quantize_before_a2a", False)
         if type(quantize_before_a2a) is not bool:
             raise ValueError("subblock quantize_before_a2a must be a boolean")
@@ -452,6 +462,7 @@ class SubBlockSparseSchedule(msgspec.Struct, frozen=True):
             min_seq_len=int(config.get("min_seq_len", DEFAULT_MIN_SEQ_LEN)),
             compute_mode=compute_mode,
             quantize_before_a2a=quantize_before_a2a,
+            dense_compute_mode=dense_compute_mode,
         )
         if not 0.0 <= schedule.sparsity < 1.0:
             raise ValueError(
@@ -534,9 +545,19 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
             )
 
     def _build_dense_impl(self, *, causal: bool) -> AttentionImpl:
-        """Use dense Sage for SM120 Sage DiT steps excluded from sparsity."""
+        """Keep the existing fallback unless SM120 dense Sage is opted into.
+
+        Prepared Sage enables dense Sage by default. Ordinary Sage SubBlock
+        remains usable with FlashInfer alone; dense Sage after BF16 exchange
+        requires an explicit dense_compute_mode='sage_fp8'.
+        """
+        dense_sage = self.schedule.dense_compute_mode == "sage_fp8" or (
+            self.schedule.dense_compute_mode == "auto"
+            and self.schedule.quantize_before_a2a
+        )
         if (
             self.schedule.compute_mode == "sage_fp8"
+            and dense_sage
             and self.layer_idx is not None
             and torch.cuda.is_available()
             and torch.cuda.get_device_capability() == (12, 0)

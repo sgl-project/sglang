@@ -173,6 +173,30 @@ class BeamUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 # real-shape GEMMs. Other GPUs and TP sizes are unmeasured.
 _FLASHINFER_AR_TOKEN_BAND = {((10, 3), 4): (96, 640)}
 
+# Most rows a fused TP boundary stages (`_all_reduce_limits` caps every arch at 64).
+_BEAM_AR_MAX_TOKENS = 64
+
+
+def _request_beam_workspace(hidden_size: int):
+    """Declare the push slots of the fused TP boundaries on the TP group's workspace."""
+    if not _is_cuda or hidden_size != 5120 or not torch.cuda.is_available():
+        return None
+    if get_parallel().tp_size not in (2, 4, 8):
+        return None
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        WorkspaceRequest,
+        request_group_workspace,
+    )
+
+    return request_group_workspace(
+        get_parallel().tp_group,
+        WorkspaceRequest(
+            owner="beam_all_reduce_norm",
+            push_slot_bytes=_BEAM_AR_MAX_TOKENS * hidden_size * 2,
+        ),
+    )
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -949,7 +973,7 @@ class BeamModel(nn.Module):
             and config.num_experts_per_tok == 8
             and not (get_lora().enable_lora or get_lora().lora_paths)
         )
-        self._beam_all_reduce_comm = None
+        self._beam_all_reduce_lease = _request_beam_workspace(config.hidden_size)
         # Offload wrappers load weights through each layer's regular forward.
         # Fusing across layer boundaries would bypass those wrappers.
         # A custom PP partition can leave a stage with no layer to fuse from.
@@ -1059,7 +1083,7 @@ class BeamModel(nn.Module):
             or not hidden_states.is_contiguous()
             or hidden_states.data_ptr() % 16 != 0
             or hidden_states.shape[1] != 5120
-            or not 0 < hidden_states.shape[0] <= 64
+            or not 0 < hidden_states.shape[0] <= _BEAM_AR_MAX_TOKENS
         ):
             return None
         # Attention owns a TP reduction independently of the expert layout.
@@ -1099,46 +1123,16 @@ class BeamModel(nn.Module):
             return None
         return attention_max_tokens, topk_max_tokens
 
-    def _prepare_all_reduce_comm(self, hidden_states, max_tokens: int):
-        """Reuse or initialize the shared push workspace during eager warmup.
-
-        The caller supplies the capacity selected by `_all_reduce_limits`.
-        Capture may reuse an initialized communicator, but never allocates one.
-        """
-        from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-            CustomAllReduceV2,
-        )
-
-        comm = get_parallel().tp_group.ca_comm
-        if not isinstance(comm, CustomAllReduceV2) or comm.disabled:
-            return None
-        if self._beam_all_reduce_comm is None:
-            # Initialize once in eager warmup, before any CUDA graph capture.
-            # Hopper's native push plane is tuned for much smaller messages.
-            # Share one bounded plane across all attention and MoE boundaries.
-            if torch.cuda.is_current_stream_capturing():
-                return None
-            required_bytes = max_tokens * hidden_states.shape[1] * 2
-            if not comm.supports_push(nbytes=required_bytes, num_blocks=max_tokens):
-                from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
-
-                comm = CustomAllReduceV2(
-                    comm.group,
-                    comm.device,
-                    max_pull_size=0,
-                    max_pull_blocks=0,
-                    max_push_size=required_bytes,
-                    max_push_blocks=max_tokens,
-                )
-                register_comm_cleanup(comm)
-            self._beam_all_reduce_comm = comm
-        comm = self._beam_all_reduce_comm
-        if not comm.supports_push(
-            nbytes=hidden_states.numel() * hidden_states.element_size(),
-            num_blocks=hidden_states.shape[0],
+    def _prepare_all_reduce_comm(self, hidden_states):
+        """The fused boundaries' planes, when one push slot can stage this batch."""
+        lease = self._beam_all_reduce_lease
+        if (
+            lease is None
+            or hidden_states.numel() * hidden_states.element_size()
+            > lease.request.push_slot_bytes
         ):
             return None
-        return comm.obj
+        return lease.get_communicator()
 
     def forward(
         self,
@@ -1189,7 +1183,7 @@ class BeamModel(nn.Module):
         limits = self._all_reduce_limits(hidden_states)
         if limits is not None:
             attention_max_tokens, topk_max_tokens = limits
-            comm = self._prepare_all_reduce_comm(hidden_states, max(limits))
+            comm = self._prepare_all_reduce_comm(hidden_states)
             if hidden_states.shape[0] <= topk_max_tokens:
                 mlp_beam_ar_topk_comm = comm
             if hidden_states.shape[0] <= attention_max_tokens:
