@@ -203,7 +203,6 @@ def read_video_fps(path: str) -> float | None:
 def control_frames_used(
     decoded_frames: int, *, requested_frames: int, manifest: CosmosDreamsManifest
 ) -> int:
-    """Frames of a ``decoded_frames``-long control clip the rollout consumes."""
     return align_pixel_frames_to_chunks(
         min(decoded_frames, requested_frames),
         temporal_compression_factor=manifest.temporal_compression_factor,
@@ -305,8 +304,6 @@ def direct_resize_control(
         raise ValueError(
             f"Control frames must have shape [3, T, H, W], got {tuple(frames.shape)}."
         )
-    # A decoded clip arrives as a view of channels-last frames; the resize kernel
-    # is chosen by layout, so it gets the channels-first one it was matched on.
     frames = frames.contiguous()
     pixels = frames.permute(1, 0, 2, 3)
     size = [int(height), int(width)]
@@ -331,9 +328,7 @@ def direct_resize_control(
 def control_fit(
     batch: Req, source_hw: tuple[int, int]
 ) -> Callable[[torch.Tensor], torch.Tensor] | None:
-    """How ``uint8 [3, T, H, W]`` control frames get onto the request's canvas;
-    None when the direct resize finds them on it already. Every recipe treats
-    each frame alone, so a clip can be fitted in pieces."""
+    """Every recipe fits each frame alone, so a clip can be fitted in pieces."""
     height, width = int(batch.height), int(batch.width)
     if batch.extra[EXTRA_CONTROL_RESIZE_MODE] != TRANSFER_RESIZE_DIRECT:
         return partial(resize_center_crop_uint8, height=height, width=width)
@@ -410,11 +405,7 @@ def normalize_control_pixels(
 
 
 def upload_control_frames(frames: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """``uint8 [3, T, H, W]`` control frames on ``device``, contiguous.
-
-    A decoded clip is a view of channels-last host frames: those move as they
-    are, in one copy, and the transpose runs on the device.
-    """
+    """Channels-last host frames move in one copy and are reordered on the device."""
     channels_last = frames.permute(1, 2, 3, 0)
     if frames.is_contiguous() or not channels_last.is_contiguous():
         return frames.to(device=device).contiguous()
@@ -460,13 +451,7 @@ def encode_decoding_control_latent(
     device: torch.device,
     float32_normalization: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """:func:`encode_control_latent` of a clip that is still decoding.
-
-    The VAE encodes a clip causally, one group of frames at a time, so each
-    group is fitted, uploaded and encoded once its frames are final while the
-    later ones decode. Returns the latent and the fitted ``[3, T, H, W]`` frames
-    it covers: every whole group of the clip.
-    """
+    """Latent and fitted frames of each whole causal group, a trailing partial one left out."""
     vae_dtype = next(vae.parameters()).dtype
     encoded_frames = 0
     fitted: list[torch.Tensor] = []
@@ -504,8 +489,6 @@ def record_transfer_plan(
     frames: torch.Tensor,
     source: str,
 ) -> None:
-    """Record the fitted ``uint8 [3, T, H, W]`` control clip and the chunk
-    partition of the rollout that follows it."""
     total_frames = int(frames.shape[1])
     target_frame = latent_frame_count(
         total_frames, manifest.temporal_compression_factor
@@ -574,8 +557,6 @@ class CosmosDreamsControlVideoStage(PipelineStage):
     def _start_control(
         self, batch: Req
     ) -> tuple[torch.Tensor | ControlClipDecode, str, float, str]:
-        """Return ``(clip, hint, fps, source)``: the clip of a request is still
-        decoding, warmup requests get a synthetic one."""
         manifest = self.manifest
         sampling_params = batch.sampling_params
         if batch.is_warmup:
@@ -609,7 +590,6 @@ class CosmosDreamsControlVideoStage(PipelineStage):
     def _resolve_canvas(
         self, batch: Req, *, hint: str, source_hw: tuple[int, int]
     ) -> None:
-        """Snap the canvas unless the request fixed it, and settle the resize recipe."""
         direct = self.resize_mode == TRANSFER_RESIZE_DIRECT and not batch.is_warmup
         batch.extra[EXTRA_CONTROL_RESIZE_MODE] = (
             TRANSFER_RESIZE_DIRECT if direct else TRANSFER_RESIZE_CENTER_CROP
@@ -745,8 +725,6 @@ class CosmosDreamsTransferPrepareStage(PipelineStage):
         )
 
     def _encode_control(self, batch: Req, device: torch.device) -> torch.Tensor:
-        """VAE-encode the control clip. One that is still decoding is fitted here
-        and its plan recorded; it is encoded as its frames arrive where it can be."""
         float32_normalization = (
             batch.extra[EXTRA_CONTROL_RESIZE_MODE] == TRANSFER_RESIZE_DIRECT
         )
@@ -761,9 +739,7 @@ class CosmosDreamsTransferPrepareStage(PipelineStage):
         latent = None
         try:
             fit = control_fit(batch, decode.source_hw)
-            # With one latent frame per chunk the rollout uses every whole VAE
-            # group of the clip; a longer chunk trims groups only the finished
-            # clip can count.
+            # One-frame chunks use every whole VAE group, longer ones trim at the clip end.
             if self.manifest.chunk_size == 1 and streams_control_encode(self.vae):
                 latent, frames = encode_decoding_control_latent(
                     self.vae,

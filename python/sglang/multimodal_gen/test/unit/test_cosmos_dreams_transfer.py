@@ -382,8 +382,6 @@ class TestTransferFramesAndHistory(unittest.TestCase):
 
     @_fails_if_hung
     def test_control_frames_stay_readable_while_the_clip_decodes_and_grows(self):
-        """A reader gets a frame as soon as it is final, well before the clip
-        ends, and the frames it holds survive the buffer growing behind them."""
         clip = torch.randint(0, 256, (9, 4, 6, 3), dtype=torch.uint8)
         released = threading.Semaphore(0)
 
@@ -429,9 +427,6 @@ class TestTransferFramesAndHistory(unittest.TestCase):
 
     @_fails_if_hung
     def test_encode_of_a_decoding_clip_matches_the_finished_clip(self):
-        """Encoding a clip group by group as it decodes gives the latent of the
-        finished clip, covers exactly the frames the rollout uses, and fitting
-        the groups one at a time gives the clip fitted whole."""
         torch.manual_seed(0)
         vae = AutoencoderKLWan(
             WanVAEConfig(
@@ -826,8 +821,6 @@ class TestTransferDirectResize(unittest.TestCase):
             )
 
     def test_only_a_composed_display_keeps_the_mp4_until_after_the_decode(self):
-        """The rollout's frames are the output, so the MP4 is encoded while they
-        decode unless the request shows the control or restores its size."""
         stage = CosmosDreamsTransferDecodingStage.__new__(
             CosmosDreamsTransferDecodingStage
         )
