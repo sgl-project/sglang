@@ -75,6 +75,7 @@ from sglang.srt.layers.moe.utils import (
     get_num_fused_shared_experts,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.minimax_m3_nvfp4 import MiniMaxM3Nvfp4Config
 from sglang.srt.layers.quantization.mxfp8_input import (
     Mxfp8SwizzledInput,
     accepts_mxfp8_deepgemm_input,
@@ -511,6 +512,15 @@ class MiniMaxM3MoE(nn.Module):
         if get_moe_a2a_backend().is_deepep():
             self.top_k = config.num_experts_per_tok
 
+        # Under graph capture, quantize the routed input on the main stream while
+        # the router runs on the alt stream.
+        self.router_quant_overlap = (
+            isinstance(quant_config, MiniMaxM3Nvfp4Config)
+            and get_platform().is_blackwell
+            and get_moe_a2a_backend().is_none()
+            and get_moe_runner_backend().is_flashinfer_trtllm_routed()
+        )
+
         # The finalize kernels never rescale: the routed scaling factor is already
         # in the top-k weights (apply_routed_scaling_factor_on_output).
         self.supports_deferred_finalize = (
@@ -629,10 +639,21 @@ class MiniMaxM3MoE(nn.Module):
             ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
+                pre_quant = quant_done = None
+                if self.router_quant_overlap:
+                    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                        quantize_nvfp4_per_token_input,
+                    )
+
+                    pre_quant = quantize_nvfp4_per_token_input(hidden_states)
+                    quant_done = current_stream.record_event()
                 shared_output = self._forward_shared_experts(hidden_states)
                 with torch.cuda.stream(self.alt_stream):
                     final_hidden_states = self._forward_router_experts(
-                        hidden_states, defer_finalize=defer_finalize
+                        hidden_states,
+                        defer_finalize=defer_finalize,
+                        pre_quant=pre_quant,
+                        pre_quant_done=quant_done,
                     )
                 current_stream.wait_stream(self.alt_stream)
             else:
@@ -659,13 +680,22 @@ class MiniMaxM3MoE(nn.Module):
         return final_hidden_states
 
     def _forward_router_experts(
-        self, hidden_states: torch.Tensor, *, defer_finalize: bool = False
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        defer_finalize: bool = False,
+        pre_quant: Optional[Tuple] = None,
+        pre_quant_done: Optional[torch.cuda.Event] = None,
     ):
         router_logits = self._compute_router_logits(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
+        if pre_quant_done is not None:
+            torch.cuda.current_stream().wait_event(pre_quant_done)
         if defer_finalize:
-            return self.experts.forward_deferred_finalize(hidden_states, topk_output)
-        return self.experts(hidden_states, topk_output)
+            return self.experts.forward_deferred_finalize(
+                hidden_states, topk_output, pre_quant_input=pre_quant
+            )
+        return self.experts(hidden_states, topk_output, pre_quant_input=pre_quant)
 
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
