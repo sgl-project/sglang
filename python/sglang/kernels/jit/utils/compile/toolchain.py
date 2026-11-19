@@ -189,7 +189,8 @@ def target_flags(kernel_name: str = "") -> List[str]:
                 f"Invalid SGLANG_SAIL_GPU_ARCH={arch!r}; expected one of "
                 f"{', '.join(_SAIL_GPU_ARCHS)}"
             )
-        return [f"-arch={arch}"]
+        # Older hgcc accepts explicit architectures, but rejects -arch=native.
+        return [] if arch == "native" else [f"-arch={arch}"]
     if is_hip_runtime():
         return [f"--offload-arch={gpu_arch_name()}"]
     arch = get_compile_arch(kernel_name)
