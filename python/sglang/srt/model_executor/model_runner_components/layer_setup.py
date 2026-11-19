@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
 import msgspec
@@ -130,6 +131,8 @@ class ModelLayerInfo(msgspec.Struct, frozen=True, kw_only=True):
     start_layer: int
     end_layer: int
     num_effective_layers: int
+    # Explicit model ownership; None keeps the PP range or draft-depth semantics.
+    layer_ids: tuple[int, ...] | None = None
     # Global ids of the layers this runner owns; None when the model has no split.
     swa_attention_layer_ids: Optional[list[int]] = None
     full_attention_layer_ids: Optional[list[int]] = None
@@ -151,22 +154,33 @@ def resolve_layer_indices(
         model=model, model_config=model_config, is_draft_worker=is_draft_worker
     )
     pp_range = _resolve_pp_layer_range(model=model, model_num_layers=model_num_layers)
-    num_effective_layers = pp_range.end_layer - pp_range.start_layer
+    draft_owns_its_depth = (
+        is_draft_worker
+        and draft_model_idx is not None
+        and getattr(model, "mtp_layer_id_is_depth", False)
+    )
+    layer_ids = None if draft_owns_its_depth else getattr(model, "layer_ids", None)
+    if layer_ids is not None:
+        layer_ids = tuple(layer_ids)
+    num_effective_layers = (
+        len(layer_ids)
+        if layer_ids is not None
+        else pp_range.end_layer - pp_range.start_layer
+    )
 
     # For LoopCoder models, each loop has its own layer_id, so we need to multiply by loop_num
     loop_num = _get_loop_num(model_config.hf_config)
     if loop_num > 1:
         num_effective_layers = num_effective_layers * loop_num
 
-    draft_owns_its_depth = (
-        is_draft_worker
-        and draft_model_idx is not None
-        and getattr(model, "mtp_layer_id_is_depth", False)
-    )
     owned_layers = (
         range(draft_model_idx, draft_model_idx + 1)
         if draft_owns_its_depth
-        else range(pp_range.start_layer, pp_range.end_layer)
+        else (
+            layer_ids
+            if layer_ids is not None
+            else range(pp_range.start_layer, pp_range.end_layer)
+        )
     )
     swa_attention_layer_ids, full_attention_layer_ids = (
         _resolve_local_hybrid_swa_layer_ids(
@@ -178,6 +192,7 @@ def resolve_layer_indices(
         start_layer=pp_range.start_layer,
         end_layer=pp_range.end_layer,
         num_effective_layers=num_effective_layers,
+        layer_ids=layer_ids,
         swa_attention_layer_ids=swa_attention_layer_ids,
         full_attention_layer_ids=full_attention_layer_ids,
         draft_owns_its_depth=draft_owns_its_depth,
@@ -210,7 +225,7 @@ def check_layer_types_hybrid_swa_split(*, model: nn.Module, model_config: ModelC
 def _resolve_local_hybrid_swa_layer_ids(
     *,
     model_config: ModelConfig,
-    owned_layers: range,
+    owned_layers: Sequence[int],
 ) -> tuple[Optional[list[int]], Optional[list[int]]]:
     if model_config.swa_attention_layer_ids is None:
         return None, None

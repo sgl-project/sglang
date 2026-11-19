@@ -88,6 +88,7 @@ class TestResolveHybridSWALayerIds(CustomTestCase):
                         model_config=_hybrid_swa_model_config(),
                         is_draft_worker=False,
                     )
+                    self.assertEqual(layer_info.num_effective_layers, end - start)
                     self.assertEqual(
                         sorted(
                             layer_info.full_attention_layer_ids
@@ -100,6 +101,50 @@ class TestResolveHybridSWALayerIds(CustomTestCase):
 
                 self.assertEqual(full_ids, GLOBAL_FULL_IDS)
                 self.assertEqual(swa_ids, GLOBAL_SWA_IDS)
+
+    def test_explicit_ownership_excludes_gaps_from_counts_and_hybrid_pools(self):
+        """Nonlocal layers inside a rank's span must not consume local KV memory."""
+        for layer_ids, swa, full in (
+            ((0, 1, 6, 7), [0, 6], [1, 7]),
+            ((2, 3, 8, 9), [2, 8], [3, 9]),
+            ((), [], []),
+        ):
+            for loop_num in (1, 3):
+                for hybrid in (False, True):
+                    with self.subTest(
+                        layer_ids=layer_ids, loop_num=loop_num, hybrid=hybrid
+                    ):
+                        model_config = _hybrid_swa_model_config()
+                        model_config.hf_config.loop_num = loop_num
+                        if not hybrid:
+                            model_config.swa_attention_layer_ids = None
+                        layer_info = resolve_layer_indices(
+                            model=SimpleNamespace(
+                                start_layer=0, end_layer=10, layer_ids=list(layer_ids)
+                            ),
+                            model_config=model_config,
+                            is_draft_worker=False,
+                        )
+                        self.assertEqual(layer_info.layer_ids, layer_ids)
+                        self.assertEqual(
+                            layer_info.num_effective_layers,
+                            len(layer_ids) * loop_num,
+                        )
+                        self.assertEqual(
+                            layer_info.swa_attention_layer_ids,
+                            swa if hybrid else None,
+                        )
+                        self.assertEqual(
+                            layer_info.full_attention_layer_ids,
+                            full if hybrid else None,
+                        )
+                        self.assertEqual(
+                            model_config.full_attention_layer_ids, GLOBAL_FULL_IDS
+                        )
+                        if hybrid:
+                            self.assertEqual(
+                                model_config.swa_attention_layer_ids, GLOBAL_SWA_IDS
+                            )
 
     def test_model_config_is_shared_and_never_modified(self):
         """Resolving one runner's view must not change the shared ModelConfig."""
@@ -125,12 +170,14 @@ class TestResolveHybridSWALayerIds(CustomTestCase):
         for depth, swa, full in ((0, [0], []), (1, [], [1]), (2, [2], [])):
             with self.subTest(depth=depth):
                 layer_info = resolve_layer_indices(
-                    model=SimpleNamespace(mtp_layer_id_is_depth=True),
+                    model=SimpleNamespace(mtp_layer_id_is_depth=True, layer_ids=(0, 2)),
                     model_config=model_config,
                     is_draft_worker=True,
                     draft_model_idx=depth,
                 )
                 self.assertTrue(layer_info.draft_owns_its_depth)
+                self.assertEqual(layer_info.num_effective_layers, 1)
+                self.assertIsNone(layer_info.layer_ids)
                 self.assertEqual(layer_info.swa_attention_layer_ids, swa)
                 self.assertEqual(layer_info.full_attention_layer_ids, full)
 
