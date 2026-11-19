@@ -283,6 +283,10 @@ class ExecKernel(msgspec.Struct):
         bool,
         "Enable the AMD monokernels from the sgl-amd-mono package. Supported decode and verify steps use persistent kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
     ] = False
+    enable_t_head_monokernel: A[
+        bool,
+        "Enable the PPU (T-Head SAIL) monokernels from the sgl-t-head-mega package. Supported decode and verify steps use persistent kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
+    ] = False
     prefill_attention_backend: A[
         Optional[str],
         Arg(
