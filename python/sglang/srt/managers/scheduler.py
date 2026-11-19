@@ -3595,7 +3595,7 @@ class Scheduler(
             )
             return
 
-        if req.captures_sampling_support:
+        if req.captures_sampling and req.return_sampling_mask:
             top_k = req.sampling_params.top_k
             sampling_mask_cap = self.server_args.sampling_mask_max_tokens
             if top_k != 1 and not (1 < top_k <= sampling_mask_cap):

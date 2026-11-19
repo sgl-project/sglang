@@ -356,7 +356,6 @@ class Sampler(nn.Module):
                     batch_next_token_ids,
                     sampling_mask_capture,
                     sampling_support_logprobs_capture_indices,
-                    return_support=any(sampling_info.captures_sampling_support),
                 )
 
         _trace_e2e_sampler("forward_returned")
@@ -546,9 +545,10 @@ class Sampler(nn.Module):
         batch_next_token_ids: torch.Tensor,
         sampling_mask_capture: _SamplingMaskCapture,
         support_capture_indices: Optional[torch.Tensor],
-        return_support: bool = True,
     ) -> SamplingMaskOutput:
         """Pack captured positive support into the fixed-cap device result."""
+        # None exactly when no captured row returns its support.
+        return_support = support_capture_indices is not None
         batch_indices = sampling_mask_capture.batch_rows
         weights = sampling_mask_capture.weights
         token_ids = sampling_mask_capture.token_ids

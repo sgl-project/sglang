@@ -696,7 +696,6 @@ class Req(ReqDllmMixin):
         self.captures_sampling = filters_sampling and (
             return_sampling_logprobs or return_sampling_mask
         )
-        self.captures_sampling_support = filters_sampling and return_sampling_mask
         self.return_flat_raw_top_logprobs = return_flat_raw_top_logprobs
 
         # Logprobs (return values)

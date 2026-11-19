@@ -35,7 +35,7 @@ def _req(**sampling_params):
         tokenizer=SimpleNamespace(eos_token_id=None, additional_stop_token_ids=None),
         custom_logit_processor=None,
         captures_sampling=False,
-        captures_sampling_support=False,
+        return_sampling_mask=False,
     )
 
 

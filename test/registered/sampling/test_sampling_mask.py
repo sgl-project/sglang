@@ -129,7 +129,7 @@ class TestSamplingMaskCapture(CustomTestCase):
             [
                 SimpleNamespace(
                     captures_sampling=i in requested_rows,
-                    captures_sampling_support=i in requested_rows,
+                    return_sampling_mask=i in requested_rows,
                 )
                 for i in range(len(sampled))
             ],
@@ -221,7 +221,7 @@ class TestSamplingMaskCapture(CustomTestCase):
                         )
                     },
                     captures_sampling=[True, True],
-                    captures_sampling_support=[True, True],
+                    return_sampling_masks=[True, True],
                     sampling_mask_batch_indices=torch.tensor([0, 1], device="cuda"),
                 )
                 logits = self.sampler._preprocess_logits(logits, info)
@@ -767,7 +767,7 @@ class TestSamplingMaskPacking(CustomTestCase):
         self.assertEqual(output.sampling_mask_output.token_ids.device.type, "cpu")
         SchedulerBatchResultProcessor.materialize_sampling_mask_output(
             [
-                SimpleNamespace(captures_sampling=flag, captures_sampling_support=flag)
+                SimpleNamespace(captures_sampling=flag, return_sampling_mask=flag)
                 for flag in (True, False, True)
             ],
             output,
@@ -811,7 +811,7 @@ class TestSamplingMaskPacking(CustomTestCase):
         )
         SchedulerBatchResultProcessor.materialize_sampling_mask_output(
             [
-                SimpleNamespace(captures_sampling=True, captures_sampling_support=x)
+                SimpleNamespace(captures_sampling=True, return_sampling_mask=x)
                 for x in (True, False)
             ],
             output,

@@ -154,7 +154,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
         )
         SchedulerBatchResultProcessor.materialize_sampling_mask_output(
             reqs=[
-                SimpleNamespace(captures_sampling=True, captures_sampling_support=x)
+                SimpleNamespace(captures_sampling=True, return_sampling_mask=x)
                 for x in (False, True)
             ],
             output=output,
@@ -185,9 +185,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
             ),
         )
         SchedulerBatchResultProcessor.materialize_sampling_mask_output(
-            reqs=[
-                SimpleNamespace(captures_sampling=True, captures_sampling_support=False)
-            ],
+            reqs=[SimpleNamespace(captures_sampling=True, return_sampling_mask=False)],
             output=output,
         )
         self.assertEqual(output.next_token_sampling_logprobs, [-0.5])
@@ -210,7 +208,8 @@ class TestSamplingMaskMaterialization(CustomTestCase):
         )
         SchedulerBatchResultProcessor.materialize_sampling_mask_output(
             reqs=[
-                SimpleNamespace(captures_sampling=x, captures_sampling_support=x)
+                # The middle request returns the mask without being captured.
+                SimpleNamespace(captures_sampling=x, return_sampling_mask=True)
                 for x in (True, False, True)
             ],
             output=output,

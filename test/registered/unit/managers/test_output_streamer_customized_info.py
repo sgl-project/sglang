@@ -1056,7 +1056,7 @@ class TestOutputStreamerSamplingMasks(unittest.TestCase):
                 for i, support in enumerate(captures_support):
                     rows = None if support is None else SamplingMaskRows()
                     req = _FakeReq(f"r{i}", array("q"), sampling_mask_rows=rows)
-                    req.captures_sampling_support = bool(support)
+                    req.return_sampling_mask = bool(support)
                     reqs.append(req)
                 expected = [([], [], []) for _ in captures_support]
                 received = [([], [], []) for _ in captures_support]

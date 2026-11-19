@@ -1422,7 +1422,7 @@ class SchedulerBatchResultProcessor:
         empty_support_logprobs = np.empty(0, dtype=np.float32)
         support_row = 0
         for row, batch_index in enumerate(batch_indices):
-            captures_support = reqs[batch_index].captures_sampling_support
+            captures_support = reqs[batch_index].return_sampling_mask
             num_tokens = num_accept_tokens[row]
             status = max(statuses[row][:num_tokens])
             status_by_batch[batch_index] = status
@@ -1497,7 +1497,7 @@ class SchedulerBatchResultProcessor:
             empty_support_logprobs = np.empty(0, dtype=np.float32)
             support_row = 0
             for row, batch_index in enumerate(batch_indices):
-                captures_support = reqs[batch_index].captures_sampling_support
+                captures_support = reqs[batch_index].return_sampling_mask
                 status = int(statuses[row])
                 if not captures_support and status == SamplingMaskStatus.OVERFLOW:
                     # Without the support there is nothing to overflow.

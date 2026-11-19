@@ -12,6 +12,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
@@ -30,7 +31,13 @@ from sglang.srt.speculative.spec_sampling_mask import (
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-def _handle_pd_request(mode, req):
+class _PastSamplingChecks(Exception):
+    """Admission reached its first step after the sampling-output checks."""
+
+
+def _handle_request(mode, req):
+    """Run admission on `req`: the abort mock, the queue mock, and whether the
+    request got past the sampling-output checks."""
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.enable_session_radix_cache = False
     scheduler.model_config = SimpleNamespace(hf_eos_token_id={1}, vocab_size=128)
@@ -44,7 +51,10 @@ def _handle_pd_request(mode, req):
     scheduler.spec_algorithm = SimpleNamespace(
         is_dflash_family=lambda: False,
         is_uno=lambda: False,
+        is_none=lambda: True,
     )
+    scheduler.server_args = SimpleNamespace(sampling_mask_max_tokens=64)
+    scheduler.init_req_max_new_tokens = MagicMock(side_effect=_PastSamplingChecks)
     scheduler._add_request_to_queue = MagicMock()
     scheduler.output_streamer = MagicMock()
     scheduler.tree_cache = MagicMock()
@@ -57,21 +67,29 @@ def _handle_pd_request(mode, req):
         session_params=None,
         session_id=None,
         input_embeds=None,
+        mm_inputs=None,
         bootstrap_port=1,
         bootstrap_room=9,
     )
-    req.exit_via = req.send_via = req.kv.retraction_backup = None
-    req.kv.holds_kv = req.kv.holds_mamba = False
+    if isinstance(req, MagicMock):
+        req.exit_via = req.send_via = req.kv.retraction_backup = None
+        req.kv.holds_kv = req.kv.holds_mamba = False
+    passed = False
     with (
         patch(
             "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
             return_value=1,
         ),
         patch("sglang.srt.managers.scheduler.Req", return_value=req),
-        patch("sglang.srt.managers.scheduler.prepare_abort") as abort,
+        patch(
+            "sglang.srt.managers.scheduler.prepare_abort", wraps=prepare_abort
+        ) as abort,
     ):
-        scheduler.handle_generate_request(recv_req)
-    return abort, scheduler._add_request_to_queue
+        try:
+            scheduler.handle_generate_request(recv_req)
+        except _PastSamplingChecks:
+            passed = True
+    return abort, scheduler._add_request_to_queue, passed
 
 
 def _spec_algorithm(name):
@@ -113,7 +131,6 @@ class TestSamplingCapture(CustomTestCase):
                     req = _sampling_req(sampling_params, logprobs=logprobs, mask=mask)
                     captured = filtered and (logprobs or mask)
                     self.assertEqual(req.captures_sampling, captured)
-                    self.assertEqual(req.captures_sampling_support, filtered and mask)
                     self.assertEqual(req.sampling_mask_rows is not None, captured)
 
     def test_speculative_decoding_admits_what_stays_exact(self):
@@ -211,7 +228,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
         """Neither PD role may queue mask requests without metadata buffers."""
         for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
             with self.subTest(mode=mode):
-                abort, add_to_queue = _handle_pd_request(
+                abort, add_to_queue, _ = _handle_request(
                     mode, MagicMock(captures_sampling=True, return_logprob=False)
                 )
                 abort.assert_called_once()
@@ -234,7 +251,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 ):
                     req = MagicMock(captures_sampling=True, return_logprob=True)
                     req.logprob.top_logprobs_num = top_logprobs_num
-                    abort, add_to_queue = _handle_pd_request(mode, req)
+                    abort, add_to_queue, _ = _handle_request(mode, req)
                     abort.assert_called_once()
                     self.assertIn(
                         (
@@ -248,6 +265,27 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                         abort.call_args.kwargs["status_code"], HTTPStatus.BAD_REQUEST
                     )
                     add_to_queue.assert_not_called()
+
+    def test_top_k_cap_applies_to_captured_mask_requests_only(self):
+        """The cap bounds the captured support. An unfiltered mask request is not
+        captured and returns empty rows, so its whole-vocabulary top_k must pass;
+        so must a filtered logprobs-only request, which captures no support."""
+        for sampling_params, flags, rejected in (
+            ({}, {"mask": True}, False),
+            ({"top_k": 20}, {"mask": True}, False),
+            ({"top_p": 0.9}, {"logprobs": True}, False),
+            ({"top_p": 0.9}, {"mask": True}, True),
+            ({"top_k": 65}, {"mask": True}, True),
+        ):
+            with self.subTest(params=sampling_params, flags=flags):
+                abort, _, passed = _handle_request(
+                    DisaggregationMode.NULL, _sampling_req(sampling_params, **flags)
+                )
+                self.assertEqual(passed, not rejected)
+                if rejected:
+                    self.assertIn("return_sampling_mask", abort.call_args.args[1])
+                else:
+                    abort.assert_not_called()
 
     def test_rejected_streaming_turn_leaves_session_idle(self):
         """A turn rejected after `create_req` must not wedge its streaming session."""
