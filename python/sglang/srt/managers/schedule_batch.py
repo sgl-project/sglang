@@ -631,6 +631,8 @@ class Req(ReqDllmMixin):
         # time and used to estimate uncached tokens / sort by longest prefix for
         # load reporting.
         self.num_matched_prefix_tokens = 0
+        # gamma-Ada step clock when a sort pass first saw it (tp or pp > 1); kept on retraction.
+        self.uniboost_first_seen_step: Optional[int] = None
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         self.storage_hit_start: Optional[int] = None
