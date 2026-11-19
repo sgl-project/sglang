@@ -380,6 +380,130 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
                         if t >= exact_from:
                             self.assertTrue(torch.equal(got, ref))
 
+    def test_gdn_prefill_shares_the_in_proj_quant_and_fuses_the_norm_quant(self):
+        """SGLANG_AMD_GDN_PREFILL_FUSED, plain extend: in_proj_qkvz and in_proj_ba take one (fp8, scale) of the
+        layer input (not at TP4, where in_proj_ba's 24 outputs are served dequantized), and the gated RMSNorm
+        writes out_proj's from 4-row norm tiles (from 22 tokens at 48 heads, 86 at 12); the output is the
+        unfused path's bit for bit. Qwen3.8-Flash-Next TP1, TP2, TP4."""
+        from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+        from sglang.srt.model_loader.utils import set_default_torch_dtype
+        from sglang.srt.models import qwen3_5
+
+        head_dim, hidden = 128, 2560
+        extend = types.SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND, logical_forward_mode=ForwardMode.EXTEND
+        )
+        no_sp = types.SimpleNamespace(sp_active=False)
+        norms = []
+        real_norm = qwen3_5.rms_norm_gated_fp8
+        for n_v, n_k in ((48, 16), (24, 8), (12, 4)):
+            with (
+                _single_rank(),
+                patch.object(qwen3_5, "get_forward", return_value=no_sp),
+                patch.object(
+                    qwen3_5,
+                    "rms_norm_gated_fp8",
+                    lambda *a, **k: norms.append(1) or real_norm(*a, **k),
+                ),
+            ):
+                norm = RMSNorm(
+                    head_dim,
+                    eps=1e-6,
+                    activation="sigmoid",
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                )
+                norm.weight.data.normal_(1.0, 0.3)
+                gdn = types.SimpleNamespace(
+                    num_k_heads=n_k,
+                    num_v_heads=n_v,
+                    attn_tp_size=1,
+                    head_k_dim=head_dim,
+                    head_v_dim=head_dim,
+                    norm=norm,
+                    alt_stream=None,
+                    _fused_in_proj_weight=None,
+                    _fused_input_proj_cpu_enabled=types.SimpleNamespace(value=False),
+                )
+                # as the model is built: a linear served dequantized keeps BF16 weights
+                with set_default_torch_dtype(torch.bfloat16):
+                    gdn.in_proj_qkvz = _quark_row_linear(
+                        hidden, 2 * (n_k + n_v) * head_dim
+                    )
+                    gdn.in_proj_ba = _quark_row_linear(hidden, 2 * n_v)
+                    gdn.out_proj = _quark_row_linear(n_v * head_dim, hidden)
+                for name in ("forward", "_forward_input_proj"):
+                    method = getattr(qwen3_5.Qwen3_5GatedDeltaNet, name)
+                    setattr(gdn, name, types.MethodType(method, gdn))
+
+                def attn(forward_batch, mixed_qkv, a, b):
+                    # stands in for the GDN core: reads v, a and b; token 5 all zero
+                    v = mixed_qkv[:, 2 * n_k * head_dim :].reshape(-1, n_v, head_dim)
+                    out = v * torch.sigmoid(b)[..., None] + a[..., None]
+                    out[5] = 0
+                    return out
+
+                gdn.attn = attn
+                for t in (65, 300, 2050):
+                    h = torch.randn(t, hidden, device="cuda").bfloat16()
+                    run = lambda: gdn.forward(h, extend)
+                    del norms[:]
+                    with patch.object(qwen3_5, "_gdn_prefill_fp8_fused", False):
+                        ref, ref_quants = self.quant_launches(run)
+                    shared = []
+                    with (
+                        patch.object(qwen3_5, "_gdn_prefill_fp8_fused", True),
+                        patch.object(
+                            qwen3_5,
+                            "per_token_group_quant_fp8",
+                            lambda *a, **k: shared.append(1) or self.quant(*a, **k),
+                        ),
+                    ):
+                        got, got_quants = self.quant_launches(run)
+                    norm_fused = t * n_v > 1024  # 4-row tiles on 256 CUs
+                    shares = gdn.in_proj_ba.weight_scale is not None
+                    with self.subTest(heads=n_v, t=t):
+                        self.assertEqual(len(norms), int(norm_fused))
+                        self.assertEqual(
+                            (ref_quants, len(shared), got_quants),
+                            (2 + shares, int(shares), 1 - shares + 1 - norm_fused),
+                        )
+                        self.assertTrue(torch.equal(got, ref))
+
+    def test_gdn_prefill_gates_blocked(self):
+        """The blocked prefill gates equal fused_gdn_gating's bit for bit on the strided b / a views of the GDN
+        in_proj output, the softplus threshold branch included, and the backend routes to them by the switch."""
+        from sglang.kernels.ops.attention.linear.fused_gdn_gating import (
+            fused_gdn_gating,
+            fused_gdn_gating_blocked,
+        )
+        from sglang.srt.layers.attention.linear import gdn_backend
+
+        n_v = 48
+        layer = types.SimpleNamespace(
+            A_log=torch.randn(n_v, device="cuda"),
+            dt_bias=torch.randn(n_v, device="cuda").bfloat16(),
+        )
+        for t in (1, 33, 6169):
+            ba = (torch.randn(t, 2 * n_v, device="cuda") * 8).bfloat16()
+            ba[:4, n_v:] = 40.0
+            b, a = ba[:, :n_v], ba[:, n_v:]
+            ref = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            calls = []
+            with (
+                patch.object(gdn_backend, "_prefill_gates_blocked", True),
+                patch.object(
+                    gdn_backend,
+                    "fused_gdn_gating_blocked",
+                    lambda *x: calls.append(1) or fused_gdn_gating_blocked(*x),
+                ),
+            ):
+                got = gdn_backend.GDNAttnBackend._prefill_gates(layer, a, b)
+            with self.subTest(t=t):
+                self.assertEqual(len(calls), 1)
+                self.assertTrue(all(torch.equal(g, r) for g, r in zip(got, ref)))
+
     def test_power_of_two_heads_keep_the_capped_launch(self):
         """_layer_norm_fwd(quant_heads=n) for a power-of-two n runs one program of n rows and
         min(n // rows_per_block, 16) warps per token at every token count: 32 heads below 17 tokens (Qwen3.5-397B

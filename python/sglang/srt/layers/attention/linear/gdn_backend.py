@@ -4,7 +4,10 @@ from typing import Optional, Tuple, Union
 import msgspec
 import torch
 
-from sglang.kernels.ops.attention.linear.fused_gdn_gating import fused_gdn_gating
+from sglang.kernels.ops.attention.linear.fused_gdn_gating import (
+    fused_gdn_gating,
+    fused_gdn_gating_blocked,
+)
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     CAUSAL_CONV1D_FWD_BLOCK_M,
 )
@@ -87,6 +90,7 @@ _fused_decode_proj_conv_fallback_logged = False
 _fused_decode_proj_conv_layers_logged: set[int] = set()
 _fused_decode_real_tensor_verified_layers: set[int] = set()
 _fused_decode_log_layer_hits = envs.SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS.get()
+_prefill_gates_blocked = _is_hip and envs.SGLANG_AMD_GDN_PREFILL_FUSED.get()
 _fused_decode_verify_real_tensors = (
     envs.SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS.get()
 )
@@ -1321,7 +1325,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
     def _prefill_gates(
         layer: RadixLinearAttention, a: torch.Tensor, b: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+        gates = fused_gdn_gating_blocked if _prefill_gates_blocked else fused_gdn_gating
+        return gates(layer.A_log, a, b, layer.dt_bias)
 
     @staticmethod
     def _split_prefill_qkv(

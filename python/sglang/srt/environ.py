@@ -1220,6 +1220,10 @@ class Envs:
     # On gfx95x with SGLANG_USE_AITER=1, quantize the BF16 Qwen3.5/3.8 GDN
     # in_proj_qkvz and out_proj to MXFP4 after loading. 0 keeps them BF16.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvBool(True)
+    # Qwen3.5/3.8 GDN prefill on ROCm, each bit-identical to the unfused path: the gates on blocks of tokens and,
+    # with SGLANG_USE_AITER=1 on gfx95x for Quark per-token FP8 linears, one input quant shared by in_proj_qkvz and
+    # in_proj_ba, and the gated RMSNorm writing out_proj's FP8 input.
+    SGLANG_AMD_GDN_PREFILL_FUSED = EnvBool(False)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")

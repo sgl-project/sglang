@@ -28,6 +28,8 @@ from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormG
 from sglang.kernels.ops.attention.fla.layernorm_gated import (
     _layer_norm_fwd,
     quant_heads_num_warps,
+    rms_norm_gated_fp8,
+    rms_norm_gated_fp8_supported,
 )
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
@@ -178,6 +180,7 @@ if _use_aiter:
         smallm_fp8_gemm_config,
         smallm_fp8_gemm_enabled,
     )
+    from sglang.kernels.ops.quantization.fp8_kernel import per_token_group_quant_fp8
 _hip_use_alt_stream = get_bool_env_var("SGLANG_ALT_STREAM") and _is_hip
 _gdn_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_GDN_QKVZ_BA_ALT_STREAM", "False") and _hip_use_alt_stream
@@ -193,6 +196,8 @@ _gdn_online_mxfp4 = (
     if envs.SGLANG_ROCM_GDN_ONLINE_MXFP4.get() and _use_aiter and _is_gfx95
     else ()
 )
+# GDN prefill: one FP8 quant for in_proj_qkvz and in_proj_ba, the norm writing out_proj's FP8 input.
+_gdn_prefill_fp8_fused = envs.SGLANG_AMD_GDN_PREFILL_FUSED.get() and _use_aiter
 _is_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
@@ -296,6 +301,8 @@ if _is_npu:
 
 # A producer quantizes for its linear when the forward has at most this many tokens, whatever its mode.
 _FP8_TUPLE_MAX_TOKENS = 256
+# _forward_input_proj's packed in_proj_qkvz + in_proj_ba GEMM serves up to this many tokens on aiter.
+_PACKED_IN_PROJ_MAX_TOKENS = 64
 
 
 def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
@@ -306,15 +313,14 @@ def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
     )
 
 
-def _fp8_tuple_input(linear: nn.Module, num_tokens: int, dtype: torch.dtype) -> bool:
-    """Whether the producer hands ``linear`` a per-token FP8 (q, scale) pair: the one apply_fp8_linear's own
-    per-token quant of the producer's BF16 output gives it, for at most ``_FP8_TUPLE_MAX_TOKENS`` tokens."""
+def _fp8_pair_linear(linear: nn.Module, dtype: torch.dtype) -> bool:
+    """Whether ``linear`` takes a per-token FP8 (q, scale) pair: the one apply_fp8_linear's own per-token quant of
+    a ``dtype`` input gives it."""
     scheme = getattr(linear, "scheme", None)
     return (
         _use_aiter
         # gfx950: the producers quantize to e4m3fn and the launch shapes are checked there
         and _is_gfx95
-        and 0 < num_tokens <= _FP8_TUPLE_MAX_TOKENS
         # the GEMM returns BF16
         and dtype == torch.bfloat16
         and type(scheme).__name__ == "QuarkW8A8Fp8"
@@ -325,6 +331,12 @@ def _fp8_tuple_input(linear: nn.Module, num_tokens: int, dtype: torch.dtype) -> 
         and not torch.compiler.is_compiling()
         and not get_forward().sp_active
     )
+
+
+def _fp8_tuple_input(linear: nn.Module, num_tokens: int, dtype: torch.dtype) -> bool:
+    """Whether the producer hands ``linear`` a per-token FP8 (q, scale) pair, for at most
+    ``_FP8_TUPLE_MAX_TOKENS`` tokens."""
+    return 0 < num_tokens <= _FP8_TUPLE_MAX_TOKENS and _fp8_pair_linear(linear, dtype)
 
 
 def _smallm_fp8_gemm_takes(linear: nn.Module, num_tokens: int) -> bool:
@@ -873,7 +885,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             x = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
             if (
                 x.dtype == torch.bfloat16
-                and 0 < x.shape[0] <= 64
+                and 0 < x.shape[0] <= _PACKED_IN_PROJ_MAX_TOKENS
                 and not torch.compiler.is_compiling()
             ):
                 if self._fused_in_proj_scale is not None:
@@ -1005,9 +1017,24 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
-        projected_states_qkvz, projected_states_ba = self._forward_input_proj(
-            hidden_states
-        )
+        if (
+            _gdn_prefill_fp8_fused
+            and forward_batch.logical_forward_mode.is_extend_without_speculative()
+            and isinstance(hidden_states, torch.Tensor)
+            and hidden_states.shape[0] > _PACKED_IN_PROJ_MAX_TOKENS
+            and _fp8_pair_linear(self.in_proj_qkvz, hidden_states.dtype)
+            and _fp8_pair_linear(self.in_proj_ba, hidden_states.dtype)
+        ):
+            # Both projections quantize this tensor per token, as this call does: quantize it once.
+            fp8 = per_token_group_quant_fp8(
+                hidden_states, group_size=hidden_states.shape[-1]
+            )
+            projected_states_qkvz, _ = self.in_proj_qkvz(fp8)
+            projected_states_ba, _ = self.in_proj_ba(fp8)
+        else:
+            projected_states_qkvz, projected_states_ba = self._forward_input_proj(
+                hidden_states
+            )
 
         use_strided_prefill_z = False
         packed_verify = False
@@ -1103,6 +1130,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out = core_attn_out_pad
 
         nv = self.num_v_heads // self.attn_tp_size
+        if (
+            use_strided_prefill_z
+            and _gdn_prefill_fp8_fused
+            and _fp8_pair_linear(self.out_proj, z.dtype)
+            and rms_norm_gated_fp8_supported(
+                len(core_attn_out), nv, self.head_v_dim, z.device
+            )
+        ):
+            # self.norm, then out_proj's per-token quant, in one launch.
+            fp8 = rms_norm_gated_fp8(
+                core_attn_out, self.norm.weight, z, self.norm.eps, self.norm.activation
+            )
+            return self.out_proj(fp8)[0]
         if (
             not use_strided_prefill_z
             and _fp8_tuple_input(self.out_proj, len(z) // nv, z.dtype)
