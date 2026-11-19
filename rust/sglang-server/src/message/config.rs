@@ -954,6 +954,31 @@ pub enum HiddenStatesMode {
     Full,
 }
 
+impl HiddenStatesMode {
+    /// Why a server whose limit is `self` refuses a request for `requested`,
+    /// if it does (Python `TokenizerManager._validate_one_request`).
+    pub fn refusal(self, requested: Self) -> Option<&'static str> {
+        if requested <= self {
+            return None;
+        }
+        Some(match self {
+            Self::Null => {
+                "The server is not configured to return hidden states. \
+                 Please set `--return-hidden-states-mode last`, \
+                 `--return-hidden-states-mode full`, or the legacy \
+                 `--enable-return-hidden-states` flag."
+            }
+            // Nothing is above `full`, so the exceeded maximum is `last`.
+            Self::Last | Self::Full => {
+                "The requested return_hidden_states mode exceeds the server \
+                 maximum `last`. Please launch with \
+                 `--return-hidden-states-mode full` to allow \
+                 return_hidden_states=True."
+            }
+        })
+    }
+}
+
 impl DisaggregationMode {
     /// The value Python reports for the same field.
     pub fn as_str(self) -> &'static str {

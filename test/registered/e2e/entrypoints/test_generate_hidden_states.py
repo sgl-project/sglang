@@ -1,8 +1,9 @@
 """HTTP `/generate` returns hidden states when the server allows the mode:
 one vector for `return_hidden_states="last"`, and for `True` a matrix for the
 prefill step followed by one vector per decode step. A mode the server does not
-allow is a 400. The Python frontend and the Rust server answer the same, on a
-server launched with no mode, with `last` and with `full`."""
+allow is a 400, or one error event once a stream has started. The Python
+frontend and the Rust server answer the same, on a server launched with no
+mode, with `last` and with `full`."""
 
 import json
 import unittest
@@ -133,6 +134,17 @@ class TestGenerateHiddenStatesUnset(HiddenStatesServerCase):
 
 class TestGenerateHiddenStatesLast(LastCases, HiddenStatesServerCase):
     server_mode = "last"
+
+    def test_mode_above_the_server_mode_is_refused(self):
+        error = self._post(PROMPT, True, status_code=400).json()["error"]
+        self.assertIn("exceeds the server maximum `last`", error["message"])
+        # One item above the mode refuses the whole batch.
+        texts, modes = [PROMPT, "Hello, my name is"], [True, "last"]
+        error = self._post(texts, modes, status_code=400).json()["error"]
+        self.assertIn("exceeds the server maximum `last`", error["message"])
+        # A stream has started by then: its only event is the error.
+        (chunk,) = self._stream_chunks(texts, modes)
+        self.assertIn("exceeds the server maximum `last`", chunk["error"]["message"])
 
 
 class TestGenerateHiddenStatesFull(LastCases, HiddenStatesServerCase):

@@ -335,7 +335,8 @@ impl CoreHandle {
     }
 
     /// Each of a client's requests, before any media prefetch: the DP rank it
-    /// names ([`Self::check_routed_dp_rank`]), then the launch's
+    /// names ([`Self::check_routed_dp_rank`]), its `return_hidden_states`
+    /// against the server's mode, then the launch's
     /// [`crate::GenerateValidator`]; the first refusal is the error.
     fn validate(&self, requests: &[GenerateRequest]) -> Result<(), CoreError> {
         requests.iter().try_for_each(|request| {
@@ -344,6 +345,15 @@ impl CoreHandle {
                     tracing::warn!(rid = %request.rid, %error, "rejected request");
                 })
         })?;
+        // Python `TokenizerManager._validate_one_request` takes the highest
+        // mode of a batch, so one item above the server's mode refuses them all.
+        let server_mode = self.inner.metadata.return_hidden_states_mode;
+        for request in requests {
+            if let Some(message) = server_mode.refusal(request.return_hidden_states) {
+                tracing::warn!(rid = %request.rid, error = %message, "rejected request");
+                return Err(CoreError::InvalidArgument(message.into()));
+            }
+        }
         let Some(validator) = &self.inner.generate_validator else {
             return Ok(());
         };
@@ -2009,6 +2019,82 @@ mod tests {
         );
         assert!(harness.intake_rx.try_recv().is_err());
         assert!(harness.abort_rx.try_recv().is_err());
+    }
+
+    /// A batch with one item above the server's hidden-states mode submits
+    /// nothing, as Python refuses the whole request; so does a single request.
+    #[tokio::test]
+    async fn hidden_states_above_the_server_mode_refuse_the_whole_batch() {
+        use crate::message::config::HiddenStatesMode::{Full, Last, Null};
+        let handle = |server| {
+            let (intake_tx, intake_rx) = flume::unbounded();
+            let handle = CoreHandle::new(
+                intake_tx,
+                flume::unbounded().0,
+                CoreConfig {
+                    response_capacity: 8,
+                    response_activity: Default::default(),
+                    startup_ready: true,
+                    is_disaggregation: false,
+                    mm_limits: Vec::new(),
+                    multimodal: false,
+                    peer_endpoints: Vec::new(),
+                    metadata: CoreMetadata {
+                        return_hidden_states_mode: server,
+                        ..Default::default()
+                    },
+                    metrics: None,
+                    request_log: None,
+                    generate_validator: None,
+                    abort_hook: None,
+                },
+            );
+            (handle, intake_rx)
+        };
+        let request = |mode| GenerateRequest {
+            return_hidden_states: mode,
+            ..Default::default()
+        };
+        for (server, batch, message) in [
+            (Last, vec![Full, Last], "exceeds the server maximum `last`"),
+            (Last, vec![Null, Full], "exceeds the server maximum `last`"),
+            (Null, vec![Null, Last], "not configured"),
+        ] {
+            let (handle, intake_rx) = handle(server);
+            let error = handle
+                .generate_batch(
+                    batch.iter().copied().map(request).collect(),
+                    ReceivedAs::without_headers(),
+                )
+                .await
+                .err()
+                .expect("refused");
+            assert_eq!(error.kind(), CoreErrorKind::InvalidArgument);
+            assert!(error.to_string().contains(message), "{server:?} {batch:?}");
+            let above = batch.iter().copied().max().unwrap();
+            let single = handle
+                .generate(request(above), ReceivedAs::without_headers())
+                .await
+                .err()
+                .expect("refused");
+            assert_eq!(single.kind(), CoreErrorKind::InvalidArgument);
+            assert!(single.to_string().contains(message), "{server:?} {above:?}");
+            assert!(
+                intake_rx.try_recv().is_err(),
+                "nothing refused was submitted"
+            );
+        }
+        // At or below the server's mode, every item is submitted.
+        let (handle, intake_rx) = handle(Full);
+        let calls = handle
+            .generate_batch(
+                vec![request(Full), request(Last)],
+                ReceivedAs::without_headers(),
+            )
+            .await;
+        assert!(calls.is_ok());
+        accept_intake(intake_rx.recv_async().await.unwrap());
+        accept_intake(intake_rx.recv_async().await.unwrap());
     }
 
     /// Python's `routed_dp_rank` check, then the listener's own: under DP a

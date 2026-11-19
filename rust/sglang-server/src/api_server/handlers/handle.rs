@@ -93,6 +93,9 @@ pub(crate) struct CoreMetadata {
     /// Priority for a generation that sets none (see
     /// `ServerArgs::default_priority_value`).
     pub(super) default_priority: Option<i64>,
+    /// The most a generation's `return_hidden_states` may ask for
+    /// (`ServerArgs::hidden_states_mode`).
+    pub(super) return_hidden_states_mode: crate::message::config::HiddenStatesMode,
     /// The scheduler `internal_state` fields `/server_info` reports beyond its
     /// typed ones, which an embedding package registers (see
     /// `RuntimeConfig::server_info_state_keys`).
@@ -137,6 +140,7 @@ impl From<&ServerArgs> for CoreMetadata {
             launch_server_info: args.launch_server_info.0.clone(),
             launch_model_info: args.launch_model_info.0.clone(),
             default_priority: args.default_priority_value,
+            return_hidden_states_mode: args.hidden_states_mode(),
             server_info_state_keys: Vec::new(),
         }
     }

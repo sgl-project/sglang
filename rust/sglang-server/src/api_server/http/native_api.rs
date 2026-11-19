@@ -913,10 +913,13 @@ pub(super) async fn drain_unary_frame(
 /// then either (unary) drain them concurrently into a request-ordered JSON array,
 /// or (streaming) multiplex their streams into one SSE response, each frame carrying
 /// its `index`.
-/// Each submitted call owns its own cancellation. A failed unary item is its
-/// own `{ "error": … }` entry; the batch response is 200. This differs from
-/// Python on purpose: there, one item failing validation fails the whole batch
-/// with a single 400.
+/// Each submitted call owns its own cancellation. A unary item that fails
+/// after admission is its own `{ "error": … }` entry; the batch response is
+/// 200. This differs from Python on purpose: there, one item failing
+/// validation fails the whole batch with a single 400. A refusal at the core's
+/// admission (a DP rank, a `return_hidden_states` above the server's mode, the
+/// launch's validator) fails the whole batch here too, before any item is
+/// submitted.
 async fn generate_batch(
     state: &AppState,
     requests: Vec<GenerateRequest>,
