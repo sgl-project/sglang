@@ -1,0 +1,253 @@
+---
+title: "DeepSeek-V4.1-Flash"
+metatags:
+  description: "Deploy DeepSeek-V4.1-Flash on Huawei Ascend 950PR/DT Series NPUs with SGLang using a unified, non-PD service."
+---
+
+## Introduction
+
+DeepSeek-V4.1-Flash is a multimodal Mixture-of-Experts (MoE) model developed by DeepSeek, with 552B backbone
+parameters and support for context lengths of up to one million tokens. It uses a Causal Encoder-Decoder architecture
+and activates 8B parameters per token during prefill and 16B during decode. This guide uses language-model-only mode,
+so image inputs are not enabled. For more model details, see the
+[DeepSeek-V4.1-Flash technical report](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash).
+
+This guide deploys DeepSeek-V4.1-Flash on Huawei Ascend 950PR/DT Series (A5) NPUs with SGLang. Prefill and decode run
+in one service; Prefill-Decode (PD) disaggregation is not configured.
+
+## Configuration summary
+
+The following table summarizes the settings configured by the script. For parameter details, see the Ascend
+[Parameter Reference](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#parameter-reference) and
+[Feature Compatibility](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#feature-compatibility).
+
+| Area | Configuration in the script |
+|------|------------------------------|
+| Hardware | Huawei Ascend 950PR/DT Series (A5), 8 NPUs per node |
+| Attention | `--attention-backend dsv4` |
+| Tensor parallelism | `--tp-size 8` |
+| Data parallelism | `--enable-dp-attention` and `--dp-size 8` |
+| MoE communication | `--moe-a2a-backend deepep` and `--deepep-mode auto` |
+| DP language-model head | `--enable-dp-lm-head` |
+| NPU graph decode batch sizes | `--cuda-graph-bs-decode 1 2 4 8 16 25` |
+| PD disaggregation | Not configured; prefill and decode run in one service |
+| DSPARK | Disabled by default; optional arguments are included in the script |
+
+## Prerequisites
+
+### Environment
+
+Prepare a Huawei Ascend 950PR/DT Series (A5) host with eight NPUs. Install a compatible Ascend driver, CANN, TorchNPU,
+ATB, and custom operators, then run the setup and launch commands inside the prepared Ascend environment. Use an SGLang
+checkout that supports DeepSeek-V4.1-Flash and the `dsv4` NPU attention backend. Keep the same SGLang revision and model
+checkpoint available at the same paths on every node.
+
+### Model weights
+
+Set `MODEL_PATH` to the directory containing the DeepSeek-V4.1 checkpoint. Replace the placeholder path in the script
+with the checkpoint directory available in your environment. For multi-node deployments, make the checkpoint accessible
+at the same path on every node.
+
+## Installation
+
+For host setup and container creation, follow the
+[SGLang Installation with NPU Support](</docs/hardware-platforms/ascend-npus/getting-started/installation#create-docker-container>) guide. Under **Create Docker Container**, select the **950PR/DT Series** instructions and use the image below wherever the guide asks for an image name. Run the deployment script in the created container.
+
+Pull the SGLang image for Huawei Ascend 950PR/DT Series (A5):
+
+```bash
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-dsv41
+```
+
+## Online service deployment
+
+The following script configures the host, initializes the Ascend environment, sets runtime variables, and launches
+SGLang. DSPARK is disabled by default; enable it only when compatible A5 custom operators are available and DSPARK has
+been validated in your environment.
+
+Before running the script, replace `/path/to/sglang` and `/path/to/dsv4.1-1017` with paths available on every node. Set
+`NODE_IPS` to the same ordered list of node IP addresses on every node. This example has one node, with `NODE_RANK=0`
+and `HCCL_IF="lo"`. For a multi-node deployment, set each node's `NODE_RANK` to its zero-based position in `NODE_IPS`
+and set `HCCL_IF` to that node's reachable HCCL interface. Run the script on every node in the prepared 950PR/DT Series
+(A5) environment, with sufficient privileges to apply the host settings.
+
+The supplied deployment script sets `TP_SIZE=8` and `DP_SIZE=8`, while its topology note specifies `DP_SIZE=NNODES`.
+Confirm the intended DP size and cross-node DeepEP support for your SGLang revision before using a multi-node deployment.
+
+```bash
+
+if [[ -w /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
+  echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null
+fi
+
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+unset https_proxy http_proxy HTTPS_PROXY HTTP_PROXY ASCEND_LAUNCH_BLOCKING || true
+export ASCEND_LAUNCH_BLOCKING=1
+export HCCL_CONNECT_TIMEOUT=300
+export HCCL_EXEC_TIMEOUT=68
+export HCCL_OP_EXPANSION_MODE=AIV
+export ACL_DEVICE_SYNC_TIMEOUT=60
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+export TRANSFORMERS_VERBOSITY=error
+export HCCL_HOST_SOCKET_PORT_RANGE=auto
+export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-data0.3001}"
+export SGLANG_SET_CPU_AFFINITY=1
+export TASK_QUEUE_ENABLE=1
+export INF_NAN_MODE_FORCE_DISABLE=1
+export SGLANG_DEFAULT_THINKING=1
+export SGLANG_DSV4_REASONING_EFFORT=max
+export HCCL_BUFFSIZE=400
+export DEEPEP_HCCL_BUFFSIZE=1800
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash
+source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+if [[ -f /usr/local/memfabric_hybrid/set_env.sh ]]; then
+  source /usr/local/memfabric_hybrid/set_env.sh
+fi
+
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=16
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=150
+export SGLANG_OPT_USE_OVERLAP_STORE_CACHE=False
+export FORCE_DRAFT_MODEL_NON_QUANT=1
+export SGLANG_DSV4_FP4_EXPERTS=True
+export SGLANG_OPT_FUSE_WQA_WKV=0
+export SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
+export SGLANG_OPT_USE_FUSED_HASH_TOPK=False
+export SGLANG_OPT_USE_TILELANG_MHC_PRE=False
+export SGLANG_OPT_DEEPGEMM_HC_PRENORM=False
+export SGLANG_OPT_USE_TILELANG_MHC_POST=False
+export SGLANG_OPT_FP8_WO_A_GEMM=False
+export SGLANG_DSV4_NATIVE_ATTN=0
+export SGLANG_DSV4_DBG_ATTN=1
+export SGLANG_SHALLOW_FUSED_ROPE_FQ4=0
+export SGLANG_COMPRESSOR_PREFILL_USE_TRITON=1
+export SGLANG_COMPRESSOR_DECODE_USE_TRITON=1
+export SGLANG_OPT_USE_HC_TRITON=0
+export SGLANG_OPT_USE_HC_TILELANG=0
+export SGLANG_DSV4_GRAPH_MAX_SEQ=131072
+
+export PYTHONPATH="/path/to/sglang/python:${PYTHONPATH:-}"
+
+ENABLE_DSPARK="${ENABLE_DSPARK:-0}"
+if [[ "$ENABLE_DSPARK" == "1" ]]; then
+  export SGLANG_ENABLE_SPEC_V2=1
+  export SGLANG_RAGGED_VERIFY_MODE=static
+  export SGLANG_DSPARK_FAST_KERNEL=0
+fi
+
+export MODEL_PATH="/path/to/dsv4.1-1017"
+SERVED_MODEL_NAME="dsv4"
+NUM_NPUS_PER_NODE=8
+PORT=30000
+DIST_PORT=5567
+NODE_IPS=("<node-0-ip>")
+NODE_RANK=0
+HCCL_IF="lo"
+NNODES="${#NODE_IPS[@]}"
+if (( NNODES < 1 )); then
+  echo "ERROR: NODE_IPS must contain at least one IP" >&2
+  exit 1
+fi
+TOTAL_NPUS=$((NNODES * NUM_NPUS_PER_NODE))
+DP_SIZE=8
+TP_SIZE=8
+MASTER_ADDR="${NODE_IPS[0]}"
+DIST_INIT_ADDR="${MASTER_ADDR}:${DIST_PORT}"
+export HCCL_SOCKET_IFNAME="$HCCL_IF"
+DSPARK_ARGS=()
+if [[ "$ENABLE_DSPARK" == "1" ]]; then
+  DSPARK_ARGS+=(
+    --speculative-algorithm DSPARK
+    --speculative-draft-attention-backend ascend
+    --speculative-num-draft-tokens 6
+    --speculative-dspark-block-size 5
+  )
+fi
+
+python3 -m sglang.launch_server \
+  --model-path "$MODEL_PATH" \
+  --served-model-name "$SERVED_MODEL_NAME" \
+  --host 0.0.0.0 \
+  --port "$PORT" \
+  --tp-size "$TP_SIZE" \
+  --nnodes "$NNODES" \
+  --node-rank "$NODE_RANK" \
+  --dist-init-addr "$DIST_INIT_ADDR" \
+  --page-size 128 \
+  --trust-remote-code \
+  --attention-backend dsv4 \
+  --device npu \
+  --enable-dp-attention \
+  --dp-size "$DP_SIZE" \
+  --enable-dp-lm-head \
+  --watchdog-timeout 9000 \
+  --max-running-requests 200 \
+  --mem-fraction-static 0.83 \
+  --max-prefill-tokens 131072 \
+  --chunked-prefill-size 131072 \
+  --kv-cache-dtype auto \
+  --json-model-override-args '{"architectures": ["DeepseekV4ForCausalLM"]}' \
+  --reasoning-parser deepseek-v4 \
+  --language-model-only \
+  --moe-a2a-backend deepep \
+  --deepep-mode auto \
+  --enable-metrics \
+  --cuda-graph-bs-decode 1 2 4 8 16 25 \
+  "${DSPARK_ARGS[@]}"
+```
+
+## Functional verification
+
+Once the server prints `The server is fired up and ready to roll!` in the terminal, it is ready to accept requests. For
+more testing examples (health checks, Generate, Chat Completions, and port usage), see
+[Testing the Service](/docs/hardware-platforms/ascend-npus/getting-started/installation#testing-the-service).
+
+Send a chat completion request to the service endpoint on port `30000`:
+
+```shell
+curl -i http://127.0.0.1:30000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"dsv4","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+Expected result: an HTTP 200 response containing a generated answer.
+
+For a multi-node deployment, send the request to the service endpoint reachable from the client, typically on the
+rank-0 node (`MASTER_ADDR`). The service output is displayed in the terminal on each node.
+
+## Accuracy evaluation
+
+For evaluation tools and dataset workflows on Ascend NPUs, see [Accuracy Evaluation on Ascend NPU](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation).
+This tutorial does not provide DeepSeek-V4.1-Flash A5 accuracy results.
+
+## Performance
+
+For benchmark tools and serving-load examples, see [Performance Testing on Ascend NPU](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing).
+This tutorial does not provide DeepSeek-V4.1-Flash A5 performance results.
+
+## Best practices
+
+### Best-practice configuration reference
+
+The existing
+[DeepSeek-V4-Flash best-practice guide](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_v4_flash)
+covers a different model and deployment configuration; treat it as background only and do not copy its values directly
+to this V4.1-Flash setup. This tutorial does not yet include a separately validated V4.1-Flash A5 best-practice profile.
+
+## Performance tuning
+
+Use the Ascend [optimization and parameter tuning guide](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning)
+to understand the launch parameters and tune them for your workload. See
+[Feature Compatibility](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#feature-compatibility)
+for supported feature combinations.
+
+## FAQ
+
+For common Ascend environment, installation, and runtime issues, see the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/faq).

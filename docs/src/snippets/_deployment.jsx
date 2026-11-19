@@ -98,6 +98,8 @@
 //                      `(selection) => array`
 //   dockerRunCommand   optional — command placed after the image and before
 //                      generated server flags; string or `(selection) => string`
+//   pythonCommand      optional — command used in Python mode; string or
+//                      `(selection) => string`; defaults to `sglang serve`
 //   runModes           optional — command output tabs to show (`python` and/or
 //                      `docker`), as an array or `(selection) => array`;
 //                      defaults to both, in that order
@@ -874,7 +876,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
         || di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
         || di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
       const dockerRunCommand = typeof config.dockerRunCommand === "function"
-        ? config.dockerRunCommand(sel)
+        ? config.dockerRunCommand(sel, cellEnv)
         : (config.dockerRunCommand || "sglang serve");
       const portFlag = flags.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
@@ -983,7 +985,14 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     } else {
       const flagBlock = flags.map((f) => "  " + f).join(" \\\n");
       const envBlock = cellEnv.length ? cellEnv.join(" \\\n") + " \\\n" : "";
-      cmd = `${envBlock}sglang serve \\\n${flagBlock}`;
+      const pythonSetupCommand = typeof config.pythonSetupCommand === "function"
+        ? config.pythonSetupCommand(sel)
+        : (config.pythonSetupCommand || "");
+      const pythonCommand = typeof config.pythonCommand === "function"
+        ? config.pythonCommand(sel)
+        : (config.pythonCommand || "sglang serve");
+      const setupBlock = pythonSetupCommand ? `${pythonSetupCommand} &&\n` : "";
+      cmd = `${setupBlock}${envBlock}${pythonCommand} \\\n${flagBlock}`;
     }
 
     const hintLines = [
