@@ -329,10 +329,22 @@ async fn decode_dp_rank_policy_is_separate_from_the_prefill_policy() {
     }
     let (mut prefill_ranks, mut decode_ranks) = (Vec::new(), Vec::new());
     for _ in 0..8 {
+        prefill.captured.lock().unwrap().headers.clear();
         // No key: the prefill rank has nothing but the policy to go on.
         decode_ranks.push(send(&app, &decode, &[]).await.unwrap());
-        let prefill_rank = prefill.captured.lock().unwrap().headers.get(RANK).cloned();
-        prefill_ranks.push(prefill_rank.unwrap());
+        // Prefill runs in the background and may land after decode's reply.
+        let started = Instant::now();
+        let prefill_rank = loop {
+            if let Some(rank) = prefill.captured.lock().unwrap().headers.get(RANK).cloned() {
+                break rank;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "prefill never called"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        prefill_ranks.push(prefill_rank);
     }
     assert_eq!(prefill_ranks, ["0", "1", "2", "3", "0", "1", "2", "3"]);
     // Decode never lands on the heaviest rank; round robin would have.
