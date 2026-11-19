@@ -26,7 +26,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
+register_mlx_ci(est_time=1, suite="extra-unit-test-mlx")
 
 _HAS_MLX = importlib.util.find_spec("mlx") is not None
 _SKIP_REASON = "requires mlx"
@@ -277,10 +277,11 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
         with _arch(hybrid=True), _published(stub):
             stub.initialize()
         pool = stub.req_to_token_pool
+        tree_slots = tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
-            SimpleNamespace(enable_mamba_extra_buffer=False),
-            tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)[0],
+            SimpleNamespace(enable_mamba_extra_buffer=False, tree_slots=tree_slots),
+            tree_slots[0],
         )
         aux_capacity = pool.auxiliary_state_pool.available_size()
         for _ in range(3 * aux_capacity):

@@ -924,7 +924,6 @@ class HiCacheHF3FS(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        len_keys = len(keys)
         keys, values = self._batch_set_preprocess(keys, host_indices)
         results = self._batch_set(keys, values)
         return results
