@@ -14,6 +14,7 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec, get_platform
 from sglang.srt.utils import is_flashinfer_available, log_info_on_rank0
 
@@ -28,6 +29,38 @@ if TYPE_CHECKING:
 
 # MXFP4 group/block size (E8M0 scale per 32 fp4 weights).
 _GROUP_SIZE = 32
+
+
+def _preprocess_humming_in_expert_chunks(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    preprocess,
+    chunk_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if chunk_size <= 0:
+        raise ValueError("Humming preprocess expert chunk size must be positive")
+    num_experts = weight.shape[0]
+    if num_experts == 0:
+        raise ValueError("Humming preprocess requires at least one local expert")
+    if scale.shape[0] != num_experts:
+        raise ValueError("Humming weight and scale expert counts must match")
+    if num_experts <= chunk_size:
+        return preprocess(weight, scale)
+
+    outputs = None
+    for start in range(0, num_experts, chunk_size):
+        end = min(start + chunk_size, num_experts)
+        chunk_outputs = preprocess(weight[start:end], scale[start:end])
+        if outputs is None:
+            outputs = tuple(
+                value.new_empty((num_experts, *value.shape[1:]))
+                for value in chunk_outputs
+            )
+        for output, chunk_output in zip(outputs, chunk_outputs):
+            output[start:end].copy_(chunk_output)
+        # 在下一块预处理前释放本块临时输出，避免两个块同时驻留。
+        del chunk_outputs, chunk_output
+    return outputs
 
 
 class Mxfp4FlashinferCutlassMoEMethod:
@@ -144,10 +177,20 @@ class Mxfp4FlashinferCutlassMoEMethod:
         precision = (
             "W4A8" if self._use_sm90_humming or self._use_mxfp8_act_scaling else "W4A16"
         )
+        humming_chunk_size = (
+            envs.SGLANG_FLASHINFER_MXFP4_PREPROCESS_EXPERT_CHUNK_SIZE.get()
+            if self._use_sm90_humming
+            else None
+        )
+        chunk_info = (
+            f", expert_chunk={humming_chunk_size}"
+            if humming_chunk_size is not None
+            else ""
+        )
         log_info_on_rank0(
             logger,
             f"Preparing DSv4 MXFP4 experts for FlashInfer {arch} CUTLASS {precision} "
-            f"(layer: {self.prefix})...",
+            f"(layer: {self.prefix}{chunk_info})...",
         )
 
         # FlashInfer consumes the raw bytes of the checkpoint's E8M0 scales.
@@ -177,28 +220,36 @@ class Mxfp4FlashinferCutlassMoEMethod:
                     preprocess_moe_weights_for_sm90_mixed_gemm_humming,
                 )
 
-                w13_il, w13_s_il, w13_residual = (
-                    preprocess_moe_weights_for_sm90_mixed_gemm_humming(
-                        layer.w13_weight.data.view(torch.uint8).contiguous(),
-                        w13_scale_u8,
-                    )
+                w13_il, w13_s_il, w13_residual = _preprocess_humming_in_expert_chunks(
+                    layer.w13_weight.data.view(torch.uint8).contiguous(),
+                    w13_scale_u8,
+                    preprocess_moe_weights_for_sm90_mixed_gemm_humming,
+                    humming_chunk_size,
                 )
-                w2_il, w2_s_il, w2_residual = (
-                    preprocess_moe_weights_for_sm90_mixed_gemm_humming(
-                        layer.w2_weight.data.view(torch.uint8).contiguous(),
-                        w2_scale_u8,
-                    )
-                )
+                layer.w13_weight = Parameter(w13_il, requires_grad=False)
+                layer.w13_weight_scale_inv = Parameter(w13_s_il, requires_grad=False)
                 layer.w13_humming_residual_scale = Parameter(
                     (w13_residual * 64.0).contiguous(), requires_grad=False
                 )
+                del w13_il, w13_s_il, w13_residual, w13_scale_u8
+                torch.cuda.empty_cache()
+
+                w2_il, w2_s_il, w2_residual = _preprocess_humming_in_expert_chunks(
+                    layer.w2_weight.data.view(torch.uint8).contiguous(),
+                    w2_scale_u8,
+                    preprocess_moe_weights_for_sm90_mixed_gemm_humming,
+                    humming_chunk_size,
+                )
+                layer.w2_weight = Parameter(w2_il, requires_grad=False)
+                layer.w2_weight_scale_inv = Parameter(w2_s_il, requires_grad=False)
                 layer.w2_humming_residual_scale = Parameter(
                     (w2_residual * 64.0).contiguous(), requires_grad=False
                 )
                 layer.humming_fc2_act_scale = Parameter(
-                    torch.ones((), dtype=torch.float32, device=w13_scale_u8.device),
+                    torch.ones((), dtype=torch.float32, device=w2_scale_u8.device),
                     requires_grad=False,
                 )
+                del w2_il, w2_s_il, w2_residual, w2_scale_u8
             else:
                 from flashinfer.fused_moe import (
                     interleave_moe_scales_for_sm90_mixed_gemm,
@@ -217,10 +268,10 @@ class Mxfp4FlashinferCutlassMoEMethod:
                 w2_s_il = interleave_moe_scales_for_sm90_mixed_gemm(
                     w2_scale_u8, group_size=_GROUP_SIZE
                 )
-            layer.w13_weight = Parameter(w13_il, requires_grad=False)
-            layer.w2_weight = Parameter(w2_il, requires_grad=False)
-            layer.w13_weight_scale_inv = Parameter(w13_s_il, requires_grad=False)
-            layer.w2_weight_scale_inv = Parameter(w2_s_il, requires_grad=False)
+                layer.w13_weight = Parameter(w13_il, requires_grad=False)
+                layer.w2_weight = Parameter(w2_il, requires_grad=False)
+                layer.w13_weight_scale_inv = Parameter(w13_s_il, requires_grad=False)
+                layer.w2_weight_scale_inv = Parameter(w2_s_il, requires_grad=False)
 
         layer._dsv4_mxfp4_backend = (
             "flashinfer_cutlass_sm120"
