@@ -30,6 +30,7 @@ from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM, Qwen3MoeModel
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -86,8 +87,8 @@ class Qwen3MoeForCausalLMMTP(Qwen3MoeForCausalLM):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     @torch.no_grad()
     def forward(

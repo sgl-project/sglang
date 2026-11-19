@@ -101,6 +101,19 @@ class TestBlockVerificationArgs(unittest.TestCase):
                 {"speculative_algorithm": "DSPARK", "device": "npu"},
                 "only supports CUDA or ROCm",
             ),
+            # XPU verify is always greedy, so every algorithm refuses rejection sampling.
+            *(
+                (
+                    {
+                        "device": "xpu",
+                        "speculative_algorithm": algorithm,
+                        "speculative_use_block_verification": False,
+                        "speculative_use_rejection_sampling": True,
+                    },
+                    "not supported on XPU",
+                )
+                for algorithm in ("EAGLE", "NGRAM")
+            ),
             ({"speculative_eagle_topk": 2}, "requires --speculative-eagle-topk=1"),
             ({"speculative_accept_threshold_single": 0.5}, "incompatible"),
             ({"speculative_accept_threshold_acc": 0.5}, "incompatible"),
