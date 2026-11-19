@@ -17,8 +17,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=200, suite="base-b-test-1-npu-a3")
-register_npu_ci(est_time=200, suite="nightly-1-npu-a3", nightly=True)
+register_npu_ci(est_time=200, suite="extra-b-test-1-npu-a3")
+register_npu_ci(est_time=200, suite="nightly-test-1-npu-a3", nightly=True)
 
 
 class TestBasicSanityEagle3(

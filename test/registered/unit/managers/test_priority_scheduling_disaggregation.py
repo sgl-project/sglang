@@ -248,6 +248,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
     def _new_unpublished_swa_state(self):
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.is_mamba_enabled = False
+        cache.request_mamba_only = False
         cache.tree_core = SimpleNamespace(is_eagle=False)
         cache.req_to_token_pool = SimpleNamespace(
             req_to_token=torch.arange(16, dtype=torch.int64).reshape(2, 8)
