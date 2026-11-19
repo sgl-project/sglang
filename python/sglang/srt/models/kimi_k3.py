@@ -6,6 +6,7 @@
 #   - MLA output gate (mla_use_output_gate)
 #   - Full-rank KDA gate (use_full_rank_gate)
 
+import functools
 import logging
 import re
 from array import array
@@ -3110,6 +3111,18 @@ class KimiK3DecoderLayer(nn.Module):
         # caller-owned storage; the FFN read's fused all-reduce must agree
         self.all_reduce_fusion = self.self_attn.all_reduce_fusion
 
+        # ROCm TP8: complete o_proj's all-reduce fused with the MLP-side
+        # aggregation (plain all-reduce when the fused kernel declines)
+        self._rocm_ar_agg = (
+            _is_hip
+            and not self._sp_moe
+            and not self.all_reduce_fusion
+            and config.attn_res_block_size is not None
+            and getattr(self.self_attn, "o_proj", None) is not None
+            and get_parallel().attn_tp_size == 8
+            and get_parallel().attn_tp_size == get_parallel().tp_size
+        )
+
         # MLP / MoE
         if self._is_moe_layer:
             self.mlp = KimiK3MoE(
@@ -3183,7 +3196,7 @@ class KimiK3DecoderLayer(nn.Module):
                 self.mlp_res_proj,
                 self.mlp_res_norm,
                 writes_block=self.is_block_write_layer,
-                ffn_input_fusions=self._ffn_input_fusions(),
+                ffn_input_fusions=self._ffn_input_fusions(attn_bank),
                 fuses_slice_collectives=self._sp_moe
                 and sp_collective
                 and envs.SGLANG_K3_SP_ATTN_RES.get(),
@@ -3198,7 +3211,7 @@ class KimiK3DecoderLayer(nn.Module):
             (ffn, self.post_attention_layernorm),
         )
 
-    def _ffn_input_fusions(self):
+    def _ffn_input_fusions(self, attn_bank=None):
         """K3's kernels that complete the attention output's sum with the
         pending residual add ahead of the bank's FFN read: the fused
         all-reduce on every row, or the tuned reduce-scatter onto this rank's
@@ -3209,7 +3222,33 @@ class KimiK3DecoderLayer(nn.Module):
             return (
                 ReadoutFusion(SumGroup.ATTN_TP, _k3_reduce_scatter_add, scatters=True),
             )
+        if self._rocm_ar_agg and attn_bank is not None:
+            return (
+                ReadoutFusion(
+                    SumGroup.ATTN_TP,
+                    functools.partial(self._rocm_ar_agg_read, attn_bank),
+                    reads=True,
+                ),
+            )
         return ()
+
+    def _rocm_ar_agg_read(
+        self, attn_bank, hidden_states, residual, forward_batch, norm
+    ):
+        """ROCm: o_proj's attention-TP all-reduce, the pending residual add
+        and the bank's FFN-side aggregation and norm in one kernel; None when
+        the kernel does not take the batch."""
+        bank = attn_bank.require()
+        if hidden_states.shape[0] != bank.block_residual.shape[0]:
+            return None
+        return bank.forward_ar_fused(
+            get_parallel().attn_tp_group.ca_comm,
+            hidden_states,
+            residual,
+            self.mlp_res_proj,
+            self.mlp_res_norm,
+            norm,
+        )
 
     def _run_self_attn(
         self,
@@ -3668,6 +3707,10 @@ class KimiK3LinearForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
         logit_scale = getattr(config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config=config, logit_scale=logit_scale)
+        if _is_hip:
+            from sglang.srt.layers.communication import k3_logits_gather
+
+            k3_logits_gather.install(self.logits_processor)
         self.capture_aux_hidden_states = False
 
     def get_input_embeddings(self):

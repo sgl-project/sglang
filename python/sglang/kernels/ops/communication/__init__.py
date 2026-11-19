@@ -112,3 +112,13 @@ for _fn in ("all_gather_matmul", "matmul_reduce_scatter"):
         )
     )
 del _fn
+
+# Kimi-K3 ROCm o_proj all-reduce fused with the attention-residual aggregation.
+register_kernel(
+    KernelSpec(
+        op="communication.k3_ar_agg_hip_ar_agg",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.communication.k3_ar_agg_hip:ar_agg",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
