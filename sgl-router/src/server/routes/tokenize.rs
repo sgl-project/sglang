@@ -42,20 +42,25 @@ pub struct DetokenizeResponse {
     pub text: String,
 }
 
-/// The served model's tokenizer. One model is served, so any `model` name uses
-/// it; a model started with `--no-tokenizer` has none.
-pub(crate) fn served_tokenizer(ctx: &AppContext) -> Result<Arc<Tokenizer>, ApiError> {
-    let model = &ctx.config.model.id;
+/// Resolve the requested model before looking up its tokenizer.
+pub(crate) fn served_tokenizer(
+    ctx: &AppContext,
+    requested: &str,
+) -> Result<Arc<Tokenizer>, ApiError> {
+    let model = ctx
+        .config
+        .resolve_model(requested)
+        .ok_or_else(|| ApiError::ModelNotFound(requested.into()))?;
     ctx.tokenizers
-        .get(model)
-        .ok_or_else(|| ApiError::BadRequest(format!("tokenizer disabled for model {model}")))
+        .get(&model.id)
+        .ok_or_else(|| ApiError::BadRequest(format!("tokenizer disabled for model {}", model.id)))
 }
 
 pub async fn tokenize(
     State(ctx): State<Arc<AppContext>>,
     Json(req): Json<TokenizeRequest>,
 ) -> Result<Json<TokenizeResponse>, ApiError> {
-    let tok = served_tokenizer(&ctx)?;
+    let tok = served_tokenizer(&ctx, &req.model)?;
     // Structured log on failure so an operator can correlate
     // "every encode for model X errors" against the route, model id, and
     // prompt size. The generic anyhow-chain log in ApiError::Internal still
@@ -83,7 +88,7 @@ pub async fn detokenize(
     State(ctx): State<Arc<AppContext>>,
     Json(req): Json<DetokenizeRequest>,
 ) -> Result<Json<DetokenizeResponse>, ApiError> {
-    let tok = served_tokenizer(&ctx)?;
+    let tok = served_tokenizer(&ctx, &req.model)?;
     let text =
         off_worker::run(|| adapter::decode_complete(&tok, &req.tokens, req.skip_special_tokens))
             .map_err(|e| {
@@ -165,6 +170,64 @@ mod tests {
             worker_registry,
             policies,
         ))
+    }
+
+    #[tokio::test]
+    async fn multi_model_tokenize_uses_each_tokenizer_and_rejects_unknown() {
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_str(include_str!("../../../tests/fixtures/tiny_tokenizer.json"))
+                .unwrap();
+        let vocab = json["model"]["vocab"].as_object_mut().unwrap();
+        let h = vocab["h"].clone();
+        let w = vocab["w"].clone();
+        vocab.insert("h".into(), w);
+        vocab.insert("w".into(), h);
+        let path = dir.path().join("tokenizer.json");
+        std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let mut ctx = Arc::try_unwrap(ctx_with_tiny()).unwrap_or_else(|_| panic!("shared context"));
+        let mut second = ctx.config.model.clone();
+        second.id = "second".into();
+        second.tokenizer_path = Some(path.to_str().unwrap().into());
+        ctx.config.additional_models.push(second);
+        ctx.tokenizers =
+            Arc::new(crate::tokenizer::TokenizerRegistry::load_from_config(&ctx.config).unwrap());
+        let app = crate::server::app::build_router(Arc::new(ctx));
+        let mut tokens = Vec::new();
+        for model in ["tiny", "second", "unknown"] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/tokenize")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({"model":model,"prompt":"hello"}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if model == "unknown" {
+                assert_eq!(res.status(), StatusCode::NOT_FOUND);
+                continue;
+            }
+            assert_eq!(res.status(), StatusCode::OK);
+            let bytes = res.into_body().collect().await.unwrap().to_bytes();
+            let response: TokenizeResponse = serde_json::from_slice(&bytes).unwrap();
+            tokens.push(response.tokens.clone());
+            let res = app.clone().oneshot(Request::builder()
+                .method("POST").uri("/v1/detokenize")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"model":model,"tokens":response.tokens,"skip_special_tokens":true}).to_string())).unwrap())
+                .await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let bytes = res.into_body().collect().await.unwrap().to_bytes();
+            let response: DetokenizeResponse = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(response.text, "hello");
+        }
+        assert_ne!(tokens[0], tokens[1]);
     }
 
     #[tokio::test]

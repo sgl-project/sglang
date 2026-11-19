@@ -189,8 +189,11 @@ impl PreparedRequest {
             }
         }
         // The fleet's sampling contract applies to the client's body on both routes.
-        let sampling_defaults =
-            resolve_sampling_defaults(&ctx.config.model.sampling_overrides, &fields, &ctx.metrics)?;
+        let sampling_defaults = resolve_sampling_defaults(
+            &ctx.model_config(&model).sampling_overrides,
+            &fields,
+            &ctx.metrics,
+        )?;
         let defaults: Vec<_> = sampling_defaults
             .iter()
             .map(|(field, value)| (field.wire_name(), value.to_string()))
@@ -232,7 +235,7 @@ impl PreparedRequest {
         let needs_tokens = should_tokenize_request(
             can_forward_input_ids,
             policy_needs_request_tokens,
-            ctx.bucket_selector.is_enabled(),
+            ctx.bucket_selector(&model).is_enabled(),
         );
         // Parse the full body only when rendering or routing needs tokens.
         let parsed_body = needs_tokens
@@ -285,14 +288,17 @@ impl PreparedRequest {
         body: Bytes,
         policy_needs_request_tokens: bool,
     ) -> Result<Self, ApiError> {
-        let sampling_defaults =
-            resolve_sampling_defaults(&ctx.config.model.sampling_overrides, &fields, &ctx.metrics)?;
+        let sampling_defaults = resolve_sampling_defaults(
+            &ctx.model_config(&model).sampling_overrides,
+            &fields,
+            &ctx.metrics,
+        )?;
         let value: Value = serde_json::from_slice(&body).map_err(|_| invalid_request())?;
         let prompts = completion_prompts(&value);
         let needs_tokens = should_tokenize_request(
             false,
             policy_needs_request_tokens,
-            ctx.bucket_selector.is_enabled(),
+            ctx.bucket_selector(&model).is_enabled(),
         );
         // Text is tokenized per prompt, as `/generate` does, but only for routing.
         let text_ids = needs_tokens
@@ -344,8 +350,8 @@ impl PreparedRequest {
         ctx: &AppContext,
         model: ModelId,
         body: Bytes,
+        value: Value,
     ) -> Result<Self, ApiError> {
-        let value = Value::Object(serde_json::from_slice(&body).map_err(|_| invalid_request())?);
         let return_logprob = value["return_logprob"] == true;
         let mut request = Self::generate_value(ctx, model, value, Some(body))?;
         request.merges_input_logprobs = return_logprob && !request.streaming && !request.fans_out;
@@ -364,7 +370,7 @@ impl PreparedRequest {
         let stream =
             Option::<bool>::deserialize(&value["stream"]).map_err(|_| invalid_request())?;
         let mut rewrite = match body {
-            Some(_) => apply_sampling_overrides(ctx, &mut value)?,
+            Some(_) => apply_sampling_overrides(ctx, &model, &mut value)?,
             None => true,
         };
         let text_ids = tokenize_text(ctx, &model, &value);
@@ -373,7 +379,7 @@ impl PreparedRequest {
         let routed = routed.as_ref().unwrap_or(&value);
         let tokens = request_tokens_for(&ctx.tokenizers, &model, routed);
         let batch = batch_prompt_tokens(routed);
-        if let Some(input_ids) = text_ids.filter(|_| forwards_text_ids(ctx, &value)) {
+        if let Some(input_ids) = text_ids.filter(|_| forwards_text_ids(ctx, &model, &value)) {
             let fields = value.as_object_mut().expect("parsed as an object");
             fields.remove("text");
             fields.insert("input_ids".into(), input_ids);
@@ -448,7 +454,7 @@ impl PreparedRequest {
         let batch = is_embedding_batch(&value["input"]);
         let media = embedding_media(&value["input"]);
         let text_ids = tokenize_input_text(ctx, &model, &value["input"]);
-        let forward = !ctx.config.model.disable_input_ids_forwarding;
+        let forward = !ctx.model_config(&model).disable_input_ids_forwarding;
         // `ClassifyRequest` takes the token IDs of one prompt, not of a batch.
         let takes_ids = !(batch && path == CLASSIFY_PATH);
         if let Some(ids) = text_ids.as_ref().filter(|_| forward && takes_ids) {
@@ -484,8 +490,7 @@ impl PreparedRequest {
 
     /// SGLang's `V1RerankReqInput`, forwarded as sent: the engine renders and
     /// tokenizes each query-document pair as its own prompt.
-    pub(super) fn rerank(model: ModelId, body: Bytes) -> Result<Self, ApiError> {
-        let value = Value::Object(serde_json::from_slice(&body).map_err(|_| invalid_request())?);
+    pub(super) fn rerank(model: ModelId, body: Bytes, value: Value) -> Result<Self, ApiError> {
         // Qwen rerankers include the instruction in every query-document prompt.
         let shared = text_len(&value["instruct"]) + text_len(&value["query"]);
         let lengths: Vec<_> = value["documents"]
@@ -530,8 +535,11 @@ impl PreparedRequest {
             });
         }
         let fields = RoutingFields::typed(view);
-        let sampling_defaults =
-            resolve_sampling_defaults(&ctx.config.model.sampling_overrides, &fields, &ctx.metrics)?;
+        let sampling_defaults = resolve_sampling_defaults(
+            &ctx.model_config(&model).sampling_overrides,
+            &fields,
+            &ctx.metrics,
+        )?;
         let fans_out = requests_multiple_samples(&fields, &sampling_defaults);
         let samples = sample_count(&fields, &sampling_defaults);
         let output = view
@@ -652,7 +660,7 @@ impl PreparedRequest {
 }
 
 fn forwarding_scope(ctx: &AppContext, model: &ModelId) -> ForwardingScope {
-    if ctx.config.model.disable_input_ids_forwarding {
+    if ctx.model_config(model).disable_input_ids_forwarding {
         return ForwardingScope::Never;
     }
     ctx.tokenizers.forwarding_scope(&model.0)
@@ -679,7 +687,7 @@ fn lower_openai(
             .iter()
             .any(|name| header_str(headers, name) == Some("1")),
     };
-    let tokenizer = ctx.tokenizers.openai();
+    let tokenizer = ctx.tokenizers.openai(&model.0);
     if path == COMPLETIONS_PATH {
         return lower_completion(body, &headers, &settings, tokenizer)
             .map(|(body, responder)| (body, Responder::Completion(Box::new(responder))))
@@ -694,12 +702,15 @@ fn lower_openai(
         .clone()
         .unwrap_or_default();
     if engine_kwargs.into_iter().collect::<HashMap<_, _>>()
-        != ctx.config.model.default_chat_template_kwargs
+        != ctx.model_config(model).default_chat_template_kwargs
     {
         return Err("default_chat_template_kwargs_differ");
     }
     let render = |request: &Value| ctx.tokenizers.encode_chat(&model.0, request);
-    let chat_model = ctx.tokenizers.chat_model();
+    let chat_model = ctx
+        .tokenizers
+        .chat_model(&model.0)
+        .ok_or("model_metadata_unavailable")?;
     lower_chat(body, &headers, &settings, chat_model, render, tokenizer)
         .map(|(body, responder)| (body, Responder::Chat(Box::new(responder))))
         .map_err(|unsupported| unsupported.0)
@@ -730,7 +741,7 @@ pub(super) fn forwarded_prompt_ids(
     path: &str,
     text: &str,
 ) -> Option<Vec<u32>> {
-    if ctx.config.model.disable_input_ids_forwarding {
+    if ctx.model_config(model).disable_input_ids_forwarding {
         return None;
     }
     if path == GENERATE_PATH {
@@ -761,8 +772,12 @@ fn tokenize_text(ctx: &AppContext, model: &ModelId, value: &Value) -> Option<Val
 
 /// Apply `--override-sampling-params` to each prompt's `sampling_params`, as chat
 /// does to its top-level fields; `true` when a default was added.
-fn apply_sampling_overrides(ctx: &AppContext, value: &mut Value) -> Result<bool, ApiError> {
-    let overrides = &ctx.config.model.sampling_overrides;
+fn apply_sampling_overrides(
+    ctx: &AppContext,
+    model: &ModelId,
+    value: &mut Value,
+) -> Result<bool, ApiError> {
+    let overrides = &ctx.model_config(model).sampling_overrides;
     if overrides.params.is_empty() {
         return Ok(false);
     }
@@ -787,9 +802,9 @@ fn apply_sampling_overrides(ctx: &AppContext, value: &mut Value) -> Result<bool,
 
 /// Whether `text` may reach the engine as `input_ids`: not when its processor expands
 /// multimodal placeholders from the text, nor under `--disable-input-ids-forwarding`.
-fn forwards_text_ids(ctx: &AppContext, value: &Value) -> bool {
+fn forwards_text_ids(ctx: &AppContext, model: &ModelId, value: &Value) -> bool {
     let engine_inputs = ["input_embeds", "image_data", "video_data", "audio_data"];
-    !ctx.config.model.disable_input_ids_forwarding
+    !ctx.model_config(model).disable_input_ids_forwarding
         && engine_inputs.iter().all(|key| value[key].is_null())
 }
 
@@ -833,8 +848,7 @@ fn parallel_samples(value: &Value) -> u64 {
 }
 
 /// An embeddings body and the model it names; chat completions also require one.
-pub(super) fn parse_embedding_request(body: &Bytes) -> Result<(ModelId, Value), ApiError> {
-    let value = Value::Object(serde_json::from_slice(body).map_err(|_| invalid_request())?);
+pub(super) fn parse_embedding_request(value: Value) -> Result<(ModelId, Value), ApiError> {
     let model = Option::<String>::deserialize(&value["model"])
         .map_err(|_| invalid_request())?
         .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?;
@@ -1840,6 +1854,12 @@ fn sampling_violation(spec: &ParamSpec, provided: SamplingValue) -> Option<Strin
     }
 }
 
+pub(super) fn parse_native_request(body: &Bytes) -> Result<(RoutingFields, Value), ApiError> {
+    let value = Value::Object(serde_json::from_slice(body).map_err(|_| invalid_request())?);
+    let fields = RoutingFields::deserialize(&value).map_err(|_| invalid_request())?;
+    Ok((fields, value))
+}
+
 pub(super) fn parse_routing_fields(body: &Bytes) -> Result<RoutingFields, ApiError> {
     let err = match serde_json::from_slice::<RoutingFields>(body) {
         Ok(fields) => return Ok(fields),
@@ -2001,13 +2021,15 @@ mod tests {
 
     /// A `/generate` request prepared with the tiny test tokenizer loaded.
     fn prepare_generate(body: Value) -> PreparedRequest {
-        let body = Bytes::from(body.to_string());
-        PreparedRequest::generate(&tokenizer_ctx(), ModelId("stub-model".into()), body).unwrap()
+        let bytes = Bytes::from(body.to_string());
+        PreparedRequest::generate(&tokenizer_ctx(), ModelId("stub-model".into()), bytes, body)
+            .unwrap()
     }
 
     fn prepare_embeddings(ctx: &AppContext, input: Value) -> (PreparedRequest, Value) {
         let body = Bytes::from(json!({"model": "stub-model", "input": input}).to_string());
-        let (model, value) = parse_embedding_request(&body).unwrap();
+        let (_, value) = parse_native_request(&body).unwrap();
+        let (model, value) = parse_embedding_request(value).unwrap();
         let r = PreparedRequest::embeddings(ctx, EMBEDDINGS_PATH, model, body, value).unwrap();
         let input = serde_json::from_slice::<Value>(&r.body).unwrap()["input"].take();
         (r, input)
@@ -2091,7 +2113,11 @@ mod tests {
             "query":[{"type":"text","text":"q"},image],
             "documents":["text only",[image, video]]
         });
-        let r = PreparedRequest::rerank(ModelId("stub-model".into()), body.to_string().into());
+        let r = PreparedRequest::rerank(
+            ModelId("stub-model".into()),
+            body.to_string().into(),
+            body.clone(),
+        );
         assert_eq!(r.unwrap().media, want);
     }
 
@@ -2157,7 +2183,11 @@ mod tests {
         let documents = json!(["abcd", [{"type": "text", "text": "abcdefgh"}, image]]);
         for (instruct, total, longest) in [(json!(null), 5, 3), (json!("abcdefgh"), 9, 5)] {
             let body = json!({"query": "abcd", "documents": documents, "instruct": instruct});
-            let r = PreparedRequest::rerank(ModelId("stub-model".into()), body.to_string().into());
+            let r = PreparedRequest::rerank(
+                ModelId("stub-model".into()),
+                body.to_string().into(),
+                body.clone(),
+            );
             let r = r.unwrap();
             assert_eq!(
                 (r.input_token_count, r.sequence_token_count),

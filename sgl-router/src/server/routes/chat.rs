@@ -29,8 +29,9 @@ use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
 use forward::{forward_request, forward_request_grpc, RequestDurationGuard, SelectedWorkers};
 use preparation::{
-    forwarded_prompt_ids, parse_embedding_request, parse_routing_fields, PreparedRequest,
-    CHAT_PATH, CLASSIFY_PATH, COMPLETIONS_PATH, EMBEDDINGS_PATH, GENERATE_PATH, RERANK_PATH,
+    forwarded_prompt_ids, parse_embedding_request, parse_native_request, parse_routing_fields,
+    PreparedRequest, CHAT_PATH, CLASSIFY_PATH, COMPLETIONS_PATH, EMBEDDINGS_PATH, GENERATE_PATH,
+    RERANK_PATH,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -285,18 +286,29 @@ fn prepare_now<'a>(
     body: Bytes,
     grpc: bool,
 ) -> Result<(PreparedRequest, ModelRouting<'a>), ApiError> {
-    // One model is served, so any `model` name routes to it; the engine still
-    // reads the name the body carries, with any `:adapter` suffix.
-    let model = ModelId(ctx.config.model.id.clone());
+    let (mut fields, native) = match endpoint {
+        Endpoint::Chat | Endpoint::Completions => (parse_routing_fields(&body)?, None),
+        _ => {
+            let (fields, value) = parse_native_request(&body)?;
+            (fields, Some(value))
+        }
+    };
+    let configured = match fields.model.as_deref() {
+        Some(name) => ctx
+            .config
+            .resolve_model(name)
+            .ok_or_else(|| ApiError::ModelNotFound(name.into()))?,
+        None => &ctx.config.model,
+    };
+    let model = ModelId(configured.id.clone());
     let routing = ModelRouting::lookup(ctx, &model)?;
     let request = match endpoint {
         Endpoint::Chat | Endpoint::Completions => {
-            let mut fields = parse_routing_fields(&body)?;
             let sent = fields.model.take();
             let sent =
                 ModelId(sent.ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?);
             let (_, body) = canonicalize_model_alias(ctx, sent, body)?;
-            let needs_tokens = routing.needs_request_tokens(ctx);
+            let needs_tokens = routing.needs_request_tokens(ctx, &model);
             let path = if matches!(endpoint, Endpoint::Chat) {
                 CHAT_PATH
             } else {
@@ -310,10 +322,10 @@ fn prepare_now<'a>(
                 PreparedRequest::openai(ctx, path, model, fields, headers, body, needs_tokens)?
             }
         }
-        Endpoint::Generate => PreparedRequest::generate(ctx, model, body)?,
+        Endpoint::Generate => PreparedRequest::generate(ctx, model, body, native.unwrap())?,
         Endpoint::Embeddings | Endpoint::Classify => {
             let path = endpoint.path();
-            let (sent, mut value) = parse_embedding_request(&body)?;
+            let (sent, mut value) = parse_embedding_request(native.unwrap())?;
             let (sent, body) = canonicalize_model_alias(ctx, sent, body)?;
             value["model"] = sent.0.into();
             require_plain_workers(ctx, &model, path)?;
@@ -321,7 +333,7 @@ fn prepare_now<'a>(
         }
         Endpoint::Rerank => {
             require_plain_workers(ctx, &model, RERANK_PATH)?;
-            PreparedRequest::rerank(model, body)?
+            PreparedRequest::rerank(model, body, native.unwrap())?
         }
     };
     Ok((request, routing))
@@ -334,7 +346,11 @@ fn canonicalize_model_alias(
     model: ModelId,
     body: Bytes,
 ) -> Result<(ModelId, Bytes), ApiError> {
-    let Some(canonical) = ctx.config.model.canonical_alias(&model.0) else {
+    let configured = ctx
+        .config
+        .resolve_model(&model.0)
+        .ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))?;
+    let Some(canonical) = configured.canonical_alias(&model.0) else {
         return Ok((model, body));
     };
     // Keep every other JSON value verbatim, including numbers outside f64's
@@ -376,9 +392,11 @@ impl<'a> ModelRouting<'a> {
         routing.ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))
     }
 
-    fn needs_request_tokens(&self, ctx: &AppContext) -> bool {
+    fn needs_request_tokens(&self, ctx: &AppContext, model: &ModelId) -> bool {
         match self {
-            Self::Legacy(policy) => policy.needs_request_tokens() || ctx.config.model.dp_aware,
+            Self::Legacy(policy) => {
+                policy.needs_request_tokens() || ctx.model_config(model).dp_aware
+            }
             // The same predicate gates `--no-tokenizer` at startup,
             // so a load-only bucket skips the body parse.
             Self::Reorg(resolver) => resolver.needs_request_tokens(),
@@ -491,7 +509,7 @@ async fn select_workers(
     let routing_context = RoutingContext {
         prefix_matches: lookup_prefix_matches(ctx, request).await?,
         load_snapshot: capture_load_snapshot(ctx, policy, candidates),
-        ..RoutingContext::from_headers(ctx, headers)?
+        ..RoutingContext::from_headers(ctx, &request.model, headers)?
     };
 
     let candidates = prefills_with_decode(ctx, request, candidates, resolver, &routing_context);
@@ -572,9 +590,13 @@ struct RoutingContext<'a> {
 
 impl<'a> RoutingContext<'a> {
     /// Header-derived selection inputs; prefix and load fields start empty.
-    fn from_headers(ctx: &AppContext, headers: &'a HeaderMap) -> Result<Self, ApiError> {
+    fn from_headers(
+        ctx: &AppContext,
+        model: &ModelId,
+        headers: &'a HeaderMap,
+    ) -> Result<Self, ApiError> {
         // Buckets group workers by token limits and service targets; disabled means one pool per role.
-        let (ttft_slo_ms, tps_slo) = if ctx.bucket_selector.is_enabled() {
+        let (ttft_slo_ms, tps_slo) = if ctx.bucket_selector(model).is_enabled() {
             (
                 parse_optional_positive_u64_header(headers, &X_SGL_TTFT_SLO_MS, "TTFT SLO")?,
                 parse_optional_positive_f64_header(headers, &X_SGL_TPS_SLO, "TPS SLO")?,
@@ -583,14 +605,12 @@ impl<'a> RoutingContext<'a> {
             (None, None)
         };
         let routing_key = ctx
-            .config
-            .model
+            .model_config(model)
             .sticky
             .as_ref()
             .and_then(|config| nonempty_header(headers, &config.header_name));
         let session_id = ctx
-            .config
-            .model
+            .model_config(model)
             .affinity
             .as_ref()
             .and_then(|config| nonempty_header(headers, &config.session_id_header));
@@ -619,11 +639,12 @@ fn pick_prefill_worker(
     candidates: &[Arc<Worker>],
     routing: &RoutingContext<'_>,
 ) -> Result<Arc<Worker>, ApiError> {
-    let affinity = ctx.config.model.affinity.as_ref();
+    let model = ctx.model_config(&request.model);
+    let affinity = model.affinity.as_ref();
     select_prefill_worker(&PrefillSelectionInputs {
         policy,
-        policy_kind: ctx.config.model.policy,
-        bucket_selector: ctx.bucket_selector.as_ref(),
+        policy_kind: model.policy,
+        bucket_selector: ctx.bucket_selector(&request.model),
         metrics: ctx.metrics.as_ref(),
         model_id: &request.model,
         body: Some(&request.body),
@@ -667,9 +688,9 @@ fn pick_decode_worker(
         .decode_peers(&request.model, prefill)
         .map_err(|error| pool_error(error, &request.model))?;
     let decode = select_decode_peer(&DecodeSelectionInputs {
-        decode_policy_kind: ctx.config.model.decode_policy,
+        decode_policy_kind: ctx.model_config(&request.model).decode_policy,
         allow_capacity_fallback,
-        bucket_selector: ctx.bucket_selector.as_ref(),
+        bucket_selector: ctx.bucket_selector(&request.model),
         model_id: &request.model,
         prefill_url: &prefill.url,
         decode_workers: &candidates,
@@ -733,10 +754,14 @@ fn policy_selection_failed(
     model: &str,
     reason: PolicySelectionFailureReason,
 ) -> ApiError {
-    ctx.metrics
-        .record_policy_selection_failure(ctx.config.model.policy, reason);
+    let policy = ctx
+        .config
+        .resolve_model(model)
+        .expect("routed model must be configured")
+        .policy;
+    ctx.metrics.record_policy_selection_failure(policy, reason);
     tracing::warn!(
-        policy = %ctx.config.model.policy,
+        policy = %policy,
         reason = reason.as_str(),
         model,
         "prefill policy selection failed"

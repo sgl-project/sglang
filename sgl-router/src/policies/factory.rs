@@ -220,11 +220,12 @@ pub fn build_registry(
     block_size_oracle: Arc<BlockSizeOracle>,
 ) -> Result<PolicyRegistry> {
     let reg = PolicyRegistry::default();
-    let m = &cfg.model;
-    reg.insert(
-        ModelId(m.id.clone()),
-        build_policy(m, Arc::clone(&tree), Arc::clone(&block_size_oracle))?,
-    );
+    for model in cfg.models() {
+        reg.insert(
+            ModelId(model.id.clone()),
+            build_policy(model, Arc::clone(&tree), Arc::clone(&block_size_oracle))?,
+        );
+    }
     Ok(reg)
 }
 
@@ -545,6 +546,20 @@ mod tests {
         let reg = build_registry(&cfg, tree, BlockSizeOracle::new()).unwrap();
         assert!(reg.get(&ModelId("qwen".into())).is_some());
         assert!(reg.get(&ModelId("missing".into())).is_none());
+    }
+
+    #[test]
+    fn models_get_independent_policy_instances() {
+        let mut config = cfg_with_model("first", PolicyKind::RoundRobin);
+        let mut second = config.model.clone();
+        second.id = "second".into();
+        config.additional_models.push(second);
+        let registry = build_registry_with_defaults(&config).unwrap();
+        let first = registry.get(&ModelId("first".into())).unwrap();
+        let second = registry
+            .get(&ModelId("second".into()))
+            .expect("second model policy");
+        assert!(!Arc::ptr_eq(&first, &second));
     }
 
     #[test]

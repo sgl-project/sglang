@@ -39,9 +39,8 @@ pub(crate) async fn messages(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
-    let inline_system = model_supports_inline_system(&ctx);
     let prepared = off_worker::run_for_body(body.len(), || {
-        let converted = parse(&body, false, inline_system)?;
+        let converted = parse(&ctx, &body, false)?;
         let chat_body = Bytes::from(serde_json::to_vec(&converted.chat).expect("serialize chat"));
         Ok::<_, ApiError>((converted, chat_body))
     });
@@ -61,14 +60,20 @@ pub(crate) async fn count_tokens(
     State(ctx): State<Arc<AppContext>>,
     body: Bytes,
 ) -> Response<Body> {
-    let inline_system = model_supports_inline_system(&ctx);
-    let mut converted =
-        match off_worker::run_for_body(body.len(), || parse(&body, true, inline_system)) {
-            Ok(c) => c,
-            Err(e) => return adapt(e.into_response(), None).await,
-        };
-    let model = ctx.config.model.id.as_str();
-    if let Err(e) = served_tokenizer(&ctx) {
+    let mut converted = match off_worker::run_for_body(body.len(), || parse(&ctx, &body, true)) {
+        Ok(c) => c,
+        Err(e) => return adapt(e.into_response(), None).await,
+    };
+    let requested = converted.chat["model"].as_str().unwrap_or("");
+    let Some(configured) = ctx.config.resolve_model(requested) else {
+        return adapt(
+            ApiError::ModelNotFound(requested.into()).into_response(),
+            None,
+        )
+        .await;
+    };
+    let model = configured.id.as_str();
+    if let Err(e) = served_tokenizer(&ctx, requested) {
         return adapt(e.into_response(), None).await;
     }
     if ctx.tokenizers.is_minimax_m31(model) {
@@ -92,21 +97,26 @@ pub(crate) async fn count_tokens(
 }
 
 fn parse(
+    ctx: &AppContext,
     body: &Bytes,
     count_only: bool,
-    inline_system: bool,
 ) -> Result<anthropic::Converted, ApiError> {
     let req: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| ApiError::BadRequest(format!("request body is not valid JSON: {e}")))?;
+    let inline_system = model_supports_inline_system(ctx, &req);
     anthropic::to_chat(req, count_only, inline_system).map_err(ApiError::BadRequest)
 }
 
 /// Whether every worker of the served model renders a system message after
 /// the first; a worker that does not report it counts as no.
-fn model_supports_inline_system(ctx: &AppContext) -> bool {
-    let workers = ctx
-        .registry
-        .workers_for(&ModelId(ctx.config.model.id.clone()));
+fn model_supports_inline_system(ctx: &AppContext, value: &serde_json::Value) -> bool {
+    let Some(model) = value["model"]
+        .as_str()
+        .and_then(|name| ctx.config.resolve_model(name))
+    else {
+        return false;
+    };
+    let workers = ctx.registry.workers_for(&ModelId(model.id.clone()));
     !workers.is_empty() && workers.iter().all(|w| w.supports_inline_system())
 }
 

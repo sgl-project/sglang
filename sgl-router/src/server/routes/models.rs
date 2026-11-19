@@ -21,14 +21,15 @@ pub struct ModelEntry {
 }
 
 pub async fn list_models(State(ctx): State<Arc<AppContext>>) -> Json<ModelsList> {
-    // The router serves a single configured model; OpenAI clients still
-    // expect a list shape, so return a one-element `data` array.
-    let m = &ctx.config.model;
-    let data = vec![ModelEntry {
-        id: m.id.clone(),
-        object: "model",
-        owned_by: "sglang",
-    }];
+    let data = ctx
+        .config
+        .models()
+        .map(|m| ModelEntry {
+            id: m.id.clone(),
+            object: "model",
+            owned_by: "sglang",
+        })
+        .collect();
     Json(ModelsList {
         object: "list",
         data,

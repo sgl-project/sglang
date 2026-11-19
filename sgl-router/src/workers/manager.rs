@@ -33,14 +33,16 @@ const BOOTSTRAP_PORT_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Resolve the circuit-breaker config for all model IDs carried by a spec.
 ///
-/// The router serves a single configured model; apply its circuit-breaker
-/// config when this worker advertises that model id, and the default config
-/// otherwise. Under `--disable-circuit-breaker` there is none, so the worker's
+/// Apply the shared circuit-breaker config when this worker advertises a
+/// configured model id, and the default config otherwise. Under `--disable-circuit-breaker` there is none, so the worker's
 /// breaker never opens.
 fn cb_config_for_spec(spec: &WorkerSpec, cfg: &Config) -> Option<CircuitBreakerConfig> {
     let model = &cfg.model;
     let cbc = model.circuit_breaker.as_ref()?;
-    if spec.model_ids.iter().any(|id| id.0 == model.id) {
+    if cfg
+        .models()
+        .any(|model| spec.model_ids.iter().any(|id| id.0 == model.id))
+    {
         return Some(CircuitBreakerConfig {
             threshold: cbc.threshold,
             cool_down: Duration::from_secs(cbc.cool_down_secs),
@@ -711,8 +713,8 @@ mod tests {
 
     #[test]
     fn cb_config_for_spec_carries_threshold_and_cool_down() {
-        let cfg = cfg_with_model_cb("m", 5, 60);
-        let spec = WorkerSpec {
+        let mut cfg = cfg_with_model_cb("m", 5, 60);
+        let mut spec = WorkerSpec {
             id: WorkerId("w".into()),
             url: "http://x".into(),
             mode: WorkerMode::Plain,
@@ -720,6 +722,13 @@ mod tests {
             ..Default::default()
         };
         let cb = cb_config_for_spec(&spec, &cfg).expect("model has cb config");
+        assert_eq!(cb.threshold.get(), 5);
+        assert_eq!(cb.cool_down, Duration::from_secs(60));
+        let mut second = cfg.model.clone();
+        second.id = "second".into();
+        cfg.additional_models.push(second);
+        spec.model_ids = vec![ModelId("second".into())];
+        let cb = cb_config_for_spec(&spec, &cfg).expect("additional model uses shared cb config");
         assert_eq!(cb.threshold.get(), 5);
         assert_eq!(cb.cool_down, Duration::from_secs(60));
     }

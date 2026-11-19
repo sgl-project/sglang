@@ -15,7 +15,7 @@ pub async fn healthz() -> StatusCode {
 
 /// Ready after startup only when ALL hold:
 /// 1. `mark_ready()` was called.
-/// 2. The configured model has a usable plain or PD pool.
+/// 2. Every configured model has a usable plain or PD pool.
 /// 3. Peer bootstrap has settled (`BootstrapTracker::settled`): every rank
 ///    resolved, or the `--kv-bootstrap-timeout-ms` deadline passed. Always
 ///    true without cache-aware and `--kv-peer-selector`.
@@ -30,18 +30,20 @@ pub async fn readyz(State(ctx): State<Arc<AppContext>>) -> StatusCode {
     if !ctx.is_ready() {
         return StatusCode::SERVICE_UNAVAILABLE;
     }
-    let model = ModelId(ctx.config.model.id.clone());
-    let pool_ready = match &ctx.chat_routing {
-        ChatRouting::Legacy => PdPoolResolver::new(Arc::clone(&ctx.registry))
-            .prefill_candidates(&model)
-            .is_ok_and(|workers| !workers.is_empty()),
-        ChatRouting::Reorg(resolvers) => resolvers.get(&model).is_some_and(|resolver| {
-            resolver
-                .buckets
-                .iter()
-                .any(|bucket| bucket.has_ready_workers(&ctx.registry, &model))
-        }),
-    };
+    let pool_ready = ctx.config.models().all(|configured| {
+        let model = ModelId(configured.id.clone());
+        match &ctx.chat_routing {
+            ChatRouting::Legacy => PdPoolResolver::new(Arc::clone(&ctx.registry))
+                .prefill_candidates(&model)
+                .is_ok_and(|workers| !workers.is_empty()),
+            ChatRouting::Reorg(resolvers) => resolvers.get(&model).is_some_and(|resolver| {
+                resolver
+                    .buckets
+                    .iter()
+                    .any(|bucket| bucket.has_ready_workers(&ctx.registry, &model))
+            }),
+        }
+    });
     if pool_ready && ctx.kv_bootstrap_admit_ready() {
         StatusCode::OK
     } else {
@@ -153,6 +155,30 @@ mod tests {
             }
             assert_eq!(readyz(State(ctx)).await == StatusCode::OK, ready);
         }
+    }
+
+    #[tokio::test]
+    async fn readiness_requires_every_configured_model() {
+        let mut ctx = AppContext::stub();
+        ctx.mark_ready();
+        add_test_worker(&ctx);
+        let mut second = ctx.config.model.clone();
+        second.id = "second".into();
+        ctx.config.additional_models.push(second);
+        let ctx = Arc::new(ctx);
+        assert_eq!(
+            readyz_status(ctx.clone()).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        ctx.registry
+            .add(crate::discovery::WorkerSpec {
+                id: crate::discovery::WorkerId("second-worker".into()),
+                url: "http://second:30000".into(),
+                model_ids: vec![ModelId("second".into())],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(readyz_status(ctx).await, StatusCode::OK);
     }
 
     #[tokio::test]

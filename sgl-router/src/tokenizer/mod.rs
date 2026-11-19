@@ -11,6 +11,7 @@ use chat_formatter::ChatFormatter;
 use dashmap::DashMap;
 use dynamo_tokenizers::{EncodeSegment, Tokenizer};
 use sglang_processor::openai::{ChatModel, OpenAiTokenizer, ReasoningToggle, TokenPieces};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -58,6 +59,7 @@ impl ChatFormatterEntry {
 
 #[derive(Default)]
 pub struct TokenizerRegistry {
+    additional: HashMap<String, TokenizerRegistry>,
     inner: DashMap<String, Arc<Tokenizer>>,
     /// Per-model chat formatter, present only when the model's prompt format is
     /// known; models without one fall back to raw prompt-text tokenization.
@@ -123,8 +125,16 @@ impl std::fmt::Debug for TokenizerRegistry {
 
 impl TokenizerRegistry {
     pub fn load_from_config(cfg: &crate::config::Config) -> Result<Self> {
+        let mut me = Self::load_model(&cfg.model)?;
+        for model in &cfg.additional_models {
+            me.additional
+                .insert(model.id.clone(), Self::load_model(model)?);
+        }
+        Ok(me)
+    }
+
+    fn load_model(m: &crate::config::ModelConfig) -> Result<Self> {
         let mut me = TokenizerRegistry::default();
-        let m = &cfg.model;
         let Some(tokenizer_path) = &m.tokenizer_path else {
             tracing::info!(model = %m.id, "tokenizer disabled; workers tokenize requests");
             return Ok(me);
@@ -219,20 +229,44 @@ impl TokenizerRegistry {
         Ok(me)
     }
 
-    pub fn openai(&self) -> Option<Arc<dyn OpenAiTokenizer>> {
-        self.openai.clone()
+    fn for_model(&self, model_id: &str) -> &Self {
+        self.additional.get(model_id).unwrap_or(self)
     }
 
-    pub fn chat_model(&self) -> &ChatModel {
-        &self.chat_model
+    pub fn openai(&self, model_id: &str) -> Option<Arc<dyn OpenAiTokenizer>> {
+        self.get(model_id)?;
+        self.for_model(model_id).openai.clone()
+    }
+
+    pub fn chat_model(&self, model_id: &str) -> Option<&ChatModel> {
+        self.get(model_id)?;
+        Some(&self.for_model(model_id).chat_model)
     }
 
     pub fn stats(&self) -> &stats::TokenizerStats {
         &self.stats
     }
 
+    pub fn render_stats(&self) -> String {
+        let total = stats::TokenizerStats::default();
+        for stats in
+            std::iter::once(&*self.stats).chain(self.additional.values().map(|m| &*m.stats))
+        {
+            let (cached, encoded) = stats.l1_tokens();
+            total.l1.cached_tokens.fetch_add(cached, Ordering::Relaxed);
+            total
+                .l1
+                .encoded_tokens
+                .fetch_add(encoded, Ordering::Relaxed);
+        }
+        total.render()
+    }
+
     pub fn get(&self, model_id: &str) -> Option<Arc<Tokenizer>> {
-        self.inner.get(model_id).map(|r| Arc::clone(&*r))
+        self.for_model(model_id)
+            .inner
+            .get(model_id)
+            .map(|r| Arc::clone(&*r))
     }
 
     /// Encode a raw prompt as the engine's `tokenizer(text)` does, special tokens included.
@@ -246,14 +280,16 @@ impl TokenizerRegistry {
     /// Whether [`Self::encode_prompt`] can tokenize for `model_id`; callers check
     /// it before handing a batch off the worker for nothing.
     pub fn can_encode_prompt(&self, model_id: &str) -> bool {
-        self.prompt_affixes.is_some() && self.inner.contains_key(model_id)
+        let me = self.for_model(model_id);
+        me.prompt_affixes.is_some() && me.inner.contains_key(model_id)
     }
 
     fn encode_prompt_now(&self, model_id: &str, text: &str) -> Option<Vec<u32>> {
-        let affixes = self.prompt_affixes.as_ref()?;
+        let me = self.for_model(model_id);
+        let affixes = me.prompt_affixes.as_ref()?;
         let tokenizer = self.get(model_id)?;
         // The supported tiktoken models use Kimi's chunked encoding, also used for chat.
-        let ids = if self.stats.backend().is_tiktoken() {
+        let ids = if me.stats.backend().is_tiktoken() {
             kimi::encode(&tokenizer, &[EncodeSegment::control(text)])
         } else {
             adapter::encode(&tokenizer, text)
@@ -265,18 +301,20 @@ impl TokenizerRegistry {
     /// Whether this model has a chat formatter (and thus the chat-aware
     /// tokenization path is available for it).
     pub fn has_chat_formatter(&self, model_id: &str) -> bool {
-        self.formatters.contains_key(model_id)
+        self.for_model(model_id).formatters.contains_key(model_id)
     }
 
     /// Whether `model_id` is MiniMax-M3.1 (see [`ChatFormatter::is_minimax_m31`]).
     pub fn is_minimax_m31(&self, model_id: &str) -> bool {
-        self.formatters
+        self.for_model(model_id)
+            .formatters
             .get(model_id)
             .is_some_and(|e| e.formatter.is_minimax_m31())
     }
 
     pub fn forwarding_scope(&self, model_id: &str) -> ForwardingScope {
-        self.formatters
+        self.for_model(model_id)
+            .formatters
             .get(model_id)
             .map_or(ForwardingScope::Never, |e| e.formatter.forwarding_scope())
     }
@@ -289,7 +327,7 @@ impl TokenizerRegistry {
     fn encode_chat_now(&self, model_id: &str, request: &serde_json::Value) -> Option<Vec<u32>> {
         // Clone the Arc and drop the DashMap guard before the CPU-bound
         // render+encode (mirrors `get`), so no shard read-lock is held across it.
-        let entry = Arc::clone(&*self.formatters.get(model_id)?);
+        let entry = Arc::clone(&*self.for_model(model_id).formatters.get(model_id)?);
         let tokenizer = self.get(model_id)?;
         match entry.formatter.encode(&tokenizer, request) {
             Ok(ids) if !ids.is_empty() => Some(ids),
@@ -305,7 +343,11 @@ impl TokenizerRegistry {
     }
 
     pub fn ids(&self) -> Vec<String> {
-        self.inner.iter().map(|kv| kv.key().clone()).collect()
+        self.inner
+            .iter()
+            .map(|kv| kv.key().clone())
+            .chain(self.additional.values().flat_map(|registry| registry.ids()))
+            .collect()
     }
 
     /// Attach a chat formatter to an already-loaded model. Lets policy tests in
@@ -313,7 +355,7 @@ impl TokenizerRegistry {
     /// fixture.
     #[cfg(test)]
     pub(crate) fn attach_chat_formatter_for_test(&self, model_id: &str, formatter: ChatFormatter) {
-        self.formatters.insert(
+        self.for_model(model_id).formatters.insert(
             model_id.to_string(),
             Arc::new(ChatFormatterEntry::new(formatter)),
         );
@@ -387,6 +429,24 @@ mod tests {
         let r = TokenizerRegistry::load_from_config(&cfg()).unwrap();
         assert!(r.get("tiny").is_some());
         assert!(r.get("missing").is_none());
+    }
+
+    #[test]
+    fn additional_model_metrics_are_aggregated() {
+        let mut config = cfg();
+        let mut second = config.model.clone();
+        second.id = "second".into();
+        config.additional_models.push(second);
+        let registry = TokenizerRegistry::load_from_config(&config).unwrap();
+        registry.stats.l1.cached_tokens.store(10, Ordering::Relaxed);
+        registry.additional["second"]
+            .stats
+            .l1
+            .cached_tokens
+            .store(20, Ordering::Relaxed);
+        assert!(registry.render_stats().contains("source=\"cached\"} 30"));
+        assert!(registry.openai("missing").is_none());
+        assert!(registry.chat_model("missing").is_none());
     }
 
     #[test]
