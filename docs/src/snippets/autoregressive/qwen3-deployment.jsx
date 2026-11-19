@@ -334,11 +334,16 @@ export const Qwen3Deployment = () => {
 
     // Add tool call parser
     if (toolcall === 'enabled') {
-      cmd += ' \\\n  --tool-call-parser qwen25';
+      cmd += ' \\\n  --tool-call-parser qwen';
     }
 
     if (hardware === 'b300') {
       cmd += ' \\\n  --enforce-disable-flashinfer-allreduce-fusion';
+    }
+
+    if (hardware === 'arc_b') {
+      cmd += ' \\\n  --attention-backend intel_xpu \\\n  --page-size 64';
+      cmd += ' \\\n  --cuda-graph-backend-decode full \\\n  --cuda-graph-backend-prefill breakable';
     }
 
     return cmd;

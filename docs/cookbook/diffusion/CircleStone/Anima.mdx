@@ -87,6 +87,13 @@ Breakable CUDA graphs reuse the conditioner's actual sequence length, without
 additional text-bucket padding. Requests with uncaptured shapes fall back to eager
 execution. Standard short prompts use the same 512-token conditioning shape.
 
+Resident eager execution reuses timestep-dependent modulation projections between
+the two serial CFG branches. It retains only the current step's values, about
+1 MiB per BF16 sample, and releases them before VAE decode. Each request starts
+with fresh state. CFG parallelism, guidance 1, layerwise offload, wrapped modules,
+compilation, and graph capture use the original projection path. BCG replay
+continues to use its captured graph.
+
 ## 5. Measured tuning
 
 For repeated requests, compilation was faster than eager execution on all three

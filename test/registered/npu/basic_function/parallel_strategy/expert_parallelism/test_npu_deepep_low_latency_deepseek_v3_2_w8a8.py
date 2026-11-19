@@ -7,7 +7,7 @@ from sglang.test.ascend.test_mmlu import TestMMLU
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=200, suite="full-16-npu-a3", nightly=True)
+register_npu_ci(est_time=200, suite="full-test-16-npu-a3", nightly=True)
 
 
 class TestDeepEpDeepseekV32(GSM8KAscendMixin, TestMMLU, CustomTestCase):
@@ -33,7 +33,8 @@ class TestDeepEpDeepseekV32(GSM8KAscendMixin, TestMMLU, CustomTestCase):
         "low_latency",
         "--mem-fraction-static",
         0.82,
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph",
+        "--disable-prefill-cuda-graph",
         "--disable-radix-cache",
         "--context-length",
         40960,

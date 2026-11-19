@@ -4,7 +4,7 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
 import torch
@@ -15,14 +15,17 @@ from sglang.srt.disaggregation.encoder import runtime as encoder_runtime
 from sglang.srt.disaggregation.encoder.preprocessor import (
     EncoderPreprocessor,
     EncoderPreprocessResult,
+    _convert,
 )
 from sglang.srt.disaggregation.encoder.receiver import EmbeddingData
 from sglang.srt.disaggregation.encoder.runtime import (
     _DP_RELEASE_AFTER_ENCODE,
     DPDispatcher,
     _retire_abandoned_encode,
+    validate_encode_request,
 )
 from sglang.srt.disaggregation.encoder.server import (
+    EncodeContext,
     EncoderMetaRegistry,
     MMEncoder,
     MMError,
@@ -32,9 +35,10 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
     MooncakeTransferEngine,
 )
 from sglang.srt.managers.io_struct import unwrap_from_pickle
+from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.utils.common import safe_pickle_loads
+from sglang.srt.utils.serialization import safe_pickle_loads
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -115,7 +119,90 @@ class TestEncoderDPErrorHandling(CustomTestCase):
         asyncio.run(run())
 
 
+class TestEncodeRequestInputEdges(CustomTestCase):
+    def test_scalar_hashes_are_rejected_before_dispatch(self):
+        request = {
+            "req_id": "r",
+            "modality": "image",
+            "mm_items": ["x"],
+            "num_parts": 1,
+            "part_idx": 0,
+            "hashes": 5,
+        }
+        self.assertIsNotNone(validate_encode_request(request))
+
+    def test_convert_leaves_an_empty_list_alone(self):
+        self.assertEqual(_convert([]), [])
+
+    def test_media_load_error_does_not_carry_the_payload(self):
+        preprocessor = EncoderPreprocessor.__new__(EncoderPreprocessor)
+        preprocessor.model_audio_sr = 16000
+        payload = "A" * 100_000
+        with patch(
+            "sglang.srt.disaggregation.encoder.preprocessor.load_audio",
+            side_effect=RuntimeError("decode failed"),
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                preprocessor._load_single_item(payload, Modality.AUDIO)
+        self.assertLess(len(str(raised.exception)), 1000)
+
+
 class TestEncoderCacheIdentity(CustomTestCase):
+    def test_direct_embedding_reuses_combined_identity(self):
+        """A prefix-cache hit returns the embedding without re-encoding or rebuilding its key."""
+
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.model_type = "qwen3_vl"
+            encoder.cache_namespace = "sha256:" + "12" * 32
+            encoder.preprocessor = EncoderPreprocessor.__new__(EncoderPreprocessor)
+            encoder.preprocessor.model_type = encoder.model_type
+            encoder.mm_cache = MultiModalStaticCache(4096)
+            encoder.mm_cache_lock = asyncio.Lock()
+            features = torch.arange(32, dtype=torch.float32).reshape(16, 2)
+            grids = torch.tensor([[1, 2, 4], [1, 4, 2]])
+            expected = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+            forward = Mock(return_value=expected)
+            ctx = EncodeContext(
+                req_id="cache-key-test",
+                modality=Modality.IMAGE,
+                preprocess_result=EncoderPreprocessResult(
+                    mm_inputs={"pixel_values": features, "image_grid_thw": grids},
+                    grid_thw=grids,
+                    token_counts=[2, 2],
+                ),
+                get_feature_fn=forward,
+                mm_feature=features,
+                num_items=2,
+                items_per_req=[2],
+                aux_data={},
+                str_mm_hashes=None,
+                use_global_cache=False,
+                is_health_check=False,
+            )
+            with patch.object(
+                MultiModalStaticCache,
+                "combine_hashes",
+                wraps=MultiModalStaticCache.combine_hashes,
+            ) as combine:
+                for _ in range(2):
+                    actual = await encoder._compute_direct_embedding(
+                        ctx, keep_on_gpu=False
+                    )
+                    torch.testing.assert_close(actual, expected)
+                self.assertEqual(combine.call_count, 2)
+            forward.assert_called_once()
+            self.assertEqual(len(encoder.mm_cache), 1)
+
+        from sglang.srt.runtime_context import get_context
+
+        override = get_context().override_server_args(enable_prefix_mm_cache=True)
+        override.install()
+        try:
+            asyncio.run(run())
+        finally:
+            override.restore()
+
     def test_grid_content_and_namespace_identify_each_embedding(self):
         encoder = MMEncoder.__new__(MMEncoder)
         encoder.model_type = "qwen3_vl"
@@ -604,6 +691,7 @@ class TestMooncakeRegistration(CustomTestCase):
     def setUp(self):
         self.engine = MooncakeTransferEngine.__new__(MooncakeTransferEngine)
         self.engine.engine = unittest.mock.Mock()
+        self.engine.ib_device = "mlx5_0"
 
     def test_register_raises_on_nonzero_status(self):
         self.engine.engine.register_memory.return_value = -1
@@ -619,6 +707,18 @@ class TestMooncakeRegistration(CustomTestCase):
             self.engine.deregister(1234)
 
         self.assertIs(ctx.exception.__cause__, backend_error)
+
+    def test_batch_register_raises_on_nonzero_status(self):
+        self.engine.engine.batch_register_memory.return_value = -202
+
+        with self.assertRaises(RuntimeError):
+            self.engine.batch_register([0x10000], [0x1000])
+
+    def test_batch_register_tolerates_already_registered(self):
+        self.engine.engine.batch_register_memory.return_value = -7
+
+        with self.assertLogs(level="ERROR"):
+            self.engine.batch_register([0x10000], [0x1000])
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(
     est_time=400,
-    suite="full-2-npu-a3",
+    suite="full-test-2-npu-a3",
     nightly=True,
 )
 
@@ -36,7 +36,8 @@ class TestNpuHierarchicalCacheTTFT(CustomTestCase):
                 "--disable-radix-cache",
                 "--chunked-prefill-size",
                 "-1",
-                "--disable-cuda-graph",
+                "--disable-decode-cuda-graph",
+                "--disable-prefill-cuda-graph",
             ],
             [
                 "--trust-remote-code",
@@ -48,7 +49,8 @@ class TestNpuHierarchicalCacheTTFT(CustomTestCase):
                 16,
                 "--chunked-prefill-size",
                 "-1",
-                "--disable-cuda-graph",
+                "--disable-decode-cuda-graph",
+                "--disable-prefill-cuda-graph",
                 "--enable-hierarchical-cache",
                 "--hicache-ratio",
                 5,

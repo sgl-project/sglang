@@ -53,7 +53,6 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
         with (
             patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
-            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
             envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.override(True),
             envs.SGLANG_OPT_USE_TOPK_V2.override(False),
             patch(
@@ -80,7 +79,6 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
     def test_torch_fallback_skips_deep_gemm_and_ineligible_topk_plan(self):
         with (
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
-            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
             envs.SGLANG_OPT_USE_TOPK_V2.override(True),
             patch("sglang.kernels.ops.attention.dsv4.plan_topk_v2") as plan_topk_v2,
         ):
@@ -272,7 +270,6 @@ class TestDSV4TopKDispatch(CustomTestCase):
         indexer_capturer = MagicMock()
         with (
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
-            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
             envs.SGLANG_OPT_USE_TOPK_V2.override(True),
             patch(
@@ -320,7 +317,6 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
                 overrides.get("enabled", True)
             ),
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
-            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
             patch(f"{_INDEXER}.is_cuda", return_value=True),
             patch(f"{_INDEXER}.is_hip", return_value=False),
@@ -1222,7 +1218,7 @@ class TestCandidateIndexerGating(CustomTestCase):
         )
 
         def sm100(value):
-            return patch.object(v41_indexer, "is_sm100_or_newer", lambda: value)
+            return patch.object(v41_indexer, "is_sm100", lambda: value)
 
         def make(topk_blocks, block_size):
             # The prefill choice reads the real DeepGEMM build and is cached.

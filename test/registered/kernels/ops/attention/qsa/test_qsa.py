@@ -107,16 +107,16 @@ def test_qsa_chunk_prefill_accepts_fp8_cached_prefix():
     [((12, 0), True), ((12, 1), False), ((10, 0), False)],
 )
 def test_is_sm120_matches_exact_capability(monkeypatch, capability, expected):
-    from sglang.srt.utils import common
+    from sglang.srt.utils import device as device_utils
 
-    common.is_sm120.cache_clear()
-    monkeypatch.setattr(common, "is_cuda", lambda: True)
+    device_utils.is_sm120.cache_clear()
+    monkeypatch.setattr(device_utils, "is_cuda", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
 
     try:
-        assert common.is_sm120() is expected
+        assert device_utils.is_sm120() is expected
     finally:
-        common.is_sm120.cache_clear()
+        device_utils.is_sm120.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -124,16 +124,16 @@ def test_is_sm120_matches_exact_capability(monkeypatch, capability, expected):
     [((12, 1), True), ((12, 0), False), ((10, 0), False)],
 )
 def test_is_sm121_matches_exact_capability(monkeypatch, capability, expected):
-    from sglang.srt.utils import common
+    from sglang.srt.utils import device as device_utils
 
-    common.is_sm121.cache_clear()
-    monkeypatch.setattr(common, "is_cuda", lambda: True)
+    device_utils.is_sm121.cache_clear()
+    monkeypatch.setattr(device_utils, "is_cuda", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
 
     try:
-        assert common.is_sm121() is expected
+        assert device_utils.is_sm121() is expected
     finally:
-        common.is_sm121.cache_clear()
+        device_utils.is_sm121.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -442,6 +442,17 @@ def _make_mtp_draft_batch(steps: int, seq_lens=(8, 16), loc_base: int = 40):
     return backend, forward_batch, pool
 
 
+@pytest.mark.parametrize("verify", [False, True], ids=["draft-extend", "target-verify"])
+def test_qsa_speculative_row_bound(verify):
+    from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+
+    # Draft-extend lengths already include four draft tokens: 16 + 4 = 20.
+    spec = SimpleNamespace(draft_token_num=4) if verify else EagleDraftExtendInput()
+    lengths = torch.tensor([8, 16] if verify else [12, 20], dtype=torch.int32)
+    batch = SimpleNamespace(seq_lens_cpu=lengths, spec_info=spec)
+    assert QwenSparseAttnBackend._speculative_max_row_length(batch, lengths) == 20
+
+
 def test_qsa_cuda_graph_pads_dynamic_draft_extend_rows():
     row_lengths, row_req_pool_indices, row_prefix_lengths = (
         QwenSparseAttnBackend._graph_speculative_layout(
@@ -640,6 +651,7 @@ def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
 
 def _make_paged_extend_backend():
     metadata = SimpleNamespace(
+        is_cuda_graph=False,
         token_to_batch_idx=torch.zeros(3, dtype=torch.int32),
         sequence_lengths=torch.tensor([8], dtype=torch.int32),
         token_slot_table=torch.arange(16, dtype=torch.int32).reshape(1, 16),

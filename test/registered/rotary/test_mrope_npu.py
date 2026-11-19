@@ -15,7 +15,7 @@ from sglang.srt.utils import is_npu
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=30, suite="full-1-npu-a3", nightly=True)
+register_npu_ci(est_time=30, suite="full-test-1-npu-a3", nightly=True)
 
 
 @unittest.skipUnless(is_npu(), "Ascend NPU not available")

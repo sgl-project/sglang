@@ -1,11 +1,11 @@
+import torch
+
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import create_empty, create_random
 from sglang.kernels.ops.activation.activation import silu_and_mul
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
     fp8_dtype,
-    fp8_max,
-    fp8_min,
 )
 
 # per_token_group_quant_8bit_v2 is the perf baseline; production only routes
@@ -36,9 +36,6 @@ def _jit_v2(G, x, x_q, x_s, scale_ue8m0):
         x_q,
         x_s,
         G,
-        1e-10,
-        float(fp8_min),
-        float(fp8_max),
         scale_ue8m0=scale_ue8m0,
     )
 
@@ -91,6 +88,24 @@ def benchmark_dense(num_tokens: int, fused: bool):
     return marker.do_bench(_dense_activation_quant, input_args=(x, fused))
 
 
+@marker.parametrize("hidden", [1536, 5120], ci_vals=[5120])
+@marker.parametrize(
+    "num_tokens", [1, 8, 32, 128, 512, 2048, 4096, 8192], ci_vals=[1, 512, 8192]
+)
+@marker.benchmark("impl", ["jit_v2", "current"])
+def benchmark_fp32_pow2(hidden: int, num_tokens: int, impl: str):
+    x = create_random(num_tokens, hidden, dtype=torch.bfloat16)
+    x_q = create_empty(num_tokens, hidden, dtype=fp8_dtype)
+    x_s = create_empty(num_tokens, hidden // 32, dtype=torch.float32)
+    return marker.do_bench(
+        FN[impl],
+        input_args=(32, x, x_q, x_s, True),
+        memory_args=(x,),
+        memory_output=(x_q, x_s),
+    )
+
+
 if __name__ == "__main__":
     benchmark.run()
     benchmark_dense.run()
+    benchmark_fp32_pow2.run()

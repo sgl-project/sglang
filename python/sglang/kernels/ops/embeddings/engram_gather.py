@@ -11,6 +11,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
+
 # e8m0 has no zero: the exponent byte 0 encodes 2**-127.
 _E8M0_ZERO = 2.0**-127
 
@@ -79,33 +81,49 @@ def _engram_gather_kernel(
     out_ptr,
     row_lo,
     row_hi,
+    n,
     DIM: tl.constexpr,
     BLK: tl.constexpr,
+    ROWS: tl.constexpr,
     E8M0_ZERO: tl.constexpr,
     HAS_DST: tl.constexpr,
     MXFP4: tl.constexpr,
 ):
-    row = tl.program_id(0).to(tl.int64)
-    idx = tl.load(ids_ptr + row).to(tl.int64)
-    dst = tl.load(dst_ptr + row).to(tl.int64) if HAS_DST else row
+    # ROWS rows per program, so the dependent loads of a row (id, payload,
+    # scales) overlap with those of the program's other rows.
+    row = tl.program_id(0).to(tl.int64) * ROWS + tl.arange(0, ROWS)
+    valid = row < n
+    idx = tl.load(ids_ptr + row, mask=valid, other=0).to(tl.int64)
+    dst = tl.load(dst_ptr + row, mask=valid, other=0).to(tl.int64) if HAS_DST else row
     # The table holds rows [row_lo, row_hi); an id outside it is not read and
     # comes out as zeros, which is what the sharded all-reduce sums.
-    owned = (idx >= row_lo) & (idx < row_hi)
+    owned = valid & (idx >= row_lo) & (idx < row_hi)
     local = tl.where(owned, idx - row_lo, 0)
     offs = tl.arange(0, DIM)
     vals = _dequant_rows(
         w_ptr.to(tl.int64),
         s_ptr.to(tl.int64),
-        local,
-        offs,
-        owned,
+        local[:, None],
+        offs[None, :],
+        owned[:, None],
         DIM,
         BLK,
         E8M0_ZERO,
         MXFP4,
     )
-    out = tl.where(owned, vals, 0.0)
-    tl.store(out_ptr + dst * DIM + offs, out.to(tl.bfloat16))
+    out = tl.where(owned[:, None], vals, 0.0)
+    tl.store(
+        out_ptr + dst[:, None] * DIM + offs[None, :],
+        out.to(tl.bfloat16),
+        mask=valid[:, None],
+    )
+
+
+def _gather_rows_per_program() -> int:
+    """Rows per program of the local gather: 16 on SM103 and SM107, where one row
+    per program is bound by its chain of dependent loads; 1 on GPUs not measured."""
+    cuda = current_arch().cuda
+    return 16 if cuda is not None and cuda.capability in ((10, 3), (10, 7)) else 1
 
 
 def engram_gather(
@@ -144,7 +162,8 @@ def engram_gather(
         dst = None
         if sort_ids:
             ids, dst = torch.sort(ids)
-        _engram_gather_kernel[(n,)](
+        rows = _gather_rows_per_program()
+        _engram_gather_kernel[(triton.cdiv(n, rows),)](
             weight_ptr,
             scale_ptr,
             ids,
@@ -152,8 +171,10 @@ def engram_gather(
             out,
             row_lo,
             row_hi,
+            n,
             DIM=dim,
             BLK=block_size,
+            ROWS=rows,
             E8M0_ZERO=_E8M0_ZERO,
             HAS_DST=dst is not None,
             MXFP4=mxfp4,

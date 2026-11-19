@@ -8,7 +8,7 @@ import torch
 
 kernel = torch.ops.sgl_kernel
 
-from sglang.srt.utils.common import (
+from sglang.srt.utils.device import (
     get_cpu_ids_by_node,
     get_physical_cpus_by_numa_or_block,
 )
@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     get_available_cpu_ids,
 )
 
-register_cpu_ci(est_time=6, suite="stage-a-tp-test-cpu-intel")
+register_cpu_ci(est_time=6, suite="extra-tp-test-cpu-intel")
 
 
 class TestBinding(CustomTestCase):
@@ -44,8 +44,8 @@ class TestBinding(CustomTestCase):
 
 
 class TestCPUTopology(CustomTestCase):
-    @patch("sglang.srt.utils.common.psutil.Process")
-    @patch("sglang.srt.utils.common.parse_lscpu_topology")
+    @patch("sglang.srt.utils.device.psutil.Process")
+    @patch("sglang.srt.utils.device.parse_lscpu_topology")
     def test_group_selection_and_affinity(self, mock_topology, mock_process):
         cases = [
             (

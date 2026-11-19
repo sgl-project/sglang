@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import replace
+from functools import partial
 from typing import Any
 
+import numpy as np
 import torch
 
+from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -31,6 +34,8 @@ class DevicePoolEntry:
         page_size: int,
         rows_are_pages: bool,
         packed: bool = True,
+        tp_replicated: bool = False,
+        dcp_sharded: bool = False,
         index_mapper: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ):
         self.name = name
@@ -40,6 +45,10 @@ class DevicePoolEntry:
         self.layer_mapping = layer_mapping
         self.page_size = page_size
         self.packed = packed
+        # MLA-family pages have no head dimension to shard, so every attention-TP
+        # rank holds identical bytes; KDA state in the same group is sharded.
+        self.tp_replicated = tp_replicated
+        self.dcp_sharded = dcp_sharded
         self._index_mapper = index_mapper
         self._page_offsets = torch.arange(page_size)
         self._row_span = 1 if rows_are_pages else page_size
@@ -127,34 +136,37 @@ class DevicePoolEntry:
     def prepare_locations(self, indices: torch.Tensor) -> list[int]:
         return self._rows(indices)
 
-    def get_prepared_layer_range_meta(self, locations: list[int], layer: int):
+    def get_prepared_layer_range_meta(
+        self, locations: list[int] | np.ndarray, layer: int
+    ):
+        """Range metadata for one layer, one nested list per object.
+
+        Every row emits the same (size, offset) items, so all rows share one
+        read-only list each; the pointers are affine in the row.
+        """
         mapped = self.layer_mapping.get(layer)
         if mapped is None:
             return None
         buffer_indices = [mapped] if isinstance(mapped, int) else list(mapped)
 
-        items = []
-        for component, offsets in zip(self.buffer_meta, self._component_offsets):
-            for buffer_index in buffer_indices:
-                base_ptr, row_stride, size = component[buffer_index]
-                items.append((base_ptr, row_stride, size, offsets[buffer_index]))
-
-        ptrs, sizes, offsets = [], [], []
-        for row in locations:
-            row_ptrs = [
-                base_ptr + row * row_stride for base_ptr, row_stride, _, _ in items
-            ]
-            row_sizes = [size for _, _, size, _ in items]
-            row_offsets = [offset for _, _, _, offset in items]
-            if self.packed:
-                ptrs.append(row_ptrs)
-                sizes.append(row_sizes)
-                offsets.append(row_offsets)
-            else:
-                ptrs.extend([[value] for value in row_ptrs])
-                sizes.extend([[value] for value in row_sizes])
-                offsets.extend([[value] for value in row_offsets])
-        return ptrs, sizes, offsets
+        items = [
+            (*component[buffer_index], offsets[buffer_index])
+            for component, offsets in zip(self.buffer_meta, self._component_offsets)
+            for buffer_index in buffer_indices
+        ]
+        base = np.array([item[0] for item in items], dtype=np.int64)
+        stride = np.array([item[1] for item in items], dtype=np.int64)
+        rows = np.asarray(locations, dtype=np.int64)
+        ptrs = rows[:, None] * stride + base
+        row_sizes = [item[2] for item in items]
+        row_offsets = [item[3] for item in items]
+        if self.packed:
+            return ptrs.tolist(), [row_sizes] * len(rows), [row_offsets] * len(rows)
+        return (
+            ptrs.reshape(-1, 1).tolist(),
+            [[value] for value in row_sizes] * len(rows),
+            [[value] for value in row_offsets] * len(rows),
+        )
 
 
 class DevicePoolGroup:
@@ -167,6 +179,7 @@ class DevicePoolGroup:
         page_size: int,
         *,
         rank_replicated: bool = False,
+        restores_sidecar_drafts: bool = False,
     ):
         self.entries = list(entries)
         self.entry_map = {entry.name: entry for entry in entries}
@@ -176,6 +189,7 @@ class DevicePoolGroup:
         self.num_layers = num_layers
         self.page_size = page_size
         self.rank_replicated = rank_replicated
+        self.restores_sidecar_drafts = restores_sidecar_drafts
         self.kv_buffer = None
 
     def resolve_transfers(
@@ -440,33 +454,116 @@ def _build_dsa_device_pool_group(
     return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
 
 
+def _with_draft_buffers(
+    layer_mapping: dict[int, int | tuple[int, ...]],
+    draft_buffer_indices: Sequence[int],
+) -> dict[int, int | tuple[int, ...]]:
+    """Attach packed draft buffers to the pool's last transfer layer; drafts
+    run after the whole target forward, so the last layer bounds their wait."""
+    if not draft_buffer_indices:
+        return layer_mapping
+    last = max(layer_mapping)
+    mapped = layer_mapping[last]
+    return layer_mapping | {
+        last: (
+            *((mapped,) if isinstance(mapped, int) else mapped),
+            *draft_buffer_indices,
+        )
+    }
+
+
 def _mha_device_pool_entry(
     name: PoolName,
     pool: Any,
     layer_mapping: dict[int, int],
     page_size: int,
     indices_from_pool: PoolName | None = None,
+    draft_pools: Sequence[Any] = (),
 ) -> DevicePoolEntry:
-    # TODO(alphabetc1): support mxfp8.
-    if pool.k_scale_buffer is not None or pool.native_k_scale_buffer is not None:
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolMXFP8
+
+    parts = [pool.k_buffer, pool.v_buffer]
+    if isinstance(pool, MHATokenToKVPoolMXFP8):
+        # Only whole aligned pages move, and a page's scales are contiguous in
+        # both layouts, so they ride as rows aligned with the payload slots.
+        slots = pool.k_buffer[0].shape[0]
+        parts += [
+            [scale.view(torch.uint8).reshape(slots, -1) for scale in scales]
+            for scales in (pool.k_scale_buffer, pool.v_scale_buffer)
+        ]
+    elif pool.k_scale_buffer is not None or pool.native_k_scale_buffer is not None:
         raise ValueError(
-            "The direct external linker does not support scaled KV caches yet."
+            "The direct external linker does not support FP4 scaled KV caches yet."
         )
+    if any(p.page_size != page_size for p in draft_pools):
+        raise ValueError("Draft KV page size must match the tree page size.")
     num_layers = len(pool.k_buffer)
+    if any(
+        p.k_scale_buffer is not None or p.native_k_scale_buffer is not None
+        for p in draft_pools
+    ):
+        raise ValueError(
+            "The direct external linker does not support scaled draft KV caches yet."
+        )
+    buffers = [buffer for part in parts for buffer in part]
+    draft_buffer_indices = []
+    for draft in draft_pools:
+        for k, v in zip(draft.k_buffer, draft.v_buffer, strict=True):
+            draft_buffer_indices += [len(buffers), len(buffers) + 1]
+            buffers += [k, v]
     return DevicePoolEntry(
         name=name,
         indices_from_pool=indices_from_pool or name,
         device_pool=pool,
-        components=[[*pool.k_buffer, *pool.v_buffer]],
-        layer_mapping={
-            layer: (index, num_layers + index) for layer, index in layer_mapping.items()
-        },
+        components=[buffers],
+        layer_mapping=_with_draft_buffers(
+            {
+                layer: tuple(part * num_layers + index for part in range(len(parts)))
+                for layer, index in layer_mapping.items()
+            },
+            draft_buffer_indices,
+        ),
         page_size=page_size,
         rows_are_pages=False,
     )
 
 
-def _mamba_device_pool_entry(state: Any, start_layer: int) -> DevicePoolEntry:
+def _split_sidecar_draft_pools(
+    draft_pools: Sequence[Any],
+) -> tuple[list[Any], list[Any]] | None:
+    """Split hybrid-SWA sidecar drafts into the sub-pools that follow target KV
+    indices and those that follow target SWA indices; None if any is unsupported."""
+    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+    kv_drafts, swa_drafts = [], []
+    for draft in draft_pools:
+        if type(draft) is MHATokenToKVPool:
+            # A DFlash draft on the target's SWA ids is sized to the SWA pool.
+            (swa_drafts if draft.follows_target_swa_ids else kv_drafts).append(draft)
+            continue
+        if not isinstance(draft, BaseSWAKVPool) or not all(
+            type(sub) is MHATokenToKVPool
+            for sub in (draft.full_kv_pool, draft.swa_kv_pool)
+        ):
+            return None
+        if draft.full_kv_pool.layer_num:
+            kv_drafts.append(draft.full_kv_pool)
+        if draft.swa_kv_pool.layer_num:
+            # A draft SWA pool addressed by full-token ids rides the KV pages;
+            # a linker page may mix head geometries.
+            if draft.swa_uses_full_indices:
+                kv_drafts.append(draft.swa_kv_pool)
+            else:
+                swa_drafts.append(draft.swa_kv_pool)
+    return kv_drafts, swa_drafts
+
+
+def _mamba_device_pool_entry(
+    state: Any,
+    start_layer: int,
+    draft_mamba_pools: Sequence[Any] = (),
+) -> DevicePoolEntry:
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
         _stage_local_layer_mapping,
     )
@@ -489,20 +586,30 @@ def _mamba_device_pool_entry(state: Any, start_layer: int) -> DevicePoolEntry:
         )
 
     mamba_pool = state.pool
-    mamba_cache = mamba_pool.mamba_cache
-    layers = range(mamba_pool.num_mamba_layers)
+    # Separate draft state shares the target's slot indices.
+    pools = (mamba_pool, *draft_mamba_pools)
+    buffers = [(pool.mamba_cache.temporal, *pool.mamba_cache.conv) for pool in pools]
     # One row per state slot; conv-only models carry an empty temporal state.
     components = [
-        [state[layer] for layer in layers]
-        for state in (mamba_cache.temporal, *mamba_cache.conv)
-        if state.numel() > 0
+        [
+            pool_buffers[i][layer]
+            for pool, pool_buffers in zip(pools, buffers)
+            for layer in range(pool.num_mamba_layers)
+        ]
+        for i, buffer in enumerate(buffers[0])
+        if buffer.numel() > 0
     ]
+    num_target_layers = mamba_pool.num_mamba_layers
+    num_draft_layers = sum(pool.num_mamba_layers for pool in draft_mamba_pools)
     return DevicePoolEntry(
         name=PoolName.MAMBA,
         indices_from_pool=PoolName.MAMBA,
         device_pool=mamba_pool,
         components=components,
-        layer_mapping=_stage_local_layer_mapping(state.layer_map, start_layer),
+        layer_mapping=_with_draft_buffers(
+            _stage_local_layer_mapping(state.layer_map, start_layer),
+            range(num_target_layers, num_target_layers + num_draft_layers),
+        ),
         page_size=1,
         rows_are_pages=True,
     )
@@ -516,19 +623,53 @@ def _build_mamba_swa_device_pool_group(
     )
 
     full_mapping, swa_mapping = _swa_layer_mappings(kvcache)
+    drafts = params.mtp_draft_device_pools
+    # A draft SWA pool addressed by full-token ids rides the KV pages; unlike
+    # a host pool, a linker page may mix head geometries.
+    kv_drafts = [
+        pool
+        for draft in drafts
+        for pool, uses_kv_indices in (
+            (draft.full_kv_pool, True),
+            (draft.swa_kv_pool, draft.swa_uses_full_indices),
+        )
+        if pool.layer_num and uses_kv_indices
+    ]
+    swa_drafts = [
+        draft.swa_kv_pool
+        for draft in drafts
+        if draft.swa_kv_pool.layer_num and not draft.swa_uses_full_indices
+    ]
+    # Non-packed sidecar drafts ride the same entries as packed MTP drafts.
+    split = _split_sidecar_draft_pools(params.sidecar_draft_device_pools)
+    if split is not None:
+        kv_drafts += split[0]
+        swa_drafts += split[1]
     entries = [
         _mha_device_pool_entry(
-            PoolName.KV, kvcache.full_kv_pool, full_mapping, page_size
+            PoolName.KV,
+            kvcache.full_kv_pool,
+            full_mapping,
+            page_size,
+            draft_pools=kv_drafts,
         ),
         _mha_device_pool_entry(
-            PoolName.SWA, kvcache.swa_kv_pool, swa_mapping, page_size
+            PoolName.SWA,
+            kvcache.swa_kv_pool,
+            swa_mapping,
+            page_size,
+            draft_pools=swa_drafts,
         ),
         _mamba_device_pool_entry(
-            params.token_to_kv_pool_allocator.state, kvcache.start_layer
+            params.token_to_kv_pool_allocator.state,
+            kvcache.start_layer,
+            params.mtp_draft_mamba_pools,
         ),
     ]
     num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
-    return DevicePoolGroup(entries, num_layers + 1, page_size)
+    return DevicePoolGroup(
+        entries, num_layers + 1, page_size, restores_sidecar_drafts=split is not None
+    )
 
 
 def _build_mamba_device_pool_group(
@@ -538,61 +679,136 @@ def _build_mamba_device_pool_group(
         _stage_local_layer_mapping,
     )
     from sglang.srt.mem_cache.memory_pool import (
+        DSATokenToKVPool,
         HybridLinearKVPool,
         MLATokenToKVPool,
     )
 
-    # TODO(alphabetc1): support other full-attention pools, DCP and packed draft KV.
+    # TODO(alphabetc1): support other full-attention pools and packed draft KV.
     full_kv_pool = kvcache.full_kv_pool
     if (
         type(kvcache) is not HybridLinearKVPool
-        or type(full_kv_pool) is not MLATokenToKVPool
-        or get_parallel().attn_dcp_size > 1
+        or type(full_kv_pool) not in (MLATokenToKVPool, DSATokenToKVPool)
         or params.mtp_draft_device_pools
     ):
         raise ValueError(
             "The direct external linker supports FULL + MAMBA models only with a "
-            "plain MLA pool, without DCP or packed draft KV."
+            "plain MLA or DSA pool, without packed draft KV."
         )
+    parallel = get_parallel()
+    dcp_size = parallel.attn_dcp_size
+    dcp_sharded = dcp_size > 1
+    # A tree page counts widened ids; this rank keeps 1/dcp_size of it as one
+    # physical page of page_size // dcp_size rows.
+    dcp_mapper = (
+        partial(
+            maybe_dcp_kernel_indices, dcp_size=dcp_size, dcp_rank=parallel.attn_dcp_rank
+        )
+        if dcp_sharded
+        else None
+    )
 
+    full_mapping = _stage_local_layer_mapping(
+        kvcache.full_attention_layer_id_mapping, kvcache.start_layer
+    )
     entries = [
         DevicePoolEntry(
             name=PoolName.KV,
             indices_from_pool=PoolName.KV,
             device_pool=full_kv_pool,
             components=[full_kv_pool.kv_buffer],
-            layer_mapping=_stage_local_layer_mapping(
-                kvcache.full_attention_layer_id_mapping, kvcache.start_layer
-            ),
-            page_size=page_size,
+            layer_mapping=full_mapping,
+            page_size=page_size // dcp_size,
             rows_are_pages=False,
+            tp_replicated=True,
+            dcp_sharded=dcp_sharded,
+            index_mapper=dcp_mapper,
         ),
         _mamba_device_pool_entry(
             params.token_to_kv_pool_allocator.state, kvcache.start_layer
         ),
     ]
-    entries.extend(_sidecar_draft_entries(params, page_size))
+    if type(full_kv_pool) is DSATokenToKVPool:
+        # One indexer row per KV page; shared-topk layers keep zero-row
+        # placeholders, so only the owning layers are transferred.
+        buffers = full_kv_pool.index_k_with_scale_buffer
+        active = {
+            layer: i
+            for i, layer in enumerate(
+                layer for layer, buffer in enumerate(buffers) if buffer.numel()
+            )
+        }
+        if active:
+            entries.append(
+                DevicePoolEntry(
+                    name=PoolName.INDEXER,
+                    indices_from_pool=PoolName.KV,
+                    device_pool=full_kv_pool,
+                    components=[[buffers[layer] for layer in active]],
+                    layer_mapping={
+                        layer: active[index]
+                        for layer, index in full_mapping.items()
+                        if index in active
+                    },
+                    page_size=page_size // dcp_size,
+                    rows_are_pages=True,
+                    tp_replicated=True,
+                    dcp_sharded=dcp_sharded,
+                    index_mapper=dcp_mapper,
+                )
+            )
+    entries.extend(
+        _sidecar_draft_entries(
+            params, page_size, dcp_size=dcp_size, dcp_mapper=dcp_mapper
+        )
+    )
     num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
     # Not rank_replicated: the Mamba state is TP-sharded.
-    return DevicePoolGroup(entries, num_layers + 1, page_size)
+    return DevicePoolGroup(
+        entries, num_layers + 1, page_size, restores_sidecar_drafts=True
+    )
 
 
-def _sidecar_draft_entries(params: Any, page_size: int) -> list[DevicePoolEntry]:
+def _sidecar_draft_entries(
+    params: Any,
+    page_size: int,
+    *,
+    dcp_size: int = 1,
+    dcp_mapper: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> list[DevicePoolEntry]:
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
     entries = []
     for draft_pool in params.sidecar_draft_device_pools:
-        if draft_pool.page_size != page_size:
+        draft_dcp_sharded = dcp_size > 1 and draft_pool.rows_are_dcp_collapsed
+        draft_page_size = page_size // dcp_size if draft_dcp_sharded else page_size
+        if draft_pool.page_size != draft_page_size:
             raise ValueError("Draft KV page size must match the tree page size.")
         # Draft layer i rides transfer layer i; the draft reads it only after
         # the batch's loads finish.
-        entries.append(
-            _mha_device_pool_entry(
+        layer_mapping = {layer: layer for layer in range(draft_pool.layer_num)}
+        if type(draft_pool) is MLATokenToKVPool:
+            entry = DevicePoolEntry(
+                name=PoolName.DRAFT,
+                indices_from_pool=PoolName.KV,
+                device_pool=draft_pool,
+                components=[draft_pool.kv_buffer],
+                layer_mapping=layer_mapping,
+                page_size=draft_page_size,
+                rows_are_pages=False,
+                tp_replicated=True,
+                dcp_sharded=draft_dcp_sharded,
+                index_mapper=dcp_mapper if draft_dcp_sharded else None,
+            )
+        else:
+            entry = _mha_device_pool_entry(
                 PoolName.DRAFT,
                 draft_pool,
-                {layer: layer for layer in range(draft_pool.layer_num)},
+                layer_mapping,
                 page_size,
                 indices_from_pool=PoolName.KV,
             )
-        )
+        entries.append(entry)
     return entries
 
 
@@ -648,7 +864,9 @@ def _build_minimax_m3_nvfp4_device_pool_group(
         *_sidecar_draft_entries(params, page_size),
     ]
     # Not rank_replicated: the KV heads are TP-sharded.
-    return DevicePoolGroup(entries, main_pool.layer_num, page_size)
+    return DevicePoolGroup(
+        entries, main_pool.layer_num, page_size, restores_sidecar_drafts=True
+    )
 
 
 def resolve_hybrid_device_pool_group(
@@ -668,8 +886,10 @@ def resolve_hybrid_device_pool_group(
         params=params,
         page_size=page_size,
     )
-    if getattr(params, "sidecar_draft_device_pools", ()) and (
-        PoolName.DRAFT not in group.entry_map
+    if (
+        getattr(params, "sidecar_draft_device_pools", ())
+        and PoolName.DRAFT not in group.entry_map
+        and not group.restores_sidecar_drafts
     ):
         raise ValueError(
             "The direct external linker does not support this model's draft KV."

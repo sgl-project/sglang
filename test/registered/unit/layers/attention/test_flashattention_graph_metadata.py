@@ -108,9 +108,7 @@ class TestFlashAttentionDraftWidth(CustomTestCase):
         )
         memory = SimpleNamespace(disable_radix_cache=False)
         modules = {
-            "sgl_kernel.flash_attn": _fake_attention_module(
-                "sgl_kernel.flash_attn", with_scheduler_metadata=True
-            ),
+            "sgl_fa3": _fake_attention_module("sgl_fa3", with_scheduler_metadata=True),
             "sglang.kernels.ops.attention.flash_attention_v4": _fake_attention_module(
                 "sglang.kernels.ops.attention.flash_attention_v4"
             ),
@@ -367,6 +365,7 @@ class TestUnifiedVerifyGraphMetadata(CustomTestCase):
         swa = torch.arange(24, device=device, dtype=torch.int32)
         swa[7] = -1
         runner_ids = RunnerIds.__new__(RunnerIds)
+        runner_ids._role_sub_pools = {}
         runner_ids._spaces = {
             IdSpaceKind.FULL: IdSpace(key="full", read_v2p=full),
         }
@@ -454,6 +453,147 @@ class TestUnifiedVerifyGraphMetadata(CustomTestCase):
                         virtual = int(tokens[row, page * ps]) // ps
                         expected[lane, page] = max(0, int(physical[virtual]))
                 torch.testing.assert_close(table.cpu(), expected)
+
+
+def _ring_fa_backend(page_size=4):
+    from sglang.srt.speculative.dflash_draft_ring import (
+        DFlashDraftKVRing,
+        draft_kv_ring_paged_rows_per_req,
+    )
+
+    b = FlashAttentionBackend.__new__(FlashAttentionBackend)
+    b.max_context_len = 128
+    b.page_size = page_size
+    b.max_num_pages = 128 // page_size
+    b.device = "cpu"
+    b.topk = 1
+    b.speculative_num_draft_tokens = 4
+    b.use_mla = False
+    b.is_prefill_aware_swa = False
+    b.has_swa = True
+    b.use_sliding_window_kv_pool = False
+    b.req_to_token_pool = SimpleNamespace(
+        req_to_token=torch.zeros((4, 128), dtype=torch.int32)
+    )
+    b.req_to_token = b.req_to_token_pool.req_to_token
+    b.runner_ids = RunnerIds(
+        req_to_token=b.req_to_token,
+        token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
+        token_to_kv_pool=SimpleNamespace(id_spaces=_plain_id_spaces),
+        page_size=page_size,
+        device="cpu",
+    )
+    b._compute_scheduler_metadata = lambda *_: None
+    b._maybe_init_local_attn_metadata = lambda *_: None
+    ring = DFlashDraftKVRing(
+        rows_per_req=draft_kv_ring_paged_rows_per_req(
+            window_left=15, block_size=4, page_size=page_size
+        ),
+        dcp_size=1,
+        req_to_token_rows=4,
+        device="cpu",
+        window_left=15,
+        dcp_rank=0,
+        pool=SimpleNamespace(maybe_get_custom_mem_pool=lambda: None),
+        page_size=page_size,
+    )
+    ring.min_pos.copy_(torch.tensor([0, 10, 0, 3], dtype=torch.int32))
+    b.set_draft_kv_ring(ring)
+    return b, ring
+
+
+class TestDraftKVRingReads(CustomTestCase):
+    def _assert_ring_table(self, table, ring, reqs):
+        cols = torch.arange(table.shape[1]) % ring.pages_per_req
+        for row, req in enumerate(reqs):
+            expected = (1 + req * ring.pages_per_req + cols).to(torch.int32)
+            self.assertTrue(torch.equal(table[row], expected))
+
+    def test_eager_verify_reads_the_ring(self):
+        b, ring = _ring_fa_backend()
+        reqs, seq_lens = [1, 3], [30, 50]
+        fb = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            ragged_verify_layout=None,
+            seq_lens=torch.tensor(seq_lens, dtype=torch.int64),
+            batch_size=2,
+            seq_lens_cpu=torch.tensor(seq_lens, dtype=torch.int64),
+            spec_info=SimpleNamespace(),
+            req_pool_indices=torch.tensor(reqs, dtype=torch.int64),
+            encoder_lens=None,
+        )
+        b.init_forward_metadata(fb)
+        m = b.forward_metadata
+        self.assertEqual(m.cache_seqlens_int32.tolist(), [30 - 10 + 4, 50 - 3 + 4])
+        self.assertEqual(m.cu_seqlens_k.tolist(), [0, 24, 75])
+        self.assertEqual(m.page_table.dtype, torch.int32)
+        self.assertGreaterEqual(m.page_table.shape[1] * b.page_size, 51)
+        self._assert_ring_table(m.page_table, ring, reqs)
+
+    def test_graph_verify_reads_the_ring(self):
+        b, ring = _ring_fa_backend()
+        calls = []
+
+        def recorded(cache_seqlens, cu_seqlens_k, page_table, *args, **kwargs):
+            seq_lens, delta = args[3], args[4]
+            calls.append(kwargs["skip_page_table"])
+            n = seq_lens.numel()
+            cache_seqlens[:n].copy_(seq_lens + delta)
+            cu_seqlens_k[1 : n + 1].copy_(torch.cumsum(cache_seqlens[:n], 0))
+
+        metadata = flashattention_module.FlashAttentionMetadata()
+        metadata.cache_seqlens_int32 = torch.zeros(2, dtype=torch.int32)
+        metadata.cu_seqlens_k = torch.zeros(3, dtype=torch.int32)
+        metadata.page_table = torch.full((2, b.max_num_pages), -1, dtype=torch.int32)
+        metadata.swa_page_table = None
+        b.target_verify_metadata = {2: metadata}
+        reqs = torch.tensor([3, 1], dtype=torch.int64)
+        with patch.object(
+            flashattention_module, "normal_decode_set_metadata", recorded
+        ):
+            b._apply_cuda_graph_metadata(
+                plan=None,
+                bs=2,
+                req_pool_indices=reqs,
+                seq_lens=torch.tensor([90, 11], dtype=torch.int64),
+                encoder_lens=None,
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                spec_info=SimpleNamespace(),
+                seq_lens_cpu=None,
+            )
+        self.assertEqual(calls, [True])
+        self.assertEqual(metadata.cache_seqlens_int32.tolist(), [87 + 4, 1 + 4])
+        self._assert_ring_table(metadata.page_table, ring, [3, 1])
+
+    def test_other_modes_stay_inside_the_ring(self):
+        b, ring = _ring_fa_backend()
+        fb = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            ragged_verify_layout=None,
+            seq_lens=torch.tensor([100, 7], dtype=torch.int64),
+            batch_size=2,
+            seq_lens_cpu=torch.tensor([100, 7], dtype=torch.int64),
+            spec_info=None,
+            req_pool_indices=torch.tensor([2, 0], dtype=torch.int64),
+            encoder_lens=None,
+        )
+        b.init_forward_metadata(fb)
+        table = b.forward_metadata.page_table
+        self.assertEqual(b.forward_metadata.cache_seqlens_int32.tolist(), [100, 7])
+        self.assertTrue(int(table.min()) >= 1)
+        self.assertTrue(int(table.max()) < 1 + 4 * ring.pages_per_req)
+
+    def test_only_a_plain_paged_pool_takes_a_ring(self):
+        for attr, value in (
+            ("use_sliding_window_kv_pool", True),
+            ("topk", 2),
+            ("use_mla", True),
+        ):
+            with self.subTest(attr):
+                b, ring = _ring_fa_backend()
+                setattr(b, attr, value)
+                with self.assertRaises(ValueError):
+                    b.set_draft_kv_ring(ring)
 
 
 if __name__ == "__main__":

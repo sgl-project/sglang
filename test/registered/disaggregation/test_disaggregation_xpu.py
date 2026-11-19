@@ -9,7 +9,7 @@ Level Zero transport; device addresses there have bit 63 set, which exercises
 the np.uint64 pointer arithmetic in disaggregation/nixl/conn.py.
 
 Requirements:
-    The ``sglang-router`` package, a mooncake-transfer-engine built with
+    The ``sgl-router`` binary, a mooncake-transfer-engine built with
     -DUSE_XPU=ON -DUSE_TENT=ON, and NIXL on a UCX built --with-ze (all installed
     by docker/xpu.Dockerfile).
 
@@ -30,7 +30,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN, is_in_ci
 
-register_xpu_ci(est_time=300, suite="nightly-xpu-kernel-main-2-gpu", nightly=True)
+register_xpu_ci(est_time=300, suite="nightly-kernel-main-test-2-gpu-xpu", nightly=True)
 
 _XPU_AVAILABLE = torch.xpu.is_available()
 # PD disaggregation needs two devices: the fixture puts decode on

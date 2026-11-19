@@ -21,7 +21,7 @@ speculative decoding.
 | Feature                  | Example usage                                                                                                                          |
 |--------------------------|----------------------------------------------------------------------------------------------------------------------------------------|
 | Tensor Parallelism       | `--tp-size 16`                                                                                                                         |
-| NPU Graph                | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs-decode`; e.g. `--cuda-graph-bs-decode 4 8 16 20 24 28 32 36 40` |
+| NPU Graph                | enabled by default; disable with `--disable-decode-cuda-graph --disable-prefill-cuda-graph`;<br/>control range via `--cuda-graph-bs-decode`; e.g. `--cuda-graph-bs-decode 4 8 16 20 24 28 32 36 40` |
 | Speculative Decoding     | `--speculative-algorithm EAGLE \`<br/>`--speculative-num-steps 2 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 3` |
 | Overlap Schedule         | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                                                           |
 | Reasoning Mode           | `extra_body={"chat_template_kwargs": {"reasoning_effort": "high"}}` — deep chain-of-thought;<br/>`"reasoning_effort": "low"` — short thinking chain;<br/>`"reasoning_effort": "no_think"` — direct response, no thinking |
@@ -30,7 +30,7 @@ speculative decoding.
 <Note>
 The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
 mode, and workload. For parameter details, see
-[Feature descriptions](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#feature-descriptions).
+[Parameter Reference](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#parameter-reference).
 </Note>
 
 For feature compatibility and conflict information between features,

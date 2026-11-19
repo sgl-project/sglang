@@ -3,7 +3,7 @@
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -20,6 +20,105 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDeepseekV41BCGMultimodal(CustomTestCase):
+    def test_cp_engram_graph_writes_global_hash_buffer_before_sharding(self):
+        class ReachedEngram(Exception):
+            pass
+
+        for cp, rank, local_rows in ((2, 0, 4), (2, 1, 4), (8, 0, 1), (8, 7, 1)):
+            with self.subTest(cp=cp, rank=rank):
+                ids = torch.arange(10, 16)
+                output = torch.empty((6, 1), dtype=torch.long)
+                hasher = Mock(side_effect=lambda ids, batch: ids[:, None])
+                hasher.new_hash_ids.return_value = output
+                expected = torch.zeros((local_rows, 1), dtype=torch.long)
+                live = ids[rank::cp]
+                expected[: live.numel(), 0] = live
+
+                def read_engram(residual, hashes, batch, **kwargs):
+                    torch.testing.assert_close(hashes, expected[:, 0])
+                    self.assertTrue(kwargs["cp_all_tokens"])
+                    raise ReachedEngram
+
+                engram = Mock(side_effect=read_engram)
+                engram.layer_hash_index = 0
+                model = SimpleNamespace(
+                    pp_group=SimpleNamespace(world_size=1),
+                    engram_hasher=hasher,
+                    late_layer_start=None,
+                    decoder_replay_tail=None,
+                    start_layer=0,
+                    end_layer=1,
+                    layers=[SimpleNamespace(engram=engram)],
+                )
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND,
+                    input_ids=ids,
+                    attn_cp_metadata=SimpleNamespace(total_seq_lens=6),
+                )
+                with (
+                    patch.object(dsv4, "is_cp_active", return_value=True),
+                    patch.object(dsv4, "is_in_breakable_cuda_graph", return_value=True),
+                    patch.object(dsv4, "_is_cuda", False),
+                    patch.object(dsv4, "_is_hip", False),
+                    patch.object(
+                        dsv4,
+                        "get_parallel",
+                        return_value=SimpleNamespace(
+                            attn_cp_size=cp, attn_cp_rank=rank, attn_dp_size=1
+                        ),
+                    ),
+                    patch.object(
+                        dsv4,
+                        "get_forward",
+                        return_value=SimpleNamespace(sp_active=False),
+                    ),
+                    patch.object(
+                        dsv4,
+                        "get_tc_piecewise_forward_context",
+                        return_value=SimpleNamespace(forward_batch=batch),
+                    ),
+                    patch.object(
+                        dsv4,
+                        "bcg_deepseek_v4_engram_hash_ids",
+                        side_effect=dsv4.deepseek_v4_engram_hash_ids,
+                    ) as graph_hash,
+                    self.assertRaises(ReachedEngram),
+                ):
+                    dsv4.DeepseekV4Model._forward_layers_hc_pre_from_prev(
+                        model,
+                        torch.arange(local_rows),
+                        torch.zeros(local_rows, 1, 2),
+                        batch,
+                        live,
+                        ids,
+                        False,
+                        None,
+                    )
+                self.assertEqual(graph_hash.call_count, 1)
+                self.assertIs(graph_hash.call_args.args[2], output)
+                torch.testing.assert_close(output[:, 0], ids)
+                hasher.new_hash_ids.assert_called_once()
+                hasher.assert_called_once()
+
+    def test_cp_low_ratio_sources_keep_an_eager_break_with_graph_backend(self):
+        batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        backend = SimpleNamespace(low_ratio_prefill_graph=True)
+        for graph, cp, tail, expected in (
+            (True, True, False, True),
+            (True, False, False, False),
+            (True, False, True, True),
+            (False, True, False, False),
+        ):
+            with (
+                self.subTest(graph=graph, cp=cp, tail=tail),
+                patch.object(dsv4, "is_in_breakable_cuda_graph", return_value=graph),
+                patch.object(dsv4, "is_cp_active", return_value=cp),
+                patch.object(dsv4, "in_replay_tail_graph", return_value=tail),
+            ):
+                self.assertEqual(
+                    dsv4._low_ratio_sources_break(backend, batch), expected
+                )
+
     def test_replay_uses_prepared_image_ids_without_mutating_scheduler_ids(self):
         for keyword in (False, True):
             with self.subTest(keyword=keyword):
@@ -85,9 +184,14 @@ class TestDeepseekV41BCGMultimodal(CustomTestCase):
                     residual, kv, weight, weight, 1e-6, 1e-6, input_ids, image_id
                 )
 
-        layer = SimpleNamespace(
+        class Layer(SimpleNamespace):
+            def __call__(self, *, hidden_states, **kwargs):
+                return hidden_states
+
+        layer = Layer(
             engram=Engram(),
             hc_cfg=None,
+            boundary_mhc_fusions=False,
             forward_hc_pre_from_prev=lambda **kw: kw["state"],
         )
         model = SimpleNamespace(

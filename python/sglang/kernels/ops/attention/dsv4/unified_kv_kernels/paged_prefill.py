@@ -49,7 +49,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils.common import is_gfx95_supported, is_gfx1250_supported
+from sglang.srt.utils.device import is_gfx95_supported, is_gfx1250_supported
 
 # OPUS gfx950 paged-prefill kernel is preferred when importable; otherwise fall
 # back to the Triton implementation below.
@@ -60,6 +60,19 @@ try:
 except ImportError:
     pa_sparse_prefill_opus = None
     _HAS_OPUS = False
+
+# Resolved once: the launch config selected below is gfx1250-only.
+_is_gfx1250 = is_gfx1250_supported()
+
+# gfx1250 aiter Gluon paged-prefill kernel; shares this module's signature and
+# reads q/kv strides directly, so it needs none of the OPUS fixups below.
+try:
+    from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
+
+    _HAS_AITER_GFX1250 = _is_gfx1250
+except ImportError:
+    pa_prefill_sparse = None
+    _HAS_AITER_GFX1250 = False
 
 
 @triton.jit
@@ -251,9 +264,23 @@ def _sparse_attn_v4_paged_prefill_triton(
     kv_indices_extend = kv_indices_extend.to(torch.int32).contiguous()
     kv_indptr_extend = kv_indptr_extend.to(torch.int32).contiguous()
 
-    block_h = 16  # AMD MFMA min tile
+    # gfx1250: (16, 16, num_stages=None) sits at the MFMA *minimum* tile with
+    # no software pipelining, which this gather-bound kernel needs.
+    # BLOCK_H=64 == index_n_heads, so one CTA covers all heads of a token.
+    # Measured 2.8x/2.1x/2.3x at T=128/512/2048 (geomean ~2.2x), tuned for
+    # large T: 90% of prefill tokens arrive at the chunked-prefill cap.
+    # Gated because non-gfx1250 targets also reach this Triton path.
+    if _is_gfx1250:
+        block_h = 64
+        block_k = 16
+        num_warps = 4
+        num_stages = 2
+    else:
+        block_h = 16  # AMD MFMA min tile
+        block_k = 16 if D >= 256 else 32
+        num_warps = 8
+        num_stages = None
     block_d = triton.next_power_of_2(D)
-    block_k = 16 if D >= 256 else 32
     _sparse_attn_v4_paged_prefill_kernel[(T, triton.cdiv(H, block_h))](
         q,
         unified_kv,
@@ -280,7 +307,8 @@ def _sparse_attn_v4_paged_prefill_triton(
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         BLOCK_K=block_k,
-        num_warps=8,
+        num_warps=num_warps,
+        **({} if num_stages is None else {"num_stages": num_stages}),
     )
     return out
 
@@ -336,6 +364,18 @@ def sparse_attn_v4_paged_prefill(
         ):
             kv = kv.as_strided(kv.shape, (kv.shape[1], 1))
         return pa_sparse_prefill_opus(
+            q,
+            unified_kv,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            kv,
+            kv_indices_extend,
+            kv_indptr_extend,
+            attn_sink,
+            softmax_scale,
+        )
+    if _HAS_AITER_GFX1250:
+        return pa_prefill_sparse(
             q,
             unified_kv,
             kv_indices_prefix,

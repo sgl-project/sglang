@@ -5,8 +5,11 @@ Keep the weight-path constants sorted by variable name within each section.
 
 import asyncio
 import copy
+import importlib.util
+import json
 import logging
 import os
+import pathlib
 import random
 import subprocess
 import threading
@@ -28,14 +31,14 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
+logger = logging.getLogger(__name__)
+
 STDERR_FILENAME = "/tmp/stderr.txt"
 STDOUT_FILENAME = "/tmp/stdout.txt"
 
 # Model weights storage directory
 MODEL_WEIGHTS_DIR = "/root/.cache/modelscope/hub/models/"
 HF_MODEL_WEIGHTS_DIR = "/root/.cache/huggingface/hub/"
-IMAGES_DIR = "/root/.cache/modelscope/hub/datasets/images/"
-VIDEO_DIR = "/root/.cache/modelscope/hub/datasets/video/"
 
 # LLM model weights path
 AFM_4_5B_BASE_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "arcee-ai/AFM-4.5B-Base")
@@ -45,7 +48,6 @@ BAICHUAN2_13B_CHAT_WEIGHTS_PATH = os.path.join(
 C4AI_COMMAND_R_V01_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "CohereForAI/c4ai-command-r-v01"
 )
-C4AI_COMMAND_R_V01_CHAT_TEMPLATE_PATH = "/__w/sglang/sglang/test/registered/npu/llm_models/tool_chat_template_c4ai_command_r_v01.jinja"
 CHATGLM2_6B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "ZhipuAI/chatglm2-6b")
 DBRX_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "AI-ModelScope/dbrx-instruct"
@@ -371,23 +373,10 @@ QWEN3_VL_30B_A3B_THINKING_MODEL_PATH = os.path.join(
 QWEN3_OMNI_30B_A3B_THINKING_MODEL_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Qwen/Qwen3-Omni-30B-A3B-Thinking"
 )
-# Images path
-IMAGES_EXAMPLE_PATH = os.path.join(IMAGES_DIR, "example_image.png")
-IMAGES_023_PATH = os.path.join(IMAGES_DIR, "023.jpg")
-IMAGES_MAN_PATH = os.path.join(IMAGES_DIR, "man.png")
-IMAGES_LOGO_PATH = os.path.join(IMAGES_DIR, "logo.png")
-VIDEO_JOBS_PATH = os.path.join(VIDEO_DIR, "jobs.mp4")
-INVOICE_WITH_BARCODE_LOGO_IMAGES_PATH = os.path.join(
-    IMAGES_DIR, "invoice_with_barcode_logo.jpeg"
-)
 # fmt: on
 
 # Other
-DEEPSEEK_CODER_JSON_PATH = "/__w/sglang/sglang/test/registered/npu/basic_function/parameter/deepseek_coder.json"
 FR_SPEC_TOKEN_MAP_PATH = "/root/.cache/sglang/FR-Spec/freq_32768.pt"
-CONFIG_YAML_PATH = (
-    "/__w/sglang/sglang/test/registered/npu/basic_function/config/config.yaml"
-)
 
 
 class ModelTestConfig(NamedTuple):
@@ -880,3 +869,93 @@ def write_github_step_summary_once(summary: str):
         return
     write_github_step_summary_once.has_written = True
     write_github_step_summary(summary)
+
+
+# Mooncake + TENT + MemFabric KV transfer config. With ``metadata_type``
+# ``p2p`` every node runs its own metadata RPC server and must advertise its
+# own IP, so ``rpc_server_hostname`` is filled per node via
+# ``resolve_local_ip()`` (``POD_IP`` on k8s, loopback for single-machine runs).
+MEMFABRIC_TENT_CONF_TEMPLATE = {
+    "metadata_type": "p2p",
+    "rpc_server_hostname": "",
+    "rpc_server_port": 0,
+    "log_level": "info",
+    "transports": {
+        "memfabric": {"enable": True},
+        "ascend_direct": {"enable": False},
+        "rdma": {"enable": False},
+        "tcp": {"enable": False},
+        "shm": {"enable": False},
+        "gds": {"enable": False},
+        "hp_tcp": {"enable": False},
+        "fabric": {"enable": False},
+        "mnnvl": {"enable": False},
+        "nvlink": {"enable": False},
+    },
+    "policy": [
+        {
+            "name": "default_memory",
+            "segment_type": "memory",
+            "transports": ["memfabric"],
+        }
+    ],
+}
+
+
+def resolve_local_ip():
+    """Resolve the current node's IP for the memfabric metadata RPC server.
+
+    Multi-node cases run on k8s where ``POD_IP`` is injected via the downward
+    API. Single-machine cases run on GitHub Actions-allocated pods that do not
+    set ``POD_IP``; all participants then share one network namespace, so the
+    loopback address is reachable by every process.
+    """
+    host_ip = os.getenv("POD_IP")
+    if host_ip:
+        return host_ip
+    return "127.0.0.1"
+
+
+def write_memfabric_tent_conf(path="/tmp/memfabric_tent.json"):
+    """Write the Mooncake TENT/MemFabric config for the current node.
+
+    The IP comes from ``resolve_local_ip()`` (``POD_IP`` on k8s, loopback for
+    single-machine runs), so the same test works on every node of a multi-node
+    PD deployment and on non-k8s single-machine runs without manually editing
+    the file per node.
+
+    Returns:
+        str: Path of the generated config file.
+    """
+    conf = copy.deepcopy(MEMFABRIC_TENT_CONF_TEMPLATE)
+    conf["rpc_server_hostname"] = resolve_local_ip()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(conf, f, indent=2)
+    logger.info(f"Wrote memfabric tent config to {path}: {conf}")
+    return path
+
+
+def append_ld_library_path(*module_specs):
+    """Build ``LD_LIBRARY_PATH`` with the given modules' library dirs first.
+
+    Each spec is ``(module_name, lib_subdir)``. ``lib_subdir`` is joined under
+    the package directory when given (e.g. ``"lib"`` for ``memfabric_hybrid``);
+    otherwise the package directory itself is used. The new directories go
+    first so they win over stale copies already on the path, and missing
+    modules are skipped.
+
+    Returns:
+        str: The resulting ``LD_LIBRARY_PATH`` value.
+    """
+    entries = [p for p in os.environ.get("LD_LIBRARY_PATH", "").split(":") if p]
+    new_entries = []
+    for module_name, lib_subdir in module_specs:
+        spec = importlib.util.find_spec(module_name)
+        if spec is None or spec.origin is None:
+            logger.warning(f"Module {module_name} not found, skip LD_LIBRARY_PATH")
+            continue
+        lib_dir = pathlib.Path(spec.origin).parent
+        if lib_subdir:
+            lib_dir = lib_dir / lib_subdir
+        new_entries.append(str(lib_dir))
+    return ":".join(dict.fromkeys([*new_entries, *entries]))

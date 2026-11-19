@@ -12,7 +12,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
 )
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import InvariantCheckLevel, envs
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+    require_mlp_tp_gather,
+)
 from sglang.srt.managers.overlap_utils import (
     CONFIDENCE_RELAY_RING_LAG,
     FutureMap,
@@ -41,7 +44,6 @@ from sglang.srt.speculative.ragged_verify import (
     round_up_grid,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
-from sglang.srt.utils.common import require_mlp_tp_gather
 from sglang.srt.utils.invariants import (
     Bucket,
     Invariant,
@@ -86,6 +88,7 @@ class DSparkVerifyPlanner:
         tp_rank: int,
         verify_num_draft_tokens: int,
         tp_sync: SpecTpSync,
+        online_confidence: bool = False,
     ) -> None:
         self.draft_model = draft_model
         self.gamma = gamma
@@ -98,6 +101,7 @@ class DSparkVerifyPlanner:
         )
 
         self._confidence_head = getattr(self.draft_model, "confidence_head", None)
+        self._online_confidence = online_confidence
 
         sts_path = get_spec().speculative_dspark_confidence_sts_path
         if sts_path and self._confidence_head is not None:
@@ -133,7 +137,8 @@ class DSparkVerifyPlanner:
             if tp_rank == 0:
                 logger.warning(
                     "DSpark STS calibration path given but no confidence head present "
-                    "(static mode / head-less checkpoint); ignoring %s.",
+                    "(static mode, or the online acceptance estimator, which "
+                    "calibrates itself); ignoring %s.",
                     sts_path,
                 )
 
@@ -145,15 +150,12 @@ class DSparkVerifyPlanner:
         self._is_verify_all = True
         self._uniform_layout_cache: dict = {}
         if self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
-            if self._confidence_head is None:
+            if not self.carries_confidence:
                 raise ValueError(
                     f"DSpark ragged-verify mode {self._ragged_verify_mode.value!r} "
-                    f"schedules per-request verify lengths from the draft confidence "
-                    f"head, but this DSpark draft checkpoint has no confidence head -- "
-                    f"the checkpoint is wrong/incomplete (it ships no "
-                    f"enable_confidence_head + trained confidence_head weights). Use a "
-                    f"draft checkpoint that includes the confidence head, or run "
-                    f"SGLANG_RAGGED_VERIFY_MODE=static."
+                    f"schedules per-request verify lengths from draft confidences, but "
+                    f"the draft has neither a confidence head nor the online "
+                    f"acceptance estimator. Run SGLANG_RAGGED_VERIFY_MODE=static."
                 )
             sps_table = build_sps_cost_table(
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
@@ -215,7 +217,7 @@ class DSparkVerifyPlanner:
 
     @property
     def carries_confidence(self) -> bool:
-        return self._confidence_head is not None
+        return self._confidence_head is not None or self._online_confidence
 
     @property
     def schedules_verify_budget(self) -> bool:
@@ -227,7 +229,13 @@ class DSparkVerifyPlanner:
 
     @property
     def is_verify_all(self) -> bool:
-        return self._is_verify_all
+        # A pinned budget (the SPS profiler's --fracs cells) is scheduled even
+        # without a cost table; the scheduler refuses to pin one under an
+        # SGLANG_SIMULATE_ACC_LEN that can run past the trimmed lengths.
+        return self._is_verify_all and (
+            self._budget_planner is None
+            or self._budget_planner.forced_budget_frac is None
+        )
 
     @property
     def mode_value(self) -> str:
@@ -265,6 +273,13 @@ class DSparkVerifyPlanner:
             self._budget_planner.note_non_decode_step()
             self._maybe_gather_dp_verify_tier(batch=batch, local_tier_num_tokens=0)
             return
+        if not self.plans_verify_budget(num_reqs=batch.batch_size()):
+            self._budget_planner.note_non_decode_step()
+            draft_input.verify_token_budget = None
+            batch.spec_verify_tier_num_tokens = (
+                batch.batch_size() * self.verify_num_draft_tokens
+            )
+            return
         resolved = future_map.resolve_confidence_cpu(batch)
         draft_input.verify_token_budget = self._budget_from_resolved(
             resolved=resolved, req_pool_indices_cpu=batch.req_pool_indices_cpu
@@ -298,6 +313,51 @@ class DSparkVerifyPlanner:
     def note_non_decode_step(self) -> None:
         if self._budget_planner is not None:
             self._budget_planner.note_non_decode_step()
+
+    def plans_verify_budget(self, *, num_reqs: int) -> bool:
+        """Whether a verify budget can shrink a decode step of ``num_reqs``
+        requests. It cannot when even the shortest plan replays the compact
+        graph of the full block, as for a single request: the step then
+        verifies every draft and prices no budget."""
+        if (
+            self._ragged_verify_mode is not RaggedVerifyMode.COMPACT
+            or not self._dynamic_graph_tier
+        ):
+            return True
+        full_tier = self._compact_graph_tier(num_reqs * self.verify_num_draft_tokens)
+        floor_tier = self._compact_graph_tier(
+            num_reqs * max(self._schedule_cfg.min_verify_len, 1)
+        )
+        return full_tier is None or floor_tier != full_tier
+
+    def _plan_verifies_every_draft(
+        self, *, num_reqs: int, budget: Optional[int]
+    ) -> bool:
+        """Whether the plan of ``budget`` replays the compact graph of the full
+        block. Trimming it would only turn verified drafts into padding rows of
+        the same graph, so the step verifies every draft."""
+        if budget is None:
+            return True
+        if not self._dynamic_graph_tier:
+            return False
+        full_tier = self._compact_graph_tier(num_reqs * self.verify_num_draft_tokens)
+        tier_num_tokens = local_verify_tier_num_tokens(
+            bs=num_reqs,
+            verify_token_budget=budget,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            min_verify_len=self._schedule_cfg.min_verify_len,
+        )
+        return full_tier is not None and (
+            self._compact_graph_tier(tier_num_tokens) == full_tier
+        )
+
+    def _compact_graph_tier(self, num_tokens: int) -> Optional[int]:
+        """The captured compact verify graph that holds ``num_tokens`` tokens,
+        or None without one."""
+        capture_num_tokens = ragged_capture_num_tokens(model_runner=self.model_runner)
+        if capture_num_tokens is None or num_tokens > capture_num_tokens[-1]:
+            return None
+        return round_up_grid(num_tokens, capture_num_tokens)
 
     def set_forced_budget_frac(self, frac) -> None:
         if self._budget_planner is not None:
@@ -339,6 +399,9 @@ class DSparkVerifyPlanner:
             return None
         if not get_schedule().disable_overlap_schedule:
             return draft_input.verify_token_budget
+        if not self.plans_verify_budget(num_reqs=int(req_pool_indices.shape[0])):
+            draft_input.verify_token_budget = None
+            return None
 
         # No collective: the budget derives only from the broadcast draft tokens
         # (via confidence), replicated req_generation, and the static sps table.
@@ -388,11 +451,21 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
-        if self._is_verify_all and self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
+        num_reqs = int(req_pool_indices.shape[0])
+        if self._ragged_verify_mode is RaggedVerifyMode.COMPACT and (
+            self.is_verify_all
+            or (
+                dp_tier_num_tokens is None
+                and self._plan_verifies_every_draft(
+                    num_reqs=num_reqs if global_num_reqs is None else global_num_reqs,
+                    budget=budget,
+                )
+            )
+        ):
             # Verify-all: the uniform layout (or None, past the captured grid)
             # is constant per (bs, tier); serve it from cache instead of paying
             # the per-step schedule and its host<->device round-trips.
-            key = (int(req_pool_indices.shape[0]), global_num_reqs)
+            key = (num_reqs, global_num_reqs)
             if key not in self._uniform_layout_cache:
                 self._uniform_layout_cache[key] = uniform_ragged_layout(
                     bs=key[0],

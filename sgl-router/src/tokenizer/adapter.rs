@@ -74,7 +74,7 @@ fn engine_keeps_normalizer(class: &str, normalizer: &serde_json::Value) -> bool 
 }
 
 /// Special tokens SGLang's `tokenizer(text)` puts around a prompt and [`encode`] leaves out.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct PromptAffixes {
     pub prefix: Vec<u32>,
     pub suffix: Vec<u32>,

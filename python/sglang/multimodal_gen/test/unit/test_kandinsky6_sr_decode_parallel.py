@@ -2,6 +2,7 @@
 """SR decode parallelism must preserve causal state and request isolation."""
 
 import os
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -97,102 +98,165 @@ def _decode(rank, world_size, tp_size, dp_size, port, spatial):
             spatial_factor=2 ** (len(TINY_KVAE["ch_mult"]) - 1),
         )
     )
-    torch.manual_seed(17)
-    reference_vae = Kandinsky6SRVAE(config).eval().to(device=rank, dtype=torch.bfloat16)
-    config = replace(
-        config, use_parallel_decode=spatial, parallel_decode_mode="spatial_shard"
+    if spatial_active:
+        # fp32 sharding must be bit-exact; bf16 may only differ by the rare
+        # shape-dependent flips calibrated in _assert_bf16_tile_close.
+        passes = ((torch.float32, (False, True)), (torch.bfloat16, (False,)))
+    else:
+        passes = ((torch.bfloat16, (False, True)),)
+    for vae_dtype, offloads in passes:
+        torch.manual_seed(17)
+        reference_vae = Kandinsky6SRVAE(config).eval().to(device=rank, dtype=vae_dtype)
+        vae_config = replace(
+            config, use_parallel_decode=spatial, parallel_decode_mode="spatial_shard"
+        )
+        vae = Kandinsky6SRVAE(vae_config).eval().to(device=rank, dtype=vae_dtype)
+        vae.load_state_dict(reference_vae.state_dict())
+        assert (
+            any(isinstance(m, SpatialParallelConv3d) for m in vae.decoder.modules())
+            == spatial_active
+        )
+        bit_exact = vae_dtype == torch.float32 or not spatial_active
+        exact_fp32 = _exact_fp32() if vae_dtype == torch.float32 else nullcontext()
+        with exact_fp32, torch.inference_mode():
+            for offload in offloads:
+                _run_requests(
+                    rank=rank,
+                    group=group,
+                    vae=vae,
+                    reference_vae=reference_vae,
+                    vae_config=vae_config,
+                    spatial_active=spatial_active,
+                    offload=offload,
+                    bit_exact=bit_exact,
+                )
+    dist.destroy_process_group()
+
+
+@contextmanager
+def _exact_fp32():
+    # Keep the decode in fp32: skip the stage's bf16 autocast, and disable cuDNN
+    # TF32, whose conv rounding is shape dependent on B200 (1/255 on ~2% of pixels).
+    allow_tf32 = torch.backends.cudnn.allow_tf32
+    torch.backends.cudnn.allow_tf32 = False
+    try:
+        with patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.tiled.bf16_autocast",
+            lambda device: nullcontext(),
+        ):
+            yield
+    finally:
+        torch.backends.cudnn.allow_tf32 = allow_tf32
+
+
+# Calibrated on H100 and B200 (2 and 4 ranks, ~1400 random tiles each): bf16 conv
+# rounding is shape dependent, and this tiny random VAE amplifies a rare 1-ulp
+# flip so that up to 0.035% of pixels exceed 4; a one-row halo or trim bug
+# moves at least 0.55%, so 0.1% leaves margin on both sides.
+_BF16_TILE_ATOL = 4
+_BF16_TILE_MAX_OUTLIER_FRACTION = 1e-3
+
+
+def _assert_bf16_tile_close(tile: torch.Tensor, reference: torch.Tensor) -> None:
+    outliers = (tile.int() - reference.int()).abs() > _BF16_TILE_ATOL
+    fraction = outliers.float().mean().item()
+    assert fraction <= _BF16_TILE_MAX_OUTLIER_FRACTION, (
+        f"{fraction:.4%} of pixels differ by more than {_BF16_TILE_ATOL} "
+        f"(allowed {_BF16_TILE_MAX_OUTLIER_FRACTION:.2%})"
     )
-    vae = Kandinsky6SRVAE(config).eval().to(device=rank, dtype=torch.bfloat16)
-    vae.load_state_dict(reference_vae.state_dict())
-    assert (
-        any(isinstance(m, SpatialParallelConv3d) for m in vae.decoder.modules())
-        == spatial_active
-    )
-    pipeline_config = Kandinsky6SRPipelineConfig(vae_config=config)
+
+
+def _run_requests(
+    *,
+    rank,
+    group,
+    vae,
+    reference_vae,
+    vae_config,
+    spatial_active,
+    offload,
+    bit_exact,
+):
+    pipeline_config = Kandinsky6SRPipelineConfig(vae_config=vae_config)
     args = SimpleNamespace(pipeline_config=pipeline_config, component_precisions={})
     set_global_server_args(args)
     stage = Kandinsky6SRDecodeStage(vae)
     stage.server_args = args
-
-    with torch.inference_mode():
-        for offload in (False, True):
-            if offload:
-                vae.configure_layerwise_offload(
-                    SimpleNamespace(
-                        performance_mode="speed",
-                        pin_cpu_memory=True,
-                        layerwise_tuning_for=lambda *args, **kwargs: (
-                            1,
-                            0,
-                            "leading",
-                            "forward",
-                        ),
-                    )
-                )
-            first = None
-            # Uneven batches, idle ranks, two temporal segments, then a repeat.
-            for sizes, frames, height in (
-                ((2, 2, 1), 9, 5),
-                ((1,), 1, 1),
-                ((2, 1), 5, 4),
-                ((2, 2, 1), 9, 5),
+    if offload:
+        vae.configure_layerwise_offload(
+            SimpleNamespace(
+                performance_mode="speed",
+                pin_cpu_memory=True,
+                layerwise_tuning_for=lambda *args, **kwargs: (
+                    1,
+                    0,
+                    "leading",
+                    "forward",
+                ),
+            )
+        )
+    first = None
+    # Uneven batches, idle ranks, two temporal segments, then a repeat.
+    for sizes, frames, height in (
+        ((2, 2, 1), 9, 5),
+        ((1,), 1, 1),
+        ((2, 1), 5, 4),
+        ((2, 2, 1), 9, 5),
+    ):
+        generator = torch.Generator().manual_seed(7 + get_dp_rank())
+        chunks = [
+            torch.randn(size, frames, height, 3, 4, generator=generator)
+            for size in sizes
+        ]
+        reference_vae.prepare_for_next_req()
+        expected = decode_chunks(
+            chunks,
+            reference_vae,
+            scaling_factor=reference_vae.scaling_factor,
+            device=torch.device("cuda", rank),
+        )
+        for parallel in (False, True):
+            vae_config.use_parallel_tiling = parallel
+            vae.prepare_for_next_req()
+            request = Req(sampling_params=Kandinsky6SRSamplingParams())
+            request.extra[SR_DENOISED_KEY] = chunks
+            with (
+                patch.object(vae, "decode", wraps=vae.decode) as decode,
+                patch.object(
+                    vae.decoder, "forward", wraps=vae.decoder.forward
+                ) as decoder,
             ):
-                generator = torch.Generator().manual_seed(7 + get_dp_rank())
-                chunks = [
-                    torch.randn(size, frames, height, 3, 4, generator=generator)
-                    for size in sizes
-                ]
-                reference_vae.prepare_for_next_req()
-                expected = decode_chunks(
-                    chunks,
-                    reference_vae,
-                    scaling_factor=reference_vae.scaling_factor,
-                    device=torch.device("cuda", rank),
+                actual = stage.forward(request, args).extra[SR_TILES_KEY]
+            count = len(range(group.rank_in_group, sum(sizes), group.world_size))
+            assert decode.call_count == (
+                count
+                if parallel and not spatial_active and sum(sizes) > 1
+                else sum(sizes)
+            )
+            local_height = height
+            if spatial_active and height >= group.world_size:
+                local_height = height // group.world_size + (
+                    group.rank_in_group < height % group.world_size
                 )
-                for parallel in (False, True):
-                    config.use_parallel_tiling = parallel
-                    vae.prepare_for_next_req()
-                    request = Req(sampling_params=Kandinsky6SRSamplingParams())
-                    request.extra[SR_DENOISED_KEY] = chunks
-                    with (
-                        patch.object(vae, "decode", wraps=vae.decode) as decode,
-                        patch.object(
-                            vae.decoder, "forward", wraps=vae.decoder.forward
-                        ) as decoder,
-                    ):
-                        actual = stage.forward(request, args).extra[SR_TILES_KEY]
-                    count = len(
-                        range(group.rank_in_group, sum(sizes), group.world_size)
-                    )
-                    assert decode.call_count == (
-                        count
-                        if parallel and not spatial_active and sum(sizes) > 1
-                        else sum(sizes)
-                    )
-                    local_height = height
-                    if spatial_active and height >= group.world_size:
-                        local_height = height // group.world_size + (
-                            group.rank_in_group < height % group.world_size
-                        )
-                    assert all(
-                        call.args[0].shape[-2] == local_height
-                        for call in decoder.call_args_list
-                    )
-                    assert len(actual) == len(expected)
-                    for tile, reference in zip(actual, expected):
-                        assert tile.device.type == "cpu" and tile.dtype == torch.uint8
-                        torch.testing.assert_close(
-                            tile, reference, rtol=0, atol=2 if spatial_active else 0
-                        )
-                if frames == 9:
-                    if first is None:
-                        first = actual
-                    else:
-                        for tile, reference in zip(actual, first):
-                            torch.testing.assert_close(tile, reference, rtol=0, atol=0)
-            if offload:
-                vae.disable_offload()
-    dist.destroy_process_group()
+            assert all(
+                call.args[0].shape[-2] == local_height
+                for call in decoder.call_args_list
+            )
+            assert len(actual) == len(expected)
+            for tile, reference in zip(actual, expected):
+                assert tile.device.type == "cpu" and tile.dtype == torch.uint8
+                if bit_exact:
+                    torch.testing.assert_close(tile, reference, rtol=0, atol=0)
+                else:
+                    _assert_bf16_tile_close(tile, reference)
+        if frames == 9:
+            if first is None:
+                first = actual
+            else:
+                for tile, reference in zip(actual, first):
+                    torch.testing.assert_close(tile, reference, rtol=0, atol=0)
+    if offload:
+        vae.disable_offload()
 
 
 @pytest.mark.parametrize(

@@ -24,8 +24,8 @@ from sglang.multimodal_gen.test.test_utils import get_dynamic_server_port
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import terminate_and_kill_process_tree
 
-register_cuda_ci(est_time=180, stage="base-b", runner_config="diffusion-1-gpu-h100")
-register_cuda_ci(est_time=480, stage="base-b", runner_config="diffusion-2-gpu-h100")
+register_cuda_ci(est_time=180, stage="base-b-diffusion", runner_config="1-gpu-large")
+register_cuda_ci(est_time=480, stage="base-b-diffusion", runner_config="2-gpu-large")
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
@@ -70,6 +70,12 @@ def server(request, tmp_path):
         ctx.cleanup()
 
 
+@pytest.fixture
+def poll_session():
+    with requests.Session() as session:
+        yield session
+
+
 @contextmanager
 def _paused(workers):
     paused = []
@@ -85,13 +91,15 @@ def _paused(workers):
 
 
 def test_video_jobs_survive_concurrency_timeouts_and_deletion(
-    server, tmp_path, record_property
+    server, tmp_path, record_property, poll_session
 ):
     ctx, mode, num_gpus = server
     base = f"http://127.0.0.1:{ctx.port}"
 
     def call(method, route, expected=200, **kwargs):
-        response = requests.request(method, base + route, timeout=10, **kwargs)
+        # only serial GETs share a session; concurrent submissions stay independent
+        request_fn = poll_session.request if method == "GET" else requests.request
+        response = request_fn(method, base + route, timeout=10, **kwargs)
         assert response.status_code == expected, (route, response.text, ctx.log_tail())
         return response
 
@@ -113,6 +121,7 @@ def test_video_jobs_survive_concurrency_timeouts_and_deletion(
         pending = set(job_ids)
         history = {job_id: ("queued", 0) for job_id in job_ids}
         deadline = time.monotonic() + 90
+        next_liveness_check = 0.0
         while pending and time.monotonic() < deadline:
             for job_id in list(pending):
                 job = call("GET", f"/v1/videos/{job_id}").json()
@@ -125,8 +134,11 @@ def test_video_jobs_survive_concurrency_timeouts_and_deletion(
                 if status in ("completed", "failed"):
                     assert status == expected, (job, ctx.log_tail())
                     pending.remove(job_id)
-            call("GET", "/liveness")
-            time.sleep(0.02)
+            if time.monotonic() >= next_liveness_check:
+                call("GET", "/liveness")
+                next_liveness_check = time.monotonic() + 1.0
+            if pending:
+                time.sleep(0.2)
         assert not pending, (pending, history, ctx.log_tail())
 
     def decoded_hash(job_id, variant=0):

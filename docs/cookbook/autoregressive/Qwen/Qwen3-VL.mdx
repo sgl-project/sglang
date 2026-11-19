@@ -46,7 +46,7 @@ import { Qwen3VLDeployment } from "/src/snippets/autoregressive/qwen3-vl-deploym
 
 * **Qwen3-VL-4B-Instruct on B300 (BF16, TP1)** : Use `--attention-backend trtllm_mha` when speculative decoding is disabled. This matches SGLang's default selection on B300. The `--mm-attention-backend` option controls the vision encoder separately.
 * **Multimodal attention backend** : Usually, `--mm-attention-backend` is default to `fa3` on H100/H200/A100 for better performance, but it is default to `triton_attn` on B200 for compatibility.
-* **TTFT Optimization** : Set `SGLANG_USE_CUDA_IPC_TRANSPORT=1` to use CUDA IPC for transferring multimodal features, which significantly improves TTFT. This consumes additional memory and may require adjusting `--mem-fraction-static` and/or `--max-running-requests`. (additional memory is proportional to image size * number of images in current running requests.)
+* **TTFT Optimization** : Pass `--mm-feature-transport cuda_ipc` to use CUDA IPC for transferring multimodal features, which significantly improves TTFT. This consumes additional memory and may require adjusting `--mem-fraction-static` and/or `--max-running-requests`. (additional memory is proportional to image size * number of images in current running requests.)
 * **Memory Management** : Set lower `--context-length` to conserve memory. A value of `128000` is sufficient for most scenarios, down from the default 262K.
 * **Expert Parallelism** : SGLang supports Expert Parallelism (EP) via `--ep`, allowing experts in MoE models to be deployed on separate GPUs for better throughput. One thing to note is that, for quantized models, you need to set `--ep` to a value that satisfies the requirement: `(moe_intermediate_size / moe_tp_size) % weight_block_size_n == 0, where moe_tp_size is equal to tp_size divided by ep_size.` Note that EP may perform worse in low concurrency scenarios due to additional communication overhead. Check out [Expert Parallelism Deployment](../../../docs/advanced_features/expert_parallelism) for more details.
 * **Kernel Tuning** : For MoE Triton kernel tuning on your specific hardware, refer to [fused_moe_triton](https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton).
@@ -61,9 +61,9 @@ import { Qwen3VLDeployment } from "/src/snippets/autoregressive/qwen3-vl-deploym
 
 **Example with full multimodal optimizations:**
 ```bash Command
-SGLANG_USE_CUDA_IPC_TRANSPORT=1 \
 SGLANG_VLM_CACHE_SIZE_MB=0 \
 python -m sglang.launch_server \
+  --mm-feature-transport cuda_ipc \
   --model-path Qwen/Qwen3-VL-235B-A22B-Instruct \
   --host 0.0.0.0 \
   --port 30000 \
@@ -601,12 +601,13 @@ Max ITL (ms):                            31.92
 
 **Optimized Results (with CUDA IPC Transport):**
 
-For further TTFT optimization, enable CUDA IPC Transport for multimodal features by setting `SGLANG_USE_CUDA_IPC_TRANSPORT=1`. This significantly reduces TTFT by using CUDA IPC for transferring multimodal features.
+For further TTFT optimization, enable CUDA IPC Transport for multimodal features with `--mm-feature-transport cuda_ipc`. This significantly reduces TTFT by using CUDA IPC for transferring multimodal features.
 
 - Model Deployment Command:
 
 ```shell Command
-SGLANG_USE_CUDA_IPC_TRANSPORT=1 python -m sglang.launch_server \
+python -m sglang.launch_server \
+  --mm-feature-transport cuda_ipc \
   --model Qwen/Qwen3-VL-235B-A22B-Instruct \
   --tp 8 \
   --host 0.0.0.0 \
@@ -632,7 +633,7 @@ python3 -m sglang.benchmark.serving \
 
 - **Test Results:**
 
-  With `SGLANG_USE_CUDA_IPC_TRANSPORT=1`, TTFT improves significantly:
+  With `--mm-feature-transport cuda_ipc`, TTFT improves significantly:
 
 ```text Output
 ============ Serving Benchmark Result ============
