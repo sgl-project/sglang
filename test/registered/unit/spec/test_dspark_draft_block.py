@@ -106,6 +106,76 @@ class TestSampleDraftBlock(CustomTestCase):
         self.assertTrue(block.greedy_draft)
 
 
+def _activated_along(head, base, hidden, anchor, tokens, activation):
+    state = head.init_state(hidden)
+    prev = anchor
+    rows = []
+    for step in range(base.shape[1]):
+        bias, state = head.step_bias(prev, hidden_states=hidden[:, step], state=state)
+        refined = base[:, step].float()
+        refined[:, : bias.shape[1]] += bias.float()
+        rows.append(activation(refined.to(head.step_logits_dtype(base.dtype))))
+        prev = tokens[:, step]
+    return torch.stack(rows, dim=1)
+
+
+class TestStepLogitsActivation(CustomTestCase):
+    """ERNIE's draft applies multimax after the Markov refine; applied to the
+    base logits instead, it drafted from logits the draft was not trained on.
+    A non-monotone activation makes the order visible in the drafted tokens."""
+
+    def _head(self):
+        head = VanillaMarkov(vocab_size=VOCAB, markov_rank=RANK).to(torch.bfloat16)
+        head.step_logits_activation = torch.neg
+        return head
+
+    def test_activation_runs_on_base_plus_bias(self):
+        head = self._head()
+        sampling_info = SimpleNamespace(
+            is_all_greedy=False,
+            temperatures=torch.tensor([[0.7], [1.0], [1.0], [1.3]]),
+            top_ks=torch.tensor([1, 50, 1, 50]),
+        )
+        block, base, hidden, anchor = _draft(
+            head, sampling_info, torch.zeros(1, dtype=torch.int64)
+        )
+        logits = _activated_along(
+            head, base, hidden, anchor, block.draft_tokens, torch.neg
+        )
+        self.assertTrue(torch.equal(block.corrected_logits, logits))
+        greedy = torch.tensor([True, False, True, False])
+        self.assertTrue(
+            torch.equal(block.draft_tokens[greedy], logits[greedy].float().argmax(-1))
+        )
+
+    def test_one_greedy_row_skips_the_fused_kernel(self):
+        # The fused greedy step argmaxes base + bias with no activation.
+        head = self._head()
+        torch.manual_seed(0)
+        base = torch.randn(1, GAMMA, VOCAB).to(torch.bfloat16)
+        hidden = torch.randn(1, GAMMA, HIDDEN).to(torch.bfloat16)
+        anchor = torch.randint(0, VOCAB, (1,))
+        block = sample_draft_block(
+            base_logits=base,
+            anchor_tokens=anchor,
+            draft_hidden=hidden,
+            sampling_info=SimpleNamespace(
+                is_all_greedy=True,
+                temperatures=torch.ones(1, 1),
+                top_ks=torch.ones(1, dtype=torch.long),
+            ),
+            markov_head=head,
+            noise=DraftNoise(key=3, offset=torch.zeros(1, dtype=torch.int64)),
+            device="cpu",
+            tp_sync=SimpleNamespace(sync=lambda site, tokens: tokens),
+            greedy_draft=True,
+        )
+        logits = _activated_along(
+            head, base, hidden, anchor, block.draft_tokens, torch.neg
+        )
+        self.assertTrue(torch.equal(block.draft_tokens, logits.float().argmax(-1)))
+
+
 class TestFusedGreedyEligibility(CustomTestCase):
     def test_only_the_plain_w2_gemv_head_fuses(self):
         # A head that changes the bias must keep the shared op.

@@ -157,6 +157,9 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
     vocab_size: int
     # The rank's slice of a TP-sharded vocab; None when the vocab is whole.
     vocab_shard: Optional[VocabShard] = None
+    # Applied to ``base_logits + bias`` before sampling, for a drafter trained
+    # with a logit activation after the Markov refine; None samples the sum.
+    step_logits_activation: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
 
     def init_state(
         self, hidden_states: Optional[torch.Tensor]
