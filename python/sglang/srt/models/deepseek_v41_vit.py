@@ -1,6 +1,8 @@
 """DeepSeek-V4.1 vision tower and aligner."""
 
+from collections.abc import Sequence
 from functools import lru_cache
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -12,6 +14,11 @@ from sglang.srt.layers.attention.vision import (
     prepare_vision_attention_metadata,
 )
 from sglang.srt.layers.layernorm import RMSNorm
+
+if TYPE_CHECKING:
+    from sglang.srt.multimodal.deepseek_v41_vit_cuda_graph_runner import (
+        DeepseekV41ViTCudaGraphRunner,
+    )
 
 
 def _rms_norm(dim: int) -> RMSNorm:
@@ -119,17 +126,39 @@ class ViT(nn.Module):
         self.patch_embed = PatchEmbed(args)
         self.blocks = nn.ModuleList([Block(args) for _ in range(args.vision_n_layers)])
         self.norm = _rms_norm(args.vision_dim)
+        self.cuda_graph_runner: DeepseekV41ViTCudaGraphRunner | None = None
+
+    def capture_cuda_graphs(self, num_patch_buckets: Sequence[int]) -> None:
+        from sglang.srt.multimodal.deepseek_v41_vit_cuda_graph_runner import (
+            DeepseekV41ViTCudaGraphRunner,
+        )
+
+        self.cuda_graph_runner = DeepseekV41ViTCudaGraphRunner(self, num_patch_buckets)
 
     def forward(self, patches: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
-        x = self.patch_embed(patches)
+        assert patches.shape[0] == n_h * n_w
+        if self.cuda_graph_runner is not None:
+            output = self.cuda_graph_runner.run(patches, n_h, n_w)
+            if output is not None:
+                return output
         cos, sin = get_vision_cos_sin(n_h, n_w, self.rope_dim, self.rope_theta)
-        cos, sin = cos.to(x.device), sin.to(x.device)
+        cos, sin = cos.to(patches.device), sin.to(patches.device)
         # Passing the known length avoids device-to-host length discovery per layer.
         metadata = prepare_vision_attention_metadata(
-            torch.tensor([0, x.shape[0]], dtype=torch.int32),
-            x.device,
-            max_seqlen=x.shape[0],
+            torch.tensor([0, patches.shape[0]], dtype=torch.int32),
+            patches.device,
+            max_seqlen=patches.shape[0],
         )
+        return self.forward_with_metadata(patches, cos, sin, metadata)
+
+    def forward_with_metadata(
+        self,
+        patches: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        metadata: VisionAttentionMetadata,
+    ) -> torch.Tensor:
+        x = self.patch_embed(patches)
         for block in self.blocks:
             x = block(x, cos, sin, metadata)
         return self.norm(x)

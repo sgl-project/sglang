@@ -146,6 +146,11 @@ def handle_asr_validation(server_args: Any):
 def handle_multimodal(server_args: Any):
     """Validate mm_process_config structure before model loading."""
     cfg = resolving_view(server_args)
+    sizes = cfg.vision_cuda_graph_sizes
+    if not sizes or any(size <= 0 for size in sizes):
+        raise ValueError("vision_cuda_graph_sizes must contain positive patch counts")
+    if sizes != sorted(set(sizes)):
+        raise ValueError("vision_cuda_graph_sizes must be strictly increasing")
     if (
         cfg.mm_preprocess_cache_size_mb is not None
         and cfg.mm_preprocess_cache_size_mb < 0
