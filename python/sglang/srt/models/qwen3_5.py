@@ -152,6 +152,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_hip,
+    is_mps,
     is_npu,
     is_xpu,
     use_intel_amx_backend,
@@ -163,6 +164,7 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_gfx95 = is_gfx95_supported()
 _is_hip = is_hip()
+_is_mps = is_mps()
 _QWEN3_5_MOE_TEXT_MODEL_TYPES = ("qwen3_5_moe_text", "qwen4_exp_text")
 # qwen4_exp shares these classes, but the ROCm packed path is Qwen3.5-only.
 _QWEN3_5_ROCM_PACKED_MODEL_TYPES = ("qwen3_5_text", "qwen3_5_moe_text")
@@ -1006,7 +1008,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and isinstance(projected_states_ba, torch.Tensor)
         )
         use_fused_contiguous_unpack = (
-            self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
+            not _is_mps
+            and self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
         )
         if use_fused_proj_conv:
             # GDN owns indexed Conv1D state and the safe unpack/Conv boundary;
@@ -1630,6 +1633,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         if self.attn_output_gate:
             if _fp8_tuple_input(self.o_proj, attn_output.shape[0]):
                 attn_output = fused_sigmoid_mul(attn_output, gate, quant=True)
+            elif _is_mps:
+                attn_output = attn_output * torch.sigmoid(gate).flatten(-2)
             elif not _is_npu:
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
             else:
