@@ -3786,6 +3786,15 @@ class KimiK3LinearForCausalLM(nn.Module):
             aux_hidden_states = None
             if self.capture_aux_hidden_states:
                 hidden_states, aux_hidden_states = hidden_states
+            if input_ids is None and layernorm_sp.runs_sp(
+                forward_batch.forward_mode, embeds.shape[0]
+            ):
+                # The multimodal routine passes embeddings only, and the logits
+                # processor gathers by the ids' count.
+                hidden_states = layernorm_sp.sp_exit_gather(
+                    hidden_states, num_tokens=embeds.shape[0]
+                )
+                get_forward().set("sp_active", False)
             return self.logits_processor(
                 input_ids,
                 hidden_states,
