@@ -243,6 +243,41 @@ def update_expert_weights_single_layer(
     log_metrics: bool = False,
     group: Optional[torch.distributed.ProcessGroup] = None,
 ):
+    install, output_logs = stage_expert_weights_single_layer(
+        routed_experts_weights,
+        temp_buffers,
+        old_physical_to_logical_map,
+        new_physical_to_logical_map,
+        num_local_physical_experts,
+        num_gpu_per_node,
+        rank,
+        world_size,
+        missing_logical_experts_info,
+        debug,
+        log_metrics,
+        group,
+    )
+    install()
+    return output_logs
+
+
+def stage_expert_weights_single_layer(
+    routed_experts_weights: List[torch.Tensor],
+    temp_buffers: List[torch.Tensor],
+    old_physical_to_logical_map: List[int],
+    new_physical_to_logical_map: List[int],
+    num_local_physical_experts: int,
+    num_gpu_per_node: int,
+    rank: int,
+    world_size: Optional[int] = None,
+    missing_logical_experts_info: Optional[List[int]] = None,
+    debug: bool = False,
+    log_metrics: bool = False,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+    *,
+    work_handles: Optional[list[torch.distributed.Work]] = None,
+):
+    """Stage a layer and return the writeback to run after transfers complete."""
     assert all(
         tensor.shape[0] == num_local_physical_experts
         for tensor in routed_experts_weights
@@ -299,7 +334,6 @@ def update_expert_weights_single_layer(
         _create_isend_ops(p2p_op_infos)
         _filter_p2p_ops(p2p_op_infos)
         _execute_p2p_ops(p2p_op_infos)
-        _execute_buffer2weight_copies(buffer2weight_copy_infos)
 
         if log_metrics:
             _log_p2p_op_metrics(
@@ -312,6 +346,8 @@ def update_expert_weights_single_layer(
         if debug:
             output_logs.append(f"{p2p_op_infos=}")
             output_logs.append(f"{buffer2weight_copy_infos=}")
+
+        return buffer2weight_copy_infos
 
     def _handle_recv(buffer2weight_copy_infos, p2p_op_infos):
         for dst_expert_location in range(*local_expert_location_range):
@@ -563,6 +599,8 @@ def update_expert_weights_single_layer(
                     batch_ops.extend(ops_by_expert[eid])
             if batch_ops:
                 reqs = torch.distributed.batch_isend_irecv(batch_ops)
+                if work_handles is not None:
+                    work_handles.extend(reqs)
                 for req in reqs:
                     req.wait()
 
@@ -587,9 +625,33 @@ def update_expert_weights_single_layer(
         )
         return expert_location % num_local_physical_experts
 
-    _entrypoint()
+    copies = _entrypoint()
 
-    return output_logs
+    def install(coalesce: bool = False):
+        if not coalesce:
+            _execute_buffer2weight_copies(copies)
+            return
+        # The NPU adapter exposes dense, physical byte rows. Only merge runs
+        # that are contiguous in both the staging and live storage.
+        ranges = []
+        for source, destination in copies:
+            source = _get_local_expert_location(source)
+            destination = _get_local_expert_location(destination)
+            if ranges:
+                prev_source, prev_dest, length = ranges[-1]
+                if source == prev_source + length and destination == prev_dest + length:
+                    ranges[-1] = (prev_source, prev_dest, length + 1)
+                    continue
+            ranges.append((source, destination, 1))
+        for source, destination, length in ranges:
+            for weight, buffer in zip(
+                routed_experts_weights, temp_buffers, strict=True
+            ):
+                weight[destination : destination + length].copy_(
+                    buffer[source : source + length]
+                )
+
+    return install, output_logs
 
 
 class _ChunkUtils:

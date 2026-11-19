@@ -311,6 +311,7 @@ POSITIONAL_FIELD_ORDER = (
     "ep_dispatch_algorithm",
     "init_expert_location",
     "enable_eplb",
+    "eplb_async_rebalance",
     "eplb_algorithm",
     "eplb_rebalance_num_iterations",
     "eplb_rebalance_layers_per_chunk",

@@ -1,0 +1,325 @@
+"""NPU implementation of the forward-boundary EPLB protocol."""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import time
+from dataclasses import dataclass, replace
+from datetime import timedelta
+
+import torch
+import torch.distributed as dist
+
+from sglang.srt.environ import envs
+from sglang.srt.eplb.async_rebalance import AsyncEplbCoordinator
+from sglang.srt.eplb.expert_location import ExpertLocationMetadata
+from sglang.srt.eplb.expert_location_updater import stage_expert_weights_single_layer
+from sglang.srt.hardware_backend.npu.eplb import (
+    _ExpertWeightAdapter,
+    _validate_migration_topology,
+    prewarm_eplb_communication,
+)
+from sglang.srt.utils import get_bool_env_var
+
+logger = logging.getLogger(__name__)
+
+
+class EplbControl:
+    def __init__(self, group):
+        self.group = group
+        self.wait_seconds = 0.0
+
+    def vote(self, epoch, phase, layer, ready, error):
+        # MAX(x), MAX(-x) detects mismatched protocol positions on every rank.
+        flags = torch.tensor(
+            [epoch, -epoch, phase, -phase, layer, -layer, int(not ready), int(error)],
+            dtype=torch.int64,
+        )
+        start = time.perf_counter()
+        dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=self.group)
+        self.wait_seconds += time.perf_counter() - start
+        values = flags.tolist()
+        if any(values[i] != -values[i + 1] for i in (0, 2, 4)):
+            raise RuntimeError("EPLB ranks reached different protocol boundaries")
+        return values[6] == 0, bool(values[7])
+
+    def drained(self, success):
+        value = torch.tensor([int(success)], dtype=torch.int32)
+        dist.all_reduce(value, op=dist.ReduceOp.MIN, group=self.group)
+        return bool(value.item())
+
+
+@dataclass(frozen=True)
+class PlanningSpec:
+    physical_experts: int
+    local_experts: int
+    groups: int | None
+    nodes: int
+    algorithm: object
+
+    def compute(self, counts):
+        from sglang.srt.eplb.eplb_algorithms import rebalance_experts
+
+        physical, logical, _ = rebalance_experts(
+            tokens_per_expert=counts,
+            num_physical_experts=self.physical_experts,
+            num_local_physical_experts=self.local_experts,
+            num_groups=self.groups,
+            num_nodes=self.nodes,
+            algorithm=self.algorithm,
+        )
+        return physical, logical
+
+
+class NpuEplbRuntime:
+    def __init__(
+        self,
+        weights,
+        metadata,
+        spec,
+        rank,
+        world_size,
+        ranks_per_node,
+        plan_group,
+        p2p_group,
+    ):
+        self.metadata, self.spec = metadata, spec
+        self.rank, self.world_size, self.ranks_per_node = (
+            rank,
+            world_size,
+            ranks_per_node,
+        )
+        self.plan_group = plan_group
+        self.p2p_group = p2p_group
+        self.log_metrics = get_bool_env_var(
+            "SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS"
+        )
+        self.layer_ids = tuple(sorted(weights))
+        adapter = _ExpertWeightAdapter(weights, list(self.layer_ids), rank)
+        self.weights = {
+            layer: adapter.make_weight_views(weights[layer]) for layer in self.layer_ids
+        }
+        self.staging = adapter.create_temp_buffers()
+        self.device = self.staging[0].device
+        self.device_module = torch.get_device_module(self.device)
+        self._p2p_stream = self.device_module.Stream(device=self.device)
+        self._prepared = self.device_module.Event()
+        self._prepared.record()
+        self._owner_stream = self.device_module.current_stream()
+        self._new_metadata = None
+        self._placements = {}
+        self._install_weights = None
+        self.stage_seconds = self.install_enqueue_seconds = 0.0
+
+    def planner(self, counts):
+        self.stage_seconds = self.install_enqueue_seconds = 0.0
+        # Snapshot on the caller's inference stream before recorder buffers reuse.
+        self._owner_stream = self.device_module.current_stream()
+        snapshot_error = None
+        try:
+            host = torch.empty(
+                counts.shape, dtype=counts.dtype, device="cpu", pin_memory=True
+            )
+            host.copy_(counts, non_blocking=True)
+            event = self.device_module.Event()
+            event.record(self._owner_stream)
+        except Exception as error:
+            snapshot_error = error
+        spec, rank, group = self.spec, self.rank, self.plan_group
+
+        def compute():
+            error = snapshot_error
+            if error is None:
+                try:
+                    self.device_module.set_device(self.device)
+                    event.synchronize()
+                except Exception as exc:
+                    error = exc
+            # Keep counts alive until the D2H finishes, then release the capture.
+            _ = counts
+            failed = torch.tensor([int(error is not None)], dtype=torch.int32)
+            dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=group)
+            if failed.item():
+                raise RuntimeError("EPLB statistics snapshot failed") from error
+            payload = [None]
+            if rank == 0:
+                try:
+                    payload[0] = (None, spec.compute(host))
+                except Exception as error:
+                    payload[0] = (str(error), None)
+            dist.broadcast_object_list(payload, src=0, group=group)
+            error, result = payload[0]
+            if error is not None:
+                raise RuntimeError(f"EPLB CPU planner failed: {error}")
+            return result
+
+        return compute
+
+    def prepare(self, placement):
+        physical, logical = placement
+        if physical.shape != self.metadata.physical_to_logical_map_cpu.shape:
+            raise ValueError("EPLB plan changed physical capacity")
+        old = self.metadata.physical_to_logical_map_cpu
+        changed = tuple(
+            layer
+            for layer in self.layer_ids
+            if not torch.equal(old[layer], physical[layer])
+        )
+        self._placements = {
+            layer: (old[layer].tolist(), physical[layer].tolist()) for layer in changed
+        }
+        # Reuse main's exact dispatch construction on CPU. Building it on NPU
+        # would immediately copy it back to CPU and synchronize the forward.
+        cpu_metadata = ExpertLocationMetadata._init_raw(
+            ep_size=self.metadata.ep_size,
+            physical_to_logical_map=physical,
+            logical_to_all_physical_map=logical,
+        )
+        device_fields = (
+            "physical_to_logical_map",
+            "logical_to_all_physical_map",
+            "logical_to_all_physical_map_num_valid",
+            "logical_to_rank_dispatch_physical_map",
+        )
+        self._new_metadata = replace(
+            cpu_metadata,
+            **{
+                name: value.to(self.device, non_blocking=True)
+                for name in device_fields
+                if (value := getattr(cpu_metadata, name)) is not None
+            },
+        )
+        self._owner_stream = self.device_module.current_stream()
+        self._prepared.record(self._owner_stream)
+        return changed
+
+    def preparation_ready(self):
+        return self._prepared.query()
+
+    def _check_stream(self):
+        if self.device_module.current_stream() != self._owner_stream:
+            raise RuntimeError("EPLB target forwards changed their owning stream")
+
+    def stage(self, layer):
+        self._check_stream()
+        old, new = self._placements[layer]
+        self._install_weights = None
+        # Record on the current owner stream, including across epoch boundaries.
+        source_ready = self.device_module.Event()
+        source_ready.record(self._owner_stream)
+
+        def transfer():
+            self.device_module.set_device(self.device)
+            start = time.perf_counter()
+            # Work.wait orders the current stream after HCCL. The Future can
+            # advertise readiness only after that dependency has completed.
+            handles = []
+            with self.device_module.stream(self._p2p_stream):
+                self._p2p_stream.wait_event(source_ready)
+                install, _ = stage_expert_weights_single_layer(
+                    self.weights[layer],
+                    self.staging,
+                    old,
+                    new,
+                    self.spec.local_experts,
+                    self.ranks_per_node,
+                    self.rank,
+                    world_size=self.world_size,
+                    log_metrics=self.log_metrics,
+                    group=self.p2p_group,
+                    work_handles=handles,
+                )
+                self._p2p_stream.synchronize()
+            self.stage_seconds += time.perf_counter() - start
+            self._install_weights = install
+
+        return transfer
+
+    def install(self, layer):
+        self._check_stream()
+        start = time.perf_counter()
+        self._install_weights(coalesce=True)
+        self._install_weights = None
+        self.metadata.update(self._new_metadata, update_layer_ids=[layer])
+        self.install_enqueue_seconds += time.perf_counter() - start
+
+    def synchronize(self):
+        # The coordinator joins the worker before draining both streams.
+        self._p2p_stream.synchronize()
+        self._owner_stream.synchronize()
+
+    def close(self):
+        dist.destroy_process_group(self.p2p_group)
+
+
+def create_npu_async_eplb(model_config, weights, metadata):
+    from sglang.srt.eplb.eplb_algorithms import compute_algorithm
+    from sglang.srt.runtime_context import get_exec, get_parallel
+
+    parallel = get_parallel()
+    world_size = dist.get_world_size()
+    _validate_migration_topology(world_size)
+    common = ExpertLocationMetadata._init_common(model_config)
+    groups = common["model_config_for_expert_location"].num_groups
+    algorithm = compute_algorithm(
+        get_exec().moe.eplb_algorithm, groups, parallel.nnodes
+    )
+    if algorithm.name.startswith("elasticity"):
+        raise ValueError("Async EPLB requires a non-elastic CPU placement algorithm")
+    spec = PlanningSpec(
+        metadata.num_physical_experts,
+        metadata.num_local_physical_experts,
+        groups,
+        parallel.nnodes,
+        algorithm,
+    )
+    # Fixed PP=1 TP=EP=WORLD: group construction order is identical on all ranks.
+    timeout = timedelta(seconds=90)
+    control_group = dist.new_group(backend="gloo", timeout=timeout)
+    plan_group = dist.new_group(backend="gloo", timeout=timeout)
+    p2p_group = dist.new_group(backend="hccl", timeout=timeout)
+    error = None
+    signature = None
+    try:
+        runtime = NpuEplbRuntime(
+            weights,
+            metadata,
+            spec,
+            parallel.tp_rank,
+            world_size,
+            world_size // parallel.nnodes,
+            plan_group,
+            p2p_group,
+        )
+        batch_size = envs.SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE.get()
+        if batch_size <= 0:
+            raise ValueError("Async EPLB requires a positive P2P batch chunk size")
+        initial_layout = metadata.physical_to_logical_map_cpu.contiguous()
+        if any(t.shape[0] != spec.local_experts for t in runtime.staging):
+            raise ValueError(
+                "Async EPLB weight rows do not match the local expert count"
+            )
+        signature = (
+            runtime.layer_ids,
+            tuple(tuple(t.shape) for t in runtime.staging),
+            batch_size,
+            spec,
+            hashlib.sha256(initial_layout.numpy().tobytes()).digest(),
+        )
+    except Exception as exc:
+        error = exc
+    signatures = [None] * world_size
+    dist.all_gather_object(signatures, signature, group=control_group)
+    if None in signatures:
+        raise RuntimeError("Async EPLB setup failed on at least one rank") from error
+    if any(s != signature for s in signatures):
+        raise ValueError(
+            "Async EPLB ranks disagree on layout, weight geometry or batching"
+        )
+    prewarm_eplb_communication(p2p_group)
+    logger.info(
+        "Async NPU EPLB ready: staging_bytes=%d",
+        sum(t.numel() for t in runtime.staging),
+    )
+    return AsyncEplbCoordinator(EplbControl(control_group), runtime)

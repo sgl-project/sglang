@@ -402,22 +402,23 @@ class _ExpertWeightAdapter:
         ]
 
 
-def prewarm_eplb_communication() -> None:
-    """Warm TP transports for enabled, non-elastic NPU EPLB before KV sizing."""
-    from sglang.srt.runtime_context import get_parallel
+def prewarm_eplb_communication(group: dist.ProcessGroup | None = None) -> None:
+    """Warm the migration communicator before KV sizing."""
+    if group is None:
+        from sglang.srt.runtime_context import get_parallel
 
-    parallel = get_parallel()
-    tp = parallel.tp_group
-    group = tp.device_group
-    _validate_migration_topology(dist.get_world_size(group))
-    if tp.world_size == 1:
+        group = get_parallel().tp_group.device_group
+    world_size = dist.get_world_size(group)
+    _validate_migration_topology(world_size)
+    if world_size == 1:
         return
     send = torch.empty(_EPLB_WARMUP_BYTES_PER_PEER, dtype=torch.uint8, device="npu")
     recv = torch.empty(
-        (tp.world_size - 1, send.numel()), dtype=send.dtype, device=send.device
+        (world_size - 1, send.numel()), dtype=send.dtype, device=send.device
     )
     ops = []
-    for slot, peer in enumerate(p for p in tp.ranks if p != tp.rank):
+    rank = dist.get_rank()
+    for slot, peer in enumerate(p for p in range(world_size) if p != rank):
         ops.extend(
             [
                 dist.P2POp(dist.isend, send, peer, group=group),
