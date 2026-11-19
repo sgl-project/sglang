@@ -1,9 +1,12 @@
 import unittest
+from dataclasses import fields, replace
 
 import torch
 
+from sglang.multimodal_gen.configs.post_training.rl_rollout import PRIMARY_STREAM
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutDitTrajectory,
+    RolloutStreamData,
     RolloutTrajectoryData,
     concat_rollout_trajectory_data,
     select_output_rollout_trajectory,
@@ -16,13 +19,21 @@ def _per_output_trajectory(output_index: int) -> RolloutTrajectoryData:
     """One per-output forward's trajectory: batch dim 1, values tagged by index."""
     tag = float(output_index + 1)
     return RolloutTrajectoryData(
-        rollout_log_probs=torch.full((1, _STEPS), tag),
-        dit_trajectory=RolloutDitTrajectory(
-            latents=torch.full((1, _STEPS + 1, 2), tag),
-            timesteps=torch.arange(_STEPS).float(),
-            sigmas=torch.linspace(1.0, 0.0, _STEPS + 1),
-        ),
+        streams={
+            PRIMARY_STREAM: RolloutStreamData(
+                rollout_log_probs=torch.full((1, _STEPS), tag),
+                dit_trajectory=RolloutDitTrajectory(
+                    latents=torch.full((1, _STEPS + 1, 2), tag),
+                    timesteps=torch.arange(_STEPS).float(),
+                    sigmas=torch.linspace(1.0, 0.0, _STEPS + 1),
+                ),
+            )
+        }
     )
+
+
+def _primary(data: RolloutTrajectoryData) -> RolloutStreamData:
+    return data.streams[PRIMARY_STREAM]
 
 
 class TestMultiOutputRolloutTrajectory(unittest.TestCase):
@@ -33,11 +44,14 @@ class TestMultiOutputRolloutTrajectory(unittest.TestCase):
             [_per_output_trajectory(i) for i in range(3)]
         )
 
-        self.assertEqual(tuple(merged.rollout_log_probs.shape), (3, _STEPS))
+        self.assertEqual(tuple(_primary(merged).rollout_log_probs.shape), (3, _STEPS))
         self.assertEqual(
-            [row[0].item() for row in merged.rollout_log_probs], [1.0, 2.0, 3.0]
+            [row[0].item() for row in _primary(merged).rollout_log_probs],
+            [1.0, 2.0, 3.0],
         )
-        self.assertEqual(tuple(merged.dit_trajectory.latents.shape), (3, _STEPS + 1, 2))
+        self.assertEqual(
+            tuple(_primary(merged).dit_trajectory.latents.shape), (3, _STEPS + 1, 2)
+        )
 
     def test_merge_keeps_group_shared_schedule_from_first_output(self):
         merged = concat_rollout_trajectory_data(
@@ -46,8 +60,12 @@ class TestMultiOutputRolloutTrajectory(unittest.TestCase):
 
         # timesteps/sigmas describe the shared schedule, so they must not gain a
         # batch dim when K outputs are merged.
-        self.assertEqual(tuple(merged.dit_trajectory.timesteps.shape), (_STEPS,))
-        self.assertEqual(tuple(merged.dit_trajectory.sigmas.shape), (_STEPS + 1,))
+        self.assertEqual(
+            tuple(_primary(merged).dit_trajectory.timesteps.shape), (_STEPS,)
+        )
+        self.assertEqual(
+            tuple(_primary(merged).dit_trajectory.sigmas.shape), (_STEPS + 1,)
+        )
 
     def test_merge_drops_trajectory_when_only_some_outputs_have_one(self):
         """Drop a partial trajectory group that cannot stay output-aligned."""
@@ -71,14 +89,40 @@ class TestMultiOutputRolloutTrajectory(unittest.TestCase):
             select_output_rollout_trajectory(merged, index) for index in range(3)
         ]
 
-        values = [entry.rollout_log_probs.flatten()[0].item() for entry in selected]
+        values = [
+            _primary(entry).rollout_log_probs.flatten()[0].item() for entry in selected
+        ]
         self.assertEqual(values, [1.0, 2.0, 3.0])
         for entry in selected:
             # Keep-dim so a grouped result matches an unexpanded one's shape.
-            self.assertEqual(tuple(entry.rollout_log_probs.shape), (1, _STEPS))
             self.assertEqual(
-                tuple(entry.dit_trajectory.latents.shape), (1, _STEPS + 1, 2)
+                tuple(_primary(entry).rollout_log_probs.shape), (1, _STEPS)
             )
+            self.assertEqual(
+                tuple(_primary(entry).dit_trajectory.latents.shape), (1, _STEPS + 1, 2)
+            )
+
+    def test_merge_and_select_keep_every_shared_trajectory_field(self):
+        """Every trajectory field but latents survives merge and select."""
+        shared = {
+            field.name: torch.arange(_STEPS + 1) + i
+            for i, field in enumerate(fields(RolloutDitTrajectory))
+            if field.name != "latents"
+        }
+        per_output = [_per_output_trajectory(i) for i in range(2)]
+        for data in per_output:
+            stream_data = _primary(data)
+            stream_data.dit_trajectory = replace(stream_data.dit_trajectory, **shared)
+
+        merged = concat_rollout_trajectory_data(per_output)
+        selected = select_output_rollout_trajectory(merged, 1)
+
+        for dit_trajectory in (
+            _primary(merged).dit_trajectory,
+            _primary(selected).dit_trajectory,
+        ):
+            for name, value in shared.items():
+                self.assertIs(getattr(dit_trajectory, name), value)
 
     def test_select_without_output_index_returns_group_trajectory(self):
         merged = concat_rollout_trajectory_data(

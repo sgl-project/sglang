@@ -79,6 +79,8 @@ class RolloutRequest(BaseModel):
     fps: Optional[int] = None
 
     rollout: bool = True
+    # Streams to roll out besides the primary one, e.g. ["audio"].
+    rollout_extra_streams: list[str] = []
     # "uint8": quantise the video engine-side; None: ship unchanged
     rollout_video_dtype: Optional[str] = None
     rollout_sde_type: str = "sde"
@@ -119,6 +121,8 @@ class RolloutResponse(BaseModel):
     rollout_debug_tensors: Optional[dict[str, Any]] = None
     denoising_env: Optional[dict[str, Any]] = None
     dit_trajectory: Optional[dict[str, Any]] = None
+    # Other streams by name, keyed like the top-level fields; log-probs are per-stream means.
+    extra_streams: Optional[dict[str, dict[str, Any]]] = None
 
     inference_time_s: Optional[float] = None
     peak_memory_mb: Optional[float] = None

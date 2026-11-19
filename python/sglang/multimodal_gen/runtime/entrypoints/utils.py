@@ -39,6 +39,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
+from sglang.multimodal_gen.registry import get_served_pipeline_class
 from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
     expand_request_outputs as expand_request_outputs,
 )
@@ -1009,6 +1010,23 @@ def _try_save_video_with_audio(
                 pass
 
 
+def _validate_rollout_request(req: Req, server_args: ServerArgs) -> None:
+    if not req.rollout:
+        return
+    requested_extra_streams = set(req.rollout_extra_streams)
+    pipeline_cls = get_served_pipeline_class(server_args)
+    if pipeline_cls is None:
+        if requested_extra_streams:
+            raise ValueError("Could not resolve the pipeline for extra stream rollout")
+        return
+    unsupported = requested_extra_streams - pipeline_cls.supported_rollout_extra_streams
+    if unsupported:
+        raise ValueError(
+            f"{pipeline_cls.__name__} does not support rollout of streams "
+            f"{sorted(unsupported)}"
+        )
+
+
 def prepare_request(
     server_args: ServerArgs,
     sampling_params: SamplingParams,
@@ -1026,6 +1044,7 @@ def prepare_request(
         VSA_sparsity=vsa_sparsity,
     )
     sampling_params.apply_request_extra(req)
+    _validate_rollout_request(req, server_args)
     if getattr(sampling_params, "max_sequence_length", None) is not None:
         req.max_sequence_length = sampling_params.max_sequence_length
 
