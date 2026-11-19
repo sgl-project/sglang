@@ -1008,8 +1008,16 @@ class DeepseekSparseAttnBackend(
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
-        self.use_fused_topk = should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend)
-        if envs.SGLANG_DSA_FUSE_TOPK.get() and not self.use_fused_topk:
+        deterministic_topk = get_exec().deterministic.enable_deterministic_inference
+        self.use_fused_topk = should_use_dsa_fused_topk(
+            seed_dsa_topk_from_draft_extend,
+            deterministic=deterministic_topk,
+        )
+        if (
+            not deterministic_topk
+            and envs.SGLANG_DSA_FUSE_TOPK.get()
+            and not self.use_fused_topk
+        ):
             print_warning_once(
                 "Disabling fused DSA top-k for IndexShare under PD disaggregation."
             )
