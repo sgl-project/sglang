@@ -41,7 +41,9 @@ from sglang.srt.layers.linear import (
     LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedParallelGroup,
     RowParallelLinear,
+    resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -742,18 +744,21 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         self.attn_tp_rank = get_parallel().attn_tp_rank
         self.attn_tp_size = get_parallel().attn_tp_size
         self.total_num_heads = config.num_attention_heads
+        dcp_size = 1 if is_nextn else get_parallel().attn_dcp_size
+        kv_parallel_group = ReplicatedParallelGroup("attn_tp", dcp_size)
+        _, kv_tp_size = resolve_linear_parallel_group(kv_parallel_group)
         assert self.total_num_heads % self.attn_tp_size == 0
         self.num_heads = self.total_num_heads // self.attn_tp_size
         self.total_num_kv_heads = config.num_key_value_heads
-        if self.total_num_kv_heads >= self.attn_tp_size:
+        if self.total_num_kv_heads >= kv_tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % self.attn_tp_size == 0
+            assert self.total_num_kv_heads % kv_tp_size == 0
         else:
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.attn_tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // self.attn_tp_size)
+            assert kv_tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // kv_tp_size)
         self.head_dim = config.head_dim or (self.hidden_size // self.num_heads)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -796,6 +801,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 else None
             ),
             parallel_group="attn_tp",
+            kv_parallel_group=kv_parallel_group,
             prefix=add_prefix("qkv_proj", prefix),
         )
 
