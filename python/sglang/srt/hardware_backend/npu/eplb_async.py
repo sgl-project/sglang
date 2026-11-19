@@ -94,12 +94,19 @@ def _make_weight_writeback(weights, buffers, rows) -> WeightWriteback:
                 continue
         ranges.append((source, destination, 1))
 
+    # Slice on the staging worker. The forward thread only submits the copies.
+    copies = [
+        (
+            weight[destination : destination + length],
+            buffer[source : source + length],
+        )
+        for source, destination, length in ranges
+        for weight, buffer in zip(weights, buffers, strict=True)
+    ]
+
     def writeback():
-        for source, destination, length in ranges:
-            for weight, buffer in zip(weights, buffers, strict=True):
-                weight[destination : destination + length].copy_(
-                    buffer[source : source + length]
-                )
+        for destination, source in copies:
+            destination.copy_(source)
 
     return writeback
 

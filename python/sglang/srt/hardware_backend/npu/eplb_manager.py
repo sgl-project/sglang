@@ -85,6 +85,7 @@ class NpuAsyncEPLBManager(EPLBManager):
             return
         start = time.perf_counter()
         snapshot = recorder.dump_record(output_mode="object")
+        snapshot_seconds = time.perf_counter() - start
         if not self._check_rebalance_needed(
             snapshot["average_utilization_rate_over_window"]
         ):
@@ -99,16 +100,19 @@ class NpuAsyncEPLBManager(EPLBManager):
         except RebalanceAborted:
             self._rebalance_disabled_reason = "asynchronous planning failed"
             logger.exception("Async EPLB drained; disabling further rebalances")
-        # A partial/mixed-layout statistics window must never feed the next plan.
-        recorder._reset()
+        # dump_record already started a fresh window. It is still valid if the
+        # planner chose no migrations or failed before the first install.
+        if coordinator.layers_installed:
+            recorder._reset()
         runtime = coordinator.runtime
         logger.info(
             "Async EPLB epoch=%d layers=%d elapsed=%.3fs control_wait=%.6fs "
-            "stage=%.6fs install_enqueue=%.6fs",
+            "stage=%.6fs install_enqueue=%.6fs snapshot=%.6fs",
             coordinator.epoch,
             coordinator.layers_installed,
             time.perf_counter() - start,
             coordinator.control.wait_seconds,
             runtime.stage_seconds,
             runtime.install_enqueue_seconds,
+            snapshot_seconds,
         )
