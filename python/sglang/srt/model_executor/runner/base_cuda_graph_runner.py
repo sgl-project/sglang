@@ -34,6 +34,8 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import ceil_align
 
 if TYPE_CHECKING:
+    import torch
+
     from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.runner_backend.base_graph_backend import (
@@ -171,6 +173,16 @@ class BaseCudaGraphRunner(BaseRunner):
         for an eager tail can instead produce ``requests * tokens_per_request``
         rows. Such a runner must return that actual row count here. ``None``
         keeps the backend's default request-count behavior.
+        """
+        return None
+
+    def cuda_graph_output_storage(
+        self, output: torch.Tensor, capacity_rows: int
+    ) -> Optional[torch.Tensor]:
+        """Runner-owned storage a tensor output leaf already is a view of.
+
+        The breakable backend uses the returned ``capacity_rows`` view as that
+        leaf of its shared output buffer instead of allocating a separate one.
         """
         return None
 

@@ -566,6 +566,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._capture_lora = False
         self.enable_cp_bcg_capture = False
         self.prefill_cp_bcg_input: Optional[PrefillCPBCGInput] = None
+        self.aux_hidden_states_buffer: Optional[torch.Tensor] = None
         # TcPiecewise does its compile pass during backend construction.
         # Wrap only that path with the prefill CUDA graph failure hint.
         try:
@@ -1832,7 +1833,68 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 )
             forward_batch = self.model_runner.prepare_dummy_forward_batch(forward_batch)
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+        forward_batch.aux_hidden_states_buffer = self._capture_aux_hidden_states_buffer(
+            num_tokens, gathered=global_num_tokens_cpu is not None
+        )
         return forward_batch, self.model_runner.attn_backend
+
+    def _capture_aux_hidden_states_buffer(
+        self, num_tokens: int, *, gathered: bool
+    ) -> Optional[torch.Tensor]:
+        """Rows the target packs its aux hidden states into while capturing.
+
+        Every shape shares the buffer, and the breakable backend returns it as
+        the graph output. Only layouts where each captured row is one local
+        token qualify.
+        """
+        if (
+            not isinstance(self.backend, BreakableCudaGraphBackend)
+            or gathered
+            or self.enable_cp_bcg_capture
+            or self.pp_size > 1
+            or self.model_runner.attn_tp_sequence_sharded(num_tokens)
+        ):
+            return None
+        if self.aux_hidden_states_buffer is None:
+            width = self._prefill_aux_hidden_states_width()
+            if width == 0:
+                return None
+            self.aux_hidden_states_buffer = torch.empty(
+                (self.max_num_tokens, width),
+                dtype=self.model_runner.dtype,
+                device=self.device,
+            )
+        return self.aux_hidden_states_buffer[:num_tokens]
+
+    def _prefill_aux_hidden_states_width(self) -> int:
+        model_runner = self.model_runner
+        get_width = getattr(
+            model_runner.model, "get_prefill_aux_hidden_states_width", None
+        )
+        # As for the decode buffer, sharing relies on a DFlash-family draft
+        # consuming the target's aux states before the next target forward.
+        if (
+            get_width is None
+            or model_runner.is_draft_worker
+            or not model_runner.spec_algorithm.is_dflash_family()
+        ):
+            return 0
+        return get_width()
+
+    def cuda_graph_output_storage(
+        self, output: torch.Tensor, capacity_rows: int
+    ) -> Optional[torch.Tensor]:
+        buffer = self.aux_hidden_states_buffer
+        if (
+            buffer is None
+            or capacity_rows > buffer.shape[0]
+            or output.data_ptr() != buffer.data_ptr()
+            or output.shape[1:] != buffer.shape[1:]
+            or output.stride() != buffer.stride()
+            or output.dtype != buffer.dtype
+        ):
+            return None
+        return buffer[:capacity_rows]
 
     def capture(self) -> None:
         with self.model_context():

@@ -148,6 +148,9 @@ class Qwen3_5ForCausalLM(nn.Module):
             [layer_id + 1 for layer_id in layer_ids]
         )
 
+    def get_prefill_aux_hidden_states_width(self) -> int:
+        return self.model.get_prefill_aux_hidden_states_width()
+
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
         if not self.pp_group.is_last_rank:
             return

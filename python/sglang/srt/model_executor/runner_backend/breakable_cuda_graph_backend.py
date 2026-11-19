@@ -215,6 +215,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseBreakableGraphBackend
         if output is None:
             return None
         if torch.is_tensor(output):
+            owned = self._cuda_graph_runner.cuda_graph_output_storage(output, size)
+            if owned is not None:
+                return owned
             return output.new_empty((size, *output.shape[1:]))
         if isinstance(output, PPProxyTensors):
             return PPProxyTensors(
