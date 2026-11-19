@@ -465,15 +465,12 @@ void biased_grouped_topk_kernel_impl(
         }
       }
 
-      // find global topk (still `topk` routed candidates; the last one is
-      // overwritten below when a shared expert is fused, matching
-      // biased_grouped_topk_impl's torch.topk(..., k=topk) then overwrite)
       std::partial_sort(
-          queue2.begin(), queue2.begin() + topk, queue2.end(), [](const elem_t& x, const elem_t& y) -> bool {
+          queue2.begin(), queue2.begin() + routed_count, queue2.end(), [](const elem_t& x, const elem_t& y) -> bool {
             return x.first > y.first;
           });
 
-      for (int64_t j = 0; j < topk; ++j) {
+      for (int64_t j = 0; j < routed_count; ++j) {
         int32_t index = queue2[j].second;
         topk_ids[i * topk + j] = index;
         topk_weights[i * topk + j] = scores[index];
@@ -491,7 +488,7 @@ void biased_grouped_topk_kernel_impl(
             [scale_vec](Vec weights) { return weights * scale_vec; },
             topk_weights + i * topk,
             topk_weights + i * topk,
-            topk);
+            routed_count);
       }
       if (num_fused_shared_experts > 0) {
         const int64_t shared_pos = i * topk + topk - 1;
@@ -846,6 +843,15 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
   int64_t num_experts = gating_output.size(1);
   TORCH_CHECK(gating_output.size(0) == num_tokens, "Number of tokens mismatch");
   TORCH_CHECK(correction_bias.numel() == num_experts, "Bias shape mismatch");
+  TORCH_CHECK(
+      num_expert_group > 0 && num_experts % num_expert_group == 0 && num_experts / num_expert_group >= 2,
+      "num_expert_group must divide num_experts with at least two experts per group");
+  TORCH_CHECK(
+      topk_group > 0 && topk_group <= num_expert_group, "topk_group must satisfy 0 < topk_group <= num_expert_group");
+  TORCH_CHECK(topk > num_fused_shared_experts, "topk must be greater than num_fused_shared_experts");
+  TORCH_CHECK(
+      topk - num_fused_shared_experts <= topk_group * (num_experts / num_expert_group),
+      "routed topk exceeds the number of experts in the selected groups");
   at::Tensor topk_weights = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kFloat));
   at::Tensor topk_ids = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kInt));
   float scaling_factor_value = routed_scaling_factor.has_value() ? routed_scaling_factor.value() : 1.0f;

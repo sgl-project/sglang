@@ -225,8 +225,8 @@ class TestBiasedGroupedTopKFusedSharedExpert(CustomTestCase):
                                 apply_routed_scaling_factor_on_output,
                             )
 
-    def test_topk_vector_boundaries(self):
-        """Normalize and scale every routed weight across vector boundaries."""
+    def test_topk_boundaries(self):
+        """Check selected-group capacity and weights across vector boundaries."""
         hidden_states = torch.zeros(3, 4, dtype=torch.bfloat16)
         scaling_factor = 2.5
         for (
@@ -236,6 +236,7 @@ class TestBiasedGroupedTopKFusedSharedExpert(CustomTestCase):
             apply_scale,
             equal_weights,
             dtype,
+            topk_group,
         ) in itertools.product(
             [15, 16, 17, 32, 33, 64, 65],
             [0, 1],
@@ -243,6 +244,7 @@ class TestBiasedGroupedTopKFusedSharedExpert(CustomTestCase):
             [False, True],
             [False, True],
             [torch.float32, torch.bfloat16],
+            [2, 8],
         ):
             with self.subTest(
                 topk=topk,
@@ -251,6 +253,7 @@ class TestBiasedGroupedTopKFusedSharedExpert(CustomTestCase):
                 apply_scale=apply_scale,
                 equal_weights=equal_weights,
                 dtype=dtype,
+                topk_group=topk_group,
             ):
                 logits = (
                     torch.zeros(128) if equal_weights else torch.linspace(-3, 3, 128)
@@ -261,22 +264,30 @@ class TestBiasedGroupedTopKFusedSharedExpert(CustomTestCase):
                     if equal_weights
                     else torch.linspace(-0.1, 0.1, 128)
                 )
-                weights, ids = biased_grouped_topk_cpu(
-                    hidden_states=hidden_states,
-                    gating_output=gating_output,
-                    correction_bias=bias,
-                    topk=topk,
-                    renormalize=renormalize,
-                    num_expert_group=8,
-                    topk_group=8,
-                    num_fused_shared_experts=shared,
-                    routed_scaling_factor=scaling_factor,
-                    apply_routed_scaling_factor_on_output=apply_scale,
-                )
+                kwargs = {
+                    "hidden_states": hidden_states,
+                    "gating_output": gating_output,
+                    "correction_bias": bias,
+                    "topk": topk,
+                    "renormalize": renormalize,
+                    "num_expert_group": 8,
+                    "topk_group": topk_group,
+                    "num_fused_shared_experts": shared,
+                    "routed_scaling_factor": scaling_factor,
+                    "apply_routed_scaling_factor_on_output": apply_scale,
+                }
+                routed_count = topk - shared
+                if routed_count > topk_group * 16:
+                    with self.assertRaisesRegex(RuntimeError, "routed topk exceeds"):
+                        biased_grouped_topk_cpu(**kwargs)
+                    continue
+
+                weights, ids = biased_grouped_topk_cpu(**kwargs)
                 scores = gating_output.float().sigmoid()
                 expected_ids = torch.topk(scores + bias, k=topk, dim=-1).indices
                 expected = scores.gather(1, expected_ids)
-                routed_count = topk - shared
+                for row in ids[:, :routed_count]:
+                    self.assertEqual(torch.unique(row).numel(), routed_count)
                 if renormalize:
                     expected /= expected[:, :routed_count].sum(dim=-1, keepdim=True)
                 if apply_scale:
