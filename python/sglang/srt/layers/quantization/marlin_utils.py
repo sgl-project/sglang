@@ -20,7 +20,6 @@ from sglang.srt.utils import get_device_capability, is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -208,18 +207,25 @@ def check_marlin_supports_shape(
     return True, None
 
 
-def check_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
-    output_size_per_partition = (
-        getattr(layer, "output_size_per_partition", None) or layer.output_size
-    )
-    input_size_per_partition = (
-        getattr(layer, "input_size_per_partition", None) or layer.input_size
-    )
+def check_marlin_supports_layer(layer: torch.nn.Module, group_size: int) -> bool:
+    from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+    if isinstance(layer, ParallelLMHead):
+        output_size_per_partition = layer.num_embeddings_padded // layer.tp_size
+        input_size_per_partition = input_size = layer.embedding_dim
+    else:
+        output_size_per_partition = (
+            getattr(layer, "output_size_per_partition", None) or layer.output_size
+        )
+        input_size_per_partition = (
+            getattr(layer, "input_size_per_partition", None) or layer.input_size
+        )
+        input_size = layer.input_size
 
     return check_marlin_supports_shape(
         output_size_per_partition=output_size_per_partition,
         input_size_per_partition=input_size_per_partition,
-        input_size=layer.input_size,
+        input_size=input_size,
         group_size=group_size,
     )[0]
 

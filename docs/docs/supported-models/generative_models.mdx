@@ -315,8 +315,8 @@ in the GitHub search bar.
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>SenseNova Loop</strong></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Canonical HF checkpoint with <code>model_type: sensenova_loop</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-derived dense hybrid attention with shared-weight Loop and optional manifold-constrained hyper-connections (mHC). Text generation from text, image, or video inputs with unquantized weights.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>sensenova/SenseNova-Loop-9B-AWQ</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-derived dense hybrid attention with shared-weight Loop and optional manifold-constrained hyper-connections (mHC). Text generation from text, image, or video inputs with BF16 or AWQ weights.</td>
     </tr>
 </tbody>
 </table>
@@ -347,5 +347,13 @@ inputs use the existing Qwen3.5 vision encoder, processor, and three-axis mRoPE
 path. The original vision weights are loaded together with the shared language
 backbone. Pure text requests use the same entry point.
 
-Pipeline parallelism, quantization, and speculative decoding are outside this
-implementation's support scope.
+The official AWQ checkpoint includes INT4 token embeddings and LM head. The
+vision encoder and mHC routers retain their checkpoint precision. On NVIDIA
+CUDA, serve it with:
+
+```shell Command
+sglang serve --model-path sensenova/SenseNova-Loop-9B-AWQ
+```
+
+Pipeline parallelism and speculative decoding are outside this implementation's
+support scope.

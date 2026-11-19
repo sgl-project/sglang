@@ -19,6 +19,7 @@ from sglang.srt.configs.sensenova_loop import (
     SenseNovaLoopConfig,
     SenseNovaLoopTextConfig,
 )
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     MHCState,
     append_stages,
@@ -28,6 +29,7 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models import qwen3_5
 from sglang.srt.runtime_context import get_parallel, get_stream
@@ -105,7 +107,14 @@ class SenseNovaLoopModel(qwen3_5.Qwen3_5ForCausalLM):
         self.config = config
         self.hidden_size = config.hidden_size
         self.pp_group = get_parallel().pp_group
-        self.embed_tokens = self._build_embed_tokens(config)
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            org_num_embeddings=config.vocab_size,
+            quant_config=quant_config,
+            prefix=add_prefix("embed_tokens", prefix),
+            enable_tp=not is_dp_attention_enabled(),
+        )
         physical_layers = {}
         alt_stream = get_stream("alt")
 
@@ -124,6 +133,7 @@ class SenseNovaLoopModel(qwen3_5.Qwen3_5ForCausalLM):
                 layer = layer_class(
                     config=config,
                     layer_id=execution_layer_id,
+                    quant_config=quant_config,
                     prefix=add_prefix(
                         "linear_attn" if is_linear_attention else "self_attn", prefix
                     ),
