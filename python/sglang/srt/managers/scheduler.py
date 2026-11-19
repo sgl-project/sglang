@@ -67,7 +67,6 @@ import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
-from torch.distributed import barrier
 
 if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
@@ -219,7 +218,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     UpdateWeightVersionReqOutput,
-    sock_send,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
 from sglang.srt.managers.min_free_slots_delayer import (
@@ -931,10 +929,7 @@ class Scheduler(
             and get_device().sleep_on_idle
         ):
             self.idle_sleeper = IdleSleeper(
-                sockets=[
-                    self.ipc_channels.recv_from_tokenizer,
-                    self.ipc_channels.recv_from_rpc,
-                ],
+                sockets=[self.ipc_channels.recv_from_tokenizer],
                 can_empty_cache=lambda: not self.pause_state.paused,
             )
         else:
@@ -2396,10 +2391,7 @@ class Scheduler(
             if output is None:
                 output = self._rust_control_ack(recv_req)
             if output is not None:
-                if self.rust_server is None and isinstance(output, RpcReqOutput):
-                    if self.ipc_channels.recv_from_rpc is not None:
-                        sock_send(self.ipc_channels.recv_from_rpc, output)
-                elif get_parallel().pp_size > 1 and isinstance(
+                if get_parallel().pp_size > 1 and isinstance(
                     output, ReleaseMemoryOccupationReqOutput
                 ):
                     # Answered by the first stage once every stage has released.
@@ -2740,7 +2732,6 @@ class Scheduler(
             )
         self.request_receiver = receiver_factory(
             recv_from_tokenizer=self.recv_from_tokenizer,
-            recv_from_rpc=self.ipc_channels.recv_from_rpc,
             recv_skipper=self.recv_skipper,
             input_blocker=self.input_blocker,
             mm_receiver=self.mm_receiver,
@@ -6470,8 +6461,7 @@ class Scheduler(
             f"handle_rpc_request: {recv_req.method}, param: {recv_req.parameters}"
         )
 
-        success = True
-        exec = None
+        error = None
         try:
             func = getattr(self, recv_req.method)
             if recv_req.parameters is not None:
@@ -6479,12 +6469,26 @@ class Scheduler(
             else:
                 func()
         except Exception as e:
-            success = False
-            exec = e
-            logger.error(f"Failed to call rpc {recv_req.method}: {str(e)}")
+            error = str(e)
+            logger.error(f"Failed to call rpc {recv_req.method}: {error}")
 
-        barrier(group=self.tp_group.cpu_group)
-        return RpcReqOutput(success=success, message="" if not exec else str(exec))
+        # Gather over the ranks that ran this request in the same step: the DP
+        # shard under DP attention, where shards may reach it in different steps.
+        parallel = get_parallel()
+        if parallel.attn_dp_enabled:
+            groups = [parallel.attn_tp_group, parallel.attn_cp_group]
+        else:
+            groups = [parallel.tp_group]
+        errors = [error]
+        for group in groups:
+            if group.world_size > 1:
+                gathered = [None] * group.world_size
+                torch.distributed.all_gather_object(
+                    gathered, errors, group=group.cpu_group
+                )
+                errors = [e for rank_errors in gathered for e in rank_errors]
+        errors = [e for e in dict.fromkeys(errors) if e is not None]
+        return RpcReqOutput(success=not errors, message="; ".join(errors))
 
     def handle_update_weight_version(
         self, recv_req: UpdateWeightVersionReqInput
