@@ -12,6 +12,7 @@ import math
 import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -60,6 +61,7 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MiniMaxH3DiTConfig,
 )
 from sglang.multimodal_gen.configs.models.fsdp import is_block
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.cache.spectrum import (
     SpectrumMixin,
     blend_h3_spectrum_prediction,
@@ -150,6 +152,26 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 )
 
 logger = init_logger(__name__)
+
+_xpu_indexed_gate = None
+_xpu_rmsnorm_indexed_adaln = None
+if current_platform.is_xpu():
+    from sgl_kernel import fused_inplace_qknorm_rope as _xpu_qknorm_rope
+    from sgl_kernel import silu_and_mul as _xpu_silu_and_mul
+
+    try:
+        from sgl_kernel import indexed_gate_bf16_ as _xpu_indexed_gate
+    except ImportError:
+        pass
+    try:
+        from sgl_kernel.h3_fused import (
+            can_use_h3_rmsnorm_indexed_adaln,
+            h3_rmsnorm_indexed_adaln,
+        )
+
+        _xpu_rmsnorm_indexed_adaln = h3_rmsnorm_indexed_adaln
+    except ImportError:
+        pass
 
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 
@@ -445,6 +467,15 @@ def _modulate_rmsnorm_scale_shift(
     which moves the denoising trajectory at rounding level.
     """
     if (
+        x.device.type == "xpu"
+        and dtype == _BF16_DTYPE
+        and _xpu_rmsnorm_indexed_adaln is not None
+        and norm.weight is not None
+        and can_use_h3_rmsnorm_indexed_adaln(x, norm.weight, shift, scale, indices)
+    ):
+        eps = norm.eps if norm.eps is not None else torch.finfo(x.dtype).eps
+        return _xpu_rmsnorm_indexed_adaln(x, norm.weight, shift, scale, indices, eps)
+    if (
         fused
         and not current_platform.is_npu()
         and x.dtype == dtype == _BF16_DTYPE
@@ -505,6 +536,26 @@ def _modulate_gate(
     """Apply an indexed gated residual, optionally reusing the input buffer."""
     # Apply the per-index gated residual: x + gate[idx] * other.
     if (
+        x.device.type == "xpu"
+        and _xpu_indexed_gate is not None
+        and x.dtype == dtype == gate.dtype == other.dtype == _BF16_DTYPE
+        and x.ndim == gate.ndim == other.ndim == 2
+        and x.shape == other.shape
+        and gate.shape[0] > 0
+        and gate.shape[1] == x.shape[1]
+        and gate.device == other.device == indices.device == x.device
+        and x.is_contiguous()
+        and other.is_contiguous()
+        and gate.stride(-1) == 1
+        and indices.ndim == 1
+        and indices.numel() == x.shape[0]
+        and indices.is_contiguous()
+        and indices.dtype in (torch.int32, torch.int64)
+        and all(t.data_ptr() % 16 == 0 for t in (x, gate, other))
+    ):
+        out = x if allow_inplace else x.clone()
+        return _xpu_indexed_gate(out, gate, other, indices)
+    if (
         x.is_cuda
         and x.dtype == _BF16_DTYPE
         and dtype == _BF16_DTYPE
@@ -525,6 +576,13 @@ def _modulate_gate(
 
 
 def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
+    if (
+        hidden.device.type == "xpu"
+        and hidden.dtype in (torch.float16, _BF16_DTYPE)
+        and hidden.is_contiguous()
+        and hidden.shape[-1] % 8 == 0
+    ):
+        return _xpu_silu_and_mul(hidden)
     if (
         hidden.is_cuda
         and hidden.dtype == _BF16_DTYPE
@@ -694,6 +752,55 @@ def _apply_qk_norm_rope(
         )
 
     if (
+        q.device.type == "xpu"
+        and not torch.compiler.is_compiling()
+        and head_dim == 128
+        and q.ndim == k.ndim == 3
+        and q.shape == k.shape
+        and q.shape[-1] == head_dim
+        and q_norm.weight is not None
+        and k_norm.weight is not None
+        and q.dtype
+        == k.dtype
+        == q_norm.weight.dtype
+        == k_norm.weight.dtype
+        == _BF16_DTYPE
+        and q_norm.eps == k_norm.eps
+        and q_norm.eps is not None
+        and q_norm.weight.shape == k_norm.weight.shape == (head_dim,)
+        and q.stride(-1) == k.stride(-1) == 1
+        and q.stride(-2) == k.stride(-2) == head_dim
+        and q_norm.weight.is_contiguous()
+        and k_norm.weight.is_contiguous()
+        and cos_sin_cache.ndim == 2
+        and cos_sin_cache.shape[-1] == 96
+        and cos_sin_cache.dtype in (torch.float32, _BF16_DTYPE)
+        and cos_sin_cache.is_contiguous()
+        and positions.shape == (q.shape[0],)
+        and positions.dtype in (torch.int32, torch.int64)
+        and positions.is_contiguous()
+        and k.device
+        == q_norm.weight.device
+        == k_norm.weight.device
+        == cos_sin_cache.device
+        == positions.device
+        == q.device
+    ):
+        _xpu_qknorm_rope(
+            q,
+            k,
+            q_norm.weight,
+            k_norm.weight,
+            cos_sin_cache,
+            positions,
+            is_neox=True,
+            eps=q_norm.eps,
+            head_dim=head_dim,
+            rope_dim=96,
+        )
+        return q, k
+
+    if (
         not current_platform.is_npu()
         and q_norm.eps is not None
         and k_norm.eps is not None
@@ -811,6 +918,69 @@ def _minimax_h3_pad_only_tail(
         and cu_seqlens_host[:2] == (0, max_seqlen)
         and cu_seqlens_host[2] > max_seqlen
     )
+
+
+@lru_cache(maxsize=None)
+def _minimax_h3_xpu_sdp(device_index: int):
+    """Resolve the optional BMG dense kernel once per device."""
+    from sgl_kernel import diffusion
+
+    if (
+        not hasattr(diffusion, "is_available")
+        or tuple(torch.ops.sgl_kernel.query_device(device_index)) != (2, 0)
+        or not diffusion.is_available()
+    ):
+        return None
+    return diffusion.sdp
+
+
+def _minimax_h3_xpu_dense_attention(
+    attention: MiniMaxH3Attention,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_host: tuple[int, ...] | None,
+) -> torch.Tensor | None:
+    """H3 Image DiT fast path within the existing FA selection."""
+    if (
+        q.device.type != "xpu"
+        or torch.compiler.is_compiling()
+        or attention._attention_backend_enum is not AttentionBackendEnum.FA
+        or not attention.prefix.startswith("blocks.")
+        or attention._attention_impl.causal
+        or not math.isclose(attention.softmax_scale, 128**-0.5, rel_tol=1e-7)
+        or q.ndim != 3
+        or q.shape != k.shape
+        or q.shape != v.shape
+        or q.shape[0] == 0
+        or q.shape[-1] != 128
+        or q.device != k.device
+        or q.device != v.device
+        or q.dtype != k.dtype
+        or q.dtype != v.dtype
+        or q.dtype not in (torch.float16, torch.bfloat16)
+        or cu_seqlens_host is None
+        or len(cu_seqlens_host) < 2
+        or cu_seqlens_host[0] != 0
+        or cu_seqlens_host[-1] != q.shape[0]
+        or any(a > b for a, b in itertools.pairwise(cu_seqlens_host))
+    ):
+        return None
+    context = get_forward_context_or_none()
+    batch = None if context is None else context.forward_batch
+    sampling = getattr(batch, "sampling_params", None)
+    if getattr(sampling, "data_type", None) is not DataType.IMAGE:
+        return None
+    sdp = _minimax_h3_xpu_sdp(q.device.index)
+    if sdp is None:
+        return None
+    out = torch.empty_like(q)
+    for start, stop in itertools.pairwise(cu_seqlens_host):
+        if stop > start:
+            out[start:stop] = sdp(
+                q[None, start:stop], k[None, start:stop], v[None, start:stop]
+            )[0]
+    return out
 
 
 def _minimax_h3_sequential_dense_attention(
@@ -1229,15 +1399,21 @@ def _minimax_h3_attention_core_impl(
                 ):
                     # Keep the refiner native when the DiT selects SD precision.
                     extra_kwargs["attn_metadata"] = AscendFAMetadata(precision="bf16")
-            out = attention._attention_impl.forward_varlen(
-                q,
-                k,
-                v,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                cu_seqlens_host=cu_seqlens_host,
-                **extra_kwargs,
-            )
+            out = None
+            if not ulysses_active and gate_compress is None:
+                out = _minimax_h3_xpu_dense_attention(
+                    attention, q, k, v, cu_seqlens_host
+                )
+            if out is None:
+                out = attention._attention_impl.forward_varlen(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    cu_seqlens_host=cu_seqlens_host,
+                    **extra_kwargs,
+                )
     if ulysses_active:
         out = _usp_output_all_to_all(out[None], head_dim=2)[0]
     return out
