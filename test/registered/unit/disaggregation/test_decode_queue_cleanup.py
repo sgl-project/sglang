@@ -442,6 +442,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
         queue.draft_kv_ring = None
         queue.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(4)
         queue.token_to_kv_pool_allocator = SimpleNamespace(
+            pools_share_memory=False,
             page_size=1,
             state=None,
             translate_kv_indices_for_transfer=lambda indices: indices,
@@ -464,6 +465,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
             enable_decode_hicache=False,
         )
         queue.scheduler.running_batch.reqs = []
+        queue.scheduler.request_retirer = leaving_retirer()
         return queue
 
     @staticmethod
@@ -541,13 +543,19 @@ class TestDeferredDestinationPublish(CustomTestCase):
         for restored in (0, 2, 4):
             with self.subTest(restored_tokens=restored):
                 queue, dr = self._storage_admission_queue(restored)
-                self.assertEqual(queue.pop_preallocated(), ([], []))
+                self.assertEqual(
+                    queue.move_preallocated(queue.transfer_queue.queue), ([], [])
+                )
                 self.assertEqual(dr.metadata_buffer_index, -1)
-                self.assertEqual(queue.pop_preallocated(), ([], []))
+                self.assertEqual(
+                    queue.move_preallocated(queue.transfer_queue.queue), ([], [])
+                )
                 self.assertFalse(dr.kv_receiver.send_metadata.called)
 
                 queue.tree_cache.check_prefetch_progress.return_value = True
-                self.assertEqual(queue.pop_preallocated(), ([dr], []))
+                self.assertEqual(
+                    queue.move_preallocated(queue.transfer_queue.queue), ([dr], [])
+                )
                 metadata = dr.kv_receiver.send_metadata.call_args.kwargs
                 self.assertEqual(metadata["decode_prefix_len"], restored)
                 self.assertEqual(metadata["suffix_tokens"], 5 - restored)
@@ -558,22 +566,26 @@ class TestDeferredDestinationPublish(CustomTestCase):
         queue._start_hicache_prefetch = lambda req, pm: setattr(
             pm, "prefetch_ticketed", pm.l3_storage_hit_length > 0
         )
-        self.assertEqual(queue.pop_preallocated(), ([], []))
+        self.assertEqual(queue.move_preallocated(queue.transfer_queue.queue), ([], []))
         self.assertFalse(dr.kv_receiver.send_metadata.called)
         queue.tree_cache.check_prefetch_progress.return_value = True
-        self.assertEqual(queue.pop_preallocated(), ([dr], []))
+        self.assertEqual(
+            queue.move_preallocated(queue.transfer_queue.queue), ([dr], [])
+        )
         self.assertEqual(
             dr.kv_receiver.send_metadata.call_args.kwargs["decode_prefix_len"], 4
         )
 
     def test_pending_storage_read_does_not_block_a_cache_miss(self):
         queue, pending = self._storage_admission_queue(0)
-        self.assertEqual(queue.pop_preallocated(), ([], []))
+        self.assertEqual(queue.move_preallocated(queue.transfer_queue.queue), ([], []))
         following = self._decode_req(_PollingReceiver())
         following.req.rid = "following"
         following.hicache_prefetch_done = True
-        queue.queue.join([following])
-        self.assertEqual(queue.pop_preallocated(), ([following], []))
+        move([following], queue.queue)
+        self.assertEqual(
+            queue.move_preallocated(queue.transfer_queue.queue), ([following], [])
+        )
         self.assertTrue(pending.hicache_prefetch_pending)
         self.assertFalse(pending.kv_receiver.send_metadata.called)
         self.assertEqual(
@@ -587,7 +599,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
         tail = self._decode_req(_PollingReceiver())
         tail.req.rid = "tail"
         tail.req.cache_request_handle = "tail-storage"
-        queue.queue.join([tail])
+        move([tail], queue.queue)
         locks = set()
 
         def match(req, *, query_storage=True):
@@ -609,8 +621,9 @@ class TestDeferredDestinationPublish(CustomTestCase):
         queue.token_to_kv_pool_allocator.sub_pool_roles = lambda: ("full", (), None)
         queue.token_to_kv_pool_allocator.available_size = lambda: 8
         queue.token_to_kv_pool_allocator.prealloc_fits = (
-            lambda demand, *, evictable, full_budget_tokens, window_budget_tokens:
-            demand.full_tokens <= full_budget_tokens
+            lambda demand, *, evictable, full_budget_tokens, window_budget_tokens: (
+                demand.full_tokens <= full_budget_tokens
+            )
         )
         queue.scheduler.last_batch = None
         queue.scheduler.waiting_queue = []
@@ -623,13 +636,13 @@ class TestDeferredDestinationPublish(CustomTestCase):
         ):
             setattr(queue, name, getattr(DecodePreallocQueue, name).__get__(queue))
 
-        self.assertEqual(queue.pop_preallocated(), ([], []))
+        self.assertEqual(queue.move_preallocated(queue.transfer_queue.queue), ([], []))
         self.assertEqual(locks, {head.req.rid, tail.req.rid})
         # Both reads are pending with independent L1 locks. Tighten capacity:
         # head needs seven tokens, but only six fit while tail retains its lock.
         queue.token_to_kv_pool_allocator.available_size = lambda: 6
         queue.tree_cache.check_prefetch_progress.return_value = True
-        admitted, failed = queue.pop_preallocated()
+        admitted, failed = queue.move_preallocated(queue.transfer_queue.queue)
         self.assertFalse(failed)
         self.assertIn(head, admitted)
         self.assertFalse(tail.hicache_prefetch_pending)
@@ -637,26 +650,30 @@ class TestDeferredDestinationPublish(CustomTestCase):
 
     def test_finished_prefetch_does_not_bypass_readmission(self):
         queue, dr = self._storage_admission_queue(0)
-        self.assertEqual(queue.pop_preallocated(), ([], []))
+        self.assertEqual(queue.move_preallocated(queue.transfer_queue.queue), ([], []))
         queue.tree_cache.check_prefetch_progress.return_value = True
         queue._prealloc_reservation_fits.return_value = False
-        self.assertEqual(queue.pop_preallocated(), ([], []))
+        self.assertEqual(queue.move_preallocated(queue.transfer_queue.queue), ([], []))
         self.assertFalse(dr.kv_receiver.send_metadata.called)
         self.assertEqual(dr.metadata_buffer_index, -1)
         queue._prealloc_reservation_fits.return_value = True
-        self.assertEqual(queue.pop_preallocated(), ([dr], []))
+        self.assertEqual(
+            queue.move_preallocated(queue.transfer_queue.queue), ([dr], [])
+        )
         self.assertEqual(
             dr.kv_receiver.send_metadata.call_args.kwargs["decode_prefix_len"], 0
         )
 
     def test_abort_while_prefetching_never_publishes(self):
         queue, dr = self._storage_admission_queue(0)
-        self.assertEqual(queue.pop_preallocated(), ([], []))
+        self.assertEqual(queue.move_preallocated(queue.transfer_queue.queue), ([], []))
         from sglang.srt.managers.req_types import FINISH_ABORT
 
         dr.req.finished_reason = FINISH_ABORT("cancelled")
         dr.req.finished_output = True
-        self.assertEqual(queue.pop_preallocated(), ([], [dr]))
+        self.assertEqual(
+            queue.move_preallocated(queue.transfer_queue.queue), ([], [dr])
+        )
         self.assertIsNone(dr.req.lock)
         self.assertFalse(dr.hicache_prefetch_pending)
         self.assertIsNone(dr.kv_receiver)
@@ -664,21 +681,35 @@ class TestDeferredDestinationPublish(CustomTestCase):
 
     def test_abort_after_storage_prefetch_completes_before_readmission(self):
         queue, dr = self._storage_admission_queue(4)
-        self.assertEqual(queue.pop_preallocated(), ([], []))
+        self.assertEqual(queue.move_preallocated(queue.transfer_queue.queue), ([], []))
         queue.tree_cache.check_prefetch_progress.return_value = True
         queue._prealloc_reservation_fits.return_value = False
-        self.assertEqual(queue.pop_preallocated(), ([], []))
+        self.assertEqual(queue.move_preallocated(queue.transfer_queue.queue), ([], []))
         self.assertTrue(dr.hicache_prefetch_done)
         from sglang.srt.managers.req_types import FINISH_ABORT
 
         dr.req.finished_reason = FINISH_ABORT("cancelled")
         dr.req.finished_output = True
-        self.assertEqual(queue.pop_preallocated(), ([], [dr]))
+        self.assertEqual(
+            queue.move_preallocated(queue.transfer_queue.queue), ([], [dr])
+        )
         self.assertFalse(dr.hicache_prefetch_done)
         self.assertIsNone(dr.req.lock)
         self.assertIsNone(dr.kv_receiver)
         self.assertEqual(len(queue.queue), 0)
         self.assertTrue(queue.tree_cache.finish.called)
+
+    def test_memory_release_cancels_prefetch_without_losing_queue_ownership(self):
+        queue, dr = self._storage_admission_queue(restored_tokens=4)
+        self.assertEqual(queue.move_preallocated(queue.transfer_queue.queue), ([], []))
+        queue._cancel_prefill_dp_rank_queries = MagicMock()
+        queue.release_memory_occupation()
+        self.assertFalse(dr.hicache_prefetch_pending)
+        self.assertIsNone(dr.req.lock)
+        self.assertEqual(list(queue.queue.items()), [dr])
+        queue.tree_cache.finish.assert_called_once()
+        queue.release_memory_occupation()
+        queue.tree_cache.finish.assert_called_once()
 
     def test_deferred_destination_keeps_its_metadata_slot_until_published(self):
         # The transfer queue frees the metadata slot of any request it fails, so

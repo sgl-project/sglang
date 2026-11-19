@@ -1333,7 +1333,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._cancel_prefill_dp_rank_queries()
         for dr in self.queue.items():
             self._cancel_hicache_admission(dr)
-        self.queue.clear()
         if self._pending_publish:
             storage = self._storage()
             for entry in self._pending_publish:
@@ -1719,6 +1718,31 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if decode_req.waiting_for_input and decode_req.hicache_prefetch_pending:
                 self._poll_hicache_prefetch(decode_req)
 
+        # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
+        # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
+        retractable_tokens = sum(
+            len(r.origin_input_ids) + len(r.output_ids)
+            for r in self.scheduler.running_batch.reqs
+        )
+
+        uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
+        window_allocatable_tokens = None
+        if self._uses_swa_reservation():
+            retractable_window_tokens = self._running_window_retractable_tokens()
+            full_allocatable_tokens, window_allocatable_tokens = (
+                self._window_aware_allocatable_token_budgets(
+                    retractable_tokens=retractable_tokens,
+                    retractable_window_tokens=retractable_window_tokens,
+                    count_retracted=True,
+                )
+            )
+        else:
+            retractable_window_tokens = None
+            full_allocatable_tokens = self._allocatable_token_budgets(
+                retractable_tokens=retractable_tokens, count_retracted=True
+            )
+        reserved_restore_tokens = self._hicache_pending_restore_tokens()
+        full_allocatable_tokens -= reserved_restore_tokens
         # HiSparse physical constraint: max requests by device buffer capacity.
         # Each admitted req needs a padded buffer plus its speculative scratch.
         # waiting_queue reqs already have device buffers (allocated in admit_request_direct),

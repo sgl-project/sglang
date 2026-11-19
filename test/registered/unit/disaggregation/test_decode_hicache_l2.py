@@ -279,6 +279,7 @@ class TestDecodeHiCacheL2(CustomTestCase):
                     ),
                     expected,
                 )
+
     def test_admission_host_pin_survives_until_dma_owns_the_prefix(self):
         self._host_prefix()
         dr = self._request(0)
