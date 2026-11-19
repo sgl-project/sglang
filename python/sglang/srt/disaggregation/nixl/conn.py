@@ -60,8 +60,8 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.common import run_with_deadline
 from sglang.srt.utils.aiter import pin_aiter_hip_runtime
+from sglang.srt.utils.common import run_with_deadline
 
 try:
     from nixl._bindings import (
