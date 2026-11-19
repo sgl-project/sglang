@@ -1,25 +1,54 @@
-# ViT attention with FA4 on SM103: row max from tcgen05.ld.red
-# (SGLANG_FA4_TMEM_LOAD_RED_MAX=1) vs FMNMX (=0). Shapes and call follow
-# VisionFlash4Attention (varlen, non-causal, no LSE). Each round CUDA-graph times both
-# back to back, in alternating order; the per-round ratio is the headline number.
+# ViT attention with FA4 on SM103: row max from tcgen05.ld.red (the default) vs
+# FMNMX (the forward kernel built with tmem_load_red_max=False). Shapes and call
+# follow VisionFlash4Attention (varlen, non-causal, no LSE). Each round CUDA-graph
+# times both back to back, in alternating order; the per-round ratio is the
+# headline number.
 # Outputs must be bit-identical.
 #
-# Run on B300 / GB300 (elsewhere the flag is ignored):
+# Run on B300 / GB300 (elsewhere both variants run the same kernel):
 #   python benchmark/kernels/attention/bench_flash_attention_tmem_red_max.py
 
 from __future__ import annotations
 
 import argparse
-import os
+import contextlib
 from typing import Iterable
 
 import torch
 
+from sglang.kernels.ops.attention.flash_attn.cute import interface as fa4_interface
+from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm100 import (
+    FlashAttentionForwardSm100,
+)
 from sglang.kernels.ops.attention.flash_attn.cute.interface import (
     flash_attn_varlen_func,
 )
 
-RED_MAX_ENV = "SGLANG_FA4_TMEM_LOAD_RED_MAX"
+
+class _FmnmxForwardSm100(FlashAttentionForwardSm100):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **{**kwargs, "tmem_load_red_max": False})
+
+
+# The FMNMX kernels share the compile keys of the default ones.
+_FMNMX_COMPILE_CACHE = {}
+
+
+@contextlib.contextmanager
+def _row_max(red_max: bool):
+    if red_max:
+        yield
+        return
+    saved = fa4_interface.FlashAttentionForwardSm100
+    saved_cache = fa4_interface._flash_attn_fwd.compile_cache
+    fa4_interface.FlashAttentionForwardSm100 = _FmnmxForwardSm100
+    fa4_interface._flash_attn_fwd.compile_cache = _FMNMX_COMPILE_CACHE
+    try:
+        yield
+    finally:
+        fa4_interface.FlashAttentionForwardSm100 = saved
+        fa4_interface._flash_attn_fwd.compile_cache = saved_cache
+
 
 # images, tokens per image, heads, head dim
 SHAPES = [
@@ -85,8 +114,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         raise RuntimeError(f"This benchmark is for SM10x. Got {major}.{minor}.")
     if minor < 3:
         print(
-            f"Note: SM{major}{minor} has no tcgen05.ld.red; {RED_MAX_ENV} is ignored "
-            "and both variants run the same kernel."
+            f"Note: SM{major}{minor} has no tcgen05.ld.red; both variants run the "
+            "same kernel."
         )
 
     torch.manual_seed(args.seed)
@@ -117,15 +146,15 @@ def main(argv: Iterable[str] | None = None) -> int:
 
         outputs, times = {}, {False: [], True: []}
         for red_max in (False, True):
-            os.environ[RED_MAX_ENV] = "1" if red_max else "0"
-            outputs[red_max] = flash_attn_varlen_func(**kwargs)[0]
+            with _row_max(red_max):
+                outputs[red_max] = flash_attn_varlen_func(**kwargs)[0]
         # Swap the order every round so clock and thermal drift hit both equally.
         for r in range(args.rounds):
             for red_max in (False, True) if r % 2 == 0 else (True, False):
-                os.environ[RED_MAX_ENV] = "1" if red_max else "0"
-                times[red_max].append(
-                    time_graph(lambda: flash_attn_varlen_func(**kwargs), args.iters)
-                )
+                with _row_max(red_max):
+                    times[red_max].append(
+                        time_graph(lambda: flash_attn_varlen_func(**kwargs), args.iters)
+                    )
         same = torch.equal(_bits(outputs[True]), _bits(outputs[False]))
         name = f"{images} x {tokens} tok, h{heads} d{head_dim}"
         if not same:
@@ -143,7 +172,6 @@ def main(argv: Iterable[str] | None = None) -> int:
         )
         del q, k, v, outputs
 
-    os.environ.pop(RED_MAX_ENV, None)
     if mismatches:
         print(f"\nOutputs differ between the variants for: {', '.join(mismatches)}")
         return 1

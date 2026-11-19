@@ -1,4 +1,4 @@
-// Row sum over [N, K] fp32, bitwise-identical to `sglang.kernels.ops.muse_spark.triton_sum`.
+// Row sum over [N, K] fp32, bitwise-identical to `sglang.test.kernels.triton_sum`.
 //
 // The point of that Triton kernel is a reduction order fixed by the compiler
 // rather than by the CUDA runtime version, so this kernel reproduces tl.sum's
@@ -67,7 +67,7 @@ void muse_spark_row_sum(
   SymbolicSize N{"num_rows"};
   SymbolicSize K{"num_cols"};
   SymbolicDevice device_;
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
   TensorMatcher({N, K}).with_dtype<fp32_t>().with_device(device_).verify(input);
   TensorMatcher({N}).with_dtype<fp32_t>().with_device(device_).verify(out);

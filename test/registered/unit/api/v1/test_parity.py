@@ -1,4 +1,4 @@
-"""Parity of the three `/generate` vocabularies: the hand-written Python
+"""Parity of the `/generate` and HiCache API vocabularies: the hand-written Python
 request structs (`io_struct.GenerateReqInput`, `SamplingParams`), the
 generated Python types (`sglang.api.v1.api_types`), and the generated Rust
 types (`rust/sglang-api-types`).
@@ -6,14 +6,17 @@ types (`rust/sglang-api-types`).
 The cross-language half runs through `rust/sglang-api-types/testdata/
 json_parity.json`: both generators must turn each fixture input into the same
 canonical bytes (`tests/json_parity.rs` checks the Rust side). The Python half
-pins the field sets against the hand-written structs and proves a schema
-request still normalizes through the dataclass the Python server runs.
+pins the field sets against the hand-written structs, checks HiCache request
+validation, and proves a generation request still normalizes through the
+dataclass the Python server runs.
 """
 
 import dataclasses
 import json
 import unittest
 from pathlib import Path
+
+from pydantic import TypeAdapter
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -27,10 +30,14 @@ from sglang.api.v1.api_types import (
     GenerateResponse,
     SamplingParams,
 )
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import (
+    AttachHiCacheStorageReqInput,
+    BaseReq,
+    GenerateReqInput,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams as PySamplingParams
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 REPO_ROOT = Path(__file__).resolve().parents[5]
 FIXTURES = REPO_ROOT / "rust" / "sglang-api-types" / "testdata" / "json_parity.json"
@@ -44,14 +51,10 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
     {
         "background",
         "conversation_id",
-        "custom_labels",
-        "custom_logit_processor",
-        "data_parallel_rank",
         "encoder_urls",
         "external_trace_header",
         "http_worker_ipc",
         "image_max_dynamic_patch",
-        "images_config",
         "input_embeds",
         "log_metrics",
         "lora_id",
@@ -59,7 +62,7 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "min_dynamic_patch",
         "mm_content_hashes",
         "mm_processor_kwargs",
-        "modalities",
+        "mm_routing_labels",
         "multi_item_delimiter_indices",
         "need_wait_for_mm_inputs",
         "no_logs",
@@ -71,13 +74,11 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "return_flat_raw_output_top_logprobs",
         "return_flat_raw_top_logprobs",
         "return_flat_raw_top_logprobs_b64",
+        "return_flat_raw_sampling_mask",
+        "return_flat_raw_sampling_mask_b64",
         "return_indexer_topk",
-        "return_prompt_token_ids",
         "return_routed_experts",
-        "return_sampling_mask",
-        "routed_experts_start_len",
         "sampling_logprobs_mode",
-        "session_id",
         "token_indices_to_pool",
         "use_audio_in_video",
         "video_config",
@@ -109,6 +110,18 @@ def load_fixtures():
         return json.load(f)["cases"]
 
 
+def codec(type_name):
+    """The (decode, encode) pair of a generated type: methods on a struct
+    class, module functions for a union alias (tagged, untagged, list)."""
+    generated = getattr(api_types, type_name)
+    if hasattr(generated, "from_json_value"):
+        return generated.from_json_value, lambda value: value.to_json_value()
+    return (
+        getattr(api_types, f"decode_{type_name}"),
+        getattr(api_types, f"encode_{type_name}"),
+    )
+
+
 # Schema-only sampling inputs the Rust server lowers before the scheduler
 # (choice -> regex); Python's SamplingParams never receives them.
 SCHEMA_ONLY_SAMPLING_FIELDS = frozenset({"choice"})
@@ -123,17 +136,42 @@ class TestCrossLanguageFixtures(CustomTestCase):
         self.assertTrue(cases)
         for case in cases:
             with self.subTest(case=f"{case['type']}: {case['name']}"):
-                cls = getattr(api_types, case["type"])
-                decoded = cls.from_json_value(case["input"])
-                self.assertEqual(compact(decoded.to_json_value()), case["canonical"])
-                again = cls.from_json_value(json.loads(case["canonical"]))
-                self.assertEqual(compact(again.to_json_value()), case["canonical"])
+                decode, encode = codec(case["type"])
+                decoded = decode(case["input"])
+                self.assertEqual(compact(encode(decoded)), case["canonical"])
+                again = decode(json.loads(case["canonical"]))
+                self.assertEqual(compact(encode(again)), case["canonical"])
 
     def test_every_fixture_type_is_a_generated_struct(self):
         """A fixture naming a type the Python module lacks would be skipped
         silently by a lookup-by-name; make it a failure."""
         for case in load_fixtures():
             self.assertTrue(hasattr(api_types, case["type"]), case["type"])
+
+
+class TestHiCacheRequestParity(CustomTestCase):
+    def test_attach_fields_match_python(self):
+        """Only scheduler transport fields are excluded from the public request."""
+        self.assertEqual(
+            set(api_types.AttachHiCacheStorageRequest.__struct_fields__),
+            set(AttachHiCacheStorageReqInput.__struct_fields__)
+            - set(BaseReq.__struct_fields__),
+        )
+
+    def test_attach_fixtures_match_python_validation_and_defaults(self):
+        """Decode using the same Pydantic adapter as the Python HTTP endpoint."""
+        adapter = TypeAdapter(AttachHiCacheStorageReqInput)
+        for case in load_fixtures():
+            if case["type"] != "AttachHiCacheStorageRequest":
+                continue
+            with self.subTest(case=case["name"]):
+                python = adapter.validate_python(case["input"])
+                generated = api_types.AttachHiCacheStorageRequest.from_json_value(
+                    case["input"]
+                )
+                self.assertIsNotNone(generated.hicache_storage_backend)
+                for name in generated.__struct_fields__:
+                    self.assertEqual(getattr(generated, name), getattr(python, name))
 
 
 class TestRequestFieldParity(CustomTestCase):
@@ -199,7 +237,7 @@ class TestRequestFieldParity(CustomTestCase):
 class TestResponseParity(CustomTestCase):
     def test_python_server_meta_info_decodes_to_the_schema_subset(self):
         """The Python server's `meta_info` carries keys the schema does not
-        model (weight_version, num_retractions, spec stats, ...). The
+        model (num_retractions, spec stats, ...). The
         generated types ignore them and re-emit the schema subset, so a
         Rust-server client and a Python-server client see one shape."""
         python_frame = {
@@ -213,7 +251,9 @@ class TestResponseParity(CustomTestCase):
                 "completion_tokens": 2,
                 "cached_tokens": 1,
                 "spec_accept_rate": 0.5,
+                "cached_tokens_details": {"device": 1, "host": 0},
                 "e2e_latency": 0.25,
+                "dp_rank": None,
             },
         }
         frame = GenerateResponse.from_json_value(python_frame)
@@ -228,10 +268,16 @@ class TestResponseParity(CustomTestCase):
                 "e2e_latency",
                 "cached_tokens",
                 "reasoning_tokens",
+                "weight_version",
+                "cached_tokens_details",
+                "dp_rank",
             ],
         )
         self.assertEqual(
             back["meta_info"]["finish_reason"], {"type": "stop", "matched": 2}
+        )
+        self.assertEqual(
+            back["meta_info"]["cached_tokens_details"], {"device": 1, "host": 0}
         )
         self.assertNotIn("output_ids", back)
 
@@ -241,15 +287,34 @@ class TestResponseParity(CustomTestCase):
         serializers must keep matching it."""
         self.assertEqual(
             list(GenerateResponse.__struct_fields__),
-            ["text", "meta_info", "output_ids", "index"],
+            ["text", "meta_info", "output_ids", "index", "prompt_token_ids"],
         )
         self.assertEqual(
-            list(GenerateMetaInfo.__struct_fields__)[:4],
-            ["id", "prompt_tokens", "completion_tokens", "finish_reason"],
-        )
-        self.assertEqual(
-            list(GenerateMetaInfo.__struct_fields__)[-3:],
-            ["e2e_latency", "cached_tokens", "reasoning_tokens"],
+            list(GenerateMetaInfo.__struct_fields__),
+            [
+                "id",
+                "prompt_tokens",
+                "completion_tokens",
+                "finish_reason",
+                "output_token_logprobs",
+                "input_token_logprobs",
+                "output_top_logprobs",
+                "input_top_logprobs",
+                "output_token_ids_logprobs",
+                "input_token_ids_logprobs",
+                "hidden_states",
+                "e2e_latency",
+                "cached_tokens",
+                "reasoning_tokens",
+                "output_token_logprobs_length",
+                "weight_version",
+                "weight_versions",
+                "image_tokens",
+                "audio_tokens",
+                "video_tokens",
+                "cached_tokens_details",
+                "dp_rank",
+            ],
         )
 
 

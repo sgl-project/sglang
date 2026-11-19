@@ -27,8 +27,10 @@ if not is_hip():
 if not torch.cuda.is_available():
     pytest.skip("Requires a GPU.", allow_module_level=True)
 
+from sglang.kernels.ops.gemm.mxfp8_amd_gfx95 import (  # noqa: E402
+    dot_scaled_mxfp8_blockscaled_linear,
+)
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (  # noqa: E402
-    _mxfp8_dot_scaled_linear,
     _mxfp8_e4m3_quantize_torch,
     _mxfp8_e4m3_quantize_triton,
     dequant_mxfp8_to_bf16,
@@ -38,7 +40,9 @@ from sglang.srt.layers.quantization.fp8_utils import (  # noqa: E402
 )
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=20, stage="base-a-jit-kernel-unit", runner_config="amd")
+# backend-specific: the native dot_scaled tests need gfx95x.
+register_amd_ci(est_time=20, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 DEVICE = "cuda"
 
@@ -110,7 +114,7 @@ def test_minimax_swiglu_mxfp8_quant_matches_unfused_fp32(m, inter):
     # the reference is the unfused fp32 swiglu followed by MXFP8 quant. Not
     # bit-identical because the reference quant runs in torch vs the fused triton
     # path, but numerically equivalent (tight relerr, scales agree within 1 ulp).
-    from sglang.kernels.ops.moe.minimax_m3_swiglu import (
+    from sglang.kernels.ops.activation.minimax_m3_swiglu import (
         swiglu_oai_mxfp8_quant,
         swiglu_oai_split,
     )
@@ -147,7 +151,7 @@ def test_mxfp8_native_linear(m, n, k):
     w_fp8, w_scale = _mxfp8_e4m3_quantize_torch(w_bf16)
     x = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16) * 0.5
 
-    got = _mxfp8_dot_scaled_linear(x, w_fp8, w_scale)
+    got = dot_scaled_mxfp8_blockscaled_linear(x, w_fp8, w_scale)
     # Reference consumes the SAME quantized weights (isolates activation-quant
     # noise) -> dequant to bf16, plain matmul.
     w_deq = dequant_mxfp8_to_bf16(w_fp8, w_scale)

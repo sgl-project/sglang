@@ -12,27 +12,34 @@ each backend owns its device-pool layout and physical I/O.
 The tree only needs a handful of guarded hooks:
 
 * ``match_prefix``      -> :meth:`UnifiedCacheLinkerWrapper.match`
+* ``_prefetch_kvcache`` -> full-layer device prefetch before admission
 * ``init_load_back``    -> :meth:`UnifiedCacheLinkerWrapper.load_back`
+* ``check_hicache_events`` -> full-layer prefetch publication before admission
 * ``BackupKV`` actions  -> :meth:`UnifiedCacheLinkerWrapper.offload_nodes`
 
-A load lands in device slots private to the loading request and joins the tree
+A layer-wise load lands in device slots private to the loading request and joins the tree
 only when that request inserts it like any computed KV. A failed load therefore
 reaches nothing but its own requests, which the scheduler aborts.
+Prefetch publishes complete KV before admission and recomputes failed reads.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
-from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
     DecLockRefParams,
+    InsertParams,
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import (
@@ -47,6 +54,8 @@ from sglang.srt.mem_cache.unified_cache.components import (
     TreeComponent,
 )
 from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.session.streaming_session import is_virtual_node
+from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -54,11 +63,13 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 logger = logging.getLogger(__name__)
+device_module = get_device_module()
 
+# The token and state components the linker stores, besides the tree's window
+# slots (which it finds by family, whatever ids the tree gives them).
 _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
     {
         ComponentType.FULL,
-        ComponentType.SWA,
         ComponentType.MAMBA,
     }
 )
@@ -83,6 +94,8 @@ class LayerWiseLoadCounter:
         self.producer_index = -1
         self.consumer_index = -1
         self.futures: dict[int, list[Future]] = {}
+        # Seconds the consumer spent blocked on unfinished layers, per batch.
+        self.blocked_seconds: dict[int, float] = {}
 
     def update_producer(self) -> int:
         self.producer_index += 1
@@ -106,7 +119,15 @@ class LayerWiseLoadCounter:
         if futures is None:
             return
         # Blocks until the layer resolves; a failure is reported by finish().
-        futures[threshold].exception()
+        future = futures[threshold]
+        if future.done():
+            future.exception()
+        else:
+            start = time.perf_counter()
+            future.exception()
+            self.blocked_seconds[index] = (
+                self.blocked_seconds.get(index, 0.0) + time.perf_counter() - start
+            )
         # Runs on failure too: an MLA dedup source must still issue the layer
         # broadcast its peers are waiting for.
         if self.on_layer_ready is not None:
@@ -123,16 +144,64 @@ class LayerWiseLoadCounter:
         del self.futures[index]
         return landed
 
+    def pop_blocked_seconds(self, index: int) -> float:
+        """Seconds the consumer of batch ``index`` waited on unfinished layers."""
+        return self.blocked_seconds.pop(index, 0.0)
+
     def reset(self) -> None:
         self.producer_index = -1
         self.consumer_index = -1
         self.futures.clear()
+        self.blocked_seconds.clear()
+
+
+class TransferReady(NamedTuple):
+    events: list[torch.cuda.Event]
+
+    def synchronize(self) -> None:
+        for event in self.events:
+            event.synchronize()
+
+    def wait(self, stream: torch.cuda.Stream) -> None:
+        for event in self.events:
+            stream.wait_event(event)
 
 
 class UnifiedCacheLinker(ABC):
-    """External KV store reached directly from the device pools."""
+    """External KV store reached directly from the device pools.
+
+    Out-of-tree linkers are constructed per worker as
+    ``Linker(server_args, params, components=..., extra_config=..., forward_stream=...)``.
+    Store ``forward_stream`` and use ``record_transfer_ready()`` to gate loads
+    and offloads. ``layer_done_counter`` provides ``set_consumer(index)`` and
+    ``wait_until(layer)``. Report completion only after device copies finish.
+    """
 
     layer_done_counter: object
+    pools: dict[PoolName, object]
+    load_mode = "layer_wise"
+    prefetch_policy = "timeout"
+    # None when the current stream is the only one using the pages.
+    forward_stream: Optional[torch.cuda.Stream] = None
+
+    def record_transfer_ready(self) -> TransferReady:
+        """Record what a transfer waits on before it touches device pages.
+
+        The current stream computed the page indices; under read-done the
+        forward in flight may still use those pages, including freed ones.
+        """
+        indices_ready = device_module.Event()
+        indices_ready.record()
+        events = [indices_ready]
+        if self.forward_stream is not None:
+            forward_done = device_module.Event()
+            forward_done.record(self.forward_stream)
+            events.append(forward_done)
+        return TransferReady(events)
+
+    def prefetch(self, transfers: list[PoolTransfer]) -> Future[bool] | None:
+        """Read all layers; the future completes after all device writes stop."""
+        return None
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
@@ -170,8 +239,14 @@ class UnifiedCacheLinker(ABC):
         """Cancel a load that has not started yet."""
 
     @abstractmethod
-    def offload(self, transfers: list[PoolTransfer]) -> bool:
-        """Queue every transfer for atomic persistence."""
+    def offload(
+        self, transfers: list[PoolTransfer], session_id: Optional[str] = None
+    ) -> bool:
+        """Queue every transfer for atomic persistence.
+
+        ``session_id`` names the session whose insert produced the transfers,
+        when known; backends may attribute the stored objects to it.
+        """
 
     @abstractmethod
     def num_completed_offloads(self) -> int:
@@ -201,10 +276,25 @@ class ExternalCacheHitMarker(NamedTuple):
     device_hit_len: int
 
 
+@dataclass
+class _ExternalCachePrefetch:
+    key: RadixKey
+    anchor_node_id: NodeId
+    anchor_lock: DecLockRefParams
+    component_transfers: list[tuple[TreeComponent, PoolTransfer]]
+    future: Future[bool] | None = None
+    timeout_s: float = 0.0
+    wait_started: float | None = None
+    discard: bool = False
+    # Outcome label when it ends unpublished for a known reason; "failed" otherwise.
+    stop_reason: str = ""
+
+
 class _PendingOffload(NamedTuple):
     lock_node_id: NodeId
     lock_params: DecLockRefParams
     publish_node_ids: list[NodeId]
+    queued_at: float
 
 
 class UnifiedCacheLinkerWrapper:
@@ -215,29 +305,39 @@ class UnifiedCacheLinkerWrapper:
         cache: UnifiedRadixCache,
         cache_linker: UnifiedCacheLinker,
     ):
-        unsupported = set(cache.tree_components) - _EXTERNAL_LINKER_SUPPORTED_COMPONENTS
+        # The linker keeps every window slot of the tree, each as its own pool.
+        windows = cache.window_slots()
+        supported = _EXTERNAL_LINKER_SUPPORTED_COMPONENTS | set(windows)
+        unsupported = set(cache.tree_components) - supported
         if unsupported:
             names = ", ".join(
                 component.name for component in sorted(unsupported, key=int)
             )
             raise ValueError(
-                "External cache linker supports only Full, SWA and Mamba tree "
+                "External cache linker supports only Full, window and Mamba tree "
                 f"components; unsupported: {names}"
             )
 
         self.cache = cache
         self.cache_linker = cache_linker
-        swa = cache.components.get(ComponentType.SWA)
-        self._skip_swa = swa is not None and is_swa_req_ring(
-            cache.token_to_kv_pool_allocator
+        self.load_mode = cache_linker.load_mode
+        if self.load_mode == "prefetch" and cache.pp_size > 1:
+            raise ValueError("External linker prefetch currently requires PP=1.")
+        self._windows = tuple(cache.components[slot] for slot in windows)
+        # A window whose pages the store lacks tombstones restored tails instead.
+        self._skipped_windows = tuple(
+            window
+            for window in self._windows
+            if window.pool_name not in cache_linker.pools
         )
         self._components = tuple(
             component
             for component in cache._components_tuple
-            if not (self._skip_swa and component is swa)
+            if not any(component is window for window in self._skipped_windows)
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
+        self.prefetches: dict[CacheRequestHandle, _ExternalCachePrefetch] = {}
         # Requests loading in the batch being built, then its counter index once
         # the batch starts; finish_loads consumes both after its forward.
         self.inflight_load_rids: list[str] = []
@@ -246,9 +346,14 @@ class UnifiedCacheLinkerWrapper:
         self.inflight_load_index = -1
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
+        # Page-aligned radix-key prefix excluded from offload during an insert.
+        self.offload_skip_prefix_len = 0
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
+        self.metrics = cache.metrics_collector
+        if self.metrics is not None:
+            self.metrics.init_linker_metrics()
 
     @property
     def layer_done_counter(self) -> object:
@@ -264,6 +369,9 @@ class UnifiedCacheLinkerWrapper:
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = result.device_prefix_len
+        if self.load_mode == "prefetch":
+            # Prefetch is issued on enqueue; only completed GPU KV is matchable.
+            return result
         if device_hit_len >= len(key):
             return result
 
@@ -287,16 +395,11 @@ class UnifiedCacheLinkerWrapper:
             num_pages=len(tail_hashes),
             device_hit_pages=0,
         )
+        self._record_lookup(len(tail_hashes) * page, hit_pages * page)
         if hit_pages == 0:
             return result
         hit_tokens = hit_pages * page
 
-        swa_transfer = by_pool.get(PoolName.SWA)
-        swa_host_hit_length = (
-            min(len(swa_transfer.keys), hit_pages) * page
-            if swa_transfer is not None
-            else 0
-        )
         # Mamba keeps a single state slot per node, so a hit is worth one slot.
         mamba_host_hit_length = 1 if PoolName.MAMBA in by_pool else 0
 
@@ -304,14 +407,232 @@ class UnifiedCacheLinkerWrapper:
             tail_hashes=list(tail_hashes[:hit_pages]),
             device_hit_len=device_hit_len,
         )
+        window_hits = dict(result.window_host_hit_lengths)
+        for window in self._windows:
+            transfer = by_pool.get(window.pool_name)
+            hit = min(len(transfer.keys), hit_pages) * page if transfer else 0
+            name = window.window_sub_pool
+            window_hits[name] = max(window_hits.get(name, 0), hit)
         return result._replace(
             last_host_node=result.best_match_node,
             host_hit_length=hit_tokens,
-            swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit_length),
+            window_host_hit_lengths=window_hits,
             mamba_host_hit_length=max(
                 result.mamba_host_hit_length, mamba_host_hit_length
             ),
         )
+
+    def prefetch(self, req: Req) -> None:
+        """Stage a queued request; publish only after all ranks succeed."""
+        if self.load_mode != "prefetch":
+            return
+        request = req.cache_request_handle
+        for previous in self.prefetches:
+            if previous.rid == request.rid and previous != request:
+                self._cancel_prefetch(previous, reason="released")
+        if self.cache.disable or request in self.prefetches:
+            return
+        req.init_next_round_input(self.cache, cow_mamba=False)
+        if is_virtual_node(req.last_node) or req.positional_embed_overrides is not None:
+            return
+        page = self.cache.page_size
+        key = RadixKey(
+            req.full_untruncated_fill_ids,
+            extra_key=req.extra_key,
+            cache_salt=req.cache_salt,
+            is_bigram=self.cache.tree_core.is_eagle,
+            limit=req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)),
+        ).page_aligned(page)
+        start = req.prefix_len
+        last_hash = self.cache.get_last_hash_value(req.last_node)
+        if len(key) <= start or (start and last_hash is None):
+            return
+        hashes = get_storage_hash_str(key[start:], last_hash, page_size=page)
+        lookups = [
+            c.build_external_linker_transfer(LinkerTransferPhase.LOOKUP, None, hashes)
+            for c in self._components
+        ]
+        if any(t is None for t in lookups):
+            return
+        try:
+            # TODO: Run storage lookup asynchronously to avoid blocking scheduling.
+            restorable = self.cache_linker.lookup(req.rid, lookups)
+        except Exception:
+            logger.warning("External linker prefetch lookup failed", exc_info=True)
+            if self.metrics is not None:
+                self.metrics.increment_linker_failures("lookup")
+            restorable = []
+        pages = self._sync_restorable_prefix(
+            restorable, num_pages=len(hashes), device_hit_pages=0
+        )
+        self._record_lookup(len(hashes) * page, pages * page)
+        if not pages:
+            return
+        end = start + pages * page
+        state = _ExternalCachePrefetch(
+            key[:end],
+            req.last_node,
+            self.cache.inc_lock_ref(req.last_node).to_dec_params(),
+            [],
+            timeout_s=self.cache.prefetch_timeout_base
+            + len(hashes) * self.cache.prefetch_timeout_per_page,
+        )
+        self.prefetches[request] = state
+        try:
+            for component in self._components:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOAD, None, hashes[:pages]
+                )
+                if transfer is None:
+                    break
+                state.component_transfers.append((component, transfer))
+            if len(state.component_transfers) == len(self._components):
+                state.future = self.cache_linker.prefetch(
+                    [t for _, t in state.component_transfers]
+                )
+        except Exception:
+            logger.warning("External linker prefetch submission failed", exc_info=True)
+        accepted = torch.tensor([state.future is not None], dtype=torch.int)
+        self.cache._all_reduce_attn_groups(accepted, torch.distributed.ReduceOp.MIN)
+        if not accepted.item():
+            state.stop_reason = "rejected"
+            self._cancel_prefetch(request)
+            self.check_prefetch_events()
+
+    def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
+        state = self.prefetches.get(request)
+        if state is None or state.discard:
+            return True
+        policy = self.cache.prefetch_stop_policy
+        if policy == "wait_complete":
+            return False
+        if policy == "timeout":
+            now = time.perf_counter()
+            expired = torch.tensor(
+                state.wait_started is not None
+                and now - state.wait_started > state.timeout_s,
+                dtype=torch.int,
+            )
+            self.cache._all_reduce_attn_groups(expired, torch.distributed.ReduceOp.MAX)
+            if not expired.item():
+                if state.wait_started is None:
+                    state.wait_started = now
+                return False
+        # Consume any fully completed read before stopping. Running reads keep
+        # their private slots until every rank has stopped writing to them.
+        self.check_prefetch_events()
+        state = self.prefetches.get(request)
+        if state is not None and not state.stop_reason:
+            state.stop_reason = "stopped"
+        self._cancel_prefetch(request)
+        return True
+
+    def _cancel_prefetch(self, request: CacheRequestHandle, reason: str = "") -> None:
+        state = self.prefetches.get(request)
+        if state is not None:
+            if reason and not state.stop_reason:
+                state.stop_reason = reason
+            state.discard = True
+            if state.future is not None:
+                state.future.cancel()
+
+    def prefetch_size(self, pool: PoolName) -> int:
+        """Device slots still owned by prefetch, including discarded writes."""
+        return sum(
+            len(transfer.device_indices)
+            for state in self.prefetches.values()
+            for _, transfer in state.component_transfers
+            if transfer.name == pool and transfer.device_indices is not None
+        )
+
+    def check_prefetch_events(self) -> None:
+        if not self.prefetches:
+            return
+        pending = list(self.prefetches.items())
+        progress = []
+        for _, state in pending:
+            future = state.future
+            done = future is None or future.done()
+            landed = False
+            try:
+                if done and future is not None and not future.cancelled():
+                    landed = future.result() is True
+            except Exception:
+                logger.warning("External linker prefetch failed", exc_info=True)
+            progress.append([done, landed and not state.discard])
+        # Keep the same operation order on every rank, including discarded
+        # reads. Local cancellation must not change collective participation.
+        verdicts = torch.tensor(progress, dtype=torch.int)
+        self.cache._all_reduce_attn_groups(verdicts, torch.distributed.ReduceOp.MIN)
+        for (request, _), (done, landed) in zip(pending, verdicts.tolist()):
+            if done:
+                self._finish_prefetch(request, publish=bool(landed))
+
+    def _finish_prefetch(self, request: CacheRequestHandle, *, publish: bool) -> None:
+        state = self.prefetches.pop(request, None)
+        if state is None:
+            return
+        # Event polling or reset/close has already quiesced every device writer.
+        if state.future is not None:
+            assert state.future.done()
+        end = len(state.key)
+        if self.metrics is not None:
+            outcome = "published" if publish else (state.stop_reason or "failed")
+            self.metrics.increment_linker_prefetch_requests(outcome)
+        try:
+            if not publish:
+                self._update_load(
+                    ExternalLinkerLoadPhase.ABORT, None, state.component_transfers, end
+                )
+                return
+            by_pool = {t.name: t for _, t in state.component_transfers}
+            storage = self.cache.kv_storage()
+            full = by_pool[PoolName.KV].device_indices
+            start = end - len(full)
+            evicted = {}
+            page = self.cache.page_size
+            for window in self._windows:
+                transfer = by_pool.get(window.pool_name)
+                if transfer is not None:
+                    storage.bind_window(
+                        window.window_sub_pool,
+                        full[-len(transfer.device_indices) :],
+                        transfer.device_indices,
+                    )
+                skipped = any(window is w for w in self._skipped_windows)
+                kept = (window.sliding_window_size + page - 1) // page * page
+                evicted[window.component_type] = end if skipped else max(0, end - kept)
+            prefix = self.cache.path_device_indices(state.anchor_node_id)
+            assert len(prefix) == start
+            # The normal insert protects the borrowed prefix and frees duplicate
+            # fetched slots. Avoid writing the just-fetched data back to storage.
+            mamba = by_pool.get(PoolName.MAMBA)
+            if mamba is not None:
+                sub_pool = storage.tree_sub_pool(ComponentType.MAMBA.name)
+                # A restored checkpoint has no pending ReplaySSM updates.
+                storage.restart_replay(sub_pool, mamba.device_indices)
+            inserted = self.cache.insert(
+                InsertParams(
+                    key=state.key,
+                    value=torch.cat([prefix, full]),
+                    mamba_value=mamba.device_indices if mamba is not None else None,
+                    prev_prefix_len=start,
+                    inserted_len=end,
+                    component_evicted_seqlens=evicted,
+                )
+            )
+            if mamba is not None and inserted.mamba_exist:
+                storage.free_state_slots(sub_pool, mamba.device_indices)
+            self.cache.prefetch_loaded_tokens_by_reqid[request] = len(full)
+            self.cache.prefetch_loaded_storage_start_by_reqid[request] = start
+            if self.metrics is not None:
+                self.metrics.increment_linker_load_tokens(len(full), "prefetch")
+        finally:
+            self.cache.dec_lock_ref(state.anchor_node_id, state.anchor_lock)
+
+    def _record_lookup(self, lookup_tokens: int, hit_tokens: int) -> None:
+        if self.metrics is not None:
+            self.metrics.increment_linker_lookup_tokens(lookup_tokens, hit_tokens)
 
     def _sync_restorable_prefix(
         self, restorable: list[int], *, num_pages: int, device_hit_pages: int
@@ -416,16 +737,12 @@ class UnifiedCacheLinkerWrapper:
         )
 
         # Components omitted from the linker do not run their PREPARE hook.
-        # Keep a non-restorable SWA range as tombstones instead of rebuilding
-        # it from an uninitialized FULL-to-SWA mapping when the tail is inserted.
-        if self._skip_swa:
-            if req.kv is None:
-                from sglang.srt.managers.schedule_batch import ReqKvInfo
-
-                req.kv = ReqKvInfo(kv_allocated_len=prefix_len)
+        # Keep a non-restorable window range as tombstones instead of rebuilding
+        # it from an uninitialized FULL-to-window mapping when the tail is inserted.
+        for window in self._skipped_windows:
+            name = window.window_sub_pool
             req.kv.set_evicted_seqlen(
-                ComponentType.SWA,
-                max(req.kv.get_evicted_seqlen(ComponentType.SWA), prefix_len),
+                name, max(req.kv.get_evicted_seqlen(name), prefix_len)
             )
 
         # match placed the SWA branch point before this tail was known; a point
@@ -437,12 +754,14 @@ class UnifiedCacheLinkerWrapper:
             req.swa_branching_seqlen = None
         self.private_load_indices[req.rid] = full_transfer.device_indices
         self.inflight_load_rids.append(req.rid)
+        # The tail comes from the external store, not a host tier.
+        req.host_hit_is_storage = True
         return len(full_transfer.device_indices), req.last_node
 
     def _update_load(
         self,
         phase: ExternalLinkerLoadPhase,
-        req: Req,
+        req: Req | None,
         component_transfers: list[tuple[TreeComponent, PoolTransfer]],
         prefix_len: int,
     ) -> list[PoolTransfer]:
@@ -471,16 +790,63 @@ class UnifiedCacheLinkerWrapper:
             transfers = self.cache.tree_core.build_external_linker_offload_transfers(
                 node_id
             )
-            if transfers is not None:
-                if self._skip_swa:
-                    transfers = [t for t in transfers if t.name != PoolName.SWA]
-                self._offload_node(node_id, transfers)
+            if transfers is None:
+                continue
+            if self._skipped_windows:
+                skipped = {window.pool_name for window in self._skipped_windows}
+                transfers = [t for t in transfers if t.name not in skipped]
+            if self.offload_skip_prefix_len:
+                transfers = self._drop_offload_skip_prefix(node_id, transfers)
+                if transfers is None:
+                    continue
+            self._offload_node(node_id, transfers)
+
+    @contextmanager
+    def skip_offload_prefix(self, length: int):
+        """Skip offloading the first ``length`` radix-key units during an insert."""
+        self.offload_skip_prefix_len = length
+        try:
+            yield
+        finally:
+            self.offload_skip_prefix_len = 0
+
+    def _drop_offload_skip_prefix(
+        self, node_id: NodeId, transfers: list[PoolTransfer]
+    ) -> Optional[list[PoolTransfer]]:
+        info = self.cache.tree_core.collect_path_info([node_id])[0][-1]
+        page = self.cache.page_size
+        kept = []
+        for transfer in transfers:
+            first = info.path_end - len(transfer.keys) * page
+            drop = min(
+                len(transfer.keys),
+                max(0, (self.offload_skip_prefix_len - first) // page),
+            )
+            if drop == len(transfer.keys):
+                if transfer.name == PoolName.KV:
+                    # The caller delegates storage of this prefix to another writer.
+                    # Mark it stored locally to suppress uploads, without a persistence ACK.
+                    self.cache.tree_core.mark_external_cache_stored_path(
+                        node_id, info.parent_id
+                    )
+                    return None
+                continue
+            if drop:
+                transfer = replace(
+                    transfer,
+                    keys=transfer.keys[drop:],
+                    device_indices=transfer.device_indices[drop * page :],
+                )
+            kept.append(transfer)
+        return kept
 
     def _offload_node(self, node_id: NodeId, transfers: list[PoolTransfer]) -> None:
         cache = self.cache
         lock_params = cache.inc_lock_ref(node_id).to_dec_params()
         try:
-            queued = self.cache_linker.offload(transfers)
+            queued = self.cache_linker.offload(
+                transfers, session_id=getattr(cache, "insert_session_id", None)
+            )
         except BaseException:
             cache.dec_lock_ref(node_id, lock_params)
             raise
@@ -489,7 +855,15 @@ class UnifiedCacheLinkerWrapper:
             return
 
         cache.tree_core.mark_external_linker_offload_pending(node_id)
-        self.pending_offloads.append(_PendingOffload(node_id, lock_params, [node_id]))
+        self.pending_offloads.append(
+            _PendingOffload(node_id, lock_params, [node_id], time.perf_counter())
+        )
+        if self.metrics is not None:
+            kv = next((t for t in transfers if t.name == PoolName.KV), None)
+            self.metrics.increment_linker_offload_tokens(
+                len(kv.keys) * cache.page_size if kv is not None else 0
+            )
+            self.metrics.set_linker_offloads_in_flight(len(self.pending_offloads))
 
     def replace_pending_offload_node(
         self, ack_id: NodeId, old_node_id: NodeId, new_node_ids: list[NodeId]
@@ -519,12 +893,19 @@ class UnifiedCacheLinkerWrapper:
 
     def commit_completed_offloads(self, successes: Sequence[bool]) -> None:
         assert len(successes) <= len(self.pending_offloads)
+        now = time.perf_counter()
         for success in successes:
             pending = self.pending_offloads.pop(0)
             self.cache.tree_core.finish_external_linker_offload(
                 pending.publish_node_ids, pending.lock_node_id, success
             )
             self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
+            if self.metrics is not None:
+                self.metrics.observe_linker_offload_duration(now - pending.queued_at)
+                if not success:
+                    self.metrics.increment_linker_failures("offload")
+        if self.metrics is not None and successes:
+            self.metrics.set_linker_offloads_in_flight(len(self.pending_offloads))
 
     def start_layer_wise_loading(self) -> int:
         self.inflight_load_index = self.cache_linker.start_layer_wise_loading()
@@ -544,40 +925,64 @@ class UnifiedCacheLinkerWrapper:
         if not rids:
             return []
         index, self.inflight_load_index = self.inflight_load_index, -1
+        start = time.perf_counter()
         landed = torch.tensor(
             [int(self.cache_linker.finish_layer_wise_loading(index))],
             dtype=torch.int,
         )
+        finish_wait = time.perf_counter() - start
+        counter = self.cache_linker.layer_done_counter
+        forward_wait = (
+            counter.pop_blocked_seconds(index)
+            if isinstance(counter, LayerWiseLoadCounter)
+            else None
+        )
+        if self.metrics is not None:
+            self.metrics.observe_linker_load_waits(forward_wait, finish_wait)
         self.cache._all_reduce_attn_groups(landed, torch.distributed.ReduceOp.MIN)
+        loaded_tokens = 0
         for rid in rids:
-            self.private_load_indices.pop(rid, None)
+            indices = self.private_load_indices.pop(rid, None)
+            if self.metrics is not None and indices is not None:
+                loaded_tokens += len(indices)
         if landed.item():
+            if self.metrics is not None:
+                self.metrics.increment_linker_load_tokens(loaded_tokens, "layer_wise")
             return []
         logger.error(
             "External linker load failed; aborting %d request(s): %s", len(rids), rids
         )
+        if self.metrics is not None:
+            self.metrics.increment_linker_failures("load", len(rids))
         return rids
 
     # ---- lifecycle ----
 
     def reset(self) -> None:
         self.cache_linker.reset()
+        self._clear_state()
+
+    def _clear_state(self) -> None:
+        for request, state in list(self.prefetches.items()):
+            state.stop_reason = state.stop_reason or "released"
+            self._finish_prefetch(request, publish=False)
         self.hit_markers.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
         self.inflight_load_index = -1
-        self._release_pending_offloads()
-
-    def _release_pending_offloads(self) -> None:
         for pending in self.pending_offloads:
             self.cache.tree_core.finish_external_linker_offload(
                 pending.publish_node_ids, pending.lock_node_id, False
             )
             self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
         self.pending_offloads.clear()
+        if self.metrics is not None:
+            self.metrics.set_linker_offloads_in_flight(0)
 
-    def release_request(self, rid: str) -> None:
+    def release_request(self, request: CacheRequestHandle) -> None:
+        rid = request.rid
         self.hit_markers.pop(rid, None)
+        self._cancel_prefetch(request, reason="released")
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):
@@ -586,6 +991,4 @@ class UnifiedCacheLinkerWrapper:
 
     def close(self) -> None:
         self.cache_linker.close()
-        self.inflight_load_rids.clear()
-        self.private_load_indices.clear()
-        self._release_pending_offloads()
+        self._clear_state()

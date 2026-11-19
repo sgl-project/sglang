@@ -1,16 +1,18 @@
 import functools
 import logging
+import os
 import sys
 from enum import IntEnum
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
-from sglang.srt.arg_groups.overrides import (
-    declare_resolution,
+from sglang.srt.arg_groups.model_override_base import (
+    model_config_of,
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
 from sglang.srt.utils import get_npu_memory_capacity, is_npu
@@ -35,16 +37,40 @@ def is_npu_arch35() -> bool:
     return acl.rt.get_device_info(0, 601) == (3510, 0)
 
 
-def use_npu_arch35_mxfp8_wo_a(quant_config) -> bool:
+# SoC version reported by Ascend 950 (Atlas A5) devices; later aclnn-only
+# SoCs report higher values and share the same capability gates.
+ASCEND_950_SOC_VERSION = 260
+
+
+def is_ascend_950() -> bool:
+    """Whether the runtime SoC is Ascend 950 (Atlas A5) or a later aclnn-only SoC.
+
+    The SoC query initializes NPU state, so this must not be called before
+    device selection (see the deferred setup in ``init_npu_backend``).
+    """
+    if not _is_npu:
+        return False
+    from torch_npu.npu._backends import get_soc_version
+
+    return get_soc_version() >= ASCEND_950_SOC_VERSION
+
+
+def use_npu_arch35_mxfp8_wo_a(
+    quant_config, wo_a_keeps_quant_config: Optional[bool] = None
+) -> bool:
     """Whether wo_a runs the native NPU arch35 MXFP8 GEMM.
 
     Only for serialized DeepSeek block-FP8 checkpoints — those are the ones
     ``Fp8LinearMethod.process_weights_after_loading`` can reinterpret into the
     NPU arch35 MXFP8 scale layout.
     """
-    if not _is_npu or not is_npu_arch35() or quant_config is None:
-        return False
-    if not getattr(quant_config, "is_checkpoint_fp8_serialized", False):
+    if (
+        wo_a_keeps_quant_config is False
+        or not _is_npu
+        or not is_npu_arch35()
+        or quant_config is None
+        or not getattr(quant_config, "is_checkpoint_fp8_serialized", False)
+    ):
         return False
     weight_block_size = getattr(quant_config, "weight_block_size", None)
     return tuple(weight_block_size or ()) == (128, 128)
@@ -170,21 +196,46 @@ def set_default_server_args(args: "ServerArgs"):
         disable_custom_all_reduce=True,
     )
 
-    # handles hierarchical cache / decode-offload configs
+    # Backup-only decode retraction also builds a HiCache host pool. The
+    # inferred backend is resolved later, once the device KV pool exists.
     if (
         cfg.enable_hierarchical_cache
         or cfg.disaggregation_decode_enable_offload_kvcache
+        or (
+            cfg.disaggregation_mode == "decode"
+            and cfg.disaggregation_decode_retraction_backup in (None, "host_pool")
+        )
     ):
         declare_resolution(
             args,
             "set_default_server_args",
             hicache_io_backend="kernel_ascend",
         )
-        if use_mla_backend(args):
+        from sglang.srt.configs.model_config import is_deepseek_v4
+
+        # Only DSV4 and MLA have migrated to AIV transfers so far;
+        # all remaining paths will migrate soon.
+        if is_deepseek_v4(model_config_of(args).hf_config):
+            os.environ.setdefault("SGLANG_HICACHE_HOST_MEM_BACKEND", "acl")
             declare_resolution(
                 args,
                 "set_default_server_args",
-                hicache_mem_layout="page_first_kv_split",
+                hicache_mem_layout=(
+                    "layer_first"
+                    if cfg.hicache_mem_layout == "layer_first"
+                    else "page_first"
+                ),
+            )
+        elif use_mla_backend(args):
+            os.environ.setdefault("SGLANG_HICACHE_HOST_MEM_BACKEND", "acl")
+            declare_resolution(
+                args,
+                "set_default_server_args",
+                hicache_mem_layout=(
+                    "layer_first_kv_split"
+                    if cfg.hicache_mem_layout in ("layer_first", "layer_first_kv_split")
+                    else "page_first_kv_split"
+                ),
             )
         else:
             declare_resolution(
@@ -203,10 +254,9 @@ def init_npu_backend():
     assert _is_npu, "NPU backend initialization called on non-NPU device."
 
     try:
-        import custom_ops  # noqa: F401
         import sgl_kernel_npu  # noqa: F401
     except ImportError as e:
-        logger.warning("NPU custom kernel packages unavailable: %s", e)
+        logger.warning("NPU sgl-kernel-npu package unavailable: %s", e)
 
     import torch_npu
 
@@ -217,7 +267,14 @@ def init_npu_backend():
 
         # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True
         torch.cuda.is_available = lambda: False
-        torch_npu.npu.config.allow_internal_format = True
+        torch.cuda.get_device_capability = lambda device=None: (0, 0)
+
+        def configure_internal_format():
+            if not is_ascend_950():
+                torch_npu.npu.config.allow_internal_format = True
+
+        # The SoC query initializes NPU state; defer it until device selection.
+        torch_npu.npu._lazy_call(configure_internal_format)
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
 
@@ -376,7 +433,7 @@ def lazy_init_zbal_gva_mem(
         return 1
 
     global gva_is_inited
-    from sglang.srt.utils.common import get_available_gpu_memory
+    from sglang.srt.utils.device import get_available_gpu_memory
 
     # TODO need to use allgather if you want use total_memory stats from mem_get_info as unbalance os
     total_memory = 61.2  # 2.5GB for other (workspace & os) outside torch

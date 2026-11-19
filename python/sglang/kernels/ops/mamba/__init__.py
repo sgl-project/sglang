@@ -32,6 +32,16 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="mamba.causal_conv1d_fn",
+        backend=KernelBackend.TRITON,
+        target=(
+            "sglang.kernels.ops.mamba.causal_conv1d_triton:"
+            "_CAUSAL_CONV1D_OP.forward_triton"
+        ),
+    )
+)
 
 
 def causal_conv1d_fwd(
@@ -89,7 +99,6 @@ __all__ = ["causal_conv1d_fwd", "causal_conv1d_update"]
 for _mod, _fn in [
     ("triton_ops.ssd_combined", "mamba_chunk_scan_combined"),
     ("triton_ops.mamba_ssm", "selective_state_update"),
-    ("causal_conv1d_triton", "causal_conv1d_fn"),
     ("mamba_state_scatter_triton", "fused_mamba_state_scatter_with_mask"),
 ]:
     register_kernel(
@@ -108,6 +117,14 @@ register_kernel(
         op="mamba.fused_qwen4_short_conv_state",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.mamba.qwen4_short_conv:fused_qwen4_short_conv_state",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="mamba.fused_qwen4_varlen_conv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.qwen4_short_conv:fused_qwen4_varlen_conv",
         capabilities=CUDA_ONLY,
     )
 )
@@ -144,3 +161,13 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+for _fn in ("kda_track_conv_window", "kda_track_ssm_state"):
+    register_kernel(
+        KernelSpec(
+            op=f"mamba.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.mamba.kda_prefill_track:{_fn}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _fn

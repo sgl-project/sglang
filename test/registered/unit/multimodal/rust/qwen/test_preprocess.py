@@ -9,7 +9,7 @@ Both HF processors are pinned, because they resample differently and either can
 be what a server runs. On transformers 5.x ``Qwen2VLImageProcessor`` is the
 torchvision path (the ``Fast`` suffix was dropped) and is what
 ``AutoImageProcessor`` hands SGLang by default; ``Qwen2VLImageProcessorPil`` is
-the PIL path, reachable via ``--disable-fast-image-processor``. The Rust resize
+the PIL path, reachable via ``--image-processor-backend pil``. The Rust resize
 clones both kernels, so each is asserted with zero tolerance under the
 ``resample`` its spec selects.
 """
@@ -32,7 +32,7 @@ from _mm_rust_utils import (  # noqa: E402
     spec_json,
 )
 
-register_cpu_ci(est_time=14, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 QWEN_CORE = getattr(load_core(), "qwen_vl", None)
 

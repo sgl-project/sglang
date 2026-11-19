@@ -1,7 +1,6 @@
 ---
 title: Ornith-1.0
 description: "Deploy DeepReinforce Ornith-1.0 with SGLang - a self-improving agentic-coding model family with 397B, 35B, and 9B checkpoints plus FP8 and GGUF variants."
-tag: NEW
 ---
 
 ## Deployment
