@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 # does this configuration select" with a (backend, flag) or None.
 _VENDORS = (
     "sglang.srt.kernel_plugins.amd.binding",
+    "sglang.srt.kernel_plugins.t_head.binding",
 )
 
 

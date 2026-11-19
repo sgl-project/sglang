@@ -518,6 +518,7 @@ POSITIONAL_FIELD_ORDER = (
     "disable_aiter_allreduce_fusion_in_prefill",
     "disable_aiter_allreduce_fusion_in_decode",
     "enable_amd_monokernel",
+    "enable_t_head_monokernel",
     "dsa_triton_union",
     "enable_dsa_fused_indexer",
     "enable_cp_tp_group_sharing",
