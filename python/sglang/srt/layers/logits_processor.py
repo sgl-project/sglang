@@ -516,6 +516,20 @@ class LogitsMetadata:
         )
 
 
+def gathered_shards_to_float32(
+    logits: torch.Tensor, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """[rows, num_shards, shard_width] vocab shards to float32 [rows, vocab],
+    in one pass."""
+    rows, num_shards, shard_width = logits.shape
+    if out is None:
+        out = torch.empty(
+            (rows, num_shards * shard_width), dtype=torch.float32, device=logits.device
+        )
+    out.view(rows, num_shards, shard_width).copy_(logits)
+    return out
+
+
 class LogitsProcessor(nn.Module):
     # Override point: a subclass serving input candidate selectors names its
     # InputLogprobProcessor subclass here.
@@ -571,6 +585,10 @@ class LogitsProcessor(nn.Module):
         # full-vocabulary gather even when the runtime master switch is on.
         self.sharded_verify = False
         self._sharded_verify_temperature_keys = False
+        # Target verify returns this rank's vocab shard [rows, vocab / attn_tp]
+        # ungathered; the caller gathers the rows it reads (finish_deferred_layout
+        # for all of them).
+        self.defer_verify_layout = False
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -1271,6 +1289,16 @@ class LogitsProcessor(nn.Module):
         ):
             return logits
 
+        if (
+            self.defer_verify_layout
+            and self.use_attn_tp_group
+            and self.do_tensor_parallel_all_gather
+            and logits_metadata.forward_mode.is_target_verify()
+            and self.vocab_size % self.attn_tp_size == 0
+            and self._casts_gathered_shards(logits)
+        ):
+            return logits
+
         used_tp_lm_head_all_to_all = False
         if self.do_tensor_parallel_all_gather:
             _trace_e2e_logits(
@@ -1553,9 +1581,9 @@ class LogitsProcessor(nn.Module):
                 dtype=logits.dtype,
             )
             attn_tp_all_gather_into_tensor(global_logits, logits)
-            global_logits = global_logits.permute(1, 0, 2).reshape(
-                logits.shape[0], self.vocab_size
-            )
+            global_logits = global_logits.permute(1, 0, 2)
+            if not self._casts_gathered_shards(global_logits):
+                global_logits = global_logits.reshape(logits.shape[0], self.vocab_size)
         else:
             global_logits = torch.empty(
                 (self.vocab_size, logits.shape[0]),
@@ -1568,6 +1596,29 @@ class LogitsProcessor(nn.Module):
                 logits,
             )
         return global_logits
+
+    def is_deferred_layout(self, logits: Optional[torch.Tensor]) -> bool:
+        return (
+            self.defer_verify_layout
+            and logits is not None
+            and logits.shape[-1] < self.vocab_size
+        )
+
+    def finish_deferred_layout(self, logits: torch.Tensor) -> torch.Tensor:
+        """Full float32 logits from a target-verify vocab shard."""
+        if logits.shape[0] == 0:
+            return logits.new_empty((0, self.vocab_size), dtype=torch.float32)
+        return gathered_shards_to_float32(self._gather_attn_tp_logits(logits))
+
+    def _casts_gathered_shards(self, logits: torch.Tensor) -> bool:
+        """Whether _copy_logits_to_buffer lays the gathered [rows, attn_tp, shard]
+        logits out as [rows, vocab] in its float32 cast, saving a copy."""
+        return (
+            logits.is_cuda
+            and logits.dtype in (torch.float16, torch.bfloat16)
+            and not self.final_logit_softcapping
+            and not self.do_tensor_parallel_all_gather_dp_attn
+        )
 
     def _can_use_tp_lm_head_all_to_all(
         self,
@@ -1643,6 +1694,14 @@ class LogitsProcessor(nn.Module):
         logits_buffer = logits_metadata.next_token_logits_buffer if use_buffer else None
         if logits is logits_buffer and softcap is None:
             return logits
+        if logits.dim() == 3:
+            rows, num_shards, shard_width = logits.shape
+            if logits_buffer is not None and tuple(logits_buffer.shape) != (
+                rows,
+                self.vocab_size,
+            ):
+                logits_buffer = None
+            return gathered_shards_to_float32(logits, out=logits_buffer)
         if logits.shape[-1] > self.vocab_size:
             logits = logits[:, : self.vocab_size]
         logits_width = logits.shape[-1]
