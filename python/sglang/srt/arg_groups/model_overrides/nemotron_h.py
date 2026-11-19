@@ -132,6 +132,15 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
                 "Use marlin as MoE runner backend on SM80-SM90 for "
                 f"{model_arch} {model_config.quantization}"
             )
+        elif (
+            model_arch == "NemotronH_Nano_Omni_Reasoning_V3"
+            and get_platform().is_sm90
+            and model_config.quantization is None
+        ):
+            # Nano Omni BF16 on Hopper keeps the auto (Triton) runner it had
+            # before it was registered here, which is faster than
+            # flashinfer_cutlass for it today.
+            pass
         elif get_platform().is_cuda:
             # FlashInfer is CUDA-only; elsewhere (ROCm BF16) keep the
             # platform's own auto runner.
