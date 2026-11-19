@@ -777,6 +777,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.npu_ragged_verify_mode:
             # Ascend FIA requires T == actual_seq_lengths[-1]; unlike CUDA
             # ragged attention it cannot leave a padded tail unassigned.
+            if self.model_runner.spec_algorithm.is_dflash():
+                # AdaFlash fills each tier with real proposals from its existing
+                # draft windows. Small tiers keep single-request decoding compact.
+                step = self.captured_req_width
+                return list(range(1, step)) + list(range(step, buckets[-1] + 1, step))
             return list(range(1, buckets[-1] + 1))
         return buckets
 

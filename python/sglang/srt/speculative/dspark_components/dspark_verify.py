@@ -527,16 +527,20 @@ class TargetVerifyExecutor:
             # avoid allocating/filling the rectangular vocabulary tensor.
             rows = ragged_window.window_index
             packed_logits = logits_output.next_token_logits[: layout.graph_num_tokens]
-            ids = sampling_argmax(packed_logits)
+            # The Ascend Triton operator compiles a new kernel for every row
+            # count. Small batches drain through many shapes in one request wave.
+            if packed_logits.device.type == "npu":
+                ids = packed_logits.argmax(dim=-1)
+            else:
+                ids = sampling_argmax(packed_logits)
             dense_rows = bs * stride
             target_predict = ids.new_zeros(dense_rows)
             target_predict.index_copy_(0, rows, ids)
             hidden = logits_output.hidden_states
             if hidden is None:
                 raise RuntimeError("Compact verify requires target hidden states.")
-            hidden_strided = hidden.new_zeros((dense_rows, hidden.shape[-1]))
-            hidden_strided.index_copy_(0, rows, hidden[: layout.graph_num_tokens])
-            logits_output.hidden_states = hidden_strided
+            hidden = hidden[: layout.graph_num_tokens]
+            logits_output.hidden_states = hidden
             logits_output.next_token_logits = None
             return (
                 TargetVerifyResult(
@@ -544,7 +548,7 @@ class TargetVerifyExecutor:
                     can_run_cuda_graph=target_verify.can_run_cuda_graph,
                     target_predict=target_predict,
                 ),
-                hidden_strided,
+                hidden,
             )
         if self.verify_epilogue is not None and target_verify.can_run_cuda_graph:
             strided_logits = self.verify_epilogue.strided_logits

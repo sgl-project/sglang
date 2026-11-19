@@ -94,11 +94,11 @@ class TestAdaFlashVerify(unittest.TestCase):
                     3, 1, 1
                 )
                 layout = adapter.layout(hidden)
-                self.assertEqual(layout.verify_lens.cpu().tolist(), [1, 7, 16])
-                self.assertEqual(layout.qo_indptr_device.cpu().tolist(), [0, 1, 8, 24])
-                self.assertEqual(layout.total_verify_tokens, 24)
-                self.assertEqual(layout.graph_num_tokens, 24)
-                self.assertEqual(adapter.num_verify_tokens, 24)
+                self.assertEqual(layout.verify_lens.cpu().tolist(), [1, 8, 16])
+                self.assertEqual(layout.qo_indptr_device.cpu().tolist(), [0, 1, 9, 25])
+                self.assertEqual(layout.total_verify_tokens, 25)
+                self.assertEqual(layout.graph_num_tokens, 25)
+                self.assertEqual(adapter.num_verify_tokens, 25)
                 self.assertEqual(adapter.num_full_width_tokens, 48)
 
     def test_matching_padding_cannot_extend_acceptance_past_verified_prefix(self):
@@ -117,7 +117,7 @@ class TestAdaFlashVerify(unittest.TestCase):
                 correct, bonus = adapter.accept(
                     candidates=candidates, logits=logits, layout=layout
                 )
-                self.assertEqual(correct.cpu().tolist(), [0, 6, 15])
+                self.assertEqual(correct.cpu().tolist(), [0, 7, 15])
                 self.assertEqual(bonus.cpu().tolist(), [0, 0, 0])
 
     def test_bonus_comes_from_last_materialized_target_row(self):

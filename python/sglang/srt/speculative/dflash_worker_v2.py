@@ -1943,6 +1943,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         commit_lens: Optional[torch.Tensor] = None,
         extend_lens: Optional[torch.Tensor] = None,
         swa_cache_loc: Optional[torch.Tensor] = None,
+        use_npu_fused_rope: bool = True,
     ) -> None:
         """Materialize target context features into the draft KV cache at explicit slots.
 
@@ -2157,6 +2158,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_positions=positions,
                 ctx_cache_loc=cache_loc,
                 ctx_swa_cache_loc=swa_cache_loc,
+                use_npu_fused_rope=use_npu_fused_rope,
             )
 
     def _append_target_hidden_sequential(
@@ -2165,6 +2167,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
         ctx_swa_cache_loc: Optional[torch.Tensor] = None,
+        use_npu_fused_rope: bool = True,
     ) -> None:
         for layer in self.draft_model.layers:
             attn = layer.self_attn
@@ -2180,7 +2183,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     swa_cache_loc=ctx_swa_cache_loc,
                 )
                 continue
-            if _is_npu:
+            if _is_npu and use_npu_fused_rope:
                 _, k, v = attn.forward_prepare_npu(ctx_positions, layer_ctx_hidden)
                 # Keep V scaling consistent with forward().
                 if attn.v_scale is not None:
@@ -3265,8 +3268,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             raise RuntimeError(
                 "DFLASH verify requires target hidden states, but got None."
             )
-        hidden = hidden.view(bs, int(self.block_size), -1)
-
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
         cache_loc = (
@@ -3274,18 +3275,38 @@ class DFlashWorkerV2(BaseSpecWorker):
             if ring_block_locs is not None
             else self._draft_write_ids(iteration_ids)
         )
-        self._append_target_hidden_to_draft_kv_by_loc(
-            target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=cache_loc,
-            cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
-            swa_cache_loc=(
-                None
-                if ring_block_locs is not None
-                else self._draft_write_ids(iteration_ids, IdSpaceKind.SLIDING_WINDOW)
-            ),
-            positions=positions,
-            commit_lens=commit_lens,
+        swa_cache_loc = (
+            None
+            if ring_block_locs is not None
+            else self._draft_write_ids(iteration_ids, IdSpaceKind.SLIDING_WINDOW)
         )
+        if verify_rows is not None:
+            # Select the committed prefix once before projecting K/V. The dense
+            # prefix writer otherwise performs a separate nonzero for each layer.
+            request_indices = verify_rows // block_size
+            in_prefix = verify_rows % block_size < commit_lens[request_indices]
+            committed = torch.nonzero(in_prefix, as_tuple=True)[0]
+            slots = verify_rows.index_select(0, committed)
+            self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=hidden.index_select(0, committed),
+                cache_loc=cache_loc.index_select(0, slots),
+                swa_cache_loc=(
+                    swa_cache_loc.index_select(0, slots)
+                    if swa_cache_loc is not None
+                    else None
+                ),
+                positions=positions.index_select(0, slots),
+                use_npu_fused_rope=False,
+            )
+        else:
+            self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=hidden,
+                cache_loc=cache_loc,
+                cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
+                swa_cache_loc=swa_cache_loc,
+                positions=positions,
+                commit_lens=commit_lens,
+            )
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None

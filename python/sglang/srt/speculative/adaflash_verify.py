@@ -1,6 +1,8 @@
 """Bridge AdaFlash's direct lengths to upstream DSpark verification."""
 
 import logging
+import math
+import os
 
 import torch
 from sglang.kernels.ops.speculative.dspark.dspark_accept import AcceptGreedy
@@ -17,6 +19,7 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,
     RaggedVerifyMode,
     read_ragged_verify_mode,
+    round_up_grid,
 )
 
 logger = logging.getLogger(__name__)
@@ -44,7 +47,14 @@ class AdaFlashVerify:
     @torch.no_grad()
     def layout(self, hidden: torch.Tensor) -> RaggedVerifyLayout:
         ratios = self.model.thresh_head_two_model(hidden).squeeze(-1)
-        lengths = (ratios * self.block_size).round().clamp(1, self.block_size)
+        length_scale = float(os.environ.get("ADAFLASH_LENGTH_SCALE", "1.2"))
+        if not math.isfinite(length_scale) or length_scale <= 0:
+            raise ValueError(
+                f"ADAFLASH_LENGTH_SCALE must be positive and finite, got {length_scale}"
+            )
+        lengths = torch.floor(ratios * self.block_size * length_scale).clamp(
+            1, self.block_size
+        )
         lengths_cpu = lengths.to(torch.int32).cpu().tolist()
         # Reuse the DSpark runner's token buckets when graph capture is enabled.
         total = sum(lengths_cpu)
@@ -57,6 +67,20 @@ class AdaFlashVerify:
             if graph_runner is not None and graph_runner.ragged_verify_mode
             else [total]
         )
+        tier = round_up_grid(total, grid)
+        # FIA needs every query assigned to a request. Fill the small gap with
+        # real draft candidates that follow the predicted prefixes. This cannot
+        # change the greedy result because the target verifies every extra token.
+        remaining = tier - total
+        for row in range(len(lengths_cpu) - 1, -1, -1):
+            if not remaining:
+                break
+            extra = min(remaining, self.block_size - lengths_cpu[row])
+            lengths_cpu[row] += extra
+            remaining -= extra
+        if remaining:
+            raise RuntimeError("AdaFlash Graph tier exceeds the live draft windows.")
+        total = tier
         layout = RaggedVerifyLayout.from_verify_lens(
             verify_lens_cpu=lengths_cpu,
             device=hidden.device,

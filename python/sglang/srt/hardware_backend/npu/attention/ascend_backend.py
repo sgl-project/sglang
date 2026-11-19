@@ -1036,6 +1036,10 @@ class AscendAttnBackend(AttentionBackend):
                 device=self.device,
             ),
         }
+        if self.speculative_num_draft_tokens is not None:
+            self.graph_metadata["target_verify_seq_lens"] = torch.empty(
+                max_bs, dtype=torch.int32, device=self.device
+            )
         if self.dense_mla_dcp_target and self.speculative_num_draft_tokens is not None:
             self.graph_metadata["dcp_mtp_attn_mask"] = torch.ones(
                 (
@@ -1173,6 +1177,10 @@ class AscendAttnBackend(AttentionBackend):
             metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         if self.use_flash_mla or self.use_paged_mtp or self.use_quant_flash_attn:
             metadata.seq_lens = torch.empty_like(seq_lens, dtype=torch.int32)
+        elif forward_mode.is_target_verify():
+            # Verify writes prefix + draft length. Keep the shared graph input
+            # unchanged across captures and reuse the output buffer across shapes.
+            metadata.seq_lens = self.graph_metadata["target_verify_seq_lens"][:bs]
         else:
             metadata.seq_lens = seq_lens
         if self.dense_mla_dcp_target and forward_mode.is_target_verify():
