@@ -830,6 +830,56 @@ class TestPPUCIDevSailDependencies(CustomTestCase):
                 )
                 self.assertEqual(result.returncode, 0 if accepted else 1)
 
+    def test_wheel_metadata_ignores_vendored_distributions(self):
+        self.root_requirements.append("setuptools>=75")
+        self.write_root()
+        self.write_wheel("blake3", "1.0.8")
+        self.write_wheel("root-helper", "1.0")
+        wheel = self.write_wheel("setuptools", "84.2.1", ["root-helper>=1"])
+        with zipfile.ZipFile(wheel, "a") as archive:
+            for name in ("packaging", "wheel"):
+                archive.writestr(
+                    f"setuptools/_vendor/{name}-1.0.dist-info/METADATA",
+                    self.message(name, "1.0", ["must-not-be-collected"]).as_string(),
+                )
+        message = self.checker.read_wheel(wheel)
+        self.assertEqual(message["Name"], "setuptools")
+        self.assertEqual(message["Version"], "84.2.1")
+        self.assertEqual(message.get_all("Requires-Dist"), ["root-helper>=1"])
+        with patch.object(self.checker.subprocess, "run") as build:
+            self.checker.collect_dev_sail(self.wheels)
+        build.assert_not_called()
+        inventory = self.checker.wheel_inventory(self.runtime)
+        self.assertIn("setuptools", inventory)
+        self.assertFalse(
+            {"packaging", "wheel", "must-not-be-collected"} & inventory.keys()
+        )
+
+    def test_wheel_metadata_requires_exactly_one_top_level_entry(self):
+        wheel = self.runtime / "metadata_probe-1.0-py3-none-any.whl"
+        message = self.message("metadata-probe", "1.0").as_string()
+        for entries in (
+            ["vendor/metadata_probe-1.0.dist-info/METADATA"],
+            [
+                "metadata_probe-1.0.dist-info/METADATA",
+                "another_probe-1.0.dist-info/METADATA",
+            ],
+            [
+                "metadata_probe-1.0.dist-info/METADATA",
+                "metadata_probe-1.0.dist-info/METADATA",
+            ],
+        ):
+            with self.subTest(entries=entries):
+                with zipfile.ZipFile(wheel, "w") as archive:
+                    for entry in entries:
+                        if entry in archive.namelist():
+                            with self.assertWarns(UserWarning):
+                                archive.writestr(entry, message)
+                        else:
+                            archive.writestr(entry, message)
+                with self.assertRaisesRegex(ValueError, "Expected one METADATA entry"):
+                    self.checker.read_wheel(wheel)
+
     def test_wheel_metadata_and_extra_selection_fail_closed(self):
         root = self.write_root()
         self.write_wheel(

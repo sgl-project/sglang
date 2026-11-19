@@ -115,7 +115,13 @@ def read_wheel(path):
 
     name, version, _, _ = parse_wheel_filename(path.name)
     with zipfile.ZipFile(path) as archive:
-        entries = [n for n in archive.namelist() if n.endswith(".dist-info/METADATA")]
+        # Vendored packages can carry their own nested .dist-info directories.
+        # Only the top-level metadata describes the wheel being installed.
+        entries = [
+            n
+            for n in archive.namelist()
+            if n.endswith(".dist-info/METADATA") and n.count("/") == 1
+        ]
         if len(entries) != 1:
             raise ValueError(f"Expected one METADATA entry in {path}")
         message = Parser().parsestr(archive.read(entries[0]).decode("utf-8"))
