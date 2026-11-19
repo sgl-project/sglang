@@ -455,6 +455,8 @@ async fn query_dp_ranks(
 
 /// No `/health` here: the merged api router already serves it (same 200 "OK"
 /// the standalone Python bootstrap server answered, so probes are unchanged).
+// TODO(rainj-me): serve the registry over gRPC too; it is HTTP-only, so a PD
+// prefill server needs its HTTP listener even when clients use gRPC.
 fn router(state: Arc<Registry>) -> Router {
     Router::new()
         // Unmatched methods on a routed path get axum's built-in 405, matching
