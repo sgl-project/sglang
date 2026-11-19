@@ -1,9 +1,15 @@
-# GDN branch and aligned-tail checkpoints
+# Hybrid Linear branch and tail checkpoints: GDN implementation
 
-An interior branch can consume the final Prefill extend's native tracking
-position under `extra_buffer`. The computed aligned prompt tail then has no
-separate checkpoint. This optional path captures the branch into one spare
-state slot while native tracking captures the aligned tail in the same forward.
+Hybrid prefix reuse requires a recoverable Linear state at the cached boundary,
+including the convolution history and recurrent state at the same token depth.
+When an extend tracks only one boundary, selecting an interior branch can leave
+its computed aligned prompt tail without a separate checkpoint. Retaining both
+requires independent state ownership for the two boundaries.
+
+This patch implements that pattern for GDN: it captures the branch into one
+spare state slot while native tracking captures the aligned tail in the same
+forward, without splitting the extend. See the [backend evidence index](backend-evidence.md)
+for the mechanism comparison and the separately validated KDA prototype.
 
 Enable it with `SGLANG_EXPERIMENTAL_GDN_BRANCH_AND_TAIL=1`. It defaults to
 disabled. The first supported configuration uses the
