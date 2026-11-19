@@ -190,6 +190,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
         # The constexpr guard must nest: MUSA triton evaluates both operands of
         # `TRACK_STATE and ...` and dereferences the None track_state pointer.
+        # TODO(musa-triton): MUSA's Triton pin (srt_musa: triton==3.2.0) does not
+        # short-circuit constexpr operands; upstream Triton >= 3.4 does. Merge
+        # the two guards back into `if TRACK_STATE and i_t == i_track:` once the
+        # MUSA pin moves to >= 3.4.
         if TRACK_STATE:
             if i_t == i_track:
                 p_t1 = p_track_base + o_v[:, None] * K + o_k1[None, :]

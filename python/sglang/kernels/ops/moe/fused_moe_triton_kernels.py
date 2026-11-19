@@ -452,6 +452,10 @@ def fused_moe_kernel(
     if inactive_expert:
         # The down GEMM never reads inactive sorted or half-width intermediates.
         # Add/reduce outputs already hold their initial value and must stay intact.
+        # TODO(musa-triton): MUSA's Triton pin (srt_musa: triton==3.2.0) rejects
+        # boolean chains with more than two operands; upstream Triton >= 3.4
+        # accepts them. Collapse this back into a single `or` chain once the
+        # MUSA pin moves to >= 3.4.
         if not (
             (c_sorted or FUSE_SWIGLU) or (FUSE_ADD_TO_OUTPUT or FUSE_SUM_ALL_REDUCE)
         ):
