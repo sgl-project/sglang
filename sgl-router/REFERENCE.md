@@ -226,8 +226,10 @@ client sent. The router picks the first of these that applies:
    than current KV because KV in use lags: a rank whose requests are all
    young holds little now and the most later. A rank whose reported capacity
    cannot take the requests sent since the reading and one more typical one
-   ranks after every rank that can. Ties, and a worker without a fresh
-   reading for every one of its ranks, fall back to the in-flight count.
+   ranks after every rank that can, and full ranks keep the same order among
+   themselves, so under sustained overload the one least over its cap still
+   wins. Ties, and a worker without a fresh reading for every one of its
+   ranks, fall back to the in-flight count.
 
 In PD mode, decode is ranked by step 3 only, under `--decode-dp-rank-policy`
 when set and `--dp-rank-policy` otherwise, so prefill and decode can balance
