@@ -2,10 +2,10 @@ import argparse
 import dataclasses
 import os
 import sys
-from typing import Optional
 
 from sglang_simulator.compat import (
     apply_simulator_server_args,
+    merge_server_config,
     validate_launch_runtime,
 )
 from sglang_simulator.simulation.sglang.hook_bootstrap import (
@@ -23,7 +23,7 @@ logger = get_logger("sgl_simulator")
 
 @dataclasses.dataclass
 class SimulationArgs:
-    sim_config_path: Optional[str] = None
+    sim_config_path: str | None = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -86,7 +86,7 @@ if __name__ == "__main__":
     g = parser.add_argument_group("simulation")
     SimulationArgs.add_cli_args(g)
 
-    argv = sys.argv[1:]
+    argv = merge_server_config(parser, sys.argv[1:])
     raw_args = parser.parse_args(argv)
     apply_simulator_defaults(raw_args, argv)
     apply_simulator_server_args(raw_args)

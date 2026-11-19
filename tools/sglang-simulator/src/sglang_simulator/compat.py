@@ -7,6 +7,16 @@ import os
 from importlib import metadata
 from urllib.parse import urlsplit
 
+
+def merge_server_config(parser, argv: list[str]) -> list[str]:
+    """Use the serving CLI's YAML merge before simulator defaults resolve."""
+    if "--config" not in argv:
+        return argv
+    from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
+
+    return ConfigArgumentMerger(parser).merge_config_with_args(argv)
+
+
 SIMULATOR_SERVER_ARG_OVERRIDES = {
     # The simulator models the target deployment topology separately through
     # sim_config.scheduler. Keep the SGLang runtime single-process so host-side

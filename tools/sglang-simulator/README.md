@@ -26,6 +26,12 @@ checks instead of branching on version numbers.
 Use an official SGLang image matching the checkout when validating GPU and
 runtime compatibility.
 
+The Simulator launch module accepts SGLang's native `--config server.yaml`.
+Use native server argument names in that YAML; explicit command-line options
+override its values. Pass the separate simulation cost/platform JSON through
+`--sim-config-path`. Modeled parallelism belongs in that JSON's `scheduler`
+section; CPU bootstrap still uses a single physical worker.
+
 ## Installation
 
 From the SGLang repository:
