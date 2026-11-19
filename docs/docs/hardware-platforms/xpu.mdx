@@ -154,42 +154,31 @@ sglang serve                        \
 | Activations | BF16 (W4A16). Clamped swiglu (GPT-OSS) and plain SiLU are supported |
 | Expert parallelism | Not yet validated on this path |
 
-## FP8 and MXFP8 MoE quantization
+## FP8 and MXFP8 MoE Quantization
 
-On Xe2 / BMG, FP8 MoE experts use the `sgl-kernel-xpu` W8A16 grouped GEMM
-when you select the default `auto` runner or `--moe-runner-backend intel_xpu`.
-Because Xe2 XMX does not have native FP8 DPAS instructions, expert weights
-are dequantized to BF16 in registers and computed via BF16 DPAS, while
-activations stay in BF16 without activation-side FP8 quantization.
-The `fp8` and `compressed-tensors` methods call this native path directly;
-the Triton runner handles FP8 and MXFP8 fallbacks.
+FP8 and MXFP8 MoE models run on Intel GPUs through `sgl-kernel-xpu` grouped GEMM
+kernels and Triton. The `fp8` and `compressed-tensors` methods are supported
+automatically on `--device xpu` (default runner is `auto`):
 
-| Weight format | Native Xe2 path |
-|---|---|
-| FP8 with per-expert tensor scales | Supported |
-| FP8 with FP32 scales per 128x128 block | Supported |
-| MXFP8 with UE8M0 scales per 32 elements | Supported, including quantization after loading BF16 weights |
+```bash
+sglang serve                 \
+    --model-path <model-path> \
+    --device xpu             \
+    --attention-backend intel_xpu
+```
 
-MXFP8 keeps `[1, 32]` in the SGLang quantization configuration, but passes
-`block_shape=None` to the native MoE function. The native function infers
-the 32-element groups from the UE8M0 scale dtype and shape. Ordinary
-block-FP8 passes `[128, 128]` instead.
+| Weight format | Native XPU path | Notes |
+|:---|:---|:---|
+| FP8 per-tensor | Supported | Per-expert scalar scales |
+| FP8 block-wise [128, 128] | Supported | DeepSeek-V3 / Mixtral FP32 block scales |
+| MXFP8 block-wise [1, 32] | Supported | OCP microscaling UE8M0 scales per 32 elements, including online quantization |
 
-The native path supports gated SiLU, gated tanh-approximated GELU
-(`gelu_tanh`), non-gated squared ReLU, GPT-OSS SwiGLU, and DeepSeek-V4
-SwiGLU with limit 10. Expert biases and routed scaling are supported.
-Other activation/gating combinations use Triton, subject to its own support.
+The native path supports gated SiLU, gated GELU (`gelu_tanh`), non-gated squared ReLU,
+and GPT-OSS / DeepSeek-V4 SwiGLU. Expert biases and routed scaling are supported.
 
-For ordinary FP8, per-channel scales, other block shapes, input-side router
-weighting, uncombined expert outputs, and exact GELU use the existing Triton
-fallback. An explicit `--moe-runner-backend triton` also bypasses the native
-FP8 path.
-
-MXFP8 also uses Triton for an explicit Triton runner, input-side router
-weighting, uncombined outputs, exact GELU, or expert parallelism (EP).
-In this fallback, activations undergo dynamic per-token-group FP8
-quantization, and the Triton GEMM kernel decodes UE8M0 scale bytes into FP32
-multipliers on the fly without materializing BF16 expert weights.
+Configurations not handled by the native path (such as per-channel scales, other block
+shapes, uncombined expert outputs, input-side router weighting, exact erf GELU, or expert parallelism), as well
+as an explicit `--moe-runner-backend triton`, automatically use the Triton MoE runner.
 
 ## Benchmarking with Requests
 
