@@ -9,9 +9,9 @@ Query GitHub Actions job status for XPU CI jobs or generate runner fleet reports
 
 Usage:
     # Per-job reports
-    python scripts/ci/utils/xpu_job_monitor.py --job "stage-a-test-1-gpu-xpu" --workflow "pr-test-xpu.yml"
-    python scripts/ci/utils/xpu_job_monitor.py --job "stage-b-test-1-gpu-xpu" --workflow "pr-test-xpu.yml" --hours 48
-    python scripts/ci/utils/xpu_job_monitor.py --job "stage-a-test-1-gpu-xpu" --workflow "pr-test-xpu.yml" --input-data-file actions-job-snapshot.json --summary
+    python scripts/ci/utils/xpu_job_monitor.py --job "extra-test-1-gpu-xpu" --workflow "pr-test-xpu.yml"
+    python scripts/ci/utils/xpu_job_monitor.py --job "extra-test-1-gpu-xpu" --workflow "pr-test-xpu.yml" --hours 48
+    python scripts/ci/utils/xpu_job_monitor.py --job "extra-test-1-gpu-xpu" --workflow "pr-test-xpu.yml" --input-data-file actions-job-snapshot.json --summary
 
     # Runner fleet report
     python scripts/ci/utils/xpu_job_monitor.py --runner-report --workflow "pr-test-xpu.yml" --hours 24

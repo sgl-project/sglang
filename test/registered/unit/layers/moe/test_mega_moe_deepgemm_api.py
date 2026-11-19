@@ -49,6 +49,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         self.deep_gemm.set_num_sms = MagicMock(
             side_effect=lambda num_sms: setattr(self.deep_gemm, "num_sms", num_sms)
         )
+        self.deep_gemm.destroy_localizer = MagicMock()
         max_num_sms = patch.object(mega_moe, "_mega_moe_max_num_sms", return_value=130)
         self.max_num_sms = max_num_sms.start()
         self.addCleanup(max_num_sms.stop)
@@ -174,6 +175,26 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         buf = self._get_test_buffer(object())
         self.assertEqual(buf, 132)
         deep_gemm.set_num_sms.assert_not_called()
+
+    def test_new_buffer_stops_mlopart_helper_on_sm100_only(self):
+        """SM100 must stop the MLOPart helper, which blocks cuda-checkpoint, once per
+        new buffer. SM90 must not call it, since that would start the helper."""
+        self.deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(
+            side_effect=lambda *_args, **_kwargs: object()
+        )
+        for sm100, expected_calls in ((False, 0), (True, 1)):
+            with (
+                self.subTest(sm100=sm100),
+                patch.object(mega_moe, "is_sm100_supported", return_value=sm100),
+            ):
+                mega_moe._MEGA_MOE_SYMM_BUFFER.clear()
+                self.deep_gemm.destroy_localizer.reset_mock()
+                group = object()
+                self._get_test_buffer(group)
+                self._get_test_buffer(group)
+                self.assertEqual(
+                    self.deep_gemm.destroy_localizer.call_count, expected_calls
+                )
 
     def test_buffer_allocation_failure_restores_sm_budget(self):
         deep_gemm = self.deep_gemm
