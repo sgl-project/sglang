@@ -107,6 +107,10 @@ class Schedule(msgspec.Struct):
             ],
         ),
     ] = "fcfs"
+    shortest_prefill_aging_factor: A[
+        float,
+        "With --schedule-policy shortest-prefill-first, each prefill token processed while a request waits lowers its rank by this many tokens, bounding its wait to about its uncached length divided by the factor, in processed tokens. 0 disables aging.",
+    ] = 0.0
     uniboost_gamma: A[
         float,
         "Boost decay rate gamma (1/s) for --schedule-policy uniboost. Larger values behave more like fcfs, smaller values more like shortest-job-first. With --enable-uniboost-gamma-ada this is the starting value. Values <= 0 fall back to fcfs.",

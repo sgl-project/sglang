@@ -143,7 +143,12 @@ from sglang.srt.runtime_context import (
     snapshot_context,
 )
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
-from sglang.srt.server_args import PortArgs, ServerArgs, redact_server_args_secrets
+from sglang.srt.server_args import (
+    PortArgs,
+    ServerArgs,
+    redact_server_args_secrets,
+    reject_removed_kwargs,
+)
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     SerializedTensorPayload,
@@ -311,6 +316,7 @@ class Engine(EngineScoreMixin, EngineBase):
             if "log_level" not in kwargs:
                 # Do not print logs by default
                 kwargs["log_level"] = "error"
+            reject_removed_kwargs(self.server_args_class, kwargs)
             server_args = self.server_args_class(**kwargs)
             # There was no command line, so the call is what the operator
             # asked for. `log_level` is filled in above when absent, so it
@@ -419,19 +425,7 @@ class Engine(EngineScoreMixin, EngineBase):
     def _resolve_routed_dp_rank(
         self,
         routed_dp_rank: Optional[int],
-        data_parallel_rank: Optional[int],
     ) -> Optional[int]:
-        if data_parallel_rank is not None:
-            import warnings
-
-            warnings.warn(
-                "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
-                DeprecationWarning,
-                stacklevel=3,
-            )
-            if routed_dp_rank is None:
-                routed_dp_rank = data_parallel_rank
-
         if routed_dp_rank is not None:
             num_dp_ranks = get_parallel().num_dp_ranks
             if num_dp_ranks <= 1 and routed_dp_rank == 0:
@@ -493,8 +487,6 @@ class Engine(EngineScoreMixin, EngineBase):
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
         kv_hints: Optional[Dict] = None,
-        # Deprecated: use routed_dp_rank instead
-        data_parallel_rank: Optional[int] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
@@ -507,9 +499,7 @@ class Engine(EngineScoreMixin, EngineBase):
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
-        routed_dp_rank = self._resolve_routed_dp_rank(
-            routed_dp_rank, data_parallel_rank
-        )
+        routed_dp_rank = self._resolve_routed_dp_rank(routed_dp_rank)
 
         obj = GenerateReqInput(
             text=prompt,
@@ -608,8 +598,6 @@ class Engine(EngineScoreMixin, EngineBase):
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
         kv_hints: Optional[Dict] = None,
-        # Deprecated: use routed_dp_rank instead
-        data_parallel_rank: Optional[int] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
@@ -622,9 +610,7 @@ class Engine(EngineScoreMixin, EngineBase):
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
-        routed_dp_rank = self._resolve_routed_dp_rank(
-            routed_dp_rank, data_parallel_rank
-        )
+        routed_dp_rank = self._resolve_routed_dp_rank(routed_dp_rank)
 
         obj = GenerateReqInput(
             text=prompt,
@@ -1263,6 +1249,7 @@ class Engine(EngineScoreMixin, EngineBase):
         # the validation stage writes through late resolution, which refuses a
         # record that is already published.
         try:
+            _check_rust_server_warmups()
             # Allocate ports for inter-process communications
             if port_args is None:
                 port_args = PortArgs.init_new(server_args)
@@ -1331,7 +1318,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 cls._terminate_weight_cache_daemons(weight_cache_daemon_procs)
                 raise
 
-            if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
+            if not envs.SGLANG_BLOCK_NONZERO_RANK_CHILDREN.get():
                 # When using `Engine` as a Python API, we don't want to block here.
                 return (
                     None,
@@ -2036,7 +2023,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if _is_cuda:
             assert_pkg_version(
                 "sglang-kernel",
-                "0.4.9",
+                "0.4.11",
                 "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
             )
 
@@ -2150,6 +2137,21 @@ def _calculate_rank_ranges(node_rank: int) -> Tuple[range, range, int, int]:
     )
 
     return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
+
+
+def _check_rust_server_warmups() -> None:
+    """In Rust mode, refuse a ``--warmups`` it cannot run before any scheduler
+    loads weights. The listener-hosting schedulers run the warmups, but this
+    process has the registry Python mode reads: an entry point may register a
+    warmup only in this launcher process, which a spawned scheduler would not
+    know and would skip as unknown."""
+    if envs.SGLANG_RUST_SERVER.get():
+        from sglang.srt.rust_server.warmups import (
+            check_rust_server_warmups,
+            rust_server_warmup_names,
+        )
+
+        check_rust_server_warmups(rust_server_warmup_names(get_serving().warmups))
 
 
 def _rank_hosts_rust_listener(pp_rank: int, tp_rank: int) -> bool:
