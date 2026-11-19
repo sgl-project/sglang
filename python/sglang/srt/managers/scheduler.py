@@ -28,6 +28,8 @@ from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
+from miles.backends.sglang_utils.gpu_delta import integration as gpu_delta
+
 from sglang.srt.runtime_context import (
     SpawnRanks,
     attention_backends,
@@ -1944,6 +1946,10 @@ class Scheduler(
                     self.list_external_corpora,
                 ),
             ]
+        )
+
+        self._request_dispatcher = gpu_delta.with_gpu_delta_controls(
+            self, self._request_dispatcher
         )
 
     def get_init_info(self) -> Dict[str, Any]:

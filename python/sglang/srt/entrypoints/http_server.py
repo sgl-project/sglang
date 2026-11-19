@@ -66,6 +66,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
+from miles.backends.sglang_utils.gpu_delta import integration as gpu_delta
 from uvicorn.supervisors.multiprocess import Multiprocess
 
 from sglang.srt.arg_groups.overrides import resolving_view
@@ -538,6 +539,7 @@ from sglang.srt.runtime_context import (
 
 elastic_ep_router.route_class = ORJSONRoute
 app.include_router(elastic_ep_router)
+gpu_delta.register_gpu_delta_routes(app, get_global_state)
 
 
 def _anthropic_validation_message(raw_errors) -> str:
