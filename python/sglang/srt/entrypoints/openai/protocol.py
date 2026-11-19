@@ -1602,19 +1602,25 @@ class ClassifyRequest(BaseModel):
 
 class ClassifyData(BaseModel):
     index: int
-    label: Union[str, List[str]]
-    probs: Union[List[float], List[List[float]]]
+    label: str
+    probs: List[float]
     num_classes: int
-    labels: Optional[Union[List[str], List[List[str]]]] = None
+    labels: Optional[List[str]] = None
 
-    @model_validator(mode="after")
-    def _validate_result_shape(self) -> ClassifyData:
-        per_token = isinstance(self.label, list)
-        if self.probs and isinstance(self.probs[0], list) != per_token:
-            raise ValueError("probs must match the sequence or token shape of label")
-        if self.labels and isinstance(self.labels[0], list) != per_token:
-            raise ValueError("labels must match the sequence or token shape of label")
-        return self
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.labels is None:
+            data.pop("labels", None)
+        return data
+
+
+class TokenClassifyData(BaseModel):
+    index: int
+    label: List[str]
+    probs: List[List[float]]
+    num_classes: int
+    labels: Optional[List[List[str]]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -1629,7 +1635,7 @@ class ClassifyResponse(BaseModel):
     object: str = "list"
     created: int
     model: str
-    data: List[ClassifyData]
+    data: List[Union[ClassifyData, TokenClassifyData]]
     usage: UsageInfo
 
 

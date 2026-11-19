@@ -19,6 +19,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ClassifyData,
     ClassifyRequest,
     ClassifyResponse,
+    TokenClassifyData,
 )
 from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -149,6 +150,7 @@ class TestServingClassify(CustomTestCase):
             [{"embedding": [[2.0, 2.0], [-2.0, 2.0], [0.0, -1000.0]]}]
         )
         item = result.data[0]
+        self.assertIsInstance(item, TokenClassifyData)
         self.assertEqual(item.label, ["category_0", "category_1", "category_0"])
         self.assertEqual(
             item.labels, [["category_0", "category_1"], ["category_1"], ["category_0"]]
@@ -178,6 +180,7 @@ class TestServingClassify(CustomTestCase):
     def test_single_token_single_class_preserves_matrix(self):
         serving = self._serving("multi_label_classification", num_labels=1)
         item = serving._build_classify_response([{"embedding": [[2.0]]}]).data[0]
+        self.assertIsInstance(item, TokenClassifyData)
         self.assertEqual(item.label, ["category_0"])
         self.assertEqual(item.num_classes, 1)
         self.assertEqual(len(item.probs), 1)
@@ -251,25 +254,28 @@ class TestServingClassify(CustomTestCase):
                 )
 
     def test_response_schema_keeps_labels_and_probabilities_consistent(self):
-        for label, labels, probs in (
-            ("a", ["a", "b"], [0.5, 0.5]),
-            (["a", "b"], [["a", "b"], ["b"]], [[0.5, 0.5], [0.25, 0.75]]),
+        for data_type, label, probs in (
+            (ClassifyData, "a", [0.5, 0.5]),
+            (TokenClassifyData, ["a", "b"], [[0.5, 0.5], [0.25, 0.75]]),
         ):
-            item = {
-                "index": 0,
-                "label": label,
-                "labels": labels,
-                "probs": probs,
-                "num_classes": 2,
-            }
-            with self.subTest(label=label):
-                self.assertEqual(ClassifyData.model_validate(item).model_dump(), item)
-                wrong_label = ["a", "b"] if isinstance(label, str) else "a"
-                with self.assertRaisesRegex(ValidationError, "probs must match"):
-                    ClassifyData.model_validate({**item, "label": wrong_label})
-                wrong_labels = [["a"], ["b"]] if isinstance(label, str) else ["a", "b"]
-                with self.assertRaisesRegex(ValidationError, "labels must match"):
-                    ClassifyData.model_validate({**item, "labels": wrong_labels})
+            with self.subTest(data_type=data_type):
+                item = data_type(index=0, label=label, probs=probs, num_classes=2)
+                response = ClassifyResponse(
+                    id="classify-test",
+                    created=0,
+                    model="test-model",
+                    data=[item.model_dump()],
+                    usage={"prompt_tokens": 2, "total_tokens": 2},
+                )
+                self.assertIsInstance(response.data[0], data_type)
+                mismatched_label = ["a", "b"] if isinstance(label, str) else "a"
+                with self.assertRaises(ValidationError):
+                    ClassifyResponse.model_validate(
+                        {
+                            **response.model_dump(),
+                            "data": [{**item.model_dump(), "label": mismatched_label}],
+                        }
+                    )
 
     def test_empty_logits_keep_existing_fallback(self):
         for embedding in ([], [[], []]):
@@ -278,6 +284,7 @@ class TestServingClassify(CustomTestCase):
                 item = serving._build_classify_response(
                     [{"embedding": embedding}]
                 ).data[0]
+                self.assertIsInstance(item, ClassifyData)
                 self.assertEqual(item.label, "Default")
                 self.assertEqual(item.probs, [1.0])
                 self.assertEqual(item.num_classes, 1)
