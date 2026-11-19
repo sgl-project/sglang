@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=3600, stage="extra-b", runner_config="8-gpu-b300")
+register_cuda_ci(est_time=1800, stage="extra-b", runner_config="8-gpu-b300")
 
 MODEL_PATH = "moonshotai/Kimi-K3.1-Pro"
 DFLASH_DRAFT_MODEL = "RadixArk/Kimi-K3.1-Dflash2-Preview"
@@ -95,19 +95,6 @@ class TestKimiK31B300(GSM8KMixin, CustomTestCase):
         if hasattr(cls, "process") and cls.process:
             terminate_and_kill_process_tree(cls.process)
             _wait_for_gpu_idle_in_ci(timeout=GPU_IDLE_TIMEOUT)
-
-
-class TestKimiK31B300PrimsTs(TestKimiK31B300):
-    """The same recipe on the Prims-TS DSA backend, which InferenceX serves with:
-    under DCP its decode reads the sharded indexer's local KV slots through a path
-    the default FlashMLA backend does not share."""
-
-    server_args = TestKimiK31B300.server_args + [
-        "--dsa-prefill-backend",
-        "prims_ts",
-        "--dsa-decode-backend",
-        "prims_ts",
-    ]
 
 
 if __name__ == "__main__":

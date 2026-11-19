@@ -57,14 +57,15 @@ def _trtllm_backend(metadata, *, dsa_index_topk, **overrides):
         dsa_shards_index_k=False,
     )
     backend.__dict__.update(overrides)
-    for name in (
-        "_pad_topk_indices",
-        "_pad_trtllm_sparse_page_table",
-        "_multi_ctas_kv_counter_for",
-    ):
-        setattr(
-            backend, name, MethodType(getattr(DeepseekSparseAttnBackend, name), backend)
-        )
+    backend._pad_topk_indices = MethodType(
+        DeepseekSparseAttnBackend._pad_topk_indices, backend
+    )
+    backend._pad_trtllm_sparse_page_table = MethodType(
+        DeepseekSparseAttnBackend._pad_trtllm_sparse_page_table, backend
+    )
+    backend._multi_ctas_kv_counter_for = MethodType(
+        DeepseekSparseAttnBackend._multi_ctas_kv_counter_for, backend
+    )
     return backend
 
 
