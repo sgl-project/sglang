@@ -9,6 +9,6 @@ mod disaggregation;
 pub(crate) mod grpc;
 pub(crate) mod handlers;
 pub(crate) mod http;
-mod log;
+pub(crate) mod log;
 pub(crate) mod ollama;
 pub(crate) mod responses;

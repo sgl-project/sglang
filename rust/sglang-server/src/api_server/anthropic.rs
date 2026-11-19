@@ -23,7 +23,7 @@ use sglang_processor::dynamo_protocols::types::{
 use sglang_processor::{ReasoningOptions, dynamo_tool_choice};
 use tonic::{Code, Status};
 
-use super::core::{CoreError, ReceivedAs};
+use super::core::CoreError;
 use super::handlers::{CoreCall, CoreHandle};
 use super::http::openai::chat::{
     OutputParsing, SamplingDefaults, chat_event_stream, chat_sampling, prepare_chat_prompt,
@@ -31,6 +31,7 @@ use super::http::openai::chat::{
 };
 use super::http::openai::pd_routing::PDRoutingFields;
 use super::http::openai::{ChatFormatter, ChatTemplateKwargs, unix_seconds_u32};
+use crate::api_server::log::ReceivedAs;
 use crate::message::config::ServerArgs;
 use crate::message::ids::Rid;
 use crate::message::request::{GenerateRequest, RenderedChat};

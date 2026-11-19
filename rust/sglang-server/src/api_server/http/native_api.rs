@@ -19,10 +19,10 @@ use super::generate_hook::{
 use super::pre_generate::HeldGeneration;
 use super::request_headers::apply_header_overrides;
 use crate::api_server::core::{
-    CoreError, CoreEvent, CoreOutput, HealthStatus, RawBody, ReceivedAs,
-    STREAM_INVALID_REQUEST_ERROR,
+    CoreError, CoreEvent, CoreOutput, HealthStatus, STREAM_INVALID_REQUEST_ERROR,
 };
 use crate::api_server::handlers::{CoreCall, PendingGeneration, recv_indexed};
+use crate::api_server::log::{RawBody, ReceivedAs};
 #[cfg(test)]
 use crate::message::ids::Rid;
 #[cfg(test)]

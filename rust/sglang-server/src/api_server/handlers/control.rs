@@ -842,9 +842,9 @@ impl CoreHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api_server::core::ReceivedAs;
     use crate::api_server::handlers::test_utils::*;
     use crate::api_server::handlers::{CoreConfig, CoreMetadata};
+    use crate::api_server::log::ReceivedAs;
     use crate::message::ids::Rid;
     use crate::message::io_struct::GetInternalStateReq;
     use crate::message::request::{GenerateRequest, Request};

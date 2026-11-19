@@ -24,11 +24,12 @@ use super::super::request_headers::apply_header_overrides;
 use super::chat::ChatBody;
 use super::template::RenderedChat;
 use super::{AppState, ChatFormatter};
-use crate::api_server::core::{CoreError, OpenAiRequest, ReceivedAs};
+use crate::api_server::core::CoreError;
 use crate::api_server::http::native_api::{
     GenerateItem, RequestState, RequestTiming, drain_unary_frame, generate_requests,
     generation_event_stream_with,
 };
+use crate::api_server::log::{OpenAiRequest, ReceivedAs};
 use crate::message::config::ServerArgs;
 use crate::message::request::check_prompt_copies;
 use crate::utils::error::Error;

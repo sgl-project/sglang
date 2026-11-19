@@ -28,8 +28,8 @@ use super::generate::{Cancellation, Generation, Generations};
 use crate::api_server::core::fanout::{ControlTarget, RankId};
 use crate::api_server::core::{
     AbortHook, CoreError, DrainEnd, DrainState, FrontendMetrics, GenerateValidator, InFlight,
-    RequestLog,
 };
+use crate::api_server::log::RequestLog;
 
 /// How long the listeners keep open connections after a drain's requests
 /// finished: enough to flush the last responses and close idle connections.

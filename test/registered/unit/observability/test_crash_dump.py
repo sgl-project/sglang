@@ -256,7 +256,7 @@ class TestTokenizerManagerCrashDump(CustomTestCase):
 
 
 # The `Server.crash_dump_snapshot()` JSON the Rust server returns
-# (rust/sglang-server/src/api_server/core/request_log.rs).
+# (rust/sglang-server/src/api_server/log/request.rs).
 _SINGLE_BODY = {
     "rid": "single",
     "text": "Hello",

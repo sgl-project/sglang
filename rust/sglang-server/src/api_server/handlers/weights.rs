@@ -885,7 +885,7 @@ mod tests {
                         input_ids: Some(vec![1]),
                         ..Default::default()
                     },
-                    crate::api_server::core::ReceivedAs::without_headers(),
+                    crate::api_server::log::ReceivedAs::without_headers(),
                 )
                 .await
         });

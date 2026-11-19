@@ -7,7 +7,8 @@ use crate::message::request::GenerateRequest;
 use crate::message::sampling::SamplingParams;
 
 use super::handle::CoreHandle;
-use crate::api_server::core::{CoreError, CoreEvent, HealthStatus, ReceivedAs};
+use crate::api_server::core::{CoreError, CoreEvent, HealthStatus};
+use crate::api_server::log::ReceivedAs;
 
 /// Sentinel host that makes the KV connector no-op. Parity with
 /// `sglang.srt.disaggregation.utils.FAKE_BOOTSTRAP_HOST`.
