@@ -124,7 +124,7 @@ class TestUvicornWorkerSpawn(CustomTestCase):
         original = spawn.get_preparation_data
         main_keys_seen_by_workers = []
 
-        def fake_uvicorn_run(app_path, **kwargs):
+        def fake_run_uvicorn_workers(app_path, **kwargs):
             data = spawn.get_preparation_data("worker")
             main_keys_seen_by_workers.append([k for k in _MAIN_KEYS if k in data])
 
@@ -158,7 +158,12 @@ class TestUvicornWorkerSpawn(CustomTestCase):
             mock.patch.object(http_server, "write_data_for_multi_tokenizer"),
             mock.patch.object(http_server, "set_uvicorn_logging_configs"),
             mock.patch.dict(LOGGING_CONFIG["loggers"]),
-            mock.patch.object(http_server.uvicorn, "run", side_effect=fake_uvicorn_run),
+            mock.patch.object(
+                http_server,
+                "_run_uvicorn_workers",
+                side_effect=fake_run_uvicorn_workers,
+            ),
+            mock.patch.object(http_server, "_shutdown_schedulers_after_http_workers"),
         ):
             http_server._setup_and_run_http_server(
                 server_args=None,
