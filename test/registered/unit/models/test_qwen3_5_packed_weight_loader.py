@@ -19,7 +19,11 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.layers.parameter import PerTensorScaleParameter
-from sglang.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
+from sglang.srt.models.qwen3_5 import (
+    Qwen3_5GatedDeltaNet,
+    Qwen3_5MoeForConditionalGeneration,
+)
+from sglang.test.test_utils import CustomTestCase
 
 
 def _make_mock_module(output_sizes):
@@ -165,6 +169,55 @@ class TestMakePackedWeightLoader(unittest.TestCase):
     # ------------------------------------------------------------------ #
     #  Edge case: nested single-element tensors                           #
     # ------------------------------------------------------------------ #
+
+
+class TestFusedExpertScaleLoading(CustomTestCase):
+    def test_scale_tensor_loads_without_its_weight_tensor(self):
+        """A fused expert scale must load when its load_weights call carries no
+        fused expert weight, as a chunked weight update can deliver it."""
+        num_experts, rows, groups = 4, 6, 2
+        loaded = {}
+
+        def record(param, weight, name, shard_id, expert_id):
+            loaded[shard_id, expert_id] = weight.clone()
+
+        experts = torch.nn.Module()
+        experts.w13_weight_scale_inv = torch.nn.Parameter(
+            torch.zeros(num_experts, 2 * rows, groups, dtype=torch.uint8),
+            requires_grad=False,
+        )
+        experts.w13_weight_scale_inv.weight_loader = record
+
+        model = Qwen3_5MoeForConditionalGeneration.__new__(
+            Qwen3_5MoeForConditionalGeneration
+        )
+        torch.nn.Module.__init__(model)
+        model.model = torch.nn.Module()
+        model.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+        model.model.start_layer, model.model.end_layer = 0, 1
+        model.model.layers[0].mlp = torch.nn.Module()
+        model.model.layers[0].mlp.experts = experts
+        model.config = SimpleNamespace(
+            num_experts=num_experts, tie_word_embeddings=False, encoder_only=False
+        )
+        model.enable_shared_expert_fusion = False
+
+        scale = torch.arange(
+            num_experts * 2 * rows * groups, dtype=torch.uint8
+        ).reshape(num_experts, 2 * rows, groups)
+        model.load_weights(
+            [
+                (
+                    "model.language_model.layers.0.mlp.experts.gate_up_proj_scale_inv",
+                    scale,
+                )
+            ]
+        )
+
+        self.assertEqual(len(loaded), 2 * num_experts)
+        for expert_id in range(num_experts):
+            gate_up = torch.cat([loaded["w1", expert_id], loaded["w3", expert_id]])
+            self.assertTrue(torch.equal(gate_up, scale[expert_id]))
 
 
 if __name__ == "__main__":

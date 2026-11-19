@@ -2832,9 +2832,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     )
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if name.endswith("experts.gate_up_proj") or name.endswith(
-                    "experts.down_proj"
-                ):
+                # Substring match: fused expert scales carry a suffix
+                # (e.g. `experts.gate_up_proj_scale_inv`).
+                if "experts.gate_up_proj" in name or "experts.down_proj" in name:
                     is_fused_expert = True
                     expert_params_mapping = fused_expert_params_mapping
 
