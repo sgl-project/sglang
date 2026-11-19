@@ -26,6 +26,7 @@ from sglang.srt.arg_groups import overrides
 from sglang.srt.disaggregation import decode_freed_slots, pp_early_finish
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.environ import envs, nv_mega_runtime_switches
+from sglang.srt.layers import lm_head_all_to_all
 from sglang.srt.layers.moe.token_dispatcher import flashinfer as a2a_dispatcher
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.managers import scheduler_pp_mixin
@@ -342,6 +343,15 @@ def _a2a_output_in_workspace(shape: Shape) -> bool:
     )
 
 
+def _tp_lm_head_fp32(shape: Shape) -> bool:
+    platform = SimpleNamespace(is_blackwell=True)
+    with patch.object(lm_head_all_to_all, "get_platform", return_value=platform):
+        return lm_head_all_to_all.fp32_output_enabled(
+            use_tp_lm_head_all_to_all=bool(get_parallel().enable_tp_lm_head_all_to_all),
+            final_logit_softcapping=None,
+        )
+
+
 RESOLVERS: Dict[str, Callable[[Shape], bool]] = {
     "SGLANG_OPT_SCHEDULER_SHM_SYNC_DP_ROWS": _dp_rows,
     "SGLANG_OPT_PD_DECODE_ADMIT_FREED_SLOTS": _freed_slots,
@@ -350,6 +360,7 @@ RESOLVERS: Dict[str, Callable[[Shape], bool]] = {
     "SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD": _pp_proxy_recv_after_forward,
     "SGLANG_OPT_SPEC_DP_POST_VERIFY_GRAPHS": _dp_post_verify_graphs,
     "SGLANG_OPT_MOE_A2A_OUTPUT_IN_WORKSPACE": _a2a_output_in_workspace,
+    "SGLANG_OPT_TP_LM_HEAD_ALL_TO_ALL_FP32": _tp_lm_head_fp32,
 }
 
 
@@ -430,7 +441,7 @@ _TWO_HOSTS = _children()
 _NO_STAGING = _children()
 # A PD decode with attention DP; the exchange rows on at most two hosts, the
 # post-verify graphs with a bound gathered sampler.
-_PD_DECODE_DP = _children("MOE_A2A_OUTPUT_IN_WORKSPACE")
+_PD_DECODE_DP = _children("MOE_A2A_OUTPUT_IN_WORKSPACE", "TP_LM_HEAD_ALL_TO_ALL_FP32")
 _DP_EXCHANGE = _children("SCHEDULER_SHM_SYNC_DP_ROWS")
 _DP_GRAPHS = _children("SPEC_DP_POST_VERIFY_GRAPHS")
 # A top-k-1 EAGLE chain outside a PD prefill and attention DP: the generic paths,

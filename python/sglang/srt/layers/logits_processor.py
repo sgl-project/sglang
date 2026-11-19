@@ -45,7 +45,7 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
-from sglang.srt.layers import layernorm_sp
+from sglang.srt.layers import layernorm_sp, lm_head_all_to_all
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStates, pack_aux_hidden_states
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -566,6 +566,10 @@ class LogitsProcessor(nn.Module):
             and self.final_logit_softcapping < 0
         ):
             self.final_logit_softcapping = None
+        self.tp_lm_head_all_to_all_fp32 = lm_head_all_to_all.fp32_output_enabled(
+            use_tp_lm_head_all_to_all=self.use_tp_lm_head_all_to_all,
+            final_logit_softcapping=self.final_logit_softcapping,
+        )
 
         self.return_full_logits = return_full_logits
         self.enable_mis = get_exec().features.enable_mis
@@ -1261,7 +1265,14 @@ class LogitsProcessor(nn.Module):
             elif self._can_use_tp_lm_head_all_to_all(
                 logits, local_hidden_states, lm_head, logits_metadata
             ):
-                logits = self._tp_lm_head_all_to_all(logits)
+                logits = self._tp_lm_head_all_to_all(
+                    logits,
+                    logits_buffer=(
+                        logits_metadata.next_token_logits_buffer
+                        if use_logits_buffer
+                        else None
+                    ),
+                )
                 used_tp_lm_head_all_to_all = True
             else:
                 logits = self._logits_gatherer(logits)
@@ -1594,13 +1605,25 @@ class LogitsProcessor(nn.Module):
         local_rows = local_hidden_states.shape[0]
         return local_rows > 0 and logits.shape[0] == local_rows * tp_size
 
-    def _tp_lm_head_all_to_all(self, logits: torch.Tensor) -> torch.Tensor:
+    def _tp_lm_head_all_to_all(
+        self, logits: torch.Tensor, logits_buffer: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """Exchange only the row block owned by each destination DP rank."""
         logits = logits.contiguous()
         all_to_all_output = torch.empty_like(logits)
         get_parallel().tp_group.all_to_all_single(
             all_to_all_output.view(-1), logits.view(-1)
         )
+        if self.tp_lm_head_all_to_all_fp32:
+            fp32_logits = lm_head_all_to_all.all_to_all_output_to_fp32(
+                all_to_all_output,
+                tp_size=get_parallel().tp_size,
+                vocab_size=self.vocab_size,
+                logit_scale=self.logit_scale,
+                logits_buffer=logits_buffer,
+            )
+            if fp32_logits is not None:
+                return fp32_logits
         return _reassemble_tp_lm_head_all_to_all_output(all_to_all_output)
 
     def _scatter_dp_attn_logits(

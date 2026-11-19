@@ -1750,6 +1750,11 @@ class Envs:
     # materializing the full-vocab log-softmax. Escape hatch only; the two
     # paths are mathematically identical.
     SGLANG_ENABLE_FAST_INPUT_LOGPROBS = EnvBool(True)
+    # Write the TP LM-head all-to-all blocks straight into fp32 logits in vocabulary
+    # order (one launch, bit-identical). Unset follows the NVIDIA runtime master.
+    SGLANG_OPT_TP_LM_HEAD_ALL_TO_ALL_FP32 = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Deterministic inference and all-reduce

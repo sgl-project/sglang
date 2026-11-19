@@ -193,6 +193,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Follows the NVIDIA runtime master (both unset: <code>false</code>)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_OPT_TP_LM_HEAD_ALL_TO_ALL_FP32`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Allow the TP LM-head all-to-all (`--enable-tp-lm-head-all-to-all`) to write the received bf16 logits blocks straight into the fp32 logits in vocabulary order, in one launch instead of a reassembling copy and an fp32 cast, when its runtime checks pass (CUDA sm100 or newer, no final logit softcap, no logit scale). The logits are bit-identical. When unset, this follows `SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION`; an explicit `0` or `1` takes precedence.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Follows the NVIDIA runtime master (both unset: <code>false</code>)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_ENABLE_TORCH_INFERENCE_MODE`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Control whether to use torch.inference_mode</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>
