@@ -41,8 +41,9 @@ def _make_case(
     s_q: int = 2,
     topk: int = TOPK,
     s_kv: int = S_KV,
+    h_q: int = H_Q,
 ):
-    q = _make_fp8_tensor((s_q, H_Q, d_qk), seed=1000 + d_qk + s_q * 13 + topk)
+    q = _make_fp8_tensor((s_q, h_q, d_qk), seed=1000 + d_qk + s_q * 13 + topk)
     kv = torch.zeros((s_kv + 1, H_KV, d_qk), dtype=DTYPE_FP8, device="cuda")
     kv[:s_kv] = _make_fp8_tensor((s_kv, H_KV, d_qk), seed=2000 + d_qk + s_kv)
 
@@ -64,7 +65,7 @@ def _make_case(
     if not with_sink:
         return q, kv, indices, sm_scale, q_scale, kv_scale, None, None
 
-    attn_sink = torch.linspace(-0.05, 0.05, H_Q, dtype=torch.float32, device="cuda")
+    attn_sink = torch.linspace(-0.05, 0.05, h_q, dtype=torch.float32, device="cuda")
     # Vary topk_length per query row to exercise the partial-topk path.
     lengths = [topk if i % 2 == 0 else max(topk - 32, topk // 2) for i in range(s_q)]
     topk_length = torch.tensor(lengths, dtype=torch.int32, device="cuda")
@@ -98,6 +99,12 @@ def _torch_sparse_attention_ref(
     for q_idx in range(q.shape[0]):
         valid_topk = topk if topk_length is None else int(topk_length[q_idx].item())
         token_ids = indices[q_idx, 0, :valid_topk].to(torch.long)
+        token_ids = token_ids[(token_ids >= 0) & (token_ids < kv.shape[0])]
+        if token_ids.numel() == 0:
+            out[q_idx].zero_()
+            max_logits[q_idx].fill_(-torch.inf)
+            lse[q_idx].fill_(-torch.inf)
+            continue
         keys = kv_f32[token_ids, 0, :]
         values = kv_f32[token_ids, 0, :D_V]
         scores = torch.matmul(q_f32[q_idx], keys.transpose(0, 1)) * sm_scale
@@ -167,6 +174,236 @@ def _run_and_check(d_qk, with_sink, s_q=2, topk=TOPK, s_kv=S_KV):
 @pytest.mark.parametrize("d_qk,with_sink", [(512, False), (576, False)])
 def test_sparse_mla_q8kv8_prefill_matches_reference(d_qk: int, with_sink: bool):
     _run_and_check(d_qk, with_sink)
+
+
+@pytest.mark.skipif(not _sm90_available(), reason="Q8KV8 ETAP requires SM90 CUDA")
+@pytest.mark.parametrize("h_q", [8, 16, 32])
+@pytest.mark.parametrize("d_qk", [512, 576])
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_sparse_mla_q8kv8_prefill_small_heads(h_q: int, d_qk: int, with_sink: bool):
+    """Transpose both GEMMs while preserving per-head softmax, masks and scales."""
+    from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
+        sparse_mla_q8kv8_prefill_fwd,
+    )
+
+    q, kv, indices, sm_scale, q_scale, kv_scale, sink, _ = _make_case(
+        d_qk, with_sink, s_q=5, topk=384, s_kv=512, h_q=h_q
+    )
+    # Unit-magnitude Q/K exercise FP8 P rounding and nonuniform logits.
+    q = (q.float() * 20).to(DTYPE_FP8)
+    kv = (kv.float() * 20).to(DTYPE_FP8)
+    q_scale.fill_(1.3)
+    kv_scale.fill_(0.7)
+    if sink is not None:
+        sink.mul_(160)
+    lengths = torch.tensor([0, 1, 63, 129, 384], device="cuda", dtype=torch.int32)
+    indices[4, 0, 17:64] = -1
+    kwargs = dict(
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=sm_scale,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+        attn_sink=sink,
+        topk_length=lengths,
+    )
+    out, max_logits, lse = sparse_mla_q8kv8_prefill_fwd(**kwargs)
+    ref, ref_max, ref_lse = _torch_sparse_attention_ref(**kwargs)
+    torch.testing.assert_close(out.float(), ref, atol=8e-2, rtol=8e-2)
+    relative_error = (out[1:].float() - ref[1:]).norm(dim=(1, 2)) / ref[1:].norm(
+        dim=(1, 2)
+    )
+    assert relative_error.max().item() < 0.04
+    torch.testing.assert_close(max_logits, ref_max, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse, ref_lse, atol=2e-3, rtol=2e-3)
+    assert torch.count_nonzero(out[0]) == 0
+
+    # The no-length dispatch must mask the same interior and trailing holes.
+    for row, length in enumerate(lengths.tolist()):
+        indices[row, 0, length:] = -1
+    if not with_sink:
+        kwargs["topk_length"] = None
+        full = sparse_mla_q8kv8_prefill_fwd(**kwargs)
+        for actual, expected in zip(full, (out, max_logits, lse)):
+            torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.skipif(not _sm90_available(), reason="Q8KV8 ETAP requires SM90 CUDA")
+@pytest.mark.parametrize("h_q", [8, 16, 32])
+@pytest.mark.parametrize("d_qk", [512, 576])
+@pytest.mark.parametrize("s_q", [32, 33, 64, 65, 66, 67])
+@pytest.mark.parametrize("topk", [128, 640, 2176])
+def test_sparse_mla_q8kv8_prefill_small_heads_query_boundaries(
+    h_q: int, d_qk: int, s_q: int, topk: int
+):
+    """Query-count routing must preserve every head and its attention sink."""
+    from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
+        sparse_mla_q8kv8_prefill_fwd,
+    )
+
+    q, kv, indices, sm_scale, q_scale, kv_scale, sink, lengths = _make_case(
+        d_qk, True, s_q=s_q, topk=topk, s_kv=1024, h_q=h_q
+    )
+    q = (q.float() * 20).to(DTYPE_FP8)
+    kv = (kv.float() * 20).to(DTYPE_FP8)
+    q_scale.fill_(1.3)
+    kv_scale.fill_(0.7)
+    sink.mul_(160)
+    kwargs = dict(
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=sm_scale,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+        attn_sink=sink,
+        topk_length=lengths,
+    )
+    for topk_length in (lengths, None):
+        kwargs["topk_length"] = topk_length
+        kwargs["attn_sink"] = sink if topk_length is not None else None
+        reference = _torch_sparse_attention_ref(**kwargs)
+        out, maximum, lse = sparse_mla_q8kv8_prefill_fwd(**kwargs)
+        torch.testing.assert_close(out.float(), reference[0], atol=8e-2, rtol=8e-2)
+        relative = (out.float() - reference[0]).norm(dim=(1, 2)) / reference[0].norm(
+            dim=(1, 2)
+        ).clamp_min(1e-12)
+        assert relative.max().item() < 0.04
+        torch.testing.assert_close(maximum, reference[1], atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(lse, reference[2], atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.skipif(not _sm90_available(), reason="Q8KV8 ETAP requires SM90 CUDA")
+@pytest.mark.parametrize("h_q", [8, 16, 32])
+@pytest.mark.parametrize("s_q", [1, 64, 67])
+@pytest.mark.parametrize("topk", [128, 640, 2176])
+def test_sparse_mla_q8kv8_prefill_small_heads_preserves_value_key_order(
+    h_q: int, s_q: int, topk: int
+):
+    """The FP8 transpose's row packing must select the original KV row."""
+    from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
+        _get_entries,
+        sparse_mla_q8kv8_prefill_fwd,
+    )
+
+    q = torch.zeros(s_q, h_q, 512, device="cuda")
+    for row in range(s_q):
+        q[row, :, row % 64] = 96
+    kv = torch.zeros(256, 1, 512, device="cuda")
+    kv[:64, 0, :64] = torch.eye(64, device="cuda")
+    indices = torch.full((s_q, 1, topk), -1, device="cuda", dtype=torch.int32)
+    indices[:, :, :64] = torch.arange(64, device="cuda")
+    lengths = torch.full((s_q,), 64, device="cuda", dtype=torch.int32)
+    scale = torch.ones((), device="cuda")
+    q, kv = q.to(DTYPE_FP8), kv.to(DTYPE_FP8)
+    out, max_logits, lse = sparse_mla_q8kv8_prefill_fwd(
+        q,
+        kv,
+        indices,
+        1.0,
+        scale,
+        scale,
+        topk_length=lengths,
+    )
+    selected = torch.arange(s_q, device="cuda") % 64
+    expected = kv[selected, 0].unsqueeze(1).expand(-1, h_q, -1).bfloat16()
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+    # Capture the dispatch after the public API has validated the inputs.
+    dispatch = _get_entries()[2]
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        dispatch(
+            q,
+            kv,
+            indices,
+            scale,
+            scale,
+            lengths,
+            out,
+            max_logits,
+            lse,
+            s_q,
+            kv.shape[0],
+            h_q,
+            1,
+            512,
+            512,
+            topk,
+            1.0,
+            torch._C._cuda_getCurrentRawStream(0),
+        )
+    for _ in range(3):
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+    # A raw FFI caller can supply a stream other than the current torch stream.
+    out.fill_(float("nan"))
+    alternate = torch.cuda.Stream()
+    alternate.wait_stream(torch.cuda.current_stream())
+    dispatch(
+        q,
+        kv,
+        indices,
+        scale,
+        scale,
+        lengths,
+        out,
+        max_logits,
+        lse,
+        s_q,
+        kv.shape[0],
+        h_q,
+        1,
+        512,
+        512,
+        topk,
+        1.0,
+        alternate.cuda_stream,
+    )
+    alternate.synchronize()
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not _sm90_available(), reason="Q8KV8 ETAP requires SM90 CUDA")
+@pytest.mark.parametrize("topk", [TOPK, 8192])
+def test_sparse_mla_q8kv8_prefill_small_heads_int64_sparse_offsets(topk):
+    """Address the last query beyond 2^31 index or output elements correctly."""
+    from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
+        sparse_mla_q8kv8_prefill_fwd,
+    )
+
+    rows = (1 << 31) // (topk if topk == 8192 else 32 * 512) + 1
+    required = rows * (32 * 512 * 3 + topk * 4 + 32 * 8 + 4)
+    if torch.cuda.mem_get_info()[0] < required + 2 * 1024**3:
+        pytest.skip("The int64 address regression needs room for its real tensors")
+    args = _make_case(512, False, s_q=2, s_kv=2, h_q=32, topk=topk)
+    q, kv, indices, sm_scale, q_scale, kv_scale, _, _ = args
+    indices[:, :, :2] = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    lengths = torch.full((2,), 2, device="cuda", dtype=torch.int32)
+    ref, _, _ = _torch_sparse_attention_ref(
+        q, kv, indices, sm_scale, q_scale, kv_scale, None, lengths
+    )
+    large_q = torch.zeros(rows, 32, 512, device="cuda", dtype=DTYPE_FP8)
+    large_q[-2:].copy_(q)
+    large_indices = torch.full((rows, 1, topk), -1, device="cuda", dtype=torch.int32)
+    large_indices[-2:].copy_(indices)
+    large_lengths = torch.zeros(rows, device="cuda", dtype=torch.int32)
+    large_lengths[-2:].copy_(lengths)
+    out, max_logits, lse = sparse_mla_q8kv8_prefill_fwd(
+        large_q,
+        kv,
+        large_indices,
+        sm_scale,
+        q_scale,
+        kv_scale,
+        topk_length=large_lengths,
+    )
+    torch.testing.assert_close(out[-2:].float(), ref, atol=8e-2, rtol=8e-2)
+    assert torch.count_nonzero(out[:-2]) == 0
+    assert torch.isneginf(max_logits[:-2]).all()
+    assert torch.isneginf(lse[:-2]).all()
 
 
 # Corner cases: minimal s_q, larger s_q, larger topk/s_kv, crossed d_qk

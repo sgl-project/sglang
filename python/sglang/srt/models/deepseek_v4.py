@@ -75,6 +75,9 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     DeepseekV41Indexer,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
+from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+    use_dsv4_q8kv8_sparse_prefill,
+)
 from sglang.srt.layers.attention.graph_utils import (
     pad_with_zero_rows,
     real_rows_scope,
@@ -1228,8 +1231,22 @@ class MqaAttentionBase(nn.Module):
             or getattr(self.wo_b, "block_fp8_mxfp8_ready", False)
         )
 
-    def _kernel_num_heads(self, num_tokens: int) -> int:
+    def _kernel_num_heads(
+        self, num_tokens: int, *, forward_batch: ForwardBatch, attn_backend
+    ) -> int:
         if self.attn_tp_size == 1:
+            return self.n_local_heads
+
+        prefill_backend = getattr(attn_backend, "dsv4_prefill_backend", None)
+        if (
+            prefill_backend is not None
+            and self.n_local_heads in (8, 16, 32)
+            and use_dsv4_q8kv8_sparse_prefill(prefill_backend)
+            and get_platform().is_sm90
+            and attn_backend._use_sparse_prefill(
+                forward_batch, num_qo_tokens=num_tokens
+            )
+        ):
             return self.n_local_heads
 
         if get_platform().is_sm120:
@@ -2822,7 +2839,9 @@ class MQALayer(MqaAttentionBase):
             kernel_num_heads = (
                 self.n_local_heads
                 if _is_hip and not unified and _hip.skip_head_pad(self)
-                else self._kernel_num_heads(x.shape[0])
+                else self._kernel_num_heads(
+                    x.shape[0], forward_batch=forward_batch, attn_backend=attn_backend
+                )
             )
             if kernel_num_heads != self.n_local_heads:
                 # Backends without an exact-head specialization retain the existing
@@ -2839,6 +2858,13 @@ class MQALayer(MqaAttentionBase):
                     q_padded = x.new_empty(x.shape[0], kernel_num_heads, self.head_dim)
                 tp_slice = slice(0, self.n_local_heads)
                 q_out = q_padded[:, tp_slice, :]
+            elif (
+                get_platform().is_sm90
+                and self.attn_tp_size > 1
+                and kernel_num_heads < 64
+            ):
+                # Preserve fused Q/RoPE rounding while removing head padding.
+                q_out = x.new_empty(x.shape[0], kernel_num_heads, self.head_dim)
         attn_sink = self._local_attn_sink(kernel_num_heads)
 
         if enable_multi_stream:

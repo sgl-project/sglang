@@ -466,14 +466,16 @@ def _patched_sparse_kernels(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("compress_ratio", [0, 4, 128])
+@pytest.mark.parametrize("local_heads", [16, 32])
 def test_q8kv8_sparse_prefill_helper_builds_fp8_workspace_matching_bf16_path(
     compress_ratio: int,
+    local_heads: int,
 ):
     from sglang.kernels.ops.attention.dsv4.dequant_k_cache import fp8_dtype
 
     device = torch.device("cuda")
     backend, forward_batch, token_to_kv_pool, q, attn_sink, core_attn_metadata = (
-        _make_sparse_prefill_case(device, local_heads=16)
+        _make_sparse_prefill_case(device, local_heads=local_heads)
     )
     _populate_compress_metadata(
         core_attn_metadata,
@@ -513,7 +515,7 @@ def test_q8kv8_sparse_prefill_helper_builds_fp8_workspace_matching_bf16_path(
         == q8_out.shape
         == (
             forward_batch.extend_num_tokens,
-            16,
+            local_heads,
             512,
         )
     )
@@ -528,9 +530,8 @@ def test_q8kv8_sparse_prefill_helper_builds_fp8_workspace_matching_bf16_path(
     assert bf16_kv.dtype == torch.bfloat16
     assert q8_kv.dtype == fp8_dtype
     assert q8_call["q"].dtype == fp8_dtype
-    assert q8_call["q"].shape[1] == 64
-    assert torch.count_nonzero(q8_call["q"][:, 16:]).item() == 0
-    assert q8_call["attn_sink"].shape == (64,)
+    assert q8_call["q"].shape[1] == local_heads
+    assert q8_call["attn_sink"].shape == (local_heads,)
     assert q8_kv.shape[0] == bf16_kv.shape[0] + 1
     torch.testing.assert_close(
         q8_kv[:-1].to(torch.bfloat16).float(),
@@ -572,26 +573,41 @@ def test_q8kv8_sparse_prefill_rejects_invalid_topk_length_bounds(
 @pytest.mark.skipif(
     not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
 )
-def test_q8kv8_sparse_prefill_real_kernel_matches_bf16_sparse_path():
+@pytest.mark.parametrize("local_heads", [8, 16, 32, 64])
+@pytest.mark.parametrize("compress_ratio", [0, 1, 2])
+def test_q8kv8_sparse_prefill_real_kernel_matches_bf16_sparse_path(
+    local_heads, compress_ratio
+):
     device = torch.device("cuda")
     backend, forward_batch, token_to_kv_pool, q, attn_sink, core_attn_metadata = (
-        _make_sparse_prefill_case(device, local_heads=64)
+        _make_sparse_prefill_case(device, local_heads=local_heads)
     )
+    if compress_ratio:
+        # V4.1 low-ratio layers combine 512 compressed picks with the SWA window.
+        core_attn_metadata.page_table = torch.tensor(
+            [[0, 1, 2]] * 3 + [[3, 4, 5]] * 2, dtype=torch.int32, device=device
+        )
+        raw_indices = torch.full((5, 512), -1, dtype=torch.int32, device=device)
+        for row, length in enumerate(core_attn_metadata.seq_lens_casual.tolist()):
+            count = length // compress_ratio
+            raw_indices[row, :count] = torch.arange(count, device=device)
+        core_attn_metadata.sparse_raw_indices = lambda ratio: raw_indices
 
+    # The legacy BF16 provider only accepts 64/128 heads on SM90.
     bf16_out = backend._forward_prefill_sparse(
-        q=q,
+        q=torch.nn.functional.pad(q, (0, 0, 0, 64 - local_heads)),
         layer_id=0,
-        compress_ratio=0,
+        compress_ratio=compress_ratio,
         forward_batch=forward_batch,
         token_to_kv_pool=token_to_kv_pool,
         core_attn_metadata=core_attn_metadata,
-        attn_sink=attn_sink,
-    )
+        attn_sink=torch.nn.functional.pad(attn_sink, (0, 64 - local_heads)),
+    )[:, :local_heads]
     sparse_cache = backend.forward_metadata.sparse_prefill_cache
     q8_out = backend._forward_prefill_sparse_q8kv8(
         q=q,
         layer_id=0,
-        compress_ratio=0,
+        compress_ratio=compress_ratio,
         forward_batch=forward_batch,
         token_to_kv_pool=token_to_kv_pool,
         core_attn_metadata=core_attn_metadata,
@@ -605,7 +621,7 @@ def test_q8kv8_sparse_prefill_real_kernel_matches_bf16_sparse_path():
         == q8_out.shape
         == (
             forward_batch.extend_num_tokens,
-            64,
+            local_heads,
             512,
         )
     )

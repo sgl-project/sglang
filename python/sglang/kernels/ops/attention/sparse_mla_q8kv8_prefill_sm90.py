@@ -347,13 +347,9 @@ def sparse_mla_q8kv8_prefill_fwd(
     if kv_d_qk != d_qk:
         raise ValueError(f"kv d_qk must match q d_qk={d_qk}, got {kv_d_qk}")
 
-    # The CUDA implementation uses B_H=64 and launches h_q / B_H CTAs.
-    # Reject unpadded TP-local head counts instead of launching zero CTAs and
-    # returning uninitialized outputs, which can appear to callers as a hang or
-    # a later collective failure.
-    if h_q == 0 or h_q % 64 != 0:
+    if h_q not in (8, 16, 32) and (h_q == 0 or h_q % 64 != 0):
         raise ValueError(
-            "sparse_mla_q8kv8_prefill_fwd requires h_q padded to a positive "
+            "sparse_mla_q8kv8_prefill_fwd requires h_q=8/16/32 or a positive "
             f"multiple of 64, got {h_q}"
         )
 
@@ -535,6 +531,8 @@ def q8kv8_padded_num_heads(num_heads: int) -> int:
     """Return a Q-head count supported by the SM90 Q8KV8 kernel."""
     if num_heads <= 0:
         raise ValueError(f"num_heads must be positive, got {num_heads}")
+    if num_heads in (8, 16, 32):
+        return num_heads
     if num_heads <= 64:
         return 64
     if num_heads <= 128:
@@ -555,9 +553,8 @@ def cast_q_fp8_for_q8kv8_prefill(
     The incoming Q is the model-produced BF16/FP16 tensor already shaped as
     ``(num_tokens, num_heads, 512)`` after removing the singleton MQA axis.
 
-    The SM90 kernel processes query heads in 64-head blocks. Tensor parallelism
-    commonly leaves fewer than 64 local heads, so the active heads are copied
-    into a zero-padded 64/128-head FP8 tensor.
+    Local head counts of 8, 16 and 32 keep their native query width.
+    Other head counts are copied into a zero-padded 64/128-head FP8 tensor.
     """
     assert q.ndim == 3
     assert q.shape[-1] == DIM_NOPE + DIM_ROPE
@@ -566,7 +563,7 @@ def cast_q_fp8_for_q8kv8_prefill(
     if padded_num_heads is None:
         padded_num_heads = q8kv8_padded_num_heads(num_heads)
 
-    if padded_num_heads not in (64, 128) or padded_num_heads < num_heads:
+    if padded_num_heads not in (8, 16, 32, 64, 128) or padded_num_heads < num_heads:
         raise ValueError(
             f"invalid padded_num_heads={padded_num_heads} for num_heads={num_heads}"
         )

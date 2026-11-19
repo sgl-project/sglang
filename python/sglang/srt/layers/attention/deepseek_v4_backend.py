@@ -4796,7 +4796,7 @@ class DeepseekV4AttnBackend(
         q: torch.Tensor,
         attn_sink: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        """Pad TP-local heads to the SM90 kernel's 64-head CTA granularity."""
+        """Cast TP-local Q and pad heads only when the SM90 kernel requires it."""
         from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
             cast_q_fp8_for_q8kv8_prefill,
             q8kv8_padded_num_heads,

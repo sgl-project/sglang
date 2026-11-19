@@ -228,6 +228,20 @@ def _make_padder():
     return backend
 
 
+@pytest.mark.parametrize("heads,kernel_heads", [(8, 8), (16, 16), (32, 32), (48, 64)])
+def test_born_fp8_query_buffer_preserves_native_small_heads_and_reuses_storage(
+    heads, kernel_heads
+):
+    backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+    backend._q8kv8_born_q_buf = None
+    query = backend.q8kv8_acquire_born_q_buffer(3, heads, 512, torch.device("cpu"))
+    assert query.shape == (3, kernel_heads, 512)
+    assert torch.count_nonzero(query[:, heads:].float()) == 0
+    reused = backend.q8kv8_acquire_born_q_buffer(1, heads, 512, torch.device("cpu"))
+    assert reused.data_ptr() == query.data_ptr()
+    assert reused.shape == (1, kernel_heads, 512)
+
+
 def test_pad_topk_width_pads_kpool_width_with_minus_one():
     indices = torch.arange(2 * 2051, dtype=torch.int32).view(2, 2051)
     padded = _make_padder()._pad_topk_width_buffered(indices, multiple=128)

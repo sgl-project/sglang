@@ -3557,7 +3557,9 @@ class DeepseekSparseAttnBackend(
         matching the _q8kv8_qpad_buf invariant the SM90 kernel relies on.
         """
         pad = 64
-        padded_heads = num_heads if num_heads % pad == 0 else pad
+        padded_heads = (
+            num_heads if num_heads in (8, 16, 32) or num_heads % pad == 0 else pad
+        )
         buf = self._q8kv8_born_q_buf
         if (
             buf is None
@@ -3687,10 +3689,11 @@ class DeepseekSparseAttnBackend(
         head_dim = d_nope + q_rope.shape[-1]
         dev = q_nope.device
 
-        # The SM90 kernel requires num_heads % 64 == 0; smaller head counts
-        # (high-TP splits) are zero-padded up to 64.
+        # ETAP consumes 8/16/32 heads directly; other counts use 64-head CTAs.
         required_padding = 64
-        need_padding = num_heads % required_padding != 0
+        need_padding = (
+            num_heads not in (8, 16, 32) and num_heads % required_padding != 0
+        )
 
         # Born-fp8 fast path (SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q): the model's
         # q-prep already wrote the padded fp8 q (fused absorbed-bmm + concat +
